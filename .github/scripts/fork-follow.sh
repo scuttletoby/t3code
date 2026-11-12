@@ -1,102 +1,233 @@
 #!/usr/bin/env bash
-# Decides what the follow-upstream workflow does next, and rebases the fork's patch series onto a
-# newer stable upstream tag when there is one. Run in a full clone with the series checked out.
-# Writes key=value lines to $GITHUB_OUTPUT (stdout without it); a failure's reason goes to $REPORT.
-set -euo pipefail
+# Plan step of fork-follow.yml: decides what the run does, and rebases the fork's patch series onto
+# a newer stable upstream tag when there is one. Run in a full clone with the series checked out.
+# It pushes and publishes nothing itself. Tests: fork-follow.test.sh.
+#
+# Environment: UPSTREAM (owner/name), UPSTREAM_URL (git URL of upstream, default GitHub), ORIGIN
+# (git remote or URL of this fork, default origin), RUN_SHA (the commit this run's workflow files
+# come from, default HEAD), REPOSITORY (owner/name of this fork, for the advice in reports), REPORT
+# (file that receives the reason when the run cannot go on).
+#
+# Output, key=value lines to $GITHUB_OUTPUT (stdout without it):
+#   action         none     the series head is the newest fork release of its base already
+#                  release  same base, but the series has commits no fork release has
+#                  rebase   rebased onto a newer tag: release the candidate, then move the series
+#                  advance  rebased onto a newer tag, and a published fork release already has the
+#                           candidate's exact files: move the series to that release, build nothing
+#                  stage    rebased, but the release workflows changed upstream: push the candidate
+#                           and stop, so it is released with its own workflow files (see $REPORT)
+#   base_tag, base_commit  the upstream tag (and its commit) the candidate sits on
+#   previous_tag, previous_head  where the series was (rebase, advance, stage)
+#   candidate      the commit to release or to move the series to
+#   released_tag   the fork release that already has the candidate's files (none, advance)
+#   dropped        subjects of patches that became empty on the new base (';'-separated)
+#   own_workflows  workflow files the series itself adds (','-separated); every other one is
+#                  upstream's and gets disabled
+set -Eeuo pipefail
 
 : "${UPSTREAM:?owner/name of the upstream repository}"
 REPORT="${REPORT:-fork-follow-report.md}"
 OUTPUT="${GITHUB_OUTPUT:-/dev/stdout}"
+ORIGIN="${ORIGIN:-origin}"
+REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:-this repository}}"
 logs="${RUNNER_TEMP:-$(mktemp -d)}"
 upstream_url="${UPSTREAM_URL:-https://github.com/$UPSTREAM.git}"
+reported=""
 
 fail() {
   printf '%s\n' "$@" > "$REPORT"
   cat "$REPORT" >&2
+  reported=1
   exit 1
 }
 
-stable_tags() {
-  git ls-remote --tags --refs "$upstream_url" 'v*' \
-    | sed -n 's|.*refs/tags/\(v[0-9]\+\.[0-9]\+\.[0-9]\+\)$|\1|p' | sort -rV
+# A command that fails outside fail() (set -e) still leaves a reason that names the step.
+on_error() {
+  local status="$1" line="$2" command="$3"
+  [[ -z "$reported" ]] || return 0
+  reported=1
+  printf '%s\n' "The plan stopped at fork-follow.sh line $line (exit $status): \`$command\`" \
+    "This is not one of the planned refusals; see the run log." > "$REPORT"
+  cat "$REPORT" >&2
 }
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
-fetch_upstream_tag() {
-  git fetch --quiet --no-tags "$upstream_url" "+refs/tags/$1:refs/upstream-tags/$1"
-  git rev-parse "refs/upstream-tags/$1^{commit}"
-}
-
+stable_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
+fork_re='^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$'
 head="$(git rev-parse HEAD)"
-target_tag="$(stable_tags | sed -n 1p)"
-[[ -n "$target_tag" ]] || fail "$UPSTREAM has no stable release tag."
+run_sha="${RUN_SHA:-$head}"
+
+# Read-only fetches into refs this run alone uses: upstream's tags and default branch, and this
+# fork's tags (its releases).
+git fetch --quiet --no-tags "$upstream_url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head" \
+  > "$logs/fetch.log" 2>&1 \
+  || fail "Could not fetch the tags and default branch of $UPSTREAM ($upstream_url):" '```' "$(tail -n 20 "$logs/fetch.log")" '```'
+git fetch --quiet --no-tags "$ORIGIN" "+refs/tags/v*:refs/fork-tags/v*" > "$logs/fetch.log" 2>&1 \
+  || fail "Could not fetch the tags of this fork ($ORIGIN):" '```' "$(tail -n 20 "$logs/fetch.log")" '```'
+
+upstream_tags="$(git for-each-ref --format='%(refname:strip=2)' refs/upstream-tags | grep -E "$stable_re" | sort -rV || true)"
+fork_tags="$(git for-each-ref --format='%(refname:strip=2)' refs/fork-tags | grep -E "$fork_re" | sort -rV || true)"
+target_tag="$(sed -n 1p <<< "$upstream_tags")"
+[[ -n "$target_tag" ]] || fail "$UPSTREAM has no stable release tag (vX.Y.Z)."
+up() { git rev-parse "refs/upstream-tags/$1^{commit}"; }
+
+# The newest fork release in the series' history names the upstream tag the series was built on.
+# If upstream deleted or moved that tag, the base found below would be an older tag (or upstream's
+# rewritten commits would count as the fork's own), so stop and name the tag instead.
+last_release=""
+for tag in $fork_tags; do
+  if git merge-base --is-ancestor "refs/fork-tags/$tag^{commit}" HEAD; then
+    last_release="$tag"
+    break
+  fi
+done
+if [[ -n "$last_release" ]]; then
+  built_on="${last_release%-fork.*}"
+  if ! git rev-parse --quiet --verify "refs/upstream-tags/$built_on^{commit}" > /dev/null; then
+    fail "$UPSTREAM no longer has the tag $built_on, which the series was built on (fork release $last_release is in its history)." \
+      "Upstream deleted or renamed that release. Decide by hand which upstream release the series should sit on; the series was left as it is."
+  fi
+  if ! git merge-base --is-ancestor "$(up "$built_on")" HEAD; then
+    fail "$UPSTREAM moved the tag $built_on, which the series was built on (fork release $last_release is in its history), to a commit the series does not contain." \
+      "Decide by hand whether to rebase onto the moved tag; the series was left as it is."
+  fi
+fi
 
 # The series sits on the newest stable upstream tag it contains.
 base_tag=""
-while read -r tag; do
-  commit="$(fetch_upstream_tag "$tag")"
-  if git merge-base --is-ancestor "$commit" HEAD; then
+for tag in $upstream_tags; do
+  if git merge-base --is-ancestor "$(up "$tag")" HEAD; then
     base_tag="$tag"
-    base="$commit"
+    base="$(up "$tag")"
     break
   fi
-done < <(stable_tags)
+done
 [[ -n "$base_tag" ]] || fail "The series ($head) contains no stable $UPSTREAM tag."
 
 # Every commit between that tag and the series head must be the fork's own. Upstream commits there
 # mean the branch is not a patch series (for example it still equals upstream's default branch).
-git fetch --quiet --no-tags "$upstream_url" "+HEAD:refs/upstream-head"
 series_count="$(git rev-list --count "$base..HEAD")"
 own_count="$(git rev-list --count "$base..HEAD" --not refs/upstream-head)"
 if [[ "$series_count" != "$own_count" ]]; then
   fail "The series holds $((series_count - own_count)) upstream commits after $base_tag." \
-    "Reset it to $base_tag plus the fork's own commits; nothing was rebased or published."
+    "Reset it to $base_tag plus the fork's own commits. The series was left as it is."
+fi
+
+# A rebase flattens merge commits, and a change made in a merge itself (a conflict resolved in the
+# merge, an edited merge) would be lost without a trace. The series must be plain commits.
+merges="$(git rev-list --merges "$base..HEAD")"
+if [[ -n "$merges" ]]; then
+  fail "The series holds merge commits after $base_tag:" \
+    "$(git log --no-walk --format='- %h %s' $merges)" "" \
+    "A rebase would flatten them and drop any change made in the merge itself, so the series was left as it is." \
+    "Rebuild it as plain commits: check that \`git show --remerge-diff <merge>\` prints no change for each merge (or keep that change as its own commit)," \
+    "run \`git rebase --onto $base_tag $base_tag <series branch>\` and force-push it. Merge fork pull requests only with squash or rebase."
 fi
 
 node .github/scripts/fork-schema-check.cjs "$base" HEAD > "$logs/schema-check.log" 2>&1 \
   || fail "The series changes the database schema:" '```' "$(cat "$logs/schema-check.log")" '```'
 
-released_head() {
-  local version="${1#v}" last
-  last="$(git ls-remote --tags --refs origin "v$version-fork.*" \
-    | sed -n "s|.*refs/tags/v$version-fork\.\([0-9]\+\)$|\1|p" | sort -n | tail -n1)"
-  [[ -z "$last" ]] || git ls-remote origin "refs/tags/v$version-fork.$last^{}" "refs/tags/v$version-fork.$last" \
-    | sort -k2 | tail -n1 | cut -f1
+# The newest fork release of a tag: "<tag> <commit>", or nothing.
+latest_release() {
+  local last
+  last="$(grep -E "^${1//./\\.}-fork\.[0-9]+$" <<< "$fork_tags" | sort -V | tail -n1 || true)"
+  [[ -z "$last" ]] || echo "$last $(git rev-parse "refs/fork-tags/$last^{commit}")"
+}
+
+own_workflows() {
+  git diff --name-only --diff-filter=A "$1" "$2" -- .github/workflows | paste -sd, -
 }
 
 if [[ "$target_tag" == "$base_tag" ]]; then
-  if [[ "$(released_head "$base_tag")" == "$head" ]]; then
+  read -r released_tag released_commit <<< "$(latest_release "$base_tag")" || true
+  if [[ "${released_commit:-}" == "$head" ]]; then
     action=none
   else
     action=release
+    released_tag=""
   fi
   {
     echo "action=$action"
     echo "base_tag=$base_tag"
+    echo "base_commit=$base"
     echo "candidate=$head"
+    echo "released_tag=${released_tag:-}"
+    echo "own_workflows=$(own_workflows "$base" HEAD)"
   } >> "$OUTPUT"
   exit 0
 fi
 
 # A newer upstream release: replay the series onto it. Patches upstream now has become empty and
-# are dropped; the release notes list the series, so a dropped patch simply no longer appears.
-target="$(fetch_upstream_tag "$target_tag")"
+# are dropped.
+target="$(up "$target_tag")"
 before="$(git log --format=%s "$base..HEAD")"
 if ! git -c user.name=t3code-fork -c user.email=noreply@users.noreply.github.com \
   rebase --empty=drop --onto "$target" "$base" > "$logs/rebase.log" 2>&1; then
-  stopped="$(git log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || echo unknown)"
+  stopped="$(git log -1 --format='%h %s' REBASE_HEAD 2> /dev/null || echo unknown)"
   conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- /')"
   git rebase --abort || true
   fail "Rebasing the series from $base_tag onto $target_tag stopped at: $stopped" "" \
-    "Conflicting files:" "$conflicts" "" "Nothing was published; the last fork release stays current."
+    "Conflicting files:" "${conflicts:-(none listed; see the run log)}" "" \
+    "The series was left as it is. To follow by hand: \`git fetch https://github.com/$UPSTREAM.git tag $target_tag\`," \
+    "\`git rebase --onto $target_tag $base_tag <series branch>\`, resolve, run the tests, then push the branch with" \
+    "\`--force-with-lease\`. The next run then releases it."
 fi
 node .github/scripts/fork-schema-check.cjs "$target" HEAD > "$logs/schema-check.log" 2>&1 \
   || fail "After rebasing onto $target_tag the series changes the database schema:" '```' "$(cat "$logs/schema-check.log")" '```'
-dropped="$(comm -23 <(sort <<<"$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
+candidate="$(git rev-parse HEAD)"
+dropped="$(comm -23 <(sort <<< "$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
+
+# A published fork release of the target with exactly these files exists (an earlier run published
+# it, then could not move the series): move the series to it rather than build it again.
+read -r released_tag released_commit <<< "$(latest_release "$target_tag")" || true
+action=rebase
+if [[ -n "${released_commit:-}" ]] \
+  && [[ "$(git rev-parse "$released_commit^{tree}")" == "$(git rev-parse "$candidate^{tree}")" ]]; then
+  action=advance
+  candidate="$released_commit"
+else
+  released_tag=""
+  # The release job runs the reusable workflows of this run's commit (the series before the rebase),
+  # not the candidate's. If upstream changed them, building would mix two upstream releases.
+  called() {
+    local queue=(.github/workflows/fork-release.yml) seen="" file
+    while ((${#queue[@]})); do
+      file="${queue[0]}"
+      queue=("${queue[@]:1}")
+      grep -qxF "$file" <<< "$seen" && continue
+      seen+="$file"$'\n'
+      while read -r used; do
+        [[ -z "$used" ]] || queue+=("$used")
+      done <<< "$(git show "$1:$file" 2> /dev/null \
+        | sed -n 's|^[[:space:]-]*uses:[[:space:]]*["'\'']\{0,1\}\./\(\.github/workflows/[^[:space:]@#"'\'']*\).*|\1|p')"
+    done
+    printf '%s' "$seen"
+  }
+  changed=""
+  for file in $(sort -u <<< "$(called "$run_sha")"$'\n'"$(called "$candidate")"); do
+    if [[ "$(git rev-parse --quiet --verify "$run_sha:$file" || true)" != "$(git rev-parse --quiet --verify "$candidate:$file" || true)" ]]; then
+      changed+="- $file"$'\n'
+    fi
+  done
+  if [[ -n "$changed" ]]; then
+    action=stage
+    printf '%s\n' \
+      "The release workflows differ between this run's commit (${run_sha:0:12}, on $base_tag) and the candidate on $target_tag:" \
+      "${changed%$'\n'}" "" \
+      "A run uses the reusable workflows of its own commit, so this run would build $target_tag with $base_tag's release steps; it built nothing." \
+      "The candidate ${candidate:0:12} is on the branch fork-follow/candidate. Release it with its own workflow files:" \
+      "\`gh workflow run fork-release.yml --repo $REPOSITORY --ref fork-follow/candidate -f ref=$candidate -f publish=true\`" \
+      "The next follow run then finds that release and moves the series to it." > "$REPORT"
+  fi
+fi
 {
-  echo "action=rebase"
+  echo "action=$action"
   echo "base_tag=$target_tag"
+  echo "base_commit=$target"
   echo "previous_tag=$base_tag"
   echo "previous_head=$head"
-  echo "candidate=$(git rev-parse HEAD)"
+  echo "candidate=$candidate"
+  echo "released_tag=${released_tag:-}"
   echo "dropped=$dropped"
+  echo "own_workflows=$(own_workflows "$target" "$candidate")"
 } >> "$OUTPUT"

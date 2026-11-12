@@ -1,15 +1,34 @@
 name: Fork follow upstream
 
 # Daily: keeps this fork's patch series on upstream's newest stable release and publishes it.
-# - Upstream has a newer stable tag: rebase the series onto it, test, build, publish, then move the
-#   series branch to the result.
-# - Same tag, but the series has commits no fork release has: test, build and publish them.
-# - Anything fails (conflict, schema change, red test, failed build): open or update one issue and
-#   publish nothing, so the last fork release stays current.
+# The plan (.github/scripts/fork-follow.sh) picks one action:
+# - none: the series head is already the newest fork release of its base.
+# - release: same base, but the series has commits no fork release has: test, build and publish.
+# - rebase: upstream has a newer stable tag: rebase the series onto it, test, build, publish, then
+#   move the series branch to the released commit (the old series is kept as a tag).
+# - advance: a published fork release already has the rebased files (an earlier run published it,
+#   then could not move the branch): move the series branch to it, build nothing.
+# - stage: upstream changed the release workflows. A run uses the reusable workflows of its own
+#   commit, so the candidate is pushed and the run stops with the command that releases it with
+#   its own files; the next run then advances to that release.
+# A conflict, merge commits in the series, a schema change, upstream commits inside the series, a
+# moved or deleted upstream tag, a red test, a failed build or push: the run fails, and the Report
+# job's summary says why and what the repository holds now (branch heads, release tags, drafts), as
+# read back from it. With Issues enabled it also opens or updates one issue, and closes it again
+# on the next good run.
 #
-# Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN: a token that may push
-# this repository's contents and workflow files (GITHUB_TOKEN may not push commits that change
-# .github/workflows); only a rebase needs it.
+# Upstream's workflows stay off: after each push and at the end, fork-workflows.sh disables every
+# active workflow the series did not add and cancels their runs for the pushed commit.
+#
+# Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN: a fine-grained token
+# for this repository only, Contents and Workflows read and write (GITHUB_TOKEN may not push commits
+# that change .github/workflows). Every run checks it first and fails when it is missing, expired or
+# may not push. It reaches only the steps that run fork-follow-push.sh; the release workflow gets the
+# signing secrets by name and never this token. If a rule protects the series branch, the token's
+# user must be allowed to bypass it.
+#
+# A conflict is resolved by hand: rebase the series branch onto the new upstream tag, resolve, test,
+# push it with --force-with-lease; the next run then releases it (the plan's report has the commands).
 on:
   schedule:
     - cron: "23 6 * * *"
@@ -30,26 +49,46 @@ jobs:
     name: Plan
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: read
     outputs:
       action: ${{ steps.plan.outputs.action }}
       base_tag: ${{ steps.plan.outputs.base_tag }}
+      previous_tag: ${{ steps.plan.outputs.previous_tag }}
       candidate: ${{ steps.plan.outputs.candidate }}
       previous_head: ${{ steps.plan.outputs.previous_head }}
+      released_tag: ${{ steps.plan.outputs.released_tag }}
       dropped: ${{ steps.plan.outputs.dropped }}
+      own_workflows: ${{ steps.plan.outputs.own_workflows }}
+      disabled: ${{ steps.sweep_plan.outputs.disabled }},${{ steps.sweep_push.outputs.disabled }}
+      cancelled: ${{ steps.sweep_push.outputs.cancelled }}
     steps:
       - name: Checkout the series
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ env.SERIES_BRANCH }}
           fetch-depth: 0
           filter: blob:none
-          token: ${{ secrets.FORK_PUSH_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Test the follow scripts
+        run: bash .github/scripts/fork-follow.test.sh
+
+      - name: Check FORK_PUSH_TOKEN
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+          REPORT: ${{ runner.temp }}/reports/token.md
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          bash .github/scripts/fork-follow-push.sh check
 
       - id: plan
         name: Plan and rebase
         env:
           GH_TOKEN: ${{ github.token }}
-          REPORT: ${{ runner.temp }}/fork-follow-report.md
+          RUN_SHA: ${{ github.sha }}
+          REPORT: ${{ runner.temp }}/reports/plan.md
         run: |
           set -euo pipefail
           UPSTREAM="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')"
@@ -60,25 +99,48 @@ jobs:
           export UPSTREAM
           bash .github/scripts/fork-follow.sh
 
-      - name: Push the rebased series as a candidate
-        if: steps.plan.outputs.action == 'rebase'
+      - id: sweep_plan
+        name: Disable upstream workflows
         env:
-          HAS_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN != '' }}
-          REPORT: ${{ runner.temp }}/fork-follow-report.md
-        run: |
-          set -euo pipefail
-          if [[ "$HAS_PUSH_TOKEN" != "true" ]]; then
-            echo "Rebasing onto ${{ steps.plan.outputs.base_tag }} needs the FORK_PUSH_TOKEN secret (contents and workflows write)." > "$REPORT"
-            exit 1
-          fi
-          git push --force origin "HEAD:refs/heads/fork-follow/candidate"
+          GH_TOKEN: ${{ github.token }}
+          OWN_WORKFLOWS: ${{ steps.plan.outputs.own_workflows }}
+          REPORT: ${{ runner.temp }}/reports/plan-workflows.md
+        run: bash .github/scripts/fork-workflows.sh
 
-      - name: Keep the failure report
-        if: failure()
-        uses: actions/upload-artifact@v7
+      - id: push
+        name: Push the rebased series as a candidate
+        if: steps.plan.outputs.action == 'rebase' || steps.plan.outputs.action == 'stage'
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+          CANDIDATE: ${{ steps.plan.outputs.candidate }}
+          REPORT: ${{ runner.temp }}/reports/push.md
+        run: bash .github/scripts/fork-follow-push.sh candidate "$CANDIDATE"
+
+      # The candidate branch is a push: an upstream workflow it brings is listed only from now on.
+      - id: sweep_push
+        name: Disable upstream workflows the candidate brought, cancel their runs
+        if: steps.push.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWN_WORKFLOWS: ${{ steps.plan.outputs.own_workflows }}
+          HEAD_SHA: ${{ steps.plan.outputs.candidate }}
+          REPORT: ${{ runner.temp }}/reports/push-workflows.md
+        run: bash .github/scripts/fork-workflows.sh
+
+      - name: Stop for a release from the candidate's own workflow files
+        if: steps.plan.outputs.action == 'stage'
+        env:
+          REPORT: ${{ runner.temp }}/reports/plan.md
+        run: |
+          cat "$REPORT" >&2
+          exit 1
+
+      - name: Keep the reason
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fork-follow-report
-          path: ${{ runner.temp }}/fork-follow-report.md
+          name: fork-follow-report-plan
+          path: ${{ runner.temp }}/reports
           if-no-files-found: ignore
           retention-days: 7
 
@@ -90,7 +152,21 @@ jobs:
       actions: read
       contents: write
     uses: ./.github/workflows/fork-release.yml
-    secrets: inherit
+    # By name, only what fork-release.yml declares (release-desktop.yml's signing secrets).
+    secrets:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      MACOS_PROVISIONING_PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
     with:
       ref: ${{ needs.plan.outputs.candidate }}
       publish: true
@@ -98,79 +174,122 @@ jobs:
   advance:
     name: Move the series branch
     needs: [plan, release]
-    if: needs.plan.outputs.action == 'rebase' && needs.release.result == 'success'
+    if: >-
+      !cancelled() && needs.plan.result == 'success' &&
+      (needs.plan.outputs.action == 'advance' ||
+       (needs.plan.outputs.action == 'rebase' && needs.release.result == 'success' &&
+        needs.release.outputs.published == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      disabled: ${{ steps.sweep.outputs.disabled }}
+      cancelled: ${{ steps.sweep.outputs.cancelled }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Checkout the scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.plan.outputs.candidate }}
           fetch-depth: 0
           filter: blob:none
-          token: ${{ secrets.FORK_PUSH_TOKEN }}
+          persist-credentials: false
 
-      # The lease refuses if the branch moved since the plan (a fork PR merged meanwhile); the next
-      # run rebases again with that change, and the release just published stays valid.
+      # Refuses if the branch moved since the plan (a fork PR merged meanwhile); the next run
+      # rebases again with that change. A re-run after a successful move finds it done.
       - name: Move the series branch to the released commit
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+          BASE_TAG: ${{ needs.plan.outputs.base_tag }}
+          PREVIOUS_HEAD: ${{ needs.plan.outputs.previous_head }}
+          CANDIDATE: ${{ needs.plan.outputs.candidate }}
+          REPORT: ${{ runner.temp }}/reports/advance.md
         run: |
-          set -euo pipefail
-          git push \
-            --force-with-lease="refs/heads/$SERIES_BRANCH:${{ needs.plan.outputs.previous_head }}" \
-            origin "${{ needs.plan.outputs.candidate }}:refs/heads/$SERIES_BRANCH"
-          git push origin --delete fork-follow/candidate || true
+          mkdir -p "$RUNNER_TEMP/reports"
+          bash .github/scripts/fork-follow-push.sh advance "$PREVIOUS_HEAD" "$CANDIDATE"
+
+      # The push to the series branch fires push workflows; an upstream one it brought is disabled
+      # and its run cancelled here.
+      - id: sweep
+        name: Disable upstream workflows, cancel their runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWN_WORKFLOWS: ${{ needs.plan.outputs.own_workflows }}
+          HEAD_SHA: ${{ needs.plan.outputs.candidate }}
+          REPORT: ${{ runner.temp }}/reports/advance-workflows.md
+        run: bash .github/scripts/fork-workflows.sh
+
+      - name: Delete the candidate branch
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+        run: bash .github/scripts/fork-follow-push.sh cleanup
+
+      - name: Keep the reason
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-follow-report-advance
+          path: ${{ runner.temp }}/reports
+          if-no-files-found: ignore
+          retention-days: 7
 
   report:
     name: Report
     needs: [plan, release, advance]
-    if: always() && needs.plan.outputs.action != 'none'
+    if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
+      actions: write
+      contents: read
       issues: write
     steps:
-      - name: Download the failure report
-        if: contains(needs.*.result, 'failure')
-        continue-on-error: true
-        uses: actions/download-artifact@v8
+      - name: Checkout the scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          name: fork-follow-report
-          path: report
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
 
-      - name: Open, update or close the follow issue
+      - name: Download the jobs' reasons
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: fork-follow-report-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/reports
+
+      # Last sweep: runs that a push started after the earlier sweeps looked.
+      - id: sweep
+        name: Disable upstream workflows, cancel their runs
+        if: needs.plan.outputs.own_workflows != ''
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
-          BASE_TAG: ${{ needs.plan.outputs.base_tag }}
-          DROPPED: ${{ needs.plan.outputs.dropped }}
+          OWN_WORKFLOWS: ${{ needs.plan.outputs.own_workflows }}
+          HEAD_SHA: ${{ needs.plan.outputs.candidate }}
+          REPORT: ${{ runner.temp }}/reports/report-workflows.md
+        run: bash .github/scripts/fork-workflows.sh
+
+      - name: Summary, issue, and the run's status
+        env:
+          GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          title="Fork cannot follow upstream"
-          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" \
-            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)"
-          if [[ "$FAILED" == "true" ]]; then
-            {
-              echo "Run: $RUN_URL"
-              echo
-              if [[ -f report/fork-follow-report.md ]]; then
-                cat report/fork-follow-report.md
-              else
-                echo "A test, build or publish job failed${BASE_TAG:+ for $BASE_TAG}; see the run. Nothing was published."
-              fi
-            } > body.md
-            if [[ -n "$issue" ]]; then
-              gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file body.md
-            else
-              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
-            fi
-            exit 0
-          fi
-          note="Published the fork release on $BASE_TAG: $RUN_URL"
-          if [[ -n "$DROPPED" ]]; then
-            note="$note"$'\n\n'"Dropped because upstream now has them: ${DROPPED//;/, }"
-          fi
-          echo "$note" >> "$GITHUB_STEP_SUMMARY"
-          if [[ -n "$issue" ]]; then
-            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "$note"
-          fi
+          ACTION: ${{ needs.plan.outputs.action }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          ADVANCE_RESULT: ${{ needs.advance.result }}
+          SWEEP_RESULT: ${{ steps.sweep.outcome }}
+          BASE_TAG: ${{ needs.plan.outputs.base_tag }}
+          PREVIOUS_TAG: ${{ needs.plan.outputs.previous_tag }}
+          PREVIOUS_HEAD: ${{ needs.plan.outputs.previous_head }}
+          CANDIDATE: ${{ needs.plan.outputs.candidate }}
+          RELEASED_TAG: ${{ needs.plan.outputs.released_tag }}
+          DROPPED: ${{ needs.plan.outputs.dropped }}
+          DISABLED: ${{ needs.plan.outputs.disabled }},${{ needs.advance.outputs.disabled }},${{ steps.sweep.outputs.disabled }}
+          CANCELLED: ${{ needs.plan.outputs.cancelled }},${{ needs.advance.outputs.cancelled }},${{ steps.sweep.outputs.cancelled }}
+          REPORTS: ${{ runner.temp }}/reports
+        run: bash .github/scripts/fork-follow-report.sh
