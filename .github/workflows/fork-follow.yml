@@ -19,9 +19,10 @@ name: Fork follow upstream
 # on the next good run.
 #
 # Upstream's workflows stay off: after each push, before the series branch moves, and at the end,
-# fork-workflows.sh disables every active workflow the series did not add, cancels every unfinished
-# run of one (any event), and names the runs that finished before it could stop them and the files
-# GitHub has not listed yet. The branch move is refused while an upstream workflow file that is new
+# fork-workflows.sh disables every active workflow the series did not add (a fork-*.yml is always the
+# fork's own, also before main has it; the plan refuses an upstream release that has one), cancels
+# every unfinished run of one (any event), and names the runs that finished before it could stop
+# them and the files GitHub has not listed yet. The branch move is refused while an upstream workflow file that is new
 # on this release is not listed (it could not be disabled, and on the branch it could ask for
 # fork-push); a person decides then.
 #

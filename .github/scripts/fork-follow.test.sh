@@ -295,6 +295,24 @@ plan
 check "plan: same base -> no new upstream workflow files" \
   eval 'action_is release && grep -qx "new_workflows=" "$root/plan.out"'
 
+# Round 4: the sweep never disables a fork-*.yml, so an upstream release that has one is refused,
+# on the rebase path and on the same base, unless a fork patch deletes it.
+new_upstream
+(cd "$root/upwork" && git checkout -q main && echo "on: push" > .github/workflows/fork-sneaky.yml \
+  && git add -A && git commit -q -m u5 && git tag v0.1.11 && git push -q https://github.com/up/t3code.git main --tags) > /dev/null 2>&1
+new_fork v0.1.10
+plan
+check "plan: rebasing onto a release with an upstream fork-*.yml is refused and names it" \
+  eval '[[ -z "$(out action)" ]] && has "named like the fork.s own" "$root/report.md" && has "fork-sneaky.yml" "$root/report.md"'
+new_fork v0.1.11
+plan
+check "plan: same base with an upstream fork-*.yml is refused too" \
+  eval '[[ -z "$(out action)" ]] && has "fork-sneaky.yml" "$root/report.md"'
+(cd "$root/work" && git rm -q .github/workflows/fork-sneaky.yml && git commit -q -m "fork: drop upstream fork-sneaky" \
+  && git push -q origin main) > /dev/null 2>&1
+plan
+check "plan: a fork patch that deletes the upstream fork-*.yml lets the plan go on" action_is release
+
 # Minor: upstream changed a reusable workflow the release calls; the run's own copy is older.
 new_upstream
 (cd "$root/upwork" && git checkout -q main && echo "on: workflow_call # v2" > .github/workflows/release-desktop.yml \
@@ -492,6 +510,30 @@ check "workflows: before the move, a new unlisted upstream file refuses it, afte
 rm -f "$root/report.md"
 check "workflows: before the move, a new upstream file GitHub lists (now disabled) and older unlisted ones do not refuse it" \
   eval 'OWN_WORKFLOWS=.github/workflows/fork-follow.yml HEAD_SHA=abc NEW_WORKFLOWS=.github/workflows/web-preview.yml REQUIRE_NEW_OFF=true sweep && [[ ! -e "$root/report.md" ]]'
+# Round 4: a fork-*.yml that main does not have yet (a fork pull request adds it; GitHub lists it
+# from the PR's branch) is the fork's own: never disabled, its runs never cancelled. A name that
+# only contains "fork" is upstream's.
+reset_api
+cat > "$root/api/workflows.json" << 'J'
+{"workflows":[
+ {"id":1,"state":"active","path":".github/workflows/fork-follow.yml"},
+ {"id":5,"state":"active","path":".github/workflows/fork-tests.yml"},
+ {"id":6,"state":"active","path":".github/workflows/fork-new.yaml"},
+ {"id":7,"state":"active","path":".github/workflows/mobile-eas-preview-fork.yml"}]}
+J
+cat > "$root/api/runs.json" << 'J'
+{"workflow_runs":[
+ {"id":21,"status":"in_progress","head_sha":"pr","event":"pull_request","path":".github/workflows/fork-tests.yml"},
+ {"id":22,"status":"queued","head_sha":"pr","event":"pull_request","path":".github/workflows/fork-new.yaml@refs/pull/9/merge"},
+ {"id":23,"status":"queued","head_sha":"abc","event":"push","path":".github/workflows/mobile-eas-preview-fork.yml"}]}
+J
+echo '[{"type":"file","path":".github/workflows/fork-follow.yml"},{"type":"file","path":".github/workflows/mobile-eas-preview-fork.yml"}]' > "$root/api/files.json"
+OWN_WORKFLOWS=.github/workflows/fork-follow.yml sweep
+check "workflows: a fork-*.yml/.yaml absent from main (a fork PR adds it) is never disabled, its runs never cancelled" \
+  eval 'hasnt "workflows/5/disable" "$root/api/writes" && hasnt "workflows/6/disable" "$root/api/writes" && hasnt "runs/21/cancel" "$root/api/writes" && hasnt "runs/22/cancel" "$root/api/writes"'
+check "workflows: an upstream name that only contains 'fork' is still disabled and its runs cancelled" \
+  eval 'has "workflows/7/disable" "$root/api/writes" && has "runs/23/cancel" "$root/api/writes" && [[ $(grep -c . "$root/api/writes") == 2 ]]'
+
 reset_api
 OWN_WORKFLOWS="" sweep
 check "workflows: an empty own list disables nothing (refusing to guess)" eval '[[ ! -e "$root/api/writes" ]] && has "refusing to guess" "$root/report.md"'

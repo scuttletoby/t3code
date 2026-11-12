@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Keeps upstream's workflows off in this fork (tests: fork-follow.test.sh). Disables every active
-# workflow under .github/workflows that is not one of the fork's own, cancels every unfinished run
-# of such a workflow (whatever event started it: push, pull_request, schedule ...), and names what
-# it could not stop:
+# workflow under .github/workflows that is not one of the fork's own (OWN_WORKFLOWS, and every
+# .github/workflows/fork-*.y[a]ml), cancels every unfinished run of such a workflow (whatever event
+# started it: push, pull_request, schedule ...), and names what it could not stop:
 #   finished      runs of upstream workflows that completed since SINCE (they ran before a sweep
 #                 could stop them), with their conclusion
 #   unregistered  upstream workflow files in the tree at TREE_REF that GitHub does not list yet
@@ -43,7 +43,10 @@ die() {
 }
 
 [[ -n "${OWN_WORKFLOWS:-}" ]] || die "The list of the fork's own workflows is empty, so no workflow was disabled (refusing to guess)."
-own() { [[ ",$OWN_WORKFLOWS," == *",$1,"* ]]; }
+# A fork-*.yml or fork-*.yaml file is the fork's own even when the series does not have it yet (a
+# fork pull request adding it runs it from its branch): it is never disabled, nor its runs
+# cancelled. The plan refuses an upstream release that has such a file (fork-follow.sh).
+own() { [[ ",$OWN_WORKFLOWS," == *",$1,"* || "$1" =~ ^\.github/workflows/fork-[^/]*\.ya?ml$ ]]; }
 upstream() { [[ "$1" == .github/workflows/* ]] && ! own "$1"; }
 new() { [[ ",${NEW_WORKFLOWS:-}," == *",$1,"* ]]; }
 

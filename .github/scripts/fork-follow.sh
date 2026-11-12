@@ -160,6 +160,22 @@ new_workflows() { # upstream workflow files added from upstream commit $1 to $2 
     | { grep -E '\.ya?ml$' || true; } | paste -sd, -
 }
 
+# The sweep (fork-workflows.sh) takes every .github/workflows/fork-*.y[a]ml as the fork's own, even
+# one the series does not have yet, and never disables it. A file of that name that the upstream
+# release has and the candidate keeps would stay enabled, so the plan refuses it.
+fork_named() { # fork_named COMMIT: its .github/workflows/fork-*.y[a]ml files, one per line
+  git -c core.quotepath=off ls-tree -r -z --name-only "$1" -- .github/workflows \
+    | tr '\0' '\n' | { grep -E '^\.github/workflows/fork-[^/]*\.ya?ml$' || true; }
+}
+refuse_upstream_fork_named() { # refuse_upstream_fork_named UPSTREAM_COMMIT TAG CANDIDATE
+  local named
+  named="$(comm -12 <(fork_named "$1" | sort) <(fork_named "$3" | sort))"
+  [[ -z "$named" ]] || fail "$UPSTREAM $2 has workflow files named like the fork's own (fork-*.yml), and the candidate keeps them:" \
+    "$(sed 's/^/- /' <<< "$named")" "" \
+    "The workflow sweep never disables a fork-* workflow, so they would run in the fork. The series was left as it is." \
+    "Add a fork patch that deletes them (or rename the fork's rule in fork-workflows.sh and fork-follow.sh), then start the follow workflow again."
+}
+
 # The release job runs the reusable workflows of this run's commit (RUN_SHA), not the candidate's.
 # They differ after upstream changed them, and on a re-run (or a queued run) of a run whose commit
 # is older than the series. Building then would mix two versions of the release steps.
@@ -202,6 +218,7 @@ stage_report() { # stage_report CANDIDATE TAG CHANGED
 }
 
 if [[ "$target_tag" == "$base_tag" ]]; then
+  refuse_upstream_fork_named "$base" "$base_tag" "$head"
   read -r released_tag released_commit <<< "$(latest_release "$base_tag")" || true
   if [[ "${released_commit:-}" == "$head" ]]; then
     action=none
@@ -244,6 +261,7 @@ if ! git -c user.name=t3code-fork -c user.email=noreply@users.noreply.github.com
 fi
 schema_check "$target" "After rebasing onto $target_tag, the series"
 candidate="$(git rev-parse HEAD)"
+refuse_upstream_fork_named "$target" "$target_tag" "$candidate"
 dropped="$(comm -23 <(sort <<< "$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
 
 # A published fork release of the target with exactly these files exists (an earlier run published
