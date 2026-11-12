@@ -3,8 +3,8 @@ import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveGitHubPublishConfig } from "../build-desktop-artifact.ts";
-import { releaseRepositoryDefine, resolveReleaseRepository } from "./release-repository.ts";
+import { resolveGitHubPublishConfig } from "./build-desktop-artifact.ts";
+import { releaseRepositoryDefine, resolveReleaseRepository } from "./lib/release-repository.ts";
 
 const desktopFeedRepository = (env: Record<string, string>) =>
   resolveGitHubPublishConfig("latest").pipe(
