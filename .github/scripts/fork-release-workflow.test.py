@@ -62,9 +62,15 @@ for job_id, job in jobs.items():
 check("release-desktop.yml gets exactly the secrets it declares", not wrong, ", ".join(wrong))
 check("FORK_PUSH_TOKEN appears nowhere", "FORK_PUSH_TOKEN" not in text)
 
-bad = [j for j, s in all_steps() if str(s.get("uses", "")).startswith("actions/checkout@")
-       and (s.get("with") or {}).get("persist-credentials") is not False]
-check("every checkout sets persist-credentials: false", not bad, ", ".join(bad))
+# actions/checkout fails on upstream's gitlinks without .gitmodules once it cleans up credentials;
+# every job checks out with the shared plain-git step instead (fork-contracts.test.py runs it).
+bad = [j for j, s in all_steps() if str(s.get("uses", "")).startswith("actions/checkout@")]
+check("no job uses actions/checkout", not bad, ", ".join(bad))
+plain = {j for j, s in all_steps() if s.get("name") == "Checkout" and "git init" in str(s.get("run", ""))}
+check("every job that checks out uses the plain-git step, with no token",
+      plain == {"preflight", "build_bundle", "assemble", "publish"}
+      and all("github.token" not in yaml.safe_dump(s) and "secrets." not in yaml.safe_dump(s)
+              for _, s in all_steps() if s.get("name") == "Checkout"), ", ".join(sorted(plain)))
 
 release_steps = [(j, s) for j, s in all_steps() if str(s.get("uses", "")).startswith("softprops/action-gh-release@")]
 check("one release-action step", len(release_steps) == 1)
@@ -132,9 +138,10 @@ check("the build sets T3CODE_DESKTOP_UPDATE_REPOSITORY to this repository",
 check("the former name T3CODE_RELEASE_REPOSITORY appears nowhere", "T3CODE_RELEASE_REPOSITORY" not in text)
 
 # The write job's guard script comes from the workflow's own commit, not the commit being built.
-guard = [s for s in steps(jobs["publish"]) if str(s.get("uses", "")).startswith("actions/checkout@")]
-check("publish checks out its guard script at github.workflow_sha",
-      len(guard) == 1 and (guard[0].get("with") or {}).get("ref") == "${{ github.workflow_sha }}")
+guard = [s for s in steps(jobs["publish"]) if "git init" in str(s.get("run", ""))]
+check("publish checks out only its guard scripts, at github.workflow_sha",
+      len(guard) == 1 and guard[0].get("env") == {"REF": "${{ github.workflow_sha }}", "HISTORY": "tip",
+                                                  "SPARSE": "/.github/scripts/"})
 
 if failures:
     print(f"{len(failures)} failed")
