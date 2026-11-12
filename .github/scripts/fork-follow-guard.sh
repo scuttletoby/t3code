@@ -22,6 +22,8 @@
 # SERIES_BRANCH (default main), REPO_SECRET_PRESENT, REPORT (receives the reason on refusal). Reads
 # the Environment with `gh api` (GH_TOKEN: GITHUB_TOKEN with actions: read is enough).
 set -euo pipefail
+# Refuses outside a GitHub Actions run unless a test runs it under the gh stub (fork-gh-guard.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
 
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:?REPOSITORY or GITHUB_REPOSITORY}}"
 : "${FORK_PUSH_ENVIRONMENT:?FORK_PUSH_ENVIRONMENT}"

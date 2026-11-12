@@ -27,6 +27,8 @@
 # (','-separated) to $GITHUB_OUTPUT, else stdout; a summary line on stderr, and a ::warning:: line
 # for finished runs and new unregistered files.
 set -euo pipefail
+# Refuses outside a GitHub Actions run unless a test runs it under the gh stub (fork-gh-guard.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
 
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:?REPOSITORY or GITHUB_REPOSITORY}}"
 REPORT="${REPORT:-fork-workflows-report.md}"

@@ -27,11 +27,13 @@ unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_ACTIONS UPSTREAM_URL ORIGIN RUN_S
 #   gh api [-X M] PATH [--paginate] [--jq EXPR]     gh issue list|comment|create|close ...
 # A file $root/api/fail_<word> makes every call whose path contains <word> fail. Run listings are
 # filtered by their head_sha= and status= query like GitHub's (created= is ignored).
+# fork_test_gh (fork-test-gh.sh) installs it first on PATH, with no token, a .invalid GH_HOST and
+# FORK_TEST_MODE, so the scripts refuse to run if any other gh would answer.
+. "$here/fork-test-gh.sh"
 mkdir -p "$root/bin" "$root/api"
-cat > "$root/bin/gh" << 'GH'
-#!/usr/bin/env bash
+fork_test_gh "$root/bin" << 'GH'
 set -euo pipefail
-api="$FAKE_API"
+api="${FAKE_API:?the gh stub needs FAKE_API}"
 echo "gh $*" >> "$api/calls"
 if [[ "$1" == issue ]]; then
   # Like GitHub: with Issues off, every issue command fails.
@@ -84,8 +86,7 @@ case "$method $path" in
 esac
 if [[ -n "$jq" ]]; then jq -r "$jq" <<< "$body"; else echo "$body"; fi
 GH
-chmod +x "$root/bin/gh"
-export PATH="$root/bin:$PATH" FAKE_API="$root/api"
+export FAKE_API="$root/api"
 
 failures=0
 pass() { echo "ok   $1"; }
@@ -581,6 +582,51 @@ echo "A repository or organisation secret named FORK_PUSH_TOKEN exists" > "$root
 report ACTION= GUARD_RESULT=failure PLAN_RESULT=skipped
 check "report: the guard refused -> the run fails with its reason, and says no job got the token" \
   eval 'failed_run && has "secret named FORK_PUSH_TOKEN exists" "$root/summary.md" && has "guard refused" "$root/summary.md"'
+
+# --- gh: no script reaches GitHub outside a run (fork-gh-guard.sh) ------------------------------
+# A gh that is not the stub (a test file run without it, an older test, a person running a script
+# by hand) answers like GitHub and records every call. Each script that calls gh must refuse before
+# it calls any gh: neither this one nor the stub.
+mkdir -p "$root/decoy" "$root/nomarker" "$root/reports"
+cat > "$root/decoy/gh" << 'D'
+#!/usr/bin/env bash
+echo "gh $*" >> "$DECOY_CALLS"
+echo '{"workflows":[{"id":9,"state":"active","path":".github/workflows/fork-tests.yml"}]}'
+D
+chmod +x "$root/decoy/gh"
+grep -vxF "$FORK_GH_STUB_MARKER" "$root/bin/gh" > "$root/nomarker/gh" && chmod +x "$root/nomarker/gh"
+gh_scripts=(fork-workflows.sh fork-follow-guard.sh fork-follow-report.sh)
+refuses() { # refuses ENV...: every gh script, run with ENV, fails, says why, and calls no gh
+  local s
+  for s in "${gh_scripts[@]}"; do
+    rm -f "$root/decoy.calls" "$root/api/calls" "$root/report.md"
+    if (cd "$root/work" && env DECOY_CALLS="$root/decoy.calls" OWN_WORKFLOWS=.github/workflows/fork-follow.yml \
+      REPORT="$root/report.md" REPO_SECRET_PRESENT=false FORK_PUSH_ENVIRONMENT=fork-push REPORTS="$root/reports" \
+      ACTION=none PLAN_RESULT=success "$@" bash "$dir/$s") > "$root/out" 2>&1; then
+      echo "$s passed" >> "$root/out"
+      return 1
+    fi
+    [[ ! -e "$root/decoy.calls" && ! -e "$root/api/calls" ]] || { echo "$s called gh" >> "$root/out"; return 1; }
+    grep -q "Refusing to run $s" "$root/out" || { echo "$s gave no refusal" >> "$root/out"; return 1; }
+  done
+}
+reset_api
+check "gh: a test run without the stub first on PATH fails closed and never calls gh" \
+  refuses PATH="$root/decoy:$PATH"
+check "gh: run by hand (no test mode, not in a GitHub Actions run) refuses before any gh call" \
+  refuses FORK_TEST_MODE= PATH="$root/decoy:$PATH"
+check "gh: test mode with a GitHub token set refuses, even with the stub" refuses GH_TOKEN=x
+check "gh: test mode with GITHUB_TOKEN set refuses, even with the stub" refuses GITHUB_TOKEN=x
+check "gh: test mode with GH_HOST github.com refuses" refuses GH_HOST=github.com
+check "gh: a gh named as the stub but without its marker line refuses" \
+  refuses PATH="$root/nomarker:$PATH" FORK_GH_STUB="$root/nomarker/gh"
+rm -f "$root/api/calls"
+check "gh: in a GitHub Actions run (not a test) the scripts use gh" \
+  eval '(cd "$root/work" && env -u FORK_TEST_MODE GITHUB_ACTIONS=true OWN_WORKFLOWS=.github/workflows/fork-follow.yml \
+    REPORT="$root/report.md" GITHUB_OUTPUT="$root/sweep.out" bash "$dir/fork-workflows.sh") > "$root/out" 2>&1 && has "actions/workflows" "$root/api/calls"'
+# A script that changes PATH after it started still cannot reach another gh: every call checks.
+check "gh: each gh call checks again (PATH changed after the start) and refuses" \
+  eval '! (. "$here/fork-gh-guard.sh"; PATH="$root/decoy:$PATH"; DECOY_CALLS="$root/decoy.calls" gh api user) > "$root/out" 2>&1 && [[ ! -e "$root/decoy.calls" ]] && has "Refusing to call gh" "$root/out"'
 
 # --- the workflow file ---------------------------------------------------------------------------
 desktop="$here/../workflows/release-desktop.yml"

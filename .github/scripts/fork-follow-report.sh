@@ -14,6 +14,8 @@
 # REPORTS (directory of the jobs' reason files), ORIGIN (git URL of this fork, default GitHub).
 # Summary to $GITHUB_STEP_SUMMARY, else stdout.
 set -uo pipefail
+# Refuses outside a GitHub Actions run unless a test runs it under the gh stub (fork-gh-guard.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
 
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:?REPOSITORY or GITHUB_REPOSITORY}}"
 ORIGIN="${ORIGIN:-https://github.com/$REPOSITORY.git}"
