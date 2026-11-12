@@ -6,9 +6,19 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-script="$(realpath "${FORK_SECRET_SCAN_SH:-$here/fork-secret-scan.sh}")"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
+
+# No script tested here calls gh. The stub (fork-test-gh.sh: no token, a .invalid GH_HOST) refuses
+# every call, so a scan that starts calling gh fails here instead of reaching GitHub.
+. "$here/fork-test-gh.sh"
+mkdir -p "$root/bin"
+fork_test_gh "$root/bin" <<'GH'
+echo "fake gh: fork-secret-scan.test.sh expects no gh call (gh $*)" >&2
+exit 97
+GH
+
+script="$(realpath "${FORK_SECRET_SCAN_SH:-$here/fork-secret-scan.sh}")"
 
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$root/gitconfig"
 git config --global user.name test

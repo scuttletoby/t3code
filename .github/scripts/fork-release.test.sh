@@ -4,20 +4,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-script="$(realpath "${FORK_RELEASE_SH:-$here/fork-release.sh}")"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
-
-# Upstream "up/t3code" and this fork "me/t3code" live under $root/gh; git reaches them through the
-# github.com URLs the workflow uses.
-export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$root/gitconfig"
-git config --global user.name test
-git config --global user.email test@example.invalid
-git config --global init.defaultBranch main
-git config --global advice.detachedHead false
-git config --global url."$root/gh/".insteadOf https://github.com/
-export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code
-unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY UPSTREAM UPSTREAM_URL ORIGIN
 
 # Fake gh: `gh api [-X M] PATH [--paginate] [--jq EXPR] [-f/-F k=v]...` served from $root/api.
 # fork_test_gh (fork-test-gh.sh) installs it first on PATH, with no token, a .invalid GH_HOST and
@@ -57,6 +45,20 @@ case "$method $path" in
 esac
 if [[ -n "$jq" ]]; then jq -r "$jq" <<< "$body"; else echo "$body"; fi
 GH
+
+script="$(realpath "${FORK_RELEASE_SH:-$here/fork-release.sh}")"
+
+# Upstream "up/t3code" and this fork "me/t3code" live under $root/gh; git reaches them through the
+# github.com URLs the workflow uses.
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$root/gitconfig"
+git config --global user.name test
+git config --global user.email test@example.invalid
+git config --global init.defaultBranch main
+git config --global advice.detachedHead false
+git config --global url."$root/gh/".insteadOf https://github.com/
+export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code
+unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY UPSTREAM UPSTREAM_URL ORIGIN
+
 export FAKE_API="$root/api"
 
 failures=0
