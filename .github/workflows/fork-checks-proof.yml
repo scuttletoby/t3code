@@ -1,0 +1,49 @@
+name: Fork checks (temporary proof, do not merge)
+# Copy of fork-checks.yml on pull_request so the branch's version runs; deleted with this PR.
+
+# Rules for this fork's own changes, run on every pull request. Upstream's CI needs runners a fork
+# does not have; fork-tests.yml runs upstream's tests on hosted runners instead.
+#
+# pull_request_target, not pull_request: GitHub then runs this workflow file and the check script
+# from the default branch, so a pull request cannot weaken, skip or delete the check that judges
+# it. The pull request's commits are only fetched as git objects and read as text; nothing from
+# them is checked out or run, so the base branch's permissions never reach pull request code.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  no_schema_changes:
+    name: No database schema changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ but no
+      # .gitmodules, and checkout's credential cleanup runs `git submodule foreach`, which fails on
+      # them. The full checkout fetches the default branch's blobs in one batch; a sparse one leaves
+      # the check to fetch every blob it reads one at a time.
+      - name: Check out the default branch and fetch the pull request's commits (not checked out)
+        env:
+          DEFAULT_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          git fetch -q --no-tags --no-recurse-submodules --filter=blob:none origin \
+            "$DEFAULT_SHA" "$BASE_SHA" "$HEAD_SHA"
+          git checkout -q --detach "$DEFAULT_SHA"
+
+      - name: Test the check
+        run: node --test .github/scripts/fork-schema-check.test.cjs
+
+      # T3 has no down-migrations, so a fork migration strands installs that return to upstream.
+      - name: Refuse schema and migration changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node .github/scripts/fork-schema-check.cjs "$BASE_SHA" "$HEAD_SHA"
