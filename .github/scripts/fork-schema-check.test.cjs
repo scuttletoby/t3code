@@ -443,9 +443,8 @@ test("workspace packages come from the workspace list, scoped or not, at any dep
   assert.deepEqual([...trace.outside].sort(), ["@t3tools/skipped", "effect", "node:fs"]);
 });
 
-test("the workflow pins actions by commit SHA", () => {
+test("any action the workflow uses is pinned by commit SHA", () => {
   const uses = fs.readFileSync(WORKFLOW, "utf8").match(/^\s*(?:-\s*)?uses:\s*\S+/gm) ?? [];
-  assert.ok(uses.length > 0);
   for (const line of uses) assert.match(line, /@[0-9a-f]{40}$/, line);
 });
 
@@ -454,10 +453,12 @@ test("the workflow runs the default branch's copy and never runs pull request co
   const code = workflow.replace(/^\s*#.*$/gm, "");
   assert.match(code, /^on:\n {2}pull_request_target:/m);
   assert.doesNotMatch(code, /^\s+pull_request:/m);
-  // No checkout of the pull request: actions/checkout without `ref` takes the default branch.
-  assert.doesNotMatch(code, /\bref:/);
-  assert.doesNotMatch(code, /git (checkout|switch|worktree|reset)/);
-  assert.match(code, /persist-credentials: false/);
+  // The only checkout is of the default branch (`github.sha` under pull_request_target).
+  assert.doesNotMatch(code, /actions\/checkout|\bref:|secrets\.|GITHUB_TOKEN/);
+  assert.deepEqual(code.match(/git (checkout|switch|worktree|reset|read-tree)\b.*/g), [
+    'git checkout -q --detach "$DEFAULT_SHA"',
+  ]);
+  assert.deepEqual(code.match(/DEFAULT_SHA:.*/g), ["DEFAULT_SHA: ${{ github.sha }}"]);
   // Event values reach the shell only through env, never pasted into the script.
   for (const line of code.split("\n").filter((l) => /run:/.test(l))) {
     assert.doesNotMatch(line, /\$\{\{/, line);
@@ -505,7 +506,34 @@ function scratchRepo() {
     });
     return { code: result.status, output: result.stdout + result.stderr };
   };
-  return { dir, git, commit, check };
+  return { dir, env, git, commit, check };
+}
+
+// The workflow's checkout step, run as CI runs it, against `origin` (a local repository).
+function runCheckoutStep(origin, shas) {
+  const workflow = fs.readFileSync(WORKFLOW, "utf8");
+  const block = workflow.match(/^ {8}run: \|\n((?: {10}.*\n)+)/m);
+  assert.ok(block && /git init/.test(block[1]), "the first run block is the checkout step");
+  const script = block[1].replace(/^ {10}/gm, "");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-checks-runner-"));
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {
+    cwd: dir,
+    env: {
+      ...origin.env,
+      GITHUB_SERVER_URL: `file://${path.dirname(origin.dir)}`,
+      GITHUB_REPOSITORY: path.basename(origin.dir),
+      ...shas,
+    },
+    encoding: "utf8",
+  });
+  return { dir, code: result.status, output: result.stdout + result.stderr };
+}
+
+/** A gitlink with no .gitmodules, as upstream's tree has under .repos/alchemy-effect/submodules/. */
+function addGitlink(repo, file, sha) {
+  repo.git("update-index", "--add", "--cacheinfo", `160000,${sha},${file}`);
+  repo.git("commit", "-q", "-m", "gitlink");
+  return repo.git("rev-parse", "HEAD");
 }
 
 const BASE_TREE = {
@@ -1099,5 +1127,55 @@ test("e2e: a package.json is judged by the entries schema code imports through i
     const result = prAgainstBase(files, base);
     assert.equal(result.code, 1, `${JSON.stringify(files)}\n${result.output}`);
     assert.match(result.output, /packages\/c\/package\.json: changes how it maps "\.\/util"/);
+  }
+});
+
+test("e2e: a tree with a gitlink and no .gitmodules is checked like any other", () => {
+  const repo = scratchRepo();
+  try {
+    repo.commit(BASE_TREE);
+    const base = addGitlink(repo, ".repos/vendor/submodules/dep", "1".repeat(40));
+    const head = repo.commit({ "apps/server/src/feature/Store.ts": "export const x = 2;\n" });
+    const bumped = addGitlink(repo, ".repos/vendor/submodules/dep", "2".repeat(40));
+    for (const result of [repo.check(base, head), repo.check(base, bumped)]) {
+      assert.equal(result.code, 0, result.output);
+      assert.match(result.output, /No database schema changes/);
+    }
+  } finally {
+    fs.rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("e2e: the workflow's checkout works on a tree with gitlinks and no .gitmodules", () => {
+  const origin = scratchRepo();
+  origin.git("config", "uploadpack.allowFilter", "true");
+  origin.git("config", "uploadpack.allowAnySHA1InWant", "true");
+  const runners = [];
+  try {
+    origin.commit(BASE_TREE);
+    const main = addGitlink(origin, ".repos/vendor/submodules/dep", "1".repeat(40));
+    const pr = origin.commit({ "apps/server/src/feature/Store.ts": "export const x = 2;\n" });
+    origin.git("checkout", "-q", "--detach", main);
+
+    const run = runCheckoutStep(origin, { DEFAULT_SHA: main, BASE_SHA: main, HEAD_SHA: pr });
+    runners.push(run.dir);
+    assert.equal(run.code, 0, run.output);
+    const git = (...args) =>
+      execFileSync("git", args, { cwd: run.dir, env: origin.env, encoding: "utf8" }).trim();
+    assert.equal(git("rev-parse", "HEAD"), main, "the default branch is checked out, not the PR");
+    assert.equal(git("cat-file", "-t", pr), "commit", "the PR head is fetched as objects");
+    assert.ok(fs.existsSync(path.join(run.dir, CHECK_FILES[0])));
+    assert.ok(!fs.existsSync(path.join(run.dir, "apps")), "only .github and root files");
+
+    // Fail closed: a commit the remote does not have stops the job.
+    const missing = runCheckoutStep(origin, {
+      DEFAULT_SHA: main,
+      BASE_SHA: main,
+      HEAD_SHA: "3".repeat(40),
+    });
+    runners.push(missing.dir);
+    assert.notEqual(missing.code, 0, missing.output);
+  } finally {
+    for (const dir of [origin.dir, ...runners]) fs.rmSync(dir, { recursive: true, force: true });
   }
 });

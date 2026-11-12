@@ -20,18 +20,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout the default branch
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          fetch-depth: 0
-          filter: blob:none
-          persist-credentials: false
-
-      - name: Fetch the pull request's commits (not checked out)
+      # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ but no
+      # .gitmodules, and checkout's credential cleanup runs `git submodule foreach`, which fails on
+      # them. Nothing is authenticated (public repository) and only the default branch is checked out.
+      - name: Check out the default branch and fetch the pull request's commits (not checked out)
         env:
+          DEFAULT_SHA: ${{ github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: git fetch --no-tags --filter=blob:none origin "$BASE_SHA" "$HEAD_SHA"
+        run: |
+          set -euo pipefail
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          git fetch -q --no-tags --no-recurse-submodules --filter=blob:none origin \
+            "$DEFAULT_SHA" "$BASE_SHA" "$HEAD_SHA"
+          git sparse-checkout set --cone .github
+          git checkout -q --detach "$DEFAULT_SHA"
 
       - name: Test the check
         run: node --test .github/scripts/fork-schema-check.test.cjs
