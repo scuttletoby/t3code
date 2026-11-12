@@ -14,10 +14,14 @@ on:
 permissions:
   contents: read
 
-# Every job starts with the same condition: on a pull request, only one whose branch is in this
-# repository. A pull request from another fork runs nothing here, not even after approval (the
-# repository asks approval only for pull_request runs, and pull_request_target skips that). A head
-# repository GitHub no longer knows reads as "another fork". Test: fork-contracts.test.py.
+# Every job but `outside_pr` starts with the same condition: on a pull request, only one whose branch
+# is in this repository. A pull request from another fork runs none of them, not even after approval
+# (the repository asks approval only for pull_request runs, and pull_request_target skips that, but
+# this file always comes from the default branch). It gets only `outside_pr`, which checks nothing
+# out, runs nothing from the pull request, gets no token and fails. A job skipped by its if: counts
+# as passed, so a ruleset that requires "No database schema changes" must also require "Outside pull
+# request". A head repository GitHub no longer knows reads as "another fork". Test:
+# fork-contracts.test.py.
 jobs:
   no_schema_changes:
     name: No database schema changes
@@ -51,3 +55,15 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node .github/scripts/fork-schema-check.cjs "$BASE_SHA" "$HEAD_SHA"
+
+  outside_pr:
+    name: Outside pull request
+    if: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Refuse an outside pull request
+        run: |
+          echo "::error::outside PR: not tested here; a maintainer must review"
+          exit 1

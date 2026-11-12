@@ -2,13 +2,18 @@
 copies that must fail (so a check that stops seeing its problem goes red too):
 
   pr-guard     every job of a workflow a pull request can start runs only for a branch in this
-               repository; a fork workflow takes no trigger where that cannot be told.
+               repository, except `outside_pr`, which runs only for another fork's pull request,
+               checks nothing out and fails, and fork-tests.yml's fork_ci_result, which needs it and
+               fails there too (a job skipped by its if: counts as passed); a fork workflow takes no
+               trigger where that cannot be told.
   checkout     no actions/checkout with persist-credentials: false (its cleanup fails on upstream's
                gitlinks); every plain-git checkout is the one shared step, run here end to end
-               against a repository with a gitlink and no .gitmodules.
-  refusals     in fork-follow.yml no refusal is swallowed: no continue-on-error, `|| true`, `|| :`,
-               `; true`, `set +e`, trap, skipped step, other shell or BASH_ENV.
-  gh-guard     every fork script that calls gh sources fork-gh-guard.sh before its first call, and
+               against a repository with a gitlink, no .gitmodules and a tag named like the branch.
+  refusals     in fork-follow.yml no refusal is swallowed: a refusal step is only its script call
+               (a whitelist), and no step before it in its job can change the shell (GITHUB_ENV,
+               GITHUB_PATH, BASH_ENV, a function, an action). Other script steps keep a blacklist.
+  gh-guard     every fork script that calls gh sources fork-gh-guard.sh at the top level, after
+               nothing but `set`, before its first call (backslash continuations joined), and
                every fork shell test sets up the gh stub (fork-test-gh.sh) before anything else.
 
     python3 .github/scripts/fork-contracts.test.py
@@ -17,6 +22,7 @@ Needs PyYAML, git and bash. Each check prints ok/FAIL; any FAIL exits 1.
 """
 
 import copy
+import json
 import os
 import pathlib
 import re
@@ -96,13 +102,73 @@ def guarded(condition):
     return expr == PR_GUARD or (expr.startswith(PR_GUARD + " && ") and one_group(expr[len(PR_GUARD) + 4 :]))
 
 
+# The job a pull request from another fork gets instead: it fails and runs nothing else. A job
+# skipped by its if: counts as passed for a required check, so without it an untested outside pull
+# request would show green.
+OUTSIDE_JOB = "outside_pr"
+OUTSIDE_IF = "github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository"
+OUTSIDE_RUN = 'echo "::error::outside PR: not tested here; a maintainer must review"\nexit 1\n'
+# fork-tests.yml's result job (the check a ruleset requires) runs on outside pull requests too: it
+# needs outside_pr, checks nothing out and refuses first.
+RESULT_JOBS = {"fork-tests.yml": "fork_ci_result"}
+RESULT_REFUSAL = ('if [[ "$OUTSIDE_PR" == true ]]; then\n'
+                  '  echo "::error::outside PR: not tested here; a maintainer must review"\n'
+                  '  exit 1\n'
+                  'fi\n')
+
+
+def outside_job_problems(name, job):
+    where = f"{name}: job {OUTSIDE_JOB}"
+    if job is None:
+        return [f"{where} is missing (an outside pull request would skip every job and show green)"]
+    problems = []
+    job_steps = job.get("steps") or []
+    if expression(job.get("if")) != OUTSIDE_IF:
+        problems.append(f"{where}: if is not exactly `{OUTSIDE_IF}`")
+    if not set(job) <= {"name", "if", "runs-on", "timeout-minutes", "permissions", "steps"} \
+            or job.get("permissions") != {}:
+        problems.append(f"{where}: more than name, if, runs-on, timeout-minutes, permissions {{}} and steps")
+    if len(job_steps) != 1 or not set(job_steps[0]) <= {"name", "run"} or job_steps[0].get("run") != OUTSIDE_RUN:
+        problems.append(f"{where}: not exactly one step that prints the refusal and exits 1")
+    return problems
+
+
+def result_job_problems(name, job):
+    where = f"{name}: job {RESULT_JOBS[name]}"
+    if job is None:
+        return [f"{where} is missing"]
+    problems = []
+    needs = job.get("needs") or []
+    if expression(job.get("if")) != "always()":
+        problems.append(f"{where}: if is not exactly always() (skipped on an outside pull request = green)")
+    if OUTSIDE_JOB not in ([needs] if isinstance(needs, str) else needs):
+        problems.append(f"{where}: does not need {OUTSIDE_JOB}")
+    job_steps = job.get("steps") or []
+    for step in job_steps:
+        uses = str(step.get("uses", ""))
+        if uses and not uses.startswith("actions/download-artifact@"):
+            problems.append(f"{where}: uses {uses}")
+        if re.search(r"\bgit\b|\.github/scripts|\bnode\b|\bbash\b", str(step.get("run", ""))):
+            problems.append(f"{where}: a step runs git or a script from the checkout")
+    first = job_steps[0] if job_steps else {}
+    if RESULT_REFUSAL not in str(first.get("run", "")) or "if" in first or \
+            expression((first.get("env") or {}).get("OUTSIDE_PR")) != OUTSIDE_IF:
+        problems.append(f"{where}: its first step does not refuse an outside pull request (OUTSIDE_PR)")
+    return problems
+
+
 def pr_guard_problems(name, wf):
     events = triggers(wf)
     problems = [f"{name}: trigger {e} is not allowed (only {', '.join(sorted(ALLOWED_EVENTS))})"
                 for e in sorted(events - ALLOWED_EVENTS)]
     if events & PR_EVENTS:
+        jobs = wf.get("jobs") or {}
+        problems += outside_job_problems(name, jobs.get(OUTSIDE_JOB))
+        if name in RESULT_JOBS:
+            problems += result_job_problems(name, jobs.get(RESULT_JOBS[name]))
         problems += [f"{name}: job {j} does not start with the pull request guard"
-                     for j, job in (wf.get("jobs") or {}).items() if not guarded(job.get("if"))]
+                     for j, job in jobs.items()
+                     if j not in {OUTSIDE_JOB, RESULT_JOBS.get(name)} and not guarded(job.get("if"))]
     return problems
 
 
@@ -110,15 +176,18 @@ real = fork_workflows()
 check("pr-guard: there are fork workflows to check, two of them started by pull requests",
       len([n for n, wf in real.items() if triggers(wf) & PR_EVENTS]) >= 2, ", ".join(real))
 problems = [p for n, wf in real.items() for p in pr_guard_problems(n, wf)]
-check("pr-guard: every job a pull request can start runs only for this repository's branches",
-      not problems, "; ".join(problems))
+check("pr-guard: every job a pull request can start runs only for this repository's branches; an outside "
+      "pull request gets only outside_pr (and fork_ci_result), which fail", not problems, "; ".join(problems))
 check("pr-guard: the guard compares the head repository with this one (null when it is gone, so no run)",
       "github.event.pull_request.head.repo.full_name == github.repository" in PR_GUARD)
 
 
 def mutant_flagged(name, mutate):
     wf = copy.deepcopy(real[name])
-    mutate(wf)
+    try:
+        mutate(wf)
+    except (KeyError, ValueError, IndexError):  # nothing to break: the shape is missing, a FAIL above
+        return False
     return bool(pr_guard_problems(name, wf))
 
 
@@ -133,6 +202,24 @@ mutants = {
     "always() || guard": set_if("fork_ci_result", "${{ always() || " + PR_GUARD + " }}"),
     "guard || always()": set_if("fork_ci_result", "${{ " + PR_GUARD + " || always() }}"),
     "guard && (a) || (b)": set_if("test", "${{ " + PR_GUARD + " && (always()) || (true) }}"),
+    "fork_ci_result skipped on outside pull requests (guard && (always()))":
+        set_if("fork_ci_result", "${{ " + PR_GUARD + " && (always()) }}"),
+    "fork_ci_result not needing outside_pr": lambda wf: wf["jobs"]["fork_ci_result"]["needs"].remove("outside_pr"),
+    "fork_ci_result without its outside refusal": lambda wf: wf["jobs"]["fork_ci_result"]["steps"][0].__setitem__(
+        "run", wf["jobs"]["fork_ci_result"]["steps"][0]["run"].replace(RESULT_REFUSAL, "")),
+    "fork_ci_result checking out": lambda wf: wf["jobs"]["fork_ci_result"]["steps"].insert(
+        1, {"uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"}),
+    "no outside_pr job": lambda wf: wf["jobs"].pop("outside_pr"),
+    "outside_pr exiting 0": lambda wf: wf["jobs"]["outside_pr"]["steps"][0].__setitem__(
+        "run", OUTSIDE_RUN.replace("exit 1", "exit 0")),
+    "outside_pr with continue-on-error": lambda wf: wf["jobs"]["outside_pr"]["steps"][0].__setitem__(
+        "continue-on-error", True),
+    "outside_pr checking out": lambda wf: wf["jobs"]["outside_pr"]["steps"].insert(
+        0, {"uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"}),
+    "outside_pr with a token": lambda wf: wf["jobs"]["outside_pr"].__setitem__("permissions", {"contents": "read"}),
+    "outside_pr with a secret in env": lambda wf: wf["jobs"]["outside_pr"].__setitem__("env", {"T": "${{ secrets.X }}"}),
+    "outside_pr on own branches (== for !=)": set_if("outside_pr", "${{ " + OUTSIDE_IF.replace("!=", "==") + " }}"),
+    "outside_pr with always()": set_if("outside_pr", "${{ always() }}"),
     "guard without its parentheses": set_if("lint", "${{ " + PR_GUARD[1:-1] + " && (true) }}"),
     "!= instead of ==": set_if("lint", "${{ " + PR_GUARD.replace("==", "!=") + " }}"),
     "the guard in a step only": lambda wf: (wf["jobs"]["changes"].pop("if", None),
@@ -142,6 +229,43 @@ for label, mutate in mutants.items():
     check(f"pr-guard: fork-tests.yml with {label} fails", mutant_flagged("fork-tests.yml", mutate))
 check("pr-guard: fork-checks.yml without the guard fails",
       mutant_flagged("fork-checks.yml", lambda wf: wf["jobs"]["no_schema_changes"].pop("if", None)))
+check("pr-guard: fork-checks.yml without outside_pr fails",
+      mutant_flagged("fork-checks.yml", lambda wf: wf["jobs"].pop("outside_pr")))
+check("pr-guard: outside_pr's if is the guard's exact negation",
+      OUTSIDE_IF == PR_GUARD[2:-1].replace(" || ", " && ").replace("==", "!="))
+
+# fork_ci_result's own script, run as Actions runs it, on the results of each kind of run.
+result_job = real["fork-tests.yml"]["jobs"].get("fork_ci_result", {})
+result_step = next((s for s in result_job.get("steps") or [] if s.get("name") == "Require every job to pass"), {})
+GATES = ["typecheck", "build", "desktop_launch", "test", "test_packages", "test_web", "test_server", "rust",
+         "release_smoke", "mobile_native"]
+
+
+def result_run(outside_pr, outside_result, others):
+    needs = result_job.get("needs") or []
+    results = {j: {"result": others, "outputs": {}} for j in needs}
+    if "changes" in results and others == "success":
+        results["changes"]["outputs"] = {g: "true" for g in GATES}
+    results[OUTSIDE_JOB] = {"result": outside_result, "outputs": {}}
+    with tempfile.NamedTemporaryFile(prefix="fork-contracts-summary-") as summary:
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", str(result_step.get("run", "exit 0"))],
+            env={"PATH": os.environ["PATH"], "RESULTS": json.dumps(results), "RELEASE_RUN": "false",
+                 "OUTSIDE_PR": outside_pr, "GITHUB_STEP_SUMMARY": summary.name},
+            capture_output=True, text=True)
+
+
+for label, (outside_pr, outside_result, others, ok) in {
+    "an outside pull request (outside_pr failed, the rest skipped) fails": ("true", "failure", "skipped", False),
+    "an outside pull request fails even when every other job succeeded": ("true", "skipped", "success", False),
+    "outside_pr failed on a run that is no outside pull request fails": ("false", "failure", "success", False),
+    "an own-branch pull request with every job passed passes": ("false", "skipped", "success", True),
+    "a push (OUTSIDE_PR empty) with every job passed passes": ("", "skipped", "success", True),
+}.items():
+    r = result_run(outside_pr, outside_result, others)
+    check(f"pr-guard: fork_ci_result's script: {label}",
+          (r.returncode == 0) == ok and (outside_pr != "true" or "outside PR: not tested here" in r.stdout),
+          f"exit {r.returncode}: {r.stdout.strip()[-300:]} {r.stderr.strip()[-300:]}")
 for event in ["issue_comment", "workflow_run", "pull_request_review", "issues"]:
     check(f"pr-guard: a fork workflow triggered by {event} fails",
           mutant_flagged("fork-release.yml", lambda wf, e=event: wf[True].__setitem__(e, None)))
@@ -255,6 +379,8 @@ first_sha = git(origin, "rev-parse", "HEAD")
 git(origin, "update-index", "--add", "--cacheinfo", f"160000,{first_sha},.repos/alchemy-effect/submodules/distilled")
 git(origin, "commit", "-q", "-m", "gitlink, no .gitmodules")
 main_sha = git(origin, "rev-parse", "HEAD")
+# A tag named like the branch, on the older commit: a bare `git fetch origin main` takes the tag.
+git(origin, "tag", "main", first_sha)
 script = shared[0][2]["run"] if shared else "exit 1"
 
 
@@ -293,6 +419,13 @@ for name, job_id, step in shared:
           and git(dest, "symbolic-ref", "-q", "HEAD", ok=False).returncode != 0,
           f"exit {r.returncode}: {r.stderr.strip()} head={head} files={present}")
 
+for history in ["tip", "full"]:
+    dest, r = run_step({"REF": "main", "HISTORY": history, "SPARSE": ""}, f"tag-{history}")
+    head = git(dest, "rev-parse", "HEAD") if r.returncode == 0 else ""
+    check(f"checkout e2e: a branch name takes the branch, never a tag of the same name ({history})",
+          r.returncode == 0 and head == main_sha, f"exit {r.returncode}: {r.stderr.strip()} head={head}")
+_, r = run_step({"REF": "refs/tags/main", "HISTORY": "tip", "SPARSE": ""}, "tag-ref")
+check("checkout e2e: a tag's full ref fails the step (a branch name or a 40-hex SHA only)", r.returncode != 0)
 full, r = run_step({"REF": main_sha, "HISTORY": "full", "SPARSE": ""}, "control")
 check("checkout e2e: full history reaches the first commit (blobs on demand)",
       r.returncode == 0 and git(full, "rev-list", "--count", "HEAD") == "2")
@@ -331,6 +464,41 @@ def refusal_steps(wf):
             yield job_id, step
 
 
+def is_refusal(step):
+    """The guard, the Environment re-check and the sweep before the move."""
+    return "fork-follow-guard.sh" in str(step.get("run", "")) or \
+        (step.get("env") or {}).get("REQUIRE_NEW_OFF") == "true"
+
+
+# Whitelist for a refusal step: these keys, and its run is the optional report folder, then exactly
+# one script call. No if, continue-on-error, shell, working-directory: the runner's default
+# `bash -e {0}` runs it.
+REFUSAL_KEYS = {"id", "name", "env", "run"}
+REFUSAL_PRE = {'mkdir -p "$RUNNER_TEMP/reports"'}
+# What may run before a refusal in its job: the shared checkout (the checkout rule holds it to one
+# text), another refusal step, or one line that writes a step output.
+OUTPUT_LINE = re.compile(r'echo "\w+=(?:\$[A-Z_]+|\$\(date -u \+[%A-Za-z:-]+\))" >> "\$GITHUB_OUTPUT"')
+SHELL_CHANGE = re.compile(r"GITHUB_ENV|GITHUB_PATH|BASH_ENV|BASH_FUNC_|^\s*(?:function\s+\S+|[^\s=()$]+\s*\(\s*\))",
+                          re.M)
+
+
+def shell_env_keys(env):
+    return {k for k in env or {} if k in SHELL_ENV or str(k).startswith("BASH_FUNC_")}
+
+
+def earlier_step_problem(step, shared_run):
+    run = str(step.get("run", ""))
+    if "uses" in step:
+        return f"an action ({step['uses']}) can write GITHUB_ENV"
+    if SHELL_CHANGE.search(run):
+        return "writes GITHUB_ENV/GITHUB_PATH/BASH_ENV or defines a shell function"
+    if run == shared_run or is_refusal(step):
+        return None
+    if not set(step) <= {"id", "name", "run"} or not OUTPUT_LINE.fullmatch(run.strip()):
+        return "is not the shared checkout, a refusal or one step-output line"
+    return None
+
+
 def refusal_problems(wf):
     problems = []
     if "defaults" in wf:
@@ -338,34 +506,43 @@ def refusal_problems(wf):
     for scope, env in [("workflow", wf.get("env"))] + [
             (j, job.get("env")) for j, job in wf["jobs"].items()] + [
             (f"{j}/{s.get('name')}", s.get("env")) for j, s in steps(wf)]:
-        problems += [f"{scope}: env {k}" for k in set(env or {}) & SHELL_ENV]
+        problems += [f"{scope}: env {k}" for k in shell_env_keys(env)]
     for job_id, job in wf["jobs"].items():
         if job_id != "report" and ("continue-on-error" in job or "defaults" in job):
             problems.append(f"{job_id}: continue-on-error or defaults on the job")
+    shared_run = shared[0][2]["run"] if shared else None
     for job_id, step in refusal_steps(wf):
         where = f"{job_id}/{step.get('name')}"
         lines = [l.strip() for l in str(step["run"]).strip().splitlines() if l.strip()]
-        calls = [l for l in lines if "bash .github/scripts/" in l]
-        if "continue-on-error" in step:
-            problems.append(f"{where}: continue-on-error")
-        if step.get("shell", "bash") != "bash":
-            problems.append(f"{where}: shell {step.get('shell')}")
-        if not calls or any(not SCRIPT_LINE.fullmatch(c) for c in calls) or lines[-1] != calls[-1]:
-            problems.append(f"{where}: the script call is not a plain last line")
-        if SWALLOW.search(str(step["run"])):
-            problems.append(f"{where}: a swallowing construct")
-        # The guard, the Environment re-check and the sweep before the move run unconditionally.
-        refusal = "fork-follow-guard.sh" in calls[-1] if calls else False
-        refusal |= (step.get("env") or {}).get("REQUIRE_NEW_OFF") == "true"
-        if refusal and "if" in step:
-            problems.append(f"{where}: a refusal step with an if:")
+        if not is_refusal(step):
+            # Other script steps: a blacklist, they may hold more than the call.
+            calls = [l for l in lines if "bash .github/scripts/" in l]
+            if "continue-on-error" in step:
+                problems.append(f"{where}: continue-on-error")
+            if step.get("shell", "bash") != "bash":
+                problems.append(f"{where}: shell {step.get('shell')}")
+            if not calls or any(not SCRIPT_LINE.fullmatch(c) for c in calls) or lines[-1] != calls[-1]:
+                problems.append(f"{where}: the script call is not a plain last line")
+            if SWALLOW.search(str(step["run"])):
+                problems.append(f"{where}: a swallowing construct")
+            continue
+        # A refusal step: only what the whitelist names.
+        if not set(step) <= REFUSAL_KEYS:
+            problems.append(f"{where}: keys {', '.join(sorted(set(step) - REFUSAL_KEYS))} on a refusal step")
+        body = lines[1:] if lines[:1] and lines[0] in REFUSAL_PRE else lines
+        if len(body) != 1 or not SCRIPT_LINE.fullmatch(body[0]):
+            problems.append(f"{where}: the run is more than the report folder and one script call")
+        job_steps = wf["jobs"][job_id]["steps"]
+        for earlier in job_steps[:next(i for i, s in enumerate(job_steps) if s is step)]:
+            why = earlier_step_problem(earlier, shared_run)
+            if why:
+                problems.append(f"{where}: an earlier step ({earlier.get('name') or earlier.get('id')}) {why}")
     return problems
 
 
 check("refusals: no refusal in fork-follow.yml can be swallowed", not refusal_problems(follow),
       "; ".join(refusal_problems(follow)))
-refusal_ids = [(j, s.get("name")) for j, s in refusal_steps(follow)
-               if "fork-follow-guard.sh" in s["run"] or (s.get("env") or {}).get("REQUIRE_NEW_OFF") == "true"]
+refusal_ids = [(j, s.get("name")) for j, s in refusal_steps(follow) if is_refusal(s)]
 check("refusals: the guard, the Environment re-check and the sweep before the move are found",
       len(refusal_ids) == 3 and {j for j, _ in refusal_ids} == {"guard", "advance"}, str(refusal_ids))
 
@@ -403,6 +580,24 @@ swallowers = {
     "BASH_ENV on the workflow": lambda wf, j, s: wf["env"].__setitem__("BASH_ENV", "x"),
     "defaults on the job": lambda wf, j, s: wf["jobs"][j].__setitem__("defaults", {"run": {"shell": "sh"}}),
     "defaults on the workflow": lambda wf, j, s: wf.__setitem__("defaults", {"run": {"shell": "sh"}}),
+    "a bare exit before the call": lambda wf, j, s: s.__setitem__("run", "exit\n" + s["run"]),
+    "a bash() function before the call": lambda wf, j, s: s.__setitem__("run", "bash() { echo skip; }\n" + s["run"]),
+    "the call inside if false; then ... fi": lambda wf, j, s: s.__setitem__(
+        "run", "if false; then\n" + s["run"] + "fi\n"),
+    "a second call after the script": tail("\nbash .github/scripts/fork-workflows.sh"),
+    "working-directory on the step": lambda wf, j, s: s.__setitem__("working-directory", "/tmp"),
+    "BASH_FUNC_bash%% in the step env": lambda wf, j, s: s.setdefault("env", {}).__setitem__(
+        "BASH_FUNC_bash%%", "() { :; }"),
+    "an earlier step writing BASH_ENV to $GITHUB_ENV": lambda wf, j, s: wf["jobs"][j]["steps"].insert(
+        0, {"name": "x", "run": 'echo "BASH_ENV=/tmp/skip" >> "$GITHUB_ENV"'}),
+    "an earlier step writing $GITHUB_PATH": lambda wf, j, s: wf["jobs"][j]["steps"].insert(
+        0, {"name": "x", "run": 'echo /tmp/fake-bin >> "$GITHUB_PATH"'}),
+    "an earlier step defining a function": lambda wf, j, s: wf["jobs"][j]["steps"].insert(
+        0, {"name": "x", "run": "function bash { :; }\nexport -f bash"}),
+    "an earlier action": lambda wf, j, s: wf["jobs"][j]["steps"].insert(
+        0, {"uses": "some/action@0000000000000000000000000000000000000000"}),
+    "an earlier step that runs anything else": lambda wf, j, s: wf["jobs"][j]["steps"].insert(
+        0, {"name": "x", "run": 'f=GITHUB_; echo "BASH_EN""V=/tmp/x" >> "${!f}EN""V"'}),
 }
 for index, (job_id, name) in enumerate(refusal_ids):
     missed = [label for label, mutate in swallowers.items() if not refusal_mutant(index, mutate)]
@@ -420,10 +615,32 @@ def code_lines(text):
     return [(n, l) for n, l in enumerate(text.splitlines(), 1) if not l.lstrip().startswith("#")]
 
 
+def joined_lines(text):
+    """Shell lines with backslash continuations joined, each numbered by its first line."""
+    out, start, parts = [], None, []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not parts and line.lstrip().startswith("#"):
+            continue
+        start = n if not parts else start
+        if line.endswith("\\") and not line.endswith("\\\\"):
+            parts.append(line[:-1] + " ")
+            continue
+        out.append((start, "".join(parts) + line))
+        parts = []
+    if parts:
+        out.append((start, "".join(parts)))
+    return out
+
+
 def gh_calls(name, text):
     if not name.endswith(".sh"):
         return [n for n, l in code_lines(text) if GH_STRING.search(l)]
-    return [n for n, l in code_lines(text) for m in GH_CALL.finditer(l) if l[max(0, m.start() - 2):m.start()] != "\\`"]
+    return [n for n, l in joined_lines(text) for m in GH_CALL.finditer(l)
+            if l[max(0, m.start() - 2):m.start()] != "\\`"]
+
+
+# Before the guard line only these may stand, so it is sourced at the top level, unconditionally.
+GUARD_PRELUDE = re.compile(r"#!.*|set -[a-z]+(?: pipefail)?|")
 
 
 def gh_guard_problems(files):
@@ -440,6 +657,11 @@ def gh_guard_problems(files):
         guard = [n for n, l in enumerate(text.splitlines(), 1) if l == GUARD_LINE]
         if not guard or guard[0] > calls[0]:
             problems.append(f"{name}: calls gh (line {calls[0]}) without sourcing fork-gh-guard.sh first")
+            continue
+        before = [l for _, l in code_lines("\n".join(text.splitlines()[:guard[0] - 1]))
+                  if not GUARD_PRELUDE.fullmatch(l.strip())]
+        if before:
+            problems.append(f"{name}: {before[0].strip()!r} before the guard line (only #!, set and comments)")
     return problems
 
 
@@ -464,6 +686,11 @@ for label, (name, text) in {
     "a python script running gh": ("fork-new.py", "subprocess.run(['gh', 'api', 'x'])\n"),
     "gh after a pipe": ("fork-new.sh", "echo x | gh api x --input -\n"),
     "gh in a command substitution": ("fork-new.sh", 'echo "$(gh api x)"\n'),
+    "gh split by a line continuation": ("fork-new.sh", "x=\"$(gh \\\n  api user)\"\n"),
+    "gh after a continued line": ("fork-new.sh", "echo a \\\n  | gh api x --input -\n" + GUARD_LINE + "\n"),
+    "the guard inside if false; then ... fi": ("fork-new.sh", "set -euo pipefail\nif false; then\n" + GUARD_LINE
+                                               + "\nfi\ngh api user\n"),
+    "the guard after an exit 0 at the top": ("fork-new.sh", "exit 0\n" + GUARD_LINE + "\ngh api user\n"),
 }.items():
     check(f"gh-guard: {label} fails", bool(gh_guard_problems({name: text})))
 check("gh-guard: a script that only mentions gh in a message passes",

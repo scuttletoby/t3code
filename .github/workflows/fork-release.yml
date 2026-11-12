@@ -98,7 +98,8 @@ jobs:
       # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ and no
       # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
       # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
-      # so no token is used. Every fork job checks out with this same step (fork-contracts.test.py).
+      # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
       - name: Checkout
         shell: bash
         env:
@@ -116,7 +117,10 @@ jobs:
           read -r -a sparse <<< "$SPARSE"
           git init -q
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
-          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$REF"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
           if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
           git checkout -q --detach FETCH_HEAD
 
@@ -155,7 +159,8 @@ jobs:
       # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ and no
       # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
       # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
-      # so no token is used. Every fork job checks out with this same step (fork-contracts.test.py).
+      # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
       - name: Checkout
         shell: bash
         env:
@@ -173,7 +178,10 @@ jobs:
           read -r -a sparse <<< "$SPARSE"
           git init -q
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
-          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$REF"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
           if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
           git checkout -q --detach FETCH_HEAD
 
@@ -385,7 +393,8 @@ jobs:
       # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ and no
       # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
       # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
-      # so no token is used. Every fork job checks out with this same step (fork-contracts.test.py).
+      # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
       - name: Checkout
         shell: bash
         env:
@@ -403,7 +412,10 @@ jobs:
           read -r -a sparse <<< "$SPARSE"
           git init -q
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
-          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$REF"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
           if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
           git checkout -q --detach FETCH_HEAD
 
@@ -521,7 +533,8 @@ jobs:
       # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ and no
       # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
       # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
-      # so no token is used. Every fork job checks out with this same step (fork-contracts.test.py).
+      # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
       - name: Checkout
         shell: bash
         env:
@@ -539,7 +552,10 @@ jobs:
           read -r -a sparse <<< "$SPARSE"
           git init -q
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
-          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$REF"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
           if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
           git checkout -q --detach FETCH_HEAD
 

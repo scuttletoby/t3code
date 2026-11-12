@@ -448,19 +448,18 @@ test("any action the workflow uses is pinned by commit SHA", () => {
   for (const line of uses) assert.match(line, /@[0-9a-f]{40}$/, line);
 });
 
-// The shell scripts of a workflow: each `run:` value, a one-line one or a whole `run: |` block (every
-// line indented past the `run:` key, blank lines included).
+// The shell scripts of a workflow: each `run:` value with every line after it that is indented past
+// the `run:` key, blank lines included. That covers a `run: |` or `>` block, a value that starts on
+// the next line (`run:` alone) and a plain or quoted scalar continued on later lines; YAML reads all
+// of them as one script.
 function runScripts(workflow) {
   const lines = workflow.split("\n");
   const scripts = [];
   for (let i = 0; i < lines.length; i++) {
-    const m = /^(\s*(?:-\s+)?)run:\s*(.*)$/.exec(lines[i]);
+    const m = /^(\s*(?:-\s+)?)run:(?:\s+(.*))?$/.exec(lines[i]);
     if (!m) continue;
-    if (!/^[|>][-+0-9]*\s*(#.*)?$/.test(m[2])) {
-      scripts.push(m[2]);
-      continue;
-    }
-    const body = [];
+    const head = (m[2] ?? "").trim();
+    const body = head === "" || /^[|>][-+0-9]*\s*(#.*)?$/.test(head) ? [] : [head];
     while (
       i + 1 < lines.length &&
       (lines[i + 1].trim() === "" || lines[i + 1].search(/\S/) > m[1].length)
@@ -522,9 +521,20 @@ test("runScripts reads one-line runs and whole run blocks", () => {
       "      - run: >-",
       "          c",
       "        env: {}",
+      "      - run:",
+      "          d",
+      "      - run: e",
+      "          f",
+      "        name: y",
     ].join("\n"),
   );
-  assert.deepEqual(scripts, ["echo one", "          a\n\n          b", "          c"]);
+  assert.deepEqual(scripts, [
+    "echo one",
+    "          a\n\n          b",
+    "          c",
+    "          d",
+    "e\n          f",
+  ]);
 });
 
 test("a workflow that pastes PR values into a script or reaches a token fails the check", () => {
@@ -550,6 +560,17 @@ test("a workflow that pastes PR values into a script or reaches a token fails th
       (line, indent) => `${line}${indent}  T: \${{ secrets.GITHUB_TOKEN }}\n`,
     ),
     "a pull_request trigger": workflow.replace(/^on:\n/m, "on:\n  pull_request:\n"),
+    // `run:` alone, the script on the next line.
+    "an expression in a run value that starts on the next line": workflow.replace(
+      /^( +)run: (node --test .*)$/m,
+      (all, indent, cmd) =>
+        `${indent}run:\n${indent}  echo \${{ github.event.pull_request.title }} && ${cmd}`,
+    ),
+    // A plain one-line run continued on the next line: YAML folds it into the same script.
+    "an expression on the continuation of a plain run": workflow.replace(
+      /^( +)run: (node --test .*)$/m,
+      (all, indent, cmd) => `${all}\n${indent}  \${{ github.head_ref }}`,
+    ),
   };
   for (const [label, text] of Object.entries(mutants)) {
     assert.notEqual(text, workflow, label);
