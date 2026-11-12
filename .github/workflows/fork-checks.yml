@@ -1,0 +1,28 @@
+name: Fork checks
+
+# Rules for this fork's own changes, run on every pull request. Upstream's CI needs runners a fork
+# does not have; fork-tests.yml runs upstream's tests on hosted runners instead.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no_schema_changes:
+    name: No database schema changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Test the check
+        run: node --test .github/scripts/fork-schema-check.test.cjs
+
+      # T3 has no down-migrations, so a fork migration strands installs that return to upstream.
+      - name: Refuse schema and migration changes
+        run: node .github/scripts/fork-schema-check.cjs "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
