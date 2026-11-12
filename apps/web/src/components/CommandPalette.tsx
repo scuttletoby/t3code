@@ -954,6 +954,7 @@ function OpenCommandPaletteDialog(props: {
   }
 
   function handleQueryChange(nextQuery: string, source: EventTarget | null): void {
+    (globalThis as { __paletteProbe?: string[] }).__paletteProbe?.push(`${performance.now().toFixed(1)} handleQueryChange ${JSON.stringify(nextQuery)}`);
     browseNavigation.invalidate();
     clearTypedHighlight();
     const resolvedQuery = canBrowsePaths ? resolvePastedPath(query, nextQuery) : nextQuery;
@@ -2539,6 +2540,7 @@ function OpenCommandPaletteDialog(props: {
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLInputElement>): void {
+    (globalThis as { __paletteProbe?: string[] }).__paletteProbe?.push(`${performance.now().toFixed(1)} handleKeyDown ${event.key} cleared=${highlightClearedRef.current} hv=${highlightedItemValue} first=${resultRows.itemValues[0]} n=${resultRows.itemValues.length}`);
     if (event.key === "Enter" && (event.nativeEvent.isComposing || event.keyCode === 229)) {
       // Confirming an IME candidate must not submit a path or select a row.
       (event as typeof event & { preventBaseUIHandler?: () => void }).preventBaseUIHandler?.();
@@ -2943,6 +2945,7 @@ function OpenCommandPaletteDialog(props: {
     <span className="text-muted-foreground text-xs">Searching messages…</span>
   ) : null;
 
+  (globalThis as { __paletteProbe?: string[] }).__paletteProbe?.push(`${performance.now().toFixed(1)} render key=${viewStack.length}-${browseGeneration}-${isBrowsing} n=${resultRows.itemValues.length} first=${resultRows.itemValues[0]} second=${resultRows.itemValues[1]} hv=${highlightedItemValue} q=${JSON.stringify(query)}`);
   return (
     <CommandPaletteContent
       key={`${viewStack.length}-${browseGeneration}-${isBrowsing}-${newProjectFlow ? "new-project" : (addProjectCloneFlow?.step ?? "none")}`}
@@ -2986,6 +2989,7 @@ function OpenCommandPaletteDialog(props: {
       items={resultRows.itemValues}
       virtualized
       onItemHighlighted={(value, eventDetails) => {
+        (globalThis as { __paletteProbe?: string[] }).__paletteProbe?.push(`${performance.now().toFixed(1)} onItemHighlighted ${String(value)} ${eventDetails.reason} idx=${eventDetails.index} cleared=${highlightClearedRef.current}`);
         if (eventDetails.reason === "none" && highlightClearedRef.current) return;
         highlightClearedRef.current = false;
         setHighlightedItemValue(typeof value === "string" ? value : null);

@@ -85,7 +85,7 @@ describe("CommandPalette open intents", () => {
     await expect.element(page.getByPlaceholder("Search...")).toHaveFocus();
   });
 
-  it("highlights the first project when New thread in... opens from the root list", async () => {
+  it("highlights the first project when New thread in... opens from the root list", { repeats: 10 }, async () => {
     const environmentId = EnvironmentId.make("local");
     const project = (id: string, title: string): Project => ({
       id: ProjectId.make(id),
@@ -101,21 +101,59 @@ describe("CommandPalette open intents", () => {
     setup({
       projects: [project("acme", "Acme"), project("beta", "Beta"), project("gamma", "Gamma")],
     });
+    const log: string[] = [];
+    (globalThis as { __paletteProbe?: string[] }).__paletteProbe = log;
+    const snap = (tag: string) => {
+      const opts = [...document.querySelectorAll('[role="option"]')];
+      const hi = opts.filter((o) => o.hasAttribute("data-highlighted")).map((o) => o.textContent?.slice(0, 22));
+      const act = opts.filter((o) => o.hasAttribute("data-active")).map((o) => o.textContent?.slice(0, 22));
+      const el = document.activeElement as HTMLElement | null;
+      log.push(`${performance.now().toFixed(1)} DOM ${tag} n=${opts.length} hi=${JSON.stringify(hi)} act=${JSON.stringify(act)} focus=${el?.tagName}:${el?.getAttribute("placeholder") ?? ""} hasFocus=${document.hasFocus()} vis=${document.visibilityState}`);
+    };
+    const mo = new MutationObserver(() => snap("mut"));
+    mo.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-highlighted", "data-active"] });
+    const onKey = (e: KeyboardEvent) => snap(`keydown:${e.key} target=${(e.target as HTMLElement).tagName}`);
+    const onPointer = (e: PointerEvent) => snap(`${e.type} ${e.clientX},${e.clientY} ${(e.target as HTMLElement).textContent?.slice(0, 15)}`);
+    const onFocus = (e: FocusEvent) => snap(`${e.type} ${(e.target as HTMLElement).tagName}`);
+    document.addEventListener("keydown", onKey, true);
+    document.addEventListener("pointermove", onPointer, true);
+    document.addEventListener("pointerover", onPointer, true);
+    document.addEventListener("focusin", onFocus, true);
+    document.addEventListener("focusout", onFocus, true);
+    window.addEventListener("blur", () => snap("window-blur"));
+    try {
     await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
 
     openCommandPalette({});
     await expect
       .element(page.getByPlaceholder("Search commands, projects, and threads..."))
       .toHaveFocus();
+    snap("focused");
     await userEvent.keyboard("{ArrowDown}");
-    await expect
-      .element(page.getByRole("option", { name: /^New thread in\.\.\./ }))
-      .toHaveAttribute("data-highlighted");
+    snap("after-key");
+    try {
+      await expect
+        .element(page.getByRole("option", { name: /^New thread in\.\.\./ }), { timeout: 5000 })
+        .toHaveAttribute("data-highlighted");
+    } catch (error) {
+      snap("fail");
+      console.log("PALETTE-PROBE-FAIL\n" + log.join("\n"));
+      throw error;
+    }
     await userEvent.keyboard("{Enter}");
 
     await expect.element(page.getByPlaceholder("Search...")).toHaveFocus();
     await expect.element(page.getByRole("option").first()).toHaveAttribute("data-highlighted");
     await expect.element(page.getByRole("option").nth(1)).not.toHaveAttribute("data-highlighted");
+    } finally {
+      mo.disconnect();
+      document.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("pointermove", onPointer, true);
+      document.removeEventListener("pointerover", onPointer, true);
+      document.removeEventListener("focusin", onFocus, true);
+      document.removeEventListener("focusout", onFocus, true);
+      (globalThis as { __paletteProbe?: string[] }).__paletteProbe = undefined;
+    }
   });
 
   it("opens a search intent with its query in the focused input", async () => {
