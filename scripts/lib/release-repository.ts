@@ -1,9 +1,7 @@
 /**
- * The GitHub repository whose releases a build updates from, baked in at build time.
- *
- * Empty means the upstream default in `@t3tools/shared/cliRelease`. A fork's release workflow sets
- * `T3CODE_RELEASE_REPOSITORY=<owner>/<repo>` so its builds look only at the fork's releases: the
- * Update button and `t3 update` can then never install an upstream build over the fork.
+ * The repository a build updates from: T3CODE_RELEASE_REPOSITORY, else an Actions build's own
+ * GITHUB_REPOSITORY (reusable workflows drop the caller's env), else "" for upstream. Keeps a
+ * fork's Update button and `t3 update` on the fork's releases.
  */
 export const RELEASE_REPOSITORY_ENV = "T3CODE_RELEASE_REPOSITORY";
 
@@ -18,11 +16,16 @@ function isValidSegment(value: string | undefined): value is string {
 export function resolveReleaseRepository(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): string {
-  const configured = env[RELEASE_REPOSITORY_ENV]?.trim() ?? "";
+  const configured =
+    env[RELEASE_REPOSITORY_ENV]?.trim() ||
+    (env.GITHUB_ACTIONS === "true" ? env.GITHUB_REPOSITORY?.trim() : "") ||
+    "";
   if (configured === "") return "";
   const [owner, name, ...rest] = configured.split("/");
   if (!isValidSegment(owner) || !isValidSegment(name) || rest.length > 0) {
-    throw new Error(`${RELEASE_REPOSITORY_ENV} must be "<owner>/<repo>", got "${configured}".`);
+    throw new Error(
+      `${RELEASE_REPOSITORY_ENV} (or GITHUB_REPOSITORY) must be "<owner>/<repo>", got "${configured}".`,
+    );
   }
   return configured;
 }

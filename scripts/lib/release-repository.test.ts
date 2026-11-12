@@ -17,6 +17,16 @@ describe("release repository build setting", () => {
     });
   });
 
+  it("names the repository a GitHub Actions build runs in, unless the setting overrides it", () => {
+    const actions = { GITHUB_ACTIONS: "true", GITHUB_REPOSITORY: "fork-owner/t3code" };
+    expect(resolveReleaseRepository(actions)).toBe("fork-owner/t3code");
+    expect(
+      resolveReleaseRepository({ ...actions, T3CODE_RELEASE_REPOSITORY: "other/t3code" }),
+    ).toBe("other/t3code");
+    // Outside Actions a stray GITHUB_REPOSITORY changes nothing.
+    expect(resolveReleaseRepository({ GITHUB_REPOSITORY: "fork-owner/t3code" })).toBe("");
+  });
+
   it("fails the build on a malformed value instead of falling back to upstream", () => {
     for (const value of ["owner", "owner/repo/extra", "owner/..", "https://github.com/o/r"]) {
       expect(() => resolveReleaseRepository({ T3CODE_RELEASE_REPOSITORY: value })).toThrow(
