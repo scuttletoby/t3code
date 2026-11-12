@@ -5,23 +5,8 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-dir="$(realpath "${FORK_FOLLOW_DIR:-$here}")"
-workflow="$(realpath "${FORK_FOLLOW_WORKFLOW:-$here/../workflows/fork-follow.yml}")"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
-
-# Upstream "up/t3code" and this fork "me/t3code" live under $root/gh; git reaches them through the
-# github.com URLs the scripts use.
-export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$root/gitconfig"
-git config --global user.name test
-git config --global user.email test@example.invalid
-git config --global init.defaultBranch main
-git config --global advice.detachedHead false
-git config --global url."$root/gh/".insteadOf https://github.com/
-export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code UPSTREAM=up/t3code
-unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_ACTIONS UPSTREAM_URL ORIGIN RUN_SHA PUSH_URL \
-  SERIES_BRANCH FORK_PUSH_TOKEN OWN_WORKFLOWS HEAD_SHA TREE_REF SINCE REPO_SECRET_PRESENT \
-  FORK_PUSH_ENVIRONMENT
 
 # Fake gh, served from $root/api:
 #   gh api [-X M] PATH [--paginate] [--jq EXPR]     gh issue list|comment|create|close ...
@@ -86,6 +71,23 @@ case "$method $path" in
 esac
 if [[ -n "$jq" ]]; then jq -r "$jq" <<< "$body"; else echo "$body"; fi
 GH
+
+dir="$(realpath "${FORK_FOLLOW_DIR:-$here}")"
+workflow="$(realpath "${FORK_FOLLOW_WORKFLOW:-$here/../workflows/fork-follow.yml}")"
+
+# Upstream "up/t3code" and this fork "me/t3code" live under $root/gh; git reaches them through the
+# github.com URLs the scripts use.
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$root/gitconfig"
+git config --global user.name test
+git config --global user.email test@example.invalid
+git config --global init.defaultBranch main
+git config --global advice.detachedHead false
+git config --global url."$root/gh/".insteadOf https://github.com/
+export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code UPSTREAM=up/t3code
+unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_ACTIONS UPSTREAM_URL ORIGIN RUN_SHA PUSH_URL \
+  SERIES_BRANCH FORK_PUSH_TOKEN OWN_WORKFLOWS HEAD_SHA TREE_REF SINCE REPO_SECRET_PRESENT \
+  FORK_PUSH_ENVIRONMENT
+
 export FAKE_API="$root/api"
 
 failures=0
@@ -655,7 +657,10 @@ echo '{"workflows":[{"id":9,"state":"active","path":".github/workflows/fork-test
 D
 chmod +x "$root/decoy/gh"
 grep -vxF "$FORK_GH_STUB_MARKER" "$root/bin/gh" > "$root/nomarker/gh" && chmod +x "$root/nomarker/gh"
-gh_scripts=(fork-workflows.sh fork-follow-guard.sh fork-follow-report.sh)
+# Every script here that sources the guard (fork-contracts.test.py requires it of each that calls gh).
+mapfile -t gh_scripts < <(cd "$dir" && grep -lxF '. "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"' fork-*.sh | grep -v '\.test\.sh$' | sort)
+check "gh: the refusal tests cover the scripts that source the guard" \
+  eval '(for s in fork-follow-guard.sh fork-follow-report.sh fork-release.sh fork-workflows.sh; do [[ " ${gh_scripts[*]} " == *" $s "* ]] || exit 1; done)'
 refuses() { # refuses ENV...: every gh script, run with ENV, fails, says why, and calls no gh
   local s
   for s in "${gh_scripts[@]}"; do
@@ -724,11 +729,8 @@ top_level="$advance_if"
 while [[ "$top_level" =~ \([^()]*\) ]]; do top_level="${top_level//"${BASH_REMATCH[0]}"/_}"; done
 check "workflow: advance's if: is a conjunction (no top-level ||) of the plan's success and this attempt's guard" \
   eval '[[ -n "$advance_if" && "$top_level" != *"||"* && "$top_level" == *"$attempt_check &&"* && "$top_level" == *"needs.plan.result == '"'"'success'"'"' &&"* ]]'
-# A refusal that only warns is no refusal: continue-on-error is allowed in the Report job alone (the
-# guard, the Environment re-check and the sweep before the move must stop their job).
-report_start="$(grep -n "^  report:$" "$workflow" | cut -d: -f1)"
-check "workflow: continue-on-error appears only in the Report job (never on the guard, the re-check or the sweep before the move)" \
-  eval '[[ -n "$report_start" ]] && ! awk -v r="$report_start" "/continue-on-error/ && NR < r { bad = 1 } END { exit !bad }" "$workflow"'
+# A refusal that only warns is no refusal. fork-contracts.test.py ("refusals") checks every way to
+# swallow one (continue-on-error, || true, || :, ; true, set +e, a trap, an if:, another shell, BASH_ENV).
 check "workflow: the move step runs only when the checks before it passed (no if:)" \
   eval 'awk "/- name: Move the series branch/ { s = 1; next } s && /^      - / { exit } s && /^        if:/ { bad = 1 } END { exit bad }" <<< "$advance_job"'
 check "workflow: action none deletes a leftover candidate branch" \
@@ -740,8 +742,10 @@ token_jobs="$(grep -vF "$presence" "$workflow" | awk '/^  [a-z_-]+:$/ { job = $1
 env_jobs="$(awk '/^  [a-z_-]+:$/ { job = $1 } /^    environment: fork-push$/ { print job }' "$workflow" | sort -u)"
 check "workflow: the jobs that read FORK_PUSH_TOKEN, and only they, run in the Environment fork-push" \
   eval '[[ -n "$token_jobs" && "$token_jobs" == "$env_jobs" ]] && grep -qx "  FORK_PUSH_ENVIRONMENT: fork-push" "$workflow"'
-check "workflow: every checkout drops its credentials" \
-  eval '[[ $(grep -c "actions/checkout@" "$workflow") == $(grep -c "persist-credentials: false" "$workflow") ]]'
+# actions/checkout fails on upstream's gitlinks without .gitmodules once it cleans up credentials;
+# every job uses the shared plain-git step (fork-contracts.test.py runs it end to end).
+check "workflow: no job uses actions/checkout; four plain-git checkouts, none with a token" \
+  eval '! grep -q "actions/checkout@" "$workflow" && [[ $(grep -c "^          git init -q$" "$workflow") == 4 ]]'
 check "workflow: every action is pinned by commit" \
   eval '! grep -E "^\s*-?\s*uses: [^.][^@]*@" "$workflow" | grep -vqE "@[0-9a-f]{40}( |$)"'
 check "workflow: the report runs on every run (also action none)" \
