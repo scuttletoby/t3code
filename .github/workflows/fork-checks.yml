@@ -22,7 +22,8 @@ jobs:
     steps:
       # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ but no
       # .gitmodules, and checkout's credential cleanup runs `git submodule foreach`, which fails on
-      # them. Nothing is authenticated (public repository) and only the default branch is checked out.
+      # them. The full checkout fetches the default branch's blobs in one batch; a sparse one leaves
+      # the check to fetch every blob it reads one at a time.
       - name: Check out the default branch and fetch the pull request's commits (not checked out)
         env:
           DEFAULT_SHA: ${{ github.sha }}
@@ -34,7 +35,6 @@ jobs:
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
           git fetch -q --no-tags --no-recurse-submodules --filter=blob:none origin \
             "$DEFAULT_SHA" "$BASE_SHA" "$HEAD_SHA"
-          git sparse-checkout set --cone .github
           git checkout -q --detach "$DEFAULT_SHA"
 
       - name: Test the check

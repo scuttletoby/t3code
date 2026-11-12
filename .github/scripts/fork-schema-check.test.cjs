@@ -1165,7 +1165,6 @@ test("e2e: the workflow's checkout works on a tree with gitlinks and no .gitmodu
     assert.equal(git("rev-parse", "HEAD"), main, "the default branch is checked out, not the PR");
     assert.equal(git("cat-file", "-t", pr), "commit", "the PR head is fetched as objects");
     assert.ok(fs.existsSync(path.join(run.dir, CHECK_FILES[0])));
-    assert.ok(!fs.existsSync(path.join(run.dir, "apps")), "only .github and root files");
 
     // Fail closed: a commit the remote does not have stops the job.
     const missing = runCheckoutStep(origin, {
