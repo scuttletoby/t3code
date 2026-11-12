@@ -15,6 +15,9 @@ copies that must fail (so a check that stops seeing its problem goes red too):
   gh-guard     every fork script that calls gh sources fork-gh-guard.sh at the top level, after
                nothing but `set`, before its first call (backslash continuations joined), and
                every fork shell test sets up the gh stub (fork-test-gh.sh) before anything else.
+  removed      .github/fork-removed-workflows.txt (the upstream workflows the fork deletes, kept
+               deleted by fork-follow.sh) is there, every line is an upstream workflow path, none of
+               them is in the tree, and it names the files the owner decided to delete.
 
     python3 .github/scripts/fork-contracts.test.py
 
@@ -749,6 +752,46 @@ check("gh-guard: a node test spawning a gh script fails",
       bool(test_problems({**files, "fork-new.test.cjs": 'spawnSync("bash", [".github/scripts/fork-release.sh", "resolve"]);\n'})))
 check("gh-guard: a node test spawning gh fails",
       bool(test_problems({**files, "fork-new.test.cjs": 'execFileSync("gh", ["api", "x"]);\n'})))
+
+# --- removed -----------------------------------------------------------------------------------
+removed_path = root / ".github/fork-removed-workflows.txt"
+REMOVED_LINE = re.compile(r"\.github/workflows/[^/,\s]+\.ya?ml")
+# Owner decision 2026-11-12: outside events start these before the sweep can disable them.
+OWNER_REMOVED = {".github/workflows/" + n for n in [
+    "mobile-eas-preview-fork.yml", "desktop-macos-preview.yml", "thread-transfer-report.yml",
+    "mobile-fingerprint-label.yml"]}
+
+
+def removed_entries(text):
+    return [l.rstrip("\r") for l in text.splitlines() if not re.fullmatch(r"\s*(#.*)?", l.rstrip("\r"))]
+
+
+def removed_problems(text, tree):
+    problems = []
+    for line in removed_entries(text):
+        if not REMOVED_LINE.fullmatch(line) or line.startswith(".github/workflows/fork-"):
+            problems.append(f"{line!r} is not an upstream workflow path")
+        elif line in tree:
+            problems.append(f"{line} is listed as deleted but is in the tree")
+    return problems
+
+
+tree = {str(p.relative_to(root)) for p in workflows_dir.iterdir()}
+removed_text = removed_path.read_text() if removed_path.is_file() else None
+check("removed: .github/fork-removed-workflows.txt is there", removed_text is not None)
+removed_text = removed_text or ""
+check("removed: every line is an upstream workflow path that is not in the tree",
+      not removed_problems(removed_text, tree), "; ".join(removed_problems(removed_text, tree)))
+check("removed: the list names the four outside-started workflows the owner decided to delete",
+      OWNER_REMOVED <= set(removed_entries(removed_text)),
+      ", ".join(sorted(OWNER_REMOVED - set(removed_entries(removed_text)))))
+for label, (text, extra) in {
+    "a listed file still in the tree": (removed_text, {".github/workflows/thread-transfer-report.yml"}),
+    "a bare name": (removed_text + "ci.yml\n", set()),
+    "a fork-*.yml": (removed_text + ".github/workflows/fork-follow.yml\n", set()),
+    "a path outside .github/workflows": (removed_text + ".github/workflows/../ci.yml\n", set()),
+}.items():
+    check(f"removed: {label} fails", bool(removed_problems(text, tree | extra)))
 
 shutil.rmtree(work, ignore_errors=True)
 if failures:
