@@ -14,9 +14,14 @@ on:
 permissions:
   contents: read
 
+# Every job starts with the same condition: on a pull request, only one whose branch is in this
+# repository. A pull request from another fork runs nothing here, not even after approval (the
+# repository asks approval only for pull_request runs, and pull_request_target skips that). A head
+# repository GitHub no longer knows reads as "another fork". Test: fork-contracts.test.py.
 jobs:
   no_schema_changes:
     name: No database schema changes
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

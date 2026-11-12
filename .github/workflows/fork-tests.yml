@@ -52,9 +52,14 @@ concurrency:
   group: fork-tests-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every job starts with the same condition: on a pull request, only one whose branch is in this
+# repository. A pull request from another fork runs nothing here, not even after approval (the
+# repository asks approval only for pull_request runs, and pull_request_target skips that). A head
+# repository GitHub no longer knows reads as "another fork". Test: fork-contracts.test.py.
 jobs:
   changes:
     name: Changes
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -143,6 +148,7 @@ jobs:
   # upstream changed since the copy was last recorded.
   workflows:
     name: Workflow lint and upstream drift
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -191,7 +197,7 @@ jobs:
   # The ranges, and why: .github/scripts/fork-secret-scan.sh.
   secrets:
     name: Secret scan
-    if: ${{ inputs.ref == '' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (inputs.ref == '') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -235,6 +241,7 @@ jobs:
 
   lint:
     name: Lint
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -284,7 +291,7 @@ jobs:
   build:
     name: Build and Typecheck
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -433,7 +440,7 @@ jobs:
   test:
     name: Test ${{ matrix.shard }}
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.test != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -550,7 +557,7 @@ jobs:
   test_web:
     name: Test Web ${{ matrix.shard }}
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test_web != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -614,6 +621,7 @@ jobs:
   # release run's resolved commit (seconds; every other job waits for it too).
   test_server:
     name: Test Server ${{ matrix.shard }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -750,7 +758,7 @@ jobs:
   rust:
     name: Rust
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.rust != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -786,7 +794,7 @@ jobs:
   mobile_native_static_analysis:
     name: Mobile Native Static Analysis
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.mobile_native != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.mobile_native != 'false') }}
     runs-on: macos-26
     timeout-minutes: 15
     steps:
@@ -817,7 +825,7 @@ jobs:
   release_smoke:
     name: Release Smoke
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.release_smoke != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.release_smoke != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -848,7 +856,7 @@ jobs:
   # branch protection, so a cancelled run must still produce a failing result.
   fork_ci_result:
     name: fork-ci-result
-    if: ${{ always() }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (always()) }}
     needs:
       [
         changes,

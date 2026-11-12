@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Sourced first by every fork test that runs a script calling gh (fork-follow.test.sh,
-# fork-release.test.sh). `fork_test_gh DIR < STUB` cuts the test off from GitHub before any script
+# Sourced first by every fork shell test (fork-contracts.test.py requires it of each *.test.sh).
+# `fork_test_gh DIR < STUB` cuts the test off from GitHub before any script
 # runs: no GitHub token, GH_HOST a .invalid host and an empty gh config (so even a real gh has
 # nothing to reach and no login), and the stub read from stdin as DIR/gh, first on PATH, with the
 # marker line fork-gh-guard.sh looks for. FORK_TEST_MODE then makes the scripts refuse whenever
