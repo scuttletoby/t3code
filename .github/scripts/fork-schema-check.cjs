@@ -1,12 +1,7 @@
 // Refuses fork changes to the database schema: T3 has no down-migrations, so a fork migration
-// strands installs that return to upstream. Usage: fork-schema-check.cjs <base> <head>.
-// Refused: migrations, schema setup and what they import; a change to how those imports map to
-// files (the package.json fields that map them, the dependency specs, catalogs and overrides of
-// the imported names, the workspace package list); a new import of theirs that should resolve
-// inside the repository but does not; shipped source files holding a schema statement; a PR copy
-// of this check or of .gitattributes that differs from the base's copy; and a branch holding
-// commits already on the base (built on an old, since rebased base, or copying its commits).
-// Files are read as git blobs.
+// strands installs that return to upstream. Refused: schema code and anything that changes what its
+// imports resolve to, a PR copy of this check or .gitattributes, and branches holding commits
+// already on the base. Files are read as git blobs. Usage: fork-schema-check.cjs <base> <head>.
 
 const { execFileSync } = require("node:child_process");
 const path = require("node:path");
@@ -75,25 +70,10 @@ const isTest = (file) => TEST_SOURCE.test(file);
 const isShippedSource = (file) => SHIPPED_SOURCE.test(file) && !isTest(file);
 
 /**
- * Files the schema roots import, transitively: relative imports, and for an import of a workspace
- * package every file any export condition of that entry can pick. For a package root
- * (`@t3tools/contracts`) only the files that declare the imported names are followed. The barrels
- * on the way to a declaring file are guarded too (a barrel edit could re-point a name), but their
- * other re-exports are not followed, so the rest of the package stays free to change. A name that
- * cannot be traced guards the whole barrel and everything it re-exports.
- *
- * Besides the files: `mappings` names, per package.json, the entries (`.`, `./sub`) the schema
- * code imports through it (only those fields are compared, so a new export elsewhere stays free);
- * `imported` holds every package name the schema code imports, from the workspace or outside, and
- * `holders` the package.json files of the packages holding schema code, plus the root one: their
- * dependency specs for those names decide what the names resolve to.
- *
- * Nothing that could be schema code is skipped silently: an import inside the repository that
- * resolves to no file is listed in `unresolved` (the check refuses it when the PR brings it), and
- * only packages outside the workspace resolve to nothing; their names are listed in `outside`.
- * @param {{ files: string[]; has(file: string): boolean; read(file: string): string }} tree
- * @returns {{ closure: Set<string>; unresolved: string[]; outside: Set<string>;
- *   imported: Set<string>; mappings: Map<string, Set<string>>; holders: Set<string> }}
+ * Files the schema roots import, transitively, plus what maps those imports (`mappings`, `imported`,
+ * `holders`). Barrels on the way to a declaring file are guarded (an edit could re-point a name),
+ * but their other re-exports are not followed. Nothing is skipped silently: an in-repo import with
+ * no file goes in `unresolved`; only packages outside the workspace go in `outside`.
  */
 function traceSchema(tree) {
   const queue = tree.files.filter(
@@ -409,11 +389,8 @@ function importedNames(source) {
 }
 
 /**
- * The files an import reaches: the files it maps to, or for a package root the files declaring
- * `names` (`files`, whose own imports matter) and the barrels re-exporting them (`barrels`, guarded
- * only). A workspace package's package.json is guarded through `ctx.guard`; an import that should
- * resolve inside the repository but does not is reported through `ctx.unresolved`.
- * @returns {{ files: string[]; barrels: string[] }}
+ * The files an import reaches. For a package root: the files declaring `names` (`files`, whose own
+ * imports matter) and the barrels re-exporting them (`barrels`, guarded only).
  */
 function resolveImport(ctx, from, specifier, names) {
   const { tree } = ctx;
@@ -483,11 +460,8 @@ function resolveImport(ctx, from, specifier, names) {
 }
 
 /**
- * Every path a package.json can map `name[/subpath]` to, for any export condition (`node`,
- * `import`, `types`, `default`, custom ones, nested or in fallback arrays): the check does not
- * guess which condition a tool picks, so it guards them all. Without `exports`: `main`, `module`,
- * `types`, a string `browser` and `index`, or the subpath itself.
- * @returns {string[]}
+ * Every path a package.json can map `name[/subpath]` to, under any export condition, nested or in
+ * fallback arrays: the check does not guess which condition a tool picks, so it guards them all.
  */
 function packageTargets(manifest, subpath) {
   const key = subpath ? `./${subpath}` : ".";
@@ -540,11 +514,9 @@ function exportEntries(exports, key) {
 }
 
 /**
- * What a package.json says about the import `key` (`.` or `./sub`): its name, type, the export
- * entries that answer that key (and whether `exports` is a subpath map), the fallback fields and
- * `imports`. Two trees whose values differ map the import differently; other export entries do not
- * count, so adding a module to the package stays free. A file that is absent or not JSON gives
- * a value of its own.
+ * What a package.json says about the import `key` (`.` or `./sub`). Other export entries do not
+ * count, so adding a module to the package stays free. An absent or non-JSON file gives a value of
+ * its own, so it never compares equal to a real mapping.
  */
 function manifestMapping(text, key) {
   if (text === undefined) return "(absent)";
@@ -604,13 +576,9 @@ function yamlEntries(text) {
 }
 
 /**
- * The dependency specs that decide what the imported `names` resolve to: their entries in the
- * dependency fields of the `holders` (the package.json files of the packages holding schema code,
- * and the root one), the root's `pnpm.overrides`, `pnpm.patchedDependencies` and `resolutions`,
- * and pnpm-workspace.yaml's `catalog`, `catalogs`, `overrides` and `patchedDependencies`. Specs of
- * other names are not read, so other dependency bumps stay free. `patches` are the patch files of
- * those names, guarded like schema code.
- * @returns {{ specs: Map<string, { file: string; where: string; name: string; value: string }>; patches: string[] }}
+ * The specs that decide what the imported `names` resolve to (the `holders`' dependency fields, root
+ * overrides and resolutions, pnpm-workspace.yaml catalogs and overrides). Specs of other names are
+ * not read, so other dependency bumps stay free. `patches` of those names are guarded like schema.
  */
 function dependencySpecs(tree, names, holders) {
   const specs = new Map();
@@ -785,13 +753,9 @@ function resolveFile(tree, file) {
 }
 
 /**
- * @param {ReadonlyArray<{ path: string; before?: string; after?: string; sameAsBase?: boolean; fromOldMain?: boolean }>} changes
- *   one entry per path the branch changes since the merge-base; `before`/`after` are the file
- *   texts (undefined when absent); `sameAsBase` says the branch's copy equals the base's copy;
- *   `fromOldMain` says the branch's copy is the one a commit already on main left there
- * @param {{ closure: ReadonlySet<string>; baseHasCheck: boolean; staleCommits?: number }} context
- *   `staleCommits`: the branch's commits that the base already holds as rebased copies
- * @returns {string[]} one reason per refused file
+ * One reason per refused file. `changes`: one entry per path changed since the merge-base, with its
+ * `before`/`after` texts (undefined when absent), `sameAsBase` (equals the base's copy) and
+ * `fromOldMain` (a commit already on main left it). `staleCommits`: commits the base holds rebased.
  */
 function findSchemaChanges(changes, { closure, baseHasCheck, staleCommits = 0 }) {
   const reasons = [];
@@ -930,14 +894,7 @@ function staleCommits(mergeBase, base, head) {
     .map((commit) => commit.sha);
 }
 
-/**
- * Judges what the branch changes in how schema code is found, between the merge-base tree and the
- * head tree: the guarded closure (both trees), imports the head cannot follow that the merge-base
- * could (`known`: the ones already on the merge-base, which the branch did not bring), and changes
- * to the workspace list, to the package.json fields that map schema imports, and to the dependency
- * specs of the names schema code imports.
- * @returns {{ closure: Set<string>; reasons: string[]; known: string[]; outside: string[] }}
- */
+/** Judges what the branch changes in how schema code is found: merge-base tree against head tree. */
 function compareTrees(before, after) {
   const trees = [before, after];
   const traces = trees.map(traceSchema);
