@@ -274,6 +274,12 @@ jobs:
           fi
           node .github/scripts/fork-ci-tests.cjs
 
+      # The fleet launcher with real runner users (created and deleted by the test):
+      # one slot's user cannot read another's copy, and nothing a job leaves (files
+      # in HOME or /dev/shm, a running process) reaches the next job.
+      - name: Fleet launcher as root
+        run: sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot
+
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
 
@@ -330,7 +336,7 @@ jobs:
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
-    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['lint'] || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['lint'][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')['lint'][0], fromJSON(needs.changes.outputs.runners || '{}')['lint'][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -380,7 +386,7 @@ jobs:
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false')) }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
-    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['build'] || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['build'][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')['build'][0], fromJSON(needs.changes.outputs.runners || '{}')['build'][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -540,7 +546,7 @@ jobs:
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test != 'false') }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
-    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test-{0}', matrix.shard)] || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test-{0}', matrix.shard)][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')[format('test-{0}', matrix.shard)][0], fromJSON(needs.changes.outputs.runners || '{}')[format('test-{0}', matrix.shard)][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -668,7 +674,7 @@ jobs:
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test_web != 'false') }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
-    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)] || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)][0], fromJSON(needs.changes.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -734,7 +740,7 @@ jobs:
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
-    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)] || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][0], fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -871,7 +877,7 @@ jobs:
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.rust != 'false') }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
-    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['rust'] || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['rust'][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')['rust'][0], fromJSON(needs.changes.outputs.runners || '{}')['rust'][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -939,7 +945,7 @@ jobs:
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.release_smoke != 'false') }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
-    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['release_smoke'] || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['release_smoke'][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')['release_smoke'][0], fromJSON(needs.changes.outputs.runners || '{}')['release_smoke'][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - name: Checkout

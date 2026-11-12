@@ -26,7 +26,8 @@ The setting, repository variable CONFIG["variable"] (route and sweep read it fro
   github             every job GitHub-hosted, as before the fleet.
 
 No fleet runner waits for work. The dispatcher makes a one-job (JIT) runner for one queued job at a time, and only when:
-the job asks for exactly a pool's label plus the per-run random label `route` made for it; GitHub's own record of the
+the job asks for exactly a pool's label plus the per-run random label `route` made for it, which the job's runs-on ends
+with its own attempt (so a runner made for one attempt can never be given another's job); GitHub's own record of the
 run passes the trust rule (`refused`: a workflow in trusted.workflows of this repository, started and triggered by a
 trusted actor, as a push to a trusted branch or a pull request whose head and base are this repository and which a
 trusted actor opened); and no other queued job could take that runner. A job that names a fleet label by itself (a
@@ -48,7 +49,10 @@ GENERIC = frozenset(('self-hosted', 'linux', 'x64', 'arm64', 'arm', 'windows', '
 LABEL = re.compile(r'[a-z0-9][a-z0-9-]{0,62}')
 VARIABLE = re.compile(r'(?!GITHUB_)[A-Z][A-Z0-9_]{0,99}')
 JOB_ID = re.compile(r'[a-z0-9_]{1,40}')
-NONCE = re.compile(r'(?P<key>[a-z0-9_]{1,40}(?:-[0-9]{1,3})?)-[0-9a-f]{16}')
+POOL = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
+# The run's label for one job: <pool label>-<job key>-<16 hex, made by route>-a<attempt, added by the job's runs-on>.
+NONCE = re.compile(r'(?P<key>[a-z0-9_]{1,40}(?:-[0-9]{1,3})?)-[0-9a-f]{16}-a(?P<attempt>[1-9][0-9]{0,4})')
+VERSION = re.compile(r'v?([0-9]{1,5})\.([0-9]{1,5})\.([0-9]{1,5})')
 JIT = re.compile(r'[A-Za-z0-9+/=]{1,65536}')
 WINDOW = 24 * 3600     # the sweep looks at runs created this long ago at most
 CANCEL_WAIT = 120      # seconds the sweep watches a run it cancelled, to re-run it in the same pass
@@ -97,6 +101,8 @@ def check_config(cfg):
             out.append(f'two pools with one {field}')
     for p in pools:
         who = f'pool {p.get("name")!r}'
+        if not (isinstance(p.get('name'), str) and POOL.fullmatch(p['name'])):
+            out.append(f'{who}: name must be a-z, 0-9, _ and - (it names the dispatcher\'s lock file)')
         if not (isinstance(p.get('label'), str) and LABEL.fullmatch(p['label']) and p['label'] not in GENERIC):
             out.append(f'{who}: label must be one label of its own (a-z, 0-9, -), none of {sorted(GENERIC)}')
         if not positive(p.get('slots')):
@@ -289,11 +295,12 @@ class GitHub:
         self.token, self.repo = token, repo
 
     def call(self, path, method='GET', data=None):
-        """path: below /repos/<repo>/."""
+        """path: below /repos/<repo>/, or from the API's root when it starts with /."""
         if not self.token:
             raise ValueError(f'no token for {path}')
         body = None if data is None else json.dumps(data).encode()
-        req = urllib.request.Request(f'{API}/repos/{self.repo}/{path}', data=body, method=method,
+        url = f'{API}{path}' if path.startswith('/') else f'{API}/repos/{self.repo}/{path}'
+        req = urllib.request.Request(url, data=body, method=method,
                                      headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'fork-fleet',
                                               'Authorization': f'Bearer {self.token}'})
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -338,6 +345,9 @@ def beacon_free(cfg, pool, env, now):
     age = now - at
     if age > cfg['beacon_fresh_seconds'] or age < -60:
         return 0, f'its dispatcher\'s last heartbeat is {int(age)} s old'
+    note = got.get('why')
+    if free <= 0 and isinstance(note, str) and note:
+        return 0, 'its dispatcher says: ' + re.sub(r'[^\w .,:;()/+=-]', '?', note)[:300]
     return max(free, 0), None
 
 
@@ -578,6 +588,10 @@ class Host:
     def fits(self, mb):
         return self._do('fits', str(int(mb))).returncode == 0
 
+    def ready(self, newest):
+        """HostError (with the launcher's reason) unless the pool's runner template is not older than `newest`."""
+        self._must('ready', newest)
+
     def start(self, name, env_text):
         self._must('start', name, stdin=env_text)
 
@@ -589,7 +603,7 @@ class Host:
 
 
 def fleet_job(cfg, labels):
-    """(pool, job key) when a job asks for exactly a pool's label and the run's own label `route` made for that job."""
+    """(pool, job key, attempt) when a job asks for exactly a pool's label and the run's own label for that job."""
     labels = list(labels or ())
     if len(labels) != 2 or labels[0] == labels[1]:
         return None
@@ -600,7 +614,7 @@ def fleet_job(cfg, labels):
         other = labels[1] if labels[0] == pool['label'] else labels[0]
         prefix = pool['label'] + '-'
         m = NONCE.fullmatch(other[len(prefix):]) if other.startswith(prefix) else None
-        return (pool, m['key']) if m and m['key'] in keys else None
+        return (pool, m['key'], int(m['attempt'])) if m and m['key'] in keys else None
     return None
 
 
@@ -628,9 +642,32 @@ def set_variable(gh, name, value):
 
 
 def new_state():
-    """Kept between passes only to pace heartbeats, idle checks, retries and messages. GitHub (runs, jobs, runner
-    registrations) and the host (units) hold everything else, so a restarted dispatcher picks up where one stopped."""
-    return {'beacon': {}, 'idle': {}, 'tries': {}, 'said': set()}
+    """Kept between passes only to pace heartbeats, idle checks, retries, messages and the newest runner release.
+    GitHub (runs, jobs, runner registrations) and the host (units) hold everything else, so a restarted dispatcher
+    picks up where one stopped."""
+    return {'beacon': {}, 'idle': {}, 'tries': {}, 'said': set(), 'newest': None}
+
+
+RELEASE_EVERY = 3600   # seconds between reads of the newest actions/runner release
+
+
+def newest_runner(gh, state, now):
+    """The newest actions/runner release (x.y.z), read at most once an hour. A failed read keeps the last one; with
+    none yet it raises (TROUBLE), so no runner starts before the template has been checked against it."""
+    last = state['newest']
+    if last and now - last[1] < RELEASE_EVERY:
+        return last[0]
+    try:
+        got = gh.call('/repos/actions/runner/releases/latest')
+        m = VERSION.fullmatch(str(got.get('tag_name')))
+        if not m:
+            raise ValueError(f'actions/runner\'s latest release is {got.get("tag_name")!r}')
+    except TROUBLE:
+        if last:
+            return last[0]
+        raise
+    state['newest'] = ('.'.join(m.groups()), now)
+    return state['newest'][0]
 
 
 def once(state, key, msg):
@@ -640,7 +677,21 @@ def once(state, key, msg):
 
 
 def dispatch_pass(cfg, gh, hosts, state, now=time.time):
+    """One pass for the pools in `hosts`. GitHub trouble stops the pass. A pool whose host fails (HostError) is left
+    alone for the rest of the pass, with a warning and a heartbeat of 0 free slots; the other pools go on."""
     pools = [p for p in cfg['pools'] if p['name'] in hosts]
+    down = {}     # pool name: why its host is left alone for the rest of this pass
+    closed = {}   # pool name: why no runner starts on it this pass (its leftovers are still cleaned up)
+
+    def host(p, verb, *args):
+        """hosts[p].<verb>(*args); on a HostError, None and the pool is down for the rest of this pass."""
+        try:
+            return getattr(hosts[p['name']], verb)(*args)
+        except HostError as e:
+            down[p['name']] = str(e)
+            say(f'::warning::fork-fleet: {e}; pool {p["name"]} is left alone for this pass, the other pools go on')
+            return None
+
     runs = {}
     for status in ('queued', 'in_progress'):
         for run in gh.pages(f'actions/runs?status={status}', 'workflow_runs', most=3):
@@ -648,9 +699,20 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
     queued = [(run, j) for run in runs.values() for j in gh.pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
               if j.get('status') == 'queued' and not j.get('runner_name')]
     queued_ids = {j['id'] for _, j in queued}
-    state['said'] = {k for k in state['said'] if k[0] in queued_ids}
+    state['said'] = {k for k in state['said'] if k[0] in queued_ids or k[0] == 'ready'}
     state['tries'] = {k: v for k, v in state['tries'].items() if k in queued_ids}
-    units = {p['name']: hosts[p['name']].units() for p in pools}
+    newest = newest_runner(gh, state, now())
+    units = {}
+    for p in pools:
+        got = host(p, 'units')
+        if got is None:
+            continue
+        units[p['name']] = got
+        try:
+            hosts[p['name']].ready(newest)
+        except HostError as e:
+            closed[p['name']] = str(e)
+            once(state, ('ready', p['name'], str(e)), f'::warning::fork-fleet: {e}')
     ours = {}
     for r in gh.pages('actions/runners', 'runners'):
         for p in pools:
@@ -659,9 +721,12 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
     state['idle'] = {k: v for k, v in state['idle'].items() if k in ours}
 
     # Leftovers: a registration with no runner behind it, and a runner whose job went away before it started. Such a
-    # runner is stopped at once when a queued job of another attempt or run could be given it (the hook would refuse
-    # that job), else after idle_passes passes (a runner that is just taking its own job is not busy yet).
+    # runner is stopped at once when a queued job of another run could be given it (the hook would refuse that job),
+    # else after idle_passes passes (a runner that is just taking its own job is not busy yet). A runner's labels name
+    # the run attempt it was made for, so no job of another attempt can be given it.
     for name, (p, r) in ours.items():
+        if p['name'] in down:
+            continue
         if r.get('status') == 'offline' and name not in units[p['name']]:
             try:
                 gh.call(f'actions/runners/{int(r["id"])}', 'DELETE')
@@ -674,16 +739,19 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
             labels = [x.get('name') for x in r.get('labels') or [] if isinstance(x, dict)]
             if state['idle'][name] >= cfg['dispatch']['idle_passes'] or \
                     any(could_take(labels, j.get('labels')) for _, j in queued):
-                hosts[p['name']].stop(name)
+                host(p, 'stop', name)
+                if p['name'] in down:
+                    continue
                 state['idle'].pop(name)
                 say(f'{name}: stopped, its job is no longer queued')
         else:
             state['idle'].pop(name, None)
     for p in pools:
-        hosts[p['name']].prune()
+        if p['name'] not in down:
+            host(p, 'prune')
 
     # Launches: one runner per queued fleet job of a trusted run.
-    active = {p['name']: len(units[p['name']]) for p in pools}
+    active = {name: len(got) for name, got in units.items()}
     pending = {p['name']: 0 for p in pools}
     started_mb = {p['name']: 0 for p in pools}   # memory of runners this pass started, not in use yet
     memory = {k: j['memory_mb'] for k, j in job_keys(cfg)}
@@ -692,12 +760,14 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
         hit = fleet_job(cfg, j.get('labels'))
         if not hit or hit[0]['name'] not in hosts:
             continue
-        pool, key = hit
+        pool, key, attempt = hit
         if j.get('run_attempt', run.get('run_attempt')) != run.get('run_attempt'):
             continue   # re-run after the run list was read: its runner would be made for the old attempt; next pass
+        if attempt != run.get('run_attempt'):
+            continue   # its label names another attempt: the gate would refuse it on any runner
         name = f'{pool["label"]}-{int(j["id"])}'
-        if name in units[pool['name']] or name in ours:
-            continue   # started already (its runner is coming up), or a leftover deleted above: next pass
+        if pool['name'] in down or name in units[pool['name']] or name in ours:
+            continue   # its host failed; or started already (its runner is coming up), or a leftover deleted above
         tag = f'job {j["id"]} ({j.get("name")}) of run {run["id"]}'
         if (run['id'], run.get('run_attempt')) not in trust:
             trust[(run['id'], run.get('run_attempt'))] = run_refused(cfg, gh, run)
@@ -706,6 +776,8 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
             once(state, (j['id'], 'trust'), f'{tag}: no runner, not a trusted run: {why}')
             continue
         pending[pool['name']] += 1
+        if pool['name'] in closed:
+            continue
         if state['tries'].get(j['id'], 0) >= MAX_TRIES:
             once(state, (j['id'], 'tries'), f'::warning::{tag}: {MAX_TRIES} runners started and none took it; left to '
                                             'the watch and the sweep')
@@ -718,7 +790,10 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
                  f'::warning::{tag}: not started while job {rivals[0]["id"]} ({rivals[0].get("name")}) of another run '
                  f'could take its runner (labels {rivals[0].get("labels")})')
             continue
-        if not hosts[pool['name']].fits(memory[key] + started_mb[pool['name']]):
+        fits = host(pool, 'fits', memory[key] + started_mb[pool['name']])
+        if pool['name'] in down:
+            continue
+        if not fits:
             once(state, (j['id'], 'memory'), f'{tag}: waits for {memory[key]} MB on pool {pool["name"]}')
             continue
         try:
@@ -730,24 +805,30 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
                 raise
             continue   # a registration with this name appeared since the list: the next pass sorts it out
         state['tries'][j['id']] = state['tries'].get(j['id'], 0) + 1
-        hosts[pool['name']].start(name, runner_env(got.get('encoded_jit_config'), run))
+        host(pool, 'start', name, runner_env(got.get('encoded_jit_config'), run))
+        if pool['name'] in down:
+            continue   # the next pass deletes its registration (no runner behind it) and tries again
         active[pool['name']] += 1
         pending[pool['name']] -= 1
         started_mb[pool['name']] += memory[key]
         say(f'{name}: started for {tag}, attempt {run.get("run_attempt")}')
 
-    # Heartbeats: what `route` may count on, per pool.
+    # Heartbeats: what `route` may count on, per pool, with the reason when it is nothing.
     t = now()
     biggest = max(memory.values())
     for p in pools:
-        free = max(p['slots'] - active[p['name']] - pending[p['name']], 0)
-        if free and not hosts[p['name']].fits(biggest + started_mb[p['name']]):
-            free = 0
+        why = down.get(p['name']) or closed.get(p['name'])
+        free = 0 if why else max(p['slots'] - active[p['name']] - pending[p['name']], 0)
+        if free and not host(p, 'fits', biggest + started_mb[p['name']]):
+            free, why = 0, down.get(p['name'])
+        beat = {'at': int(t), 'free': free}
+        if why:
+            beat['why'] = why[:300]
         last = state['beacon'].get(p['name'])
-        if last and last[0] == free and t - last[1] < cfg['dispatch']['beacon_seconds']:
+        if last and last[0] == (free, why) and t - last[1] < cfg['dispatch']['beacon_seconds']:
             continue
-        set_variable(gh, p['beacon'], json.dumps({'at': int(t), 'free': free}, separators=(',', ':')))
-        state['beacon'][p['name']] = (free, t)
+        set_variable(gh, p['beacon'], json.dumps(beat, separators=(',', ':')))
+        state['beacon'][p['name']] = ((free, why), t)
     return 0
 
 
@@ -769,8 +850,22 @@ def take_lock(path):
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        os.close(fd)
         raise ValueError(f'another dispatcher holds {path}') from None
     return fd
+
+
+def take_locks(lock_dir, names):
+    """One lock per pool served: a second dispatcher may serve the other pools, never one this one serves."""
+    fds = []
+    try:
+        for name in sorted(set(names)):
+            fds.append(take_lock(os.path.join(lock_dir, f'dispatch-{name}.lock')))
+    except ValueError:
+        for fd in fds:
+            os.close(fd)
+        raise
+    return fds
 
 
 def cmd_dispatch(cfg, args, sleep=time.sleep):
@@ -779,7 +874,7 @@ def cmd_dispatch(cfg, args, sleep=time.sleep):
     if unknown:
         raise ValueError(f'no pool {unknown} in the config')
     token = read_token(args.token_file)
-    lock = take_lock(args.lock)
+    locks = take_locks(args.lock_dir, names)
     gh = GitHub(token, cfg['repository'])
     hosts = {p['name']: Host(p) for p in cfg['pools'] if p['name'] in names}
     state = new_state()
@@ -791,7 +886,8 @@ def cmd_dispatch(cfg, args, sleep=time.sleep):
             if args.once:
                 return 1
         if args.once:
-            os.close(lock)
+            for fd in locks:
+                os.close(fd)
             return 0
         sleep(cfg['dispatch']['every_seconds'])
 
@@ -807,10 +903,10 @@ def main(argv=None, env=None):
     sub.add_parser('gate')
     sub.add_parser('watch')
     sub.add_parser('sweep')
-    dis = sub.add_parser('dispatch')
+    dis = sub.add_parser('dispatch', allow_abbrev=False)   # --lock (one lock for all pools) is gone: no prefix match
     dis.add_argument('--pool', action='append', help='a pool this host serves (default: every pool)')
     dis.add_argument('--token-file', default='/etc/fork-fleet/token')
-    dis.add_argument('--lock', default='/run/fork-fleet/dispatch.lock')
+    dis.add_argument('--lock-dir', default='/run/fork-fleet', help='where dispatch-<pool>.lock is taken, one per pool')
     dis.add_argument('--once', action='store_true', help='one pass, then exit (1 when it stopped half-way)')
     args = ap.parse_args(argv)
     cfg = load(args.config)
