@@ -5,6 +5,7 @@ import { defaultInclude, defineConfig } from "vite-plus";
 
 import { isDesktopRuntimeExternalDependency } from "../../scripts/lib/desktop-external-packages.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
+import { releaseRepositoryDefine } from "../../scripts/lib/release-repository.ts";
 
 const repoEnv = loadRepoEnv();
 const domTests = ["src/preview/PickPreload.test.ts"];
@@ -21,6 +22,7 @@ const devElectronCommand =
     ? "node scripts/dev-electron.mjs"
     : "exec node scripts/dev-electron.mjs";
 const publicConfigDefine = {
+  ...releaseRepositoryDefine(),
   __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
     repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
   ),
