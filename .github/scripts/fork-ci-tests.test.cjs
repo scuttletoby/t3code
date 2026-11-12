@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { plan, readList, findTests } = require("./fork-ci-tests.cjs");
+const { plan, readList, findTests, TEST_DIRS } = require("./fork-ci-tests.cjs");
 
 const never = () => false;
 const here = (...files) => files.map((file) => ({ file, runBy: null }));
@@ -95,4 +95,8 @@ test("finds every *.test.* file, subdirectories included", () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("the composite actions' tests under fork-ci are found too", () => {
+  assert.deepEqual(TEST_DIRS, [".github/scripts", "fork-ci"]);
 });
