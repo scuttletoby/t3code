@@ -1,4 +1,5 @@
-// Fork only: every `*.test.*` under .github/scripts must be listed in .github/fork-ci-tests.txt.
+// Fork only: every `*.test.*` under .github/scripts and fork-ci must be listed in .github/fork-ci-tests.txt.
+// A folder missing from the checkout fails (readdir throws), so a narrower sparse checkout cannot hide tests.
 // A plain entry runs here by its extension (RUNNER); `<test> run by <file>` is run by that file,
 // which must name the test and cannot be a (disabled) upstream workflow. Unlisted or runner-less
 // tests fail; a listed test that is gone fails once the tested history had it, a note before.
@@ -8,7 +9,7 @@ const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "../..");
 const LIST = ".github/fork-ci-tests.txt";
-const SCRIPTS = ".github/scripts";
+const TEST_DIRS = [".github/scripts", "fork-ci"];
 const TEST_FILE = /\.test\.([^./]+)$/;
 const RUNNER = {
   sh: ["bash"],
@@ -113,7 +114,8 @@ function readFile(file) {
 
 function main() {
   const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8"));
-  const result = plan(entries, findTests(SCRIPTS), everInHistory, readFile);
+  const present = TEST_DIRS.flatMap((dir) => findTests(dir));
+  const result = plan(entries, present, everInHistory, readFile);
   const rows = [];
   let failed =
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;

@@ -175,7 +175,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # scripts/: some tests are run by a script there (.github/fork-ci-tests.txt).
+      # scripts/: some tests are run by a script there (.github/fork-ci-tests.txt);
+      # fork-ci/: the composite actions' tests.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -183,6 +184,7 @@ jobs:
           sparse-checkout: |
             /.github/
             /scripts/
+            /fork-ci/
           sparse-checkout-cone-mode: false
 
       # Pinned release, verified by checksum. Upstream's own workflows use runner
@@ -199,7 +201,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
 
-      # Every test under .github/scripts, checked against .github/fork-ci-tests.txt:
+      # Every test under .github/scripts and fork-ci, checked against .github/fork-ci-tests.txt:
       # the fork's tests run here, the others must be named by the job or script
       # that runs them. An unlisted test, or a listed one deleted from history,
       # fails; a listed one whose pull request has not merged yet is a note.
