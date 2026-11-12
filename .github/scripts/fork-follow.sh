@@ -28,6 +28,14 @@
 #                  new one (','-separated; empty without a new base). The branch move refuses while
 #                  one of them is not listed by GitHub yet, so it cannot be disabled before main has
 #                  it (a changed file may now run on push).
+#
+# Removed upstream workflows: .github/fork-removed-workflows.txt (read from the series head) lists
+# upstream workflow files the fork deletes. A rebase conflict on listed files only is resolved by
+# deleting them; any listed file the rebased candidate still has (upstream re-added it) is deleted
+# by one more commit. On the same base the series must not have one. A missing or malformed list
+# stops the plan: it never ships the files because it could not read which ones to delete.
+# A workflow file the new upstream release adds that someone outside the fork can start (see
+# outside_events) and that the list does not delete stops the plan too, naming it.
 set -Eeuo pipefail
 
 : "${UPSTREAM:?owner/name of the upstream repository}"
@@ -64,6 +72,7 @@ stable_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
 fork_re='^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$'
 head="$(git rev-parse HEAD)"
 run_sha="${RUN_SHA:-$head}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Read-only fetches into refs this run alone uses: upstream's tags and default branch, and this
 # fork's tags (its releases).
@@ -145,6 +154,68 @@ schema_check() { # schema_check BASE WHAT: fails with the check's output, a refu
     '```' "$(tail -n 20 "$logs/schema-check.log")" '```' "The series was left as it is."
 }
 schema_check "$base" "The series"
+
+# The upstream workflow files the fork deletes, from the series head. Fail closed: without a
+# readable list the plan cannot keep them deleted, so it stops instead of shipping them.
+removed_file=.github/fork-removed-workflows.txt
+removed_re='^\.github/workflows/[^/,[:space:]]+\.ya?ml$'
+git cat-file -e "$head:$removed_file" 2> /dev/null \
+  || fail "The series has no $removed_file, the list of upstream workflow files the fork deletes." \
+    "Without it the plan cannot keep them deleted, so it stopped; the series was left as it is." \
+    "Restore the file with a fork patch (an empty list holds only comment lines)."
+removed=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line%$'\r'}"
+  [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+  if [[ ! "$line" =~ $removed_re || "$line" =~ ^\.github/workflows/fork- ]]; then
+    fail "$removed_file has a line that is not an upstream workflow path (.github/workflows/<name>.yml, not fork-*):" \
+      "\`$line\`" "The series was left as it is. Fix the line with a fork patch."
+  fi
+  removed+=("$line")
+done < <(git show "$head:$removed_file")
+is_removed() { local p; for p in "${removed[@]}"; do [[ "$p" != "$1" ]] || return 0; done; return 1; }
+present_removed() { # present_removed COMMIT: the listed files COMMIT has, one per line
+  local p
+  for p in "${removed[@]}"; do
+    git cat-file -e "$1:$p" 2> /dev/null && printf '%s\n' "$p"
+  done
+  return 0
+}
+
+# Events someone outside the fork can start a workflow with. GitHub runs such a workflow before
+# the sweep can see and disable it, so a new one must not reach the series. Directly: an outside
+# pull request (pull_request_target, main's copy), a review or a review comment on a pull request
+# from a fork/* branch (pull_request_review, pull_request_review_comment: that branch's copy, with
+# the repository's token), an issue or a comment (issues, issue_comment), a discussion
+# (discussion, discussion_comment), a star (watch), a fork, a wiki edit if the wiki is open
+# (gollum). Indirectly: a workflow of a given name that an outside pull request can add
+# (workflow_run), and the checks, commit statuses and deployments that apps post on an outside
+# pull request's commits (check_run, check_suite, status, deployment_status). pull_request from
+# another fork gets a read-only token and no secrets, so the sweep is enough for it. The rest need
+# write access or more.
+outside_events='^(pull_request_target|pull_request_review|pull_request_review_comment|issues|issue_comment|discussion|discussion_comment|watch|fork|gollum|workflow_run|check_run|check_suite|status|deployment_status)$'
+refuse_outside_workflows() { # refuse_outside_workflows UPSTREAM_BASE UPSTREAM_TARGET TAG CANDIDATE
+  local path list=() found=() events status
+  workflow_paths A "$1" "$2"
+  IFS=, read -r -a list <<< "$paths"
+  for path in "${list[@]}"; do
+    [[ "$path" == *.yml || "$path" == *.yaml ]] || continue
+    git cat-file -e "$4:$path" 2> /dev/null || continue
+    git show "$4:$path" > "$logs/workflow.yml"
+    status=0
+    events="$(node "$here/fork-workflow-triggers.cjs" "$logs/workflow.yml" 2> "$logs/triggers.log")" || status=$?
+    if ((status != 0)); then
+      found+=("- \`$path\`: its triggers could not be read ($(tr '\n' ' ' < "$logs/triggers.log"| sed 's/ *$//'))")
+    elif grep -qE "$outside_events" <<< "$events" || grep -qwE 'pull_request_target|workflow_run' "$logs/workflow.yml"; then
+      found+=("- \`$path\`: on $(paste -sd ',' <<< "$events" | sed 's/,/, /g')")
+    fi
+  done
+  ((${#found[@]} == 0)) || fail "$UPSTREAM $3 adds workflow files that someone outside the fork can start, or whose triggers could not be read:" \
+    "${found[@]}" "" \
+    "The workflow sweep cannot stop the first run of such a file, so the series was left as it is." \
+    "Add each one to $removed_file with a fork patch (the next follow then deletes it) and start the follow workflow again;" \
+    "or, to keep one, rebase onto $3 by hand (see the conflict advice in fork-follow.yml)."
+}
 
 # The newest fork release of a tag: "<tag> <commit>", or nothing.
 latest_release() {
@@ -243,6 +314,11 @@ stage_report() { # stage_report CANDIDATE TAG CHANGED
 
 if [[ "$target_tag" == "$base_tag" ]]; then
   refuse_upstream_fork_named "$base" "$base_tag" "$head"
+  # The candidate here is the series head itself, so a listed file in it is refused, not deleted.
+  kept="$(present_removed "$head")"
+  [[ -z "$kept" ]] || fail "The series still has workflow files that $removed_file lists as deleted:" \
+    "$(sed 's/^/- /' <<< "$kept")" "" \
+    "The plan does not release them. Delete them with a fork patch (or take them off the list), then start the follow workflow again."
   read -r released_tag released_commit <<< "$(latest_release "$base_tag")" || true
   if [[ "${released_commit:-}" == "$head" ]]; then
     action=none
@@ -269,11 +345,31 @@ if [[ "$target_tag" == "$base_tag" ]]; then
 fi
 
 # A newer upstream release: replay the series onto it. Patches upstream now has become empty and
-# are dropped.
+# are dropped. A stop whose conflicts are all on listed (deleted) workflow files is resolved by
+# deleting them: upstream edited or brought back a file the fork deletes.
 target="$(up "$target_tag")"
 before="$(git log --format=%s "$base..HEAD")"
-if ! git -c user.name=t3code-fork -c user.email=noreply@users.noreply.github.com \
-  rebase --empty=drop --onto "$target" "$base" > "$logs/rebase.log" 2>&1; then
+as_fork() { git -c user.name=t3code-fork -c user.email=noreply@users.noreply.github.com "$@"; }
+rebasing() { [[ -d "$(git rev-parse --git-path rebase-merge)" || -d "$(git rev-parse --git-path rebase-apply)" ]]; }
+rebase_ok=0
+if as_fork rebase --empty=drop --onto "$target" "$base" > "$logs/rebase.log" 2>&1; then
+  rebase_ok=1
+fi
+steps=0
+while ((!rebase_ok)) && rebasing && ((steps++ <= series_count)); do
+  unmerged=()
+  while IFS= read -r -d '' path; do unmerged+=("$path"); done \
+    < <(git -c core.quotepath=off diff -z --name-only --diff-filter=U)
+  ((${#unmerged[@]})) || break
+  for path in "${unmerged[@]}"; do is_removed "$path" || break 2; done
+  git rm -q --ignore-unmatch -- "${unmerged[@]}" >> "$logs/rebase.log" 2>&1
+  if git diff --cached --quiet HEAD; then
+    GIT_EDITOR=true as_fork rebase --skip >> "$logs/rebase.log" 2>&1 && rebase_ok=1
+  else
+    GIT_EDITOR=true as_fork rebase --continue >> "$logs/rebase.log" 2>&1 && rebase_ok=1
+  fi
+done
+if ((!rebase_ok)); then
   stopped="$(git log -1 --format='%h %s' REBASE_HEAD 2> /dev/null || echo unknown)"
   conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- /')"
   git rebase --abort || true
@@ -284,9 +380,19 @@ if ! git -c user.name=t3code-fork -c user.email=noreply@users.noreply.github.com
     "\`--force-with-lease\`, and start the follow workflow once (\`gh workflow run fork-follow.yml --repo $REPOSITORY\`):" \
     "it releases the series and disables the upstream workflows that push started."
 fi
+# Upstream brought back a listed file where no fork patch deletes it any more (the deleting patch
+# became empty and was dropped once upstream had deleted the file itself): delete it again.
+kept="$(present_removed HEAD)"
+if [[ -n "$kept" ]]; then
+  mapfile -t kept_list <<< "$kept"
+  git rm -q -- "${kept_list[@]}"
+  as_fork commit -q -m "fork: delete upstream workflows listed in $removed_file" \
+    -m "Upstream $target_tag has them again: $(paste -sd ' ' <<< "$kept")"
+fi
 schema_check "$target" "After rebasing onto $target_tag, the series"
 candidate="$(git rev-parse HEAD)"
 refuse_upstream_fork_named "$target" "$target_tag" "$candidate"
+refuse_outside_workflows "$base" "$target" "$target_tag" "$candidate"
 dropped="$(comm -23 <(sort <<< "$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
 
 # A published fork release of the target with exactly these files exists (an earlier run published
