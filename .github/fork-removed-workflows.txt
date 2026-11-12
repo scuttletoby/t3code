@@ -1,0 +1,14 @@
+# Upstream workflow files the fork deletes and keeps deleted (fork-follow.sh). One path per line;
+# '#' starts a comment line. On every follow the plan deletes each listed file that upstream edited
+# or brought back (a rebase conflict on a listed file is resolved by deleting it), and it stops red
+# when this file is missing or a line is not a .github/workflows/*.yml path. The fork's sweep
+# (fork-workflows.sh) disables upstream workflows only once GitHub lists them, which cannot stop the
+# first run of one that someone outside the fork can start; these are such files.
+#
+# pull_request_target: an outside pull request starts it with main's copy and a write token.
+.github/workflows/mobile-eas-preview-fork.yml
+# Owner decision, 2026-11-12.
+.github/workflows/desktop-macos-preview.yml
+# workflow_run on a workflow named "CI": an outside pull request can add a workflow of that name.
+.github/workflows/thread-transfer-report.yml
+.github/workflows/mobile-fingerprint-label.yml
