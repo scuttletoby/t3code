@@ -110,6 +110,15 @@ scanned="$(sed -E 's/\x1b\[[0-9;]*m//g' "$log" | sed -nE 's/.* ([0-9]+) commits 
 echo "gitleaks scanned ${scanned:-no} commit(s); $expected commit(s) in range have changes it reads"
 summary "### Secret scan" ""
 if [[ -n "$warning" ]]; then summary "Warning: $warning." ""; fi
+# gitleaks 8.30.1 logs git's stderr as ERR (and `ERR error="stderr is not empty"`), stops reading
+# diffs once git exits, and still exits 0; the count above misses that when the dropped files all
+# belong to a commit it already counted. Any ERR line with exit 0 fails the job.
+errors="$(sed -E 's/\x1b\[[0-9;]*m//g' "$log" | grep -E '^([^[:space:]]+[[:space:]]+)?ERR[[:space:]]' || true)"
+if [[ $status -eq 0 && -n "$errors" ]]; then
+  echo "::error::Secret scan: gitleaks logged an error and still passed, so it may not have read every change: $(head -n 1 <<< "$errors")" >&2
+  summary "Failed: gitleaks logged an error while scanning $what (see the job log), so the scan may be incomplete."
+  exit 2
+fi
 if [[ $status -eq 0 && ( -z "$scanned" || "$scanned" -lt "$expected" ) ]]; then
   echo "::error::Secret scan: gitleaks scanned ${scanned:-no} commit(s), but $expected commit(s) in range have changes (a git error stopped it?)" >&2
   summary "Failed: gitleaks scanned ${scanned:-no} of the $expected commit(s) with changes in $what, so the rest were not checked."
