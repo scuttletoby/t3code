@@ -3,7 +3,19 @@ import * as Schema from "effect/Schema";
 
 import { compareSemverVersions } from "./semver.ts";
 
-const CLI_RELEASE_REPOSITORY = "pingdotgg/t3code";
+// Set at build time from T3CODE_DESKTOP_UPDATE_REPOSITORY (scripts/lib/release-repository.ts), the
+// desktop updater's setting, so a fork's builds list and download only the fork's releases.
+declare const __T3CODE_RELEASE_REPOSITORY__: string | undefined;
+const UPSTREAM_RELEASE_REPOSITORY = "pingdotgg/t3code";
+
+/** The repository releases come from: the build's setting, or upstream when it has none. */
+export function resolveCliReleaseRepository(configured: string | undefined): string {
+  return configured?.trim() || UPSTREAM_RELEASE_REPOSITORY;
+}
+
+const CLI_RELEASE_REPOSITORY = resolveCliReleaseRepository(
+  typeof __T3CODE_RELEASE_REPOSITORY__ === "undefined" ? undefined : __T3CODE_RELEASE_REPOSITORY__,
+);
 export const CLI_RELEASES_PAGE_URL = `https://github.com/${CLI_RELEASE_REPOSITORY}/releases`;
 export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";
 export const CLI_RELEASE_BASE_URL_ENV = "T3CODE_RELEASE_BASE_URL";
