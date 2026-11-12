@@ -4,7 +4,12 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { CHECK_FILES, findSchemaChanges, schemaClosure } = require("./fork-schema-check.cjs");
+const {
+  CHECK_FILES,
+  findSchemaChanges,
+  parseRawDiff,
+  schemaClosure,
+} = require("./fork-schema-check.cjs");
 
 const SCRIPT = path.join(__dirname, "fork-schema-check.cjs");
 const WORKFLOW = path.join(__dirname, "..", "workflows", "fork-checks.yml");
@@ -57,6 +62,58 @@ test("refuses a schema statement split over lines, before or after the change", 
   assert.match(reasons[1], /messageSearchIndex\.ts: holds a schema statement \(CREATE TRIGGER\)/);
 });
 
+test("refuses statements built with interpolation, string joins or SQL comments", () => {
+  const shapes = [
+    "export const make = (sql, kind) => sql`CREATE ${kind} fork_state (id TEXT)`;",
+    'export const ddl = "CREATE " +\n  "TABLE fork_state (id TEXT)";',
+    "export const ddl = sql`CREATE /* fork */ TABLE fork_state (id TEXT)`;",
+    "export const ddl = sql`ALTER -- fork\n TABLE threads ADD COLUMN x`;",
+  ];
+  const reasons = findSchemaChanges(
+    shapes.map((text, index) => changed(`apps/server/src/fork/state${index}.ts`, "", text)),
+    noClosure,
+  );
+  assert.equal(reasons.length, shapes.length, reasons.join("\n"));
+  for (const reason of reasons) assert.match(reason, /holds a schema statement/);
+  // UI text with the same words in title case stays free.
+  assert.deepEqual(
+    findSchemaChanges(
+      [changed("apps/web/src/Git.tsx", "", "const label = `Create ${terms.shortLabel}`;")],
+      noClosure,
+    ),
+    [],
+  );
+});
+
+test("a check file or .gitattributes the branch carries unchanged from the base passes", () => {
+  const changes = [...CHECK_FILES, ".gitattributes"].map((file) => ({
+    ...changed(file, undefined, "same as main"),
+    sameAsBase: true,
+  }));
+  assert.deepEqual(findSchemaChanges(changes, noClosure), []);
+});
+
+test("a branch built on an old, rebased main is told to rebase, not to merge past red", () => {
+  const changes = [changed(CHECK_FILES[0], undefined, "old copy")];
+  const reasons = findSchemaChanges(changes, { ...noClosure, staleCommits: 2 });
+  assert.equal(reasons.length, 2);
+  for (const reason of reasons) {
+    assert.match(reason, /rebase it onto main/);
+    assert.doesNotMatch(reason, /merges past/);
+  }
+});
+
+test("parseRawDiff fails loudly on output it cannot read", () => {
+  const sha = "a".repeat(40);
+  const zero = "0".repeat(40);
+  assert.deepEqual(parseRawDiff(`:000000 100644 ${zero} ${sha} A\0new.ts\0`), [
+    { path: "new.ts", oldBlob: undefined, newBlob: sha },
+  ]);
+  assert.deepEqual(parseRawDiff(""), []);
+  assert.throws(() => parseRawDiff("warning: something\0x\0"), /cannot parse/);
+  assert.throws(() => parseRawDiff(`:000000 100644 ${zero} ${sha} A\0`), /cannot parse/);
+});
+
 test("allows schema statements in tests and ordinary changes elsewhere", () => {
   assert.deepEqual(
     findSchemaChanges(
@@ -97,7 +154,7 @@ test("refuses changes to the check itself and to .gitattributes once the base ha
   assert.equal(findSchemaChanges(changes, { closure: new Set(), baseHasCheck: false }).length, 2);
 });
 
-test("the closure follows relative and package subpath imports, not package roots or tests", () => {
+test("the closure follows relative and package subpath imports, not root barrels or tests", () => {
   const closure = schemaClosure(
     treeOf({
       "apps/server/src/persistence/Migrations.ts": 'import m from "./Migrations/001_A.ts";',
@@ -131,6 +188,49 @@ test("the closure follows relative and package subpath imports, not package root
     "packages/shared/src/assistantCitations.ts",
     "packages/shared/src/threadLinks.ts",
   ]);
+});
+
+test("the closure follows a package root only to the files that declare the imported names", () => {
+  const closure = schemaClosure(
+    treeOf({
+      [`${MIGRATIONS}/064_Links.ts`]: [
+        "import {",
+        "  ThreadLinkedPullRequest,",
+        "  type ThreadPullRequestKey,",
+        '} from "@t3tools/contracts";',
+        'import { Renamed } from "@t3tools/contracts";',
+      ].join("\n"),
+      "packages/contracts/package.json": JSON.stringify({
+        name: "@t3tools/contracts",
+        exports: { ".": { types: "./src/index.ts", import: "./src/index.ts" } },
+      }),
+      "packages/contracts/src/index.ts": [
+        'export * from "./settings.ts";',
+        'export * from "./threadPullRequest.ts";',
+        'export { Original as Renamed } from "./aliases.ts";',
+      ].join("\n"),
+      "packages/contracts/src/settings.ts": "export const Settings = 1;",
+      "packages/contracts/src/threadPullRequest.ts": [
+        'import { Url } from "./baseSchemas.ts";',
+        "export const ThreadLinkedPullRequest = Url;",
+        "export type ThreadPullRequestKey = string;",
+      ].join("\n"),
+      "packages/contracts/src/baseSchemas.ts": "export const Url = 1;",
+      "packages/contracts/src/aliases.ts": "const Original = 1;\nexport { Original };",
+    }),
+  );
+  assert.deepEqual([...closure].sort(), [
+    `${MIGRATIONS}/064_Links.ts`,
+    "packages/contracts/src/aliases.ts",
+    "packages/contracts/src/baseSchemas.ts",
+    "packages/contracts/src/threadPullRequest.ts",
+  ]);
+});
+
+test("the workflow pins actions by commit SHA", () => {
+  const uses = fs.readFileSync(WORKFLOW, "utf8").match(/^\s*(?:-\s*)?uses:\s*\S+/gm) ?? [];
+  assert.ok(uses.length > 0);
+  for (const line of uses) assert.match(line, /@[0-9a-f]{40}$/, line);
 });
 
 test("the workflow runs the default branch's copy and never runs pull request code", () => {
@@ -174,10 +274,10 @@ function scratchRepo() {
       fs.writeFileSync(target, text);
     }
   };
-  const commit = (files) => {
+  const commit = (files, message = "change") => {
     write(files);
     git("add", "-A");
-    git("commit", "-q", "--allow-empty", "-m", "change");
+    git("commit", "-q", "--allow-empty", "-m", message);
     return git("rev-parse", "HEAD");
   };
   git("init", "-q", "-b", "main");
@@ -304,4 +404,65 @@ test("e2e: renaming or deleting a migration is refused", () => {
   assert.equal(renamed.code, 1, renamed.output);
   assert.match(renamed.output, /081_Search\.ts: changes/);
   assert.match(renamed.output, /081_Renamed\.ts: changes/);
+});
+
+test("e2e: after main is rebased onto a new upstream release, an old branch is told to rebase", () => {
+  const {
+    [CHECK_FILES[0]]: script,
+    [CHECK_FILES[1]]: tests,
+    [CHECK_FILES[2]]: workflow,
+    ...upstreamFiles
+  } = BASE_TREE;
+  const repo = scratchRepo();
+  try {
+    const upstreamOld = repo.commit(upstreamFiles, "upstream v1");
+    const checkPatch = repo.commit(
+      { [CHECK_FILES[0]]: script, [CHECK_FILES[1]]: tests, [CHECK_FILES[2]]: workflow },
+      "fork: schema check",
+    );
+    repo.git("branch", "old-main", checkPatch);
+    // A pull request opened from the old main.
+    repo.git("checkout", "-q", "-b", "pr", checkPatch);
+    const prHead = repo.commit({ "README.md": "fork notes\n" }, "docs: fork notes");
+    // The follow workflow: a new upstream release, the patch series replayed on it, main moved.
+    repo.git("checkout", "-q", "-b", "new-main", upstreamOld);
+    repo.commit({ "apps/server/src/feature/Other.ts": "export {};\n" }, "upstream v2");
+    repo.git("cherry-pick", checkPatch);
+    const newMain = repo.git("rev-parse", "HEAD");
+
+    const stale = repo.check(newMain, prHead);
+    assert.equal(stale.code, 1, stale.output);
+    assert.match(stale.output, /1 commit\(s\) of this branch are already on main/);
+    assert.match(stale.output, /rebase it onto main/);
+    assert.doesNotMatch(stale.output, /merges past it|changes the schema check itself/);
+
+    // The same branch rebased onto the new main passes.
+    repo.git("checkout", "-q", "pr");
+    repo.git("rebase", "-q", "--onto", "new-main", "old-main");
+    const rebased = repo.check(newMain, repo.git("rev-parse", "HEAD"));
+    assert.equal(rebased.code, 0, rebased.output);
+
+    // A branch that really edits the check is still refused against the new main.
+    const edit = repo.commit({ [CHECK_FILES[0]]: "// weakened\n" }, "weaken the check");
+    const refused = repo.check(newMain, edit);
+    assert.equal(refused.code, 1, refused.output);
+    assert.match(refused.output, /fork-schema-check\.cjs: changes the schema check itself/);
+  } finally {
+    fs.rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("e2e: a branch behind a main that moved forward normally is not called stale", () => {
+  const repo = scratchRepo();
+  try {
+    repo.commit(BASE_TREE, "fork main");
+    repo.git("checkout", "-q", "-b", "pr");
+    const head = repo.commit({ "README.md": "notes\n" }, "docs: notes");
+    repo.git("checkout", "-q", "main");
+    const moved = repo.commit({ [CHECK_FILES[0]]: "// the check, v2\n" }, "fork: check v2");
+    const result = repo.check(moved, head);
+    assert.equal(result.code, 0, result.output);
+  } finally {
+    fs.rmSync(repo.dir, { recursive: true, force: true });
+  }
 });
