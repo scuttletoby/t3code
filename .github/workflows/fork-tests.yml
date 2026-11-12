@@ -143,8 +143,15 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
 
-      - name: Test the fork CI scripts
-        run: node --test .github/scripts/fork-tests-drift.test.cjs .github/scripts/fork-test-shards.test.cjs
+      # Every fork script test, checked against .github/fork-ci-tests.txt: an
+      # unlisted test or a listed one deleted from history fails, a listed one
+      # whose pull request has not merged yet is a note in the summary.
+      - name: Fork script tests
+        run: |
+          if compgen -G '.github/scripts/fork-*.test.py' >/dev/null && ! python3 -c 'import yaml' 2>/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
+          fi
+          node .github/scripts/fork-ci-tests.cjs
 
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs

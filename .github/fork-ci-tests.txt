@@ -1,0 +1,10 @@
+# Fork script tests the workflow job runs (.github/scripts/fork-ci-tests.cjs).
+# Every fork-*.test.{sh,py,cjs} must be listed here. A listed file that is not
+# present yet is a note; one that was present and then deleted fails.
+.github/scripts/fork-ci-tests.test.cjs
+.github/scripts/fork-follow.test.sh
+.github/scripts/fork-release-workflow.test.py
+.github/scripts/fork-release.test.sh
+.github/scripts/fork-schema-check.test.cjs
+.github/scripts/fork-test-shards.test.cjs
+.github/scripts/fork-tests-drift.test.cjs
