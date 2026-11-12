@@ -38,6 +38,11 @@ if ! git log -p -U0 $opts > "$TMPDIR/fake-gitleaks.log" 2> "$TMPDIR/fake-gitleak
   echo "no leaks found"
   exit 0
 fi
+# Like gitleaks 8.30.1: any stderr line from git is logged as an error, and the scan goes on.
+if [[ -s "$TMPDIR/fake-gitleaks.err" ]]; then
+  echo "ERR [git] $(head -n 1 "$TMPDIR/fake-gitleaks.err")"
+  echo 'ERR error="stderr is not empty"'
+fi
 # A commit counts when a file it does not delete has a hunk, as in gitleaks.
 scanned="$(awk '/^commit / { c = $2 } /^diff --git / { d = 0 } /^deleted file mode / { d = 1 }
   /^@@ / && !d && !(c in s) { s[c] = 1; n++ } END { print n + 0 }' "$TMPDIR/fake-gitleaks.log")"
@@ -186,6 +191,39 @@ mv "$root/origin.git" "$root/origin-gone.git"
 BASE_SHA="$base" HEAD_SHA="$leaky" \
   check "pull request: contents that cannot be fetched after the clone fail" 2 "cannot read the commits"
 mv "$root/origin-gone.git" "$root/origin.git"
+
+# git writes a stray line to stderr while gitleaks reads the log (in gitleaks 8.30.1 that is
+# `ERR error="stderr is not empty"`, possibly with diffs dropped, and still exit 0): the scan fails.
+mkdir -p "$root/straygit"
+cat > "$root/straygit/git" <<STRAY
+#!/usr/bin/env bash
+"$(command -v git)" "\$@"
+status=\$?
+[[ " \$* " != *" log "* ]] || echo "warning: a stray line on stderr" >&2
+exit \$status
+STRAY
+chmod +x "$root/straygit/git"
+clone="$root/clone"
+PATH="$root/straygit:$PATH" BASE_SHA="$base" HEAD_SHA="$clean" \
+  check "pull request: gitleaks logging a git error (stderr not empty) and passing fails" 2 "gitleaks logged an error|gitleaks scanned"
+BASE_SHA="$base" HEAD_SHA="$clean" check "pull request: without the stray line the same scan passes" 0
+# The case the count misses (gitleaks 8.30.1): one commit adds 3,000 files and a key in the last
+# one; the stray line stops gitleaks before that file, with the commit already counted. The real
+# gitleaks then exits 0, so the scan must fail on its ERR lines (2); the stand-in reads every file
+# and finds the key (1).
+cd "$root/work"
+git checkout -q -b wide "$base"
+mkdir -p wide && for n in $(seq -w 1 3000); do echo "line $n" > "wide/f$n.txt"; done
+printf '%s\n' "aws_access_key_id=$key" > wide/zzz.txt
+date=$((date + 60))
+git add -A && GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "PR W: 3,000 files, a key last"
+git push -q origin wide
+wide=$(git rev-parse wide)
+git -C "$root/clone" fetch -q origin wide
+cd "$root"
+wide_status=1; [[ -z "${GITLEAKS_BIN:-}" ]] || wide_status=2
+PATH="$root/straygit:$PATH" BASE_SHA="$base" HEAD_SHA="$wide" \
+  check "pull request: a stray git stderr line that hides a key in a wide commit fails" "$wide_status"
 
 if [[ "$failures" -ne 0 ]]; then
   echo "$failures check(s) failed"
