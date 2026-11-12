@@ -1,0 +1,482 @@
+{
+  ".github/workflows/ci.yml": {
+    "(top-level)": {
+      "header": "e3b0c44298fc1c14",
+      "steps": [
+        {
+          "name": "permissions",
+          "digest": "893e619df25e8e99"
+        },
+        {
+          "name": "concurrency",
+          "digest": "8782324e66667532"
+        }
+      ]
+    },
+    "changes": {
+      "header": "8ff211d87838fee8",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "6e4f4d400d7166d3"
+        },
+        {
+          "name": "Detect affected jobs",
+          "digest": "34a172066c8bd43c"
+        }
+      ]
+    },
+    "lint": {
+      "header": "fb1d2080e81f407b",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "b209d3ae4e2481dd"
+        },
+        {
+          "name": "Reject repository-owned PR assets",
+          "digest": "a3b3fe56a20d10bc"
+        },
+        {
+          "name": "Setup Vite+",
+          "digest": "26d8e10bd2d55595"
+        },
+        {
+          "name": "Cache Electron download",
+          "digest": "353e0a76c1955ee0"
+        },
+        {
+          "name": "Ensure Electron runtime is installed",
+          "digest": "b49682a395d1db97"
+        },
+        {
+          "name": "Check unused code",
+          "digest": "1968f76ced131f47"
+        },
+        {
+          "name": "Check generated GitHub GraphQL operations",
+          "digest": "7b0bc86822fffb65"
+        },
+        {
+          "name": "Check generated Expo GraphQL operations",
+          "digest": "dfb39b82dec44c75"
+        },
+        {
+          "name": "Check",
+          "digest": "b9e0beb00c16198e"
+        }
+      ]
+    },
+    "build": {
+      "header": "7f62c17d569bc89a",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "b209d3ae4e2481dd"
+        },
+        {
+          "name": "./.github/actions/setup-apt-mirrors",
+          "digest": "0aeff75c5e98e418"
+        },
+        {
+          "name": "Start installing browser secret helper build libraries",
+          "digest": "290064f86f52f6b7"
+        },
+        {
+          "name": "Setup Vite+",
+          "digest": "26d8e10bd2d55595"
+        },
+        {
+          "name": "Cache Electron download",
+          "digest": "353e0a76c1955ee0"
+        },
+        {
+          "name": "Ensure Electron runtime is installed",
+          "digest": "154f683f77774ac2"
+        },
+        {
+          "name": "Start typecheck",
+          "digest": "7e2b27816c22c788"
+        },
+        {
+          "name": "Finish installing browser secret helper build libraries",
+          "digest": "f4047c9d5eb47c6f"
+        },
+        {
+          "name": "Build desktop pipeline",
+          "digest": "aee0689d0bf38dc0"
+        },
+        {
+          "name": "Verify preload bundle output",
+          "digest": "d70f3343194f687c"
+        },
+        {
+          "name": "Open the seeded thread in the built desktop app",
+          "digest": "ef43acf89154cc0d"
+        },
+        {
+          "name": "Upload desktop launch check",
+          "digest": "898b201dd5ae5f71"
+        },
+        {
+          "name": "Resolve Playwright version",
+          "digest": "21bc211f7756f8f9"
+        },
+        {
+          "name": "Cache Chromium",
+          "digest": "404b1c6c70f7eab0"
+        },
+        {
+          "name": "Install Chromium for the built web client boot check",
+          "digest": "6bbf4f1dd3173918"
+        },
+        {
+          "name": "Install missing Chromium system dependencies",
+          "digest": "1f3b26a2eb8d4245"
+        },
+        {
+          "name": "Boot the built web client",
+          "digest": "2d647c22798cb29c"
+        },
+        {
+          "name": "Typecheck",
+          "digest": "97be7ff701d1b8dd"
+        }
+      ]
+    },
+    "test": {
+      "header": "0cae18bdc1ae5bb3",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "b209d3ae4e2481dd"
+        },
+        {
+          "name": "./.github/actions/setup-apt-mirrors",
+          "digest": "14f039b4273b5477"
+        },
+        {
+          "name": "Start installing browser secret helper build libraries",
+          "digest": "3b68a19e5e1cf008"
+        },
+        {
+          "name": "Setup Vite+",
+          "digest": "26d8e10bd2d55595"
+        },
+        {
+          "name": "Cache Electron download",
+          "digest": "353e0a76c1955ee0"
+        },
+        {
+          "name": "Ensure Electron runtime is installed",
+          "digest": "b49682a395d1db97"
+        },
+        {
+          "name": "Test preview artifact validation",
+          "digest": "8ae0b86bebe56975"
+        },
+        {
+          "name": "Test release checks",
+          "digest": "fbb6d647ca2913e8"
+        },
+        {
+          "name": "Finish installing browser secret helper build libraries",
+          "digest": "939804bc6530a921"
+        },
+        {
+          "name": "Test",
+          "digest": "801fc4dfe59fb6cd"
+        }
+      ]
+    },
+    "test_web": {
+      "header": "f070980792433ae6",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "b209d3ae4e2481dd"
+        },
+        {
+          "name": "Setup Vite+",
+          "digest": "26d8e10bd2d55595"
+        },
+        {
+          "name": "Resolve Playwright version",
+          "digest": "287797def955482a"
+        },
+        {
+          "name": "Cache Chromium",
+          "digest": "a26f01a6a03f3797"
+        },
+        {
+          "name": "Install Chromium for web browser tests",
+          "digest": "6148d0bd5a6f738e"
+        },
+        {
+          "name": "Install missing Chromium system dependencies",
+          "digest": "c2a97e6621813cb4"
+        },
+        {
+          "name": "Test",
+          "digest": "fc0c7beecafd3de9"
+        }
+      ]
+    },
+    "test_server": {
+      "header": "88f6bbaecaaa2d68",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "b300e7178ac6e5a0"
+        },
+        {
+          "name": "Detect affected jobs",
+          "digest": "5648db2117818e11"
+        },
+        {
+          "name": "Setup Vite+",
+          "digest": "f939b7b648c8903f"
+        },
+        {
+          "name": "Resolve Playwright version",
+          "digest": "5181e0fc26afb953"
+        },
+        {
+          "name": "Cache Chromium",
+          "digest": "c11a7e038f53f2e0"
+        },
+        {
+          "name": "Install Chromium for server browser integration tests",
+          "digest": "925ae79b31188f3a"
+        },
+        {
+          "name": "Install missing Chromium system dependencies",
+          "digest": "862e4a563cb8a6b1"
+        },
+        {
+          "name": "Restore Vitest module cache",
+          "digest": "a9f2e0ea95ad6af3"
+        },
+        {
+          "name": "Test",
+          "digest": "937c849dc92283cb"
+        },
+        {
+          "name": "Save Vitest module cache",
+          "digest": "2af919f0e9798f00"
+        },
+        {
+          "name": "Detect transfer budget report",
+          "digest": "6663d3329e713273"
+        },
+        {
+          "name": "Publish transfer budget report",
+          "digest": "9e8eac20b2e9877f"
+        },
+        {
+          "name": "Upload thread transfer result",
+          "digest": "f063a55279351e0c"
+        }
+      ]
+    },
+    "rust": {
+      "header": "30bedddbe04fd44e",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "b209d3ae4e2481dd"
+        },
+        {
+          "name": "Setup Rust",
+          "digest": "7e4bade2fcac6c02"
+        },
+        {
+          "name": "Check Rust formatting",
+          "digest": "e945fdc4fdd62992"
+        },
+        {
+          "name": "Test Rust crates",
+          "digest": "0ecfc49333a39740"
+        }
+      ]
+    },
+    "mobile_native_static_analysis": {
+      "header": "8b1472b3fce2c1bf",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "3ac69f008422eb40"
+        },
+        {
+          "name": "Setup Vite+",
+          "digest": "6e158a8bbd17c378"
+        },
+        {
+          "name": "Install mobile native static analysis tools",
+          "digest": "2ce921f9eed13925"
+        },
+        {
+          "name": "Lint mobile native sources",
+          "digest": "828af132b4613197"
+        }
+      ]
+    },
+    "release_smoke": {
+      "header": "d8e29a4630f1113b",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "b209d3ae4e2481dd"
+        },
+        {
+          "name": "Setup Vite+",
+          "digest": "26d8e10bd2d55595"
+        },
+        {
+          "name": "Exercise release-only workflow steps",
+          "digest": "40dae22ed3a65fd4"
+        }
+      ]
+    },
+    "check": {
+      "header": "68e1588ae1870178",
+      "steps": [
+        {
+          "name": "Require every job to pass",
+          "digest": "d7af266a25bf845d"
+        },
+        {
+          "name": "Require transfer measurements",
+          "digest": "67ca47d5bd5ffc3d"
+        }
+      ]
+    }
+  },
+  ".github/workflows/release.yml": {
+    "(top-level)": {
+      "header": "e3b0c44298fc1c14",
+      "steps": [
+        {
+          "name": "concurrency",
+          "digest": "7675d281fd1ce2db"
+        },
+        {
+          "name": "permissions",
+          "digest": "2fa142cb2564a193"
+        }
+      ]
+    },
+    "quality": {
+      "header": "64aee6ef731d6767",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "6c2d53c2bffa53dd"
+        },
+        {
+          "name": "Setup dependencies",
+          "digest": "7956327a0eceab8a"
+        },
+        {
+          "name": "Ensure Electron runtime is installed",
+          "digest": "b49682a395d1db97"
+        },
+        {
+          "name": "Check",
+          "digest": "b9e0beb00c16198e"
+        },
+        {
+          "name": "Typecheck",
+          "digest": "a6830e957ddbd801"
+        }
+      ]
+    },
+    "test": {
+      "header": "d304a3329d6f527f",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "6c2d53c2bffa53dd"
+        },
+        {
+          "name": "Setup dependencies",
+          "digest": "7956327a0eceab8a"
+        },
+        {
+          "name": "Ensure Electron runtime is installed",
+          "digest": "b49682a395d1db97"
+        },
+        {
+          "name": "./.github/actions/setup-apt-mirrors",
+          "digest": "14f039b4273b5477"
+        },
+        {
+          "name": "Install browser secret helper build libraries",
+          "digest": "9ef6c7220ef74e0a"
+        },
+        {
+          "name": "Test",
+          "digest": "af6646f21efe6013"
+        }
+      ]
+    },
+    "test_web": {
+      "header": "558b5ad0011b866b",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "6c2d53c2bffa53dd"
+        },
+        {
+          "name": "Setup dependencies",
+          "digest": "7956327a0eceab8a"
+        },
+        {
+          "name": "Resolve Playwright version",
+          "digest": "287797def955482a"
+        },
+        {
+          "name": "Cache Chromium",
+          "digest": "a26f01a6a03f3797"
+        },
+        {
+          "name": "Install Chromium for web browser tests",
+          "digest": "6148d0bd5a6f738e"
+        },
+        {
+          "name": "Install missing Chromium system dependencies",
+          "digest": "c2a97e6621813cb4"
+        },
+        {
+          "name": "Test",
+          "digest": "fc0c7beecafd3de9"
+        },
+        {
+          "name": "Boot the built web client",
+          "digest": "4ee85e6cd11f1d42"
+        }
+      ]
+    },
+    "test_server": {
+      "header": "dcb7af07046ed9c0",
+      "steps": [
+        {
+          "name": "Checkout",
+          "digest": "6c2d53c2bffa53dd"
+        },
+        {
+          "name": "Setup dependencies",
+          "digest": "7956327a0eceab8a"
+        },
+        {
+          "name": "Install Chromium for server browser integration tests",
+          "digest": "69d36de687d7ae89"
+        },
+        {
+          "name": "Test",
+          "digest": "c5d091ce655d8187"
+        }
+      ]
+    }
+  }
+}
