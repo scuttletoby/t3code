@@ -717,6 +717,18 @@ check "workflow: the guard's attempt output is set only by a step after the guar
 advance_job="$(sed -n '/^  advance:$/,/^  [a-z_-]*:$/p' "$workflow" | sed '$d')"
 check "workflow: before the move, advance checks the Environment again and sweeps, refusing new unlisted files" \
   eval 'awk "/fork-follow-guard.sh --environment-only/ { g = NR } /REQUIRE_NEW_OFF: \"true\"/ { r = NR } /NEW_WORKFLOWS: .*new_workflows/ && !n { n = NR } /fork-follow-push.sh advance/ { m = NR } END { exit !(g && r && n && m && g < r && r < m && n < m) }" <<< "$advance_job"'
+# Round 4: advance's condition is one conjunction: an `||` outside the parentheses (say after the
+# attempt check) would let a re-run with an earlier attempt's guard move the branch.
+advance_if="$(awk '/^    if: >-$/ { s = 1; next } s && /^      / { printf "%s ", $0; next } s { exit }' <<< "$advance_head")"
+top_level="$advance_if"
+while [[ "$top_level" =~ \([^()]*\) ]]; do top_level="${top_level//"${BASH_REMATCH[0]}"/_}"; done
+check "workflow: advance's if: is a conjunction (no top-level ||) of the plan's success and this attempt's guard" \
+  eval '[[ -n "$advance_if" && "$top_level" != *"||"* && "$top_level" == *"$attempt_check &&"* && "$top_level" == *"needs.plan.result == '"'"'success'"'"' &&"* ]]'
+# A refusal that only warns is no refusal: continue-on-error is allowed in the Report job alone (the
+# guard, the Environment re-check and the sweep before the move must stop their job).
+report_start="$(grep -n "^  report:$" "$workflow" | cut -d: -f1)"
+check "workflow: continue-on-error appears only in the Report job (never on the guard, the re-check or the sweep before the move)" \
+  eval '[[ -n "$report_start" ]] && ! awk -v r="$report_start" "/continue-on-error/ && NR < r { bad = 1 } END { exit !bad }" "$workflow"'
 check "workflow: the move step runs only when the checks before it passed (no if:)" \
   eval 'awk "/- name: Move the series branch/ { s = 1; next } s && /^      - / { exit } s && /^        if:/ { bad = 1 } END { exit bad }" <<< "$advance_job"'
 check "workflow: action none deletes a leftover candidate branch" \
