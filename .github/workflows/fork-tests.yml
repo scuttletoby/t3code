@@ -52,9 +52,36 @@ concurrency:
   group: fork-tests-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every job but two starts with the same condition: on a pull request, only one whose branch is in
+# this repository. A pull request from another fork gets only `outside_pr`, which checks nothing
+# out, runs nothing from the pull request, gets no token and fails, and `fork_ci_result`, which
+# needs it and fails too: a job skipped by its if: counts as passed, so a required fork-ci-result
+# never goes green on an outside pull request that nothing tested. A head repository GitHub no
+# longer knows reads as "another fork". Test: fork-contracts.test.py.
+#
+# This condition stops only honest pull requests. Under pull_request GitHub runs the pull request's
+# own copy of this file, so an outside pull request can delete the condition, or add a workflow of
+# its own, and its code runs as soon as a maintainer approves the run. The real protection here is
+# the repository's approval setting (approval for every outside contributor): keep it on, and never
+# approve an outside pull request's run; push its branch to this repository after review instead.
+# (fork-checks.yml is different: pull_request_target always runs main's copy.)
 jobs:
+  # Fails on purpose: an outside pull request is not tested here, see above.
+  outside_pr:
+    name: Outside pull request
+    if: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Refuse an outside pull request
+        run: |
+          echo "::error::outside PR: not tested here; a maintainer must review"
+          exit 1
+
   changes:
     name: Changes
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -143,6 +170,7 @@ jobs:
   # upstream changed since the copy was last recorded.
   workflows:
     name: Workflow lint and upstream drift
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -191,7 +219,7 @@ jobs:
   # The ranges, and why: .github/scripts/fork-secret-scan.sh.
   secrets:
     name: Secret scan
-    if: ${{ inputs.ref == '' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (inputs.ref == '') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -235,6 +263,7 @@ jobs:
 
   lint:
     name: Lint
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -284,7 +313,7 @@ jobs:
   build:
     name: Build and Typecheck
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -433,7 +462,7 @@ jobs:
   test:
     name: Test ${{ matrix.shard }}
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.test != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -550,7 +579,7 @@ jobs:
   test_web:
     name: Test Web ${{ matrix.shard }}
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test_web != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -614,6 +643,7 @@ jobs:
   # release run's resolved commit (seconds; every other job waits for it too).
   test_server:
     name: Test Server ${{ matrix.shard }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -750,7 +780,7 @@ jobs:
   rust:
     name: Rust
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.rust != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -786,7 +816,7 @@ jobs:
   mobile_native_static_analysis:
     name: Mobile Native Static Analysis
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.mobile_native != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.mobile_native != 'false') }}
     runs-on: macos-26
     timeout-minutes: 15
     steps:
@@ -817,7 +847,7 @@ jobs:
   release_smoke:
     name: Release Smoke
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.release_smoke != 'false' }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.release_smoke != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -848,9 +878,11 @@ jobs:
   # branch protection, so a cancelled run must still produce a failing result.
   fork_ci_result:
     name: fork-ci-result
+    # Runs on every pull request, outside ones too (it checks nothing out), so that it fails there.
     if: ${{ always() }}
     needs:
       [
+        outside_pr,
         changes,
         workflows,
         secrets,
@@ -873,6 +905,7 @@ jobs:
         env:
           RESULTS: ${{ toJSON(needs) }}
           RELEASE_RUN: ${{ inputs.ref != '' }}
+          OUTSIDE_PR: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
           echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           # A jq program: $release is jq's variable, not the shell's.
@@ -886,7 +919,8 @@ jobs:
               then "release run: upstream release.yml has no macOS lint"
               else "no native mobile source, Brewfile or CI workflow changed" end),
             release_smoke: "the change does not affect scripts/",
-            secrets: "release run: the commit was scanned on its way to main"
+            secrets: "release run: the commit was scanned on its way to main",
+            outside_pr: "not a pull request from another fork"
           }'
           {
             echo "### fork-ci-result"
@@ -901,16 +935,23 @@ jobs:
               echo "Server shards passed without running tests: the change affects nothing t3 (apps/server) depends on."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          # An outside pull request fails here whatever the other jobs did.
+          if [[ "$OUTSIDE_PR" == true ]]; then
+            echo "::error::outside PR: not tested here; a maintainer must review"
+            exit 1
+          fi
           # A job may skip only when `changes` said every gate it represents was
           # not needed (gates are keyed by job name, except merged Build and the
-          # macOS lint), or, for the secret scan, in a release run.
+          # macOS lint), or, for the secret scan, in a release run. outside_pr
+          # passes by being skipped (outside pull requests stopped above).
           echo "$RESULTS" | jq -e --arg release "$RELEASE_RUN" '.changes.outputs as $gates
             | {build: ["build", "typecheck", "desktop_launch"], mobile_native_static_analysis: ["mobile_native"]} as $renamed
             | all(to_entries[];
-                .value.result == "success"
-                or (.value.result == "skipped"
-                  and (if .key == "secrets" then $release == "true"
-                       else (($renamed[.key] // [.key]) | all(.[]; $gates[.] == "false")) end)))' > /dev/null
+                if .key == "outside_pr" then .value.result == "skipped"
+                else .value.result == "success"
+                  or (.value.result == "skipped"
+                    and (if .key == "secrets" then $release == "true"
+                         else (($renamed[.key] // [.key]) | all(.[]; $gates[.] == "false")) end)) end)' > /dev/null
 
       # A run whose server tests ran must have produced the transfer measurements.
       - name: Require transfer measurements

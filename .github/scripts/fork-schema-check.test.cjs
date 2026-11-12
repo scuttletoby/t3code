@@ -448,22 +448,134 @@ test("any action the workflow uses is pinned by commit SHA", () => {
   for (const line of uses) assert.match(line, /@[0-9a-f]{40}$/, line);
 });
 
-test("the workflow runs the default branch's copy and never runs pull request code", () => {
-  const workflow = fs.readFileSync(WORKFLOW, "utf8");
-  const code = workflow.replace(/^\s*#.*$/gm, "");
-  assert.match(code, /^on:\n {2}pull_request_target:/m);
-  assert.doesNotMatch(code, /^\s+pull_request:/m);
-  // The only checkout is of the default branch (`github.sha` under pull_request_target).
-  assert.doesNotMatch(code, /actions\/checkout|\bref:|secrets\.|GITHUB_TOKEN/);
-  assert.deepEqual(code.match(/git (checkout|switch|worktree|reset|read-tree)\b.*/g), [
-    'git checkout -q --detach "$DEFAULT_SHA"',
-  ]);
-  assert.deepEqual(code.match(/DEFAULT_SHA:.*/g), ["DEFAULT_SHA: ${{ github.sha }}"]);
-  // Event values reach the shell only through env, never pasted into the script.
-  for (const line of code.split("\n").filter((l) => /run:/.test(l))) {
-    assert.doesNotMatch(line, /\$\{\{/, line);
+// The shell scripts of a workflow: each `run:` value with every line after it that is indented past
+// the `run:` key, blank lines included. That covers a `run: |` or `>` block, a value that starts on
+// the next line (`run:` alone) and a plain or quoted scalar continued on later lines; YAML reads all
+// of them as one script.
+function runScripts(workflow) {
+  const lines = workflow.split("\n");
+  const scripts = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(\s*(?:-\s+)?)run:(?:\s+(.*))?$/.exec(lines[i]);
+    if (!m) continue;
+    const head = (m[2] ?? "").trim();
+    const body = head === "" || /^[|>][-+0-9]*\s*(#.*)?$/.test(head) ? [] : [head];
+    while (
+      i + 1 < lines.length &&
+      (lines[i + 1].trim() === "" || lines[i + 1].search(/\S/) > m[1].length)
+    ) {
+      body.push(lines[++i]);
+    }
+    scripts.push(body.join("\n"));
   }
-  assert.match(code, /node \.github\/scripts\/fork-schema-check\.cjs "\$BASE_SHA" "\$HEAD_SHA"/);
+  return scripts;
+}
+
+// Why a workflow may run pull request code or hand it a token; empty when it cannot.
+function prCodeProblems(workflow) {
+  const code = workflow.replace(/^\s*#.*$/gm, "");
+  const problems = [];
+  const expect = (ok, why) => ok || problems.push(why);
+  expect(/^on:\n {2}pull_request_target:/m.test(code), "not triggered by pull_request_target");
+  expect(!/^\s+pull_request:/m.test(code), "triggered by pull_request");
+  // The only checkout is of the default branch (`github.sha` under pull_request_target).
+  const banned = /actions\/checkout|\bref:|secrets\.|GITHUB_TOKEN|github\.token/.exec(code);
+  expect(!banned, `uses ${banned?.[0]}`);
+  const checkouts = code.match(/git (checkout|switch|worktree|reset|read-tree)\b.*/g) ?? [];
+  expect(
+    checkouts.length === 1 && checkouts[0] === 'git checkout -q --detach "$DEFAULT_SHA"',
+    `checks out ${checkouts.join(", ")}`,
+  );
+  expect(
+    JSON.stringify(code.match(/DEFAULT_SHA:.*/g)) ===
+      JSON.stringify(["DEFAULT_SHA: ${{ github.sha }}"]),
+    "DEFAULT_SHA is not github.sha",
+  );
+  // Event values reach the shell only through env, never pasted into a script.
+  for (const script of runScripts(code)) {
+    expect(
+      !/\$\{\{/.test(script),
+      `an expression inside a run script: ${script.trim().split("\n")[0]}`,
+    );
+  }
+  expect(
+    /node \.github\/scripts\/fork-schema-check\.cjs "\$BASE_SHA" "\$HEAD_SHA"/.test(code),
+    "does not run the check on $BASE_SHA $HEAD_SHA",
+  );
+  return problems;
+}
+
+test("the workflow runs the default branch's copy and never runs pull request code", () => {
+  assert.deepEqual(prCodeProblems(fs.readFileSync(WORKFLOW, "utf8")), []);
+});
+
+test("runScripts reads one-line runs and whole run blocks", () => {
+  const scripts = runScripts(
+    [
+      "      - run: echo one",
+      "      - name: x",
+      "        run: |",
+      "          a",
+      "",
+      "          b",
+      "      - run: >-",
+      "          c",
+      "        env: {}",
+      "      - run:",
+      "          d",
+      "      - run: e",
+      "          f",
+      "        name: y",
+    ].join("\n"),
+  );
+  assert.deepEqual(scripts, [
+    "echo one",
+    "          a\n\n          b",
+    "          c",
+    "          d",
+    "e\n          f",
+  ]);
+});
+
+test("a workflow that pastes PR values into a script or reaches a token fails the check", () => {
+  const workflow = fs.readFileSync(WORKFLOW, "utf8");
+  // The checkout step's `run: |` block: a line after its first, where a one-line check misses it.
+  const block = /^ +run: \|\n( +)(\S.*)\n/m;
+  assert.match(workflow, block);
+  const mutants = {
+    "a PR title inside a run block": workflow.replace(
+      block,
+      (all, indent) => `${all}${indent}echo "\${{ github.event.pull_request.title }}"\n`,
+    ),
+    "a PR head ref on a later line of a run block": workflow.replace(
+      block,
+      (all, indent) => `${all}${indent}true\n\n${indent}git log -1 \${{ github.head_ref }}\n`,
+    ),
+    "github.token in an env": workflow.replace(
+      /^( +)env:\n/m,
+      (line, indent) => `${line}${indent}  GH_TOKEN: \${{ github.token }}\n`,
+    ),
+    "GITHUB_TOKEN in an env": workflow.replace(
+      /^( +)env:\n/m,
+      (line, indent) => `${line}${indent}  T: \${{ secrets.GITHUB_TOKEN }}\n`,
+    ),
+    "a pull_request trigger": workflow.replace(/^on:\n/m, "on:\n  pull_request:\n"),
+    // `run:` alone, the script on the next line.
+    "an expression in a run value that starts on the next line": workflow.replace(
+      /^( +)run: (node --test .*)$/m,
+      (all, indent, cmd) =>
+        `${indent}run:\n${indent}  echo \${{ github.event.pull_request.title }} && ${cmd}`,
+    ),
+    // A plain one-line run continued on the next line: YAML folds it into the same script.
+    "an expression on the continuation of a plain run": workflow.replace(
+      /^( +)run: (node --test .*)$/m,
+      (all, indent, cmd) => `${all}\n${indent}  \${{ github.head_ref }}`,
+    ),
+  };
+  for (const [label, text] of Object.entries(mutants)) {
+    assert.notEqual(text, workflow, label);
+    assert.notDeepEqual(prCodeProblems(text), [], label);
+  }
 });
 
 // End to end: the real git in a scratch repository, the way CI calls the check.
