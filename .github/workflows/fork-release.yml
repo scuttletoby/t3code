@@ -6,8 +6,13 @@ name: Fork release
 # upstream tag the commit contains; <n> counts the fork's earlier builds of it.
 #
 # Builds name this repository as their release repository (scripts/lib/release-repository.ts reads
-# GITHUB_REPOSITORY), so the server's update and the desktop app's updater look only at this fork.
-# Publishing makes a normal (not pre-) release marked latest; a draft until every file is uploaded.
+# T3CODE_RELEASE_REPOSITORY, else GITHUB_REPOSITORY in Actions), so the server's update and the
+# desktop app's updater look only at this fork. Publishing makes a normal (not pre-) release, a draft
+# until every file is uploaded, marked latest only when it is the highest fork version.
+#
+# The guards live in .github/scripts/fork-release.sh (tests: fork-release.test.sh, run in preflight):
+# only released upstream code, never a version that is already published, no silent API failures.
+# Actions are pinned by commit. Only the publish job holds a write token, and it runs no package code.
 on:
   workflow_dispatch:
     inputs:
@@ -30,13 +35,41 @@ on:
         required: false
         default: false
         type: boolean
+    # Only the signing secrets release-desktop.yml declares; a caller passes these, never others.
+    secrets:
+      CSC_LINK:
+        required: false
+      CSC_KEY_PASSWORD:
+        required: false
+      APPLE_API_KEY:
+        required: false
+      APPLE_API_KEY_ID:
+        required: false
+      APPLE_API_ISSUER:
+        required: false
+      MACOS_PROVISIONING_PROFILE:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_CLIENT_SECRET:
+        required: false
+      AZURE_TRUSTED_SIGNING_ENDPOINT:
+        required: false
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME:
+        required: false
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME:
+        required: false
+      AZURE_TRUSTED_SIGNING_PUBLISHER_NAME:
+        required: false
     outputs:
       version:
         value: ${{ jobs.preflight.outputs.version }}
       tag:
         value: ${{ jobs.preflight.outputs.tag }}
       published:
-        value: ${{ jobs.publish.result == 'success' }}
+        value: ${{ jobs.publish.outputs.published == 'true' }}
 
 concurrency:
   group: fork-release
@@ -57,51 +90,27 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
       base_tag: ${{ steps.meta.outputs.base_tag }}
+      upstream: ${{ steps.meta.outputs.upstream }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           filter: blob:none
+          persist-credentials: false
 
+      - name: Test the release guards
+        shell: bash
+        run: bash .github/scripts/fork-release.test.sh
+
+      # Refuses unreleased upstream commits, a stray upstream tag and a base above upstream's latest.
       - id: meta
         name: Resolve fork release version
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          upstream="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')"
-          if [[ -z "$upstream" ]]; then
-            echo "::error::$GITHUB_REPOSITORY is not a fork, so there is no upstream release to build on."
-            exit 1
-          fi
-          # The newest stable upstream tag (vX.Y.Z, no suffix) that this commit contains.
-          base_tag=""
-          while read -r tag; do
-            commit="$(git ls-remote "https://github.com/$upstream.git" "refs/tags/$tag^{}" "refs/tags/$tag" | sort -k2 | tail -n1 | cut -f1)"
-            if git merge-base --is-ancestor "$commit" HEAD 2>/dev/null; then
-              base_tag="$tag"
-              break
-            fi
-          done < <(git ls-remote --tags --refs "https://github.com/$upstream.git" 'v*' \
-            | sed -n 's|.*refs/tags/\(v[0-9]\+\.[0-9]\+\.[0-9]\+\)$|\1|p' | sort -rV)
-          if [[ -z "$base_tag" ]]; then
-            echo "::error::$(git rev-parse HEAD) contains no stable $upstream release tag."
-            exit 1
-          fi
-          base="${base_tag#v}"
-          last="$(git ls-remote --tags --refs origin "v$base-fork.*" \
-            | sed -n "s|.*refs/tags/v$base-fork\.\([0-9]\+\)$|\1|p" | sort -n | tail -n1)"
-          version="$base-fork.$(( ${last:-0} + 1 ))"
-          {
-            echo "ref=$(git rev-parse HEAD)"
-            echo "base_tag=$base_tag"
-            echo "version=$version"
-            echo "tag=v$version"
-          } >> "$GITHUB_OUTPUT"
-          echo "Building $version from $(git rev-parse --short HEAD) on $upstream $base_tag." >> "$GITHUB_STEP_SUMMARY"
+        run: bash .github/scripts/fork-release.sh resolve
 
   tests:
     name: Tests
@@ -117,9 +126,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.preflight.outputs.ref }}
+          persist-credentials: false
           sparse-checkout: |
             /*
             !/.repos/
@@ -131,25 +141,33 @@ jobs:
           install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
 
       - name: Align package versions to release version
-        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: node scripts/update-release-package-versions.ts "$VERSION"
 
       - name: Check bundle-only build support
         id: bundle_build
+        shell: bash
         run: |
+          set -euo pipefail
           script="$(node -p "require('./package.json').scripts['build:desktop:bundle'] ? 'build:desktop:bundle' : 'build:desktop'")"
           echo "script=$script" >> "$GITHUB_OUTPUT"
 
       - name: Install browser secret helper build libraries
         if: steps.bundle_build.outputs.script == 'build:desktop'
+        shell: bash
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
 
       - name: Build JS bundle
+        shell: bash
         env:
           T3CODE_TELEMETRY_CHANNEL: dev
           T3CODE_RELEASE_REPOSITORY: ${{ github.repository }}
         run: vp run ${{ steps.bundle_build.outputs.script }}
 
-      # A build that still names upstream would update a fork install to upstream's releases.
+      # A build that still names upstream would update a fork install to upstream's releases. This
+      # is the JS bundle; the assemble job checks the CLI archives, which bundle the server again.
       - name: Check the bundle names this repository
         shell: bash
         run: |
@@ -160,7 +178,7 @@ jobs:
           fi
 
       - name: Upload JS bundle
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-bundle
           path: |
@@ -173,7 +191,20 @@ jobs:
     name: Desktop Linux x64
     needs: [preflight, build_bundle]
     uses: ./.github/workflows/release-desktop.yml
-    secrets: inherit
+    secrets:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      MACOS_PROVISIONING_PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
     with:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ needs.preflight.outputs.ref }}
@@ -197,7 +228,20 @@ jobs:
     name: Desktop Windows x64
     needs: [preflight, build_bundle]
     uses: ./.github/workflows/release-desktop.yml
-    secrets: inherit
+    secrets:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      MACOS_PROVISIONING_PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
     with:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ needs.preflight.outputs.ref }}
@@ -222,7 +266,20 @@ jobs:
     name: Desktop macOS arm64
     needs: [preflight, build_bundle]
     uses: ./.github/workflows/release-desktop.yml
-    secrets: inherit
+    secrets:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      MACOS_PROVISIONING_PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
     with:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ needs.preflight.outputs.ref }}
@@ -246,7 +303,20 @@ jobs:
     name: Desktop macOS x64
     needs: [preflight, build_bundle]
     uses: ./.github/workflows/release-desktop.yml
-    secrets: inherit
+    secrets:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      MACOS_PROVISIONING_PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
     with:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ needs.preflight.outputs.ref }}
@@ -266,22 +336,21 @@ jobs:
       cli_archive: false
       launch_check: false
 
-  publish:
-    name: Publish release
+  # Collects and checks every release file with a read-only token; package code runs here only.
+  assemble:
+    name: Assemble release files
     needs:
       [preflight, tests, desktop_linux_x64, desktop_win_x64, desktop_mac_arm64, desktop_mac_x64]
-    if: ${{ inputs.publish }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.preflight.outputs.ref }}
           fetch-depth: 0
           filter: blob:none
+          persist-credentials: false
 
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
@@ -289,14 +358,14 @@ jobs:
           install-args: --filter=@t3tools/scripts...
 
       - name: Download desktop builds
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: desktop-*
           merge-multiple: true
           path: release-assets
 
       - name: Download CLI archives
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: cli-*
           merge-multiple: true
@@ -304,20 +373,29 @@ jobs:
 
       - name: Write CLI archive checksums
         shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           cd release-assets
           shopt -s nullglob
           archives=(t3-*.tar.gz t3-*.zip)
-          if [[ ! -f "t3-${{ needs.preflight.outputs.version }}-linux-x64.tar.gz" ]]; then
+          if [[ ! -f "t3-$VERSION-linux-x64.tar.gz" ]]; then
             echo "::error::The Linux x64 server archive is missing." >&2
             exit 1
           fi
           sha256sum "${archives[@]}" > SHA256SUMS
           cat SHA256SUMS
 
+      # The `t3` executable in each archive bundles the server again (release-desktop.yml build-exe).
+      - name: Check the CLI archives name this repository
+        shell: bash
+        run: bash .github/scripts/fork-release.sh check-archives release-assets
+
       - name: Merge macOS updater manifests
+        shell: bash
         run: |
+          set -euo pipefail
           shopt -s nullglob
           for x64_manifest in release-assets/*-mac-x64.yml; do
             arm64_manifest="${x64_manifest%-x64.yml}.yml"
@@ -328,7 +406,9 @@ jobs:
           done
 
       - name: Name the Windows updater manifest
+        shell: bash
         run: |
+          set -euo pipefail
           shopt -s nullglob
           for x64_manifest in release-assets/*-win-x64.yml; do
             mv "$x64_manifest" "${x64_manifest%-win-x64.yml}.yml"
@@ -349,33 +429,69 @@ jobs:
       - name: Write release notes
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ needs.preflight.outputs.upstream }}
           BASE_TAG: ${{ needs.preflight.outputs.base_tag }}
           REF: ${{ needs.preflight.outputs.ref }}
         run: |
           set -euo pipefail
-          upstream="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name')"
-          git fetch --no-tags "https://github.com/$upstream.git" "refs/tags/$BASE_TAG:refs/upstream/$BASE_TAG"
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$BASE_TAG:refs/upstream/$BASE_TAG"
           {
-            echo "Upstream [$BASE_TAG](https://github.com/$upstream/releases/tag/$BASE_TAG) with this fork's changes on top:"
+            echo "Upstream [$BASE_TAG](https://github.com/$UPSTREAM/releases/tag/$BASE_TAG) with this fork's changes on top:"
             echo
             git log --reverse --format='- %s (%h)' "refs/upstream/$BASE_TAG..$REF"
-          } > release-notes.md
-          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+          } > release-assets/release-notes.md
+          cat release-assets/release-notes.md >> "$GITHUB_STEP_SUMMARY"
 
-      # A run that stopped after creating its draft leaves it behind; drafts have no tag yet, so this
-      # run picked the same version. Published releases are never touched.
-      - name: Remove a draft left by an earlier run
+      - name: Upload release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-files
+          path: release-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job with a write token: it checks out just the guard script and runs no package code.
+  publish:
+    name: Publish release
+    needs: [preflight, assemble]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+    steps:
+      - name: Checkout the guard script
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Download release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-files
+          path: release-assets
+
+      - name: Move the release notes aside
+        shell: bash
+        run: mv release-assets/release-notes.md release-notes.md
+
+      # "Re-run failed jobs" reuses the preflight's version: refuse it once a tag or published
+      # release has it. Drafts have no tag; one left by a stopped run of this version is removed.
+      - name: Refuse a published version, remove leftover drafts
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
-            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id" \
-            | while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"; done
+        run: bash .github/scripts/fork-release.sh remove-drafts "$TAG"
 
       - name: Create the release as a draft
-        uses: softprops/action-gh-release@v3
+        id: draft
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           target_commitish: ${{ needs.preflight.outputs.ref }}
@@ -383,7 +499,7 @@ jobs:
           body_path: release-notes.md
           draft: true
           prerelease: false
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
           files: |
             release-assets/*.dmg
             release-assets/*.zip
@@ -394,8 +510,14 @@ jobs:
             release-assets/*.tar.gz
             release-assets/SHA256SUMS
 
-      # Updaters skip drafts, so nobody sees a release until every file above is uploaded.
-      - name: Publish the draft as the latest release
+      # Updaters skip drafts, so nobody sees a release until every file above is uploaded. The tag
+      # check runs again right before; latest only when no published fork version is as high.
+      - name: Publish the draft
+        id: publish
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${{ needs.preflight.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: bash .github/scripts/fork-release.sh publish "$RELEASE_ID" "$TAG" "$VERSION"
