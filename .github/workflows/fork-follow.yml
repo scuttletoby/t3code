@@ -1,0 +1,176 @@
+name: Fork follow upstream
+
+# Daily: keeps this fork's patch series on upstream's newest stable release and publishes it.
+# - Upstream has a newer stable tag: rebase the series onto it, test, build, publish, then move the
+#   series branch to the result.
+# - Same tag, but the series has commits no fork release has: test, build and publish them.
+# - Anything fails (conflict, schema change, red test, failed build): open or update one issue and
+#   publish nothing, so the last fork release stays current.
+#
+# Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN: a token that may push
+# this repository's contents and workflow files (GITHUB_TOKEN may not push commits that change
+# .github/workflows); only a rebase needs it.
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: fork-follow
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SERIES_BRANCH: ${{ vars.FORK_SERIES_BRANCH || 'main' }}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      base_tag: ${{ steps.plan.outputs.base_tag }}
+      candidate: ${{ steps.plan.outputs.candidate }}
+      previous_head: ${{ steps.plan.outputs.previous_head }}
+      dropped: ${{ steps.plan.outputs.dropped }}
+    steps:
+      - name: Checkout the series
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SERIES_BRANCH }}
+          fetch-depth: 0
+          filter: blob:none
+          token: ${{ secrets.FORK_PUSH_TOKEN || github.token }}
+
+      - id: plan
+        name: Plan and rebase
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ runner.temp }}/fork-follow-report.md
+        run: |
+          set -euo pipefail
+          UPSTREAM="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')"
+          if [[ -z "$UPSTREAM" ]]; then
+            echo "$GITHUB_REPOSITORY is not a fork, so there is no upstream to follow." > "$REPORT"
+            exit 1
+          fi
+          export UPSTREAM
+          bash .github/scripts/fork-follow.sh
+
+      - name: Push the rebased series as a candidate
+        if: steps.plan.outputs.action == 'rebase'
+        env:
+          HAS_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN != '' }}
+          REPORT: ${{ runner.temp }}/fork-follow-report.md
+        run: |
+          set -euo pipefail
+          if [[ "$HAS_PUSH_TOKEN" != "true" ]]; then
+            echo "Rebasing onto ${{ steps.plan.outputs.base_tag }} needs the FORK_PUSH_TOKEN secret (contents and workflows write)." > "$REPORT"
+            exit 1
+          fi
+          git push --force origin "HEAD:refs/heads/fork-follow/candidate"
+
+      - name: Keep the failure report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-follow-report
+          path: ${{ runner.temp }}/fork-follow-report.md
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Release
+    needs: [plan]
+    if: needs.plan.outputs.action == 'release' || needs.plan.outputs.action == 'rebase'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/fork-release.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.plan.outputs.candidate }}
+      publish: true
+
+  advance:
+    name: Move the series branch
+    needs: [plan, release]
+    if: needs.plan.outputs.action == 'rebase' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.candidate }}
+          fetch-depth: 0
+          filter: blob:none
+          token: ${{ secrets.FORK_PUSH_TOKEN }}
+
+      # The lease refuses if the branch moved since the plan (a fork PR merged meanwhile); the next
+      # run rebases again with that change, and the release just published stays valid.
+      - name: Move the series branch to the released commit
+        run: |
+          set -euo pipefail
+          git push \
+            --force-with-lease="refs/heads/$SERIES_BRANCH:${{ needs.plan.outputs.previous_head }}" \
+            origin "${{ needs.plan.outputs.candidate }}:refs/heads/$SERIES_BRANCH"
+          git push origin --delete fork-follow/candidate || true
+
+  report:
+    name: Report
+    needs: [plan, release, advance]
+    if: always() && needs.plan.outputs.action != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Download the failure report
+        if: contains(needs.*.result, 'failure')
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: fork-follow-report
+          path: report
+
+      - name: Open, update or close the follow issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          BASE_TAG: ${{ needs.plan.outputs.base_tag }}
+          DROPPED: ${{ needs.plan.outputs.dropped }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Fork cannot follow upstream"
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)"
+          if [[ "$FAILED" == "true" ]]; then
+            {
+              echo "Run: $RUN_URL"
+              echo
+              if [[ -f report/fork-follow-report.md ]]; then
+                cat report/fork-follow-report.md
+              else
+                echo "A test, build or publish job failed${BASE_TAG:+ for $BASE_TAG}; see the run. Nothing was published."
+              fi
+            } > body.md
+            if [[ -n "$issue" ]]; then
+              gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file body.md
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+            fi
+            exit 0
+          fi
+          note="Published the fork release on $BASE_TAG: $RUN_URL"
+          if [[ -n "$DROPPED" ]]; then
+            note="$note"$'\n\n'"Dropped because upstream now has them: ${DROPPED//;/, }"
+          fi
+          echo "$note" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$issue" ]]; then
+            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "$note"
+          fi
