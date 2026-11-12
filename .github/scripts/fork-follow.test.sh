@@ -231,6 +231,22 @@ fork_tag v0.1.10-fork.1
 plan
 check "plan: upstream moved the tag the series was built on -> named" has "moved the tag v0.1.10" "$root/report.md"
 
+# State: empty or tagless history. No stable tag upstream, or none inside the series.
+new_upstream
+new_fork v0.1.10
+for t in v0.1.8 v0.1.9 v0.1.10; do git -C "$root/gh/up/t3code.git" tag -d "$t" > /dev/null; done
+work git tag -d v0.1.8 v0.1.9 v0.1.10
+plan
+check "plan: upstream has no stable tag -> refused with a reason, nothing planned" \
+  eval 'has "no stable release tag" "$root/report.md" && [[ -z "$(out action)" ]]'
+new_upstream
+new_fork v0.1.8
+git -C "$root/gh/up/t3code.git" tag -d v0.1.8 > /dev/null
+work git tag -d v0.1.8
+plan
+check "plan: the series contains no stable upstream tag -> refused with a reason" \
+  eval 'has "contains no stable" "$root/report.md" && [[ -z "$(out action)" ]]'
+
 # Major: a release was published, then the series branch did not move. The next plan moves the
 # branch to that release instead of building and publishing another one.
 new_upstream
@@ -277,6 +293,13 @@ check "push: a working token passes the check" push check
 prev="$(series)"
 work git commit -q --allow-empty -m "fork: next"
 next="$(work_head)"
+# Minor: a refused candidate push (say, a token without Workflows write) leaves a reason.
+hook="$root/gh/me/t3code.git/hooks/pre-receive"
+printf '#!/bin/sh\necho "refusing to allow a token without workflows permission" >&2\nexit 1\n' > "$hook" && chmod +x "$hook"
+rm -f "$root/report.md"
+check "push: a refused candidate push fails with git's reason" \
+  eval '! push candidate "$next" && has "Could not push the candidate" "$root/report.md" && has "workflows permission" "$root/report.md"'
+rm -f "$hook"
 push candidate "$next"
 check "push: the candidate goes to fork-follow/candidate" eval '[[ "$(series fork-follow/candidate)" == "$next" ]] && has candidate_pushed=true "$root/push.out"'
 push advance "$prev" "$next"
