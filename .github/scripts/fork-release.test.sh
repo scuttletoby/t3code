@@ -20,11 +20,13 @@ export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code
 unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY UPSTREAM UPSTREAM_URL ORIGIN
 
 # Fake gh: `gh api [-X M] PATH [--paginate] [--jq EXPR] [-f/-F k=v]...` served from $root/api.
+# fork_test_gh (fork-test-gh.sh) installs it first on PATH, with no token, a .invalid GH_HOST and
+# FORK_TEST_MODE, so the script refuses to run if any other gh would answer.
+. "$here/fork-test-gh.sh"
 mkdir -p "$root/bin" "$root/api"
-cat > "$root/bin/gh" <<'GH'
-#!/usr/bin/env bash
+fork_test_gh "$root/bin" <<'GH'
 set -euo pipefail
-api="$FAKE_API"
+api="${FAKE_API:?the gh stub needs FAKE_API}"
 echo "gh $*" >> "$api/calls"
 [[ "$1" == api ]] || { echo "fake gh: only api" >&2; exit 2; }
 shift
@@ -55,8 +57,7 @@ case "$method $path" in
 esac
 if [[ -n "$jq" ]]; then jq -r "$jq" <<< "$body"; else echo "$body"; fi
 GH
-chmod +x "$root/bin/gh"
-export PATH="$root/bin:$PATH" FAKE_API="$root/api"
+export FAKE_API="$root/api"
 
 failures=0
 pass() { echo "ok   $1"; }
@@ -286,6 +287,32 @@ check_gt v0.1.10-fork.1 v0.1.9-fork.12 gt
 check_gt 0.1.9-fork.2 0.1.9-fork.2 not
 check_gt 0.1.9-fork.2 0.2.0-fork.1 not
 check_gt v1.0.0 v0.1.10 gt
+
+# --- gh: never GitHub outside a run (fork-gh-guard.sh) ------------------------------------------
+# A gh that is not the stub answers like GitHub and records every call; the script must refuse
+# before it calls any gh: neither this one nor the stub.
+mkdir -p "$root/decoy"
+printf '#!/usr/bin/env bash\necho "gh $*" >> "%s"\necho "[]"\n' "$root/decoy.calls" > "$root/decoy/gh"
+chmod +x "$root/decoy/gh"
+new_upstream
+new_fork v0.1.9
+reset_api v0.1.9
+refuses() { # refuses NAME ENV...: resolve and remove-drafts, run with ENV, fail, say why, call no gh
+  local name="$1" sub ok=true
+  shift
+  for sub in resolve "remove-drafts v0.1.9-fork.1"; do
+    rm -f "$root/decoy.calls" "$root/api/calls"
+    # shellcheck disable=SC2086
+    if (cd "$root/work" && env "$@" "$script" $sub) > "$root/out" 2>&1; then ok=false; fi
+    [[ ! -e "$root/decoy.calls" && ! -e "$root/api/calls" ]] || ok=false
+    grep -q "Refusing to run fork-release.sh" "$root/out" || ok=false
+  done
+  if $ok; then pass "$name"; else fail "$name"; fi
+}
+refuses "gh: a test run without the stub first on PATH fails closed and never calls gh" PATH="$root/decoy:$PATH"
+refuses "gh: run by hand (no test mode, not in a GitHub Actions run) refuses" FORK_TEST_MODE= PATH="$root/decoy:$PATH"
+refuses "gh: test mode with a GitHub token set refuses, even with the stub" GH_TOKEN=x
+refuses "gh: test mode with GH_HOST github.com refuses" GH_HOST=github.com
 
 if (( failures )); then
   echo "$failures failed"
