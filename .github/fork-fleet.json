@@ -2,14 +2,13 @@
   "_doc": [
     "Where fork-tests.yml's Linux jobs run: this repository's own fleet of self-hosted runners, or GitHub-hosted.",
     "The one place for every fact about this repository and its fleet: .github/scripts/fork-fleet.py has none.",
-    "Read by `route` (fork-tests.yml), `sweep` (fork-fleet.yml), `capacity` (a step of each routed job) and `gate`",
-    "(each fleet runner's job-started hook runs an installed copy of the script with an installed copy of this file).",
-    "The setting is the repository variable named in `variable`: auto (unset too), fleet or github. Runbook:",
-    ".github/fork-fleet.md."
+    "Read by `route` (a step of fork-tests.yml's changes job), `watch` (fork-tests.yml), `sweep` (fork-fleet.yml),",
+    "and on each fleet host by `dispatch` and `gate` (an installed copy of main's script and of this file).",
+    "The setting is the repository variable named in `variable`: auto (unset too), fleet or github.",
+    "Runbook, owner steps and the failure table: .github/fork-fleet.md."
   ],
   "repository": "scuttletoby/t3code",
   "variable": "CI_RUNNERS",
-  "token_secret": "FLEET_RUNNERS_TOKEN",
   "hosted": "ubuntu-24.04",
   "trusted": {
     "workflows": [".github/workflows/fork-tests.yml"],
@@ -18,24 +17,28 @@
   },
   "pools": [
     {
-      "_doc": "The owner's PC: one-job (JIT) registrations, so a runner is online only while the PC waits for a job.",
+      "_doc": "The owner's PC: its dispatcher runs on the always-on host and starts runners on the PC over ssh.",
       "name": "pc",
-      "labels": ["fleet-pc-t3code"],
-      "runner_name": "^fleet-pc-t3code$",
-      "capacity": null,
+      "label": "fleet-pc-t3code",
+      "slots": 1,
+      "beacon": "FLEET_BEACON_PC",
+      "launch": ["/opt/fork-fleet/launch-pc"],
       "waits": false
     },
     {
-      "_doc": "A sandboxed always-on runner VM (one runner, memory check before each job): fleet mode queues here.",
-      "name": "vm106",
-      "labels": ["self-hosted", "fleet-vm106-t3code"],
-      "runner_name": "^vm106-t3code$",
-      "capacity": ["/usr/local/bin/t3-capacity", "{mb}"],
+      "_doc": "A sandboxed always-on runner VM: fleet mode queues here.",
+      "name": "vm",
+      "label": "fleet-vm-t3code",
+      "slots": 2,
+      "beacon": "FLEET_BEACON_VM",
+      "launch": ["/opt/fork-fleet/fork-fleet-launch.sh"],
       "waits": true
     }
   ],
-  "capacity_wait": { "every_seconds": 30, "max_seconds": 300 },
+  "beacon_fresh_seconds": 180,
   "stuck_seconds": 600,
+  "fleet_stuck_seconds": 7200,
+  "dispatch": { "every_seconds": 20, "beacon_seconds": 60, "idle_passes": 3 },
   "jobs": [
     { "job": "test", "shards": 2, "gates": ["test"], "memory_mb": 4096 },
     { "job": "test_web", "shards": 2, "gates": ["test_web"], "memory_mb": 4096 },

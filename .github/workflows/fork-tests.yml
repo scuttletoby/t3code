@@ -14,17 +14,21 @@ name: Fork tests
 # Require only `fork-ci-result` in a ruleset: it needs every other job, so jobs
 # can be added, split or resharded without touching the ruleset.
 #
-# Runners: the `route` job picks, per Linux job, one of this repository's own
-# fleet runners or GitHub-hosted Ubuntu 24.04 (like upstream's runners, so an OS
-# upgrade is a reviewed change here, not a surprise from ubuntu-latest). The
-# setting is the repository variable CI_RUNNERS: auto (unset too), fleet or
-# github; facts about the fleet are in .github/fork-fleet.json, the runbook in
-# .github/fork-fleet.md. Only trusted runs may use the fleet (pushes to main and
-# the owner's own pull requests from this repository): this repository is
-# public, and a pull request from a fork must never run its code on a fleet
-# machine. Each fleet runner's job-started hook refuses any other job, so naming
-# a fleet label in a changed workflow does not get past that. The macOS job and
-# the short jobs before and after the tests stay GitHub-hosted.
+# Runners: the `route` step of `changes` picks, per Linux job, this
+# repository's own fleet or GitHub-hosted Ubuntu 24.04 (like upstream's runners,
+# so an OS upgrade is a reviewed change here, not a surprise from
+# ubuntu-latest). The setting is the repository variable CI_RUNNERS: auto
+# (unset too), fleet or github; facts about the fleet are in
+# .github/fork-fleet.json, the runbook in .github/fork-fleet.md. Only trusted
+# runs may use the fleet (pushes to main and the owner's own pull requests from
+# this repository): this repository is public, and a pull request from a fork
+# must never run its code on a fleet machine. No fleet runner waits for work: a
+# dispatcher on each fleet host reads GitHub's record of a run and starts a
+# one-job runner only for a queued job of a trusted run that asks for the
+# random label `route` made for it. So a changed workflow that names a fleet
+# label finds no runner, and each runner's job-started hook kills any job but
+# the one it was made for. The macOS job and the short jobs before and after the
+# tests stay GitHub-hosted.
 #
 # Two modes:
 # - pull_request / push to main: CI. Jobs a change cannot affect are skipped by
@@ -105,6 +109,11 @@ jobs:
       rust: ${{ steps.release.outputs.rust || steps.detect.outputs.rust }}
       release_smoke: ${{ steps.release.outputs.release_smoke || steps.detect.outputs.release_smoke }}
       mobile_native: ${{ steps.release.outputs.mobile_native || steps.fork.outputs.mobile_native }}
+      # Where each Linux job runs (the `route` step; empty in a release run, which is GitHub-hosted).
+      runners: ${{ steps.route.outputs.runners }}
+      fleet_mode: ${{ steps.route.outputs.mode }}
+      fleet_attempt: ${{ steps.route.outputs.attempt }}
+      fleet_watch: ${{ steps.route.outputs.watch || 'false' }}
     steps:
       - name: Checkout
         if: inputs.ref == ''
@@ -117,6 +126,8 @@ jobs:
             /.github/actions/ci-changes/
             /*/package.json
             /*/*/package.json
+            /.github/fork-fleet.json
+            /.github/scripts/fork-fleet.py
             !/.repos/
           sparse-checkout-cone-mode: false
 
@@ -172,38 +183,51 @@ jobs:
           echo "test_packages=" >> "$GITHUB_OUTPUT"
           echo "mobile_native=false" >> "$GITHUB_OUTPUT"
 
-  # Where each Linux job below runs (.github/scripts/fork-fleet.py route). It
-  # never fails for GitHub trouble in auto mode: anything unclear is
-  # GitHub-hosted with a note. A failed or missing route also means
-  # GitHub-hosted, and fork-ci-result fails. A re-run of failed jobs keeps this
-  # job's answer only in fleet mode; in auto mode it goes GitHub-hosted.
-  route:
-    name: Route
+      # Where each Linux job below runs (.github/scripts/fork-fleet.py route). It
+      # calls no API and never fails for the fleet: a pool counts only with a
+      # fresh heartbeat (a repository variable its dispatcher writes), anything
+      # unclear is GitHub-hosted with a note. A failed step fails `changes`; an
+      # empty answer means GitHub-hosted. A re-run of failed jobs keeps this
+      # answer only while the setting is still fleet; otherwise it is GitHub-hosted.
+      # Each pool's heartbeat is passed by name: a toJSON of all variables would print the rest.
+      - name: Route
+        id: route
+        if: inputs.ref == ''
+        env:
+          FLEET_MODE: ${{ vars.CI_RUNNERS }}
+          FLEET_BEACON_PC: ${{ vars.FLEET_BEACON_PC }}
+          FLEET_BEACON_VM: ${{ vars.FLEET_BEACON_VM }}
+          GATES: ${{ toJSON(steps.detect.outputs) }}
+        run: python3 -I .github/scripts/fork-fleet.py route
+
+  # A fleet job that waits too long for its runner cancels the run with an
+  # error (.github/scripts/fork-fleet.py watch): 10 minutes in auto mode (the
+  # sweep then re-runs it GitHub-hosted), 120 in fleet mode. Only in a run
+  # that sent a job to the fleet.
+  fleet_watch:
+    name: Fleet watch
     needs: changes
-    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled()) }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (needs.changes.outputs.fleet_watch == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      runners: ${{ steps.route.outputs.runners }}
-      mode: ${{ steps.route.outputs.mode }}
-      attempt: ${{ steps.route.outputs.attempt }}
+    timeout-minutes: 125
+    permissions:
+      actions: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /.github/fork-fleet.json
             /.github/scripts/fork-fleet.py
           sparse-checkout-cone-mode: false
 
-      - name: Pick fleet or GitHub-hosted for each job
-        id: route
+      - name: Cancel the run if a fleet job waits too long
         env:
-          FLEET_MODE: ${{ vars.CI_RUNNERS }}
-          FLEET_TOKEN: ${{ secrets.FLEET_RUNNERS_TOKEN }}
-          GATES: ${{ toJSON(needs.changes.outputs) }}
-        run: python3 -I .github/scripts/fork-fleet.py route
+          FLEET_MODE: ${{ needs.changes.outputs.fleet_mode }}
+          FLEET_RUNNERS: ${{ needs.changes.outputs.runners }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/fork-fleet.py watch
 
   # A broken fork workflow is red on its own pull request, and the fork copy
   # must follow upstream's test jobs: the drift check lists every job and step
@@ -303,10 +327,10 @@ jobs:
 
   lint:
     name: Lint
-    needs: [changes, route]
+    needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
-    # Fleet or GitHub-hosted: the `route` job (.github/fork-fleet.json).
-    runs-on: ${{ (needs.route.outputs.attempt == github.run_attempt || needs.route.outputs.mode == 'fleet') && fromJSON(needs.route.outputs.runners || '{}')['lint'] || 'ubuntu-24.04' }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['lint'] || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -318,10 +342,6 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
-
-      # A fleet runner waits here until its pool's memory check passes; GitHub-hosted: nothing.
-      - name: Wait for memory on a fleet runner
-        run: python3 -I .github/scripts/fork-fleet.py capacity lint
 
       - name: Reject repository-owned PR assets
         run: |
@@ -357,10 +377,10 @@ jobs:
 
   build:
     name: Build and Typecheck
-    needs: [changes, route]
+    needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false')) }}
-    # Fleet or GitHub-hosted: the `route` job (.github/fork-fleet.json).
-    runs-on: ${{ (needs.route.outputs.attempt == github.run_attempt || needs.route.outputs.mode == 'fleet') && fromJSON(needs.route.outputs.runners || '{}')['build'] || 'ubuntu-24.04' }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['build'] || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -372,10 +392,6 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
-
-      # A fleet runner waits here until its pool's memory check passes; GitHub-hosted: nothing.
-      - name: Wait for memory on a fleet runner
-        run: python3 -I .github/scripts/fork-fleet.py capacity build
 
       # Runs in the background while Vite+ installs; the step before the build waits for it.
       # Xvfb is for the desktop launch check below.
@@ -521,10 +537,10 @@ jobs:
   # vitest slice of every large package and half of the others, whole.
   test:
     name: Test ${{ matrix.shard }}
-    needs: [changes, route]
+    needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test != 'false') }}
-    # Fleet or GitHub-hosted: the `route` job (.github/fork-fleet.json).
-    runs-on: ${{ (needs.route.outputs.attempt == github.run_attempt || needs.route.outputs.mode == 'fleet') && fromJSON(needs.route.outputs.runners || '{}')[format('test-{0}', matrix.shard)] || 'ubuntu-24.04' }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test-{0}', matrix.shard)] || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -540,10 +556,6 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
-
-      # A fleet runner waits here until its pool's memory check passes; GitHub-hosted: nothing.
-      - name: Wait for memory on a fleet runner
-        run: python3 -I .github/scripts/fork-fleet.py capacity test
 
       # A shard with nothing to run says so in the summary and stops here.
       - name: Pick this shard's packages
@@ -653,10 +665,10 @@ jobs:
   # took 7.5 minutes, so two runners each take a vitest slice.
   test_web:
     name: Test Web ${{ matrix.shard }}
-    needs: [changes, route]
+    needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test_web != 'false') }}
-    # Fleet or GitHub-hosted: the `route` job (.github/fork-fleet.json).
-    runs-on: ${{ (needs.route.outputs.attempt == github.run_attempt || needs.route.outputs.mode == 'fleet') && fromJSON(needs.route.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)] || 'ubuntu-24.04' }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)] || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -672,10 +684,6 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
-
-      # A fleet runner waits here until its pool's memory check passes; GitHub-hosted: nothing.
-      - name: Wait for memory on a fleet runner
-        run: python3 -I .github/scripts/fork-fleet.py capacity test_web
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
@@ -723,10 +731,10 @@ jobs:
   # release run's resolved commit (seconds; every other job waits for it too).
   test_server:
     name: Test Server ${{ matrix.shard }}
-    needs: [changes, route]
+    needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
-    # Fleet or GitHub-hosted: the `route` job (.github/fork-fleet.json).
-    runs-on: ${{ (needs.route.outputs.attempt == github.run_attempt || needs.route.outputs.mode == 'fleet') && fromJSON(needs.route.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)] || 'ubuntu-24.04' }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)] || 'ubuntu-24.04' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -743,10 +751,6 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
-
-      # A fleet runner waits here until its pool's memory check passes; GitHub-hosted: nothing.
-      - name: Wait for memory on a fleet runner
-        run: python3 -I .github/scripts/fork-fleet.py capacity test_server
 
       - name: Detect affected jobs
         id: changes
@@ -864,10 +868,10 @@ jobs:
 
   rust:
     name: Rust
-    needs: [changes, route]
+    needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.rust != 'false') }}
-    # Fleet or GitHub-hosted: the `route` job (.github/fork-fleet.json).
-    runs-on: ${{ (needs.route.outputs.attempt == github.run_attempt || needs.route.outputs.mode == 'fleet') && fromJSON(needs.route.outputs.runners || '{}')['rust'] || 'ubuntu-24.04' }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['rust'] || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -879,10 +883,6 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
-
-      # A fleet runner waits here until its pool's memory check passes; GitHub-hosted: nothing.
-      - name: Wait for memory on a fleet runner
-        run: python3 -I .github/scripts/fork-fleet.py capacity rust
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -936,10 +936,10 @@ jobs:
 
   release_smoke:
     name: Release Smoke
-    needs: [changes, route]
+    needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.release_smoke != 'false') }}
-    # Fleet or GitHub-hosted: the `route` job (.github/fork-fleet.json).
-    runs-on: ${{ (needs.route.outputs.attempt == github.run_attempt || needs.route.outputs.mode == 'fleet') && fromJSON(needs.route.outputs.runners || '{}')['release_smoke'] || 'ubuntu-24.04' }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['release_smoke'] || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -951,10 +951,6 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
-
-      # A fleet runner waits here until its pool's memory check passes; GitHub-hosted: nothing.
-      - name: Wait for memory on a fleet runner
-        run: python3 -I .github/scripts/fork-fleet.py capacity release_smoke
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
@@ -979,7 +975,7 @@ jobs:
       [
         outside_pr,
         changes,
-        route,
+        fleet_watch,
         workflows,
         secrets,
         lint,
@@ -1016,7 +1012,8 @@ jobs:
               else "no native mobile source, Brewfile or CI workflow changed" end),
             release_smoke: "the change does not affect scripts/",
             secrets: "release run: the commit was scanned on its way to main",
-            outside_pr: "not a pull request from another fork"
+            outside_pr: "not a pull request from another fork",
+            fleet_watch: "no job of this run went to the fleet"
           }'
           {
             echo "### fork-ci-result"

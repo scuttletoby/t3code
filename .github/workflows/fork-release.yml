@@ -146,6 +146,13 @@ jobs:
   tests:
     name: Tests
     needs: [preflight]
+    # A called workflow's job may not ask for more than its caller grants, even a job that is
+    # skipped: fork-tests.yml's fleet_watch asks for actions: write (it cancels a run stuck waiting
+    # for the fleet; never in a release run, which is GitHub-hosted). fork-tests.yml's own
+    # top-level permissions keep its other jobs at contents: read.
+    permissions:
+      actions: write
+      contents: read
     uses: ./.github/workflows/fork-tests.yml
     with:
       ref: ${{ needs.preflight.outputs.ref }}
