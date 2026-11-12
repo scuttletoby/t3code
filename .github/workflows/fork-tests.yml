@@ -483,7 +483,7 @@ jobs:
 
       - name: Test release checks
         if: matrix.shard == 1
-        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs
+        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/test-delta.test.cjs
 
       - name: Finish installing browser secret helper build libraries
         if: steps.shard.outputs.any == 'true'
@@ -578,8 +578,10 @@ jobs:
             node apps/web/node_modules/playwright/cli.js install-deps chromium
           fi
 
-      # Upstream: `vp run --filter @t3tools/web test`. Same script, run in its
-      # directory, because `vp run` does not pass --shard through to vitest.
+      # Upstream: `vp run --filter @t3tools/web test --shard N/total`. The same
+      # script, run in its directory with the slice, as on the Test shards.
+      # Upstream's release test_web also boots the built client on shard 1;
+      # here the Build job does that, for CI and release runs alike.
       - name: Test
         env:
           SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
@@ -666,6 +668,16 @@ jobs:
             node apps/server/node_modules/playwright-core/cli.js install-deps chromium
           fi
 
+      # As upstream: Vitest's module cache, saved only by pushes to main so
+      # pull requests never evict each other's entries.
+      - name: Restore Vitest module cache
+        if: steps.changes.outputs.test_server != 'false'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: node_modules/.vitest-cache
+          key: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
+          restore-keys: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+
       - name: Test
         if: steps.changes.outputs.test_server != 'false'
         env:
@@ -674,15 +686,14 @@ jobs:
         run: >-
           vp run test:cached -- --shard ${{ matrix.shard }}/${{ strategy.job-total }}
           --uncached apps/server/integration/transferBudgetV2.integration.test.ts
-          --verify-hits 1 --report "${{ runner.temp }}/test-cache-${{ matrix.shard }}.json" apps/server
+          --verify-hits 1 apps/server
 
-      - name: Upload test cache measurements
-        if: always() && steps.changes.outputs.test_server != 'false'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - name: Save Vitest module cache
+        if: github.event_name == 'push' && steps.changes.outputs.test_server != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          name: test-cache-${{ matrix.shard }}
-          path: ${{ runner.temp }}/test-cache-${{ matrix.shard }}.json
-          if-no-files-found: error
+          path: node_modules/.vitest-cache
+          key: vitest-modules-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
 
       # integration/transferBudgetV2.integration.test.ts writes the report; exactly one shard
       # produces these files.

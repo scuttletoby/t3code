@@ -164,7 +164,7 @@
         },
         {
           "name": "Test release checks",
-          "digest": "71e6a78fc8671f6f"
+          "digest": "fbb6d647ca2913e8"
         },
         {
           "name": "Finish installing browser secret helper build libraries",
@@ -177,7 +177,7 @@
       ]
     },
     "test_web": {
-      "header": "0f5921c085423d52",
+      "header": "f070980792433ae6",
       "steps": [
         {
           "name": "Checkout",
@@ -205,7 +205,7 @@
         },
         {
           "name": "Test",
-          "digest": "b10e14843b443739"
+          "digest": "fc0c7beecafd3de9"
         }
       ]
     },
@@ -241,12 +241,16 @@
           "digest": "862e4a563cb8a6b1"
         },
         {
-          "name": "Test",
-          "digest": "1b94880171b914ed"
+          "name": "Restore Vitest module cache",
+          "digest": "a9f2e0ea95ad6af3"
         },
         {
-          "name": "Upload test cache measurements",
-          "digest": "10c0ad9a0337747b"
+          "name": "Test",
+          "digest": "937c849dc92283cb"
+        },
+        {
+          "name": "Save Vitest module cache",
+          "digest": "2af919f0e9798f00"
         },
         {
           "name": "Detect transfer budget report",
@@ -391,7 +395,7 @@
       ]
     },
     "test_web": {
-      "header": "fb7844322e849dba",
+      "header": "558b5ad0011b866b",
       "steps": [
         {
           "name": "Checkout",
@@ -419,11 +423,11 @@
         },
         {
           "name": "Test",
-          "digest": "b10e14843b443739"
+          "digest": "fc0c7beecafd3de9"
         },
         {
           "name": "Boot the built web client",
-          "digest": "354fd8deb3f3b123"
+          "digest": "4ee85e6cd11f1d42"
         }
       ]
     },
