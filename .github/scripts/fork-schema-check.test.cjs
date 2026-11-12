@@ -94,13 +94,21 @@ test("a check file or .gitattributes the branch carries unchanged from the base 
 });
 
 test("a branch built on an old, rebased main is told to rebase, not to merge past red", () => {
-  const changes = [changed(CHECK_FILES[0], undefined, "old copy")];
+  const changes = [{ ...changed(CHECK_FILES[0], undefined, "old copy"), fromOldMain: true }];
   const reasons = findSchemaChanges(changes, { ...noClosure, staleCommits: 2 });
   assert.equal(reasons.length, 2);
   for (const reason of reasons) {
-    assert.match(reason, /rebase it onto main/);
+    assert.match(reason, /rebase/);
     assert.doesNotMatch(reason, /merges past/);
   }
+});
+
+test("on a stale branch, a real edit to the check is still reported as one", () => {
+  const changes = [{ ...changed(CHECK_FILES[0], "a", "weakened"), fromOldMain: false }];
+  const reasons = findSchemaChanges(changes, { ...noClosure, staleCommits: 1 });
+  assert.equal(reasons.length, 2);
+  assert.match(reasons[0], /already on main/);
+  assert.match(reasons[1], /changes the schema check itself.*\(also rebase onto main\)/);
 });
 
 test("parseRawDiff fails loudly on output it cannot read", () => {
@@ -185,6 +193,8 @@ test("the closure follows relative and package subpath imports, not root barrels
     "apps/server/src/orchestration-v2/types.ts",
     "apps/server/src/persistence/Migrations.ts",
     `${MIGRATIONS}/001_A.ts`,
+    // `Thread` is declared nowhere, so the barrel is guarded whole (fail closed).
+    "packages/contracts/src/index.ts",
     "packages/shared/src/assistantCitations.ts",
     "packages/shared/src/threadLinks.ts",
   ]);
@@ -223,7 +233,50 @@ test("the closure follows a package root only to the files that declare the impo
     `${MIGRATIONS}/064_Links.ts`,
     "packages/contracts/src/aliases.ts",
     "packages/contracts/src/baseSchemas.ts",
+    // The barrel on the way is guarded (an edit to it could re-point a name), not followed:
+    // settings.ts stays free.
+    "packages/contracts/src/index.ts",
     "packages/contracts/src/threadPullRequest.ts",
+  ]);
+});
+
+// A migration importing `S` from a package root whose barrel re-exports `./a.ts` with `reexport`.
+const rootImportTree = (reexport, declaring, extra = {}) =>
+  treeOf({
+    [`${MIGRATIONS}/001_A.ts`]: 'import { S } from "@t3tools/c";',
+    "packages/c/package.json": JSON.stringify({ name: "@t3tools/c", exports: "./src/index.ts" }),
+    "packages/c/src/index.ts": `${reexport}\nexport * from "./other.ts";`,
+    "packages/c/src/a.ts": declaring,
+    "packages/c/src/other.ts": "export const Other = 1;",
+    ...extra,
+  });
+
+test("the closure traces the declaration shapes a name can have", () => {
+  const shapes = [
+    ['export * from "./a.ts";', "export async function S() {}"],
+    ['export * from "./a.ts";', "const S = 1;\ntype T = 2;\nexport { type T, S };"],
+    ['export * from "./a.ts";', "type X = 1;\nexport { type X as S };"],
+    ['export { default as S } from "./a.ts";', "export default function () {}"],
+    ['export * from "./a.ts";', "const o = { S: 1 };\nexport const { S } = o;"],
+    ['export * from "./a.ts";', "export const [first, S] = [1, 2];"],
+    ['export * from "./a.ts";', "export function* S() {}"],
+  ];
+  for (const [reexport, declaring] of shapes) {
+    assert.deepEqual(
+      [...schemaClosure(rootImportTree(reexport, declaring))].sort(),
+      [`${MIGRATIONS}/001_A.ts`, "packages/c/src/a.ts", "packages/c/src/index.ts"],
+      declaring,
+    );
+  }
+});
+
+test("a name the closure cannot trace guards the whole barrel and what it re-exports", () => {
+  const closure = schemaClosure(rootImportTree('export * from "./a.ts";', "export const NotS = 1;"));
+  assert.deepEqual([...closure].sort(), [
+    `${MIGRATIONS}/001_A.ts`,
+    "packages/c/src/a.ts",
+    "packages/c/src/index.ts",
+    "packages/c/src/other.ts",
   ]);
 });
 
@@ -406,6 +459,54 @@ test("e2e: renaming or deleting a migration is refused", () => {
   assert.match(renamed.output, /081_Renamed\.ts: changes/);
 });
 
+test("e2e: a barrel-only edit that re-points a name a migration imports is refused", () => {
+  const files = {
+    ...BASE_TREE,
+    [`${MIGRATIONS}/064_Links.ts`]: 'import { ThreadLinkedPullRequest } from "@t3tools/contracts";\n',
+    "packages/contracts/package.json": JSON.stringify({
+      name: "@t3tools/contracts",
+      exports: { ".": "./src/index.ts" },
+    }),
+    "packages/contracts/src/index.ts":
+      'export * from "./orchestration.ts";\nexport * from "./threadPullRequest.ts";\n',
+    "packages/contracts/src/orchestration.ts": "export const ProviderKind = 1;\n",
+    "packages/contracts/src/threadPullRequest.ts": "export const ThreadLinkedPullRequest = 2;\n",
+  };
+  const repo = scratchRepo();
+  try {
+    const base = repo.commit(files);
+    const head = repo.commit({
+      "packages/contracts/src/index.ts": `${files["packages/contracts/src/index.ts"]}export { ProviderKind as ThreadLinkedPullRequest } from "./orchestration.ts";\n`,
+    });
+    const result = repo.check(base, head);
+    assert.equal(result.code, 1, result.output);
+    assert.match(result.output, /contracts\/src\/index\.ts: changes the database schema/);
+  } finally {
+    fs.rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("e2e: an edit to a declaring file the closure cannot trace is refused (fail closed)", () => {
+  const files = {
+    ...BASE_TREE,
+    [`${MIGRATIONS}/001_A.ts`]: 'import { S } from "@t3tools/c";\n',
+    "packages/c/package.json": JSON.stringify({ name: "@t3tools/c", exports: "./src/index.ts" }),
+    "packages/c/src/index.ts": 'export * from "./a.ts";\n',
+    // A shape the tracer does not know: `S` is declared, but not in a way it recognises.
+    "packages/c/src/a.ts": "const o = { S: 1 };\nexport default o;\nexport const { S: renamed } = o;\nexports.S = 1;\n",
+  };
+  const repo = scratchRepo();
+  try {
+    const base = repo.commit(files);
+    const head = repo.commit({ "packages/c/src/a.ts": `${files["packages/c/src/a.ts"]}// edited\n` });
+    const result = repo.check(base, head);
+    assert.equal(result.code, 1, result.output);
+    assert.match(result.output, /packages\/c\/src\/a\.ts: changes the database schema/);
+  } finally {
+    fs.rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
 test("e2e: after main is rebased onto a new upstream release, an old branch is told to rebase", () => {
   const {
     [CHECK_FILES[0]]: script,
@@ -434,6 +535,7 @@ test("e2e: after main is rebased onto a new upstream release, an old branch is t
     assert.equal(stale.code, 1, stale.output);
     assert.match(stale.output, /1 commit\(s\) of this branch are already on main/);
     assert.match(stale.output, /rebase it onto main/);
+    assert.doesNotMatch(stale.output, /rebased copies|has since been rebased/);
     assert.doesNotMatch(stale.output, /merges past it|changes the schema check itself/);
 
     // The same branch rebased onto the new main passes.
@@ -462,6 +564,45 @@ test("e2e: a branch behind a main that moved forward normally is not called stal
     const moved = repo.commit({ [CHECK_FILES[0]]: "// the check, v2\n" }, "fork: check v2");
     const result = repo.check(moved, head);
     assert.equal(result.code, 0, result.output);
+  } finally {
+    fs.rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("e2e: a stale branch that also edits the check is told both", () => {
+  const { [CHECK_FILES[0]]: script, ...rest } = BASE_TREE;
+  const repo = scratchRepo();
+  try {
+    const old = repo.commit(rest, "upstream v1");
+    const patch = repo.commit({ [CHECK_FILES[0]]: script }, "fork: schema check");
+    repo.git("checkout", "-q", "-b", "pr", patch);
+    const head = repo.commit({ [CHECK_FILES[0]]: "// weakened\n" }, "weaken the check");
+    repo.git("checkout", "-q", "-b", "new-main", old);
+    repo.commit({ "apps/server/src/feature/Other.ts": "export {};\n" }, "upstream v2");
+    repo.git("cherry-pick", patch);
+    const result = repo.check(repo.git("rev-parse", "HEAD"), head);
+    assert.equal(result.code, 1, result.output);
+    assert.match(result.output, /already on main/);
+    assert.match(result.output, /fork-schema-check\.cjs: changes the schema check itself/);
+  } finally {
+    fs.rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("e2e: a branch behind main that only cherry-picks a main commit is told to rebase", () => {
+  const repo = scratchRepo();
+  try {
+    repo.commit(BASE_TREE, "fork main");
+    repo.git("checkout", "-q", "-b", "pr");
+    repo.commit({ "README.md": "notes\n" }, "docs: notes");
+    repo.git("checkout", "-q", "main");
+    const fix = repo.commit({ "apps/server/src/feature/Store.ts": "export const x = 3;\n" }, "fix");
+    repo.git("checkout", "-q", "pr");
+    repo.git("cherry-pick", fix);
+    const result = repo.check(fix, repo.git("rev-parse", "HEAD"));
+    assert.equal(result.code, 1, result.output);
+    assert.match(result.output, /already on main \(it is based on an old main, or it copies/);
+    assert.doesNotMatch(result.output, /has since been rebased/);
   } finally {
     fs.rmSync(repo.dir, { recursive: true, force: true });
   }

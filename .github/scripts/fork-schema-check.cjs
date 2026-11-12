@@ -2,7 +2,8 @@
 // strands installs that return to upstream. Usage: fork-schema-check.cjs <base> <head>.
 // Refused: migrations, schema setup and what they import; shipped source files holding a schema
 // statement; a PR copy of this check or of .gitattributes that differs from the base's copy; and a
-// branch built on an old (since rebased) base. Files are read as git blobs.
+// branch holding commits already on the base (built on an old, since rebased base, or copying its
+// commits). Files are read as git blobs.
 
 const { execFileSync } = require("node:child_process");
 const path = require("node:path");
@@ -57,7 +58,9 @@ const isShippedSource = (file) => SHIPPED_SOURCE.test(file) && !isTest(file);
 /**
  * Files the schema roots import, transitively: relative and package subpath imports, and for a
  * package root (`@t3tools/contracts`) the files that declare the names imported from it. The
- * root's barrel itself is not added, so the rest of the package stays free to change.
+ * barrels on the way to a declaring file are guarded too (a barrel edit could re-point a name),
+ * but their other re-exports are not followed, so the rest of the package stays free to change.
+ * A name that cannot be traced guards the whole barrel and everything it re-exports.
  * @param {{ files: string[]; has(file: string): boolean; read(file: string): string }} tree
  * @returns {Set<string>}
  */
@@ -67,14 +70,18 @@ function schemaClosure(tree) {
     (file) => SCHEMA_ROOTS.some((pattern) => pattern.test(file)) && !isTest(file),
   );
   const closure = new Set(queue);
+  const walked = new Set(queue);
   while (queue.length > 0) {
     const file = queue.pop();
     const text = tree.read(file);
     const names = importedNames(text);
     for (const match of text.matchAll(IMPORT_SPECIFIER)) {
-      for (const target of resolveImport(tree, packages, file, match[1], names.get(match[1]))) {
-        if (!isTest(target) && !closure.has(target)) {
+      const reached = resolveImport(tree, packages, file, match[1], names.get(match[1]));
+      for (const target of reached.barrels) if (!isTest(target)) closure.add(target);
+      for (const target of reached.files) {
+        if (!isTest(target) && !walked.has(target)) {
           closure.add(target);
+          walked.add(target);
           queue.push(target);
         }
       }
@@ -122,15 +129,21 @@ function importedNames(text) {
   return names;
 }
 
-/** The files an import reaches: one file, or for a package root the files declaring `names`. */
+/**
+ * The files an import reaches: one file, or for a package root the files declaring `names`
+ * (`files`, whose own imports matter) and the barrels re-exporting them (`barrels`, guarded only).
+ * @returns {{ files: string[]; barrels: string[] }}
+ */
 function resolveImport(tree, packages, from, specifier, names) {
+  const none = { files: [], barrels: [] };
+  const whole = (file) => ({ files: [file], barrels: [] });
   if (specifier.startsWith(".")) {
     const target = resolveFile(tree, path.posix.join(path.posix.dirname(from), specifier));
-    return target ? [target] : [];
+    return target ? whole(target) : none;
   }
   const parts = specifier.match(/^(@[^/]+\/[^/]+)(?:\/(.+))?$/);
   const pkg = parts && packages.get(parts[1]);
-  if (!pkg || !pkg.exports) return [];
+  if (!pkg || !pkg.exports) return none;
   const exports =
     typeof pkg.exports === "string" || "import" in pkg.exports || "default" in pkg.exports
       ? { ".": pkg.exports }
@@ -140,36 +153,42 @@ function resolveImport(tree, packages, from, specifier, names) {
     typeof entry === "string" ? entry : entry && (entry.import ?? entry.default ?? entry.types);
   const file =
     typeof target === "string" ? resolveFile(tree, path.posix.join(pkg.dir, target)) : undefined;
-  if (!file) return [];
-  if (parts[2] || !names || names.has("*") || names.has("default")) return [file];
+  if (!file) return none;
+  if (parts[2] || !names || names.has("*") || names.has("default")) return whole(file);
   const found = new Set();
-  for (const name of names) declaringFiles(tree, packages, file, name, found, new Set());
-  return [...found];
+  const barrels = new Set();
+  for (const name of names) {
+    // A name no file is seen to declare fails closed: the barrel is walked whole.
+    if (!declaringFiles(tree, packages, file, name, found, barrels, new Map())) return whole(file);
+  }
+  return { files: [...found], barrels: [...barrels] };
 }
 
-/** Follows `export * from` and `export { name } from` until a file declares `name`. */
-function declaringFiles(tree, packages, file, name, found, seen) {
-  if (seen.has(`${file}\0${name}`)) return;
-  seen.add(`${file}\0${name}`);
+/**
+ * Follows `export * from` and `export { name } from` until a file declares `name`. Adds declaring
+ * files to `found` and the re-exporting files on the way to `barrels`.
+ * @returns {boolean} whether `name` was traced to a declaring file from `file`
+ */
+function declaringFiles(tree, packages, file, name, found, barrels, seen) {
+  const key = `${file}\0${name}`;
+  if (seen.has(key)) return seen.get(key);
+  seen.set(key, false);
   const text = tree.read(file);
-  const word = name.replace(/\$/g, "\\$");
-  const declares = new RegExp(
-    String.raw`\bexport\s+(?:declare\s+)?(?:abstract\s+)?(?:const|let|var|function\*?|class|type|interface|enum|namespace)\s+${word}(?![\w$])`,
-  );
-  const local = [...text.matchAll(/\bexport\s+(?:type\s+)?\{([^}]*)\}(?!\s*from)/g)].some(
-    (match) => match[1].split(",").some((part) => part.trim().split(/\s+as\s+/).pop() === name),
-  );
-  if (declares.test(text) || local) {
+  if (declaresName(text, name)) {
     found.add(file);
-    return;
+    seen.set(key, true);
+    return true;
   }
+  let traced = false;
   for (const match of text.matchAll(
     /\bexport\s+(?:type\s+)?(\*(?:\s+as\s+([\w$]+))?|\{[^}]*\})\s*from\s*["']([^"'\n]+)["']/g,
   )) {
     const [, clause, namespace, specifier] = match;
-    const targets = resolveImport(tree, packages, file, specifier, new Set(["*"]));
+    const targets = resolveImport(tree, packages, file, specifier, new Set(["*"])).files;
     if (clause.startsWith("*") && !namespace) {
-      for (const target of targets) declaringFiles(tree, packages, target, name, found, seen);
+      for (const target of targets) {
+        if (declaringFiles(tree, packages, target, name, found, barrels, seen)) traced = true;
+      }
       continue;
     }
     const exported = namespace
@@ -183,9 +202,36 @@ function declaringFiles(tree, packages, file, name, found, seen) {
     if (!exported) continue;
     for (const target of targets) {
       if (exported === "*") found.add(target);
-      else declaringFiles(tree, packages, target, exported, found, seen);
+      if (exported === "*" || declaringFiles(tree, packages, target, exported, found, barrels, seen)) {
+        traced = true;
+      }
     }
   }
+  if (traced) barrels.add(file);
+  seen.set(key, traced);
+  return traced;
+}
+
+/**
+ * Whether `text` declares and exports `name` itself: a declaration (`export async function`,
+ * `export const { name } = ...` and the like), a local `export { [type] x as name }`, or for
+ * `default` an `export default`.
+ */
+function declaresName(text, name) {
+  const word = name.replace(/\$/g, "\\$");
+  const bound = String.raw`(?<![\w$])${word}(?![\w$])`;
+  const declarations = [
+    String.raw`\bexport\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|function\s*\*?|class|type|interface|enum|namespace|module)\s*${bound}`,
+    // Destructuring: `export const { a, b: name } = o` or `export const [name] = list`.
+    String.raw`\bexport\s+(?:const|let|var)\s*[{[][^=;]*?${bound}[^=;]*?[}\]]\s*(?::[^=;]*)?=`,
+  ];
+  if (name === "default") declarations.push(String.raw`\bexport\s+default\b`);
+  if (declarations.some((pattern) => new RegExp(pattern).test(text))) return true;
+  return [...text.matchAll(/\bexport\s+(?:type\s+)?\{([^}]*)\}(?!\s*from)/g)].some((match) =>
+    match[1]
+      .split(",")
+      .some((part) => part.trim().replace(/^type\s+/, "").split(/\s+as\s+/).pop().trim() === name),
+  );
 }
 
 function resolveFile(tree, file) {
@@ -195,36 +241,38 @@ function resolveFile(tree, file) {
 }
 
 /**
- * @param {ReadonlyArray<{ path: string; before?: string; after?: string; sameAsBase?: boolean }>} changes
+ * @param {ReadonlyArray<{ path: string; before?: string; after?: string; sameAsBase?: boolean; fromOldMain?: boolean }>} changes
  *   one entry per path the branch changes since the merge-base; `before`/`after` are the file
- *   texts (undefined when absent); `sameAsBase` says the branch's copy equals the base's copy
+ *   texts (undefined when absent); `sameAsBase` says the branch's copy equals the base's copy;
+ *   `fromOldMain` says the branch's copy is the one a commit already on main left there
  * @param {{ closure: ReadonlySet<string>; baseHasCheck: boolean; staleCommits?: number }} context
  *   `staleCommits`: the branch's commits that the base already holds as rebased copies
  * @returns {string[]} one reason per refused file
  */
 function findSchemaChanges(changes, { closure, baseHasCheck, staleCommits = 0 }) {
   const reasons = [];
-  const rebase =
-    "this branch is based on an old main that has since been rebased; rebase it onto main";
   if (staleCommits > 0) {
     reasons.push(
-      `${staleCommits} commit(s) of this branch are already on main as rebased copies, so ${rebase}.`,
+      `${staleCommits} commit(s) of this branch are already on main (it is based on an old main, ` +
+        "or it copies main's commits), so rebase it onto main.",
     );
   }
+  const also = staleCommits > 0 ? " (also rebase onto main)" : "";
   for (const change of changes) {
     const file = change.path;
     const guarded = CHECK_FILES.includes(file) || GITATTRIBUTES.test(file);
     // The branch carries main's copy (e.g. it branched before main was rebased): nothing to judge.
     if (guarded && change.sameAsBase) continue;
-    if (guarded && staleCommits > 0) {
-      reasons.push(`${file}: differs from main's copy because ${rebase}.`);
+    // Main's own older copy, carried by commits already on main: only the rebase is needed.
+    if (guarded && staleCommits > 0 && change.fromOldMain) {
+      reasons.push(`${file}: differs from main's copy, because this branch needs a rebase onto main.`);
       continue;
     }
     if (CHECK_FILES.includes(file)) {
       if (baseHasCheck) {
         reasons.push(
           `${file}: changes the schema check itself. Only the owner may do that: the check stays ` +
-            "red, and the owner merges past it.",
+            `red, and the owner merges past it${also}.`,
         );
       }
       continue;
@@ -232,7 +280,7 @@ function findSchemaChanges(changes, { closure, baseHasCheck, staleCommits = 0 })
     if (GITATTRIBUTES.test(file)) {
       reasons.push(
         `${file}: changes how git treats files, which can hide changes from review. Only the ` +
-          "owner may do that.",
+          `owner may do that${also}.`,
       );
       continue;
     }
@@ -321,16 +369,20 @@ function blobAt(rev, file) {
 }
 
 /**
- * The branch's commits (merge-base..head) that the base already holds as rebased copies, matched
- * by author, author time and subject: a rebase keeps all three. Needs no file contents.
+ * The branch's commits (merge-base..head) that the base already holds as copies (rebased or
+ * cherry-picked), matched by author, author time and subject: both keep all three. Needs no file
+ * contents. Returns the branch-side commit ids.
  */
-function staleCommitCount(mergeBase, base, head) {
+function staleCommits(mergeBase, base, head) {
   const ids = (range) =>
-    git(["log", "--no-merges", "--format=%an%x00%ae%x00%at%x00%s", range])
+    git(["log", "--no-merges", "--format=%H%x00%an%x00%ae%x00%at%x00%s", range])
       .split("\n")
-      .filter(Boolean);
-  const onBase = new Set(ids(`${mergeBase}..${base}`));
-  return ids(`${mergeBase}..${head}`).filter((id) => onBase.has(id)).length;
+      .filter(Boolean)
+      .map((line) => ({ sha: line.slice(0, line.indexOf("\0")), id: line.slice(line.indexOf("\0")) }));
+  const onBase = new Set(ids(`${mergeBase}..${base}`).map((commit) => commit.id));
+  return ids(`${mergeBase}..${head}`)
+    .filter((commit) => onBase.has(commit.id))
+    .map((commit) => commit.sha);
 }
 
 function main(argv) {
@@ -346,11 +398,16 @@ function main(argv) {
   // Only shipped source is searched for statements, so only its texts are read.
   const text = (entry, sha) => (sha && isShippedSource(entry.path) ? readBlob(sha) : undefined);
   const guarded = (file) => CHECK_FILES.includes(file) || GITATTRIBUTES.test(file);
+  const stale = staleCommits(mergeBase, base, head);
+  // A guarded file's copy that one of those commits left: main's older copy, not a branch edit.
+  const fromOldMain = (entry) =>
+    stale.some((sha) => blobAt(sha, entry.path) === entry.newBlob);
   const changes = entries.map((entry) => ({
     path: entry.path,
     before: text(entry, entry.oldBlob),
     after: text(entry, entry.newBlob),
     sameAsBase: guarded(entry.path) ? blobAt(base, entry.path) === entry.newBlob : undefined,
+    fromOldMain: guarded(entry.path) && stale.length > 0 ? fromOldMain(entry) : undefined,
   }));
   const closure = new Set([
     ...schemaClosure(readTree(mergeBase)),
@@ -359,7 +416,7 @@ function main(argv) {
   const reasons = findSchemaChanges(changes, {
     closure,
     baseHasCheck: treeHas(base, CHECK_SCRIPT),
-    staleCommits: staleCommitCount(mergeBase, base, head),
+    staleCommits: stale.length,
   });
   if (reasons.length === 0) {
     console.log(`No database schema changes (${changes.length} changed files checked).`);
