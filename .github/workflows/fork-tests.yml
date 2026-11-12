@@ -1,0 +1,707 @@
+name: Fork tests
+
+# Fork only. Upstream's CI checks (ci.yml) on GitHub-hosted runners, because the
+# fork has none of upstream's runners and upstream's workflows are disabled here.
+# Commands follow ci.yml step for step; only the runners, time limits, apt setup
+# and the private task cache differ. Upstream's composite actions and change
+# detector (.github/actions, .github/scripts/ci-changes.cjs) are used as they
+# are, so a rebase brings their changes. The `drift` job fails when upstream's
+# ci.yml or release.yml test jobs change and this copy did not follow
+# (.github/scripts/fork-tests-drift.cjs).
+#
+# Two modes:
+# - pull_request / push to main: CI. Jobs a change cannot affect are skipped by
+#   upstream's detector; every skip is named with its reason in the run summary.
+# - workflow_call / workflow_dispatch with `ref`: release. Every Linux job runs
+#   on that commit, no path filter. Covers release.yml's quality, test, test_web
+#   and test_server (ci.yml checks a superset of them).
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to test
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or branch to test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its older run. Main and release runs finish.
+# The event name keeps a release's workflow_call apart from its caller's group.
+concurrency:
+  group: fork-tests-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      typecheck: ${{ steps.release.outputs.typecheck || steps.detect.outputs.typecheck }}
+      build: ${{ steps.release.outputs.build || steps.detect.outputs.build }}
+      desktop_launch: ${{ steps.release.outputs.desktop_launch || steps.detect.outputs.desktop_launch }}
+      test: ${{ steps.release.outputs.test || steps.detect.outputs.test }}
+      test_packages: ${{ steps.release.outputs.test_packages || steps.detect.outputs.test_packages }}
+      test_web: ${{ steps.release.outputs.test_web || steps.detect.outputs.test_web }}
+      test_server: ${{ steps.release.outputs.test_server || steps.detect.outputs.test_server }}
+      rust: ${{ steps.release.outputs.rust || steps.detect.outputs.rust }}
+      release_smoke: ${{ steps.release.outputs.release_smoke || steps.detect.outputs.release_smoke }}
+      mobile_native: ${{ steps.release.outputs.mobile_native || steps.fork.outputs.mobile_native }}
+    steps:
+      - name: Checkout
+        if: inputs.ref == ''
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+          sparse-checkout: |
+            /pnpm-workspace.yaml
+            /.github/scripts/ci-changes.cjs
+            /.github/actions/ci-changes/
+            /*/package.json
+            /*/*/package.json
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Detect affected jobs
+        id: detect
+        if: inputs.ref == ''
+        uses: ./.github/actions/ci-changes
+
+      # ci-changes.cjs runs the macOS lint when upstream's ci.yml changes; the
+      # fork's copy of it counts the same.
+      - name: Fork workflow changes run the macOS lint
+        id: fork
+        if: inputs.ref == ''
+        env:
+          DETECTED: ${{ steps.detect.outputs.mobile_native }}
+        run: |
+          value="$DETECTED"
+          if grep -qxE '\.github/workflows/fork-tests\.yml' "$RUNNER_TEMP/changed-paths" 2>/dev/null; then
+            value=true
+          fi
+          echo "mobile_native=$value" >> "$GITHUB_OUTPUT"
+
+      # Release runs test the whole commit. upstream's release.yml has no macOS lint.
+      - name: Release run checks everything
+        id: release
+        if: inputs.ref != ''
+        run: |
+          for gate in typecheck build desktop_launch test test_web test_server rust release_smoke; do
+            echo "$gate=true" >> "$GITHUB_OUTPUT"
+          done
+          echo "test_packages=" >> "$GITHUB_OUTPUT"
+          echo "mobile_native=false" >> "$GITHUB_OUTPUT"
+
+  # The fork copy must follow upstream's test jobs. Fails with the list of
+  # jobs and steps upstream changed since the copy was last recorded.
+  drift:
+    name: Upstream drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /.github/
+          sparse-checkout-cone-mode: false
+
+      - name: Test the drift check
+        run: node --test .github/scripts/fork-tests-drift.test.cjs
+
+      - name: Compare upstream's test jobs with the recorded copy
+        run: node .github/scripts/fork-tests-drift.cjs
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Reject repository-owned PR assets
+        run: |
+          files="$(git ls-files .github/pr-assets)"
+          if test -n "$files"; then
+            printf 'PR evidence must be uploaded to GitHub, not committed:\n%s\n' "$files" >&2
+            exit 1
+          fi
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+
+      - name: Cache Electron download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Check unused code
+        run: vp run knip:check
+
+      - name: Check generated GitHub GraphQL operations
+        run: vp run --filter @t3tools/source-control-github generate --check
+
+      - name: Check generated Expo GraphQL operations
+        run: vp run --filter t3 generate --check
+
+      - name: Check
+        run: vp check
+
+  build:
+    name: Build and Typecheck
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      # Runs in the background while Vite+ installs; the step before the build waits for it.
+      # Xvfb is for the desktop launch check below.
+      - name: Start installing browser secret helper build libraries
+        if: needs.changes.outputs.build != 'false'
+        run: |
+          (
+            set +e
+            sudo apt-get update -o Acquire::Languages=none \
+              -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false &&
+              sudo apt-get install -y libsecret-1-dev pkg-config xvfb
+            echo "$?" > "$RUNNER_TEMP/apt-status"
+          ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          # Lint saves the pnpm store; the others only restore it.
+          save-pnpm-store: false
+
+      - name: Cache Electron download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+
+      - name: Ensure Electron runtime is installed
+        id: electron
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      # Runs in the background while the build runs, and reports in the last
+      # step: neither result hides the other.
+      - name: Start typecheck
+        id: typecheck
+        if: ${{ !cancelled() && steps.electron.outcome == 'success' && needs.changes.outputs.typecheck != 'false' }}
+        run: |
+          (
+            set +e
+            vpr typecheck
+            echo "$?" > "$RUNNER_TEMP/typecheck-status"
+          ) > "$RUNNER_TEMP/typecheck.log" 2>&1 < /dev/null &
+
+      - name: Finish installing browser secret helper build libraries
+        id: apt
+        if: ${{ !cancelled() && needs.changes.outputs.build != 'false' }}
+        timeout-minutes: 5
+        run: |
+          until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
+          cat "$RUNNER_TEMP/apt.log"
+          exit "$(cat "$RUNNER_TEMP/apt-status")"
+
+      - name: Build desktop pipeline
+        id: build
+        if: ${{ !cancelled() && steps.electron.outcome == 'success' && steps.apt.outcome == 'success' && needs.changes.outputs.build != 'false' }}
+        run: vp run build:desktop
+
+      - name: Verify preload bundle output
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node apps/desktop/scripts/verify-preload-bundle.mjs
+
+      - name: Open the seeded thread in the built desktop app
+        id: desktop_launch
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.desktop_launch != 'false' }}
+        timeout-minutes: 4
+        run: |
+          electron=$(node -p "require('./apps/desktop/node_modules/electron')")
+          xvfb-run -a node scripts/smoke-desktop-app.ts --executable "$electron" --app apps/desktop \
+            --artifacts-dir "$RUNNER_TEMP/desktop-launch-check"
+
+      - name: Upload desktop launch check
+        if: ${{ failure() && steps.desktop_launch.outcome == 'failure' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: desktop-launch-check
+          path: ${{ runner.temp }}/desktop-launch-check
+          if-no-files-found: ignore
+
+      - name: Resolve Playwright version
+        id: playwright_version
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.test_web != 'false' }}
+        run: echo "version=$(node -p "require('./apps/web/node_modules/playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Chromium
+        id: chromium_cache
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.test_web != 'false' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-shell-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright_version.outputs.version }}
+
+      - name: Install Chromium for the built web client boot check
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.test_web != 'false' && steps.chromium_cache.outputs.cache-hit != 'true' }}
+        run: node apps/web/node_modules/playwright/cli.js install --only-shell chromium
+
+      - name: Install missing Chromium system dependencies
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.test_web != 'false' }}
+        run: |
+          browser=$(find "$HOME/.cache/ms-playwright" -name chrome-headless-shell -type f -print -quit)
+          test -n "$browser"
+          if ldd "$browser" | grep '=> not found'; then
+            node apps/web/node_modules/playwright/cli.js install-deps chromium
+          fi
+
+      - name: Boot the built web client
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.test_web != 'false' }}
+        timeout-minutes: 3
+        run: node apps/web/scripts/verify-built-boot.ts
+
+      - name: Typecheck
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          until test -s "$RUNNER_TEMP/typecheck-status"; do sleep 1; done
+          cat "$RUNNER_TEMP/typecheck.log"
+          exit "$(cat "$RUNNER_TEMP/typecheck-status")"
+
+  # Everything except `t3` (apps/server) and the web app, which have their own jobs.
+  test:
+    name: Test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.test != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      # The desktop tests compile the browser secret helper. The install runs in
+      # the background while Vite+ installs; the step before the tests waits for it.
+      - name: Start installing browser secret helper build libraries
+        run: |
+          (
+            set +e
+            sudo apt-get update -o Acquire::Languages=none \
+              -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
+              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false &&
+              sudo apt-get install -y libsecret-1-dev pkg-config
+            echo "$?" > "$RUNNER_TEMP/apt-status"
+          ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          # Lint saves the pnpm store; the others only restore it.
+          save-pnpm-store: false
+
+      - name: Cache Electron download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Test preview artifact validation
+        run: python3 -B .github/scripts/stage-preview-bundle.test.py
+
+      - name: Test release checks
+        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs
+
+      - name: Finish installing browser secret helper build libraries
+        timeout-minutes: 5
+        run: |
+          until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
+          cat "$RUNNER_TEMP/apt.log"
+          exit "$(cat "$RUNNER_TEMP/apt-status")"
+
+      # `changes` lists the affected packages, or nothing when all of them are.
+      - name: Test
+        env:
+          TEST_PACKAGES: ${{ needs.changes.outputs.test_packages }}
+        run: |
+          set -o pipefail
+          filters=(--filter '!t3' --filter '!@t3tools/monorepo' --filter '!@t3tools/web')
+          if [[ -n "$TEST_PACKAGES" ]]; then
+            filters=()
+            for package in $TEST_PACKAGES; do filters+=(--filter "$package"); done
+          fi
+          # The runner's trace writer can crash on surrogate pairs in test output.
+          vp run --parallel --concurrency-limit 4 "${filters[@]}" test 2>&1 | python3 -u -c '
+          import sys
+          for line in sys.stdin:
+              sys.stdout.write(line.encode("ascii", "backslashreplace").decode("ascii"))
+          '
+
+  test_web:
+    name: Test Web
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          # Lint saves the pnpm store; the others only restore it.
+          save-pnpm-store: false
+
+      - name: Resolve Playwright version
+        id: playwright_version
+        run: echo "version=$(node -p "require('./apps/web/node_modules/playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Chromium
+        id: chromium_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-shell-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright_version.outputs.version }}
+
+      - name: Install Chromium for web browser tests
+        if: steps.chromium_cache.outputs.cache-hit != 'true'
+        run: node apps/web/node_modules/playwright/cli.js install --only-shell chromium
+
+      - name: Install missing Chromium system dependencies
+        run: |
+          browser=$(find "$HOME/.cache/ms-playwright" -name chrome-headless-shell -type f -print -quit)
+          test -n "$browser"
+          if ldd "$browser" | grep '=> not found'; then
+            node apps/web/node_modules/playwright/cli.js install-deps chromium
+          fi
+
+      - name: Test
+        run: vp run --filter @t3tools/web test
+
+  # apps/server runs its test files one at a time; shards spread them over
+  # separate runners. The shards gate themselves instead of waiting for
+  # `changes`; a shard the change cannot affect says so in its summary.
+  test_server:
+    name: Test Server ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 2
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Detect affected jobs
+        id: changes
+        if: inputs.ref == ''
+        uses: ./.github/actions/ci-changes
+
+      - name: Report skip
+        if: steps.changes.outputs.test_server == 'false'
+        run: |
+          msg="Skipped: upstream's change detector found no change that affects t3 (apps/server)."
+          echo "::notice title=Test Server ${{ matrix.shard }} skipped::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Vite+
+        if: steps.changes.outputs.test_server != 'false'
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          # Lint saves the pnpm store; the others only restore it.
+          save-pnpm-store: false
+
+      - name: Resolve Playwright version
+        id: playwright_version
+        if: steps.changes.outputs.test_server != 'false'
+        run: echo "version=$(node -p "require('./apps/server/node_modules/playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Chromium
+        id: chromium_cache
+        if: steps.changes.outputs.test_server != 'false'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-shell-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright_version.outputs.version }}
+
+      - name: Install Chromium for server browser integration tests
+        if: steps.changes.outputs.test_server != 'false' && steps.chromium_cache.outputs.cache-hit != 'true'
+        run: node apps/server/node_modules/playwright-core/cli.js install --only-shell chromium
+
+      - name: Install missing Chromium system dependencies
+        if: steps.changes.outputs.test_server != 'false'
+        run: |
+          browser=$(find "$HOME/.cache/ms-playwright" -name chrome-headless-shell -type f -print -quit)
+          test -n "$browser"
+          if ldd "$browser" | grep '=> not found'; then
+            node apps/server/node_modules/playwright-core/cli.js install-deps chromium
+          fi
+
+      - name: Test
+        if: steps.changes.outputs.test_server != 'false'
+        env:
+          T3CODE_TRANSFER_BUDGET_REPORT_PATH: ${{ runner.temp }}/t3code-transfer-budget.md
+          T3CODE_TRANSFER_BUDGET_RESULT_PATH: ${{ runner.temp }}/thread-transfer-result.json
+        run: >-
+          vp run test:cached -- --shard ${{ matrix.shard }}/${{ strategy.job-total }}
+          --uncached apps/server/integration/transferBudgetV2.integration.test.ts
+          --verify-hits 1 --report "${{ runner.temp }}/test-cache-${{ matrix.shard }}.json" apps/server
+
+      - name: Upload test cache measurements
+        if: always() && steps.changes.outputs.test_server != 'false'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-cache-${{ matrix.shard }}
+          path: ${{ runner.temp }}/test-cache-${{ matrix.shard }}.json
+          if-no-files-found: error
+
+      # integration/transferBudgetV2.integration.test.ts writes the report; exactly one shard
+      # produces these files.
+      - name: Detect transfer budget report
+        id: transfer_budget
+        if: always()
+        run: |
+          if test -f "${{ runner.temp }}/thread-transfer-result.json"; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish transfer budget report
+        if: always() && steps.transfer_budget.outputs.present == 'true'
+        run: |
+          if test -f "${{ runner.temp }}/t3code-transfer-budget.md"; then
+            tee -a "$GITHUB_STEP_SUMMARY" < "${{ runner.temp }}/t3code-transfer-budget.md"
+          else
+            echo "Transfer budget report was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload thread transfer result
+        if: always() && steps.transfer_budget.outputs.present == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: thread-transfer-results
+          path: ${{ runner.temp }}/thread-transfer-result.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  rust:
+    name: Rust
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt
+
+      - name: Check Rust formatting
+        run: |
+          for crate in resource-monitor kde-snap-shot hyprland-snap-shot; do
+            cargo fmt --manifest-path "native/$crate/Cargo.toml" -- --check
+          done
+
+      - name: Test Rust crates
+        run: |
+          for crate in resource-monitor kde-snap-shot hyprland-snap-shot; do
+            cargo test --locked --manifest-path "native/$crate/Cargo.toml"
+          done
+
+  # Upstream runs this on macOS 26. GitHub-hosted macOS minutes are free on a
+  # public repository; it runs only for native mobile sources or a workflow change.
+  mobile_native_static_analysis:
+    name: Mobile Native Static Analysis
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.mobile_native != 'false' }}
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=@t3tools/scripts...
+
+      - name: Install mobile native static analysis tools
+        run: brew bundle install --file apps/mobile/Brewfile
+
+      - name: Lint mobile native sources
+        run: vp run lint:mobile
+
+  release_smoke:
+    name: Release Smoke
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.release_smoke != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          # Lint saves the pnpm store; the others only restore it.
+          save-pnpm-store: false
+
+      - name: Exercise release-only workflow steps
+        run: node scripts/release-smoke.ts
+
+  # The one check to require. Fails when any job fails, is cancelled, or is
+  # skipped without `changes` saying it was not needed. The run summary lists
+  # every job, and every skip with its reason.
+  check:
+    name: Check
+    if: ${{ always() }}
+    needs:
+      [
+        changes,
+        drift,
+        lint,
+        build,
+        test,
+        test_web,
+        test_server,
+        rust,
+        mobile_native_static_analysis,
+        release_smoke,
+      ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          RELEASE_RUN: ${{ inputs.ref != '' }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          {
+            echo "### Fork tests"
+            echo
+            echo "| Job | Result | Why skipped |"
+            echo "| --- | --- | --- |"
+            echo "$RESULTS" | jq -r --arg release "$RELEASE_RUN" '.changes.outputs as $g
+              | {build: "the change affects neither desktop, server nor web, and no package needs a typecheck",
+                 test: "the change affects no package this job tests",
+                 test_web: "the change affects nothing @t3tools/web depends on",
+                 rust: "the change touches none of the native Rust crates",
+                 mobile_native_static_analysis: (if $release == "true"
+                   then "release run: upstream release.yml has no macOS lint"
+                   else "no native mobile source, Brewfile or CI workflow changed" end),
+                 release_smoke: "the change does not affect scripts/"} as $why
+              | to_entries[]
+              | "| \(.key) | \(.value.result) | \(if .value.result == "skipped" then ($why[.key] // "not explained") else "" end) |"'
+            if [[ "$(echo "$RESULTS" | jq -r '.changes.outputs.test_server')" == false ]]; then
+              echo
+              echo "Server shards passed without running tests: the change affects nothing t3 (apps/server) depends on."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A job may skip only when `changes` said every gate it represents was
+          # not needed. Gates are keyed by job name, except merged Build and the
+          # macOS lint.
+          echo "$RESULTS" | jq -e '.changes.outputs as $gates
+            | {build: ["build", "typecheck", "desktop_launch"], mobile_native_static_analysis: ["mobile_native"]} as $renamed
+            | all(to_entries[];
+                .value.result == "success"
+                or (.value.result == "skipped"
+                  and (($renamed[.key] // [.key]) | all(.[]; $gates[.] == "false"))))' > /dev/null
+
+      # A run whose server tests ran must have produced the transfer measurements.
+      - name: Require transfer measurements
+        if: needs.test_server.result == 'success' && needs.changes.outputs.test_server != 'false'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: thread-transfer-results
+          path: ${{ runner.temp }}/thread-transfer
