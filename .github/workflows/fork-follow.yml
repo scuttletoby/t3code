@@ -18,9 +18,15 @@ name: Fork follow upstream
 # read back from it. With Issues enabled it also opens or updates one issue, and closes it again
 # on the next good run.
 #
-# Upstream's workflows stay off: after each push and at the end, fork-workflows.sh disables every
-# active workflow the series did not add, cancels every unfinished run of one (any event), and
-# names the runs that finished before it could stop them and the files GitHub has not listed yet.
+# Upstream's workflows stay off: after each push, before the series branch moves, and at the end,
+# fork-workflows.sh disables every active workflow the series did not add, cancels every unfinished
+# run of one (any event), and names the runs that finished before it could stop them and the files
+# GitHub has not listed yet. The branch move is refused while an upstream workflow file that is new
+# on this release is not listed (it could not be disabled, and on the branch it could ask for
+# fork-push); a person decides then.
+#
+# A re-run of failed jobs (or of one job) keeps the Guard job's earlier result, so the jobs with
+# the token are skipped unless the guard passed in this attempt: use "Re-run all jobs".
 #
 # Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN, only in the
 # Environment fork-push, whose deployment branches are "Selected branches and tags" with the one
@@ -65,6 +71,10 @@ jobs:
       contents: read
     outputs:
       started: ${{ steps.started.outputs.at }}
+      # Set only once the guard passed. The jobs that get the token run only when it is this run
+      # attempt: "Re-run failed jobs" or "Re-run job" keeps an earlier attempt's guard result
+      # without running the guard again, and the settings may have changed since.
+      attempt: ${{ steps.passed.outputs.attempt }}
     steps:
       - id: started
         name: Note the start
@@ -86,6 +96,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/reports"
           bash .github/scripts/fork-follow-guard.sh
 
+      - id: passed
+        name: Note the attempt the guard passed in
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
       - name: Keep the reason
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -95,9 +109,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Job-level if (implied success()): a skipped job never reaches the Environment, so GitHub
+  # neither hands it the token nor auto-creates the Environment.
   plan:
     name: Plan
     needs: [guard]
+    if: needs.guard.outputs.attempt == github.run_attempt
     environment: fork-push
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -113,6 +130,7 @@ jobs:
       released_tag: ${{ steps.plan.outputs.released_tag }}
       dropped: ${{ steps.plan.outputs.dropped }}
       own_workflows: ${{ steps.plan.outputs.own_workflows }}
+      new_workflows: ${{ steps.plan.outputs.new_workflows }}
       disabled: ${{ steps.sweep_plan.outputs.disabled }},${{ steps.sweep_push.outputs.disabled }}
       cancelled: ${{ steps.sweep_push.outputs.cancelled }}
     steps:
@@ -156,6 +174,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OWN_WORKFLOWS: ${{ steps.plan.outputs.own_workflows }}
+          NEW_WORKFLOWS: ${{ steps.plan.outputs.new_workflows }}
           REPORT: ${{ runner.temp }}/reports/plan-workflows.md
         run: bash .github/scripts/fork-workflows.sh
 
@@ -175,6 +194,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OWN_WORKFLOWS: ${{ steps.plan.outputs.own_workflows }}
+          NEW_WORKFLOWS: ${{ steps.plan.outputs.new_workflows }}
           HEAD_SHA: ${{ steps.plan.outputs.candidate }}
           REPORT: ${{ runner.temp }}/reports/push-workflows.md
         run: bash .github/scripts/fork-workflows.sh
@@ -233,9 +253,10 @@ jobs:
   advance:
     name: Move the series branch
     environment: fork-push
-    needs: [plan, release]
+    needs: [guard, plan, release]
     if: >-
       !cancelled() && needs.plan.result == 'success' &&
+      needs.guard.outputs.attempt == github.run_attempt &&
       (needs.plan.outputs.action == 'advance' ||
        (needs.plan.outputs.action == 'rebase' && needs.release.result == 'success' &&
         needs.release.outputs.published == 'true'))
@@ -255,6 +276,31 @@ jobs:
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
+
+      # The release can take an hour or more, so the Environment's rule is checked again. (The
+      # repository secret cannot be checked from inside the Environment; the Guard job did.)
+      - name: Check again that only the series branch may deploy to fork-push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ runner.temp }}/reports/advance-guard.md
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          bash .github/scripts/fork-follow-guard.sh --environment-only
+
+      # Any workflow file on the series branch may ask for fork-push, and the move fires its push
+      # workflows. So upstream workflows are disabled first, and the move is refused while an
+      # upstream file new on this release is not listed by GitHub (it cannot be disabled yet).
+      - id: sweep_before
+        name: Disable upstream workflows before the move, refuse while a new one cannot be
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWN_WORKFLOWS: ${{ needs.plan.outputs.own_workflows }}
+          NEW_WORKFLOWS: ${{ needs.plan.outputs.new_workflows }}
+          REQUIRE_NEW_OFF: "true"
+          HEAD_SHA: ${{ needs.plan.outputs.candidate }}
+          PREVIOUS_HEAD: ${{ needs.plan.outputs.previous_head }}
+          REPORT: ${{ runner.temp }}/reports/advance-before.md
+        run: bash .github/scripts/fork-workflows.sh
 
       # Refuses if the branch moved since the plan (a fork PR merged meanwhile); the next run
       # rebases again with that change. A re-run after a successful move finds it done.
@@ -277,6 +323,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OWN_WORKFLOWS: ${{ needs.plan.outputs.own_workflows }}
+          NEW_WORKFLOWS: ${{ needs.plan.outputs.new_workflows }}
           HEAD_SHA: ${{ needs.plan.outputs.candidate }}
           REPORT: ${{ runner.temp }}/reports/advance-workflows.md
         run: bash .github/scripts/fork-workflows.sh
@@ -331,6 +378,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OWN_WORKFLOWS: ${{ needs.plan.outputs.own_workflows }}
+          NEW_WORKFLOWS: ${{ needs.plan.outputs.new_workflows }}
           HEAD_SHA: ${{ needs.plan.outputs.candidate }}
           SINCE: ${{ needs.guard.outputs.started }}
           REPORT: ${{ runner.temp }}/reports/report-workflows.md
@@ -342,6 +390,8 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ACTION: ${{ needs.plan.outputs.action }}
           GUARD_RESULT: ${{ needs.guard.result }}
+          GUARD_ATTEMPT: ${{ needs.guard.outputs.attempt }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           PLAN_RESULT: ${{ needs.plan.result }}
           RELEASE_RESULT: ${{ needs.release.result }}
           ADVANCE_RESULT: ${{ needs.advance.result }}
@@ -356,5 +406,6 @@ jobs:
           CANCELLED: ${{ needs.plan.outputs.cancelled }},${{ needs.advance.outputs.cancelled }},${{ steps.sweep.outputs.cancelled }}
           FINISHED: ${{ steps.sweep.outputs.finished }}
           UNREGISTERED: ${{ steps.sweep.outputs.unregistered }}
+          UNREGISTERED_OLD: ${{ steps.sweep.outputs.unregistered_old }}
           REPORTS: ${{ runner.temp }}/reports
         run: bash .github/scripts/fork-follow-report.sh

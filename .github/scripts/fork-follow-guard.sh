@@ -13,6 +13,11 @@
 #    SERIES_BRANCH, written without wildcards. "Protected branches only" is refused, because the
 #    API cannot prove that no other branch is protected (or becomes protected later).
 #
+# `fork-follow-guard.sh --environment-only` makes check 2 alone. The job that moves the series
+# branch runs it right before the push, because that can be an hour or more after the Guard job
+# looked. Check 1 cannot be made there: inside the Environment, `secrets.FORK_PUSH_TOKEN` is the
+# Environment's own secret.
+#
 # Environment: REPOSITORY (owner/name; GITHUB_REPOSITORY in a run), FORK_PUSH_ENVIRONMENT,
 # SERIES_BRANCH (default main), REPO_SECRET_PRESENT, REPORT (receives the reason on refusal). Reads
 # the Environment with `gh api` (GH_TOKEN: GITHUB_TOKEN with actions: read is enough).
@@ -34,7 +39,13 @@ die() {
   exit 1
 }
 
-case "${REPO_SECRET_PRESENT:-}" in
+case "${1:-}" in
+  "") secret_check=true ;;
+  --environment-only) secret_check=false ;;
+  *) echo "usage: $0 [--environment-only]" >&2; exit 2 ;;
+esac
+
+[[ "$secret_check" == false ]] || case "${REPO_SECRET_PRESENT:-}" in
   false) ;;
   true)
     die "A repository or organisation secret named FORK_PUSH_TOKEN exists, so this run does not use the token." \
@@ -84,4 +95,8 @@ if [[ "$rules" != "branch $SERIES_BRANCH" ]] || [[ "$SERIES_BRANCH" == *[][*?]* 
     "Under $settings keep exactly one rule, branch $SERIES_BRANCH, and delete the others (a tag rule or a pattern lets other refs deploy too)."
 fi
 
-echo "FORK_PUSH_TOKEN is only an Environment secret, and only $SERIES_BRANCH may deploy to $env_name."
+if [[ "$secret_check" == true ]]; then
+  echo "FORK_PUSH_TOKEN is only an Environment secret, and only $SERIES_BRANCH may deploy to $env_name."
+else
+  echo "Only $SERIES_BRANCH may deploy to $env_name (the repository secret was checked by the Guard job)."
+fi

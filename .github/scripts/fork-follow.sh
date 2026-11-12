@@ -24,6 +24,9 @@
 #   dropped        subjects of patches that became empty on the new base (';'-separated)
 #   own_workflows  workflow files the series itself adds (','-separated); every other one is
 #                  upstream's and gets disabled
+#   new_workflows  upstream workflow files added between the series' old base and the new one
+#                  (','-separated; empty without a new base). The branch move refuses while one of
+#                  them is not listed by GitHub yet, so it cannot be disabled before main has it.
 set -Eeuo pipefail
 
 : "${UPSTREAM:?owner/name of the upstream repository}"
@@ -152,6 +155,10 @@ latest_release() {
 own_workflows() {
   git diff --name-only --diff-filter=A "$1" "$2" -- .github/workflows | paste -sd, -
 }
+new_workflows() { # upstream workflow files added from upstream commit $1 to $2 (a rename counts as new)
+  git diff --no-renames --name-only --diff-filter=A "$1" "$2" -- .github/workflows \
+    | { grep -E '\.ya?ml$' || true; } | paste -sd, -
+}
 
 # The release job runs the reusable workflows of this run's commit (RUN_SHA), not the candidate's.
 # They differ after upstream changed them, and on a re-run (or a queued run) of a run whose commit
@@ -214,6 +221,7 @@ if [[ "$target_tag" == "$base_tag" ]]; then
     echo "candidate=$head"
     echo "released_tag=${released_tag:-}"
     echo "own_workflows=$(own_workflows "$base" HEAD)"
+    echo "new_workflows="
   } >> "$OUTPUT"
   exit 0
 fi
@@ -264,4 +272,5 @@ fi
   echo "released_tag=${released_tag:-}"
   echo "dropped=$dropped"
   echo "own_workflows=$(own_workflows "$target" "$candidate")"
+  echo "new_workflows=$(new_workflows "$base" "$target")"
 } >> "$OUTPUT"

@@ -7,9 +7,10 @@
 # repository has Issues enabled it also opens or comments on one issue, "Fork cannot follow
 # upstream", and closes it once a run succeeds; with Issues disabled it says so and opens none.
 #
-# Environment (from the run): REPOSITORY, SERIES_BRANCH, RUN_URL, ACTION, GUARD_RESULT, PLAN_RESULT,
-# RELEASE_RESULT, ADVANCE_RESULT, BASE_TAG, PREVIOUS_TAG, PREVIOUS_HEAD, CANDIDATE, RELEASED_TAG,
-# DROPPED, DISABLED, CANCELLED, FINISHED, UNREGISTERED (from the workflow sweeps), SWEEP_RESULT,
+# Environment (from the run): REPOSITORY, SERIES_BRANCH, RUN_URL, ACTION, GUARD_RESULT,
+# GUARD_ATTEMPT (the run attempt the guard passed in), RUN_ATTEMPT, PLAN_RESULT, RELEASE_RESULT,
+# ADVANCE_RESULT, BASE_TAG, PREVIOUS_TAG, PREVIOUS_HEAD, CANDIDATE, RELEASED_TAG, DROPPED, DISABLED,
+# CANCELLED, FINISHED, UNREGISTERED, UNREGISTERED_OLD (from the workflow sweeps), SWEEP_RESULT,
 # REPORTS (directory of the jobs' reason files), ORIGIN (git URL of this fork, default GitHub).
 # Summary to $GITHUB_STEP_SUMMARY, else stdout.
 set -uo pipefail
@@ -31,12 +32,25 @@ done
 [[ "$ACTION" != stage ]] || failed=true
 [[ "${SWEEP_RESULT:-success}" != failure ]] || failed=true
 
+# A re-run of failed jobs (or of one job) keeps the guard's result from an earlier attempt; the jobs
+# that get FORK_PUSH_TOKEN skip themselves then. Say so whenever one of them was skipped for it.
+stale_guard=false
+if [[ "${GUARD_RESULT:-success}" == success && -n "${GUARD_ATTEMPT:-}" && -n "${RUN_ATTEMPT:-}" \
+  && "$GUARD_ATTEMPT" != "$RUN_ATTEMPT" ]]; then
+  if [[ "${PLAN_RESULT:-}" == skipped ]] \
+    || [[ "${ADVANCE_RESULT:-skipped}" == skipped && ( "$ACTION" == advance || "$ACTION" == rebase ) ]]; then
+    stale_guard=true
+    failed=true
+  fi
+fi
+
 # The sweeps' lists arrive joined with ','; drop the empty parts and repeats.
 tidy() { tr ',' '\n' <<< "$1" | sed '/^$/d' | awk '!seen[$0]++' | paste -sd, -; }
 DISABLED="$(tidy "${DISABLED:-}")"
 CANCELLED="$(tidy "${CANCELLED:-}")"
 FINISHED="$(tidy "${FINISHED:-}")"
 UNREGISTERED="$(tidy "${UNREGISTERED:-}")"
+UNREGISTERED_OLD="$(tidy "${UNREGISTERED_OLD:-}")"
 
 state=()
 row() { state+=("| $1 | $2 |"); }
@@ -98,10 +112,13 @@ fi
 [[ -z "${CANCELLED:-}" ]] || row "Their runs cancelled" "${CANCELLED//,/, }"
 [[ -z "${FINISHED:-}" ]] || row "**Upstream runs that finished before a sweep could stop them**" "${FINISHED//,/, }"
 [[ -z "${UNREGISTERED:-}" ]] \
-  || row "**Upstream workflow files GitHub does not list yet, so not disabled** (the sweep after their first run disables them)" "${UNREGISTERED//,/, }"
+  || row "**Upstream workflow files new on this release that GitHub does not list yet, so not disabled** (the sweep after an event reaches them disables them; the branch move waits for that)" "${UNREGISTERED//,/, }"
 [[ -z "${DROPPED:-}" ]] || row "Patches dropped (empty on $BASE_TAG: upstream has the change)" "${DROPPED//;/, }"
 
 reasons=""
+if [[ "$stale_guard" == true ]]; then
+  reasons+="This is attempt $RUN_ATTEMPT of the run, but the guard passed in attempt $GUARD_ATTEMPT: \"Re-run failed jobs\" and \"Re-run job\" keep the guard's earlier result without checking again, so the jobs that get FORK_PUSH_TOKEN were skipped. Use \"Re-run all jobs\", or start a new run (\`gh workflow run fork-follow.yml --repo $REPOSITORY\`)."$'\n\n'
+fi
 if [[ -n "$REPORTS" && -d "$REPORTS" ]]; then
   for file in "$REPORTS"/*.md; do
     [[ -f "$file" ]] && reasons+="$(cat "$file")"$'\n\n'
@@ -116,6 +133,8 @@ case "$ACTION" in
   stage) what="Push the candidate on ${BASE_TAG:-?}; its release needs its own workflow files." ;;
   *) if [[ "${GUARD_RESULT:-success}" != success ]]; then
        what="None: the guard refused, so no job got FORK_PUSH_TOKEN."
+     elif [[ "$stale_guard" == true ]]; then
+       what="None: the guard did not run in this attempt, so no job got FORK_PUSH_TOKEN."
      else
        what="The plan did not finish."
      fi ;;
@@ -142,6 +161,14 @@ body="$(mktemp)"
   echo "| What | State now |"
   echo "|---|---|"
   printf '%s\n' "${state[@]}"
+  if [[ -n "$UNREGISTERED_OLD" ]]; then
+    echo
+    echo "<details><summary>Upstream workflow files from earlier releases that GitHub does not list (not a warning)</summary>"
+    echo
+    echo "Most of them run only on events this fork never sends (workflow_call, workflow_dispatch, workflow_run), so they stay unlisted. A sweep disables one once an event reaches it: ${UNREGISTERED_OLD//,/, }"
+    echo
+    echo "</details>"
+  fi
 } > "$body"
 
 # --- the issue, when the repository has Issues ---------------------------------------------------

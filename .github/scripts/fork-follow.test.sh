@@ -279,6 +279,21 @@ work git reset -q --hard "$(series)"
 plan
 check "plan: a release of different files does not count -> rebase" action_is rebase
 
+# Round 3: upstream workflow files new on the target release are named, so the branch move can
+# refuse while GitHub does not list one. A rename counts as new; a same-base plan names none.
+new_upstream
+(cd "$root/upwork" && git checkout -q main && echo "on: push" > .github/workflows/nightly.yml \
+  && git mv .github/workflows/ci.yml .github/workflows/ci-v2.yml && git add -A && git commit -q -m u5 \
+  && git tag v0.1.11 && git push -q https://github.com/up/t3code.git main --tags) > /dev/null 2>&1
+new_fork v0.1.10
+plan
+check "plan: a rebase names the upstream workflow files new on the target release (a rename too)" \
+  eval 'action_is rebase && [[ "$(out new_workflows)" == .github/workflows/ci-v2.yml,.github/workflows/nightly.yml ]]'
+new_fork v0.1.11
+plan
+check "plan: same base -> no new upstream workflow files" \
+  eval 'action_is release && grep -qx "new_workflows=" "$root/plan.out"'
+
 # Minor: upstream changed a reusable workflow the release calls; the run's own copy is older.
 new_upstream
 (cd "$root/upwork" && git checkout -q main && echo "on: workflow_call # v2" > .github/workflows/release-desktop.yml \
@@ -412,6 +427,16 @@ echo '{"total_count":1,"branch_policies":[{"id":1,"name":"main*","type":"branch"
 check "guard: a pattern rule (main*) -> refused" eval '! guard && has "main\*" "$root/report.md"'
 echo '{"total_count":0,"branch_policies":[]}' > "$root/api/branch-policies.json"
 check "guard: no rule at all -> refused" eval '! guard && has "(none)" "$root/report.md"'
+# Round 3: a series branch that is itself a pattern, with the matching rule, is still refused.
+echo '{"total_count":1,"branch_policies":[{"id":1,"name":"main*","type":"branch"}]}' > "$root/api/branch-policies.json"
+check "guard: a series branch that is a pattern (main*), even with the rule 'branch main*' -> refused" \
+  eval '! SERIES_BRANCH="main*" guard && has "must let only the branch main\*" "$root/report.md"'
+good_env
+check "guard: --environment-only (before the branch move) passes without the secret answer" \
+  eval 'REPO_SECRET_PRESENT= REPORT="$root/report.md" FORK_PUSH_ENVIRONMENT=fork-push bash "$dir/fork-follow-guard.sh" --environment-only > "$root/out" 2>&1'
+echo '{"name":"fork-push","deployment_branch_policy":null}' > "$root/api/environment.json"
+check "guard: --environment-only still refuses an Environment any branch may deploy to" \
+  eval '! REPORT="$root/report.md" FORK_PUSH_ENVIRONMENT=fork-push bash "$dir/fork-follow-guard.sh" --environment-only > "$root/out" 2>&1 && has "Any branch may deploy" "$root/report.md"'
 good_env
 touch "$root/api/fail_environments"
 check "guard: the Environment cannot be read -> refused with gh's reason" \
@@ -419,7 +444,7 @@ check "guard: the Environment cannot be read -> refused with gh's reason" \
 unset REPO_SECRET_PRESENT
 
 # --- workflows: fork-workflows.sh ------------------------------------------------------------
-sweep() { REPORT="$root/report.md" GITHUB_OUTPUT="$root/sweep.out" bash "$dir/fork-workflows.sh" > "$root/out" 2>&1; }
+sweep() { rm -f "$root/sweep.out"; REPORT="$root/report.md" GITHUB_OUTPUT="$root/sweep.out" bash "$dir/fork-workflows.sh" > "$root/out" 2>&1; }
 reset_api
 cat > "$root/api/workflows.json" << 'J'
 {"workflows":[
@@ -454,8 +479,18 @@ check "workflows: an upstream run from another event and commit (pull_request_ta
   eval 'has "runs/14/cancel" "$root/api/writes" && [[ $(grep -c cancel "$root/api/writes") == 2 ]]'
 check "workflows: upstream runs that finished before the sweep are named with event and conclusion; own and cancelled ones are not" \
   eval '[[ "$(sed -n "s/^finished=//p" "$root/sweep.out")" == "13 (.github/workflows/relay-preview.yml: success after push)" ]]'
-check "workflows: upstream workflow files GitHub does not list yet are named, not called disabled" \
-  eval '[[ "$(sed -n "s/^unregistered=//p" "$root/sweep.out")" == ".github/workflows/release.yml" ]] && has "does not list yet" "$root/out"'
+check "workflows: an unlisted upstream file from an earlier release is named apart, with no warning" \
+  eval '[[ -z "$(sed -n "s/^unregistered=//p" "$root/sweep.out")" && "$(sed -n "s/^unregistered_old=//p" "$root/sweep.out")" == ".github/workflows/release.yml" ]] && hasnt "::warning::.*does not list yet" "$root/out"'
+rm -f "$root/api/writes"
+OWN_WORKFLOWS=.github/workflows/fork-follow.yml,.github/workflows/fork-tests.yml HEAD_SHA=abc NEW_WORKFLOWS=.github/workflows/release.yml sweep
+check "workflows: an unlisted upstream file new on this release is named with a warning, not called disabled" \
+  eval '[[ "$(sed -n "s/^unregistered=//p" "$root/sweep.out")" == ".github/workflows/release.yml" && -z "$(sed -n "s/^unregistered_old=//p" "$root/sweep.out")" ]] && has "::warning::.*new on this release.*does not list yet" "$root/out"'
+rm -f "$root/api/writes" "$root/report.md"
+check "workflows: before the move, a new unlisted upstream file refuses it, after disabling the listed ones" \
+  eval '! OWN_WORKFLOWS=.github/workflows/fork-follow.yml HEAD_SHA=abc NEW_WORKFLOWS=.github/workflows/release.yml REQUIRE_NEW_OFF=true sweep && has "main was not moved" "$root/report.md" && has "release.yml" "$root/report.md" && has "A person decides" "$root/report.md" && has "workflows/2/disable" "$root/api/writes"'
+rm -f "$root/report.md"
+check "workflows: before the move, a new upstream file GitHub lists (now disabled) and older unlisted ones do not refuse it" \
+  eval 'OWN_WORKFLOWS=.github/workflows/fork-follow.yml HEAD_SHA=abc NEW_WORKFLOWS=.github/workflows/web-preview.yml REQUIRE_NEW_OFF=true sweep && [[ ! -e "$root/report.md" ]]'
 reset_api
 OWN_WORKFLOWS="" sweep
 check "workflows: an empty own list disables nothing (refusing to guess)" eval '[[ ! -e "$root/api/writes" ]] && has "refusing to guess" "$root/report.md"'
@@ -523,6 +558,24 @@ report ACTION=none PLAN_RESULT=success CANDIDATE="$cand" SWEEP_RESULT=success \
   FINISHED="13 (.github/workflows/relay-preview.yml: success after push)" UNREGISTERED=".github/workflows/release.yml"
 check "report: names upstream runs that finished first and files GitHub does not list yet" \
   eval 'has "finished before a sweep could stop them" "$root/summary.md" && has "relay-preview.yml: success after push" "$root/summary.md" && has "does not list yet" "$root/summary.md" && has "release.yml" "$root/summary.md"'
+reset_api false
+echo '{"draft":false}' > "$root/api/release-v0.1.10-fork.2"
+report ACTION=none PLAN_RESULT=success CANDIDATE="$cand" SWEEP_RESULT=success UNREGISTERED_OLD=".github/workflows/publish-aur.yml"
+check "report: unlisted upstream files from earlier releases go in a collapsed note, not a bold row, and pass" \
+  eval '! failed_run && has "<details>" "$root/summary.md" && has "publish-aur.yml" "$root/summary.md" && hasnt "\*\*.*publish-aur" "$root/summary.md"'
+# Round 3: "Re-run failed jobs" keeps the guard's earlier result; the token jobs skip themselves.
+rm -rf "$root/reports" && mkdir -p "$root/reports"
+reset_api false
+report ACTION= GUARD_RESULT=success GUARD_ATTEMPT=1 RUN_ATTEMPT=2 PLAN_RESULT=skipped
+check "report: the guard passed in an earlier attempt, the plan skipped -> fails, says to re-run all jobs" \
+  eval 'failed_run && has "did not run in this attempt" "$root/summary.md" && has "Re-run all jobs" "$root/summary.md"'
+report ACTION=rebase GUARD_RESULT=success GUARD_ATTEMPT=1 RUN_ATTEMPT=2 PLAN_RESULT=success RELEASE_RESULT=success \
+  ADVANCE_RESULT=skipped BASE_TAG=v0.1.10 PREVIOUS_HEAD="$prev" CANDIDATE="$cand"
+check "report: released, but the move skipped for an earlier attempt's guard -> fails and says why" \
+  eval 'failed_run && has "guard passed in attempt 1" "$root/summary.md"'
+echo '{"draft":false}' > "$root/api/release-v0.1.10-fork.2"
+report ACTION=none GUARD_RESULT=success GUARD_ATTEMPT=1 RUN_ATTEMPT=2 PLAN_RESULT=success CANDIDATE="$cand" RELEASED_TAG=v0.1.10-fork.2
+check "report: a re-run of the report alone after a good run does not cry wolf" eval '! failed_run'
 rm -rf "$root/reports" && mkdir -p "$root/reports"
 echo "A repository or organisation secret named FORK_PUSH_TOKEN exists" > "$root/reports/guard.md"
 report ACTION= GUARD_RESULT=failure PLAN_RESULT=skipped
@@ -542,8 +595,24 @@ check "workflow: FORK_PUSH_TOKEN reaches only fork-follow-push.sh steps, never a
 guard_job="$(sed -n '/^  guard:$/,/^  [a-z_-]*:$/p' "$workflow" | sed '$d')"
 check "workflow: a Guard job without an Environment sees only whether a repository/organisation secret exists, and runs the guard" \
   eval '[[ -n "$guard_job" ]] && ! grep -q "environment:" <<< "$guard_job" && [[ $(grep -cF "$presence" "$workflow") == 1 ]] && grep -qF "$presence" <<< "$guard_job" && grep -q "fork-follow-guard.sh" <<< "$guard_job" && grep -q "actions: read" <<< "$guard_job"'
-check "workflow: the plan (the first job with the token) waits for the guard; advance waits for the plan" \
-  eval 'sed -n "/^  plan:$/,/^    steps:$/p" "$workflow" | grep -qx "    needs: \[guard\]" && sed -n "/^  advance:$/,/^    steps:$/p" "$workflow" | grep -q "^    needs: \[plan"'
+plan_head="$(sed -n "/^  plan:$/,/^    steps:$/p" "$workflow")"
+advance_head="$(sed -n "/^  advance:$/,/^    steps:$/p" "$workflow")"
+attempt_check="needs.guard.outputs.attempt == github.run_attempt"
+check "workflow: the plan (the first job with the token) waits for the guard; advance waits for the guard and the plan" \
+  eval 'grep -qx "    needs: \[guard\]" <<< "$plan_head" && grep -qx "    needs: \[guard, plan, release\]" <<< "$advance_head"'
+# Round 3: the plan's only job-level condition is this attempt's guard, with the implied success():
+# always(), !cancelled() or failure() there would let it run after the guard refused.
+check "workflow: the plan runs only after a guard that passed in this attempt (no always/cancelled/failure)" \
+  eval '[[ "$(grep -c "^    if:" <<< "$plan_head")" == 1 ]] && grep -qxF "    if: $attempt_check" <<< "$plan_head" && ! grep -qE "always\(\)|cancelled\(\)|failure\(\)" <<< "$plan_head"'
+check "workflow: advance needs the plan's success and this attempt's guard" \
+  eval 'grep -qF "needs.plan.result == '"'"'success'"'"'" <<< "$advance_head" && grep -qF "$attempt_check" <<< "$advance_head" && ! grep -qE "always\(\)|failure\(\)" <<< "$advance_head"'
+check "workflow: the guard's attempt output is set only by a step after the guard script" \
+  eval 'grep -qF "attempt: \${{ steps.passed.outputs.attempt }}" <<< "$guard_job" && awk "/fork-follow-guard.sh/ { g = NR } /id: passed/ { p = NR } /attempt=\\\$GITHUB_RUN_ATTEMPT/ { a = NR } END { exit !(g && p > g && a > p) }" <<< "$guard_job"'
+advance_job="$(sed -n '/^  advance:$/,/^  [a-z_-]*:$/p' "$workflow" | sed '$d')"
+check "workflow: before the move, advance checks the Environment again and sweeps, refusing new unlisted files" \
+  eval 'awk "/fork-follow-guard.sh --environment-only/ { g = NR } /REQUIRE_NEW_OFF: \"true\"/ { r = NR } /NEW_WORKFLOWS: .*new_workflows/ && !n { n = NR } /fork-follow-push.sh advance/ { m = NR } END { exit !(g && r && n && m && g < r && r < m && n < m) }" <<< "$advance_job"'
+check "workflow: the move step runs only when the checks before it passed (no if:)" \
+  eval 'awk "/- name: Move the series branch/ { s = 1; next } s && /^      - / { exit } s && /^        if:/ { bad = 1 } END { exit bad }" <<< "$advance_job"'
 check "workflow: action none deletes a leftover candidate branch" \
   eval 'grep -B2 -A3 "action == .none." "$workflow" | grep -q "fork-follow-push.sh cleanup"'
 check "workflow: the last sweep reports runs since the run began" \
