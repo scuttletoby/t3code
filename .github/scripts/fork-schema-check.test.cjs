@@ -569,7 +569,7 @@ test("a workflow that pastes PR values into a script or reaches a token fails th
     // A plain one-line run continued on the next line: YAML folds it into the same script.
     "an expression on the continuation of a plain run": workflow.replace(
       /^( +)run: (node --test .*)$/m,
-      (all, indent, cmd) => `${all}\n${indent}  \${{ github.head_ref }}`,
+      (all, indent) => `${all}\n${indent}  \${{ github.head_ref }}`,
     ),
   };
   for (const [label, text] of Object.entries(mutants)) {
