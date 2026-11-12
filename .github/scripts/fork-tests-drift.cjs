@@ -124,7 +124,9 @@ function compare(recorded, now) {
         continue;
       }
       if (a.header !== b.header)
-        changes.push(`${file}: job \`${job}\`: settings changed (runs-on, if, needs, matrix, env...)`);
+        changes.push(
+          `${file}: job \`${job}\`: settings changed (runs-on, if, needs, matrix, env...)`,
+        );
       const oldSteps = new Map(a.steps.map((s) => [s.name, s.digest]));
       const newSteps = new Map(b.steps.map((s) => [s.name, s.digest]));
       for (const [name, d] of newSteps) {

@@ -2,12 +2,22 @@ name: Fork tests
 
 # Fork only. Upstream's CI checks (ci.yml) on GitHub-hosted runners, because the
 # fork has none of upstream's runners and upstream's workflows are disabled here.
-# Commands follow ci.yml step for step; only the runners, time limits, apt setup
-# and the private task cache differ. Upstream's composite actions and change
-# detector (.github/actions, .github/scripts/ci-changes.cjs) are used as they
-# are, so a rebase brings their changes. The `drift` job fails when upstream's
-# ci.yml or release.yml test jobs change and this copy did not follow
-# (.github/scripts/fork-tests-drift.cjs).
+# Commands follow ci.yml step for step; only the runners, time limits, apt
+# setup, the task cache (kept with actions/cache instead of upstream's private
+# remote cache) and the Test job's split across two runners differ. Upstream's
+# composite actions and change detector (.github/actions,
+# .github/scripts/ci-changes.cjs) are used as they are, so a rebase brings their
+# changes. The `workflows` job lints the fork workflows (actionlint) and fails
+# when upstream's ci.yml or release.yml test jobs change and this copy did not
+# follow (.github/scripts/fork-tests-drift.cjs).
+#
+# Require only `fork-ci-result` in a ruleset: it needs every other job, so jobs
+# can be added, split or resharded without touching the ruleset.
+#
+# Runners: GitHub-hosted only, Ubuntu 24.04 as upstream (ubuntu-latest is now
+# 26.04, whose newer git fails an apps/server test upstream never sees). Never
+# add a self-hosted runner to this workflow: this repository is public, so a
+# pull request from any fork would run its code on that machine.
 #
 # Two modes:
 # - pull_request / push to main: CI. Jobs a change cannot affect are skipped by
@@ -45,7 +55,7 @@ concurrency:
 jobs:
   changes:
     name: Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       typecheck: ${{ steps.release.outputs.typecheck || steps.detect.outputs.typecheck }}
@@ -103,11 +113,12 @@ jobs:
           echo "test_packages=" >> "$GITHUB_OUTPUT"
           echo "mobile_native=false" >> "$GITHUB_OUTPUT"
 
-  # The fork copy must follow upstream's test jobs. Fails with the list of
-  # jobs and steps upstream changed since the copy was last recorded.
-  drift:
-    name: Upstream drift
-    runs-on: ubuntu-latest
+  # A broken fork workflow is red on its own pull request, and the fork copy
+  # must follow upstream's test jobs: the drift check lists every job and step
+  # upstream changed since the copy was last recorded.
+  workflows:
+    name: Workflow lint and upstream drift
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -118,15 +129,90 @@ jobs:
             /.github/
           sparse-checkout-cone-mode: false
 
-      - name: Test the drift check
-        run: node --test .github/scripts/fork-tests-drift.test.cjs
+      # Pinned release, verified by checksum. Upstream's own workflows use runner
+      # labels this fork does not have, so only the fork's workflows are linted.
+      - name: Lint fork workflows (actionlint)
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/${archive}"
+          echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
+
+      - name: Test the fork CI scripts
+        run: node --test .github/scripts/fork-tests-drift.test.cjs .github/scripts/fork-test-shards.test.cjs
 
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
 
+  # Every commit a pull request or a push to main adds, history included: a
+  # secret committed and then deleted is still public. Release runs test a
+  # commit that already passed this on its way to main, so they skip it.
+  secrets:
+    name: Secret scan
+    if: ${{ inputs.ref == '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # A pull request fetches only its own commits (plus the parent of the
+      # oldest, below). A push fetches history without file contents;
+      # gitleaks then reads only the pushed commits.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && github.event.pull_request.commits || 0 }}
+          filter: ${{ github.event_name != 'pull_request' && 'blob:none' || '' }}
+
+      - name: Install gitleaks
+        env:
+          VERSION: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          archive="gitleaks_${VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${archive}"
+          echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+
+      - name: Scan the added commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMITS: ${{ github.event.pull_request.commits }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            # One more commit, so the oldest one is diffed against its parent
+            # instead of being read as a root that adds the whole tree.
+            git fetch --no-tags --quiet --deepen=1 origin "$(git rev-parse HEAD)"
+            range="--max-count=$COMMITS"
+            what="the pull request's $COMMITS commit(s)"
+          elif [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..$GITHUB_SHA"
+            what="the commits pushed after ${BEFORE:0:12}"
+          else
+            range="--max-count=1"
+            what="the pushed commit (no earlier commit to compare with)"
+          fi
+          echo "Scanning $what"
+          set +e
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --verbose --log-opts="$range" .
+          status=$?
+          set -e
+          if [[ $status -eq 0 ]]; then
+            echo "### Secret scan"$'\n\n'"No secrets found in $what." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Secret scan"$'\n\n'"gitleaks found possible secrets in $what (values redacted; see the job log). Rotate any real secret: it is already public." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -175,7 +261,7 @@ jobs:
     name: Build and Typecheck
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -217,6 +303,18 @@ jobs:
       - name: Ensure Electron runtime is installed
         id: electron
         run: vp run --filter @t3tools/desktop ensure:electron
+
+      # Upstream reads a private remote task cache (a secret the fork has not
+      # got). Here vp's local task cache is kept between runs instead: vp
+      # fingerprints each task's inputs, so a restored entry only replays a
+      # task whose inputs are unchanged. A new lockfile starts a fresh cache.
+      - name: Cache vp tasks
+        if: needs.changes.outputs.typecheck != 'false'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: node_modules/.vite/task-cache
+          key: vp-tasks-v1-typecheck-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'package.json') }}-${{ github.sha }}
+          restore-keys: vp-tasks-v1-typecheck-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'package.json') }}-
 
       # Runs in the background while the build runs, and reports in the last
       # step: neither result hides the other.
@@ -305,12 +403,19 @@ jobs:
           exit "$(cat "$RUNNER_TEMP/typecheck-status")"
 
   # Everything except `t3` (apps/server) and the web app, which have their own jobs.
+  # Upstream runs this on one large runner. Here the packages are split across
+  # two 4-CPU runners by test file count (.github/scripts/fork-test-shards.cjs);
+  # one runner took 6 minutes, the longest job of the run.
   test:
-    name: Test
+    name: Test ${{ matrix.shard }}
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -322,9 +427,20 @@ jobs:
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
 
+      # Shard 1 always gets the heaviest affected package; a shard left with
+      # none says so in the summary and stops here.
+      - name: Pick this shard's packages
+        id: shard
+        env:
+          TEST_PACKAGES: ${{ needs.changes.outputs.test_packages }}
+        run: |
+          packages=$(node .github/scripts/fork-test-shards.cjs "${{ matrix.shard }}/${{ strategy.job-total }}" | tr '\n' ' ')
+          echo "packages=${packages% }" >> "$GITHUB_OUTPUT"
+
       # The desktop tests compile the browser secret helper. The install runs in
       # the background while Vite+ installs; the step before the tests waits for it.
       - name: Start installing browser secret helper build libraries
+        if: steps.shard.outputs.packages != ''
         run: |
           (
             set +e
@@ -336,44 +452,47 @@ jobs:
           ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
 
       - name: Setup Vite+
+        if: steps.shard.outputs.packages != ''
         uses: ./.github/actions/setup-ci-deps
         with:
           # Lint saves the pnpm store; the others only restore it.
           save-pnpm-store: false
 
       - name: Cache Electron download
+        if: steps.shard.outputs.packages != ''
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/electron
           key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
 
       - name: Ensure Electron runtime is installed
+        if: steps.shard.outputs.packages != ''
         run: vp run --filter @t3tools/desktop ensure:electron
 
       - name: Test preview artifact validation
+        if: matrix.shard == 1
         run: python3 -B .github/scripts/stage-preview-bundle.test.py
 
       - name: Test release checks
+        if: matrix.shard == 1
         run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs
 
       - name: Finish installing browser secret helper build libraries
+        if: steps.shard.outputs.packages != ''
         timeout-minutes: 5
         run: |
           until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
           cat "$RUNNER_TEMP/apt.log"
           exit "$(cat "$RUNNER_TEMP/apt-status")"
 
-      # `changes` lists the affected packages, or nothing when all of them are.
       - name: Test
+        if: steps.shard.outputs.packages != ''
         env:
-          TEST_PACKAGES: ${{ needs.changes.outputs.test_packages }}
+          PACKAGES: ${{ steps.shard.outputs.packages }}
         run: |
           set -o pipefail
-          filters=(--filter '!t3' --filter '!@t3tools/monorepo' --filter '!@t3tools/web')
-          if [[ -n "$TEST_PACKAGES" ]]; then
-            filters=()
-            for package in $TEST_PACKAGES; do filters+=(--filter "$package"); done
-          fi
+          filters=()
+          for package in $PACKAGES; do filters+=(--filter "$package"); done
           # The runner's trace writer can crash on surrogate pairs in test output.
           vp run --parallel --concurrency-limit 4 "${filters[@]}" test 2>&1 | python3 -u -c '
           import sys
@@ -385,7 +504,7 @@ jobs:
     name: Test Web
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -435,7 +554,7 @@ jobs:
   # `changes`; a shard the change cannot affect says so in its summary.
   test_server:
     name: Test Server ${{ matrix.shard }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -471,6 +590,18 @@ jobs:
         with:
           # Lint saves the pnpm store; the others only restore it.
           save-pnpm-store: false
+
+      # Upstream reads a private remote task cache (a secret the fork has not
+      # got). Here vp's local task cache is kept between runs instead: vp
+      # fingerprints each task's inputs, so a restored entry only replays a
+      # task whose inputs are unchanged. A new lockfile starts a fresh cache.
+      - name: Cache vp tasks
+        if: steps.changes.outputs.test_server != 'false'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: node_modules/.vite/task-cache
+          key: vp-tasks-v1-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'package.json') }}-${{ github.sha }}
+          restore-keys: vp-tasks-v1-server-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'package.json') }}-
 
       - name: Resolve Playwright version
         id: playwright_version
@@ -550,7 +681,7 @@ jobs:
     name: Rust
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -617,7 +748,7 @@ jobs:
     name: Release Smoke
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.release_smoke != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -639,16 +770,20 @@ jobs:
       - name: Exercise release-only workflow steps
         run: node scripts/release-smoke.ts
 
-  # The one check to require. Fails when any job fails, is cancelled, or is
-  # skipped without `changes` saying it was not needed. The run summary lists
-  # every job, and every skip with its reason.
-  check:
-    name: Check
+  # The one check a ruleset requires. Fails when any job fails or is cancelled,
+  # or is skipped without a reason: `changes` said its gates were not needed,
+  # or (secret scan) it is a release run. The summary lists every job, the
+  # reason for every skip, and each job's wall time.
+  # `always()` rather than `!cancelled()`: a skipped job reports success to
+  # branch protection, so a cancelled run must still produce a failing result.
+  fork_ci_result:
+    name: fork-ci-result
     if: ${{ always() }}
     needs:
       [
         changes,
-        drift,
+        workflows,
+        secrets,
         lint,
         build,
         test,
@@ -658,7 +793,7 @@ jobs:
         mobile_native_static_analysis,
         release_smoke,
       ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require every job to pass
@@ -667,36 +802,40 @@ jobs:
           RELEASE_RUN: ${{ inputs.ref != '' }}
         run: |
           echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          why='{
+            build: "the change affects neither desktop, server nor web, and no package needs a typecheck",
+            test: "the change affects no package this job tests",
+            test_web: "the change affects nothing @t3tools/web depends on",
+            rust: "the change touches none of the native Rust crates",
+            mobile_native_static_analysis: (if $release == "true"
+              then "release run: upstream release.yml has no macOS lint"
+              else "no native mobile source, Brewfile or CI workflow changed" end),
+            release_smoke: "the change does not affect scripts/",
+            secrets: "release run: the commit was scanned on its way to main"
+          }'
           {
-            echo "### Fork tests"
+            echo "### fork-ci-result"
             echo
             echo "| Job | Result | Why skipped |"
             echo "| --- | --- | --- |"
-            echo "$RESULTS" | jq -r --arg release "$RELEASE_RUN" '.changes.outputs as $g
-              | {build: "the change affects neither desktop, server nor web, and no package needs a typecheck",
-                 test: "the change affects no package this job tests",
-                 test_web: "the change affects nothing @t3tools/web depends on",
-                 rust: "the change touches none of the native Rust crates",
-                 mobile_native_static_analysis: (if $release == "true"
-                   then "release run: upstream release.yml has no macOS lint"
-                   else "no native mobile source, Brewfile or CI workflow changed" end),
-                 release_smoke: "the change does not affect scripts/"} as $why
+            echo "$RESULTS" | jq -r --arg release "$RELEASE_RUN" "$why as \$why
               | to_entries[]
-              | "| \(.key) | \(.value.result) | \(if .value.result == "skipped" then ($why[.key] // "not explained") else "" end) |"'
+              | \"| \(.key) | \(.value.result) | \(if .value.result == \"skipped\" then (\$why[.key] // \"no reason: fails\") else \"\" end) |\""
             if [[ "$(echo "$RESULTS" | jq -r '.changes.outputs.test_server')" == false ]]; then
               echo
               echo "Server shards passed without running tests: the change affects nothing t3 (apps/server) depends on."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           # A job may skip only when `changes` said every gate it represents was
-          # not needed. Gates are keyed by job name, except merged Build and the
-          # macOS lint.
-          echo "$RESULTS" | jq -e '.changes.outputs as $gates
+          # not needed (gates are keyed by job name, except merged Build and the
+          # macOS lint), or, for the secret scan, in a release run.
+          echo "$RESULTS" | jq -e --arg release "$RELEASE_RUN" '.changes.outputs as $gates
             | {build: ["build", "typecheck", "desktop_launch"], mobile_native_static_analysis: ["mobile_native"]} as $renamed
             | all(to_entries[];
                 .value.result == "success"
                 or (.value.result == "skipped"
-                  and (($renamed[.key] // [.key]) | all(.[]; $gates[.] == "false"))))' > /dev/null
+                  and (if .key == "secrets" then $release == "true"
+                       else (($renamed[.key] // [.key]) | all(.[]; $gates[.] == "false")) end)))' > /dev/null
 
       # A run whose server tests ran must have produced the transfer measurements.
       - name: Require transfer measurements
@@ -705,3 +844,26 @@ jobs:
         with:
           name: thread-transfer-results
           path: ${{ runner.temp }}/thread-transfer
+
+      # Information only: read from the public run's job list, never fails the run.
+      - name: Job wall times
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" 2>/dev/null) || {
+            echo "Job timings unavailable." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          {
+            echo
+            echo "#### Job wall times"
+            echo
+            echo "| Job | Queued | Ran |"
+            echo "| --- | ---: | ---: |"
+            echo "$jobs" | jq -r '.jobs[]
+              | select(.completed_at != null and .started_at != null)
+              | ((.started_at | fromdateiso8601) - (.created_at | fromdateiso8601)) as $queued
+              | ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601)) as $ran
+              | "| \(.name) | \($queued)s | \($ran / 60 | floor)m \($ran % 60)s |"'
+          } >> "$GITHUB_STEP_SUMMARY"
