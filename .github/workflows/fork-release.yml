@@ -1,0 +1,401 @@
+name: Fork release
+
+# Builds this fork's release `v<upstream>-fork.<n>`: upstream's tests, the Linux x64 server archive
+# with SHA256SUMS, and the desktop apps (Linux x64, Windows x64, macOS arm64 and x64), all on
+# GitHub-hosted runners and unsigned unless signing secrets exist. <upstream> is the newest stable
+# upstream tag the commit contains; <n> counts the fork's earlier builds of it.
+#
+# Builds name this repository as their release repository (scripts/lib/release-repository.ts reads
+# GITHUB_REPOSITORY), so the server's update and the desktop app's updater look only at this fork.
+# Publishing makes a normal (not pre-) release marked latest; a draft until every file is uploaded.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or branch to build
+        required: false
+        default: main
+        type: string
+      publish:
+        description: Publish the release (off builds and keeps the files on the run only)
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      publish:
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      version:
+        value: ${{ jobs.preflight.outputs.version }}
+      tag:
+        value: ${{ jobs.preflight.outputs.tag }}
+      published:
+        value: ${{ jobs.publish.result == 'success' }}
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  # The Windows desktop job reads this run's artifact list to wait for the Linux CLI archive.
+  actions: read
+  contents: read
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ref: ${{ steps.meta.outputs.ref }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      base_tag: ${{ steps.meta.outputs.base_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          filter: blob:none
+
+      - id: meta
+        name: Resolve fork release version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')"
+          if [[ -z "$upstream" ]]; then
+            echo "::error::$GITHUB_REPOSITORY is not a fork, so there is no upstream release to build on."
+            exit 1
+          fi
+          # The newest stable upstream tag (vX.Y.Z, no suffix) that this commit contains.
+          base_tag=""
+          while read -r tag; do
+            commit="$(git ls-remote "https://github.com/$upstream.git" "refs/tags/$tag^{}" "refs/tags/$tag" | sort -k2 | tail -n1 | cut -f1)"
+            if git merge-base --is-ancestor "$commit" HEAD 2>/dev/null; then
+              base_tag="$tag"
+              break
+            fi
+          done < <(git ls-remote --tags --refs "https://github.com/$upstream.git" 'v*' \
+            | sed -n 's|.*refs/tags/\(v[0-9]\+\.[0-9]\+\.[0-9]\+\)$|\1|p' | sort -rV)
+          if [[ -z "$base_tag" ]]; then
+            echo "::error::$(git rev-parse HEAD) contains no stable $upstream release tag."
+            exit 1
+          fi
+          base="${base_tag#v}"
+          last="$(git ls-remote --tags --refs origin "v$base-fork.*" \
+            | sed -n "s|.*refs/tags/v$base-fork\.\([0-9]\+\)$|\1|p" | sort -n | tail -n1)"
+          version="$base-fork.$(( ${last:-0} + 1 ))"
+          {
+            echo "ref=$(git rev-parse HEAD)"
+            echo "base_tag=$base_tag"
+            echo "version=$version"
+            echo "tag=v$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $version from $(git rev-parse --short HEAD) on $upstream $base_tag." >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: Tests
+    needs: [preflight]
+    uses: ./.github/workflows/fork-tests.yml
+    with:
+      ref: ${{ needs.preflight.outputs.ref }}
+
+  build_bundle:
+    name: Build JS bundle
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+
+      - name: Check bundle-only build support
+        id: bundle_build
+        run: |
+          script="$(node -p "require('./package.json').scripts['build:desktop:bundle'] ? 'build:desktop:bundle' : 'build:desktop'")"
+          echo "script=$script" >> "$GITHUB_OUTPUT"
+
+      - name: Install browser secret helper build libraries
+        if: steps.bundle_build.outputs.script == 'build:desktop'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Build JS bundle
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+          T3CODE_RELEASE_REPOSITORY: ${{ github.repository }}
+        run: vp run ${{ steps.bundle_build.outputs.script }}
+
+      # A build that still names upstream would update a fork install to upstream's releases.
+      - name: Check the bundle names this repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -rqF "\"$GITHUB_REPOSITORY\"" apps/server/dist; then
+            echo "::error::apps/server/dist does not name $GITHUB_REPOSITORY as its release repository."
+            exit 1
+          fi
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 3
+
+  desktop_linux_x64:
+    name: Desktop Linux x64
+    needs: [preflight, build_bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ needs.preflight.outputs.ref }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: ""
+      clerk_jwt_template: ""
+      clerk_cli_oauth_client_id: ""
+      relay_url: ""
+      label: Linux x64
+      runner: ubuntu-latest
+      platform: linux
+      target: AppImage
+      arch: x64
+      rust_target: x86_64-unknown-linux-gnu
+      resource_key: linux-x64
+      cli_archive: true
+      launch_check: true
+
+  desktop_win_x64:
+    name: Desktop Windows x64
+    needs: [preflight, build_bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ needs.preflight.outputs.ref }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: ""
+      clerk_jwt_template: ""
+      clerk_cli_oauth_client_id: ""
+      relay_url: ""
+      label: Windows x64
+      runner: ubuntu-latest
+      verify_runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+      cli_archive: true
+      launch_check: false
+
+  desktop_mac_arm64:
+    name: Desktop macOS arm64
+    needs: [preflight, build_bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ needs.preflight.outputs.ref }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: ""
+      clerk_jwt_template: ""
+      clerk_cli_oauth_client_id: ""
+      relay_url: ""
+      label: macOS arm64
+      runner: ${{ vars.FORK_MACOS_RUNNER || 'macos-26' }}
+      platform: mac
+      target: dmg
+      arch: arm64
+      rust_target: aarch64-apple-darwin
+      resource_key: darwin-arm64
+      cli_archive: false
+      launch_check: true
+
+  desktop_mac_x64:
+    name: Desktop macOS x64
+    needs: [preflight, build_bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ needs.preflight.outputs.ref }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: ""
+      clerk_jwt_template: ""
+      clerk_cli_oauth_client_id: ""
+      relay_url: ""
+      label: macOS x64
+      runner: ${{ vars.FORK_MACOS_RUNNER || 'macos-26' }}
+      platform: mac
+      target: dmg
+      arch: x64
+      rust_target: x86_64-apple-darwin
+      resource_key: darwin-x64
+      cli_archive: false
+      launch_check: false
+
+  publish:
+    name: Publish release
+    needs:
+      [preflight, tests, desktop_linux_x64, desktop_win_x64, desktop_mac_arm64, desktop_mac_x64]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/scripts...
+
+      - name: Download desktop builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Download CLI archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Write CLI archive checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          shopt -s nullglob
+          archives=(t3-*.tar.gz t3-*.zip)
+          if [[ ! -f "t3-${{ needs.preflight.outputs.version }}-linux-x64.tar.gz" ]]; then
+            echo "::error::The Linux x64 server archive is missing." >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Merge macOS updater manifests
+        run: |
+          shopt -s nullglob
+          for x64_manifest in release-assets/*-mac-x64.yml; do
+            arm64_manifest="${x64_manifest%-x64.yml}.yml"
+            if [[ -f "$arm64_manifest" ]]; then
+              node scripts/merge-update-manifests.ts --platform mac "$arm64_manifest" "$x64_manifest"
+              rm -f "$x64_manifest"
+            fi
+          done
+
+      - name: Name the Windows updater manifest
+        run: |
+          shopt -s nullglob
+          for x64_manifest in release-assets/*-win-x64.yml; do
+            mv "$x64_manifest" "${x64_manifest%-win-x64.yml}.yml"
+          done
+
+      # The desktop app on each platform reads one of these from the latest release.
+      - name: Check updater manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in latest.yml latest-mac.yml latest-linux.yml; do
+            if [[ ! -f "release-assets/$manifest" ]]; then
+              echo "::error::release-assets/$manifest is missing, so that platform's desktop app would find no update."
+              exit 1
+            fi
+          done
+
+      - name: Write release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_TAG: ${{ needs.preflight.outputs.base_tag }}
+          REF: ${{ needs.preflight.outputs.ref }}
+        run: |
+          set -euo pipefail
+          upstream="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name')"
+          git fetch --no-tags "https://github.com/$upstream.git" "refs/tags/$BASE_TAG:refs/upstream/$BASE_TAG"
+          {
+            echo "Upstream [$BASE_TAG](https://github.com/$upstream/releases/tag/$BASE_TAG) with this fork's changes on top:"
+            echo
+            git log --reverse --format='- %s (%h)' "refs/upstream/$BASE_TAG..$REF"
+          } > release-notes.md
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      # A run that stopped after creating its draft leaves it behind; drafts have no tag yet, so this
+      # run picked the same version. Published releases are never touched.
+      - name: Remove a draft left by an earlier run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id" \
+            | while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"; done
+
+      - name: Create the release as a draft
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          target_commitish: ${{ needs.preflight.outputs.ref }}
+          name: T3 Code ${{ needs.preflight.outputs.tag }}
+          body_path: release-notes.md
+          draft: true
+          prerelease: false
+          fail_on_unmatched_files: false
+          files: |
+            release-assets/*.dmg
+            release-assets/*.zip
+            release-assets/*.AppImage
+            release-assets/*.exe
+            release-assets/*.blockmap
+            release-assets/*.yml
+            release-assets/*.tar.gz
+            release-assets/SHA256SUMS
+
+      # Updaters skip drafts, so nobody sees a release until every file above is uploaded.
+      - name: Publish the draft as the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ needs.preflight.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --draft=false --latest
