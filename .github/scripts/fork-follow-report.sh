@@ -7,10 +7,11 @@
 # repository has Issues enabled it also opens or comments on one issue, "Fork cannot follow
 # upstream", and closes it once a run succeeds; with Issues disabled it says so and opens none.
 #
-# Environment (from the run): REPOSITORY, SERIES_BRANCH, RUN_URL, ACTION, PLAN_RESULT,
+# Environment (from the run): REPOSITORY, SERIES_BRANCH, RUN_URL, ACTION, GUARD_RESULT, PLAN_RESULT,
 # RELEASE_RESULT, ADVANCE_RESULT, BASE_TAG, PREVIOUS_TAG, PREVIOUS_HEAD, CANDIDATE, RELEASED_TAG,
-# DROPPED, DISABLED, CANCELLED (from the workflow sweeps), SWEEP_RESULT, REPORTS (directory of the jobs' reason
-# files), ORIGIN (git URL of this fork, default GitHub). Summary to $GITHUB_STEP_SUMMARY, else stdout.
+# DROPPED, DISABLED, CANCELLED, FINISHED, UNREGISTERED (from the workflow sweeps), SWEEP_RESULT,
+# REPORTS (directory of the jobs' reason files), ORIGIN (git URL of this fork, default GitHub).
+# Summary to $GITHUB_STEP_SUMMARY, else stdout.
 set -uo pipefail
 
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:?REPOSITORY or GITHUB_REPOSITORY}}"
@@ -23,7 +24,7 @@ title="Fork cannot follow upstream"
 short() { [[ -n "$1" ]] && echo "\`${1:0:12}\`" || echo "(none)"; }
 
 failed=false
-for result in "${PLAN_RESULT:-}" "${RELEASE_RESULT:-skipped}" "${ADVANCE_RESULT:-skipped}"; do
+for result in "${GUARD_RESULT:-success}" "${PLAN_RESULT:-}" "${RELEASE_RESULT:-skipped}" "${ADVANCE_RESULT:-skipped}"; do
   [[ "$result" == success || "$result" == skipped ]] || failed=true
 done
 [[ "${PLAN_RESULT:-}" == success ]] || failed=true
@@ -34,6 +35,8 @@ done
 tidy() { tr ',' '\n' <<< "$1" | sed '/^$/d' | awk '!seen[$0]++' | paste -sd, -; }
 DISABLED="$(tidy "${DISABLED:-}")"
 CANCELLED="$(tidy "${CANCELLED:-}")"
+FINISHED="$(tidy "${FINISHED:-}")"
+UNREGISTERED="$(tidy "${UNREGISTERED:-}")"
 
 state=()
 row() { state+=("| $1 | $2 |"); }
@@ -93,6 +96,9 @@ else
 fi
 [[ -z "${DISABLED:-}" ]] || row "Upstream workflows disabled" "${DISABLED//,/, }"
 [[ -z "${CANCELLED:-}" ]] || row "Their runs cancelled" "${CANCELLED//,/, }"
+[[ -z "${FINISHED:-}" ]] || row "**Upstream runs that finished before a sweep could stop them**" "${FINISHED//,/, }"
+[[ -z "${UNREGISTERED:-}" ]] \
+  || row "**Upstream workflow files GitHub does not list yet, so not disabled** (the sweep after their first run disables them)" "${UNREGISTERED//,/, }"
 [[ -z "${DROPPED:-}" ]] || row "Patches dropped (empty on $BASE_TAG: upstream has the change)" "${DROPPED//;/, }"
 
 reasons=""
@@ -107,8 +113,12 @@ case "$ACTION" in
   release) what="Release the series on ${BASE_TAG:-?} as it is." ;;
   rebase) what="Rebase the series from ${PREVIOUS_TAG:-?} onto ${BASE_TAG:-?}, release it, then move \`$SERIES_BRANCH\`." ;;
   advance) what="Move \`$SERIES_BRANCH\` onto ${BASE_TAG:-?}: ${RELEASED_TAG:-?} already has the rebased series." ;;
-  stage) what="Rebase onto ${BASE_TAG:-?} and push the candidate; its release needs its own workflow files." ;;
-  *) what="The plan did not finish." ;;
+  stage) what="Push the candidate on ${BASE_TAG:-?}; its release needs its own workflow files." ;;
+  *) if [[ "${GUARD_RESULT:-success}" != success ]]; then
+       what="None: the guard refused, so no job got FORK_PUSH_TOKEN."
+     else
+       what="The plan did not finish."
+     fi ;;
 esac
 
 body="$(mktemp)"
@@ -125,7 +135,7 @@ body="$(mktemp)"
     if [[ -n "$reasons" ]]; then
       printf '%s' "$reasons"
     else
-      echo "A job failed without writing a reason (results: plan ${PLAN_RESULT:-?}, release ${RELEASE_RESULT:-skipped}, advance ${ADVANCE_RESULT:-skipped}); see the run."
+      echo "A job failed without writing a reason (results: guard ${GUARD_RESULT:-success}, plan ${PLAN_RESULT:-?}, release ${RELEASE_RESULT:-skipped}, advance ${ADVANCE_RESULT:-skipped}); see the run."
       echo
     fi
   fi

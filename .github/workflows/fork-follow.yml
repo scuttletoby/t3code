@@ -8,9 +8,10 @@ name: Fork follow upstream
 #   move the series branch to the released commit (the old series is kept as a tag).
 # - advance: a published fork release already has the rebased files (an earlier run published it,
 #   then could not move the branch): move the series branch to it, build nothing.
-# - stage: upstream changed the release workflows. A run uses the reusable workflows of its own
-#   commit, so the candidate is pushed and the run stops with the command that releases it with
-#   its own files; the next run then advances to that release.
+# - stage: the release workflows of this run's commit differ from the candidate's (upstream changed
+#   them, or this is a re-run or queued run of an older commit). A run uses the reusable workflows
+#   of its own commit, so the candidate is pushed and the run stops with the command that releases
+#   it with its own files; the next run then finds that release (and advances to it).
 # A conflict, merge commits in the series, a schema change, upstream commits inside the series, a
 # moved or deleted upstream tag, a red test, a failed build or push: the run fails, and the Report
 # job's summary says why and what the repository holds now (branch heads, release tags, drafts), as
@@ -18,19 +19,23 @@ name: Fork follow upstream
 # on the next good run.
 #
 # Upstream's workflows stay off: after each push and at the end, fork-workflows.sh disables every
-# active workflow the series did not add and cancels their runs for the pushed commit.
+# active workflow the series did not add, cancels every unfinished run of one (any event), and
+# names the runs that finished before it could stop them and the files GitHub has not listed yet.
 #
-# Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN in the Environment
-# fork-push, whose deployment branches are limited to the series branch (a repository secret could
-# be read by a workflow file on any pushed branch; the jobs that push run in that Environment and no
-# other job sees the secret): a fine-grained token for this repository only, Contents and Workflows read and write (GITHUB_TOKEN may not push commits
-# that change .github/workflows). Every run checks it first and fails when it is missing, expired or
-# may not push. It reaches only the steps that run fork-follow-push.sh; the release workflow gets the
-# signing secrets by name and never this token. If a rule protects the series branch, the token's
-# user must be allowed to bypass it.
+# Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN, only in the
+# Environment fork-push, whose deployment branches are "Selected branches and tags" with the one
+# rule: branch <series branch>. A repository secret could be read by a workflow file on any pushed
+# branch, and an Environment without that rule hands its secret to any branch. The Guard job checks
+# both before any job gets the token (fork-follow-guard.sh) and refuses, saying what to change.
+# The token: a fine-grained token for this repository only, Contents and Workflows read and write
+# (GITHUB_TOKEN may not push commits that change .github/workflows). The plan checks it first and
+# fails when it is missing, expired or may not push. It reaches only the steps that run
+# fork-follow-push.sh; the release workflow gets the signing secrets by name and never this token.
+# If a rule protects the series branch, the token's user must be allowed to bypass it.
 #
 # A conflict is resolved by hand: rebase the series branch onto the new upstream tag, resolve, test,
-# push it with --force-with-lease; the next run then releases it (the plan's report has the commands).
+# push it with --force-with-lease, then start this workflow once: it releases the series and disables
+# the upstream workflows that push started (the plan's report has the commands).
 on:
   schedule:
     - cron: "23 6 * * *"
@@ -49,8 +54,50 @@ env:
   FORK_PUSH_ENVIRONMENT: fork-push
 
 jobs:
+  # No Environment here, so the FORK_PUSH_TOKEN secret seen here can only be a repository or
+  # organisation secret. Only whether it is empty reaches the step, never the value.
+  guard:
+    name: Guard the token
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      started: ${{ steps.started.outputs.at }}
+    steps:
+      - id: started
+        name: Note the start
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Refuse unless only the Environment holds FORK_PUSH_TOKEN, for the series branch only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SECRET_PRESENT: ${{ secrets.FORK_PUSH_TOKEN != '' }}
+          REPORT: ${{ runner.temp }}/reports/guard.md
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          bash .github/scripts/fork-follow-guard.sh
+
+      - name: Keep the reason
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-follow-report-guard
+          path: ${{ runner.temp }}/reports
+          if-no-files-found: ignore
+          retention-days: 7
+
   plan:
     name: Plan
+    needs: [guard]
     environment: fork-push
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -131,6 +178,13 @@ jobs:
           HEAD_SHA: ${{ steps.plan.outputs.candidate }}
           REPORT: ${{ runner.temp }}/reports/push-workflows.md
         run: bash .github/scripts/fork-workflows.sh
+
+      # Nothing waits for a candidate when the series head is already released.
+      - name: Delete a leftover candidate branch
+        if: steps.plan.outputs.action == 'none'
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+        run: bash .github/scripts/fork-follow-push.sh cleanup
 
       - name: Stop for a release from the candidate's own workflow files
         if: steps.plan.outputs.action == 'stage'
@@ -243,7 +297,7 @@ jobs:
 
   report:
     name: Report
-    needs: [plan, release, advance]
+    needs: [guard, plan, release, advance]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -268,7 +322,8 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/reports
 
-      # Last sweep: runs that a push started after the earlier sweeps looked.
+      # Last sweep: runs that a push started after the earlier sweeps looked, the upstream runs that
+      # finished since the run began, and the upstream files GitHub has not listed yet.
       - id: sweep
         name: Disable upstream workflows, cancel their runs
         if: needs.plan.outputs.own_workflows != ''
@@ -277,6 +332,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OWN_WORKFLOWS: ${{ needs.plan.outputs.own_workflows }}
           HEAD_SHA: ${{ needs.plan.outputs.candidate }}
+          SINCE: ${{ needs.guard.outputs.started }}
           REPORT: ${{ runner.temp }}/reports/report-workflows.md
         run: bash .github/scripts/fork-workflows.sh
 
@@ -285,6 +341,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ACTION: ${{ needs.plan.outputs.action }}
+          GUARD_RESULT: ${{ needs.guard.result }}
           PLAN_RESULT: ${{ needs.plan.result }}
           RELEASE_RESULT: ${{ needs.release.result }}
           ADVANCE_RESULT: ${{ needs.advance.result }}
@@ -297,5 +354,7 @@ jobs:
           DROPPED: ${{ needs.plan.outputs.dropped }}
           DISABLED: ${{ needs.plan.outputs.disabled }},${{ needs.advance.outputs.disabled }},${{ steps.sweep.outputs.disabled }}
           CANCELLED: ${{ needs.plan.outputs.cancelled }},${{ needs.advance.outputs.cancelled }},${{ steps.sweep.outputs.cancelled }}
+          FINISHED: ${{ steps.sweep.outputs.finished }}
+          UNREGISTERED: ${{ steps.sweep.outputs.unregistered }}
           REPORTS: ${{ runner.temp }}/reports
         run: bash .github/scripts/fork-follow-report.sh

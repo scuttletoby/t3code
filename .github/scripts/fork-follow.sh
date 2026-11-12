@@ -14,8 +14,9 @@
 #                  rebase   rebased onto a newer tag: release the candidate, then move the series
 #                  advance  rebased onto a newer tag, and a published fork release already has the
 #                           candidate's exact files: move the series to that release, build nothing
-#                  stage    rebased, but the release workflows changed upstream: push the candidate
-#                           and stop, so it is released with its own workflow files (see $REPORT)
+#                  stage    the release workflows of this run's commit differ from the candidate's
+#                           (upstream changed them, or this is a re-run of an older run): push the
+#                           candidate and stop, so it is released with its own files (see $REPORT)
 #   base_tag, base_commit  the upstream tag (and its commit) the candidate sits on
 #   previous_tag, previous_head  where the series was (rebase, advance, stage)
 #   candidate      the commit to release or to move the series to
@@ -44,6 +45,9 @@ fail() {
 # A command that fails outside fail() (set -e) still leaves a reason that names the step.
 on_error() {
   local status="$1" line="$2" command="$3"
+  # Only the script's own shell reports: a command substitution inherits the trap (set -E), and a
+  # failure there that matters fails the line that uses it, which is reported here.
+  ((BASH_SUBSHELL == 0)) || return 0
   [[ -z "$reported" ]] || return 0
   reported=1
   printf '%s\n' "The plan stopped at fork-follow.sh line $line (exit $status): \`$command\`" \
@@ -124,8 +128,19 @@ if [[ -n "$merges" ]]; then
     "run \`git rebase --onto $base_tag $base_tag <series branch>\` and force-push it. Merge fork pull requests only with squash or rebase."
 fi
 
-node .github/scripts/fork-schema-check.cjs "$base" HEAD > "$logs/schema-check.log" 2>&1 \
-  || fail "The series changes the database schema:" '```' "$(cat "$logs/schema-check.log")" '```'
+# The schema check exits 1 both when it refuses and when node crashes; only a refusal prints this.
+schema_refusal="Fork changes must not change the database schema"
+schema_check() { # schema_check BASE WHAT: fails with the check's output, a refusal or a crash
+  local status=0
+  node .github/scripts/fork-schema-check.cjs "$1" HEAD > "$logs/schema-check.log" 2>&1 || status=$?
+  ((status != 0)) || return 0
+  if ((status == 1)) && grep -qF "$schema_refusal" "$logs/schema-check.log"; then
+    fail "$2 changes the database schema:" '```' "$(cat "$logs/schema-check.log")" '```'
+  fi
+  fail "The schema check crashed (exit $status), so it did not say whether the series touches the database schema:" \
+    '```' "$(tail -n 20 "$logs/schema-check.log")" '```' "The series was left as it is."
+}
+schema_check "$base" "The series"
 
 # The newest fork release of a tag: "<tag> <commit>", or nothing.
 latest_release() {
@@ -138,6 +153,47 @@ own_workflows() {
   git diff --name-only --diff-filter=A "$1" "$2" -- .github/workflows | paste -sd, -
 }
 
+# The release job runs the reusable workflows of this run's commit (RUN_SHA), not the candidate's.
+# They differ after upstream changed them, and on a re-run (or a queued run) of a run whose commit
+# is older than the series. Building then would mix two versions of the release steps.
+if ! git cat-file -e "$run_sha^{commit}" 2> /dev/null; then
+  git fetch --quiet --no-tags "$ORIGIN" "$run_sha" > "$logs/fetch.log" 2>&1 \
+    || fail "This run's commit $run_sha is not in the fork, so the plan cannot compare its release workflows with the candidate's." \
+      "Start a new run (\`gh workflow run fork-follow.yml --repo $REPOSITORY\`) instead of re-running this one."
+fi
+called() { # the release workflow and every local workflow it calls, at commit $1, one per line
+  local queue=(.github/workflows/fork-release.yml) seen="" file used
+  while ((${#queue[@]})); do
+    file="${queue[0]}"
+    queue=("${queue[@]:1}")
+    grep -qxF -- "$file" <<< "$seen" && continue
+    seen+="$file"$'\n'
+    while read -r used; do
+      [[ -z "$used" ]] || queue+=("$used")
+    done <<< "$({ git show "$1:$file" 2> /dev/null || true; } \
+      | sed -n 's|^[[:space:]-]*uses:[[:space:]]*["'\'']\{0,1\}\./\(\.github/workflows/[^[:space:]@#"'\'']*\).*|\1|p')"
+  done
+  printf '%s' "$seen"
+}
+changed_release_workflows() { # lists the release workflow files that differ between RUN_SHA and $1
+  local file
+  while read -r file; do
+    [[ -n "$file" ]] || continue
+    if [[ "$(git rev-parse --quiet --verify "$run_sha:$file" || true)" != "$(git rev-parse --quiet --verify "$1:$file" || true)" ]]; then
+      printf -- '- %s\n' "$file"
+    fi
+  done <<< "$(sort -u <<< "$(called "$run_sha")"$'\n'"$(called "$1")")"
+}
+stage_report() { # stage_report CANDIDATE TAG CHANGED
+  printf '%s\n' \
+    "The release workflows differ between this run's commit (${run_sha:0:12}) and the candidate ${1:0:12} on $2:" \
+    "${3%$'\n'}" "" \
+    "A run uses the reusable workflows of its own commit, so this run would build the candidate with other release steps than its own; it built nothing." \
+    "The candidate ${1:0:12} is on the branch fork-follow/candidate. Release it with its own workflow files:" \
+    "\`gh workflow run fork-release.yml --repo $REPOSITORY --ref fork-follow/candidate -f ref=$1 -f publish=true\`" \
+    "The next follow run then finds that release (and moves the series to it if it is not there yet)." > "$REPORT"
+}
+
 if [[ "$target_tag" == "$base_tag" ]]; then
   read -r released_tag released_commit <<< "$(latest_release "$base_tag")" || true
   if [[ "${released_commit:-}" == "$head" ]]; then
@@ -145,6 +201,11 @@ if [[ "$target_tag" == "$base_tag" ]]; then
   else
     action=release
     released_tag=""
+    changed="$(changed_release_workflows "$head")"
+    if [[ -n "$changed" ]]; then
+      action=stage
+      stage_report "$head" "$base_tag" "$changed"
+    fi
   fi
   {
     echo "action=$action"
@@ -170,10 +231,10 @@ if ! git -c user.name=t3code-fork -c user.email=noreply@users.noreply.github.com
     "Conflicting files:" "${conflicts:-(none listed; see the run log)}" "" \
     "The series was left as it is. To follow by hand: \`git fetch https://github.com/$UPSTREAM.git tag $target_tag\`," \
     "\`git rebase --onto $target_tag $base_tag <series branch>\`, resolve, run the tests, then push the branch with" \
-    "\`--force-with-lease\`. The next run then releases it."
+    "\`--force-with-lease\`, and start the follow workflow once (\`gh workflow run fork-follow.yml --repo $REPOSITORY\`):" \
+    "it releases the series and disables the upstream workflows that push started."
 fi
-node .github/scripts/fork-schema-check.cjs "$target" HEAD > "$logs/schema-check.log" 2>&1 \
-  || fail "After rebasing onto $target_tag the series changes the database schema:" '```' "$(cat "$logs/schema-check.log")" '```'
+schema_check "$target" "After rebasing onto $target_tag, the series"
 candidate="$(git rev-parse HEAD)"
 dropped="$(comm -23 <(sort <<< "$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
 
@@ -187,37 +248,10 @@ if [[ -n "${released_commit:-}" ]] \
   candidate="$released_commit"
 else
   released_tag=""
-  # The release job runs the reusable workflows of this run's commit (the series before the rebase),
-  # not the candidate's. If upstream changed them, building would mix two upstream releases.
-  called() {
-    local queue=(.github/workflows/fork-release.yml) seen="" file
-    while ((${#queue[@]})); do
-      file="${queue[0]}"
-      queue=("${queue[@]:1}")
-      grep -qxF "$file" <<< "$seen" && continue
-      seen+="$file"$'\n'
-      while read -r used; do
-        [[ -z "$used" ]] || queue+=("$used")
-      done <<< "$(git show "$1:$file" 2> /dev/null \
-        | sed -n 's|^[[:space:]-]*uses:[[:space:]]*["'\'']\{0,1\}\./\(\.github/workflows/[^[:space:]@#"'\'']*\).*|\1|p')"
-    done
-    printf '%s' "$seen"
-  }
-  changed=""
-  for file in $(sort -u <<< "$(called "$run_sha")"$'\n'"$(called "$candidate")"); do
-    if [[ "$(git rev-parse --quiet --verify "$run_sha:$file" || true)" != "$(git rev-parse --quiet --verify "$candidate:$file" || true)" ]]; then
-      changed+="- $file"$'\n'
-    fi
-  done
+  changed="$(changed_release_workflows "$candidate")"
   if [[ -n "$changed" ]]; then
     action=stage
-    printf '%s\n' \
-      "The release workflows differ between this run's commit (${run_sha:0:12}, on $base_tag) and the candidate on $target_tag:" \
-      "${changed%$'\n'}" "" \
-      "A run uses the reusable workflows of its own commit, so this run would build $target_tag with $base_tag's release steps; it built nothing." \
-      "The candidate ${candidate:0:12} is on the branch fork-follow/candidate. Release it with its own workflow files:" \
-      "\`gh workflow run fork-release.yml --repo $REPOSITORY --ref fork-follow/candidate -f ref=$candidate -f publish=true\`" \
-      "The next follow run then finds that release and moves the series to it." > "$REPORT"
+    stage_report "$candidate" "$target_tag" "$changed"
   fi
 fi
 {
