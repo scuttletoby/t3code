@@ -22,9 +22,9 @@ name: Fork follow upstream
 # fork-workflows.sh disables every active workflow the series did not add (a fork-*.yml is always the
 # fork's own, also before main has it; the plan refuses an upstream release that has one), cancels
 # every unfinished run of one (any event), and names the runs that finished before it could stop
-# them and the files GitHub has not listed yet. The branch move is refused while an upstream workflow file that is new
-# on this release is not listed (it could not be disabled, and on the branch it could ask for
-# fork-push); a person decides then.
+# them and the files GitHub has not listed yet. The branch move is refused while an upstream
+# workflow file that is new or changed on this release is not listed (it could not be disabled, and
+# on the branch it could ask for fork-push); a person decides then.
 #
 # A re-run of failed jobs (or of one job) keeps the Guard job's earlier result, so the jobs with
 # the token are skipped unless the guard passed in this attempt: use "Re-run all jobs".
@@ -290,7 +290,8 @@ jobs:
 
       # Any workflow file on the series branch may ask for fork-push, and the move fires its push
       # workflows. So upstream workflows are disabled first, and the move is refused while an
-      # upstream file new on this release is not listed by GitHub (it cannot be disabled yet).
+      # upstream file new or changed on this release is not listed by GitHub (it cannot be
+      # disabled yet).
       - id: sweep_before
         name: Disable upstream workflows before the move, refuse while a new one cannot be
         env:

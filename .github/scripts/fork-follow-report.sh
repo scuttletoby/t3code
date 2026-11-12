@@ -114,7 +114,7 @@ fi
 [[ -z "${CANCELLED:-}" ]] || row "Their runs cancelled" "${CANCELLED//,/, }"
 [[ -z "${FINISHED:-}" ]] || row "**Upstream runs that finished before a sweep could stop them**" "${FINISHED//,/, }"
 [[ -z "${UNREGISTERED:-}" ]] \
-  || row "**Upstream workflow files new on this release that GitHub does not list yet, so not disabled** (the sweep after an event reaches them disables them; the branch move waits for that)" "${UNREGISTERED//,/, }"
+  || row "**Upstream workflow files new or changed on this release that GitHub does not list yet, so not disabled** (the sweep after an event reaches them disables them; the branch move waits for that)" "${UNREGISTERED//,/, }"
 [[ -z "${DROPPED:-}" ]] || row "Patches dropped (empty on $BASE_TAG: upstream has the change)" "${DROPPED//;/, }"
 
 reasons=""

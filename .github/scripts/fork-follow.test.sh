@@ -313,6 +313,24 @@ check "plan: same base with an upstream fork-*.yml is refused too" \
 plan
 check "plan: a fork patch that deletes the upstream fork-*.yml lets the plan go on" action_is release
 
+# Round 4: a changed upstream workflow counts like a new one (an unlisted file that now runs on push
+# must hold the move too), and a non-ASCII name comes out as GitHub lists it, not quoted by git.
+new_upstream
+(cd "$root/upwork" && git checkout -q main && echo "on: [push] # changed" > .github/workflows/ci.yml \
+  && echo "on: push" > .github/workflows/dé.yml && git add -A && git commit -q -m u5 \
+  && git tag v0.1.11 && git push -q https://github.com/up/t3code.git main --tags) > /dev/null 2>&1
+new_fork v0.1.10
+plan
+check "plan: a changed upstream workflow and a non-ASCII new one are both named, unquoted" \
+  eval 'action_is rebase && [[ "$(out new_workflows)" == ".github/workflows/ci.yml,.github/workflows/dé.yml" ]]'
+new_upstream
+(cd "$root/upwork" && git checkout -q main && echo "on: push" > ".github/workflows/a,b.yml" && git add -A \
+  && git commit -q -m u5 && git tag v0.1.11 && git push -q https://github.com/up/t3code.git main --tags) > /dev/null 2>&1
+new_fork v0.1.10
+plan
+check "plan: a new upstream workflow with ',' in its name (cannot be listed) is refused, nothing planned" \
+  eval '[[ -z "$(out action)" ]] && has "a,b.yml" "$root/report.md" && has "cannot be named" "$root/report.md" && hasnt "plan stopped at" "$root/report.md"'
+
 # Minor: upstream changed a reusable workflow the release calls; the run's own copy is older.
 new_upstream
 (cd "$root/upwork" && git checkout -q main && echo "on: workflow_call # v2" > .github/workflows/release-desktop.yml \
@@ -503,7 +521,7 @@ check "workflows: an unlisted upstream file from an earlier release is named apa
 rm -f "$root/api/writes"
 OWN_WORKFLOWS=.github/workflows/fork-follow.yml,.github/workflows/fork-tests.yml HEAD_SHA=abc NEW_WORKFLOWS=.github/workflows/release.yml sweep
 check "workflows: an unlisted upstream file new on this release is named with a warning, not called disabled" \
-  eval '[[ "$(sed -n "s/^unregistered=//p" "$root/sweep.out")" == ".github/workflows/release.yml" && -z "$(sed -n "s/^unregistered_old=//p" "$root/sweep.out")" ]] && has "::warning::.*new on this release.*does not list yet" "$root/out"'
+  eval '[[ "$(sed -n "s/^unregistered=//p" "$root/sweep.out")" == ".github/workflows/release.yml" && -z "$(sed -n "s/^unregistered_old=//p" "$root/sweep.out")" ]] && has "::warning::.*new or changed on this release.*does not list yet" "$root/out"'
 rm -f "$root/api/writes" "$root/report.md"
 check "workflows: before the move, a new unlisted upstream file refuses it, after disabling the listed ones" \
   eval '! OWN_WORKFLOWS=.github/workflows/fork-follow.yml HEAD_SHA=abc NEW_WORKFLOWS=.github/workflows/release.yml REQUIRE_NEW_OFF=true sweep && has "main was not moved" "$root/report.md" && has "release.yml" "$root/report.md" && has "A person decides" "$root/report.md" && has "workflows/2/disable" "$root/api/writes"'

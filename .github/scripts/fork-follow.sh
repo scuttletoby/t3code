@@ -24,9 +24,10 @@
 #   dropped        subjects of patches that became empty on the new base (';'-separated)
 #   own_workflows  workflow files the series itself adds (','-separated); every other one is
 #                  upstream's and gets disabled
-#   new_workflows  upstream workflow files added between the series' old base and the new one
-#                  (','-separated; empty without a new base). The branch move refuses while one of
-#                  them is not listed by GitHub yet, so it cannot be disabled before main has it.
+#   new_workflows  upstream workflow files added or changed between the series' old base and the
+#                  new one (','-separated; empty without a new base). The branch move refuses while
+#                  one of them is not listed by GitHub yet, so it cannot be disabled before main has
+#                  it (a changed file may now run on push).
 set -Eeuo pipefail
 
 : "${UPSTREAM:?owner/name of the upstream repository}"
@@ -152,12 +153,35 @@ latest_release() {
   [[ -z "$last" ]] || echo "$last $(git rev-parse "refs/fork-tags/$last^{commit}")"
 }
 
-own_workflows() {
-  git diff --name-only --diff-filter=A "$1" "$2" -- .github/workflows | paste -sd, -
+# Workflow paths, read NUL-separated with core.quotepath=off, so a name with non-ASCII bytes, a
+# quote or a backslash comes out as GitHub lists it. The lists are ','-joined, so a name with a ','
+# or a newline cannot be named and the plan refuses it. These run in the plan's own shell (no
+# command substitution), so a refusal stops the plan.
+workflow_paths() { # workflow_paths FILTER FROM TO: sets paths, the ','-joined files FROM..TO shows as FILTER
+  local path
+  paths=""
+  git -c core.quotepath=off diff -z --no-renames --name-only --diff-filter="$1" "$2" "$3" -- .github/workflows \
+    > "$logs/paths" || fail "Could not list the workflow files that differ between ${2:0:12} and ${3:0:12}."
+  while IFS= read -r -d '' path; do
+    if [[ "$path" == *[,$'\n']* ]]; then
+      fail "The workflow file \`$path\` (between ${2:0:12} and ${3:0:12}) has a ',' or a newline in its name, so it cannot be named to the workflow sweep." \
+        "The series was left as it is. Rename or delete it with a fork patch."
+    fi
+    paths+="${paths:+,}$path"
+  done < "$logs/paths"
 }
-new_workflows() { # upstream workflow files added from upstream commit $1 to $2 (a rename counts as new)
-  git diff --no-renames --name-only --diff-filter=A "$1" "$2" -- .github/workflows \
-    | { grep -E '\.ya?ml$' || true; } | paste -sd, -
+own_workflows() { # own_workflows UPSTREAM_COMMIT TIP: sets own_list, the workflow files the series adds
+  workflow_paths A "$1" "$2"
+  own_list="$paths"
+}
+new_workflows() { # new_workflows FROM TO: sets new_list, the upstream workflow files added or changed
+  local path list=()
+  workflow_paths AM "$1" "$2" # a rename counts as new
+  IFS=, read -r -a list <<< "$paths"
+  new_list=""
+  for path in "${list[@]}"; do
+    [[ "$path" != *.yml && "$path" != *.yaml ]] || new_list+="${new_list:+,}$path"
+  done
 }
 
 # The sweep (fork-workflows.sh) takes every .github/workflows/fork-*.y[a]ml as the fork's own, even
@@ -231,13 +255,14 @@ if [[ "$target_tag" == "$base_tag" ]]; then
       stage_report "$head" "$base_tag" "$changed"
     fi
   fi
+  own_workflows "$base" HEAD
   {
     echo "action=$action"
     echo "base_tag=$base_tag"
     echo "base_commit=$base"
     echo "candidate=$head"
     echo "released_tag=${released_tag:-}"
-    echo "own_workflows=$(own_workflows "$base" HEAD)"
+    echo "own_workflows=$own_list"
     echo "new_workflows="
   } >> "$OUTPUT"
   exit 0
@@ -280,6 +305,8 @@ else
     stage_report "$candidate" "$target_tag" "$changed"
   fi
 fi
+own_workflows "$target" "$candidate"
+new_workflows "$base" "$target"
 {
   echo "action=$action"
   echo "base_tag=$target_tag"
@@ -289,6 +316,6 @@ fi
   echo "candidate=$candidate"
   echo "released_tag=${released_tag:-}"
   echo "dropped=$dropped"
-  echo "own_workflows=$(own_workflows "$target" "$candidate")"
-  echo "new_workflows=$(new_workflows "$base" "$target")"
+  echo "own_workflows=$own_list"
+  echo "new_workflows=$new_list"
 } >> "$OUTPUT"

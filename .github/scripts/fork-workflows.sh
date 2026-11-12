@@ -6,8 +6,8 @@
 #   finished      runs of upstream workflows that completed since SINCE (they ran before a sweep
 #                 could stop them), with their conclusion
 #   unregistered  upstream workflow files in the tree at TREE_REF that GitHub does not list yet
-#                 and that are new on this upstream release (NEW_WORKFLOWS). GitHub lists a
-#                 workflow only once an event has reached its file, so these can be neither
+#                 and that are new or changed on this upstream release (NEW_WORKFLOWS). GitHub
+#                 lists a workflow only once an event has reached its file, so these can be neither
 #                 disabled nor cancelled until then; the next sweep after that event does.
 #   unregistered_old  the other unlisted upstream files, from earlier releases. Most of them run
 #                 only on events the fork never sends (workflow_call, workflow_dispatch,
@@ -18,7 +18,7 @@
 #
 # Environment: REPOSITORY (owner/name; GITHUB_REPOSITORY in a run), OWN_WORKFLOWS (','-separated
 # paths the fork's own commits add; required, nothing is guessed), NEW_WORKFLOWS (','-separated
-# upstream files added since the series' old base; optional), REQUIRE_NEW_OFF (true: fail when one
+# upstream files added or changed since the series' old base; optional), REQUIRE_NEW_OFF (true: fail when one
 # of NEW_WORKFLOWS is in the tree and not listed, because then it cannot be disabled before the
 # series branch has it), TREE_REF (commit or branch whose workflow files are checked; default
 # HEAD_SHA, else SERIES_BRANCH, else main), HEAD_SHA, SERIES_BRANCH, PREVIOUS_HEAD (the series head
@@ -119,7 +119,7 @@ join() { local IFS=,; echo "$*"; }
 ((${#finished[@]} == 0)) \
   || echo "::warning::Upstream workflow runs finished before they could be stopped: $(join "${finished[@]}")" >&2
 ((${#unregistered[@]} == 0)) \
-  || echo "::warning::Upstream workflow files new on this release that GitHub does not list yet, so not disabled: $(join "${unregistered[@]}")" >&2
+  || echo "::warning::Upstream workflow files new or changed on this release that GitHub does not list yet, so not disabled: $(join "${unregistered[@]}")" >&2
 echo "Upstream workflows disabled: ${#disabled[@]}; runs cancelled: ${#cancelled[@]}; finished before a sweep: ${#finished[@]}; new and not registered yet: ${#unregistered[@]}; older and not registered: ${#unregistered_old[@]}." >&2
 
 # Before the series branch moves: any workflow file on it may ask for the Environment that holds
@@ -127,7 +127,7 @@ echo "Upstream workflows disabled: ${#disabled[@]}; runs cancelled: ${#cancelled
 # new upstream file that GitHub does not list cannot be disabled first, so a person decides.
 if [[ "${REQUIRE_NEW_OFF:-}" == true ]] && ((${#unregistered[@]})); then
   branch="${SERIES_BRANCH:-main}"
-  die "$branch was not moved: upstream workflow files that are new on this release are not listed by GitHub yet, so they could not be disabled before $branch gets them:" \
+  die "$branch was not moved: upstream workflow files that are new or changed on this release are not listed by GitHub yet, so they could not be disabled before $branch gets them:" \
     "$(printf -- '- `%s`\n' "${unregistered[@]}")" "" \
     "On $branch, a push starts their push workflows before a sweep can stop them, and any workflow file there may ask for the Environment that holds FORK_PUSH_TOKEN." \
     "A person decides. Read them in the candidate (\`git show ${TREE_REF:0:12}:<file>\`). If they are harmless, move $branch to $TREE_REF yourself" \
