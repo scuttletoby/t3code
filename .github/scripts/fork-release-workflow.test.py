@@ -116,6 +116,25 @@ check("preflight resolves the version through the guard script",
       "fork-release.sh resolve" in "\n".join(str(s.get("run", "")) for s in steps(jobs["preflight"])))
 check("preflight runs the guard tests", "fork-release.test.sh" in runs)
 check("the CLI archives are checked for the release repository", "fork-release.sh check-archives release-assets" in runs)
+check("preflight runs this shape test", "fork-release-workflow.test.py" in
+      "\n".join(str(s.get("run", "")) for s in steps(jobs["preflight"])))
+
+# The server bundle check skips dist/client, which names this repository on every Actions build.
+bundle_steps = [s for s in steps(jobs["build_bundle"]) if "apps/server/dist" in str(s.get("run", ""))]
+check("the server bundle is checked through check-bundle (without dist/client)",
+      [str(s.get("run", "")).strip() for s in bundle_steps]
+      == ["bash .github/scripts/fork-release.sh check-bundle apps/server/dist"])
+
+# The build names this fork through the setting scripts/lib/release-repository.ts reads.
+build = next((s for s in steps(jobs["build_bundle"]) if s.get("name") == "Build JS bundle"), {})
+check("the build sets T3CODE_DESKTOP_UPDATE_REPOSITORY to this repository",
+      (build.get("env") or {}).get("T3CODE_DESKTOP_UPDATE_REPOSITORY") == "${{ github.repository }}")
+check("the former name T3CODE_RELEASE_REPOSITORY appears nowhere", "T3CODE_RELEASE_REPOSITORY" not in text)
+
+# The write job's guard script comes from the workflow's own commit, not the commit being built.
+guard = [s for s in steps(jobs["publish"]) if str(s.get("uses", "")).startswith("actions/checkout@")]
+check("publish checks out its guard script at github.workflow_sha",
+      len(guard) == 1 and (guard[0].get("with") or {}).get("ref") == "${{ github.workflow_sha }}")
 
 if failures:
     print(f"{len(failures)} failed")

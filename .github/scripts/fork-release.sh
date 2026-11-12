@@ -4,9 +4,11 @@
 #
 #   resolve                 Preflight: picks base tag, version and tag for HEAD (key=value lines).
 #   remove-drafts TAG       Refuses a published TAG, then deletes drafts with TAG left by earlier runs.
-#   publish ID TAG VERSION  Refuses a published TAG, then publishes draft ID, marked latest only
-#                           when VERSION is above every published fork release.
-#   check-archives DIR      Every CLI archive in DIR must name REPOSITORY as its release repository.
+#   publish ID TAG VERSION  Refuses a published TAG or a published release that is not below
+#                           VERSION, then publishes draft ID as the latest release.
+#   check-bundle DIR        The server bundle DIR (apps/server/dist) outside DIR/client must name
+#                           REPOSITORY as its release repository.
+#   check-archives DIR      The `t3` program of every CLI archive in DIR must name REPOSITORY.
 #
 # Environment: REPOSITORY (owner/name of this fork; GITHUB_REPOSITORY in a run), UPSTREAM
 # (owner/name, resolve looks it up), UPSTREAM_URL (git URL of upstream, default GitHub), ORIGIN
@@ -61,6 +63,23 @@ refuse_published() {
   if [[ -n "$published" ]]; then
     die "A published release ($published) already has tag $tag. Start a new run (Re-run all jobs); nothing was changed."
   fi
+}
+
+# The server's updater (packages/shared/src/cliRelease.ts newestCliReleaseVersion) takes the
+# newest-created non-draft release on its channel, not the highest version. So every new release
+# must be above every published one, or `t3 update` would see a downgrade and stall until a higher
+# build exists. Stable channel = any vX.Y.Z[-...] tag except -nightly./-preview. builds.
+refuse_older() {
+  local version="$1" other published
+  published="$(releases '.[] | select(.draft | not) | .tag_name')"
+  for other in $published; do
+    [[ "$other" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]] || continue
+    [[ ! "$other" =~ -(nightly|preview)\. ]] || continue
+    [[ "$other" =~ $stable_version_re || "$other" =~ $fork_version_re ]] \
+      || die "Published release $other is on the server's stable channel but has no X.Y.Z or X.Y.Z-fork.N version, so $version cannot be ordered against it; nothing was changed."
+    version_gt "$version" "$other" \
+      || die "$other is published and not below $version. The server updates to the newest-created release, so publishing $version would show every server a downgrade. Build a newer upstream release instead; to go back, install the older release with t3 update --version X --allow-downgrade. Nothing was changed."
+  done
 }
 
 cmd_resolve() {
@@ -119,6 +138,7 @@ cmd_resolve() {
   last="$(git ls-remote --tags --refs "$ORIGIN" "v$version-fork.*" \
     | sed -n "s|.*refs/tags/v$version-fork\.\([0-9]\+\)$|\1|p" | sort -n | tail -n1)"
   version="$version-fork.$(( ${last:-0} + 1 ))"
+  refuse_older "$version"
   {
     echo "ref=$head"
     echo "upstream=$upstream"
@@ -146,28 +166,35 @@ cmd_publish() {
   local id="${1:?release id}" tag="${2:?tag}" version="${3:?version}"
   [[ "$version" =~ $fork_version_re ]] || die "'$version' is not a fork version."
   refuse_published "$tag"
-  # Latest only when above every published fork release: building an older ref must not move
-  # /releases/latest backwards, where the desktop updater would then find nothing newer.
-  local latest=true other published
-  published="$(releases '.[] | select((.draft or .prerelease) | not) | .tag_name')"
-  for other in $published; do
-    [[ "$other" =~ $fork_version_re ]] || continue
-    if ! version_gt "$version" "$other"; then
-      latest=false
-      echo "$other is published and not below $version, so $tag is not marked latest."
-      break
-    fi
-  done
-  gh api -X PATCH "repos/$REPOSITORY/releases/$id" -F draft=false -f make_latest="$latest" > /dev/null
-  echo "Published $tag (latest: $latest)."
+  # Checked again here: a release published since preflight must not end up above this one. After
+  # this check VERSION is the highest release, so the server and the desktop updater agree on it.
+  refuse_older "$version"
+  gh api -X PATCH "repos/$REPOSITORY/releases/$id" -F draft=false -f make_latest=true > /dev/null
+  echo "Published $tag (latest: true)."
   {
     echo "published=true"
-    echo "latest=$latest"
+    echo "latest=true"
   } >> "$OUTPUT"
 }
 
+# The web client (DIR/client) names this repository on every Actions build anyway: upstream's
+# apps/web/vite.config.ts bakes GITHUB_REPOSITORY into it. Only the server code counts here.
+cmd_check_bundle() {
+  local dir="${1:?directory}" file files
+  [[ -d "$dir" ]] || die "No server bundle at $dir."
+  files="$(find "$dir" -path "$dir/client" -prune -o -type f -print)"
+  [[ -n "$files" ]] || die "The server bundle $dir holds no files outside client/."
+  while IFS= read -r file; do
+    if grep -qaF "\"$REPOSITORY\"" "$file"; then
+      echo "The server bundle names $REPOSITORY (${file#"$dir"/})."
+      return 0
+    fi
+  done <<< "$files"
+  die "The server bundle $dir (outside client/) does not name $REPOSITORY as its release repository, so it would update from elsewhere."
+}
+
 cmd_check_archives() {
-  local dir="${1:?directory}" archive work found=0
+  local dir="${1:?directory}" archive work name stem program found=0
   shopt -s nullglob
   for archive in "$dir"/t3-*.tar.gz "$dir"/t3-*.zip; do
     found=1
@@ -176,12 +203,19 @@ cmd_check_archives() {
       *.tar.gz) tar -xzf "$archive" -C "$work" ;;
       *.zip) python3 -I -m zipfile -e "$archive" "$work" ;;
     esac
-    # The `t3` executable bundles the server again (release-desktop.yml build-exe), so this checks
-    # the code that ships rather than the separate JS bundle.
-    grep -rqaF "\"$REPOSITORY\"" "$work" \
-      || die "$(basename "$archive") does not name $REPOSITORY as its release repository, so it would update from elsewhere."
+    # Only the `t3` program at <stem>/ (scripts/build-cli-archive.ts): it bundles the server again,
+    # and its updater is what counts. client/ names this repository on every Actions build anyway.
+    name="$(basename "$archive")"
+    stem="${name%.tar.gz}"
+    stem="${stem%.zip}"
+    program="$work/$stem/t3"
+    [[ "$archive" != *.zip ]] || program="$work/$stem/t3.exe"
+    [[ -f "$program" ]] \
+      || die "$name has no ${program#"$work"/}, so the server program in it cannot be checked."
+    grep -qaF "\"$REPOSITORY\"" "$program" \
+      || die "${program#"$work"/} in $name does not name $REPOSITORY as its release repository, so it would update from elsewhere."
     rm -rf "$work"
-    echo "$(basename "$archive") names $REPOSITORY."
+    echo "${program#"$work"/} in $name names $REPOSITORY."
   done
   (( found )) || die "No CLI archive in $dir."
 }
@@ -192,7 +226,8 @@ case "$command" in
   resolve) cmd_resolve "$@" ;;
   remove-drafts) cmd_remove_drafts "$@" ;;
   publish) cmd_publish "$@" ;;
+  check-bundle) cmd_check_bundle "$@" ;;
   check-archives) cmd_check_archives "$@" ;;
   version-gt) version_gt "$@" ;;
-  *) die "usage: $0 resolve | remove-drafts TAG | publish ID TAG VERSION | check-archives DIR" ;;
+  *) die "usage: $0 resolve | remove-drafts TAG | publish ID TAG VERSION | check-bundle DIR | check-archives DIR" ;;
 esac

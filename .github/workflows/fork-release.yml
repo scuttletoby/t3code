@@ -6,13 +6,16 @@ name: Fork release
 # upstream tag the commit contains; <n> counts the fork's earlier builds of it.
 #
 # Builds name this repository as their release repository (scripts/lib/release-repository.ts reads
-# T3CODE_RELEASE_REPOSITORY, else GITHUB_REPOSITORY in Actions), so the server's update and the
-# desktop app's updater look only at this fork. Publishing makes a normal (not pre-) release, a draft
-# until every file is uploaded, marked latest only when it is the highest fork version.
+# T3CODE_DESKTOP_UPDATE_REPOSITORY, else GITHUB_REPOSITORY in Actions), so the server's update and
+# the desktop app's updater look only at this fork. Publishing makes a normal (not pre-) release, a
+# draft until every file is uploaded, and only above every published release: the server's updater
+# takes the newest-created release, so an older one published later would read as a downgrade.
 #
-# The guards live in .github/scripts/fork-release.sh (tests: fork-release.test.sh, run in preflight):
-# only released upstream code, never a version that is already published, no silent API failures.
-# Actions are pinned by commit. Only the publish job holds a write token, and it runs no package code.
+# The guards live in .github/scripts/fork-release.sh (tests: fork-release.test.sh and
+# fork-release-workflow.test.py, both run in preflight): only released upstream code, never a
+# version that is already published or below a published one, no silent API failures. Actions are
+# pinned by commit. Only the publish job holds a write token; it runs no package code, and its guard
+# script comes from this workflow's own commit, not from the commit being built.
 on:
   workflow_dispatch:
     inputs:
@@ -104,6 +107,13 @@ jobs:
         shell: bash
         run: bash .github/scripts/fork-release.test.sh
 
+      - name: Test the workflow's shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2> /dev/null || { sudo apt-get update && sudo apt-get install -y python3-yaml; }
+          python3 .github/scripts/fork-release-workflow.test.py
+
       # Refuses unreleased upstream commits, a stray upstream tag and a base above upstream's latest.
       - id: meta
         name: Resolve fork release version
@@ -163,19 +173,15 @@ jobs:
         shell: bash
         env:
           T3CODE_TELEMETRY_CHANNEL: dev
-          T3CODE_RELEASE_REPOSITORY: ${{ github.repository }}
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
         run: vp run ${{ steps.bundle_build.outputs.script }}
 
       # A build that still names upstream would update a fork install to upstream's releases. This
-      # is the JS bundle; the assemble job checks the CLI archives, which bundle the server again.
-      - name: Check the bundle names this repository
+      # is the server bundle without dist/client (the web client names this repository on every
+      # Actions build); the assemble job checks the `t3` program in each CLI archive.
+      - name: Check the server bundle names this repository
         shell: bash
-        run: |
-          set -euo pipefail
-          if ! grep -rqF "\"$GITHUB_REPOSITORY\"" apps/server/dist; then
-            echo "::error::apps/server/dist does not name $GITHUB_REPOSITORY as its release repository."
-            exit 1
-          fi
+        run: bash .github/scripts/fork-release.sh check-bundle apps/server/dist
 
       - name: Upload JS bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -450,7 +456,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # The only job with a write token: it checks out just the guard script and runs no package code.
+  # The only job with a write token: it checks out just the guard script, from this workflow's own
+  # commit (a caller's commit for workflow_call), and runs no package code.
   publish:
     name: Publish release
     needs: [preflight, assemble]
@@ -465,7 +472,7 @@ jobs:
       - name: Checkout the guard script
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ needs.preflight.outputs.ref }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: true
@@ -511,7 +518,7 @@ jobs:
             release-assets/SHA256SUMS
 
       # Updaters skip drafts, so nobody sees a release until every file above is uploaded. The tag
-      # check runs again right before; latest only when no published fork version is as high.
+      # and "nothing published is as high" checks run again right before; it is then made latest.
       - name: Publish the draft
         id: publish
         shell: bash

@@ -140,6 +140,14 @@ expect_refused "resolve: refuses a base above upstream's latest release" "above 
 echo v0.1.10 > "$root/api/upstream_latest"
 expect_resolved "resolve: accepts it once upstream marks it latest" 0.1.10-fork.1
 
+reset_api v0.1.10
+echo '[{"id":5,"draft":false,"prerelease":false,"tag_name":"v0.1.10-fork.3"}]' > "$root/api/releases.json"
+new_fork v0.1.9
+expect_refused "resolve: refuses a build below a published release (older ref after a newer one)" \
+  "v0.1.10-fork.3 is published and not below 0.1.9-fork.1" "$root/work" resolve
+echo '[{"id":5,"draft":true,"prerelease":false,"tag_name":"v0.1.10-fork.3"}]' > "$root/api/releases.json"
+expect_resolved "resolve: a higher draft does not block (updaters skip drafts)" 0.1.9-fork.1
+
 # --- remove-drafts -----------------------------------------------------------------------------
 new_upstream
 reset_api
@@ -182,11 +190,30 @@ fi
 reset_api
 echo '[{"id":5,"draft":false,"prerelease":false,"tag_name":"v0.1.10-fork.1"},
        {"id":9,"draft":true,"prerelease":false,"tag_name":"v0.1.9-fork.2"}]' > "$root/api/releases.json"
-if run "$root/work" publish 9 v0.1.9-fork.2 0.1.9-fork.2 && grep -qx "patched 9 draft=false make_latest=false" "$root/api/writes"; then
-  pass "publish: an older version is published without becoming latest"
+expect_refused "publish: refuses a version below a published release (server takes the newest created)" \
+  "v0.1.10-fork.1 is published and not below 0.1.9-fork.2" "$root/work" publish 9 v0.1.9-fork.2 0.1.9-fork.2
+[[ ! -e "$root/api/writes" ]] || fail "publish: nothing written for an older version"
+
+reset_api
+echo '[{"id":5,"draft":false,"prerelease":true,"tag_name":"v0.1.10-fork.1"},
+       {"id":9,"draft":true,"prerelease":false,"tag_name":"v0.1.9-fork.2"}]' > "$root/api/releases.json"
+expect_refused "publish: a higher prerelease also blocks (the server ignores the prerelease flag)" \
+  "not below" "$root/work" publish 9 v0.1.9-fork.2 0.1.9-fork.2
+
+reset_api
+echo '[{"id":4,"draft":false,"prerelease":false,"tag_name":"v0.2.0-nightly.20261101.3"},
+       {"id":6,"draft":false,"prerelease":false,"tag_name":"notes"},
+       {"id":9,"draft":true,"prerelease":false,"tag_name":"v0.1.9-fork.2"}]' > "$root/api/releases.json"
+if run "$root/work" publish 9 v0.1.9-fork.2 0.1.9-fork.2 && grep -qx "patched 9 draft=false make_latest=true" "$root/api/writes"; then
+  pass "publish: nightly and non-version tags are other channels and do not block"
 else
-  fail "publish: an older version is published without becoming latest"
+  fail "publish: nightly and non-version tags are other channels and do not block"
 fi
+
+reset_api
+echo '[{"id":4,"draft":false,"prerelease":false,"tag_name":"v0.1.8-rc.1"}]' > "$root/api/releases.json"
+expect_refused "publish: a stable-channel tag it cannot order fails loudly" "cannot be ordered" \
+  "$root/work" publish 9 v0.1.9-fork.2 0.1.9-fork.2
 
 reset_api
 echo '[{"id":9,"draft":true,"prerelease":false,"tag_name":"v0.1.9-fork.1"}]' > "$root/api/releases.json"
@@ -199,16 +226,55 @@ expect_refused "publish: a failed release listing fails the step" "Could not lis
 [[ ! -e "$root/api/writes" ]] || fail "publish: nothing written after a failed listing"
 
 # --- check-archives ----------------------------------------------------------------------------
-mkdir -p "$root/arch/good/t3" "$root/arch/bad/t3" "$root/assets-good" "$root/assets-bad" "$root/assets-none"
-printf 'x\0const repo = "me/t3code";\0' > "$root/arch/good/t3/t3"
-printf 'x\0const repo = "up/t3code";\0' > "$root/arch/bad/t3/t3"
-tar -czf "$root/assets-good/t3-0.1.9-fork.1-linux-x64.tar.gz" -C "$root/arch/good" t3
-(cd "$root/arch/good" && python3 -I -m zipfile -c "$root/assets-good/t3-0.1.9-fork.1-win-x64.zip" t3)
-cp "$root/assets-good/"*.tar.gz "$root/assets-bad/"
-(cd "$root/arch/bad" && python3 -I -m zipfile -c "$root/assets-bad/t3-0.1.9-fork.1-win-x64.zip" t3)
-if run "$root" check-archives "$root/assets-good"; then pass "check-archives: archives naming this fork pass"; else fail "check-archives: archives naming this fork pass"; fi
-expect_refused "check-archives: an archive naming upstream fails" "win-x64.zip does not name me/t3code" "$root" check-archives "$root/assets-bad"
+# Layout of scripts/build-cli-archive.ts: <stem>/t3 (t3.exe in the Windows zip) plus <stem>/client/.
+# The web client names this fork on every Actions build (upstream's apps/web/vite.config.ts), so it
+# must not count; only the program does.
+stage() { # stage DIR STEM PROGRAM PROGRAM_REPO CLIENT_REPO
+  mkdir -p "$1/$2/client/assets"
+  printf 'x\0const repo = "%s";\0' "$4" > "$1/$2/$3"
+  printf 'const u = "%s";' "$5" > "$1/$2/client/assets/index.js"
+}
+pack() { # pack DIR STEM OUT
+  case "$3" in
+    *.tar.gz) tar -czf "$3" -C "$1" "$2" ;;
+    *.zip) (cd "$1" && python3 -I -m zipfile -c "$3" "$2") ;;
+  esac
+}
+lin=t3-0.1.9-fork.1-linux-x64 win=t3-0.1.9-fork.1-win-x64
+mkdir -p "$root/assets-good" "$root/assets-bad" "$root/assets-repro" "$root/assets-noprog" "$root/assets-none"
+stage "$root/arch/good" "$lin" t3 me/t3code me/t3code
+stage "$root/arch/good" "$win" t3.exe me/t3code me/t3code
+pack "$root/arch/good" "$lin" "$root/assets-good/$lin.tar.gz"
+pack "$root/arch/good" "$win" "$root/assets-good/$win.zip"
+cp "$root/assets-good/$lin.tar.gz" "$root/assets-bad/"
+stage "$root/arch/bad" "$win" t3.exe up/t3code up/t3code
+pack "$root/arch/bad" "$win" "$root/assets-bad/$win.zip"
+# The review's repro: t3 names upstream, the web client names the fork.
+stage "$root/arch/repro" "$lin" t3 up/t3code me/t3code
+pack "$root/arch/repro" "$lin" "$root/assets-repro/$lin.tar.gz"
+# No program at all, but the client names the fork.
+mkdir -p "$root/arch/noprog/$lin/client" && printf '"me/t3code"' > "$root/arch/noprog/$lin/client/x.js"
+printf '"me/t3code"' > "$root/arch/noprog/$lin/t3.sh"
+pack "$root/arch/noprog" "$lin" "$root/assets-noprog/$lin.tar.gz"
+if run "$root" check-archives "$root/assets-good"; then pass "check-archives: archives whose program names this fork pass"; else fail "check-archives: archives whose program names this fork pass"; fi
+expect_refused "check-archives: an archive naming upstream fails" "$win/t3.exe in $win.zip does not name me/t3code" "$root" check-archives "$root/assets-bad"
+expect_refused "check-archives: t3 names upstream, client/ names the fork -> fails" "$lin/t3 in $lin.tar.gz does not name me/t3code" "$root" check-archives "$root/assets-repro"
+expect_refused "check-archives: a missing program fails" "has no $lin/t3" "$root" check-archives "$root/assets-noprog"
 expect_refused "check-archives: no archive at all fails" "No CLI archive" "$root" check-archives "$root/assets-none"
+
+# --- check-bundle (apps/server/dist with the web client in dist/client) ------------------------
+bundle() { # bundle NAME SERVER_REPO CLIENT_REPO
+  mkdir -p "$root/dist-$1/client/assets"
+  printf 'const repo = "%s";' "$2" > "$root/dist-$1/bin.mjs"
+  printf 'const u = "%s";' "$3" > "$root/dist-$1/client/assets/index.js"
+}
+bundle good me/t3code me/t3code
+bundle repro up/t3code me/t3code
+mkdir -p "$root/dist-clientonly/client" && printf '"me/t3code"' > "$root/dist-clientonly/client/x.js"
+if run "$root" check-bundle "$root/dist-good"; then pass "check-bundle: a server bundle naming this fork passes"; else fail "check-bundle: a server bundle naming this fork passes"; fi
+expect_refused "check-bundle: server names upstream, client/ names the fork -> fails" "outside client/) does not name me/t3code" "$root" check-bundle "$root/dist-repro"
+expect_refused "check-bundle: only client/ files -> fails" "no files outside client/" "$root" check-bundle "$root/dist-clientonly"
+expect_refused "check-bundle: a missing bundle fails" "No server bundle" "$root" check-bundle "$root/dist-missing"
 
 # --- version order -----------------------------------------------------------------------------
 check_gt() {
