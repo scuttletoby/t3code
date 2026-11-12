@@ -81,12 +81,34 @@ jobs:
         name: Note the start
         run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the scripts
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-          sparse-checkout: .github/scripts
-          sparse-checkout-cone-mode: true
+      # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ and no
+      # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
+      # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
+      # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ github.sha }}
+          HISTORY: tip
+          SPARSE: /.github/scripts/
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
 
       - name: Refuse unless only the Environment holds FORK_PUSH_TOKEN, for the series branch only
         env:
@@ -135,13 +157,34 @@ jobs:
       disabled: ${{ steps.sweep_plan.outputs.disabled }},${{ steps.sweep_push.outputs.disabled }}
       cancelled: ${{ steps.sweep_push.outputs.cancelled }}
     steps:
-      - name: Checkout the series
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ env.SERIES_BRANCH }}
-          fetch-depth: 0
-          filter: blob:none
-          persist-credentials: false
+      # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ and no
+      # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
+      # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
+      # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ env.SERIES_BRANCH }}
+          HISTORY: full
+          SPARSE: ""
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
 
       - name: Test the follow scripts
         run: bash .github/scripts/fork-follow.test.sh
@@ -270,13 +313,34 @@ jobs:
       disabled: ${{ steps.sweep.outputs.disabled }}
       cancelled: ${{ steps.sweep.outputs.cancelled }}
     steps:
-      - name: Checkout the scripts
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ needs.plan.outputs.candidate }}
-          fetch-depth: 0
-          filter: blob:none
-          persist-credentials: false
+      # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ and no
+      # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
+      # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
+      # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ needs.plan.outputs.candidate }}
+          HISTORY: full
+          SPARSE: ""
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
 
       # The release can take an hour or more, so the Environment's rule is checked again. (The
       # repository secret cannot be checked from inside the Environment; the Guard job did.)
@@ -355,13 +419,34 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: Checkout the scripts
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          sparse-checkout: .github/scripts
-          sparse-checkout-cone-mode: true
+      # Plain git, not actions/checkout: upstream's tree has gitlinks under .repos/ and no
+      # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
+      # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
+      # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ github.sha }}
+          HISTORY: tip
+          SPARSE: /.github/scripts/
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
 
       - name: Download the jobs' reasons
         continue-on-error: true
