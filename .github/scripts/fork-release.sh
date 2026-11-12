@@ -14,6 +14,8 @@
 # (owner/name, resolve looks it up), UPSTREAM_URL (git URL of upstream, default GitHub), ORIGIN
 # (git remote or URL of this fork, default origin). Output goes to $GITHUB_OUTPUT, else stdout.
 set -euo pipefail
+# Refuses outside a GitHub Actions run unless a test runs it under the gh stub (fork-gh-guard.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
 
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:?REPOSITORY or GITHUB_REPOSITORY}}"
 ORIGIN="${ORIGIN:-origin}"
