@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   CHECK_FILES,
+  compareTrees,
   findSchemaChanges,
   parseRawDiff,
   schemaClosure,
@@ -198,11 +199,8 @@ test("the closure follows relative and package subpath imports, not root barrels
     "apps/server/src/persistence/Migrations.ts",
     `${MIGRATIONS}/001_A.ts`,
     "apps/server/src/persistence/testkit/seed.ts",
-    // A package's manifest maps the import to files, so it is guarded too.
-    "packages/contracts/package.json",
     // `Thread` is declared nowhere, so the barrel is guarded whole (fail closed).
     "packages/contracts/src/index.ts",
-    "packages/shared/package.json",
     "packages/shared/src/assistantCitations.ts",
     "packages/shared/src/threadLinks.ts",
   ]);
@@ -239,7 +237,6 @@ test("the closure follows a package root only to the files that declare the impo
   );
   assert.deepEqual([...closure].sort(), [
     `${MIGRATIONS}/064_Links.ts`,
-    "packages/contracts/package.json",
     "packages/contracts/src/aliases.ts",
     "packages/contracts/src/baseSchemas.ts",
     // The barrel on the way is guarded (an edit to it could re-point a name), not followed:
@@ -273,12 +270,7 @@ test("the closure traces the declaration shapes a name can have", () => {
   for (const [reexport, declaring] of shapes) {
     assert.deepEqual(
       [...schemaClosure(rootImportTree(reexport, declaring))].sort(),
-      [
-        `${MIGRATIONS}/001_A.ts`,
-        "packages/c/package.json",
-        "packages/c/src/a.ts",
-        "packages/c/src/index.ts",
-      ],
+      [`${MIGRATIONS}/001_A.ts`, "packages/c/src/a.ts", "packages/c/src/index.ts"],
       declaring,
     );
   }
@@ -290,7 +282,6 @@ test("a name the closure cannot trace guards the whole barrel and what it re-exp
   );
   assert.deepEqual([...closure].sort(), [
     `${MIGRATIONS}/001_A.ts`,
-    "packages/c/package.json",
     "packages/c/src/a.ts",
     "packages/c/src/index.ts",
     "packages/c/src/other.ts",
@@ -327,7 +318,7 @@ const packageTree = (manifest, extra = {}) =>
     ...extra,
   });
 
-test("a package import guards every file any export condition can pick, and its package.json", () => {
+test("a package import guards every file any export condition can pick, and its mapping", () => {
   const trace = traceSchema(
     packageTree({
       exports: {
@@ -339,11 +330,16 @@ test("a package import guards every file any export condition can pick, and its 
   assert.deepEqual(trace.unresolved, []);
   assert.deepEqual([...trace.closure].sort(), [
     `${MIGRATIONS}/001_A.ts`,
-    "packages/c/package.json",
     "packages/c/src/index.ts",
     "packages/c/src/node.ts",
     "packages/c/src/util.ts",
   ]);
+  // The package.json is judged by the entries that map these imports, not as a whole file.
+  assert.deepEqual(
+    [...trace.mappings].map(([file, keys]) => [file, [...keys].sort()]),
+    [["packages/c/package.json", [".", "./util"]]],
+  );
+  assert.deepEqual([...trace.imported], ["@t3tools/c"]);
 });
 
 test("a package without exports resolves through main, module, types and index", () => {
@@ -352,12 +348,13 @@ test("a package without exports resolves through main, module, types and index",
   );
   assert.deepEqual([...closure].sort(), [
     `${MIGRATIONS}/001_A.ts`,
-    "packages/c/package.json",
     "packages/c/src/index.ts",
     "packages/c/src/node.ts",
     // Without exports, a subpath is a path inside the package.
     "packages/c/util.ts",
   ]);
+  // A string `browser` field is a fallback entry as well.
+  assert.ok(schemaClosure(packageTree({ browser: "./src/node.ts" })).has("packages/c/src/node.ts"));
 });
 
 test("an in-repository import that resolves to no file is reported, not skipped", () => {
@@ -440,9 +437,7 @@ test("workspace packages come from the workspace list, scoped or not, at any dep
   assert.deepEqual(trace.unresolved, []);
   assert.deepEqual([...trace.closure].sort(), [
     "apps/mobile/modules/deep/index.ts",
-    "apps/mobile/modules/deep/package.json",
     `${MIGRATIONS}/001_A.ts`,
-    "packages/plain/package.json",
     "packages/plain/src/schema.ts",
   ]);
   assert.deepEqual([...trace.outside].sort(), ["@t3tools/skipped", "effect", "node:fs"]);
@@ -816,7 +811,7 @@ test("e2e: a package.json edit that re-points a name a migration imports is refu
     const result = prAgainstBase(files, PACKAGE_BASE);
     return !(
       result.code === 1 &&
-      /packages\/c\/package\.json: changes the database schema/.test(result.output)
+      /packages\/c\/package\.json: changes how it maps "\."/.test(result.output)
     );
   });
   assert.deepEqual(
@@ -833,13 +828,9 @@ test("e2e: a package.json edit that re-points a name a migration imports is refu
 
 test("e2e: an import of a workspace package the check cannot resolve is refused, naming it", () => {
   const broken = {
-    ...PACKAGE_BASE,
     "packages/c/package.json": manifest({ exports: { ".": { import: "./src/missing.ts" } } }),
   };
-  const result = prAgainstBase(
-    { "apps/server/src/feature/Store.ts": "export const x = 2;\n" },
-    broken,
-  );
+  const result = prAgainstBase(broken, PACKAGE_BASE);
   assert.equal(result.code, 1, result.output);
   assert.match(
     result.output,
@@ -851,10 +842,78 @@ test("e2e: an import of a workspace package the check cannot resolve is refused,
   assert.match(removed.output, /imports "@t3tools\/c", but/);
 });
 
+test("e2e: an import the merge-base already cannot follow is listed, not blamed on the PR", () => {
+  // As after an upstream release that brings an import shape the check does not know.
+  const upstream = {
+    ...PACKAGE_BASE,
+    "packages/c/package.json": manifest({ exports: { ".": { import: "./src/missing.ts" } } }),
+    [`${MIGRATIONS}/002_B.ts`]: "export const load = (name) => import(name);\n",
+    "apps/server/src/persistence/Migrations.ts": `${BASE_TREE["apps/server/src/persistence/Migrations.ts"]}import b from "./Migrations/002_B.ts";\n`,
+  };
+  const result = prAgainstBase(
+    { "apps/server/src/feature/Store.ts": "export const x = 2;\n" },
+    upstream,
+  );
+  assert.equal(result.code, 0, result.output);
+  assert.match(result.output, /already on the merge-base \(not this branch's doing/);
+  assert.match(result.output, /002_B\.ts: imports "import\(\.\.\.", but its target is computed/);
+  assert.match(result.output, /001_A\.ts: imports "@t3tools\/c", but/);
+});
+
+test("an unfollowable import is refused when the branch brings it, not when the base has it", () => {
+  const files = (loader) => ({
+    [`${MIGRATIONS}/001_A.ts`]: 'import { load } from "../loader.ts";',
+    "apps/server/src/persistence/loader.ts": loader,
+  });
+  const plain = "export const load = () => 1;";
+  const computed = "export const load = (name) => require(name);";
+  const brought = compareTrees(treeOf(files(plain)), treeOf(files(computed)));
+  assert.match(brought.reasons.join("\n"), /loader\.ts: imports "require\(\.\.\.", but/);
+  assert.deepEqual(brought.known, []);
+  const kept = compareTrees(treeOf(files(computed)), treeOf(files(computed)));
+  assert.deepEqual(kept.reasons, []);
+  assert.equal(kept.known.length, 1);
+});
+
+test("imports are read from code: comments and strings do not count, specifiers do", () => {
+  const trace = traceSchema(
+    treeOf({
+      [`${MIGRATIONS}/001_A.ts`]: [
+        "// each step must require (in order) the step before it",
+        "/* import x from './gone.ts'; import(name) */",
+        'const note = "require (anything) or import (this)";',
+        "const re = /import\\(/;",
+        "const sql = `SELECT 1 -- require (x) ${'import(y)'}`;",
+        'import { b } from "./b.ts"; // import { c } from "./c.ts";',
+        "const url = 'https://example.invalid/require(';",
+      ].join("\n"),
+      [`${MIGRATIONS}/b.ts`]: "export const b = 1;",
+    }),
+  );
+  assert.deepEqual(trace.unresolved, []);
+  assert.ok(trace.closure.has(`${MIGRATIONS}/b.ts`));
+  // A real computed import, also inside a template's interpolation, is still seen.
+  const computed = traceSchema(
+    treeOf({ [`${MIGRATIONS}/001_A.ts`]: "const s = `${require(name)}`;" }),
+  );
+  assert.match(computed.unresolved.join(""), /require\(\.\.\.", but its target is computed/);
+  // A file whose comment or template never ends cannot be read, so it is reported.
+  const open = traceSchema(
+    treeOf({ [`${MIGRATIONS}/001_A.ts`]: 'const s = `never ends\nimport x from "./x.ts";' }),
+  );
+  assert.match(
+    open.unresolved.join(""),
+    /001_A\.ts: a comment, string or template in it does not end/,
+  );
+});
+
 test("e2e: the output names the imports from outside the repository that are not guarded", () => {
   const result = prAgainstBase({ "apps/server/src/feature/Store.ts": "export const x = 2;\n" });
   assert.equal(result.code, 0, result.output);
-  assert.match(result.output, /Imports from outside this repository, not guarded: effect\./);
+  assert.match(
+    result.output,
+    /Imports from outside this repository \(their dependency specs are guarded, their code is not\): effect\./,
+  );
 });
 
 test("e2e: a change to the workspace package list is refused", () => {
@@ -872,4 +931,173 @@ test("e2e: a change to the workspace package list is refused", () => {
     PACKAGE_BASE,
   );
   assert.equal(catalog.code, 0, catalog.output);
+});
+
+// The importer's side: apps/server holds the migrations and depends on `@t3tools/c` and `effect`,
+// which the migrations import; `other` is a dependency the schema code does not import.
+const SPEC_BASE = {
+  ...PACKAGE_BASE,
+  "package.json": JSON.stringify({ name: "root", private: true }),
+  "pnpm-workspace.yaml": [
+    "packages:",
+    "  - apps/*",
+    "  - packages/*",
+    "catalog:",
+    "  effect: 4.1.2",
+    "  other: 1.0.0",
+    "catalogs:",
+    "  next:",
+    "    effect: 4.2.0",
+    "overrides:",
+    '  "dbus-next>usocket": "-"',
+    "patchedDependencies:",
+    "  other@1.0.0: patches/other@1.0.0.patch",
+    "  effect@4.1.2: patches/effect@4.1.2.patch",
+    "",
+  ].join("\n"),
+  "patches/other@1.0.0.patch": "--- a\n+++ b\n",
+  "patches/effect@4.1.2.patch": "--- a\n+++ b\n",
+  [`${MIGRATIONS}/001_A.ts`]:
+    'import { S } from "@t3tools/c";\nimport * as Sql from "effect/sql";\n',
+  "apps/server/package.json": JSON.stringify({
+    name: "server",
+    dependencies: { effect: "catalog:", other: "catalog:" },
+    devDependencies: { "@t3tools/c": "workspace:*" },
+  }),
+};
+const json = (fields) => JSON.stringify(fields);
+const yamlWith = (from, to) => SPEC_BASE["pnpm-workspace.yaml"].replace(from, to);
+
+test("e2e: re-pointing a name the schema code imports from the importer's side is refused", () => {
+  const server = JSON.parse(SPEC_BASE["apps/server/package.json"]);
+  const tricks = {
+    "link: spec in the importer": {
+      "apps/server/package.json": json({
+        ...server,
+        devDependencies: { "@t3tools/c": "link:../../x/evil" },
+      }),
+      "x/evil/package.json": json({ name: "@t3tools/c", main: "index.ts" }),
+      "x/evil/index.ts": "export const S = 3;\n",
+    },
+    "npm: alias in the importer": {
+      "apps/server/package.json": json({
+        ...server,
+        devDependencies: { "@t3tools/c": "npm:left-pad@1.3.0" },
+      }),
+    },
+    "file: spec for an outside name": {
+      "apps/server/package.json": json({
+        ...server,
+        dependencies: { ...server.dependencies, effect: "file:../../x/effect" },
+      }),
+    },
+    "the name added to the root manifest": {
+      "package.json": json({ name: "root", dependencies: { effect: "link:./x/effect" } }),
+    },
+    "workspace overrides": {
+      "pnpm-workspace.yaml": yamlWith(
+        "overrides:\n",
+        'overrides:\n  "@t3tools/c": "link:./x/evil"\n',
+      ),
+    },
+    "a nested override of the name": {
+      "pnpm-workspace.yaml": yamlWith("overrides:\n", "overrides:\n  foo>effect@^4: 4.0.0\n"),
+    },
+    catalog: { "pnpm-workspace.yaml": yamlWith("  effect: 4.1.2", "  effect: link:./x/effect") },
+    "named catalog": {
+      "pnpm-workspace.yaml": yamlWith("    effect: 4.2.0", "    effect: npm:evil@1"),
+    },
+    "a patch of the name re-pointed": {
+      "pnpm-workspace.yaml": yamlWith(
+        "effect@4.1.2: patches/effect@4.1.2.patch",
+        "effect@4.1.2: patches/effect-fork.patch",
+      ),
+      "patches/effect-fork.patch": "--- a\n+++ b\n",
+    },
+    "root pnpm.overrides": {
+      "package.json": json({ name: "root", pnpm: { overrides: { effect: "link:./x" } } }),
+    },
+    "root resolutions": {
+      "package.json": json({ name: "root", resolutions: { "**/@t3tools/c": "link:./x" } }),
+    },
+    "the importer's package.json made unreadable": { "apps/server/package.json": "{ broken" },
+  };
+  const passed = Object.entries(tricks).filter(([, files]) => {
+    const result = prAgainstBase(files, SPEC_BASE);
+    return !(result.code === 1 && /changes what "[^"]+" resolves to/.test(result.output));
+  });
+  assert.deepEqual(
+    passed.map(([trick]) => trick),
+    [],
+  );
+  // The patch file of a name the schema code imports is guarded like schema code.
+  const patched = prAgainstBase(
+    { "patches/effect@4.1.2.patch": "--- a\n+++ b\n@@ fork @@\n" },
+    SPEC_BASE,
+  );
+  assert.equal(patched.code, 1, patched.output);
+  assert.match(patched.output, /patches\/effect@4\.1\.2\.patch: changes the database schema/);
+});
+
+test("e2e: dependency changes of names the schema code does not import stay free", () => {
+  const server = JSON.parse(SPEC_BASE["apps/server/package.json"]);
+  const result = prAgainstBase(
+    {
+      "pnpm-workspace.yaml": yamlWith("  other: 1.0.0", "  other: 1.1.0\n  added: 2.0.0").replace(
+        "overrides:\n",
+        "overrides:\n  other: 1.1.0\n",
+      ),
+      "patches/other@1.0.0.patch": "--- a\n+++ b\n@@ changed @@\n",
+      "apps/server/package.json": json({
+        ...server,
+        dependencies: { ...server.dependencies, other: "2.0.0", added: "1.0.0" },
+      }),
+      // A package that holds no schema code may depend on the guarded names as it likes.
+      "packages/d/package.json": json({ name: "@t3tools/d", dependencies: { effect: "link:x" } }),
+    },
+    SPEC_BASE,
+  );
+  assert.equal(result.code, 0, result.output);
+});
+
+test("e2e: a package.json is judged by the entries schema code imports through it", () => {
+  const base = {
+    ...SPEC_BASE,
+    [`${MIGRATIONS}/001_A.ts`]: 'import { U } from "@t3tools/c/util";\n',
+    "packages/c/package.json": manifest({
+      exports: { ".": "./src/index.ts", "./util": "./src/util.ts", "./ui/*": "./src/ui/*.ts" },
+    }),
+    "packages/c/src/util.ts": "export const U = 1;\n",
+  };
+  const exportsWith = (exports) => ({ "packages/c/package.json": manifest({ exports }) });
+  const kept = { ".": "./src/index.ts", "./util": "./src/util.ts", "./ui/*": "./src/ui/*.ts" };
+  const free = [
+    // A new module, an edit of an entry no schema code imports, unrelated fields.
+    {
+      ...exportsWith({ ...kept, "./newThing": "./src/newThing.ts" }),
+      "packages/c/src/newThing.ts": "",
+    },
+    exportsWith({ ...kept, ".": "./src/settings.ts" }),
+    {
+      "packages/c/package.json": manifest({ exports: kept, scripts: { test: "x" }, version: "2" }),
+    },
+  ];
+  for (const files of free) {
+    const result = prAgainstBase(files, base);
+    assert.equal(result.code, 0, result.output);
+  }
+  const refused = [
+    exportsWith({ ...kept, "./util": "./src/settings.ts" }),
+    exportsWith({ ...kept, "./util": { node: "./src/evil.ts", default: "./src/util.ts" } }),
+    // A pattern added in front of the entry, or the entry turned into a pattern.
+    exportsWith({ ".": "./src/index.ts", "./*": "./src/*.ts" }),
+    { "packages/c/package.json": manifest({ exports: kept, imports: { "#u": "./x.ts" } }) },
+    { "packages/c/package.json": JSON.stringify({ name: "@t3tools/other", exports: kept }) },
+    { "packages/c/package.json": null },
+  ];
+  for (const files of refused) {
+    const result = prAgainstBase(files, base);
+    assert.equal(result.code, 1, `${JSON.stringify(files)}\n${result.output}`);
+    assert.match(result.output, /packages\/c\/package\.json: changes how it maps "\.\/util"/);
+  }
 });

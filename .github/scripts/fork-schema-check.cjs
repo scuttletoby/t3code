@@ -1,11 +1,12 @@
 // Refuses fork changes to the database schema: T3 has no down-migrations, so a fork migration
 // strands installs that return to upstream. Usage: fork-schema-check.cjs <base> <head>.
-// Refused: migrations, schema setup and what they import (with the package.json files that map
-// those imports, and the workspace package list); an import of theirs that should resolve inside
-// the repository but does not; shipped source files holding a schema statement; a PR copy of this
-// check or of .gitattributes that differs from the base's copy; and a branch holding commits
-// already on the base (built on an old, since rebased base, or copying its commits). Files are
-// read as git blobs.
+// Refused: migrations, schema setup and what they import; a change to how those imports map to
+// files (the package.json fields that map them, the dependency specs, catalogs and overrides of
+// the imported names, the workspace package list); a new import of theirs that should resolve
+// inside the repository but does not; shipped source files holding a schema statement; a PR copy
+// of this check or of .gitattributes that differs from the base's copy; and a branch holding
+// commits already on the base (built on an old, since rebased base, or copying its commits).
+// Files are read as git blobs.
 
 const { execFileSync } = require("node:child_process");
 const path = require("node:path");
@@ -52,30 +53,47 @@ const SOURCE_EXTENSIONS = ["", ".ts", ".tsx", ".mts", ".js", "/index.ts", "/inde
 const SCRIPT_SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const MANIFEST = /(^|\/)package\.json$/;
 const WORKSPACE_FILE = "pnpm-workspace.yaml";
-const IMPORT_SPECIFIER = /\b(?:from|import|require)\s*\(?\s*["']([^"'\n]+)["']/g;
+// These run on code whose comments are removed and whose string contents are blanked (see lex), so
+// prose such as `require (in order)` in a comment or a string is not taken for an import; the
+// specifier itself is then read back from the same offsets of the text with its strings intact.
+const IMPORT_SPECIFIER = /\b(?:from|import|require)\s*\(?\s*["']([^"'\n]+)["']/dg;
 // An import whose target is computed (`import(name)`, a template, `import.meta.glob`): not followed.
 const COMPUTED_IMPORT = /\b(?:import|require)\s*\(\s*(?!["'\s])|\bimport\.meta\.glob\b/g;
 // `import { A, type B as C } from "x"` and `export { A } from "x"`: the names a static clause takes.
 const IMPORT_CLAUSE =
-  /\b(?:import|export)\s+(?:type\s+)?([\w$*{}\s,]*?)\s*from\s*["']([^"'\n]+)["']/g;
+  /\b(?:import|export)\s+(?:type\s+)?([\w$*{}\s,]*?)\s*from\s*["']([^"'\n]+)["']/dg;
+const REEXPORT =
+  /\bexport\s+(?:type\s+)?(\*(?:\s+as\s+([\w$]+))?|\{[^}]*\})\s*from\s*["']([^"'\n]+)["']/dg;
+const DEPENDENCY_FIELDS = [
+  "dependencies",
+  "devDependencies",
+  "peerDependencies",
+  "optionalDependencies",
+];
 
 const isTest = (file) => TEST_SOURCE.test(file);
 const isShippedSource = (file) => SHIPPED_SOURCE.test(file) && !isTest(file);
 
 /**
  * Files the schema roots import, transitively: relative imports, and for an import of a workspace
- * package its package.json (which maps the import to files) and every file any export condition
- * of that entry can pick. For a package root (`@t3tools/contracts`) only the files that declare
- * the imported names are followed. The barrels on the way to a declaring file are guarded too (a
- * barrel edit could re-point a name), but their other re-exports are not followed, so the rest of
- * the package stays free to change. A name that cannot be traced guards the whole barrel and
- * everything it re-exports.
+ * package every file any export condition of that entry can pick. For a package root
+ * (`@t3tools/contracts`) only the files that declare the imported names are followed. The barrels
+ * on the way to a declaring file are guarded too (a barrel edit could re-point a name), but their
+ * other re-exports are not followed, so the rest of the package stays free to change. A name that
+ * cannot be traced guards the whole barrel and everything it re-exports.
+ *
+ * Besides the files: `mappings` names, per package.json, the entries (`.`, `./sub`) the schema
+ * code imports through it (only those fields are compared, so a new export elsewhere stays free);
+ * `imported` holds every package name the schema code imports, from the workspace or outside, and
+ * `holders` the package.json files of the packages holding schema code, plus the root one: their
+ * dependency specs for those names decide what the names resolve to.
  *
  * Nothing that could be schema code is skipped silently: an import inside the repository that
- * resolves to no file is listed in `unresolved` (the check refuses it), and only packages outside
- * the workspace resolve to nothing; their names are listed in `outside`.
+ * resolves to no file is listed in `unresolved` (the check refuses it when the PR brings it), and
+ * only packages outside the workspace resolve to nothing; their names are listed in `outside`.
  * @param {{ files: string[]; has(file: string): boolean; read(file: string): string }} tree
- * @returns {{ closure: Set<string>; unresolved: string[]; outside: Set<string> }}
+ * @returns {{ closure: Set<string>; unresolved: string[]; outside: Set<string>;
+ *   imported: Set<string>; mappings: Map<string, Set<string>>; holders: Set<string> }}
  */
 function traceSchema(tree) {
   const queue = tree.files.filter(
@@ -83,11 +101,14 @@ function traceSchema(tree) {
   );
   const closure = new Set(queue);
   const unresolved = new Map();
+  const mappings = new Map();
+  const workspace = workspacePackages(tree);
   const ctx = {
     tree,
-    ...workspacePackages(tree),
+    ...workspace,
     outside: new Set(),
-    guard: (file) => closure.add(file),
+    imported: new Set(),
+    map: (file, key) => mappings.set(file, (mappings.get(file) ?? new Set()).add(key)),
     unresolved: (from, specifier, why) =>
       unresolved.set(`${from}\0${specifier}`, `${from}: imports "${specifier}", but ${why}.`),
   };
@@ -95,17 +116,24 @@ function traceSchema(tree) {
   while (queue.length > 0) {
     const file = queue.pop();
     if (!SCRIPT_SOURCE.test(file)) continue;
-    const text = tree.read(file);
-    const names = importedNames(text);
-    for (const match of text.matchAll(COMPUTED_IMPORT)) {
+    const source = lexed(tree.read(file));
+    if (source.open) {
+      unresolved.set(
+        `${file}\0`,
+        `${file}: a comment, string or template in it does not end, so its imports cannot be read.`,
+      );
+    }
+    const names = importedNames(source);
+    for (const match of source.code.matchAll(COMPUTED_IMPORT)) {
       ctx.unresolved(
         file,
         `${match[0].trim()}...`,
         "its target is computed, so it cannot be followed",
       );
     }
-    for (const match of text.matchAll(IMPORT_SPECIFIER)) {
-      const reached = resolveImport(ctx, file, match[1], names.get(match[1]));
+    for (const match of source.code.matchAll(IMPORT_SPECIFIER)) {
+      const specifier = source.group(match, 1);
+      const reached = resolveImport(ctx, file, specifier, names.get(specifier));
       // A test-path file that schema code imports ships with it, so it is guarded too.
       for (const target of reached.barrels) closure.add(target);
       for (const target of reached.files) {
@@ -120,11 +148,139 @@ function traceSchema(tree) {
   const why =
     "the check cannot resolve it to a file in this repository, so it cannot tell which files " +
     "the schema depends on. Fix the import (or teach the check this import shape)";
+  // The package holding a file is its deepest workspace member directory.
+  const holders = new Set(tree.has("package.json") ? ["package.json"] : []);
+  for (const file of closure) {
+    const holder = workspace.members
+      .filter((member) => member.dir !== "" && file.startsWith(`${member.dir}/`))
+      .sort((a, b) => b.dir.length - a.dir.length)[0];
+    if (holder) holders.add(holder.file);
+  }
   return {
     closure,
     unresolved: [...unresolved.values()].map((reason) => reason.replace(/\.$/, `: ${why}.`)),
     outside: ctx.outside,
+    imported: ctx.imported,
+    mappings,
+    holders,
   };
+}
+
+/**
+ * The text with comments and the contents of strings, templates and regular expressions blanked
+ * (`code`), at the same offsets as the text. `open` says the text ends inside a block comment or a
+ * template. `group(match, n)` reads a match's group `n` (found in `code`, `d` flag) from the text,
+ * where strings are intact.
+ */
+function lex(text) {
+  const code = text.split("");
+  const blank = (array, from, to) => {
+    for (let k = from; k < Math.min(to, text.length); k += 1) {
+      if (array[k] !== "\n") array[k] = " ";
+    }
+  };
+  const templates = []; // the brace depth at each open `${`
+  let depth = 0;
+  let prev = ""; // the last code token: a punctuation character or a word
+  let open = false;
+  let i = 0;
+  // From just after a backtick, or the `}` that closes an interpolation, to the next `${` or `.
+  const template = () => {
+    const start = i;
+    while (i < text.length) {
+      if (text[i] === "\\") i += 2;
+      else if (text[i] === "`") {
+        blank(code, start, i);
+        i += 1;
+        prev = ")";
+        return;
+      } else if (text[i] === "$" && text[i + 1] === "{") {
+        blank(code, start, i);
+        i += 2;
+        templates.push(depth);
+        depth += 1;
+        prev = "{";
+        return;
+      } else i += 1;
+    }
+    blank(code, start, text.length);
+    open = true;
+  };
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "/" && text[i + 1] === "/") {
+      const end = text.indexOf("\n", i);
+      const stop = end < 0 ? text.length : end;
+      blank(code, i, stop);
+      i = stop;
+    } else if (c === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      if (end < 0) open = true;
+      const stop = end < 0 ? text.length : end + 2;
+      blank(code, i, stop);
+      i = stop;
+    } else if (c === "'" || c === '"' || (c === "/" && REGEX_AFTER.has(prev))) {
+      // A string or a regular expression literal: both end at the line's end at the latest.
+      let j = i + 1;
+      let inClass = false;
+      while (j < text.length && text[j] !== "\n") {
+        if (text[j] === "\\") j += 1;
+        else if (c === "/" && text[j] === "[") inClass = true;
+        else if (c === "/" && text[j] === "]") inClass = false;
+        else if (text[j] === c && !inClass) break;
+        j += 1;
+      }
+      blank(code, i + 1, j);
+      i = j + 1;
+      prev = ")";
+    } else if (c === "`") {
+      i += 1;
+      template();
+    } else if (c === "}" && templates.at(-1) === depth - 1) {
+      templates.pop();
+      depth -= 1;
+      i += 1;
+      template();
+    } else if (/[\w$]/.test(c)) {
+      const word = text.slice(i).match(/^[\w$]+/)[0];
+      prev = word;
+      i += word.length;
+    } else {
+      if (c === "{") depth += 1;
+      if (c === "}") depth -= 1;
+      if (!/\s/.test(c)) prev = c;
+      i += 1;
+    }
+  }
+  if (templates.length > 0) open = true;
+  return {
+    code: code.join(""),
+    open,
+    group: (match, n) => match.indices[n] && text.slice(...match.indices[n]),
+  };
+}
+// After these tokens a `/` starts a regular expression, not a division.
+const REGEX_AFTER = new Set([
+  ..."(,=:[!&|?{};+-*%<>~^",
+  "",
+  "return",
+  "typeof",
+  "case",
+  "in",
+  "of",
+  "new",
+  "delete",
+  "void",
+  "throw",
+  "yield",
+  "await",
+  "else",
+  "do",
+]);
+const lexCache = new Map();
+function lexed(text) {
+  if (!lexCache.has(text)) lexCache.set(text, lex(text));
+  return lexCache.get(text);
 }
 
 /** The files the schema roots import, transitively (see traceSchema). */
@@ -198,10 +354,12 @@ function workspacePackages(tree) {
       : !/(^|\/)node_modules(\/|$)/.test(dir);
   const packages = new Map();
   const broken = [];
+  const members = [];
   for (const file of tree.files) {
     if (!MANIFEST.test(file)) continue;
     const dir = file === "package.json" ? "" : path.posix.dirname(file);
     if (!member(dir)) continue;
+    members.push({ dir, file });
     let manifest;
     try {
       manifest = JSON.parse(tree.read(file));
@@ -214,17 +372,20 @@ function workspacePackages(tree) {
     list.push({ dir, file, manifest });
     packages.set(manifest.name, list);
   }
-  return { packages, broken };
+  return { packages, broken, members };
 }
 
 /**
  * Per specifier, the names static clauses take from it; `*` for a namespace or a clause it cannot
  * read. A specifier with no entry (dynamic import, require, side-effect import) takes everything.
+ * @param {ReturnType<typeof lex>} source
  * @returns {Map<string, Set<string>>}
  */
-function importedNames(text) {
+function importedNames(source) {
   const names = new Map();
-  for (const [, clause, specifier] of text.matchAll(IMPORT_CLAUSE)) {
+  for (const match of source.code.matchAll(IMPORT_CLAUSE)) {
+    const clause = match[1];
+    const specifier = source.group(match, 2);
     const set = names.get(specifier) ?? new Set();
     names.set(specifier, set);
     const braces = clause.match(/\{([^}]*)\}/);
@@ -275,6 +436,7 @@ function resolveImport(ctx, from, specifier, names) {
     return none;
   }
   const [, name, subpath] = parts;
+  ctx.imported.add(name);
   const candidates = ctx.packages.get(name);
   if (!candidates) {
     if (ctx.broken.length > 0) {
@@ -290,7 +452,7 @@ function resolveImport(ctx, from, specifier, names) {
   }
   const entries = [];
   for (const pkg of candidates) {
-    ctx.guard(pkg.file);
+    ctx.map(pkg.file, subpath ? `./${subpath}` : ".");
     for (const target of packageTargets(pkg.manifest, subpath)) {
       const file = resolveFile(tree, path.posix.join(pkg.dir, target));
       if (file && !entries.includes(file)) entries.push(file);
@@ -341,12 +503,6 @@ function packageTargets(manifest, subpath) {
       "./index",
     ].filter((target) => typeof target === "string");
   }
-  const map =
-    typeof exports === "object" &&
-    !Array.isArray(exports) &&
-    Object.keys(exports).some((each) => each.startsWith("."))
-      ? exports
-      : { ".": exports };
   const targets = [];
   const leaves = (value, star) => {
     if (typeof value === "string")
@@ -355,18 +511,174 @@ function packageTargets(manifest, subpath) {
     else if (value && typeof value === "object")
       for (const each of Object.values(value)) leaves(each, star);
   };
-  if (Object.hasOwn(map, key)) leaves(map[key]);
-  else {
-    for (const [pattern, value] of Object.entries(map)) {
-      const star = pattern.indexOf("*");
-      if (star < 0) continue;
-      const [prefix, suffix] = [pattern.slice(0, star), pattern.slice(star + 1)];
-      if (key.length >= pattern.length - 1 && key.startsWith(prefix) && key.endsWith(suffix)) {
-        leaves(value, key.slice(prefix.length, key.length - suffix.length));
+  for (const [, value, star] of exportEntries(exports, key)) leaves(value, star);
+  return targets;
+}
+
+/**
+ * The `exports` entries that can answer `key`: the exact key, or else every `*` pattern that
+ * matches it, as [pattern, value, what the star stands for].
+ */
+function exportEntries(exports, key) {
+  const map =
+    typeof exports === "object" &&
+    !Array.isArray(exports) &&
+    Object.keys(exports).some((each) => each.startsWith("."))
+      ? exports
+      : { ".": exports };
+  if (Object.hasOwn(map, key)) return [[key, map[key], undefined]];
+  const entries = [];
+  for (const [pattern, value] of Object.entries(map)) {
+    const star = pattern.indexOf("*");
+    if (star < 0) continue;
+    const [prefix, suffix] = [pattern.slice(0, star), pattern.slice(star + 1)];
+    if (key.length >= pattern.length - 1 && key.startsWith(prefix) && key.endsWith(suffix)) {
+      entries.push([pattern, value, key.slice(prefix.length, key.length - suffix.length)]);
+    }
+  }
+  return entries;
+}
+
+/**
+ * What a package.json says about the import `key` (`.` or `./sub`): its name, type, the export
+ * entries that answer that key (and whether `exports` is a subpath map), the fallback fields and
+ * `imports`. Two trees whose values differ map the import differently; other export entries do not
+ * count, so adding a module to the package stays free. A file that is absent or not JSON gives
+ * a value of its own.
+ */
+function manifestMapping(text, key) {
+  if (text === undefined) return "(absent)";
+  let manifest;
+  try {
+    manifest = JSON.parse(text);
+  } catch {
+    return `(not JSON) ${text}`;
+  }
+  if (!manifest || typeof manifest !== "object") return `(not an object) ${text}`;
+  const { exports } = manifest;
+  const fields = ["name", "type", "main", "module", "types", "typings", "browser", "imports"];
+  return JSON.stringify({
+    ...Object.fromEntries(fields.map((field) => [field, manifest[field]])),
+    exports:
+      exports === undefined || exports === null
+        ? exports
+        : {
+            map:
+              typeof exports === "object" &&
+              !Array.isArray(exports) &&
+              Object.keys(exports).some((each) => each.startsWith(".")),
+            entries: exportEntries(exports, key).map(([pattern, value]) => [pattern, value]),
+          },
+  });
+}
+
+/** The package name an override, resolution, catalog or patch key is about (`a>b@^1` -> `b`). */
+function keyNames(key, names) {
+  const last = key.split(">").pop().trim();
+  const bare = last.replace(/(.)@[^/]*$/, "$1");
+  return [...names].filter((name) => bare === name || bare.endsWith(`/${name}`));
+}
+
+/**
+ * Top-level YAML map entries as { path, value } (`catalog:` / `  effect: 4.1.2` gives
+ * { path: ["catalog", "effect"], value: "4.1.2" }); enough for pnpm-workspace.yaml, whose
+ * catalogs and overrides are plain maps. List items and other lines are skipped.
+ */
+function yamlEntries(text) {
+  const entries = [];
+  const stack = [];
+  for (const line of text.split("\n")) {
+    if (/^\s*(#|-|$)/.test(line)) continue;
+    const match = line.match(
+      /^(\s*)(?:"([^"]*)"|'([^']*)'|([^\s#'"][^:#]*?))\s*:(?:\s+(.*?))?\s*$/,
+    );
+    if (!match) continue;
+    const indent = match[1].length;
+    const key = match[2] ?? match[3] ?? match[4];
+    const value = (match[5] ?? "").replace(/\s+#.*$/, "").replace(/^(["'])(.*)\1$/, "$2");
+    while (stack.length > 0 && stack.at(-1).indent >= indent) stack.pop();
+    entries.push({ path: [...stack.map((each) => each.key), key], value });
+    stack.push({ indent, key });
+  }
+  return entries;
+}
+
+/**
+ * The dependency specs that decide what the imported `names` resolve to: their entries in the
+ * dependency fields of the `holders` (the package.json files of the packages holding schema code,
+ * and the root one), the root's `pnpm.overrides`, `pnpm.patchedDependencies` and `resolutions`,
+ * and pnpm-workspace.yaml's `catalog`, `catalogs`, `overrides` and `patchedDependencies`. Specs of
+ * other names are not read, so other dependency bumps stay free. `patches` are the patch files of
+ * those names, guarded like schema code.
+ * @returns {{ specs: Map<string, { file: string; where: string; name: string; value: string }>; patches: string[] }}
+ */
+function dependencySpecs(tree, names, holders) {
+  const specs = new Map();
+  const patches = [];
+  const add = (file, where, name, value) => {
+    const text = typeof value === "string" ? value : JSON.stringify(value);
+    specs.set(`${file}\0${where}\0${name}`, { file, where, name, value: text });
+  };
+  const keyed = (file, where, map, isPatch) => {
+    if (map === undefined) return;
+    if (!map || typeof map !== "object") return add(file, where, "*", map);
+    for (const [key, value] of Object.entries(map)) {
+      for (const name of keyNames(key, names)) {
+        add(file, `${where} ${JSON.stringify(key)}`, name, value);
+        if (isPatch && typeof value === "string") patches.push(path.posix.normalize(value));
+      }
+    }
+  };
+  for (const file of holders) {
+    if (!tree.has(file)) continue;
+    let manifest;
+    try {
+      manifest = JSON.parse(tree.read(file));
+    } catch {
+      add(file, "(not JSON)", "*", tree.read(file));
+      continue;
+    }
+    for (const field of DEPENDENCY_FIELDS) {
+      const deps = manifest?.[field];
+      if (deps === undefined) continue;
+      if (!deps || typeof deps !== "object") {
+        add(file, field, "*", deps);
+        continue;
+      }
+      for (const name of names) {
+        if (Object.hasOwn(deps, name)) add(file, field, name, deps[name]);
+      }
+    }
+    if (file === "package.json") {
+      keyed(file, "pnpm.overrides", manifest?.pnpm?.overrides);
+      keyed(file, "pnpm.patchedDependencies", manifest?.pnpm?.patchedDependencies, true);
+      keyed(file, "resolutions", manifest?.resolutions);
+    }
+  }
+  if (tree.has(WORKSPACE_FILE)) {
+    const sections = ["catalog", "catalogs", "overrides", "patchedDependencies"];
+    for (const { path: keys, value } of yamlEntries(tree.read(WORKSPACE_FILE))) {
+      const [section] = keys;
+      if (!sections.includes(section)) continue;
+      // A section written inline (`catalog: { ... }`) is compared whole.
+      if (keys.length === 1) {
+        if (value) add(WORKSPACE_FILE, section, "*", value);
+        continue;
+      }
+      if (section === "catalogs" && keys.length === 2) {
+        if (value) add(WORKSPACE_FILE, `catalogs.${keys[1]}`, "*", value);
+        continue;
+      }
+      const key = section === "catalogs" ? keys[2] : keys[1];
+      if (keys.length > (section === "catalogs" ? 3 : 2)) continue;
+      const where = section === "catalogs" ? `catalogs.${keys[1]}` : section;
+      for (const name of keyNames(key, names)) {
+        add(WORKSPACE_FILE, `${where} ${JSON.stringify(key)}`, name, value);
+        if (section === "patchedDependencies") patches.push(path.posix.normalize(value));
       }
     }
   }
-  return targets;
+  return { specs, patches };
 }
 
 /**
@@ -378,17 +690,17 @@ function declaringFiles(ctx, file, name, found, barrels, seen) {
   const key = `${file}\0${name}`;
   if (seen.has(key)) return seen.get(key);
   seen.set(key, false);
-  const text = ctx.tree.read(file);
+  const source = lexed(ctx.tree.read(file));
+  const text = source.code;
   if (declaresName(text, name)) {
     found.add(file);
     seen.set(key, true);
     return true;
   }
   let traced = false;
-  for (const match of text.matchAll(
-    /\bexport\s+(?:type\s+)?(\*(?:\s+as\s+([\w$]+))?|\{[^}]*\})\s*from\s*["']([^"'\n]+)["']/g,
-  )) {
-    const [, clause, namespace, specifier] = match;
+  for (const match of text.matchAll(REEXPORT)) {
+    const [, clause, namespace] = match;
+    const specifier = source.group(match, 3);
     const targets = resolveImport(ctx, file, specifier, new Set(["*"])).files;
     if (clause.startsWith("*") && !namespace) {
       for (const target of targets) {
@@ -618,6 +930,71 @@ function staleCommits(mergeBase, base, head) {
     .map((commit) => commit.sha);
 }
 
+/**
+ * Judges what the branch changes in how schema code is found, between the merge-base tree and the
+ * head tree: the guarded closure (both trees), imports the head cannot follow that the merge-base
+ * could (`known`: the ones already on the merge-base, which the branch did not bring), and changes
+ * to the workspace list, to the package.json fields that map schema imports, and to the dependency
+ * specs of the names schema code imports.
+ * @returns {{ closure: Set<string>; reasons: string[]; known: string[]; outside: string[] }}
+ */
+function compareTrees(before, after) {
+  const trees = [before, after];
+  const traces = trees.map(traceSchema);
+  const union = (pick) => new Set(traces.flatMap((trace) => [...pick(trace)]));
+  const closure = union((trace) => trace.closure);
+  const reasons = [];
+  // An import the merge-base already could not follow is not the branch's doing: listed, not
+  // refused. Only the ones the branch brings (a changed or newly guarded file, or a target it
+  // moved or broke) are refused.
+  const onBase = new Set(traces[0].unresolved);
+  const known = traces[1].unresolved.filter((reason) => onBase.has(reason));
+  reasons.push(...traces[1].unresolved.filter((reason) => !onBase.has(reason)));
+  // Which directories are workspace packages decides what a package import resolves to.
+  const [listBefore, listAfter] = trees.map(workspacePatterns);
+  if (JSON.stringify(listBefore) !== JSON.stringify(listAfter)) {
+    reasons.push(
+      `${listAfter.source ?? listBefore.source}: changes which directories are workspace ` +
+        "packages, which can re-point a package the schema code imports",
+    );
+  }
+  // The package.json fields that map a schema import to files.
+  const mappings = new Map();
+  for (const trace of traces) {
+    for (const [file, keys] of trace.mappings) {
+      mappings.set(file, new Set([...(mappings.get(file) ?? []), ...keys]));
+    }
+  }
+  for (const [file, keys] of [...mappings].sort()) {
+    const read = (tree) => (tree.has(file) ? tree.read(file) : undefined);
+    const changed = [...keys]
+      .sort()
+      .filter((key) => manifestMapping(read(before), key) !== manifestMapping(read(after), key));
+    if (changed.length > 0) {
+      reasons.push(
+        `${file}: changes how it maps ${changed.map((key) => `"${key}"`).join(", ")}, which the ` +
+          "schema code imports (the fields for other entries stay free)",
+      );
+    }
+  }
+  // The dependency specs of the names schema code imports.
+  const names = union((trace) => trace.imported);
+  const holders = union((trace) => trace.holders);
+  const [specsBefore, specsAfter] = trees.map((tree) => dependencySpecs(tree, names, holders));
+  for (const key of new Set([...specsBefore.specs.keys(), ...specsAfter.specs.keys()])) {
+    const [old, now] = [specsBefore.specs.get(key), specsAfter.specs.get(key)];
+    if (old?.value === now?.value) continue;
+    const { file, where, name } = old ?? now;
+    const show = (spec) => (spec ? JSON.stringify(spec.value) : "(none)");
+    reasons.push(
+      `${file}: changes what "${name}" resolves to (${where}: ${show(old)} -> ${show(now)}), ` +
+        "which the schema code imports",
+    );
+  }
+  for (const patch of [...specsBefore.patches, ...specsAfter.patches]) closure.add(patch);
+  return { closure, reasons, known, outside: [...union((trace) => trace.outside)].sort() };
+}
+
 function main(argv) {
   const [base, head] = argv;
   if (!base || !head) {
@@ -641,18 +1018,9 @@ function main(argv) {
     sameAsBase: guarded(entry.path) ? blobAt(base, entry.path) === entry.newBlob : undefined,
     fromOldMain: guarded(entry.path) && stale.length > 0 ? fromOldMain(entry) : undefined,
   }));
-  const trees = [readTree(mergeBase), readTree(head)];
-  const traces = trees.map(traceSchema);
-  const closure = new Set(traces.flatMap((trace) => [...trace.closure]));
-  const reasons = [...new Set(traces.flatMap((trace) => trace.unresolved))];
-  // Which directories are workspace packages decides what a package import resolves to.
-  const [before, after] = trees.map(workspacePatterns);
-  if (JSON.stringify(before) !== JSON.stringify(after)) {
-    reasons.push(
-      `${after.source ?? before.source}: changes which directories are workspace packages, which ` +
-        "can re-point a package the schema code imports",
-    );
-  }
+  const judged = compareTrees(readTree(mergeBase), readTree(head));
+  const { closure, outside } = judged;
+  const reasons = [...judged.reasons];
   reasons.push(
     ...findSchemaChanges(changes, {
       closure,
@@ -660,11 +1028,17 @@ function main(argv) {
       staleCommits: stale.length,
     }),
   );
-  const outside = [...new Set(traces.flatMap((trace) => [...trace.outside]))].sort();
   console.log(
-    `Schema code: ${closure.size} guarded files. Imports from outside this repository, not ` +
-      `guarded: ${outside.join(", ") || "none"}.`,
+    `Schema code: ${closure.size} guarded files. Imports from outside this repository (their ` +
+      `dependency specs are guarded, their code is not): ${outside.join(", ") || "none"}.`,
   );
+  if (judged.known.length > 0) {
+    console.log(
+      "Imports of the schema code the check cannot follow, already on the merge-base (not this " +
+        "branch's doing; the check needs teaching, the branch needs no change):",
+    );
+    for (const reason of judged.known) console.log(`- ${reason}`);
+  }
   if (reasons.length === 0) {
     console.log(`No database schema changes (${changes.length} changed files checked).`);
     return 0;
@@ -675,7 +1049,9 @@ function main(argv) {
 }
 
 module.exports = {
+  compareTrees,
   findSchemaChanges,
+  lex,
   parseRawDiff,
   schemaClosure,
   traceSchema,
