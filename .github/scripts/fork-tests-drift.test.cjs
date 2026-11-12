@@ -77,7 +77,9 @@ test("top-level env, defaults, concurrency and permissions count, wherever they 
   assert.deepEqual(compare(wrap(withPerms), wrap(withPerms.replace(": read", ": write"))), [
     "ci.yml: top-level `permissions:` changed",
   ]);
-  assert.deepEqual(compare(wrap(withPerms), wrap(base)), ["ci.yml: top-level `permissions:` removed"]);
+  assert.deepEqual(compare(wrap(withPerms), wrap(base)), [
+    "ci.yml: top-level `permissions:` removed",
+  ]);
   // `on:` and `name:` are not digested.
   assert.deepEqual(compare(wrap(base), wrap(base.replace("on: push", "on: pull_request"))), []);
 });

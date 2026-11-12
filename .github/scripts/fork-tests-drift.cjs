@@ -1,14 +1,7 @@
-// Fork only: fails when upstream's ci.yml or release.yml test jobs change since
-// the copy in .github/workflows/fork-tests.yml last followed them. Compares a
-// digest of every job and step, and of the top-level keys that change how every
-// job runs (TOP_LEVEL), with .github/fork-tests-upstream.json; comments are ignored.
-//
-// Limit: the check compares upstream with its own record, not with
-// fork-tests.yml. Recording without porting passes, so --record prints what
-// changed, and the commit and PR that update the record must say, for each line,
-// what was ported or why it does not apply.
-//   node .github/scripts/fork-tests-drift.cjs           check
-//   node .github/scripts/fork-tests-drift.cjs --record  after porting: print the changes, save the record
+// Fork only: fails when upstream's ci.yml or release.yml test jobs or TOP_LEVEL keys changed since
+// .github/fork-tests-upstream.json recorded them (comments ignored). It compares upstream with its
+// record, not with fork-tests.yml: `--record` prints the changes and saves them, and its commit and
+// PR must say per change what was ported or why it does not apply. Run: `node <this> [--record]`.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");

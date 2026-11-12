@@ -1,11 +1,7 @@
-// Fork only: every test file under `.github/scripts` (`*.test.*`, subdirectories
-// included) must be run somewhere, checked against `.github/fork-ci-tests.txt`.
-// A plain entry is run here, by its extension (RUNNER). An entry
-// `<test> run by <file>` is run by that file, which must name the test's path; it
-// cannot be one of upstream's workflows, which are disabled in the fork. A
-// present test missing from the list fails, and so does a test with no runner
-// for its extension. A listed test that is missing fails once it has been in the
-// tested commit's history (deleted while still listed) and is a note before that.
+// Fork only: every `*.test.*` under .github/scripts must be listed in .github/fork-ci-tests.txt.
+// A plain entry runs here by its extension (RUNNER); `<test> run by <file>` is run by that file,
+// which must name the test and cannot be a (disabled) upstream workflow. Unlisted or runner-less
+// tests fail; a listed test that is gone fails once the tested history had it, a note before.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -41,7 +37,8 @@ function plan(entries, present, ever, read = () => null) {
   for (const { file, runBy } of entries) {
     if (!runBy || !present.includes(file)) continue;
     let why = null;
-    if (UPSTREAM_WORKFLOW.test(runBy)) why = `${runBy} is an upstream workflow, disabled in the fork`;
+    if (UPSTREAM_WORKFLOW.test(runBy))
+      why = `${runBy} is an upstream workflow, disabled in the fork`;
     else {
       const text = read(runBy);
       if (text === null) why = `${runBy} does not exist`;
@@ -68,7 +65,10 @@ function readList(text) {
     .filter(Boolean)
     .map((line) => {
       const match = line.match(/^(\S+)(?:\s+run by\s+(\S+))?$/);
-      if (!match) throw new Error(`${LIST}: cannot read "${line}" (expected "<test>" or "<test> run by <file>")`);
+      if (!match)
+        throw new Error(
+          `${LIST}: cannot read "${line}" (expected "<test>" or "<test> run by <file>")`,
+        );
       return { file: match[1], runBy: match[2] ?? null };
     });
 }
@@ -141,12 +141,14 @@ function main() {
     );
   for (const { file, why } of result.notRun)
     console.log(`::error file=${file}::${file} is not run: ${why}`);
-  for (const { file, runBy } of result.elsewhere) rows.push(`| \`${file}\` | run by \`${runBy}\` | |`);
+  for (const { file, runBy } of result.elsewhere)
+    rows.push(`| \`${file}\` | run by \`${runBy}\` | |`);
   for (const file of result.pending)
     rows.push(`| \`${file}\` | not present: its PR has not merged | |`);
   for (const file of result.unlisted) rows.push(`| \`${file}\` | **not in ${LIST}** | |`);
   for (const file of result.deleted) rows.push(`| \`${file}\` | **deleted while listed** | |`);
-  for (const file of result.noRunner) rows.push(`| \`${file}\` | **no runner for its extension** | |`);
+  for (const file of result.noRunner)
+    rows.push(`| \`${file}\` | **no runner for its extension** | |`);
   for (const { file, why } of result.notRun) rows.push(`| \`${file}\` | **not run: ${why}** | |`);
 
   const summary = process.env.GITHUB_STEP_SUMMARY;

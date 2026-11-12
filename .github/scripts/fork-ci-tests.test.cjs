@@ -35,7 +35,11 @@ test("a listed test never in history is pending, not a failure", () => {
 });
 
 test("a listed test deleted from history fails", () => {
-  const result = plan(here("a.test.sh", "gone.test.sh"), ["a.test.sh"], (f) => f === "gone.test.sh");
+  const result = plan(
+    here("a.test.sh", "gone.test.sh"),
+    ["a.test.sh"],
+    (f) => f === "gone.test.sh",
+  );
   assert.deepEqual(result.deleted, ["gone.test.sh"]);
   assert.deepEqual(result.pending, []);
 });
@@ -83,7 +87,11 @@ test("finds every *.test.* file, subdirectories included", () => {
       fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
       fs.writeFileSync(path.join(root, file), "");
     }
-    assert.deepEqual(findTests("s", root), ["s/a.test.cjs", "s/sub/c.test.mjs", "s/sub/deep/d.test.ts"]);
+    assert.deepEqual(findTests("s", root), [
+      "s/a.test.cjs",
+      "s/sub/c.test.mjs",
+      "s/sub/deep/d.test.ts",
+    ]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

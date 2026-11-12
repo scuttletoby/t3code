@@ -23,6 +23,15 @@
 # Merge commits are diffed with --remerge-diff: only what the merge itself changed beyond an
 # automatic merge of its parents (a conflict resolution, or a file added in the merge). Without it
 # git log shows merges with no diff at all, so gitleaks would never read them.
+#
+# Offline, and counted: the checkout is a blob-less clone, so file contents are fetched on demand.
+# gitleaks 8.30.1 stops reading at the first git error (a blob fetch that fails: network, GitHub
+# 5xx), logs "0 commits scanned" and still exits 0. So the script runs gitleaks' own git log first,
+# which fetches every blob the scan reads and fails the job if a fetch fails, then runs gitleaks with
+# GIT_NO_LAZY_FETCH=1, and fails when gitleaks scanned fewer commits than that git log holds.
+# gitleaks counts a commit when a file it neither deletes nor turns binary has a hunk: a pure
+# rename, a mode change, an empty new file or a merge with nothing beyond the automatic merge has
+# none, so the count can be below `git rev-list --count`.
 set -euo pipefail
 
 have() { git cat-file -e "$1^{commit}" 2>/dev/null; }
@@ -75,14 +84,39 @@ esac
 
 echo "Scanning $what ($range)"
 if [[ -n "$warning" ]]; then echo "::warning title=Secret scan::$warning"; fi
+
+# gitleaks runs `git log -p -U0 <log-opts>`. The same command here fetches what it reads; counts the
+# commits gitleaks will scan (see the header); and fails the job (pipefail) when a fetch fails.
+# shellcheck disable=SC2086
+if ! expected="$(git log -p -U0 $opts | awk '
+  /^commit / { sha = $2; next }
+  /^diff --git / { deleted = 0; next }
+  /^deleted file mode / { deleted = 1; next }
+  /^@@ / { if (!deleted && sha != "" && !(sha in seen)) { seen[sha] = 1; n++ } }
+  END { print n + 0 }')"; then
+  echo "::error::Secret scan: cannot read the commits to scan (a file content fetch failed?)" >&2
+  summary "### Secret scan" "" "Failed: the contents of $what could not be read, so nothing was scanned."
+  exit 2
+fi
+
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
 set +e
-"$GITLEAKS" git --no-banner --redact --verbose --log-opts="$opts" .
+GIT_NO_LAZY_FETCH=1 "$GITLEAKS" git --no-banner --no-color --redact --verbose --log-opts="$opts" . > "$log" 2>&1
 status=$?
 set -e
+cat "$log"
+scanned="$(sed -E 's/\x1b\[[0-9;]*m//g' "$log" | sed -nE 's/.* ([0-9]+) commits scanned.*/\1/p' | tail -n 1)"
+echo "gitleaks scanned ${scanned:-no} commit(s); $expected commit(s) in range have changes it reads"
 summary "### Secret scan" ""
 if [[ -n "$warning" ]]; then summary "Warning: $warning." ""; fi
+if [[ $status -eq 0 && ( -z "$scanned" || "$scanned" -lt "$expected" ) ]]; then
+  echo "::error::Secret scan: gitleaks scanned ${scanned:-no} commit(s), but $expected commit(s) in range have changes (a git error stopped it?)" >&2
+  summary "Failed: gitleaks scanned ${scanned:-no} of the $expected commit(s) with changes in $what, so the rest were not checked."
+  exit 2
+fi
 if [[ $status -eq 0 ]]; then
-  summary "No secrets found in $what."
+  summary "No secrets found in $what ($scanned commit(s) with changes scanned)."
 else
   summary "gitleaks found possible secrets in $what (values redacted; see the job log). Rotate any real secret: it is already public."
 fi

@@ -24,13 +24,24 @@ else
   export TMPDIR="$root"
   cat > "$gitleaks" <<'FAKE'
 #!/usr/bin/env bash
-# Stand-in: `gitleaks git ... --log-opts=OPTS .` fails when the diffs of `git log OPTS` add a key id.
-set -euo pipefail
+# Stand-in: `gitleaks git ... --log-opts=OPTS .` fails when the diffs of `git log -p -U0 OPTS` add a
+# key id, and logs how many commits it scanned. Like gitleaks 8.30.1, a git error (a file content
+# fetch that fails) stops it with "0 commits scanned" and exit 0.
+set -uo pipefail
 opts=""
 for arg in "$@"; do [[ "$arg" == --log-opts=* ]] && opts="${arg#--log-opts=}"; done
 # Into a file first: `grep -q` stops reading early, and pipefail would read git's SIGPIPE as no match.
 # shellcheck disable=SC2086
-git log -p -U0 $opts > "$TMPDIR/fake-gitleaks.log"
+if ! git log -p -U0 $opts > "$TMPDIR/fake-gitleaks.log" 2> "$TMPDIR/fake-gitleaks.err"; then
+  echo "ERR [git] $(head -n 1 "$TMPDIR/fake-gitleaks.err")"
+  echo "INF 0 commits scanned."
+  echo "no leaks found"
+  exit 0
+fi
+# A commit counts when a file it does not delete has a hunk, as in gitleaks.
+scanned="$(awk '/^commit / { c = $2 } /^diff --git / { d = 0 } /^deleted file mode / { d = 1 }
+  /^@@ / && !d && !(c in s) { s[c] = 1; n++ } END { print n + 0 }' "$TMPDIR/fake-gitleaks.log")"
+echo "INF $scanned commits scanned."
 if grep -qE '^\+.*(AKIA)[A-Z2-7]{16}' "$TMPDIR/fake-gitleaks.log"; then echo "leaks found: 1"; exit 1; fi
 echo "no leaks found"
 FAKE
@@ -142,6 +153,39 @@ BEFORE="1111111111111111111111111111111111111111" AFTER="$leaky" \
   check "push: an old tip that cannot be fetched warns" 0 "::warning.*cannot be fetched"
 
 EVENT_NAME=workflow_dispatch check "an unknown event fails" 2
+
+export EVENT_NAME=pull_request BEFORE="" AFTER=""
+BASE_SHA="1111111111111111111111111111111111111111" HEAD_SHA="$leaky" \
+  check "pull request: a base commit that cannot be fetched fails" 2 "cannot fetch commit 1111"
+BASE_SHA="$base" HEAD_SHA="2222222222222222222222222222222222222222" \
+  check "pull request: a head commit that cannot be fetched fails" 2 "cannot fetch commit 2222"
+
+# gitleaks stopping early (a git error part-way) without failing: it scans only the newest commit.
+real_gitleaks="$gitleaks"
+gitleaks="$root/early-stop-gitleaks"
+cat > "$gitleaks" <<STOP
+#!/usr/bin/env bash
+args=()
+for arg in "\$@"; do
+  if [[ "\$arg" == --log-opts=* ]]; then arg="--log-opts=--max-count=1 \${arg#--log-opts=}"; fi
+  args+=("\$arg")
+done
+"$real_gitleaks" "\${args[@]}" || true
+exit 0
+STOP
+chmod +x "$gitleaks"
+BASE_SHA="$base" HEAD_SHA="$leaky" \
+  check "pull request: gitleaks scanning fewer commits than the range has fails" 2 "scanned 1 commit"
+gitleaks="$real_gitleaks"
+
+# The file contents cannot be fetched part-way: a fresh blob-less clone (no contents yet) whose
+# origin is gone afterwards. gitleaks would log "0 commits scanned" and exit 0.
+clone="$root/clone-offline"
+git clone -q --filter=blob:none --no-checkout --single-branch --branch leaky "file://$root/origin.git" "$clone"
+mv "$root/origin.git" "$root/origin-gone.git"
+BASE_SHA="$base" HEAD_SHA="$leaky" \
+  check "pull request: contents that cannot be fetched after the clone fail" 2 "cannot read the commits"
+mv "$root/origin-gone.git" "$root/origin.git"
 
 if [[ "$failures" -ne 0 ]]; then
   echo "$failures check(s) failed"
