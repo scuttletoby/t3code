@@ -476,6 +476,13 @@ fork_commit "fork: comments only" 'printf "# nothing\n\n  # still nothing\n" > .
 plan
 check "plan: a list with comments only deletes nothing, the plan goes on" \
   eval 'action_is rebase && in_candidate ci.yml'
+new_upstream
+up_release v0.1.11 'echo "on: [push] # edited" > .github/workflows/ci.yml'
+new_fork v0.1.10
+fork_commit "fork: delete ci.yml, CRLF list" "printf '# deleted\\r\\n.github/workflows/ci.yml\\r\\n' > .github/fork-removed-workflows.txt && rm .github/workflows/ci.yml"
+plan
+check "plan: a list with CRLF line ends is read like one with LF, the listed file stays deleted" \
+  eval 'action_is rebase && ! in_candidate ci.yml && git -C "$root/work" show "$(out candidate):.github/fork-removed-workflows.txt" | grep -q $'"'"'ci.yml\r$'"'"''
 
 # Upstream renames a listed file: git reports a rename/delete conflict on the new name, which the
 # list does not name, so the plan stops and names it rather than shipping it under that name.
@@ -492,7 +499,12 @@ for case in "pull_request_target|printf 'on:\n  pull_request_target:\n    types:
   "workflow_run|printf 'name: x\non:\n  workflow_run:\n    workflows: [CI]\n'" \
   "issues|printf 'on: [push, issues]\n'" \
   "issue_comment|printf 'on: issue_comment # comments\n'" \
+  "pull_request_review|printf 'on:\n  pull_request_review:\n    types: [submitted]\n'" \
+  "pull_request_review_comment|printf 'on: [pull_request_review_comment]\n'" \
+  "gollum|printf 'on: gollum\n'" \
+  "on push|printf 'on: push\njobs:\n  a:\n    if: github.event_name == \"pull_request_target\"\n'" \
   "could not be read|printf 'on: {workflow_run: {workflows: [CI]}}\n'" \
+  "could not be read|printf 'name: \"x\non: push\n\"\non : issues\n'" \
   "could not be read|printf 'jobs: {}\n'"; do
   want="${case%%|*}"
   new_upstream

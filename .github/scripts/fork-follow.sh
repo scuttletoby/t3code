@@ -182,11 +182,18 @@ present_removed() { # present_removed COMMIT: the listed files COMMIT has, one p
   return 0
 }
 
-# Events someone outside the fork can start a workflow with, from main's copy of the file: an
-# outside pull request (pull_request_target), a workflow of a given name that an outside pull
-# request can add (workflow_run), an issue, a comment, a discussion, a star or a fork. GitHub runs
-# such a workflow before the sweep can see and disable it, so a new one must not reach the series.
-outside_events='^(pull_request_target|workflow_run|issue_comment|issues|discussion|discussion_comment|watch|fork)$'
+# Events someone outside the fork can start a workflow with. GitHub runs such a workflow before
+# the sweep can see and disable it, so a new one must not reach the series. Directly: an outside
+# pull request (pull_request_target, main's copy), a review or a review comment on a pull request
+# from a fork/* branch (pull_request_review, pull_request_review_comment: that branch's copy, with
+# the repository's token), an issue or a comment (issues, issue_comment), a discussion
+# (discussion, discussion_comment), a star (watch), a fork, a wiki edit if the wiki is open
+# (gollum). Indirectly: a workflow of a given name that an outside pull request can add
+# (workflow_run), and the checks, commit statuses and deployments that apps post on an outside
+# pull request's commits (check_run, check_suite, status, deployment_status). pull_request from
+# another fork gets a read-only token and no secrets, so the sweep is enough for it. The rest need
+# write access or more.
+outside_events='^(pull_request_target|pull_request_review|pull_request_review_comment|issues|issue_comment|discussion|discussion_comment|watch|fork|gollum|workflow_run|check_run|check_suite|status|deployment_status)$'
 refuse_outside_workflows() { # refuse_outside_workflows UPSTREAM_BASE UPSTREAM_TARGET TAG CANDIDATE
   local path list=() found=() events status
   workflow_paths A "$1" "$2"
