@@ -6,6 +6,7 @@
 # A present test that is not listed fails. A listed file that is not present yet
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs
+.github/scripts/fork-fleet.test.py
 .github/scripts/fork-follow.test.sh
 .github/scripts/fork-release-workflow.test.py
 .github/scripts/fork-release.test.sh

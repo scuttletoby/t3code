@@ -1,0 +1,48 @@
+name: Fork fleet sweep
+
+# Fork only. In auto and github mode (repository variable CI_RUNNERS; unset is
+# auto), a Fork tests run is not left waiting for a fleet runner that went away
+# after `route` picked it, and a fleet job that the fleet did not finish runs
+# again GitHub-hosted:
+# - a fleet job queued 10 minutes (stuck_seconds) without a runner: the run is
+#   cancelled and re-run;
+# - a run that ended red because a fleet runner stopped during a job (no failed
+#   step of the job's own), or never had the memory the job needs: re-run.
+# A re-run is attempt 2 of all jobs, and `route` sends attempt 2+ of an auto run
+# GitHub-hosted, so each run is re-run at most once. Nothing is kept between
+# sweeps: each reads the runs of the last 24 hours from GitHub, so a sweep that
+# stopped half-way is finished by the next. Fleet mode waits for the fleet and
+# moves nothing. .github/scripts/fork-fleet.py sweep; runbook .github/fork-fleet.md.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-fleet-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: |
+            /.github/fork-fleet.json
+            /.github/scripts/fork-fleet.py
+          sparse-checkout-cone-mode: false
+
+      - name: Cancel and re-run what the fleet did not finish
+        env:
+          FLEET_MODE: ${{ vars.CI_RUNNERS }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/fork-fleet.py sweep
