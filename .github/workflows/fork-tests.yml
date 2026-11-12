@@ -832,6 +832,9 @@ jobs:
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # The job list API needs actions: read; nothing here checks out code.
+    permissions:
+      actions: read
     steps:
       - name: Require every job to pass
         env:
@@ -884,16 +887,18 @@ jobs:
           name: thread-transfer-results
           path: ${{ runner.temp }}/thread-transfer
 
-      # Information only: read from the public run's job list, never fails the run.
+      # Information only: read from the run's job list, never fails the run.
       - name: Job wall times
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" 2>/dev/null) || {
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100") || {
+            echo "::warning::Job timings unavailable: the job list API call failed."
             echo "Job timings unavailable." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           }
+          echo "Job timings for $(echo "$jobs" | jq '.jobs | length') jobs."
           {
             echo
             echo "#### Job wall times"
