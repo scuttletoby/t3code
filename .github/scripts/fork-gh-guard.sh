@@ -9,7 +9,7 @@
 # Anything else refuses: the script exits 1 when it sources this file, before any gh call, and
 # every later call goes through the gh function below, which checks again (a script may change
 # PATH). The marker must match FORK_GH_STUB_MARKER in fork-test-gh.sh. Tests: fork-follow.test.sh
-# and fork-release.test.sh.
+# and fork-release.test.sh; fork-contracts.test.py requires this file of every script calling gh.
 
 FORK_GH_STUB_MARKER="# fork-gh-stub: a test stand-in for gh that never reaches GitHub"
 
