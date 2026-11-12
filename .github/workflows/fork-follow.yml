@@ -12,6 +12,10 @@ name: Fork follow upstream
 #   them, or this is a re-run or queued run of an older commit). A run uses the reusable workflows
 #   of its own commit, so the candidate is pushed and the run stops with the command that releases
 #   it with its own files; the next run then finds that release (and advances to it).
+# Upstream workflow files listed in .github/fork-removed-workflows.txt stay deleted: the plan
+# resolves a rebase conflict on them by deleting them and deletes any that upstream brings back.
+# A missing or malformed list, and a new upstream workflow that someone outside the fork can start
+# (pull_request_target, workflow_run, issues ...; fork-follow.sh) and the list does not name, stop it.
 # A conflict, merge commits in the series, a schema change, upstream commits inside the series, a
 # moved or deleted upstream tag, a red test, a failed build or push: the run fails, and the Report
 # job's summary says why and what the repository holds now (branch heads, release tags, drafts), as
