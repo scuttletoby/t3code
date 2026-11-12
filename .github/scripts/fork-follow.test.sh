@@ -140,7 +140,8 @@ new_upstream() {
 }
 
 # The fork's checkout in $root/work: upstream rev $1 plus the fork's own commit (its workflow
-# files and scripts, and feature.txt), pushed as the fork's main.
+# files and scripts, an empty list of removed upstream workflows, and feature.txt), pushed as the
+# fork's main.
 new_fork() {
   rm -rf "$root/work"
   git clone -q https://github.com/up/t3code.git "$root/work" 2> /dev/null
@@ -152,6 +153,7 @@ new_fork() {
     cp "$here/fork-schema-check.cjs" .github/scripts/
     printf 'jobs:\n  desktop:\n    uses: ./.github/workflows/release-desktop.yml\n' > .github/workflows/fork-release.yml
     echo "on: workflow_dispatch" > .github/workflows/fork-follow.yml
+    echo "# upstream workflow files the fork deletes" > .github/fork-removed-workflows.txt
     echo feature > feature.txt
     git add -A && git commit -q -m "fork: own change"
     git push -q --force origin main 2> /dev/null
@@ -389,6 +391,142 @@ printf '#!/bin/sh\necho "Fork changes must not change the database schema (no do
   bash "$dir/fork-follow.sh") > "$root/out" 2>&1
 check "plan: a schema check refusal is reported as a schema change" \
   eval 'has "The series changes the database schema" "$root/report.md" && has "a.sql" "$root/report.md"'
+
+# Round 5: upstream workflow files the fork deletes (.github/fork-removed-workflows.txt) stay
+# deleted on every follow, and a new upstream workflow that someone outside the fork can start
+# stops the plan. Here the fork deletes upstream's ci.yml.
+up_release() { # up_release TAG CMD...: one upstream commit on main made by CMD, tagged TAG
+  (cd "$root/upwork" && git checkout -q main && eval "${*:2}" && git add -A && git commit -q -m "$1" \
+    && git tag "$1" && git push -q https://github.com/up/t3code.git main --tags) > /dev/null 2>&1
+}
+fork_commit() { # fork_commit MESSAGE CMD...: one fork commit made by CMD, pushed as main
+  (cd "$root/work" && eval "${*:2}" && git add -A && git commit -q -m "$1" && git push -q origin main) > /dev/null 2>&1
+}
+fork_remove() { # fork_remove FILE...: a fork patch that lists and deletes upstream workflow files
+  local f cmd=""
+  for f in "$@"; do cmd+="echo .github/workflows/$f >> .github/fork-removed-workflows.txt && rm -f .github/workflows/$f && "; done
+  fork_commit "fork: delete $*" "${cmd}true"
+}
+in_candidate() { git -C "$root/work" cat-file -e "$(out candidate):.github/workflows/$1" 2> /dev/null; }
+
+new_upstream
+up_release v0.1.11 'echo "on: [push] # edited" > .github/workflows/ci.yml'
+new_fork v0.1.10
+fork_remove ci.yml
+plan
+check "plan: upstream edits a deleted listed file -> the conflict is resolved by deleting it, rebase" \
+  eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.11 ]] && ! in_candidate ci.yml && [[ ! -e "$root/report.md" ]]'
+check "plan: the resolved rebase keeps the fork's patches and its list" \
+  eval 'action_is rebase && git -C "$root/work" cat-file -e "$(out candidate):feature.txt" && git -C "$root/work" show "$(out candidate):.github/fork-removed-workflows.txt" | grep -qx .github/workflows/ci.yml'
+# Re-run: an earlier run published this candidate, then stopped before the branch moved. The
+# next run rebuilds the same files and advances to that release instead of building again.
+released="$(out candidate)"
+fork_tag v0.1.11-fork.1 "$released"
+work git checkout -q main && work git reset -q --hard "$(series)"
+plan
+check "plan: re-run after a resolved deletion -> the same files, advance to the earlier release" \
+  eval 'action_is advance && [[ "$(out candidate)" == "$released" ]]'
+
+new_upstream
+up_release v0.1.11 'echo "on: [push] # edited" > .github/workflows/ci.yml'
+new_fork v0.1.10
+fork_remove ci.yml
+fork_commit "fork: own u4" 'echo mine > u4.txt'
+before="$(work_head)"
+plan
+check "plan: a conflict on a listed file and an unlisted one is refused, naming the unlisted one" \
+  eval '[[ -z "$(out action)" ]] && has "u4.txt" "$root/report.md" && hasnt "\.github/workflows/ci.yml" "$root/report.md" && [[ ! -d "$root/work/.git/rebase-merge" && "$(work_head)" == "$before" ]]'
+
+# Upstream deleted the file itself (the fork's deleting patch has nothing left to do), then brings
+# it back: the plan deletes it again with one more commit.
+new_upstream
+up_release v0.1.11 'git rm -q .github/workflows/ci.yml'
+up_release v0.1.12 'echo "on: pull_request_target" > .github/workflows/ci.yml'
+new_fork v0.1.11
+fork_commit "fork: list ci.yml" 'echo .github/workflows/ci.yml >> .github/fork-removed-workflows.txt'
+plan
+check "plan: upstream brings a listed file back -> deleted again on the candidate, rebase" \
+  eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.12 ]] && ! in_candidate ci.yml && git -C "$root/work" log -1 --format=%s "$(out candidate)" | grep -q "fork: delete upstream workflows listed"'
+
+new_upstream
+new_fork v0.1.10
+fork_commit "fork: list ci.yml" 'echo .github/workflows/ci.yml >> .github/fork-removed-workflows.txt'
+plan
+check "plan: same base, the series still has a listed file -> refused, naming it" \
+  eval '[[ -z "$(out action)" ]] && has "still has workflow files" "$root/report.md" && has "ci.yml" "$root/report.md"'
+
+# Fail closed: no list, or a line that is not an upstream workflow path, stops the plan.
+new_upstream
+new_fork v0.1.10
+fork_commit "fork: lose the list" 'git rm -q .github/fork-removed-workflows.txt'
+plan
+check "plan: the list of removed workflows is missing -> refused, nothing planned" \
+  eval '[[ -z "$(out action)" ]] && has "has no .github/fork-removed-workflows.txt" "$root/report.md"'
+for bad in "ci.yml" ".github/workflows/fork-follow.yml" ".github/workflows/a b.yml" "../ci.yml"; do
+  new_fork v0.1.10
+  fork_commit "fork: bad list" "echo '$bad' >> .github/fork-removed-workflows.txt"
+  plan
+  check "plan: a list line '$bad' -> refused, nothing planned" \
+    eval '[[ -z "$(out action)" ]] && has "not an upstream workflow path" "$root/report.md"'
+done
+new_upstream
+up_release v0.1.11 'echo "on: [push] # edited" > .github/workflows/ci.yml'
+new_fork v0.1.10
+fork_commit "fork: comments only" 'printf "# nothing\n\n  # still nothing\n" > .github/fork-removed-workflows.txt'
+plan
+check "plan: a list with comments only deletes nothing, the plan goes on" \
+  eval 'action_is rebase && in_candidate ci.yml'
+new_upstream
+up_release v0.1.11 'echo "on: [push] # edited" > .github/workflows/ci.yml'
+new_fork v0.1.10
+fork_commit "fork: delete ci.yml, CRLF list" "printf '# deleted\\r\\n.github/workflows/ci.yml\\r\\n' > .github/fork-removed-workflows.txt && rm .github/workflows/ci.yml"
+plan
+check "plan: a list with CRLF line ends is read like one with LF, the listed file stays deleted" \
+  eval 'action_is rebase && ! in_candidate ci.yml && git -C "$root/work" show "$(out candidate):.github/fork-removed-workflows.txt" | grep -q $'"'"'ci.yml\r$'"'"''
+
+# Upstream renames a listed file: git reports a rename/delete conflict on the new name, which the
+# list does not name, so the plan stops and names it rather than shipping it under that name.
+new_upstream
+up_release v0.1.11 'git mv .github/workflows/ci.yml .github/workflows/ci-renamed.yml'
+new_fork v0.1.10
+fork_remove ci.yml
+plan
+check "plan: upstream renames a listed file -> refused, naming the new name, rebase aborted" \
+  eval '[[ -z "$(out action)" ]] && has "ci-renamed.yml" "$root/report.md" && hasnt "plan stopped at" "$root/report.md" && [[ ! -d "$root/work/.git/rebase-merge" ]]'
+
+# A new upstream workflow that someone outside the fork can start is refused unless listed.
+for case in "pull_request_target|printf 'on:\n  pull_request_target:\n    types: [opened]\n'" \
+  "workflow_run|printf 'name: x\non:\n  workflow_run:\n    workflows: [CI]\n'" \
+  "issues|printf 'on: [push, issues]\n'" \
+  "issue_comment|printf 'on: issue_comment # comments\n'" \
+  "pull_request_review|printf 'on:\n  pull_request_review:\n    types: [submitted]\n'" \
+  "pull_request_review_comment|printf 'on: [pull_request_review_comment]\n'" \
+  "gollum|printf 'on: gollum\n'" \
+  "on push|printf 'on: push\njobs:\n  a:\n    if: github.event_name == \"pull_request_target\"\n'" \
+  "could not be read|printf 'on: {workflow_run: {workflows: [CI]}}\n'" \
+  "could not be read|printf 'name: \"x\non: push\n\"\non : issues\n'" \
+  "could not be read|printf 'jobs: {}\n'"; do
+  want="${case%%|*}"
+  new_upstream
+  up_release v0.1.11 "${case#*|} > .github/workflows/outside.yml"
+  new_fork v0.1.10
+  plan
+  check "plan: upstream adds a workflow ($want) -> refused, naming it" \
+    eval '[[ -z "$(out action)" ]] && has "outside.yml" "$root/report.md" && has "$want" "$root/report.md" && has "fork-removed-workflows.txt" "$root/report.md"'
+done
+new_upstream
+up_release v0.1.11 "printf 'on:\n  push:\n    branches: [main]\npermissions:\n  issues: write\njobs:\n  issues:\n    runs-on: x\n' > .github/workflows/inside.yml"
+new_fork v0.1.10
+plan
+check "plan: a new upstream workflow on push only (issues: as a permission and a job) goes on" \
+  eval 'action_is rebase && in_candidate inside.yml'
+new_upstream
+up_release v0.1.11 "printf 'on: pull_request_target\n' > .github/workflows/outside.yml"
+new_fork v0.1.10
+fork_commit "fork: list outside.yml" 'echo .github/workflows/outside.yml >> .github/fork-removed-workflows.txt'
+plan
+check "plan: a new outside-started upstream workflow that the list names -> deleted, rebase" \
+  eval 'action_is rebase && ! in_candidate outside.yml'
 
 # --- pushes: fork-follow-push.sh -------------------------------------------------------------
 new_upstream
