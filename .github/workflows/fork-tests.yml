@@ -39,7 +39,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Commit or branch to test
+        description: Commit or branch to test (resolved to one commit for every job)
         required: true
         type: string
 
@@ -58,6 +58,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
+      # Release runs: the commit every job checks out. Empty on pull_request and
+      # push, where each checkout already takes the run's own commit.
+      sha: ${{ steps.resolve.outputs.sha }}
       typecheck: ${{ steps.release.outputs.typecheck || steps.detect.outputs.typecheck }}
       build: ${{ steps.release.outputs.build || steps.detect.outputs.build }}
       desktop_launch: ${{ steps.release.outputs.desktop_launch || steps.detect.outputs.desktop_launch }}
@@ -102,6 +105,28 @@ jobs:
           fi
           echo "mobile_native=$value" >> "$GITHUB_OUTPUT"
 
+      # A branch name is resolved once, here: jobs start minutes apart, and a
+      # branch that moves in between would otherwise test two commits in one run.
+      - name: Checkout the commit to test
+        if: inputs.ref != ''
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /package.json
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve the commit to test
+        id: resolve
+        if: inputs.ref != ''
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "Testing $sha (from \`$REF\`) in every job."
+          echo "Release run: every job tests \`$sha\` (from \`$REF\`)." >> "$GITHUB_STEP_SUMMARY"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       # Release runs test the whole commit. upstream's release.yml has no macOS lint.
       - name: Release run checks everything
         id: release
@@ -118,15 +143,18 @@ jobs:
   # upstream changed since the copy was last recorded.
   workflows:
     name: Workflow lint and upstream drift
+    needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # scripts/: some tests are run by a script there (.github/fork-ci-tests.txt).
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /.github/
+            /scripts/
           sparse-checkout-cone-mode: false
 
       # Pinned release, verified by checksum. Upstream's own workflows use runner
@@ -143,9 +171,10 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
 
-      # Every fork script test, checked against .github/fork-ci-tests.txt: an
-      # unlisted test or a listed one deleted from history fails, a listed one
-      # whose pull request has not merged yet is a note in the summary.
+      # Every test under .github/scripts, checked against .github/fork-ci-tests.txt:
+      # the fork's tests run here, the others must be named by the job or script
+      # that runs them. An unlisted test, or a listed one deleted from history,
+      # fails; a listed one whose pull request has not merged yet is a note.
       - name: Fork script tests
         run: |
           if compgen -G '.github/scripts/fork-*.test.py' >/dev/null && ! python3 -c 'import yaml' 2>/dev/null; then
@@ -159,21 +188,21 @@ jobs:
   # Every commit a pull request or a push to main adds, history included: a
   # secret committed and then deleted is still public. Release runs test a
   # commit that already passed this on its way to main, so they skip it.
+  # The ranges, and why: .github/scripts/fork-secret-scan.sh.
   secrets:
     name: Secret scan
     if: ${{ inputs.ref == '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      # A pull request fetches only its own commits (plus the parent of the
-      # oldest, below). A push fetches history without file contents;
-      # gitleaks then reads only the pushed commits.
+      # Full history without file contents; gitleaks then fetches the contents
+      # of only the scanned commits.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: ${{ github.event_name == 'pull_request' && github.event.pull_request.commits || 0 }}
-          filter: ${{ github.event_name != 'pull_request' && 'blob:none' || '' }}
+          fetch-depth: 0
+          filter: blob:none
 
       - name: Install gitleaks
         env:
@@ -186,46 +215,33 @@ jobs:
           echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
 
+      # The range rules against this gitleaks: a key added and deleted again
+      # before a merge of main, a key only a merge commit adds, push ranges.
+      - name: Test the scan ranges
+        env:
+          GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
+        run: bash .github/scripts/fork-secret-scan.test.sh
+
       - name: Scan the added commits
         env:
+          GITLEAKS: ${{ runner.temp }}/gitleaks
           EVENT_NAME: ${{ github.event_name }}
-          COMMITS: ${{ github.event.pull_request.commits }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BEFORE: ${{ github.event.before }}
-        run: |
-          if [[ "$EVENT_NAME" == pull_request ]]; then
-            # One more commit, so the oldest one is diffed against its parent
-            # instead of being read as a root that adds the whole tree.
-            git fetch --no-tags --quiet --deepen=1 origin "$(git rev-parse HEAD)"
-            range="--max-count=$COMMITS"
-            what="the pull request's $COMMITS commit(s)"
-          elif [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            range="$BEFORE..$GITHUB_SHA"
-            what="the commits pushed after ${BEFORE:0:12}"
-          else
-            range="--max-count=1"
-            what="the pushed commit (no earlier commit to compare with)"
-          fi
-          echo "Scanning $what"
-          set +e
-          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --verbose --log-opts="$range" .
-          status=$?
-          set -e
-          if [[ $status -eq 0 ]]; then
-            echo "### Secret scan"$'\n\n'"No secrets found in $what." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### Secret scan"$'\n\n'"gitleaks found possible secrets in $what (values redacted; see the job log). Rotate any real secret: it is already public." >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit $status
+          AFTER: ${{ github.sha }}
+        run: bash .github/scripts/fork-secret-scan.sh
 
   lint:
     name: Lint
+    needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -274,7 +290,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -427,7 +443,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -481,9 +497,11 @@ jobs:
         if: matrix.shard == 1
         run: python3 -B .github/scripts/stage-preview-bundle.test.py
 
+      # Upstream's ci.yml runs the first four; the fork adds thread-transfer-report,
+      # which upstream runs from a workflow_run of its CI (disabled in the fork).
       - name: Test release checks
         if: matrix.shard == 1
-        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/test-delta.test.cjs
+        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/test-delta.test.cjs .github/scripts/thread-transfer-report.test.cjs
 
       - name: Finish installing browser secret helper build libraries
         if: steps.shard.outputs.any == 'true'
@@ -542,7 +560,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -589,10 +607,13 @@ jobs:
         run: eval "$(jq -r .scripts.test package.json) --shard=$SHARD"
 
   # apps/server runs its test files one at a time; shards spread them over
-  # separate runners. The shards gate themselves instead of waiting for
-  # `changes`; a shard the change cannot affect says so in its summary.
+  # separate runners. As upstream, the shards run the change detector
+  # themselves, so the steps follow ci.yml one for one; a shard the change
+  # cannot affect says so in its summary. They wait for `changes` only for a
+  # release run's resolved commit (seconds; every other job waits for it too).
   test_server:
     name: Test Server ${{ matrix.shard }}
+    needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -603,7 +624,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           fetch-depth: 2
           sparse-checkout: |
             /*
@@ -735,7 +756,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -771,7 +792,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -802,7 +823,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /*
             !/.repos/

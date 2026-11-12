@@ -1,10 +1,26 @@
-# Fork script tests the workflow job runs (.github/scripts/fork-ci-tests.cjs).
-# Every fork-*.test.{sh,py,cjs} must be listed here. A listed file that is not
-# present yet is a note; one that was present and then deleted fails.
+# Every test file under .github/scripts (*.test.*, subdirectories included) and
+# where it runs (.github/scripts/fork-ci-tests.cjs checks this list).
+#   <test>                  run by the workflows job, by extension (sh, py, cjs, mjs, js)
+#   <test> run by <file>    run by <file>, which must name the test's path (not one
+#                           of upstream's workflows: they are disabled in the fork)
+# A present test that is not listed fails. A listed file that is not present yet
+# is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs
 .github/scripts/fork-follow.test.sh
 .github/scripts/fork-release-workflow.test.py
 .github/scripts/fork-release.test.sh
 .github/scripts/fork-schema-check.test.cjs
+.github/scripts/fork-secret-scan.test.sh
 .github/scripts/fork-test-shards.test.cjs
 .github/scripts/fork-tests-drift.test.cjs
+
+# Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
+.github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml
+.github/scripts/mobile-preview-comment.test.cjs run by .github/workflows/fork-tests.yml
+.github/scripts/stage-preview-bundle.test.py run by .github/workflows/fork-tests.yml
+.github/scripts/test-delta.test.cjs run by .github/workflows/fork-tests.yml
+.github/scripts/vercel-deployment-output.test.cjs run by .github/workflows/fork-tests.yml
+# Upstream runs this one from thread-transfer-report.yml (workflow_run of the disabled CI).
+.github/scripts/thread-transfer-report.test.cjs run by .github/workflows/fork-tests.yml
+# Release Smoke runs scripts/release-smoke.ts, which runs this one.
+.github/scripts/relay-state-output.test.cjs run by scripts/release-smoke.ts

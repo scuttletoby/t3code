@@ -1,7 +1,14 @@
-// Fork only: fails when upstream's ci.yml or release.yml test jobs change and
-// .github/workflows/fork-tests.yml did not follow. Compares a digest of every
-// job and step with .github/fork-tests-upstream.json; comments are ignored.
-// After porting a change: node .github/scripts/fork-tests-drift.cjs --record
+// Fork only: fails when upstream's ci.yml or release.yml test jobs change since
+// the copy in .github/workflows/fork-tests.yml last followed them. Compares a
+// digest of every job and step, and of the top-level keys that change how every
+// job runs (TOP_LEVEL), with .github/fork-tests-upstream.json; comments are ignored.
+//
+// Limit: the check compares upstream with its own record, not with
+// fork-tests.yml. Recording without porting passes, so --record prints what
+// changed, and the commit and PR that update the record must say, for each line,
+// what was ported or why it does not apply.
+//   node .github/scripts/fork-tests-drift.cjs           check
+//   node .github/scripts/fork-tests-drift.cjs --record  after porting: print the changes, save the record
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -14,6 +21,10 @@ const TRACKED = {
   ".github/workflows/ci.yml": null,
   ".github/workflows/release.yml": ["quality", "test", "test_web", "test_server"],
 };
+
+// Top-level keys digested as the pseudo-job TOP (job ids cannot contain parentheses).
+const TOP_LEVEL = ["env", "defaults", "concurrency", "permissions"];
+const TOP = "(top-level)";
 
 const digest = (lines) =>
   crypto.createHash("sha256").update(lines.join("\n")).digest("hex").slice(0, 16);
@@ -28,6 +39,18 @@ function parseJobs(text) {
     .filter((line) => line.trim() !== "" && !line.trim().startsWith("#"));
   const start = lines.findIndex((line) => line === "jobs:");
   if (start === -1) throw new Error("no top-level `jobs:` key");
+
+  // Top-level keys, wherever they are in the file: one "step" per key present.
+  const top = [];
+  let topKey = null;
+  for (const line of lines) {
+    if (indentOf(line) === 0) {
+      const key = line.match(/^([A-Za-z0-9_-]+):/)?.[1];
+      topKey = TOP_LEVEL.includes(key) ? { name: key, lines: [] } : null;
+      if (topKey) top.push(topKey);
+    }
+    topKey?.lines.push(line);
+  }
 
   const jobs = {};
   let job = null;
@@ -65,6 +88,11 @@ function parseJobs(text) {
   }
 
   const result = {};
+  if (top.length)
+    result[TOP] = {
+      header: digest([]),
+      steps: top.map((key) => ({ name: key.name, digest: digest(key.lines) })),
+    };
   for (const [name, { header, steps }] of Object.entries(jobs)) {
     const seen = new Map();
     result[name] = {
@@ -86,19 +114,22 @@ function parseJobs(text) {
   return result;
 }
 
+// Returns the digests and the tracked jobs upstream no longer has.
 function current() {
   const out = {};
+  const missing = [];
   for (const [file, only] of Object.entries(TRACKED)) {
     const jobs = parseJobs(fs.readFileSync(path.join(root, file), "utf8"));
     if (only) {
-      const missing = only.filter((name) => !jobs[name]);
-      out[file] = Object.fromEntries(only.map((name) => [name, jobs[name] ?? null]));
-      if (missing.length) console.error(`${file}: tracked jobs missing: ${missing.join(", ")}`);
+      for (const name of only) if (!jobs[name]) missing.push(`${file}: job \`${name}\``);
+      out[file] = Object.fromEntries(
+        [TOP, ...only].filter((name) => jobs[name]).map((name) => [name, jobs[name]]),
+      );
     } else {
       out[file] = jobs;
     }
   }
-  return out;
+  return { now: out, missing };
 }
 
 function compare(recorded, now) {
@@ -107,13 +138,29 @@ function compare(recorded, now) {
     const before = recorded[file] ?? {};
     const after = now[file] ?? {};
     for (const job of new Set([...Object.keys(before), ...Object.keys(after)])) {
-      const a = before[job];
-      const b = after[job];
-      if (!a && b) {
+      // A record saved before --record refused missing jobs may hold null.
+      const a = before[job] ?? null;
+      const b = after[job] ?? null;
+      if (job === TOP) {
+        const oldKeys = new Map((a?.steps ?? []).map((s) => [s.name, s.digest]));
+        const newKeys = new Map((b?.steps ?? []).map((s) => [s.name, s.digest]));
+        for (const [key, d] of newKeys) {
+          if (!oldKeys.has(key)) changes.push(`${file}: top-level \`${key}:\` added`);
+          else if (oldKeys.get(key) !== d) changes.push(`${file}: top-level \`${key}:\` changed`);
+        }
+        for (const key of oldKeys.keys())
+          if (!newKeys.has(key)) changes.push(`${file}: top-level \`${key}:\` removed`);
+        continue;
+      }
+      if (!a && !b) {
+        changes.push(`${file}: job \`${job}\` missing upstream (renamed or removed?)`);
+        continue;
+      }
+      if (!a) {
         changes.push(`${file}: job \`${job}\` added upstream`);
         continue;
       }
-      if (a && !b) {
+      if (!b) {
         changes.push(`${file}: job \`${job}\` removed upstream`);
         continue;
       }
@@ -139,13 +186,45 @@ function compare(recorded, now) {
   return changes;
 }
 
-function main() {
-  const now = current();
-  if (process.argv.includes("--record")) {
-    fs.writeFileSync(recordPath, `${JSON.stringify(now, null, 2)}\n`);
-    console.log(`Recorded ${path.relative(root, recordPath)}`);
+function readRecord(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+// Refuses while a tracked job is missing: the copy in fork-tests.yml then follows
+// a job upstream no longer has, and TRACKED must be updated first.
+function record(now, missing, file = recordPath) {
+  if (missing.length) {
+    console.error(
+      `Not recorded: tracked jobs missing upstream: ${missing.join(", ")}.\n` +
+        "Find what replaced them, port that into fork-tests.yml and update TRACKED in " +
+        "fork-tests-drift.cjs, then record again.",
+    );
+    process.exitCode = 1;
     return;
   }
+  const changes = compare(readRecord(file), now);
+  fs.writeFileSync(file, `${JSON.stringify(now, null, 2)}\n`);
+  console.log(`Recorded ${path.relative(root, file)}.`);
+  if (changes.length === 0) {
+    console.log("Nothing changed upstream since the last record.");
+    return;
+  }
+  console.log(
+    `\nUpstream changes this record accepts (${changes.length}):\n` +
+      changes.map((c) => `- ${c}`).join("\n") +
+      "\n\nSay in the commit message and the PR body, for each line, what was ported " +
+      "into fork-tests.yml or why it does not apply. The check cannot tell; reviewers rely on it.",
+  );
+}
+
+function main() {
+  const { now, missing } = current();
+  if (process.argv.includes("--record")) return record(now, missing);
   const recorded = JSON.parse(fs.readFileSync(recordPath, "utf8"));
   const changes = compare(recorded, now);
   const summary = process.env.GITHUB_STEP_SUMMARY;
@@ -167,6 +246,6 @@ function main() {
   process.exitCode = 1;
 }
 
-module.exports = { parseJobs, compare };
+module.exports = { parseJobs, compare, record, TOP };
 
 if (require.main === module) main();

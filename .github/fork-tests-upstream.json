@@ -1,5 +1,18 @@
 {
   ".github/workflows/ci.yml": {
+    "(top-level)": {
+      "header": "e3b0c44298fc1c14",
+      "steps": [
+        {
+          "name": "permissions",
+          "digest": "893e619df25e8e99"
+        },
+        {
+          "name": "concurrency",
+          "digest": "8782324e66667532"
+        }
+      ]
+    },
     "changes": {
       "header": "8ff211d87838fee8",
       "steps": [
@@ -340,6 +353,19 @@
     }
   },
   ".github/workflows/release.yml": {
+    "(top-level)": {
+      "header": "e3b0c44298fc1c14",
+      "steps": [
+        {
+          "name": "concurrency",
+          "digest": "7675d281fd1ce2db"
+        },
+        {
+          "name": "permissions",
+          "digest": "2fa142cb2564a193"
+        }
+      ]
+    },
     "quality": {
       "header": "64aee6ef731d6767",
       "steps": [
