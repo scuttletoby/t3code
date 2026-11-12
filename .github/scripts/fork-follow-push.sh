@@ -10,7 +10,8 @@
 #                    Already at SHA (a re-run) is success; moved elsewhere is a refusal.
 #   cleanup          Deletes the branch fork-follow/candidate; a failure is only a warning.
 #
-# Environment: FORK_PUSH_TOKEN, REPOSITORY (owner/name; GITHUB_REPOSITORY in a run), PUSH_URL
+# Environment: FORK_PUSH_TOKEN, FORK_PUSH_ENVIRONMENT (the GitHub Environment that should hold the
+# token; named when it is missing), REPOSITORY (owner/name; GITHUB_REPOSITORY in a run), PUSH_URL
 # (default https://github.com/$REPOSITORY.git), SERIES_BRANCH (default main), BASE_TAG (advance),
 # REPORT. Output (candidate_pushed, moved, backup_tag) goes to $GITHUB_OUTPUT, else stdout.
 #
@@ -37,6 +38,13 @@ die() {
 git_said() { printf '%s\n' '```' "$(tail -n 15 "$err")" '```'; }
 
 with_token() {
+  if [[ -z "${FORK_PUSH_TOKEN:-}" && -n "${FORK_PUSH_ENVIRONMENT:-}" ]]; then
+    die "The secret FORK_PUSH_TOKEN is missing in the Environment $FORK_PUSH_ENVIRONMENT (or the Environment does not exist yet), so this run cannot push." \
+      "Under Settings > Environments, create $FORK_PUSH_ENVIRONMENT (a run that names a missing Environment makes an empty one with no rules)," \
+      "limit its deployment branches to $SERIES_BRANCH, and add the secret FORK_PUSH_TOKEN there: a fine-grained token for $REPOSITORY only, with Contents and Workflows read and write." \
+      "Keep it out of the repository secrets: a workflow file on any pushed branch can read those, while an Environment limited to $SERIES_BRANCH gives it only to runs from $SERIES_BRANCH." \
+      "GITHUB_TOKEN cannot replace it: it may not push commits that change workflow files."
+  fi
   [[ -n "${FORK_PUSH_TOKEN:-}" ]] \
     || die "The secret FORK_PUSH_TOKEN is missing, so this run cannot push." \
       "Add it under Settings > Secrets and variables > Actions: a fine-grained token for $REPOSITORY only, with Contents and Workflows read and write." \

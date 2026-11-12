@@ -265,6 +265,9 @@ push() { (cd "$root/work" && REPORT="$root/report.md" GITHUB_OUTPUT="$root/push.
   BASE_TAG=v0.1.10 bash "$dir/fork-follow-push.sh" "$@") > "$root/out" 2>&1; }
 rm -f "$root/report.md"
 check "push: a missing FORK_PUSH_TOKEN fails and says so" eval '! push check && has "FORK_PUSH_TOKEN is missing" "$root/report.md"'
+rm -f "$root/report.md"
+check "push: a missing FORK_PUSH_TOKEN names the Environment that should hold it" \
+  eval '! FORK_PUSH_ENVIRONMENT=fork-push push check && has "missing in the Environment fork-push" "$root/report.md" && has "deployment branches to main" "$root/report.md"'
 export FORK_PUSH_TOKEN=test-token
 check "push: a token GitHub refuses (expired) fails and says so" \
   eval '! PUSH_URL="$root/gh/me/gone.git" push check && has "refused FORK_PUSH_TOKEN" "$root/report.md"'
@@ -384,6 +387,11 @@ check "workflow: release gets exactly the signing secrets by name, no 'secrets: 
   eval '! grep -q "secrets: inherit" "$workflow" && [[ -n "$declared" && "$passed" == "$(sed "s/.*/&=&/" <<< "$declared")" ]]'
 check "workflow: FORK_PUSH_TOKEN reaches only fork-follow-push.sh steps, never a checkout" \
   eval '! grep -q "token: \${{ secrets.FORK_PUSH_TOKEN" "$workflow" && [[ $(grep -c "secrets.FORK_PUSH_TOKEN" "$workflow") == $(grep -cE "^\s*(run: )?bash \.github/scripts/fork-follow-push\.sh" "$workflow") ]]'
+# Each job that reads FORK_PUSH_TOKEN runs in the Environment that holds it, named as in env.
+token_jobs="$(awk '/^  [a-z_-]+:$/ { job = $1 } /secrets\.FORK_PUSH_TOKEN/ { print job }' "$workflow" | sort -u)"
+env_jobs="$(awk '/^  [a-z_-]+:$/ { job = $1 } /^    environment: fork-push$/ { print job }' "$workflow" | sort -u)"
+check "workflow: the jobs that read FORK_PUSH_TOKEN, and only they, run in the Environment fork-push" \
+  eval '[[ -n "$token_jobs" && "$token_jobs" == "$env_jobs" ]] && grep -qx "  FORK_PUSH_ENVIRONMENT: fork-push" "$workflow"'
 check "workflow: every checkout drops its credentials" \
   eval '[[ $(grep -c "actions/checkout@" "$workflow") == $(grep -c "persist-credentials: false" "$workflow") ]]'
 check "workflow: every action is pinned by commit" \

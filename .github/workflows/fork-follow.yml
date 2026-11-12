@@ -20,8 +20,10 @@ name: Fork follow upstream
 # Upstream's workflows stay off: after each push and at the end, fork-workflows.sh disables every
 # active workflow the series did not add and cancels their runs for the pushed commit.
 #
-# Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN: a fine-grained token
-# for this repository only, Contents and Workflows read and write (GITHUB_TOKEN may not push commits
+# Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN in the Environment
+# fork-push, whose deployment branches are limited to the series branch (a repository secret could
+# be read by a workflow file on any pushed branch; the jobs that push run in that Environment and no
+# other job sees the secret): a fine-grained token for this repository only, Contents and Workflows read and write (GITHUB_TOKEN may not push commits
 # that change .github/workflows). Every run checks it first and fails when it is missing, expired or
 # may not push. It reaches only the steps that run fork-follow-push.sh; the release workflow gets the
 # signing secrets by name and never this token. If a rule protects the series branch, the token's
@@ -43,10 +45,13 @@ permissions:
 
 env:
   SERIES_BRANCH: ${{ vars.FORK_SERIES_BRANCH || 'main' }}
+  # Must match `environment:` of the jobs that push (an expression there cannot read env).
+  FORK_PUSH_ENVIRONMENT: fork-push
 
 jobs:
   plan:
     name: Plan
+    environment: fork-push
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -173,6 +178,7 @@ jobs:
 
   advance:
     name: Move the series branch
+    environment: fork-push
     needs: [plan, release]
     if: >-
       !cancelled() && needs.plan.result == 'success' &&
