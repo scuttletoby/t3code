@@ -2,10 +2,10 @@ name: Fork tests
 
 # Fork only. Upstream's CI checks (ci.yml) on GitHub-hosted runners, because the
 # fork has none of upstream's runners and upstream's workflows are disabled here.
-# Commands follow ci.yml step for step; only the runners, time limits, apt
-# setup, the task cache (kept with actions/cache instead of upstream's private
-# remote cache) and the Test job's split across two runners differ. Upstream's
-# composite actions and change detector (.github/actions,
+# Commands follow ci.yml step for step. Only the runners, time limits, apt
+# setup and the task cache differ (kept with actions/cache instead of upstream's
+# private remote cache), and Test and Test Web split over two runners each.
+# Upstream's composite actions and change detector (.github/actions,
 # .github/scripts/ci-changes.cjs) are used as they are, so a rebase brings their
 # changes. The `workflows` job lints the fork workflows (actionlint) and fails
 # when upstream's ci.yml or release.yml test jobs change and this copy did not
@@ -14,8 +14,8 @@ name: Fork tests
 # Require only `fork-ci-result` in a ruleset: it needs every other job, so jobs
 # can be added, split or resharded without touching the ruleset.
 #
-# Runners: GitHub-hosted only, Ubuntu 24.04 as upstream (ubuntu-latest is now
-# 26.04, whose newer git fails an apps/server test upstream never sees). Never
+# Runners: GitHub-hosted only, Ubuntu 24.04 like upstream's runners, so an OS
+# upgrade is a reviewed change here, not a surprise from ubuntu-latest. Never
 # add a self-hosted runner to this workflow: this repository is public, so a
 # pull request from any fork would run its code on that machine.
 #
@@ -403,9 +403,9 @@ jobs:
           exit "$(cat "$RUNNER_TEMP/typecheck-status")"
 
   # Everything except `t3` (apps/server) and the web app, which have their own jobs.
-  # Upstream runs this on one large runner. Here the packages are split across
-  # two 4-CPU runners by test file count (.github/scripts/fork-test-shards.cjs);
-  # one runner took 6 minutes, the longest job of the run.
+  # Upstream runs this on one large runner; one 4-CPU runner took 6 minutes.
+  # Two runners split it (.github/scripts/fork-test-shards.cjs): each runs a
+  # vitest slice of every large package and half of the others, whole.
   test:
     name: Test ${{ matrix.shard }}
     needs: changes
@@ -427,20 +427,21 @@ jobs:
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
 
-      # Shard 1 always gets the heaviest affected package; a shard left with
-      # none says so in the summary and stops here.
+      # A shard with nothing to run says so in the summary and stops here.
       - name: Pick this shard's packages
         id: shard
         env:
           TEST_PACKAGES: ${{ needs.changes.outputs.test_packages }}
         run: |
-          packages=$(node .github/scripts/fork-test-shards.cjs "${{ matrix.shard }}/${{ strategy.job-total }}" | tr '\n' ' ')
-          echo "packages=${packages% }" >> "$GITHUB_OUTPUT"
+          work=$(node .github/scripts/fork-test-shards.cjs "${{ matrix.shard }}/${{ strategy.job-total }}")
+          whole=$(awk '$1 == "whole" { printf "%s ", $2 }' <<< "$work")
+          split=$(awk '$1 == "split" { printf "%s ", $2 }' <<< "$work")
+          { echo "whole=${whole% }"; echo "split=${split% }"; echo "any=$([[ -n "$work" ]] && echo true || echo false)"; } >> "$GITHUB_OUTPUT"
 
       # The desktop tests compile the browser secret helper. The install runs in
       # the background while Vite+ installs; the step before the tests waits for it.
       - name: Start installing browser secret helper build libraries
-        if: steps.shard.outputs.packages != ''
+        if: steps.shard.outputs.any == 'true'
         run: |
           (
             set +e
@@ -452,21 +453,21 @@ jobs:
           ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
 
       - name: Setup Vite+
-        if: steps.shard.outputs.packages != ''
+        if: steps.shard.outputs.any == 'true'
         uses: ./.github/actions/setup-ci-deps
         with:
           # Lint saves the pnpm store; the others only restore it.
           save-pnpm-store: false
 
       - name: Cache Electron download
-        if: steps.shard.outputs.packages != ''
+        if: steps.shard.outputs.any == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/electron
           key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
 
       - name: Ensure Electron runtime is installed
-        if: steps.shard.outputs.packages != ''
+        if: steps.shard.outputs.any == 'true'
         run: vp run --filter @t3tools/desktop ensure:electron
 
       - name: Test preview artifact validation
@@ -478,34 +479,58 @@ jobs:
         run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs
 
       - name: Finish installing browser secret helper build libraries
-        if: steps.shard.outputs.packages != ''
+        if: steps.shard.outputs.any == 'true'
         timeout-minutes: 5
         run: |
           until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
           cat "$RUNNER_TEMP/apt.log"
           exit "$(cat "$RUNNER_TEMP/apt-status")"
 
+      # Whole packages as upstream runs them; a large package's slice runs its
+      # own test script in its directory with vitest's --shard (`vp run` does
+      # not pass arguments through to vitest).
       - name: Test
-        if: steps.shard.outputs.packages != ''
+        if: steps.shard.outputs.any == 'true'
         env:
-          PACKAGES: ${{ steps.shard.outputs.packages }}
+          WHOLE: ${{ steps.shard.outputs.whole }}
+          SPLIT: ${{ steps.shard.outputs.split }}
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: |
           set -o pipefail
-          filters=()
-          for package in $PACKAGES; do filters+=(--filter "$package"); done
           # The runner's trace writer can crash on surrogate pairs in test output.
-          vp run --parallel --concurrency-limit 4 "${filters[@]}" test 2>&1 | python3 -u -c '
+          ascii() {
+            python3 -u -c '
           import sys
           for line in sys.stdin:
               sys.stdout.write(line.encode("ascii", "backslashreplace").decode("ascii"))
           '
+          }
+          status=0
+          if [[ -n "$WHOLE" ]]; then
+            filters=()
+            for package in $WHOLE; do filters+=(--filter "$package"); done
+            vp run --parallel --concurrency-limit 4 "${filters[@]}" test 2>&1 | ascii || status=1
+          fi
+          for dir in $SPLIT; do
+            echo "::group::$dir slice $SHARD"
+            script=$(jq -r .scripts.test "$dir/package.json")
+            (cd "$dir" && eval "$script --shard=$SHARD") 2>&1 | ascii || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
 
+  # Upstream runs this on one large runner; on a 4-CPU runner the 548 files
+  # took 7.5 minutes, so two runners each take a vitest slice.
   test_web:
-    name: Test Web
+    name: Test Web ${{ matrix.shard }}
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -546,8 +571,13 @@ jobs:
             node apps/web/node_modules/playwright/cli.js install-deps chromium
           fi
 
+      # Upstream: `vp run --filter @t3tools/web test`. Same script, run in its
+      # directory, because `vp run` does not pass --shard through to vitest.
       - name: Test
-        run: vp run --filter @t3tools/web test
+        env:
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+        working-directory: apps/web
+        run: eval "$(jq -r .scripts.test package.json) --shard=$SHARD"
 
   # apps/server runs its test files one at a time; shards spread them over
   # separate runners. The shards gate themselves instead of waiting for
@@ -802,6 +832,8 @@ jobs:
           RELEASE_RUN: ${{ inputs.ref != '' }}
         run: |
           echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # A jq program: $release is jq's variable, not the shell's.
+          # shellcheck disable=SC2016
           why='{
             build: "the change affects neither desktop, server nor web, and no package needs a typecheck",
             test: "the change affects no package this job tests",

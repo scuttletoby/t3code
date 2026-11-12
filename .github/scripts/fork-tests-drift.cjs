@@ -1,13 +1,7 @@
-// Fork only. .github/workflows/fork-tests.yml copies upstream's test jobs onto
-// GitHub-hosted runners. This check fails when upstream's jobs change and the
-// copy was not updated: it digests every job and step of the tracked upstream
-// workflows and compares them with .github/fork-tests-upstream.json.
-//
-//   node .github/scripts/fork-tests-drift.cjs           check (CI)
-//   node .github/scripts/fork-tests-drift.cjs --record  after updating fork-tests.yml
-//
-// Comment-only and blank-line changes are ignored. No dependencies: the
-// workflows are parsed by indentation, which is all a job/step list needs.
+// Fork only: fails when upstream's ci.yml or release.yml test jobs change and
+// .github/workflows/fork-tests.yml did not follow. Compares a digest of every
+// job and step with .github/fork-tests-upstream.json; comments are ignored.
+// After porting a change: node .github/scripts/fork-tests-drift.cjs --record
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
