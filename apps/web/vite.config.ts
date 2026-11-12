@@ -19,10 +19,7 @@ import {
 } from "@t3tools/shared/devProxy";
 
 import { loadRepoEnv } from "../../scripts/lib/public-config";
-import {
-  releaseRepositoryDefine,
-  resolveReleaseRepository,
-} from "../../scripts/lib/release-repository";
+import { releaseRepositoryDefine } from "../../scripts/lib/release-repository";
 import { thirdPartyLicensesPlugin } from "../../scripts/lib/third-party-licenses";
 import { tailwindPlugins } from "./vite/tailwind";
 import { warmBundledDevPlugin } from "./vite/warmBundledDev";
@@ -51,7 +48,6 @@ const configuredReleaseChannel =
 const configuredAppVersion = process.env.APP_VERSION?.trim() || pkg.version;
 const configuredDesktopUpdateRepository =
   process.env.T3CODE_DESKTOP_UPDATE_REPOSITORY?.trim() ||
-  resolveReleaseRepository() ||
   process.env.GITHUB_REPOSITORY?.trim() ||
   "";
 const configuredFeatureSecrets = process.env.T3CODE_FEATURE_SECRETS?.trim() || "";

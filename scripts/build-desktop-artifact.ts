@@ -2693,12 +2693,10 @@ export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig"
 ) {
   const env = yield* Config.all({
     updateRepository: Config.String("T3CODE_DESKTOP_UPDATE_REPOSITORY").pipe(Config.option),
-    releaseRepository: Config.String("T3CODE_RELEASE_REPOSITORY").pipe(Config.option),
     githubRepository: Config.String("GITHUB_REPOSITORY").pipe(Config.option),
   });
   const rawRepo = (
     Option.getOrUndefined(env.updateRepository)?.trim() ||
-    Option.getOrUndefined(env.releaseRepository)?.trim() ||
     Option.getOrUndefined(env.githubRepository)?.trim() ||
     ""
   ).trim();

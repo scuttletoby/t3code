@@ -3,8 +3,8 @@ import * as Schema from "effect/Schema";
 
 import { compareSemverVersions } from "./semver.ts";
 
-// Set at build time from T3CODE_RELEASE_REPOSITORY (scripts/lib/release-repository.ts). A fork's
-// builds name the fork here, so they list and download only the fork's releases.
+// Set at build time from T3CODE_DESKTOP_UPDATE_REPOSITORY (scripts/lib/release-repository.ts), the
+// desktop updater's setting, so a fork's builds list and download only the fork's releases.
 declare const __T3CODE_RELEASE_REPOSITORY__: string | undefined;
 const UPSTREAM_RELEASE_REPOSITORY = "pingdotgg/t3code";
 

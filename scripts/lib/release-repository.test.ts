@@ -1,18 +1,27 @@
+import { it as effectIt } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
+import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vite-plus/test";
 
+import { resolveGitHubPublishConfig } from "../build-desktop-artifact.ts";
 import { releaseRepositoryDefine, resolveReleaseRepository } from "./release-repository.ts";
+
+const desktopFeedRepository = (env: Record<string, string>) =>
+  resolveGitHubPublishConfig("latest").pipe(
+    Effect.map((config) => (config ? `${config.owner}/${config.repo}` : "")),
+    Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
+  );
 
 describe("release repository build setting", () => {
   it("is empty (the upstream default) when unset or blank", () => {
     expect(resolveReleaseRepository({})).toBe("");
-    expect(resolveReleaseRepository({ T3CODE_RELEASE_REPOSITORY: "  " })).toBe("");
+    expect(resolveReleaseRepository({ T3CODE_DESKTOP_UPDATE_REPOSITORY: "  " })).toBe("");
   });
 
-  it("keeps a valid owner/repo", () => {
-    expect(resolveReleaseRepository({ T3CODE_RELEASE_REPOSITORY: " some-owner/t3code " })).toBe(
-      "some-owner/t3code",
-    );
-    expect(releaseRepositoryDefine({ T3CODE_RELEASE_REPOSITORY: "some-owner/t3code" })).toEqual({
+  it("is upstream's desktop update setting, so the server follows the desktop feed", () => {
+    const env = { T3CODE_DESKTOP_UPDATE_REPOSITORY: " some-owner/t3code " };
+    expect(resolveReleaseRepository(env)).toBe("some-owner/t3code");
+    expect(releaseRepositoryDefine(env)).toEqual({
       __T3CODE_RELEASE_REPOSITORY__: JSON.stringify("some-owner/t3code"),
     });
   });
@@ -21,16 +30,42 @@ describe("release repository build setting", () => {
     const actions = { GITHUB_ACTIONS: "true", GITHUB_REPOSITORY: "fork-owner/t3code" };
     expect(resolveReleaseRepository(actions)).toBe("fork-owner/t3code");
     expect(
-      resolveReleaseRepository({ ...actions, T3CODE_RELEASE_REPOSITORY: "other/t3code" }),
+      resolveReleaseRepository({ ...actions, T3CODE_DESKTOP_UPDATE_REPOSITORY: "other/t3code" }),
     ).toBe("other/t3code");
-    // Outside Actions a stray GITHUB_REPOSITORY changes nothing.
-    expect(resolveReleaseRepository({ GITHUB_REPOSITORY: "fork-owner/t3code" })).toBe("");
+  });
+
+  effectIt.effect("names the same repository as the desktop updater feed for every setting", () =>
+    Effect.gen(function* () {
+      const cases: Array<Record<string, string>> = [
+        {},
+        { T3CODE_DESKTOP_UPDATE_REPOSITORY: "fork-owner/t3code" },
+        { GITHUB_REPOSITORY: "fork-owner/t3code" },
+        { T3CODE_DESKTOP_UPDATE_REPOSITORY: "a/t3code", GITHUB_REPOSITORY: "b/t3code" },
+        { T3CODE_RELEASE_REPOSITORY: "b/t3code", GITHUB_REPOSITORY: "b/t3code" },
+      ];
+      for (const env of cases) {
+        const feed = yield* desktopFeedRepository(env);
+        expect(resolveReleaseRepository(env), JSON.stringify(env)).toBe(feed);
+      }
+    }),
+  );
+
+  it("fails the build when the former setting disagrees with the desktop updater's", () => {
+    for (const env of [
+      { T3CODE_RELEASE_REPOSITORY: "fork-owner/t3code" },
+      { T3CODE_RELEASE_REPOSITORY: "b/t3code", T3CODE_DESKTOP_UPDATE_REPOSITORY: "a/t3code" },
+      { T3CODE_RELEASE_REPOSITORY: "b/t3code", GITHUB_REPOSITORY: "a/t3code" },
+    ]) {
+      expect(() => resolveReleaseRepository(env), JSON.stringify(env)).toThrow(
+        /T3CODE_RELEASE_REPOSITORY=".+" disagrees.*Set T3CODE_DESKTOP_UPDATE_REPOSITORY/,
+      );
+    }
   });
 
   it("fails the build on a malformed value instead of falling back to upstream", () => {
     for (const value of ["owner", "owner/repo/extra", "owner/..", "https://github.com/o/r"]) {
-      expect(() => resolveReleaseRepository({ T3CODE_RELEASE_REPOSITORY: value })).toThrow(
-        /T3CODE_RELEASE_REPOSITORY/,
+      expect(() => resolveReleaseRepository({ T3CODE_DESKTOP_UPDATE_REPOSITORY: value })).toThrow(
+        /T3CODE_DESKTOP_UPDATE_REPOSITORY/,
       );
     }
   });
