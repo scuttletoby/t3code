@@ -1,0 +1,64 @@
+name: Gradle cache (locked Maven local repository)
+description: >-
+  Stages exactly the files a lock lists, sha256-checked, from release assets into a new folder for
+  `./gradlew -Dmaven.repo.local=<folder>`. A runner-local cache by sha256 saves the downloads; the
+  asset list is still read on every run. Usage and troubleshooting: README.md next to this file.
+inputs:
+  lock:
+    description: The lock file, relative to the workspace (project fact).
+    required: true
+  out:
+    description: >-
+      The folder to stage into: RUNNER_TEMP/gradle-cache* or a folder inside one (default
+      RUNNER_TEMP/gradle-cache-m2). Removed first, so a rerun starts empty.
+    required: false
+    default: ""
+  cache-dir:
+    description: The runner's cache folder, absolute or ~/... (default ~/.cache/fork-ci-gradle-cache).
+    required: false
+    default: ""
+  cache-max-age-days:
+    description: Cache entries no row of this lock uses are removed after this many days unused.
+    required: false
+    default: "30"
+  repository:
+    description: The repository whose releases hold the assets.
+    required: false
+    default: ${{ github.repository }}
+  token:
+    description: A token that can read the repository's releases (contents read).
+    required: false
+    default: ${{ github.token }}
+outputs:
+  maven-repo-local:
+    description: The staged folder, for -Dmaven.repo.local.
+    value: ${{ steps.stage.outputs.dir }}
+runs:
+  using: composite
+  steps:
+    - id: stage
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        LOCK: ${{ inputs.lock }}
+        OUT: ${{ inputs.out }}
+        CACHE_DIR: ${{ inputs.cache-dir }}
+        MAX_AGE: ${{ inputs.cache-max-age-days }}
+        REPO: ${{ inputs.repository }}
+        GH_TOKEN: ${{ inputs.token }}
+      # The script is the copy next to this file (the pinned action), never one from the caller's
+      # workspace. OUT is removed only if it is RUNNER_TEMP/gradle-cache* or inside one: never RUNNER_TEMP, the
+      # runner's own _* folders there (GITHUB_OUTPUT, GITHUB_ENV) or another tool's folder.
+      run: |
+        set -euo pipefail
+        temp=$(realpath -m -- "$RUNNER_TEMP")
+        out=$(realpath -m -- "${OUT:-$RUNNER_TEMP/gradle-cache-m2}")
+        case "$out" in
+          "$temp"/gradle-cache*) ;;
+          *) echo "::error::gradle-cache: out ($out) must be a folder RUNNER_TEMP/gradle-cache* or one inside it (RUNNER_TEMP is $temp)"; exit 1 ;;
+        esac
+        rm -rf -- "$out"
+        args=(stage --lock "$LOCK" --out "$out" --cache-max-age-days "$MAX_AGE" --repo "$REPO")
+        if [ -n "$CACHE_DIR" ]; then args+=(--cache "$CACHE_DIR"); fi
+        python3 -I "$ACTION_PATH/gradle_cache.py" "${args[@]}"
+        echo "dir=$out" >> "$GITHUB_OUTPUT"
