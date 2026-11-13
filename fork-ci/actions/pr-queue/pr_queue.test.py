@@ -52,12 +52,12 @@ import pr_queue as Q  # noqa: E402
 REPO = 'owner/proj'
 CFG_RAW = {
     'required_checks': ['build', 'test', 'review-check'], 'merge_method': 'squash', 'delete_branch': True,
-    'bot_logins': ['review-bot'], 'override': {'prefix': 'tool ready --head', 'author_association': 'OWNER'},
+    'bot_logins': ['review-bot'], 'lens_author_associations': ['OWNER', 'COLLABORATOR'], 'override': {'prefix': 'tool ready --head', 'author_association': 'OWNER'},
     'ready_command': 'tool ready {pr}', 'push_command': 'tool push', 'lens_format_doc': 'docs/review.md',
     'head_check': 'review-check',
 }
 CFG = config.parse(json.dumps(CFG_RAW))
-REVIEW = lens.Review(CFG.bot_logins, CFG.override_prefix, CFG.override_association)
+REVIEW = lens.Review(CFG.bot_logins, CFG.override_prefix, CFG.override_association, CFG.lens_author_associations)
 H1, H2, H3 = 'a1' * 20, 'b2' * 20, 'c3' * 20   # shas for the lens-read rules only (no git)
 LENS = 'lens'   # built at run time: no line of this file starts with the lens marker
 READ_AT = r'(?i)read at\s*:|\blens\s*:'
@@ -208,8 +208,10 @@ class QueueGh:
         return [k for k in map(self.kind, self.calls) if k != 'view']
 
 
-def note(body, when, login='owner'):
-    return {'body': body, 'createdAt': when, 'author': {'login': login}}
+def note(body, when, login='owner', association='OWNER', edited=False):
+    """A comment as gh shows it: by default the owner's, never edited."""
+    return {'body': body, 'createdAt': when, 'author': {'login': login}, 'authorAssociation': association,
+            'includesCreatedEdit': edited}
 
 
 def lens_at(name, sha, when='2026-11-07T10:00:00Z'):
@@ -515,27 +517,26 @@ class Main(Base):
 
 class ReviewedHead(unittest.TestCase):   # which head the queue keeps
     def test_one_sha_for_every_lens(self):
-        pr = {'headRefOid': H1, 'comments': [lens_at('correctness', H1[:7], 't1'), lens_at('data-integrity', H1[:9], 't2')]}
-        self.assertEqual(REVIEW.reviewed_head(pr)[:2], (True, H1), 'two prefixes of the head are the head')
         pr = {'headRefOid': H2, 'commits': [{'oid': H1}, {'oid': H2}],
-              'comments': [lens_at('correctness', H1[:7], 't1'), lens_at('data-integrity', H1, 't2')]}
-        self.assertEqual(REVIEW.reviewed_head(pr)[:2], (True, H1), 'an earlier commit of the PR, in 7 and 40 hex')
-        pr = {'headRefOid': H2, 'comments': [lens_at('correctness', H1[:7], 't1')]}
-        self.assertEqual(REVIEW.reviewed_head(pr)[:2], (True, None), 'a read that is no commit of the PR')
+              'comments': [lens_at('correctness', H1, 't1'), lens_at('data-integrity', H1, 't2')]}
+        self.assertEqual(REVIEW.reviewed_head(pr)[:2], (True, H1), 'an earlier commit of the PR')
+        for short in (7, 12, 39):   # even of the head itself: a force-push can bring a commit with the same prefix
+            pr = {'headRefOid': H1, 'comments': [lens_at('correctness', H1[:short], 't1'), lens_at('di', H1, 't2')]}
+            self.assertEqual(REVIEW.reviewed_head(pr)[:2], (True, None), short)
 
     def test_lenses_that_read_different_heads_give_no_head(self):
         pr = {'headRefOid': H2, 'commits': [{'oid': H1}, {'oid': H2}],
-              'comments': [lens_at('correctness', H1[:7], 't1'), lens_at('data-integrity', H2[:7], 't2')]}
+              'comments': [lens_at('correctness', H1, 't1'), lens_at('data-integrity', H2, 't2')]}
         reviewed, sha, why = REVIEW.reviewed_head(pr)
         self.assertEqual((reviewed, sha), (True, None))
         self.assertIn('did not all read one head', why)
 
     def test_an_override_covers_only_the_lenses_older_than_it(self):
-        lenses = [lens_at('correctness', H1[:7], '2026-11-07T10:00:00Z'), lens_at('di', H1[:7], '2026-11-07T10:00:01Z')]
+        lenses = [lens_at('correctness', H1, '2026-11-07T10:00:00Z'), lens_at('di', H1, '2026-11-07T10:00:01Z')]
         pr = {'headRefOid': H2, 'commits': [{'oid': H1}, {'oid': H2}], 'comments': lenses + [override(H2, '2026-11-07T11:00:00Z')]}
         self.assertEqual(REVIEW.reviewed_head(pr)[:2], (True, H2))
-        pr['comments'].append(lens_at('correctness r2', H2[:7], '2026-11-07T12:00:00Z'))   # a re-check after it
-        self.assertEqual(REVIEW.reviewed_head(pr)[:2], (True, H2), 'correctness says H2[:7], the override H2: one head')
+        pr['comments'].append(lens_at('correctness r2', H2, '2026-11-07T12:00:00Z'))   # a re-check after it
+        self.assertEqual(REVIEW.reviewed_head(pr)[:2], (True, H2), 'correctness and the override say H2: one head')
         pr['comments'][-1] = lens_at('correctness r2', H3, '2026-11-07T12:00:00Z')
         self.assertEqual(REVIEW.reviewed_head(pr)[1], None, 'a newer lens read of another head is not covered')
 
@@ -543,7 +544,7 @@ class ReviewedHead(unittest.TestCase):   # which head the queue keeps
         self.assertEqual(REVIEW.reviewed_head({'comments': [override(H2, 't')]})[:2], (False, None))
 
     def test_an_override_quoted_or_by_a_bot_does_not_count(self):
-        base = [lens_at('correctness', H1[:7], '2026-11-07T10:00:00Z')]
+        base = [lens_at('correctness', H1, '2026-11-07T10:00:00Z')]
         quoted = note('> ' + override(H2, 'x')['body'], '2026-11-07T11:00:00Z')
         bot = dict(override(H2, '2026-11-07T11:00:00Z'), author={'login': 'review-bot'})
         for extra in (quoted, bot):
@@ -553,14 +554,14 @@ class ReviewedHead(unittest.TestCase):   # which head the queue keeps
 class QueueKeepsTheReadChange(Base):
     def test_lenses_on_different_heads_stay_off_and_are_not_updated(self):
         other = self.w.commit({'x.py': lines(extra=['other'], at=20)}, [self.m0])
-        f = self.fake(comments=[lens_at('correctness', self.c[:7], 't1'), lens_at('di', other[:7], 't2')])
+        f = self.fake(comments=[lens_at('correctness', self.c, 't1'), lens_at('di', other, 't2')])
         code, out = self.update(f)
         self.assertEqual((f.armed, f.updated), (None, False), out)
         self.assertIn('did not all read one head', f.comments[0])
         self.assertNotRegex(f.comments[0], READ_AT)
 
     def test_the_head_of_an_override_is_re_armed_after_a_clean_update(self):
-        f = self.fake(comments=[lens_at('correctness', self.m0[:7], '2026-11-07T10:00:00Z'),
+        f = self.fake(comments=[lens_at('correctness', self.m0, '2026-11-07T10:00:00Z'),
                                 override(self.c, '2026-11-07T11:00:00Z')])
         code, out = self.update(f)
         self.assertEqual((code, f.armed), (0, self.up), out)
@@ -569,7 +570,7 @@ class QueueKeepsTheReadChange(Base):
         m2 = self.w.commit({'x.py': lines(extra=['main 1', 'main 2', 'main 3'], at=0)}, [self.m1])
         self.w.set('refs/heads/main', m2)
         self.up2 = self.w.merge(self.up, m2)
-        f = self.fake('up2', h1=self.up, comments=[lens_at('correctness', self.c[:7], 't1'), lens_at('di', self.c, 't2')])
+        f = self.fake('up2', h1=self.up, comments=[lens_at('correctness', self.c, 't1'), lens_at('di', self.c, 't2')])
         code, out = self.update(f)
         self.assertEqual((code, f.armed), (0, self.up2), out + str(f.comments))
 
@@ -582,9 +583,7 @@ class QueueKeepsTheReadChange(Base):
 class Recover(Base):   # a run killed after its disarm
     def recover(self, fake, state, q=None):
         q = q or self.q
-        os.makedirs(os.path.dirname(q.state), exist_ok=True)
-        with open(q.state, 'w') as f:
-            f.write(state if isinstance(state, str) else json.dumps(state))
+        Q.write_text(q.state, state if isinstance(state, str) else json.dumps(state))   # as the queue writes it
         q.gh = fake
         return run_quiet(q.recover)
 
@@ -640,9 +639,9 @@ class Recover(Base):   # a run killed after its disarm
         c1 = self.w.commit({'x.py': lines(extra=['new 1'], at=20)}, [self.m0])
         c2 = self.w.commit({'x.py': lines(extra=['new 1', 'new 2'], at=20)}, [c1])
         up2 = self.w.merge(c2, self.m1)
-        before = [lens_at('correctness', c2[:7], '2026-11-07T10:00:00Z'), lens_at('di', c2, '2026-11-07T10:00:01Z')]
+        before = [lens_at('correctness', c2, '2026-11-07T10:00:00Z'), lens_at('di', c2, '2026-11-07T10:00:01Z')]
         # the stopped run read c2; since then both lenses re-read and vouch only for the older c1
-        after = [lens_at('correctness r2', c1[:7], '2026-11-07T12:00:00Z'), lens_at('di r2', c1, '2026-11-07T12:00:01Z')]
+        after = [lens_at('correctness r2', c1, '2026-11-07T12:00:00Z'), lens_at('di r2', c1, '2026-11-07T12:00:01Z')]
         f = self.fake(armed=False, h1=up2, comments=before + after)
         code, out = self.recover(f, self.plan(old=c2, read=c2))
         self.assertEqual((f.armed, len(f.comments)), (None, 1), out)
@@ -656,24 +655,21 @@ class Recover(Base):   # a run killed after its disarm
         self.assertNotRegex(f.comments[0], READ_AT)
         # every lens re-read the updated head itself: that head is re-armed
         f = self.fake(armed=False, h1=up2, comments=before + [lens_at('correctness r2', up2, '2026-11-07T12:00:00Z'),
-                                                             lens_at('di r2', up2[:7], '2026-11-07T12:00:01Z')])
+                                                             lens_at('di r2', up2, '2026-11-07T12:00:01Z')])
         code, out = self.recover(f, self.plan(old=c2, read=c2))
         self.assertEqual((f.armed, f.comments), (up2, []), out)
 
-    def test_a_lens_comment_edited_after_the_stop_counts_as_it_reads_now(self):   # same comment, new text
-        c1 = self.w.commit({'x.py': lines(extra=['new 1'], at=20)}, [self.m0])
-        c2 = self.w.commit({'x.py': lines(extra=['new 1', 'new 2'], at=20)}, [c1])
-        up2 = self.w.merge(c2, self.m1)
-        lens_comment = lens_at('correctness', c2[:7], '2026-11-07T10:00:00Z')
-        f = self.fake(armed=False, h1=up2, comments=[lens_comment])
-        lens_comment['body'] = lens_comment['body'].replace(c2[:7], c1[:7])   # edited: it now vouches for c1 only
-        code, out = self.recover(f, self.plan(old=c2, read=c2))
+    def test_a_lens_comment_edited_after_the_stop_reads_nothing_until_that_lens_posts_again(self):
+        lens_comment = lens_at('correctness', self.c, '2026-11-07T10:00:00Z')
+        lens_comment['includesCreatedEdit'] = True   # GitHub says it changed, not what: `read at` may name another head
+        f = self.fake(armed=False, h1=self.up, comments=[lens_comment])
+        code, out = self.recover(f, self.plan())
         self.assertEqual((f.armed, len(f.comments)), (None, 1), out)
-        self.assertIn(c1[:12], f.comments[0], 'the edited read counts, not the one the stopped run stored')
-        lens_comment['body'] = lens_comment['body'].replace(c1[:7], up2[:12])   # edited again: it read the new head
-        f = self.fake(armed=False, h1=up2, comments=[lens_comment])
-        code, out = self.recover(f, self.plan(old=c2, read=c2))
-        self.assertEqual((f.armed, f.comments), (up2, []), out)
+        self.assertIn('edited after posting', f.comments[0])
+        self.assertNotRegex(f.comments[0], READ_AT)
+        f = self.fake(armed=False, h1=self.up, comments=[lens_comment, lens_at('correctness', self.c, '2026-11-07T11:00Z')])
+        code, out = self.recover(f, self.plan())
+        self.assertEqual((f.armed, f.comments), (self.up, []), 'a new comment of that lens: ' + out)
 
     def test_a_gh_error_keeps_the_state_and_says_so_once(self):
         f = self.fake(armed=False, fail=('view',))
@@ -722,7 +718,7 @@ class Recover(Base):   # a run killed after its disarm
         self.stuck_folder(self.q.cache)   # not a bare git repo
         got, out = self.fetch(self.c)
         self.assertTrue(got, out)
-        self.assertIn('is not a bare git repo: rebuilding it', out)
+        self.assertIn(': rebuilding it', out)
         self.assertIn('could not delete all of', out, 'the part left behind is said, not silent')
         self.assertEqual(len(self.leftovers()), 1)
         self.assertTrue(self.fetch(self.c)[0], 'the next run uses the new cache')
@@ -754,6 +750,33 @@ class Recover(Base):   # a run killed after its disarm
         got, out = self.fetch(self.c)
         self.assertIsNone(got, out)
         self.assertIn('could not move', out)
+
+    def test_the_plan_is_this_users_alone(self):   # STATE decides what is re-armed
+        self.assertEqual(self.update(self.fake(after=None))[0], Q.SILENT)
+        self.assertEqual(os.stat(self.q.state).st_mode & 0o777, 0o600)
+
+    def test_a_plan_another_user_could_write_is_kept_aside_and_not_followed(self):
+        f = self.fake(armed=False, h1=self.up)
+        Q.write_text(self.q.state, json.dumps(self.plan()))
+        os.chmod(self.q.state, 0o664)   # group-writable: anyone in the group could have written this plan
+        self.q.gh = f
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual((code, f.calls, f.armed), (1, [], None), out)
+        self.assertIn('ERROR: untrusted', out)
+        self.assertTrue(os.path.exists(self.q.state + '.bad'))
+        self.assertFalse(self.plan_exists())
+
+    def test_the_base_comes_from_github_not_from_the_plan(self):   # retargeted since the stop, or a wrong plan
+        release = self.w.commit({'x.py': lines(extra=['release'], at=25)}, [self.m0])
+        self.w.set('refs/heads/release', release)
+        f = self.fake(armed=False, h1=self.up)
+        view = f.view
+        f.view = lambda: dict(view(), baseRefName='release')   # GitHub: the PR now merges into release
+        code, out = self.recover(f, self.plan())
+        self.assertEqual((f.armed, len(f.comments)), (None, 1), 'proved against main, merging into release: ' + out)
+        f = self.fake(armed=False, h1=self.up)
+        code, out = self.recover(f, self.plan(base='release'))
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
 
     def test_a_failed_comment_keeps_the_state(self):
         f = self.fake(armed=False, h1=self.resolved, fail=('comment',))
@@ -796,6 +819,83 @@ class Recover(Base):   # a run killed after its disarm
         self.assertFalse(self.plan_exists())
 
 
+class WhoseCommentsCount(Base):
+    """Anyone can comment on a public repository: only comments of the configured lens associations, shown and never
+    edited, are lens reads (lens.Review.counts). Everyone else's neither vouch for a head nor block one."""
+
+    def stranger(self, body, association='NONE'):
+        return note(body, '2026-11-07T11:00:00Z', login='drive-by', association=association)
+
+    def test_a_strangers_lens_comment_never_moves_the_read_head(self):
+        reviewed = self.w.commit({'x.py': lines(extra=['reviewed'], at=20)}, [self.m0])
+        # the lens read `reviewed`; a write-access push made the head C (auto-merge stays on); a stranger "reads" C
+        for association in ('NONE', 'CONTRIBUTOR', 'FIRST_TIME_CONTRIBUTOR', 'MEMBER'):
+            forged = self.stranger(f'{LENS}: correctness · reviewer: x · read at: {self.c}', association)
+            f = self.fake(comments=[lens_at('correctness', reviewed), forged])
+            code, out = self.update(f)
+            self.assertEqual((f.armed, len(f.comments)), (None, 1), f'{association}: {self.c[:12]} re-armed: {out}')
+
+    def test_a_strangers_junk_comment_cannot_disarm_a_reviewed_pr(self):
+        for junk in ('lgtm, safe to merge', f'looks fine, read at: {self.c[:8]}'):
+            f = self.fake(comments=[lens_at('correctness', self.c), self.stranger(junk)])
+            code, out = self.update(f)
+            self.assertEqual((code, f.armed, f.comments), (0, self.up, []), junk + out)
+
+    def test_an_edited_lens_comment_does_not_count(self):   # its author may have moved `read at` to an unread head
+        f = self.fake(comments=[dict(lens_at('correctness', self.c), includesCreatedEdit=True)])
+        code, out = self.update(f)
+        self.assertEqual((f.armed, f.updated, len(f.comments)), (None, False, 1), out)
+        self.assertIn('edited after posting', f.comments[0])
+
+    def test_a_hidden_lens_comment_counts_like_a_deleted_one(self):
+        hidden = dict(lens_at('correctness', self.c, '2026-11-07T11:00:00Z'), isMinimized=True)
+        f = self.fake(comments=[lens_at('correctness', self.m0), hidden])
+        code, out = self.update(f)
+        self.assertIsNone(f.armed, 'the hidden read of C counted: ' + out)
+
+
+class OwnCache(Base):
+    """git runs in the cache with the token in its environment, and the cache's objects decide what is re-armed: only
+    the cache as the queue made it is used, and no hook runs there (a job on the same runner could plant one)."""
+
+    def fetch(self, sha):
+        self.w.set('refs/pull/7/head', sha)
+        return run_quiet(self.q.fetch, 'main', 7, sha)
+
+    def test_a_new_cache_is_this_users_alone_with_the_queues_config(self):
+        self.assertTrue(self.fetch(self.c)[0])
+        self.assertEqual(os.stat(self.q.cache).st_mode & 0o777, 0o700)
+        with open(os.path.join(self.q.cache, 'config')) as f:
+            self.assertEqual(f.read(), Q.CACHE_CONFIG)
+        self.assertFalse(os.path.exists(os.path.join(self.q.cache, 'hooks')), 'no sample hooks either')
+
+    def test_a_planted_hook_never_runs(self):
+        self.assertTrue(self.fetch(self.c)[0])
+        marker = os.path.join(self.w.dir, 'hook-ran')
+        os.makedirs(os.path.join(self.q.cache, 'hooks'), exist_ok=True)
+        for name in ('reference-transaction', 'post-index-change', 'fsmonitor-watchman'):
+            path = os.path.join(self.q.cache, 'hooks', name)
+            with open(path, 'w') as h:
+                h.write(f'#!/bin/sh\necho {name} >> {shlex.quote(marker)}\n')
+            os.chmod(path, 0o755)
+        got, out = self.fetch(self.up)   # moves refs/queue/pr7: a ref transaction
+        self.assertTrue(got, out)
+        self.assertFalse(os.path.exists(marker), 'a hook in the cache ran with the token in its environment')
+
+    def test_a_cache_with_another_config_or_open_to_others_is_rebuilt(self):
+        self.assertTrue(self.fetch(self.c)[0])
+        with open(os.path.join(self.q.cache, 'config'), 'a') as f:   # fetch "GitHub" from somewhere else
+            f.write(f'[url "{os.path.join(self.w.dir, "elsewhere.git")}"]\n\tinsteadOf = {self.q.remote}\n')
+        got, out = self.fetch(self.up)
+        self.assertTrue(got, out)
+        self.assertIn('has a config the queue did not write: rebuilding it', out)
+        os.chmod(self.q.cache, 0o770)
+        got, out = self.fetch(self.c)
+        self.assertTrue(got, out)
+        self.assertIn("is not this user's alone", out)
+        self.assertEqual(os.stat(self.q.cache).st_mode & 0o777, 0o700)
+
+
 # --- the source project's lens-review cases for the queue ------------------------------------------------------------
 HEAD = 'def wipe(player, island):\n'
 READ = HEAD + "    if is_admin(player):\n        log.info('wipe')\n        wipe_island(island)\n"   # only an admin wipes
@@ -836,14 +936,14 @@ class OnlyWhatALensReadIsReArmed(Admin):
     def test_a_push_after_ready_is_not_re_armed(self):
         w = self.w
         h1 = self.push(self.p, EXTRA)
-        f = QueueGh(w, h1, w.merge(h1, self.m1), comments=[lens_at('data-integrity', self.p[:7]),
-                                                             lens_at('correctness', self.p[:7])])
+        f = QueueGh(w, h1, w.merge(h1, self.m1), comments=[lens_at('data-integrity', self.p),
+                                                             lens_at('correctness', self.p)])
         code, out = self.update(f)
         self.assertIsNone(f.armed, f'the queue armed a head with a push no lens read (lenses read {self.p[:7]}): {out}')
         self.assertEqual(len(f.comments), 1, 'auto-merge left off must say so on the PR')
 
     def test_control_the_head_the_lenses_read_is_still_re_armed(self):
-        f = QueueGh(self.w, self.p, self.w.merge(self.p, self.m1), comments=[lens_at('correctness', self.p[:7])])
+        f = QueueGh(self.w, self.p, self.w.merge(self.p, self.m1), comments=[lens_at('correctness', self.p)])
         self.update(f)
         self.assertEqual(f.armed, f.after)
 
@@ -876,7 +976,7 @@ class WhitespaceIsPartOfTheChange(Admin):
         # P was read. Between the queue's view and update-branch, someone pushes a dedent on top of P; update-branch
         # merges the base into THAT head.
         pushed = self.push(self.p, DEDENTED)
-        f = QueueGh(self.w, self.p, self.w.merge(pushed, self.m1), comments=[lens_at('correctness', self.p[:7])])
+        f = QueueGh(self.w, self.p, self.w.merge(pushed, self.m1), comments=[lens_at('correctness', self.p)])
         code, out = self.update(f)
         self.assertNotEqual(f.armed, f.after, 'armed a head where every player wipes islands: ' + out)
 
@@ -950,35 +1050,42 @@ class AMovedHunkIsAnotherChange(Islands):
     def test_the_owner_check_moved_to_another_function_is_not_re_armed(self):
         moved = self.w.commit({'w.py': islands('visit_island')}, [self.read])   # pushed after ready, kept armed
         f = QueueGh(self.w, moved, self.w.merge(moved, self.m1),
-                    comments=[lens_at('correctness', self.read[:7]), lens_at('data-integrity', self.read[:7])])
+                    comments=[lens_at('correctness', self.read), lens_at('data-integrity', self.read)])
         code, out = self.update(f)
         self.assertIsNone(f.armed, 'armed a head whose owner check sits in visit_island, not wipe_island: ' + out)
 
     def test_control_the_read_change_merged_with_main_is_re_armed(self):
         up = self.w.merge(self.read, self.m1)
-        f = QueueGh(self.w, self.read, up, comments=[lens_at('correctness', self.read[:7])])
+        f = QueueGh(self.w, self.read, up, comments=[lens_at('correctness', self.read)])
         self.update(f)
         self.assertEqual(f.armed, up)
 
 
-class PrefixesOfOneShaAreOneHead(Islands):
-    """Lenses that wrote 7 and 12 hex of the same head read one head: left OFF, the ready command arms it again, and
-    the queue turns it OFF again: a loop."""
+class ShortReadsNameNoHead(Islands):
+    """A read shorter than 40 hex names nothing, even of the head itself: after a force-push, a new commit can be made
+    to share the prefix of the dropped one that was read. Left OFF, the comment says how to post the read."""
 
-    def test_reads_of_one_head_with_different_lengths_are_re_armed(self):
+    def test_a_short_read_of_the_head_is_left_off_with_the_way_out(self):
         up = self.w.merge(self.read, self.m1)
         f = QueueGh(self.w, self.read, up,
                     comments=[lens_at('correctness', self.read[:7]), lens_at('data-integrity', self.read[:12])])
-        shas = [sha for _, sha in REVIEW.lens_entries(f.view()).values()]
-        self.assertTrue(len(shas) == 2 and all(sha and self.read.startswith(sha) for sha in shas), shas)
         code, out = self.update(f)
-        self.assertEqual(f.armed, up, 'every lens read the head (7 and 12 hex), the queue left it OFF: '
-                                      + out + str(f.comments))
+        self.assertEqual((f.armed, f.updated, len(f.comments)), (None, False, 1), out)
+        self.assertIn(lens.SHORT, f.comments[0])
+        self.assertIn('re-post it with that', f.comments[0])
+        self.assertNotRegex(f.comments[0], READ_AT)
+
+    def test_control_full_reads_of_one_head_are_re_armed(self):
+        up = self.w.merge(self.read, self.m1)
+        f = QueueGh(self.w, self.read, up,
+                    comments=[lens_at('correctness', self.read), lens_at('data-integrity', self.read)])
+        code, out = self.update(f)
+        self.assertEqual(f.armed, up, out + str(f.comments))
 
     def test_control_reads_of_two_heads_still_give_no_head(self):
         other = H1[:7] + 'f' * 33
         pr = {'headRefOid': H1, 'commits': [{'oid': H1}, {'oid': other}],
-              'comments': [lens_at('correctness', H1[:12]), lens_at('data-integrity', other[:12])]}
+              'comments': [lens_at('correctness', H1), lens_at('data-integrity', other)]}
         self.assertIsNone(REVIEW.reviewed_head(pr)[1])
 
 
@@ -1058,9 +1165,10 @@ class GitCalls(unittest.TestCase):
         with unittest.mock.patch.object(Q.subprocess, 'run', lambda argv, **kw: seen.append((argv, kw)) or ok()):
             q.git('fetch', 'x')
         (argv, kw), = seen
-        self.assertEqual(argv[:6], ['git', '-c', 'credential.https://github.com.helper=',
-                                    '-c', 'credential.https://github.com.helper=!gh auth git-credential', '--git-dir'])
-        self.assertEqual(argv[6:], [q.cache, 'fetch', 'x'])
+        self.assertEqual(argv[:11], ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                                     '--no-replace-objects', '-c', 'credential.https://github.com.helper=',
+                                     '-c', 'credential.https://github.com.helper=!gh auth git-credential', '--git-dir'])
+        self.assertEqual(argv[11:], [q.cache, 'fetch', 'x'])
         self.assertEqual(kw['env']['GIT_TERMINAL_PROMPT'], '0')
 
     def test_the_empty_helper_resets_any_helper_the_machine_set(self):   # git's rule, checked on this git

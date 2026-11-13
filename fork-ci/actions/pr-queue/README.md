@@ -114,6 +114,13 @@ conflict, `DIRTY`) is passed over, and the run says so.
 queue's own bare repository (`--cache`) and gets its login from
 `gh auth git-credential` only, never from a helper the machine configured.
 
+The token is in git's environment and `STATE` decides what is re-armed, so run
+the queue on a runner (or runner group) that runs no `pull_request` job and no
+other repository's job, as a user of its own. The `--state-file` and `--cache`
+folders belong to that user alone. git runs with no hooks, no fsmonitor and no
+replace refs, and a cache that is not that user's alone (mode `0700`) or has a
+config the queue did not write is rebuilt, never used.
+
 | Exit | Meaning                                                                                                     |
 | ---- | ----------------------------------------------------------------------------------------------------------- |
 | 0    | Done, or nothing to do (also: another run holds the lock).                                                  |
@@ -128,14 +135,17 @@ error, or a git older than 2.38 (`merge-tree --write-tree`).
 
 `--state-file` (`STATE`) holds the plan of the run that turned auto-merge off:
 `{"repo", "pr", "old", "base", "read"}` (and `"told"` once the pull request was
-told the run could not finish yet). It is written to disk before the disarm
-and removed when the pull request is re-armed or told why not. The next run
-finishes a plan first, against the review as it is then (a lens posted or
-edited since counts), and touches no other pull request until it has. A plan
+told the run could not finish yet). It is written to disk (mode `0600`) before
+the disarm and removed when the pull request is re-armed or told why not. The
+next run finishes a plan first, against the review and the base as GitHub shows
+them then (a lens posted since counts; an edited one reads nothing), and
+touches no other pull request until it has. A plan
 whose `repo` is another repository ends the run with exit 1 and stays as it
 was: give each queue its own `--state-file`. A plan without `repo` (the source
-queue's format) is this repository's. An unreadable plan is kept as
-`STATE.bad`, the run fails, and every later run warns while that file exists.
+queue's format) is this repository's. An unreadable plan, or one another user
+could have written (not this user's, or writable by its group or others), is
+kept as `STATE.bad`, the run fails, and every later run warns while that file
+exists.
 
 `--lock-file` (default: `STATE.lock`) keeps two runs from overlapping.
 `--dry-run` takes no lock and writes nothing: no `STATE`, no cache, no comment.

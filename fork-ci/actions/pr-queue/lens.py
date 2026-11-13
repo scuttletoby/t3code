@@ -33,6 +33,7 @@ FULL_SHA = re.compile(r'[0-9a-f]{40}')
 NO_HEADER = 'comment without a first-line lens header'
 EDITED = 'edited after posting: post a new comment instead'
 HIDDEN = 'hidden: post a new comment instead'
+SHORT = 'not a full 40-hex sha'
 EMBEDDED = 'holds a lens header line'   # lens_problem: `not a lens:` cannot clear it
 # What a lens report looks like (ONE rule on normalised lines): on a plain line (outside code blocks and quotes) a
 # `lens:`, a `read at:` or `read at <hex>`, `safe to merge`, or in its first TOP_LINES plain lines a Markdown heading
@@ -317,6 +318,6 @@ class Review:
 
         def gap(k):
             _, sha, why = found[k]
-            return why or (f'{sha[:12]}: not a full 40-hex sha' if sha else 'no sha: no single commit of this PR')
+            return why or (f'{sha[:12]}: {SHORT}' if sha else 'no sha: no single commit of this PR')
         listed = ', '.join(f'{k} {v[:12] if v else "(" + gap(k) + ")"}' for k, v in sorted(reads.items()))
         return True, None, f'the lenses did not all read one head: {listed}'

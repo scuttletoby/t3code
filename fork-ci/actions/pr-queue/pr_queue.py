@@ -9,6 +9,7 @@ moved is not documented, and "armed" does not say at which head (a plain push ke
 on neither. For the PR it updates (head H1):
   1. R = the full sha the review vouched for (lens.Review.reviewed_head): the one commit every lens's newest `read at:`
      names, or a newer override comment's; no lens comments: R = H1; lenses that read different commits: R unknown.
+     Only comments of the config's lens_author_associations count, shown and unedited: anyone can comment.
      The base branch, the PR head and R are fetched into the queue's own bare repository (--cache).
   2. The plan goes into STATE (--state-file), then auto-merge OFF; if that fails, nothing else happens (if gh's error
      leaves it unclear whether it is OFF, STATE stays for the next run). R unknown or not on GitHub: the PR stays OFF,
@@ -18,14 +19,16 @@ on neither. For the PR it updates (head H1):
   4. Auto-merge back ON with --match-head-commit H2 only if H2 holds exactly R's change on top of the base (holds()).
      Anything else (a push after the lenses, a conflict resolution, any gh or git error): it stays OFF with a comment
      that it needs a lens read and the ready command. No new head in time: STATE stays, the next run checks it.
-A PR already up to date never reaches these steps: the project's head_check (if any) covers its head.
-Stopped half-way, the next run finishes that PR first from STATE (recover), against the review as it is then, and
-touches no other PR until it has re-armed it or said on it why not: a PR is never OFF and silent.
+A PR already up to date never reaches these steps: the project's head_check (required) covers its head.
+Stopped half-way, the next run finishes that PR first from STATE (recover), against the review and the base as GitHub
+shows them then, and touches no other PR until it has re-armed it or said on it why not: a PR is never OFF and silent.
+Files the queue trusts are this user's alone: STATE is written 0600 and read only if no one else could have written it;
+the cache is used only as the queue made it (own_cache), and git runs there with no hooks and no replace refs.
 Exit codes: 0 done; 1 a step failed, the next run tries again; 2 refused to start, nothing touched; 3 a PR may be OFF
 and no comment says so yet (STATE stays, the next run finishes it).
     pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 """
-import argparse, fcntl, json, os, re, shutil, subprocess, sys, time
+import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, time
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +45,11 @@ REFUSED, SILENT = 2, 3
 # git gets the login from gh (GH_TOKEN, or gh's own login), never from a credential helper of the machine's git config.
 GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
             '-c', 'credential.https://github.com.helper=!gh auth git-credential')
+# Every git call, whatever the repository's files say: no hooks, no fsmonitor command, no replace refs.
+GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '--no-replace-objects')
+# The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
+# or hook path) is rebuilt, never run.
+CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
 VIEW = 'number,state,isDraft,autoMergeRequest,mergeStateStatus,headRefOid,baseRefName,comments,reviews,commits'
 LIST = 'number,title,isDraft,autoMergeRequest,mergeStateStatus,createdAt,statusCheckRollup,headRefOid,baseRefName'
 
@@ -101,10 +109,11 @@ def remove_old(*paths):
 
 def write_text(path, text):
     """Via a synced temp file and os.replace: neither a kill nor a reboot mid-write leaves half a file, and a plan
-    written before the disarm is on disk before the disarm."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    written before the disarm is on disk before the disarm. Only this user may read or write it (0600)."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
+    with open(tmp, 'w', opener=lambda p, flags: os.open(p, flags | os.O_NOFOLLOW, 0o600)) as f:
+        os.fchmod(f.fileno(), 0o600)   # a .tmp an older run left keeps its mode otherwise
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
@@ -140,22 +149,44 @@ class Queue:
     def __init__(self, repo, cfg, state, cache, lock, sleep=time.sleep):
         self.repo, self.cfg, self.state, self.cache, self.lock, self.sleep = repo, cfg, state, cache, lock, sleep
         self.remote = f'https://github.com/{repo}.git'
-        self.review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association)
+        self.review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association,
+                                  cfg.lens_author_associations)
 
     def gh(self, *a):
         return subprocess.run(['gh', *a], text=True, capture_output=True)
 
     def git(self, *a):
-        return subprocess.run(['git', *GIT_AUTH, '--git-dir', self.cache, *a], text=True, capture_output=True,
+        return subprocess.run(['git', *GIT_SAFE, *GIT_AUTH, '--git-dir', self.cache, *a], text=True, capture_output=True,
                               env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
+    def cache_problem(self):
+        """Why the cache is not the one the queue made, or None. git runs there with the token in its environment, and
+        its objects decide what is re-armed: only a directory of this user that no one else can enter, whose config is
+        CACHE_CONFIG, and that is a bare repository, counts."""
+        try:
+            st = os.lstat(self.cache)
+            if not stat.S_ISDIR(st.st_mode):
+                return 'is not a directory'
+            if st.st_uid != os.getuid() or st.st_mode & 0o077:
+                return f'is not this user\'s alone (owner {st.st_uid}, mode {st.st_mode & 0o777:o})'
+            with open(os.path.join(self.cache, 'config'), opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
+                if f.read() != CACHE_CONFIG:
+                    return 'has a config the queue did not write'
+        except (OSError, ValueError) as e:
+            return f'cannot be checked ({e})'
+        if self.git('rev-parse', '--is-bare-repository').stdout.strip() != 'true':
+            return 'is not a bare git repository'
+        return None
+
     def own_cache(self):
-        """The cache, made on first use (`git init --bare`; the first fetch brings the objects). One that is not a bare
-        git repository (emptied, half-deleted) is set aside and made again, never trusted. Every failure on the way is
-        said and returns False (fetch then knows nothing, so nothing is done), never an exception."""
-        if os.path.isdir(self.cache):
-            if self.git('rev-parse', '--is-bare-repository').stdout.strip() == 'true':
+        """The cache, made on first use (`git init --bare`; the first fetch brings the objects). One that is not the
+        queue's own (cache_problem: emptied, half-deleted, someone else's, open to others, another config) is set aside
+        and made again, never trusted. Every failure on the way is said and returns False (fetch then knows nothing,
+        so nothing is done), never an exception."""
+        if os.path.lexists(self.cache):
+            problem = self.cache_problem()
+            if not problem:
                 # A fetch killed half-way leaves a ref lock that fails every later fetch. Only the queue uses the cache,
                 # and only while it holds the lock: a lock file here is always a stale one.
                 for d, _, files in os.walk(os.path.join(self.cache, 'refs', 'queue')):
@@ -163,7 +194,7 @@ class Queue:
                         if f.endswith('.lock'):
                             os.remove(os.path.join(d, f))
                 return True
-            print(f'{self.cache} is not a bare git repo: rebuilding it')
+            print(f'{self.cache} {problem}: rebuilding it')
         parent, name = os.path.split(self.cache)
         os.makedirs(parent, exist_ok=True)
         remove_old(*(os.path.join(parent, f) for f in sorted(os.listdir(parent))   # CACHE.old-*, CACHE.new.old-*
@@ -171,11 +202,19 @@ class Queue:
         new = self.cache + '.new'
         if not (set_aside(self.cache) and set_aside(new)):   # a broken cache; one made half-way
             return False
-        r = subprocess.run(['git', 'init', '-q', '--bare', new], text=True, capture_output=True)
+        try:
+            os.mkdir(new, 0o700)   # no one else can enter it, from the start
+            os.chmod(new, 0o700)
+        except OSError as e:
+            print(f'could not make {new}: {e}')
+            return False
+        r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
+                           capture_output=True)
         if r.returncode != 0:
             print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
             return False
         try:
+            write_text(os.path.join(new, 'config'), CACHE_CONFIG)
             os.rename(new, self.cache)
         except OSError as e:   # something made the cache between the two steps: the next run sets it aside
             print(f'could not move the new repository to {self.cache}: {e}')
@@ -247,6 +286,16 @@ class Queue:
             return SILENT
         return 0
 
+    def read_advice(self, why):
+        """The way out when the review names no head, for the queue's comment."""
+        if lens.NO_HEADER in why:
+            return ('A comment that looks like a lens report counts only with a lens header as its first plain line, '
+                    f'not in a code block ({self.cfg.lens_format_doc}): re-post it that way, or someone who read the '
+                    f'head posts the override `{self.cfg.override_prefix} <sha>: <why>`.')
+        if lens.SHORT in why:
+            return f'A lens read names the full 40-hex sha ({self.cfg.lens_format_doc}): re-post it with that.'
+        return ''
+
     def arm(self, n, head):
         return self.gh('pr', 'merge', str(n), '--repo', self.repo, '--auto', f'--{self.cfg.merge_method}',
                        *(['--delete-branch'] if self.cfg.delete_branch else []), '--match-head-commit', head)
@@ -290,10 +339,7 @@ class Queue:
             return SILENT
         if not read:
             return self.leave_off(n, f'{why}, so it was not updated: which head the review vouched for is unclear.',
-                                  'A comment that looks like a lens report counts only with a lens header as its first '
-                                  f'plain line, not in a code block ({self.cfg.lens_format_doc}): re-post it that way, '
-                                  'or someone who read the head posts the override '
-                                  f'`{self.cfg.override_prefix} <sha>: <why>`.' if lens.NO_HEADER in why else '')
+                                  self.read_advice(why))
         if not fetched:
             return self.leave_off(n, f'GitHub does not have the commit read at {read[:12]} (any more), so it was not '
                                      f'updated. Merge {base} into it yourself and push',
@@ -352,9 +398,12 @@ class Queue:
         if os.path.exists(bad):
             print(f'WARNING: {bad} is an unreadable plan of an earlier run: a PR may still have auto-merge OFF. Look '
                   'at the open PRs without auto-merge, then delete it')
+        mine = True
         try:
-            with open(self.state) as f:
-                st = json.load(f)
+            with open(self.state, 'rb', opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
+                info = os.fstat(f.fileno())   # a plan someone else could have written is no plan of this queue
+                mine = info.st_uid == os.getuid() and not info.st_mode & 0o022
+                st = json.loads(f.read()) if mine else {}
         except FileNotFoundError:
             return 0
         except (OSError, ValueError):
@@ -363,7 +412,8 @@ class Queue:
         if not isinstance(n, int) or isinstance(n, bool):   # which PR it was is lost: never quietly
             os.replace(self.state, bad)
             sync_dir(bad)
-            print(f'ERROR: unreadable {self.state}, kept as {bad}: a PR may have auto-merge OFF and nothing says so')
+            print(f'ERROR: {"unreadable" if mine else "untrusted (another user could write it)"} {self.state}, kept as '
+                  f'{bad}: a PR may have auto-merge OFF and nothing says so')
             return 1
         if st.get('repo', self.repo) != self.repo:   # a plan without `repo` is an older queue's, for this repository
             print(f'ERROR: {self.state} is the plan of a queue run for {st["repo"]}, not {self.repo}: two repositories '
@@ -374,20 +424,20 @@ class Queue:
             print(f'#{n}: a stopped run left it OFF, and gh cannot show it now: trying again next run, no other PR '
                   'meanwhile')
             return self.tell_once(st, n, 'gh cannot show this PR right now')
-        head = (cur.get('headRefOid') or '').lower()
+        head, base = (cur.get('headRefOid') or '').lower(), cur.get('baseRefName') or ''
         open_off = cur.get('state') == 'OPEN' and not cur.get('autoMergeRequest')
         # The review as it is now, not the read the stopped run stored: a lens posted since then counts. No lens
         # comments: the stored read, the head that run started from.
         reviewed, read, why = self.review.reviewed_head(cur)
         read = read if reviewed else st.get('read')
-        same = self.same_change(st.get('base'), n, head, read) if open_off and not cur.get('isDraft') and read else False
+        same = self.same_change(base, n, head, read) if open_off and not cur.get('isDraft') and read else False
         old = (st.get('old') or '?')[:12]
         if not open_off:
             code = 0
         elif not read:
             code = self.leave_off(n, f'a pr_queue run that was stopped half-way or could not finish turned auto-merge '
                                      f'off at {old}; {why or "it stored no read commit"}, so it was not re-armed: which '
-                                     'head the review vouches for is unclear.')
+                                     'head the review vouches for is unclear.', self.read_advice(why or ''))
         elif same is None:   # never OFF and silent: say it once on the PR, as for a gh error
             print(f'#{n}: could not fetch from GitHub to check {head[:12]}: trying again next run, no other PR meanwhile')
             return self.tell_once(st, n, f'the queue could not fetch {head[:12]} from GitHub to check it')
