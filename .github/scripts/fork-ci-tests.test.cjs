@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { plan, readList, findTests, TEST_DIRS } = require("./fork-ci-tests.cjs");
+const { plan, readList, findTests, presentTests } = require("./fork-ci-tests.cjs");
 
 const never = () => false;
 const here = (...files) => files.map((file) => ({ file, runBy: null }));
@@ -97,6 +97,18 @@ test("finds every *.test.* file, subdirectories included", () => {
   }
 });
 
-test("the composite actions' tests under fork-ci are found too", () => {
-  assert.deepEqual(TEST_DIRS, [".github/scripts", "fork-ci"]);
+test("the composite actions' tests under fork-ci are found too, and a missing folder adds none", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-tests-"));
+  const files = [".github/scripts/a.test.cjs", "fork-ci/actions/x/b.test.py", "other/c.test.py"];
+  try {
+    for (const file of files) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), "");
+    }
+    assert.deepEqual(presentTests(root), files.slice(0, 2));
+    fs.rmSync(path.join(root, "fork-ci"), { recursive: true });
+    assert.deepEqual(presentTests(root), files.slice(0, 1));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

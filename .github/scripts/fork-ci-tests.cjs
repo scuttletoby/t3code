@@ -83,6 +83,14 @@ function findTests(dir, root = ROOT) {
   return out.toSorted();
 }
 
+// Every test file under TEST_DIRS. A folder that is not there adds none: a listed test in it is then
+// missing, which plan() reports (a failure once the tested history had it).
+function presentTests(root = ROOT) {
+  return TEST_DIRS.filter((dir) => fs.existsSync(path.join(root, dir))).flatMap((dir) =>
+    findTests(dir, root),
+  );
+}
+
 function git(args) {
   return childProcess.execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
 }
@@ -113,10 +121,7 @@ function readFile(file) {
 
 function main() {
   const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8"));
-  const present = TEST_DIRS.filter((dir) => fs.existsSync(path.join(ROOT, dir))).flatMap((dir) =>
-    findTests(dir),
-  );
-  const result = plan(entries, present, everInHistory, readFile);
+  const result = plan(entries, presentTests(), everInHistory, readFile);
   const rows = [];
   let failed =
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
@@ -170,6 +175,6 @@ function main() {
   if (failed) process.exitCode = 1;
 }
 
-module.exports = { plan, readList, findTests, TEST_DIRS };
+module.exports = { plan, readList, findTests, presentTests };
 
 if (require.main === module) main();

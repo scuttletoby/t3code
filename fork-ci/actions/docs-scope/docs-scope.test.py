@@ -3,7 +3,7 @@ Real git repos: GitHub's refs/pull/N/merge is a merge commit (HEAD^1 = the base,
 with `git merge --no-ff`. Anything unclear must mean a full run.
 Run: python3 fork-ci/actions/docs-scope/docs-scope.test.py
 """
-import json, os, re, shutil, subprocess, sys, tempfile, unittest
+import contextlib, json, os, re, shutil, subprocess, sys, tempfile, unittest
 
 sys.dont_write_bytecode = True   # the Globs test imports docs_scope.py: leave no __pycache__ in the action folder
 
@@ -15,7 +15,7 @@ ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 
        'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
 REGISTRY_PATH = 'tools/registry.json'
 REGISTRY = {'modules': [
-    {'id': 'site', 'kind': 'plugin', 'inputs': ['net/site/README.md']},
+    {'id': 'site', 'kind': 'plugin', 'inputs': ['plugins/site/README.md']},
     {'id': 'content-locale', 'kind': 'engine-module', 'inputs': ['plugins/locale/common/src/main/java/Wire.java']},
     {'id': 'content-travel', 'kind': 'engine-module', 'inputs': ['plugins/travel/common/src/main/java']},
 ]}
@@ -62,14 +62,14 @@ class Repo(unittest.TestCase):
         return r.stdout.strip()
 
     def write(self, files):
-        for path, text in files.items():
-            full = os.path.join(self.d, path)
+        for path, text in files.items():   # a bytes path or text is written as those bytes
+            full = os.path.join(os.fsencode(self.d), os.fsencode(path))
             if text is None:
                 os.remove(full)
                 continue
             os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, 'w') as f:
-                f.write(text)
+            with open(full, 'wb') as f:
+                f.write(text if isinstance(text, bytes) else text.encode())
 
     def commit(self, msg='c', files=None):
         if files:
@@ -89,20 +89,40 @@ class Repo(unittest.TestCase):
             self.commit('main moved', main_after)
         self.git('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
 
-    def scope(self, event='pull_request', base=''):
-        """(docs_only, jobs, stdout)."""
-        out = os.path.join(self.d, '.output')
-        r = subprocess.run([sys.executable, '-I', SCRIPT, '--config', CONFIG_PATH, '--event', event, '--base', base],
-                           cwd=self.d, text=True, capture_output=True, env={**os.environ, **ENV, 'GITHUB_OUTPUT': out})
-        self.assertEqual(r.returncode, 0, r.stderr)
-        with open(out) as f:
-            written = f.read()
-        os.remove(out)
+    def scope(self, event='pull_request', base='', config=CONFIG_PATH, sha=None, head_sha=None):
+        """(docs_only, jobs, stdout). The runner's view: $GITHUB_SHA is HEAD and the event's pull_request.head.sha
+        is HEAD^2 (HEAD for a commit that is not a merge), unless the test says otherwise ('' = unset)."""
+        out, event_path = os.path.join(self.d, '.output'), os.path.join(self.d, '.event.json')
+        head = self.git('rev-parse', 'HEAD')
+        parents = self.git('rev-list', '--parents', '-n', '1', 'HEAD').split()
+        head_sha = (parents[2] if len(parents) == 3 else head) if head_sha is None else head_sha
+        env = {**os.environ, **ENV, 'GITHUB_OUTPUT': out, 'GITHUB_SHA': head if sha is None else sha}
+        if head_sha:
+            with open(event_path, 'w') as f:
+                json.dump({'pull_request': {'head': {'sha': head_sha}}}, f)
+            env['GITHUB_EVENT_PATH'] = event_path
+        r = subprocess.run([sys.executable, '-I', SCRIPT, '--config', config, '--event', event, '--base', base],
+                           cwd=self.d, capture_output=True, env=env)
+        stdout = r.stdout.decode()   # strict: the script prints UTF-8 only, whatever the file names hold
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        with open(out, 'rb') as f:
+            written = f.read().decode()
+        for f in (out, event_path):
+            os.remove(f) if os.path.exists(f) else None
         m = re.fullmatch(r'docs_only=(true|false)\njobs=(\{.*\})\nreason=([^\n]+)\n', written)
         self.assertTrue(m, written)
-        self.assertEqual(r.stdout.startswith('docs-only: '), m[1] == 'true', r.stdout)
-        self.assertEqual(m[3], r.stdout.splitlines()[0])
-        return m[1] == 'true', json.loads(m[2]), r.stdout
+        self.assertEqual(stdout.startswith('docs-only: '), m[1] == 'true', stdout)
+        self.assertEqual(m[3], stdout.splitlines()[0])
+        for line in stdout.splitlines():   # a file name never starts a line: no ::workflow-command::
+            self.assertRegex(line, r'^(docs-only|full run|not docs-only|job [^:]+):', stdout)
+            self.assertTrue(line.isprintable(), repr(line))
+        return m[1] == 'true', json.loads(m[2]), stdout
+
+    def reset(self):
+        self.git('checkout', '-q', '-f', 'main')
+        self.git('reset', '-q', '--hard', self.base)
+        for b in ('pr', 'pr-real'):
+            self.git('branch', '-q', '-D', b) if self.git('branch', '--list', b) else None
 
     def assertDocsOnly(self, expected):
         docs, _, out = self.scope()
@@ -170,16 +190,32 @@ class BuildAndTestInputs(Repo):
         self.check('plugins/RELEASE-CLAIMS.md')
 
     def test_an_md_listed_in_the_registry(self):
-        self.check('net/site/README.md')
+        self.check('plugins/site/README.md')
 
     def test_an_md_newly_listed_in_the_registry_by_main(self):   # read at the base too, not only the head
         self.pr({'docs/new.md': 'doc'}, main_after={REGISTRY_PATH: json.dumps(
-            {'modules': [{'id': 'docs-site', 'inputs': ['docs/']}]})})
-        self.assertDocsOnly(False)
+            {'modules': REGISTRY['modules'] + [{'id': 'docs-site', 'inputs': ['docs/']}]})})
+        self.assertIn('docs-site inputs: docs', self.assertDocsOnly(False))
 
-    def test_a_pr_that_drops_a_registry_input_does_not_free_it(self):   # the base's entry still counts
-        self.pr({REGISTRY_PATH: json.dumps({'modules': []}), 'net/site/README.md': 'y'})
-        self.assertDocsOnly(False)
+
+class RegistryAtTheBase(Repo):
+    """A pull request cannot free a file by deleting its entry: the base's entries count. Here the registry change
+    itself does not decide (it is docs, or a job's own path), so only the base read can."""
+    config = {'docs': ['**'], 'never_docs_from': CONFIG['never_docs_from'],
+              'jobs': {'plugins': {'paths': ['plugins/**', 'tools/**']}, 'engine': CONFIG['jobs']['engine']}}
+
+    def drop(self, module_id):
+        return json.dumps({'modules': [m for m in REGISTRY['modules'] if m['id'] != module_id]})
+
+    def test_a_pr_that_drops_a_never_docs_entry_does_not_free_the_file(self):
+        self.pr({REGISTRY_PATH: self.drop('site'), 'plugins/site/README.md': 'y'})
+        docs, _, out = self.scope()
+        self.assertFalse(docs, out)
+        self.assertIn('site inputs: plugins/site/README.md', out)
+
+    def test_a_pr_that_drops_a_jobs_entry_still_runs_the_job(self):
+        self.pr({REGISTRY_PATH: self.drop('content-locale'), 'plugins/locale/common/src/main/java/Wire.java': 'x'})
+        self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'true'})
 
 
 class FailsClosed(Repo):
@@ -232,6 +268,135 @@ class FailsClosed(Repo):
         self.assertEqual((docs, jobs), (False, {}), out)
         self.assertIn('cannot be read as configured', out)
 
+    def test_registry_entries_that_could_never_match_are_a_full_run(self):   # never fail open on a list
+        site = {'id': 'site', 'kind': 'plugin', 'inputs': ['plugins/site/README.md']}
+        for name, modules in (
+                ('a renamed field', [{**site, 'inputs': None, 'input': ['plugins/site/README.md']}]),
+                ('an object without the field', [site, {'id': 'other', 'kind': 'plugin'}]),
+                ('./', [{**site, 'inputs': ['./plugins/site/README.md']}]),
+                ('a leading /', [{**site, 'inputs': ['/plugins/site/README.md']}]),
+                ('..', [{**site, 'inputs': ['plugins/../plugins/site/README.md']}]),
+                ('a wildcard', [{**site, 'inputs': ['plugins/**/*.md']}]),
+                ('a number', [{**site, 'inputs': [5]}]),
+                ('no object of the kind a job keeps', None)):
+            with self.subTest(name):
+                self.reset()
+                engine = [m for m in REGISTRY['modules'] if m['kind'] == 'engine-module'] if modules else []
+                modules = [{k: v for k, v in m.items() if v is not None} for m in modules or [site]] + engine
+                self.base = self.commit('registry', {REGISTRY_PATH: json.dumps({'modules': modules})})
+                self.pr({'plugins/site/README.md': 'y'})
+                docs, jobs, out = self.scope()
+                self.assertEqual((docs, jobs), (False, {}), out)
+                self.assertIn('cannot be read as configured', out)
+
+
+class MergeCommit(Repo):
+    """On pull_request, HEAD must be GitHub's merge commit before HEAD^1 is trusted as the base: a checkout of a PR
+    head whose last commit merged main in would make the PR's code vanish from both diffs and read the config from
+    the PR."""
+
+    def setUp(self):
+        super().setUp()
+        self.git('checkout', '-q', '-b', 'pr', self.base)
+        self.commit('code + a looser config', {'app/Main.java': 'class Main { int x; }',
+                                               CONFIG_PATH: json.dumps({'docs': ['**']})})
+        self.git('checkout', '-q', 'main')
+        self.commit('docs on main', {'README.md': 'y'})
+        self.git('checkout', '-q', 'pr')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge main into pr', 'main')
+        self.pr_head = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-q', 'main')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
+        self.github_sha = self.git('rev-parse', 'HEAD')   # what GitHub's refs/pull/N/merge would hold
+        self.git('checkout', '-q', '--detach', self.pr_head)   # but the caller checked out the PR head
+
+    def test_the_real_merge_commit_is_a_full_run(self):   # the check does not refuse the right checkout
+        self.git('checkout', '-q', '--detach', self.github_sha)
+        self.assertEqual(self.scope(head_sha=self.pr_head)[:2], (False, {'plugins': 'true', 'engine': 'true'}))
+
+    def test_a_pr_head_checkout_is_a_full_run(self):
+        docs, jobs, out = self.scope(sha=self.github_sha, head_sha=self.pr_head)
+        self.assertEqual((docs, jobs), (False, {}), out)
+        self.assertIn('is not the commit this run is for', out)
+
+    def test_a_merge_whose_second_parent_is_not_the_pr_head_is_a_full_run(self):
+        docs, jobs, out = self.scope(sha=self.pr_head, head_sha=self.pr_head)
+        self.assertEqual((docs, jobs), (False, {}), out)
+        self.assertIn("not the event's pull_request.head.sha", out)
+
+    def test_no_github_sha_or_event_is_a_full_run(self):
+        self.git('checkout', '-q', '--detach', self.github_sha)
+        for sha, head_sha, why in (('', self.pr_head, 'unset'), (None, '', 'event file')):
+            with self.subTest(why):
+                docs, jobs, out = self.scope(sha=sha, head_sha=head_sha)
+                self.assertEqual((docs, jobs), (False, {}), out)
+                self.assertIn(why, out)
+
+    def test_a_push_run_checks_github_sha_too(self):
+        self.git('checkout', '-q', 'main')
+        docs, jobs, out = self.scope('push', self.base, sha=self.pr_head)
+        self.assertEqual((docs, jobs), (False, {}), out)
+
+
+class NeverCrashes(Repo):
+    """Every error is a full run with outputs. A crash leaves no outputs: a `needs:` job that is skipped reads as
+    passing on a required check."""
+
+    def test_a_file_name_that_is_not_utf8(self):
+        self.pr({b'docs/\xff.md': 'x'})
+        docs, jobs, out = self.scope()
+        self.assertFalse(docs, out)
+        self.assertIn('not UTF-8', out)
+        self.assertIn('docs/\\udcff.md', out)
+
+    def test_a_registry_at_the_head_that_is_not_utf8_or_too_deep(self):
+        for name, text in (('not utf-8', b'\xff'), ('too deep', '[' * 200000)):
+            with self.subTest(name):
+                self.reset()
+                self.pr({REGISTRY_PATH: text, 'README.md': 'y'})
+                docs, jobs, out = self.scope()
+                self.assertEqual((docs, jobs), (False, {}), out)
+                self.assertIn('cannot be read as configured', out)
+
+    def test_an_error_nobody_foresaw(self):   # the last net: main() turns any exception into a full run
+        sys.path.insert(0, HERE)
+        try:
+            import docs_scope
+        finally:
+            sys.path.remove(HERE)
+        out = os.path.join(self.d, '.output')
+
+        def broken(*a):
+            raise RuntimeError('boom')
+        old = os.environ.get('GITHUB_OUTPUT')
+        os.environ['GITHUB_OUTPUT'] = out
+        try:
+            with open(os.devnull, 'w') as devnull, contextlib.redirect_stdout(devnull):
+                self.assertEqual(docs_scope.main(['--config', CONFIG_PATH, '--event', 'pull_request'], run=broken), 0)
+        finally:
+            os.environ.pop('GITHUB_OUTPUT') if old is None else os.environ.__setitem__('GITHUB_OUTPUT', old)
+        with open(out) as f:
+            self.assertEqual(f.read(), 'docs_only=false\njobs={}\nreason=full run: docs-scope failed '
+                                       '(RuntimeError: boom)\n')
+
+
+class OddNames(Repo):
+    def test_a_newline_name_in_a_source_set_is_not_docs(self):
+        self.pr({'p/src/main/resources/he\nlp.md': 'x'})
+        self.assertDocsOnly(False)
+
+    def test_a_newline_name_in_a_job_folder_runs_that_job_by_its_paths(self):
+        self.pr({'plugins/x\ny.java': 'x'})
+        docs, jobs, out = self.scope()
+        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'false'}, out)
+        self.assertIn('matches its paths', out)
+
+    def test_a_name_cannot_inject_a_workflow_command_or_an_output(self):   # scope() checks every line
+        self.pr({'a\ndocs_only=true\njobs={}\n::warning::injected\n.java': 'x', 'README.md': 'y'})
+        docs, _, out = self.scope()
+        self.assertFalse(docs, out)
+        self.assertIn('a\\ndocs_only=true', out)
+
 
 class ConfigAtTheBase(Repo):
     """The rules come from the base commit and the code from the action's pinned folder, so a pull request cannot
@@ -240,7 +405,7 @@ class ConfigAtTheBase(Repo):
     def test_a_pr_that_loosens_its_own_config_still_runs_in_full(self):
         self.pr({CONFIG_PATH: json.dumps({'docs': ['**'], 'jobs': {}}), 'engine/A.java': 'class A {}'})
         docs, jobs, out = self.scope()
-        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'engine': 'true'}), out)   # the base's jobs
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)   # the base's jobs, all
 
     def test_no_config_at_the_base(self):   # the PR that adds the config runs in full
         self.git('rm', '-q', CONFIG_PATH)
@@ -255,11 +420,10 @@ class ConfigAtTheBase(Repo):
                     json.dumps({'never_docs': []}), json.dumps({'docs': '**/*.md'}),
                     json.dumps({'docs': ['*.md'], 'never_docs': [{'glob': 'x'}]}),
                     json.dumps({'docs': ['*.md'], 'never_docs_from': [{'file': 'r.json', 'field': 'f'}]}),
-                    json.dumps({'docs': ['*.md'], 'jobs': {'j': {'path': ['x/**']}}})):
+                    json.dumps({'docs': ['*.md'], 'jobs': {'j': {'path': ['x/**']}}}),
+                    json.dumps({'docs': ['*.md'], 'never_docs': [{'glob': 5, 'why': 'x'}]})):   # was a crash
             with self.subTest(bad=bad):
-                self.git('checkout', '-q', 'main')
-                self.git('reset', '-q', '--hard', self.base)
-                self.git('branch', '-q', '-D', 'pr') if self.git('branch', '--list', 'pr') else None
+                self.reset()
                 self.commit('bad config', {CONFIG_PATH: bad})
                 self.git('checkout', '-q', '-b', 'pr')
                 self.commit('docs', {'README.md': bad})
@@ -270,12 +434,36 @@ class ConfigAtTheBase(Repo):
                 self.assertIn('config', out)
 
 
+    def test_a_bad_source_entry_names_itself(self):   # wrong types and typos in a *_from entry: a full run, why
+        source = CONFIG['never_docs_from'][0]
+        for bad, why in (({'field': 5}, 'needs a plain file path'), ({'field': []}, 'needs a plain file path'),
+                         ({'where': ['kind']}, 'needs a plain file path'), ({'label': 3}, 'needs a plain file path'),
+                         ({'list': None}, 'needs a plain file path'), ({'file': './' + REGISTRY_PATH}, 'needs a plain'),
+                         ({'field': ['inputs', 'inptus']}, "no kept object has the field(s) ['inptus']"),
+                         ({'where': {'kind': 'plugn'}}, "no kept object has the field(s) ['inputs']")):
+            with self.subTest(bad=bad):
+                self.reset()
+                self.commit('bad source', {CONFIG_PATH: json.dumps({**CONFIG, 'never_docs_from': [{**source, **bad}]})})
+                self.pr({'README.md': 'y'})
+                docs, jobs, out = self.scope()
+                self.assertEqual((docs, jobs), (False, {}), out)
+                self.assertIn(why, out)
+
+
 class LooseConfig(Repo):
     config = {'docs': ['**']}   # everything is docs, except the config itself
 
     def test_the_config_file_is_never_docs(self):
         self.pr({CONFIG_PATH: json.dumps({'docs': ['**'], 'jobs': {}})})
         self.assertIn('the docs-scope config', self.assertDocsOnly(False))
+
+    def test_a_config_path_that_is_not_plain_is_a_full_run(self):   # ./x would dodge "the config is never docs"
+        self.pr({CONFIG_PATH: json.dumps({'docs': ['**'], 'jobs': {}})})
+        for config in ('./' + CONFIG_PATH, '.github//docs-scope.json', '/' + CONFIG_PATH):
+            with self.subTest(config):
+                docs, jobs, out = self.scope(config=config)
+                self.assertEqual((docs, jobs), (False, {}), out)
+                self.assertIn('not a plain repository path', out)
 
 
 class Jobs(Repo):
@@ -286,8 +474,23 @@ class Jobs(Repo):
         self.assertIn('job engine: skip', out)
 
     def test_docs_in_a_job_folder_do_not_run_it(self):   # code elsewhere makes it a full run, not an engine build
-        self.pr({'engine/README.md': 'y', 'app/Main.java': 'class Main { int x; }'})
-        self.assertEqual(self.scope()[1], {'plugins': 'false', 'engine': 'false'})
+        self.pr({'engine/README.md': 'y', 'plugins/a/A.java': 'class A {}'})
+        self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'false'})
+
+    def test_a_file_no_job_names_runs_every_job(self):   # unclear which job it reaches: all of them
+        for path in ('app/Main.java', '.github/workflows/ci.yml', CONFIG_PATH):
+            with self.subTest(path):
+                self.reset()
+                self.pr({path: json.dumps(CONFIG) + ' '})
+                docs, jobs, out = self.scope()
+                self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)
+                self.assertIn('every job runs', out.splitlines()[0])
+
+    def test_a_config_change_runs_every_job_even_if_a_job_names_it(self):
+        cfg = {**CONFIG, 'jobs': {**CONFIG['jobs'], 'plugins': {'paths': ['plugins/**', '.github/**']}}}
+        self.base = self.commit('a job names .github', {CONFIG_PATH: json.dumps(cfg)})
+        self.pr({CONFIG_PATH: json.dumps(cfg) + ' '})
+        self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'true'})
 
     def test_an_md_input_in_a_job_folder_runs_it(self):
         self.pr({'engine/core/src/main/resources/help.md': 'y'})
@@ -306,15 +509,13 @@ class Jobs(Repo):
                            ('plugins/locale/common/src/main/java/Other.java', 'false'),
                            ('plugins/travel/common/src/main/java/a/Leg.java', 'true')):
             with self.subTest(path=path):
-                self.git('checkout', '-q', 'main')
-                self.git('reset', '-q', '--hard', self.base)
-                self.git('branch', '-q', '-D', 'pr') if self.git('branch', '--list', 'pr') else None
+                self.reset()
                 self.pr({path: 'class X {}'})
                 docs, jobs, out = self.scope()
                 self.assertEqual(jobs['engine'], runs, out)
 
     def test_a_registry_entry_of_another_kind_does_not_run_the_job(self):
-        self.pr({'net/site/README.md': 'y'})   # an input of a "plugin", not of an "engine-module"
+        self.pr({'plugins/site/README.md': 'y'})   # an input of a "plugin", not of an "engine-module"
         self.assertEqual(self.scope()[1]['engine'], 'false')
 
 
@@ -356,7 +557,9 @@ class Globs(unittest.TestCase):
                 ('**/test/**', ['test/a', 'x/test/b/c'], ['x/tests/a', 'xtest/a']),
                 ('src/**', ['src/a', 'src/a/b'], ['x/src/a', 'srcx/a']),
                 ('a?.md', ['ab.md'], ['a/.md', 'abc.md']),
-                ('a.b+c', ['a.b+c'], ['aXb+c'])):
+                ('a.b+c', ['a.b+c'], ['aXb+c']),
+                ('**/src/**', ['p/src/a\nb.md'], ['p/s\nrc/a']),   # ** crosses a newline in a name
+                ('app/**', ['app/x\ny.java'], ['ap\np/x'])):
             for p in yes:
                 self.assertTrue(glob_re(pattern).match(p), (pattern, p))
             for p in no:

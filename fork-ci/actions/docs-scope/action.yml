@@ -5,13 +5,14 @@ description: >-
   Anything unclear means a full run. Usage: README.md next to this file.
 inputs:
   config:
-    description: The JSON config, a path in the repository; read at the base commit, never from the checkout.
+    description: >-
+      The JSON config, a plain path in the repository (no ./); read at the base commit, never from the checkout.
     required: false
     default: .github/docs-scope.json
   base:
     description: >-
-      Events other than pull_request only: the commit to compare HEAD with (for example the last
-      main commit whose run passed). Empty: such runs run in full.
+      Events other than pull_request only: the commit to compare HEAD with, the last commit whose
+      run passed (never github.event.before: see README). Empty: such runs run in full.
     required: false
     default: ""
 outputs:
@@ -30,6 +31,7 @@ runs:
   using: composite
   steps:
     # Only code from this action's folder (the caller's pinned SHA) runs; nothing from the checkout.
+    # The script also reads the runner's GITHUB_SHA and GITHUB_EVENT_PATH (HEAD must be the run's commit).
     - id: scope
       shell: bash
       env:

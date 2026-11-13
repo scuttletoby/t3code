@@ -3,7 +3,8 @@
 A composite action that answers two questions about the change a CI run tests:
 
 - **Is it docs-only?** Then the build and test jobs can pass at once.
-- **Which jobs does it reach?** A job runs only when a changed file that is not docs matches its paths.
+- **Which jobs does it reach?** A job runs when a changed file that is not docs matches its paths. A file that is
+  not docs but that no job names (a root build file, a workflow), or a change to the config, runs every job.
 
 It is the general half of a docs-only gate. The project half (which files are docs, which docs a build or test
 reads, which folders each job builds) is a JSON config in the calling repository.
@@ -16,13 +17,21 @@ Pin the action by full SHA (the tagged one, so a rebase of this fork cannot orph
 jobs:
   build:
     steps:
-      - uses: actions/checkout@<sha> # pull_request: GitHub's merge commit, refs/pull/N/merge
+      - uses: actions/checkout@<sha> # the default ref: on pull_request GitHub's merge commit ($GITHUB_SHA)
         with: { fetch-depth: 0 } # the merge base must be there
+      # Optional, push only: the last commit whose run of this workflow passed (see "The base on push").
+      - id: green
+        if: github.event_name == 'push'
+        env: { GH_TOKEN: "${{ github.token }}" } # needs `actions: read`
+        run: |
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha // ""') || sha=""
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - id: scope
         uses: scuttletoby/t3code/fork-ci/actions/docs-scope@<full sha> # ci/vN
         with:
           config: .github/docs-scope.json # default
-          base: ${{ github.event_name == 'push' && github.event.before || '' }} # optional, see below
+          base: ${{ steps.green.outputs.sha }} # empty: a full run
       - if: steps.scope.outputs.docs_only != 'true'
         run: ./gradlew build
       - if: fromJSON(steps.scope.outputs.jobs).engine != 'false'
@@ -31,6 +40,10 @@ jobs:
 
 Always test `!= 'true'` and `!= 'false'`, never `== 'false'` or `== 'true'`: a missing or empty output then means
 "run". `jobs` is `{}` when the change or the config is unknown, so every job reads as "run".
+
+Run it as a step of the jobs it gates, as above. If it runs in a job of its own that others `need`, a failure of that
+job skips them, and GitHub counts a skipped required job as passing: gate them with
+`if: ${{ !cancelled() && (needs.scope.result != 'success' || fromJSON(needs.scope.outputs.jobs).engine != 'false') }}`.
 
 ### Outputs
 
@@ -41,16 +54,29 @@ Always test `!= 'true'` and `!= 'false'`, never `== 'false'` or `== 'true'`: a m
 | `reason`    | one line: why (every skip and every full run says why)                     |
 
 The step log also prints one line per job: `job engine: run (engine/A.java matches its paths)` or
-`job engine: skip (...)`.
+`job engine: skip (...)`. Control characters, line separators and bytes that are not UTF-8 in a file name are
+printed escaped (`\n`, `\udcff`), so a file name can neither start a `::workflow-command::` line nor add an output.
 
 ## What "the change" is
 
 - **pull_request:** the union of two diffs without rename detection (a rename is its old and its new path):
   merge base .. PR head (every push of the PR together, never the last push alone) and base .. GitHub's merge commit.
-  HEAD must be that merge commit.
-- **Any other event** (push, merge_group, workflow_dispatch): `base` .. HEAD, only when the caller gives `base`.
-  Without it the run is a full run. Such an event is docs-only only when `docs_only_events` names it; its `jobs` are
-  read either way, so a docs-only push to main can still skip the build jobs.
+  HEAD must be that merge commit: HEAD == `$GITHUB_SHA`, it has two parents, and HEAD^2 is the event's
+  `pull_request.head.sha`. Only then is HEAD^1 trusted as the base. A checkout of the PR head is a full run: if its
+  last commit merged main in, HEAD^1 would be the PR's own commit, the PR's code would drop out of both diffs and the
+  config would be read from the PR.
+- **Any other event** (push, merge_group, workflow_dispatch): `base` .. HEAD, only when the caller gives `base` and
+  HEAD == `$GITHUB_SHA`. Without a base the run is a full run. Such an event is docs-only only when
+  `docs_only_events` names it; its `jobs` are read either way, so a docs-only push to main can still skip the build
+  jobs.
+
+### The base on push
+
+Pass the last commit whose run of the workflow **passed**, or nothing (a full run). Never `github.event.before`: if
+push A (code) went red or was cancelled (for example by `concurrency`), push B (docs) diffs B against A, every job
+reads `false`, and main turns green with A's code never tested; a rerun of B gives the same answer. Against the last
+green commit, A's code is in the diff until a run that tests it passes. Any commit works as a base, an ancestor or
+not, because the diff compares trees; one that is not in the checkout is a full run.
 
 ## Config
 
@@ -89,17 +115,23 @@ The step log also prints one line per job: `job engine: run (engine/A.java match
 }
 ```
 
-- `docs` (required): globs of docs files. `**/` is any number of folders, `**` anything, `*` and `?` stay in one name.
+- `docs` (required): globs of docs files. `**/` is any number of folders, `**` anything (a newline in a name too),
+  `*` and `?` stay in one name. A name with a control character or bytes that are not UTF-8 is never docs.
 - `never_docs`: files that match `docs` but that a build, test or tool reads; each says why.
 - `never_docs_from` / `paths_from`: paths listed in a JSON file of the repository. `list` is a dotted key to a list
   of objects (none: the file itself), `where` keeps the objects whose keys equal these values, `field` names the key
   (or keys) holding a path or a list of paths, `label` names an object in the log. An entry matches a path exactly or
   as a folder. The file is read at the base and at the head; an entry at either counts, so a pull request cannot
-  free a file by removing it from the list.
+  free a file by removing it from the list. A list that could drop a rule quietly is an error: a kept object with
+  none of the `field` keys, a `field` key no kept object has (a typo, or a `where` that keeps nothing), or an entry
+  that is not a plain repository path (`./x`, `/x`, `x/../y`, `x//y`, a wildcard), which could never match.
 - `docs_only_events`: events that may be docs-only (default `["pull_request"]`).
-- `jobs`: per job, `paths` globs and `paths_from` lists. Docs files never run a job; a `never_docs` file does.
+- `jobs`: per job, `paths` globs and `paths_from` lists. Docs files never run a job; a `never_docs` file does. A
+  file that is not docs and that no job names runs every job, and so does a change to the config.
 
-Unknown keys are an error (a typo such as `never_doc` must not drop a rule quietly), and an error means a full run.
+Unknown keys and wrong types are an error (a typo such as `never_doc` must not drop a rule quietly), and an error
+means a full run that names it. The `config` input must be a plain repository path (no `./`, `..` or leading `/`),
+so the "config is never docs" rule cannot be dodged by spelling.
 
 ## Why a pull request cannot loosen it
 
@@ -113,10 +145,13 @@ runs in full for it; pin only SHAs that this fork's CI tested and tagged.
 
 ## Fails closed
 
-A full run (and `jobs` = `{}`) for: an event without a base, a pull_request HEAD that is not a two-parent merge
-commit, no merge base (shallow checkout), a base that is not a commit, a git error, an empty change, no config at
-the base, a config that does not parse or has unknown keys, a `*_from` file at neither side or not readable as
-configured. A symlink or submodule is never docs. A crash fails the step, so the job is red.
+A full run (and `jobs` = `{}`) for: an event without a base, HEAD that is not `$GITHUB_SHA`, a pull_request HEAD
+that is not GitHub's merge commit (two parents, HEAD^2 = the event's PR head; no event file), no merge base (shallow
+checkout), a base that is not a commit, a git error, an empty change, a config path that is not plain, no config at
+the base, a config that does not parse or has unknown keys or wrong types, a `*_from` file at neither side or not
+readable as configured (not UTF-8, nested too deep, a missing field, an entry that is not a plain path). Any other
+error is caught too and gives a full run with its message, never a step without outputs. A symlink or submodule is
+never docs.
 
 ## Tests
 
