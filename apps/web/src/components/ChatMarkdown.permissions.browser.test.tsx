@@ -10,7 +10,8 @@ import {
 import { AsyncResult } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 
-import { act, render } from "../../test/render";
+import { act, fakeTimers, render } from "../../test/render";
+import type { RemoteOpenState } from "../remoteOpen";
 import { useRightPanelStore } from "../rightPanelStore";
 
 const state = vi.hoisted(() => ({
@@ -24,6 +25,9 @@ const state = vi.hoisted(() => ({
   openFile: vi.fn(),
   openExternal: vi.fn(),
   copy: vi.fn(),
+  openRemote: vi.fn(),
+  setMaximized: vi.fn(),
+  remote: { mode: "local-exec" } as RemoteOpenState,
   pullRequests: [] as ThreadPullRequestLink[],
 }));
 
@@ -80,7 +84,9 @@ vi.mock(import("../state/entities"), async (original) => ({
 }));
 vi.mock(import("../remoteOpen"), async (original) => ({
   ...(await original()),
-  useRemoteOpenResolution: () => ({ state: { mode: "local-exec" }, isResolved: true }) as never,
+  useRemoteOpenResolution: () => ({ state: state.remote, isResolved: true }) as never,
+  useRemoteCapableEditors: () => ["vscode"],
+  openRemoteEditorUrl: state.openRemote,
 }));
 vi.mock(import("../hooks/useLocalStorage"), async (original) => ({
   ...(await original()),
@@ -137,10 +143,13 @@ function setup() {
   state.choose.mockReset().mockResolvedValue(null);
   state.openFile.mockReset();
   state.openExternal.mockReset().mockResolvedValue(undefined);
+  state.openRemote.mockReset().mockResolvedValue(true);
+  state.setMaximized.mockReset();
+  state.remote = { mode: "local-exec" };
   state.copy.mockReset().mockResolvedValue(undefined);
-  const { openFile } = useRightPanelStore.getState();
-  useRightPanelStore.setState({ openFile: state.openFile });
-  stack.defer(() => useRightPanelStore.setState({ openFile }));
+  const { openFile, setMaximized } = useRightPanelStore.getState();
+  useRightPanelStore.setState({ openFile: state.openFile, setMaximized: state.setMaximized });
+  stack.defer(() => useRightPanelStore.setState({ openFile, setMaximized }));
   stack.use(vi.spyOn(navigator.clipboard, "writeText").mockImplementation(state.copy));
   stack.use(
     vi.spyOn(navigator.clipboard, "write").mockImplementation(async (items) => {
@@ -185,11 +194,13 @@ it("removes host actions after revocation while keeping file preview and copying
   using _setup = setup();
   await using screen = await renderMarkdown("[Readme](docs/readme.md)");
   await screen.openContextMenu();
-  expect(offeredActions()).toEqual(["open", "reveal", "copy-relative", "copy-full"]);
+  const fileActions = ["open-in-panel", "open-full-size"];
+  const copies = ["download", "copy-relative", "copy-full"];
+  expect(offeredActions()).toEqual([...fileActions, "open", "reveal", ...copies]);
   await setAllowed(false);
   state.choose.mockResolvedValue("copy-full");
   await screen.openContextMenu();
-  expect(offeredActions()).toEqual(["copy-relative", "copy-full"]);
+  expect(offeredActions()).toEqual([...fileActions, ...copies]);
   await vi.waitFor(() => expect(state.copy).toHaveBeenCalledWith("/work/docs/readme.md"));
   await act(async () => screen.anchor().click());
   expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined);
@@ -278,3 +289,67 @@ it.each(["link-to-thread", "unlink-from-thread"])(
     );
   },
 );
+
+it("opens a remote environment's file in this machine's editor at the linked line", async () => {
+  using _setup = setup();
+  state.remote = { mode: "remote-links", host: { kind: "ssh-alias", host: "devbox" } };
+  state.choose.mockResolvedValue("open");
+  await using screen = await renderMarkdown("[Setup](</work/my scripts/setup.ps1#L12>)");
+  await screen.openContextMenu();
+  expect(state.choose.mock.lastCall![0]).toContainEqual({ id: "open", label: "Open in VS Code" });
+  await vi.waitFor(() =>
+    expect(state.openRemote).toHaveBeenCalledExactlyOnceWith(
+      "vscode://vscode-remote/ssh-remote+devbox/work/my%20scripts/setup.ps1:12:1",
+    ),
+  );
+  expect(state.openEditor).not.toHaveBeenCalled();
+
+  await act(async () => screen.anchor().click());
+  expect(state.openFile).toHaveBeenCalledWith(threadRef, "my scripts/setup.ps1", 12);
+});
+
+it("opens a file full size and downloads it from the environment", async () => {
+  using _setup = setup();
+  state.choose.mockResolvedValueOnce("open-full-size").mockResolvedValueOnce("download");
+  await using screen = await renderMarkdown("[Readme](/work/docs/readme.md:3)");
+  await screen.openContextMenu();
+  expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", 3);
+  expect(state.setMaximized).toHaveBeenCalledWith(threadRef, true);
+
+  await screen.openContextMenu();
+  await vi.waitFor(() =>
+    expect(state.search).toHaveBeenCalledWith({
+      environmentId: threadRef.environmentId,
+      input: {
+        resource: {
+          _tag: "media-file",
+          threadId: threadRef.threadId,
+          path: "/work/docs/readme.md",
+          disposition: "attachment",
+        },
+      },
+    }),
+  );
+});
+
+it("opens the file menu on a touch long press instead of following the link", async () => {
+  using _setup = setup();
+  await using screen = await renderMarkdown("[Readme](/work/docs/readme.md)");
+  using _timers = fakeTimers();
+  const press = (type: string) =>
+    screen
+      .anchor()
+      .dispatchEvent(
+        new PointerEvent(type, { bubbles: true, pointerType: "touch", clientX: 5, clientY: 5 }),
+      );
+  await act(async () => {
+    press("pointerdown");
+    vi.advanceTimersByTime(500);
+    press("pointerup");
+  });
+  expect(state.choose).toHaveBeenCalledOnce();
+  await screen.openContextMenu();
+  await act(async () => screen.anchor().click());
+  expect(state.choose).toHaveBeenCalledOnce();
+  expect(state.openFile).not.toHaveBeenCalled();
+});

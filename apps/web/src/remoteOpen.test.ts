@@ -285,4 +285,29 @@ describe("buildRemoteOpenUrl", () => {
       ).toBe(expected);
     }
   });
+
+  it.each([
+    {
+      editor: "vscode",
+      line: 42,
+      expected: "vscode://vscode-remote/ssh-remote+sol/tmp/my%20file.md:42:1",
+    },
+    {
+      editor: "cursor",
+      line: 42,
+      column: 7,
+      expected: "cursor://vscode-remote/ssh-remote+sol/tmp/my%20file.md:42:7",
+    },
+    { editor: "zed", line: 42, expected: "zed://ssh/sol/tmp/my%20file.md" },
+  ] as const)("opens $editor at a file's line", ({ editor, expected, ...position }) => {
+    expect(
+      buildRemoteOpenUrl({
+        editor,
+        host: "sol",
+        absolutePath: "/tmp/my file.md",
+        isFile: true,
+        ...position,
+      }),
+    ).toBe(expected);
+  });
 });
