@@ -2079,6 +2079,8 @@ code {
 .chat-markdown-file-link {
   display: inline-block;
   user-select: text;
+  /* A long press opens the file link's own menu instead of the iOS link callout. */
+  -webkit-touch-callout: none;
   overflow-x: clip;
   text-overflow: ellipsis;
   white-space: nowrap;

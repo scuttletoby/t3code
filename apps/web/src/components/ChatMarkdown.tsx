@@ -224,6 +224,7 @@ import {
 import { MarkdownExternalLinkContent } from "./chat/MarkdownExternalLink";
 import { MarkdownFileLink } from "./chat/MarkdownFileLink";
 import { canUseMarkdownFileShellActions } from "./chat/MarkdownFileLink.logic";
+import { useForkMarkdownFileRemoteEditor } from "./chat/forkMarkdownFileLinkActions"; // Fork
 import { handleMarkdownFragmentClick } from "./chat/markdownFragments";
 import { hastHasText, hastPlainTextDeep, plainHastText } from "./chat/markdownHast.logic";
 import {
@@ -749,6 +750,7 @@ function useChatMarkdownState(
     ).data ?? undefined;
   const [preferredEditor] = usePreferredEditor(availableEditors);
   const preferredEditorMenuLabel = openInEditorMenuLabel(preferredEditor, messages);
+  const forkRemoteEditor = useForkMarkdownFileRemoteEditor(remoteOpen.state, cwd, messages); // Fork
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors, cwd);
   const openInEditor = useAtomCommand(shellEnvironment.openInEditor, {
     reportFailure: false,
@@ -1063,12 +1065,27 @@ function useChatMarkdownState(
           markdownFileCopyPaths(fileLinkMeta, await resolveHostPath(), cwd)
         }
         onOpenInPanel={(path) => openFileInPanel(fileLinkMeta, path)}
+        onOpenFullSize={
+          threadRef && panelPath
+            ? () => {
+                openFileInPanel(fileLinkMeta, panelPath);
+                useRightPanelStore.getState().setMaximized(threadRef, true);
+              }
+            : undefined
+        }
         onOpenMedia={
           threadRef && canPreviewMedia
             ? () => openMarkdownMedia(mediaPath, fileLinkMeta.filePath)
             : undefined
         }
         openInEditorMenuLabel={canOpenApp ? gt("Open app") : preferredEditorMenuLabel}
+        // Fork: over SSH the viewing device's editor opens the file, and the menu names it.
+        {...forkRemoteEditor?.linkProps({
+          canOpenApp,
+          canUseShellActions,
+          fileLinkMeta,
+          resolveAbsolutePath: async () => (await resolveHostPath()).absolutePath,
+        })}
         onReveal={
           canUseShellActions && revealInFileManagerLabel !== undefined
             ? async () => revealFileInFileManager((await resolveHostPath()).absolutePath)
