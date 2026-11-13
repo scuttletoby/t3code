@@ -8,9 +8,10 @@ only for a head that holds exactly the change the review read.
 This folder is built in four stacked pull requests:
 
 1. the review rules and the config (`lens.py`, `config.py`);
-2. the queue itself (`pr_queue.py`, section "The queue"): this part;
+2. the queue itself (`pr_queue.py`, section "The queue");
 3. armed pull requests that cannot merge (a red required check, or one that
-   ended without passing or never reported) are told once and passed over;
+   ended without passing or never reported) are told once and passed over:
+   this part;
 4. the "red only because the base was red" rule, the reusable workflow
    `.github/workflows/fork-pr-queue.yml`, `action.yml` and the usage sections
    of this file.
@@ -110,6 +111,24 @@ first, and acts on the first one it can:
 A pull request in a merge state the queue neither updates nor waits for (a
 conflict, `DIRTY`) is passed over, and the run says so.
 
+An armed pull request that cannot merge does not hold the queue. It is told
+why on the pull request, once per head, check and reason, and passed over:
+
+- a required check whose newest run failed (`FAILURE`, `ERROR`, `TIMED_OUT`,
+  or `CANCELLED` after a red with nothing green since), behind or not. Its
+  author fixes it; nothing in the queue re-runs it.
+- up to date, and a required check's newest run ended without passing and
+  without a red (`CANCELLED`, `STARTUP_FAILURE`, `STALE`, ...): nothing
+  re-runs it by itself. The comment says to re-run the CI run or push.
+- up to date, and a required check never reported although no workflow runs
+  on the head any more. The comment says to push or merge the base: a re-run
+  repeats the jobs of the workflow files the head was built with, so it cannot
+  add a check those files do not have (one added or renamed since).
+
+Only the newest run of a check counts, and a check not in `required_checks` is
+ignored. When GitHub cannot say which workflows still run on the head, the
+pull request is not called stuck: it holds the queue, and the run says why.
+
 `gh` must be logged in for the repository (`GH_TOKEN`). Git fetches into the
 queue's own bare repository (`--cache`) and gets its login from
 `gh auth git-credential` only, never from a helper the machine configured.
@@ -177,4 +196,8 @@ everything project-specific comes from the config; `STATE` names its
 repository; exit 3 (was 2) means "may be off and silent", so that 2 can mean
 "refused"; the step that adopted an older queue's state file is gone; and the
 queue's own advice in a comment keeps its backticks and `<sha>` placeholder
-(`lens.no_lens_text(keep_markdown=True)`), which the source dropped.
+(`lens.no_lens_text(keep_markdown=True)`), which the source dropped. For a
+required check that never reported, the comment says to push or merge the
+base; the source said to re-run, which cannot add a check the head's workflow
+files do not have. With two red checks the comment names the first by name
+(the source named whichever the check list gave first).

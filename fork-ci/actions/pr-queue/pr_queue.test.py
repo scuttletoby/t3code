@@ -949,6 +949,237 @@ class OwnCache(Base):
         self.assertEqual(os.stat(self.q.cache).st_mode & 0o777, 0o700)
 
 
+class RedChecks(unittest.TestCase):
+    """Only the newest run of a check counts, and an armed PR the queue skips says why on the PR."""
+    H = 'd4' * 20
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix='pr-queue-red-')
+        self.addCleanup(shutil.rmtree, d, True)
+        self.q = make_queue(d)
+
+    @staticmethod
+    def rollup(*runs, name='review-check'):
+        return [{'__typename': 'CheckRun', 'workflowName': 'ci', 'name': name, 'startedAt': s, 'conclusion': c}
+                for s, c in runs]
+
+    def failing(self, *runs, name='review-check'):
+        return self.q.failing({'statusCheckRollup': self.rollup(*runs, name=name)})
+
+    def test_an_older_red_under_a_newer_green_is_not_failing(self):
+        self.assertIsNone(self.failing(('2026-11-09T01:00:00Z', 'FAILURE'), ('2026-11-09T02:00:00Z', 'SUCCESS')))
+
+    def test_a_newer_red_over_an_older_green_is_failing(self):
+        self.assertEqual(self.failing(('2026-11-09T02:00:00Z', 'FAILURE'), ('2026-11-09T01:00:00Z', 'SUCCESS')),
+                         'review-check')
+
+    def test_a_newest_timed_out_run_is_failing_and_a_cancelled_one_is_not(self):
+        self.assertEqual(self.failing(('2026-11-09T02:00:00Z', 'TIMED_OUT')), 'review-check')
+        self.assertIsNone(self.failing(('2026-11-09T02:00:00Z', 'CANCELLED')))
+
+    def test_a_red_that_only_a_cancelled_run_followed_still_stands(self):
+        self.assertEqual(self.failing(('2026-11-09T01:00:00Z', 'FAILURE'), ('2026-11-09T02:00:00Z', 'CANCELLED')),
+                         'review-check')
+
+    def test_a_green_that_a_cancelled_run_followed_is_not_red(self):
+        self.assertIsNone(self.failing(('2026-11-09T01:00:00Z', 'SUCCESS'), ('2026-11-09T02:00:00Z', 'CANCELLED')))
+
+    def test_a_check_that_is_not_required_is_ignored(self):
+        self.assertIsNone(self.failing(('2026-11-09T02:00:00Z', 'FAILURE'), name='lint'))
+
+    def test_two_red_checks_name_the_first_by_name(self):
+        rollup = self.rollup(('2026-11-09T02:00:00Z', 'FAILURE'), name='test') + \
+            self.rollup(('2026-11-09T02:00:00Z', 'FAILURE'), name='build')
+        self.assertEqual(self.q.failing({'statusCheckRollup': rollup}), 'build')
+
+    def sweep(self, state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE'),), comments=(), head=None, dry=False,
+              fail=(), name='review-check'):
+        self.posted, self.updated = [], []
+        listed = [{'number': 7, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1}, 'mergeStateStatus': state,
+                   'createdAt': '2026-11-07T00:00:00Z', 'statusCheckRollup': self.rollup(*runs, name=name)}]
+
+        def gh(*a):
+            if a[:2] == ('pr', 'list'):
+                return ok(json.dumps(listed))
+            if a[:2] == ('pr', 'view'):
+                if 'view' in fail:
+                    return failed('boom')
+                return ok(json.dumps({'headRefOid': head or self.H, 'comments': [{'body': b} for b in comments]}))
+            if a[:2] == ('pr', 'comment'):
+                self.posted.append(a[-1])
+                return failed('boom') if 'comment' in fail else ok()
+            raise AssertionError(a)
+        self.q.gh = gh
+        self.q.update = lambda n, d: self.updated.append(n) or 0
+        return run_quiet(self.q.run, dry)[0]
+
+    def test_a_red_armed_pr_is_told_whether_or_not_it_is_behind(self):
+        for state in ('BEHIND', 'BLOCKED', 'UNSTABLE'):
+            with self.subTest(state=state):
+                self.sweep(state)
+                self.assertEqual((len(self.posted), self.updated), (1, []))
+                self.assertIn(f'required check review-check is red on {self.H[:12]}', self.posted[0])
+
+    def test_a_red_then_cancelled_armed_pr_is_told_and_does_not_hold_the_queue(self):
+        runs = (('2026-11-09T01:00:00Z', 'FAILURE'), ('2026-11-09T02:00:00Z', 'CANCELLED'))
+        for state in ('BLOCKED', 'BEHIND'):
+            with self.subTest(state=state):
+                self.sweep(state, runs=runs)
+                self.assertEqual((len(self.posted), self.updated), (1, []))
+
+    def test_the_message_promises_no_re_run(self):   # nothing in the queue re-runs a red check
+        for name in ('review-check', 'build'):
+            with self.subTest(name=name):
+                self.sweep(name=name)
+                self.assertNotIn('re-run', self.posted[0])
+
+    def test_only_the_head_check_is_pointed_at_the_ready_command(self):   # the lenses are about the head check alone
+        self.sweep()
+        self.assertIn('`tool ready 7`', self.posted[0])
+        self.sweep(name='build')
+        self.assertNotIn('tool ready', self.posted[0])
+
+    def test_it_is_told_once_per_head(self):
+        self.sweep()
+        first = self.posted[0]
+        self.sweep(comments=[first])
+        self.assertEqual(self.posted, [])
+        self.sweep(comments=[first], head='e5' * 20)
+        self.assertEqual(len(self.posted), 1, 'a new head that is red is a new message')
+
+    def test_a_dry_run_posts_nothing(self):
+        self.sweep(dry=True)
+        self.assertEqual(self.posted, [])
+
+    def test_a_failed_comment_or_read_does_not_stop_the_queue(self):
+        for fail in ('comment', 'view'):
+            with self.subTest(fail=fail):
+                self.assertEqual(self.sweep(fail=(fail,)), 0)
+
+    def test_an_older_red_no_longer_skips_the_pr(self):
+        self.sweep(runs=(('2026-11-09T01:00:00Z', 'FAILURE'), ('2026-11-09T02:00:00Z', 'SUCCESS')))
+        self.assertEqual((self.posted, self.updated), ([], [7]))
+
+    def test_the_message_can_never_count_as_a_lens(self):
+        self.sweep()
+        post = {'body': self.posted[0], 'author': {'login': 'owner'}}
+        self.assertIsNone(REVIEW.lens_problem(post))
+        self.assertEqual(REVIEW.reviewed_head({'comments': [post], 'reviews': []}), (False, None, 'no lens comments'))
+
+
+class StuckUpToDate(unittest.TestCase):
+    """An armed, up-to-date PR whose required check ended without passing (cancelled) or never reported cannot merge,
+    and nothing re-runs that check. It is told once per head and passed over; it does not hold the queue."""
+    H1, H2 = 'e1' * 20, 'f2' * 20
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix='pr-queue-stuck-')
+        self.addCleanup(shutil.rmtree, d, True)
+        self.q = make_queue(d)
+
+    @staticmethod
+    def checks(**states):   # every required check green, except the ones named (None: the check never reported)
+        out = []
+        for name in sorted(CFG.required_checks):
+            state = states.get(name.replace('-', '_'), 'SUCCESS')
+            if state is None:
+                continue
+            run = {'__typename': 'CheckRun', 'workflowName': 'ci', 'name': name, 'startedAt': '2026-11-11T01:00:00Z',
+                   'status': 'COMPLETED', 'conclusion': state}
+            if state == 'IN_PROGRESS':
+                run.update(status='IN_PROGRESS', conclusion='')
+            out.append(run)
+        return out
+
+    def sweep(self, first, comments=(), runs='[]', runs_fail=False, dry=False):
+        """#1 (oldest): up to date (BLOCKED) with rollup `first`; #2: BEHIND and green."""
+        self.posted, self.updated, self.asked = [], [], []
+        listed = [{'number': 1, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1}, 'mergeStateStatus': 'BLOCKED',
+                   'createdAt': '2026-11-07T00:00:01Z', 'statusCheckRollup': first, 'headRefOid': self.H1,
+                   'baseRefName': 'main'},
+                  {'number': 2, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1}, 'mergeStateStatus': 'BEHIND',
+                   'createdAt': '2026-11-07T00:00:02Z', 'statusCheckRollup': self.checks(), 'headRefOid': self.H2,
+                   'baseRefName': 'main'}]
+
+        def gh(*a):
+            if a[:2] == ('pr', 'list'):
+                return ok(json.dumps(listed))
+            if a[:2] == ('pr', 'view'):
+                return ok(json.dumps({'headRefOid': self.H1, 'comments': [{'body': b} for b in comments]}))
+            if a[:2] == ('pr', 'comment'):
+                self.posted.append(a[-1])
+                return ok()
+            if a[:2] == ('run', 'list'):
+                self.asked.append(a[a.index('--commit') + 1])
+                return failed('boom') if runs_fail else ok(runs)
+            raise AssertionError(a)
+        self.q.gh = gh
+        self.q.update = lambda n, d: self.updated.append(n) or 0
+        return run_quiet(self.q.run, dry)
+
+    def test_a_cancelled_required_check_is_told_and_passed_over(self):
+        code, out = self.sweep(self.checks(build='CANCELLED'))
+        self.assertEqual((code, self.updated, len(self.posted)), (0, [2], 1), out)
+        self.assertIn(f'required check build ended CANCELLED on {self.H1[:12]}', self.posted[0])
+        self.assertIn('Re-run failed jobs', self.posted[0])
+        self.assertNotIn('tool ready', self.posted[0])
+
+    def test_a_rerun_tells_it_once_per_head_and_still_moves_on(self):
+        self.sweep(self.checks(review_check='CANCELLED'))
+        first = self.posted[0]
+        self.sweep(self.checks(review_check='CANCELLED'), comments=[first])
+        self.assertEqual((self.posted, self.updated), ([], [2]))
+        self.assertNotIn('tool ready', first, 'a cancelled head check needs a re-run, not new lenses')
+
+    def test_other_ended_states_count_too(self):   # check_state's rule: only an unfinished check is running
+        for state in ('STARTUP_FAILURE', 'STALE', 'ACTION_REQUIRED'):
+            with self.subTest(state=state):
+                self.sweep(self.checks(test=state))
+                self.assertEqual(self.updated, [2])
+                self.assertIn(f'ended {state}', self.posted[0])
+                self.assertIn('Re-run failed jobs', self.posted[0])
+
+    def test_a_re_run_of_the_cancelled_check_holds_the_queue_again(self):   # the newest run counts: it is running
+        rerun = self.checks(build='CANCELLED') + [{'__typename': 'CheckRun', 'workflowName': 'ci', 'name': 'build',
+                                                   'status': 'QUEUED', 'conclusion': ''}]
+        code, out = self.sweep(rerun)
+        self.assertEqual((code, self.updated, self.posted), (0, [], []), out)
+        self.assertIn('#1 is up to date and waiting', out)
+
+    def test_green_or_running_checks_still_hold_the_queue(self):
+        for first in (self.checks(), self.checks(review_check='IN_PROGRESS'), []):
+            with self.subTest(first=len(first)):
+                code, out = self.sweep(first)
+                self.assertEqual((code, self.updated, self.posted, self.asked), (0, [], [], []), out)
+
+    def test_a_required_check_that_never_reports_is_told_once_nothing_runs(self):
+        code, out = self.sweep(self.checks(test=None), runs='[{"status": "completed", "workflowName": "ci"}]')
+        self.assertEqual((self.asked, self.updated, len(self.posted)), ([self.H1], [2], 1), out)
+        self.assertIn('required check test never reported', self.posted[0])
+
+    def test_a_check_that_never_reported_is_not_told_to_re_run(self):   # the source told it to re-run
+        # A re-run repeats the jobs of the workflow files the head was built with: a check added to the workflows
+        # after that never runs on a re-run. Only a push or a merge of the base runs the current workflows.
+        self.sweep(self.checks(test=None), runs='[{"status": "completed", "workflowName": "ci"}]')
+        told = self.posted[0]
+        self.assertNotIn('Re-run failed jobs', told, 'a re-run cannot add a check its workflow files do not have')
+        self.assertIn('A re-run cannot add it', told)
+        self.assertIn('`tool push`', told)
+        self.assertIn('merge main into it', told)
+
+    def test_a_missing_check_waits_while_a_workflow_runs_or_when_runs_are_unknown(self):
+        for kw in ({'runs': '[{"status": "in_progress", "workflowName": "ci"}]'}, {'runs_fail': True}, {'runs': 'x'}):
+            with self.subTest(**kw):
+                code, out = self.sweep(self.checks(test=None), **kw)
+                self.assertEqual((code, self.updated, self.posted), (0, [], []), out)
+        self.assertIn('is unknown: waiting', out, 'an unknown answer is said, not treated as "nothing runs"')
+
+    def test_a_dry_run_posts_nothing_and_says_what_it_skips(self):
+        code, out = self.sweep(self.checks(build='CANCELLED'), dry=True)
+        self.assertEqual((self.posted, self.updated), ([], [2]))
+        self.assertIn('skip #1: up to date, but required check build ended CANCELLED', out)
+
+
 # --- the source project's lens-review cases for the queue ------------------------------------------------------------
 HEAD = 'def wipe(player, island):\n'
 READ = HEAD + "    if is_admin(player):\n        log.info('wipe')\n        wipe_island(island)\n"   # only an admin wipes
