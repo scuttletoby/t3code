@@ -1,4 +1,4 @@
-// Fork only: every `*.test.*` under .github/scripts must be listed in .github/fork-ci-tests.txt.
+// Fork only: every `*.test.*` under .github/scripts and fork-ci must be listed in .github/fork-ci-tests.txt.
 // A plain entry runs here by its extension (RUNNER); `<test> run by <file>` is run by that file,
 // which must name the test and cannot be a (disabled) upstream workflow. Unlisted or runner-less
 // tests fail; a listed test that is gone fails once the tested history had it, a note before.
@@ -8,7 +8,7 @@ const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "../..");
 const LIST = ".github/fork-ci-tests.txt";
-const SCRIPTS = ".github/scripts";
+const TEST_DIRS = [".github/scripts", "fork-ci"];
 const TEST_FILE = /\.test\.([^./]+)$/;
 const RUNNER = {
   sh: ["bash"],
@@ -83,6 +83,14 @@ function findTests(dir, root = ROOT) {
   return out.toSorted();
 }
 
+// Every test file under TEST_DIRS. A folder that is not there adds none: a listed test in it is then
+// missing, which plan() reports (a failure once the tested history had it).
+function presentTests(root = ROOT) {
+  return TEST_DIRS.filter((dir) => fs.existsSync(path.join(root, dir))).flatMap((dir) =>
+    findTests(dir, root),
+  );
+}
+
 function git(args) {
   return childProcess.execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
 }
@@ -113,7 +121,7 @@ function readFile(file) {
 
 function main() {
   const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8"));
-  const result = plan(entries, findTests(SCRIPTS), everInHistory, readFile);
+  const result = plan(entries, presentTests(), everInHistory, readFile);
   const rows = [];
   let failed =
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
@@ -167,6 +175,6 @@ function main() {
   if (failed) process.exitCode = 1;
 }
 
-module.exports = { plan, readList, findTests };
+module.exports = { plan, readList, findTests, presentTests };
 
 if (require.main === module) main();
