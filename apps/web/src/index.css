@@ -2043,6 +2043,8 @@ code {
    prose stay inline-level down to the icon and label. */
 .chat-markdown-file-link {
   display: inline-block;
+  /* A long press opens the file link's own menu instead of the iOS link callout. */
+  -webkit-touch-callout: none;
   overflow-x: clip;
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -189,12 +189,47 @@ export const isLocalEditorFileUrl = (url: URL): boolean =>
   url.password.length === 0 &&
   url.pathname.length > 1;
 
+// Resolves `.` and `..` the way a URL parser would, but never above the root (or a Windows drive):
+// in remote editor URLs the host is the path segment before the file path, so a `..` left in the
+// path removes the host and the next segment becomes the host.
+const normalizeRootedPath = (rootedPath: string): string => {
+  const segments: string[] = [];
+  const parts = rootedPath.slice(1).split("/");
+  const driveRoot = /^[A-Za-z]:$/.test(parts[0] ?? "") ? 1 : 0;
+  for (const part of parts) {
+    if (part === ".") continue;
+    if (part === "..") {
+      if (segments.length > driveRoot) segments.pop();
+      continue;
+    }
+    segments.push(part);
+  }
+  return `/${segments.join("/")}`;
+};
+
+const rootPath = (absolutePath: string): string => {
+  const posixPath = absolutePath.replaceAll("\\", "/");
+  return posixPath.startsWith("/") ? posixPath : `/${posixPath}`;
+};
+
+// The built URL is what Electron and the OS handler parse; refuse any that a parser reads
+// differently (another host, path or authority) instead of trusting that encoding covered it.
+const parsesToItself = (url: string): string | undefined => {
+  try {
+    return new URL(url).href === url ? url : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 export const buildRemoteOpenUrl = (input: {
   readonly editor: EditorId;
   readonly host: string;
   readonly username?: string;
   readonly absolutePath: string;
   readonly isFile?: boolean;
+  readonly line?: number;
+  readonly column?: number;
 }): string | undefined => {
   const scheme = remoteSchemeForEditor(input.editor);
   if (scheme === undefined) {
@@ -206,16 +241,16 @@ export const buildRemoteOpenUrl = (input: {
       h: input.host,
       launchIde: "true",
       ideHint: editor.jetbrainsProductCode,
+      // A query value, so dot segments cannot reach the host here.
       projectHint: input.absolutePath.replaceAll("\\", "/"),
     });
     if (input.username !== undefined) {
       params.set("u", input.username);
     }
-    return `${scheme}://gateway/ssh/environment?${params.toString()}`;
+    return parsesToItself(`${scheme}://gateway/ssh/environment?${params.toString()}`);
   }
   // Windows server paths (`C:\...`) appear as `/C:/...` in vscode-remote URIs.
-  const posixPath = input.absolutePath.replaceAll("\\", "/");
-  const rootedPath = posixPath.startsWith("/") ? posixPath : `/${posixPath}`;
+  const rootedPath = normalizeRootedPath(rootPath(input.absolutePath));
   const encodedHost = encodeURIComponent(input.host);
   if (input.editor === "zed") {
     // Zed roots paths on the system drive, so omit the Windows drive prefix.
@@ -226,7 +261,7 @@ export const buildRemoteOpenUrl = (input: {
       input.username === undefined
         ? encodedHost
         : `${encodeURIComponent(input.username)}@${encodedHost}`;
-    return `${scheme}://ssh/${zedDestination}${encodedZedPath}`;
+    return parsesToItself(`${scheme}://ssh/${zedDestination}${encodedZedPath}`);
   }
   const encodedPath = rootedPath.split("/").map(encodeURIComponent).join("/");
   const plainDestination =
@@ -240,7 +275,10 @@ export const buildRemoteOpenUrl = (input: {
       ).join("")
     : plainDestination;
   // VS Code opens a bare vscode-remote path as a folder; a trailing position makes it open the file.
-  return `${scheme}://vscode-remote/ssh-remote+${encodeURIComponent(destination)}${encodedPath}${input.isFile ? ":1:1" : ""}`;
+  const position = input.isFile ? `:${input.line ?? 1}:${input.column ?? 1}` : "";
+  return parsesToItself(
+    `${scheme}://vscode-remote/ssh-remote+${encodeURIComponent(destination)}${encodedPath}${position}`,
+  );
 };
 
 export const RemoteOpenTargetKind = Schema.Literals(["tailscale", "mdns"]);

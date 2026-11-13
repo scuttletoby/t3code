@@ -11,7 +11,8 @@ import { AsyncResult } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 import { userEvent } from "vite-plus/test/browser";
 
-import { act, render } from "../../test/render";
+import { act, fakeTimers, render } from "../../test/render";
+import type { RemoteOpenState } from "../remoteOpen";
 import { useRightPanelStore } from "../rightPanelStore";
 
 const state = vi.hoisted(() => ({
@@ -25,6 +26,10 @@ const state = vi.hoisted(() => ({
   openFile: vi.fn(),
   openExternal: vi.fn(),
   copy: vi.fn(),
+  openRemote: vi.fn(),
+  setMaximized: vi.fn(),
+  remote: { mode: "local-exec" } as RemoteOpenState,
+  connection: null as { httpBaseUrl: string } | null,
   pullRequests: [] as ThreadPullRequestLink[],
 }));
 
@@ -49,8 +54,11 @@ vi.mock(import("../state/session"), async (original) => {
   const readEnvironmentScope = (id: EnvironmentId | null, scope: AuthEnvironmentScope) =>
     id !== null &&
     (scope !== AuthOrchestrationOperateScope || id !== threadRef.environmentId || state.allowed);
+  const actual = await original();
   return {
-    ...(await original()),
+    ...actual,
+    readPreparedConnection: ((id: EnvironmentId) =>
+      state.connection ?? actual.readPreparedConnection(id)) as never,
     readEnvironmentScope,
     useEnvironmentScope: (id: EnvironmentId | null, scope: AuthEnvironmentScope) =>
       useSyncExternalStore(
@@ -81,7 +89,9 @@ vi.mock(import("../state/entities"), async (original) => ({
 }));
 vi.mock(import("../remoteOpen"), async (original) => ({
   ...(await original()),
-  useRemoteOpenResolution: () => ({ state: { mode: "local-exec" }, isResolved: true }) as never,
+  useRemoteOpenResolution: () => ({ state: state.remote, isResolved: true }) as never,
+  useRemoteCapableEditors: () => ["vscode"],
+  openRemoteEditorUrl: state.openRemote,
 }));
 vi.mock(import("../hooks/useLocalStorage"), async (original) => ({
   ...(await original()),
@@ -139,10 +149,14 @@ function setup() {
   state.choose.mockReset().mockResolvedValue(null);
   state.openFile.mockReset();
   state.openExternal.mockReset().mockResolvedValue(undefined);
+  state.openRemote.mockReset().mockResolvedValue(true);
+  state.setMaximized.mockReset();
+  state.remote = { mode: "local-exec" };
+  state.connection = null;
   state.copy.mockReset().mockResolvedValue(undefined);
-  const { openFile } = useRightPanelStore.getState();
-  useRightPanelStore.setState({ openFile: state.openFile });
-  stack.defer(() => useRightPanelStore.setState({ openFile }));
+  const { openFile, setMaximized } = useRightPanelStore.getState();
+  useRightPanelStore.setState({ openFile: state.openFile, setMaximized: state.setMaximized });
+  stack.defer(() => useRightPanelStore.setState({ openFile, setMaximized }));
   stack.use(vi.spyOn(navigator.clipboard, "writeText").mockImplementation(state.copy));
   stack.use(
     vi.spyOn(navigator.clipboard, "write").mockImplementation(async (items) => {
@@ -187,11 +201,13 @@ it("removes host actions after revocation while keeping file preview and copying
   using _setup = setup();
   await using screen = await renderMarkdown("[Readme](docs/readme.md)");
   await screen.openContextMenu();
-  expect(offeredActions()).toEqual(["open", "reveal", "copy-relative", "copy-full"]);
+  const fileActions = ["open-in-panel", "open-full-size"];
+  const copies = ["download", "copy-relative", "copy-full"];
+  expect(offeredActions()).toEqual([...fileActions, "open", "reveal", ...copies]);
   await setAllowed(false);
   state.choose.mockResolvedValue("copy-full");
   await screen.openContextMenu();
-  expect(offeredActions()).toEqual(["copy-relative", "copy-full"]);
+  expect(offeredActions()).toEqual([...fileActions, ...copies]);
   await vi.waitFor(() => expect(state.copy).toHaveBeenCalledWith("/work/docs/readme.md"));
   await act(async () => screen.anchor().click());
   expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined);
@@ -308,7 +324,11 @@ it("preserves keyboard activation of a file-options button", async () => {
       copyMarkdown="[Readme](readme.md)"
       theme="dark"
       onOpenInPanel={vi.fn()}
-      resolveCopyPaths={async () => ({ relativePath: "readme.md", fullPath: "/work/readme.md" })}
+      resolveCopyPaths={async () => ({
+        relativePath: "readme.md",
+        fullPath: "/work/readme.md",
+        pathOnly: "/work/readme.md",
+      })}
       openInEditorMenuLabel="Open in editor"
     />,
   );
@@ -321,4 +341,264 @@ it("preserves keyboard activation of a file-options button", async () => {
   }
   await userEvent.click(button);
   await vi.waitFor(() => expect(state.choose.mock.lastCall?.[2]).toBe("mouse"));
+});
+
+it("opens a remote environment's file in this machine's editor at the linked line", async () => {
+  using _setup = setup();
+  state.remote = { mode: "remote-links", host: { kind: "ssh-alias", host: "devbox" } };
+  state.choose.mockResolvedValue("open");
+  await using screen = await renderMarkdown("[Setup](</work/my scripts/setup.ps1#L12>)");
+  await screen.openContextMenu();
+  expect(state.choose.mock.lastCall![0]).toContainEqual({ id: "open", label: "Open in VS Code" });
+  await vi.waitFor(() =>
+    expect(state.openRemote).toHaveBeenCalledExactlyOnceWith(
+      "vscode://vscode-remote/ssh-remote+devbox/work/my%20scripts/setup.ps1:12:1",
+    ),
+  );
+  expect(state.openEditor).not.toHaveBeenCalled();
+
+  await act(async () => screen.anchor().click());
+  expect(state.openFile).toHaveBeenCalledWith(threadRef, "my scripts/setup.ps1", 12);
+});
+
+it("opens a file full size and downloads it from the environment", async () => {
+  using _setup = setup();
+  using disposables = new DisposableStack();
+  const stack = (disposable: Disposable) => disposables.use(disposable);
+  state.choose.mockResolvedValueOnce("open-full-size").mockResolvedValueOnce("download");
+  await using screen = await renderMarkdown("[Readme](/work/docs/readme.md:3)");
+  await screen.openContextMenu();
+  expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", 3);
+  expect(state.setMaximized).toHaveBeenCalledWith(threadRef, true);
+
+  state.connection = { httpBaseUrl: "http://environment.test/" };
+  state.search.mockResolvedValue(AsyncResult.success({ relativeUrl: "/api/assets/readme?t=1" }));
+  const fetched: string[] = [];
+  stack(
+    vi.spyOn(window, "fetch").mockImplementation(async (input) => {
+      fetched.push(String(input));
+      return new Response("# Readme");
+    }),
+  );
+  const saved: { name: string; text: Promise<string> }[] = [];
+  const click = HTMLAnchorElement.prototype.click;
+  stack(
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      if (!this.download) return click.call(this);
+      saved.push({ name: this.download, text: fetch(this.href).then((r) => r.text()) });
+    }),
+  );
+  await screen.openContextMenu();
+  await vi.waitFor(() => expect(saved).toHaveLength(1));
+  expect(state.search).toHaveBeenCalledWith({
+    environmentId: threadRef.environmentId,
+    input: {
+      resource: {
+        _tag: "media-file",
+        threadId: threadRef.threadId,
+        path: "/work/docs/readme.md",
+        disposition: "attachment",
+      },
+    },
+  });
+  expect(fetched[0]).toBe("http://environment.test/api/assets/readme?t=1");
+  expect(saved[0]!.name).toBe("readme.md");
+  expect(await saved[0]!.text).toBe("# Readme");
+});
+
+it("opens the file menu on a touch long press instead of following the link", async () => {
+  using _setup = setup();
+  await using screen = await renderMarkdown("[Readme](/work/docs/readme.md)");
+  using _timers = fakeTimers();
+  const press = (type: string) =>
+    screen
+      .anchor()
+      .dispatchEvent(
+        new PointerEvent(type, { bubbles: true, pointerType: "touch", clientX: 5, clientY: 5 }),
+      );
+  await act(async () => {
+    press("pointerdown");
+    vi.advanceTimersByTime(500);
+    press("pointerup");
+  });
+  expect(state.choose).toHaveBeenCalledOnce();
+  expect(state.choose.mock.lastCall?.[2]).toBe("mouse");
+  await screen.openContextMenu();
+  // The click that ends a touch press has detail 1; element.click() is keyboard-like (detail 0).
+  await act(async () =>
+    screen
+      .anchor()
+      .dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 })),
+  );
+  expect(state.choose).toHaveBeenCalledOnce();
+  expect(state.openFile).not.toHaveBeenCalled();
+});
+
+function touch(target: Element, type: string, point = 5) {
+  target.dispatchEvent(
+    new PointerEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      pointerType: "touch",
+      clientX: point,
+      clientY: point,
+    }),
+  );
+}
+
+it.each([
+  { platform: "Android (contextmenu while held)", liftFirst: false },
+  { platform: "Windows touch (contextmenu on lift)", liftFirst: true },
+])(
+  "keeps the real long-press menu open when $platform sends its own contextmenu late",
+  async ({ liftFirst }) => {
+    using _setup = setup();
+    const { dismissContextMenu, showContextMenuFallback } = await import("../contextMenuFallback");
+    let shown: Promise<unknown> = Promise.resolve(undefined);
+    state.choose.mockImplementation((items, position) => {
+      shown = showContextMenuFallback(items, position);
+      return shown;
+    });
+    await using screen = await renderMarkdown("[Readme](/work/docs/readme.md)");
+    // The full set, so the menu's own animation frames (which arm its outside-click dismissal)
+    // advance with the clock.
+    using _timers = fakeTimers();
+    const menu = () => document.querySelector('[data-context-menu="true"]');
+    try {
+      await act(async () => {
+        touch(screen.anchor(), "pointerdown");
+        vi.advanceTimersByTime(500);
+      });
+      expect(menu()).not.toBeNull();
+      await act(async () => {
+        // The platform's touch & hold delay runs past the menu's arming frames.
+        vi.advanceTimersByTime(500);
+        if (liftFirst) touch(screen.anchor(), "pointerup");
+        screen.anchor().dispatchEvent(
+          new MouseEvent("contextmenu", {
+            bubbles: true,
+            cancelable: true,
+            clientX: 5,
+            clientY: 5,
+          }),
+        );
+        if (!liftFirst) touch(screen.anchor(), "pointerup");
+        vi.advanceTimersByTime(100);
+      });
+      expect(menu()).not.toBeNull();
+      expect(state.choose).toHaveBeenCalledOnce();
+      // The next real gesture still dismisses the menu.
+      await act(async () => {
+        document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+        vi.advanceTimersByTime(100);
+      });
+      expect(menu()).toBeNull();
+      expect(await shown).toBeNull();
+    } finally {
+      dismissContextMenu();
+    }
+  },
+);
+
+it.each([
+  { press: "ends with a click", endingClick: true },
+  // Phones usually send no click after a long press that opened a menu.
+  { press: "ends with no click", endingClick: false },
+])(
+  "takes keyboard Enter and the menu key on a chip after a long press that $press",
+  async ({ endingClick }) => {
+    using _setup = setup();
+    await using screen = await renderMarkdown("[Readme](/work/docs/readme.md)");
+    {
+      using _timers = fakeTimers();
+      await act(async () => {
+        touch(screen.anchor(), "pointerdown");
+        vi.advanceTimersByTime(500);
+        touch(screen.anchor(), "pointerup");
+        // The click that ends the touch press is not an open.
+        if (endingClick) {
+          screen
+            .anchor()
+            .dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 }));
+        }
+      });
+    }
+    expect(state.choose).toHaveBeenCalledOnce();
+    expect(state.openFile).not.toHaveBeenCalled();
+
+    await act(async () => {
+      screen.anchor().focus();
+      screen.anchor().dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+      screen
+        .anchor()
+        .dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 0 }));
+    });
+    expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined);
+
+    await act(async () => {
+      screen
+        .anchor()
+        .dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "ContextMenu" }));
+      screen
+        .anchor()
+        .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    });
+    expect(state.choose).toHaveBeenCalledTimes(2);
+  },
+);
+
+it("takes a right-click and a new long press after a long press that got no late contextmenu", async () => {
+  // iOS sends no contextmenu for a long press, so nothing ends the wait for one but the next
+  // gesture.
+  using _setup = setup();
+  await using screen = await renderMarkdown("[Readme](/work/docs/readme.md)");
+  using _timers = fakeTimers();
+  const longPress = async () =>
+    act(async () => {
+      touch(screen.anchor(), "pointerdown");
+      vi.advanceTimersByTime(500);
+      touch(screen.anchor(), "pointerup");
+    });
+  const rightClick = async () =>
+    act(async () => {
+      screen.anchor().dispatchEvent(
+        new PointerEvent("pointerdown", {
+          bubbles: true,
+          cancelable: true,
+          pointerType: "mouse",
+          button: 2,
+          clientX: 5,
+          clientY: 5,
+        }),
+      );
+      screen.anchor().dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: 5,
+          clientY: 5,
+        }),
+      );
+    });
+  await longPress();
+  expect(state.choose).toHaveBeenCalledTimes(1);
+  await rightClick();
+  expect(state.choose).toHaveBeenCalledTimes(2);
+  await longPress();
+  expect(state.choose).toHaveBeenCalledTimes(3);
+  await rightClick();
+  expect(state.choose).toHaveBeenCalledTimes(4);
+  expect(state.openFile).not.toHaveBeenCalled();
+});
+
+it("does not open a menu for a chip that unmounts during a long press", async () => {
+  using _setup = setup();
+  const screen = await renderMarkdown("[Readme](/work/docs/readme.md)");
+  using _timers = fakeTimers();
+  await act(async () => touch(screen.anchor(), "pointerdown"));
+  await screen.unmount();
+  vi.advanceTimersByTime(1_000);
+  expect(state.choose).not.toHaveBeenCalled();
 });
