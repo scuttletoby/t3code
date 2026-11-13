@@ -31,6 +31,9 @@ done
 case "$method $path" in
   "GET repos/me/t3code") body='{"parent":{"full_name":"up/t3code"}}' ;;
   "GET repos/up/t3code/releases/latest") body="{\"tag_name\":\"$(cat "$api/upstream_latest")\"}" ;;
+  "GET repos/up/t3code/releases/tags/"*)
+    [[ -f "$api/up-release-${path##*/}" ]] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    body="$(cat "$api/up-release-${path##*/}")" ;;
   "GET repos/me/t3code/releases")
     [[ ! -e "$api/fail_list" ]] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
     body="$(cat "$api/releases.json")" ;;
@@ -58,6 +61,8 @@ git config --global advice.detachedHead false
 git config --global url."$root/gh/".insteadOf https://github.com/
 export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code
 unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY UPSTREAM UPSTREAM_URL ORIGIN
+# The cases below use stable tags; the nightly section sets the channel itself.
+export FORK_FOLLOW_CHANNEL=stable
 
 export FAKE_API="$root/api"
 
@@ -150,6 +155,90 @@ expect_refused "resolve: refuses a build below a published release (older ref af
   "v0.1.10-fork.3 is published and not below 0.1.9-fork.1" "$root/work" resolve
 echo '[{"id":5,"draft":true,"prerelease":false,"tag_name":"v0.1.10-fork.3"}]' > "$root/api/releases.json"
 expect_resolved "resolve: a higher draft does not block (updaters skip drafts)" 0.1.9-fork.1
+
+# --- the nightly channel (fork-channel.sh) ----------------------------------------------------
+# Upstream: u1 (v0.1.9) - n1 (v0.1.10-nightly.20261113.4630) - u3 (untagged, upstream main).
+nt=v0.1.10-nightly.20261113.4630
+nightly_upstream() {
+  rm -rf "$root/gh" "$root/upwork"
+  mkdir -p "$root/gh/up" "$root/gh/me"
+  git init -q --bare "$root/gh/up/t3code.git"
+  git init -q --bare "$root/gh/me/t3code.git"
+  git init -q "$root/upwork"
+  (
+    cd "$root/upwork"
+    git commit -q --allow-empty -m u1 && git tag v0.1.9
+    git commit -q --allow-empty -m n1 && git tag "$nt"
+    git commit -q --allow-empty -m u3
+    git push -q https://github.com/up/t3code.git main --tags
+  )
+}
+up_released() { echo "{\"tag_name\":\"$1\",\"draft\":${2:-false},\"prerelease\":true}" > "$root/api/up-release-$1"; }
+nightly_upstream
+reset_api
+up_released "$nt"
+new_fork "$nt"
+export FORK_FOLLOW_CHANNEL=nightly
+expect_resolved "nightly: a published nightly plus a fork commit is <nightly>.fork.1" "${nt#v}.fork.1"
+grep -qx "tag=$nt.fork.1" "$root/out" && pass "nightly: its tag is v<nightly>.fork.1" || fail "nightly: its tag is v<nightly>.fork.1"
+fork_tag "$nt.fork.1"
+expect_resolved "nightly: the next build counts the <nightly>.fork.N tags" "${nt#v}.fork.2"
+unset FORK_FOLLOW_CHANNEL
+expect_resolved "nightly: the default channel is nightly" "${nt#v}.fork.2"
+export FORK_FOLLOW_CHANNEL=nightly
+up_released "$nt" true
+expect_refused "nightly: a nightly whose upstream release is a draft is refused" "not published" "$root/work" resolve
+rm "$root/api/up-release-$nt"
+expect_refused "nightly: a nightly with no upstream release is refused" "Could not read up/t3code's release of $nt" "$root/work" resolve
+up_released "$nt"
+new_fork main
+expect_refused "nightly: untagged upstream commits after the nightly are refused" "unreleased" "$root/work" resolve
+new_fork v0.1.9
+expect_refused "nightly: a series with no nightly tag is refused" "contains no nightly" "$root/work" resolve
+FORK_FOLLOW_CHANNEL=beta expect_refused "nightly: an unknown channel is refused" "FORK_FOLLOW_CHANNEL is 'beta'" "$root/work" resolve
+
+# Ordering: a published fork release of a nightly is on the updaters' stable track, so it blocks
+# a lower build; an upstream-style nightly name (another track) does not.
+export FORK_FOLLOW_CHANNEL=stable
+reset_api v0.1.9
+echo "[{\"id\":5,\"draft\":false,\"prerelease\":false,\"tag_name\":\"$nt.fork.1\"}]" > "$root/api/releases.json"
+expect_refused "nightly: a published <nightly>.fork.1 blocks a lower build" "$nt.fork.1 is published and not below 0.1.9-fork.1" "$root/work" resolve
+echo '[{"id":5,"draft":false,"prerelease":true,"tag_name":"v0.1.11-nightly.20261114.1"}]' > "$root/api/releases.json"
+expect_resolved "nightly: an upstream-style nightly release (another track) does not block" 0.1.9-fork.1
+export FORK_FOLLOW_CHANNEL=nightly
+nightly_upstream
+reset_api
+up_released "$nt"
+new_fork "$nt"
+echo '[{"id":5,"draft":false,"prerelease":false,"tag_name":"v0.1.10-fork.4"}]' > "$root/api/releases.json"
+expect_resolved "nightly: <nightly>.fork.1 is above a stable fork release of the same X.Y.Z" "${nt#v}.fork.1"
+echo "[{\"id\":5,\"draft\":false,\"prerelease\":false,\"tag_name\":\"v0.1.10-nightly.20261113.4631.fork.1\"}]" > "$root/api/releases.json"
+expect_refused "nightly: a newer published nightly release blocks an older one" "4631.fork.1 is published and not below" "$root/work" resolve
+export FORK_FOLLOW_CHANNEL=stable
+
+# version_gt / newest_first (fork-channel.sh): numbers compare as numbers, forms rank as semver.
+. "$(dirname "$script")/fork-channel.sh"
+vcase() { # vcase A B WANT: version_gt A B exits WANT
+  local got=0
+  version_gt "$1" "$2" || got=$?
+  [[ "$got" == "$3" ]] && pass "version_gt $1 $2 -> $3" || { : > "$root/out"; fail "version_gt $1 $2 -> $3 (got $got)"; }
+}
+vcase v0.1.10-nightly.20261112.1000 v0.1.10-nightly.20261112.999 0
+vcase v0.1.10-nightly.20261113.1 v0.1.10-nightly.20261112.9999 0
+vcase v0.1.10-nightly.20261113.4630.fork.1 v0.1.10-nightly.20261113.4630 0
+vcase v0.1.10-nightly.20261113.4630.fork.10 v0.1.10-nightly.20261113.4630.fork.9 0
+vcase v0.1.10-nightly.20261113.4630.fork.9 v0.1.10-nightly.20261113.4631 1
+vcase 0.1.10-nightly.20261113.1.fork.1 v0.1.10-fork.3 0
+vcase v0.1.10-fork.1 v0.1.10 0
+vcase v0.1.11 v0.1.10-nightly.20261113.4630.fork.1 0
+vcase v0.1.10 v0.1.10 1
+vcase v0.1.10-rc.1 v0.1.9 2
+got="$(printf '%s\n' v0.1.10-nightly.20261112.999 v0.1.10-nightly.20261112.1000 v0.1.9 v0.1.10-nightly.20261112.1000.fork.2 | newest_first | tr '\n' ' ')"
+[[ "$got" == "v0.1.10-nightly.20261112.1000.fork.2 v0.1.10-nightly.20261112.1000 v0.1.10-nightly.20261112.999 v0.1.9 " ]] \
+  && pass "newest_first orders by version, not by name" || { echo "$got" > "$root/out"; fail "newest_first orders by version, not by name"; }
+printf 'v0.1.9\nv0.1.10-rc.1\n' | newest_first > /dev/null && fail "newest_first fails on a form it cannot order" \
+  || pass "newest_first fails on a form it cannot order"
+new_upstream
 
 # --- remove-drafts -----------------------------------------------------------------------------
 new_upstream
