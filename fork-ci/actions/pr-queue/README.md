@@ -208,7 +208,10 @@ message is the merge commit's first parent. `tested-base/` writes it only on a
 `pull_request` run whose checkout is exactly the run's merge commit (`HEAD` is
 `GITHUB_SHA`, with two parents, the second the event's pull request head).
 Otherwise it writes a warning and no note. It never fails the job, and a
-depth-1 checkout is enough.
+depth-1 checkout is enough. The pull request's own code runs in that job and
+could write such a note too. A forged note can only get a red pull request
+updated, or told that its base is the reason; it never re-arms one, because
+the re-arm still needs exactly the change the lenses read.
 
 ## Use it
 
@@ -216,7 +219,13 @@ The queue needs:
 
 - a self-hosted runner whose disk outlives the job, with git 2.38+, `gh` and
   `python3`: the plan in `--state-file` and the cache must be there for the
-  next run;
+  next run. That runner (or runner group) runs no `pull_request` job and no
+  other repository's job, as a user of its own, and the state and cache
+  folders are that user's alone: the token is in git's environment there, and
+  the plan decides what is re-armed ("The queue");
+- a required `head_check` that fails a head no lens read. The queue only
+  touches pull requests that are behind; without that check, a push to an
+  armed pull request that is already up to date merges unread;
 - a run after each push to the base branch and on a timer, so a pull request
   armed while the base is quiet is still picked up;
 - a token that can update branches, comment and merge (a fine-grained personal

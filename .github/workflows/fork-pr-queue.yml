@@ -9,7 +9,7 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: JSON for runs-on, a self-hosted runner whose disk outlives the job, e.g. '["self-hosted", "queue"]'.
+        description: JSON for runs-on, a self-hosted runner whose disk outlives the job and that runs no pull_request job (README, "Use it"), e.g. '["self-hosted", "queue"]'.
         type: string
         required: true
       config:
