@@ -1,7 +1,8 @@
 # Host tools: agents on a person's own computer (design, no code)
 
-Status: design for review, revision 3. Fork feature, not upstream. Nothing here names a real machine, person or
-address; those live in each install's local settings.
+Status: design for review, revision 4 (owner decisions of 2026-11-13 on the second security review folded in). Fork
+feature, not upstream. Nothing here names a real machine, person or address; those live in each install's local
+settings.
 
 ## In short
 
@@ -9,9 +10,10 @@ address; those live in each install's local settings.
   another of your computers: "I want X done". The agent works out the fastest, best route itself: files, commands, the
   apps' own automation, app-side bridges, accessibility elements, and the mouse and keyboard only as the last resort.
 - **Scope (owner decision 2026-11-13):** the agent may use the **whole computer except sensitive things**: keys, `.env`
-  files, credentials, password fields and secret stores. It looks only at what the task needs. When it needs something
-  more specific (the short high-risk list in §4.2), it **asks once with a list**: "Can I use X, Y and Z?". Your answers
-  are remembered for the scope you choose. This replaces a per-app allow list.
+  files, credentials, password fields and secret stores. It may read system areas too (not their secrets). It looks
+  only at what the task needs. When it needs something more specific (the short high-risk list in §4.2), it **asks
+  once with a list**: "Can I use X, Y and Z?". Your answers are remembered for the scope you choose. This replaces a
+  per-app allow list.
 - **Speed first:** the computer runs a whole list of steps locally, with waits like "until this button appears", and
   sends back only what changed. One network hop and one model turn do the work that takes classic computer use dozens
   of screenshot-and-click turns (§7, §8). When the agent is unsure which of two ways works, it tries both at once on
@@ -21,34 +23,43 @@ address; those live in each install's local settings.
 - **Invisible by default:** commands, scripts and batches run in the background with no window shown and no focus
   taken. Only UI work you asked for touches the visible screen, and a test checks that nothing else ever does (§6.8).
 - **How it is kept safe:** commands run as a separate, limited **agent account** that the OS keeps out of your
-  sensitive files and away from T3's own data (T3 itself runs as a second account). Nothing the agent writes is ever run
-  as you. The rules live in a store the agent cannot change; widening them needs you.
-- **While the agent uses your screen:** a clear on-screen sign shows it; any real mouse or keyboard input from you takes
-  control back at once; everything is logged.
-- **What you click:** the one batched ask, when the agent needs something from the high-risk list (installs and admin
-  are on it). Nothing else asks.
+  sensitive files and away from T3's own data (T3 itself runs as a second account). The rules live in a store the
+  agent cannot change; widening them needs you.
+- **Said openly: in your apps, the agent acts as you** (owner decision 2026-11-13). Through an app's file dialog, a
+  link or a launcher it can run any file with your rights, including one it wrote, and nothing marks or asks first.
+  What holds then: **protected areas** (system folders, other users' profiles and every autostart and persistence
+  point) are never written, deleted or run without your OK for that one action, enforced by the OS where it can be
+  (§4.4); and a **log of every file the agent wrote or ran** is in the tray.
+- **While the agent uses your screen:** a clear on-screen sign shows it. When it drives your real mouse and keyboard,
+  **any real click or key press from you takes control back at once**, and the agent stays paused until you say
+  continue. Everything is logged.
+- **Network:** the agent account has **no direct internet** by default. Web search and fetch run on the server; the
+  agent account reaches only your own linked machines, and a goal that needs more asks once (§3.5).
+- **What you click:** the one batched ask, when the agent needs something from the high-risk list (installs, admin
+  and protected-area actions are on it). Nothing else asks.
 - **What you can always do:** from the tray icon: pause, **wind down** (start nothing new, finish or park what runs,
   then "safe to shut down"), the kill switch, and revoke every link; undo the agent's file changes of the last 24 hours.
 - **Power can go at any time:** every part recovers on the next start (§12.3, §15).
-- **Links between your machines** last long and extend with one click or one command, without new pairing codes; the
-  strong controls are against outsiders (§10).
+- **Links between your machines** expire after 365 days and extend with one click from the tray or any linked
+  machine, without new pairing codes; the strong controls are against outsiders (§10).
+- **Off by default for new projects:** each project gets host tools only when you switch them on (§4.3 rule 9).
 - **Background runners** (CI jobs, builds) use the hardware you leave free, minus a small buffer, and shrink when you
   need it back (§11). Host tools themselves never slow down because you are busy.
 
 ## 1. Parts
 
-| Part                         | Where it runs                                       | Built from                                                       | What it does                                                                                                 |
-| ---------------------------- | --------------------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Host environment             | the computer, as the **host account** (§3)          | upstream T3 server, installed with upstream's background service | serves the host tools over the link; owns T3's data; runs no agent code                                      |
-| Command broker               | the computer, as the **agent account** (§3)         | **fork**, small, per OS                                          | starts every agent command as the agent account; accepts requests only from the host account                 |
-| Linked environment           | between the agent machine and the computer          | upstream peer links (`docs/internals/remote.md`, "Peer links")   | transport, auth, routes (Tailscale, LAN), revocation, access ceiling, expiry (§10)                           |
-| `host` toolkit               | inside T3's MCP server                              | **fork**, one toolkit like `toolkits/environment/`               | typed tools (§9); each takes `environmentId`, so upstream forwards it to the computer                        |
-| Session helper               | the computer, in **your** desktop session, as you   | **fork** add-on to the T3 desktop app (main process)             | tray (§12), the batched ask (§4.2), policy view; starts the engine; hosts the bridge endpoint                |
-| Engine                       | the computer, as you, started by the session helper | **fork**, new, one native binary per OS (§13)                    | the seeing and acting layer (§6-§8): app state, accessibility tree cache, batches, waits, input, screenshots |
-| Guard service                | the computer, as the system (admin)                 | **fork**, per OS, installed once                                 | owns the protected store, snapshots, the authoritative log, the kill switch, permission re-application       |
-| Protected store              | the computer, owned by the guard service            | **fork**, JSON, shown in T3's settings UI and the tray           | reach map, secret patterns, ask answers, recipes, approved scripts, named commands, bridges                  |
-| Availability, project grants | the agent machine's T3 settings                     | **fork**, server settings                                        | per linked computer: on / off / off until; per project: may this project use host tools (§4.3 rule 9)        |
-| Activity service             | the computer, in your session (part of the helper)  | **fork** (§11)                                                   | measures free hardware for background runners and for sizing speculative runs; never gates host tools        |
+| Part                         | Where it runs                                       | Built from                                                       | What it does                                                                                                                            |
+| ---------------------------- | --------------------------------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Host environment             | the computer, as the **host account** (§3)          | upstream T3 server, installed with upstream's background service | serves the host tools over the link; owns T3's data; runs no agent code                                                                 |
+| Command broker               | the computer, as the **agent account** (§3)         | **fork**, small, per OS                                          | starts every agent command as the agent account; accepts requests only from the host account                                            |
+| Linked environment           | between the agent machine and the computer          | upstream peer links (`docs/internals/remote.md`, "Peer links")   | transport, auth, routes (Tailscale, LAN), revocation, access ceiling, expiry (§10)                                                      |
+| `host` toolkit               | inside T3's MCP server                              | **fork**, one toolkit like `toolkits/environment/`               | typed tools (§9); each takes `environmentId`, so upstream forwards it to the computer                                                   |
+| Session helper               | the computer, in **your** desktop session, as you   | **fork** add-on to the T3 desktop app (main process)             | tray (§12), the batched ask (§4.2), policy view; starts the engine; hosts the bridge endpoint                                           |
+| Engine                       | the computer, as you, started by the session helper | **fork**, new, one native binary per OS (§13)                    | the seeing and acting layer (§6-§8): app state, accessibility tree cache, batches, waits, input, screenshots                            |
+| Guard service                | the computer, as the system (admin)                 | **fork**, per OS, installed once                                 | owns the protected store, snapshots, the authoritative log, the kill switch, permission re-application, the protected-area watch (§4.4) |
+| Protected store              | the computer, owned by the guard service            | **fork**, JSON, shown in T3's settings UI and the tray           | reach map, secret patterns, ask answers, recipes, approved scripts, named commands, bridges                                             |
+| Availability, project grants | the agent machine's T3 settings                     | **fork**, server settings                                        | per linked computer: on / off / off until; per project: may this project use host tools (§4.3 rule 9)                                   |
+| Activity service             | the computer, in your session (part of the helper)  | **fork** (§11)                                                   | measures free hardware for background runners and for sizing speculative runs; never gates host tools                                   |
 
 The **core is OS-neutral**: tool schemas, the policy format and checks, the step language, the input ladder logic,
 recipes, snapshot and diff format, secret patterns, the log format, pause and wind-down logic, the undo index. The
@@ -70,7 +81,7 @@ was considered and why it is not the base.
 | Reach the computer, auth, revoke      | linked environments: pairing code, OAuth session in the secret store, routes over Tailscale/LAN, revoke in Sharing & access (`apps/server/src/peer/PeerLinks.ts`)            | a longer link lifetime setting, one-click extension, device binding and revoke-all (§10), in a form upstream could take   |
 | Send a tool call to the computer      | tools whose parameters take `OrchestratorMcpEnvironmentTarget` are forwarded by `McpToolAccess.toLayer` after the caller is checked (`apps/server/src/mcp/McpToolAccess.ts`) | the `host` toolkit, declared like `t3_environment_read` (`apps/server/src/mcp/toolkits/environment/tools.ts`)             |
 | Limit what a link may do              | link access (read-only or a runtime-mode ceiling), `T3-Mode-Limit` on every forwarded call, `linkOrigin` fence below full access                                             | host tools are declared read or write with upstream's access declarations; a read-only link gets only the read tools      |
-| A full agent working on the computer  | `delegate_task` with `environmentId`; the child is an ordinary thread there (`apps/server/src/peer/RemoteDelegation.ts`)                                                     | **off in v1** for host-tools computers: its provider process would run as the host account (§3.2)                         |
+| A full agent working on the computer  | `delegate_task` with `environmentId`; the child is an ordinary thread there (`apps/server/src/peer/RemoteDelegation.ts`)                                                     | **off in v1** for host-tools computers, with every other forwarded tool outside the host allowlist (§3.2)                 |
 | Settings and their UI                 | `ServerSettings` / `ServerSettingsPatch` (`packages/contracts/src/settings.ts`), settings pages, settings search                                                             | availability and project grants (§4.3), link lifetime (§10), a read view of the policy                                    |
 | Keep the tool list small              | `McpToolExposure` and `tool_search` (deferred tools); link tools are hidden while the beta is off (merged #30371)                                                            | host tools are deferred and hidden unless a linked computer reports host tools on                                         |
 
@@ -119,7 +130,8 @@ clients get a 403 for write tools), #34293 (host CPU and memory load in `t3_envi
 (root dispatcher, one Linux user per slot, one-job runners, `.github/fork-fleet.json`). Host tools give agents typed
 access to a person's own computer. They share Tailscale, the tray (§12) and the activity service (§11), and no other
 code or config in v1. A computer that is both a fleet host and a host-tools computer keeps them in **separate
-accounts**, and neither account can reach the other's folders.
+accounts**, and neither account can reach the other's folders; runner accounts on a personal computer get the isolation
+of §11.
 
 ## 3. The two accounts (per OS)
 
@@ -131,6 +143,9 @@ long random one held by the OS's task or service store, or none where the OS all
 - **Agent account** (for example `t3-agent`): runs every command, build and script the agent starts, through the
   **command broker**, which runs as this account and accepts requests only from the host account. It cannot read or
   write T3's data, T3's secrets or the T3 install.
+- **Agent group** (for example `t3-agents`): the agent account and every per-slot user of speculative runs (§7.4).
+  Every reach-map grant, secret deny entry and auto-run deny entry names this group, never one account, so a slot user
+  can never read what the agent account cannot (lens N6).
 - The **T3 install** (program files) is owned by an administrator and read-only to both accounts. The computer's T3
   holds **no outbound link** to the agent machine, so nothing on the computer can reach back with T3's credentials.
 
@@ -140,16 +155,17 @@ caller details.
 
 ### 3.1 Per OS
 
-|                                     | Windows (first)                                                                                                                                     | macOS                                                                                                         | Linux                                                                     |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| Create both accounts                | local standard users, not in Administrators or Remote Desktop Users; "deny log on locally" and "deny log on through RDP" so nobody signs in as them | standard users, hidden from the login window (`IsHidden`), no admin group                                     | system users with a home, no sudo, shell login disabled for people        |
-| Run T3 as the host account          | a Task Scheduler task "run whether the user is signed in or not", at boot (upstream installs "at logon, as me"; the fork adds `--account`)          | a LaunchDaemon with `UserName` (a login item would only run when that user logs in)                           | a systemd system unit with `User=`                                        |
-| Run the broker as the agent account | a second such task; the broker's named pipe ACL admits only the host account                                                                        | a second LaunchDaemon; Unix socket owned by the host account's group, mode 0660                               | a second unit; same socket rule                                           |
-| Reach of the agent account          | Modify on the reach map's folders (§4.3 rule 1), inherited, applied by the helper as the folders' owner                                             | ACL entries (`chmod +a`) by the folders' owner                                                                | POSIX ACLs (`setfacl`) or a shared group                                  |
-| Secret and auto-run paths           | an explicit Deny ACE for the agent account on each match (§4.3 rules 2-3)                                                                           | a deny ACL entry                                                                                              | an ACL with no rights for the account (or the file left out of the group) |
-| Disk quota (agent account)          | NTFS per-user quota on each volume it can write                                                                                                     | APFS has no per-user quota: the agent account's scratch lives on its own APFS volume with a quota (to verify) | `quota` / XFS or ext4 project quota                                       |
-| Network                             | §3.5                                                                                                                                                | §3.5                                                                                                          | §3.5                                                                      |
-| Screen, apps, clipboard             | none: neither account is in your session. Only through the engine (§6), which admits only the host account                                          | same                                                                                                          | same                                                                      |
+|                                     | Windows (first)                                                                                                                                     | macOS                                                                                                         | Linux                                                              |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Create both accounts                | local standard users, not in Administrators or Remote Desktop Users; "deny log on locally" and "deny log on through RDP" so nobody signs in as them | standard users, hidden from the login window (`IsHidden`), no admin group                                     | system users with a home, no sudo, shell login disabled for people |
+| Run T3 as the host account          | a Task Scheduler task "run whether the user is signed in or not", at boot (upstream installs "at logon, as me"; the fork adds `--account`)          | a LaunchDaemon with `UserName` (a login item would only run when that user logs in)                           | a systemd system unit with `User=`                                 |
+| Run the broker as the agent account | a second such task; the broker's named pipe ACL admits only the host account                                                                        | a second LaunchDaemon; Unix socket owned by the host account's group, mode 0660                               | a second unit; same socket rule                                    |
+| Reach of the agent group            | Modify on the reach map's folders (§4.3 rule 1), inherited, applied by the helper as the folders' owner                                             | ACL entries (`chmod +a`) by the folders' owner                                                                | POSIX ACLs (`setfacl`) for the group                               |
+| Secret and auto-run paths           | an explicit Deny ACE for the agent group on each match (§4.3 rules 2-3)                                                                             | a deny ACL entry for the group                                                                                | an ACL entry with no rights for the group                          |
+| The agents' own persistence points  | Deny ACEs on the agent accounts' own Startup folders and Run keys; the guard deletes and logs any scheduled task an agent account registers         | no write to their own `LaunchAgents`; `cron` and `at` denied                                                  | `cron.deny`, `at.deny`; no `systemd --user` lingering              |
+| Disk quota (agent account)          | NTFS per-user quota on each volume it can write                                                                                                     | APFS has no per-user quota: the agent account's scratch lives on its own APFS volume with a quota (to verify) | `quota` / XFS or ext4 project quota                                |
+| Network                             | §3.5                                                                                                                                                | §3.5                                                                                                          | §3.5                                                               |
+| Screen, apps, clipboard             | none: neither account is in your session. Only through the engine (§6), which admits only the host account                                          | same                                                                                                          | same                                                               |
 
 ### 3.2 How commands run
 
@@ -163,14 +179,40 @@ delegated agent would run as the host account and could reach T3's data. They ar
 and terminal processes through the broker (one spawn point, to locate in upstream code when built). Host tools need no
 provider on the computer. This changes the r2 statement that delegated agents need nothing added.
 
+**Forwarded tools: an allowlist on the computer (lens N2).** `delegate_task` is not the only upstream tool that starts
+work where it is forwarded: thread launch and thread creation start a provider, project create and clone, worktree,
+terminal and git tools make the server run processes. On a host-tools computer, the host account's T3 refuses **every**
+forwarded tool call outside an allowlist: the `host_*` tools and upstream's read-only environment reads
+(`t3_environment_read` and the like). The check runs on the computer, where the call arrives, not on the agent
+machine. T3's own terminal and provider features are switched off in that install (a fork setting the install writes;
+the host account's T3 starts no provider and no terminal). The install verify (§3.3) checks both.
+
 ### 3.3 Install verify (host tools stay off until it passes)
 
-The install, and every later start, checks: both accounts exist and are in no admin or remote group; the install is
-admin-owned and read-only to both; the broker's and the engine's channel ACLs are as stated; the reach map's grants,
-the secret deny pass and the auto-run denies are applied and current; the firewall rules exist and each network class
-of §3.5 is probed from the agent account; the disk quota is set. **Host tools stay off until every check passes**, and
-`host_status` reports which one failed. `host_status` re-runs the quick checks on every call and the full set daily; a
-failure turns host tools off again with the reason.
+The install, and every later start, checks:
+
+- both accounts exist and are in no admin or remote group; the agent group holds exactly the agent account and the
+  slot users; the install is admin-owned and read-only to both; the broker's and the engine's channel ACLs are as
+  stated;
+- the forwarded-tool allowlist is on and T3's terminal and provider features are off in the host account's T3 (§3.2);
+- the reach map's grants, the secret deny pass and the auto-run denies are applied and current; the agents' own
+  persistence points are denied (§3.1); the protected-area watch runs (§4.4);
+- the firewall rules exist and each network class of §3.5 is probed from the agent account, including the computer's
+  own global addresses and an on-link neighbour;
+- the disk quota is set; on Linux `fs.protected_hardlinks=1` and `fs.protected_symlinks=1`;
+- elevation stays behind a prompt the engine cannot click: Windows UAC on, with the secure desktop; Linux and macOS:
+  no `NOPASSWD` sudo rule for your account (§4.4);
+- runner accounts, if any, have the isolation of §11.
+
+**Host tools stay off until every check passes**, and `host_status` reports which one failed. `host_status` re-runs
+the quick checks on every call and the full set daily; a failure turns host tools off again with the reason.
+
+**Warnings that do not block** (shown in the tray and `host_status`, and named in §14): your Windows account is an
+administrator with UAC below "Always notify" (known auto-elevation tricks skip the prompt at the default level); git
+`safe.directory = *` in your git config (git then trusts a `.git` the agent account made); IDE settings that run code
+when build files change (IntelliJ and Android Studio auto-reload of Gradle or Maven builds, rust-analyzer build scripts
+and proc macros, Visual Studio design-time builds, VS Code `task.allowAutomaticTasks` on or Workspace Trust off), §4.3
+rule 3.
 
 **Reach check.** Some places are readable by every user by default (Windows: folders on extra drives, `C:\Users\Public`;
 macOS and Linux: world-readable shared folders). The install walks every fixed drive as the agent account and lists
@@ -197,24 +239,39 @@ copies) follows these rules:
 Test (per OS): a planted junction to a system folder, a symlink to your profile and a hard link to one of your files do
 not widen any grant, do not redirect any restore or copy, and are reported.
 
-### 3.5 Network for the agent account (lens M3)
+### 3.5 Network for the agent account (lens M3, N5; owner decision 2026-11-13)
 
-Default deny for the agent account, with these classes listed explicitly: loopback (`127.0.0.0/8`, `::1`), RFC 1918,
-CGNAT and tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), link-local (`169.254.0.0/16`, `fe80::/10`, which includes
-cloud metadata `169.254.169.254`), ULA (`fc00::/7`), multicast and broadcast. Allowed: the public internet (builds,
-git, package downloads), and explicit entries you accept through the batched ask (for example a git server on your
-LAN).
+**Owner decision: no direct internet by default.** Work that needs no computer of yours runs on the server: web search
+and fetch already do. The agent account (and the agent group) gets:
+
+- **Allowed by default:** only your own linked machines (§10), by their tailnet addresses, so a git server or package
+  cache you run there works. Name lookups go only to the tailnet's resolver, so DNS cannot carry data out.
+- **Opened per goal:** a goal that needs more (a package registry, a git host, "the public internet") asks once through
+  the batched ask (§4.2), default scope **this task**. The ask names the hosts; "the public internet" is one item of
+  its own.
+- **Browsing as you** (your logins, your sites) happens in your own browser session through the UI, which is acting as
+  you (§4.4), not through the agent account.
+
+**Always denied, even when the internet is opened** (the floor no answer removes, except an explicit entry for one
+address): loopback (`127.0.0.0/8`, `::1`), RFC 1918, CGNAT and tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) other
+than your linked machines, link-local (`169.254.0.0/16`, `fe80::/10`, which includes cloud metadata
+`169.254.169.254`), ULA (`fc00::/7`), multicast and broadcast, **every address of every local interface** in both
+families (so your own services listening on all addresses are not reachable through the computer's global IPv6
+address), and **every on-link prefix** (so a NAS or router with a global IPv6 address on your LAN is not "the
+internet"). The guard re-reads the interface addresses and prefixes on every address change (Windows
+`NotifyIpInterfaceChange`, macOS `SCDynamicStore`, Linux rtnetlink) and updates the rules before the next agent
+connection; while an update is pending, the agent account's network is closed.
 
 - **Loopback:** the agent account may reach only listeners of its own (tests that start a local server). Linux: each
   command runs in its own network namespace with its own loopback and a user-mode route out (`pasta`); macOS: `pf`
   `user` rules on `lo0` (to verify); Windows: a WFP filter on loopback that matches the connecting and the listening
   user (to verify). It never reaches your dev servers, a browser's debug port, a desktop T3, container APIs or sync UIs.
-- **Per OS:** Windows Firewall / WFP rules scoped to the account's SID; macOS `pf` with `user`; Linux `nftables`
-  `meta skuid`.
+- **Per OS:** Windows Firewall / WFP rules scoped to the agent group's SIDs; macOS `pf` with `user`; Linux `nftables`
+  `meta skuid` / `meta skgid`.
 - The computer's T3 gives loopback callers **no** trust or bootstrap: other local accounts are remote clients that must
   sign in.
-- The install verify (§3.3) probes one address of each class from the agent account and refuses to enable host tools
-  if any answers.
+- The install verify (§3.3) probes one address of each class from the agent account, plus the computer's own global
+  IPv6 address and an on-link neighbour, and refuses to enable host tools if any answers.
 
 ## 4. Scope and rules
 
@@ -226,13 +283,17 @@ and it looks only at what is relevant to the task.
 **Open by default:**
 
 - Your data folders (the reach map, §4.3 rule 1): read and write, with undo.
-- Every app and window, for seeing and acting, through the routes of §5 and the input ladder of §6.4.
+- System areas: **read** as far as the OS lets any standard user, except secrets. Writing, deleting and running there
+  is a protected-area action (§4.4).
+- Every app and window, for seeing and acting, through the routes of §5 and the input ladder of §6.4. Acting there is
+  acting **as you** (§4.4).
 - The clipboard (with the limits of §6.7).
 
 **The sensitive set: never usable, no answer can open it** (hard refusals):
 
 - Secret files by built-in pattern (keys, `.env`, `*.pem`, `*.kdbx`, cloud and CLI credential files, …) and every
   secret store: OS keychains and credential managers, browser login and cookie stores, password managers, wallets.
+  System secrets too (the SAM and SECURITY hives, `/etc/shadow`, SSH host keys), which the OS already denies.
 - Password and credential fields and dialogs, the lock screen and the secure desktop, elevation prompts.
 - The tray, the helper, the ask dialog, T3's host-tools settings and the protected store (§4.3 rule 5).
 
@@ -251,16 +312,18 @@ helper shows one dialog: **"Can I use X, Y and Z?"**, each item with what it is 
 reason last and marked unverified; Deny is the default; one ask is open at a time; unanswered after 2 minutes it is
 denied.
 
-| On the high-risk list                                                                                                                                                                  | Why                                                                         | Default scope            |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------ |
-| **Full-user-rights apps** for acting: shells and terminals, the Run dialog, the file manager, system settings, the task scheduler, the registry editor, script hosts, browser devtools | acting there runs any code as you, the whole policy depends on it (lens B3) | this task                |
-| **Privilege elevation:** a command run as admin, a machine-wide install                                                                                                                | changes the OS for everyone                                                 | this task (one command)  |
-| Installs for you (winget / Homebrew / the distro's package manager)                                                                                                                    | new code that runs as you                                                   | this task                |
-| Your profile's config and app-data areas (`AppData`, `~/Library`, `~/.config`, dot-folders) beyond the reach map                                                                       | they hold tokens and sessions outside the built-in patterns                 | this project             |
-| Auto-run paths in a folder (git hooks and config, IDE task files, mods and plug-in folders; §4.3 rule 3)                                                                               | code there runs as you without you choosing to run it                       | this project, per folder |
-| Other users' data on the computer                                                                                                                                                      | not yours to give                                                           | this task                |
-| A new app-side bridge, with its verbs listed (§6.6)                                                                                                                                    | a bridge acts inside an app with your rights                                | always                   |
-| A network address in a blocked class (§3.5)                                                                                                                                            | your LAN and tailnet services                                               | this project             |
+| On the high-risk list                                                                                                                                                                                                                                                                                             | Why                                                                                                    | Default scope                        |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------ |
+| **Full-user-rights apps** for acting: shells and terminals (also those built into IDEs, and IDE task runners), the Run dialog, the Start/Search box, Spotlight and other launchers, the file manager, system settings, the task scheduler, the registry editor, script hosts and macro consoles, browser devtools | acting there runs any code as you directly (other apps can too, through a file dialog or a link; §4.4) | this task                            |
+| **Privilege elevation:** a command run as admin, a machine-wide install                                                                                                                                                                                                                                           | changes the OS for everyone                                                                            | once (one command), never remembered |
+| **A protected-area action** (§4.4): one exact write, delete or run in a system area, another user's profile or an autostart or persistence point                                                                                                                                                                  | system-wide or lasting effects                                                                         | once, never remembered               |
+| Installs for you (winget / Homebrew / the distro's package manager)                                                                                                                                                                                                                                               | new code that runs as you                                                                              | this task                            |
+| Your profile's config and app-data areas (`AppData`, `~/Library`, `~/.config`, dot-folders) beyond the reach map                                                                                                                                                                                                  | they hold tokens and sessions outside the built-in patterns                                            | this project                         |
+| Auto-run paths in a folder (git hooks and config, IDE task files, mods and plug-in folders; §4.3 rule 3)                                                                                                                                                                                                          | code there runs as you without you choosing to run it                                                  | this project, per folder             |
+| Other users' data on the computer                                                                                                                                                                                                                                                                                 | not yours to give                                                                                      | this task                            |
+| A new app-side bridge, with its verbs listed (§6.6)                                                                                                                                                                                                                                                               | a bridge acts inside an app with your rights                                                           | always                               |
+| Network for the agent account beyond your linked machines (§3.5): named hosts, or the public internet                                                                                                                                                                                                             | data can leave; downloads can bring code in                                                            | this task (per goal)                 |
+| An address in an always-denied class (§3.5), one address at a time                                                                                                                                                                                                                                                | your LAN and tailnet services                                                                          | this project                         |
 
 **Remembered.** Answers live in the protected store, per scope: the agent never asks twice for what you already
 answered in that scope. A "this task" grant ends with the task (the T3 turn chain that asked), on pause, and on the
@@ -269,22 +332,41 @@ kill switch.
 **Not worn down (lens m4).** After a Deny, the same item is not shown again in that task; a new ask with only items
 denied in the last 10 minutes is dropped without a dialog; the dialog shows how many asks this task already made.
 
-**Confirmed where the agent cannot click.** The engine refuses to see or act on the ask dialog. Items that grant
-**full user rights or elevation** are also confirmed through the OS's own consent (Windows UAC on the secure desktop;
-macOS authorization through `SecurityAgent`; Linux polkit), because once a full-rights grant is active, code with your
-rights exists and could click a dialog in your session. For the same reason, **while a full-rights grant is active,
-every widening of the policy needs that OS consent**; narrowing (Deny, pause, revoke) never does. This is one extra OS
-prompt on top of A, forced by blocker B3.
+**Confirmed where the agent cannot click (owner decision 2026-11-13: keep the OS consent).** The engine refuses to see
+or act on the ask dialog. Items that grant **full user rights, elevation or a protected-area action** are also
+confirmed through the OS's own consent, because code with your rights may already run (a full-rights grant, or a file
+run through an app's UI, §4.4) and could click a dialog in your session. For the same reason, **while a full-rights
+grant is active or an agent-caused process runs as you (§4.4), every widening of the policy needs that OS consent**;
+narrowing (Deny, pause, revoke) never does.
+
+**The guard checks the consent itself (lens N4).** The helper runs as you, so code running as you could inject into
+it or call the guard's channel and claim "the owner agreed". The guard therefore never takes the helper's word for an
+item that needs OS consent; it writes the answer only after it verified the consent itself:
+
+- Windows: the answer must come from a process the guard can check: the fork's signed confirm binary, started through
+  UAC on the secure desktop, connecting with a full (elevated) high-integrity token. The guard checks the token's
+  elevation type and integrity, the image path and its signature.
+- macOS: the guard itself calls `AuthorizationCopyRights` for its own right, defined with user authentication every
+  time (no shared timeout), so `SecurityAgent` asks you.
+- Linux: the guard itself makes the polkit check for its own action (`auth_self`, not kept), with the helper's
+  process as subject, so your polkit agent asks you.
+
+Other answers (a dot-folder, a network host) come from the helper as before. Code running as you could forge those;
+they grant the agent account only things your own account already has, but a forged "always" answer would outlive the
+code. That is why widening needs OS consent while an agent-caused process runs as you, and why every remembered
+answer is listed in the tray with its time and the consent it carried.
 
 ### 4.3 Rules the computer enforces
 
 Normal work needs no click. Each rule says **who enforces it**, because a command run as the agent account can change
 anything that account owns. Nothing that must hold is enforced only by the T3 server.
 
-1. **Reach map** (OS). The agent account gets read-write on your data folders: by default the profile's document,
-   desktop, download, media and source folders and the data folders of extra drives, set at install and editable in
-   the tray. Your profile root, its config and app-data areas, other profiles and system folders are not granted (they
-   are on the ask list). The helper applies grants as the folders' owner; the guard service re-applies them daily
+1. **Reach map** (OS). The agent group gets read-write on your data folders. **Default (owner decision 2026-11-13):**
+   documents, desktop, downloads, media (pictures, music, videos), code folders and the data drives. The list is
+   config: it grows over time (the tray and settings add folders; the install suggests code folders it finds), and
+   the core holds only the default kinds, never a person's paths. Your profile root, its config and app-data areas and
+   other profiles are not granted (they are on the ask list); system folders are readable as the OS allows and are
+   protected areas (§4.4). The helper applies grants as the folders' owner; the guard service re-applies them daily
    (§3.4 rules) and reports drift. Removing a folder ends every agent-account process with an open handle under it
    (Windows Restart Manager, `lsof`/`/proc`), because an open handle keeps its access after an ACL change.
 2. **Secret deny list** (OS, applied by the helper and the guard). Built-in patterns, one OS-neutral list in the core;
@@ -293,40 +375,70 @@ anything that account owns. Nothing that must hold is enforced only by the T3 se
    overflow and after the daily re-apply, a full deny pass runs **before** file tools are enabled, and the server
    refuses file reads while the pass is not current (lens M8b). Token shapes (`ghp_`, `sk-ant-`, `AKIA…`, JWTs, …) are
    redacted in every output path and every stored record (§6.7).
-3. **Auto-run paths are read-only to the agent** (OS deny entries, lens B1e). Inside writable folders: `.git/config`,
-   `.git/hooks/`, `.git/info/`, `.gitattributes` filter lines are left alone but `.git/config` is where filters run;
-   IDE task and settings files (`.vscode/`, `.idea/`), `.envrc`, shell profiles, the Startup folder and login items,
-   and the mod and plug-in folders of apps you run. Code there runs as you when you merely open or `git status` the
-   folder. Unlocked per folder through the ask. Git commands that write repo config (`push -u`, `remote add`) fail for
-   the agent until then; the tool descriptions say so. Package manifests (`package.json`, …) stay writable: they run
-   only when you choose to run them, and agent work is code (see §14.1).
-4. **Nothing the agent wrote runs as you** (engine and helper, lens B1).
-   - The engine never opens, launches or Shell-executes a file in an agent-writable folder if the type is executable
-     or a script: `PATHEXT` types, `.lnk`, `.url`, `.scf`, `.hta`, `.msi`, `.desktop`, `.command`, `+x` files,
-     `.app` bundles, and Office files with macros. Data files open in any app. COM servers (Office and similar) are
-     created with macros forced off (`AutomationSecurity = msoAutomationSecurityForceDisable`).
+3. **Auto-run paths are read-only to the agent** (OS deny entries and the guard, lens B1e, N3). Inside writable
+   folders: `.git/config`, `.git/hooks/`, `.git/info/` (`.gitattributes` filter lines are left alone, since the
+   filters themselves live in `.git/config`); IDE task and settings files (`.vscode/`, `.idea/`); `.envrc`; and the
+   mod and plug-in folders of apps you run. Code there runs as you when you merely open or `git status` the folder.
+   **`.git/config` stays read-only until you unlock that repo** through the ask (owner decision 2026-11-13); git
+   commands that write repo config (`push -u`, `remote add`) fail for the agent until then, and the tool descriptions
+   say so. Autostart places outside a project (shell profiles, Startup folders, login items) are protected areas
+   (§4.4).
+   - **No rename or delete around the deny** (N3a). Windows: Deny `DELETE` on each auto-run file and folder, and Deny
+     `FILE_DELETE_CHILD` on the folder that holds it, for the agent group (Windows allows a rename or delete if either
+     right is there, so both are denied; other entries in that folder stay deletable through their own `DELETE`).
+     macOS: Endpoint Security `AUTH_RENAME`, `AUTH_UNLINK` and `AUTH_CREATE` deny the agent group on auto-run names.
+     Linux: each command runs in its own mount namespace (next to the network namespace of §3.5), and every existing
+     auto-run path is bind-mounted read-only into it; a mount point cannot be renamed or removed.
+   - **New auto-run paths are quarantined** (N3b). Where the agent group **creates** an auto-run path (a new
+     `.vscode/tasks.json` in a folder that had none, an `.envrc`, a new plug-in in a mod folder), it is blocked where the
+     OS can block (macOS Endpoint Security; Linux a BPF LSM where the kernel has one), otherwise the guard moves it into
+     the undo store within about a second (writer recorded, §3.4 link-safe) and lists it in the tray and the next ask,
+     with its content, as "keep this?". A live watcher alone is not relied on: the quarantine happens whether or not you
+     are looking.
+   - **New repositories** (`git init`, `git clone` by the agent) are agent work and are not quarantined: their `.git` is
+     owned by the agent account, and your git refuses to use it (git's `safe.directory` owner check) until you take it
+     over with "make it mine" in the tray, which hands `.git` to you and applies the denies above. With
+     `safe.directory = *` in your git config (warned in §3.3), new `.git` folders are quarantined like other auto-run
+     paths.
+   - **Package manifests and build files stay writable** (`package.json`, `build.gradle(.kts)`, `build.rs`, `.csproj`,
+     …): agent work is code. They run when you choose to build, **and also when an IDE syncs them on its own**
+     (IntelliJ and Android Studio Gradle or Maven reload, rust-analyzer build scripts and proc macros, Visual Studio
+     design-time builds). The install verify warns about these settings (§3.3); every agent write to a build file is
+     flagged in the activity log (rule 7); the residual is in §14.1 (N3d).
+4. **Approved runs use frozen copies** (engine and helper, lens B1). This rule covers what T3 runs as you on your
+   behalf; running files through the UI is open (§4.4).
    - Every launch, approved script, named command and admin command runs in a working folder the agent account cannot
      write (so no planted DLL is picked up).
    - Approved scripts, named commands and admin commands may not run files from agent-writable folders. A command that
      needs one (a deploy from a repo) runs from a **frozen copy**: the helper copies the referenced files, or makes a
-     git worktree at a commit, into a protected folder; the ask shows the hash or commit; the copy runs. The same hash
-     later needs no new ask.
+     git worktree at a commit, into a protected folder; the ask shows the hash or commit **and the diff since the last
+     commit you approved** (lens n6); the copy runs. The same hash later needs no new ask.
    - A bridge whose file is in an agent-writable folder must be listed with its hash (§6.6).
+   - The engine's own COM automation (Office and similar) creates servers with macros forced off
+     (`AutomationSecurity = msoAutomationSecurityForceDisable`).
+   - **No mark and no ask before opening** (owner decision 2026-11-13). Files the agent writes get no Mark-of-the-Web or
+     quarantine flag, and the engine's `app open` and `window launch` open any file you could open. The r3 file-type
+     rule is dropped: it held only for the engine's own verbs, and any app's file dialog went around it (lens N1).
+     Every open of an executable or script by an agent-caused process is logged as a run (rule 7).
 5. **Protected store** (guard service, lens B3). The policy, ask answers, recipes, approved scripts, named commands,
-   bridges and pause state live in a store owned by the guard service. Your account and both service accounts can only
-   read it. Changes go through the guard: the helper asks, the guard writes, and widening follows §4.2. A store file
-   edited outside the guard (by an admin) fails the guard's signature check on load and is ignored until you confirm it
-   in the tray with OS consent. The engine refuses acting on any window whose document is in the store's folder and
-   refuses file-dialog navigation into it.
+   bridges and pause state live in a store owned by the guard service. Your account and the host account can only read
+   it; the agent group cannot read it at all (lens n4). Changes go through the guard: the helper asks, the guard writes,
+   and widening follows §4.2, with the consent the guard checks itself. A store file edited outside the guard (by an
+   admin) fails the guard's signature check on load and is ignored until you confirm it in the tray with OS consent
+   (recovery after a power cut: §12.3). The engine refuses acting on any window whose document is in the store's folder
+   and refuses file-dialog navigation into it.
 6. **Undo** (guard service).
    - **Snapshots:** OS snapshots of the volumes in the reach map, taken by the guard before an agent write or run when
      the last one is older than 30 minutes (at most 48 a day, under the Windows Volume Shadow Copy limit of 64). Kept
      **at most 24 hours** (setting, shorter allowed) within a **tight size cap** (setting; default the smaller of 5 GB
      and 2 % of the volume). Windows: Volume Shadow Copy; macOS: APFS local snapshots (`tmutil localsnapshot`), which
-     macOS keeps about 24 h anyway; Linux: btrfs/ZFS/LVM-thin snapshots where the folder lives on one, otherwise a
-     root-owned `rsync --link-dest` copy of only the files the agent changed.
+     macOS keeps about 24 h anyway; Linux: btrfs/ZFS/LVM-thin snapshots where the folder lives on one, otherwise a copy
+     of only the files the agent changed, made by the guard's own link-safe walker (§3.4; not `rsync`, lens n1).
    - **Pre-images:** T3's own file tools (`host_write`, `host_move`, `host_delete`) keep the previous version of each
-     file they change in the undo store, so their changes undo exactly, not only to the last snapshot.
+     file they change in the undo store, so their changes undo exactly, not only to the last snapshot. The undo store
+     has its own size cap (setting; default the smaller of 2 GB and 1 % of the volume) and keeps pre-images 24 hours. A
+     call whose pre-images would not fit (a `host_delete` of a large tree) is **refused** with the size needed, as for
+     snapshots; it is not run without undo (lens n7).
    - **Writer recorded:** the guard records which account changed each file (Windows ETW kernel file events, macOS
      Endpoint Security, Linux `fanotify`). Where the writer cannot be told, the change counts as yours.
    - **Fail closed (lens M8a):** if a snapshot cannot be taken, or keeping it would push out one younger than 1 hour
@@ -335,26 +447,40 @@ anything that account owns. Nothing that must hold is enforced only by the T3 se
    - **Agent undo restores only agent changes (lens M9):** an agent-called `host_undo` restores only files whose
      changes in the window came from the agent account, and only if the file still has the hash the agent left it
      with. Files you changed are listed, not touched; restoring them is offered only in the tray.
-   - The guarantee: any file can go back to its state at the last snapshot before the change (exactly, for T3 file
-     tool writes), within 24 hours. Changes **inside apps** are not covered unless the app saves into the reach map.
+   - **The real guarantee (lens N9).** T3 file tool changes undo exactly for 24 hours (pre-images). Other changes go
+     back to the last snapshot before them for **24 hours normally, and at least 1 hour (the floor) under heavy
+     writes**: snapshot stores grow with every changed block, not with bytes kept, so an agent that rewrites a large
+     file over and over can push older snapshots out once they pass the floor. The tray warns whenever a snapshot is
+     evicted before 24 hours, naming the agent changes that lost their undo. A setting (off by default) refuses agent
+     writes instead when an eviction would drop the newest snapshot before an agent delete or overwrite that you have
+     not kept or undone. Changes **inside apps** are not covered unless the app saves into the reach map.
 7. **Log** (guard service is the authority, lens m2). The guard's log records every file change with its writer,
    every batch and step the engine ran (app, target, action, rung, result, timing), every ask and answer, take-over,
    pause, wind-down and kill switch. The T3 log (host account) records every host tool call and its caller (§9): who,
    tool, arguments without file contents, result, bytes, time. Each line carries the hash of the line before; every 5
    minutes the guard countersigns the T3 log's head into its own log, so a forged or cut T3 log shows. A call whose
    log write fails is refused.
+   - **What the agent wrote and ran** (owner decision 2026-11-13). A tray view, also in `host_status`, lists every file
+     written by the agent group or by an agent-caused process as you (§4.4), and every program and script an
+     agent-caused process started, with time, task and thread, writer, path, hash, and the file's last writer (so a run
+     of a file the agent wrote stands out). Writes to build files that IDEs sync (rule 3) and every held protected-area
+     change are flagged. Each line offers Undo or Remove where one exists.
 8. **Pause, wind down, kill switch, revoke all** (tray, §12). _Pause_: every host tool and every new turn is refused
    with "paused by owner"; **every agent-account process** is ended (the T3 server is the host account, so nothing it
    needs survives; daemonised children and scheduled runs go too, lens m1); batches stop; held keys and buttons are
-   released; "this task" grants end. _Wind down_: §12.2. _Kill switch_: the guard ends every agent-account process,
-   stops the engine and the host account's T3, and disables both accounts until you turn them back on. _Revoke all_:
-   every link to and from this computer is revoked (§10). Pause and wind-down rely on the guard and the helper; the
-   kill switch relies only on the OS.
+   released; "this task" grants end; agent-caused processes running as you (§4.4) are listed in the tray with "end"
+   (they may be apps you now use, so pause does not end them). _Wind down_: §12.2. _Kill switch_: the guard ends every
+   agent-group process **and every agent-caused process running as you**, stops the engine and the host account's T3,
+   and disables both accounts until you turn them back on (with OS consent the guard checks). _Revoke all_: every link
+   to and from this computer is revoked (§10). Pause and wind-down rely on the guard and the helper; the kill switch
+   relies only on the OS. **Narrowing is durable before it is confirmed (lens N8):** pause, kill switch, revoke, Deny
+   and narrowing the reach map are written and fsynced by the guard, in the store and as a narrowing record in its log,
+   before the tray shows them as done.
 9. **Availability and who may call** (agent machine, then the computer; lens M6).
    - Per computer, on the agent machine: Settings → Linked environments → _computer_ → Host tools: **on** (default),
      **off**, or **off until** a time. Stored in `ServerSettings`.
-   - Per project, on the agent machine: **host tools for this project** on or off (a project setting, default off for
-     new projects, one toggle each). Your own machines and projects are trusted; this keeps them away from projects
+   - Per project, on the agent machine: **host tools for this project** on or off (a project setting, **default off
+     for new projects**, owner decision 2026-11-13; one toggle each). Your own machines and projects are trusted; this keeps them away from projects
      that mostly read outside text.
    - Per thread: a thread marked **outside input** (set by you, or by a launcher for work on outside contributions,
      public issues or web research) gets the read tools at most.
@@ -364,6 +490,59 @@ anything that account owns. Nothing that must hold is enforced only by the T3 se
 
 **No activity gate.** Host tools do not check whether you are gaming or busy. Work you asked an agent to do runs while
 you do anything else. Only §11's background runners adapt to the free hardware.
+
+### 4.4 Acting as you, and protected areas (owner decision 2026-11-13, lens N1)
+
+**Said openly: when the agent acts in your apps' UI, it acts as you.** Any app with a file dialog, a launcher, a link,
+a built-in terminal or a macro console can run a file with your rights, including a file the agent wrote, and the OS
+shows no warning: it sees you opening a file. Files the agent writes are not marked as downloaded, and nothing asks
+before opening (§4.3 rule 4). The full-user-rights list (§4.2) closes the direct routes (terminals, launchers); it is
+not a wall around the rest. Once agent-caused code runs as you, it can do whatever your account can. What holds
+instead:
+
+1. **Protected areas** need your OK for each single action, enforced by the OS where it can be (below).
+2. **Every file the agent wrote or ran is logged and shown** (§4.3 rule 7).
+3. The sensitive set (§4.1), take-over (§6.7), undo (§4.3 rule 6), the guard-checked consent (§4.2) and the kill
+   switch, which also ends agent-caused processes running as you.
+
+**Protected areas** (one OS-neutral list of kinds in the core, with per-OS entries; the policy can add entries, never
+remove a built-in one):
+
+| Kind                      | Windows                                                                                                                                                                                                                                                                                                                                                                                                                                                  | macOS                                                                                                                                                                                    | Linux                                                                                                                                                                                      |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| System                    | `C:\Windows` (System32 and the rest), `Program Files*`, `ProgramData`, boot and EFI partitions, the HKLM registry                                                                                                                                                                                                                                                                                                                                        | `/System`, `/Library`, `/usr`, `/bin`, `/sbin`, `/etc`, `/private`, `/Applications`, boot volumes                                                                                        | `/etc`, `/boot`, the EFI partition, `/usr`, `/bin`, `/sbin`, `/lib*`, `/opt`, `/var/lib`                                                                                                   |
+| Other users               | other profiles under `C:\Users`                                                                                                                                                                                                                                                                                                                                                                                                                          | other folders under `/Users`                                                                                                                                                             | other homes, `/root`                                                                                                                                                                       |
+| Autostart and persistence | Startup folders (yours and all users'), Run and RunOnce keys (HKCU and HKLM, both views), scheduled tasks, services and drivers, WMI event subscriptions, Winlogon, Image File Execution Options and AppInit keys, per-user COM and file-association overrides (`HKCU\Software\Classes`), PowerShell profiles, Office add-in and template folders, browser extension folders, **WSL boot config** (`.wslconfig`, each distro's `/etc/wsl.conf` `[boot]`) | LaunchAgents and LaunchDaemons (yours and the system's), login items and Background Task Management items, `cron`, `periodic`, shell profiles, `/etc/paths.d`, browser extension folders | systemd system and user units, timers and generators, `cron` and `anacron`, `/etc/profile.d`, shell profiles, XDG autostart (`~/.config/autostart`), udev rules, browser extension folders |
+
+**What "your OK per action" means.** A write, delete or run in a protected area is one `host_ask` item (§4.2) that
+names the exact path, key or command, shows the content or the diff, has the fixed scope **once** and is never
+remembered, and is confirmed through OS consent that the guard checks itself. **Reading** protected areas stays allowed,
+except secrets (§4.1). "Run" here means anything that runs with system or admin rights or registers something to run
+(a service, driver, scheduled task, boot or login entry); running an ordinary program (a shell, git, a compiler) with
+the agent account's or your rights is not a protected-area action.
+
+**Who enforces it:**
+
+| Route                                          | Enforced by                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Commands (agent group)                         | **the OS:** standard accounts with no admin rights and no way to elevate (they have no interactive session to show a prompt in); other profiles are not readable or writable to them; their own persistence points are denied (§3.1)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Acting as you: system areas and other profiles | **the OS:** writing there needs elevation, and the elevation prompt is on the secure desktop or in `SecurityAgent` / the polkit agent, which the engine refuses (§6.7), so only you can approve, once. The install verify requires UAC on with the secure desktop and no `NOPASSWD` sudo rule for your account (§3.3); on Linux and macOS the guard clears your sudo timestamps when an acting batch or a full-rights grant starts, so a recent `sudo` of yours in an open terminal does not carry over                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Acting as you: your own persistence points     | **the guard**, three layers. (1) **Lock while acting:** while an acting batch or a full-rights grant runs, and for 2 minutes after (setting), the guard puts deny-write entries for your account on the persistence points that take ACLs (Startup folder, Run keys, profile files, `LaunchAgents`, systemd user unit and autostart folders), and takes ownership of them for that time (SYSTEM / root), since an owner can always rewrite its own ACL; afterwards it gives ownership back and removes the entries, and a ledger undoes leftovers on the next start. Renaming a parent folder around a lock is caught by (2). (2) **Watch always:** Windows ETW registry and file events plus Task Scheduler and service-control events; macOS Endpoint Security, which can block; Linux `fanotify`, plus a BPF LSM where the kernel has one, which can block. A change by an agent-caused process, or any change during the window of (1), is **held**: blocked where the OS can block, otherwise reverted at once into the undo store, and offered in the tray and the next ask with Keep (OS consent, once) or Remove. Other new entries (your own installs) are shown in the tray with Remove and logged, not held. (3) **Baseline diff (lens N4):** each full-rights grant and each visible batch records the persistence points at its start and diffs them at its end; every addition is shown with Remove and logged |
+
+**Agent-caused processes.** The guard marks as agent-caused: every agent-group process; every process the engine
+starts; every process started as you by an app the engine acted in, during the batch or within 10 s after (setting);
+and the descendants of all of these. It tracks them from the OS's process events (Windows ETW kernel process events,
+macOS Endpoint Security, Linux the proc connector). Code running as you can start processes through services that break
+the parent chain (WMI, the Task Scheduler, COM servers, `systemd-run --user`, `launchctl`), so the mark is best effort;
+layers (1) and (3) above do not depend on it.
+
+**What is left** (also in §14): code that runs as you can read and change everything your account can outside the
+protected areas, including your profile's secrets, for as long as it runs; it can wait until the lock window has passed
+and use a persistence point not on the built-in list, or change a program you run that lives in a writable folder (a
+tool in `~/bin`, a global package), which only the activity log shows. On Windows, `wsl -u root` needs no password, so
+such code is root inside your WSL distros; only their boot config is watched. With UAC at the default level and an
+administrator account, known auto-elevation tricks write system areas with no prompt (warned in §3.3). Windows blocks
+only by ACL in v1; a signed minifilter and registry callback would let the guard block per process there too (§17).
 
 ## 5. Seeing and acting: principles (owner decision, speed first)
 
@@ -401,7 +580,7 @@ session; Wayland gives these only to the session's own clients). So:
 - It has a **local channel** with a fixed set of verbs: a Windows named pipe or a Unix socket whose ACL admits **only
   the host account** (the T3 server). The agent account, its commands and speculative runs cannot connect (lens M1,
   M2). The engine still **enforces the policy itself**: pause, wind-down, the sensitive set, the high-risk list, the
-  file-type rule (§4.3 rule 4), limits, and its own log line to the guard. The T3 server's checks come first but are
+  take-over pause (§6.7), limits, and its own log line to the guard. The T3 server's checks come first but are
   not relied on.
 - The engine runs **no free-form script as you**. Automation adapters are typed verbs shipped with the fork. A raw
   script (PowerShell, AppleScript, a shell line) runs as you only if it is an **approved script** in the protected
@@ -413,8 +592,9 @@ session; Wayland gives these only to the session's own clients). So:
   indicator.
 
 **What this means plainly:** with A's open scope, the agent can do in a non-sensitive app what you could do there by
-hand, with your rights. An app that runs code (a terminal, the Run dialog, the file manager) is the way around every
-other rule, which is why those need the batched ask (§4.2) and why files the agent wrote never run as you.
+hand, with your rights, and that includes running files through a file dialog, a link or a launcher (§4.4). Terminals
+and launchers need the batched ask (§4.2); protected areas, the activity log, undo, take-over and the kill switch are
+what limit the rest.
 
 ### 6.2 Seeing: sources, which wins, and how the agent finds them
 
@@ -475,8 +655,9 @@ All acting goes through `host_do` (§7). The step kinds, in the order agents sho
 | `wait`      | until a condition holds or a timeout (§7.1)                                                             | event-driven where the OS sends events, else a 25 ms poll                                                                                            |
 | `observe`   | add a snapshot or diff (or a crop) to the result at this point                                          | §6.2                                                                                                                                                 |
 
-`app open` and `window launch` follow the file-type rule of §4.3 rule 4. `input` steps aim at an element (its centre,
-or an offset in it) or at a point relative to a window, never at a bare screen point.
+`app open` and `window launch` open any file you could (§4.3 rule 4); opening an executable or a script is logged as a
+run. `input` steps aim at an element (its centre, or an offset in it) or at a point relative to a window, never at a
+bare screen point.
 
 ### 6.4 The input ladder (owner decision 2026-11-13)
 
@@ -484,12 +665,12 @@ The agent **may** simulate mouse and keyboard when it needs to, but must **never
 keyboard when a lower-level way exists**. Each `input` step (and each `el` action) runs on the fastest, least intrusive
 rung that works for that app; the engine steps down only when a rung did not work.
 
-| Rung | How                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Reaches                                                                                                                                                                                            | Cannot reach                                                                                                                                                                                                                                                                                  | Speed (p50)                                                                   | Your cursor and keys                                  |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------- |
-| 1    | **Actions with no coordinates:** UIA Invoke / Value / Toggle patterns; macOS AX actions and `AXValue`; AT-SPI Action and EditableText; app bridges; CDP `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Input.insertText` for the agents' browser                                                                                                                                                                                                                                                                                    | standard controls in most apps, browser pages, any app with a bridge, background windows                                                                                                           | custom-drawn UIs, canvases and games without a bridge; controls that expose no pattern                                                                                                                                                                                                        | dispatch ≤ 10 ms; 1,000 chars of text in one `set_value`/`insertText` ≤ 20 ms | untouched                                             |
-| 2    | **Events sent to one window** at window coordinates, cursor not moved: Windows `PostMessage`/`SendMessage` of `WM_*BUTTON*`, `WM_MOUSEWHEEL`, `WM_KEYDOWN`/`WM_CHAR` to the window handle; macOS `CGEventPostToPid`; X11 `XSendEvent` (xdotool `--window`)                                                                                                                                                                                                                                                                                  | classic Win32 and many toolkit apps, many macOS apps for keys, X11 apps that accept sent events                                                                                                    | games using Raw Input, DirectInput or `GetAsyncKeyState`; some Chromium content areas, UWP/WinUI windows and apps that check real key state; windows of higher integrity (UIPI blocks them); X11 apps that drop `send_event` events (xterm by default); native Wayland apps (no such channel) | ≤ 1 ms per event; 1,000 chars ≤ 60 ms                                         | untouched                                             |
-| 3    | **The agent's own screen and input.** Windows: a hidden desktop in your session (`CreateDesktop`) for apps that need your logins, or the agent account's own non-interactive window station for apps that do not; a loopback RDP session of the agent account on editions that allow several sessions. macOS: a virtual display or a second background GUI session (both to verify; weakest OS here). Linux: Xvfb or a headless compositor (weston or wlroots headless, gamescope headless) as the agent account, or nested in your session | apps the agent opens for its own use; on Linux real XTest/libei input into its own display (games included); on Windows and macOS rungs 1-2 inside it (`SendInput` reaches only the input desktop) | apps already open on your screen (they would have to be reopened there); on Windows and macOS, apps that need real hardware input; GPU apps where the hidden display has no GPU (to verify per OS)                                                                                            | as the rung used inside it, plus the app's start                              | untouched                                             |
-| 4    | **Real synthetic input on your desktop:** `SendInput` / `CGEventPost` / XTest on X11, libei through the RemoteDesktop portal on Wayland (`uinput` only through a root-owned guard device as a last fallback, to verify)                                                                                                                                                                                                                                                                                                                     | everything you can reach by hand                                                                                                                                                                   | elevated and secure-desktop windows (UIPI, refused anyway)                                                                                                                                                                                                                                    | ≤ 2 ms per event; 1,000 chars ≤ 300 ms with the checks below                  | **used**: needs `visible: true`, indicator, take-over |
+| Rung | How                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Reaches                                                                                                                                                                                            | Cannot reach                                                                                                                                                                                                                                                                                  | Speed (p50)                                                                   | Your cursor and keys                                  |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------- |
+| 1    | **Actions with no coordinates:** UIA Invoke / Value / Toggle patterns; macOS AX actions and `AXValue`; AT-SPI Action and EditableText; app bridges; CDP `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Input.insertText` for the agents' browser                                                                                                                                                                                                                                                                       | standard controls in most apps, browser pages, any app with a bridge, background windows                                                                                                           | custom-drawn UIs, canvases and games without a bridge; controls that expose no pattern                                                                                                                                                                                                        | dispatch ≤ 10 ms; 1,000 chars of text in one `set_value`/`insertText` ≤ 20 ms | untouched                                             |
+| 2    | **Events sent to one window** at window coordinates, cursor not moved: Windows `PostMessage`/`SendMessage` of `WM_*BUTTON*`, `WM_MOUSEWHEEL`, `WM_KEYDOWN`/`WM_CHAR` to the window handle; macOS `CGEventPostToPid`; X11 `XSendEvent` (xdotool `--window`)                                                                                                                                                                                                                                                                     | classic Win32 and many toolkit apps, many macOS apps for keys, X11 apps that accept sent events                                                                                                    | games using Raw Input, DirectInput or `GetAsyncKeyState`; some Chromium content areas, UWP/WinUI windows and apps that check real key state; windows of higher integrity (UIPI blocks them); X11 apps that drop `send_event` events (xterm by default); native Wayland apps (no such channel) | ≤ 1 ms per event; 1,000 chars ≤ 60 ms                                         | untouched                                             |
+| 3    | **The agent's own screen and input.** Windows: a hidden desktop in your session (`CreateDesktop`) for apps that need your logins, or the agent account's own non-interactive window station for apps that do not (no RDP session: the agent account may not log on through RDP, lens N7). macOS: a virtual display or a second background GUI session (both to verify; weakest OS here). Linux: Xvfb or a headless compositor (weston or wlroots headless, gamescope headless) as the agent account, or nested in your session | apps the agent opens for its own use; on Linux real XTest/libei input into its own display (games included); on Windows and macOS rungs 1-2 inside it (`SendInput` reaches only the input desktop) | apps already open on your screen (they would have to be reopened there); on Windows and macOS, apps that need real hardware input; GPU apps where the hidden display has no GPU (to verify per OS)                                                                                            | as the rung used inside it, plus the app's start                              | untouched                                             |
+| 4    | **Real synthetic input on your desktop:** `SendInput` / `CGEventPost` / XTest on X11, libei through the RemoteDesktop portal on Wayland (no `uinput` fallback: kernel-level input would reach the lock screen and polkit agents past every check, lens N7)                                                                                                                                                                                                                                                                     | everything you can reach by hand                                                                                                                                                                   | elevated and secure-desktop windows (UIPI, refused anyway)                                                                                                                                                                                                                                    | ≤ 2 ms per event; 1,000 chars ≤ 300 ms with the checks below                  | **used**: needs `visible: true`, indicator, take-over |
 
 **How the engine knows a rung did not work, and steps down:**
 
@@ -521,24 +702,26 @@ rung that works for that app; the engine steps down only when a rung did not wor
 
 **Take-over by rung.** Rungs 1-3 never move your pointer or type into the window you use, so the agent keeps working
 while you use other windows. Take-over (§6.7) stops a batch on rungs 1-2 only when your real input goes to the same
-window the agent is acting in. Rung 4 stops at any real input.
+window the agent is acting in. On rung 4, **any** real click or key press stops it (owner decision 2026-11-13). Either
+way the agent then stays paused until you say continue (§6.7).
 
 **Rules that hold on every rung:** the sensitive set, the high-risk list (keys sent to a terminal by `PostMessage` are
-still acting in a full-user-rights app), the file-type rule, the indicator (for rungs 1-3 a quiet banner "agent working
+still acting in a full-user-rights app), protected areas (§4.4), the indicator (for rungs 1-3 a quiet banner "agent working
 in _app_"; rung 4 the full border), the log.
 
 ### 6.5 Browsers (lens M10)
 
 - **The agents' browser, headless:** runs as the **agent account** on its own display (rung 3), so a page it visits has
-  the agent account's file rights, not yours. CDP over a pipe only the engine holds (`--remote-debugging-pipe`), no
-  local port.
-- **The agents' browser, visible** (a task needs it on your screen): runs as you with browser policy that blocks
-  `file://` and other local schemes, pins downloads to a folder in the reach map, allows no extensions and no sync
-  sign-in, and turns off the password manager and autofill.
+  the agent account's file rights, not yours, and its network (§3.5: your linked machines only, unless a goal opened
+  more). Used for local pages and the agent's own test servers. CDP over a pipe only the engine holds
+  (`--remote-debugging-pipe`), no local port.
+- **No visible agents' browser** (r3 had one running as you with browser policy). Dropped: per-user browser policy also
+  bound your own browser of the same brand (lens n3), and browsing on your screen is now done in your own browser.
 - **CDP is never passed through:** the engine exposes typed verbs (navigate, read the page tree, element actions, the
   `Input.*` calls of rung 1, screenshot), not raw protocol.
-- **Your own browser** (your logins): through its accessibility tree, or a bridge extension you allow (§6.6), which
-  also offers typed verbs only. Its password manager pages, autofill and saved-login screens are in the sensitive set.
+- **Your own browser** (your logins, owner decision 2026-11-13): browsing as you happens here, through its
+  accessibility tree or a bridge extension you allow (§6.6), which also offers typed verbs only. It is acting as you
+  (§4.4). Its password manager pages, autofill and saved-login screens are in the sensitive set.
 
 ### 6.6 App-side bridges
 
@@ -565,8 +748,9 @@ each marked read or act, with a JSON schema.
   window whose document matches a secret pattern; the tray, helper, ask dialog and T3's host-tools screens; windows and
   file dialogs inside the protected store's folder. Seeing and acting return `refused` with the reason.
 - **Full-user-rights apps** act only under an active grant (§4.2); without it they can be seen, not acted on.
-- **Inactive session (lens m3):** acting on your desktop (rungs 1, 2, 4) is refused while your session is locked,
-  disconnected, switched away or remote; rung 3 work in the agent account's own display goes on.
+- **Inactive session (lens m3, n5):** acting in your session is refused while it is locked, disconnected, switched away
+  or remote: rungs 1, 2 and 4, and rung 3 on a hidden desktop in your session (its apps run as you). Rung 3 in the
+  agent account's own window station or display goes on.
 - **On-screen indicator.** While a batch acts, the tray icon changes and a small banner names the app, the step and the
   rung. On rung 4 a coloured border runs around the screen and the agent's pointer is drawn. Drawn by the helper; the
   engine stops without the helper's heartbeat (§6.1).
@@ -574,13 +758,20 @@ each marked read or act, with a JSON schema.
   `LLMHF_INJECTED` / `LLKHF_INJECTED`; macOS: an event tap, our events carry a source tag; X11: XInput2 raw events by
   device; Wayland: the compositor's idle and input signals, to verify per compositor). On take-over (rules per rung in
   §6.4): the running step stops, every key and button the engine holds is released, queued steps are dropped, and the
-  batch returns `interrupted_by_user` with what ran and a fresh diff. A new acting batch on that window starts when you
-  have been idle for a set time (default 5 s; open point 1) or press "let the agent continue".
-- **Clipboard (lens M4).** Read is refused when the content carries a concealed or excluded marker (Windows
+  batch returns `interrupted_by_user` with what ran and a fresh diff. When the engine cannot tell your input from its
+  own on a desktop (a compositor without the signals), rung 4 is not offered there.
+- **Paused after a take-over (owner decision 2026-11-13: no idle timer).** After a take-over, the task's acting in
+  your session (rungs 1, 2 and 4, and rung 3 on a hidden desktop in your session) **stays paused**. It continues only
+  when you press **Continue** in the tray or in T3, or when the agent asks again through `host_ask` (item "continue on
+  your screen") and you allow it. Commands, file tools and rung 3 in the agent account's own display go on meanwhile.
+  The pause is written to the protected store, so a restart keeps it.
+- **Clipboard (lens M4, n2).** Read is refused when the content carries a concealed or excluded marker (Windows
   `ExcludeClipboardContentFromMonitorProcessing` or `CanIncludeInClipboardHistory = 0`; macOS
   `org.nspasteboard.ConcealedType`; KDE `x-kde-passwordManagerHint`), and token shapes are redacted. A write counts as
-  acting: logged, indicator on, and the previous content is **put back when the batch ends** (unless the step says the
-  result is for you), so nothing the agent placed waits to be pasted into a terminal.
+  acting: logged, indicator on, and the previous content is **put back when the batch ends**. A step may mark its
+  result "for you" (left on the clipboard); then the tray shows the kept content in a notification, so you see what you
+  would paste. Your previous clipboard is journalled for the restore (§15); content with a concealed marker is
+  journalled only encrypted for you (DPAPI, the keychain, the Secret Service) and deleted after the restore.
 - **Redaction everywhere (lens M4):** token-shape redaction applies to every output path and every stored record:
   observe text, titles, diffs, bridge results, journalled results returned on retry, `host_run` arguments and output,
   both logs. Typed values are logged as length only when the target is a field marked sensitive or the text matches a
@@ -607,7 +798,7 @@ batch starts, and every other step runs off-screen (rungs 1-3 need no window in 
 | `host_run` (agent account)       | the broker runs from a "whether signed in or not" task, so its processes live in a non-interactive window station and **cannot** draw on your desktop; children are started with `CREATE_NO_WINDOW` anyway, a pseudo-console (ConPTY) only when a program needs a terminal  | a LaunchDaemon has no GUI session; processes cannot reach the window server                                                                                           | no `DISPLAY`, `WAYLAND_DISPLAY` or session bus is passed; the unit has no access to your session's sockets                                 |
 | engine and helper (as you)       | engine is a GUI-subsystem binary with no window; every child: `CREATE_NO_WINDOW` for console programs, `STARTF_USESHOWWINDOW` + `SW_HIDE` for GUI ones; PowerShell `-NoProfile -NonInteractive -WindowStyle Hidden` started without a console, never through `cmd /c start` | engine and helper are `LSUIElement` / background-only; apps opened with `open -g -j` or Launch Services with "don't activate"; scripts use `launch`, never `activate` | apps started without an activation token (`xdg-activation` on Wayland; no `_NET_WM_USER_TIME` on X11), so compositors refuse to focus them |
 | automation adapters (§5 route 2) | COM servers created with `Visible = false` / `DisplayAlerts = false` and macros forced off; WinRT and Shell verbs that need no UI                                                                                                                                           | Apple Events to a running app or a hidden launch; scripting dictionaries without `activate`                                                                           | D-Bus calls, no window                                                                                                                     |
-| browser work                     | the agents' browser runs headless as the agent account unless the batch is `visible` (§6.5)                                                                                                                                                                                 | same                                                                                                                                                                  | same                                                                                                                                       |
+| browser work                     | the agents' browser always runs headless as the agent account; visible browsing uses your own browser (§6.5)                                                                                                                                                                | same                                                                                                                                                                  | same                                                                                                                                       |
 | rungs 1-3                        | UIA patterns and window messages work on windows that are not in front; the engine does not call `SetForegroundWindow`; rung 3 windows are on a desktop you do not see                                                                                                      | AX actions without `AXRaise`; `CGEventPostToPid` does not activate                                                                                                    | AT-SPI actions without focus; rung 3 on its own display                                                                                    |
 
 **Watched while it runs.** While a non-visible batch or `host_run` runs, the engine watches for new shown top-level
@@ -710,11 +901,13 @@ act verbs, `host_ask`, `host_named`, approved scripts, and anything that sends o
 
 - Linux: a mount namespace with the real folders bound read-only and only the private layer writable; a fresh network
   namespace with no interfaces; no access to `/run/user`, abstract sockets or any host socket.
-- macOS: a sandbox profile with file-write limited to the private layer, network denied, and no Mach or Unix-socket
-  IPC to the engine, the broker or T3; each run under a per-slot hidden user from a small pool, so cleanup ends every
-  process of that user (process groups do not hold `setsid` daemons).
+- macOS: a sandbox profile with file-write limited to the private layer, network denied, file-read denied on every
+  secret-pattern path, and no Mach or Unix-socket IPC to the engine, the broker or T3; each run under a per-slot hidden
+  user from a small pool, so cleanup ends every process of that user (process groups do not hold `setsid` daemons).
+  The slot users are in the agent group (§3), so every deny entry of the agent account holds for them too (lens N6).
 - Windows: an AppContainer with no capabilities and ACEs only on the private layer; the engine's and broker's pipes
-  carry no AppContainer ACE, so they refuse it.
+  carry no AppContainer ACE, so they refuse it. The AppContainer's read ACEs on the real folders are applied with the
+  §3.4 walk and are on the uninstall removal list (§15; lens n8).
 - The private layer is made **by the agent account**, so denied files cannot be read and are skipped, and copies of
   secret-pattern files are never made. A denied `.env` never becomes readable in a copy.
 - Speculative processes cannot reach the engine, the T3 server or any local socket (also because the engine admits only
@@ -741,10 +934,13 @@ This sizes parallelism only; it never delays work you asked for (no activity gat
 loser's processes are ended (job object / cgroup / per-slot user: a polite stop, then a hard kill after 2 s); its
 private layer is deleted; its waits, watchers and cached trees are dropped; it is logged as `cancelled_speculative`.
 
-**Applying the winner.** Read-only winners just return their results. A winner's changes are applied to the real
-folders as one write burst: snapshot first (§4.3 rule 6), then each file compare-and-swapped against the hash it had
-when the layer was made, through the link-safe operations of §3.4. If any real file changed meanwhile, nothing is
-applied and the result is `conflict` with the list.
+**Applying the winner (lens N6).** Read-only winners just return their results. A winner's changes are applied to the
+real folders as one write burst **by the agent account**, through the broker, so every OS deny entry holds: a layer
+that contains a `.git/hooks/post-checkout`, a new `.vscode/tasks.json` or a file named `.env` fails to apply there just
+as a direct write would. The applier also refuses, before it writes anything, every path that matches a secret pattern
+or an auto-run path, so a refused apply never leaves half a layer. The burst: snapshot first (§4.3 rule 6), then each
+file compare-and-swapped against the hash it had when the layer was made, through the link-safe operations of §3.4.
+If any real file changed meanwhile, nothing is applied and the result is `conflict` with the list.
 
 ## 8. Speed: budget, measurement, and why not classic computer use
 
@@ -828,14 +1024,16 @@ The batched ask (§4.2) is the only dialog. Two of its item kinds carry a little
 1. **Installs.** The item names a package (winget / Homebrew / the distro's package manager), its source and size, and
    for whom. On Allow the helper installs as **you**; Windows UAC or the OS password prompt follows when it is
    machine-wide. Installing tools for the agent account only (into its own folders) needs no ask.
-2. **Admin commands.** The item shows the exact command. The helper copies every file the command references into a
-   protected folder and shows its hash or content; on Allow the OS's own elevation prompt follows and the **copy** runs,
-   in a protected working folder, so nothing can be swapped between the ask and the run (lens B1).
+2. **Admin commands and other protected-area actions** (§4.4). The item shows the exact command, path or key and the
+   content or diff. The helper copies every file the command references into a protected folder and shows its hash or
+   content; on Allow the OS's own elevation prompt follows, the guard checks it (§4.2) and the **copy** runs, in a
+   protected working folder, so nothing can be swapped between the ask and the run (lens B1). Each Allow covers that
+   one action once.
 
 **Named commands and approved scripts** are entries in the protected store, run by the helper as you, with output
 scrubbed of every secret value: things that need **your** secrets (a deploy with your SSH key) or your session. They
 need no ask because you wrote or approved them, and they run from a frozen copy (§4.3 rule 4): a deploy from a repo
-runs at the commit you approved; a new commit is one ask showing the commit.
+runs at the commit you approved; a new commit is one ask showing the commit and the diff since the last approved one.
 
 ## 10. Network, auth and links
 
@@ -860,19 +1058,21 @@ runs at the commit you approved; a new commit is one ask showing the commit.
   sessions), PR #26757 (open: Tailscale identity sign-in for clients), PR #25024 (open: the desktop app renews its own
   local session only). No open upstream PR adds renewal of peer links.
 
-**Owner decision (2026-11-13): a long link lifetime, easy to extend; no refresh tokens.** You trust your own computers;
-the goal is to keep **outside people** out, not to add friction between your machines.
+**Owner decision (2026-11-13): links expire after 365 days and extend with one click; no refresh tokens.** You trust
+your own computers; the goal is to keep **outside people** out, not to add friction between your machines.
 
 1. **Lifetime setting.** `peerLinkSessionDays` on the computer, for the MCP-client sessions it issues to peer links:
-   default **365 days**, any number of days, or **never expires** (open point 2). It replaces the fixed constant at
-   `EnvironmentAuth.ts:79` for peer-link sessions only, and the issued `expires_in` follows it, so the linking side's
-   own expiry check keeps working unchanged. Written as a small change upstream could take for #33183.
-2. **Extending is one action, no pairing code.** On the computer, the tray's **Extend links** sets every link to now +
-   the lifetime, including links that expired in the last 30 days (older ones need pairing again). From any of your
-   already-linked machines, one command (`t3` link extend for a named computer, also a button in Sharing & access)
-   asks over its live link; the computer extends that link, and, when the caller's link has write access, any other
-   link you name. The extension happens on the computer, in the same transaction that checks revocation, so a revoke
-   always wins over an extension in flight.
+   default **365 days**; a shorter or longer number of days is allowed, "never expires" is not. It replaces the fixed
+   constant at `EnvironmentAuth.ts:79` for peer-link sessions only, and the issued `expires_in` follows it, so the
+   linking side's own expiry check keeps working unchanged. Written as a small change upstream could take for #33183.
+2. **Extending is one click, no pairing code**, from the tray or from any linked machine. On the computer, the tray's
+   **Extend links** sets every link to now + the lifetime, including links that expired in the last 30 days (older
+   ones need pairing again). From any of your already-linked machines, one click in Sharing & access (or `t3` link
+   extend for a named computer) asks over its live link; the computer extends that link, and, when the caller's link
+   has write access, any other link you name. The extension happens on the computer, in the same transaction that
+   checks revocation, so a revoke always wins over an extension in flight. **Only device-bound links extend:** a link
+   with no recorded device (made before device binding) is not extended and is not given host tools; the tray asks you
+   to pair it again (a stolen unbound token can therefore not bind itself to a new device).
 3. **Heads-up** 7 days before any link expires: tray on both machines, `host_status`, and a T3 notification on the
    agent machine, each with the extend action.
 
@@ -945,6 +1145,21 @@ you write and the runner dispatcher (system) reads. Other runner kinds read the 
 (deploys, releases) never run on a personal PC. Suspending a CI job (freezing its processes) is not used: a frozen
 runner loses its connection and the job fails; it is an option only for local jobs with no connection to keep.
 
+**Isolation of runner accounts on a personal PC (lens N10).** A CI job runs repository code, so runner slot accounts get
+at least the agent account's walls, checked by the install verify (§3.3) and daily:
+
+- **Accounts:** one standard account per slot, in a runner group that is separate from the agent group; no admin, no
+  remote or local logon, no session of yours (no window station, display or session bus; §6.8's `host_run` row).
+- **Files:** no reach map at all; each slot works in its own folder. The reach check (§3.3) runs as each slot account
+  and must find nothing of yours readable; the secret deny pass applies to the runner group too.
+- **Network:** the always-denied floor of §3.5 (loopback except its own, LAN, tailnet, link-local, the computer's own
+  addresses, on-link prefixes). Unlike the agent account, a runner has the public internet, since a CI job needs it.
+- **Disk:** a quota per slot account, and the cgroup or job-object caps of this section.
+- **Persistence:** the agents' own-persistence denies of §3.1 apply to runner accounts too; slots are wiped after each
+  job (the fleet runners' one-job rule, #13).
+- **Who may trigger:** on a personal PC, only jobs started by you (your pushes, your PRs, schedules of your repos) run;
+  jobs from other people's pull requests go to the server pool or GitHub-hosted runners.
+
 ## 12. Tray icon, wind down, kill switch and power loss
 
 One tray icon per computer, from the session helper, covering host tools and runner work: in the Windows notification
@@ -956,11 +1171,13 @@ no tray today.
 
 - **Status:** host tools (idle, working, acting in _app_ on rung _n_, paused, winding down, safe to shut down), the
   calling project and thread while acting, link expiry and last use, runners (jobs running, budget and why).
-- **Pause / Resume.**
+- **Pause / Resume**, and **Continue** after a take-over (§6.7).
 - **Wind down** and **Shut down when safe** (wind down, then the OS shutdown).
 - **Kill switch** (asks once: "stop every agent process on this computer now?"), and **Revoke all links**.
-- **Extend links** (§10), grants in force (with Revoke), runner override (§11), open log, open policy, recipes, bridges
-  waiting.
+- **What the agent wrote and ran** (§4.3 rule 7), **held changes** to protected areas and quarantined auto-run paths
+  (Keep / Remove), agent-caused processes running as you (with End).
+- **Extend links** (§10), grants in force and remembered answers (with Revoke), runner override (§11), open log, open
+  policy, recipes, bridges waiting, install-verify warnings (§3.3), snapshot evictions before 24 h (§4.3 rule 6).
 
 ### 12.2 Wind down (owner decision 2026-11-13: no fixed timer)
 
@@ -983,14 +1200,21 @@ The **kill switch** stays the immediate stop (§4.3 rule 8).
 The computer may be switched off at any moment. Every part writes its state so that the next start recovers:
 
 - **Atomic and durable writes:** the protected store, recipes, journals, ledgers and state files are written to a temp
-  file, fsynced, then renamed; logs are fsynced per line.
-- **On the next start, in order:** the guard checks the protected store's signature (falls back to the last good
-  version) and the log tails (a half line gets a `truncated` marker); the helper runs the full deny pass and the
+  file, fsynced, then renamed; logs are fsynced per line. **Narrowing first (lens N8):** revoke, Deny, pause, the kill
+  switch and narrowing the reach map are durable (store and a narrowing record in the guard's log, both fsynced)
+  before the tray confirms them; a power cut can lose a narrowing only if the tray never said it was done.
+- **No fallback that widens (lens N8):** when the store's signature fails, the guard does not simply load the last
+  good version, which could hold grants you revoked since, an auto-run unlock you withdrew or no pause. It loads that
+  version and **replays every narrowing record in its log since that version**. If it cannot (the log is damaged too),
+  it starts with **no grants beyond the built-in defaults and with pause on**, and the tray says so.
+- **On the next start, in order:** the guard checks the protected store's signature (with the fallback above) and the
+  log tails (a half line gets a `truncated` marker); it removes leftover persistence locks from its ledger (§4.4); the
+  helper runs the full deny pass and the
   install verify before host tools come back (§3.3); the engine drops held-input files from before the boot (the OS
   reset input) and marks journalled started-but-unconfirmed steps `unknown`; speculative layers listed in the journal
   are deleted; snapshots the OS did not finish are discarded; the runner dispatcher re-asks for every job in its ledger
   and for jobs that were running on this computer (GitHub reports them failed with a lost runner); `winding_down` from
-  before the boot is cleared; "this task" grants are ended.
+  before the boot is cleared; "this task" grants are ended; a take-over pause stays (§6.7).
 - **What is lost:** work inside apps that was not saved; agent file changes after the last snapshot that were not made
   through T3's file tools (those have pre-images). Both are stated in the failure table (§15).
 
@@ -1009,122 +1233,155 @@ The computer may be switched off at any moment. Every part writes its state so t
 
 ## 14. Threat model and what still leaks
 
-| Threat                                         | What stops it                                                                                                                            | What is left                                                                                           |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Prompt injection from files, screens, bridges  | the sensitive set, the high-risk ask, untrusted marking, project grants and outside-input threads, indicator, take-over, undo, log       | in a non-sensitive app it can do what you could there (send a message, press a button)                 |
-| Files the agent wrote run as you (B1)          | file-type rule, protected working folders, frozen copies for scripts, named and admin commands, bridge hashes, auto-run paths denied     | a data file that exploits a bug in an app's parser                                                     |
-| Planted links redirect a privileged write (B2) | link-safe operations (§3.4): no following, link count 1, final-path check, walks stop at links                                           |                                                                                                        |
-| The agent widens its own policy (B3)           | protected store owned by the guard; widening through the ask, with OS consent while a full-rights grant is active; store windows refused | during a full-rights grant the agent has your user rights (§14.1)                                      |
-| A command takes over T3 on the computer (M1)   | separate host and agent accounts; admin-owned install; engine admits only the host account; no outbound link                             | delegated full agents stay off until they run through the broker                                       |
-| Speculative run escapes (M2)                   | OS-enforced sandbox; no network or local IPC; layers made by the agent account                                                           |                                                                                                        |
-| Agent reaches local services (M3)              | default-deny network classes, own-loopback only, probed at install                                                                       | the public internet: anything readable can leave                                                       |
-| Secrets via clipboard, logs, outputs (M4)      | concealed markers, restored clipboard, redaction on every path and record                                                                | a secret in an unknown format                                                                          |
-| Typing lands in the wrong window (M5)          | the input ladder (rungs 1-3 need no focus); rung 4 focus lock, chunk checks, abort                                                       | an app that changes its own focus inside a chunk of 8 events                                           |
-| An untrusted thread calls host tools (M6)      | per-project grants, outside-input threads read-only, caller shown and logged                                                             | a thread in a granted project that reads outside text without the flag                                 |
-| Stolen link (M7)                               | device binding, unknown-device alert, revoke all, last use shown                                                                         | an infected own machine can use its links until kill switch / revoke all                               |
-| State fails open (M8)                          | fail-closed rows in §15; install verify gates host tools; heartbeat; uninstall rows                                                      |                                                                                                        |
-| Agent undo wipes your work (M9)                | writer recorded; agent undo restores only agent changes with matching hash                                                               | changes whose writer the OS cannot tell count as yours and are not undone by the agent                 |
-| Browser with your rights (M10)                 | headless as the agent account; hardened visible profile; typed CDP verbs only                                                            | your own browser through a bridge acts with your logins                                                |
-| Reading your other files                       | reach map, sensitive set, reach check                                                                                                    | folders every user may read that you chose to keep                                                     |
-| Secrets inside the reach map                   | built-in patterns, deny entries, fail-closed deny pass, watcher                                                                          | a secret in an unknown format or ordinary file name; about one second after you create a matching file |
-| Damage to your folders                         | snapshots, pre-images, writer log, `host_undo`, quota                                                                                    | agent changes between snapshots made by commands; changes older than 24 hours; changes inside apps     |
+| Threat                                             | What stops it                                                                                                                                                                                                          | What is left                                                                                                                                                                                                                 |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Prompt injection from files, screens, bridges      | the sensitive set, the high-risk ask, protected areas, untrusted marking, project grants and outside-input threads, indicator, take-over, the activity log, undo, the kill switch                                      | **in any app it acts as you** (§4.4): it can send a message, and through a file dialog, a link or a launcher run any file as you, including one it wrote; that code can do what your account can outside the protected areas |
+| Agent-caused code persists after the task (N1, N4) | protected areas held per action (OS-enforced for system areas; locked while acting, watched always and diffed per grant for yours); kill switch ends agent-caused processes                                            | a persistence place not on the built-in list, a changed program in a writable folder, or a change made after the lock window through a process that escaped the agent-caused mark: shown only in the activity log            |
+| Files the agent wrote run as you (B1, N1)          | approved runs use frozen copies and protected working folders; bridge hashes; auto-run paths denied, renames blocked, new ones quarantined; the activity log flags every run of an agent-written file                  | **open by owner decision:** you or the agent opening such a file through an app's UI runs it, with no OS warning; IDE build sync can run an agent-edited build file (N3d)                                                    |
+| Planted links redirect a privileged write (B2)     | link-safe operations (§3.4): no following, link count 1, final-path check, walks stop at links; the guard's own copy walker on Linux                                                                                   |                                                                                                                                                                                                                              |
+| The agent widens its own policy (B3, N4)           | protected store owned by the guard, unreadable to the agent group; consent for full rights, elevation and protected areas checked by the guard itself; widening needs that consent while agent-caused code runs as you | a forged ordinary answer while agent-caused code escaped the mark; it grants only what your account already has, and is listed in the tray                                                                                   |
+| A command takes over T3 on the computer (M1, N2)   | separate host and agent accounts; admin-owned install; engine admits only the host account; no outbound link; forwarded-tool allowlist on the computer; T3 terminal and provider features off there                    | delegated full agents stay off until they run through the broker                                                                                                                                                             |
+| Speculative run escapes (M2, N6)                   | OS-enforced sandbox; no network or local IPC; layers made by the agent account; slot users in the agent group; winner applied by the agent account, secret and auto-run paths refused                                  |                                                                                                                                                                                                                              |
+| Agent reaches the network (M3, N5)                 | no direct internet by default; your linked machines only; per-goal ask; an always-denied floor including the computer's own addresses and on-link prefixes; DNS through the tailnet only; probed at install            | after you open the internet for a goal: anything the agent account can read can leave during that goal                                                                                                                       |
+| Secrets via clipboard, logs, outputs (M4)          | concealed markers, restored clipboard, "for you" content shown, concealed journal copies encrypted, redaction on every path and record                                                                                 | a secret in an unknown format                                                                                                                                                                                                |
+| Typing lands in the wrong window (M5)              | the input ladder (rungs 1-3 need no focus); rung 4 focus lock, chunk checks, abort; any real input stops rung 4 and pauses                                                                                             | an app that changes its own focus inside a chunk of 8 events                                                                                                                                                                 |
+| An untrusted thread calls host tools (M6)          | per-project grants (new projects off), outside-input threads read-only, caller shown and logged                                                                                                                        | a thread in a granted project that reads outside text without the flag                                                                                                                                                       |
+| Stolen link (M7)                                   | device binding, only bound links extend or get host tools, unknown-device alert, revoke all, last use shown, 365-day expiry                                                                                            | an infected own machine can use its links until kill switch / revoke all                                                                                                                                                     |
+| State fails open (M8, N8)                          | fail-closed rows in §15; install verify gates host tools; heartbeat; narrowing durable before confirmed; fallback replays narrowing or starts paused; uninstall rows                                                   |                                                                                                                                                                                                                              |
+| Agent undo wipes your work (M9)                    | writer recorded; agent undo restores only agent changes with matching hash                                                                                                                                             | changes whose writer the OS cannot tell count as yours and are not undone by the agent                                                                                                                                       |
+| Browser with your rights (M10)                     | the agents' browser headless as the agent account, typed CDP verbs only; no visible agents' browser                                                                                                                    | browsing in your own browser acts with your logins (§4.4)                                                                                                                                                                    |
+| Input below the OS's checks (N7)                   | no RDP session for the agent account; no `uinput`                                                                                                                                                                      |                                                                                                                                                                                                                              |
+| Hostile CI job on your PC (N10)                    | runner accounts: own group, no reach map, network floor, quota, no session, only your own jobs                                                                                                                         | what the public internet gives a job you started                                                                                                                                                                             |
+| Elevation without a prompt                         | UAC on with the secure desktop, sudo timestamps cleared, no `NOPASSWD`                                                                                                                                                 | an administrator account at the default UAC level (known auto-elevation tricks; warned); root inside your WSL distros (`wsl -u root`)                                                                                        |
+| Reading your other files                           | reach map, sensitive set, reach check                                                                                                                                                                                  | folders every user may read that you chose to keep; system areas (readable by design)                                                                                                                                        |
+| Secrets inside the reach map                       | built-in patterns, deny entries, fail-closed deny pass, watcher                                                                                                                                                        | a secret in an unknown format or ordinary file name; about one second after you create a matching file                                                                                                                       |
+| Damage to your folders                             | snapshots, pre-images with their own cap, writer log, `host_undo`, quota, eviction warning                                                                                                                             | changes made by commands between snapshots; under heavy agent writes, snapshot undo only for the 1-hour floor (N9); changes inside apps                                                                                      |
 
-**What still leaks, plainly:** files in the reach map and what the apps the agent uses show (trees, values,
-screenshots) can reach the model provider and the internet. Process names and redacted window titles of all apps. Data
-read goes into transcripts.
+**What still leaks, plainly:** files in the reach map, readable system areas, and what the apps the agent uses show
+(trees, values, screenshots) reach the model provider through the agent machine, and the internet when you open it for
+a goal. Process names and redacted window titles of all apps. Data read goes into transcripts. **Anything your account
+can read can leave once agent-caused code runs as you**, because that code has your network, not the agent account's.
 
 ### 14.1 Owner scope vs lens
 
 Where a lens fix would contradict the owner's scope (A: goal-driven, whole computer except sensitive things, one
-batched ask), A is kept and the hole is closed another way.
+batched ask), A is kept and the hole is closed another way, or the owner accepts it and it is said openly.
 
-| Finding | Lens default not taken                                        | Why                                                                    | What closes the hole instead                                                                                                         | Residual risk                                                                     |
-| ------- | ------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| B3c     | full-user-rights apps never get acting from a default         | A: one batched ask, not per-app acknowledgements in the tray           | they are on the high-risk list; granted with OS consent, scope "this task" by default; widening needs OS consent while one is active | during a grant the agent has your user rights, including your profile's secrets   |
-| m5      | unknown apps hidden, opt-in per app                           | A: whole computer by default                                           | sensitive set refused, relevance-scoped observation, redacted titles, untrusted marking                                              | what a used app shows (mail, chat) reaches the provider                           |
-| B1a     | open files only in apps named in the policy                   | A: no per-app list                                                     | the file-type rule for agent-writable folders in every app; macros forced off; protected working folders                             | a data file that exploits an app's parser                                         |
-| r2 §6.5 | acting and synthetic input off until enabled                  | A and the owner's input decision                                       | the input ladder: real input only last, `visible: true`, indicator, take-over                                                        | rung 4 still uses your mouse when nothing else works                              |
-| M4      | clipboard read and write off by default                       | A: the clipboard is part of the computer                               | concealed markers refused, redaction, writes are acting and put back after the batch                                                 | a password copied from a plain app without markers is readable                    |
-| M6      | host tools off for every thread until granted                 | owner: his machines and projects are trusted, no friction between them | one toggle per project; outside-input threads read-only; caller logged and shown                                                     | a thread in a granted project reading outside text without the flag               |
-| M7      | refresh-token rotation, reuse detection, absolute lifetime    | owner chose the long link lifetime and easy extension                  | device binding, unknown-device alert, last use shown, revoke all, lifetime setting                                                   | an infected own machine can use its links until kill switch / revoke all          |
-| B1e     | package manifests and other code files read-only to the agent | agent work is code; A                                                  | only auto-run paths (code that runs without you choosing it) are denied; named commands use frozen copies                            | code you choose to run (a test) may contain agent changes, as with any agent work |
-| m4      | bridge verbs allowed one at a time                            | A: one batched ask                                                     | the ask lists every verb with its own tick box; changed bridge files go back to waiting                                              | "Allow" with all boxes ticked grants every verb                                   |
+| Finding  | Lens default not taken                                                                                                                              | Why                                                                                                        | What closes the hole instead                                                                                                                                                                                             | Residual risk                                                                                                                                           |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| N1       | file dialogs limited to typing a path; full-rights class by ability with an exec backstop; Mark-of-the-Web / quarantine flag on agent-written files | owner decision 2026-11-13: option A only, acting in the UI is acting as you, no marking or ask-before-open | said openly (§4.4); protected areas per action, OS-enforced where possible; the activity log of every file written and run; launchers and IDE terminals on the full-rights list; kill switch ends agent-caused processes | agent-caused code runs as you and can do what your account can outside the protected areas, until the kill switch                                       |
+| B3c      | full-user-rights apps never get acting from a default                                                                                               | A: one batched ask, not per-app acknowledgements in the tray                                               | high-risk list; OS consent the guard checks itself (owner kept it); scope "this task"; widening needs that consent while agent-caused code runs as you; persistence baseline diff per grant                              | during a grant the agent has your user rights, including your profile's secrets; after it, whatever escaped the persistence watch (§4.4 "What is left") |
+| m5       | unknown apps hidden, opt-in per app                                                                                                                 | A: whole computer by default                                                                               | sensitive set refused, relevance-scoped observation, redacted titles, untrusted marking                                                                                                                                  | what a used app shows (mail, chat) reaches the provider                                                                                                 |
+| B1a      | open files only in apps named in the policy                                                                                                         | A: no per-app list                                                                                         | macros forced off in the engine's own automation; protected working folders; the activity log                                                                                                                            | a data file that exploits an app's parser; any file run through the UI (N1)                                                                             |
+| r2 §6.5  | acting and synthetic input off until enabled                                                                                                        | A and the owner's input decision                                                                           | the input ladder: real input only last, `visible: true`, indicator, take-over that pauses until you continue                                                                                                             | rung 4 still uses your mouse when nothing else works                                                                                                    |
+| M4       | clipboard read and write off by default                                                                                                             | A: the clipboard is part of the computer                                                                   | concealed markers refused, redaction, writes are acting and put back after the batch                                                                                                                                     | a password copied from a plain app without markers is readable                                                                                          |
+| M6       | host tools off for every thread until granted                                                                                                       | owner: your own machines and projects are trusted, no friction between them                                | one toggle per project, off for new projects; outside-input threads read-only; caller logged and shown                                                                                                                   | a thread in a granted project reading outside text without the flag                                                                                     |
+| M7       | refresh-token rotation, reuse detection, absolute lifetime                                                                                          | owner chose 365 days with one-click extension                                                              | device binding, only bound links extend, unknown-device alert, last use shown, revoke all                                                                                                                                | an infected own machine can use its links until kill switch / revoke all                                                                                |
+| B1e, N3d | package manifests, build files and other code read-only to the agent; or IDE auto-sync required off                                                 | agent work is code; A                                                                                      | only auto-run paths are denied, with rename blocks and quarantine; IDE sync settings warned at install; agent writes to build files flagged in the activity log                                                          | an IDE that syncs build files on change runs an agent edit as you with no click; code you choose to run (a test) may contain agent changes              |
+| m4       | bridge verbs allowed one at a time                                                                                                                  | A: one batched ask                                                                                         | the ask lists every verb with its own tick box; changed bridge files go back to waiting                                                                                                                                  | "Allow" with all boxes ticked grants every verb                                                                                                         |
 
-**Owner decisions changed by a blocker:** only one. B3 adds the OS's own consent prompt to ask items that grant full
-user rights or elevation, and to any widening while such a grant is active. Everything else from earlier rounds stays
-(speed first, invisible by default, speculative batches, tray and wind down, runner-side activity), changed only where
-the owner changed it this round (links, wind-down timer, runner levels, snapshot size, speculative sizing).
+**Owner decisions changed by a blocker:** B3 (round 2) added the OS's own consent to ask items that grant full user
+rights or elevation; the owner kept it in round 3 and it now also covers protected-area actions, checked by the guard
+itself (N4). Blocker N1 (round 3) did not change an owner decision: the owner chose to keep A and say it openly, and
+added the protected areas and the activity log. Everything else from earlier rounds stays (speed first, invisible by
+default, speculative batches, tray and wind down, runner-side activity, goal-driven scope, the batched ask, the input
+ladder), changed only where the owner changed it (no direct internet for the agent account, take-over pause with no
+idle timer, 365-day links, default folders, no visible agents' browser).
 
 ## 15. Failure table (state the feature changes)
 
 What happens when it runs again, stops half-way, or meets old or empty state:
 
-| Step that writes                         | Crash or stop half-way                                                                                                                                                                                                                            | Run again                                                                                                                        | Old / empty / half-written state                                                                                                                                                           | Test                          |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------- |
-| install: create both accounts            | one or both exist, nothing else                                                                                                                                                                                                                   | finds them, keeps them, re-checks groups (refuses if either is an admin)                                                         | an account of that name that is an admin or in a remote group: refused                                                                                                                     | fake OS layer                 |
-| install: reach map grants                | some folders granted                                                                                                                                                                                                                              | re-applies all through link-safe walks (idempotent); removes grants for folders no longer listed                                 | a folder deleted since: reported, skipped; a planted link in a folder: not followed, reported                                                                                              | fake ACL layer + link fixture |
-| install: services, broker, guard         | some installed, not started                                                                                                                                                                                                                       | replaced with the same definitions                                                                                               | an upstream "as me" task for the same T3 home: refused with the reason                                                                                                                     | fake OS layer                 |
-| **install verify half-applied**          | host tools stay off; `host_status` names the failed check                                                                                                                                                                                         | re-runs every check; tools come on only when all pass                                                                            | a later change (account added to a group, rule deleted): next quick or daily check turns tools off                                                                                         | verify fakes per check        |
-| **secret deny pass**                     | file tools stay off until a full pass completes                                                                                                                                                                                                   | a full pass is idempotent                                                                                                        | files created while the helper was down or during a watcher overflow: covered by the pass on start / after overflow; reads refused while the pass is stale                                 | fake FS + clock               |
-| reach map: folder removed                | grants removed for some files                                                                                                                                                                                                                     | removal finishes; agent processes with handles under it are ended first                                                          | a process that held a handle across the change: ended, logged                                                                                                                              | handle fixture                |
-| ask answer (guard)                       | answer written atomically or not at all; not written = denied                                                                                                                                                                                     | the same answer again is a no-op                                                                                                 | a "this task" grant from before a restart: ended; an unanswered ask after a restart: denied                                                                                                | fake guard                    |
-| protected store edit                     | temp + atomic rename by the guard                                                                                                                                                                                                                 | new store or old one, never half                                                                                                 | edited outside the guard (signature fails): ignored, last good version used, tray asks you to confirm with OS consent; unreadable: all write and acting tools refused                      | signature test                |
-| `host_write`                             | temp beside target, target unchanged; pre-image saved first                                                                                                                                                                                       | same content: OK; other content: compare-and-swap refuses                                                                        | target changed since read: refused                                                                                                                                                         | fake FS                       |
-| **snapshot**                             | snapshot taken or not; log line says which; an unfinished OS snapshot is discarded on start                                                                                                                                                       | a request within 30 minutes of the last reuses it                                                                                | store full, or keeping it would push out one younger than 1 hour: agent writes and runs **refused**, tray red                                                                              | fake snapshot store           |
-| `host_undo` (agent)                      | some files restored, each through link-safe writes                                                                                                                                                                                                | re-run restores the rest; already-restored files compare equal                                                                   | a file you changed since: listed, not restored; writer unknown: treated as yours; snapshot expired: refused with the oldest time                                                           | writer fixture                |
-| log line                                 | line written before the action and after; a call whose log write fails is refused                                                                                                                                                                 | the guard's countersign continues from the last good head                                                                        | half line at the end: `truncated` marker, chain continues; a T3 log head that differs from the countersigned one: tray alert                                                               | log fixture                   |
-| `host_do` batch                          | journal (fsynced) says which steps are done; started-but-unconfirmed is `unknown`                                                                                                                                                                 | same key: journalled results, no step re-runs; a new key is a new batch                                                          | journal from before a restart: kept 24 h for retries, then dropped; empty step list: `ok`, nothing run                                                                                     | fake engine back end          |
-| **input rung step-down**                 | the rung tried and its result are journalled before the next rung is used                                                                                                                                                                         | same key: no rung is re-tried; an unsafe-to-repeat action with an unclear check returns `unknown`, never a second apply          | rung memory from an older app version: tried first, steps down once, memory updated                                                                                                        | fake app per rung             |
-| **focus change mid-burst (rung 4)**      | burst aborted between chunks, held input released, `stale` with the chunks sent                                                                                                                                                                   | the agent re-plans from a fresh diff; never resumes the burst by itself                                                          | the target window gone: `stale`                                                                                                                                                            | focus-steal test per OS       |
-| **you grab the mouse/keyboard mid-step** | step stops, all held keys and buttons released, queued steps dropped, `interrupted_by_user` with what ran and a diff                                                                                                                              | a new acting batch on that window waits for your idle time or "let the agent continue"                                           | a take-over during a `wait`: the wait ends as interrupted too                                                                                                                              | input hook fake               |
-| **helper dies, engine lives**            | engine stops acting within 500 ms of the missed heartbeat and releases held input                                                                                                                                                                 | acting resumes only when the helper is back and the indicator is up                                                              | an engine from before a helper restart: the new helper stops it and starts a fresh one                                                                                                     | kill test per OS              |
-| **engine dies mid-drag**                 | the engine writes every held key/button to a held-input file before sending it; the helper (or the next start) sends the ups, then deletes the file                                                                                               | after restart the batch is `unknown` from the journal and is not re-sent                                                         | a held-input file from before a reboot: dropped (the OS reset input)                                                                                                                       | kill test per OS              |
-| **clipboard write**                      | the previous content is saved in the journal before the write                                                                                                                                                                                     | after a crash the next start puts the saved content back if the clipboard still holds the agent's value                          | the clipboard changed by you since: left alone                                                                                                                                             | fake clipboard                |
-| **speculative batch**                    | the journal lists each private layer **before** it is made; on restart every listed layer is deleted and its per-slot processes ended; a winner whose apply did not finish is re-applied file by file (compare-and-swap makes done files a no-op) | same key: the journalled winner and outcome, nothing re-runs; a key whose alternatives never finished: `unknown`, layers cleaned | layers with no journal entry: left alone and reported; a real file changed during the run: `conflict`, nothing applied; zero alternatives: refused                                         | fake engine + fake FS         |
-| **window pops in front** (§6.8)          | the engine hides it and gives the front back; if the engine dies first, the window stays and the next start logs it                                                                                                                               | the same program is started the other way the result told the agent; a repeat offender is stopped                                | a recipe that now shows a window: `visible_side_effect`, recipe marked `needs repair`                                                                                                      | no-pop-in test                |
-| recipe save                              | temp + atomic rename into the store                                                                                                                                                                                                               | same content: no-op (content hash); new content: new version                                                                     | a recipe for an older app version: runs, and a failing step marks it `needs repair`; empty store: fine                                                                                     | fake guard                    |
-| pause / kill switch / revoke all         | pause state in the store; accounts disabled; links revoked one by one, each committed                                                                                                                                                             | idempotent; a revoke-all re-run revokes what is left                                                                             | kill switch with no agent processes: OK; revoke-all with no links: OK                                                                                                                      | fake OS layer                 |
-| **wind down**                            | the `winding_down` state (start time, items, choice per item) is written first; after a helper crash it is read back and continues; parked and moved items are in the ledger and not moved again                                                  | pressing it again shows progress, starts nothing new                                                                             | a `winding_down` state older than the last boot: cleared at sign-in (unless "stay paused"); nothing running: "safe to shut down" at once                                                   | fake clock + fakes            |
-| **runner shrink**                        | the ledger line (job, run, attempt, choice) is written before the park or cancel; on restart, lines without "re-run asked" get it; a job already re-run (newer attempt exists) is marked done                                                     | same budget again: no-op; growth held off by the 2-minute rule; a second drop does not move the same attempt twice               | `activity.json` stale or unreadable while someone is signed in: admit nothing new, tray note; unknown format: same; no jobs: only the heartbeat changes                                    | fake dispatcher + fake meters |
-| **power loss (any moment)**              | every write above is atomic or journalled; on start: store signature, log tails, deny pass, install verify, held-input drop, journal `unknown`s, layer cleanup, unfinished snapshots discarded, runner ledger and lost-runner jobs re-asked       | a second power loss during recovery: each recovery step is idempotent and runs again                                             | lost: unsaved work inside apps; command changes after the last snapshot (T3 file tool changes have pre-images)                                                                             | power-cut test in a VM per OS |
-| **link extend**                          | the computer commits the new expiry in one transaction with the revocation check; the caller may miss the reply                                                                                                                                   | extending again sets the same or a later expiry (idempotent)                                                                     | a link expired more than 30 days ago: refused, pair again; a link made before device binding: bound to the first device that extends it, with a tray note                                  | fake clock                    |
-| **link used from an unknown device**     | the call is refused before any tool runs                                                                                                                                                                                                          | each further try is refused and counted                                                                                          | a link whose device identity was never recorded (older link): works until it is extended or re-paired, then bound                                                                          | fake tailnet whois            |
-| availability, project grants             | settings saved                                                                                                                                                                                                                                    |                                                                                                                                  | "off until" in the past: on; bad value: off; a project with no setting: off                                                                                                                | settings test                 |
-| **host tools off / uninstall**           | each step is listed in a removal ledger first; a half removal finishes on the next run                                                                                                                                                            | idempotent                                                                                                                       | removes: reach map grants, deny entries, auto-run denies, firewall rules, services, broker, guard tasks, snapshots it made, links it issued, both accounts (after you confirm their files) | uninstall test per OS         |
+| Step that writes                         | Crash or stop half-way                                                                                                                                                                                                                                                                                                                             | Run again                                                                                                                            | Old / empty / half-written state                                                                                                                                                                                                                                                                                        | Test                              |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| install: create both accounts            | one or both exist, nothing else                                                                                                                                                                                                                                                                                                                    | finds them, keeps them, re-checks groups (refuses if either is an admin)                                                             | an account of that name that is an admin or in a remote group: refused                                                                                                                                                                                                                                                  | fake OS layer                     |
+| install: reach map grants                | some folders granted                                                                                                                                                                                                                                                                                                                               | re-applies all through link-safe walks (idempotent); removes grants for folders no longer listed                                     | a folder deleted since: reported, skipped; a planted link in a folder: not followed, reported                                                                                                                                                                                                                           | fake ACL layer + link fixture     |
+| install: services, broker, guard         | some installed, not started                                                                                                                                                                                                                                                                                                                        | replaced with the same definitions                                                                                                   | an upstream "as me" task for the same T3 home: refused with the reason                                                                                                                                                                                                                                                  | fake OS layer                     |
+| **install verify half-applied**          | host tools stay off; `host_status` names the failed check                                                                                                                                                                                                                                                                                          | re-runs every check; tools come on only when all pass                                                                                | a later change (account added to a group, rule deleted): next quick or daily check turns tools off                                                                                                                                                                                                                      | verify fakes per check            |
+| **secret deny pass**                     | file tools stay off until a full pass completes                                                                                                                                                                                                                                                                                                    | a full pass is idempotent                                                                                                            | files created while the helper was down or during a watcher overflow: covered by the pass on start / after overflow; reads refused while the pass is stale                                                                                                                                                              | fake FS + clock                   |
+| reach map: folder removed                | grants removed for some files                                                                                                                                                                                                                                                                                                                      | removal finishes; agent processes with handles under it are ended first                                                              | a process that held a handle across the change: ended, logged                                                                                                                                                                                                                                                           | handle fixture                    |
+| ask answer (guard)                       | answer written atomically or not at all; not written = denied                                                                                                                                                                                                                                                                                      | the same answer again is a no-op                                                                                                     | a "this task" grant from before a restart: ended; an unanswered ask after a restart: denied                                                                                                                                                                                                                             | fake guard                        |
+| **protected-area change held** (§4.4)    | blocked, or reverted into the undo store with a ledger line written first; the hold is in the store                                                                                                                                                                                                                                                | Keep or Remove twice: the second is a no-op; a revert interrupted by a crash is finished on start from the ledger                    | a held change whose entry you since changed by hand: shown with both versions, nothing applied without you; nothing held: no tray item                                                                                                                                                                                  | fake watcher per OS               |
+| **persistence lock window** (§4.4)       | the guard writes each lock (object, old owner, old ACL) to its ledger before applying it                                                                                                                                                                                                                                                           | a second lock on a locked object is a no-op; ending the window restores from the ledger                                              | locks left by a crash or power cut: restored to the recorded owner and ACL on the next start; an object you deleted meanwhile: ledger line dropped                                                                                                                                                                      | fake ACL layer + power cut        |
+| **auto-run path quarantined**            | the move into the undo store is link-safe and journalled; the tray item appears after the move                                                                                                                                                                                                                                                     | Keep restores it with your denies applied; repeated Keep or Remove: no-op                                                            | a quarantined path whose folder is gone: Keep refused with the reason; "make it mine" on a repo whose `.git` you already own: no-op                                                                                                                                                                                     | fake FS + writer fixture          |
+| **forwarded tool outside the allowlist** | refused on the computer before anything runs; logged                                                                                                                                                                                                                                                                                               | refused again                                                                                                                        | an older agent machine without the allowlist: still refused on the computer                                                                                                                                                                                                                                             | toolkit test                      |
+| **network floor on address change**      | the agent group's network is closed while the rule update is pending                                                                                                                                                                                                                                                                               | the update is idempotent                                                                                                             | a new global IPv6 address or on-link prefix: in the floor before the next agent connection                                                                                                                                                                                                                              | fake interface events             |
+| protected store edit                     | temp + atomic rename by the guard                                                                                                                                                                                                                                                                                                                  | new store or old one, never half                                                                                                     | edited outside the guard or damaged (signature fails): the last good version plus every narrowing record from the guard's log since it; if those cannot be replayed, built-in defaults with pause on and a tray note; you confirm an outside edit with OS consent; unreadable: all write and acting tools refused       | signature test + narrowing replay |
+| `host_write`, `host_delete`              | temp beside target, target unchanged; pre-image saved first                                                                                                                                                                                                                                                                                        | same content: OK; other content: compare-and-swap refuses                                                                            | target changed since read: refused; pre-images that would not fit the undo store's cap: refused with the size                                                                                                                                                                                                           | fake FS                           |
+| **snapshot**                             | snapshot taken or not; log line says which; an unfinished OS snapshot is discarded on start                                                                                                                                                                                                                                                        | a request within 30 minutes of the last reuses it                                                                                    | store full, or keeping it would push out one younger than 1 hour: agent writes and runs **refused**, tray red; a snapshot evicted before 24 h: tray warning naming the agent changes that lost their undo                                                                                                               | fake snapshot store               |
+| `host_undo` (agent)                      | some files restored, each through link-safe writes                                                                                                                                                                                                                                                                                                 | re-run restores the rest; already-restored files compare equal                                                                       | a file you changed since: listed, not restored; writer unknown: treated as yours; snapshot expired: refused with the oldest time                                                                                                                                                                                        | writer fixture                    |
+| log line                                 | line written before the action and after; a call whose log write fails is refused                                                                                                                                                                                                                                                                  | the guard's countersign continues from the last good head                                                                            | half line at the end: `truncated` marker, chain continues; a T3 log head that differs from the countersigned one: tray alert                                                                                                                                                                                            | log fixture                       |
+| `host_do` batch                          | journal (fsynced) says which steps are done; started-but-unconfirmed is `unknown`                                                                                                                                                                                                                                                                  | same key: journalled results, no step re-runs; a new key is a new batch                                                              | journal from before a restart: kept 24 h for retries, then dropped; empty step list: `ok`, nothing run                                                                                                                                                                                                                  | fake engine back end              |
+| **input rung step-down**                 | the rung tried and its result are journalled before the next rung is used                                                                                                                                                                                                                                                                          | same key: no rung is re-tried; an unsafe-to-repeat action with an unclear check returns `unknown`, never a second apply              | rung memory from an older app version: tried first, steps down once, memory updated                                                                                                                                                                                                                                     | fake app per rung                 |
+| **focus change mid-burst (rung 4)**      | burst aborted between chunks, held input released, `stale` with the chunks sent                                                                                                                                                                                                                                                                    | the agent re-plans from a fresh diff; never resumes the burst by itself                                                              | the target window gone: `stale`                                                                                                                                                                                                                                                                                         | focus-steal test per OS           |
+| **you grab the mouse/keyboard mid-step** | step stops, all held keys and buttons released, queued steps dropped, `interrupted_by_user` with what ran and a diff; the take-over pause is written to the store                                                                                                                                                                                  | acting in your session stays paused until you press Continue or allow the agent's ask; no idle timer                                 | a take-over during a `wait`: the wait ends as interrupted too; a pause from before a restart: kept                                                                                                                                                                                                                      | input hook fake                   |
+| **helper dies, engine lives**            | engine stops acting within 500 ms of the missed heartbeat and releases held input                                                                                                                                                                                                                                                                  | acting resumes only when the helper is back and the indicator is up                                                                  | an engine from before a helper restart: the new helper stops it and starts a fresh one                                                                                                                                                                                                                                  | kill test per OS                  |
+| **engine dies mid-drag**                 | the engine writes every held key/button to a held-input file before sending it; the helper (or the next start) sends the ups, then deletes the file                                                                                                                                                                                                | after restart the batch is `unknown` from the journal and is not re-sent                                                             | a held-input file from before a reboot: dropped (the OS reset input)                                                                                                                                                                                                                                                    | kill test per OS                  |
+| **clipboard write**                      | the previous content is saved in the journal before the write (encrypted for you when it carries a concealed marker)                                                                                                                                                                                                                               | after a crash the next start puts the saved content back if the clipboard still holds the agent's value, then deletes the saved copy | the clipboard changed by you since: left alone, saved copy deleted                                                                                                                                                                                                                                                      | fake clipboard                    |
+| **speculative batch**                    | the journal lists each private layer **before** it is made; on restart every listed layer is deleted and its per-slot processes ended; a winner whose apply did not finish is re-applied file by file by the agent account (compare-and-swap makes done files a no-op)                                                                             | same key: the journalled winner and outcome, nothing re-runs; a key whose alternatives never finished: `unknown`, layers cleaned     | layers with no journal entry: left alone and reported; a real file changed during the run: `conflict`, nothing applied; a layer with a secret or auto-run path: refused before any write; zero alternatives: refused                                                                                                    | fake engine + fake FS             |
+| **window pops in front** (§6.8)          | the engine hides it and gives the front back; if the engine dies first, the window stays and the next start logs it                                                                                                                                                                                                                                | the same program is started the other way the result told the agent; a repeat offender is stopped                                    | a recipe that now shows a window: `visible_side_effect`, recipe marked `needs repair`                                                                                                                                                                                                                                   | no-pop-in test                    |
+| recipe save                              | temp + atomic rename into the store                                                                                                                                                                                                                                                                                                                | same content: no-op (content hash); new content: new version                                                                         | a recipe for an older app version: runs, and a failing step marks it `needs repair`; empty store: fine                                                                                                                                                                                                                  | fake guard                        |
+| pause / kill switch / revoke all         | each is fsynced in the store and as a narrowing record in the guard's log **before** the tray confirms it; accounts disabled; links revoked one by one, each committed                                                                                                                                                                             | idempotent; a revoke-all re-run revokes what is left                                                                                 | kill switch with no agent processes: OK; revoke-all with no links: OK; a narrowing the tray confirmed survives any power cut                                                                                                                                                                                            | fake OS layer + power cut         |
+| **wind down**                            | the `winding_down` state (start time, items, choice per item) is written first; after a helper crash it is read back and continues; parked and moved items are in the ledger and not moved again                                                                                                                                                   | pressing it again shows progress, starts nothing new                                                                                 | a `winding_down` state older than the last boot: cleared at sign-in (unless "stay paused"); nothing running: "safe to shut down" at once                                                                                                                                                                                | fake clock + fakes                |
+| **runner shrink**                        | the ledger line (job, run, attempt, choice) is written before the park or cancel; on restart, lines without "re-run asked" get it; a job already re-run (newer attempt exists) is marked done                                                                                                                                                      | same budget again: no-op; growth held off by the 2-minute rule; a second drop does not move the same attempt twice                   | `activity.json` stale or unreadable while someone is signed in: admit nothing new, tray note; unknown format: same; no jobs: only the heartbeat changes                                                                                                                                                                 | fake dispatcher + fake meters     |
+| **power loss (any moment)**              | every write above is atomic or journalled; narrowing is durable before it is confirmed; on start: store signature with narrowing replay, log tails, leftover persistence locks removed, deny pass, install verify, held-input drop, journal `unknown`s, layer cleanup, unfinished snapshots discarded, runner ledger and lost-runner jobs re-asked | a second power loss during recovery: each recovery step is idempotent and runs again                                                 | lost: unsaved work inside apps; command changes after the last snapshot (T3 file tool changes have pre-images); never lost: a narrowing the tray confirmed                                                                                                                                                              | power-cut test in a VM per OS     |
+| **link extend**                          | the computer commits the new expiry in one transaction with the revocation check; the caller may miss the reply                                                                                                                                                                                                                                    | extending again sets the same or a later expiry (idempotent)                                                                         | a link expired more than 30 days ago: refused, pair again; a link with no recorded device: refused, pair again (tray note)                                                                                                                                                                                              | fake clock                        |
+| **link used from an unknown device**     | the call is refused before any tool runs                                                                                                                                                                                                                                                                                                           | each further try is refused and counted                                                                                              | a link whose device identity was never recorded (older link): ordinary upstream calls work until its expiry; host tools and extension refused                                                                                                                                                                           | fake tailnet whois                |
+| availability, project grants             | settings saved                                                                                                                                                                                                                                                                                                                                     |                                                                                                                                      | "off until" in the past: on; bad value: off; a project with no setting: off                                                                                                                                                                                                                                             | settings test                     |
+| **host tools off / uninstall**           | each step is listed in a removal ledger first; a half removal finishes on the next run                                                                                                                                                                                                                                                             | idempotent                                                                                                                           | removes: reach map grants, deny entries, auto-run denies and rename blocks, AppContainer read ACEs, persistence locks, firewall and network-floor rules, the protected-area watch, services, broker, guard tasks, snapshots it made, links it issued, both accounts and the agent group (after you confirm their files) | uninstall test per OS             |
 
 ## 16. Tests (when built)
 
-- **Core on Linux CI with a fake OS layer:** policy checks (reach map, sensitive set, high-risk list, file-type rule),
+- **Core on Linux CI with a fake OS layer:** policy checks (reach map, sensitive set, high-risk list, protected areas),
   secret patterns (a hand-written fixture of expected secret paths per pattern, so weakening a pattern turns a test
   red), the ask (scopes, remembered answers, wear-down rules, OS-consent items), step-list checks and limits, journal
   and idempotency, input ladder logic with fake rungs (step-down, no double apply, rung memory), recipes, snapshot and
   undo with writers (agent undo never touches a file you changed), log chain and countersign, pause, wind-down choices
-  by cost, availability and project grants, link extend and device binding, redaction of every output path.
+  by cost, availability and project grants, link extend and device binding, redaction of every output path, the take-over
+  pause (kept across a restart; only Continue or an allowed ask ends it; no timer ends it), narrowing replay after a
+  store fallback, and the persistence-lock ledger.
 - **The toolkit** through upstream's MCP test kit: a forwarded call over a test link; a read-only link refusing write
   tools; an outside-input thread getting read tools only; the caller id arriving on the computer; a token from another
-  device refused.
+  device refused; **N2:** a forwarded thread launch, `delegate_task` and every other forwarded tool outside the
+  allowlist are refused on the computer, also when the agent machine runs an older build without the allowlist.
 - **Per-OS layers** (a real run on each OS before that OS is enabled, Windows first):
   - accounts: the agent account cannot read your profile root, a denied `.env`, T3's data or install, and cannot write
     an auto-run path; the host account cannot be reached by agent commands; the broker refuses the agent account;
   - links (B2): a planted junction, symlink and hard link do not widen a grant or redirect a restore or copy;
-  - B1: the engine refuses to open an agent-written `.bat`, `.lnk` and `+x` file; an admin command runs the copy shown,
-    not a file swapped after the ask;
+  - B1: an admin command runs the frozen copy shown in the ask, not a file swapped after the ask;
+  - **protected areas (N1):** in a UI-acting batch the agent writes a `.bat` that adds a Run key, a Startup shortcut and
+    a scheduled task, then opens it through a file dialog; each change is blocked or held and reverted, the tray offers
+    Keep or Remove, and the activity log shows the write and the run; the same on macOS (a LaunchAgent) and Linux (a
+    systemd user unit, an XDG autostart entry); a write to a system area needs the elevation prompt and is refused by
+    the engine; a change made after the lock window by a process with a broken parent chain is shown by the baseline
+    diff; locks are gone after a power cut in the window;
+  - **N3:** renaming or deleting `.vscode`, `.idea` or `.git/hooks` as the agent account is denied; a new
+    `tasks.json`, `.envrc` or git hook from the agent account is quarantined; "make it mine" applies your denies;
+  - **N6:** a speculative winner that writes an auto-run path or a secret path is refused before any file is applied;
+    on macOS a slot user cannot read a denied `.env`;
   - B3: an edited store file is ignored; the store's folder is refused in file dialogs; widening during a full-rights
     grant needs OS consent;
-  - network (M3): each class of §3.5 unreachable from the agent account; own loopback reachable;
+  - network (M3, N5): no direct internet from the agent group; each class of §3.5 unreachable, including the
+    computer's own global IPv6 and LAN addresses and an on-link neighbour; a new address added mid-run is in the floor
+    before the next connection; only linked machines are reachable; a per-goal ask opens exactly what it names;
   - speculative (M2): a speculative run cannot reach the engine, the broker, T3 or a denied file in its layer, cannot
     reach the network, and leaves no process after cleanup;
   - clipboard (M4): concealed content refused; content put back after a batch;
   - input (M5): a window that steals focus mid-burst gets no typed text; each rung reaches the test apps it claims and
     steps down from the ones it cannot;
+  - **take-over:** a real click or key press during a rung-4 step stops it and releases all held input; acting stays
+    paused with no timer; Continue in the tray or T3, or your Allow on the agent's ask, ends the pause; the pause
+    survives a restart;
   - the kill switch ends every agent process; pause ends daemonised children; the engine stops without the helper;
   - a snapshot restores a deleted file; refusal when the snapshot store is full;
   - refusals (lock screen, password field, own policy screens, inactive session);
   - power cut in a VM at random points during a batch, a speculative call, a wind-down and a runner shrink: the next
-    start recovers as §15 says;
+    start recovers as §15 says; **N8:** a power cut just after the tray confirms a pause, a revoke or a narrowing, also
+    with the store file damaged: the narrowing holds after the restart;
   - the §8.2 micro-benchmarks; the **no pop-in test** of §6.8 (required, blocks enabling an OS).
 - **Runners:** the budget logic with fake meters (a game taking memory, a spike), finish / park / move choices by cost
-  with a fake dispatcher.
+  with a fake dispatcher; **N10:** a runner job cannot read the agent accounts' or your files, cannot reach the engine,
+  broker or T3, and leaves no process after it ends.
 
 ## 17. Costs and open points
 
@@ -1132,30 +1389,42 @@ What happens when it runs again, stops half-way, or meets old or empty state:
   installs (agent machine and computer).
 - **MCP tool-list size.** The host tools add several KB, so they are hidden unless at least one linked computer
   reports host tools on, and then deferred behind `tool_search`.
-- **Two accounts and three small services** on the computer (T3 as the host account, the broker, the guard), plus the
-  desktop app's helper. Setup is one installer run with one UAC prompt.
+- **Two accounts, an agent group and three small services** on the computer (T3 as the host account, the agent
+  account in the `t3-agents` group, the broker, the guard), plus the desktop app's helper and, for speculative runs and
+  runners, extra accounts in that group. Setup is one installer run with one UAC prompt.
 - **Two T3 installs on the computer** if you also use the desktop app there; the host account's T3 is separate.
-- **Delegated full agents on the computer** wait for the broker spawn hook (§3.2).
+- **Delegated full agents on the computer** wait for the broker spawn hook (§3.2) and stay outside the forwarded-tool
+  allowlist until then.
 - **A new native component** (the engine, and the small broker and guard) with a Rust build per OS in fork CI.
 - **Rung 3 on Windows and macOS is weaker** than on Linux: no real hardware-style input into a hidden desktop; apps
   that need it use rung 4. To verify per OS, including GPU apps on hidden displays.
 - **Wayland** rung 4 needs the RemoteDesktop portal, which asks once per session on some desktops; rung 2 does not
   exist for native Wayland apps.
 
+**Decided by the owner (2026-11-13)**, kept here so the reasons stay with the design: acting in the UI acts as you,
+with protected areas and the activity log (§4.4); take-over pauses until you continue, no idle timer (§6.7); links
+expire after 365 days with one-click extension (§10); the default reach map is documents, desktop, downloads, media,
+code and data drives, a list in config (§4.3); the OS consent prompt stays for full-rights grants (§4.2); host tools are
+off in new projects (§4.3); `.git/config` is read-only until you unlock a repo (§4.3); the agent group has no direct
+internet, only your linked machines, with a per-goal ask for more (§3.5).
+
 **Open for the owner** (first one first):
 
-1. After you take over a window: resume after 5 s of idle (recommended), another time, or only when you press "let the
-   agent continue"?
-2. Link lifetime default: **365 days with one-click extension** (recommended: a link stolen without anyone noticing
-   still dies within a year, and extending costs one click), or **never expires**?
-3. The default reach map: your profile's documents, desktop, downloads, media and source folders plus the data folders
-   on extra drives (recommended), or a smaller start?
-4. Full-user-rights apps: keep the OS consent prompt for these grants (recommended, forced by blocker B3), or accept
-   the risk that a running full-rights grant can approve further grants by itself?
-5. Project grants on the agent machine: new projects **off** until you toggle them (recommended), or on?
-6. `.git/config` read-only for the agent until you unlock a repo through the ask (recommended), so `git push -u` fails
-   for agents there; or writable with a guard that strips code-running keys?
-7. Whether the agent account's internet should be limited further (for example to package registries and git hosts).
+1. **"Run" in protected areas.** This design reads "no run in system areas without your OK" as: anything that runs
+   with system or admin rights, or registers something to run (service, driver, scheduled task, boot or login entry).
+   Running an ordinary program as the agent account or as you is not asked each time (§4.4). Is that the intended
+   reading, or should every program start from a system folder be asked?
+2. **Take-over pause scope.** The pause stops acting in your session (input, UI automation). Commands as the agent
+   account and file tools go on (§6.7). Should a take-over pause commands too?
+3. **"The agent asks again."** This design lets the agent's renewed ask end the pause only when you press Allow on it;
+   the ask itself does not resume anything. Is that right, or should the agent be able to resume by itself after asking?
+4. **UAC "Always notify".** At the default UAC level, known auto-elevation tricks write system areas with no prompt.
+   The install warns and suggests "Always notify" but does not require it (§3.3). Require it instead?
+5. **A Windows driver for blocking.** On Windows v1 blocks protected-area writes by ACL during the lock window and
+   otherwise reverts them. A signed minifilter and registry callback would block per process at all times, at the cost
+   of a kernel driver, its signing and its upkeep. Build it later, or never?
+6. **Refuse writes when undo is evicted.** When the snapshot store pushes out a snapshot younger than 24 hours, the
+   tray warns (§15). A setting can instead refuse agent writes until there is room; it is off by default. Default on?
 
 **Follow-up research (named here, not done in this design):** which command languages and tools agents should use on
 each OS for speed and reliability, general across projects: whether agents should write Python at all; how good the
