@@ -1001,7 +1001,8 @@ class RedChecks(unittest.TestCase):
               fail=(), name='review-check'):
         self.posted, self.updated = [], []
         listed = [{'number': 7, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1}, 'mergeStateStatus': state,
-                   'createdAt': '2026-11-07T00:00:00Z', 'statusCheckRollup': self.rollup(*runs, name=name)}]
+                   'createdAt': '2026-11-07T00:00:00Z', 'statusCheckRollup': self.rollup(*runs, name=name),
+                   'baseRefName': 'main'}]
 
         def gh(*a):
             if a[:2] == ('pr', 'list'):
@@ -1013,6 +1014,10 @@ class RedChecks(unittest.TestCase):
             if a[:2] == ('pr', 'comment'):
                 self.posted.append(a[-1])
                 return failed('boom') if 'comment' in fail else ok()
+            if a[:2] == ('api', 'graphql'):   # main is green; these runs name no tested base (RedChecksWithTheBaseRule)
+                return ok(json.dumps({'data': {'repository': {'object': {'oid': 'e9' * 20, 'statusCheckRollup': {
+                    'contexts': {'nodes': [{'__typename': 'CheckRun', 'name': name, 'status': 'COMPLETED',
+                                            'conclusion': 'SUCCESS', 'startedAt': '2026-11-09T00:00:00Z'}]}}}}}}))
             raise AssertionError(a)
         self.q.gh = gh
         self.q.update = lambda n, d: self.updated.append(n) or 0
@@ -1192,6 +1197,190 @@ class StuckUpToDate(unittest.TestCase):
         code, out = self.sweep(self.checks(build='CANCELLED'), dry=True)
         self.assertEqual((self.posted, self.updated), ([], [2]))
         self.assertIn('skip #1: up to date, but required check build ended CANCELLED', out)
+
+
+class RedChecksWithTheBaseRule(RedChecks):
+    """Every RedChecks case again with update_when_base_was_red on: a red whose run names no tested base (its job has
+    no tested-base step) is the PR's own, as with the rule off."""
+    def setUp(self):
+        super().setUp()
+        self.q.cfg = config.parse(json.dumps({**CFG_RAW, 'update_when_base_was_red': True}))
+
+
+class RedOnOldBase(unittest.TestCase):
+    """update_when_base_was_red: a BEHIND PR red only because the base commit its run merged with was red is updated; a
+    red of its own, or a base that proves nothing (cancelled, stale, skipped, running), still skips it. The base comes
+    from the run (each job's tested-base annotation), never from clocks: jobs start late, and a re-run tests its old
+    merge again. The source project's draft fix, ported (README.md, "Where the rules come from").
+    main: M0 (build green) -> M1 (build FAILURE) -> M2 (green again, the tip)."""
+    H, H2 = 'a7' * 20, 'b8' * 20
+    M0, M1, M2 = 'e0' * 20, 'e1' * 20, 'e2' * 20
+    RUN, RERUN = '2026-11-07T22:30:00Z', '2026-11-08T02:20:00Z'
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix='pr-queue-base-red-')
+        self.addCleanup(shutil.rmtree, d, True)
+        self.q = make_queue(d, config.parse(json.dumps({**CFG_RAW, 'update_when_base_was_red': True})))
+
+    def main_of(self, m1='FAILURE', tip='SUCCESS', check='build', other=None):
+        """{sha: {check: conclusion}} of main's commits; M2 is the tip."""
+        return {self.M0: {check: 'SUCCESS', **(other or {})}, self.M1: {check: m1, **(other or {})},
+                self.M2: {check: tip, **(other or {})}}
+
+    def sweep(self, prs, main, state='BEHIND', dry=False, notes_fail=False, main_fails=False, more=False, comments=()):
+        """prs: [(number, head, {name: [(startedAt, conclusion, tested base or None), ...]})]; main: main_of()."""
+        self.posted, self.updated, self.tip_reads, self.api = [], [], 0, 0
+        notes, listed = {}, []
+        for n, head, runs in prs:
+            rollup = []
+            for name, rs in runs.items():
+                for t, c, base in rs:
+                    job = str(1000 + len(notes))
+                    notes[job] = [{'title': Q.TESTED_BASE, 'message': base}] if base else []
+                    rollup.append({'__typename': 'CheckRun', 'workflowName': 'ci', 'name': name, 'startedAt': t,
+                                   'conclusion': c, 'detailsUrl': f'https://github.com/{REPO}/actions/runs/9/job/{job}'})
+            listed.append({'number': n, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1},
+                           'mergeStateStatus': state, 'createdAt': f'2026-11-07T00:00:0{n}Z', 'statusCheckRollup': rollup,
+                           'headRefOid': head, 'baseRefName': 'main'})
+        heads = {n: head for n, head, _ in prs}
+
+        def gh(*a):
+            if a[:2] == ('pr', 'list'):
+                return ok(json.dumps(listed))
+            if a[:2] == ('pr', 'view'):
+                return ok(json.dumps({'headRefOid': heads[int(a[2])], 'comments': [own(c) for c in comments]}))
+            if a[:2] == ('pr', 'comment'):
+                self.posted.append(a[-1])
+                return ok()
+            self.api += a[0] == 'api'
+            if a[0] == 'api' and a[1].endswith('/annotations?per_page=100'):
+                return failed() if notes_fail else ok(json.dumps(notes[a[1].split('/')[-2]]))
+            if a[:2] == ('api', 'graphql'):
+                if main_fails:
+                    return failed()
+                expr = next(x[5:] for x in a if x.startswith('expr='))
+                sha = self.M2 if expr == 'refs/heads/main' else expr
+                self.tip_reads += expr == 'refs/heads/main'
+                if sha not in main:
+                    return ok(json.dumps({'data': {'repository': {'object': None}}}))
+                nodes = [{'__typename': 'CheckRun', 'name': k, 'status': 'COMPLETED' if c else 'IN_PROGRESS',
+                          'conclusion': c, 'startedAt': self.RUN, 'checkSuite': {'workflowRun': {'workflow': {'name': 'ci'}}}}
+                         for k, c in main[sha].items()]
+                return ok(json.dumps({'data': {'repository': {'object': {'oid': sha, 'statusCheckRollup': {
+                    'contexts': {'pageInfo': {'hasNextPage': more}, 'nodes': nodes}}}}}}))
+            raise AssertionError(a)
+        self.q.gh = gh
+        self.q.update = lambda n, d: self.updated.append((n, d)) or 0
+        return run_quiet(self.q.run, dry)
+
+    def one(self, runs, main=None, **kw):
+        return self.sweep([(7, self.H, runs)], main or self.main_of(), **kw)
+
+    def test_a_red_from_a_red_base_that_is_green_now_is_updated(self):   # the issue
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)], 'test': [(self.RUN, 'SUCCESS', self.M1)]})
+        self.assertEqual((code, self.updated, self.posted), (0, [(7, False)], []), out)
+        self.assertIn('required check build failed on a main commit where it failed too, and it is green on main now',
+                      out)
+
+    def test_off_by_default_the_red_is_the_prs_own_and_nothing_more_is_read(self):   # a project without the notes
+        self.q.cfg = CFG
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)]})
+        self.assertEqual((code, self.updated, len(self.posted), self.api), (0, [], 1, 0), out)
+        self.assertIn('Fix the cause and push', self.posted[0])
+
+    def test_a_job_that_started_late_is_judged_by_the_base_it_tested_not_its_clock(self):
+        # its jobs queued for hours: it started after M2 went green, but its merge was made on M1
+        code, out = self.one({'build': [(self.RERUN, 'FAILURE', self.M1)]})
+        self.assertEqual((self.updated, self.posted), ([(7, False)], []), out)
+        # the other way round: it started while M1 was the tip, but its merge was made on the green M0 before
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M0)]})
+        self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+        self.assertIn(f'build was not red on the main commit {self.M0[:12]} its run tested (ok)', out)
+
+    def test_a_re_run_of_the_old_merge_must_be_updated(self):   # a re-run tests the old red base again
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1), (self.RERUN, 'FAILURE', self.M1)]})
+        self.assertEqual((self.updated, self.posted), ([(7, False)], []), out)
+
+    def test_its_red_after_the_update_is_its_own_and_is_told_no_loop(self):   # a real new merge head
+        # the update made head H2; its run merged H2 with the green M2 and still failed: its own red, told once
+        code, out = self.sweep([(7, self.H2, {'build': [(self.RERUN, 'FAILURE', self.M2)]})], self.main_of())
+        self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+        self.assertIn(f'build was not red on the main commit {self.M2[:12]} its run tested (ok)', out)
+        self.assertIn(f'required check build is red on {self.H2[:12]}', self.posted[0])
+        self.assertIn('Fix the cause and push', self.posted[0])
+
+    def test_a_base_check_that_proves_nothing_is_not_base_was_red(self):
+        for m1, said in (('CANCELLED', 'CANCELLED'), ('STALE', 'STALE'), ('STARTUP_FAILURE', 'STARTUP_FAILURE'),
+                         ('TIMED_OUT', 'TIMED_OUT'), ('SKIPPED', 'ok'), (None, 'running')):
+            with self.subTest(main=m1):
+                code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)]}, self.main_of(m1=m1))
+                self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+                self.assertIn(f'its run tested ({said})', out)
+                self.assertIn('Fix the cause and push', self.posted[0])
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)]}, self.main_of(check='test'))
+        self.assertEqual(self.updated, [], out)
+        self.assertIn('(not reported)', out)
+
+    def test_a_base_still_red_waits_and_says_the_base_is_the_reason(self):   # not "fix and push"
+        for tip, said in (('FAILURE', 'FAILURE'), ('CANCELLED', 'CANCELLED'), (None, 'running')):
+            with self.subTest(tip=tip):
+                code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)]}, self.main_of(tip=tip))
+                self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+                self.assertIn(f'is not green on main now ({said})', out)
+                self.assertIn(f'required check build failed as on main on {self.H[:12]}', self.posted[0])
+                self.assertIn('not this PR', self.posted[0])
+                self.assertIn('updates it by itself once build is green on main', self.posted[0])
+                self.assertNotIn('Fix the cause and push', self.posted[0])
+        told = self.posted[0]
+        self.one({'build': [(self.RUN, 'FAILURE', self.M1)]}, self.main_of(tip='FAILURE'), comments=[told])
+        self.assertEqual(self.posted, [], 'told once per head')
+
+    def test_every_red_check_must_come_from_the_base(self):   # one red of its own keeps it skipped
+        runs = {'build': [(self.RUN, 'FAILURE', self.M1)], 'test': [(self.RUN, 'FAILURE', self.M1)]}
+        code, out = self.one(runs, self.main_of(other={'test': 'SUCCESS'}))
+        self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+        self.assertIn(f'test was not red on the main commit {self.M1[:12]} its run tested (ok)', out)
+
+    def test_an_unknown_tested_base_or_base_is_said_and_skipped(self):   # unknown is never "the base was red"
+        for kw, base, said in (({}, None, 'tested is unknown'), ({'notes_fail': True}, self.M1, 'HTTP 502'),
+                               ({'main_fails': True}, self.M1, 'HTTP 502'), ({}, 'ff' * 20, 'are unknown'),
+                               ({'more': True}, self.M1, 'more than 100, not all read')):
+            with self.subTest(said=said):
+                code, out = self.one({'build': [(self.RUN, 'FAILURE', base)]}, **kw)
+                self.assertEqual((code, self.updated, len(self.posted)), (0, [], 1), out)
+                self.assertIn(said, out)
+                self.assertIn('Fix the cause and push', self.posted[0])
+
+    def test_a_job_with_no_note_two_notes_or_no_job_has_no_tested_base(self):
+        url = f'https://github.com/{REPO}/actions/runs/9/job/5'
+        for notes, said in (([{'title': Q.TESTED_BASE, 'message': self.M1}, {'title': Q.TESTED_BASE, 'message': self.M0}],
+                             'names 2 tested bases'),
+                            ([{'title': Q.TESTED_BASE, 'message': 'main'}], 'names 0 tested bases'),
+                            ([{'title': 'lint', 'message': 'x'}] * 100, 'may be on a later page')):
+            with self.subTest(said=said):
+                self.q.gh = lambda *a, n=notes: ok(json.dumps(n))
+                got, out = run_quiet(self.q.tested_base, {'name': 'build', 'detailsUrl': url})
+                self.assertIsNone(got)
+                self.assertIn(said, out)
+        got, out = run_quiet(self.q.tested_base, {'name': 'build', 'detailsUrl': 'https://ci.example/build/5'})
+        self.assertEqual(got, None)
+        self.assertIn('no Actions job', out)
+
+    def test_the_base_is_read_once_per_run(self):
+        prs = [(7, self.H, {'build': [(self.RUN, 'FAILURE', self.M0)]}),
+               (8, self.H2, {'build': [(self.RUN, 'FAILURE', self.M1)]})]
+        code, out = self.sweep(prs, self.main_of())
+        self.assertEqual((self.updated, len(self.posted), self.tip_reads), ([(8, False)], 1, 1), out)
+
+    def test_an_up_to_date_red_pr_never_asks_for_the_base(self):   # an update would not change its base
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)]}, state='BLOCKED')
+        self.assertEqual((self.updated, len(self.posted), self.api), ([], 1, 0), out)
+
+    def test_a_dry_run_says_it_would_update_and_posts_nothing(self):
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)]}, dry=True)
+        self.assertEqual((self.updated, self.posted), ([(7, True)], []), out)
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)]}, self.main_of(tip='FAILURE'), dry=True)
+        self.assertEqual((self.updated, self.posted), ([], []), out)
 
 
 # --- the source project's lens-review cases for the queue ------------------------------------------------------------

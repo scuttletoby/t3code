@@ -1,0 +1,99 @@
+# Fork only. The merge queue of fork-ci/actions/pr-queue as a reusable workflow (that folder's README.md, "Use it").
+# A caller runs it after each push to its base branch and on a timer. It runs the queue from this workflow's own
+# commit (job.workflow_repository and job.workflow_sha), never from the caller's tree, and only on push, schedule or
+# workflow_dispatch: the code that merges pull requests must never run for a pull request.
+# Tests: .github/scripts/fork-pr-queue-workflow.test.py.
+name: Fork PR queue
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON for runs-on, a self-hosted runner whose disk outlives the job, e.g. '["self-hosted", "queue"]'.
+        type: string
+        required: true
+      config:
+        description: Path of the queue's JSON config in the caller's repository, from its root.
+        type: string
+        required: true
+      state-file:
+        description: Absolute path on the runner, outside the workspace, of the plan a stopped run leaves.
+        type: string
+        required: true
+      cache:
+        description: Absolute path on the runner, outside the workspace, of the queue's own bare git repository.
+        type: string
+        required: true
+      lock-file:
+        description: Absolute path of the lock that keeps two runs apart (default the state file + .lock).
+        type: string
+        default: ""
+      dry-run:
+        description: Say what a run would do and write nothing.
+        type: boolean
+        default: false
+    secrets:
+      token:
+        description: Updates branches, comments and merges; not GITHUB_TOKEN (its branch updates start no workflow).
+        required: true
+
+permissions: {}
+
+jobs:
+  queue:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    concurrency:
+      group: fork-pr-queue-${{ github.repository }}
+      cancel-in-progress: false # a cancel is a stop half-way: the next run would have to finish it
+    steps:
+      - name: Refuse other events; find this workflow's own commit
+        id: toolkit
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          CONFIG: ${{ inputs.config }}
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          case "$EVENT" in
+            push|schedule|workflow_dispatch) ;;
+            *) echo "::error::pr-queue: refused on a ${EVENT:-unnamed} event: it runs only on push, schedule or workflow_dispatch"
+               exit 1 ;;
+          esac
+          if [[ -z "$CONFIG" || "$CONFIG" == /* || "/$CONFIG/" == */../* ]]; then
+            echo "::error::pr-queue: config '$CONFIG' is not a path inside the caller's repository"
+            exit 1
+          fi
+          read -r repo sha < <(python3 -I -c 'import json, os
+          job = json.loads(os.environ["JOB_CONTEXT"] or "{}")
+          print(job.get("workflow_repository") or "-", job.get("workflow_sha") or "-")') || true
+          if ! [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::pr-queue: the runner does not say which commit this reusable workflow is (job.workflow_repository, job.workflow_sha; runner 2.334.0 or newer), so it will not guess which queue to run"
+            exit 1
+          fi
+          echo "pr-queue from $repo at $sha"
+          { echo "repo=$repo"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+      - name: Check out the caller's config
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: caller
+          sparse-checkout: ${{ inputs.config }}
+          sparse-checkout-cone-mode: false
+      - name: Check out the queue at this workflow's own commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ steps.toolkit.outputs.repo }}
+          ref: ${{ steps.toolkit.outputs.sha }}
+          path: toolkit
+          sparse-checkout: fork-ci/actions/pr-queue
+      - name: Run the queue
+        uses: ./toolkit/fork-ci/actions/pr-queue
+        with:
+          config: caller/${{ inputs.config }}
+          state-file: ${{ inputs.state-file }}
+          cache: ${{ inputs.cache }}
+          lock-file: ${{ inputs.lock-file }}
+          dry-run: ${{ inputs.dry-run }}
+          token: ${{ secrets.token }}

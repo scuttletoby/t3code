@@ -43,6 +43,9 @@ GONE_RE = re.compile(r"not our ref|unadvertised object|couldn't find remote ref|
 RED_STATES = ('FAILURE', 'ERROR', 'TIMED_OUT')
 WAITS_FOR = ('BLOCKED', 'UNSTABLE', 'CLEAN', 'HAS_HOOKS')   # up-to-date merge states whose checks the queue waits for
 NEVER = 'never reported'
+TESTED_BASE = 'pr_queue tested base'   # the annotation title the tested-base action writes (tested_base.py)
+BASE_RED = ('FAILURE', 'ERROR')   # "the base was red": a real failure. CANCELLED, STALE, STARTUP_FAILURE, TIMED_OUT,
+# SKIPPED, not reported or running say nothing about the base's code (a busy runner times out or cancels base runs)
 UPDATES = 3   # holds() follows at most this many queue updates in a row
 GIT_MIN = (2, 38)   # git merge-tree --write-tree
 REFUSED, SILENT = 2, 3
@@ -368,6 +371,92 @@ class Queue:
         if r.returncode != 0:
             print(f'#{n}: could not comment: {r.stderr.strip()[:300]}')
 
+    # --- red only because the base it was tested on was red (config update_when_base_was_red) -----------------------
+    def tested_base(self, c):
+        """The base commit the run of rollup item `c` merged the PR with: its job's TESTED_BASE annotation (the
+        tested-base action writes the merge commit's first parent), so a re-run of an old merge and a job that started
+        late both name the base they really tested, never a clock. None when unknown (printed)."""
+        name = c.get('name') or c.get('context')
+        m = re.search(r'/actions/runs/\d+/job/(\d+)', c.get('detailsUrl') or '')
+        if not m:
+            print(f'{name}: no Actions job to read its tested base from')
+            return None
+        r = self.gh('api', f'repos/{self.repo}/check-runs/{m[1]}/annotations?per_page=100')
+        try:
+            notes = json.loads(r.stdout) if r.returncode == 0 else None
+        except ValueError:
+            notes = None
+        if not isinstance(notes, list):
+            print(f'{name}: reading the annotations of job {m[1]} failed: {r.stderr.strip()[:200] or "no JSON list"}')
+            return None
+        found = {(a.get('message') or '').strip() for a in notes
+                 if isinstance(a, dict) and a.get('title') == TESTED_BASE}
+        found = {x for x in found if SHA.fullmatch(x)}
+        if len(found) != 1:
+            more = ' (it has 100 or more annotations: the note may be on a later page)' if len(notes) >= 100 else ''
+            print(f'{name}: job {m[1]} names {len(found)} tested bases{more}')
+            return None
+        return found.pop()
+
+    def commit_checks(self, expr, cache):
+        """(oid, required_now of its checks) of commit `expr` (a sha or refs/heads/<base>), read once per run (`cache`);
+        None when GitHub could not say (printed)."""
+        if expr in cache:
+            return cache[expr]
+        owner, name = self.repo.split('/')
+        q = ('query($owner:String!,$name:String!,$expr:String!){repository(owner:$owner,name:$name){object(expression:'
+             '$expr){... on Commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename '
+             '... on CheckRun{name status conclusion startedAt checkSuite{workflowRun{workflow{name}}}} '
+             '... on StatusContext{context state}}}}}}}}')
+        r = self.gh('api', 'graphql', '-f', f'query={q}', '-f', f'owner={owner}', '-f', f'name={name}',
+                    '-f', f'expr={expr}')
+        out = None
+        try:
+            commit = json.loads(r.stdout)['data']['repository']['object'] if r.returncode == 0 else None
+            contexts = (commit.get('statusCheckRollup') or {}).get('contexts') or {} if commit else {}
+            if r.returncode != 0:
+                print(f'reading the checks of {expr[:40]} failed: {r.stderr.strip()[:200]}')
+            elif not commit or not SHA.fullmatch(commit.get('oid') or ''):
+                print(f'the checks of {expr[:40]}: GitHub gave no commit')
+            elif (contexts.get('pageInfo') or {}).get('hasNextPage'):
+                print(f'the checks of {expr[:40]}: more than 100, not all read')
+            else:
+                rollup = [{**x, 'workflowName': (((x.get('checkSuite') or {}).get('workflowRun') or {}).get('workflow')
+                                                 or {}).get('name') or ''} for x in contexts.get('nodes') or []]
+                out = (commit['oid'], self.required_now(rollup))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            print(f'the checks of {expr[:40]}: GitHub gave no commit')
+        cache[expr] = out
+        return out
+
+    def red_from_old_base(self, p, cache):
+        """A BEHIND PR whose required checks failed only because the base they were tested on was red. (None, None)
+        when, for EVERY red required check C, the base commit its run really merged with (tested_base) has a real
+        failure of C (BASE_RED) and the base branch has C green now: an update makes a new merge on that green tip.
+        Otherwise (why not, base_is_why): base_is_why says the PR waits for its base, not for its author. No state and
+        no loop: after the update the next run names a base where C is green, so a red then is the PR's own and it is
+        passed over (told); a re-run of the old merge names the old red base again and is updated, which it needs."""
+        reds, base = self.red_checks(p), p.get('baseRefName') or ''
+        if not re.fullmatch(r'[\w./-]+', base):
+            return 'its base branch is unknown', False
+        tip = self.commit_checks(f'refs/heads/{base}', cache)
+        if not tip:
+            return f'the checks of {base} are unknown (see above)', False
+        for check, c in sorted(reds.items()):
+            tested = self.tested_base(c)
+            if not tested:
+                return f'the base its {check} run tested is unknown (see above)', False
+            then = self.commit_checks(tested, cache)
+            if not then:
+                return f'the checks of {base} commit {tested[:12]} are unknown (see above)', False
+            was = then[1].get(check, 'not reported')
+            if was not in BASE_RED:   # running, ok, cancelled, skipped, stale...: nothing proves the base was red
+                return f'{check} was not red on the {base} commit {tested[:12]} its run tested ({was})', False
+            now = tip[1].get(check, 'not reported')
+            if now != 'ok':
+                return f'{check} failed on {base} {tested[:12]} too and is not green on {base} now ({now})', True
+        return None, None
+
     # --- steps 2-4 --------------------------------------------------------------------------------------------------
     def view(self, n):
         r = self.gh('pr', 'view', str(n), '--repo', self.repo, '--json', VIEW)
@@ -617,13 +706,30 @@ class Queue:
         if len(prs) >= limit:
             print(f'WARNING: gh listed {len(prs)} open PRs, the list_limit: GitHub lists the newest first, so the '
                   'oldest waiting ones may be missing. Raise list_limit (at most 100) or close old PRs')
+        cache = {}   # commit_checks: the base's checks read once per run
         for p in sorted(prs, key=lambda p: p.get('createdAt') or ''):
             n = p['number']
             if p.get('isDraft') or not p.get('autoMergeRequest'):
                 continue
             bad = self.failing(p)
-            if bad:
+            if bad and p.get('mergeStateStatus') == 'BEHIND' and self.cfg.update_when_base_was_red:
+                base = p.get('baseRefName') or 'its base'
+                why, base_is_why = self.red_from_old_base(p, cache)
+                if why is None:
+                    reds = ', '.join(sorted(self.red_checks(p)))
+                    print(f'update #{n} {(p.get("title") or "")[:70]}: required check {reds} failed on a {base} '
+                          f'commit where it failed too, and it is green on {base} now')
+                    return self.update(n, dry)
+                print(f'skip #{n}: required check {bad} failed and an update would not fix it yet: {why}')
+                if base_is_why:
+                    if not dry:
+                        self.tell_red(n, bad, f'failed as on {base}',
+                                      f'{base} failed {bad} too, so this is not this PR\'s fault: the queue updates it '
+                                      f'by itself once {bad} is green on {base}')
+                    continue
+            elif bad:
                 print(f'skip #{n}: required check {bad} failed (its author fixes it)')
+            if bad:
                 if not dry:
                     self.tell_red(n, bad)
                 continue
