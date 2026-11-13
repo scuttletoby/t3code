@@ -52,8 +52,9 @@ A run is **trusted** when all of these hold:
 
 - the workflow is `fork-tests.yml` of `scuttletoby/t3code`;
 - the actor _and_ the triggering actor are `scuttletoby`;
-- the run is a push to `main`, or a pull request whose head and base are both
-  this repository and which `scuttletoby` opened.
+- the run is a push to `main` of a commit the upstream sync did not make, or a
+  pull request whose head and base are both this repository and which
+  `scuttletoby` opened.
 
 Everything else is untrusted. That includes pull requests from other
 repositories, bots, other events, the sweep's own re-runs (triggered by
@@ -61,6 +62,24 @@ repositories, bots, other events, the sweep's own re-runs (triggered by
 The repository is public, so a pull request from another fork would otherwise
 run its own code on the owner's machines. Owner rule: pull requests from outside
 the fork never run on the fleet.
+
+**The upstream sync's push runs GitHub-hosted.** Owner decision: upstream's
+code runs on GitHub-hosted runners only. The daily sync (`fork-follow.yml`)
+moves `main` with `FORK_PUSH_TOKEN`, the owner's own token, so the push run that
+follows has the owner as actor and would pass every check above. So
+`fork-follow-push.sh advance` first pushes the tag
+`fork-follow/synced/<sha>` (`upstream_sync.tag_prefix` in `fork-fleet.json`)
+for the commit it moves `main` to, and moves `main` only when that push
+worked. The rule asks this repository, anonymously
+(`git ls-remote --exit-code`), whether the pushed commit has that tag: if it
+has, or if the answer cannot be read, the run is untrusted. An upstream commit
+cannot fake its way past this: only a holder of push rights here (the owner,
+the sync's token) can make a tag in this repository, and nothing in a commit
+(its message, author, files) or upstream (its branches, tags, pull requests)
+makes or removes one. The only thing a tag does is send a run GitHub-hosted.
+Keep the tags: a run can be re-run for 30 days. What this does not cover: once
+synced, upstream's code is in `main`, so the owner's later pull requests and
+pushes, which build on it, run it on the fleet.
 
 ### Three lines of defence
 
@@ -108,14 +127,29 @@ Two more things limit what a job can do:
 - **Containment:** each runner uses a single copy, and its `HOME` and `TMPDIR`
   are in that copy. The copy's top directory is its runner user's alone (0700),
   so the other slot's user cannot read its JIT config, tokens or caches, or
-  change how it starts. The unit's whole process group is killed when it stops,
-  and a unit lives at most 1 hour. A runner user has no sudo, no docker group,
-  no lingering and no cron or at. Before a user is given a new job, the launcher
-  kills every process left of it, removes its files in `/dev/shm` and removes
-  every copy it ran in (with its home). So a job leaves nothing for the next
-  job: not a process, not a file in its home, not one in shared memory. The
-  launcher refuses two slots that are one user, or a runner user in any other
-  group or lingering.
+  change how it starts. Each unit has its own `/tmp`, `/var/tmp`, `/dev/shm`
+  and `/run` (memory file systems that go with the unit) and its own IPC. It
+  sees no `/home`, no other user's processes, and the rest of the system
+  read-only. The unit's whole process group is killed when it stops, and a unit
+  lives at most 1 hour. A runner user has no sudo, no docker group, no lingering
+  and no cron or at. Before a user is given a new job, the launcher kills every
+  process left of it and removes every copy it ran in (with its home). So a job
+  leaves nothing for the next job: not a process, not a file in its home, not
+  one in shared memory. Root never deletes inside a directory a runner user can
+  still write: a copy is removed only once no unit can write it. The launcher
+  refuses two slots that are one user, or a runner user in any other group or
+  lingering.
+- **Network:** the `vm` pool runs on VM106, the owner's workspace, not on a VM
+  of its own. So each runner user has a network namespace of its own
+  (`fork-fleet-<user>`) with its own loopback: a job reaches none of the host's
+  loopback services (T3's server, web GUIs, databases) and no abstract socket of
+  it. Its one link goes out through the host to the public internet only. The
+  nft table `inet fork_fleet` refuses the host itself, RFC 1918 (the LAN and its
+  other machines), CGNAT `100.64.0.0/10` (Tailscale and the like), link-local,
+  the other reserved ranges and all of IPv6. The unit's `IPAddressDeny` refuses the same
+  ranges again, in the kernel, should the table ever go. The launcher (re)makes
+  the namespace and the table at every start and starts no runner when either
+  fails. Host step 6 proves it from inside a runner.
 
 Fleet jobs read no secrets (a test checks this). The fleet's GitHub token lives
 only on the fleet host, readable by root.
@@ -245,8 +279,12 @@ does leave the marker, and that turns the test red.
 ## Host setup (VM106, the `vm` pool)
 
 Run as root on the host. Nothing here prints a secret. Use the `main` commit
-that has this change. Re-install the files (step 3) after any change on `main`
-to the script, the config, the hook or the launcher, then
+that has this change. VM106 is the owner's workspace, not a VM of its own: the
+runners' network (step 1b, the launcher, step 6) is what keeps jobs off its
+services and its LAN. Steps 1b to 3 each run in a subshell with
+`set -euo pipefail`, so the first failing command stops that step (and leaves
+your shell open). Re-install the files (step 3) after any change on `main` to
+the script, the config, the hook or the launcher, then
 `systemctl restart t3code-fleet-dispatcher`. Until then, the host keeps the old
 rule.
 
@@ -264,39 +302,79 @@ done
 # The launcher refuses a runner user that is in another group, lingers, or is the same user as another slot.
 # A shared user from an earlier install is no longer used: id fork-runner >/dev/null 2>&1 && userdel -r fork-runner
 
+# 1b. What the runners' network needs (the launcher makes each runner user's namespace and the nft table itself,
+#     at every start, and starts nothing without them): nftables, IPv4 forwarding on, and the jobs' resolv.conf
+#     (public nameservers: this host's resolver is on its loopback, which a runner's namespace does not have).
+#     NET_BASE (step 4; default 10.204, the runners' 10.204.0.0/16) must be a range nothing else on the host uses
+#     (another sandbox, a VPN, Docker networks). Safe to run again.
+(
+  set -euo pipefail
+  command -v nft >/dev/null || apt-get install -y nftables
+  printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/60-fork-fleet.conf
+  sysctl -q -p /etc/sysctl.d/60-fork-fleet.conf
+  install -d -m 700 /etc/fork-fleet
+  printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > /etc/fork-fleet/resolv.conf
+  chmod 644 /etc/fork-fleet/resolv.conf
+  ! ip -4 route | grep -q '^10\.204\.' || echo "10.204 is in use here: pick another NET_BASE in step 4"
+)
+
 # 2. The runner template: an unconfigured actions/runner release, owned by root, checked by sha256.
 #    Take the newest version and its linux-x64 sha256 from https://github.com/actions/runner/releases
 #    Run this again for each new release: the fleet starts no runner while the template is older than the newest one.
 #    /opt and /var/lib must be on one filesystem: each copy hard-links the template (the launcher checks it).
-ver=X.Y.Z; sum=SHA256_FROM_THE_RELEASE_PAGE
-tmp=$(mktemp -d)
-curl -fsSLo "$tmp/runner.tgz" "https://github.com/actions/runner/releases/download/v$ver/actions-runner-linux-x64-$ver.tar.gz"
-echo "$sum  $tmp/runner.tgz" | sha256sum -c -
-install -d -m 755 /opt/fork-fleet
-rm -rf /opt/fork-fleet/runner-template.new && install -d -m 755 /opt/fork-fleet/runner-template.new
-tar -xzf "$tmp/runner.tgz" -C /opt/fork-fleet/runner-template.new --no-same-owner
-printf '%s\n' "$ver" > /opt/fork-fleet/runner-template.new/.fork-fleet-version
-chmod -R go-w /opt/fork-fleet/runner-template.new
-/opt/fork-fleet/runner-template.new/bin/installdependencies.sh   # the runner's own libraries
-ls -a /opt/fork-fleet/runner-template.new        # no .env, .path, .runner or .credentials (never run config.sh here)
-# Swap with no runner starting: stop the dispatcher (running jobs keep their own copies), swap, start it again.
-systemctl stop t3code-fleet-dispatcher 2>/dev/null || true
-rm -rf /opt/fork-fleet/runner-template.old
-[ ! -e /opt/fork-fleet/runner-template ] || mv -T /opt/fork-fleet/runner-template /opt/fork-fleet/runner-template.old
-mv -T /opt/fork-fleet/runner-template.new /opt/fork-fleet/runner-template
-rm -rf /opt/fork-fleet/runner-template.old
-systemctl start t3code-fleet-dispatcher 2>/dev/null || true   # on a first install, step 5 starts it
+#    The new template is checked (sha256, unconfigured, its version file) before anything is replaced; the old one
+#    stays in place until then, and a failure stops here with the dispatcher still running the old one.
+(
+  set -euo pipefail
+  ver=X.Y.Z; sum=SHA256_FROM_THE_RELEASE_PAGE
+  [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $sum =~ ^[0-9a-f]{64}$ ]] || { echo "set ver and sum first"; exit 1; }
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  new=/opt/fork-fleet/runner-template.new live=/opt/fork-fleet/runner-template old=/opt/fork-fleet/runner-template.old
+  curl -fsSLo "$tmp/runner.tgz" "https://github.com/actions/runner/releases/download/v$ver/actions-runner-linux-x64-$ver.tar.gz"
+  echo "$sum  $tmp/runner.tgz" | sha256sum -c --strict -
+  install -d -m 755 /opt/fork-fleet
+  rm -rf "$new" && install -d -m 755 "$new"
+  tar -xzf "$tmp/runner.tgz" -C "$new" --no-same-owner
+  printf '%s\n' "$ver" > "$new/.fork-fleet-version"
+  chmod -R go-w "$new"
+  "$new/bin/installdependencies.sh"              # the runner's own libraries
+  [ -x "$new/run.sh" ] && [ -x "$new/bin/Runner.Listener" ] && [ "$(cat "$new/.fork-fleet-version")" = "$ver" ]
+  for f in .env .path .runner .credentials .credentials_rsaparams; do [ ! -e "$new/$f" ]; done   # never config.sh here
+  # Swap with no runner starting: stop the dispatcher (running jobs keep their own copies), swap, start it again.
+  systemctl stop t3code-fleet-dispatcher 2>/dev/null || true
+  rm -rf "$old"
+  [ ! -e "$live" ] || mv -T "$live" "$old"
+  mv -T "$new" "$live"
+  rm -rf "$old"
+  systemctl start t3code-fleet-dispatcher 2>/dev/null || true   # on a first install, step 5 starts it
+  echo "template: actions/runner $(cat "$live/.fork-fleet-version")"
+)
 
-# 3. The fleet files, from one pinned main commit.
-sha=FULL_MAIN_SHA
-base=https://raw.githubusercontent.com/scuttletoby/t3code/$sha/.github
-install -d -m 755 /opt/fork-fleet
-for f in fork-fleet.json:fork-fleet.json:644 scripts/fork-fleet.py:fork-fleet.py:644 \
-         scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755; do
-  IFS=: read -r src dst mode <<<"$f"
-  curl -fsSLo "$tmp/$dst" "$base/$src" && install -o root -g root -m "$mode" "$tmp/$dst" "/opt/fork-fleet/$dst"
-done
-echo "$sha" > /opt/fork-fleet/SOURCE
+# 3. The fleet files, from one pinned main commit. All four are fetched first and installed only when each came;
+#    SOURCE is written last, so it never names a commit whose files are not all in place.
+(
+  set -euo pipefail
+  sha=FULL_MAIN_SHA
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "set sha first"; exit 1; }
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  base=https://raw.githubusercontent.com/scuttletoby/t3code/$sha/.github
+  files="fork-fleet.json:fork-fleet.json:644 scripts/fork-fleet.py:fork-fleet.py:644
+         scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755"
+  for f in $files; do
+    IFS=: read -r src dst mode <<<"$f"
+    curl -fsSLo "$tmp/$dst" "$base/$src"
+  done
+  # It loads and its config passes: the gate then gets as far as its refusal outside a runner.
+  out=$(python3 -I "$tmp/fork-fleet.py" --config "$tmp/fork-fleet.json" gate </dev/null 2>&1 || true)
+  grep -q 'no Runner.Worker above this hook' <<<"$out" || { printf '%s\n' "$out"; exit 1; }
+  bash -n "$tmp/hook.sh" && bash -n "$tmp/fork-fleet-launch.sh"
+  install -d -m 755 /opt/fork-fleet
+  for f in $files; do
+    IFS=: read -r src dst mode <<<"$f"
+    install -o root -g root -m "$mode" "$tmp/$dst" "/opt/fork-fleet/$dst"
+  done
+  echo "$sha" > /opt/fork-fleet/SOURCE
+)
 python3 -I /opt/fork-fleet/fork-fleet.py --config /opt/fork-fleet/fork-fleet.json gate </dev/null; echo "exit $?"
 # ^ expect an ::error:: line, "no Runner.Worker above this hook" and exit 1: the gate refuses outside a runner
 
@@ -307,6 +385,7 @@ chmod 600 /etc/fork-fleet/launch.conf
 ( umask 077; read -rsp 'token: ' t; printf '%s\n' "$t" > /etc/fork-fleet/token ); echo
 # RUNNER_USERS: one user per slot of the pool (step 1). WORK_ROOT (/var/lib/fork-fleet/runners): the launcher makes
 # it 0711. Every directory above it must let the runner users through (o+x), or no runner can reach its copy.
+# NET_BASE (10.204) and RESOLV_CONF (/etc/fork-fleet/resolv.conf): add a line only to change one (step 1b).
 
 # 5. The dispatcher, for the vm pool only.
 cat > /etc/systemd/system/t3code-fleet-dispatcher.service <<'EOF'
@@ -325,7 +404,19 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload && systemctl enable --now t3code-fleet-dispatcher
 journalctl -u t3code-fleet-dispatcher -n 20      # each runner it starts or skips is logged here
-rm -rf "$tmp"
+
+# 6. Prove the runners' network, from inside a runner: check-net runs a probe as a free runner user, in the very
+#    sandbox a runner gets. The URL (public) must answer; each HOST:PORT must be closed from inside. The targets are
+#    every IPv4 service this host listens on, from each of its addresses: its loopback services, its LAN address,
+#    its Tailscale (100.64.0.0/10) address, its Docker bridges. check-net refuses a target the host itself does not
+#    reach (its refusal inside would prove nothing): if a listener just closed, run it again. Expect "ok" on every
+#    line and exit 0. Run it again after any network change on the host, and whenever a new service listens.
+mapfile -t addrs < <(ip -4 -o addr show | awk '{ sub("/.*", "", $4); print $4 }')
+mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
+    n = split($4, hp, ":"); h = hp[1]; p = hp[n]; sub(/%.*/, "", h)
+    if (h == "0.0.0.0" || h == "*") { k = split(addrs, a, " "); for (i = 1; i <= k; i++) print a[i] ":" p } else print h ":" p
+  }' | sort -u)
+/opt/fork-fleet/fork-fleet-launch.sh check-net https://github.com "${targets[@]}"; echo "exit $?"
 ```
 
 Do not name the dispatcher's unit `fork-fleet-*`: that prefix is for runner
@@ -455,14 +546,17 @@ Then check each of these:
 6. **No slot reaches the other.** Set the proof pool to `slots: 2` and restart
    the dispatcher. Give `lint` one more step before the others:
    `echo leftover > "$HOME/planted"; echo leftover > /dev/shm/planted-$RANDOM; (setsid sleep 3000 &); sleep 120`,
-   and before it `! ls /dev/shm/planted-* && ! ls "$HOME/planted"`. Push to
+   and before it `! ls /dev/shm/planted-* && ! ls "$HOME/planted"` and the
+   network check `curl -fsS -o /dev/null https://github.com && ! timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3773' && ! timeout 5 bash -c 'exec 3<>/dev/tcp/LAN_ADDRESS/22'`
+   with the host's LAN address for `LAN_ADDRESS` (the public internet answers;
+   T3 on the host's loopback and the host's LAN address do not). Push to
    `main`, then push again within a minute, so two runs hold both slots. While
    both sleep, as root:
    `systemctl show -p User,WorkingDirectory 'fork-fleet-*'` shows two different
    users, and `setpriv --reuid=fork-runner-1 --regid=fork-runner-1 --clear-groups ls <fork-runner-2's WorkingDirectory>`
    fails with "Permission denied" (and the other way round). After both jobs,
    push again: the new job's first check passes (no file from the earlier job in
-   its home or `/dev/shm`), and while it runs that check, `pgrep -af 'sleep 3000'`
+   its home or `/dev/shm`, which is the unit's own), and while it runs that check, `pgrep -af 'sleep 3000'`
    prints nothing. Set `slots: 1` again.
 
 Delete the proof install (`/opt/fork-fleet-proof`, `/etc/fork-fleet-proof`,
@@ -475,61 +569,68 @@ or meets existing, old or empty state? GitHub (runs, jobs, runner registrations,
 the heartbeat variables) and the host (systemd units, copies) hold all state. The
 dispatcher keeps only pacing in memory, so a restart starts over cleanly.
 
-| Part        | Situation                                                                                     | What happens                                                                                                                                                                                                                                                                                              |
-| ----------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Setting     | `CI_RUNNERS` unset or empty                                                                   | `auto`.                                                                                                                                                                                                                                                                                                   |
-| Setting     | Misspelled                                                                                    | `Route` fails, so the run is red, and the message says why. Fix the variable and re-run.                                                                                                                                                                                                                  |
-| Route       | No heartbeat, an old one (over 180 s) or a garbled one                                        | That pool counts no free slot. `auto`: GitHub-hosted, with a note. `fleet`: queue on `vm`.                                                                                                                                                                                                                |
-| Route       | The `changes` outputs cannot be read                                                          | Every routed job counts as running, with a warning.                                                                                                                                                                                                                                                       |
-| Route       | Untrusted run (fork's pull request, bot, other actor, release run)                            | GitHub-hosted in every mode. A release run skips `Route` and is GitHub-hosted.                                                                                                                                                                                                                            |
-| Route       | Re-run of failed jobs                                                                         | `route` does not run again. `auto` (attempt differs): GitHub-hosted. `fleet`: the old labels, while the setting is still `fleet`. `github` now: GitHub-hosted.                                                                                                                                            |
-| Route       | Re-run of all jobs                                                                            | `route` runs again with a new label: fleet as in a new run if the owner re-ran it, GitHub-hosted if the sweep or someone else did.                                                                                                                                                                        |
-| Route       | Re-run of a run from before this change                                                       | That commit's workflow has no `Route`: GitHub-hosted.                                                                                                                                                                                                                                                     |
-| Watch       | A job waits past the bound                                                                    | The run is cancelled with an error naming the job. `auto`: the sweep re-runs it GitHub-hosted within 10 minutes.                                                                                                                                                                                          |
-| Watch       | A routed job never shows up (a matrix job skipped)                                            | After 2 minutes, the watch counts only the jobs it saw.                                                                                                                                                                                                                                                   |
-| Watch       | GitHub truncated, garbled or failed a reply                                                   | A warning. It tries again in 30 s, and after the bound it stops watching without turning red. The sweep is the fallback.                                                                                                                                                                                  |
-| Watch       | Re-run attempt                                                                                | It watches its own attempt's jobs only.                                                                                                                                                                                                                                                                   |
-| Sweep       | Stops half-way (cancelled, did not re-run)                                                    | The next sweep finds the cancelled run, whose fleet job waited 10 minutes and never started, and re-runs it.                                                                                                                                                                                              |
-| Sweep       | A cancel that takes over 2 minutes                                                            | It is left for the next sweep.                                                                                                                                                                                                                                                                            |
-| Sweep       | Runs again on a run it re-ran                                                                 | The re-run's triggering actor is `github-actions`, so the run is untrusted and left alone. Each run is re-run at most once.                                                                                                                                                                               |
-| Sweep       | Two sweeps at once (manual and cron)                                                          | The concurrency group runs them one at a time.                                                                                                                                                                                                                                                            |
-| Sweep       | A stranger's run with fleet jobs                                                              | Left alone: never cancelled or re-run.                                                                                                                                                                                                                                                                    |
-| Sweep       | A person cancels a run                                                                        | Stands if a fleet runner had the job. A run cancelled while a fleet job had already waited 10 minutes is re-run, as the sweep would have done.                                                                                                                                                            |
-| Sweep       | Branch moved on or deleted                                                                    | Not re-run.                                                                                                                                                                                                                                                                                               |
-| Sweep       | Runner lost mid-job (VM restart)                                                              | `auto`: re-run GitHub-hosted. `fleet`: stays red, and the owner re-runs it.                                                                                                                                                                                                                               |
-| Sweep       | A test fails on a fleet runner                                                                | Red, as on GitHub-hosted. Not re-run.                                                                                                                                                                                                                                                                     |
-| Sweep       | GitHub trouble on one run                                                                     | A warning, the sweep fails, and the next one tries again.                                                                                                                                                                                                                                                 |
-| Sweep       | `fleet` mode, a job waits 2 hours                                                             | The run is cancelled with an error, even a re-run of failed jobs that has no watch. Not re-run.                                                                                                                                                                                                           |
-| Dispatcher  | Crash after `generate-jitconfig`, before `start`                                              | An offline registration with no unit. The next pass deletes it, and the pass after starts the job's runner again (at most 3 tries per job, then it is left to the watch and the sweep).                                                                                                                   |
-| Dispatcher  | Crash after `start`                                                                           | The unit is there. The next pass sees it and starts nothing twice.                                                                                                                                                                                                                                        |
-| Dispatcher  | Launcher killed half-way through copying the template                                         | No unit. The next pass deletes the registration, `prune` removes the half copy and any environment file, and the job's runner is started again.                                                                                                                                                           |
-| Dispatcher  | Restart, or a host reboot                                                                     | It reads everything again from GitHub and systemd. The lock directory under `/run` is made again after a boot. After a reboot, a job that was running fails as a lost runner (`auto`: the sweep re-runs it GitHub-hosted). A job still queued has its offline registration deleted and gets a new runner. |
-| Dispatcher  | Two dispatchers for one pool                                                                  | The second one fails on that pool's lock (`dispatch-<pool>.lock`). Two dispatchers for different pools both run.                                                                                                                                                                                          |
-| Dispatcher  | The job went away before its runner took it (cancelled)                                       | The idle runner is stopped after 3 passes, or at once if another queued job asks for all of its labels. A re-run's job never can: its label names its own attempt.                                                                                                                                        |
-| Dispatcher  | A queued job whose label names another attempt than its run                                   | No runner: the gate would refuse it on any runner. The watch or the sweep handles it.                                                                                                                                                                                                                     |
-| Dispatcher  | Re-run between reading the run and its jobs                                                   | Skipped for one pass, then a runner is made for the new attempt.                                                                                                                                                                                                                                          |
-| Dispatcher  | The PC or VM has no memory                                                                    | No start, and the heartbeat shows 0 free slots. `auto`: new runs go GitHub-hosted.                                                                                                                                                                                                                        |
-| Dispatcher  | GitHub fails during a pass                                                                    | A warning. The pass stops, and the next one, 20 s later, starts over.                                                                                                                                                                                                                                     |
-| Dispatcher  | One pool's host fails (launcher error, cannot be run)                                         | That pool is left alone for the rest of the pass: no cleanup, no start, heartbeat `free: 0` with the reason. Other pools go on.                                                                                                                                                                           |
-| Dispatcher  | The runner template is older than the newest release, or has no `.fork-fleet-version`         | No runner starts on that pool; cleanup goes on. Heartbeat `free: 0` with a `why` that says to refresh the template (host step 2). `auto`: GitHub-hosted.                                                                                                                                                  |
-| Dispatcher  | Token file missing, readable by anyone but root, or empty                                     | It refuses to start. `systemctl status` shows why.                                                                                                                                                                                                                                                        |
-| Dispatcher  | Down for a while                                                                              | Heartbeats go stale after 180 s. `auto`: GitHub-hosted. `fleet`: jobs queue, and the watch reports after 2 hours.                                                                                                                                                                                         |
-| Gate        | Run, attempt or trust rule does not match                                                     | `Runner.Worker` is killed before the first step: the job fails and no `always()` step runs.                                                                                                                                                                                                               |
-| Gate        | Broken installed config                                                                       | It refuses every job, failing closed. The dispatcher stops too. Re-install from `main`.                                                                                                                                                                                                                   |
-| Gate        | Installed script that does not even start (a syntax error)                                    | The dispatcher fails on start too, so no runner starts. Restart the dispatcher after each re-install, so it never runs an older copy than the hook.                                                                                                                                                       |
-| Gate        | No `FORK_FLEET_RUN` (a runner not made by the dispatcher)                                     | Refused.                                                                                                                                                                                                                                                                                                  |
-| Launcher    | Template configured (`.env` and the like), a symlink, or writable by others                   | It refuses to start a runner, and the dispatcher logs the reason.                                                                                                                                                                                                                                         |
-| Launcher    | `launch.conf` or the hook writable by anyone but root                                         | It refuses.                                                                                                                                                                                                                                                                                               |
-| Launcher    | Bad input (an extra line, a key twice, a malformed value)                                     | It refuses before touching anything.                                                                                                                                                                                                                                                                      |
-| Launcher    | A name that ran already                                                                       | It refuses. `prune` removes the old copy once its unit is gone.                                                                                                                                                                                                                                           |
-| Launcher    | `systemd-run` fails                                                                           | The environment file is removed on exit. The copy stays until `prune`.                                                                                                                                                                                                                                    |
-| Launcher    | A runner that never gets its job, or hangs                                                    | Its unit stops after 1 hour (`MAX_SECONDS`), and its whole process group is killed.                                                                                                                                                                                                                       |
-| Launcher    | A job left a process (double fork, `setsid`), or files in `/dev/shm` or its home              | Before its runner user is used again, every process of that user is killed, its `/dev/shm` files are removed, and its old copies (home and tmp inside) are deleted. If a process or file stays, the launcher refuses to start.                                                                            |
-| Launcher    | `RUNNER_USERS` names one user twice, root, a user in another group, or a lingering one        | It refuses.                                                                                                                                                                                                                                                                                               |
-| Launcher    | Every runner user has a unit                                                                  | It refuses: no slot is free.                                                                                                                                                                                                                                                                              |
-| Launcher    | `TEMPLATE` and `WORK_ROOT` on different filesystems                                           | It refuses, with a message: `cp -al` cannot hard-link across filesystems.                                                                                                                                                                                                                                 |
-| Host setup  | Step 1 or 2 run again                                                                         | Step 1 keeps existing users and adds each deny line once. Step 2 stops the dispatcher, swaps the template with `mv -T`, and starts it again; a running job keeps its own copy.                                                                                                                            |
-| Old state   | Leftover copies or environment files from an old install                                      | `prune` removes any whose unit is gone, on every pass.                                                                                                                                                                                                                                                    |
-| Old state   | Old `FLEET_RUNNERS_TOKEN` secret, or a standing runner from the first design (`vm106-t3code`) | Unused. Delete both. A standing runner is what this design removes, because any job asking for its labels can reach it. The fork has no runners today.                                                                                                                                                    |
-| Old state   | Installed copy older than `main`                                                              | It applies the old rule until re-installed (host step 3). `SOURCE` names the commit.                                                                                                                                                                                                                      |
-| Empty state | No runs, no runners, no variables yet                                                         | The dispatcher creates the heartbeat variables on its first pass. `route` counts no slot until then.                                                                                                                                                                                                      |
+| Part        | Situation                                                                                                                     | What happens                                                                                                                                                                                                                                                                                              |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Setting     | `CI_RUNNERS` unset or empty                                                                                                   | `auto`.                                                                                                                                                                                                                                                                                                   |
+| Setting     | Misspelled                                                                                                                    | `Route` fails, so the run is red, and the message says why. Fix the variable and re-run.                                                                                                                                                                                                                  |
+| Route       | No heartbeat, an old one (over 180 s) or a garbled one                                                                        | That pool counts no free slot. `auto`: GitHub-hosted, with a note (a `::notice::` on the run page when the pool has a heartbeat at all). `fleet`: queue on `vm`.                                                                                                                                          |
+| Route       | A pool its dispatcher closed or reports down (a new actions/runner release, a host failure)                                   | A `::notice::` on the run page names the pool and the reason, so `auto` never goes GitHub-hosted unseen for days. `auto`: GitHub-hosted. `fleet`: queue on `vm`.                                                                                                                                          |
+| Route       | The `changes` outputs cannot be read                                                                                          | Every routed job counts as running, with a warning.                                                                                                                                                                                                                                                       |
+| Route       | Untrusted run (fork's pull request, bot, other actor, release run, the upstream sync's push)                                  | GitHub-hosted in every mode. A release run skips `Route` and is GitHub-hosted.                                                                                                                                                                                                                            |
+| Route       | A push to `main` of a commit tagged `fork-follow/synced/<sha>` (the upstream sync moved `main` to it)                         | Untrusted: GitHub-hosted in every mode; the dispatcher makes no runner for it and the gate refuses it. When the tag cannot be read (GitHub or git fails), the run is untrusted too.                                                                                                                       |
+| Route       | The sync stops between its tag and `main` (killed, the `main` push refused)                                                   | The tag names a commit `main` does not have yet: harmless. The next sync tags it again (a no-op) and then moves `main`. A sync whose tag push fails does not move `main` and is red.                                                                                                                      |
+| Route       | Re-run of failed jobs                                                                                                         | `route` does not run again. `auto` (attempt differs): GitHub-hosted. `fleet`: the old labels, while the setting is still `fleet`. `github` now: GitHub-hosted.                                                                                                                                            |
+| Route       | Re-run of all jobs                                                                                                            | `route` runs again with a new label: fleet as in a new run if the owner re-ran it, GitHub-hosted if the sweep or someone else did.                                                                                                                                                                        |
+| Route       | Re-run of a run from before this change                                                                                       | That commit's workflow has no `Route`: GitHub-hosted.                                                                                                                                                                                                                                                     |
+| Watch       | A job waits past the bound                                                                                                    | The run is cancelled with an error naming the job. `auto`: the sweep re-runs it GitHub-hosted within 10 minutes.                                                                                                                                                                                          |
+| Watch       | A routed job never shows up (a matrix job skipped)                                                                            | After 2 minutes, the watch counts only the jobs it saw.                                                                                                                                                                                                                                                   |
+| Watch       | GitHub truncated, garbled or failed a reply                                                                                   | A warning. It tries again in 30 s, and after the bound it stops watching without turning red. The sweep is the fallback.                                                                                                                                                                                  |
+| Watch       | Re-run attempt                                                                                                                | It watches its own attempt's jobs only.                                                                                                                                                                                                                                                                   |
+| Sweep       | Stops half-way (cancelled, did not re-run)                                                                                    | The next sweep finds the cancelled run, whose fleet job waited 10 minutes and never started, and re-runs it.                                                                                                                                                                                              |
+| Sweep       | A cancel that takes over 2 minutes                                                                                            | It is left for the next sweep.                                                                                                                                                                                                                                                                            |
+| Sweep       | Runs again on a run it re-ran                                                                                                 | The re-run's triggering actor is `github-actions`, so the run is untrusted and left alone. Each run is re-run at most once.                                                                                                                                                                               |
+| Sweep       | Two sweeps at once (manual and cron)                                                                                          | The concurrency group runs them one at a time.                                                                                                                                                                                                                                                            |
+| Sweep       | A stranger's run with fleet jobs                                                                                              | Left alone: never cancelled or re-run.                                                                                                                                                                                                                                                                    |
+| Sweep       | A person cancels a run                                                                                                        | Stands if a fleet runner had the job. A run cancelled while a fleet job had already waited 10 minutes is re-run, as the sweep would have done.                                                                                                                                                            |
+| Sweep       | Branch moved on or deleted                                                                                                    | Not re-run.                                                                                                                                                                                                                                                                                               |
+| Sweep       | Runner lost mid-job (VM restart)                                                                                              | `auto`: re-run GitHub-hosted. `fleet`: stays red, and the owner re-runs it.                                                                                                                                                                                                                               |
+| Sweep       | A test fails on a fleet runner                                                                                                | Red, as on GitHub-hosted. Not re-run.                                                                                                                                                                                                                                                                     |
+| Sweep       | GitHub trouble on one run                                                                                                     | A warning, the sweep fails, and the next one tries again.                                                                                                                                                                                                                                                 |
+| Sweep       | `fleet` mode, a job waits 2 hours                                                                                             | The run is cancelled with an error, even a re-run of failed jobs that has no watch. Not re-run.                                                                                                                                                                                                           |
+| Dispatcher  | Crash after `generate-jitconfig`, before `start`                                                                              | An offline registration with no unit. The next pass deletes it, and the pass after starts the job's runner again (at most 3 tries per job, then it is left to the watch and the sweep).                                                                                                                   |
+| Dispatcher  | Crash after `start`                                                                                                           | The unit is there. The next pass sees it and starts nothing twice.                                                                                                                                                                                                                                        |
+| Dispatcher  | Launcher killed half-way through copying the template                                                                         | No unit. The next pass deletes the registration, `prune` removes the half copy and any environment file, and the job's runner is started again.                                                                                                                                                           |
+| Dispatcher  | Restart, or a host reboot                                                                                                     | It reads everything again from GitHub and systemd. The lock directory under `/run` is made again after a boot. After a reboot, a job that was running fails as a lost runner (`auto`: the sweep re-runs it GitHub-hosted). A job still queued has its offline registration deleted and gets a new runner. |
+| Dispatcher  | Two dispatchers for one pool                                                                                                  | The second one fails on that pool's lock (`dispatch-<pool>.lock`). Two dispatchers for different pools both run.                                                                                                                                                                                          |
+| Dispatcher  | The job went away before its runner took it (cancelled)                                                                       | The idle runner is stopped after 3 passes, or at once if another queued job asks for all of its labels. A re-run's job never can: its label names its own attempt.                                                                                                                                        |
+| Dispatcher  | A queued job whose label names another attempt than its run                                                                   | No runner: the gate would refuse it on any runner. The watch or the sweep handles it.                                                                                                                                                                                                                     |
+| Dispatcher  | Re-run between reading the run and its jobs                                                                                   | Skipped for one pass, then a runner is made for the new attempt.                                                                                                                                                                                                                                          |
+| Dispatcher  | The PC or VM has no memory                                                                                                    | No start, and the heartbeat shows 0 free slots. `auto`: new runs go GitHub-hosted.                                                                                                                                                                                                                        |
+| Dispatcher  | GitHub fails during a pass                                                                                                    | A warning. The pass stops, and the next one, 20 s later, starts over.                                                                                                                                                                                                                                     |
+| Dispatcher  | One pool's host fails (launcher error, cannot be run)                                                                         | That pool is left alone for the rest of the pass: no cleanup, no start, heartbeat `free: 0` with the reason. Other pools go on.                                                                                                                                                                           |
+| Dispatcher  | The runner template is older than the newest release, or has no `.fork-fleet-version`                                         | No runner starts on that pool; cleanup goes on. Heartbeat `free: 0` with a `why` that says to refresh the template (host step 2). `auto`: GitHub-hosted.                                                                                                                                                  |
+| Dispatcher  | Token file missing, readable by anyone but root, or empty                                                                     | It refuses to start. `systemctl status` shows why.                                                                                                                                                                                                                                                        |
+| Dispatcher  | Down for a while                                                                                                              | Heartbeats go stale after 180 s. `auto`: GitHub-hosted. `fleet`: jobs queue, and the watch reports after 2 hours.                                                                                                                                                                                         |
+| Gate        | Run, attempt or trust rule does not match                                                                                     | `Runner.Worker` is killed before the first step: the job fails and no `always()` step runs.                                                                                                                                                                                                               |
+| Gate        | Broken installed config                                                                                                       | It refuses every job, failing closed. The dispatcher stops too. Re-install from `main`.                                                                                                                                                                                                                   |
+| Gate        | Installed script that does not even start (a syntax error)                                                                    | The dispatcher fails on start too, so no runner starts. Restart the dispatcher after each re-install, so it never runs an older copy than the hook.                                                                                                                                                       |
+| Gate        | No `FORK_FLEET_RUN` (a runner not made by the dispatcher)                                                                     | Refused.                                                                                                                                                                                                                                                                                                  |
+| Launcher    | Template configured (`.env` and the like), a symlink, or writable by others                                                   | It refuses to start a runner, and the dispatcher logs the reason.                                                                                                                                                                                                                                         |
+| Launcher    | `launch.conf` or the hook writable by anyone but root                                                                         | It refuses.                                                                                                                                                                                                                                                                                               |
+| Launcher    | Bad input (an extra line, a key twice, a malformed value)                                                                     | It refuses before touching anything.                                                                                                                                                                                                                                                                      |
+| Launcher    | A name that ran already                                                                                                       | It refuses. `prune` removes the old copy once its unit is gone.                                                                                                                                                                                                                                           |
+| Launcher    | `systemd-run` fails                                                                                                           | The environment file is removed on exit. The copy stays until `prune`.                                                                                                                                                                                                                                    |
+| Launcher    | A runner that never gets its job, or hangs                                                                                    | Its unit stops after 1 hour (`MAX_SECONDS`), and its whole process group is killed.                                                                                                                                                                                                                       |
+| Launcher    | A job left a process (double fork, `setsid`), or files in its home, `/tmp` or `/dev/shm`                                      | `/tmp`, `/var/tmp`, `/dev/shm` and `/run` were the unit's own and went with it. Before its runner user is used again, every process of that user is killed and its old copies (home inside) are deleted. If a process or copy stays, the launcher refuses to start.                                       |
+| Launcher    | The runners' network cannot be made (no `nft`, IPv4 forwarding off, no nameserver in `RESOLV_CONF`, an `ip` or `nft` failure) | It refuses to start a runner and says why; the dispatcher marks the pool down (`free: 0` with the reason). Host step 1b, then step 6.                                                                                                                                                                     |
+| Launcher    | The `fork_fleet` table removed or changed while runners run                                                                   | The unit's `IPAddressDeny` still refuses the same ranges in the kernel. The next start makes the table again.                                                                                                                                                                                             |
+| Launcher    | `RUNNER_USERS` names one user twice, root, a user in another group, or a lingering one                                        | It refuses.                                                                                                                                                                                                                                                                                               |
+| Launcher    | Every runner user has a unit                                                                                                  | It refuses: no slot is free.                                                                                                                                                                                                                                                                              |
+| Launcher    | `TEMPLATE` and `WORK_ROOT` on different filesystems                                                                           | It refuses, with a message: `cp -al` cannot hard-link across filesystems.                                                                                                                                                                                                                                 |
+| Host setup  | Step 1 or 2 run again                                                                                                         | Step 1 keeps existing users and adds each deny line once. Step 2 stops the dispatcher, swaps the template with `mv -T`, and starts it again; a running job keeps its own copy.                                                                                                                            |
+| Host setup  | Step 1b, 2 or 3 fails half-way (a download, the checksum, a check)                                                            | The step stops at that command (`set -euo pipefail`). Step 2 has not touched the running template or the dispatcher yet; step 3 has installed nothing and not written `SOURCE`.                                                                                                                           |
+| Host setup  | Step 6 says a service is reachable from inside                                                                                | Do not use the pool: stop the dispatcher until step 6 passes.                                                                                                                                                                                                                                             |
+| Old state   | Leftover copies or environment files from an old install                                                                      | `prune` removes any whose unit is gone, on every pass.                                                                                                                                                                                                                                                    |
+| Old state   | Old `FLEET_RUNNERS_TOKEN` secret, or a standing runner from the first design (`vm106-t3code`)                                 | Unused. Delete both. A standing runner is what this design removes, because any job asking for its labels can reach it. The fork has no runners today.                                                                                                                                                    |
+| Old state   | Installed copy older than `main`                                                                                              | It applies the old rule until re-installed (host step 3). `SOURCE` names the commit.                                                                                                                                                                                                                      |
+| Empty state | No runs, no runners, no variables yet                                                                                         | The dispatcher creates the heartbeat variables on its first pass. `route` counts no slot until then.                                                                                                                                                                                                      |

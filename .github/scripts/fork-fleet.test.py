@@ -28,12 +28,48 @@ HOSTED = CFG['hosted']
 NONCE = '0123456789abcdef'
 NEWEST_RUNNER = '2.330.0'
 T0 = 1_800_000_000
+SHA = '0123456789abcdef0123456789abcdef01234567'      # a pushed commit
+SYNCED = 'feedface' * 5                                # a commit the upstream sync tagged
+UNKNOWN = 'decafbad' * 5                               # a commit whose tag cannot be read (git fails)
+SYNC_TAG = CFG['upstream_sync']['tag_prefix']
+GIT_ENV = {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1', 'LC_ALL': 'C',
+           'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
+
+
+def fake_ls_remote(argv, **kw):
+    """`git ls-remote --exit-code <repo> <ref>` of this repository: SYNCED's tag exists, UNKNOWN's read fails."""
+    code = 0 if argv[-1].endswith(SYNCED) else 128 if argv[-1].endswith(UNKNOWN) else 2
+    return subprocess.CompletedProcess(argv, code, '', '')
+
+
+REAL_MADE_BY_THE_SYNC = ff.made_by_the_sync
+
+
+def made_by_the_sync_offline(cfg, sha, run=fake_ls_remote):
+    return REAL_MADE_BY_THE_SYNC(cfg, sha, run=run)
+
+
+ff.made_by_the_sync = made_by_the_sync_offline   # every test but UpstreamSync and GateProcess: no network
+
+
+def sync_remote(top):
+    """(SYNC_REMOTE of a local bare copy of this repository, a commit the sync tagged there) for the real git."""
+    def git(*a):
+        return subprocess.run(['git', *a], env=GIT_ENV, check=True, capture_output=True, text=True).stdout.strip()
+    remote = os.path.join(top, 'remote', '{}.git')
+    work = os.path.join(top, 'work')
+    git('init', '-q', '--bare', remote.format(REPO))
+    git('init', '-q', work)
+    git('-C', work, 'commit', '-q', '--allow-empty', '-m', 'upstream')
+    sha = git('-C', work, 'rev-parse', 'HEAD')
+    git('-C', work, 'push', '-q', remote.format(REPO), f'HEAD:refs/tags/{SYNC_TAG}{sha}')
+    return 'file://' + remote, sha
 
 
 def env(**over):
     e = {'GITHUB_REPOSITORY': REPO, 'GITHUB_WORKFLOW_REF': f'{REPO}/{WORKFLOW}@refs/heads/main',
          'GITHUB_ACTOR': OWNER, 'GITHUB_TRIGGERING_ACTOR': OWNER, 'GITHUB_EVENT_NAME': 'push',
-         'GITHUB_REF': 'refs/heads/main', 'GITHUB_RUN_ID': '5', 'GITHUB_RUN_ATTEMPT': '1'}
+         'GITHUB_REF': 'refs/heads/main', 'GITHUB_SHA': SHA, 'GITHUB_RUN_ID': '5', 'GITHUB_RUN_ATTEMPT': '1'}
     e.update(over)
     return {k: v for k, v in e.items() if v is not None}
 
@@ -74,7 +110,7 @@ def http_error(code):
 
 
 def a_run(rid=5, *, actor=OWNER, triggering=None, event='push', branch='main', attempt=1, status='queued',
-          conclusion=None, prs=(), head_repo=REPO, repo=REPO, path=WORKFLOW, sha='abc'):
+          conclusion=None, prs=(), head_repo=REPO, repo=REPO, path=WORKFLOW, sha=SHA):
     """A workflow run as GitHub's API records it."""
     return {'id': rid, 'run_attempt': attempt, 'status': status, 'conclusion': conclusion, 'event': event,
             'head_branch': branch, 'head_sha': sha, 'path': path, 'repository': {'full_name': repo},
@@ -185,6 +221,9 @@ class Config(unittest.TestCase):
             'a job id with a dash': (lambda c: c['jobs'][0].__setitem__('job', 'a-b'), 'id'),
             'a dispatcher pace of 0': (lambda c: c['dispatch'].__setitem__('every_seconds', 0), 'every_seconds'),
             'no stuck bound': (lambda c: c.pop('stuck_seconds'), 'stuck_seconds'),
+            'no upstream sync tag prefix': (lambda c: c.pop('upstream_sync'), 'upstream_sync'),
+            'a sync tag prefix without its /': (lambda c: c['upstream_sync'].__setitem__('tag_prefix', 'synced'),
+                                                'tag_prefix'),
         }
         for name, (change, word) in cases.items():
             with self.subTest(name):
@@ -232,6 +271,10 @@ class Rule(unittest.TestCase):
             'pull_request_target': (env(GITHUB_EVENT_NAME='pull_request_target'), pr()),
             'no payload': (env(), None),
             'no variables': ({}, PUSH),
+            'a push the upstream sync made (its tag exists)': (env(GITHUB_SHA=SYNCED), PUSH),
+            'a push whose sync tag cannot be read': (env(GITHUB_SHA=UNKNOWN), PUSH),
+            'a push with no commit sha': (env(GITHUB_SHA=None), PUSH),
+            'a push with a short sha': (env(GITHUB_SHA=SHA[:12]), PUSH),
         }
         for name, (e, event) in cases.items():
             with self.subTest(name):
@@ -274,6 +317,8 @@ class RunRefused(unittest.TestCase):
             'another repository': (a_run(repo='someone/t3code'), None),
             'a workflow_dispatch run': (a_run(event='workflow_dispatch'), None),
             'a workflow_run run': (a_run(event='workflow_run'), None),
+            'the push run of a commit the upstream sync made': (a_run(sha=SYNCED), None),
+            'a push run whose sync tag cannot be read': (a_run(sha=UNKNOWN), None),
         }
         for name, (run, setup) in cases.items():
             with self.subTest(name):
@@ -308,6 +353,7 @@ class Gate(unittest.TestCase):
             'another run': env(GITHUB_RUN_ID='6', **self.MADE),
             'a re-run on a runner made for attempt 1': env(GITHUB_RUN_ATTEMPT='2', **self.MADE),
             'a stranger\'s run': env(GITHUB_ACTOR='someone', **self.MADE),
+            'a push the upstream sync made': env(GITHUB_SHA=SYNCED, **self.MADE),
         }
         for name, e in cases.items():
             with self.subTest(name):
@@ -369,20 +415,23 @@ class GateProcess(unittest.TestCase):
               'with open(marker, "w") as f:   # an `if: always()` step\n'
               '    f.write("ran")\n')
 
-    def install(self, d, config=None, mutate=None):
+    def install(self, d, config=None, mutate=None, remote=None):
+        """remote: SYNC_REMOTE of the copy (a local bare repository, sync_remote), so its sync check reads no network."""
         opt = os.path.join(d, 'opt')
         os.mkdir(opt)
         shutil.copy(os.path.join(HERE, 'fork-fleet.py'), opt)
         shutil.copy(os.path.join(HERE, 'fork-fleet-hook.sh'), os.path.join(opt, 'hook.sh'))
         with open(os.path.join(opt, 'fork-fleet.json'), 'w') as f:
             f.write(json.dumps(CFG) if config is None else config)
-        if mutate:
-            path = os.path.join(opt, 'fork-fleet.py')
+        changes = ([mutate] if mutate else []) + ([(f'SYNC_REMOTE = {ff.SYNC_REMOTE!r}', f'SYNC_REMOTE = {remote!r}')]
+                                                  if remote else [])
+        path = os.path.join(opt, 'fork-fleet.py')
+        for old, new in changes:
             with open(path) as f:
                 text = f.read()
-            self.assertEqual(text.count(mutate[0]), 1)
+            self.assertEqual(text.count(old), 1)
             with open(path, 'w') as f:
-                f.write(text.replace(*mutate))
+                f.write(text.replace(old, new))
         return os.path.join(opt, 'hook.sh')
 
     def start(self, d, hook, e, event):
@@ -399,8 +448,17 @@ class GateProcess(unittest.TestCase):
 
     def test_the_hook_ends_a_refused_job_before_its_always_steps(self):
         made = dict(FORK_FLEET_RUN='5', FORK_FLEET_ATTEMPT='1')
+        with tempfile.TemporaryDirectory() as top:
+            remote, synced = sync_remote(top)
+            self.check_hook(made, remote, synced)
+
+    def check_hook(self, made, remote, synced):
         cases = {   # name: (environment, event, config, mutation, the always() step runs)
             'allowed': (env(**made), PUSH, None, None, True),
+            'a push the upstream sync made (real git, its tag in the repository)':
+                (env(GITHUB_SHA=synced, **made), PUSH, None, None, False),
+            'a push whose sync tag cannot be read (git fails)':
+                (env(**made), PUSH, None, ("'ls-remote', '--exit-code'", "'no-such-command', '--exit-code'"), False),
             'a fork\'s pull request': (env(**PR_ENV, **made), pr(head='someone/t3code'), None, None, False),
             'a re-run on an old runner': (env(GITHUB_RUN_ATTEMPT='2', **made), PUSH, None, None, False),
             'a runner the dispatcher did not start': (env(), PUSH, None, None, False),
@@ -414,7 +472,7 @@ class GateProcess(unittest.TestCase):
             for i, (name, (e, event, config, mutate, runs)) in enumerate(cases.items()):
                 d = os.path.join(top, str(i))
                 os.mkdir(d)
-                started[name] = self.start(d, self.install(d, config, mutate), e, event), runs
+                started[name] = self.start(d, self.install(d, config, mutate, remote), e, event), runs
             for name, ((proc, marker), runs) in started.items():
                 with self.subTest(name):
                     out = proc.communicate(timeout=60)[0]
@@ -432,6 +490,66 @@ class GateProcess(unittest.TestCase):
             out = proc.communicate(timeout=60)[0]
             self.assertIn('the gate itself failed', out)
             self.assertFalse(os.path.exists(marker))
+
+
+class UpstreamSync(unittest.TestCase):
+    """made_by_the_sync itself, with the real git: the push run of a commit the upstream sync tagged never uses the
+    fleet (owner decision: upstream code runs on GitHub-hosted runners only); any doubt refuses."""
+
+    def call(self, sha, code=2, error=None):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            if error:
+                raise error
+            return subprocess.CompletedProcess(argv, code, '', '')
+        return REAL_MADE_BY_THE_SYNC(CFG, sha, run=run), calls
+
+    def test_it_asks_this_repository_anonymously_for_the_one_tag(self):
+        why, calls = self.call(SHA)
+        self.assertIsNone(why)
+        (argv, kw), = calls
+        self.assertEqual(argv, ['git', '-c', 'protocol.version=2', 'ls-remote', '--exit-code',
+                                f'https://github.com/{REPO}.git', f'refs/tags/{SYNC_TAG}{SHA}'])
+        self.assertEqual(kw['env']['GIT_CONFIG_GLOBAL'], '/dev/null')   # no config, helper or token of the caller
+        self.assertEqual(kw['env']['GIT_CONFIG_NOSYSTEM'], '1')
+        self.assertEqual(kw['env']['GIT_TERMINAL_PROMPT'], '0')
+        self.assertFalse({k for k in kw['env'] if 'TOKEN' in k or k == 'HOME'})
+        self.assertTrue(0 < kw['timeout'] <= 60)
+
+    def test_a_tagged_commit_and_any_doubt_are_refused(self):
+        cases = {'tagged': (SHA, 0, None, 'pushed by the upstream sync'),
+                 'git fails': (SHA, 128, None, 'cannot be told (git ls-remote exit 128)'),
+                 'git hangs': (SHA, 0, subprocess.TimeoutExpired('git', 30), 'cannot be told (TimeoutExpired)'),
+                 'no git': (SHA, 0, FileNotFoundError('git'), 'cannot be told (FileNotFoundError)')}
+        for name, (sha, code, error, words) in cases.items():
+            with self.subTest(name):
+                self.assertIn(words, self.call(sha, code, error)[0])
+        for sha in (None, '', SHA[:12], SHA.upper(), SHA + '0', '-' + SHA[1:], f'{SHA[:39]}\n'):
+            with self.subTest(sha=sha):
+                why, calls = self.call(sha)
+                self.assertIn('not a full sha', why)
+                self.assertEqual(calls, [])   # nothing a run controls reaches git unchecked
+
+    @unittest.skipUnless(shutil.which('git', path='/usr/bin:/bin'), 'git in /usr/bin or /bin')
+    def test_with_the_real_git(self):
+        with tempfile.TemporaryDirectory() as top:
+            remote, synced = sync_remote(top)
+            saved = ff.SYNC_REMOTE
+            try:
+                ff.SYNC_REMOTE = remote
+                self.assertIn('pushed by the upstream sync', REAL_MADE_BY_THE_SYNC(CFG, synced))
+                self.assertIsNone(REAL_MADE_BY_THE_SYNC(CFG, SHA))
+                ff.SYNC_REMOTE = remote.replace(top, os.path.join(top, 'gone'))
+                self.assertIn('cannot be told', REAL_MADE_BY_THE_SYNC(CFG, SHA))
+            finally:
+                ff.SYNC_REMOTE = saved
+
+    def test_the_sync_pushes_the_tag_this_rule_reads(self):
+        with open(os.path.join(HERE, 'fork-follow-push.sh')) as f:
+            text = f.read()
+        self.assertIn(f'\nSYNCED_TAG_PREFIX={SYNC_TAG}\n', text)
 
 
 def beacon(free, at=T0):
@@ -475,6 +593,20 @@ class Route(unittest.TestCase):
                 if name != 'negative':
                     self.assertRegex(log, 'cannot be read|s old')
 
+    def test_a_closed_pool_is_a_notice_on_the_run_page(self):
+        """A new actions/runner release closes the pool (fail closed): auto goes hosted, and the run page says why."""
+        closed = json.dumps({'at': T0, 'free': 0, 'why': 'the runner template is actions/runner 2.329.9, older than '
+                             'the newest release 2.330.0: no runner starts until the owner refreshes the template '
+                             '(.github/fork-fleet.md, host step 2)'})
+        _, out, log = self.route(beacons={FIRST: closed, SECOND: beacon(2, at=T0 - CFG['beacon_fresh_seconds'] - 1)})
+        self.assertEqual(self.fleet(out), {})
+        self.assertIn(f'::notice::fork-fleet: pool {FIRST}: no free slot counted: its dispatcher says: the runner '
+                      'template is actions/runner 2.329.9, older than the newest release 2.330.0', log)
+        self.assertRegex(log, rf'::notice::fork-fleet: pool {SECOND}: no free slot counted: .* s old')
+        _, _, log = self.route()   # never set up: a log line, no notice
+        self.assertIn(f'pool {FIRST}: no free slot counted: no heartbeat', log)
+        self.assertNotIn('::notice::', log)
+
     def test_fleet_mode_queues_the_rest_on_the_waiting_pool(self):
         mode, out, _ = self.route('fleet', beacons={FIRST: beacon(1)})
         self.assertEqual(mode, 'fleet')
@@ -499,6 +631,14 @@ class Route(unittest.TestCase):
                                          event=pr(head='someone/t3code'))
                 self.assertEqual(set(out.values()), {HOSTED})
                 self.assertIn('only trusted runs', log)
+
+    def test_the_upstream_syncs_push_run_is_hosted_in_every_mode(self):
+        for mode in ('auto', 'fleet'):
+            with self.subTest(mode):
+                _, out, log = self.route(mode, beacons={FIRST: beacon(5), SECOND: beacon(5)}, e=env(GITHUB_SHA=SYNCED))
+                self.assertEqual(set(out.values()), {HOSTED})
+                self.assertIn(f'::notice::fork-fleet: GitHub-hosted for every job: commit {SYNCED[:12]} was pushed '
+                              'by the upstream sync', log)
 
     def test_each_run_gets_labels_of_its_own_that_the_dispatcher_reads_back(self):
         _, a, _ = self.route('fleet', nonce=None)
@@ -603,7 +743,7 @@ class Watch(unittest.TestCase):
 
 
 class Sweep(unittest.TestCase):
-    def sweep(self, run, *jobs, mode='', head='abc', at=T0 + 800, setup=None):
+    def sweep(self, run, *jobs, mode='', head=SHA, at=T0 + 800, setup=None):
         gh = FakeGitHub()
         gh.add(run, *jobs)
         gh.branches[run['head_branch']] = head
@@ -677,6 +817,7 @@ class Sweep(unittest.TestCase):
             'a fork\'s pull request': a_run(event='pull_request', branch='x', head_repo='someone/t3code',
                                             status='in_progress'),
             'the sweep\'s own re-run': a_run(attempt=2, triggering='github-actions[bot]', status='in_progress'),
+            'the upstream sync\'s push run': a_run(sha=SYNCED, status='in_progress'),
         }
         for name, run in cases.items():
             with self.subTest(name):
@@ -824,7 +965,10 @@ class Dispatch(unittest.TestCase):
         def someone_elses_pr(gh):
             gh.own_pr(user='someone')
             gh.add(a_run(event='pull_request', branch='x', prs=[7]), a_job(11, job_labels(WAITING, 'lint')))
-        for setup in (fork_pr, stranger, sweep_rerun, someone_elses_pr):
+
+        def upstream_sync(gh):
+            gh.add(a_run(sha=SYNCED), a_job(11, job_labels(WAITING, 'lint')))
+        for setup in (fork_pr, stranger, sweep_rerun, someone_elses_pr, upstream_sync):
             with self.subTest(setup.__name__):
                 self.setUp()
                 setup(self.gh)
@@ -1178,14 +1322,22 @@ class Dispatch(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith('linux') and os.geteuid() != 0, 'Linux, not as root')
 class Launcher(unittest.TestCase):
-    """fork-fleet-launch.sh with a fake systemd-run, systemctl, chown, pgrep and setpriv (it runs here as this user,
-    not root; LauncherAsRoot runs the real ones). The fake systemd-run records each unit it starts, with its user,
-    for `systemctl list-units` and `systemctl show`."""
+    """fork-fleet-launch.sh with a fake systemd-run, systemctl, chown, pgrep, setpriv, ip, nft, iptables and id (it
+    runs here as this user, not root; LauncherAsRoot runs the real ones). The fake systemd-run records each unit it
+    starts, with its user, for `systemctl list-units` and `systemctl show` (with --wait, check-net's probe, it runs the
+    command itself, or exits $REC/probe-exit when that file exists). The fake ip keeps the namespaces and links
+    it made in $REC/netns and $REC/links; the fake iptables has a DOCKER-USER chain only when $REC/docker-user exists;
+    the fake id answers from $REC/id-<flag>-<user> when that file exists."""
 
     FAKES = {
         'systemd-run': '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$REC/systemd-run"\n'
+                       'printf "%s\\0" "$@" > "$REC/systemd-run.0"\n'
                        'for a in "$@"; do case $a in EnvironmentFile=*) f=${a#EnvironmentFile=}; '
                        'cp -- "$f" "$REC/env"; stat -c %a -- "$f" > "$REC/env-mode" ;; esac; done\n'
+                       # check-net's probe (--wait): exits $REC/probe-exit when that file exists, else runs here.
+                       'if [[ " $* " == *" --wait "* ]]; then '
+                       '[[ ! -e $REC/probe-exit ]] || exit "$(cat "$REC/probe-exit")"; '
+                       'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"; fi\n'
                        'code=$(cat "$REC/systemd-run-exit" 2>/dev/null || echo 0)\n'
                        'if [[ $code == 0 ]]; then while (($#)); do case $1 in --unit) unit=$2 ;; --uid) user=$2 ;; '
                        'esac; shift; done; printf "%s.service loaded active running x\\n" "$unit" >> "$REC/units"; '
@@ -1200,7 +1352,22 @@ class Launcher(unittest.TestCase):
                  '[[ -e $REC/procs-$2 ]]\n',
         'setpriv': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/setpriv"\n'
                    '[[ -e $REC/procs-stay ]] || rm -f -- "$REC"/procs-*\n',
+        'nft': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/nft-args"\ncat > "$REC/nft"\n[[ ! -e $REC/nft-fails ]]\n',
+        'ip': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/ip"\n[[ ! -e $REC/ip-fails ]] || exit 1\n'
+              'case "$*" in "-n "*" link show lo") grep -qxF -- "$2" "$REC/netns" 2>/dev/null ;; '
+              '"netns add "*) printf "%s\\n" "$3" >> "$REC/netns" ;; '
+              '"link show "*) grep -qxF -- "$3" "$REC/links" 2>/dev/null ;; '
+              '"link add "*) printf "%s\\n" "$3" >> "$REC/links" ;; esac\n',
+        'iptables': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/iptables"\n[[ -e $REC/docker-user ]] || exit 1\n'
+                    'case $3 in -S) exit 0 ;; '
+                    '-C) [[ ! -e $REC/iptables-C-exit ]] || exit "$(cat "$REC/iptables-C-exit")"; '
+                    'grep -qxF -- "${*:5}" "$REC/docker-user" ;; '
+                    '-I) printf "%s\\n" "${*:6}" >> "$REC/docker-user" ;; *) exit 2 ;; esac\n',
+        'id': '#!/usr/bin/env bash\nf=$REC/id${1}-${!#}\nif [[ -e $f ]]; then cat -- "$f"; exit 0; fi\n'
+              'for p in /usr/bin/id /bin/id; do [[ -x $p ]] && exec "$p" "$@"; done\nexit 127\n',
     }
+    PRIVATE4 = ('0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 '
+                '192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4')
     USERS = ('nobody', 'daemon')   # two slots: two users of their own (in CI and here, each in its own group only)
     NAME = 'fleet-vm-t3code-11'
     JIT = 'SklUc2VjcmV0'
@@ -1227,8 +1394,9 @@ class Launcher(unittest.TestCase):
         self.write('template/run.sh', '#!/bin/sh\n', 0o755)
         self.write('template/bin/Runner.Listener', 'x', 0o755)
         self.write('template/.fork-fleet-version', f'{NEWEST_RUNNER}\n', 0o644)
-        os.mkdir(self.path('shm'))
         os.mkdir(self.path('linger'))
+        self.write('resolv.conf', 'nameserver 1.1.1.1\n', 0o644)
+        self.write('ip_forward', '1\n', 0o644)
         for d in ('template', 'template/bin'):
             os.chmod(self.path(d), 0o755)   # whatever this machine's umask is
         self.hook = self.write('hook.sh', '#!/bin/sh\n', 0o755)
@@ -1247,8 +1415,9 @@ class Launcher(unittest.TestCase):
 
     def conf(self, extra='', **over):
         settings = dict(RUNNER_USERS=','.join(self.USERS), TEMPLATE=self.template, WORK_ROOT=self.path('var/runners'),
-                        RUN_DIR=self.path('run'), HOOK=self.hook, SHM=self.path('shm'), LINGER_DIR=self.path('linger'),
-                        RESERVE_MB='2048', MAX_SECONDS='3600',
+                        RUN_DIR=self.path('run'), HOOK=self.hook, LINGER_DIR=self.path('linger'),
+                        RESERVE_MB='2048', MAX_SECONDS='3600', NET_BASE='10.204', RESOLV_CONF=self.path('resolv.conf'),
+                        IP_FORWARD=self.path('ip_forward'),
                         MEMINFO=self.path('meminfo'), SYSTEMD_RUN=self.path('bin/systemd-run'),
                         SYSTEMCTL=self.path('bin/systemctl'))
         settings.update(over)
@@ -1268,19 +1437,28 @@ class Launcher(unittest.TestCase):
         except FileNotFoundError:
             return None
 
+    def sandbox(self, user):
+        """The unit's sandbox, start's and check-net's alike: its own network namespace, the private ranges refused in
+        the kernel too, its own /run, /dev/shm, /tmp and /var/tmp (so root never cleans a shared one), no /home, no
+        other user's processes, its own IPC."""
+        props = (f'NetworkNamespacePath=/run/netns/fork-fleet-{user}', f'IPAddressDeny={self.PRIVATE4} ::/0',
+                 'IPAddressAllow=localhost',
+                 'TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777',
+                 f'BindReadOnlyPaths={self.path("resolv.conf")}:{os.path.realpath("/etc/resolv.conf")}',
+                 'NoNewPrivileges=yes', 'ProtectSystem=strict', 'ProtectHome=yes', 'ProtectProc=invisible',
+                 'PrivateIPC=yes', 'RemoveIPC=yes')
+        return [a for prop in props for a in ('-p', prop)]
+
     def test_start(self):
         got = self.launch('start', self.NAME, stdin=self.INPUT)
         self.assertEqual(got.returncode, 0, got.stderr)
         run_dir, dest = self.path('run'), self.path(f'var/runners/{self.NAME}')
         args = self.rec_text('systemd-run').splitlines()
-        self.assertEqual(args[args.index('--unit') + 1], f'fork-fleet-{self.NAME}')
-        self.assertEqual(args[args.index('--uid') + 1], 'nobody')
-        self.assertEqual(args[args.index('--working-directory') + 1], dest)
-        for prop in ('Type=exec', 'KillMode=control-group', f'EnvironmentFile={run_dir}/{self.NAME}.env',
-                     'NoNewPrivileges=yes', 'PrivateTmp=yes', 'ProtectSystem=strict', f'ReadWritePaths={dest}',
-                     'RemoveIPC=yes', 'RuntimeMaxSec=3600'):
-            self.assertEqual(args[args.index(prop) - 1], '-p', prop)
-        self.assertEqual(args[-2:], ['--', f'{dest}/run.sh'])
+        # Exactly these: no PrivateTmp (it leaves /dev/shm shared), nothing dropped.
+        self.assertEqual(args, ['--quiet', '--unit', f'fork-fleet-{self.NAME}', '--collect', '--uid', 'nobody',
+                                '--working-directory', dest, '-p', 'Type=exec', '-p', 'KillMode=control-group',
+                                '-p', f'EnvironmentFile={run_dir}/{self.NAME}.env', *self.sandbox('nobody'),
+                                '-p', f'ReadWritePaths={dest}', '-p', 'RuntimeMaxSec=3600', '--', f'{dest}/run.sh'])
         # HOME and TMPDIR inside the copy, which goes once its unit is gone: nothing of a job reaches the next one.
         self.assertEqual(self.rec_text('env'), self.INPUT + f'HOME={dest}/home\nTMPDIR={dest}/tmp\n'
                                                             f'ACTIONS_RUNNER_HOOK_JOB_STARTED={self.hook}\n')
@@ -1510,11 +1688,205 @@ class Launcher(unittest.TestCase):
         self.assertEqual(os.listdir(run), ['launch.lock'])
         self.assertTrue(os.path.isdir(self.path('elsewhere')))
 
+    # Item 1 of round 3: each runner user's own network namespace, internet only, made (or found) before every start.
+    NOBODY_NET, DAEMON_NET = '10.204.255.248', '10.204.0.4'   # uid % 16384 * 4 from NET_BASE: 65534 and 1
+
+    def ip_calls(self, user, net, made=True):
+        uid = pwd.getpwnam(user).pw_uid
+        ns, host, peer, base = f'fork-fleet-{user}', f'ffh-{uid}', f'ffp-{uid}', net.rsplit('.', 1)[0]
+        last = int(net.rsplit('.', 1)[1])
+        return [f'-n {ns} link show lo', *([f'netns add {ns}'] if made else []), f'link show {host}',
+                *([f'link add {host} type veth peer name {peer} netns {ns}'] if made else []),
+                f'addr replace {base}.{last + 1}/30 dev {host}', f'link set {host} up', f'-n {ns} link set lo up',
+                f'-n {ns} addr replace {base}.{last + 2}/30 dev {peer}', f'-n {ns} link set {peer} up',
+                f'-n {ns} route replace default via {base}.{last + 1}']
+
+    def test_each_runner_gets_a_network_of_its_own_with_internet_only(self):
+        self.assertEqual(self.start('fleet-vm-t3code-11'), 'nobody')
+        self.assertEqual(self.rec_text('ip').splitlines(), self.ip_calls('nobody', self.NOBODY_NET))
+        self.assertEqual(self.rec_text('nft-args'), '-f -\n')
+        table = self.rec_text('nft')
+        # One transaction: the old table (if any) goes and the new one comes, or neither (nft -f is atomic).
+        self.assertTrue(table.startswith('table inet fork_fleet\ndelete table inet fork_fleet\ntable inet fork_fleet {'))
+        self.assertIn('elements = { ' + ', '.join(self.PRIVATE4.split()) + ' }', table)
+        for rule in ('type filter hook input priority -10; policy accept;',
+                     'iifname "ffh-*" counter reject with icmpx admin-prohibited',   # the host itself: nothing of it
+                     'iifname "ffh-*" ip daddr @private4 counter reject with icmpx admin-prohibited',
+                     'iifname "ffh-*" meta nfproto ipv6 counter drop',
+                     'oifname "ffh-*" ct state != { established, related } counter drop',   # nothing opens to it
+                     'ip saddr 10.204.0.0/16 oifname != "ffh-*" masquerade'):
+            with self.subTest(rule):
+                self.assertIn(f'    {rule}\n', table)
+        self.assertEqual(len(re.findall(r'iifname "ffh-\*"', table)), 3)
+        self.assertEqual(self.start('fleet-vm-t3code-12'), 'daemon')
+        self.assertEqual(self.rec_text('ip').splitlines(),
+                         self.ip_calls('nobody', self.NOBODY_NET) + self.ip_calls('daemon', self.DAEMON_NET))
+        # The unit is put in it, and refused the same ranges again in the kernel (IPAddressDeny), should the table go.
+        args = self.rec_text('systemd-run').splitlines()
+        self.assertEqual(args[args.index('NetworkNamespacePath=/run/netns/fork-fleet-daemon') - 1], '-p')
+        self.assertIn(f'IPAddressDeny={self.PRIVATE4} ::/0', args)
+        # The next job of that user: its namespace and link are there, nothing is made twice, the table is made again.
+        os.remove(os.path.join(self.rec, 'ip'))
+        self.write('rec/units', 'fork-fleet-fleet-vm-t3code-12.service loaded active running x\n', 0o644)
+        self.assertEqual(self.start('fleet-vm-t3code-13'), 'nobody')
+        self.assertEqual(self.rec_text('ip').splitlines(), self.ip_calls('nobody', self.NOBODY_NET, made=False))
+        self.assertEqual(self.rec_text('nft-args'), '-f -\n' * 3)
+        self.assertEqual(self.rec_text('netns'), 'fork-fleet-nobody\nfork-fleet-daemon\n')
+        self.assertNotIn(' -I ', self.rec_text('iptables'))   # no DOCKER-USER chain here: nothing added
+
+    def test_no_runner_starts_without_its_network(self):
+        """Fail closed: when any part of the network cannot be made, or the host does not forward, no unit starts."""
+        cases = {'nft fails': ('rec/nft-fails', 'network: nft -f - failed'),
+                 'ip fails': ('rec/ip-fails', 'network: ip netns add fork-fleet-nobody failed')}
+        for name, (mark, word) in cases.items():
+            with self.subTest(name):
+                self.write(mark, '', 0o644)
+                self.refused(word)
+                os.remove(self.path(mark))
+        self.write('ip_forward', '0\n', 0o644)
+        self.refused('ip_forward is not 1')
+        self.write('ip_forward', '1\n', 0o644)
+        self.write('resolv.conf', '# none\nsearch lan\n', 0o644)
+        self.refused('names no nameserver')
+        os.remove(self.path('resolv.conf'))
+        self.refused('resolv.conf is missing')
+        self.write('resolv.conf', 'nameserver 1.1.1.1\n', 0o666)
+        self.refused('writable by its owner only')
+        for bad in ('10.300', '192.168', '10.204.0', '10.04', '10.x'):
+            with self.subTest(bad):
+                self.conf(NET_BASE=bad)
+                self.refused('NET_BASE is 10.N', 'active')
+
+    def test_dockers_forward_policy_gets_its_two_rules_once(self):
+        """On a host with Docker (FORWARD policy DROP) the table's traffic needs two accepts in DOCKER-USER: added
+        once, never twice; an iptables that gives no clear answer stops the start."""
+        self.write('rec/docker-user', '', 0o644)
+        self.start('fleet-vm-t3code-11')
+        self.start('fleet-vm-t3code-12')
+        # (the fake appends; iptables -I 1 puts each at the top)
+        self.assertEqual(self.rec_text('docker-user'), '-o ffh-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n'
+                                                       '-i ffh-+ -j ACCEPT\n')
+        self.assertEqual(sum(1 for line in self.rec_text('iptables').splitlines() if ' -I ' in f' {line} '), 2)
+        os.remove(os.path.join(self.rec, 'systemd-run'))
+        self.write('rec/units', '', 0o644)
+        self.write('rec/iptables-C-exit', '4', 0o644)
+        self.refused('iptables -C DOCKER-USER gave no answer (exit 4)', 'start', 'fleet-vm-t3code-13')
+
+    def test_a_runner_user_in_another_group_is_refused(self):
+        """A runner user also in, say, docker (root on the host) or adm (the logs) is never handed a job."""
+        gid = pwd.getpwnam('daemon').pw_gid
+        self.write('rec/id-G-daemon', f'{gid} 999\n', 0o644)
+        self.refused('daemon is in other groups')
+        self.write('rec/id-G-daemon', f'{gid}\n', 0o644)
+        self.assertEqual(self.start(self.NAME), 'nobody')
+
+    def test_two_users_that_would_share_a_network_are_refused(self):
+        self.write('rec/id-u-daemon', '16382\n', 0o644)   # 65534 % 16384 too: nobody's /30
+        self.refused('daemon and nobody would share one network')
+
+    def test_one_launcher_at_a_time(self):
+        """launch.lock: a second launcher (the other pool's dispatcher) waits until the first is done."""
+        import fcntl, time
+        os.mkdir(self.path('run'), 0o700)
+        with open(self.path('run/launch.lock'), 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            stdin = self.write('input', self.INPUT, 0o600)
+            with open(stdin) as i, open(os.path.join(self.rec, 'err'), 'w') as e:
+                proc = subprocess.Popen(['bash', LAUNCH, 'start', self.NAME], stdin=i, stdout=subprocess.DEVNULL,
+                                        stderr=e, env=self.env())
+            self.addCleanup(proc.kill)
+            time.sleep(3)
+            self.assertIsNone(proc.poll())   # waiting for the lock: nothing made, nothing started
+            self.assertIsNone(self.rec_text('systemd-run'))
+            self.assertIsNone(self.rec_text('ip'))
+        self.assertEqual(proc.wait(30), 0, self.rec_text('err'))
+        self.assertIsNotNone(self.rec_text('systemd-run'))
+
+    # check-net, the proof of the network (.github/fork-fleet.md, host step 6).
+    def server(self):
+        import http.server, threading
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)
+        srv.RequestHandlerClass.log_message = lambda *a: None
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def closed_port(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+
+    def test_check_net_refuses_what_proves_nothing(self):
+        port = self.server()
+        cases = {('check-net',): 'usage: check-net', ('check-net', 'https://example.com'): 'usage: check-net',
+                 ('check-net', 'ftp://example.com', f'127.0.0.1:{port}'): 'not a plain http(s) URL',
+                 ('check-net', 'https://example.com/$(id)', f'127.0.0.1:{port}'): 'not a plain http(s) URL',
+                 ('check-net', 'https://example.com', f'localhost:{port}'): 'not an IPv4 HOST:PORT',
+                 ('check-net', 'https://example.com', f'127.0.0.1:{port};id'): 'not an IPv4 HOST:PORT',
+                 # A service this host does not reach either: its refusal inside would say nothing.
+                 ('check-net', 'https://example.com', f'127.0.0.1:{port}', f'127.0.0.1:{self.closed_port()}'):
+                     'would prove nothing'}
+        for args, word in cases.items():
+            with self.subTest(args):
+                self.refused(word, *args)
+
+    def check_net(self, *targets, url='https://example.com/'):
+        return self.launch('check-net', url, *targets)
+
+    def test_check_net_runs_its_probe_in_a_runners_own_sandbox(self):
+        port = self.server()
+        self.write('rec/probe-exit', '0', 0o644)
+        got = self.check_net(f'127.0.0.1:{port}')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn('the runners reach https://example.com/ and none of the 1 services named', got.stdout)
+        with open(os.path.join(self.rec, 'systemd-run.0')) as f:
+            args = f.read().split('\0')[:-1]
+        dash = args.index('--')
+        # The very sandbox a job gets (the same props as start), as a free runner user, in its namespace.
+        self.assertEqual(args[:dash], ['--quiet', '--wait', '--pipe', '--collect', '--unit', 'fork-fleet-check-net',
+                                       '--uid', 'nobody', *self.sandbox('nobody'), '-p', 'RuntimeMaxSec=120'])
+        self.assertEqual(args[dash + 1:dash + 4], ['/bin/bash', '--norc', '--noprofile'])
+        self.assertEqual(args[dash + 4], '-c')
+        self.assertEqual(args[dash + 6:], ['check-net', 'https://example.com/', '127.0.0.1', str(port)])
+        self.assertEqual(self.rec_text('ip').splitlines(), self.ip_calls('nobody', self.NOBODY_NET))
+        self.write('rec/probe-exit', '1', 0o644)
+        got = self.check_net(f'127.0.0.1:{port}')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('NOT as it must be', got.stderr)
+
+    def test_check_nets_probe_fails_on_anything_reachable(self):
+        """The probe itself, run here outside any namespace: the service this host reaches is reachable, so it fails."""
+        port = self.server()
+        got = self.check_net(f'127.0.0.1:{port}', url=f'http://127.0.0.1:{port}/')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn(f'FAIL  127.0.0.1:{port} is reachable from inside', got.stdout)
+        self.assertIn(f'ok    http://127.0.0.1:{port}/ answers (HTTP 200)', got.stdout)
+        self.assertIn('NOT as it must be', got.stderr)
+
     def test_usage(self):
         for args in ((), ('start',), ('active', 'x'), ('nope',), ('ready',)):
             with self.subTest(args):
                 self.assertIn('usage', self.launch(*args).stderr)
         self.assertIn('ready NEWEST', self.launch().stderr)
+        self.assertIn('check-net URL HOST:PORT...', self.launch().stderr)
+
+
+# LauncherAsRoot's systemd-run for check-net: the unit's namespace and user, the rest of its sandbox left out.
+NETNS_SYSTEMD_RUN = """#!/usr/bin/env bash
+ns='' user=''
+while (($#)); do
+  case $1 in
+    --uid) user=$2 && shift ;;
+    -p) [[ $2 != NetworkNamespacePath=* ]] || ns=${2#NetworkNamespacePath=}; shift ;;
+    --) shift && break ;;
+  esac
+  shift
+done
+[[ -n $ns && -n $user ]] || { echo "fake systemd-run: no namespace or no user" >&2; exit 99; }
+exec nsenter --net="$ns" -- setpriv --reuid="$(id -u -- "$user")" --regid="$(id -g -- "$user")" --clear-groups -- "$@"
+"""
 
 
 @unittest.skipUnless(sys.platform.startswith('linux') and os.geteuid() == 0 and
@@ -1523,9 +1895,10 @@ class Launcher(unittest.TestCase):
                      'job; elsewhere: a throwaway container)')
 class LauncherAsRoot(unittest.TestCase):
     """fork-fleet-launch.sh as root with two real runner users and the real chown, pgrep, setpriv and find (systemd-run
-    and systemctl stay fakes: no unit really starts). Item 1 of round 2: a slot's user cannot read or change another
-    slot's copy, HOME or start config, and nothing a job leaves (files in HOME or SHM, a running process) reaches the
-    next job of that user."""
+    and systemctl stay fakes: no unit really starts; ip, nft and iptables are the fakes too, but for the network test,
+    which makes real namespaces). Item 1 of round 2: a slot's user cannot read or change another slot's copy, HOME or
+    start config, and nothing a job leaves (files in HOME, a running process) reaches the next job of that user.
+    Round 3: root deletes nothing in /dev/shm (the swap race), and check-net proves a runner's network for real."""
 
     USERS = ('fork-fleet-t1', 'fork-fleet-t2')
     NAME = Launcher.NAME
@@ -1553,30 +1926,37 @@ class LauncherAsRoot(unittest.TestCase):
         for d in ('rec', 'bin', 'template/bin', 'linger'):
             os.makedirs(self.path(d))
         os.chmod(self.rec, 0o700)
-        for name in ('systemd-run', 'systemctl'):
+        for name in ('systemd-run', 'systemctl', 'ip', 'nft', 'iptables'):
             Launcher.write(self, f'bin/{name}', Launcher.FAKES[name].replace('$REC', self.rec), 0o755)
         self.template = self.path('template')
         Launcher.write(self, 'template/run.sh', '#!/bin/sh\n', 0o755)
         Launcher.write(self, 'template/.fork-fleet-version', f'{NEWEST_RUNNER}\n', 0o644)
         for d in ('template', 'template/bin'):
             os.chmod(self.path(d), 0o755)
-        self.shm = self.path('shm')
-        os.mkdir(self.shm)
-        os.chmod(self.shm, 0o1777)   # as /dev/shm
         self.hook = Launcher.write(self, 'hook.sh', '#!/bin/sh\n', 0o755)
         Launcher.write(self, 'meminfo', 'MemAvailable:    8388608 kB\n', 0o644)
-        settings = dict(RUNNER_USERS=','.join(self.USERS), TEMPLATE=self.template, WORK_ROOT=self.path('var/runners'),
-                        RUN_DIR=self.path('run'), HOOK=self.hook, SHM=self.shm, LINGER_DIR=self.path('linger'),
-                        MEMINFO=self.path('meminfo'), SYSTEMD_RUN=self.path('bin/systemd-run'),
-                        SYSTEMCTL=self.path('bin/systemctl'))
-        Launcher.write(self, 'launch.conf', ''.join(f'{k}={v}\n' for k, v in settings.items()), 0o600)
+        Launcher.write(self, 'resolv.conf', 'nameserver 1.1.1.1\n', 0o644)
+        Launcher.write(self, 'ip_forward', '1\n', 0o644)
+        self.conf()
 
     path = Launcher.path
 
+    def conf(self, **over):
+        settings = dict(RUNNER_USERS=','.join(self.USERS), TEMPLATE=self.template, WORK_ROOT=self.path('var/runners'),
+                        RUN_DIR=self.path('run'), HOOK=self.hook, LINGER_DIR=self.path('linger'),
+                        MEMINFO=self.path('meminfo'), RESOLV_CONF=self.path('resolv.conf'),
+                        IP_FORWARD=self.path('ip_forward'), SYSTEMD_RUN=self.path('bin/systemd-run'),
+                        SYSTEMCTL=self.path('bin/systemctl'))
+        settings.update(over)
+        Launcher.write(self, 'launch.conf', ''.join(f'{k}={v}\n' for k, v in settings.items() if v), 0o600)
+
+    def launch(self, *args, stdin='', path=None):
+        return subprocess.run(['bash', LAUNCH, *args], input=stdin, capture_output=True, text=True, timeout=300,
+                              env={'PATH': f'{path or self.path("bin")}:/usr/sbin:/usr/bin:/sbin:/bin',
+                                   'FORK_FLEET_LAUNCH_CONF': self.path('launch.conf')})
+
     def start(self, name):
-        got = subprocess.run(['bash', LAUNCH, 'start', name], input=self.INPUT, capture_output=True, text=True,
-                             timeout=60, env={'PATH': f'{self.path("bin")}:/usr/sbin:/usr/bin:/sbin:/bin',
-                                              'FORK_FLEET_LAUNCH_CONF': self.path('launch.conf')})
+        got = self.launch('start', name, stdin=self.INPUT)
         self.assertEqual(got.returncode, 0, got.stderr)
         with open(os.path.join(self.rec, 'systemd-run')) as f:
             args = f.read().splitlines()
@@ -1612,12 +1992,8 @@ class LauncherAsRoot(unittest.TestCase):
         self.assertEqual(user, self.USERS[0])
         other_user, b = self.start('fleet-vm-t3code-12')   # the other slot: running, must keep its files
         plant = (f'mkdir -p {a}/home/.vite-plus && echo x > {a}/home/.vite-plus/planted && '
-                 f'mkdir {self.shm}/d && echo x > {self.shm}/d/planted && echo x > {self.shm}/planted && '
-                 f'ln -s /etc/passwd {self.shm}/link')
+                 f'ln -s /etc/passwd {a}/home/link && echo x > {a}/tmp/planted')
         self.assertEqual(self.as_user(user, 'sh', '-c', plant).returncode, 0)
-        self.assertEqual(self.as_user(other_user, 'sh', '-c', f'echo x > {self.shm}/other').returncode, 0)
-        with open(f'{self.shm}/roots', 'w') as f:
-            f.write('x')
         pw = pwd.getpwnam(user)
         left = subprocess.Popen(['setpriv', f'--reuid={pw.pw_uid}', f'--regid={pw.pw_gid}', '--clear-groups', '--',
                                  'sh', '-c', 'sleep 300 & exec sleep 300'], start_new_session=True,
@@ -1635,9 +2011,137 @@ class LauncherAsRoot(unittest.TestCase):
         self.assertEqual(subprocess.run(['pgrep', '-u', str(pw.pw_uid)]).returncode, 1)   # the background one too
         self.assertFalse(os.path.exists(a))   # with its HOME and TMPDIR
         self.assertEqual(os.listdir(f'{c}/home') + os.listdir(f'{c}/tmp'), [])
-        self.assertEqual(sorted(os.listdir(self.shm)), ['other', 'roots'])
         self.assertTrue(os.path.isdir(b))
         self.assertEqual(os.stat('/etc/passwd').st_size > 0, True)   # the link went, not what it pointed at
+        # /tmp, /var/tmp, /dev/shm and /run: the unit's own memory file systems (systemd's, not tested here), gone
+        # with it; the launcher never deletes in a shared one (test_root_deletes_nothing_in_dev_shm).
+
+    def as_user_bg(self, user, *cmd):
+        pw = pwd.getpwnam(user)
+        proc = subprocess.Popen(['setpriv', f'--reuid={pw.pw_uid}', f'--regid={pw.pw_gid}', '--clear-groups', '--',
+                                 *cmd], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def stop():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        self.addCleanup(stop)
+        return stop
+
+    def test_root_deletes_nothing_in_dev_shm(self):
+        """The swap race (round 3, S-2), in the real /dev/shm: runner user B owns a directory there and lets user A's
+        job leave a file in it; while root readies A for its next job, B swaps that directory for a symlink to one
+        under /etc, again and again. Root must never delete through it: the launcher deletes nothing in /dev/shm (each
+        unit has a /dev/shm of its own, gone with it), so the file under /etc stays, every round."""
+        a, b = self.USERS
+        pb = pwd.getpwnam(b)
+        victim_dir = tempfile.mkdtemp(prefix='fork-fleet-victim-', dir='/etc')
+        self.addCleanup(shutil.rmtree, victim_dir, True)
+        os.chmod(victim_dir, 0o755)
+        victim = os.path.join(victim_dir, 'planted')
+        bdir = tempfile.mkdtemp(prefix='fork-fleet-race-', dir='/dev/shm')
+        self.addCleanup(shutil.rmtree, bdir, True)
+        os.chown(bdir, pb.pw_uid, pb.pw_gid)
+        os.chmod(bdir, 0o755)
+        sub = os.path.join(bdir, 'sub')
+        # B's swap: sub a directory (with A's file), then a symlink to the directory under /etc, and back, forever
+        # (one process per step: each state lasts about a millisecond, long enough for a find and an rm to see it).
+        racer = f'cd {bdir} && while :; do mv -T sub real; mv -T link sub; mv -T sub link; mv -T real sub; done'
+        failed = []
+        for round_ in range(40):
+            with open(victim, 'w') as f:
+                f.write('root\'s\n')
+            self.assertEqual(self.as_user(b, 'sh', '-c', f'cd {bdir} && rm -rf sub real link && mkdir -m 777 sub && '
+                                                          f'ln -s {victim_dir} link').returncode, 0)
+            self.assertEqual(self.as_user(a, 'sh', '-c', f'echo x > {sub}/planted').returncode, 0)   # A's job
+            stop = self.as_user_bg(b, 'sh', '-c', racer)
+            with open(os.path.join(self.rec, 'units'), 'w') as f:
+                f.write('')   # A's last unit ended: its user is free
+            got = self.launch('start', f'fleet-vm-t3code-{100 + round_}', stdin=self.INPUT)
+            stop()
+            self.assertTrue(os.path.exists(victim), f'round {round_}: root deleted {victim} through /dev/shm')
+            if got.returncode:
+                failed.append(f'round {round_}: {got.stderr.strip()}')
+        self.assertEqual(failed, [])
+
+    def test_check_net_proves_a_runners_network(self):
+        """check-net with real namespaces and the real nft table (CI installs nftables): from inside a runner's
+        namespace, as its user, the host's loopback service, the host's own LAN, Tailscale-like and public-looking
+        addresses, a LAN host and a Tailscale-like resolver are closed, and a public web server answers. systemd-run is
+        a fake that enters the namespace and becomes the runner user: the unit's IPAddressDeny (the same ranges, the
+        kernel's second refusal) is not part of this test."""
+        for tool in ('nft', 'ip', 'nsenter', 'curl', 'timeout'):
+            self.assertIsNotNone(shutil.which(tool), f'no {tool} here')
+        forward = '/proc/sys/net/ipv4/ip_forward'
+        with open(forward) as f:
+            if f.read().strip() != '1':
+                with open(forward, 'w') as w:   # a throwaway machine (CI) or container only
+                    w.write('1\n')
+
+        def ip(*args):
+            subprocess.run(['ip', *args], check=True, capture_output=True, text=True)
+
+        def later(*cmd):
+            self.addCleanup(subprocess.run, list(cmd), capture_output=True, check=False)
+        later('nft', 'delete', 'table', 'inet', 'fork_fleet')
+        for user in self.USERS:
+            later('ip', 'netns', 'del', f'fork-fleet-{user}')
+        # A LAN (192.168.77.0/24) with a host .2 that also has a Tailscale-like resolver 100.100.100.100, a "public"
+        # network 203.0.113.0/24 with a web server .2, and this host's own public-looking and Tailscale-like addresses.
+        for ns, link, mine, theirs in (('fft-lan', 'fft-lan0', '192.168.77.1', '192.168.77.2'),
+                                       ('fft-wan', 'fft-wan0', '203.0.113.1', '203.0.113.2')):
+            later('ip', 'netns', 'del', ns)
+            ip('netns', 'add', ns)
+            ip('link', 'add', link, 'type', 'veth', 'peer', 'name', 'eth0', 'netns', ns)
+            ip('addr', 'add', f'{mine}/24', 'dev', link)
+            ip('link', 'set', link, 'up')
+            ip('-n', ns, 'addr', 'add', f'{theirs}/24', 'dev', 'eth0')
+            ip('-n', ns, 'link', 'set', 'eth0', 'up')
+            ip('-n', ns, 'link', 'set', 'lo', 'up')
+        ip('-n', 'fft-lan', 'addr', 'add', '100.100.100.100/32', 'dev', 'lo')
+        ip('route', 'add', '100.100.100.100/32', 'via', '192.168.77.2')
+        later('ip', 'link', 'del', 'fft-dummy')
+        ip('link', 'add', 'fft-dummy', 'type', 'dummy')
+        for addr in ('198.51.100.7/32', '100.64.7.1/32'):
+            ip('addr', 'add', addr, 'dev', 'fft-dummy')
+        ip('link', 'set', 'fft-dummy', 'up')
+        import socket
+        for addr in (('127.0.0.1', 8384), ('0.0.0.0', 3773)):   # a GUI-like one on loopback, a T3-like one on every address
+            srv = socket.create_server(addr)
+            self.addCleanup(srv.close)
+        web = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, web, True)
+        for cmd in (['nsenter', '--net=/run/netns/fft-lan', 'python3', '-I', '-c',
+                     'import socket, time\nss = [socket.create_server(("0.0.0.0", p)) for p in (22, 53)]\n'
+                     'time.sleep(600)'],
+                    ['nsenter', '--net=/run/netns/fft-wan', 'python3', '-I', '-m', 'http.server', '80', '--bind',
+                     '203.0.113.2', '--directory', web]):
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+        import time
+        for host, port in (('192.168.77.2', 22), ('100.100.100.100', 53), ('203.0.113.2', 80)):
+            for _ in range(100):
+                try:
+                    socket.create_connection((host, port), 1).close()
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                self.fail(f'{host}:{port} never listened')
+        os.makedirs(self.path('netbin'))
+        Launcher.write(self, 'netbin/systemd-run', NETNS_SYSTEMD_RUN, 0o755)
+        self.conf(SYSTEMD_RUN=self.path('netbin/systemd-run'), IP_FORWARD=forward)
+        targets = ('127.0.0.1:8384', '192.168.77.1:3773', '198.51.100.7:3773', '100.64.7.1:3773', '192.168.77.2:22',
+                   '100.100.100.100:53')
+        got = self.launch('check-net', 'http://203.0.113.2/', *targets, path=self.path('netbin'))
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        for target in targets:
+            self.assertIn(f'ok    {target} is closed', got.stdout)
+        self.assertIn('ok    http://203.0.113.2/ answers (HTTP 200)', got.stdout)
+        self.assertIn(f'check-net: as {self.USERS[0]}, in its namespace fork-fleet-{self.USERS[0]}', got.stdout)
 
 class Wiring(unittest.TestCase):
     """fork-tests.yml, fork-fleet.yml, fork-release.yml and the hook against the config."""
@@ -1791,7 +2295,9 @@ class Wiring(unittest.TestCase):
         job = self.tests['jobs']['workflows']
         self.assertEqual(job['runs-on'], HOSTED)
         runs = [st.get('run') for st in job['steps']]
-        self.assertIn('sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot', runs)
+        root = runs.index('sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot')
+        # check-net's test needs the real nft, which the hosted image may lack: installed in a step before it.
+        self.assertTrue(any('apt-get install -y -qq nftables' in (r or '') for r in runs[:root]), runs)
 
     def test_the_route_step(self):
         changes = self.tests['jobs']['changes']

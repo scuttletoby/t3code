@@ -418,11 +418,25 @@ check "push: a refused candidate push fails with git's reason" \
 rm -f "$hook"
 push candidate "$next"
 check "push: the candidate goes to fork-follow/candidate" eval '[[ "$(series fork-follow/candidate)" == "$next" ]] && has candidate_pushed=true "$root/push.out"'
+# The synced tag keeps the push run of the synced commit off the fleet (fork-fleet.py made_by_the_sync), so
+# main may only move once it exists: a refused tag push leaves main where it was.
+synced_tag() { git -C "$root/gh/me/t3code.git" rev-parse -q --verify "refs/tags/fork-follow/synced/$1" 2> /dev/null; }
+printf '#!/bin/sh\nwhile read -r old new ref; do case "$ref" in refs/tags/fork-follow/synced/*) echo "no synced tags" >&2; exit 1;; esac; done\n' > "$hook" && chmod +x "$hook"
+rm -f "$root/report.md"
+check "push: advance refuses to move the series when the synced tag cannot be pushed" \
+  eval '! push advance "$prev" "$next" && [[ "$(series)" == "$prev" ]] && has "Could not tag ${next:0:12} as fork-follow/synced/$next, so main was not moved" "$root/report.md" && has "no synced tags" "$root/report.md"'
+printf '#!/bin/sh\nwhile read -r old new ref; do echo "$ref" >> "%s"; done\n' "$root/pushed-refs" > "$hook"
+rm -f "$root/pushed-refs"
 push advance "$prev" "$next"
 check "push: advance moves the series and keeps the old one as a tag" \
   eval '[[ "$(series)" == "$next" && "$(git -C "$root/gh/me/t3code.git" rev-parse "refs/tags/fork-follow/pre-v0.1.10-${prev:0:12}")" == "$prev" ]]'
+check "push: advance tags the new series fork-follow/synced/<sha> before it moves the series" \
+  eval '[[ "$(synced_tag "$next")" == "$next" ]] && [[ "$(grep -n "" "$root/pushed-refs" | grep -E "refs/tags/fork-follow/synced/$next\$|refs/heads/main\$" | cut -d: -f2 | tr "\n" " ")" == "refs/tags/fork-follow/synced/$next refs/heads/main " ]]'
+rm -f "$hook"
+git -C "$root/gh/me/t3code.git" tag -d "fork-follow/synced/$next" > /dev/null
 push advance "$prev" "$next"
 check "push: advance again after it moved (re-run) succeeds without a push" has moved=already "$root/push.out"
+check "push: advance again after it moved (re-run) makes a missing synced tag" eval '[[ "$(synced_tag "$next")" == "$next" ]]'
 work git commit -q --allow-empty -m "fork: merged meanwhile"
 work git push -q origin HEAD:main
 moved="$(series)"

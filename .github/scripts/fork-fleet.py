@@ -54,6 +54,10 @@ POOL = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
 NONCE = re.compile(r'(?P<key>[a-z0-9_]{1,40}(?:-[0-9]{1,3})?)-[0-9a-f]{16}-a(?P<attempt>[1-9][0-9]{0,4})')
 VERSION = re.compile(r'v?([0-9]{1,5})\.([0-9]{1,5})\.([0-9]{1,5})')
 JIT = re.compile(r'[A-Za-z0-9+/=]{1,65536}')
+SHA = re.compile(r'[0-9a-f]{40}')
+TAG_PREFIX = re.compile(r'[a-z0-9][a-z0-9/_-]{0,58}/')
+SYNC_REMOTE = 'https://github.com/{}.git'   # .format(repository): read anonymously, the repository is public
+SYNC_CHECK_SECONDS = 30
 WINDOW = 24 * 3600     # the sweep looks at runs created this long ago at most
 CANCEL_WAIT = 120      # seconds the sweep watches a run it cancelled, to re-run it in the same pass
 SHOW_UP = 120          # seconds the watch waits for every routed fleet job to be listed (a skipped one never is)
@@ -82,8 +86,8 @@ def positive(x):
 
 def check_config(cfg):
     out = []
-    for key in ('repository', 'variable', 'hosted', 'trusted', 'pools', 'jobs', 'stuck_seconds', 'fleet_stuck_seconds',
-                'beacon_fresh_seconds', 'dispatch'):
+    for key in ('repository', 'variable', 'hosted', 'trusted', 'upstream_sync', 'pools', 'jobs', 'stuck_seconds',
+                'fleet_stuck_seconds', 'beacon_fresh_seconds', 'dispatch'):
         if key not in cfg:
             out.append(f'no {key!r}')
     if out:
@@ -94,6 +98,9 @@ def check_config(cfg):
     for key in ('every_seconds', 'beacon_seconds', 'idle_passes'):
         if not positive((cfg['dispatch'] or {}).get(key)):
             out.append(f'dispatch.{key} must be a positive whole number')
+    prefix = (cfg['upstream_sync'] or {}).get('tag_prefix')
+    if not (isinstance(prefix, str) and TAG_PREFIX.fullmatch(prefix)):
+        out.append('upstream_sync.tag_prefix must be a tag name prefix ending in / (a-z, 0-9, /, _ and -)')
     pools = cfg['pools']
     for field in ('name', 'label', 'beacon'):
         got = [p.get(field) for p in pools]
@@ -182,7 +189,7 @@ def refused(cfg, env, event):
             return f'a push to {env.get("GITHUB_REF")!r}'
         if (event.get('repository') or {}).get('full_name') != repo:
             return 'a push to another repository'
-        return None
+        return made_by_the_sync(cfg, env.get('GITHUB_SHA'))
     if kind != 'pull_request':
         return f'a {kind!r} event'
     pr = event.get('pull_request') or {}
@@ -195,6 +202,35 @@ def refused(cfg, env, event):
     return None
 
 
+def made_by_the_sync(cfg, sha, run=subprocess.run):
+    """Why a push of commit `sha` may not use the fleet because the upstream sync made it, or None.
+
+    Owner decision: upstream's code runs on GitHub-hosted runners only. The sync (fork-follow-push.sh advance) moves
+    main with the owner's token, so its push run passes every other check here. It first tags the commit
+    <upstream_sync.tag_prefix><sha> in this repository and moves main only when that push worked. A tag here can only
+    be made by a holder of push rights (the owner, the sync's token): nothing an upstream commit holds (its message,
+    author, files, a branch or pull request upstream) makes or removes one. And a tag only ever sends a run to
+    GitHub-hosted runners, so the worst a stray tag does is that. Read anonymously (the job hook has no token); any
+    doubt (no full sha, git failing, a timeout) refuses."""
+    if not (isinstance(sha, str) and SHA.fullmatch(sha)):
+        return f'the pushed commit {sha!r} is not a full sha, so whether the upstream sync made it cannot be told'
+    ref = f'refs/tags/{cfg["upstream_sync"]["tag_prefix"]}{sha}'
+    plain = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'GIT_TERMINAL_PROMPT': '0', 'GIT_CONFIG_NOSYSTEM': '1',
+             'GIT_CONFIG_GLOBAL': '/dev/null'}   # no git config of whoever runs this (the job hook: a runner user)
+    try:
+        got = run(['git', '-c', 'protocol.version=2', 'ls-remote', '--exit-code', SYNC_REMOTE.format(cfg['repository']),
+                   ref], env=plain, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                  timeout=SYNC_CHECK_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f'whether the upstream sync made {sha[:12]} cannot be told ({e.__class__.__name__})'
+    if got.returncode == 2:   # --exit-code: the remote has no such ref
+        return None
+    if got.returncode == 0:
+        return (f'commit {sha[:12]} was pushed by the upstream sync (tag {ref}): upstream code runs on '
+                'GitHub-hosted runners only')
+    return f'whether the upstream sync made {sha[:12]} cannot be told (git ls-remote exit {got.returncode})'
+
+
 def facts_of_run(run):
     """The GITHUB_* variables `refused` reads, from GitHub's own record of a workflow run (never from a job)."""
     repo = (run.get('repository') or {}).get('full_name')
@@ -202,7 +238,8 @@ def facts_of_run(run):
     return {'GITHUB_REPOSITORY': repo, 'GITHUB_WORKFLOW_REF': f'{repo}/{path}@refs/heads/{run.get("head_branch")}',
             'GITHUB_ACTOR': (run.get('actor') or {}).get('login'),
             'GITHUB_TRIGGERING_ACTOR': (run.get('triggering_actor') or {}).get('login'),
-            'GITHUB_EVENT_NAME': run.get('event'), 'GITHUB_REF': f'refs/heads/{run.get("head_branch")}'}
+            'GITHUB_EVENT_NAME': run.get('event'), 'GITHUB_REF': f'refs/heads/{run.get("head_branch")}',
+            'GITHUB_SHA': run.get('head_sha')}
 
 
 def run_refused(cfg, gh, run):
@@ -352,7 +389,8 @@ def beacon_free(cfg, pool, env, now):
 
 
 def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None):
-    """(mode, {key: runs-on}). Raises only for a broken setting or CONFIG; it calls no API."""
+    """(mode, {key: runs-on}). Raises only for a broken setting or CONFIG; it calls no API (a push: one anonymous
+    git ls-remote, made_by_the_sync)."""
     mode = mode_of(mode_value)
     hosted = cfg['hosted']
     out = {key: hosted for key, _ in job_keys(cfg)}
@@ -375,7 +413,11 @@ def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None):
     for pool in cfg['pools']:
         free, why = beacon_free(cfg, pool, env, t)
         if why:
-            say(f'pool {pool["name"]}: no free slot counted: {why}')
+            # A pool its dispatcher closed (a new actions/runner release: the owner refreshes the template) or reports
+            # down, or a heartbeat gone stale: a notice on the run page, or auto would go hosted unseen for days. A pool
+            # with no heartbeat at all was never set up: a log line.
+            seen = '::notice::fork-fleet: ' if env.get(pool['beacon']) else ''
+            say(f'{seen}pool {pool["name"]}: no free slot counted: {why}')
         for _ in range(free):
             if not todo:
                 break

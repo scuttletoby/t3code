@@ -275,8 +275,13 @@ jobs:
           node .github/scripts/fork-ci-tests.cjs
 
       # The fleet launcher with real runner users (created and deleted by the test):
-      # one slot's user cannot read another's copy, and nothing a job leaves (files
-      # in HOME or /dev/shm, a running process) reaches the next job.
+      # one slot's user cannot read another's copy, nothing a job leaves (files in
+      # HOME, a running process) reaches the next job, root deletes nothing in a
+      # directory a runner user can write, and check-net proves a runner's network
+      # with real namespaces and the real nft table (hence nftables).
+      - name: Install nftables for the launcher's network test
+        run: command -v nft >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq nftables; }
+
       - name: Fleet launcher as root
         run: sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot
 

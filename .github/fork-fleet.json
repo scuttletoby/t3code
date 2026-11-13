@@ -15,6 +15,15 @@
     "actors": ["scuttletoby"],
     "push_branches": ["main"]
   },
+  "upstream_sync": {
+    "_doc": [
+      "Upstream's code runs on GitHub-hosted runners only (owner decision). The daily sync pushes main with the owner's",
+      "token, so its push run would pass `trusted`: scripts/fork-follow-push.sh tags each commit it moves main to as",
+      "<tag_prefix><sha> before the move, and a push run of a tagged commit never uses the fleet. Keep the tags: a",
+      "run can be re-run for 30 days."
+    ],
+    "tag_prefix": "fork-follow/synced/"
+  },
   "pools": [
     {
       "_doc": "The owner's PC: its dispatcher runs on the always-on host and starts runners on the PC over ssh.",
@@ -26,7 +35,7 @@
       "waits": false
     },
     {
-      "_doc": "A sandboxed always-on runner VM: fleet mode queues here.",
+      "_doc": "The always-on host (the owner's workspace, not a VM of its own): each runner runs as its own user in its own network namespace with internet only (fork-fleet.md, Containment). Fleet mode queues here.",
       "name": "vm",
       "label": "fleet-vm-t3code",
       "slots": 2,
