@@ -87,6 +87,8 @@ export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code UPSTREAM=up/t3code
 unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_ACTIONS UPSTREAM_URL ORIGIN RUN_SHA PUSH_URL \
   SERIES_BRANCH FORK_PUSH_TOKEN OWN_WORKFLOWS HEAD_SHA TREE_REF SINCE REPO_SECRET_PRESENT \
   FORK_PUSH_ENVIRONMENT
+# The cases below use stable tags; the nightly section sets the channel itself.
+export FORK_FOLLOW_CHANNEL=stable
 
 export FAKE_API="$root/api"
 
@@ -528,6 +530,141 @@ plan
 check "plan: a new outside-started upstream workflow that the list names -> deleted, rebase" \
   eval 'action_is rebase && ! in_candidate outside.yml'
 
+# --- plan: the nightly channel (fork-channel.sh) -------------------------------------------------
+# Upstream: u1 (v0.1.9) - n1 (v0.1.10-nightly.20261112.999) - n2 (...20261112.1000) - n3 (untagged,
+# upstream main). Run 1000 is newer than run 999, which a sort of the names puts first.
+nightly_up() {
+  rm -rf "$root/gh" "$root/upwork"
+  mkdir -p "$root/gh/up" "$root/gh/me"
+  git init -q --bare "$root/gh/up/t3code.git"
+  git init -q --bare "$root/gh/me/t3code.git"
+  git init -q "$root/upwork"
+  (
+    cd "$root/upwork"
+    mkdir -p .github/workflows
+    echo "on: workflow_call" > .github/workflows/release-desktop.yml
+    echo base > shared.txt
+    git add -A && git commit -q -m u1 && git tag v0.1.9
+    echo n1 > n1.txt && git add -A && git commit -q -m n1 && git tag v0.1.10-nightly.20261112.999
+    echo n2 > n2.txt && git add -A && git commit -q -m n2 && git tag v0.1.10-nightly.20261112.1000
+    echo n3 > n3.txt && git add -A && git commit -q -m n3
+    git push -q https://github.com/up/t3code.git main --tags
+  ) > /dev/null 2>&1
+}
+n4=v0.1.10-nightly.20261113.1004
+nightly_more() { # n4 (tagged $n4) and n5 (untagged upstream main) on top of n3
+  up_release "$n4" 'echo n4 > n4.txt'
+  (cd "$root/upwork" && echo n5 > n5.txt && git add -A && git commit -q -m n5 \
+    && git push -q https://github.com/up/t3code.git main) > /dev/null 2>&1
+}
+upc() { git -C "$root/upwork" rev-parse "$1"; }
+nplan() { FORK_FOLLOW_CHANNEL="$1" plan; }
+
+nightly_up
+reset_api
+new_fork v0.1.10-nightly.20261112.999
+nplan nightly
+check "nightly: newest by version (run 1000 above run 999) -> rebase onto it" \
+  eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.10-nightly.20261112.1000 && "$(out previous_tag)" == v0.1.10-nightly.20261112.999 ]]'
+new_fork v0.1.9
+nplan stable
+check "nightly: the stable channel ignores nightly tags -> same base v0.1.9, release" \
+  eval 'action_is release && [[ "$(out base_tag)" == v0.1.9 ]]'
+new_fork v0.1.10-nightly.20261112.999
+nplan beta
+check "nightly: an unknown channel is refused, nothing planned" \
+  eval '[[ -z "$(out action)" ]] && has "FORK_FOLLOW_CHANNEL is .beta." "$root/report.md"'
+
+# The fork was made from upstream main at an untagged commit (n3): no nightly contains it yet.
+new_fork "$(upc main)"
+nplan nightly
+check "nightly: an untagged base newer than the newest nightly -> refused, waits for the next" \
+  eval '[[ -z "$(out action)" ]] && has "newer than the newest nightly, v0.1.10-nightly.20261112.1000" "$root/report.md"'
+n3="$(upc main)"
+nightly_more
+new_fork "$n3"
+before="$(work_head)"
+(cd "$root/work" && REPORT="$root/report.md" GITHUB_OUTPUT="$root/plan.out" env -u FORK_FOLLOW_CHANNEL bash "$dir/fork-follow.sh") > "$root/out" 2>&1
+check "nightly: the default channel; the jump from the untagged base onto the first nightly above it" \
+  eval 'action_is rebase && [[ "$(out base_tag)" == "$n4" && "$(out previous_tag)" == "${n3:0:12}" && "$(out previous_head)" == "$before" ]]'
+check "nightly: the rebased candidate holds the fork's patch on the nightly" \
+  eval 'git -C "$root/work" cat-file -e "$(out candidate):feature.txt" && git -C "$root/work" merge-base --is-ancestor "$(upc "$n4")" "$(out candidate)"'
+
+# Same nightly: release, then none once <tag>.fork.1 is the head.
+new_fork "$n4"
+nplan nightly
+check "nightly: same nightly, no fork release yet -> release" eval 'action_is release && [[ "$(out base_tag)" == "$n4" ]]'
+fork_tag "$n4.fork.1"
+nplan nightly
+check "nightly: the head is <nightly>.fork.1 -> none, naming it" eval 'action_is none && [[ "$(out released_tag)" == "$n4.fork.1" ]]'
+fork_commit "fork: more" 'echo more > more.txt'
+nplan nightly
+check "nightly: a new fork commit on the same nightly -> release" action_is release
+
+# Upstream deletes or moves the nightly the released series sits on.
+git -C "$root/gh/up/t3code.git" tag -d "$n4" > /dev/null
+nplan nightly
+check "nightly: upstream deleted the nightly the series was built on -> named, nothing planned" \
+  eval '[[ -z "$(out action)" ]] && has "no longer has the tag $n4" "$root/report.md"'
+(cd "$root/upwork" && git checkout -q -b moved "$n3" && echo again > n4.txt && git add -A && git commit -q -m n4b \
+  && git tag -f "$n4" && git push -q --force https://github.com/up/t3code.git "refs/tags/$n4") > /dev/null 2>&1
+nplan nightly
+check "nightly: upstream moved the nightly the series was built on -> named" has "moved the tag $n4" "$root/report.md"
+
+# A newest nightly that does not contain the series' base (tagged on another line).
+nightly_up
+nightly_more
+(cd "$root/upwork" && git checkout -q -b side v0.1.10-nightly.20261112.1000 && echo side > side.txt && git add -A \
+  && git commit -q -m side && git tag v0.1.10-nightly.20261114.1010 \
+  && git push -q https://github.com/up/t3code.git refs/tags/v0.1.10-nightly.20261114.1010) > /dev/null 2>&1
+new_fork "$n4"
+before="$(work_head)"
+nplan nightly
+check "nightly: a newest nightly that does not contain the base -> refused, the series left as it is" \
+  eval '[[ -z "$(out action)" ]] && has "does not contain the series. base $n4" "$root/report.md" && [[ "$(work_head)" == "$before" ]]'
+
+# A newest nightly tagged on another upstream branch that does contain the base: not one of
+# upstream's nightlies (they are cut from its default branch).
+nightly_up
+nightly_more
+(cd "$root/upwork" && git checkout -q -b side "$n4" && echo side > side.txt && git add -A \
+  && git commit -q -m side && git tag v0.1.10-nightly.20261114.1010 \
+  && git push -q https://github.com/up/t3code.git refs/tags/v0.1.10-nightly.20261114.1010) > /dev/null 2>&1
+new_fork "$n4"
+before="$(work_head)"
+nplan nightly
+check "nightly: a newest nightly off upstream's default branch that contains the base -> refused, left as it is" \
+  eval '[[ -z "$(out action)" ]] && has "v0.1.10-nightly.20261114.1010 (.*), is not on its default branch" "$root/report.md" && [[ "$(work_head)" == "$before" ]]'
+
+# Upstream rewrote main past the series' nightly: main restarts from nightly 1000 without n3 and
+# n4, and a newer nightly is tagged on the new line. The merge-base with upstream main (nightly
+# 1000) must not become an untagged base: n3 and n4, gone from upstream, would then count as the
+# fork's own commits and be replayed into the next release.
+nightly_up
+nightly_more
+new_fork "$n4"
+(cd "$root/upwork" && git checkout -q -B main v0.1.10-nightly.20261112.1000 && echo n3b > n3b.txt && git add -A \
+  && git commit -q -m n3b && git tag v0.1.10-nightly.20261114.1006 \
+  && git push -q --force https://github.com/up/t3code.git main refs/tags/v0.1.10-nightly.20261114.1006) > /dev/null 2>&1
+before="$(work_head)"
+nplan nightly
+check "nightly: upstream rewrote main past the series' nightly -> refused, nothing replayed" \
+  eval '[[ -z "$(out action)" && -z "$(out candidate)" ]] && has "does not contain the series. base $n4" "$root/report.md" \
+    && [[ "$(work_head)" == "$before" && ! -d "$root/work/.git/rebase-merge" ]]'
+
+# A published <nightly>.fork.1 of the rebased files: advance to it.
+nightly_up
+nightly_more
+new_fork v0.1.10-nightly.20261112.1000
+nplan nightly
+released="$(out candidate)"
+work git push -q origin "$released:refs/heads/fork-follow/candidate"
+fork_tag "$n4.fork.1" "$released"
+work git checkout -q main && work git reset -q --hard "$(series)"
+nplan nightly
+check "nightly: a published <nightly>.fork.1 of the rebased files -> advance to it" \
+  eval 'action_is advance && [[ "$(out candidate)" == "$released" && "$(out released_tag)" == "$n4.fork.1" ]]'
+
 # --- pushes: fork-follow-push.sh -------------------------------------------------------------
 new_upstream
 new_fork v0.1.10
@@ -731,6 +868,15 @@ report ACTION=rebase PLAN_RESULT=success RELEASE_RESULT=success ADVANCE_RESULT=f
   BASE_TAG=v0.1.10 PREVIOUS_TAG=v0.1.9 PREVIOUS_HEAD="$prev" CANDIDATE="$cand"
 check "report: published but not moved -> says both, never 'nothing was published'" \
   eval 'failed_run && has "v0.1.10-fork.2 \*\*published\*\*" "$root/summary.md" && has "not moved" "$root/summary.md" && hasnt -i "nothing was published" "$root/summary.md"'
+work git commit -q --allow-empty -m "fork: rebased on a nightly"
+ncand="$(work_head)"
+fork_tag v0.1.10-nightly.20261113.1004.fork.1 "$ncand"
+echo '{"draft":false}' > "$root/api/release-v0.1.10-nightly.20261113.1004.fork.1"
+report ACTION=rebase PLAN_RESULT=success RELEASE_RESULT=success ADVANCE_RESULT=failure \
+  BASE_TAG=v0.1.10-nightly.20261113.1004 PREVIOUS_TAG=v0.1.10-nightly.20261112.1000 PREVIOUS_HEAD="$prev" CANDIDATE="$ncand"
+check "report: a published <nightly>.fork.1 at the candidate is named as published" \
+  has "v0.1.10-nightly.20261113.1004.fork.1 \*\*published\*\*" "$root/summary.md"
+work git reset -q --hard "$cand"
 rm -rf "$root/reports" && mkdir -p "$root/reports"
 report ACTION=rebase PLAN_RESULT=success RELEASE_RESULT=failure ADVANCE_RESULT=skipped \
   BASE_TAG=v0.1.11 PREVIOUS_HEAD="$prev" CANDIDATE="$(git -C "$root/work" rev-parse HEAD~1)"
