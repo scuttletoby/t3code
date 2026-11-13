@@ -19,27 +19,31 @@ Pin the action by full SHA (the commit a `ci/vN` tag names):
 - id: m2
   uses: scuttletoby/t3code/fork-ci/actions/gradle-cache@<sha> # ci/vN
   with:
-    lock: engine/m2-lock.json          # project fact
-    cache-dir: ~/.cache/my-ci-m2       # optional: keep an existing warm cache
+    lock: engine/m2-lock.json # project fact
+    cache-dir: ~/.cache/my-ci-m2 # optional: keep an existing warm cache
 - run: ./gradlew --offline -Dmaven.repo.local="${{ steps.m2.outputs.maven-repo-local }}" build
 ```
 
-| Input | Default | Meaning |
-| --- | --- | --- |
-| `lock` | required | The lock file, relative to the workspace. |
-| `out` | `$RUNNER_TEMP/gradle-cache-m2` | The folder to stage into: `$RUNNER_TEMP/gradle-cache*` or a folder inside one. It is removed first. |
-| `cache-dir` | `~/.cache/fork-ci-gradle-cache` | The runner's cache: an absolute path or `~/...` (expanded to the runner user's home). A relative path is refused. Runners on one machine may share it. |
-| `cache-max-age-days` | `30` | An entry no row of this lock uses is removed after this many days unused. |
-| `repository` | `github.repository` | Where the release is. |
-| `token` | `github.token` | Needs `contents: read`. |
+| Input                | Default                         | Meaning                                                                                                                                                |
+| -------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `lock`               | required                        | The lock file, relative to the workspace.                                                                                                              |
+| `out`                | `$RUNNER_TEMP/gradle-cache-m2`  | The folder to stage into: `$RUNNER_TEMP/gradle-cache*` or a folder inside one. It is removed first.                                                    |
+| `cache-dir`          | `~/.cache/fork-ci-gradle-cache` | The runner's cache: an absolute path or `~/...` (expanded to the runner user's home). A relative path is refused. Runners on one machine may share it. |
+| `cache-max-age-days` | `30`                            | An entry no row of this lock uses is removed after this many days unused.                                                                              |
+| `repository`         | `github.repository`             | Where the release is.                                                                                                                                  |
+| `token`              | `github.token`                  | Needs `contents: read`.                                                                                                                                |
 
 Output `maven-repo-local`: the staged folder.
 
 ## The lock
 
 ```json
-{"release": "m2-jars",
- "files": [{"path": "org/example/engine/1.0/engine-1.0.jar", "sha256": "<64 hex>", "release": "m2-jars"}]}
+{
+  "release": "m2-jars",
+  "files": [
+    { "path": "org/example/engine/1.0/engine-1.0.jar", "sha256": "<64 hex>", "release": "m2-jars" }
+  ]
+}
 ```
 
 A row's `release` says which release holds its asset (default: the lock's `release`). `publish`
@@ -82,21 +86,21 @@ names the rows that have no `release` of their own; set the lock's `release` bac
 
 ## Troubleshooting
 
-| Message | Cause | What to do |
-| --- | --- | --- |
-| `... has no asset <sha>-<file>` | The asset was deleted, or a lock row was written without its upload. | Run `publish` for that version from a machine whose `~/.m2` has the same bytes. Or upload the runner's cached copy: `cp <cache>/<sha> <sha>-<file> && gh release upload <tag> <sha>-<file>`. |
-| `the upload of ... never finished` | An upload was killed. | Run `publish` for that version: it replaces the asset (`--clobber`). |
-| `the asset has digest ..., the lock says ...` | Other bytes were uploaded under that name. | Delete that asset, then `publish` the version from the machine that has the locked bytes. |
-| `the download has sha256 ...` | As above, for an asset with no listed digest. | As above. |
-| `GitHub answered 404` | The release is gone, or the token cannot read it. | Check `permissions: contents: read`. If the release is gone, recreate it with `publish` for every locked version. |
-| `... is not empty` | The script was called directly on a folder that has files. | Use the action, which empties `out` first, or pass a new folder. |
-| `... cannot be read` / `no "release"` / `bad path` / `listed twice` | The lock is broken. | Fix the lock in the pull request. Nothing is staged from a lock that cannot be read. |
-| `GitHub allows 1000 per release (asset limit)` | The release is full. | Follow "A full release" above (publish a locked version first, then move `release`). |
+| Message                                                                                                    | Cause                                                                                                                                                                      | What to do                                                                                                                                                                                                                             |
+| ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `... has no asset <sha>-<file>`                                                                            | The asset was deleted, or a lock row was written without its upload.                                                                                                       | Run `publish` for that version from a machine whose `~/.m2` has the same bytes. Or upload the runner's cached copy: `cp <cache>/<sha> <sha>-<file> && gh release upload <tag> <sha>-<file>`.                                           |
+| `the upload of ... never finished`                                                                         | An upload was killed.                                                                                                                                                      | Run `publish` for that version: it replaces the asset (`--clobber`).                                                                                                                                                                   |
+| `the asset has digest ..., the lock says ...`                                                              | Other bytes were uploaded under that name.                                                                                                                                 | Delete that asset, then `publish` the version from the machine that has the locked bytes.                                                                                                                                              |
+| `the download has sha256 ...`                                                                              | As above, for an asset with no listed digest.                                                                                                                              | As above.                                                                                                                                                                                                                              |
+| `GitHub answered 404`                                                                                      | The release is gone, or the token cannot read it.                                                                                                                          | Check `permissions: contents: read`. If the release is gone, recreate it with `publish` for every locked version.                                                                                                                      |
+| `... is not empty`                                                                                         | The script was called directly on a folder that has files.                                                                                                                 | Use the action, which empties `out` first, or pass a new folder.                                                                                                                                                                       |
+| `... cannot be read` / `no "release"` / `bad path` / `listed twice`                                        | The lock is broken.                                                                                                                                                        | Fix the lock in the pull request. Nothing is staged from a lock that cannot be read.                                                                                                                                                   |
+| `GitHub allows 1000 per release (asset limit)`                                                             | The release is full.                                                                                                                                                       | Follow "A full release" above (publish a locked version first, then move `release`).                                                                                                                                                   |
 | `... rows have no "release" of their own and the release ... has no asset for them` / `does not exist yet` | The lock's `release` was moved before every row had its own, or such a row's asset was deleted. `publish` cannot tell which older release holds it, so it changed nothing. | Moved: set `release` back and follow "A full release". Deleted: write `"release": "<tag>"` into those rows (the tag the asset was in), then `publish` the version to put it back. Never re-upload an old version into the new release. |
-| `a version is never reused` | `~/.m2` has other bytes for a version the lock pins. | Publish a new version number. |
-| `out ... must be a folder RUNNER_TEMP/gradle-cache*` | `out` is outside `RUNNER_TEMP`, is `RUNNER_TEMP` itself, or names another folder there (the runner's own `_*` folders, another tool's). | Use `$RUNNER_TEMP/gradle-cache-<name>`, or leave `out` empty. |
-| `cache dir ... must be an absolute path` | `cache-dir` is relative (it would be a folder in the checkout, wiped on every run). | Use an absolute path or `~/...`. |
-| `WARN: cache ... cannot be used / read / written` | The cache dir is another user's, read-only, or the disk is full. Stage still works. | Fix the folder's owner or free space; until then every run downloads. |
+| `a version is never reused`                                                                                | `~/.m2` has other bytes for a version the lock pins.                                                                                                                       | Publish a new version number.                                                                                                                                                                                                          |
+| `out ... must be a folder RUNNER_TEMP/gradle-cache*`                                                       | `out` is outside `RUNNER_TEMP`, is `RUNNER_TEMP` itself, or names another folder there (the runner's own `_*` folders, another tool's).                                    | Use `$RUNNER_TEMP/gradle-cache-<name>`, or leave `out` empty.                                                                                                                                                                          |
+| `cache dir ... must be an absolute path`                                                                   | `cache-dir` is relative (it would be a folder in the checkout, wiped on every run).                                                                                        | Use an absolute path or `~/...`.                                                                                                                                                                                                       |
+| `WARN: cache ... cannot be used / read / written`                                                          | The cache dir is another user's, read-only, or the disk is full. Stage still works.                                                                                        | Fix the folder's owner or free space; until then every run downloads.                                                                                                                                                                  |
 
 ## Tests
 

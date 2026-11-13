@@ -12,15 +12,15 @@ inputs:
       The folder to stage into: RUNNER_TEMP/gradle-cache* or a folder inside one (default
       RUNNER_TEMP/gradle-cache-m2). Removed first, so a rerun starts empty.
     required: false
-    default: ''
+    default: ""
   cache-dir:
     description: The runner's cache folder, absolute or ~/... (default ~/.cache/fork-ci-gradle-cache).
     required: false
-    default: ''
+    default: ""
   cache-max-age-days:
     description: Cache entries no row of this lock uses are removed after this many days unused.
     required: false
-    default: '30'
+    default: "30"
   repository:
     description: The repository whose releases hold the assets.
     required: false
