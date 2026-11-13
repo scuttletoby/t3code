@@ -1,8 +1,7 @@
-// Fork only: every `*.test.*` under .github/scripts and fork-ci must be listed in .github/fork-ci-tests.txt.
-// A folder missing from the checkout fails (readdir throws), so a narrower sparse checkout cannot hide tests.
-// A plain entry runs here by its extension (RUNNER); `<test> run by <file>` is run by that file,
-// which must name the test and cannot be a (disabled) upstream workflow. Unlisted or runner-less
-// tests fail; a listed test that is gone fails once the tested history had it, a note before.
+// Fork only: every `*.test.*` under .github/scripts and fork-ci must be listed in .github/fork-ci-tests.txt; a
+// folder missing from the checkout fails (readdir throws). A plain entry runs here by its extension (RUNNER);
+// `<test> run by <file>` is run by that file, which must name the test and cannot be a (disabled) upstream workflow.
+// Unlisted or runner-less tests fail; a listed test that is gone fails once the tested history had it, a note before.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
