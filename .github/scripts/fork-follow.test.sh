@@ -623,6 +623,35 @@ nplan nightly
 check "nightly: a newest nightly that does not contain the base -> refused, the series left as it is" \
   eval '[[ -z "$(out action)" ]] && has "does not contain the series. base $n4" "$root/report.md" && [[ "$(work_head)" == "$before" ]]'
 
+# A newest nightly tagged on another upstream branch that does contain the base: not one of
+# upstream's nightlies (they are cut from its default branch).
+nightly_up
+nightly_more
+(cd "$root/upwork" && git checkout -q -b side "$n4" && echo side > side.txt && git add -A \
+  && git commit -q -m side && git tag v0.1.10-nightly.20261114.1010 \
+  && git push -q https://github.com/up/t3code.git refs/tags/v0.1.10-nightly.20261114.1010) > /dev/null 2>&1
+new_fork "$n4"
+before="$(work_head)"
+nplan nightly
+check "nightly: a newest nightly off upstream's default branch that contains the base -> refused, left as it is" \
+  eval '[[ -z "$(out action)" ]] && has "v0.1.10-nightly.20261114.1010 (.*), is not on its default branch" "$root/report.md" && [[ "$(work_head)" == "$before" ]]'
+
+# Upstream rewrote main past the series' nightly: main restarts from nightly 1000 without n3 and
+# n4, and a newer nightly is tagged on the new line. The merge-base with upstream main (nightly
+# 1000) must not become an untagged base: n3 and n4, gone from upstream, would then count as the
+# fork's own commits and be replayed into the next release.
+nightly_up
+nightly_more
+new_fork "$n4"
+(cd "$root/upwork" && git checkout -q -B main v0.1.10-nightly.20261112.1000 && echo n3b > n3b.txt && git add -A \
+  && git commit -q -m n3b && git tag v0.1.10-nightly.20261114.1006 \
+  && git push -q --force https://github.com/up/t3code.git main refs/tags/v0.1.10-nightly.20261114.1006) > /dev/null 2>&1
+before="$(work_head)"
+nplan nightly
+check "nightly: upstream rewrote main past the series' nightly -> refused, nothing replayed" \
+  eval '[[ -z "$(out action)" && -z "$(out candidate)" ]] && has "does not contain the series. base $n4" "$root/report.md" \
+    && [[ "$(work_head)" == "$before" && ! -d "$root/work/.git/rebase-merge" ]]'
+
 # A published <nightly>.fork.1 of the rebased files: advance to it.
 nightly_up
 nightly_more

@@ -341,6 +341,12 @@ if [[ "$channel" == nightly ]] && ! git merge-base --is-ancestor "$base" "$targe
   fail "$UPSTREAM's newest nightly, $target_tag (${target:0:12}), does not contain the series' base $base_tag (${base:0:12})." \
     "Upstream moved or deleted a nightly tag, or tagged another branch. The series was left as it is; decide by hand which nightly it should sit on."
 fi
+# Upstream cuts nightlies from its default branch. A nightly-shaped tag on another branch that
+# contains the base would pass the check above and bring that branch's code to every install.
+if [[ "$channel" == nightly ]] && ! git merge-base --is-ancestor "$target" refs/upstream-head; then
+  fail "$UPSTREAM's newest nightly, $target_tag (${target:0:12}), is not on its default branch, so it is not one of upstream's nightlies (or upstream rewrote that branch)." \
+    "The series was left as it is; decide by hand which nightly it should sit on."
+fi
 
 if [[ -z "$untagged" && "$target_tag" == "$base_tag" ]]; then
   refuse_upstream_fork_named "$base" "$base_tag" "$head"

@@ -603,13 +603,15 @@ jobs:
             release-assets/*.tar.gz
             release-assets/SHA256SUMS
 
-      # Updaters skip drafts, so nobody sees a release until every file above is uploaded. The tag
-      # and "nothing published is as high" checks run again right before; it is then made latest.
+      # Updaters skip drafts, so nobody sees a release until every file above is uploaded. The tag,
+      # "nothing published is as high" and "upstream still has the base released" checks run again
+      # right before; it is then made latest.
       - name: Publish the draft
         id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ needs.preflight.outputs.upstream }}
           RELEASE_ID: ${{ steps.draft.outputs.id }}
           TAG: ${{ needs.preflight.outputs.tag }}
           VERSION: ${{ needs.preflight.outputs.version }}

@@ -34,6 +34,16 @@ case "$method $path" in
   "GET repos/up/t3code/releases/tags/"*)
     [[ -f "$api/up-release-${path##*/}" ]] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
     body="$(cat "$api/up-release-${path##*/}")" ;;
+  "GET repos/up/t3code/compare/"*) # A...B: how upstream tag B relates to tag A, from the local upstream
+    range="${path#*/compare/}" up_git="$api/../gh/up/t3code.git"
+    a="$(git -C "$up_git" rev-parse -q --verify "refs/tags/${range%%...*}^{commit}")" \
+      && b="$(git -C "$up_git" rev-parse -q --verify "refs/tags/${range#*...}^{commit}")" \
+      || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    if [[ "$a" == "$b" ]]; then status=identical
+    elif git -C "$up_git" merge-base --is-ancestor "$a" "$b"; then status=ahead
+    elif git -C "$up_git" merge-base --is-ancestor "$b" "$a"; then status=behind
+    else status=diverged; fi
+    body="{\"status\":\"$status\"}" ;;
   "GET repos/me/t3code/releases")
     [[ ! -e "$api/fail_list" ]] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
     body="$(cat "$api/releases.json")" ;;
@@ -211,9 +221,76 @@ reset_api
 up_released "$nt"
 new_fork "$nt"
 echo '[{"id":5,"draft":false,"prerelease":false,"tag_name":"v0.1.10-fork.4"}]' > "$root/api/releases.json"
-expect_resolved "nightly: <nightly>.fork.1 is above a stable fork release of the same X.Y.Z" "${nt#v}.fork.1"
+expect_refused "nightly: a published v0.1.10-fork.4 whose upstream v0.1.10 is gone cannot be ordered -> refused" \
+  "Could not compare up/t3code v0.1.10 with $nt" "$root/work" resolve
+(cd "$root/upwork" && git tag v0.1.10 "$nt" && git push -q https://github.com/up/t3code.git v0.1.10) > /dev/null 2>&1
+expect_resolved "nightly: <nightly>.fork.1 is above a stable fork release of the same X.Y.Z it contains" "${nt#v}.fork.1"
 echo "[{\"id\":5,\"draft\":false,\"prerelease\":false,\"tag_name\":\"v0.1.10-nightly.20261113.4631.fork.1\"}]" > "$root/api/releases.json"
 expect_refused "nightly: a newer published nightly release blocks an older one" "4631.fork.1 is published and not below" "$root/work" resolve
+# A plain X.Y.Z sorts above every pre-release of it, in the app as in semver (compareSemverVersions).
+echo '[{"id":5,"draft":false,"prerelease":false,"tag_name":"v0.1.10"}]' > "$root/api/releases.json"
+expect_refused "nightly: a published plain v0.1.10 blocks a <0.1.10 nightly>.fork.1 (the app ranks it lower)" \
+  "v0.1.10 is published and not below ${nt#v}.fork.1" "$root/work" resolve
+
+# A nightly tag on another upstream branch than the default one, even one that is the newest in
+# the series' history, is not one of upstream's nightlies.
+side=v0.1.10-nightly.20261114.4700
+(cd "$root/upwork" && git checkout -q -b side "$nt" && git commit -q --allow-empty -m side && git tag "$side" \
+  && git push -q https://github.com/up/t3code.git "refs/tags/$side" && git checkout -q main) > /dev/null 2>&1
+echo '[]' > "$root/api/releases.json"
+up_released "$side"
+new_fork "$side"
+expect_refused "nightly: a nightly tag that is not on upstream's default branch is refused" \
+  "$side is not on up/t3code's default branch" "$root/work" resolve
+
+# Upstream names a nightly after the release it leads up to: v0.1.9-nightly.20261109.4443 is older
+# than v0.1.9, yet its fork build sorts above a published v0.1.9-fork.1. Nightly 4515 is the
+# v0.1.9 commit itself. Upstream: o1 (4443) - s1 (v0.1.9 = 4515) - main.
+old_n=v0.1.9-nightly.20261109.4443 same_n=v0.1.9-nightly.20261110.4515
+rm -rf "$root/gh" "$root/upwork"
+mkdir -p "$root/gh/up" "$root/gh/me"
+git init -q --bare "$root/gh/up/t3code.git"
+git init -q --bare "$root/gh/me/t3code.git"
+git init -q "$root/upwork"
+(cd "$root/upwork" && git commit -q --allow-empty -m o1 && git tag "$old_n" \
+  && git commit -q --allow-empty -m s1 && git tag v0.1.9 && git tag "$same_n" \
+  && git commit -q --allow-empty -m u3 && git push -q https://github.com/up/t3code.git main --tags) > /dev/null 2>&1
+reset_api v0.1.9
+up_released "$old_n"
+up_released "$same_n"
+echo '[{"id":5,"draft":false,"prerelease":false,"tag_name":"v0.1.9-fork.1"}]' > "$root/api/releases.json"
+new_fork "$old_n"
+expect_refused "nightly: a build of a nightly older than a published v0.1.9-fork.1's v0.1.9 is refused" \
+  "v0.1.9-fork.1 is published and built on up/t3code v0.1.9, which $old_n does not contain" "$root/work" resolve
+new_fork "$same_n"
+expect_resolved "nightly: a nightly that contains v0.1.9 goes forward from v0.1.9-fork.1" "${same_n#v}.fork.1"
+echo '[{"id":5,"draft":false,"prerelease":false,"tag_name":"v0.1.9-fork.1"},
+       {"id":9,"draft":true,"prerelease":false,"tag_name":"'"$old_n"'.fork.1"}]' > "$root/api/releases.json"
+expect_refused "nightly: publish re-checks that ancestry (v0.1.9-fork.1 published during the build)" \
+  "which $old_n does not contain" "$root/work" publish 9 "$old_n.fork.1" "${old_n#v}.fork.1"
+[[ ! -e "$root/api/writes" ]] || fail "nightly: nothing written for an older nightly"
+
+# Publish re-checks upstream's release of the nightly: one withdrawn during the build (release
+# deleted, or set back to draft) is not published to auto-updating installs.
+echo '[{"id":9,"draft":true,"prerelease":false,"tag_name":"'"$same_n"'.fork.1"}]' > "$root/api/releases.json"
+rm -f "$root/api/writes"
+rm "$root/api/up-release-$same_n"
+expect_refused "nightly: publish refuses a nightly whose upstream release was deleted during the build" \
+  "Could not read up/t3code's release of $same_n" "$root/work" publish 9 "$same_n.fork.1" "${same_n#v}.fork.1"
+[[ ! -e "$root/api/writes" ]] || fail "nightly: nothing written for a withdrawn nightly"
+rm -f "$root/api/writes"
+up_released "$same_n" true
+expect_refused "nightly: publish refuses a nightly whose upstream release went back to draft" \
+  "release of $same_n is not published" "$root/work" publish 9 "$same_n.fork.1" "${same_n#v}.fork.1"
+[[ ! -e "$root/api/writes" ]] || fail "nightly: nothing written for a nightly back in draft"
+rm -f "$root/api/writes"
+up_released "$same_n"
+if run "$root/work" publish 9 "$same_n.fork.1" "${same_n#v}.fork.1" \
+  && grep -qx "patched 9 draft=false make_latest=true" "$root/api/writes"; then
+  pass "nightly: publish goes ahead while upstream's release of the nightly is published"
+else
+  fail "nightly: publish goes ahead while upstream's release of the nightly is published"
+fi
 export FORK_FOLLOW_CHANNEL=stable
 
 # version_gt / newest_first (fork-channel.sh): numbers compare as numbers, forms rank as semver.
@@ -229,7 +306,12 @@ vcase v0.1.10-nightly.20261113.4630.fork.1 v0.1.10-nightly.20261113.4630 0
 vcase v0.1.10-nightly.20261113.4630.fork.10 v0.1.10-nightly.20261113.4630.fork.9 0
 vcase v0.1.10-nightly.20261113.4630.fork.9 v0.1.10-nightly.20261113.4631 1
 vcase 0.1.10-nightly.20261113.1.fork.1 v0.1.10-fork.3 0
-vcase v0.1.10-fork.1 v0.1.10 0
+# Plain X.Y.Z above every pre-release of it, as compareSemverVersions has it (checked with the app:
+# -1 for the first two pairs, 1 for the next two).
+vcase v0.1.10-fork.1 v0.1.10 1
+vcase v0.1.10-nightly.20261113.1.fork.1 v0.1.10 1
+vcase v0.1.10 v0.1.10-fork.1 0
+vcase v0.1.10 v0.1.10-nightly.20261113.4630.fork.1 0
 vcase v0.1.11 v0.1.10-nightly.20261113.4630.fork.1 0
 vcase v0.1.10 v0.1.10 1
 vcase v0.1.10-rc.1 v0.1.9 2

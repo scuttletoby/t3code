@@ -25,10 +25,13 @@ fork_sep() { if [[ "$1" == *-nightly.* ]]; then printf .; else printf -- -; fi; 
 
 # version_key VERSION: "X Y Z KIND DATE RUN FORK", numbers only, for vX.Y.Z, vX.Y.Z-fork.N,
 # vX.Y.Z-nightly.D.R and vX.Y.Z-nightly.D.R.fork.N (leading v optional); fails on any other form.
-# KIND: 0 plain, 1 stable fork, 2 nightly. Within one X.Y.Z this is semver's order except that a
-# stable fork release sorts above X.Y.Z itself (the fork's own rule); a nightly sorts above a
-# stable fork release as in semver ("nightly" > "fork"), so the updaters agree with it. Numbers
+# KIND: 1 stable fork, 2 nightly, 3 plain. Within one X.Y.Z this is semver's order, which the app's
+# updaters use (packages/shared/src/semver.ts compareSemverVersions): every pre-release sorts below
+# X.Y.Z itself, and a nightly sorts above a stable fork release ("nightly" > "fork"). Numbers
 # compare as numbers: run 1000 is above run 999 (a plain sort of the names gets that wrong).
+# A version is not an age: upstream names a nightly after the release it leads up to, so
+# vX.Y.Z-nightly.D.N.fork.M sorts above X.Y.Z-fork.N although its code can be older
+# (fork-release.sh refuse_older checks that pair by ancestry).
 version_key() {
   local re='^v?([0-9]+)\.([0-9]+)\.([0-9]+)(-fork\.([0-9]+)|-nightly\.([0-9]{8})\.([0-9]+)(\.fork\.([0-9]+))?)?$'
   [[ "$1" =~ $re ]] || return 1
@@ -38,7 +41,7 @@ version_key() {
   elif [[ -n "${m[6]}" ]]; then
     echo "${m[1]} ${m[2]} ${m[3]} 2 ${m[6]} ${m[7]} ${m[9]:-0}"
   else
-    echo "${m[1]} ${m[2]} ${m[3]} 0 0 0 0"
+    echo "${m[1]} ${m[2]} ${m[3]} 3 0 0 0"
   fi
 }
 
