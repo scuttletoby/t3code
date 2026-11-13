@@ -19,12 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@<sha> # the default ref: on pull_request GitHub's merge commit ($GITHUB_SHA)
         with: { fetch-depth: 0 } # the merge base must be there
-      # Optional, push only: the last commit whose run of this workflow passed (see "The base on push").
+      # Optional, push only: the last commit whose push run of this workflow passed (see "The base on push").
       - id: green
         if: github.event_name == 'push'
         env: { GH_TOKEN: "${{ github.token }}" } # needs `actions: read`
         run: |
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=1" \
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=1" \
             --jq '.workflow_runs[0].head_sha // ""') || sha=""
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - id: scope
@@ -47,11 +47,11 @@ job skips them, and GitHub counts a skipped required job as passing: gate them w
 
 ### Outputs
 
-| Output      | Value                                                                      |
-| ----------- | -------------------------------------------------------------------------- |
-| `docs_only` | `true` only when every changed file is docs and the event may be docs-only |
-| `jobs`      | JSON `{"<job>": "true" \| "false"}`; `{}` when unknown                     |
-| `reason`    | one line: why (every skip and every full run says why)                     |
+| Output      | Value                                                                          |
+| ----------- | ------------------------------------------------------------------------------ |
+| `docs_only` | `true` only when every changed file is docs and the event may be docs-only     |
+| `jobs`      | JSON `{"<job>": "true" \| "false"}`; `{}` when unknown                         |
+| `reason`    | one line: `docs-only:`, `full run:`, `scoped run:` or `not docs-only:` and why |
 
 The step log also prints one line per job: `job engine: run (engine/A.java matches its paths)` or
 `job engine: skip (...)`. Control characters, line separators and bytes that are not UTF-8 in a file name are
@@ -66,17 +66,23 @@ printed escaped (`\n`, `\udcff`), so a file name can neither start a `::workflow
   last commit merged main in, HEAD^1 would be the PR's own commit, the PR's code would drop out of both diffs and the
   config would be read from the PR.
 - **Any other event** (push, merge_group, workflow_dispatch): `base` .. HEAD, only when the caller gives `base` and
-  HEAD == `$GITHUB_SHA`. Without a base the run is a full run. Such an event is docs-only only when
+  HEAD == `$GITHUB_SHA`, and the base must be on HEAD's first-parent line. Without a base the run is a full run. Such an event is docs-only only when
   `docs_only_events` names it; its `jobs` are read either way, so a docs-only push to main can still skip the build
   jobs.
 
 ### The base on push
 
-Pass the last commit whose run of the workflow **passed**, or nothing (a full run). Never `github.event.before`: if
-push A (code) went red or was cancelled (for example by `concurrency`), push B (docs) diffs B against A, every job
-reads `false`, and main turns green with A's code never tested; a rerun of B gives the same answer. Against the last
-green commit, A's code is in the diff until a run that tests it passes. Any commit works as a base, an ancestor or
-not, because the diff compares trees; one that is not in the checkout is a full run.
+Pass the last commit whose **push** run of the workflow on main **passed**, or nothing (a full run). Never
+`github.event.before`: if push A (code) went red or was cancelled (for example by `concurrency`), push B (docs) diffs
+B against A, every job reads `false`, and main turns green with A's code never tested; a rerun of B gives the same
+answer. Against the last green commit, A's code is in the diff until a run that tests it passes.
+
+Keep `event=push` in the query: `branch` matches a run's head branch, so without it a passing `pull_request` run from
+a fork whose branch is also called `main` counts, and its head commit is a PR head that no run tested as main (the PR
+run tested GitHub's merge commit). The action enforces the same rule: the base must be on HEAD's first-parent line
+(main's own pushes), so a merged branch's commit, another branch or a force-pushed-away commit is a full run, and so
+is a base that is not in the checkout. A rerun can see a newer green base than the first run did; that only shrinks
+the diff to commits a passing push run already tested.
 
 ## Config
 
@@ -121,8 +127,10 @@ not, because the diff compares trees; one that is not in the checkout is a full 
 - `never_docs_from` / `paths_from`: paths listed in a JSON file of the repository. `list` is a dotted key to a list
   of objects (none: the file itself), `where` keeps the objects whose keys equal these values, `field` names the key
   (or keys) holding a path or a list of paths, `label` names an object in the log. An entry matches a path exactly or
-  as a folder. The file is read at the base and at the head; an entry at either counts, so a pull request cannot
-  free a file by removing it from the list. A list that could drop a rule quietly is an error: a kept object with
+  as a folder. The file is read at the base and at the head; an entry at either makes a file not docs or runs a
+  job, so a pull request cannot free a file by removing it from the list. Whether a file is named by no job (so
+  every job runs) is judged by the base's entries only: a pull request that adds an entry for a root file, even with
+  a new module, adds that job but cannot stop the full run. A list that could drop a rule quietly is an error: a kept object with
   none of the `field` keys, a `field` key no kept object has (a typo, or a `where` that keeps nothing), or an entry
   that is not a plain repository path (`./x`, `/x`, `x/../y`, `x//y`, a wildcard), which could never match.
 - `docs_only_events`: events that may be docs-only (default `["pull_request"]`).
@@ -145,13 +153,14 @@ runs in full for it; pin only SHAs that this fork's CI tested and tagged.
 
 ## Fails closed
 
-A full run (and `jobs` = `{}`) for: an event without a base, HEAD that is not `$GITHUB_SHA`, a pull_request HEAD
-that is not GitHub's merge commit (two parents, HEAD^2 = the event's PR head; no event file), no merge base (shallow
-checkout), a base that is not a commit, a git error, an empty change, a config path that is not plain, no config at
+A full run (and `jobs` = `{}`) for: an event without a base, a base off HEAD's first-parent line, HEAD that is not
+`$GITHUB_SHA`, a pull_request HEAD that is not GitHub's merge commit (two parents, HEAD^2 = the event's PR head; no
+event file), no merge base (shallow checkout), a base that is not a commit, a git error, an empty change, a config path that is not plain, no config at
 the base, a config that does not parse or has unknown keys or wrong types, a `*_from` file at neither side or not
 readable as configured (not UTF-8, nested too deep, a missing field, an entry that is not a plain path). Any other
 error is caught too and gives a full run with its message, never a step without outputs. A symlink or submodule is
-never docs.
+never docs, and the diff uses `--ignore-submodules=none`, so neither `ignore = all` in `.gitmodules` nor the runner's
+`diff.ignoreSubmodules` can hide a gitlink bump.
 
 ## Tests
 

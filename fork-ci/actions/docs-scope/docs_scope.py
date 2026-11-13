@@ -7,17 +7,20 @@ The change:
     base .. GitHub's merge commit (what merging changes on the base it was tested with). HEAD must be GitHub's merge
     commit (refs/pull/N/merge): HEAD == $GITHUB_SHA, two parents, and HEAD^2 == the event's pull_request.head.sha.
     Only then is HEAD^1 the base (a checkout of a PR head that merged main in would otherwise pose as one).
-  - any other event: --base .. HEAD, only when the caller gives --base (the last commit whose run passed; never
-    github.event.before, see README) and HEAD == $GITHUB_SHA.
+  - any other event: --base .. HEAD, only when the caller gives --base (the last commit whose push run passed; never
+    github.event.before, see README), HEAD == $GITHUB_SHA and the base is on HEAD's first-parent line (a commit that
+    reached the branch through a merge's second parent, such as a fork PR's head, was never tested as the branch).
 
 A path is docs when it is a plain file (no symlink or submodule), matches a `docs` glob, is not the config file, and
 matches no `never_docs` glob or `never_docs_from` entry, and its name has no control character and is UTF-8. The change
 is docs-only when every path is docs and the event is in `docs_only_events`. A job runs when a path that is not docs
 matches its `paths` or `paths_from`; every job runs when such a path matches no job, or when the config changed.
+"Matches no job" is judged by the base's entries only: a head-only `*_from` entry can add a job, never stop a full run.
 
 The config is read from the BASE commit, never from the checkout, and this script runs from the action's own folder
 at the caller's pinned SHA: a pull request cannot loosen the rules or the code that judge it. `*_from` files are read
-at the base and the head; an entry at either counts.
+at the base and the head: an entry at either makes a file not docs or runs a job, but only the base's entries can keep
+a file that no job names from running every job.
 
 Fails closed: anything unclear, including an error this script did not foresee, means docs_only=false and every job
 runs, with the reason printed. Jobs missing from the `jobs` output (config unreadable) must be read as "run": callers
@@ -75,7 +78,8 @@ def glob_re(pattern):
 
 def changes(a, b, run=git):
     """[(path, old mode, new mode)] between commits a and b, renames as delete + add; None on a git error."""
-    out = run('diff', '--raw', '--no-renames', '--no-abbrev', '-z', a, b)
+    # --ignore-submodules=none: a .gitmodules `ignore = all` or a runner's diff.ignoreSubmodules hides no gitlink bump
+    out = run('diff', '--raw', '--no-renames', '--no-abbrev', '--ignore-submodules=none', '-z', a, b)
     if out is None:
         return None
     parts, rows = out.split('\0'), []
@@ -123,6 +127,9 @@ def the_change(event, head, base, run=git, sha='', event_path=''):
         resolved = (run('rev-parse', '-q', '--verify', f'{base}^{{commit}}') or '').strip()
         if not resolved:
             raise Unclear(f'the base {base} is not a commit here (shallow checkout or force push?)')
+        if resolved not in (run('rev-list', '--first-parent', head) or '').split():
+            raise Unclear(f'the base {resolved[:10]} is not on the first-parent line of {head} (a merged branch\'s '
+                          f'commit, another branch, or a force push): it was never tested as this branch')
         base, pairs, what = resolved, ((resolved, head),), f'the base {resolved[:10]}'
     rows = []
     for a, b in pairs:
@@ -186,12 +193,14 @@ def load_config(path, ref, run=git):
 
 
 def read_entries(src, refs, run=git):
-    """{path prefix: label} of every entry the source names at any ref; Unclear if no ref has the file, or one is
+    """[{path prefix: label} per ref, {} where the file is not]; Unclear if no ref has the file, or one is
     malformed: an object without any named field, a field no kept object has (a typo; none kept), or an entry that is
     not a plain path (./, /, .., a wildcard) and so could never match. Entries match a path exactly or as a folder."""
-    found, read = {}, False
+    per_ref, read = [], False
     fields = src['field'] if isinstance(src['field'], list) else [src['field']]
     for ref in refs:
+        found = {}
+        per_ref.append(found)
         text = run('show', f'{ref}:{src["file"]}')
         if text is None:
             continue
@@ -221,7 +230,11 @@ def read_entries(src, refs, run=git):
         read = True
     if not read:
         raise Unclear(f'{src["file"]} is at neither the base nor the head: its entries are unknown')
-    return found
+    return per_ref
+
+
+def union(per_ref):
+    return {k: v for found in per_ref for k, v in found.items()}
 
 
 def entry_match(path, entries):
@@ -239,9 +252,11 @@ def decide(event, config_path, head='HEAD', base='', run=git, sha='', event_path
         rows, cbase, what = the_change(event, head, base, run, sha, event_path)
         c = load_config(config_path, cbase, run)
         refs = (cbase, head)
-        never_from = [(s, read_entries(s, refs, run)) for s in c['never_docs_from']]
-        jobs = {n: ([glob_re(g) for g in j['paths']], [read_entries(s, refs, run) for s in j['paths_from']])
-                for n, j in c['jobs'].items()}
+        never_from = [(s, union(read_entries(s, refs, run))) for s in c['never_docs_from']]
+        jobs = {}   # name -> (globs, entries at the base or the head (run the job), entries at the base (judge "every"))
+        for n, j in c['jobs'].items():
+            per = [read_entries(s, refs, run) for s in j['paths_from']]
+            jobs[n] = ([glob_re(g) for g in j['paths']], [union(p) for p in per], [p[0] for p in per])
     except Unclear as e:
         return False, {}, [f'full run: {e}']
     docs_globs = [glob_re(g) for g in c['docs']]
@@ -276,18 +291,21 @@ def decide(event, config_path, head='HEAD', base='', run=git, sha='', event_path
         return next((f'{m[1]}: {m[0]}' for e in froms for m in [entry_match(p, e)] if m), None)
 
     # A file that is not docs but that no job names (a root build file, a workflow, the config): every job runs.
+    # "Names" by the base's rules only: the PR's own registry entries may add a job, never cancel the full run.
     every = (config_path if config_path in not_docs else
-             next((p for p in not_docs if not any(job_hit(p, *j) for j in jobs.values())), None))
-    if not_docs:
-        first = every or next(iter(not_docs))
-        more = f' and {len(not_docs) - 1} more' if len(not_docs) > 1 else ''
-        tail = ', which no job names: every job runs' if every and every != config_path else (
-            ': every job runs' if every else '')
-        lines.append(f'full run: {first} is {not_docs[first]}{more}{tail}')
+             next((p for p in not_docs if not any(job_hit(p, globs, base_froms)
+                                                  for globs, _, base_froms in jobs.values())), None))
+    more = f' and {len(not_docs) - 1} more' if len(not_docs) > 1 else ''
+    if every:
+        tail = ': every job runs' if every == config_path else ', which no job names at the base: every job runs'
+        lines.append(f'full run: {every} is {not_docs[every]}{more}{tail}')
+    elif not_docs:
+        first = next(iter(not_docs))
+        lines.append(f'scoped run: {first} is {not_docs[first]}{more}; only the jobs these files reach run')
     else:
         lines.append(f'not docs-only: only docs changed, but a {event or "unknown"} run is not in docs_only_events')
     out = {}
-    for n, (globs, froms) in jobs.items():
+    for n, (globs, froms, _) in jobs.items():
         hit = None if every else next(((p, h) for p in not_docs for h in [job_hit(p, globs, froms)] if h), None)
         out[n] = 'true' if every or hit else 'false'
         lines.append(f'job {n}: run (every job runs for {every})' if every else

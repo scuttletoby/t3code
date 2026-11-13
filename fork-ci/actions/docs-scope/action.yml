@@ -12,7 +12,8 @@ inputs:
   base:
     description: >-
       Events other than pull_request only: the commit to compare HEAD with, the last commit whose
-      run passed (never github.event.before: see README). Empty: such runs run in full.
+      push run passed (event=push; never github.event.before: see README), on HEAD's first-parent
+      line. Empty or off that line: such runs run in full.
     required: false
     default: ""
 outputs:

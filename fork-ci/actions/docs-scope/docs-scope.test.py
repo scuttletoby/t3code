@@ -10,6 +10,7 @@ sys.dont_write_bytecode = True   # the Globs test imports docs_scope.py: leave n
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, 'docs_scope.py')
 ACTION = os.path.join(HERE, 'action.yml')
+README = os.path.join(HERE, 'README.md')
 CONFIG_PATH = '.github/docs-scope.json'
 ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
        'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
@@ -114,7 +115,7 @@ class Repo(unittest.TestCase):
         self.assertEqual(stdout.startswith('docs-only: '), m[1] == 'true', stdout)
         self.assertEqual(m[3], stdout.splitlines()[0])
         for line in stdout.splitlines():   # a file name never starts a line: no ::workflow-command::
-            self.assertRegex(line, r'^(docs-only|full run|not docs-only|job [^:]+):', stdout)
+            self.assertRegex(line, r'^(docs-only|full run|scoped run|not docs-only|job [^:]+):', stdout)
             self.assertTrue(line.isprintable(), repr(line))
         return m[1] == 'true', json.loads(m[2]), stdout
 
@@ -216,6 +217,63 @@ class RegistryAtTheBase(Repo):
     def test_a_pr_that_drops_a_jobs_entry_still_runs_the_job(self):
         self.pr({REGISTRY_PATH: self.drop('content-locale'), 'plugins/locale/common/src/main/java/Wire.java': 'x'})
         self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'true'})
+
+
+class RegistryAtTheHead(Repo):
+    """The PR's own registry entries may add a job, never cancel "a file no job names runs every job": the rules that
+    judge a PR come from the base. The registry sits in a job's paths (the common case), so its change alone does not
+    run every job."""
+    config = {**CONFIG, 'jobs': {'plugins': {'paths': ['plugins/**']},
+                                 'engine': {**CONFIG['jobs']['engine'], 'paths': ['engine/**', 'tools/**']}}}
+
+    def add(self, *modules):
+        return json.dumps({'modules': REGISTRY['modules'] + list(modules)})
+
+    def test_a_head_only_entry_cannot_claim_a_file_no_job_names(self):   # even innocently: a new module lists it
+        self.pr({REGISTRY_PATH: self.add({'id': 'root', 'kind': 'engine-module', 'inputs': ['build.gradle']}),
+                 'build.gradle': 'x'})
+        docs, jobs, out = self.scope()
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)
+        self.assertIn('full run: build.gradle is not a docs file', out.splitlines()[0])
+        self.assertIn('which no job names at the base: every job runs', out.splitlines()[0])
+
+    def test_a_head_only_entry_still_adds_its_job(self):
+        self.pr({REGISTRY_PATH: self.add({'id': 'new', 'kind': 'engine-module', 'inputs': ['plugins/new/X.java']}),
+                 'plugins/new/X.java': 'x'})
+        docs, jobs, out = self.scope()
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)
+        self.assertIn('job engine: run (plugins/new/X.java matches new inputs', out)
+
+
+class Submodules(Repo):
+    """A gitlink bump is never docs, whatever .gitmodules (at the base, so in the checkout) or the runner's git config
+    says about ignoring submodules."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.d, 'lib'))   # an uninitialised submodule: an empty folder
+        self.write({'.gitmodules': '[submodule "lib"]\n\tpath = lib\n\turl = ./lib\n\tignore = all\n'})
+        self.git('update-index', '--add', '--cacheinfo', f'160000,{"1" * 40},lib')
+        self.base = self.commit('a submodule that .gitmodules ignores')
+
+    def bump(self):
+        self.git('checkout', '-q', '-b', 'pr', self.base)
+        self.git('update-index', '--cacheinfo', f'160000,{"2" * 40},lib')
+        self.commit('bump lib', {'README.md': 'y'})
+        self.git('checkout', '-q', 'main')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge', 'pr')
+
+    def test_a_submodule_bump_with_ignore_all_in_gitmodules(self):
+        self.bump()
+        self.assertIn('lib is a symlink or submodule', self.assertDocsOnly(False))
+
+    def test_a_submodule_bump_with_diff_ignore_submodules_in_the_git_config(self):
+        self.write({'.gitmodules': None})   # only the runner's config hides it now (the base still has .gitmodules)
+        self.git('rm', '-q', '--cached', '.gitmodules')
+        self.base = self.commit('no .gitmodules')
+        self.git('config', 'diff.ignoreSubmodules', 'all')
+        self.bump()
+        self.assertIn('lib is a symlink or submodule', self.assertDocsOnly(False))
 
 
 class FailsClosed(Repo):
@@ -440,7 +498,8 @@ class ConfigAtTheBase(Repo):
                          ({'where': ['kind']}, 'needs a plain file path'), ({'label': 3}, 'needs a plain file path'),
                          ({'list': None}, 'needs a plain file path'), ({'file': './' + REGISTRY_PATH}, 'needs a plain'),
                          ({'field': ['inputs', 'inptus']}, "no kept object has the field(s) ['inptus']"),
-                         ({'where': {'kind': 'plugn'}}, "no kept object has the field(s) ['inputs']")):
+                         ({'where': {'kind': 'plugn'}}, "no kept object has the field(s) ['inputs']"),
+                         ({'wehre': {'kind': 'plugin'}}, 'no other keys than')):   # a typo key drops no filter
             with self.subTest(bad=bad):
                 self.reset()
                 self.commit('bad source', {CONFIG_PATH: json.dumps({**CONFIG, 'never_docs_from': [{**source, **bad}]})})
@@ -448,6 +507,16 @@ class ConfigAtTheBase(Repo):
                 docs, jobs, out = self.scope()
                 self.assertEqual((docs, jobs), (False, {}), out)
                 self.assertIn(why, out)
+
+    def test_an_unknown_key_in_a_paths_from_entry(self):   # "wehre" would drop the kind filter: the job runs more
+        engine = CONFIG['jobs']['engine']
+        source = {**{k: v for k, v in engine['paths_from'][0].items() if k != 'where'}, 'wehre': {'kind': 'x'}}
+        self.commit('typo', {CONFIG_PATH: json.dumps(
+            {**CONFIG, 'jobs': {**CONFIG['jobs'], 'engine': {**engine, 'paths_from': [source]}}})})
+        self.pr({'README.md': 'y'})
+        docs, jobs, out = self.scope()
+        self.assertEqual((docs, jobs), (False, {}), out)
+        self.assertIn('jobs.engine.paths_from entry', out)
 
 
 class LooseConfig(Repo):
@@ -496,6 +565,17 @@ class Jobs(Repo):
         self.pr({'engine/core/src/main/resources/help.md': 'y'})
         self.assertEqual(self.scope()[1]['engine'], 'true')
 
+    def test_a_scoped_run_says_so_and_a_full_run_says_full(self):   # the reason matches what the jobs do
+        self.pr({'engine/A.java': 'class A {}'})
+        docs, jobs, out = self.scope()
+        self.assertEqual(jobs, {'plugins': 'false', 'engine': 'true'}, out)
+        self.assertTrue(out.startswith('scoped run: engine/A.java is not a docs file; only the jobs'), out)
+        self.reset()
+        self.pr({'engine/A.java': 'class A {}', 'app/Main.java': 'x'})
+        docs, jobs, out = self.scope()
+        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'true'}, out)
+        self.assertTrue(out.startswith('full run: app/Main.java is not a docs file and 1 more, which no job'), out)
+
     def test_docs_only_skips_every_job(self):
         self.pr({'README.md': 'y'})
         self.assertEqual(self.scope()[:2], (True, {'plugins': 'false', 'engine': 'false'}))
@@ -537,6 +617,18 @@ class OtherEvents(Repo):
         self.commit('docs', {'README.md': 'y'})
         self.assertTrue(self.scope('push', self.base)[0])
 
+    def test_a_base_off_the_first_parent_line_is_a_full_run(self):   # a merged fork PR's head was never tested
+        self.commit('code A (its run went red)', {'engine/A.java': 'class A {}'})
+        self.git('checkout', '-q', '-b', 'fork-main')
+        fork_pr_head = self.commit('docs (its pull_request run passed)', {'README.md': 'y'})
+        self.git('checkout', '-q', 'main')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge the fork PR', 'fork-main')
+        self.commit('docs push', {'docs/a.md': 'z'})
+        docs, jobs, out = self.scope('push', fork_pr_head)
+        self.assertEqual((docs, jobs), (False, {}), out)
+        self.assertIn('not on the first-parent line', out)
+        self.assertEqual(self.scope('push', self.base)[1], {'plugins': 'false', 'engine': 'true'})   # main's green
+
     def test_a_base_that_is_not_a_commit(self):
         self.commit('docs', {'README.md': 'y'})
         docs, jobs, out = self.scope('push', '0' * 40)
@@ -564,6 +656,15 @@ class Globs(unittest.TestCase):
                 self.assertTrue(glob_re(pattern).match(p), (pattern, p))
             for p in no:
                 self.assertFalse(glob_re(pattern).match(p), (pattern, p))
+
+
+class Readme(unittest.TestCase):
+    def test_the_last_green_query_takes_push_runs_only(self):   # `branch` matches a fork PR's head branch "main" too
+        with open(README) as f:
+            queries = re.findall(r'/runs\?([^"\s]*)', f.read())
+        self.assertTrue(queries)
+        for q in queries:
+            self.assertLessEqual({'branch=main', 'status=success', 'event=push'}, set(q.split('&')), q)
 
 
 class Action(unittest.TestCase):
