@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Plan step of fork-follow.yml: decides what the run does, and rebases the fork's patch series onto
-# a newer stable upstream tag when there is one. Run in a full clone with the series checked out.
+# a newer upstream tag of the followed channel when there is one (FORK_FOLLOW_CHANNEL, nightly by
+# default, or stable; fork-channel.sh). Run in a full clone with the series checked out.
 # It pushes and publishes nothing itself. Tests: fork-follow.test.sh.
 #
-# Environment: UPSTREAM (owner/name), UPSTREAM_URL (git URL of upstream, default GitHub), ORIGIN
-# (git remote or URL of this fork, default origin), RUN_SHA (the commit this run's workflow files
-# come from, default HEAD), REPOSITORY (owner/name of this fork, for the advice in reports), REPORT
-# (file that receives the reason when the run cannot go on).
+# Nightly: the series may sit on a commit of upstream's default branch that no nightly tag marks
+# (it was made from that branch). Its base is then that commit, and the plan rebases it onto the
+# newest nightly, which must contain it; while no nightly does, the plan refuses and waits.
+#
+# Environment: FORK_FOLLOW_CHANNEL, UPSTREAM (owner/name), UPSTREAM_URL (git URL of upstream,
+# default GitHub), ORIGIN (git remote or URL of this fork, default origin), RUN_SHA (the commit
+# this run's workflow files come from, default HEAD), REPOSITORY (owner/name of this fork, for the
+# advice in reports), REPORT (file that receives the reason when the run cannot go on).
 #
 # Output, key=value lines to $GITHUB_OUTPUT (stdout without it):
 #   action         none     the series head is the newest fork release of its base already
@@ -68,24 +73,25 @@ on_error() {
 }
 trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
-stable_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
-fork_re='^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$'
 head="$(git rev-parse HEAD)"
 run_sha="${RUN_SHA:-$head}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/fork-channel.sh"
+fork_channel_init || fail "FORK_FOLLOW_CHANNEL is '$FORK_FOLLOW_CHANNEL'; it must be nightly or stable. Nothing was planned."
 
 # Read-only fetches into refs this run alone uses: upstream's tags and default branch, and this
-# fork's tags (its releases).
-git fetch --quiet --no-tags "$upstream_url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head" \
+# fork's tags (its releases). Pruned, so a tag deleted since an earlier fetch here is gone too.
+git fetch --quiet --prune --no-tags "$upstream_url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head" \
   > "$logs/fetch.log" 2>&1 \
   || fail "Could not fetch the tags and default branch of $UPSTREAM ($upstream_url):" '```' "$(tail -n 20 "$logs/fetch.log")" '```'
-git fetch --quiet --no-tags "$ORIGIN" "+refs/tags/v*:refs/fork-tags/v*" > "$logs/fetch.log" 2>&1 \
+git fetch --quiet --prune --no-tags "$ORIGIN" "+refs/tags/v*:refs/fork-tags/v*" > "$logs/fetch.log" 2>&1 \
   || fail "Could not fetch the tags of this fork ($ORIGIN):" '```' "$(tail -n 20 "$logs/fetch.log")" '```'
 
-upstream_tags="$(git for-each-ref --format='%(refname:strip=2)' refs/upstream-tags | grep -E "$stable_re" | sort -rV || true)"
-fork_tags="$(git for-each-ref --format='%(refname:strip=2)' refs/fork-tags | grep -E "$fork_re" | sort -rV || true)"
+# Newest first by version (fork-channel.sh), not by name or by when a tag was made.
+upstream_tags="$(git for-each-ref --format='%(refname:strip=2)' refs/upstream-tags | { grep -E "$channel_re" || true; } | newest_first)"
+fork_tags="$(git for-each-ref --format='%(refname:strip=2)' refs/fork-tags | { grep -E "$fork_re" || true; } | newest_first)"
 target_tag="$(sed -n 1p <<< "$upstream_tags")"
-[[ -n "$target_tag" ]] || fail "$UPSTREAM has no stable release tag (vX.Y.Z)."
+[[ -n "$target_tag" ]] || fail "$UPSTREAM has no $channel release tag ($channel_form)."
 up() { git rev-parse "refs/upstream-tags/$1^{commit}"; }
 
 # The newest fork release in the series' history names the upstream tag the series was built on.
@@ -99,7 +105,7 @@ for tag in $fork_tags; do
   fi
 done
 if [[ -n "$last_release" ]]; then
-  built_on="${last_release%-fork.*}"
+  built_on="${last_release%[-.]fork.*}"
   if ! git rev-parse --quiet --verify "refs/upstream-tags/$built_on^{commit}" > /dev/null; then
     fail "$UPSTREAM no longer has the tag $built_on, which the series was built on (fork release $last_release is in its history)." \
       "Upstream deleted or renamed that release. Decide by hand which upstream release the series should sit on; the series was left as it is."
@@ -110,7 +116,7 @@ if [[ -n "$last_release" ]]; then
   fi
 fi
 
-# The series sits on the newest stable upstream tag it contains.
+# The series sits on the newest upstream tag of the channel it contains.
 base_tag=""
 for tag in $upstream_tags; do
   if git merge-base --is-ancestor "$(up "$tag")" HEAD; then
@@ -119,7 +125,17 @@ for tag in $upstream_tags; do
     break
   fi
 done
-[[ -n "$base_tag" ]] || fail "The series ($head) contains no stable $UPSTREAM tag."
+# Nightly: or on a later commit of upstream's default branch that no nightly tag marks. Its base is
+# then that commit (base_tag names it by its short hash), and only a rebase can move it onto a tag.
+untagged=""
+if [[ "$channel" == nightly ]] && fork_point="$(git merge-base HEAD refs/upstream-head)" \
+  && [[ "$fork_point" != "${base:-}" ]] \
+  && { [[ -z "$base_tag" ]] || git merge-base --is-ancestor "$base" "$fork_point"; }; then
+  untagged=1
+  base="$fork_point"
+  base_tag="${base:0:12}"
+fi
+[[ -n "$base_tag" ]] || fail "The series ($head) contains no $channel $UPSTREAM tag."
 
 # Every commit between that tag and the series head must be the fork's own. Upstream commits there
 # mean the branch is not a patch series (for example it still equals upstream's default branch).
@@ -217,10 +233,11 @@ refuse_outside_workflows() { # refuse_outside_workflows UPSTREAM_BASE UPSTREAM_T
     "or, to keep one, rebase onto $3 by hand (see the conflict advice in fork-follow.yml)."
 }
 
-# The newest fork release of a tag: "<tag> <commit>", or nothing.
+# The newest fork release of a tag (<tag>-fork.N or <tag>.fork.N): "<tag> <commit>", or nothing.
 latest_release() {
-  local last
-  last="$(grep -E "^${1//./\\.}-fork\.[0-9]+$" <<< "$fork_tags" | sort -V | tail -n1 || true)"
+  local last sep=-
+  [[ "$(fork_sep "$1")" != . ]] || sep='\.'
+  last="$(grep -E "^${1//./\\.}${sep}fork\.[0-9]+$" <<< "$fork_tags" | head -n1 || true)"
   [[ -z "$last" ]] || echo "$last $(git rev-parse "refs/fork-tags/$last^{commit}")"
 }
 
@@ -312,7 +329,26 @@ stage_report() { # stage_report CANDIDATE TAG CHANGED
     "The next follow run then finds that release (and moves the series to it if it is not there yet)." > "$REPORT"
 }
 
-if [[ "$target_tag" == "$base_tag" ]]; then
+# Nightly: the newest nightly must contain the series' base. A nightly tag moved or added to an older
+# commit would otherwise take the series backwards, and an untagged base newer than every nightly
+# has no tag a release could name yet.
+target="$(up "$target_tag")"
+if [[ "$channel" == nightly ]] && ! git merge-base --is-ancestor "$base" "$target"; then
+  if [[ -n "$untagged" ]] && git merge-base --is-ancestor "$target" "$base"; then
+    fail "The series sits on $UPSTREAM commit $base_tag, which is newer than the newest nightly, $target_tag." \
+      "A fork release names the upstream tag it sits on, so the series was left as it is; a run after the next nightly follows it."
+  fi
+  fail "$UPSTREAM's newest nightly, $target_tag (${target:0:12}), does not contain the series' base $base_tag (${base:0:12})." \
+    "Upstream moved or deleted a nightly tag, or tagged another branch. The series was left as it is; decide by hand which nightly it should sit on."
+fi
+# Upstream cuts nightlies from its default branch. A nightly-shaped tag on another branch that
+# contains the base would pass the check above and bring that branch's code to every install.
+if [[ "$channel" == nightly ]] && ! git merge-base --is-ancestor "$target" refs/upstream-head; then
+  fail "$UPSTREAM's newest nightly, $target_tag (${target:0:12}), is not on its default branch, so it is not one of upstream's nightlies (or upstream rewrote that branch)." \
+    "The series was left as it is; decide by hand which nightly it should sit on."
+fi
+
+if [[ -z "$untagged" && "$target_tag" == "$base_tag" ]]; then
   refuse_upstream_fork_named "$base" "$base_tag" "$head"
   # The candidate here is the series head itself, so a listed file in it is refused, not deleted.
   kept="$(present_removed "$head")"
@@ -347,7 +383,6 @@ fi
 # A newer upstream release: replay the series onto it. Patches upstream now has become empty and
 # are dropped. A stop whose conflicts are all on listed (deleted) workflow files is resolved by
 # deleting them: upstream edited or brought back a file the fork deletes.
-target="$(up "$target_tag")"
 before="$(git log --format=%s "$base..HEAD")"
 as_fork() { git -c user.name=t3code-fork -c user.email=noreply@users.noreply.github.com "$@"; }
 rebasing() { [[ -d "$(git rev-parse --git-path rebase-merge)" || -d "$(git rev-parse --git-path rebase-apply)" ]]; }
