@@ -126,7 +126,8 @@ why on the pull request, once per head, check and reason, and passed over:
   add a check those files do not have (one added or renamed since).
 
 Only the newest run of a check counts, and a check not in `required_checks` is
-ignored. When GitHub cannot say which workflows still run on the head, the
+ignored. Only the queue's own comment (posted with its token) counts as told:
+a copy of it by anyone else does not silence it. When GitHub cannot say which workflows still run on the head, the
 pull request is not called stuck: it holds the queue, and the run says why.
 
 `gh` must be logged in for the repository (`GH_TOKEN`). Git fetches into the

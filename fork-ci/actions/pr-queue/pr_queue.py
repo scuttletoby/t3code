@@ -349,19 +349,22 @@ class Queue:
 
     def tell_red(self, n, check, what='is red', fix='Fix the cause and push'):
         """An armed PR the queue skips says why on the PR, once per head, check and reason. No answer from GitHub: the
-        next run tries again."""
+        next run tries again. Told means a comment of the queue's own login (viewerDidAuthor) that starts with the mark:
+        anyone can post a copy of it on a public repository."""
         pr = self.view(n)
         if not pr:
             print(f'#{n}: could not read it to say why it waits')
             return
         mark = f'required check {check} {what} on {(pr.get("headRefOid") or "?")[:12]}'
-        if any(mark in (c.get('body') or '') for c in pr.get('comments') or []):
+        told = f'pr_queue: {mark},'
+        if any(c.get('viewerDidAuthor') is True and (c.get('body') or '').startswith(told)
+               for c in pr.get('comments') or []):
             return
         also = '.'
         if check == self.cfg.head_check and what == 'is red':
             also = f', or if a new lens read or override covers this head: `{self.cfg.ready(n)}`.'
         r = self.gh('pr', 'comment', str(n), '--repo', self.repo, '--body',
-                    f'pr_queue: {mark}, so this armed PR waits and the queue passes over it. {fix}' + also)
+                    f'{told} so this armed PR waits and the queue passes over it. {fix}' + also)
         if r.returncode != 0:
             print(f'#{n}: could not comment: {r.stderr.strip()[:300]}')
 

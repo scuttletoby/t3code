@@ -949,6 +949,11 @@ class OwnCache(Base):
         self.assertEqual(os.stat(self.q.cache).st_mode & 0o777, 0o700)
 
 
+def own(comment):
+    """A PR comment for a fake `gh pr view`: a plain body is one the queue's own login posted."""
+    return comment if isinstance(comment, dict) else {'body': comment, 'viewerDidAuthor': True}
+
+
 class RedChecks(unittest.TestCase):
     """Only the newest run of a check counts, and an armed PR the queue skips says why on the PR."""
     H = 'd4' * 20
@@ -1004,7 +1009,7 @@ class RedChecks(unittest.TestCase):
             if a[:2] == ('pr', 'view'):
                 if 'view' in fail:
                     return failed('boom')
-                return ok(json.dumps({'headRefOid': head or self.H, 'comments': [{'body': b} for b in comments]}))
+                return ok(json.dumps({'headRefOid': head or self.H, 'comments': [own(c) for c in comments]}))
             if a[:2] == ('pr', 'comment'):
                 self.posted.append(a[-1])
                 return failed('boom') if 'comment' in fail else ok()
@@ -1046,6 +1051,15 @@ class RedChecks(unittest.TestCase):
         self.assertEqual(self.posted, [])
         self.sweep(comments=[first], head='e5' * 20)
         self.assertEqual(len(self.posted), 1, 'a new head that is red is a new message')
+
+    def test_only_the_queues_own_comment_counts_as_told(self):   # anyone can post a copy of the mark
+        self.sweep()
+        first = self.posted[0]
+        for copy in ({'body': first, 'viewerDidAuthor': False}, {'body': first},
+                     {'body': '> ' + first, 'viewerDidAuthor': True}):
+            with self.subTest(copy=copy):
+                self.sweep(comments=[copy])
+                self.assertEqual(self.posted, [first], 'a copy of the mark silenced the queue')
 
     def test_a_dry_run_posts_nothing(self):
         self.sweep(dry=True)
@@ -1105,7 +1119,7 @@ class StuckUpToDate(unittest.TestCase):
             if a[:2] == ('pr', 'list'):
                 return ok(json.dumps(listed))
             if a[:2] == ('pr', 'view'):
-                return ok(json.dumps({'headRefOid': self.H1, 'comments': [{'body': b} for b in comments]}))
+                return ok(json.dumps({'headRefOid': self.H1, 'comments': [own(c) for c in comments]}))
             if a[:2] == ('pr', 'comment'):
                 self.posted.append(a[-1])
                 return ok()
