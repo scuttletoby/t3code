@@ -73,11 +73,18 @@ describe("buildRemoteOpenUrl keeps the host when the path climbs", () => {
     expect(new URL(url!).href).toBe(url);
   });
 
-  it("refuses a host that would itself change the URL's authority or path", () => {
-    for (const host of ["evil/../x", "a/b"]) {
+  it.each([".", ".."])("refuses a Zed host of %s, which a URL parser would drop", (host) => {
+    // `zed://ssh/../a.ts` parses to `zed://ssh/a.ts`: the host segment is gone, and only the
+    // parse-to-itself check catches it.
+    expect(buildRemoteOpenUrl({ editor: "zed", host, absolutePath: "/a.ts" })).toBeUndefined();
+  });
+
+  it("keeps a host with a slash inside its own encoded segment", () => {
+    for (const host of ["evil/../x", "a/b", ".."]) {
       for (const editor of ["vscode", "zed"] as const) {
-        const url = buildRemoteOpenUrl({ editor, host, absolutePath: "/a.ts" });
-        expect(url === undefined || new URL(url).href === url).toBe(true);
+        const url = buildRemoteOpenUrl({ editor, host, username: "dev", absolutePath: "/a.ts" });
+        expect(url).toBeDefined();
+        expect(new URL(url!).href).toBe(url);
       }
     }
   });

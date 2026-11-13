@@ -453,42 +453,95 @@ it.each([
   },
 );
 
-it("takes keyboard Enter and the menu key on a chip after a long press", async () => {
+it.each([
+  { press: "ends with a click", endingClick: true },
+  // Phones usually send no click after a long press that opened a menu.
+  { press: "ends with no click", endingClick: false },
+])(
+  "takes keyboard Enter and the menu key on a chip after a long press that $press",
+  async ({ endingClick }) => {
+    using _setup = setup();
+    await using screen = await renderMarkdown("[Readme](/work/docs/readme.md)");
+    {
+      using _timers = fakeTimers();
+      await act(async () => {
+        touch(screen.anchor(), "pointerdown");
+        vi.advanceTimersByTime(500);
+        touch(screen.anchor(), "pointerup");
+        // The click that ends the touch press is not an open.
+        if (endingClick) {
+          screen
+            .anchor()
+            .dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 }));
+        }
+      });
+    }
+    expect(state.choose).toHaveBeenCalledOnce();
+    expect(state.openFile).not.toHaveBeenCalled();
+
+    await act(async () => {
+      screen.anchor().focus();
+      screen.anchor().dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+      screen
+        .anchor()
+        .dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 0 }));
+    });
+    expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined);
+
+    await act(async () => {
+      screen
+        .anchor()
+        .dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "ContextMenu" }));
+      screen
+        .anchor()
+        .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    });
+    expect(state.choose).toHaveBeenCalledTimes(2);
+  },
+);
+
+it("takes a right-click and a new long press after a long press that got no late contextmenu", async () => {
+  // iOS sends no contextmenu for a long press, so nothing ends the wait for one but the next
+  // gesture.
   using _setup = setup();
   await using screen = await renderMarkdown("[Readme](/work/docs/readme.md)");
-  {
-    using _timers = fakeTimers();
-    await act(async () => {
+  using _timers = fakeTimers();
+  const longPress = async () =>
+    act(async () => {
       touch(screen.anchor(), "pointerdown");
       vi.advanceTimersByTime(500);
       touch(screen.anchor(), "pointerup");
-      // The click that ends the touch press is not an open.
-      screen
-        .anchor()
-        .dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 }));
     });
-  }
-  expect(state.choose).toHaveBeenCalledOnce();
-  expect(state.openFile).not.toHaveBeenCalled();
-
-  await act(async () => {
-    screen.anchor().focus();
-    screen.anchor().dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
-    screen
-      .anchor()
-      .dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 0 }));
-  });
-  expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined);
-
-  await act(async () => {
-    screen
-      .anchor()
-      .dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "ContextMenu" }));
-    screen
-      .anchor()
-      .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
-  });
+  const rightClick = async () =>
+    act(async () => {
+      screen.anchor().dispatchEvent(
+        new PointerEvent("pointerdown", {
+          bubbles: true,
+          cancelable: true,
+          pointerType: "mouse",
+          button: 2,
+          clientX: 5,
+          clientY: 5,
+        }),
+      );
+      screen.anchor().dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: 5,
+          clientY: 5,
+        }),
+      );
+    });
+  await longPress();
+  expect(state.choose).toHaveBeenCalledTimes(1);
+  await rightClick();
   expect(state.choose).toHaveBeenCalledTimes(2);
+  await longPress();
+  expect(state.choose).toHaveBeenCalledTimes(3);
+  await rightClick();
+  expect(state.choose).toHaveBeenCalledTimes(4);
+  expect(state.openFile).not.toHaveBeenCalled();
 });
 
 it("does not open a menu for a chip that unmounts during a long press", async () => {
