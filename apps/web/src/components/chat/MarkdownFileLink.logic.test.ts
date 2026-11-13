@@ -102,6 +102,31 @@ describe("markdownFileRemoteEditorUrl", () => {
     ).toBe("vscode://vscode-remote/ssh-remote+dev%40devbox.example.ts.net/srv/app/a.ts:3:1");
   });
 
+  it.each([
+    { editor: "vscode", href: "/../ssh-remote+evil.example/etc/x.ts" },
+    { editor: "vscode", href: "/%2E%2E/ssh-remote+evil.example/etc/x.ts" },
+    { editor: "zed", href: "/../evil.example/tmp/x.ts" },
+    { editor: "zed", href: "/%2E%2E/evil.example/tmp/x.ts" },
+    { editor: "zed", href: "/.%2e/evil.example/tmp/x.ts" },
+  ] as const)("keeps $editor on the environment's host for $href", ({ editor, href }) => {
+    const meta = resolveMarkdownFileLinkMeta(href, "/srv/app");
+    const url = meta
+      ? markdownFileRemoteEditorUrl({
+          editor,
+          host,
+          path: meta.filePath,
+          cwd: "/srv/app",
+          line: meta.line,
+          column: meta.column,
+        })
+      : undefined;
+    if (url === undefined) return;
+    const parsed = new URL(url);
+    expect(parsed.href).toBe(url);
+    const authority = decodeURIComponent(parsed.pathname.split("/")[1]!);
+    expect(authority).toBe(editor === "zed" ? "devbox" : "ssh-remote+devbox");
+  });
+
   it("refuses a relative path it cannot anchor to a workspace", () => {
     expect(
       markdownFileRemoteEditorUrl({

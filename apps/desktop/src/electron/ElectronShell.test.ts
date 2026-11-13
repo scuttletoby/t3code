@@ -169,6 +169,27 @@ describe("ElectronShell", () => {
     }).pipe(Effect.provide(ElectronShell.layer)),
   );
 
+  it.effect("does not open remote editor URLs whose dot segments move the host", () =>
+    Effect.gen(function* () {
+      openExternalMock.mockResolvedValue(undefined);
+
+      const electronShell = yield* ElectronShell.ElectronShell;
+      const results = yield* Effect.all([
+        electronShell.openExternal("zed://ssh/toby@devbox/../evil.example/tmp/x.ts"),
+        electronShell.openExternal("zed://ssh/toby@devbox/%2E%2E/evil.example/tmp/x.ts"),
+        electronShell.openExternal(
+          "vscode://vscode-remote/ssh-remote+devbox/../ssh-remote+evil.example/etc/x.ts:1:1",
+        ),
+        electronShell.openExternal(
+          "vscode://vscode-remote/ssh-remote+devbox/%2e%2E/ssh-remote+evil.example/etc/x.ts:1:1",
+        ),
+      ]);
+
+      assert.deepEqual(results, [false, false, false, false]);
+      assert.equal(openExternalMock.mock.calls.length, 0);
+    }).pipe(Effect.provide(ElectronShell.layer)),
+  );
+
   it.effect("does not open unsafe external URLs", () =>
     Effect.gen(function* () {
       const electronShell = yield* ElectronShell.ElectronShell;

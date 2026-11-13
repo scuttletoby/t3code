@@ -8,6 +8,7 @@ import {
 import type { EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
 import {
   memo,
+  useEffect,
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
@@ -330,23 +331,48 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
     x: number;
     y: number;
     fired: boolean;
-  }>({ timer: undefined, x: 0, y: 0, fired: false });
+    releaseContextMenu: (() => void) | undefined;
+  }>({ timer: undefined, x: 0, y: 0, fired: false, releaseContextMenu: undefined });
   const cancelLongPress = () => {
     clearTimeout(longPress.current.timer);
     longPress.current.timer = undefined;
   };
+  const releaseLateContextMenu = () => {
+    longPress.current.releaseContextMenu?.();
+    longPress.current.releaseContextMenu = undefined;
+  };
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- clears the long-press timer and the window contextmenu listener this chip holds until unmount.
+  useEffect(() => {
+    const pending = longPress.current;
+    return () => {
+      clearTimeout(pending.timer);
+      pending.releaseContextMenu?.();
+    };
+  }, []);
   const handlePointerDown = (event: ReactPointerEvent<HTMLElement>) => {
     cancelLongPress();
+    releaseLateContextMenu();
     longPress.current.fired = false;
     if (event.pointerType !== "touch") return;
+    const chip = event.currentTarget;
     const { clientX: x, clientY: y } = event;
     longPress.current.x = x;
     longPress.current.y = y;
     longPress.current.timer = setTimeout(() => {
       longPress.current.timer = undefined;
       longPress.current.fired = true;
+      // Android (after its touch & hold delay) and Windows touch (on lift) send their own
+      // contextmenu for this press after the timer. The open menu would take it as an outside
+      // right-click and close, so the first one on the chip is swallowed before anything sees it.
+      longPress.current.releaseContextMenu = swallowLateContextMenu(chip);
       void showFileContextMenu({ x, y });
     }, LONG_PRESS_MS);
+  };
+  // Only the click that ends the touch press; keyboard activation has detail 0.
+  const consumeLongPressClick = (event: ReactMouseEvent<HTMLElement>) => {
+    if (!longPress.current.fired || event.detail === 0) return false;
+    longPress.current.fired = false;
+    return true;
   };
   const handlePointerMove = (event: ReactPointerEvent<HTMLElement>) => {
     const { x, y } = longPress.current;
@@ -362,8 +388,6 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
   const handleContextMenu = (event: ReactMouseEvent<HTMLElement>) => {
     event.preventDefault();
     event.stopPropagation();
-    // Android fires contextmenu for the same press; show one menu.
-    if (longPress.current.fired) return;
     cancelLongPress();
     const position =
       event.clientX === 0 && event.clientY === 0
@@ -407,7 +431,7 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                if (longPress.current.fired) return;
+                if (consumeLongPressClick(event)) return;
                 if (onOpen && shouldOpenMarkdownFileLinkInEditor(event)) {
                   handleOpenInEditor();
                   return;
@@ -442,7 +466,14 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
               className={cn(MARKDOWN_FILE_LINK_CLASS_NAME, "select-text")}
               data-markdown-copy={copyMarkdown}
               {...longPressHandlers}
-              onClick={handleContextMenu}
+              onClick={(event) => {
+                if (!consumeLongPressClick(event)) {
+                  handleContextMenu(event);
+                  return;
+                }
+                event.preventDefault();
+                event.stopPropagation();
+              }}
               onContextMenu={handleContextMenu}
             >
               <FileTagChipContent
@@ -466,6 +497,26 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
     </Tooltip>
   );
 }, areMarkdownFileLinkPropsEqual);
+
+// Window capture runs before the menu's own document listeners. The next pointer or key press is
+// a new gesture, so it ends the wait (iOS sends no contextmenu at all).
+function swallowLateContextMenu(chip: HTMLElement): () => void {
+  const onContextMenu = (event: MouseEvent) => {
+    if (!(event.target instanceof Node) || !chip.contains(event.target)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    release();
+  };
+  const release = () => {
+    window.removeEventListener("contextmenu", onContextMenu, true);
+    window.removeEventListener("pointerdown", release, true);
+    window.removeEventListener("keydown", release, true);
+  };
+  window.addEventListener("contextmenu", onContextMenu, true);
+  window.addEventListener("pointerdown", release, true);
+  window.addEventListener("keydown", release, true);
+  return release;
+}
 
 function areMarkdownFileLinkPropsEqual(
   previous: Readonly<MarkdownFileLinkProps>,
