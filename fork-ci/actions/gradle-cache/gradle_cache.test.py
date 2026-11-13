@@ -434,7 +434,8 @@ class Issue1329ReleaseMistakes(PublishBase):
             readme = f.read()
         rows = '\n'.join(line for line in readme.split('## Troubleshooting', 1)[1].splitlines() if line.startswith('|'))
         for message in ('has no asset', 'the upload of', 'the asset has digest', 'the download has sha256',
-                        'GitHub answered 404', 'is not empty', 'cannot be read', 'asset limit', 'never reused'):
+                        'GitHub answered 404', 'is not empty', 'cannot be read', 'asset limit', 'never reused',
+                        'no "release" of their own'):
             self.assertIn(message, rows)
 
 
@@ -567,6 +568,82 @@ class LensSameVersionTwice(PublishBase):
                 self.publish(coords=coords)
                 M.read_lock(self.lock_file)
                 self.assertEqual(self.paths(), [(r['path'], r['sha256']) for r in self.rows()])
+
+
+class LensLegacyLockRollover(PublishBase):
+    """Lens S2 round 2 (minor): a lock whose rows name no release (the source format) and the rollover done as the README
+    said (move "release", publish the new version): publish wrote the new tag into every old row, whose assets are in the
+    old release, and the repair then re-uploaded the old versions into the new release."""
+    def setUp(self):
+        super().setUp()
+        self.lock(self.rows())   # no "release" in any row
+        self.release = {f'{sha(JAR)}-engine-1.0.jar': JAR, f'{sha(POM)}-engine-1.0.pom': POM}
+        folder = os.path.join(self.m2, 'org', 'example', 'engine', '1.1')
+        os.makedirs(folder)
+        for name in ('engine-1.1.jar', 'engine-1.1.pom'):
+            with open(os.path.join(folder, name), 'wb') as f:
+                f.write(name.encode())
+
+    def move_to(self, tag):
+        lock = self.read_lock()
+        lock['release'] = tag
+        with open(self.lock_file, 'w') as f:
+            json.dump(lock, f)
+
+    def lock_bytes(self):
+        with open(self.lock_file, 'rb') as f:
+            return f.read()
+
+    def test_a_move_before_every_row_names_its_release_is_refused_before_any_upload(self):
+        self.move_to('jars-2')
+        before = self.lock_bytes()
+        for coords in (['org.example:engine:1.1'], ['org.example:engine:1.0'], ['org.example:engine:1.0'] * 2):
+            with self.subTest(coords=coords):   # the new version, the repair of an old one, and a rerun of it
+                with self.assertRaisesRegex(M.Refused, r'(?s)no "release" of their own.*engine-1\.0\.jar.*'
+                                            r'engine-1\.0\.pom.*Nothing was uploaded'):
+                    self.publish(coords=coords)
+                self.assertEqual((self.uploaded, self.created), ([], []))
+                self.assertEqual(self.lock_bytes(), before)
+                self.assertNotIn('jars-2', self.others)
+        self.move_to('jars')   # undone by hand: stage still finds every old file
+        gh = FakeGitHub(self.release)
+        self.stage(gh)
+        self.assertEqual(self.staged(), [f'{V}/engine-1.0.jar', f'{V}/engine-1.0.pom'])
+
+    def test_the_readme_rollover_writes_every_rows_release_first_and_a_rerun_changes_nothing(self):
+        self.publish()   # step 1: publish a version the lock already has; it uploads nothing, only writes the releases
+        self.assertEqual((self.uploaded, self.created), ([], []))
+        self.assertEqual({r['release'] for r in self.read_lock()['files']}, {'jars'})
+        self.move_to('jars-2')   # step 2
+        self.publish(coords=['org.example:engine:1.1'])   # step 3
+        self.assertEqual(self.created, ['jars-2'])
+        self.assertEqual(sorted(self.uploaded),
+                         sorted(f'jars-2/{sha(n.encode())}-{n}' for n in ('engine-1.1.jar', 'engine-1.1.pom')))
+        self.assertEqual({r['path'].split('/')[3]: r['release'] for r in self.read_lock()['files']},
+                         {'1.0': 'jars', '1.1': 'jars-2'})
+        gh = FakeGitHub(self.release)
+        gh.releases['jars-2'] = dict(self.others['jars-2'])
+        self.stage(gh)
+        self.assertEqual(len(self.staged()), 4)
+        before, self.uploaded = self.lock_bytes(), []
+        self.publish(coords=['org.example:engine:1.0', 'org.example:engine:1.1'])
+        self.assertEqual((self.uploaded, self.created, self.lock_bytes()), ([], ['jars-2'], before))
+
+    def test_a_deleted_asset_of_a_row_that_names_no_release_is_never_guessed(self):
+        """The lock's release may have moved, so publish cannot tell 'deleted here' from 'lives in an older release'."""
+        del self.release[f'{sha(JAR)}-engine-1.0.jar']
+        before = self.lock_bytes()
+        with self.assertRaisesRegex(M.Refused, r'no "release" of their own.*engine-1\.0\.jar'):
+            self.publish()
+        self.assertEqual((self.uploaded, self.lock_bytes()), ([], before))
+        lock = self.read_lock()   # the README's repair: write the tag that held it, then publish
+        for row in lock['files']:
+            row['release'] = 'jars'
+        with open(self.lock_file, 'w') as f:
+            json.dump(lock, f)
+        self.publish()
+        self.assertEqual(self.uploaded, [f'{sha(JAR)}-engine-1.0.jar'])
+        self.stage(FakeGitHub(self.release))
 
 
 class LensUnwritableCache(Base):
