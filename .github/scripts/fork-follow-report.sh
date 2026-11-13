@@ -16,6 +16,8 @@
 set -uo pipefail
 # Refuses outside a GitHub Actions run unless a test runs it under the gh stub (fork-gh-guard.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
+# fork_re: the names of the fork's releases.
+. "$(dirname "${BASH_SOURCE[0]}")/fork-channel.sh"
 
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:?REPOSITORY or GITHUB_REPOSITORY}}"
 ORIGIN="${ORIGIN:-https://github.com/$REPOSITORY.git}"
@@ -78,7 +80,7 @@ if refs="$(git ls-remote "$ORIGIN" "refs/heads/$SERIES_BRANCH" refs/heads/fork-f
   tags=""
   if [[ -n "${CANDIDATE:-}" ]]; then
     tags="$(awk -v sha="$CANDIDATE" '$1 == sha { t = $2; sub("refs/tags/", "", t); sub(/\^\{\}$/, "", t); print t }' <<< "$refs" \
-      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$' | sort -uV)"
+      | grep -E "$fork_re" | sort -uV)"
   fi
   if [[ -z "${CANDIDATE:-}" ]]; then
     row "Release" "none: the plan did not pick a commit"
