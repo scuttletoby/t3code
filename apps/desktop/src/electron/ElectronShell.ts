@@ -51,7 +51,9 @@ export function parseSafeExternalUrl(rawUrl: unknown): Option.Option<string> {
     const url = new URL(rawUrl);
     return SAFE_WEB_PROTOCOLS.has(url.protocol) ||
       APP_LAUNCH_URLS.has(url.href) ||
-      isRemoteEditorUrl(url) ||
+      // The host of a remote editor URL sits in its path, where a `..` the parser removed has
+      // already replaced it, so only a URL that parses to itself is opened.
+      (isRemoteEditorUrl(url) && url.href === rawUrl) ||
       isLocalEditorFileUrl(url)
       ? Option.some(url.href)
       : Option.none();
