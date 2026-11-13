@@ -10,12 +10,14 @@ import contextlib, errno, hashlib, http.server, importlib.util, io, json, os, re
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# No GITHUB_* variable (and no token) from the runner that runs these tests: the script reads GITHUB_API_URL at import
+# and GITHUB_REPOSITORY as --repo's default, and a test that wants one sets it. Cleared before the import.
+for name in [k for k in os.environ if k.startswith('GITHUB_')] + ['GH_TOKEN']:
+    os.environ.pop(name, None)
+os.environ['FORK_CI_TEST_MODE'] = '1'   # run_gh refuses
 spec = importlib.util.spec_from_file_location('gradle_cache', os.path.join(HERE, 'gradle_cache.py'))
 M = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(M)
-for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
-    os.environ.pop(name, None)
-os.environ['FORK_CI_TEST_MODE'] = '1'   # run_gh refuses
 
 JAR, POM = b'jar bytes', b'<project/>'
 V = 'org/example/engine/1.0'
