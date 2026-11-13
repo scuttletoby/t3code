@@ -132,6 +132,7 @@ describe("chat file chip paths", () => {
     );
     expect(markdownFileCopyPaths(meta, hostPath, cwd)).toEqual({
       fullPath: String.raw`C:\Users\alice\project\src\discord\events\user.ts:261:7`,
+      pathOnly: String.raw`C:\Users\alice\project\src\discord\events\user.ts`,
       relativePath: "src/discord/events/user.ts:261:7",
     });
   });

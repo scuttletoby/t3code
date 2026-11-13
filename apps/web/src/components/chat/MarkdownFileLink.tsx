@@ -27,6 +27,11 @@ import {
   shouldUseMarkdownFileBrowserPrimaryAction,
 } from "./MarkdownFileLink.logic";
 import { reportMarkdownActionFailure } from "./markdownActionFailure";
+import {
+  forkDownloadMarkdownFile,
+  useForkMarkdownFileLongPress,
+} from "./forkMarkdownFileLinkActions"; // Fork
+import { forkMarkdownFileMenu } from "./forkMarkdownFileLinkMenu"; // Fork
 import { WorkspaceEntryTooltip } from "./WorkspaceEntryIcon";
 
 interface MarkdownFileLinkProps {
@@ -44,6 +49,8 @@ interface MarkdownFileLinkProps {
   threadRef?: ScopedThreadRef | undefined;
   onOpen?: (() => Promise<AtomCommandResult<unknown, unknown>>) | undefined;
   onOpenInPanel: (panelPath: string, line: number | undefined) => void;
+  onOpenFullSize?: (() => void) | undefined;
+  onDownload?: (() => Promise<void>) | undefined;
   resolveDragPath: () => Promise<string>;
   resolveCopyPaths: () => Promise<ReturnType<typeof markdownFileCopyPaths>>;
   openInEditorMenuLabel: string;
@@ -70,6 +77,8 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
   threadRef,
   onOpen,
   onOpenInPanel,
+  onOpenFullSize,
+  onDownload,
   openInEditorMenuLabel,
   onOpenInBrowser,
   onOpenMedia,
@@ -256,7 +265,13 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
 
     try {
       const copyItems = markdownFileCopyMenuItems({ targetPath, workspaceRelativePath });
-      const clicked = await api.contextMenu.show(
+      // Fork: the fork's entries join upstream's below (forkMarkdownFileLinkMenu.ts).
+      const forkMenu = forkMarkdownFileMenu(api.contextMenu, {
+        hasLine: line !== undefined,
+        canOpenInPanel: threadRef !== undefined && Boolean(panelPath),
+        canDownload: onDownload !== undefined,
+      });
+      const clicked = await forkMenu.show(
         [
           ...(onOpenMedia ? ([{ id: "preview-media", label: gt("Preview media") }] as const) : []),
           ...(onOpen ? ([{ id: "open", label: openInEditorMenuLabel }] as const) : []),
@@ -270,6 +285,15 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
         source,
       );
 
+      // Fork: the fork's entries.
+      if (clicked === "open-in-panel" && panelPath) return onOpenInPanel(panelPath, line);
+      if (clicked === "open-full-size") return onOpenFullSize?.();
+      if (clicked === "download") {
+        return forkDownloadMarkdownFile(onDownload, targetPath, gt("An error occurred."));
+      }
+      if (clicked === "copy-path-only") {
+        return handleCopy(() => resolveCopyPaths().then((paths) => paths.pathOnly), "Full path");
+      }
       if (clicked === "preview-media") {
         onOpenMedia?.();
         return;
@@ -303,9 +327,12 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
     }
   };
 
+  const longPress = useForkMarkdownFileLongPress(showFileContextMenu); // Fork
+
   const handleContextMenu = (event: ReactMouseEvent<HTMLElement>) => {
     event.preventDefault();
     event.stopPropagation();
+    if (longPress.opensNoMenu(event)) return; // Fork
     const position =
       event.clientX === 0 && event.clientY === 0
         ? (() => {
@@ -344,9 +371,11 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
               render={<a href={href} />}
               className={MARKDOWN_FILE_LINK_CLASS_NAME}
               data-markdown-copy={copyMarkdown}
+              {...longPress.handlers}
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
+                if (longPress.consumeClick(event)) return; // Fork
                 if (onOpen && shouldOpenMarkdownFileLinkInEditor(event)) {
                   handleOpenInEditor();
                   return;
@@ -381,6 +410,7 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
               aria-haspopup="menu"
               className={cn(MARKDOWN_FILE_LINK_CLASS_NAME, "select-text")}
               data-markdown-copy={copyMarkdown}
+              {...longPress.handlers}
               onClick={handleContextMenu}
               onContextMenu={handleContextMenu}
             >
@@ -425,6 +455,8 @@ function areMarkdownFileLinkPropsEqual(
     previous.isAppBundle === next.isAppBundle &&
     previous.onOpen === next.onOpen &&
     previous.onOpenInPanel === next.onOpenInPanel &&
+    previous.onOpenFullSize === next.onOpenFullSize &&
+    previous.onDownload === next.onDownload &&
     previous.openInEditorMenuLabel === next.openInEditorMenuLabel &&
     previous.onOpenInBrowser === next.onOpenInBrowser &&
     previous.onOpenMedia === next.onOpenMedia &&
