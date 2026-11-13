@@ -188,6 +188,15 @@ def cached(cache, row, say):
     return data
 
 
+def cache_dir(path):
+    """The action passes cache-dir as written, so `~` is expanded here. Any other relative path is refused: it would be a
+    folder in the caller's checkout, which the checkout step wipes, so the cache would never be warm."""
+    full = os.path.expanduser(path)
+    if not os.path.isabs(full):
+        raise Refused(f'cache dir {path!r} must be an absolute path or start with ~/ (a relative one lands in the checkout)')
+    return full
+
+
 def write_atomic(dest_dir, name, data):
     fd, tmp = tempfile.mkstemp(dir=dest_dir, prefix='.part-')
     try:
@@ -212,21 +221,36 @@ def stage(lock_file, out, gh, cache=CACHE, max_age_days=30, say=print, now=None)
     assets, problems = listed_assets(lock, rows, gh)
     if problems:
         raise Refused('\n'.join(problems))
-    os.makedirs(cache, exist_ok=True)
-    prune_cache(cache, {r['sha256'] for r in rows}, max_age_days, say, time.time() if now is None else now)
+    try:   # the cache saves downloads only: one that cannot be made, read or written is a warning, never a red stage
+        os.makedirs(cache, exist_ok=True)
+        prune_cache(cache, {r['sha256'] for r in rows}, max_age_days, say, time.time() if now is None else now)
+    except OSError as e:
+        say(f'WARN: cache {cache} cannot be used ({e}); every file is downloaded')
+        cache = None
     out = os.path.abspath(out)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     building = tempfile.mkdtemp(dir=os.path.dirname(out), prefix=f'.{os.path.basename(out)}.part-')
     downloaded = 0
     try:
         for row in rows:
-            data = cached(cache, row, say)
+            data = None
+            if cache:
+                try:
+                    data = cached(cache, row, say)
+                except OSError as e:
+                    say(f'WARN: cache {cache} cannot be read ({e}); the rest is downloaded and not cached')
+                    cache = None
             if data is None:
                 data = gh.download(assets[release_of(lock, row)][asset_name(row)])
                 if sha256(data) != row['sha256']:
                     raise Refused(f'{row["path"]}: the download has sha256 {sha256(data)}, the lock says {row["sha256"]}')
-                write_atomic(cache, row['sha256'], data)
                 downloaded += 1
+                if cache:
+                    try:
+                        write_atomic(cache, row['sha256'], data)
+                    except OSError as e:
+                        say(f'WARN: cache {cache} cannot be written ({e}); the rest is downloaded and not cached')
+                        cache = None
             dest = os.path.join(building, *row['path'].split('/'))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, 'wb') as f:
@@ -284,7 +308,7 @@ def publish(lock_file, coords, repo, m2=M2, run=None, say=print, max_assets=MAX_
     lock = read_lock(lock_file)
     tag = lock['release']
     have = {r['path']: r for r in lock['files']}
-    want = []   # (row, source file): every build file of the versions, locked or new
+    want, seen = [], set()   # (row, source file, size): every build file of the versions, locked or new, once
     for coord in coords:
         rel = version_dir(coord)
         folder = os.path.join(m2, *rel.split('/'))
@@ -296,6 +320,9 @@ def publish(lock_file, coords, repo, m2=M2, run=None, say=print, max_assets=MAX_
             with open(os.path.join(folder, n), 'rb') as f:
                 data = f.read()
             row = {'path': f'{rel}/{n}', 'sha256': sha256(data), 'release': tag}
+            if row['path'] in seen:   # a version named twice (or as g.a and g/a): one row, never two that break the lock
+                continue
+            seen.add(row['path'])
             old = have.get(row['path'])
             if old and old['sha256'] != row['sha256']:
                 raise Refused(f'{row["path"]} is in the lock with other bytes ({old["sha256"][:16]}, ~/.m2 has '
@@ -305,8 +332,8 @@ def publish(lock_file, coords, repo, m2=M2, run=None, say=print, max_assets=MAX_
     if problems:
         raise Refused('the lock could not read these rows, so nothing is uploaded: ' + '; '.join(problems)
                       + ' (a version takes only [A-Za-z0-9._-])')
-    listed = {}
-    for t in sorted({row['release'] for row, _, _ in want}):
+    listed = {}   # the lock's release too: after it moved to a new tag, a repair of an older row still runs
+    for t in sorted({row['release'] for row, _, _ in want} | {tag}):
         listed[t] = release_assets(run, repo, t)
         if listed[t] is None and t != tag:
             raise Refused(f'locked rows name the release {t}, which is gone: restore it by hand (README.md)')
@@ -323,7 +350,7 @@ def publish(lock_file, coords, repo, m2=M2, run=None, say=print, max_assets=MAX_
         if count + adds > max_assets:
             raise Refused(f'the release {t} has {count} assets and this publish adds {adds}: GitHub allows {max_assets} '
                           f'per release (asset limit). Set "release" in {lock_file} to a new tag; rows keep theirs')
-    if listed[tag] is None:
+    if listed[tag] is None and any(row['release'] == tag for row, _, _ in uploads):
         run(['gh', 'release', 'create', tag, '-R', repo, '--prerelease', '--latest=false', '--title', 'CI: Maven local jars',
              '--notes', 'The jars a Gradle build takes from a Maven local repository, named <sha256>-<file>. '
              'Pinned by a lock file; written only by fork-ci/actions/gradle-cache/gradle_cache.py publish.'])
@@ -374,7 +401,8 @@ def main(argv=None):
             raise Refused('no --repo and no GITHUB_REPOSITORY')
         token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
         if args.cmd == 'stage':
-            stage(args.lock, args.out, GitHub(token, args.repo), cache=args.cache, max_age_days=args.cache_max_age_days)
+            stage(args.lock, args.out, GitHub(token, args.repo), cache=cache_dir(args.cache),
+                  max_age_days=args.cache_max_age_days)
         elif args.cmd == 'check':
             check(args.lock, GitHub(token, args.repo))
         elif args.cmd == 'publish':

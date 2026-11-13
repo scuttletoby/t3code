@@ -8,11 +8,13 @@ inputs:
     description: The lock file, relative to the workspace (project fact).
     required: true
   out:
-    description: The folder to stage into, inside RUNNER_TEMP. Removed first, so a rerun starts empty.
+    description: >-
+      The folder to stage into: RUNNER_TEMP/gradle-cache* or a folder inside one (default
+      RUNNER_TEMP/gradle-cache-m2). Removed first, so a rerun starts empty.
     required: false
     default: ''
   cache-dir:
-    description: The runner's cache folder (default ~/.cache/fork-ci-gradle-cache).
+    description: The runner's cache folder, absolute or ~/... (default ~/.cache/fork-ci-gradle-cache).
     required: false
     default: ''
   cache-max-age-days:
@@ -45,14 +47,15 @@ runs:
         REPO: ${{ inputs.repository }}
         GH_TOKEN: ${{ inputs.token }}
       # The script is the copy next to this file (the pinned action), never one from the caller's
-      # workspace. OUT is removed only inside RUNNER_TEMP, so a wrong input cannot remove anything else.
+      # workspace. OUT is removed only if it is RUNNER_TEMP/gradle-cache* or inside one: never RUNNER_TEMP, the
+      # runner's own _* folders there (GITHUB_OUTPUT, GITHUB_ENV) or another tool's folder.
       run: |
         set -euo pipefail
         temp=$(realpath -m -- "$RUNNER_TEMP")
         out=$(realpath -m -- "${OUT:-$RUNNER_TEMP/gradle-cache-m2}")
         case "$out" in
-          "$temp"/?*) ;;
-          *) echo "::error::gradle-cache: out ($out) must be a folder inside RUNNER_TEMP ($temp)"; exit 1 ;;
+          "$temp"/gradle-cache*) ;;
+          *) echo "::error::gradle-cache: out ($out) must be a folder RUNNER_TEMP/gradle-cache* or one inside it (RUNNER_TEMP is $temp)"; exit 1 ;;
         esac
         rm -rf -- "$out"
         args=(stage --lock "$LOCK" --out "$out" --cache-max-age-days "$MAX_AGE" --repo "$REPO")

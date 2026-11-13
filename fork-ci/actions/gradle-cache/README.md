@@ -7,7 +7,9 @@ on every run: the same bytes on a fresh runner and on a warm one, and never an o
 - **The bytes** are assets of a GitHub release in the same repository, named `<sha256>-<file name>`.
   The job's own token can read them, so a runner needs no other secret.
 - **The cache** is a per-runner folder of files named by sha256. It saves downloads only: the asset
-  list is read on every run, so a deleted asset is red on a warm runner too.
+  list is read on every run, so a deleted asset is red on a warm runner too. A cache that cannot be
+  made, read or written (another user's, read-only, a full disk) is a warning, and the files are
+  downloaded.
 
 ## Use in a workflow
 
@@ -25,8 +27,8 @@ Pin the action by full SHA (the commit a `ci/vN` tag names):
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `lock` | required | The lock file, relative to the workspace. |
-| `out` | `$RUNNER_TEMP/gradle-cache-m2` | The folder to stage into. It must be inside `RUNNER_TEMP`; it is removed first. |
-| `cache-dir` | `~/.cache/fork-ci-gradle-cache` | The runner's cache. Runners on one machine may share it. |
+| `out` | `$RUNNER_TEMP/gradle-cache-m2` | The folder to stage into: `$RUNNER_TEMP/gradle-cache*` or a folder inside one. It is removed first. |
+| `cache-dir` | `~/.cache/fork-ci-gradle-cache` | The runner's cache: an absolute path or `~/...` (expanded to the runner user's home). A relative path is refused. Runners on one machine may share it. |
 | `cache-max-age-days` | `30` | An entry no row of this lock uses is removed after this many days unused. |
 | `repository` | `github.repository` | Where the release is. |
 | `token` | `github.token` | Needs `contents: read`. |
@@ -56,7 +58,7 @@ python3 -I $S prune-lock --lock engine/m2-lock.json --keep org.example:engine:1.
 
 - `publish` uploads the version's jar, pom, module and `maven-metadata-local.xml` (no sources or
   javadoc), then writes the rows.
-  - A second run changes nothing.
+  - A second run changes nothing. A version named twice gets one set of rows.
   - A row whose asset is gone or unfinished gets that asset uploaded again.
   - A path the lock already has with other bytes is refused, because a version is never reused.
 - `check` downloads nothing. Run it on a schedule, so a deleted asset shows up before a build needs it.
@@ -67,7 +69,8 @@ python3 -I $S prune-lock --lock engine/m2-lock.json --keep org.example:engine:1.
 turns red.
 
 **A full release** (GitHub allows 1000 assets per release): set the lock's `release` to a new tag and
-publish. Older rows keep their `release`.
+publish. Older rows keep their `release`, and `publish` of an older version still repairs its assets
+in that older release. The new release is created only when a new row needs it.
 
 ## Troubleshooting
 
@@ -82,7 +85,9 @@ publish. Older rows keep their `release`.
 | `... cannot be read` / `no "release"` / `bad path` / `listed twice` | The lock is broken. | Fix the lock in the pull request. Nothing is staged from a lock that cannot be read. |
 | `GitHub allows 1000 per release (asset limit)` | The release is full. | Set the lock's `release` to a new tag and publish again. |
 | `a version is never reused` | `~/.m2` has other bytes for a version the lock pins. | Publish a new version number. |
-| `out ... must be a folder inside RUNNER_TEMP` | `out` points outside the job's temp folder. | Use a path under `$RUNNER_TEMP`, or leave `out` empty. |
+| `out ... must be a folder RUNNER_TEMP/gradle-cache*` | `out` is outside `RUNNER_TEMP`, is `RUNNER_TEMP` itself, or names another folder there (the runner's own `_*` folders, another tool's). | Use `$RUNNER_TEMP/gradle-cache-<name>`, or leave `out` empty. |
+| `cache dir ... must be an absolute path` | `cache-dir` is relative (it would be a folder in the checkout, wiped on every run). | Use an absolute path or `~/...`. |
+| `WARN: cache ... cannot be used / read / written` | The cache dir is another user's, read-only, or the disk is full. Stage still works. | Fix the folder's owner or free space; until then every run downloads. |
 
 ## Tests
 
