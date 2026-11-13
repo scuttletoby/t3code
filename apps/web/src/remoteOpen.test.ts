@@ -4,9 +4,9 @@ import {
   SshConnectionTarget,
 } from "@t3tools/client-runtime/connection";
 import { buildRemoteOpenUrl, EnvironmentId } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
-import { remoteFallbackEditors, resolveRemoteOpenState } from "./remoteOpen";
+import { openRemoteEditorUrl, remoteFallbackEditors, resolveRemoteOpenState } from "./remoteOpen";
 
 const environmentId = EnvironmentId.make("environment-1");
 
@@ -283,6 +283,80 @@ describe("buildRemoteOpenUrl", () => {
         }),
         `${editor}, isFile=${isFile}`,
       ).toBe(expected);
+    }
+  });
+
+  it.each([
+    {
+      editor: "vscode",
+      line: 42,
+      expected: "vscode://vscode-remote/ssh-remote+sol/tmp/my%20file.md:42:1",
+    },
+    {
+      editor: "cursor",
+      line: 42,
+      column: 7,
+      expected: "cursor://vscode-remote/ssh-remote+sol/tmp/my%20file.md:42:7",
+    },
+  ] as const)("opens $editor at a file's line", ({ editor, expected, ...position }) => {
+    expect(
+      buildRemoteOpenUrl({
+        editor,
+        host: "sol",
+        absolutePath: "/tmp/my file.md",
+        isFile: true,
+        ...position,
+      }),
+    ).toBe(expected);
+  });
+
+  // Their ssh deep links have no position field, so the line is not sent and the menu entry only
+  // says "Open in <editor>".
+  it.each([
+    { editor: "zed", expected: "zed://ssh/sol/tmp/my%20file.md" },
+    {
+      editor: "idea",
+      expected:
+        "jetbrains://gateway/ssh/environment?h=sol&launchIde=true&ideHint=IU&projectHint=%2Ftmp%2Fmy+file.md",
+    },
+  ] as const)("opens $editor on the file without its line", ({ editor, expected }) => {
+    expect(
+      buildRemoteOpenUrl({
+        editor,
+        host: "sol",
+        absolutePath: "/tmp/my file.md",
+        isFile: true,
+        line: 42,
+        column: 7,
+      }),
+    ).toBe(expected);
+  });
+});
+
+describe("openRemoteEditorUrl", () => {
+  it.each([
+    "zed://ssh/dev@devbox/../evil.example/tmp/x.ts",
+    "vscode://vscode-remote/ssh-remote+devbox/%2E%2E/ssh-remote%2Bevil.example/etc/x.ts:1:1",
+  ])("refuses %s, which a URL parser reads with another host", async (url) => {
+    const assign = vi.fn();
+    vi.stubGlobal("window", { location: { assign } });
+    try {
+      expect(await openRemoteEditorUrl(url)).toBe(false);
+      expect(assign).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("opens a URL that parses to itself", async () => {
+    const assign = vi.fn();
+    vi.stubGlobal("window", { location: { assign } });
+    try {
+      const url = "zed://ssh/dev@devbox/tmp/x.ts";
+      expect(await openRemoteEditorUrl(url)).toBe(true);
+      expect(assign).toHaveBeenCalledExactlyOnceWith(url);
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 });
