@@ -4,6 +4,7 @@ with `git merge --no-ff`. Anything unclear must mean a full run.
 Run: python3 fork-ci/actions/docs-scope/docs-scope.test.py
 """
 import contextlib, json, os, re, shutil, subprocess, sys, tempfile, unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True   # the Globs test imports docs_scope.py: leave no __pycache__ in the action folder
 
@@ -45,10 +46,24 @@ CONFIG = {
 }
 
 
-class Repo(unittest.TestCase):
+class CleanEnv(unittest.TestCase):
+    """Every test starts with no GITHUB_* variable. On a runner the job's own GITHUB_EVENT_PATH, GITHUB_SHA and
+    GITHUB_OUTPUT would otherwise reach the script (fork CI run 43452154314: the job's event file stood in for the
+    one a test leaves unset). os.environ is restored after each test."""
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in [k for k in os.environ if k.startswith('GITHUB_')]:
+            del os.environ[key]
+
+
+class Repo(CleanEnv):
     config = CONFIG
 
     def setUp(self):
+        super().setUp()
         self.d = tempfile.mkdtemp(prefix='docs-scope-')
         self.addCleanup(shutil.rmtree, self.d, True)
         self.git('init', '-q', '-b', 'main')
@@ -645,7 +660,7 @@ class OtherEvents(Repo):
         self.assertIn('not a commit here', out)
 
 
-class Globs(unittest.TestCase):
+class Globs(CleanEnv):
     def test_globs(self):
         sys.path.insert(0, HERE)
         try:
@@ -667,7 +682,7 @@ class Globs(unittest.TestCase):
                 self.assertFalse(glob_re(pattern).match(p), (pattern, p))
 
 
-class Readme(unittest.TestCase):
+class Readme(CleanEnv):
     def test_the_last_green_query_takes_push_runs_only(self):   # `branch` matches a fork PR's head branch "main" too
         with open(README) as f:
             queries = re.findall(r'/runs\?([^"\s]*)', f.read())
@@ -676,7 +691,7 @@ class Readme(unittest.TestCase):
             self.assertLessEqual({'branch=main', 'status=success', 'event=push'}, set(q.split('&')), q)
 
 
-class Action(unittest.TestCase):
+class Action(CleanEnv):
     """action.yml runs only this folder's script (the caller's pinned SHA), never a file from the checkout."""
     text = open(ACTION).read()
 
