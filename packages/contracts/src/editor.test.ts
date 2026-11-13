@@ -17,12 +17,12 @@ describe("buildRemoteOpenUrl keeps the host when the path climbs", () => {
   const editors: ReadonlyArray<EditorId> = ["vscode", "cursor", "zed"];
 
   it.each(editors.flatMap((editor) => climbs.map((absolutePath) => ({ editor, absolutePath }))))(
-    "$editor: $absolutePath stays on toby@devbox",
+    "$editor: $absolutePath stays on dev@devbox",
     ({ editor, absolutePath }) => {
       const url = buildRemoteOpenUrl({
         editor,
         host: "devbox",
-        username: "toby",
+        username: "dev",
         absolutePath,
         isFile: true,
         line: 3,
@@ -32,7 +32,7 @@ describe("buildRemoteOpenUrl keeps the host when the path climbs", () => {
       expect(new URL(url!).href).toBe(url);
       const segments = new URL(url!).pathname.split("/");
       expect(decodeURIComponent(segments[1]!)).toMatch(
-        editor === "zed" ? /^toby@devbox$/ : /^ssh-remote\+toby@devbox$/,
+        editor === "zed" ? /^dev@devbox$/ : /^ssh-remote\+dev@devbox$/,
       );
       expect(url).not.toMatch(/\/\.\.?(?:\/|$)/);
     },

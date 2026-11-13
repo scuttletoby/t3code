@@ -175,8 +175,8 @@ describe("ElectronShell", () => {
 
       const electronShell = yield* ElectronShell.ElectronShell;
       const results = yield* Effect.all([
-        electronShell.openExternal("zed://ssh/toby@devbox/../evil.example/tmp/x.ts"),
-        electronShell.openExternal("zed://ssh/toby@devbox/%2E%2E/evil.example/tmp/x.ts"),
+        electronShell.openExternal("zed://ssh/dev@devbox/../evil.example/tmp/x.ts"),
+        electronShell.openExternal("zed://ssh/dev@devbox/%2E%2E/evil.example/tmp/x.ts"),
         electronShell.openExternal(
           "vscode://vscode-remote/ssh-remote+devbox/../ssh-remote+evil.example/etc/x.ts:1:1",
         ),

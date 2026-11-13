@@ -335,7 +335,7 @@ describe("buildRemoteOpenUrl", () => {
 
 describe("openRemoteEditorUrl", () => {
   it.each([
-    "zed://ssh/toby@devbox/../evil.example/tmp/x.ts",
+    "zed://ssh/dev@devbox/../evil.example/tmp/x.ts",
     "vscode://vscode-remote/ssh-remote+devbox/%2E%2E/ssh-remote%2Bevil.example/etc/x.ts:1:1",
   ])("refuses %s, which a URL parser reads with another host", async (url) => {
     const assign = vi.fn();
@@ -352,7 +352,7 @@ describe("openRemoteEditorUrl", () => {
     const assign = vi.fn();
     vi.stubGlobal("window", { location: { assign } });
     try {
-      const url = "zed://ssh/toby@devbox/tmp/x.ts";
+      const url = "zed://ssh/dev@devbox/tmp/x.ts";
       expect(await openRemoteEditorUrl(url)).toBe(true);
       expect(assign).toHaveBeenCalledExactlyOnceWith(url);
     } finally {
