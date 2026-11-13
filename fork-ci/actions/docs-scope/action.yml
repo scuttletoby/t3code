@@ -1,0 +1,42 @@
+name: docs-scope
+description: >-
+  Is this change docs-only, and which configured jobs does it reach? Reads its rules from the base
+  commit and runs its own code at the pinned SHA, so a pull request cannot loosen what judges it.
+  Anything unclear means a full run. Usage: README.md next to this file.
+inputs:
+  config:
+    description: >-
+      The JSON config, a plain path in the repository (no ./); read at the base commit, never from the checkout.
+    required: false
+    default: .github/docs-scope.json
+  base:
+    description: >-
+      Events other than pull_request only: the commit to compare HEAD with, the last commit whose
+      push run passed (event=push; never github.event.before: see README), on HEAD's first-parent
+      line. Empty or off that line: such runs run in full.
+    required: false
+    default: ""
+outputs:
+  docs_only:
+    description: "'true' only when every changed file is docs and the event may be docs-only; test != 'true'."
+    value: ${{ steps.scope.outputs.docs_only }}
+  jobs:
+    description: >-
+      JSON {"<job>": "true"|"false"}; {} when the change or the config is unknown. Read a job as
+      fromJSON(steps.<id>.outputs.jobs).<job> != 'false', so a missing job runs.
+    value: ${{ steps.scope.outputs.jobs }}
+  reason:
+    description: One line saying why.
+    value: ${{ steps.scope.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    # Only code from this action's folder (the caller's pinned SHA) runs; nothing from the checkout.
+    # The script also reads the runner's GITHUB_SHA and GITHUB_EVENT_PATH (HEAD must be the run's commit).
+    - id: scope
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        BASE: ${{ inputs.base }}
+        EVENT: ${{ github.event_name }}
+      run: python3 -I "$GITHUB_ACTION_PATH/docs_scope.py" --config "$CONFIG" --event "$EVENT" --base "$BASE"
