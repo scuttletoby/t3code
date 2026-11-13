@@ -337,6 +337,16 @@ def publish(lock_file, coords, repo, m2=M2, run=None, say=print, max_assets=MAX_
         listed[t] = release_assets(run, repo, t)
         if listed[t] is None and t != tag:
             raise Refused(f'locked rows name the release {t}, which is gone: restore it by hand (README.md)')
+    # A row without "release" is read from the lock's, and publish writes that tag into it. That is only true when its
+    # asset is in the lock's release now: after the lock moved to a new tag the asset is in an older one, and which one
+    # cannot be known here, so nothing is guessed, uploaded or written (lens S2 round 2).
+    unnamed = [r['path'] for r in lock['files'] if 'release' not in r and asset_name(r) not in (listed[tag] or {})]
+    if unnamed:
+        raise Refused(f'{len(unnamed)} locked rows have no "release" of their own and the release {tag} '
+                      f'{"has no asset for them" if listed[tag] is not None else "does not exist yet"}: '
+                      f'{", ".join(unnamed[:10])}{" ..." if len(unnamed) > 10 else ""}. Write into each row the tag '
+                      'that holds its asset ("release": "<tag>"), or set the lock\'s "release" back and publish a '
+                      'locked version first (README.md "A full release"). Nothing was uploaded and the lock is unchanged')
     uploads = []
     for row, src, size in want:
         a = (listed[row['release']] or {}).get(asset_name(row))

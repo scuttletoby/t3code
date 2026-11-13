@@ -43,7 +43,8 @@ Output `maven-repo-local`: the staged folder.
 ```
 
 A row's `release` says which release holds its asset (default: the lock's `release`). `publish`
-always uploads to the lock's `release` and writes it into every row.
+uploads new versions to the lock's `release` and writes a `release` into every row; a row without
+one gets the lock's only when its asset is there, otherwise `publish` refuses.
 
 ## By hand: publish, check, prune
 
@@ -68,9 +69,16 @@ python3 -I $S prune-lock --lock engine/m2-lock.json --keep org.example:engine:1.
 **Never delete an asset** of a lock that any commit you may re-run still uses: that commit's stage
 turns red.
 
-**A full release** (GitHub allows 1000 assets per release): set the lock's `release` to a new tag and
-publish. Older rows keep their `release`, and `publish` of an older version still repairs its assets
-in that older release. The new release is created only when a new row needs it.
+**A full release** (GitHub allows 1000 assets per release), in this order:
+
+1. `publish` a version the lock already has. It uploads nothing new; it writes the current
+   `release` into every row that has none (a lock from before per-row releases has none).
+2. Set the lock's `release` to a new tag.
+3. `publish` the new version. The new release is created only when a new row needs it.
+
+Older rows keep their `release`, and `publish` of an older version still repairs its assets in that
+older release, never in the new one. If step 1 was skipped, `publish` refuses before any upload and
+names the rows that have no `release` of their own; set the lock's `release` back and start at step 1.
 
 ## Troubleshooting
 
@@ -83,7 +91,8 @@ in that older release. The new release is created only when a new row needs it.
 | `GitHub answered 404` | The release is gone, or the token cannot read it. | Check `permissions: contents: read`. If the release is gone, recreate it with `publish` for every locked version. |
 | `... is not empty` | The script was called directly on a folder that has files. | Use the action, which empties `out` first, or pass a new folder. |
 | `... cannot be read` / `no "release"` / `bad path` / `listed twice` | The lock is broken. | Fix the lock in the pull request. Nothing is staged from a lock that cannot be read. |
-| `GitHub allows 1000 per release (asset limit)` | The release is full. | Set the lock's `release` to a new tag and publish again. |
+| `GitHub allows 1000 per release (asset limit)` | The release is full. | Follow "A full release" above (publish a locked version first, then move `release`). |
+| `... rows have no "release" of their own and the release ... has no asset for them` / `does not exist yet` | The lock's `release` was moved before every row had its own, or such a row's asset was deleted. `publish` cannot tell which older release holds it, so it changed nothing. | Moved: set `release` back and follow "A full release". Deleted: write `"release": "<tag>"` into those rows (the tag the asset was in), then `publish` the version to put it back. Never re-upload an old version into the new release. |
 | `a version is never reused` | `~/.m2` has other bytes for a version the lock pins. | Publish a new version number. |
 | `out ... must be a folder RUNNER_TEMP/gradle-cache*` | `out` is outside `RUNNER_TEMP`, is `RUNNER_TEMP` itself, or names another folder there (the runner's own `_*` folders, another tool's). | Use `$RUNNER_TEMP/gradle-cache-<name>`, or leave `out` empty. |
 | `cache dir ... must be an absolute path` | `cache-dir` is relative (it would be a folder in the checkout, wiped on every run). | Use an absolute path or `~/...`. |
