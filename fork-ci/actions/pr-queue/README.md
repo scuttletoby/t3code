@@ -7,8 +7,8 @@ only for a head that holds exactly the change the review read.
 
 This folder is built in four stacked pull requests:
 
-1. the review rules and the config (`lens.py`, `config.py`): this part;
-2. the queue itself (`pr_queue.py`);
+1. the review rules and the config (`lens.py`, `config.py`);
+2. the queue itself (`pr_queue.py`, section "The queue"): this part;
 3. armed pull requests that cannot merge (a red required check, or one that
    ended without passing or never reported) are told once and passed over;
 4. the "red only because the base was red" rule, the reusable workflow
@@ -92,6 +92,54 @@ heading near the top, or two `covered:`/`checks:` lines. A comment that is no
 report says so on its first line, `not a lens: ...`. That clears it unless one of
 its lines is a lens header or a `lens:` field with a sha.
 
+## The queue
+
+```
+pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
+```
+
+One run looks at the open, non-draft pull requests with auto-merge on, oldest
+first, and acts on the first one it can:
+
+- up to date with its base: it holds the queue while its required checks run;
+- behind its base: auto-merge off, `gh pr update-branch`, and auto-merge back
+  on for the new head only if that head is exactly the change the review read
+  merged with the base. Anything else leaves it off with a comment that names
+  the way out.
+
+A pull request in a merge state the queue neither updates nor waits for (a
+conflict, `DIRTY`) is passed over, and the run says so.
+
+`gh` must be logged in for the repository (`GH_TOKEN`). Git fetches into the
+queue's own bare repository (`--cache`) and gets its login from
+`gh auth git-credential` only, never from a helper the machine configured.
+
+| Exit | Meaning                                                                                                     |
+| ---- | ----------------------------------------------------------------------------------------------------------- |
+| 0    | Done, or nothing to do (also: another run holds the lock).                                                  |
+| 1    | A step failed; the next run tries again (a plan in `STATE` first).                                          |
+| 2    | Refused to start; touched nothing. Every reason is printed at once.                                         |
+| 3    | A pull request may have auto-merge off and no comment says so yet. `STATE` stays; the next run finishes it. |
+
+It refuses to start on a GitHub-hosted runner (its disk, and with it the plan,
+goes with the job), with a `--repo` that is not `owner/name`, a relative path,
+a path inside the job's workspace (the next checkout empties it), a config
+error, or a git older than 2.38 (`merge-tree --write-tree`).
+
+`--state-file` (`STATE`) holds the plan of the run that turned auto-merge off:
+`{"repo", "pr", "old", "base", "read"}` (and `"told"` once the pull request was
+told the run could not finish yet). It is written to disk before the disarm
+and removed when the pull request is re-armed or told why not. The next run
+finishes a plan first, against the review as it is then (a lens posted or
+edited since counts), and touches no other pull request until it has. A plan
+whose `repo` is another repository ends the run with exit 1 and stays as it
+was: give each queue its own `--state-file`. A plan without `repo` (the source
+queue's format) is this repository's. An unreadable plan is kept as
+`STATE.bad`, the run fails, and every later run warns while that file exists.
+
+`--lock-file` (default: `STATE.lock`) keeps two runs from overlapping.
+`--dry-run` takes no lock and writes nothing: no `STATE`, no cache, no comment.
+
 ## Where the rules come from
 
 `lens.py` is a port of a production queue's review rules, behaviour for
@@ -108,3 +156,11 @@ comments carry no author association: the replay gives them `OWNER` and
 unedited. A read shorter than 40 hex, and a lens comment edited after posting,
 read nothing here (54 recorded answers). The source's `full_sha`, which matched
 a short read to the pull request's commits, is gone.
+
+`pr_queue.py` is a port of the same project's queue, and `pr_queue.test.py`
+holds that project's queue tests with the port's names. What the port changed:
+everything project-specific comes from the config; `STATE` names its
+repository; exit 3 (was 2) means "may be off and silent", so that 2 can mean
+"refused"; the step that adopted an older queue's state file is gone; and the
+queue's own advice in a comment keeps its backticks and `<sha>` placeholder
+(`lens.no_lens_text(keep_markdown=True)`), which the source dropped.

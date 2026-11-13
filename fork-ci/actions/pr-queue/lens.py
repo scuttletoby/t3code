@@ -148,13 +148,16 @@ def loose_header(line):
     return bool(m and HEX_RE.search(m.group(1)))
 
 
-def no_lens_text(text):
+def no_lens_text(text, keep_markdown=False):
     """Text that can never count as a lens read, name a lens or look like a lens report (lens_problem), for anything
-    the queue quotes into a comment (gh errors): no `read at`, no `lens:`, no `safe to merge`."""
-    text = clean_inline(text)
-    text = re.sub(r'\bread([\s-]*)at\b', r'read\1@', text, flags=re.I)
-    text = re.sub(r'\bsafe(\s+)to(\s+)merge\b', r'safe\1to\2land', text, flags=re.I)
-    return re.sub(r'\blens(\s*):', r'lens\1-', text, flags=re.I)
+    the queue quotes into a comment (gh errors): no `read at`, no `lens:`, no `safe to merge`. keep_markdown: the
+    queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown,
+    it holds none of these; otherwise it is cleaned like any other text."""
+    plain = clean_inline(text)
+    out = re.sub(r'\bread([\s-]*)at\b', r'read\1@', plain, flags=re.I)
+    out = re.sub(r'\bsafe(\s+)to(\s+)merge\b', r'safe\1to\2land', out, flags=re.I)
+    out = re.sub(r'\blens(\s*):', r'lens\1-', out, flags=re.I)
+    return text if keep_markdown and out == plain else out
 
 
 def check_state(c):
