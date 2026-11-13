@@ -58,6 +58,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
+import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import {
   codexArtifactTemplatePresentationLabel,
   type CodexArtifactTemplate,
@@ -115,7 +116,7 @@ import {
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { markdownImageGallery } from "./chat/markdownImageGallery";
 import { type MediaActionSource } from "./media/MediaActions";
-import { resolveProtocolRelativeMediaUrl } from "./media/mediaContent";
+import { downloadFile, resolveProtocolRelativeMediaUrl } from "./media/mediaContent";
 import {
   revealInFileExplorerLabelForKind,
   revealInFileExplorerLabelForOs,
@@ -158,7 +159,12 @@ import { readLocalApi } from "../localApi";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { hostEnvironmentIdAtom } from "../state/primaryEnvironment";
 import { cn } from "../lib/utils";
-import { resolveRemoteOpenState, useRemoteOpenResolution } from "../remoteOpen";
+import {
+  openRemoteEditorUrl,
+  resolveRemoteOpenState,
+  useRemoteCapableEditors,
+  useRemoteOpenResolution,
+} from "../remoteOpen";
 import { useRightPanelStore } from "../rightPanelStore";
 import { useOpenIssueLink } from "../lib/openIssueLink";
 import { readThreadShell, useProjects } from "../state/entities";
@@ -217,7 +223,10 @@ import {
 } from "./chat/ChatMarkdownMedia";
 import { MarkdownExternalLinkContent } from "./chat/MarkdownExternalLink";
 import { MarkdownFileLink } from "./chat/MarkdownFileLink";
-import { canUseMarkdownFileShellActions } from "./chat/MarkdownFileLink.logic";
+import {
+  canUseMarkdownFileShellActions,
+  markdownFileRemoteEditorUrl,
+} from "./chat/MarkdownFileLink.logic";
 import { rehypeChipPunctuation } from "./chat/markdownChipPunctuation";
 import { handleMarkdownFragmentClick, rehypeHeadingIds } from "./chat/markdownFragments";
 import { rehypeTextDirection } from "./chat/markdownTextDirection";
@@ -581,6 +590,7 @@ function useChatMarkdownState({
   const environmentId = threadRef?.environmentId ?? explicitEnvironmentId ?? null;
   const canOperateHost = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
   const canOperatePreview = useEnvironmentScope(environmentId, AuthPreviewOperateScope);
+  const canReadFiles = useEnvironmentScope(environmentId, AuthFilesystemReadScope);
   const isClientHost = useAtomValue(clientHostEnvironmentAtom(environmentId));
   const remoteOpen = useRemoteOpenResolution(environmentId);
   const canUseShellActions =
@@ -657,7 +667,15 @@ function useChatMarkdownState({
   );
   const projects = useProjects();
   const [preferredEditor] = usePreferredEditor(availableEditors);
-  const preferredEditorMenuLabel = openInEditorMenuLabel(preferredEditor);
+  const remoteCapableEditors = useRemoteCapableEditors();
+  const [preferredRemoteEditor] = usePreferredEditor(remoteCapableEditors);
+  const remoteEditorHost =
+    remoteOpen.state.mode === "remote-links" && preferredRemoteEditor !== null
+      ? remoteOpen.state.host
+      : null;
+  const preferredEditorMenuLabel = openInEditorMenuLabel(
+    remoteEditorHost === null ? preferredEditor : preferredRemoteEditor,
+  );
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors, cwd);
   const openInEditor = useAtomCommand(shellEnvironment.openInEditor, {
     reportFailure: false,
@@ -857,6 +875,38 @@ function useChatMarkdownState({
     }
     return findAgentDirectoryMatch(workspaceRelativePath, agentRoots, searchRoot);
   };
+  const openFileInRemoteEditor = async (fileLinkMeta: MarkdownFileLinkMeta, path: string) => {
+    const url =
+      remoteEditorHost === null || preferredRemoteEditor === null
+        ? undefined
+        : markdownFileRemoteEditorUrl({
+            editor: preferredRemoteEditor,
+            host: remoteEditorHost,
+            path,
+            cwd,
+            line: fileLinkMeta.line,
+            column: fileLinkMeta.column,
+          });
+    if (url !== undefined && (await openRemoteEditorUrl(url))) {
+      return AsyncResult.success<void>(undefined);
+    }
+    return AsyncResult.failure<void, Error>(
+      Cause.fail(new Error("The editor could not open this file over SSH.")),
+    );
+  };
+  const downloadMarkdownFile = async (path: string, fileName: string) => {
+    if (!threadRef) return;
+    const { environmentId: fileEnvironmentId, threadId } = threadRef;
+    const result = await createAssetUrl({
+      environmentId: fileEnvironmentId,
+      input: { resource: { _tag: "media-file", threadId, path, disposition: "attachment" } },
+    });
+    if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+    const connection = readPreparedConnection(fileEnvironmentId);
+    const url = connection && resolveAssetUrl(connection.httpBaseUrl, result.value.relativeUrl);
+    if (!url) throw new Error("Reconnect to the environment and try again.");
+    await downloadFile(url, fileName);
+  };
   const openFileInPanel = (fileLinkMeta: MarkdownFileLinkMeta, panelPath: string) => {
     if (!threadRef) return;
     // Every open supersedes pending lookups, including synchronous opens.
@@ -942,7 +992,10 @@ function useChatMarkdownState({
                   openInPreferredEditor(
                     markdownFileEditorTarget(fileLinkMeta, await resolveHostPath()),
                   )
-              : undefined
+              : remoteEditorHost !== null
+                ? async () =>
+                    openFileInRemoteEditor(fileLinkMeta, (await resolveHostPath()).absolutePath)
+                : undefined
         }
         resolveDragPath={async () =>
           resolvePathLinkTarget((await resolveHostPath()).absolutePath, cwd ?? "")
@@ -951,6 +1004,20 @@ function useChatMarkdownState({
           markdownFileCopyPaths(fileLinkMeta, await resolveHostPath(), cwd)
         }
         onOpenInPanel={(path) => openFileInPanel(fileLinkMeta, path)}
+        onOpenFullSize={
+          threadRef && panelPath
+            ? () => {
+                openFileInPanel(fileLinkMeta, panelPath);
+                useRightPanelStore.getState().setMaximized(threadRef, true);
+              }
+            : undefined
+        }
+        onDownload={
+          threadRef && canReadFiles && !isAppBundle
+            ? async () =>
+                downloadMarkdownFile((await resolveHostPath()).absolutePath, fileLinkMeta.basename)
+            : undefined
+        }
         onOpenMedia={
           threadRef && canPreviewMedia
             ? () => openMarkdownMedia(mediaPath, fileLinkMeta.filePath)
