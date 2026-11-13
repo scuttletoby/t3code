@@ -65,6 +65,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
+import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import type {
   CodexArtifactTemplate,
   CodexArtifactTemplateKind,
@@ -123,6 +124,7 @@ import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { markdownImageGallery } from "./chat/markdownImageGallery";
 import { type MediaActionSource } from "./media/MediaActions";
 import { resolveProtocolRelativeMediaUrl } from "./media/mediaContent";
+import { downloadFile } from "./media/mediaContent"; // Fork
 import {
   revealInFileExplorerLabelForKind,
   revealInFileExplorerLabelForOs,
@@ -230,6 +232,7 @@ import {
 import { MarkdownExternalLinkContent } from "./chat/MarkdownExternalLink";
 import { MarkdownFileLink } from "./chat/MarkdownFileLink";
 import { canUseMarkdownFileShellActions } from "./chat/MarkdownFileLink.logic";
+import { useForkMarkdownFileRemoteEditor } from "./chat/forkMarkdownFileLinkActions"; // Fork
 import { rehypeChipPunctuation } from "./chat/markdownChipPunctuation";
 import { handleMarkdownFragmentClick, rehypeHeadingIds } from "./chat/markdownFragments";
 import { rehypeTextDirection } from "./chat/markdownTextDirection";
@@ -600,6 +603,7 @@ function useChatMarkdownState({
   const environmentId = threadRef?.environmentId ?? explicitEnvironmentId ?? null;
   const canOperateHost = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
   const canOperatePreview = useEnvironmentScope(environmentId, AuthPreviewOperateScope);
+  const canReadFiles = useEnvironmentScope(environmentId, AuthFilesystemReadScope);
   const isClientHost = useAtomValue(clientHostEnvironmentAtom(environmentId));
   const remoteOpen = useRemoteOpenResolution(environmentId);
   const canUseShellActions =
@@ -694,6 +698,7 @@ function useChatMarkdownState({
     ).data ?? undefined;
   const [preferredEditor] = usePreferredEditor(availableEditors);
   const preferredEditorMenuLabel = openInEditorMenuLabel(preferredEditor, messages);
+  const forkRemoteEditor = useForkMarkdownFileRemoteEditor(remoteOpen.state, cwd, messages); // Fork
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors, cwd);
   const openInEditor = useAtomCommand(shellEnvironment.openInEditor, {
     reportFailure: false,
@@ -893,6 +898,19 @@ function useChatMarkdownState({
     }
     return findAgentDirectoryMatch(workspaceRelativePath, agentRoots, searchRoot);
   };
+  const downloadMarkdownFile = async (path: string, fileName: string) => {
+    if (!threadRef) return;
+    const { environmentId: fileEnvironmentId, threadId } = threadRef;
+    const result = await createAssetUrl({
+      environmentId: fileEnvironmentId,
+      input: { resource: { _tag: "media-file", threadId, path, disposition: "attachment" } },
+    });
+    if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+    const connection = readPreparedConnection(fileEnvironmentId);
+    const url = connection && resolveAssetUrl(connection.httpBaseUrl, result.value.relativeUrl);
+    if (!url) throw new Error("Reconnect to the environment and try again.");
+    await downloadFile(url, fileName);
+  };
   const openFileInPanel = (fileLinkMeta: MarkdownFileLinkMeta, panelPath: string) => {
     if (!threadRef) return;
     const openAt = (path: string) =>
@@ -993,12 +1011,33 @@ function useChatMarkdownState({
           markdownFileCopyPaths(fileLinkMeta, await resolveHostPath(), cwd)
         }
         onOpenInPanel={(path) => openFileInPanel(fileLinkMeta, path)}
+        onOpenFullSize={
+          threadRef && panelPath
+            ? () => {
+                openFileInPanel(fileLinkMeta, panelPath);
+                useRightPanelStore.getState().setMaximized(threadRef, true);
+              }
+            : undefined
+        }
+        onDownload={
+          threadRef && canReadFiles && !isAppBundle
+            ? async () =>
+                downloadMarkdownFile((await resolveHostPath()).absolutePath, fileLinkMeta.basename)
+            : undefined
+        }
         onOpenMedia={
           threadRef && canPreviewMedia
             ? () => openMarkdownMedia(mediaPath, fileLinkMeta.filePath)
             : undefined
         }
         openInEditorMenuLabel={canOpenApp ? gt("Open app") : preferredEditorMenuLabel}
+        // Fork: over SSH the viewing device's editor opens the file, and the menu names it.
+        {...forkRemoteEditor?.linkProps({
+          canOpenApp,
+          canUseShellActions,
+          fileLinkMeta,
+          resolveAbsolutePath: async () => (await resolveHostPath()).absolutePath,
+        })}
         onReveal={
           canUseShellActions && revealInFileManagerLabel !== undefined
             ? async () => revealFileInFileManager((await resolveHostPath()).absolutePath)

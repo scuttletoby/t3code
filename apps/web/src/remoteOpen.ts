@@ -173,8 +173,13 @@ export function useRemoteCapableEditors(): ReadonlyArray<EditorId> {
   return useAtomValue(remoteCapableEditorsAtom);
 }
 
-/** Resolves false when the desktop refuses the URL, including unsupported editor schemes. */
+/**
+ * Resolves false when the desktop refuses the URL, including unsupported editor schemes, and for
+ * a URL a parser reads differently from how it was written: the host of a remote editor URL sits
+ * in its path, so a dot segment the parser removes replaces the host.
+ */
 export async function openRemoteEditorUrl(url: string): Promise<boolean> {
+  if (!parsesToItself(url)) return false;
   const bridge = window.desktopBridge;
   if (bridge !== undefined) {
     try {
@@ -185,6 +190,14 @@ export async function openRemoteEditorUrl(url: string): Promise<boolean> {
   }
   window.location.assign(url);
   return true;
+}
+
+function parsesToItself(url: string): boolean {
+  try {
+    return new URL(url).href === url;
+  } catch {
+    return false;
+  }
 }
 
 const REMOTE_OPEN_HINT_KEY = "t3code:remote-open-hint-seen";
