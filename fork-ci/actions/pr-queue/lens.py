@@ -6,12 +6,15 @@ A lens is one review angle, posted as one PR comment whose FIRST line is its hea
 
 also `Lens:`, `**Lens:**`, `## lens:`, `- lens:`. This grammar is fixed (README.md, "Lens comments"): it is the one
 format the queue reads, and a project that writes its lens reports differently must change its reports, not this
-file. What differs per project comes from the config (config.py): which logins are bots, and the override comment
-(`<prefix> <40-hex sha>: ...`, posted by an account with one author association and never edited) that vouches for a
-head when the lenses read older commits.
+file. What differs per project comes from the config (config.py): whose comments count at all (author associations;
+which logins are bots), and the override comment (`<prefix> <40-hex sha>: ...`, posted by an account with one author
+association and never edited) that vouches for a head when the lenses read older commits.
 
-Fail closed throughout: a comment that LOOKS like a lens report but is not exactly one valid read counts as a lens that
-read nothing, so the queue never takes a reviewed PR for an unreviewed one.
+Only what GitHub records decides who wrote a comment: one by an account without a configured lens association (anyone
+can comment on a public repository), by a bot, or hidden (minimized) is ignored entirely, neither a read nor a lens
+that read nothing. Among the rest, fail closed throughout: a comment that LOOKS like a lens report but is not exactly
+one valid read, or a lens comment edited after posting, counts as a lens that read nothing, so the queue never takes a
+reviewed PR for an unreviewed one. A read is a full 40-hex sha: a shorter one could be matched by a commit pushed later.
 """
 import re
 
@@ -28,6 +31,7 @@ FIELD_RE = re.compile(r'\s*(?:[·,—]\s*)?\b(?:reviewer\s*:|read[\s-]*at\b\s*(?
 READ_AT_RE = re.compile(r'\bread[\s-]*at\b\s*:?\s*([0-9a-f]{7,40})\b', re.I)
 FULL_SHA = re.compile(r'[0-9a-f]{40}')
 NO_HEADER = 'comment without a first-line lens header'
+EDITED = 'edited after posting: post a new comment instead'
 EMBEDDED = 'holds a lens header line'   # lens_problem: `not a lens:` cannot clear it
 # What a lens report looks like (ONE rule on normalised lines): on a plain line (outside code blocks and quotes) a
 # `lens:`, a `read at:` or `read at <hex>`, `safe to merge`, or in its first TOP_LINES plain lines a Markdown heading
@@ -140,15 +144,6 @@ def loose_header(line):
     return bool(m and HEX_RE.search(m.group(1)))
 
 
-def full_sha(read, candidates):
-    """The one sha rule: a `read at:` (7-40 hex) stands for the one full 40-hex sha in `candidates` it is a prefix of.
-    None if it names none, or several."""
-    if not re.fullmatch(r'[0-9a-f]{7,40}', read or ''):
-        return None
-    hits = {c for c in candidates if c.startswith(read)}
-    return hits.pop() if len(hits) == 1 else None
-
-
 def no_lens_text(text):
     """Text that can never count as a lens read, name a lens or look like a lens report (lens_problem), for anything
     the queue quotes into a comment (gh errors): no `read at`, no `lens:`, no `safe to merge`."""
@@ -185,14 +180,22 @@ def latest_checks(rollup):
 class Review:
     """The rules that read a PR's comments, with the project's bot logins and override comment (config.py)."""
 
-    def __init__(self, bot_logins, override_prefix, override_association):
+    def __init__(self, bot_logins, override_prefix, override_association, lens_associations):
         self.bots = tuple(b.lower() for b in bot_logins)
         self.override_re = re.compile(re.escape(override_prefix) + r' ([0-9a-f]{40}):')
         self.override_association = override_association
+        self.lens_associations = tuple(lens_associations)
 
     def is_bot(self, post):
         login = ((post.get('author') or {}).get('login') or '').lower()
         return login in self.bots or login.endswith('[bot]')
+
+    def counts(self, post):
+        """The comment or review takes part in the review at all: GitHub records its author with one of the configured
+        lens associations, and it is not hidden (minimized; gh gives no isMinimized for reviews, so a review counts as
+        shown). Everyone else's posts are ignored entirely: a stranger's lens-looking comment neither vouches for a
+        head nor blocks one. A hidden comment is treated like a deleted one: whoever can hide it can delete it."""
+        return post.get('authorAssociation') in self.lens_associations and post.get('isMinimized') is not True
 
     def override_sha(self, post):
         """The sha a valid override comment vouches for, else None. Text proves nothing, so only what GitHub itself
@@ -246,42 +249,50 @@ class Review:
         return [(when, i, post) for i, (when, post) in enumerate(posts) if not self.is_bot(post)]
 
     def lens_entries(self, pr):
-        """{lens key: ((when, index), sha or None)}: each lens's NEWEST header. A comment that looks like a lens report
-        but is not one valid read (lens_problem) is an entry of its own with no sha: it read nothing until it is
-        re-posted as one comment per lens with a first-line header, or an override covers it."""
+        """{lens key: ((when, index), sha or None, why or None)}: each lens's NEWEST header, from the posts that count
+        (counts). A comment that looks like a lens report but is not one valid read (lens_problem) is an entry of its
+        own with no sha: it read nothing until it is re-posted as one comment per lens with a first-line header, or an
+        override covers it. A lens comment edited after posting (includesCreatedEdit not false: GitHub records that it
+        changed, not what) read nothing until that lens posts a new comment."""
         found = {}
         for when, i, post in self.lens_posts(pr):
+            if not self.counts(post):
+                continue
             problem = self.lens_problem(post)
             if problem:
                 where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
-                found[f'{NO_HEADER} ({where}, {problem})'] = ((when, i), None)
+                found[f'{NO_HEADER} ({where}, {problem})'] = ((when, i), None, None)
                 continue
             header = lens_header(post.get('body') or '')
             if not header:
                 continue
             key = lens_key(header[0])
             if key not in found or (when, i) >= found[key][0]:
-                found[key] = ((when, i), header[1])
+                edited = post.get('includesCreatedEdit') is not False
+                found[key] = ((when, i), None, EDITED) if edited else ((when, i), header[1], None)
         return found
 
     def reviewed_head(self, pr):
-        """(reviewed, sha, why). Not reviewed (no lens comments): (False, None, ...). Reviewed: the one full sha every
-        lens's newest read names (full_sha against the PR head, the PR's commits and any full sha a lens or override
-        wrote, so 7 and 40 hex of one commit are one head). An override covers each lens whose newest read is older
-        than it. Lenses that name different commits, no commit of the PR, or none: sha None."""
+        """(reviewed, sha, why). Not reviewed (no lens comments): (False, None, ...). Reviewed: the one full 40-hex sha
+        every lens's newest read names. A shorter read names nothing: the queue can only match a prefix against the
+        commits GitHub lists now, and after a force-push a new commit can be made to share the prefix of the dropped
+        one that was read. A full sha need not be a commit of the PR now (a rebase or force-push drops the read
+        commit; GitHub keeps it, and the queue compares content). An override covers each lens whose newest read is
+        older than it. Lenses that name different commits, a short sha or none: sha None."""
         found = self.lens_entries(pr)
         overrides = [((when, i), sha) for when, i, post in self.lens_posts(pr) for sha in [self.override_sha(post)]
                      if sha]
         if not found:
             return False, None, 'no lens comments'
         newest = max(overrides) if overrides else None
-        known = [pr.get('headRefOid') or ''] + [c.get('oid') or '' for c in pr.get('commits') or []]
-        known += [sha for _, sha in found.values() if sha] + [sha for _, sha in overrides]
-        known = {s.lower() for s in known if FULL_SHA.fullmatch(s.lower())}
-        reads = {k: (newest[1] if newest and at < newest[0] else full_sha(sha, known)) for k, (at, sha) in found.items()}
+        reads = {k: (newest[1] if newest and at < newest[0] else sha if FULL_SHA.fullmatch(sha or '') else None)
+                 for k, (at, sha, _) in found.items()}
         shas = set(reads.values())
         if len(shas) == 1 and None not in shas:
             return True, shas.pop(), 'every lens read it'
-        listed = ', '.join(f'{k} {v[:12] if v else "(" + (found[k][1] or "no sha")[:12] + ": no single commit of this PR)"}'
-                           for k, v in sorted(reads.items()))
+
+        def gap(k):
+            _, sha, why = found[k]
+            return why or (f'{sha[:12]}: not a full 40-hex sha' if sha else 'no sha: no single commit of this PR')
+        listed = ', '.join(f'{k} {v[:12] if v else "(" + gap(k) + ")"}' for k, v in sorted(reads.items()))
         return True, None, f'the lenses did not all read one head: {listed}'

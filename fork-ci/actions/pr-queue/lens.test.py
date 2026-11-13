@@ -3,9 +3,10 @@
 testdata/lens-corpus.jsonl holds, one case per line, every call the source project's lens tests made to its copy of
 these rules, with that copy's answer (README.md, "Where the rules come from"): 2021 cases, replayed here against lens.py. Logins and the
 project name in it were replaced (owner, proj); the replaced corpus was checked against the source copy before it was
-committed, with the source's override prefix set to `proj ready --head`.
+committed, with the source's override prefix set to `proj ready --head`. Where the port differs from the source on
+purpose, the replay says so (Corpus).
 """
-import json, os, sys, unittest
+import copy, json, os, re, sys, unittest
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
@@ -15,39 +16,71 @@ import config  # noqa: E402
 import lens  # noqa: E402
 
 CORPUS = os.path.join(HERE, 'testdata', 'lens-corpus.jsonl')
-SOURCE = lens.Review(('coderabbitai', 'github-actions', 'copilot'), 'proj ready --head', 'OWNER')
-SHA_A, SHA_B = 'a' * 40, 'b' * 40
+SOURCE = lens.Review(('coderabbitai', 'github-actions', 'copilot'), 'proj ready --head', 'OWNER', ('OWNER',))
+SHA_A, SHA_B, SHA_C = 'a' * 40, 'b' * 40, 'c' * 40
 VALID = {
     'required_checks': ['build', 'test'], 'merge_method': 'squash', 'delete_branch': True,
-    'bot_logins': ['review-bot'], 'override': {'prefix': 'tool ready --head', 'author_association': 'OWNER'},
+    'bot_logins': ['review-bot'], 'lens_author_associations': ['OWNER'],
+    'override': {'prefix': 'tool ready --head', 'author_association': 'OWNER'},
     'ready_command': 'tool ready {pr}', 'push_command': 'tool push', 'lens_format_doc': 'docs/review.md',
+    'head_check': 'test',
 }
+# The port's deliberate changes to recorded reviewed_head answers (README.md, "Where the rules come from"): a read
+# shorter than 40 hex, or a lens comment edited after posting, is a lens that read nothing.
+SHORT_READ = re.compile(r'read[\s*`_-]*at\b[\s*`:_[]*([0-9a-f]{7,39})(?![0-9a-z])', re.I)
+CHANGED = ('not a full 40-hex sha', lens.EDITED)
 
 
 def post(body, login='someone', when='2026-01-01T00:00:00Z', **extra):
-    return {'body': body, 'author': {'login': login}, 'createdAt': when, **extra}
+    """A comment as gh shows it, by default from the owner and never edited; a field set to ... is left out."""
+    p = {'body': body, 'author': {'login': login}, 'createdAt': when, 'authorAssociation': 'OWNER',
+         'includesCreatedEdit': False, **extra}
+    return {k: v for k, v in p.items() if v is not ...}
+
+
+def stranger(body, when='2026-01-02T00:00:00Z', association='NONE', **extra):
+    return post(body, login='drive-by', when=when, authorAssociation=association, **extra)
 
 
 def pr(*comments, head=SHA_B, commits=(SHA_A, SHA_B)):
     return {'headRefOid': head, 'comments': list(comments), 'reviews': [], 'commits': [{'oid': c} for c in commits]}
 
 
+def as_owner(pr):
+    """A recorded PR whose posts carry no GitHub author fields: the source's repository is private, so every one was
+    written by an account with write access; posts that carry a field keep what was recorded."""
+    pr = copy.deepcopy(pr)
+    for p in (pr.get('comments') or []) + (pr.get('reviews') or []):
+        if 'authorAssociation' not in p and 'includesCreatedEdit' not in p:
+            p.update(authorAssociation='OWNER', includesCreatedEdit=False)
+    return pr
+
+
 class Corpus(unittest.TestCase):
     def test_every_recorded_call_gives_the_source_answer(self):
+        """Every recorded answer, except: full_sha is gone (short reads name nothing), and a reviewed_head case whose
+        input holds a short read or an edited lens comment may only change to no head, for that reason."""
         with open(CORPUS, encoding='utf-8') as f:
             cases = [json.loads(line) for line in f]
         self.assertEqual(len(cases), 2021)
-        fns = {'lens_problem': SOURCE.lens_problem, 'reviewed_head': SOURCE.reviewed_head,
+        fns = {'lens_problem': SOURCE.lens_problem, 'reviewed_head': lambda pr: SOURCE.reviewed_head(as_owner(pr)),
                'override_sha': SOURCE.override_sha, 'lens_header': lens.lens_header, 'no_lens_text': lens.no_lens_text,
-               'latest_checks': lens.latest_checks, 'check_state': lens.check_state, 'lens_key': lens.lens_key,
-               'full_sha': lambda read, cands: lens.full_sha(read, set(cands))}
-        self.assertEqual({c['fn'] for c in cases}, set(fns))
-        wrong = []
-        for c in cases:
+               'latest_checks': lens.latest_checks, 'check_state': lens.check_state, 'lens_key': lens.lens_key}
+        self.assertEqual({c['fn'] for c in cases}, set(fns) | {'full_sha'})
+        wrong, changed = [], 0
+        for c in (c for c in cases if c['fn'] in fns):
             got = json.loads(json.dumps(fns[c['fn']](*c['args'])))
-            if got != c['out']:
-                wrong.append(f'{c["fn"]}{json.dumps(c["args"])[:160]}: got {got!r}, source {c["out"]!r}')
+            if got == c['out']:
+                continue
+            posts = (c['args'][0].get('comments') or []) + (c['args'][0].get('reviews') or []) \
+                if c['fn'] == 'reviewed_head' else []
+            cause = any(SHORT_READ.search(p.get('body') or '') or p.get('includesCreatedEdit') for p in posts)
+            if cause and got[:2] == [True, None] and any(w in got[2] for w in CHANGED):
+                changed += 1
+                continue
+            wrong.append(f'{c["fn"]}{json.dumps(c["args"])[:160]}: got {got!r}, source {c["out"]!r}')
         self.assertEqual(wrong, [], f'{len(wrong)} of {len(cases)} differ; first: {wrong[:3]}')
+        self.assertEqual(changed, 54, 'answers changed on purpose (a short read or an edited lens comment)')
 
 
 class Gaps(unittest.TestCase):
@@ -65,30 +98,30 @@ class Gaps(unittest.TestCase):
 class ProjectRules(unittest.TestCase):
     """What the config changes: the override comment and the bot logins."""
     def test_the_configured_override_prefix_counts_and_another_does_not(self):
-        r = lens.Review((), 'tool ready --head', 'OWNER')
+        r = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',))
         mine = post(f'tool ready --head {SHA_B}: read the merge', authorAssociation='OWNER', includesCreatedEdit=False)
         other = dict(mine, body=f'proj ready --head {SHA_B}: read the merge')
         self.assertEqual(r.override_sha(mine), SHA_B)
         self.assertIsNone(r.override_sha(other))
 
     def test_an_override_counts_only_from_the_configured_association_and_unedited(self):
-        r = lens.Review((), 'tool ready --head', 'MEMBER')
+        r = lens.Review((), 'tool ready --head', 'MEMBER', ('MEMBER',))
         body = f'tool ready --head {SHA_B}: read it'
         self.assertEqual(r.override_sha(post(body, authorAssociation='MEMBER', includesCreatedEdit=False)), SHA_B)
         for bad in ({'authorAssociation': 'OWNER', 'includesCreatedEdit': False},    # not the configured one
                     {'authorAssociation': 'MEMBER', 'includesCreatedEdit': True},    # edited after posting
-                    {'authorAssociation': 'MEMBER'}):                                 # GitHub did not say
+                    {'authorAssociation': 'MEMBER', 'includesCreatedEdit': ...}):    # GitHub did not say
             self.assertIsNone(r.override_sha(post(body, **bad)), bad)
 
     def test_an_override_covers_older_lens_reads(self):
-        r = lens.Review((), 'tool ready --head', 'OWNER')
+        r = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',))
         p = pr(post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z'),
                post(f'tool ready --head {SHA_B}: read the rest', when='2026-01-02T00:00:00Z',
                     authorAssociation='OWNER', includesCreatedEdit=False))
         self.assertEqual(r.reviewed_head(p), (True, SHA_B, 'every lens read it'))
 
     def test_a_configured_bot_and_any_login_ending_in_bot_never_count(self):
-        r = lens.Review(('Review-Bot',), 'tool ready --head', 'OWNER')
+        r = lens.Review(('Review-Bot',), 'tool ready --head', 'OWNER', ('OWNER',))
         body = f'lens: correctness · reviewer: x · read at: {SHA_A}'
         for login in ('review-bot', 'helper[bot]'):
             self.assertEqual(r.reviewed_head(pr(post(body, login=login))), (False, None, 'no lens comments'), login)
@@ -100,6 +133,64 @@ class ProjectRules(unittest.TestCase):
         reviewed, sha, why = SOURCE.reviewed_head(p)
         self.assertEqual((reviewed, sha), (True, None))
         self.assertIn('did not all read one head', why)
+
+
+class WhoCounts(unittest.TestCase):
+    """Only posts GitHub records as written by a configured lens association, shown and never edited, are reads."""
+    R = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER', 'COLLABORATOR'))
+    OWN = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
+
+    def head(self, *posts, commits=(SHA_A, SHA_B)):
+        return self.R.reviewed_head(pr(*posts, commits=commits))
+
+    def test_a_strangers_lens_comment_never_moves_the_read_head(self):   # the blocker: a forged read of a later push
+        forged = f'lens: correctness · reviewer: x · read at: {SHA_B}'
+        for association in ('NONE', 'CONTRIBUTOR', 'FIRST_TIME_CONTRIBUTOR', 'FIRST_TIMER', 'MEMBER', ...):
+            self.assertEqual(self.head(self.OWN, stranger(forged, association=association)),
+                             (True, SHA_A, 'every lens read it'), association)
+        self.assertEqual(self.head(stranger(forged)), (False, None, 'no lens comments'))   # nor makes one reviewed
+        collaborator = post(forged, when='2026-01-02T00:00:00Z', authorAssociation='COLLABORATOR')
+        self.assertEqual(self.head(self.OWN, collaborator), (True, SHA_B, 'every lens read it'),
+                         'a configured association counts')
+
+    def test_a_strangers_look_alike_or_junk_comment_neither_vouches_nor_blocks(self):   # the denial of service
+        for junk in ('lgtm, safe to merge', 'looks fine, read at: deadbee1', f'read at: {SHA_A[:7]}',
+                     f'lens: correctness · reviewer: x · read at: {SHA_A[:7]}', f'lens: other · read at: {SHA_B}'):
+            self.assertEqual(self.head(self.OWN, stranger(junk)), (True, SHA_A, 'every lens read it'), junk)
+        self.assertIsNotNone(self.R.lens_problem(post('lgtm, safe to merge')), 'the same text from the owner blocks')
+
+    def test_a_hidden_comment_counts_like_a_deleted_one(self):
+        newer = post(f'lens: correctness · reviewer: x · read at: {SHA_B}', when='2026-01-02T00:00:00Z')
+        self.assertEqual(self.head(self.OWN, newer), (True, SHA_B, 'every lens read it'))
+        self.assertEqual(self.head(self.OWN, dict(newer, isMinimized=True)), (True, SHA_A, 'every lens read it'))
+        self.assertEqual(self.head(dict(self.OWN, isMinimized=True)), (False, None, 'no lens comments'))
+
+    def test_an_edited_lens_comment_read_nothing_until_that_lens_posts_again(self):
+        for edited in (True, ...):   # GitHub says it was edited, or does not say
+            reviewed, sha, why = self.head(post(self.OWN['body'], includesCreatedEdit=edited))
+            self.assertEqual((reviewed, sha), (True, None), edited)
+            self.assertIn(f'correctness ({lens.EDITED})', why)
+        again = post(f'lens: correctness · reviewer: x · read at: {SHA_B}', when='2026-01-03T00:00:00Z')
+        edited = dict(self.OWN, includesCreatedEdit=True)
+        self.assertEqual(self.head(edited, again), (True, SHA_B, 'every lens read it'))
+
+    def test_a_short_read_names_no_head(self):   # a force-push can bring a new commit with the same prefix
+        for n in (7, 12, 39):
+            short = post(f'lens: correctness · reviewer: x · read at: {SHA_B[:n]}')
+            for commits in ((SHA_A, SHA_B), (SHA_B,)):
+                reviewed, sha, why = self.head(short, commits=commits)
+                self.assertEqual((reviewed, sha), (True, None), (n, commits))
+                self.assertIn(f'correctness ({SHA_B[:min(n, 12)]}: not a full 40-hex sha)', why)
+
+    def test_a_full_read_need_not_be_a_commit_of_the_pr(self):   # a rebase dropped it; the queue compares content
+        read_c = post(f'lens: correctness · reviewer: x · read at: {SHA_C}')
+        self.assertEqual(self.head(read_c, commits=(SHA_B,)), (True, SHA_C, 'every lens read it'))
+
+    def test_an_override_counts_whether_or_not_its_association_writes_lenses(self):
+        r = lens.Review((), 'tool ready --head', 'OWNER', ('COLLABORATOR',))
+        lens_post = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', authorAssociation='COLLABORATOR')
+        over = post(f'tool ready --head {SHA_B}: read the rest', when='2026-01-02T00:00:00Z')
+        self.assertEqual(r.reviewed_head(pr(lens_post, over)), (True, SHA_B, 'every lens read it'))
 
 
 class Config(unittest.TestCase):
@@ -117,7 +208,8 @@ class Config(unittest.TestCase):
         c = self.parse()
         self.assertEqual(c.required_checks, frozenset({'build', 'test'}))
         self.assertEqual((c.override_prefix, c.override_association), ('tool ready --head', 'OWNER'))
-        self.assertEqual((c.head_check, c.wait_seconds, c.poll_seconds), (None, 60, 5))
+        self.assertEqual((c.head_check, c.wait_seconds, c.poll_seconds), ('test', 60, 5))
+        self.assertEqual(c.lens_author_associations, ('OWNER',))
         self.assertEqual(c.ready(12), 'tool ready 12')
 
     def test_required_checks_missing_or_empty_is_an_error(self):
@@ -141,8 +233,26 @@ class Config(unittest.TestCase):
         self.refused('ready_command', ready_command='tool ready')
 
     def test_head_check_must_be_a_required_check(self):
-        self.assertEqual(self.parse(head_check='test').head_check, 'test')
+        self.assertEqual(self.parse(head_check='build').head_check, 'build')
         self.refused("head_check 'lint' is not one of required_checks", head_check='lint')
+
+    def test_head_check_is_required(self):   # without one, a push to an armed, up-to-date PR merges unread
+        self.refused('head_check is missing', head_check=...)
+        self.refused('head_check is null', head_check=None)
+
+    def test_lens_author_associations_are_required_and_only_ones_a_stranger_cannot_get(self):
+        self.assertEqual(self.parse(lens_author_associations=['OWNER', 'MEMBER']).lens_author_associations,
+                         ('OWNER', 'MEMBER'))
+        for bad in (..., [], ['CONTRIBUTOR'], ['NONE'], ['OWNER', 'OWNER'], 'OWNER'):
+            self.refused('lens_author_associations', lens_author_associations=bad)
+
+    def test_a_key_written_twice_is_an_error(self):   # json keeps the last one: a shorter required_checks, quietly
+        text = json.dumps(VALID)[:-1] + ', "required_checks": ["build"]}'
+        for t in (text, json.dumps(VALID).replace('"author_association": "OWNER"',
+                                                  '"author_association": "OWNER", "author_association": "MEMBER"')):
+            with self.assertRaises(config.ConfigError) as e:
+                config.parse(t)
+            self.assertIn('key written twice', str(e.exception))
 
     def test_timings(self):
         self.refused('wait_seconds', wait_seconds=0)
