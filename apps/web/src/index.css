@@ -2039,6 +2039,11 @@ code {
   text-decoration: none;
 }
 
+/* A long press opens the file link's own menu instead of the iOS link callout. */
+.chat-markdown-file-link {
+  -webkit-touch-callout: none;
+}
+
 /* File links and context chips own their color and focus ring. */
 .chat-markdown a:not(.chat-markdown-file-link, :has([data-slot="context-chip-label"])) {
   color: var(--info-foreground);

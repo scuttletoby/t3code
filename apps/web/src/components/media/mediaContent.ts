@@ -69,7 +69,16 @@ async function readMediaBlob(src: string): Promise<Blob> {
 }
 
 export async function downloadMedia(src: string, name: string): Promise<void> {
-  const url = URL.createObjectURL(await readMediaBlob(src));
+  saveBlob(await readMediaBlob(src), name);
+}
+
+/** Any file type, an HTML page included. */
+export async function downloadFile(src: string, name: string): Promise<void> {
+  saveBlob(await fetchMediaBlob(src), name);
+}
+
+function saveBlob(blob: Blob, name: string): void {
+  const url = URL.createObjectURL(blob);
   try {
     const anchor = document.createElement("a");
     anchor.href = url;

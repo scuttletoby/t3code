@@ -175,16 +175,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # scripts/: some tests are run by a script there (.github/fork-ci-tests.txt);
-      # fork-ci/: the composite actions' tests.
+      # scripts/: some tests are run by a script there (.github/fork-ci-tests.txt).
+      # fork-ci/: the composite actions and their tests.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /.github/
-            /scripts/
             /fork-ci/
+            /scripts/
           sparse-checkout-cone-mode: false
 
       # Pinned release, verified by checksum. Upstream's own workflows use runner

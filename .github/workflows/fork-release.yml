@@ -1,9 +1,11 @@
 name: Fork release
 
-# Builds this fork's release `v<upstream>-fork.<n>`: upstream's tests, the Linux x64 server archive
-# with SHA256SUMS, and the desktop apps (Linux x64, Windows x64, macOS arm64 and x64), all on
-# GitHub-hosted runners and unsigned unless signing secrets exist. <upstream> is the newest stable
-# upstream tag the commit contains; <n> counts the fork's earlier builds of it.
+# Builds this fork's release `v<upstream>.fork.<n>` (nightly) or `v<upstream>-fork.<n>` (stable):
+# upstream's tests, the Linux x64 server archive with SHA256SUMS, and the desktop apps (Linux x64,
+# Windows x64, macOS arm64 and x64), all on GitHub-hosted runners and unsigned unless signing
+# secrets exist. <upstream> is the newest upstream tag of the channel (variable
+# FORK_FOLLOW_CHANNEL, default nightly) the commit contains; <n> counts the fork's earlier builds
+# of it. Both names read as the app's stable track, so the builds use the stable feed and branding.
 #
 # Builds name this repository as their release repository (scripts/lib/release-repository.ts reads
 # T3CODE_DESKTOP_UPDATE_REPOSITORY, else GITHUB_REPOSITORY in Actions), so the server's update and
@@ -135,12 +137,14 @@ jobs:
           python3 -c 'import yaml' 2> /dev/null || { sudo apt-get update && sudo apt-get install -y python3-yaml; }
           python3 .github/scripts/fork-release-workflow.test.py
 
-      # Refuses unreleased upstream commits, a stray upstream tag and a base above upstream's latest.
+      # Refuses unreleased upstream commits, a stray upstream tag, and a base upstream has not
+      # released (stable: above upstream's latest; nightly: no published release of that tag).
       - id: meta
         name: Resolve fork release version
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          FORK_FOLLOW_CHANNEL: ${{ vars.FORK_FOLLOW_CHANNEL || 'nightly' }}
         run: bash .github/scripts/fork-release.sh resolve
 
   tests:
@@ -599,13 +603,15 @@ jobs:
             release-assets/*.tar.gz
             release-assets/SHA256SUMS
 
-      # Updaters skip drafts, so nobody sees a release until every file above is uploaded. The tag
-      # and "nothing published is as high" checks run again right before; it is then made latest.
+      # Updaters skip drafts, so nobody sees a release until every file above is uploaded. The tag,
+      # "nothing published is as high" and "upstream still has the base released" checks run again
+      # right before; it is then made latest.
       - name: Publish the draft
         id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ needs.preflight.outputs.upstream }}
           RELEASE_ID: ${{ steps.draft.outputs.id }}
           TAG: ${{ needs.preflight.outputs.tag }}
           VERSION: ${{ needs.preflight.outputs.version }}

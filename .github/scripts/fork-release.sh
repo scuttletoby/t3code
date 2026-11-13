@@ -2,20 +2,25 @@
 # The guards of fork-release.yml, one subcommand each, so they can be tested without a run
 # (fork-release.test.sh). Every refusal exits non-zero with a ::error:: line; nothing falls back.
 #
-#   resolve                 Preflight: picks base tag, version and tag for HEAD (key=value lines).
+#   resolve                 Preflight: picks base tag, version and tag for HEAD (key=value lines):
+#                           <base>-fork.N on a stable base, <base>.fork.N on a nightly one.
 #   remove-drafts TAG       Refuses a published TAG, then deletes drafts with TAG left by earlier runs.
-#   publish ID TAG VERSION  Refuses a published TAG or a published release that is not below
-#                           VERSION, then publishes draft ID as the latest release.
+#   publish ID TAG VERSION  Refuses a published TAG, a published release that is not below
+#                           VERSION, or an upstream base that is no longer released (a nightly
+#                           withdrawn during the build), then publishes draft ID as the latest release.
 #   check-bundle DIR        The server bundle DIR (apps/server/dist) outside DIR/client must name
 #                           REPOSITORY as its release repository.
 #   check-archives DIR      The `t3` program of every CLI archive in DIR must name REPOSITORY.
 #
-# Environment: REPOSITORY (owner/name of this fork; GITHUB_REPOSITORY in a run), UPSTREAM
-# (owner/name, resolve looks it up), UPSTREAM_URL (git URL of upstream, default GitHub), ORIGIN
-# (git remote or URL of this fork, default origin). Output goes to $GITHUB_OUTPUT, else stdout.
+# Environment: FORK_FOLLOW_CHANNEL (nightly or stable, default nightly: which upstream tags a base
+# may be; fork-channel.sh), REPOSITORY (owner/name of this fork; GITHUB_REPOSITORY in a run), UPSTREAM
+# (owner/name; this fork's parent when unset), UPSTREAM_URL (git URL of upstream, default GitHub),
+# ORIGIN (git remote or URL of this fork, default origin). Output goes to $GITHUB_OUTPUT, else stdout.
 set -euo pipefail
 # Refuses outside a GitHub Actions run unless a test runs it under the gh stub (fork-gh-guard.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
+# The channel, the fork's release names and version_gt.
+. "$(dirname "${BASH_SOURCE[0]}")/fork-channel.sh"
 
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:?REPOSITORY or GITHUB_REPOSITORY}}"
 ORIGIN="${ORIGIN:-origin}"
@@ -27,23 +32,11 @@ die() {
 }
 
 stable_version_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
-fork_version_re='^v?[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$'
-
-# version_gt A B: A sorts above B. Takes X.Y.Z or X.Y.Z-fork.N (leading v allowed). A fork
-# release of X.Y.Z sorts above X.Y.Z itself here, which is what this fork's ordering needs.
-version_gt() {
-  local a="${1#v}" b="${2#v}" i
-  local -a x y
-  IFS=. read -r -a x <<< "${a/-fork./.}"
-  IFS=. read -r -a y <<< "${b/-fork./.}"
-  for i in 0 1 2 3; do
-    if (( 10#${x[i]:-0} != 10#${y[i]:-0} )); then
-      (( 10#${x[i]:-0} > 10#${y[i]:-0} ))
-      return
-    fi
-  done
-  return 1
-}
+# A fork version, with or without the leading v (fork_re in fork-channel.sh).
+fork_version_re="^v?${fork_re#^v}"
+# The updaters' own rule for a release on another track (cliReleaseChannelOf): the version ends in
+# -nightly.YYYYMMDD.N or -preview.YYYYMMDD.N. A fork release of a nightly does not, so it counts.
+other_track_re='^v[^-+]+-(nightly|preview)\.[0-9]{8}\.[0-9]+$'
 
 # Prints the releases of this fork through a jq filter; a failed listing stops everything.
 releases() {
@@ -67,65 +60,113 @@ refuse_published() {
   fi
 }
 
-# The server's updater (packages/shared/src/cliRelease.ts newestCliReleaseVersion) takes the
-# newest-created non-draft release on its channel, not the highest version. So every new release
-# must be above every published one, or `t3 update` would see a downgrade and stall until a higher
-# build exists. Stable channel = any vX.Y.Z[-...] tag except -nightly./-preview. builds.
-refuse_older() {
-  local version="$1" other published
-  published="$(releases '.[] | select(.draft | not) | .tag_name')"
-  for other in $published; do
-    [[ "$other" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]] || continue
-    [[ ! "$other" =~ -(nightly|preview)\. ]] || continue
-    [[ "$other" =~ $stable_version_re || "$other" =~ $fork_version_re ]] \
-      || die "Published release $other is on the server's stable channel but has no X.Y.Z or X.Y.Z-fork.N version, so $version cannot be ordered against it; nothing was changed."
-    version_gt "$version" "$other" \
-      || die "$other is published and not below $version. The server updates to the newest-created release, so publishing $version would show every server a downgrade. Build a newer upstream release instead; to go back, install the older release with t3 update --version X --allow-downgrade. Nothing was changed."
-  done
-}
-
-cmd_resolve() {
+upstream_repo() { # prints UPSTREAM, or this fork's parent
   local upstream="${UPSTREAM:-}"
   if [[ -z "$upstream" ]]; then
     upstream="$(gh api "repos/$REPOSITORY" --jq '.parent.full_name // empty')"
     [[ -n "$upstream" ]] || die "$REPOSITORY is not a fork, so there is no upstream release to build on."
   fi
+  printf '%s\n' "$upstream"
+}
+
+# The upstream tag a fork version is built on: X.Y.Z-fork.N on vX.Y.Z, X.Y.Z-nightly.D.R.fork.N on
+# vX.Y.Z-nightly.D.R.
+fork_base_tag() { local v="v${1#v}"; if [[ "$v" == *-nightly.* ]]; then printf '%s\n' "${v%.fork.*}"; else printf '%s\n' "${v%-fork.*}"; fi; }
+
+# Only released upstream versions, checked by preflight and again right before publishing (a
+# nightly upstream withdraws during the build must not reach auto-updating installs).
+# Stable tag: never above the release upstream marks latest. Nightly tag: upstream published a
+# release of that tag itself (a nightly is a pre-release, which "latest" never names; a tag whose
+# release is missing or still a draft was not released; this fork's token cannot see another
+# repository's drafts, so a draft reads as missing).
+require_released() { # require_released UPSTREAM TAG
+  local upstream="$1" tag="$2" draft upstream_latest
+  if [[ "$tag" == *-nightly.* ]]; then
+    draft="$(gh api "repos/$upstream/releases/tags/$tag" --jq '.draft')" \
+      || die "Could not read $upstream's release of $tag (it has none, or the lookup failed). Only released upstream versions are built and published."
+    [[ "$draft" == false ]] || die "$upstream's release of $tag is not published (draft: $draft). Only released upstream versions are built and published."
+  else
+    upstream_latest="$(gh api "repos/$upstream/releases/latest" --jq '.tag_name')"
+    [[ "$upstream_latest" =~ $stable_version_re ]] \
+      || die "$upstream's latest release is '$upstream_latest', not a stable vX.Y.Z tag."
+    if version_gt "$tag" "$upstream_latest"; then
+      die "$tag sorts above $upstream's latest release $upstream_latest. Only released upstream versions are built and published."
+    fi
+  fi
+}
+
+# The server's updater (packages/shared/src/cliRelease.ts newestCliReleaseVersion) takes the
+# newest-created non-draft release on its channel, not the highest version. So every new release
+# must be above every published one, or `t3 update` would see a downgrade and stall until a higher
+# build exists. Stable channel = any vX.Y.Z[-...] tag except upstream-style nightly and preview builds.
+#
+# A higher version is not newer code for one pair: upstream names a nightly after the release it
+# leads up to, so vX.Y.Z-nightly.D.R (older than vX.Y.Z) still sorts above a published X.Y.Z-fork.N.
+# Its fork build would install older upstream code over the stable one, which may lack migrations
+# that build already ran. So a nightly build of the same X.Y.Z as a published stable fork release
+# must contain that release's upstream tag (GitHub's compare of the two upstream tags).
+refuse_older() { # refuse_older VERSION UPSTREAM
+  local version="$1" upstream="$2" other published mine status
+  mine="v${version#v}"
+  published="$(releases '.[] | select(.draft | not) | .tag_name')"
+  for other in $published; do
+    [[ "$other" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]] || continue
+    [[ ! "$other" =~ $other_track_re ]] || continue
+    [[ "$other" =~ $stable_version_re || "$other" =~ $fork_version_re ]] \
+      || die "Published release $other is on the server's stable channel but has no X.Y.Z, X.Y.Z-fork.N or X.Y.Z-nightly.D.N.fork.N version, so $version cannot be ordered against it; nothing was changed."
+    version_gt "$version" "$other" \
+      || die "$other is published and not below $version. The server updates to the newest-created release, so publishing $version would show every server a downgrade. Build a newer upstream release instead; to go back, install the older release with t3 update --version X --allow-downgrade. Nothing was changed."
+    if [[ "$mine" == *-nightly.* && "$other" != *-nightly.* && "$other" == *-fork.* \
+      && "${mine%%-*}" == "${other%%-*}" ]]; then
+      status="$(gh api "repos/$upstream/compare/$(fork_base_tag "$other")...$(fork_base_tag "$mine")" --jq '.status')" \
+        || die "Could not compare $upstream $(fork_base_tag "$other") with $(fork_base_tag "$mine"), so $version cannot be ordered against the published $other; nothing was changed."
+      [[ "$status" == ahead || "$status" == identical ]] \
+        || die "$other is published and built on $upstream $(fork_base_tag "$other"), which $(fork_base_tag "$mine") does not contain ($status). Upstream names a nightly after the release it leads up to, so $version sorts above $other but holds older upstream code; every install would update to it. Build a nightly that contains $(fork_base_tag "$other") instead. Nothing was changed."
+    fi
+  done
+}
+
+cmd_resolve() {
+  local upstream
+  upstream="$(upstream_repo)"
   local url="${UPSTREAM_URL:-https://github.com/$upstream.git}"
-  local head
+  local head channel channel_re channel_form
+  fork_channel_init || die "FORK_FOLLOW_CHANNEL is '$FORK_FOLLOW_CHANNEL'; it must be nightly or stable."
   head="$(git rev-parse HEAD)"
 
   # Read-only fetch of upstream's tags and default branch into refs this run alone uses.
-  git fetch --quiet --no-tags "$url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head"
+  git fetch --quiet --prune --no-tags "$url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head"
 
   # Lists are read into variables first: a failure inside <(...) would go unnoticed.
   local refs tag
   local -a contained=()
   refs="$(git for-each-ref --format='%(refname:strip=2)' refs/upstream-tags)"
-  for tag in $(grep -E "$stable_version_re" <<< "$refs" | sort -rV || true); do
+  refs="$({ grep -E "$channel_re" <<< "$refs" || true; } | newest_first)"
+  for tag in $refs; do
     if git merge-base --is-ancestor "refs/upstream-tags/$tag^{commit}" HEAD; then
       contained+=("$tag")
     fi
   done
-  (( ${#contained[@]} > 0 )) || die "$head contains no stable $upstream release tag."
+  (( ${#contained[@]} > 0 )) || die "$head contains no $channel $upstream release tag ($channel_form)."
   local base_tag="${contained[0]}"
   local base
   base="$(git rev-parse "refs/upstream-tags/$base_tag^{commit}")"
 
-  # The base must be the newest stable tag in the series' history, not just the highest name: a
+  # The base must be the newest tag of the channel in the series' history, not just the highest: a
   # stray tag on an old commit (say v1.0.0) would otherwise outrank every later real release.
   for tag in "${contained[@]:1}"; do
     git merge-base --is-ancestor "refs/upstream-tags/$tag^{commit}" "$base" \
-      || die "$base_tag sorts highest but is not the newest stable $upstream tag in this history ($tag is not part of it). Delete or fix the stray tag; nothing was built."
+      || die "$base_tag sorts highest but is not the newest $channel $upstream tag in this history ($tag is not part of it). Delete or fix the stray tag; nothing was built."
   done
 
-  # Upstream's own ordering: never above the release upstream marks latest.
-  local upstream_latest
-  upstream_latest="$(gh api "repos/$upstream/releases/latest" --jq '.tag_name')"
-  [[ "$upstream_latest" =~ $stable_version_re ]] \
-    || die "$upstream's latest release is '$upstream_latest', not a stable vX.Y.Z tag."
-  if version_gt "$base_tag" "$upstream_latest"; then
-    die "$base_tag sorts above $upstream's latest release $upstream_latest. Only released upstream versions are built."
+  # Nightly: upstream cuts nightlies from its default branch. A nightly-shaped tag on another
+  # branch (which the checks above accept when it is the newest one in this history) is not one.
+  if [[ "$channel" == nightly ]]; then
+    git merge-base --is-ancestor "$base" refs/upstream-head \
+      || die "$base_tag is not on $upstream's default branch, so it is not one of upstream's nightlies (or upstream rewrote that branch). Only nightlies of the default branch are built; nothing was built."
   fi
+
+  require_released "$upstream" "$base_tag"
 
   # Releases only: every commit after the base tag must be the fork's own. Upstream commits there
   # are unreleased upstream code (for example a branch that still equals upstream's default branch).
@@ -136,11 +177,13 @@ cmd_resolve() {
     die "$head holds $((total - own)) unreleased $upstream commits after $base_tag. Build a branch of $base_tag plus the fork's own commits."
   fi
 
-  local version="${base_tag#v}" last
-  last="$(git ls-remote --tags --refs "$ORIGIN" "v$version-fork.*" \
-    | sed -n "s|.*refs/tags/v$version-fork\.\([0-9]\+\)$|\1|p" | sort -n | tail -n1)"
-  version="$version-fork.$(( ${last:-0} + 1 ))"
-  refuse_older "$version"
+  local version="${base_tag#v}" sep sep_re=- last
+  sep="$(fork_sep "$base_tag")"
+  [[ "$sep" != . ]] || sep_re='\.'
+  last="$(git ls-remote --tags --refs "$ORIGIN" "v${version}${sep}fork.*" \
+    | sed -n "s|.*refs/tags/v${version//./\\.}${sep_re}fork\.\([0-9]\+\)$|\1|p" | sort -n | tail -n1)"
+  version="${version}${sep}fork.$(( ${last:-0} + 1 ))"
+  refuse_older "$version" "$upstream"
   {
     echo "ref=$head"
     echo "upstream=$upstream"
@@ -168,9 +211,14 @@ cmd_publish() {
   local id="${1:?release id}" tag="${2:?tag}" version="${3:?version}"
   [[ "$version" =~ $fork_version_re ]] || die "'$version' is not a fork version."
   refuse_published "$tag"
+  local upstream
+  upstream="$(upstream_repo)"
   # Checked again here: a release published since preflight must not end up above this one. After
   # this check VERSION is the highest release, so the server and the desktop updater agree on it.
-  refuse_older "$version"
+  refuse_older "$version" "$upstream"
+  # And upstream must still have released the base: a nightly withdrawn during the build (release
+  # deleted or set back to draft) is not published to auto-updating installs.
+  require_released "$upstream" "$(fork_base_tag "$version")"
   gh api -X PATCH "repos/$REPOSITORY/releases/$id" -F draft=false -f make_latest=true > /dev/null
   echo "Published $tag (latest: true)."
   {

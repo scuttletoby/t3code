@@ -1,10 +1,19 @@
 name: Fork follow upstream
 
-# Daily: keeps this fork's patch series on upstream's newest stable release and publishes it.
+# Daily: keeps this fork's patch series on upstream's newest tag of one channel and publishes it.
+# The channel is the variable FORK_FOLLOW_CHANNEL: nightly (the default; tags
+# vX.Y.Z-nightly.YYYYMMDD.N, released as <tag>.fork.<n>) or stable (vX.Y.Z, released as
+# <tag>-fork.<n>); .github/scripts/fork-channel.sh. Upstream cuts several nightlies a day: a run
+# takes the newest by version (every nightly contains the ones before it), so once a day costs one
+# rebase, test and build however many nightlies there were; start a run by hand for one sooner.
+# Nightly also starts from a series on an untagged commit of upstream's default branch: it is
+# rebased onto the newest nightly that contains that commit. Switching nightly -> stable is by
+# hand (rebase onto a stable tag that contains the series' nightly), and the first stable release
+# must be on a newer X.Y.Z than the last nightly one, or the release refuses it as a downgrade.
 # The plan (.github/scripts/fork-follow.sh) picks one action:
 # - none: the series head is already the newest fork release of its base.
 # - release: same base, but the series has commits no fork release has: test, build and publish.
-# - rebase: upstream has a newer stable tag: rebase the series onto it, test, build, publish, then
+# - rebase: upstream has a newer tag: rebase the series onto it, test, build, publish, then
 #   move the series branch to the released commit (the old series is kept as a tag).
 # - advance: a published fork release already has the rebased files (an earlier run published it,
 #   then could not move the branch): move the series branch to it, build nothing.
@@ -17,10 +26,11 @@ name: Fork follow upstream
 # A missing or malformed list, and a new upstream workflow that someone outside the fork can start
 # (pull_request_target, workflow_run, issues ...; fork-follow.sh) and the list does not name, stop it.
 # A conflict, merge commits in the series, a schema change, upstream commits inside the series, a
-# moved or deleted upstream tag, a red test, a failed build or push: the run fails, and the Report
-# job's summary says why and what the repository holds now (branch heads, release tags, drafts), as
-# read back from it. With Issues enabled it also opens or updates one issue, and closes it again
-# on the next good run.
+# moved or deleted upstream tag, a newest nightly that does not contain the series' base (moved
+# backwards, or the series sits past it), a red test, a failed build or push: the run fails, and
+# the Report job's summary says why and what the repository holds now (branch heads, release
+# tags, drafts), as read back from it. With Issues enabled it also opens or updates one issue, and
+# closes it again on the next good run.
 #
 # Upstream's workflows stay off: after each push, before the series branch moves, and at the end,
 # fork-workflows.sh disables every active workflow the series did not add (a fork-*.yml is always the
@@ -33,7 +43,8 @@ name: Fork follow upstream
 # A re-run of failed jobs (or of one job) keeps the Guard job's earlier result, so the jobs with
 # the token are skipped unless the guard passed in this attempt: use "Re-run all jobs".
 #
-# Settings: variable FORK_SERIES_BRANCH (default main). Secret FORK_PUSH_TOKEN, only in the
+# Settings: variables FORK_SERIES_BRANCH (default main) and FORK_FOLLOW_CHANNEL (nightly or stable,
+# default nightly; fork-release.yml reads the same one). Secret FORK_PUSH_TOKEN, only in the
 # Environment fork-push, whose deployment branches are "Selected branches and tags" with the one
 # rule: branch <series branch>. A repository secret could be read by a workflow file on any pushed
 # branch, and an Environment without that rule hands its secret to any branch. The Guard job checks
@@ -206,6 +217,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_SHA: ${{ github.sha }}
+          FORK_FOLLOW_CHANNEL: ${{ vars.FORK_FOLLOW_CHANNEL || 'nightly' }}
           REPORT: ${{ runner.temp }}/reports/plan.md
         run: |
           set -euo pipefail
