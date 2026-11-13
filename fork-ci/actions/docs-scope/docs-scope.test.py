@@ -201,7 +201,8 @@ class BuildAndTestInputs(Repo):
 
 class RegistryAtTheBase(Repo):
     """A pull request cannot free a file by deleting its entry: the base's entries count. Here the registry change
-    itself does not decide (it is docs, or a job's own path), so only the base read can."""
+    itself does not decide (it is docs, or a job's own path), so only the registry read can (an entry the PR adds
+    counts too: never_docs_from is read at the head as well)."""
     config = {'docs': ['**'], 'never_docs_from': CONFIG['never_docs_from'],
               'jobs': {'plugins': {'paths': ['plugins/**', 'tools/**']}, 'engine': CONFIG['jobs']['engine']}}
 
@@ -217,6 +218,14 @@ class RegistryAtTheBase(Repo):
     def test_a_pr_that_drops_a_jobs_entry_still_runs_the_job(self):
         self.pr({REGISTRY_PATH: self.drop('content-locale'), 'plugins/locale/common/src/main/java/Wire.java': 'x'})
         self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'true'})
+
+    def test_a_pr_that_adds_a_never_docs_entry_counts_it_at_the_head(self):   # never_docs_from read at both sides
+        self.pr({REGISTRY_PATH: json.dumps({'modules': REGISTRY['modules'] + [{'id': 'manual',
+                                                                                'inputs': ['docs/manual.md']}]}),
+                 'docs/manual.md': 'y'})
+        docs, jobs, out = self.scope()
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)
+        self.assertIn('manual inputs: docs/manual.md', out)
 
 
 class RegistryAtTheHead(Repo):
