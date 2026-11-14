@@ -12,20 +12,23 @@ A check run belongs to a commit, not to a pull request: the newest one of the na
 request with that head. So the gate judges a head, never one pull request alone: every open, ready pull request into
 the default branch whose head it is must pass (the strictest verdict wins), and a draft or a pull request into any
 other branch is never judged: a head only such pull requests have gets a failure. Runs for one head wait for each other
-(concurrency per head), and each one reads every such pull request again.
+(concurrency per head and check name), and each one reads every such pull request again.
 
 One subcommand per workflow step. Every one reads GitHub with gh and the job's own token, except start and finish,
 which get the App token and make the writes. Every read tries again on a 5xx or a rate limit (READ_TRIES in all).
 Every way a run can end leaves the head "not passed" unless it judged and passed: a run that cannot judge posts a
 failure. A run posts nothing only when it cannot post at all (README.md, "Stops before start", lists every case):
-GitHub does not take the first write (start), no token can be made (no key, no App, no Environment), the head is
-unknown (on an event that does not carry it, the pull request read fails every try and so does git's
-refs/pull/N/head), the backfill cannot list the open pull requests, or the run never reaches start.
+GitHub does not take the first write (start), no token can be made (no key, no App, no Environment), the guard job
+cannot read the Environment (it may not exist; when REST says 5xx or a rate limit every try, GraphQL, with its own
+rate limit, may still show it exists), the head is unknown (on an event that does not carry it, the pull
+request read fails every try and so does git's refs/pull/N/head), the backfill cannot list the open pull requests, a
+step before start fails, or the run never reaches start.
   guard   GITHUB_OUTPUT guard=ok when the key can only be the Environment's: no repository or organisation secret of
           its name (REPO_SECRET_PRESENT=true|false: the workflow passes only whether one is set), the Environment
           exists, and its deployment branches are exactly one rule, the default branch. Else exit 1 and guard=fail
           (the gate posts only failures: a failure never passes, whoever could reach the key), or no output when the
-          Environment does not exist (no key; a job that named it would create it, open to every branch).
+          Environment does not exist or was not seen to exist (REST, then GraphQL after a 5xx or a rate limit; a
+          job that named a missing one would create it, open to every branch).
           --environment-only: the Environment part alone, for the gate job right before the token is made.
   prs     the heads to judge, as a JSON list of {pr, sha} for the matrix (GITHUB_OUTPUT prs=...): the head of the
           event's pull request unless it is merged (a draft's, another base's or a closed one's too: each gets a
@@ -139,7 +142,8 @@ def refuse(out, env, first, *more):
 def guard(repo, environment, secret_name, secret_present, environment_only, gh, out, env):
     """0 and guard=ok when the key can only come from the Environment (see the module's doc). Else 1 with every step
     to fix it, and guard=fail: the gate then posts only failures, which never pass whoever could reach the key. No
-    output at all when the Environment does not exist: there is no key, and a job that named it would create it."""
+    output at all when the Environment does not exist or was not read (guard job only): there may be no key, and a
+    job that named a missing Environment would create it, open to every branch."""
     settings = f'Settings > Environments > {environment} > Deployment branches and tags'
     problem = None
     if not environment_only:
@@ -168,6 +172,14 @@ def guard(repo, environment, secret_name, secret_present, environment_only, gh, 
                       f'branches and tags {one_rule}. Then add the variable HEAD_GATE_APP_ID and the secret '
                       f'{secret_name} there.')
     if not isinstance(found, dict):
+        # Never seen to exist: a gate job that named it could create it, open to all. GraphQL has its own rate limit,
+        # so a spent REST limit alone does not stop the gate from posting failures on an Environment that exists.
+        if not environment_only and not (transient_why(why) and environment_exists_by_graphql(repo, environment, gh)):
+            return refuse(out, env, *(problem or ()), f'Could not read the Environment {environment} ({why}), so '
+                          'the gate job does not start and nothing is posted: a job that named an Environment that '
+                          'does not exist would make GitHub create it, open to every branch.', 'An older check run on '
+                          'the head stays until a later run can read it: post an issue comment on the pull request '
+                          'or dispatch the gate again (the job token\'s rate limit resets each hour).')
         problem = problem or (f'Could not read the Environment {environment}: {why}',)
     elif not problem:
         problem = environment_problem(repo, environment, found.get('deployment_branch_policy'), branch, settings,
@@ -180,6 +192,26 @@ def guard(repo, environment, secret_name, secret_present, environment_only, gh, 
                                                         if environment_only else f', and {secret_name} is no repository '
                                                         'or organisation secret.'))
     return 0
+
+
+def transient_why(why):
+    return bool(why and TRANSIENT.search(why))
+
+
+ENVIRONMENT_QUERY = ('query($owner: String!, $name: String!, $environment: String!) '
+                     '{ repository(owner: $owner, name: $name) { environment(name: $environment) { name } } }')
+
+
+def environment_exists_by_graphql(repo, environment, gh):
+    """True only when GitHub's GraphQL API names the Environment (it exists); anything else is False."""
+    owner, _, name = repo.partition('/')
+    r = read(gh, 'graphql', '-f', f'query={ENVIRONMENT_QUERY}', '-f', f'owner={owner}', '-f', f'name={name}',
+             '-f', f'environment={environment}')
+    try:
+        found = ((json.loads(r.stdout).get('data') or {}).get('repository') or {}).get('environment') or {}
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return isinstance(found, dict) and found.get('name') == environment
 
 
 def environment_problem(repo, environment, policy, branch, settings, one_rule, gh):

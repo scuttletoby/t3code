@@ -38,6 +38,12 @@ def not_found():
     return answer(1, '', 'gh: Not Found (HTTP 404)')
 
 
+GRAPHQL_FOUND = {'data': {'repository': {'environment': {'name': ENV_NAME}}}}
+GRAPHQL_MISSING = answer(1, json.dumps({'data': {'repository': {'environment': None}}, 'errors': [
+    {'type': 'NOT_FOUND', 'message': 'Could not resolve to an Environment with the name head-gate.'}]}),
+    'gh: Could not resolve to an Environment with the name head-gate.')
+
+
 class Seq(list):
     """A route that answers in turn: each call takes the next answer, the last one stays."""
 
@@ -51,6 +57,10 @@ class Api:
 
     def __call__(self, *a, stdin=None):
         self.calls.append((a, stdin))
+        if a[:2] == ('api', 'graphql') and 'graphql' in self.routes:   # the guard's Environment query
+            assert a[2:] == ('-f', f'query={G.ENVIRONMENT_QUERY}', '-f', f'owner={REPO.split("/")[0]}', '-f',
+                             f'name={REPO.split("/")[1]}', '-f', f'environment={ENV_NAME}'), a
+            a = ('api', 'graphql')
         if a[0] == 'api' and len(a) == 2 and a[1] in self.routes:
             v = self.routes[a[1]]
             if isinstance(v, Seq):
@@ -90,7 +100,7 @@ class Files:
 class Guard(Files, unittest.TestCase):
     ENV_PATH = f'repos/{REPO}/environments/{ENV_NAME}'
 
-    def routes(self, policy='default', rules='default', env=None, repo=None):
+    def routes(self, policy='default', rules='default', env=None, repo=None, graphql=None):
         if policy == 'default':
             policy = {'protected_branches': False, 'custom_branch_policies': True}
         if rules == 'default':
@@ -99,7 +109,9 @@ class Guard(Files, unittest.TestCase):
                 self.ENV_PATH: {'name': ENV_NAME, 'deployment_branch_policy': policy} if env is None else env,
                 self.ENV_PATH + '/deployment-branch-policies?per_page=100':
                     rules if isinstance(rules, types.SimpleNamespace) else
-                    {'total_count': len(rules), 'branch_policies': rules}}
+                    {'total_count': len(rules), 'branch_policies': rules},
+                # GraphQL names the Environment when the REST answer is one; any other env: a missing one, unless given
+                'graphql': graphql if graphql is not None else GRAPHQL_FOUND if env is None else GRAPHQL_MISSING}
 
     def guard(self, secret='false', environment_only=False, **kw):
         gh, out = Api(self.routes(**kw)), []
@@ -183,14 +195,42 @@ class Guard(Files, unittest.TestCase):
         self.assertEqual(code, 1, out)
 
     def test_unreadable_answers_are_refused(self):   # unknown never judges: the gate posts only failures
-        for kw in ({'repo': {}}, {'repo': answer(1, '', 'HTTP 502')}, {'env': answer(1, '', 'HTTP 502')},
-                   {'rules': answer(1, '', 'HTTP 403')}, {'rules': answer(0, 'not json')},
-                   {'env': answer(1, '', 'gh: API rate limit exceeded (HTTP 403)')}):
+        for kw in ({'repo': {}}, {'repo': answer(1, '', 'HTTP 502')}, {'rules': answer(1, '', 'HTTP 403')},
+                   {'rules': answer(0, 'not json')}):
             with self.subTest(kw=str(kw)[:60]):
                 code, out, _ = self.guard(**kw)
                 self.assertEqual((code, self.outputs()), (1, {'guard': 'fail'}), out)
                 os.remove(self.env['GITHUB_OUTPUT'])
                 self.assertIn('::error::head gate:', out)
+
+    def test_an_environment_the_guard_job_cannot_read_is_never_named_by_the_gate_job(self):   # sec85r2 n1
+        # It may not exist yet (before setup), and a job that named it would make GitHub create it, open to every
+        # branch. A commenter can spend the job token's rate limit, so this must not depend on the error.
+        for env in (answer(1, '', 'gh: Server Error (HTTP 502)'), answer(1, '', 'gh: API rate limit exceeded (HTTP 403)'),
+                    answer(1, '', 'HTTP 401'), answer(0, 'not json'), answer(0, '[]')):
+            for secret in ('false', 'true'):
+                for graphql in (GRAPHQL_MISSING, answer(1, '', 'gh: API rate limit exceeded (HTTP 403)'),
+                                answer(0, 'not json'), {'data': {'repository': {'environment': {'name': 'other'}}}}):
+                    with self.subTest(env=env.stderr or env.stdout, secret=secret, graphql=str(graphql)[:50]):
+                        code, out, _ = self.guard(env=env, secret=secret, graphql=graphql)
+                        self.assertEqual((code, self.file('output')), (1, None), out)
+                        self.assertIn('the gate job does not start and nothing is posted', out)
+
+    def test_graphql_that_names_the_environment_after_a_spent_rest_limit_lets_the_gate_post_failures(self):
+        # sec85r R1 kept closed with n1: comment spam spends the job token's REST limit; GraphQL has its own.
+        for env in (answer(1, '', 'gh: API rate limit exceeded (HTTP 403)'), answer(1, '', 'gh: Server Error (HTTP 502)')):
+            with self.subTest(env=env.stderr):
+                code, out, gh = self.guard(env=env, graphql=GRAPHQL_FOUND)
+                self.assertEqual((code, self.outputs()), (1, {'guard': 'fail'}), out)   # never ok: not read
+                self.assertIn('graphql', gh.paths())
+                os.remove(self.env['GITHUB_OUTPUT'])
+        code, out, gh = self.guard(env=answer(1, '', 'HTTP 401'), graphql=GRAPHQL_FOUND)   # not 5xx/rate: no GraphQL
+        self.assertEqual((code, self.file('output'), 'graphql' in gh.paths()), (1, None, False), out)
+        for env in (answer(1, '', 'gh: Server Error (HTTP 502)'), answer(0, 'not json')):   # the gate job: it exists
+            with self.subTest(env=env.stderr or env.stdout, environment_only=True):
+                code, out, _ = self.guard(env=env, environment_only=True)
+                self.assertEqual((code, self.outputs()), (1, {'guard': 'fail'}), out)
+                os.remove(self.env['GITHUB_OUTPUT'])
 
     def test_a_5xx_or_a_rate_limit_is_read_again(self):   # round 2: one API error no longer decides the run
         routes = self.routes()
@@ -209,7 +249,7 @@ class Guard(Files, unittest.TestCase):
                            ('gh: Resource not accessible by integration (HTTP 403)', 1), ('HTTP 401', 1)):
             with self.subTest(err=err):
                 gh = Api(self.routes(env=answer(1, '', err)))
-                code = G.guard(REPO, ENV_NAME, KEY, 'false', False, gh, lambda *_: None, self.env)
+                code = G.guard(REPO, ENV_NAME, KEY, 'false', True, gh, lambda *_: None, self.env)
                 self.assertEqual((code, self.outputs(), gh.paths().count(self.ENV_PATH)), (1, {'guard': 'fail'}, calls))
                 os.remove(self.env['GITHUB_OUTPUT'])
 
@@ -921,8 +961,8 @@ class Workflow(Files, unittest.TestCase):
     H, TIP, OLD = 'a1' * 20, 'e5' * 20, 'd4' * 20
     ENV_PATH = Guard.ENV_PATH
 
-    def routes(self, pull=None, env=None, tip=None, caller_sha=None, **kw):
-        routes = {**Guard.routes(self, env=env), **run_routes(tip or self.TIP, caller_sha, **kw)}
+    def routes(self, pull=None, env=None, tip=None, caller_sha=None, graphql=None, **kw):
+        routes = {**Guard.routes(self, env=env, graphql=graphql), **run_routes(tip or self.TIP, caller_sha, **kw)}
         routes[f'repos/{REPO}/pulls/7'] = pull or {'state': 'open', 'draft': False, 'merged': False,
                                                    'head': {'sha': self.H}, 'base': {'ref': 'main'}}
         return routes
@@ -996,10 +1036,17 @@ class Workflow(Files, unittest.TestCase):
                 self.assertEqual((newest, did), ('failure', ['failure']), out)
 
     def test_a_guard_that_cannot_prove_the_key_still_posts_a_failure(self):   # sec85r R1: rate limited every try
-        for env in (answer(1, '', 'gh: API rate limit exceeded (HTTP 403)'),
-                    {'name': ENV_NAME, 'deployment_branch_policy': None}):
-            with self.subTest(env=str(env)[:40]):
-                newest, did, out = self.revoke(self.routes(env=env))
+        rules = self.ENV_PATH + '/deployment-branch-policies?per_page=100'
+        rate = answer(1, '', 'gh: API rate limit exceeded (HTTP 403)')
+        for name, routes in (('any branch may deploy', self.routes(env={'name': ENV_NAME,
+                                                                         'deployment_branch_policy': None})),
+                             ('the rules rate limited', {**self.routes(), rules: rate}),
+                             ('every read but the Environment rate limited',   # it was read: a failure is posted
+                              {**{k: rate for k in self.routes()}, self.ENV_PATH: self.routes()[self.ENV_PATH]}),
+                             ('every REST read rate limited, GraphQL shows the Environment',   # its own limit
+                              {**{k: rate for k in self.routes()}, 'graphql': self.routes()['graphql']})):
+            with self.subTest(name):
+                newest, did, out = self.revoke(routes, git_head=lambda *a: (self.H, None))
                 self.assertEqual(newest, 'failure', out)
                 self.assertIn('the guard did not pass', out)
         newest, did, out = self.revoke(self.routes(), secret='true')   # a repository secret appeared
@@ -1043,6 +1090,10 @@ class Workflow(Files, unittest.TestCase):
     def test_the_cases_that_post_nothing_are_only_those_that_cannot(self):   # the README's list, exactly
         newest, did, out = self.revoke(self.routes(env=not_found()))   # no Environment: no key, no token
         self.assertEqual((newest, did), ('success', ['guard job failed']), out)
+        rate = answer(1, '', 'gh: API rate limit exceeded (HTTP 403)')   # the Environment never seen (sec85r2 n1)
+        for graphql in (rate, GRAPHQL_MISSING):
+            newest, did, out = self.revoke(self.routes(env=rate, graphql=graphql), git_head=lambda *a: (self.H, None))
+            self.assertEqual((newest, did), ('success', ['guard job failed']), out)
         down = Seq([answer(1, '', 'gh: Server Error (HTTP 502)')])   # GitHub's API and git both down
         newest, did, out = self.revoke(self.routes(pull=down), git_head=lambda *a: (None, 'git ls-remote: down'))
         self.assertEqual((newest, did), ('success', ['guard job failed']), out)
