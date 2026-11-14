@@ -30,8 +30,8 @@ export const UsageReading = Schema.Struct({
   windows: Schema.Array(ServerProviderUsageWindow),
   /**
    * Limits UI account as hashed `<base>` or `<base>.<workspace>`; a failed probe keeps the last
-   * known one (`resolveAccount`). Absent = never identified. Swap = a change between two present
-   * values, except `<base>` -> `<base>.<workspace>` (the workspace became known).
+   * known one (`resolveAccount`). Absent = never identified. Swap: see `isAccountSwap`; a change
+   * between `<base>` and `<base>.<workspace>` of one base, or to or from a borrowed one, is none.
    */
   account: Schema.optional(TrimmedNonEmptyString),
   /**
@@ -40,6 +40,12 @@ export const UsageReading = Schema.Struct({
    */
   borrowed: Schema.optional(Schema.Literal(true)),
   unavailable: Schema.optional(Schema.Literals(["unsupported", "probeFailed"])),
+  /**
+   * A full read: a provider check brought these limits (both its stamp and the usage stamp
+   * moved since the snapshot before), so every window in it was read now. A streamed update
+   * moves one window and carries the others' old values; it is never full. Absent = not known.
+   */
+  full: Schema.optional(Schema.Literal(true)),
 });
 export type UsageReading = typeof UsageReading.Type;
 
@@ -108,6 +114,24 @@ export function accountOf(provider: ServerProvider): string | undefined {
 const baseOf = (account: string) => account.split(".")[0];
 const hasWorkspace = (account: string) => account.includes(".");
 
+/**
+ * Whether two readings of one instance belong to different accounts, so a meter series must not
+ * run across them. Knowing less (no account, no workspace, a borrowed workspace) is no swap.
+ */
+export function isAccountSwap(
+  previous: Pick<UsageReading, "account" | "borrowed">,
+  next: Pick<UsageReading, "account" | "borrowed">,
+): boolean {
+  if (previous.account === undefined || next.account === undefined) return false;
+  if (baseOf(previous.account) !== baseOf(next.account)) return true;
+  if (previous.borrowed === true || next.borrowed === true) return false;
+  return (
+    hasWorkspace(previous.account) &&
+    hasWorkspace(next.account) &&
+    previous.account !== next.account
+  );
+}
+
 interface ResolvedAccount {
   readonly account: string | undefined;
   readonly borrowed: boolean;
@@ -137,7 +161,34 @@ function resolveAccount(
     : { account: own, borrowed: false };
 }
 
-function readingOf(provider: ServerProvider, resolved: ResolvedAccount): UsageReading | undefined {
+/** The stamps of the last snapshot of an instance seen by this process. */
+interface SeenStamps {
+  readonly provider: string;
+  readonly usage: string | undefined;
+}
+
+/**
+ * Whether a snapshot's limits are a full read: a provider check ran (its stamp moved) and its
+ * limits were taken (the usage stamp moved too). A streamed update moves only the usage stamp; a
+ * check that kept the published limits moves only the provider stamp. The first snapshot after
+ * start has nothing to compare with, so it is not known to be full.
+ */
+function isFullRead(provider: ServerProvider, seen: SeenStamps | undefined): boolean {
+  const limits = provider.usageLimits;
+  return (
+    seen !== undefined &&
+    limits !== undefined &&
+    limits.unavailable === undefined &&
+    provider.checkedAt !== seen.provider &&
+    limits.checkedAt !== seen.usage
+  );
+}
+
+function readingOf(
+  provider: ServerProvider,
+  resolved: ResolvedAccount,
+  full: boolean,
+): UsageReading | undefined {
   const limits = provider.usageLimits;
   if (limits === undefined) return undefined;
   return {
@@ -146,6 +197,7 @@ function readingOf(provider: ServerProvider, resolved: ResolvedAccount): UsageRe
     ...(resolved.account === undefined ? {} : { account: resolved.account }),
     ...(resolved.account !== undefined && resolved.borrowed ? { borrowed: true as const } : {}),
     ...(limits.unavailable === undefined ? {} : { unavailable: limits.unavailable.reason }),
+    ...(full ? { full: true as const } : {}),
   };
 }
 
@@ -184,6 +236,8 @@ export function shouldRecord(
   previous: UsageReading | undefined,
   next: UsageReading,
   heartbeatMs: number = DEFAULT_HEARTBEAT_MS,
+  /** The previous reading is known to be partial (a streamed update or a failed read). */
+  previousPartial: boolean = false,
 ): boolean {
   if (previous === undefined) return true;
   const previousMs = msOf(previous);
@@ -191,6 +245,9 @@ export function shouldRecord(
   // A republished or older snapshot (cache hydration, out-of-order events) is never history.
   if (!(nextMs > previousMs)) return false;
   return (
+    // A full read after a partial one confirms the windows the partial one only carried, also
+    // those that did not move (part 3 paces on it). Full after full adds only time: the heartbeat.
+    (next.full === true && previousPartial) ||
     structureChanged(previous, next) ||
     windowsChanged(previous, next, METER_STEP) ||
     nextMs - previousMs >= heartbeatMs
@@ -349,6 +406,10 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
   const lock = yield* Semaphore.make(1);
   /** Loaded histories, in append order. An instance is absent until its file was read. */
   const histories = new Map<ProviderInstanceId, Array<HistoryReading>>();
+  /** Per instance, the stamps of the last snapshot `record` saw, to tell full reads apart. */
+  const seenStamps = new Map<ProviderInstanceId, SeenStamps>();
+  /** Instances whose last recorded reading is known partial (seen after start, not full). */
+  const partialRecorded = new Set<ProviderInstanceId>();
   /** Instances whose file is known to end with a newline, so an append needs none first. */
   const cleanEnd = new Set<ProviderInstanceId>();
   const appendsSinceCompaction = new Map<ProviderInstanceId, number>();
@@ -520,19 +581,27 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
         providers,
         (provider) =>
           Effect.gen(function* () {
-            if (provider.usageLimits === undefined) return;
             const instanceId = provider.instanceId;
+            const seen = seenStamps.get(instanceId);
+            const full = isFullRead(provider, seen);
+            seenStamps.set(instanceId, {
+              provider: provider.checkedAt,
+              usage: provider.usageLimits?.checkedAt,
+            });
+            if (provider.usageLimits === undefined) return;
             const history = yield* load(instanceId);
             const lastKnown = history.findLast(
               (entry) => entry.account !== undefined && entry.borrowed !== true,
             )?.account;
             const resolved = resolveAccount(accountOf(provider), lastKnown, snapshotAccounts);
-            const reading = readingOf(provider, resolved);
+            const reading = readingOf(provider, resolved, full);
             if (reading === undefined) return;
             // Compared with the last reading the clock has reached: a reading stamped ahead of it
             // (the clock stepped back) must not block recording. It stays; a segment starts here.
             const nowMs = yield* Clock.currentTimeMillis;
-            if (!shouldRecord(history.findLast(notAhead(nowMs)), reading, heartbeatMs)) return;
+            const previous = history.findLast(notAhead(nowMs));
+            const previousPartial = partialRecorded.has(instanceId);
+            if (!shouldRecord(previous, reading, heartbeatMs, previousPartial)) return;
             yield* fs.makeDirectory(options.directory, { recursive: true });
             // A torn last line (crash or partial write) must not swallow this reading.
             const separator = cleanEnd.has(instanceId) ? "" : "\n";
@@ -543,6 +612,8 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
             cleanEnd.add(instanceId);
             yield* recovered(instanceId);
             history.push({ ...reading, segment: segmentAfter(history.at(-1), reading) });
+            if (seen !== undefined && !full) partialRecorded.add(instanceId);
+            else partialRecorded.delete(instanceId);
             newestMs = Math.max(newestMs, msOf(reading));
             const appends = (appendsSinceCompaction.get(instanceId) ?? 0) + 1;
             appendsSinceCompaction.set(instanceId, appends);
@@ -599,6 +670,8 @@ export const layer = Layer.effect(
     const path = yield* Path.Path;
     const registry = yield* ProviderRegistry;
     const history = yield* make({ directory: path.join(config.stateDir, HISTORY_DIRECTORY) });
+    // Known gap (low impact): a snapshot published between `getProviders` and the subscription is
+    // not seen, so a later probe may count as full once; the next read corrects it.
     yield* forkParked(
       history.compact.pipe(
         Effect.andThen(registry.getProviders),
