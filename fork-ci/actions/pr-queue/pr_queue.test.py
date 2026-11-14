@@ -1366,6 +1366,8 @@ class StuckUpToDate(unittest.TestCase):
             if a[:2] == ('run', 'list'):
                 self.asked.append(a[a.index('--commit') + 1])
                 return failed('boom') if runs_fail else ok(runs)
+            if a[0] == 'api' and '/check-runs?' in a[1] and self.q.cfg.head_check_app:   # the gate App's: none
+                return ok('{"total_count": 0, "check_runs": []}')
             raise AssertionError(a)
         self.q.gh = gh
         self.q.update = lambda n, d: self.updated.append(n) or 0
@@ -1431,6 +1433,19 @@ class StuckUpToDate(unittest.TestCase):
         code, out = self.sweep(self.checks(test=None), runs='[{"status": "completed", "workflowName": "ci"}]')
         self.assertEqual((self.asked, self.updated, len(self.posted)), ([self.H1], [2], 1), out)
         self.assertIn('required check test never reported', self.posted[0])
+
+    def test_a_missing_gate_check_is_told_the_gate_posts_it(self):   # PR #85 corr note: the gate is queued
+        # The head gate's runs belong to the default branch, so none lists on the head: while the gate waits (for an
+        # earlier run on the head, or a runner) every workflow of the head has ended and the check is missing. Push
+        # again is the wrong advice: the gate App posts it, and a dispatch starts it.
+        self.q.cfg = config.parse(json.dumps({**CFG_RAW, 'head_check_app': 4242}))
+        self.sweep(self.checks(review_check=None), runs='[{"status": "completed", "workflowName": "ci"}]')
+        told = self.posted[0]
+        self.assertIn('required check review-check not posted by the gate App yet', told)
+        self.assertIn('dispatch the gate', told)
+        self.assertNotIn('Push again', told)
+        self.sweep(self.checks(test=None, review_check=None), runs='[{"status": "completed", "workflowName": "ci"}]')
+        self.assertIn('required check test never reported', self.posted[0], 'a workflow check missing too: as before')
 
     def test_a_check_that_never_reported_is_not_told_to_re_run(self):   # the source told it to re-run
         # A re-run repeats the jobs of the workflow files the head was built with: a check added to the workflows
@@ -2598,6 +2613,122 @@ class Cli(unittest.TestCase):
         os.remove(self.config)
         self.refused('GitHub-hosted', 'is not owner/name', 'not an absolute path', 'cannot read it', 'git 2.38',
                      repo='x', state='p', env={'RUNNER_ENVIRONMENT': 'github-hosted'}, git='git 2.38 or newer')
+
+
+class GateApp(unittest.TestCase):
+    """head_check_app: the head gate's App alone posts head_check. GitHub's rollup names no App, so a job of any
+    workflow (a pull request can add one) or a commit status of that name would count by name; with the key the queue
+    reads that check by app id instead and drops every other item of the name (../head-check/README.md, "The gate")."""
+    APP, H1, H2 = 4242, 'd1' * 20, 'd2' * 20
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix='pr-queue-gate-app-')
+        self.addCleanup(shutil.rmtree, d, True)
+        self.q = make_queue(d, config.parse(json.dumps({**CFG_RAW, 'head_check_app': self.APP})))
+
+    @staticmethod
+    def run_of(name='review-check', conclusion='SUCCESS', typename='CheckRun'):
+        if typename == 'StatusContext':
+            return {'__typename': typename, 'context': name, 'state': conclusion}
+        return {'__typename': typename, 'workflowName': 'ci', 'name': name, 'startedAt': '2026-11-14T01:00:00Z',
+                'status': 'COMPLETED', 'conclusion': conclusion}
+
+    def app_run(self, conclusion='success', app=None, status='completed'):
+        return {'name': 'review-check', 'status': status, 'conclusion': conclusion,
+                'started_at': '2026-11-14T00:00:00Z', 'app': {'id': self.APP if app is None else app}}
+
+    def sweep(self, forged, runs=None, api_fails=False, cfg=None):
+        """#1 (oldest) BEHIND: build and test green, plus `forged` (items named review-check from anyone); the gate
+        App's runs of review-check on its head are `runs`. #2 BEHIND, all green, read the same way."""
+        if cfg is not None:
+            self.q.cfg = cfg
+        self.updated, self.asked = [], []
+        green = [self.run_of('build'), self.run_of('test')]
+        listed = [{'number': n, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1}, 'mergeStateStatus': 'BEHIND',
+                   'createdAt': f'2026-11-07T00:00:0{n}Z', 'statusCheckRollup': green + rollup, 'headRefOid': head,
+                   'baseRefName': 'main'} for n, head, rollup in ((1, self.H1, forged), (2, self.H2, []))]
+
+        def gh(*a):
+            if a[:2] == ('pr', 'list'):
+                return ok(json.dumps(listed))
+            if a[:2] == ('pr', 'view'):
+                return ok(json.dumps({'headRefOid': self.H1, 'comments': []}))
+            if a[:2] == ('pr', 'comment'):
+                return ok()
+            if a[0] == 'api' and '/check-runs?' in a[1]:
+                self.asked.append(a[1])
+                if api_fails or (runs is None and self.H1 in a[1]):
+                    return failed('HTTP 502')
+                if runs == 'odd' and self.H1 in a[1]:
+                    return ok('{"check_runs": "x"}')
+                mine = runs if self.H1 in a[1] else [self.app_run()]
+                return ok(json.dumps({'total_count': len(mine), 'check_runs': mine}))
+            raise AssertionError(a)
+        self.q.gh = gh
+        self.q.update = lambda n, d: self.updated.append(n) or 0
+        return run_quiet(self.q.run, False)
+
+    def test_a_green_check_of_the_name_from_a_workflow_does_not_pass_it(self):   # the forged check
+        for forged in ([self.run_of()], [self.run_of(conclusion='SUCCESS', typename='StatusContext')]):
+            with self.subTest(forged=forged[0]['__typename']):
+                code, out = self.sweep(forged, runs=[self.app_run('failure')])
+                self.assertEqual((code, self.updated), (0, [2]), out)
+                self.assertIn('skip #1: required check review-check failed', out)
+        code, out = self.sweep([self.run_of()], runs=[self.app_run('failure')], cfg=CFG)
+        self.assertEqual((self.updated, self.asked), ([1], []), 'without the key the name alone counts, as before')
+
+    def test_a_red_check_of_the_name_from_a_workflow_does_not_fail_it(self):   # only the App's run decides
+        code, out = self.sweep([self.run_of(conclusion='FAILURE')], runs=[self.app_run('success')])
+        self.assertEqual((code, self.updated), (0, [1]), out)
+
+    def test_the_check_is_read_by_app_id_newest_only_on_the_head(self):
+        self.sweep([], runs=[self.app_run()])
+        self.assertIn(f'repos/{REPO}/commits/{self.H1}/check-runs?check_name=review-check&app_id={self.APP}'
+                      '&filter=latest&per_page=100', self.asked)
+
+    def test_a_run_of_another_app_in_the_answer_is_dropped(self):   # never trust the filter alone
+        code, out = self.sweep([], runs=[self.app_run('failure', app=15368)])
+        self.assertEqual((code, self.updated), (0, [1]), 'its red does not count: the check is missing, not red')
+        code, out = self.sweep([], runs=[self.app_run('failure')])
+        self.assertEqual((code, self.updated), (0, [2]), out)
+
+    def test_an_unreadable_gate_check_skips_that_pr_only(self):   # unknown is never green
+        for runs in (None, 'odd'):
+            with self.subTest(runs=runs):
+                code, out = self.sweep([self.run_of()], runs=runs)
+                self.assertEqual((code, self.updated), (0, [2]), out)
+                self.assertIn('skip #1: its review-check check from the gate App is unknown', out)
+
+    def test_a_running_gate_check_is_not_red(self):
+        code, out = self.sweep([], runs=[self.app_run(None, status='in_progress')])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('skip #1', out)
+
+    def test_the_base_checks_count_only_the_apps_run_too(self):   # commit_checks, for update_when_base_was_red
+        nodes = [{'__typename': 'CheckRun', 'name': 'review-check', 'status': 'COMPLETED', 'conclusion': c,
+                  'startedAt': t, 'checkSuite': {'app': {'databaseId': app}, 'workflowRun': None}}
+                 for c, t, app in (('FAILURE', '2026-11-14T00:00:00Z', self.APP), ('SUCCESS', '2026-11-14T02:00:00Z', 15368))]
+        nodes.append({'__typename': 'StatusContext', 'context': 'review-check', 'state': 'SUCCESS'})
+        sha = 'e9' * 20
+        self.q.gh = lambda *a: ok(json.dumps({'data': {'repository': {'object': {'oid': sha, 'statusCheckRollup': {
+            'contexts': {'pageInfo': {'hasNextPage': False}, 'nodes': nodes}}}}}}))
+        self.assertEqual(self.q.commit_checks('refs/heads/main', {})[1].get('review-check'),
+                         lens.check_state(self.run_of(conclusion='FAILURE')))
+        self.q.cfg = CFG
+        self.assertNotEqual(self.q.commit_checks('refs/heads/main', {})[1].get('review-check'),
+                            lens.check_state(self.run_of(conclusion='FAILURE')), 'without the key the name alone counts')
+
+    def test_the_key_is_checked(self):
+        for bad in (0, -1, True, '4242', 1.5, 2 ** 60):
+            with self.subTest(bad=bad), self.assertRaisesRegex(config.ConfigError, 'head_check_app is'):
+                config.parse(json.dumps({**CFG_RAW, 'head_check_app': bad}))
+        self.assertIsNone(CFG.head_check_app)
+
+    def test_a_release_without_the_key_refuses_a_config_with_it(self):   # the rollout order: code first, then key
+        old = {k: v for k, v in config.KEYS.items() if k != 'head_check_app'}
+        with unittest.mock.patch.object(config, 'KEYS', old), \
+                self.assertRaisesRegex(config.ConfigError, "unknown key 'head_check_app'"):
+            config.parse(json.dumps({**CFG_RAW, 'head_check_app': self.APP}))
 
 
 if __name__ == '__main__':

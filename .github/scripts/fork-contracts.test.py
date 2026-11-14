@@ -15,6 +15,12 @@ copies that must fail (so a check that stops seeing its problem goes red too):
   gh-guard     every fork script that calls gh sources fork-gh-guard.sh at the top level, after
                nothing but `set`, before its first call (backslash continuations joined), and
                every fork shell test sets up the gh stub (fork-test-gh.sh) before anything else.
+  head-gate    fork-head-gate.yml is only a reusable workflow; it checks out only its own toolkit (never
+               the caller's tree or a pull request), puts no expression in a run script, every job only
+               reads, every action is pinned by commit, only the gate job (after the guard job) names an
+               Environment, the App key is named only by the guard's presence test and the one token
+               step, and that token reaches only the start step right after it and the finish step
+               (the last). No other fork workflow names the key.
   removed      .github/fork-removed-workflows.txt (the upstream workflows the fork deletes, kept
                deleted by fork-follow.sh) is there, every line is an upstream workflow path, none of
                them is in the tree, and it names the files the owner decided to delete.
@@ -752,6 +758,134 @@ check("gh-guard: a node test spawning a gh script fails",
       bool(test_problems({**files, "fork-new.test.cjs": 'spawnSync("bash", [".github/scripts/fork-release.sh", "resolve"]);\n'})))
 check("gh-guard: a node test spawning gh fails",
       bool(test_problems({**files, "fork-new.test.cjs": 'execFileSync("gh", ["api", "x"]);\n'})))
+
+# --- head-gate ---------------------------------------------------------------------------------
+GATE_FILE = "fork-head-gate.yml"
+GATE_KEY = "secrets.HEAD_GATE_APP_KEY"
+GATE_READ = {"contents": "read", "pull-requests": "read", "actions": "read"}
+GATE_TOOLKIT = {"repository": "${{ steps.toolkit.outputs.repo }}", "ref": "${{ steps.toolkit.outputs.sha }}"}
+
+
+def head_gate_problems(wfs):
+    wf = wfs.get(GATE_FILE)
+    if not wf:
+        return [f"{GATE_FILE} is missing"]
+    problems = []
+    if triggers(wf) != {"workflow_call"}:
+        problems.append(f"triggers {sorted(map(str, triggers(wf)))}: only workflow_call")
+    if wf.get("permissions") != {}:
+        problems.append("top-level permissions are not {}")
+    jobs = wf.get("jobs") or {}
+    for job_id, job in jobs.items():
+        if job.get("permissions") != GATE_READ:
+            problems.append(f"{job_id}: permissions {job.get('permissions')} are not read-only")
+        if "uses" in job:
+            problems.append(f"{job_id}: calls another workflow")
+        if job_id != "gate" and "environment" in job:
+            problems.append(f"{job_id}: names an Environment")
+    gate = jobs.get("gate") or {}
+    if gate.get("environment") != "${{ inputs.environment }}" or gate.get("needs") != "guard" \
+            or "needs.guard.result == 'success'" not in str(gate.get("if")):
+        problems.append("gate: the Environment is not behind the guard job")
+    tokens = []
+    for job_id, step in steps(wf):
+        label = f"{job_id}/{step.get('name')}"
+        uses = str(step.get("uses", ""))
+        if "${{" in str(step.get("run", "")):
+            problems.append(f"{label}: an expression inside run")
+        if uses and not re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", uses):
+            problems.append(f"{label}: {uses} is not pinned by commit")
+        if uses.startswith("actions/checkout@"):
+            w = step.get("with") or {}
+            if {k: w.get(k) for k in GATE_TOOLKIT} != GATE_TOOLKIT or w.get("path") != "toolkit" \
+                    or set(w) != {"repository", "ref", "path", "sparse-checkout"}:
+                problems.append(f"{label}: checks out something other than the gate's own toolkit")
+        if "git " in str(step.get("run", "")) or "fetch" in str(step.get("run", "")).split():
+            problems.append(f"{label}: runs git itself")
+        if "steps.token" in str(step):
+            tokens.append(label)
+        if uses.startswith("actions/create-github-app-token@"):
+            if "continue-on-error" in step:
+                problems.append(f"{label}: no token must fail the job visibly")
+            if job_id != "gate" or step.get("id") != "token" \
+                    or {k for k in (step.get("with") or {}) if k.startswith("permission-")} != {"permission-checks"} \
+                    or (step.get("with") or {}).get("permission-checks") != "write":
+                problems.append(f"{label}: the App token is not the gate's checks-write token")
+    gate_steps = gate.get("steps") or []
+    makers = [s for s in gate_steps if str(s.get("uses", "")).startswith("actions/create-github-app-token@")]
+    at = next((i for i, s in enumerate(gate_steps) if s in makers), -1)
+    after = gate_steps[at + 1] if 0 <= at < len(gate_steps) - 1 else {}
+    if len(makers) != 1 or after.get("id") != "start":
+        problems.append("gate: not exactly one token step, right before the start step")
+    if not gate_steps or tokens != [f"gate/{after.get('name')}", f"gate/{gate_steps[-1].get('name')}"] \
+            or gate_steps[-1].get("id") != "finish":
+        problems.append(f"the App token reaches {tokens}, not only the start step and the finish step (the last)")
+    text = yaml.safe_dump(wf)
+    if text.count("secrets.") != 2 or text.count(GATE_KEY) != 2 or (makers and GATE_KEY not in str(makers[0])):
+        problems.append(f"the key is named {text.count(GATE_KEY)} times, other secrets {text.count('secrets.')}")
+    for name, other in wfs.items():
+        if name != GATE_FILE and ("HEAD_GATE_APP_KEY" in yaml.safe_dump(other)):
+            problems.append(f"{name}: names the gate App key")
+    return problems
+
+
+check("head-gate: fork-head-gate.yml keeps the App key and its token to the token, start and finish steps",
+      not head_gate_problems(real), "; ".join(head_gate_problems(real)))
+
+
+def gate_mutant(mutate):
+    wfs = copy.deepcopy(real)
+    try:
+        mutate(wfs[GATE_FILE], wfs)
+    except (KeyError, IndexError, TypeError, StopIteration):  # the shape is missing: the check above failed
+        return False
+    return bool(head_gate_problems(wfs))
+
+
+def gate_step(wf, job, name_part):
+    return next(s for s in wf["jobs"][job]["steps"] if name_part in str(s.get("name")))
+
+
+gate_mutants = {
+    "a pull_request trigger": lambda wf, _: wf[True].__setitem__("pull_request", None),
+    "a write permission": lambda wf, _: wf["jobs"]["gate"]["permissions"].__setitem__("checks", "write"),
+    "top-level permissions": lambda wf, _: wf.__setitem__("permissions", {"contents": "read"}),
+    "the guard job with the Environment": lambda wf, _: wf["jobs"]["guard"].__setitem__("environment", "head-gate"),
+    "the gate job not needing the guard": lambda wf, _: wf["jobs"]["gate"].pop("needs"),
+    "the gate job running when the guard failed": lambda wf, _: wf["jobs"]["gate"].__setitem__(
+        "if", "always() && needs.guard.outputs.prs != '[]'"),
+    "a checkout of the pull request": lambda wf, _: wf["jobs"]["gate"]["steps"].insert(3, {
+        "name": "pr", "uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "with": {"ref": "${{ github.event.pull_request.head.sha }}"}}),
+    "the toolkit at the caller's ref": lambda wf, _: gate_step(wf, "gate", "Check out")["with"].__setitem__(
+        "ref", "${{ github.sha }}"),
+    "an expression in a run script": lambda wf, _: gate_step(wf, "gate", "Judge").__setitem__(
+        "run", gate_step(wf, "gate", "Judge")["run"].replace('"$SHA"', '"${{ matrix.sha }}"')),
+    "an action pinned by tag": lambda wf, _: gate_step(wf, "gate", "token").__setitem__(
+        "uses", "actions/create-github-app-token@v3"),
+    "the token with more permissions": lambda wf, _: gate_step(wf, "gate", "token")["with"].__setitem__(
+        "permission-contents", "write"),
+    "the token handed to judge": lambda wf, _: gate_step(wf, "gate", "Judge")["env"].__setitem__(
+        "GH_TOKEN", "${{ steps.token.outputs.token }}"),
+    "the token handed to target": lambda wf, _: gate_step(wf, "gate", "find what to judge")["env"].__setitem__(
+        "GH_TOKEN", "${{ steps.token.outputs.token }}"),
+    "the token made before target": lambda wf, _: wf["jobs"]["gate"]["steps"].insert(
+        3, wf["jobs"]["gate"]["steps"].pop(5)),
+    "a token step that hides its failure": lambda wf, _: gate_step(wf, "gate", "token").__setitem__(
+        "continue-on-error", True),
+    "a step after finish": lambda wf, _: wf["jobs"]["gate"]["steps"].append({"name": "x", "run": "true"}),
+    "finish without the token": lambda wf, _: gate_step(wf, "gate", "Complete")["env"].pop("GH_TOKEN"),
+    "the key in the judge step": lambda wf, _: gate_step(wf, "gate", "Judge")["env"].__setitem__(
+        "KEY", "${{ secrets.HEAD_GATE_APP_KEY }}"),
+    "another secret": lambda wf, _: gate_step(wf, "gate", "Judge")["env"].__setitem__("T", "${{ secrets.OTHER }}"),
+    "a git fetch in a run step": lambda wf, _: gate_step(wf, "gate", "Judge").__setitem__(
+        "run", "git fetch origin\n" + gate_step(wf, "gate", "Judge")["run"]),
+    "another fork workflow naming the key": lambda _, wfs: next(
+        s for n, w in wfs.items() if n != GATE_FILE for _, s in steps(w) if "run" in s).__setitem__(
+        "env", {"K": "${{ secrets.HEAD_GATE_APP_KEY }}"}),
+}
+for label, mutate in gate_mutants.items():
+    check(f"head-gate: {label} fails", gate_mutant(mutate))
 
 # --- removed -----------------------------------------------------------------------------------
 removed_path = root / ".github/fork-removed-workflows.txt"
