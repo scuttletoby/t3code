@@ -93,6 +93,18 @@ export function backoffMs(intervalMs: number, failures: number): number {
   return Math.min(intervalMs * 2 ** failures, Math.max(MAX_BACKOFF_MS, intervalMs));
 }
 
+/** Room for a sweep that runs late: scheduler ticks, and another instance refreshed first. */
+const SWEEP_SLACK_MS = REFRESH_TIMEOUT_MS + 60 * 1000;
+
+/**
+ * The longest gap between two good readings of one instance when one refresh fails: the failed
+ * refresh is due an interval after the last good one, its retry waits `backoffMs(interval, 1)`
+ * from that attempt and may run until the timeout; either sweep may start late.
+ */
+export function oneFailureGapMs(intervalMs: number): number {
+  return intervalMs + backoffMs(intervalMs, 1) + REFRESH_TIMEOUT_MS + SWEEP_SLACK_MS;
+}
+
 interface FailureState {
   readonly failures: number;
   readonly retryAtMs: number;
