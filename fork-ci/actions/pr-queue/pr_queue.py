@@ -45,8 +45,10 @@ REFUSED, SILENT = 2, 3
 # git gets the login from gh (GH_TOKEN, or gh's own login), never from a credential helper of the machine's git config.
 GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
             '-c', 'credential.https://github.com.helper=!gh auth git-credential')
-# Every git call, whatever the repository's files say: no hooks, no fsmonitor command, no replace refs.
-GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '--no-replace-objects')
+# Every git call, whatever the repository's files say: no hooks, no fsmonitor command, no replace refs, and no
+# commit-graph (a planted objects/info/commit-graph(s) could change the parents git reports; git rebuilds nothing from it).
+GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
+            '--no-replace-objects')
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'

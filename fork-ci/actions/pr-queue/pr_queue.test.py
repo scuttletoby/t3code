@@ -1218,10 +1218,11 @@ class GitCalls(unittest.TestCase):
         with unittest.mock.patch.object(Q.subprocess, 'run', lambda argv, **kw: seen.append((argv, kw)) or ok()):
             q.git('fetch', 'x')
         (argv, kw), = seen
-        self.assertEqual(argv[:11], ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
-                                     '--no-replace-objects', '-c', 'credential.https://github.com.helper=',
+        self.assertEqual(argv[:13], ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                                     '-c', 'core.commitGraph=false', '--no-replace-objects',
+                                     '-c', 'credential.https://github.com.helper=',
                                      '-c', 'credential.https://github.com.helper=!gh auth git-credential', '--git-dir'])
-        self.assertEqual(argv[11:], [q.cache, 'fetch', 'x'])
+        self.assertEqual(argv[13:], [q.cache, 'fetch', 'x'])
         self.assertEqual(kw['env']['GIT_TERMINAL_PROMPT'], '0')
 
     def test_the_empty_helper_resets_any_helper_the_machine_set(self):   # git's rule, checked on this git
