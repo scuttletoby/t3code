@@ -9,6 +9,7 @@
 .github/scripts/fork-contracts.test.py
 .github/scripts/fork-fleet.test.py
 .github/scripts/fork-follow.test.sh
+.github/scripts/fork-pr-queue-workflow.test.py
 .github/scripts/fork-release-workflow.test.py
 .github/scripts/fork-release.test.sh
 .github/scripts/fork-schema-check.test.cjs
@@ -21,6 +22,7 @@ fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/job-changed/job-changed.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
+fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 
 # Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
 .github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml
