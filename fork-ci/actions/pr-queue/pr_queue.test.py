@@ -580,9 +580,12 @@ class ReviewFlagsQuery(unittest.TestCase):
 
     def test_a_next_page_without_a_new_cursor_fails(self):
         r = gh_review('x', 't')
-        for cursor in ('', 'c1'):
-            (flags, why), _ = self.read(flags_page(r, more='c1'), flags_page(r, more=cursor))
+        for cursor in ('', 'c1'):   # GitHub repeats the token: stop at once, not after REVIEW_PAGES calls
+            pages = [flags_page(r, more='c1')] + [flags_page(r, more=cursor)] * Q.REVIEW_PAGES
+            (flags, why), calls = self.read(*pages)
             self.assertIsNone(flags, cursor)
+            self.assertIn('no next page', why)
+            self.assertEqual(len(calls), 2, cursor)
         (flags, why), _ = self.read(flags_page(r, more=''))
         self.assertIsNone(flags)
 
@@ -1982,7 +1985,8 @@ class ArmWaitsOutTheQueuedCheckRace(Base):
     def test_every_not_started_yet_wording_is_the_same_race(self):
         for msg in ('Required status check "build" is in progress.', 'Required status check "build" is expected.',
                     'Required status check "build" is pending.', '2 of 2 required status checks are expected.',
-                    'GraphQL: Required status check "build" is queued. (mergePullRequest)'):
+                    'GraphQL: Required status check "build" is queued. (mergePullRequest)',
+                    'Required status check "test (3.12)" is queued.', 'Required status check "v1.2.3 build" is pending.'):
             with self.subTest(msg=msg):
                 self.assertTrue(Q.CHECK_NOT_DONE_RE.search(msg))
                 f = self.fake(arm_says=[msg])
@@ -1995,7 +1999,7 @@ class ArmWaitsOutTheQueuedCheckRace(Base):
         self.assertEqual(self.sleeps, [5, 10, 15, 20], 'the waits grow and end')
         self.assertLessEqual(sum(self.sleeps), CFG.wait_seconds)
         self.assertLeftOff(f, code, 'is queued', tries=5)
-        self.assertIn('tried again for 60 s', f.comments[0])
+        self.assertIn('tried again for up to 60 s', f.comments[0])
 
     def test_the_waits_stay_within_the_configs_wait_seconds(self):
         for wait, poll, waits in ((5, 1, [1, 2]), (5, 5, [5]), (60, 60, [60]), (600, 60, [60, 120, 180, 240]),
@@ -2013,7 +2017,8 @@ class ArmWaitsOutTheQueuedCheckRace(Base):
     def test_any_other_refusal_is_final_at_once(self):
         for msg in (MOVED, 'Pull request is not mergeable', 'HTTP 502', '',
                     'Required status check "build" is failing.', 'Required status check "build" has not succeeded.',
-                    'Required status check "build" is failing. The merge queue is expected to run later.'):
+                    'Required status check "build" is failing. The merge queue is expected to run later.',
+                'Required status check "test (3.12)" is failing. The merge queue is expected to run later.'):
             with self.subTest(msg=msg):
                 self.assertFalse(Q.CHECK_NOT_DONE_RE.search(msg))
                 self.sleeps.clear()

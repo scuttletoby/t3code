@@ -88,8 +88,9 @@ REVIEW_PAGES = 50   # pages of 100 reviews or 100 inline comments: a PR with mor
 # queued. gh then tries a direct merge instead of turning auto-merge on, and GitHub refuses it: `Required status check
 # "build" is queued` (also "in progress", "expected", "pending"; within one sentence). That one refusal is a race, not
 # a verdict (arm). Every other refusal (the head moved, a conflict, a failing check, no permission) is final.
-CHECK_NOT_DONE_RE = re.compile(r'required status checks?\b[^.\n]*\b(?:is|are) (?:queued|in progress|expected|pending)\b',
-                               re.I)
+# A quoted check name may hold dots (`"test (3.12)"`); outside quotes a dot ends the sentence.
+CHECK_NOT_DONE_RE = re.compile(r'required status checks?\b(?:"[^"\n]*"|[^."\n])*\b(?:is|are) '
+                               r'(?:queued|in progress|expected|pending)\b', re.I)
 
 
 def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
@@ -686,7 +687,7 @@ class Queue:
         """Why arm() failed, for the comment: gh's words, and that the queue did wait when it was the checks race."""
         why = r.stderr.strip()[:200]
         if CHECK_NOT_DONE_RE.search(r.stderr or ''):
-            why += f' (GitHub still said so after the queue tried again for {self.cfg.wait_seconds} s)'
+            why += f' (GitHub still said so after the queue tried again for up to {self.cfg.wait_seconds} s)'
         return why
 
     def update(self, n, dry=False):
