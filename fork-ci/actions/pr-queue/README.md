@@ -283,7 +283,9 @@ It runs only on `push`, `schedule` and `workflow_dispatch`, so the code that
 merges pull requests never runs for a pull request. It checks out only the
 config file from the caller, and the queue from the workflow's own repository
 and commit (`job.workflow_repository`, `job.workflow_sha`, runner 2.334.0 or
-newer): the queue that runs is the one the caller pinned. One run per
+newer): the queue that runs is the one the caller pinned. `<40-hex sha>` here and
+below is a release commit (`@<sha> # ci/vN`), never a commit of main: see
+[`fork-ci/README.md`](../../README.md#pinning). One run per
 repository at a time, never cancelled half-way. Inputs: `runs-on`, `config`,
 `state-file`, `cache`, `lock-file` and `dry-run`, as in "The queue".
 
