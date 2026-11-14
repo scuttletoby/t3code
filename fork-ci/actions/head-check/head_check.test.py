@@ -49,6 +49,7 @@ sys.path.insert(0, HERE)
 import head_check as H  # noqa: E402
 import config  # noqa: E402  (../pr-queue, put on the path by head_check)
 import lens  # noqa: E402
+import pr_queue  # noqa: E402
 
 REPO = 'owner/proj'
 CONFIG_PATH = '.github/pr-queue.json'
@@ -184,17 +185,37 @@ def base_files(cfg_raw=CFG_RAW, **files):
     return {CONFIG_PATH: json.dumps(cfg_raw), 'x.py': lines(), **files}
 
 
-def fake_gh(*answers, calls=None):
-    """gh that answers `pr view` with each answer in turn (the last one repeats): (code, stdout)."""
+def fake_gh(*answers, calls=None, flags=()):
+    """gh that answers `pr view` with each answer in turn (the last one repeats): (code, stdout). flags: the answers to
+    the reviews' flags query (pr_queue.review_flags), in turn; none left: it fails."""
     calls = [] if calls is None else calls
+    views, flags = [], list(flags)
 
     def gh(*a):
         calls.append(a)
+        if a[:2] == ('api', 'graphql') and f'query={pr_queue.REVIEW_FLAGS_QUERY}' in a:
+            code, out = flags.pop(0) if flags else (1, '')
+            return types.SimpleNamespace(returncode=code, stdout=out, stderr='boom' if code else '')
         if a[:2] != ('pr', 'view'):
             raise AssertionError(f'gh must only read: {a}')
-        code, out = answers[min(len(calls) - 1, len(answers) - 1)]
+        views.append(a)
+        code, out = answers[min(len(views) - 1, len(answers) - 1)]
         return types.SimpleNamespace(returncode=code, stdout=out, stderr='boom' if code else '')
     return gh
+
+
+def gh_review(body, n=1):
+    """A review as gh pr view prints it (issue #56): includesCreatedEdit false whether or not it was edited, because
+    gh never asks GitHub for it on reviews; no isMinimized, no url."""
+    return {'id': f'PRR_{n}', 'body': body, 'author': {'login': 'owner'}, 'authorAssociation': 'OWNER',
+            'includesCreatedEdit': False, 'submittedAt': f'2026-11-14T02:{n % 60:02d}:00Z', 'state': 'COMMENTED'}
+
+
+def flags_page(*reviews, edited=False, more=None):
+    nodes = [{'id': r['id'], 'includesCreatedEdit': edited, 'isMinimized': False, 'url': f'https://x/{r["id"]}',
+              'author': {'__typename': 'User', 'login': 'owner'}} for r in reviews]
+    return 0, json.dumps({'data': {'repository': {'pullRequest': {'reviews': {
+        'pageInfo': {'hasNextPage': more is not None, 'endCursor': more}, 'nodes': nodes}}}}})
 
 
 def run_cli(path, gh, *extra, env=None, sleeps=None):
@@ -539,6 +560,43 @@ class Runs(unittest.TestCase):
                      json.dumps(dict(pr(), comments=None)), json.dumps(dict(pr(), reviews=None))):
             with self.subTest(text=text):
                 self.assertEqual(run_cli(self.path, fake_gh((0, text)))[0], 1)
+
+    def review_pr(self, n=1, others=0):
+        lens_review = gh_review(f'{LENS}: correctness · reviewer: x · read at: {self.read}\nfindings: none', n)
+        reviews = [gh_review('looks fine', i) for i in range(n + 1, n + 1 + others)] + [lens_review]
+        return reviews, json.dumps(pr(reviews=reviews, head=self.read))
+
+    def test_a_review_counts_only_when_its_own_flags_say_unedited(self):   # issue #56
+        reviews, answer = self.review_pr()
+        code, out = run_cli(self.path, fake_gh((0, answer), flags=[flags_page(*reviews)]))
+        self.assertEqual(code, 0, out)
+        code, out = run_cli(self.path, fake_gh((0, answer), flags=[flags_page(*reviews, edited=True)]))
+        self.assertEqual(code, 1, out)
+        self.assertIn('edited after posting', out)
+        code, out = run_cli(self.path, fake_gh((0, answer), flags=[flags_page()]))   # the review is not in the answer
+        self.assertEqual(code, 1, out)
+        self.assertIn(lens.FLAGS_UNREAD, out)
+
+    def test_a_failed_flags_read_fails_after_the_retries(self):   # unknown never passes
+        reviews, answer = self.review_pr()
+        calls, sleeps = [], []
+        code, out = run_cli(self.path, fake_gh((0, answer), calls=calls), env=self.env, sleeps=sleeps)
+        self.assertEqual(code, 1, out)
+        self.assertEqual([c[:2] for c in calls], [('pr', 'view'), ('api', 'graphql')] * H.ATTEMPTS)
+        self.assertIn('edit flags', out)
+        self.assertEqual(self.read_file('output'), 'result=fail\n')
+        code, out = run_cli(self.path, fake_gh((0, answer), flags=[(1, ''), flags_page(*reviews)]))
+        self.assertEqual(code, 0, out)   # one failed read is retried, the view with it
+
+    def test_more_than_100_reviews_are_all_read(self):
+        reviews, answer = self.review_pr(n=1, others=149)   # the lens review is the last of 150
+        pages = [flags_page(*reviews[:100], more='c1'), flags_page(*reviews[100:])]
+        calls = []
+        code, out = run_cli(self.path, fake_gh((0, answer), calls=calls, flags=pages))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sum(c[:2] == ('api', 'graphql') for c in calls), 2)
+        code, out = run_cli(self.path, fake_gh((0, answer), flags=pages[:1]))   # page 2 fails every time
+        self.assertEqual(code, 1, out)
 
     def test_pass_and_fail_reach_the_exit_code_summary_and_output(self):
         code, out = run_cli(self.path, fake_gh((0, self.good)), env=self.env)
