@@ -13,11 +13,11 @@ on every run: the same bytes on a fresh runner and on a warm one, and never an o
 
 ## Use in a workflow
 
-Pin the action by full SHA (the commit a `ci/vN` tag names):
+Pin a release commit by its full SHA, never a commit of main ([why](../../README.md#pinning)):
 
 ```yaml
 - id: m2
-  uses: scuttletoby/t3code/fork-ci/actions/gradle-cache@<sha> # ci/vN
+  uses: scuttletoby/t3code/fork-ci/actions/gradle-cache@<release sha> # ci/vN
   with:
     lock: engine/m2-lock.json # project fact
     cache-dir: ~/.cache/my-ci-m2 # optional: keep an existing warm cache
