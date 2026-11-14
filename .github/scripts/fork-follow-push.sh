@@ -6,8 +6,11 @@
 #   check            Fails unless FORK_PUSH_TOKEN is set, accepted by GitHub and may push here.
 #   candidate SHA    Force-pushes SHA as the branch fork-follow/candidate.
 #   advance PREV SHA Moves SERIES_BRANCH from PREV to SHA with a lease. First keeps PREV as the tag
-#                    fork-follow/pre-<BASE_TAG>-<PREV, 12 hex>, so the old series stays reachable.
-#                    Already at SHA (a re-run) is success; moved elsewhere is a refusal.
+#                    fork-follow/pre-<BASE_TAG>-<PREV, 12 hex>, so the old series stays reachable,
+#                    then tags SHA as fork-follow/synced/<SHA>: the push run of a tagged commit never
+#                    uses the fleet (upstream code runs GitHub-hosted only; tag_prefix in
+#                    .github/fork-fleet.json, which must say the same). Already at SHA (a re-run) tags
+#                    it and is success; moved elsewhere is a refusal.
 #   cleanup          Deletes the branch fork-follow/candidate; a failure is only a warning.
 #
 # Environment: FORK_PUSH_TOKEN, FORK_PUSH_ENVIRONMENT (the GitHub Environment that should hold the
@@ -25,6 +28,7 @@ SERIES_BRANCH="${SERIES_BRANCH:-main}"
 REPORT="${REPORT:-fork-follow-report.md}"
 OUTPUT="${GITHUB_OUTPUT:-/dev/stdout}"
 CANDIDATE_BRANCH=fork-follow/candidate
+SYNCED_TAG_PREFIX=fork-follow/synced/
 err="$(mktemp)"
 trap 'rm -f "$err"' EXIT
 
@@ -83,6 +87,12 @@ cmd_candidate() {
   echo "Pushed ${sha:0:12} to $CANDIDATE_BRANCH."
 }
 
+tag_synced() { # tag_synced SHA OUTCOME: the tag keeping the push run of SHA off the fleet, made before main is SHA
+  git push "$PUSH_URL" "$1:refs/tags/$SYNCED_TAG_PREFIX$1" > /dev/null 2> "$err" \
+    || die "Could not tag ${1:0:12} as $SYNCED_TAG_PREFIX$1, $2." \
+      "Without the tag, the push run of a synced commit may use the fleet; upstream code runs on GitHub-hosted runners only. git said:" "$(git_said)"
+}
+
 cmd_advance() {
   local prev="${1:?PREV}" sha="${2:?SHA}" now backup
   : "${BASE_TAG:?BASE_TAG}"
@@ -90,6 +100,7 @@ cmd_advance() {
   now="$(remote_ref "refs/heads/$SERIES_BRANCH")" \
     || die "Could not read $SERIES_BRANCH of $REPOSITORY, so it was not moved. git said:" "$(git_said)"
   if [[ "$now" == "$sha" ]]; then
+    tag_synced "$sha" "so a re-run of its push run could use the fleet" # an earlier run moved it
     echo "moved=already" >> "$OUTPUT"
     echo "$SERIES_BRANCH is already at ${sha:0:12}."
     return 0
@@ -101,6 +112,7 @@ cmd_advance() {
   git push "$PUSH_URL" "$prev:refs/tags/$backup" > /dev/null 2> "$err" \
     || die "Could not keep the old series ${prev:0:12} as tag $backup, so $SERIES_BRANCH was not moved. git said:" "$(git_said)"
   echo "backup_tag=$backup" >> "$OUTPUT"
+  tag_synced "$sha" "so $SERIES_BRANCH was not moved"
   git push --force-with-lease="refs/heads/$SERIES_BRANCH:$prev" "$PUSH_URL" "$sha:refs/heads/$SERIES_BRANCH" > /dev/null 2> "$err" \
     || die "Could not move $SERIES_BRANCH from ${prev:0:12} to ${sha:0:12}." \
       "If a rule protects $SERIES_BRANCH, the token's user must be allowed to bypass it. The old series is kept as tag $backup. git said:" "$(git_said)"
