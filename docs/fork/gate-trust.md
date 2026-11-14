@@ -67,7 +67,7 @@ with no owner credential at all (agents only through App tokens).
 | ------------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------ | ---------------------------------- | --------- |
 | A pull request changes the workflow so its gate passes        | yes                | **no**                                                                                           | no                                 | no        |
 | A same-named job, or a status, under the required name        | yes                | **no**                                                                                           | no                                 | no        |
-| Read the gate App key                                         | (no key)           | only by first changing the Environment rule (row 7)                                              | **no**                             | no        |
+| Read the gate App key                                         | (no key)           | only by first changing the Environment rule (row 7) or pushing past the gate (row 8)             | **no**                             | no        |
 | Read an agent App key or a cached token                       | yes                | **no** (host kit)                                                                                | no                                 | no        |
 | Change the `gh` tool or its guard                             | yes                | **no** (host kit, root-owned)                                                                    | no                                 | no        |
 | Get a token out of a command                                  | yes                | **hard** (host kit): never printed, output scrubbed; worst case 1 hour, one repository, no admin | same                               | same      |
@@ -147,10 +147,13 @@ Then delete the downloaded `.pem`. Keep no repository or organisation secret nam
 number (the backfill), as the README's setup says.
 
 **4. Host install** (as root; not available yet). The host install kit is not in the fork yet. Its
-planned shape, which the kit's pull request fixes exactly:
+planned shape, which the kit's pull request fixes exactly. The first line deletes a file an earlier
+try left, and `&&` stops the chain at the first failure, so a failed download never runs an older
+script:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/KIT_PATH/bootstrap.sh -o /root/gh-apps-bootstrap.sh
+rm -f /root/gh-apps-bootstrap.sh &&
+curl -fsSL https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/KIT_PATH/bootstrap.sh -o /root/gh-apps-bootstrap.sh &&
 sh /root/gh-apps-bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA --agent-user AGENT_USER
 ```
 
@@ -165,9 +168,11 @@ gh-apps-admin add-key APP_NAME --app-id AGENT_APP_ID --repo OWNER/REPO < PATH_TO
 ```
 
 **6. Bind the check to the gate App**, only after the backfill shows the gate's check on every open
-pull request (otherwise those pull requests wait until their next event). Each block reads the rule,
-rewrites only the gate's entry with `jq` into a temporary folder, and writes it back; a failed step
-stops the chain before the write. Safe to run again: the second run writes the same rule.
+pull request (otherwise those pull requests wait until their next event). The one exception is a gate
+App made again: there this step comes **first**, before the gate posts as the new App (Rotation and
+repair, "App made again"). Each block reads the rule, rewrites only the gate's entry with `jq` into a
+temporary folder, and writes it back; a failed step stops the chain before the write. Safe to run
+again: the second run writes the same rule.
 
 With a ruleset (the entry for `CHECK_NAME` is replaced by one bound to `APP_ID`; every other check and
 rule stays as it is). It refuses a ruleset with no or two required-checks rules, and one whose bypass
@@ -237,35 +242,46 @@ only, after lens identity).
 4. A pull request sets the queue's `head_check` to the new name and removes the old step; then
    `head_check_app` (owner step 7).
 
-Roll back at any point: remove the one ruleset or protection entry.
+Roll back at any point: remove the one ruleset or protection entry. After owner step 7, also take
+`head_check_app` out of the queue config (a pull request, merged by hand), or the queue keeps waiting
+for the gate App's check.
 
 ## Rotation and repair
 
 - **Gate key:** add first, then delete. In the App's page add a new key; set the Environment secret
-  again (step 3's last line); dispatch the backfill and see the check on every open pull request;
-  then delete the old key. The wrong order is **not** fail closed: with the old key deleted first, no
-  token is made and nothing is posted (the README's "Stops before start"). New heads get no check and
-  wait, but a head that already passed stays passed, even after an event that should fail it (a
-  deleted override or lens comment), until the gate can post again and the backfill has run. Old
-  check runs stay valid: they belong to the App, not to the key.
+  again (step 3's last line) and delete the new downloaded `.pem`; dispatch the backfill and see the
+  check on every open pull request; then delete the old key. The wrong order is **not** fail closed:
+  with the old key deleted first, no token is made and nothing is posted (the README's "Stops before
+  start"). New heads get no check and wait, but a head that already passed stays passed, even after an
+  event that should fail it (a deleted override or lens comment), until the gate can post again and
+  the backfill has run. Old check runs stay valid: they belong to the App, not to the key.
 - **App reinstalled:** fine, the installation is looked up on every run.
-- **App made again** (a new App has a new id), in this order: make the new App and install it
-  (steps 1 and 2); set `HEAD_GATE_APP_ID` and `HEAD_GATE_APP_KEY` to the new App's (step 3's last
-  two lines); dispatch the backfill; bind the check to the new id (step 6); set `head_check_app` to
-  the new id (step 7); then delete the old App. Until step 6 names the new id, the old App's passes
-  still count and the old App can no longer post, so a head it passed stays passed even after an
-  event that should fail it: keep that window short and merge nothing in it. Until step 7, the queue
-  counts only the old App's runs, finds none on a new head and waits; merge that one config change
-  by hand once the new App's check on it is green.
+- **App made again** (a new App has a new id), in this order: make the new App and install it (steps 1
+  and 2); bind the check to the new id (step 6) **first**; only then set `HEAD_GATE_APP_ID` and
+  `HEAD_GATE_APP_KEY` to the new App's (step 3's last two lines, and delete the downloaded `.pem`);
+  dispatch the backfill; set `head_check_app` to the new id (step 7); then delete the old App. The
+  queue stays blocked at every point. From step 6 until the backfill has posted, nothing can merge:
+  the required check now wants the new App, which has posted nothing yet (an admin bypass excepted,
+  row 8). From the switch until step 7, a head needs both the new App's pass (the required check) and
+  the old App's pass (the queue still counts only the old App), and the old App no longer posts, so a
+  new head waits; a failure the new App posts blocks the merge. Merge the step 7 config change by hand
+  once the new App's check on it is green. The other order (switch first, bind later) is **not** fail
+  closed: until the bind, the new App's failures count nowhere and an old pass of the old App still
+  merges.
 - **Agent App keys** (host kit): the next token request fails with a clear error naming the App; a
   cached token works until it ends (at most one hour). Rotate as in step 5.
-- **Environment widened** (a second branch rule, a tag or pattern rule, or "protected branches"):
-  the guard refuses and the gate posts a failure on every head it runs for until the one
-  default-branch rule is back (step 3's read-back and delete). Then dispatch the backfill.
+- **Environment widened** (a second branch rule, a tag or pattern rule, or "protected branches"): the
+  guard refuses and the gate posts a failure on every head it runs for until the one default-branch
+  rule is back. Run step 3 again (its first line turns "protected branches" off, which the read-back
+  cannot show), then its read-back and delete. Then dispatch the backfill. With "protected branches"
+  on, the gate may post nothing instead of failures: when GitHub does not count the default branch as
+  protected, the gate job is refused the Environment (the README's "No token can be made"), and as
+  with a deleted key, a head that already passed stays passed.
 - **Environment deleted, or the guard cannot see it:** the guard job fails and nothing is posted (a
   gate job that named a missing Environment would make GitHub create it, open to every branch). As
-  with a deleted key, a head that already passed stays passed: make it again (step 3), then dispatch
-  the backfill.
+  with a deleted key, a head that already passed stays passed. Deleted: make it again (step 3), then
+  dispatch the backfill. Not seen (GitHub does not answer, or a rate limit): once GitHub answers
+  again, comment on the pull request or dispatch the gate (the README's "Stops before start").
 
 ## General vs project
 

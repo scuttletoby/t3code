@@ -8,7 +8,8 @@ answers like GitHub from a JSON state and logs every call. So the `jq` parts and
 pastes are the ones tested. Each block is run twice (safe to run again), on old shapes (no rule, two
 rules, a check bound to another App, a placeholder left in, an Environment with other rules) and with a
 GitHub read that fails. The page's claims of what the gate posts (Environment widened, deleted, key
-deleted first, classic protection) are checked against head_gate's own guard and drift. Then: every relative link of the fork pages this touches resolves (anchors too), the page names nothing
+deleted first, classic protection) are checked against head_gate's own guard and drift, and each ordered
+procedure (App made again, gate key, rollout) by the order of its steps. Step 4 runs with a fake curl. Then: every relative link of the fork pages this touches resolves (anchors too), the page names nothing
 personal, and no other page carries a copy of the commands.
 
 Needs bash and jq. Reaches no network and no GitHub. Each check prints ok/FAIL; any FAIL exits 1.
@@ -373,7 +374,8 @@ def bullet(start):
 
 # The page's claims about what is posted are the code's (the lens's two must-fix findings were wrong claims here).
 widened_text = bullet("**Environment widened**")
-check("posts a failure on every head" in widened_text and "nothing" not in widened_text,
+check("posts a failure on every head" in widened_text
+      and "nothing" not in widened_text.replace("may post nothing", ""),
       f"rotation: 'Environment widened' says a failure is posted on every head, as the guard does ({widened_text[:120]})")
 said, log = guard_says(None)
 deleted_text = bullet("**Environment deleted")
@@ -384,10 +386,98 @@ readme = (root / "fork-ci/actions/head-check/README.md").read_text()
 check("**not** fail closed" in key_text and "stays passed" in key_text and "No token can be made" in readme
       and "Stops before start" in key_text and "Stops before start" in readme,
       "rotation: a key deleted first is not fail closed (the README's no-post case), and an old pass stays")
+
+
+def in_order(text, marks):
+    """The first place of each mark in text: (all found and strictly in this order, the places)."""
+    at = [text.find(m) for m in marks]
+    return all(a >= 0 for a in at) and at == sorted(at) and len(set(at)) == len(at), dict(zip(marks, at))
+
+
+# Ordered procedures: the step order is checked, not only the words (a lens put a wrong order back, all words kept).
 again_text = bullet("**App made again**")
-check(all(w in again_text for w in ("install", "HEAD_GATE_APP_ID", "HEAD_GATE_APP_KEY", "step 6", "step 7",
-                                    "then delete the old App")),
-      f"rotation: 'App made again' installs the new App and sets its id and key before deleting the old one")
+ok, at = in_order(again_text, ["install", "(step 6)", "HEAD_GATE_APP_ID", "backfill", "(step 7)", "delete the old App"])
+check(ok and "HEAD_GATE_APP_KEY" in again_text,
+      f"rotation: 'App made again' order: install, bind the new id (step 6), switch id and key, backfill, step 7, then "
+      f"delete the old App ({at})")
+
+
+# The same order as a model: the gate posts as `gate`, the ruleset requires `ruleset`'s check, the queue counts only
+# `queue`'s runs. A head the old App passed then gets an event that should fail it; it must never merge at any point.
+def stale_pass_merges(s):
+    newest = {"old": "pass"}
+    newest[s["gate"]] = "fail"
+    return newest.get(s["ruleset"]) == "pass" and newest.get(s["queue"]) == "pass"
+
+
+points = sorted((p, k) for k, p in {"switch": again_text.find("HEAD_GATE_APP_ID"), "bind": again_text.find("(step 6)"),
+                                     "queue": again_text.find("(step 7)")}.items() if p >= 0)
+s, open_after = {"gate": "old", "ruleset": "old", "queue": "old"}, []
+for _, k in points:
+    s = {**s, {"switch": "gate", "bind": "ruleset", "queue": "queue"}[k]: "new"}
+    if stale_pass_merges(s):
+        open_after.append(k)
+check(len(points) == 3 and not open_after,
+      f"rotation: 'App made again' is closed at every point: no old pass merges after a failing event "
+      f"(open after {open_after}, order {[k for _, k in points]})")
+check("not** fail closed" in again_text and "blocked at every point" in again_text,
+      "rotation: 'App made again' names the window and says the other order is not fail closed")
+step6_intro = PAGE.read_text().split("**6. Bind the check to the gate App**", 1)[1].split("<!-- owner-step:", 1)[0]
+check(re.search(r"App\s+made again", step6_intro) and "**first**" in step6_intro,
+      "step 6: its 'only after the backfill' rule names the App-made-again exception (bind first)")
+
+ok, at = in_order(key_text, ["add a new key", "Environment secret", "backfill", "delete the old key"])
+check(ok and "delete the new downloaded `.pem`" in key_text,
+      f"rotation: gate key order: add, set the secret (and delete the .pem), backfill, then delete the old key ({at})")
+rollout = PAGE.read_text().split("## Rollout order", 1)[1].split("\n## ", 1)[0]
+ok, at = in_order(rollout, ["Backfill", "owner step 6", "owner step 7", "Roll back"])
+check(ok and "head_check_app" in rollout.split("Roll back", 1)[1],
+      f"rollout: backfill, bind (step 6), queue key (step 7); a rollback after step 7 also takes the key out ({at})")
+
+# The other places that state what the guard does: failures are posted, the guard does not "refuse to run".
+proves = bullet("**Only the default branch could make the App's token.**")
+step3_intro = PAGE.read_text().split("**3. Environment, App id and key.**", 1)[1].split("<!-- owner-step:", 1)[0]
+for where, said_text in (("What the gate proves", proves), ("step 3 intro", " ".join(step3_intro.split()))):
+    check("posts only failures" in said_text and not re.search(r"guard( job)? refuses (to run|anything)", said_text),
+          f"{where}: says the gate posts only failures, not that the guard job refuses to run ({said_text[:120]})")
+
+# "Environment widened" by "protected branches": the read-back shows only the good line while the guard fails, so the
+# fix must be step 3 again (its PUT); and the page must say the gate may post nothing in that case.
+pb = {"deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False},
+      "policies": [{"id": 101, "name": "main", "type": "branch"}]}
+said, _ = guard_says(pb)
+code_r, _, _, _, tmp_r = run(b["environment-rules"], {**empty_state(), "envs": {"head-gate": pb}})
+shown = (tmp_r / "stdout.txt").read_text().splitlines()
+check(said == "fail" and shown == ["101 branch main"],
+      f"protected branches: the guard fails ({said}) while the read-back shows only the good line ({shown})")
+check(all(w in widened_text for w in ("protected branches", "Run step 3 again", "may post nothing")),
+      "rotation: 'Environment widened' sends 'protected branches' to step 3 again and says the gate may post nothing")
+
+# Step 4: a failed download never runs an older script left by an earlier try; a good one runs the new script.
+m = re.search(r"\*\*4\. Host install\*\*.*?```sh\n(.*?)```", PAGE.read_text(), re.S)
+block4 = m.group(1) if m else ""
+
+
+def run_step4(download_ok):
+    tmp = pathlib.Path(tempfile.mkdtemp(dir=BASE.name))
+    (tmp / "bin").mkdir()
+    curl = ('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+            f"echo \"touch '{tmp}/NEW_SCRIPT_RAN'\" > \"$out\"\n") if download_ok else \
+        "#!/bin/sh\necho 'curl: (22) The requested URL returned error: 404' >&2\nexit 22\n"
+    (tmp / "bin/curl").write_text(curl)
+    (tmp / "bin/curl").chmod(0o755)
+    (tmp / "gh-apps-bootstrap.sh").write_text(f"touch '{tmp}/OLD_SCRIPT_RAN'\n")  # left by an earlier try
+    script = fill(block4.replace("/root/", str(tmp) + "/"), [("FORK_OWNER", "o"), ("FORK", "f"),
+                                                             ("RELEASE_SHA", "a" * 40), ("KIT_PATH", "kit"),
+                                                             ("AGENT_USER", "agent")])
+    subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=tmp, capture_output=True, text=True,
+                   env={"PATH": f"{tmp / 'bin'}:/usr/bin:/bin", "HOME": str(tmp)}, timeout=30)
+    return (tmp / "OLD_SCRIPT_RAN").exists(), (tmp / "NEW_SCRIPT_RAN").exists()
+
+
+check(block4 and run_step4(False) == (False, False),
+      "step 4: a failed download runs nothing, not an older script left at the same path")
+check(block4 and run_step4(True) == (False, True), "step 4: a good download runs the new script, not the old one")
 
 # --- step 6: bind the check in a ruleset ---------------------------------------------------------------------------
 blk = b["bind-ruleset"]
