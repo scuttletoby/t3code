@@ -106,24 +106,30 @@ def _strip_links(text):
     out.append(text[pos:])
     return ''.join(out)
 
+# The earlier, narrower forms (a tag holds no `<`, a link text no bracket, its target no paren). Each line is read both
+# ways (lens_problem): either way can show a header the other hides (`lens<a title="<">: ...` only the source's way,
+# `<lens: ... read at: <sha></b>` only this way), so a comment counts only when both read it alike.
+_TAG_NARROW = re.compile(r'</?[A-Za-z][^<>]*>')
+_LINK_NARROW = re.compile(r'!?\[([^\[\]]*)\]\([^()]*\)')
 
 
-def clean_inline(text):
+def clean_inline(text, narrow=False):
     """Markdown that can hide a word, gone: HTML tags (`<b>`, also a `<name>` placeholder), links `[x](y)` -> x, `*` and
-    backticks, `|` -> space, `_` at a word edge (`_lens_` -> lens; `pr_queue` stays)."""
+    backticks, `|` -> space, `_` at a word edge (`_lens_` -> lens; `pr_queue` stays). narrow: the narrower tag and link
+    forms (_TAG_NARROW, _LINK_NARROW)."""
     # The source's regexes `</?[A-Za-z][^>]*>` and `!?\[([^\]]*)\]\([^)]*\)`, as linear scans: the regexes took time
     # that grows with the square of the text (an unclosed `[` x 64 KB took minutes), and the earlier fix ([^<>],
     # [^\[\]], [^()]) changed the answers: `lens<a title="<">: x · read at<a title="<">: <sha>` renders as a lens header
     # but read as none, so a stale lens went unseen.
-    text = _strip_links(_strip_tags(text))
+    text = _LINK_NARROW.sub(r'\1', _TAG_NARROW.sub('', text)) if narrow else _strip_links(_strip_tags(text))
     text = re.sub(r'[*`]', '', text).replace('|', ' ')
     return re.sub(r'(?<![^\W_])_+|_+(?![^\W_])', '', text)
 
 
-def norm_line(line):
+def norm_line(line, narrow=False):
     """One line as lens_problem and lens_header read it: clean_inline, then any leading quote markers, list markers (`-`
     `+` `•` `1.` `1)`, a task box `[x]`; `*` is gone already), heading marks and `~~~` fences stripped."""
-    s, prev = clean_inline(line), None
+    s, prev = clean_inline(line, narrow), None
     while s != prev:
         prev = s
         s = re.sub(r'^\s*(?:>|[-+•](?=\s|$)|\d{1,9}[.)](?=\s|$)|#{1,6}(?=\s|$)|~{3,}|\[[ xX]\](?=\s|$))\s*', '', s)
@@ -170,13 +176,13 @@ def names_a_lens(name):
         and not re.fullmatch(r'unnamed|r\d+|lens|re-?check', key)
 
 
-def lens_header(body):
+def lens_header(body, narrow=False):
     """(name, sha or None) of a comment's lens header, or None. The header is the first non-blank line, if it opens
     plain and its normalised form is a `lens: <name> ...` line whose name names a lens."""
     first = next((line for line in (body or '').splitlines() if line.strip()), '')
     if not opens_plain(first):
         return None
-    line = norm_line(first)
+    line = norm_line(first, narrow)
     m = LENS_RE.match(line)
     if not m:
         return None
@@ -300,13 +306,25 @@ class Review:
         """Why a comment that looks like a lens report is not one valid lens read (None: it is one, or it does not look
         like a lens report). An override comment never counts. Every line is read normalised, in code blocks and
         quotes too. Two or more header lines, a first-line header that names no lens, or a header line that is not the
-        first plain line: flagged, and `not a lens:` cannot clear it (the text holds EMBEDDED)."""
+        first plain line: flagged, and `not a lens:` cannot clear it (the text holds EMBEDDED). Read both ways
+        (clean_inline narrow or not): flagged when either way flags it, or when the two read different headers."""
         body = post.get('body') or ''
         if self.override_re.match(body):
             return None
+        problem = self.read_problem(body) or self.read_problem(body, narrow=True)
+        if problem is None and lens_header(body) != lens_header(body, narrow=True):
+            first = next((line for line in body.splitlines() if line.strip()), '')
+            return (f'its first line reads as a different lens header, or as one and as none, depending on how its HTML '
+                    f'tags and links are read; starts with {first.strip()[:60]!r}')
+        return problem
+
+    def read_problem(self, body, narrow=False):
+        """lens_problem's rules with one way of reading tags and links (clean_inline)."""
+        def norm(line):
+            return norm_line(line, narrow)
         lines = body.splitlines()
         first = next((line for line in lines if line.strip()), '')
-        normed, start = [norm_line(line) for line in lines], f'starts with {first.strip()[:60]!r}'
+        normed, start = [norm(line) for line in lines], f'starts with {first.strip()[:60]!r}'
         at = next((i for i, line in enumerate(lines) if line.strip()), 0)
         # a header line, or (after the first line) a line starting `lens:` with a sha in any form (a second lens's
         # loosely written read behind a valid header). Only at the line start: `lens:` in mid-line is often a mention.
@@ -314,20 +332,20 @@ class Review:
                       for i, line in enumerate(normed))
         if headers > 1:
             return f'{EMBEDDED} {headers} times (post one comment per lens), {start}'
-        if lens_header(body):
+        if lens_header(body, narrow):
             return None
-        if opens_plain(first) and LENS_RE.match(norm_line(first)):
+        if opens_plain(first) and LENS_RE.match(norm(first)):
             return f'its first-line header names no lens (a placeholder, a round or nothing), {start}'
         if headers:
             return f'{EMBEDDED} that is not its first plain line (a later line, a code block, quote or table), {start}'
         if any(loose_header(line) for line in normed):
             return f'{EMBEDDED} (a lens line with a sha not written `read at: <sha>`), {start}'
-        if opens_plain(first) and NOT_A_LENS_RE.match(norm_line(first)):
+        if opens_plain(first) and NOT_A_LENS_RE.match(norm(first)):
             return None
         plain = plain_lines(body)
-        if sum(bool(FIELD_LINE_RE.match(norm_line(line))) for line in plain) >= 2:   # fields of a headerless report
+        if sum(bool(FIELD_LINE_RE.match(norm(line))) for line in plain) >= 2:   # fields of a headerless report
             return start
-        if any(READ_AT_RE.search(line) for line in normed) or any(LOOKS_RE.search(norm_line(line)) for line in plain) \
+        if any(READ_AT_RE.search(line) for line in normed) or any(LOOKS_RE.search(norm(line)) for line in plain) \
                 or any(LOOKS_HEADING_RE.match(line) for line in plain[:TOP_LINES]):
             return start
         return None
