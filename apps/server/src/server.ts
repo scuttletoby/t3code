@@ -848,6 +848,9 @@ const layerMakeRoutes = Layer.mergeAll(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
+  // Fork: /mcp reads the usage pacer only if it is there (the usage pacing gate). Asking for it
+  // here, beside /mcp, makes a server wired without it a type error instead of a silent gate.
+  Layer.effectDiscard(UsagePacer.UsagePacer.pipe(Effect.asVoid)),
   // Follows delegated tasks running in linked environments, including after a restart.
   Layer.effectDiscard(
     RemoteDelegation.RemoteDelegation.pipe(Effect.flatMap((remote) => remote.start())),

@@ -250,6 +250,10 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
     description: "True only on the timed-out wait call. The child keeps running.",
   }),
   next: Schema.optional(OrchestratorMcpRunningTaskNext),
+  // Fork: set only on the delegate_task call the usage pacing gate acted on or could not judge.
+  usagePacingNote: Schema.optional(Schema.String).annotate({
+    description: "What usage pacing did with this task (moved it, lowered its effort, or why not).",
+  }),
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
 
@@ -947,6 +951,8 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "orchestration_error",
       "thread_credential_required",
       "target_required",
+      // Fork: the usage pacing gate held a delegated task; the message says until when.
+      "usage_pacing_hold",
     ]),
     message: Schema.String,
   },
