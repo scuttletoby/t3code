@@ -37,6 +37,7 @@ class Config:
     poll_seconds: int = 5
     list_limit: int = 50
     update_when_base_was_red: bool = False
+    head_check_app: int = None
 
     def ready(self, n):
         """The command that re-arms PR n after a lens read, as the project writes it."""
@@ -87,6 +88,9 @@ KEYS = {
     'list_limit': (False, _int(1, 100), 'how many open PRs the queue reads, 1-100'),
     'update_when_base_was_red': (False, lambda v: isinstance(v, bool),
                                  'true only when every required check\'s job runs the tested-base action, else false'),
+    'head_check_app': (False, _int(1, 2 ** 53),
+                       'the id of the GitHub App that alone posts head_check (the head gate): the queue then counts '
+                       'only that App\'s check runs of that name'),
 }
 
 
