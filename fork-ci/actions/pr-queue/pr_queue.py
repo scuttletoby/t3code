@@ -4,14 +4,15 @@
 BEHIND its base and has no failing required check. Its CI runs, it merges itself, and the run after the next push to
 the base moves the queue on. An armed PR that is already up to date holds the queue while its required checks run. One
 whose required check ended without passing (cancelled) or never reported cannot merge and nothing re-runs that check:
-it is told once per head and passed over, as is a red one.
+it is told once per head and passed over, as is a red one, and one that conflicts with its base (DIRTY).
 
 Auto-merge only ever merges a head someone checked. Whether GitHub checks --match-head-commit again after the head
 moved is not documented, and "armed" does not say at which head (a plain push keeps auto-merge on), so the queue relies
 on neither. For the PR it updates (head H1):
   1. R = the full sha the review vouched for (lens.Review.reviewed_head): the one commit every lens's newest `read at:`
      names, or a newer override comment's; no lens comments: R = H1; lenses that read different commits: R unknown.
-     Only comments of the config's lens_author_associations count, shown and unedited: anyone can comment.
+     Only comments of the config's lens_author_associations count, shown and unedited: anyone can comment. Inline
+     review comments (on a line of the diff) are comments too, read with the reviews' flags (review_flags).
      The base branch, the PR head and R are fetched into the queue's own bare repository (--cache).
   2. The plan goes into STATE (--state-file), then auto-merge OFF; if that fails, nothing else happens (if gh's error
      leaves it unclear whether it is OFF, STATE stays for the next run). R unknown or not on GitHub: the PR stays OFF,
@@ -19,8 +20,10 @@ on neither. For the PR it updates (head H1):
      PR stays as it was and the next run tries again.
   3. `gh pr update-branch`, then wait until the head moves (at most wait_seconds).
   4. Auto-merge back ON with --match-head-commit H2 only if H2 holds exactly R's change on top of the base (holds()).
-     Anything else (a push after the lenses, a conflict resolution, any gh or git error): it stays OFF with a comment
-     that it needs a lens read and the ready command. No new head in time: STATE stays, the next run checks it.
+     GitHub can refuse that only because the new head's required checks have not started yet: then, and only then,
+     the same arm is tried again for at most wait_seconds (arm). Anything else (a push after the lenses, a conflict
+     resolution, any gh or git error): it stays OFF with a comment that it needs a lens read and the ready command.
+     No new head in time: STATE stays, the next run checks it.
 A PR already up to date never reaches these steps: the project's head_check (required) covers its head.
 Stopped half-way, the next run finishes that PR first from STATE (recover), against the review and the base as GitHub
 shows them then, and touches no other PR until it has re-armed it or said on it why not: a PR is never OFF and silent.
@@ -69,10 +72,24 @@ LIST = 'number,title,isDraft,autoMergeRequest,mergeStateStatus,createdAt,statusC
 # What gh pr view never fetches for reviews (gh 2.102 asks only id, author login, authorAssociation, submittedAt, body,
 # state, commit, reactionGroups) yet prints with Go's defaults (`includesCreatedEdit: false`): read with one query of
 # our own, by PR, 100 reviews a page. lens.Review trusts a review's flags only from this answer (lens.REVIEW_FLAGS).
+# The same query reads what gh pr view does not list at all: each review's inline comments (on a line of the diff;
+# every one belongs to a review), 100 a page, for lens.REVIEW_COMMENTS. A review with more is read on with
+# MORE_COMMENTS_QUERY, by the review's node id.
+INLINE_COMMENTS = ('pageInfo{hasNextPage endCursor} nodes{state body createdAt publishedAt includesCreatedEdit '
+                   'isMinimized url authorAssociation author{__typename login}}')
 REVIEW_FLAGS_QUERY = ('query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,'
                       'name:$name){pullRequest(number:$number){reviews(first:100,after:$after){pageInfo{hasNextPage '
-                      'endCursor} nodes{id includesCreatedEdit isMinimized url author{__typename login}}}}}}')
-REVIEW_PAGES = 50   # 5000 reviews: a PR with more is not read (fails closed)
+                      'endCursor} nodes{id includesCreatedEdit isMinimized url author{__typename login} '
+                      'comments(first:100){' + INLINE_COMMENTS + '}}}}}}')
+MORE_COMMENTS_QUERY = ('query($id:ID!,$after:String!){node(id:$id){... on PullRequestReview{comments(first:100,'
+                       'after:$after){' + INLINE_COMMENTS + '}}}}')
+REVIEW_PAGES = 50   # pages of 100 reviews or 100 inline comments: a PR with more is not read (fails closed)
+# Right after update-branch GitHub can still show the PR as mergeable while the new head's required checks are only
+# queued. gh then tries a direct merge instead of turning auto-merge on, and GitHub refuses it: `Required status check
+# "build" is queued` (also "in progress", "expected", "pending"; within one sentence). That one refusal is a race, not
+# a verdict (arm). Every other refusal (the head moved, a conflict, a failing check, no permission) is final.
+CHECK_NOT_DONE_RE = re.compile(r'required status checks?\b[^.\n]*\b(?:is|are) (?:queued|in progress|expected|pending)\b',
+                               re.I)
 
 
 def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
@@ -96,39 +113,89 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     return False
 
 
+def connection(found, after):
+    """(nodes, next) of one page of a GraphQL connection asked for with `pageInfo{hasNextPage endCursor} nodes`: next is
+    None on the last page, the cursor of the next one, or False when GitHub says there are more but gives no new
+    cursor. TypeError or KeyError when it is not that shape."""
+    page, nodes = found['pageInfo'], found['nodes']
+    if not isinstance(nodes, list) or not isinstance(page['hasNextPage'], bool):
+        raise TypeError
+    if not page['hasNextPage']:
+        return nodes, None
+    cursor = page.get('endCursor')
+    return nodes, cursor if isinstance(cursor, str) and cursor and cursor != after else False
+
+
+def inline_post(node):
+    """An inline review comment as a post lens.Review reads like any PR comment (body, createdAt, author with GitHub's
+    own type, authorAssociation, includesCreatedEdit, isMinimized, url), or None for one of a review that is not
+    submitted yet (PENDING: only its author sees it, so it is not posted). Its time is when it was published (the
+    review's submit), not when it was drafted. TypeError when a field is not what was asked for: a comment nobody could
+    read in full must not go missing."""
+    texts, flags = ('state', 'body', 'createdAt', 'authorAssociation', 'url'), ('includesCreatedEdit', 'isMinimized')
+    if not isinstance(node, dict) or not all(isinstance(node.get(k), bool) for k in flags) \
+            or not all(isinstance(node.get(k), str) for k in texts):
+        raise TypeError
+    if node['state'] == 'PENDING':
+        return None
+    published, author = node.get('publishedAt'), node.get('author')
+    return {'body': node['body'], 'createdAt': published if isinstance(published, str) and published else node['createdAt'],
+            'author': author if isinstance(author, dict) else None, 'authorAssociation': node['authorAssociation'],
+            'includesCreatedEdit': node['includesCreatedEdit'], 'isMinimized': node['isMinimized'], 'url': node['url']}
+
+
 def review_flags(gh, repo, n):
-    """({review node id: {includesCreatedEdit, isMinimized, url, author}}, None) for every review of PR n, read with
-    REVIEW_FLAGS_QUERY page by page; (None, why) when any page fails or is not the shape asked for (then nothing about
-    any review is known, and the caller must not decide). A node without a boolean includesCreatedEdit and isMinimized
-    is left out: lens.Review counts a review it has no flags for as one that reads nothing. Read AFTER gh pr view: a
-    review edited between the two reads then shows here as edited, never as an unedited body that is not the one
-    read."""
+    """({review node id: {includesCreatedEdit, isMinimized, url, author}}, [inline review comments], None) for PR n,
+    read with REVIEW_FLAGS_QUERY page by page (and MORE_COMMENTS_QUERY for a review with more than 100 inline
+    comments); (None, None, why) when any page fails or is not the shape asked for (then nothing about any review or
+    inline comment is known, and the caller must not decide). A review node without a boolean includesCreatedEdit and
+    isMinimized is left out of the flags: lens.Review counts a review it has no flags for as one that reads nothing.
+    Its inline comments are read all the same, as inline_post gives them: gh pr view lists none, so one left out
+    would be one nobody reads. Read AFTER gh pr view: a review edited between the two reads then shows here as
+    edited, never as an unedited body that is not the one read."""
     owner, name = repo.split('/', 1)
-    flags, after = {}, None
+    what = 'reading the reviews\' edit flags and inline comments'
+    flags, inline, todo = {}, [], [(None, None)]   # todo: (review node id, or None for the PR's reviews; cursor)
     for _ in range(REVIEW_PAGES):
-        r = gh('api', 'graphql', '-f', f'query={REVIEW_FLAGS_QUERY}', '-f', f'owner={owner}', '-f', f'name={name}',
-               '-F', f'number={n}', *(['-f', f'after={after}'] if after else []))
+        if not todo:
+            return flags, inline, None
+        review, after = todo.pop(0)
+        if review is None:
+            ask = ('-f', f'query={REVIEW_FLAGS_QUERY}', '-f', f'owner={owner}', '-f', f'name={name}',
+                   '-F', f'number={n}', *(['-f', f'after={after}'] if after else []))
+        else:
+            ask = ('-f', f'query={MORE_COMMENTS_QUERY}', '-f', f'id={review}', '-f', f'after={after}')
+        r = gh('api', 'graphql', *ask)
         if r.returncode != 0:
-            return None, f'reading the reviews\' edit flags failed: {(r.stderr or r.stdout or "").strip()[:200]}'
+            return None, None, f'{what} failed: {(r.stderr or r.stdout or "").strip()[:200]}'
         try:
             answer = json.loads(r.stdout)
-            reviews = answer['data']['repository']['pullRequest']['reviews']
-            page, nodes = reviews['pageInfo'], reviews['nodes']
-            if answer.get('errors') or not isinstance(nodes, list) or not isinstance(page['hasNextPage'], bool):
+            if answer.get('errors'):
                 raise TypeError
-        except (ValueError, KeyError, TypeError):
-            return None, 'reading the reviews\' edit flags: GitHub gave no list of reviews'
-        for node in nodes:
-            if isinstance(node, dict) and isinstance(node.get('id'), str) and node['id'] \
-                    and isinstance(node.get('includesCreatedEdit'), bool) and isinstance(node.get('isMinimized'), bool):
-                flags[node['id']] = {k: node.get(k) for k in ('includesCreatedEdit', 'isMinimized', 'url', 'author')}
-        if not page['hasNextPage']:
-            return flags, None
-        cursor = page.get('endCursor')
-        if not isinstance(cursor, str) or not cursor or cursor == after:
-            return None, 'reading the reviews\' edit flags: GitHub said there are more but gave no next page'
-        after = cursor
-    return None, f'reading the reviews\' edit flags: more than {REVIEW_PAGES * 100} reviews, not all read'
+            if review is None:
+                nodes, more = connection(answer['data']['repository']['pullRequest']['reviews'], after)
+                found = [(node.get('id'), node['comments'], None) for node in nodes]
+                keys = ('includesCreatedEdit', 'isMinimized', 'url', 'author')
+                for node in nodes:
+                    if isinstance(node.get('id'), str) and node['id'] and all(isinstance(node.get(k), bool) for k in keys[:2]):
+                        flags[node['id']] = {k: node.get(k) for k in keys}
+            else:
+                more, found = None, [(review, answer['data']['node']['comments'], after)]
+            pages = [(more, None)] if more is not None else []
+            for of, comments, since in found:
+                nodes, next_page = connection(comments, since)
+                inline += filter(None, map(inline_post, nodes))
+                if next_page is not None and not (isinstance(of, str) and of):
+                    raise TypeError   # more inline comments, and no review id to ask for them with
+                pages += [(next_page, of)] if next_page is not None else []
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, None, f'{what}: GitHub gave no list of reviews and their inline comments'
+        if any(cursor is False for cursor, _ in pages):
+            return None, None, f'{what}: GitHub said there are more but gave no next page'
+        todo += [(of, cursor) for cursor, of in pages]
+    if not todo:
+        return flags, inline, None
+    return None, None, f'{what}: more than {REVIEW_PAGES} pages (of 100 reviews or inline comments), not all read'
 
 
 def set_aside(path):
@@ -406,11 +473,12 @@ class Queue:
                     'it, so that the current workflows run')
         return 'Nothing re-runs it by itself: re-run the CI run (Actions, "Re-run failed jobs") or push'
 
-    def tell_red(self, n, head, check, what='is red', fix='Fix the cause and push'):
-        """An armed PR the queue skips says why on the PR, once per head, check and reason. No answer from GitHub: the
-        next run tries again. Told means a comment of the queue's own login (viewerDidAuthor) that starts with the mark:
+    def tell(self, n, head, reason, way_out, still=None):
+        """An armed PR the queue skips says why on the PR, once per head and reason. No answer from GitHub: the next
+        run tries again. Told means a comment of the queue's own login (viewerDidAuthor) that starts with the mark:
         anyone can post a copy of it on a public repository. `head` is the head the reason was found on (the list):
-        after a push the reason is not known for the new head, and a mark for it would silence its real notice."""
+        after a push the reason is not known for the new head, and a mark for it would silence its real notice.
+        `still`: what the PR must still show when it is read for this (the list is older), else nothing is said."""
         pr = self.view(n)
         if not pr:
             print(f'#{n}: could not read it to say why it waits')
@@ -418,18 +486,34 @@ class Queue:
         if (pr.get('headRefOid') or '').lower() != (head or '').lower():
             print(f'#{n}: its head moved from {(head or "?")[:12]} since the list: the next run tells it')
             return
-        mark = f'required check {check} {what} on {(pr.get("headRefOid") or "?")[:12]}'
-        told = f'pr_queue: {mark},'
+        if still and not still(pr):
+            print(f'#{n}: it changed since the list ({reason} no longer shows): the next run tells it what it finds')
+            return
+        told = f'pr_queue: {reason} on {(pr.get("headRefOid") or "?")[:12]},'
         if any(c.get('viewerDidAuthor') is True and (c.get('body') or '').startswith(told)
                for c in pr.get('comments') or []):
             return
+        r = self.gh('pr', 'comment', str(n), '--repo', self.repo, '--body',
+                    f'{told} so this armed PR waits and the queue passes over it. {way_out}')
+        if r.returncode != 0:
+            print(f'#{n}: could not comment: {r.stderr.strip()[:300]}')
+
+    def tell_red(self, n, head, check, what='is red', fix='Fix the cause and push'):
+        """tell() for a required check: once per head, check and reason."""
         also = '.'
         if check == self.cfg.head_check and what == 'is red':
             also = f', or if a new lens read or override covers this head: `{self.cfg.ready(n)}`.'
-        r = self.gh('pr', 'comment', str(n), '--repo', self.repo, '--body',
-                    f'{told} so this armed PR waits and the queue passes over it. {fix}' + also)
-        if r.returncode != 0:
-            print(f'#{n}: could not comment: {r.stderr.strip()[:300]}')
+        self.tell(n, head, f'required check {check} {what}', fix + also)
+
+    def tell_dirty(self, n, head, base):
+        """tell() for an armed PR that conflicts with its base (merge state DIRTY): GitHub cannot merge it and the queue
+        cannot update it, and auto-merge stays on without a word, so without this it waits unseen. Once per head: a
+        push is the only way out, and a new head that still conflicts is told again. Said only while the PR still
+        shows the conflict and is still armed."""
+        self.tell(n, head, f'merge conflict with {base}',
+                  f'GitHub cannot merge it and the queue cannot update it: merge {base} into it, resolve the conflict '
+                  f'and push (`{self.cfg.push_command}`).',
+                  still=lambda pr: pr.get('mergeStateStatus') == 'DIRTY' and bool(pr.get('autoMergeRequest')))
 
     # --- red only because the base it was tested on was red (config update_when_base_was_red) -----------------------
     def tested_base(self, c):
@@ -524,19 +608,21 @@ class Queue:
 
     # --- steps 2-4 --------------------------------------------------------------------------------------------------
     def view(self, n, reviews=False):
-        """PR n as gh shows it, or None. reviews: also its reviews' own flags (review_flags, under lens.REVIEW_FLAGS),
-        for the review rules; None when they cannot be read, so nothing is decided on a review nobody could check."""
+        """PR n as gh shows it, or None. reviews: also its reviews' own flags and its inline review comments
+        (review_flags, under lens.REVIEW_FLAGS and lens.REVIEW_COMMENTS), for the review rules; None when they cannot
+        be read, so nothing is decided on a review or an inline comment nobody could check. Read for every PR, also
+        one gh pr view lists no review for: an inline comment shows only in that read."""
         r = self.gh('pr', 'view', str(n), '--repo', self.repo, '--json', VIEW)
         try:
             pr = json.loads(r.stdout) if r.returncode == 0 else None
         except ValueError:
             return None
-        if reviews and isinstance(pr, dict) and pr.get('reviews'):
-            flags, why = review_flags(self.gh, self.repo, n)
+        if reviews and isinstance(pr, dict):
+            flags, inline, why = review_flags(self.gh, self.repo, n)
             if flags is None:
                 print(f'#{n}: {why}')
                 return None
-            pr[lens.REVIEW_FLAGS] = flags
+            pr[lens.REVIEW_FLAGS], pr[lens.REVIEW_COMMENTS] = flags, inline
         return pr
 
     def new_head(self, n, old):
@@ -577,8 +663,31 @@ class Queue:
         return ''
 
     def arm(self, n, head):
-        return self.gh('pr', 'merge', str(n), '--repo', self.repo, '--auto', f'--{self.cfg.merge_method}',
-                       *(['--delete-branch'] if self.cfg.delete_branch else []), '--match-head-commit', head)
+        """Auto-merge ON for PR n, for `head` only: every try carries --match-head-commit, so GitHub refuses a head that
+        moved meanwhile and nothing else is ever armed. Only the refusal CHECK_NOT_DONE_RE names (the new head's
+        required checks have not started yet) is tried again: after poll_seconds, then twice that, three times that...
+        while the waits together stay within wait_seconds (defaults: 5, 10, 15, 20 s). Returns the last try's result:
+        any other refusal at once, and this one when GitHub still said it after the last wait (the caller then leaves
+        the PR OFF with a comment). Killed in a wait: STATE is still there, and the next run's recover() arms it."""
+        wait = waited = 0
+        while True:
+            r = self.gh('pr', 'merge', str(n), '--repo', self.repo, '--auto', f'--{self.cfg.merge_method}',
+                        *(['--delete-branch'] if self.cfg.delete_branch else []), '--match-head-commit', head)
+            wait += self.cfg.poll_seconds
+            if r.returncode == 0 or not CHECK_NOT_DONE_RE.search(r.stderr or '') \
+                    or waited + wait > self.cfg.wait_seconds:
+                return r
+            print(f'#{n}: GitHub refused auto-merge for {head[:12]} only because a required check of that head has not '
+                  f'started yet ({r.stderr.strip()[:120]}): trying again in {wait} s')
+            self.sleep(wait)
+            waited += wait
+
+    def arm_failed(self, r):
+        """Why arm() failed, for the comment: gh's words, and that the queue did wait when it was the checks race."""
+        why = r.stderr.strip()[:200]
+        if CHECK_NOT_DONE_RE.search(r.stderr or ''):
+            why += f' (GitHub still said so after the queue tried again for {self.cfg.wait_seconds} s)'
+        return why
 
     def update(self, n, dry=False):
         """Bring PR n up to date with its base and re-arm only the change the review read (steps 1-4)."""
@@ -642,7 +751,7 @@ class Queue:
                                      f'with {base} (a push after the lenses, or a conflict resolution?).')
         r = self.arm(n, head)
         if r.returncode != 0:
-            return self.leave_off(n, f'turning auto-merge back on for {head[:12]} failed: {r.stderr.strip()[:200]}')
+            return self.leave_off(n, f'turning auto-merge back on for {head[:12]} failed: {self.arm_failed(r)}')
         print(f'#{n}: updated to {head[:12]}, exactly the change read at {read[:12]} merged with {base}: auto-merge '
               'back on for that head only')
         return 0
@@ -729,7 +838,7 @@ class Queue:
                 code = 0
             else:
                 code = self.leave_off(n, f'an earlier pr_queue run turned auto-merge off; turning it back on for '
-                                         f'{head[:12]} (the change read at {read[:12]}) failed: {r.stderr.strip()[:200]}')
+                                         f'{head[:12]} (the change read at {read[:12]}) failed: {self.arm_failed(r)}')
         else:
             code = self.leave_off(n, f'a pr_queue run that was stopped half-way or could not finish turned auto-merge '
                                      f'off at {old}; the head {head[:12]} could not be shown to be the change read at '
@@ -799,7 +908,16 @@ class Queue:
             n = p['number']
             if p.get('isDraft') or not p.get('autoMergeRequest'):
                 continue
-            bad, head = self.failing(p), p.get('headRefOid') or ''
+            head = p.get('headRefOid') or ''
+            if p.get('mergeStateStatus') == 'DIRTY':   # before its checks: only a push ends a conflict, and a red
+                base = p.get('baseRefName') or ''      # check of this head goes with the head
+                base = base if re.fullmatch(r'[\w./-]+', base) else 'its base'
+                print(f'skip #{n}: merge conflict with {base} (merge state DIRTY): GitHub cannot merge it and the queue '
+                      'cannot update it (its author resolves it)')
+                if not dry:
+                    self.tell_dirty(n, head, base)
+                continue
+            bad = self.failing(p)
             if bad and p.get('mergeStateStatus') == 'BEHIND' and self.cfg.update_when_base_was_red:
                 base = p.get('baseRefName') or 'its base'
                 why, check, base_red = self.red_from_old_base(p, cache)

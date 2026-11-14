@@ -38,7 +38,7 @@ an error: the queue then exits non-zero and touches no pull request.
 | `push_command`             | yes      | The command people run to push a fixed branch. Only quoted in comments.                                                                                                                                                                                                                        |
 | `lens_format_doc`          | yes      | Where the project documents its lens comments. Only quoted in comments.                                                                                                                                                                                                                        |
 | `head_check`               | yes      | The required check that fails a head no lens read; it must be one of `required_checks`. The queue acts only on pull requests that are behind: without this check, a push to an armed pull request that is already up to date merges unread.                                                    |
-| `wait_seconds`             | no       | How long to wait for GitHub to show the updated head (default 60).                                                                                                                                                                                                                             |
+| `wait_seconds`             | no       | How long to wait for GitHub to show the updated head, and how long to keep trying to turn auto-merge back on while GitHub says a required check of that head is still queued (default 60).                                                                                                     |
 | `poll_seconds`             | no       | How often to look meanwhile (default 5).                                                                                                                                                                                                                                                       |
 | `list_limit`               | no       | How many open pull requests to read (default 50).                                                                                                                                                                                                                                              |
 | `update_when_base_was_red` | no       | `true` updates a behind pull request whose required checks failed only because the base commit they tested failed them too (section "The base was red"). Set it only when the job of every required check runs the `tested-base` action. Default `false`.                                      |
@@ -62,9 +62,10 @@ newest read names, or a newer override comment's sha (config `override`). A
 pull request with no lens comments is not reviewed, and the queue then vouches
 only for the head it found.
 
-Only comments and reviews that GitHub records as written by one of
-`lens_author_associations` count: anyone can comment on a public repository,
-so everyone else's comments are neither reads nor reports. The run log names
+Only comments, reviews and inline review comments (see below) that GitHub
+records as written by one of `lens_author_associations` count: anyone can
+comment on a public repository, so everyone else's comments are neither reads
+nor reports. The run log names
 each lens-looking comment it ignored this way and its author association, so a
 wrong `lens_author_associations` shows there. A lens comment edited after
 posting, or hidden (minimized), reads nothing until that lens posts a new
@@ -83,6 +84,17 @@ its own, by pull request, 100 reviews a page, after the view. A review that
 query does not return reads nothing (and is no override). If the query fails,
 nothing about the pull request is decided: the queue leaves it as it is and the
 next run tries again; the head check fails.
+
+An inline review comment (written on a line of the diff, in the "Files
+changed" tab) is a comment like any other: it can be a lens read, a comment
+that looks like a report and reads nothing, or an override, by the same author,
+edit and hidden rules. `gh pr view` lists none of them, so the same query reads
+them, 100 a page for each review, with their own edited and hidden flags and
+author type; every pull request is read this way, also one without a review in
+`gh pr view`. A comment of a review that is not submitted yet (pending) does
+not count: only its author can see it. Resolving the thread changes nothing: a
+resolved comment still counts. Its ways out are the same as any comment's
+(delete it, `not a lens: ...`, or an override).
 
 The grammar is fixed: a project writes its lens reports this way, it does not
 configure another way. It fails closed. A comment that looks like a lens report
@@ -114,8 +126,18 @@ first, and acts on the first one it can:
   merged with the base. Anything else leaves it off with a comment that names
   the way out.
 
-A pull request in a merge state the queue neither updates nor waits for (a
-conflict, `DIRTY`) is passed over, and the run says so. `UNKNOWN` (GitHub is
+Right after the update GitHub can refuse to turn auto-merge back on only
+because the new head's required checks have not started
+(`Required status check "..." is queued`, or `in progress`, `expected`,
+`pending`). That refusal alone is tried again for the same head, after
+`poll_seconds`, then twice that, and so on, for at most `wait_seconds` in all.
+Every try names the head that was checked, so a head pushed meanwhile is never
+armed. Any other refusal, or a check still not started after that time, leaves
+auto-merge off with the usual comment. A run stopped during the wait is
+finished by the next run, the same way.
+
+A pull request in a merge state the queue neither updates nor waits for is
+passed over, and the run says so. `UNKNOWN` (GitHub is
 still computing it, often for a few seconds after a push to the base) is listed
 again every `poll_seconds`, for at most `wait_seconds`, before it is passed
 over, so a younger pull request is not updated ahead of it.
@@ -123,6 +145,12 @@ over, so a younger pull request is not updated ahead of it.
 An armed pull request that cannot merge does not hold the queue. It is told
 why on the pull request, once per head, check and reason, and passed over:
 
+- a conflict with its base (merge state `DIRTY`): GitHub cannot merge it and
+  the queue cannot update it, and GitHub leaves auto-merge on without a word.
+  The comment says to merge the base into it, resolve the conflict and push
+  (`push_command`). The new head is then a change no lens read, so it needs a
+  new read or an override like any push. A conflict is said before a red
+  check of the same head: only a push ends either.
 - a required check whose newest run failed (`FAILURE`, `ERROR`, `TIMED_OUT`,
   or `CANCELLED` after a red with nothing green since), behind or not. The
   newest run of the name counts, whichever workflow ran it, as the ruleset

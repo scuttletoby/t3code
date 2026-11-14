@@ -384,6 +384,68 @@ class Reviews(unittest.TestCase):
         self.assertIn(lens.NO_HEADER, why)
 
 
+class InlineComments(unittest.TestCase):
+    """Inline review comments (on a line of the diff) take part like comments (lens_posts). gh pr view lists none of
+    them: the caller reads them and passes them as lens.REVIEW_COMMENTS, each with its own flags and author type."""
+    R = WhoCounts.R
+    READ_A, READ_B = (f'lens: correctness · reviewer: x · read at: {sha}' for sha in (SHA_A, SHA_B))
+
+    @staticmethod
+    def inline(body, when='2026-01-02T00:00:00Z', typename='User', **extra):
+        return post(body, when=when, **{'author': {'__typename': typename, 'login': 'someone'}, 'isMinimized': False,
+                                        **extra})
+
+    def head(self, comments=(), inline=..., r=None):
+        pr = {'headRefOid': SHA_B, 'comments': list(comments), 'reviews': [], lens.REVIEW_FLAGS: {}}
+        if inline is not ...:
+            pr[lens.REVIEW_COMMENTS] = inline
+        return (r or self.R).reviewed_head(pr)
+
+    def test_a_counted_inline_comment_is_a_read(self):
+        self.assertEqual(self.head(inline=[self.inline(self.READ_B)]), (True, SHA_B, 'every lens read it'))
+
+    def test_none_read_is_the_same_as_none_there(self):   # old state: a caller that reads no inline comments
+        own = post(self.READ_A)
+        for inline in (..., None, []):
+            self.assertEqual(self.head([own], inline), (True, SHA_A, 'every lens read it'))
+            self.assertEqual(self.head(inline=inline), (False, None, 'no lens comments'))
+
+    def test_the_newest_of_comments_and_inline_comments_counts(self):
+        own = post(self.READ_A, when='2026-01-02T00:00:00Z')
+        self.assertEqual(self.head([own], [self.inline(self.READ_B, when='2026-01-03T00:00:00Z')])[1], SHA_B)
+        self.assertEqual(self.head([own], [self.inline(self.READ_B, when='2026-01-01T00:00:00Z')])[1], SHA_A)
+
+    def test_a_counted_authors_inline_look_alike_blocks(self):
+        own = post(self.READ_B)
+        for body in ('lgtm, safe to merge', f'lens: design · read at: {SHA_B[:7]}'):
+            reviewed, sha, why = self.head([own], [self.inline(body)])
+            self.assertEqual((reviewed, sha), (True, None), body)
+
+    def test_an_edited_or_hidden_inline_lens_reads_nothing(self):
+        for change, text in (({'includesCreatedEdit': True}, lens.EDITED), ({'isMinimized': True}, lens.HIDDEN),
+                             ({'includesCreatedEdit': ...}, lens.EDITED)):   # not said: never "unedited"
+            reviewed, sha, why = self.head(inline=[self.inline(self.READ_B, **change)])
+            self.assertEqual((reviewed, sha), (True, None), change)
+            self.assertIn(text, why)
+
+    def test_a_strangers_or_a_bots_inline_comment_is_ignored(self):
+        own = post(self.READ_A)
+        for forged in (self.inline(self.READ_B, authorAssociation='NONE'), self.inline(self.READ_B, typename='Bot'),
+                       self.inline('safe to merge', authorAssociation='CONTRIBUTOR'),
+                       self.inline('safe to merge', typename='Bot')):
+            self.assertEqual(self.head([own], [forged]), (True, SHA_A, 'every lens read it'))
+            self.assertEqual(self.head(inline=[forged]), (False, None, 'no lens comments'))
+
+    def test_an_inline_override_vouches_like_any_other(self):
+        r = lens.Review((), 'proj ready --head', 'OWNER', ('OWNER',))
+        own = post(self.READ_A)
+        ov = self.inline(f'proj ready --head {SHA_B}: read the rest')
+        self.assertEqual(self.head([own], [ov], r), (True, SHA_B, 'every lens read it'))
+        for change in ({'includesCreatedEdit': True}, {'isMinimized': True}, {'authorAssociation': 'MEMBER'},
+                       {'when': '2025-12-31T00:00:00Z'}):
+            self.assertEqual(self.head([own], [self.inline(ov['body'], **change)], r)[1], SHA_A, change)
+
+
 class Config(unittest.TestCase):
     def parse(self, **change):
         raw = {**VALID, **change}

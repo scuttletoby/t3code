@@ -8,7 +8,8 @@ queue's own rules, imported, never copied:
   - lens.Review.reviewed_head and lens_reads: the one full 40-hex sha every lens's newest read names, or a newer
     override comment's. Only comments of the config's lens_author_associations count (bots never); an edited or
     hidden lens comment, a short sha and a comment that only looks like a lens report read nothing. A review's edited
-    and hidden flags come from the queue's own query (pr_queue.review_flags), never from gh pr view.
+    and hidden flags come from the queue's own query (pr_queue.review_flags), never from gh pr view; the same query
+    reads the inline review comments (on a line of the diff), which count like any other comment.
   - pr_queue.holds: the head is that commit, or a clean merge of the base into it, byte for byte (a queue update).
 The config is the queue's own JSON file (config.py), read from the base commit, so the check and the queue read the
 same people and override, and a pull request cannot change them for its own check.
@@ -16,9 +17,9 @@ same people and override, and a pull request cannot change them for its own chec
 
 Pass: every lens read the head (or a newer override vouches for it), and every required lens is there; a pull
 request with no lens comments and no required lens (nothing to compare); a draft, with --pass-drafts only. Fail,
-never pass, when anything is unknown: GitHub unreadable after ATTEMPTS (the reviews' own flags too), a malformed
-answer, a checkout whose merge commit merges another head than the one GitHub reports, a read commit that is not in the
-checkout and cannot be fetched.
+never pass, when anything is unknown: GitHub unreadable after ATTEMPTS (the reviews' flags and inline comments too), a
+malformed answer, a checkout whose merge commit merges another head than the one GitHub reports, a read commit that is
+not in the checkout and cannot be fetched.
 Refuse to start (exit 2, before GitHub is read) on a config or argument error, a git older than 2.38, and a checkout
 that is not GitHub's two-parent merge commit, is shallow or is tampered with. Reads only (a fetch of a missing read
 commit into the job's own checkout aside) and posts nothing: a re-run on the same head gives the same answer, and a
@@ -105,9 +106,10 @@ def well_formed(pr):
 
 
 def read_pr(repo, n, gh, sleep):
-    """(the PR, None) or (None, why it could not be read), after ATTEMPTS tries. A PR with reviews also needs its
-    reviews' own flags (pr_queue.review_flags, read after the view): gh pr view prints includesCreatedEdit false for
-    every review without asking GitHub, so a PR whose flags cannot be read is a PR that could not be read."""
+    """(the PR, None) or (None, why it could not be read), after ATTEMPTS tries. Every PR also needs its reviews' own
+    flags and its inline review comments (pr_queue.review_flags, read after the view): gh pr view prints
+    includesCreatedEdit false for every review without asking GitHub and lists no inline comment at all, so a PR for
+    which that read fails is a PR that could not be read."""
     why = ''
     for attempt in range(ATTEMPTS):
         if attempt:
@@ -120,11 +122,9 @@ def read_pr(repo, n, gh, sleep):
         if not well_formed(pr):
             why = (r.stderr or r.stdout or '').strip()[:300] or 'gh gave no usable answer'
             continue
-        if not pr['reviews']:
-            return pr, None
-        flags, why = pr_queue.review_flags(gh, repo, n)
+        flags, inline, why = pr_queue.review_flags(gh, repo, n)
         if flags is not None:
-            pr[lens.REVIEW_FLAGS] = flags
+            pr[lens.REVIEW_FLAGS], pr[lens.REVIEW_COMMENTS] = flags, inline
             return pr, None
     return None, why
 

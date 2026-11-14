@@ -150,13 +150,17 @@ def failed(err='HTTP 502'):
 class QueueGh:
     """`gh` for one armed PR #7 that is BEHIND main, at head `h1` (real commits of World `w`). update-branch makes the
     PR head `after` (GitHub shows it after `polls` more views). `fail`: kinds whose gh call fails; `kill_at`: the kind
-    where the process dies ('poll': the first view after update-branch)."""
+    where the process dies ('poll': the first view after update-branch). `flags`: the answers to review_flags' pages,
+    in turn (none left: the read fails); not given: one page, the reviews as gh shows them (unedited, shown) with the
+    `inline` review comments (inline_node) under a review of their own. `arm_says`: what GitHub answers to each arm in
+    turn, an error text or None (armed); none left: armed."""
     def __init__(self, w, h1, after, comments=(), polls=0, fail=(), armed=True, behind=True, kill_at=None, reviews=(),
-                 flags=()):
+                 flags=None, inline=(), arm_says=()):
         self.w = w
         self.head, self.after, self.armed, self.behind, self.updated = h1, after, (h1 if armed else None), behind, False
         self.on_pr, self.polls, self.fail, self.kill_at = list(comments), polls, set(fail), kill_at
-        self.reviews, self.flags = list(reviews), list(flags)   # flags: the answers to review_flags' pages, in turn
+        self.reviews, self.flags, self.inline = list(reviews), flags if flags is None else list(flags), list(inline)
+        self.arm_says = list(arm_says)
         self.calls, self.comments = [], []
         w.set('refs/pull/7/head', h1)
 
@@ -193,6 +197,8 @@ class QueueGh:
         if kind == 'view':
             return ok(json.dumps(self.view()))
         if kind == 'api graphql' and f'query={Q.REVIEW_FLAGS_QUERY}' in a:
+            if self.flags is None:
+                return flags_page(*self.reviews, inline=self.inline)
             return self.flags.pop(0) if self.flags else failed('no more pages')
         if kind == 'list':
             return ok(json.dumps([self.view()]))
@@ -203,13 +209,19 @@ class QueueGh:
             if self.after:
                 self.w.set('refs/pull/7/head', self.after)
         elif kind == 'arm':
+            says = self.arm_says.pop(0) if self.arm_says else None
+            if says:
+                return failed(says)
             self.armed = a[a.index('--match-head-commit') + 1]
         elif kind == 'comment':
             self.comments.append(a[a.index('--body') + 1])
         return ok()
 
-    def order(self):
-        return [k for k in map(self.kind, self.calls) if k != 'view']
+    def order(self):   # what the queue did, without its reads (the view, and the reviews' flags and inline comments)
+        return [k for k in map(self.kind, self.calls) if k not in ('view', 'api graphql')]
+
+    def reads(self):   # how often the reviews' flags and inline comments were read
+        return sum(self.kind(a) == 'api graphql' for a in self.calls)
 
 
 def note(body, when, login='owner', association='OWNER', edited=False):
@@ -229,12 +241,35 @@ def gh_review(body, when, n=1, login='owner', association='OWNER'):
             'authorAssociation': association, 'includesCreatedEdit': False, 'state': 'COMMENTED'}
 
 
-def flags_page(*reviews, edited=False, hidden=False, more=None, typename='User'):
-    """One page of REVIEW_FLAGS_QUERY's answer; more: the endCursor of a next page."""
+def inline_node(body, when='2026-11-07T10:00:00Z', login='owner', association='OWNER', edited=False, hidden=False,
+                typename='User', state='SUBMITTED', n=1):
+    """An inline review comment (on a line of the diff) as REVIEW_FLAGS_QUERY's answer gives it."""
+    return {'state': state, 'body': body, 'createdAt': '2026-11-01T00:00:00Z', 'publishedAt': when,
+            'includesCreatedEdit': edited, 'isMinimized': hidden, 'url': f'https://x/pull/7#discussion_r{n}',
+            'authorAssociation': association, 'author': {'__typename': typename, 'login': login}}
+
+
+def inline_page(nodes=(), more=None):
+    """One page of a review's inline comments; more: the endCursor of a next page."""
+    return {'pageInfo': {'hasNextPage': more is not None, 'endCursor': more}, 'nodes': list(nodes)}
+
+
+def flags_page(*reviews, edited=False, hidden=False, more=None, typename='User', inline=(), inline_more=None):
+    """One page of REVIEW_FLAGS_QUERY's answer; more: the endCursor of a next page. `inline`: inline review comments
+    (inline_node), under a review of their own that gh pr view does not list (PRR_inline; inline_more: the endCursor
+    of that review's next page of them)."""
     nodes = [{'id': r['id'], 'includesCreatedEdit': edited, 'isMinimized': hidden, 'url': f'https://x/{r["id"]}',
-              'author': {'__typename': typename, 'login': 'owner'}} for r in reviews]
+              'author': {'__typename': typename, 'login': 'owner'}, 'comments': inline_page()} for r in reviews]
+    if inline or inline_more:
+        nodes.append({'id': 'PRR_inline', 'includesCreatedEdit': False, 'isMinimized': False, 'url': 'https://x/PRR_inline',
+                      'author': {'__typename': 'User', 'login': 'owner'}, 'comments': inline_page(inline, inline_more)})
     page = {'hasNextPage': more is not None, 'endCursor': more}
     return ok(json.dumps({'data': {'repository': {'pullRequest': {'reviews': {'pageInfo': page, 'nodes': nodes}}}}}))
+
+
+def more_comments_page(nodes=(), more=None):
+    """One page of MORE_COMMENTS_QUERY's answer: a review's next 100 inline comments."""
+    return ok(json.dumps({'data': {'node': {'comments': inline_page(nodes, more)}}}))
 
 
 def override(sha, when):   # an override comment as the project's ready command posts it
@@ -488,14 +523,14 @@ class ReviewFlags(Base):   # issue #56: gh pr view prints includesCreatedEdit fa
             with self.subTest(answer=answer):
                 f = self.fake(reviews=[r], flags=[answer])
                 code, out = self.update(f)
-                self.assertEqual((code, f.order(), f.armed, f.comments), (1, ['api graphql'], self.c, []), out)
+                self.assertEqual((code, f.order(), f.reads(), f.armed, f.comments), (1, [], 1, self.c, []), out)
                 self.assertIn('nothing changed', out)
                 self.assertFalse(self.plan_exists())
 
-    def test_a_pr_without_reviews_needs_no_flags_read(self):
+    def test_a_pr_gh_lists_no_review_for_is_read_all_the_same(self):   # an inline comment shows only in that read
         f = self.fake(comments=[lens_at('correctness', self.c)])
         self.assertEqual(self.update(f)[0], 0)
-        self.assertNotIn('api graphql', f.order())
+        self.assertEqual((f.reads(), f.armed), (1, self.up))
 
     def test_a_stopped_run_rereads_the_flags_before_it_rearms(self):   # STATE from a run killed after the disarm
         r = self.lens_review(self.c)
@@ -521,7 +556,9 @@ class ReviewFlagsQuery(unittest.TestCase):
         def gh(*a):
             calls.append(a)
             return answers.pop(0) if answers else failed('no more pages')
-        return Q.review_flags(gh, REPO, 7), calls
+        flags, self.inline, why = Q.review_flags(gh, REPO, 7)
+        self.assertEqual(flags is None, self.inline is None, 'flags and inline comments are read together or not at all')
+        return (flags, why), calls
 
     def test_more_than_100_reviews_are_read_page_by_page(self):
         reviews = [gh_review('x', 't', n) for n in range(1, 251)]
@@ -635,11 +672,11 @@ class Main(Base):
         self.assertTrue(self.plan_exists(), 'the plan is shown, not finished or removed')
         self.assertFalse(os.path.exists(self.q.cache))
 
-    def test_a_merge_state_the_queue_does_not_handle_is_said(self):   # skipped, never silently
+    def test_a_merge_state_the_queue_does_not_handle_is_said(self):   # skipped, never silently (DIRTY: Conflict)
         f = self.fake()
-        code, out = self.main(self.listing(f, [self.listed(3, 'DIRTY')]))
+        code, out = self.main(self.listing(f, [self.listed(3, 'DRAFT')]))
         self.assertEqual((code, f.order(), f.armed), (0, ['list'], self.c), out)
-        self.assertIn('skip #3: merge state DIRTY', out)
+        self.assertIn('skip #3: merge state DRAFT', out)
 
     def test_a_held_lock_runs_nothing(self):   # two runs at once (a push and the timer): the second does nothing
         os.makedirs(os.path.dirname(self.q.lock), exist_ok=True)
@@ -733,7 +770,7 @@ class Recover(Base):   # a run killed after its disarm
     def test_armed_again_or_closed_needs_nothing(self):
         f = self.fake()   # still armed: the run was killed before its disarm, or someone re-armed it
         code, out = self.recover(f, self.plan())
-        self.assertEqual((code, [f.kind(c) for c in f.calls], f.armed), (0, ['view'], self.c))
+        self.assertEqual((code, [f.kind(c) for c in f.calls], f.armed), (0, ['view', 'api graphql'], self.c))
         self.assertFalse(self.plan_exists())
 
     def test_off_at_the_same_change_is_re_armed_for_that_head(self):
@@ -1910,6 +1947,500 @@ class AFailedRecoverIsNotDropped(Islands):
         run_quiet(self.q.main)   # the next run: gh works again
         self.assertTrue(f.armed9 == h9 or f.comments9, 'PR 9: OFF since the stopped run, never re-armed, no comment')
         self.assertFalse(os.path.exists(self.q.state))
+
+
+# --- gaps found before the source project moved to this queue -------------------------------------------------------
+QUEUED = 'GraphQL: Required status check "build" is queued. (mergePullRequest)'
+MOVED = 'GraphQL: Head branch was modified. Review and try the merge again. (enablePullRequestAutoMerge)'
+
+
+class ArmWaitsOutTheQueuedCheckRace(Base):
+    """Right after update-branch GitHub can refuse the re-arm with `Required status check "build" is queued`: the new
+    head's checks have not started. Only that refusal is tried again, for the same head, bounded by wait_seconds; before,
+    the first refusal left a PR that held exactly the read change OFF until a person ran the ready command."""
+    def arms(self, f):
+        return [a[a.index('--match-head-commit') + 1] for a in f.calls if QueueGh.kind(a) == 'arm']
+
+    def assertLeftOff(self, f, code, said, tries):
+        self.assertEqual((code, f.armed, len(f.comments)), (0, None, 1), f.comments)
+        self.assertEqual(self.arms(f), [self.up] * tries)
+        self.assertIn(said, f.comments[0])
+        self.assertIn('`tool ready 7`', f.comments[0])
+        self.assertIsNone(REVIEW.lens_problem(note(f.comments[0], 't')), 'a queue comment must never look like a lens')
+        self.assertFalse(self.plan_exists(), 'OFF and said on the PR: nothing left to finish')
+
+    def test_a_queued_check_then_success_rearms_the_same_head(self):
+        f = self.fake(arm_says=[QUEUED])
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+        self.assertEqual(f.order(), ['disarm', 'update', 'arm', 'arm'])
+        self.assertEqual(self.arms(f), [self.up, self.up], 'every try names the head that was checked')
+        self.assertEqual(self.sleeps, [CFG.poll_seconds])
+        self.assertIn('trying again in 5 s', out)
+        self.assertFalse(self.plan_exists())
+
+    def test_every_not_started_yet_wording_is_the_same_race(self):
+        for msg in ('Required status check "build" is in progress.', 'Required status check "build" is expected.',
+                    'Required status check "build" is pending.', '2 of 2 required status checks are expected.',
+                    'GraphQL: Required status check "build" is queued. (mergePullRequest)'):
+            with self.subTest(msg=msg):
+                self.assertTrue(Q.CHECK_NOT_DONE_RE.search(msg))
+                f = self.fake(arm_says=[msg])
+                code, out = self.update(f)
+                self.assertEqual((code, f.armed, self.arms(f)), (0, self.up, [self.up] * 2), out)
+
+    def test_a_check_that_stays_queued_leaves_it_off_after_bounded_tries(self):
+        f = self.fake(arm_says=[QUEUED] * 50)
+        code, out = self.update(f)
+        self.assertEqual(self.sleeps, [5, 10, 15, 20], 'the waits grow and end')
+        self.assertLessEqual(sum(self.sleeps), CFG.wait_seconds)
+        self.assertLeftOff(f, code, 'is queued', tries=5)
+        self.assertIn('tried again for 60 s', f.comments[0])
+
+    def test_the_waits_stay_within_the_configs_wait_seconds(self):
+        for wait, poll, waits in ((5, 1, [1, 2]), (5, 5, [5]), (60, 60, [60]), (600, 60, [60, 120, 180, 240]),
+                                  (59, 30, [30])):
+            with self.subTest(wait=wait, poll=poll):
+                sleeps = []
+                q = make_queue(self.w.dir, config.parse(json.dumps({**CFG_RAW, 'wait_seconds': wait,
+                                                                    'poll_seconds': poll})), sleeps, self.w.remote)
+                f = self.fake(arm_says=[QUEUED] * 50, armed=False)
+                q.gh = f
+                r = run_quiet(q.arm, 7, self.up)[0]
+                self.assertEqual((r.returncode, sleeps, len(self.arms(f))), (1, waits, len(waits) + 1))
+                self.assertLessEqual(sum(sleeps), wait)
+
+    def test_any_other_refusal_is_final_at_once(self):
+        for msg in (MOVED, 'Pull request is not mergeable', 'HTTP 502', '',
+                    'Required status check "build" is failing.', 'Required status check "build" has not succeeded.',
+                    'Required status check "build" is failing. The merge queue is expected to run later.'):
+            with self.subTest(msg=msg):
+                self.assertFalse(Q.CHECK_NOT_DONE_RE.search(msg))
+                self.sleeps.clear()
+                f = self.fake(arm_says=[msg or ' ', QUEUED])   # ' ': the fake arms on an empty answer
+                code, out = self.update(f)
+                self.assertEqual(self.sleeps, [])
+                self.assertLeftOff(f, code, 'back on', tries=1)
+                self.assertNotIn('tried again', f.comments[0])
+
+    def test_a_head_that_moved_during_the_wait_is_never_armed(self):   # --match-head-commit on every try
+        f = self.fake(arm_says=[QUEUED, MOVED])
+        code, out = self.update(f)
+        self.assertEqual(self.sleeps, [5])
+        self.assertLeftOff(f, code, 'Head branch was modified', tries=2)
+
+    def test_a_run_killed_in_the_wait_is_finished_by_the_next_run(self):   # stops half-way: STATE is still there
+        f = self.fake(arm_says=[QUEUED])
+
+        def killed(seconds):
+            raise Killed('sleep')
+        self.q.sleep = killed
+        with self.assertRaises(Killed):
+            self.update(f)
+        self.assertEqual((f.armed, f.comments), (None, []))
+        self.assertTrue(self.plan_exists(), 'the plan must outlive a run killed between two tries')
+        self.q.sleep = self.sleeps.append
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+        self.assertFalse(self.plan_exists())
+
+    def test_the_next_run_waits_out_the_race_too(self):   # recover(): the same arm, the same rule
+        self.q.write_state({'repo': REPO, 'pr': 7, 'old': self.c, 'base': 'main', 'read': self.c})
+        f = self.fake(armed=False, arm_says=[QUEUED, QUEUED])
+        self.q.gh = f
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual((code, f.armed, f.comments, self.sleeps), (0, self.c, [], [5, 10]), out)
+        self.assertFalse(self.plan_exists())
+
+    def test_the_next_run_says_it_once_when_the_check_stays_queued(self):
+        self.q.write_state({'repo': REPO, 'pr': 7, 'old': self.c, 'base': 'main', 'read': self.c})
+        f = self.fake(armed=False, arm_says=[QUEUED] * 50)
+        self.q.gh = f
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual((code, f.armed, len(f.comments), self.sleeps), (0, None, 1, [5, 10, 15, 20]), out)
+        self.assertIn('is queued', f.comments[0])
+        self.assertFalse(self.plan_exists())
+        code, out = run_quiet(self.q.recover)   # a re-run: no plan, so nothing is tried or said again
+        self.assertEqual((code, len(f.comments)), (0, 1))
+
+
+class Conflict(unittest.TestCase):
+    """An armed PR that conflicts with its base (merge state DIRTY) cannot merge, the queue cannot update it, and
+    GitHub leaves auto-merge on without a word. It is told once per head and passed over; before, only the run log
+    said it."""
+    H, NEW = 'd4' * 20, 'e5' * 20
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix='pr-queue-conflict-')
+        self.addCleanup(shutil.rmtree, d, True)
+        self.q = make_queue(d)
+
+    @staticmethod
+    def listed(n, state, head, runs=()):
+        return {'number': n, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1}, 'mergeStateStatus': state,
+                'createdAt': f'2026-11-07T00:00:0{n}Z', 'statusCheckRollup': RedChecks.rollup(*runs), 'headRefOid': head,
+                'baseRefName': 'main'}
+
+    def sweep(self, comments=(), head=None, dry=False, fail=(), now=None, runs=(), state='DIRTY'):
+        """PR 7 (older, `state`) and PR 8 (behind). now: what `gh pr view 7` shows when the notice is written, if
+        other than the list (a push, a resolved conflict, auto-merge turned off)."""
+        self.posted, self.updated, self.calls = [], [], []
+        head = head or self.H
+        listed = [self.listed(7, state, head, runs), self.listed(8, 'BEHIND', 'f6' * 20)]
+
+        def gh(*a):
+            self.calls.append(a)
+            if a[:2] == ('pr', 'list'):
+                return ok(json.dumps(listed))
+            if a[:3] == ('pr', 'view', '7'):
+                if 'view' in fail:
+                    return failed('boom')
+                shown = {'headRefOid': head, 'mergeStateStatus': 'DIRTY', 'autoMergeRequest': {'m': 1},
+                         'comments': [own(c) for c in comments], **(now or {})}
+                asked = a[a.index('--json') + 1].split(',')   # gh prints only what was asked for
+                return ok(json.dumps({k: v for k, v in shown.items() if k in asked}))
+            if a[:3] == ('pr', 'comment', '7'):
+                self.posted.append(a[-1])
+                return failed('boom') if 'comment' in fail else ok()
+            raise AssertionError(a)
+        self.q.gh = gh
+        self.q.update = lambda n, d: self.updated.append(n) or 0
+        code, self.out = run_quiet(self.q.run, dry)
+        return code
+
+    def test_a_conflicted_armed_pr_is_told_and_the_queue_moves_on(self):
+        self.assertEqual(self.sweep(), 0)
+        self.assertEqual(self.posted, [
+            f'pr_queue: merge conflict with main on {self.H[:12]}, so this armed PR waits and the queue passes over '
+            'it. GitHub cannot merge it and the queue cannot update it: merge main into it, resolve the conflict and '
+            'push (`tool push`).'])
+        self.assertEqual(self.updated, [8], 'the next PR is not held up')
+        self.assertIn('skip #7: merge conflict with main', self.out)
+
+    def test_it_is_told_once_per_head(self):   # runs again: every push to the base starts a run
+        self.sweep()
+        first = self.posted[0]
+        self.sweep(comments=['an older comment', first])
+        self.assertEqual((self.posted, self.updated), ([], [8]))
+        self.sweep(comments=[first], head=self.NEW)
+        self.assertEqual(len(self.posted), 1, 'a new head that still conflicts is a new message')
+        self.assertIn(self.NEW[:12], self.posted[0])
+
+    def test_only_the_queues_own_comment_counts_as_told(self):   # anyone can post a copy of the mark
+        self.sweep()
+        first = self.posted[0]
+        for copy in ({'body': first, 'viewerDidAuthor': False}, {'body': first},
+                     {'body': '> ' + first, 'viewerDidAuthor': True}):
+            with self.subTest(copy=copy):
+                self.sweep(comments=[copy])
+                self.assertEqual(self.posted, [first], 'a copy of the mark silenced the queue')
+
+    def test_a_red_notice_of_the_same_head_does_not_count_as_told(self):   # PRs the older queue already wrote on
+        red = f'pr_queue: required check build is red on {self.H[:12]}, so this armed PR waits and the queue passes over it.'
+        self.sweep(comments=[red])
+        self.assertEqual(len(self.posted), 1)
+
+    def test_a_failed_comment_is_tried_again_by_the_next_run(self):   # stopped half-way: nothing remembers "told"
+        self.assertEqual(self.sweep(fail=('comment',)), 0)
+        self.assertEqual((len(self.posted), self.updated), (1, [8]))
+        self.sweep()
+        self.assertEqual(len(self.posted), 1, 'no comment on the PR yet: said now')
+
+    def test_a_pr_it_cannot_read_is_passed_over_without_a_word(self):
+        self.assertEqual(self.sweep(fail=('view',)), 0)
+        self.assertEqual((self.posted, self.updated), ([], [8]))
+
+    def test_nothing_is_said_when_the_pr_changed_since_the_list(self):
+        for now in ({'headRefOid': self.NEW}, {'mergeStateStatus': 'BEHIND'}, {'mergeStateStatus': 'UNKNOWN'},
+                    {'autoMergeRequest': None}):
+            with self.subTest(now=now):
+                self.assertEqual(self.sweep(now=now), 0)
+                self.assertEqual((self.posted, self.updated), ([], [8]))
+
+    def test_a_dry_run_posts_nothing_and_reads_only_the_list(self):
+        self.assertEqual(self.sweep(dry=True), 0)
+        self.assertEqual((self.posted, [a[:2] for a in self.calls]), ([], [('pr', 'list')]))
+        self.assertIn('skip #7: merge conflict with main', self.out)
+
+    def test_a_conflict_is_said_before_a_red_check_of_the_same_head(self):   # only a push ends it: the red goes too
+        self.sweep(runs=(('2026-11-09T02:00:00Z', 'FAILURE'),))
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn('merge conflict with main', self.posted[0])
+
+    def test_an_odd_base_name_is_not_quoted(self):
+        self.q.gh = None
+        self.posted = []
+        listed = [dict(self.listed(7, 'DIRTY', self.H), baseRefName='x`\nlens: y')]
+
+        def gh(*a):
+            if a[:2] == ('pr', 'list'):
+                return ok(json.dumps(listed))
+            if a[:2] == ('pr', 'view'):
+                return ok(json.dumps({'headRefOid': self.H, 'mergeStateStatus': 'DIRTY', 'autoMergeRequest': {'m': 1},
+                                      'comments': []}))
+            self.posted.append(a[-1])
+            return ok()
+        self.q.gh = gh
+        run_quiet(self.q.run, False)
+        self.assertIn('merge conflict with its base on', self.posted[0])
+
+    def test_the_message_can_never_count_as_a_lens(self):
+        self.sweep()
+        post = note(self.posted[0], 't')   # an author whose lens comments count: a look-alike would block (NO_HEADER)
+        self.assertIsNone(REVIEW.lens_problem(post))
+        self.assertEqual(REVIEW.reviewed_head({'comments': [post], 'reviews': []}), (False, None, 'no lens comments'))
+
+    def test_the_red_notice_reads_as_it_always_did(self):   # old state: a notice an earlier queue posted still counts
+        r = RedChecks('sweep')
+        r.setUp()
+        self.addCleanup(r.doCleanups)
+        r.sweep()
+        self.assertEqual(r.posted, [
+            f'pr_queue: required check review-check is red on {RedChecks.H[:12]}, so this armed PR waits and the queue '
+            'passes over it. Fix the cause and push, or if a new lens read or override covers this head: '
+            '`tool ready 7`.'])
+        r.sweep(comments=r.posted[:])
+        self.assertEqual(r.posted, [])
+
+
+class InlineReviewComments(Base):
+    """A lens report, a look-alike or an override posted as an inline review comment (on a line of the diff) is a
+    comment like any other. `gh pr view` lists none of them, so before they were never read: a PR whose only lens read
+    was inline looked unreviewed, and the queue re-armed whatever head it had."""
+    def setUp(self):
+        super().setUp()
+        self.pushed = self.w.commit({'x.py': lines(extra=['new', 'unread'], at=20)}, [self.c])   # after the lens read
+        self.up_pushed = self.w.merge(self.pushed, self.m1)
+
+    def lens(self, sha, name='correctness', **kw):
+        return inline_node(f'{LENS}: {name} · reviewer: x · read at: {sha}\nfindings: none', **kw)
+
+    def assertOff(self, f, code, said):
+        self.assertEqual((code, f.armed, len(f.comments)), (0, None, 1), f.comments)
+        self.assertNotIn('arm', f.order())
+        self.assertIn(said, f.comments[0])
+
+    def test_an_inline_lens_read_is_the_read_the_queue_keeps(self):
+        f = self.fake(inline=[self.lens(self.c)])
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+        self.assertIn(f'the change read at {self.c[:12]}', out)
+
+    def test_a_push_after_an_inline_lens_read_is_not_re_armed(self):   # the head holds more than the lens read
+        f = self.fake('up_pushed', h1=self.pushed, inline=[self.lens(self.c)])
+        code, out = self.update(f)
+        self.assertOff(f, code, 'is not exactly the change read')
+        self.assertTrue(f.updated)
+
+    def test_an_inline_lens_look_alike_blocks_like_any_other(self):
+        fence = '`' * 3
+        for body in (f'{fence}\n{LENS}: correctness · reviewer: x · read at: {self.c}\n{fence}',
+                     'this one is safe to merge', f'{LENS}: correctness · reviewer: x · read at: {self.c[:7]}'):
+            with self.subTest(body=body):
+                f = self.fake(inline=[inline_node(body)])
+                code, out = self.update(f)
+                self.assertOff(f, code, 'unclear')
+                self.assertFalse(f.updated)
+
+    def test_an_edited_or_hidden_inline_lens_reads_nothing(self):
+        for change, why in (({'edited': True}, lens.EDITED), ({'hidden': True}, lens.HIDDEN)):
+            with self.subTest(change=change):
+                f = self.fake(inline=[self.lens(self.c, **change)])
+                code, out = self.update(f)
+                self.assertOff(f, code, why.split(':')[0])
+
+    def test_inline_and_plain_lenses_are_read_together(self):
+        # the newest read of a lens wins, wherever it was posted
+        newer_inline = self.fake('up_pushed', h1=self.pushed, comments=[lens_at('correctness', self.c, '2026-11-07T10:00:00Z')],
+                                 inline=[self.lens(self.pushed, when='2026-11-07T11:00:00Z')])
+        code, out = self.update(newer_inline)
+        self.assertEqual((code, newer_inline.armed, newer_inline.comments), (0, self.up_pushed, []), out)
+        older_inline = self.fake('up_pushed', h1=self.pushed, comments=[lens_at('correctness', self.pushed, '2026-11-07T10:00:00Z')],
+                                 inline=[self.lens(self.c, when='2026-11-07T09:00:00Z')])
+        code, out = self.update(older_inline)
+        self.assertEqual((code, older_inline.armed), (0, self.up_pushed), out)
+        # two lenses, one inline, that read different heads: unclear
+        two = self.fake('up_pushed', h1=self.pushed, comments=[lens_at('correctness', self.pushed)],
+                        inline=[self.lens(self.c, name='design')])
+        code, out = self.update(two)
+        self.assertOff(two, code, 'did not all read one head')
+
+    def test_an_inline_override_vouches_for_its_head(self):
+        text = override(self.pushed, 't')['body']
+        f = self.fake('up_pushed', h1=self.pushed, comments=[lens_at('correctness', self.c, '2026-11-07T10:00:00Z')],
+                      inline=[inline_node(text, when='2026-11-07T11:00:00Z')])
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up_pushed, []), out)
+        for change in ({'edited': True}, {'hidden': True}, {'association': 'COLLABORATOR'}, {'typename': 'Bot'}):
+            with self.subTest(change=change):   # only the override's own author, unedited and shown
+                f = self.fake('up_pushed', h1=self.pushed, comments=[lens_at('correctness', self.c, '2026-11-07T10:00:00Z')],
+                              inline=[inline_node(text, when='2026-11-07T11:00:00Z', **change)])
+                code, out = self.update(f)
+                self.assertOff(f, code, 'is not exactly the change read')
+
+    def test_a_strangers_or_a_bots_inline_comment_neither_reads_nor_blocks(self):   # anyone can review a public PR
+        for who in ({'association': 'NONE', 'login': 'stranger'}, {'association': 'CONTRIBUTOR', 'login': 'stranger'},
+                    {'typename': 'Bot', 'login': 'some-app'}, {'login': 'review-bot'}):
+            with self.subTest(who=who):
+                f = self.fake('up_pushed', h1=self.pushed, inline=[self.lens(self.c, **who),
+                                                                   inline_node('safe to merge', **who)])
+                code, out = self.update(f)
+                self.assertEqual((code, f.armed, f.comments), (0, self.up_pushed, []), out)
+
+    def test_an_inline_comment_of_an_unsubmitted_review_is_not_posted_yet(self):   # PENDING: only its author sees it
+        f = self.fake('up_pushed', h1=self.pushed, inline=[self.lens(self.c, state='PENDING')])
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up_pushed, []), out)
+
+    def test_plain_review_talk_on_a_line_changes_nothing(self):   # the usual inline comment
+        f = self.fake(inline=[inline_node('nit: rename this'), inline_node('why not a set here?', n=2)])
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+
+    def test_inline_comments_that_cannot_be_read_change_nothing(self):   # also for a PR gh lists no review for
+        f = self.fake(flags=[failed('HTTP 502')])
+        code, out = self.update(f)
+        self.assertEqual((code, f.order(), f.armed, f.comments), (1, [], self.c, []), out)
+        self.assertIn('nothing changed', out)
+        self.assertFalse(self.plan_exists())
+
+    def test_a_stopped_run_reads_the_inline_comments_again_before_it_rearms(self):   # recover(): the review as it is now
+        f = self.fake('up_pushed', h1=self.pushed, kill_at='update')
+        with self.assertRaises(Killed):
+            self.update(f)   # no lens comments yet: the plan stores the head as the read
+        self.assertTrue(self.plan_exists())
+        f.kill_at, f.inline = None, [self.lens(self.c)]   # posted meanwhile: the lens read less than the head holds
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual((code, f.armed, len(f.comments)), (0, None, 1), out)
+        self.assertIn('could not be shown to be the change read', f.comments[0])
+        self.assertFalse(self.plan_exists())
+
+    def test_the_inline_comments_reach_the_rules_with_their_own_flags_and_time(self):
+        f = self.fake(inline=[self.lens(self.c, when='2026-11-07T12:00:00Z', n=5)])
+        self.q.gh = f
+        pr = self.q.view(7, reviews=True)
+        self.assertEqual(pr[lens.REVIEW_COMMENTS], [{
+            'body': f'{LENS}: correctness · reviewer: x · read at: {self.c}\nfindings: none',
+            'createdAt': '2026-11-07T12:00:00Z', 'author': {'__typename': 'User', 'login': 'owner'},
+            'authorAssociation': 'OWNER', 'includesCreatedEdit': False, 'isMinimized': False,
+            'url': 'https://x/pull/7#discussion_r5'}], 'the time it was published, not drafted')
+        self.assertNotIn(lens.REVIEW_COMMENTS, self.q.view(7), 'a plain view reads no reviews')
+
+
+class InlineCommentsQuery(ReviewFlagsQuery):
+    """review_flags' inline comments: every page of every review, and any doubt is a failure of the whole read."""
+    test_more_than_100_reviews_are_read_page_by_page = test_any_page_that_fails_fails_the_whole_read = None
+    test_a_next_page_without_a_new_cursor_fails = test_more_pages_than_the_limit_fail = None
+    test_a_node_without_both_flags_is_left_out = None   # the flags' own tests run once, in ReviewFlagsQuery
+
+    def bodies(self):
+        return [c['body'] for c in self.inline]
+
+    def test_the_query_asks_for_what_the_rules_read(self):
+        for field in ('state', 'body', 'createdAt', 'publishedAt', 'includesCreatedEdit', 'isMinimized', 'url',
+                      'authorAssociation', 'author{__typename login}'):
+            self.assertIn(field, Q.INLINE_COMMENTS)
+        for query in (Q.REVIEW_FLAGS_QUERY, Q.MORE_COMMENTS_QUERY):
+            self.assertIn('comments(first:100', query)
+            self.assertIn(Q.INLINE_COMMENTS, query)
+
+    def test_a_review_with_more_than_100_inline_comments_is_read_page_by_page(self):
+        nodes = [inline_node(f'c{i}', n=i) for i in range(250)]
+        (flags, why), calls = self.read(flags_page(gh_review('x', 't'), inline=nodes[:100], inline_more='i1'),
+                                        more_comments_page(nodes[100:200], more='i2'), more_comments_page(nodes[200:]))
+        self.assertIsNone(why)
+        self.assertEqual(self.bodies(), [f'c{i}' for i in range(250)])
+        self.assertEqual(set(flags), {'PRR_1', 'PRR_inline'})
+        for call, after in zip(calls[1:], ('i1', 'i2')):
+            self.assertIn(f'query={Q.MORE_COMMENTS_QUERY}', call)
+            self.assertIn('id=PRR_inline', call)
+            self.assertIn(f'after={after}', call)
+
+    def test_more_reviews_and_more_inline_comments_are_both_read(self):
+        (flags, why), calls = self.read(
+            flags_page(gh_review('x', 't', 1), inline=[inline_node('a')], inline_more='i1', more='r1'),
+            flags_page(gh_review('x', 't', 2)), more_comments_page([inline_node('b')]))
+        self.assertEqual((why, set(flags), sorted(self.bodies())), (None, {'PRR_1', 'PRR_2', 'PRR_inline'}, ['a', 'b']))
+        self.assertEqual(len(calls), 3)
+
+    def test_any_page_of_inline_comments_that_fails_fails_the_whole_read(self):
+        for second in (failed('HTTP 502'), ok('{}'), ok('null'), ok('{"data": {"node": null}}'),
+                       ok('{"data": {"node": {}}}'), ok('{"data": {"node": {"comments": {"nodes": []}}}}'),
+                       ok(json.dumps({'errors': [{'message': 'x'}], **json.loads(more_comments_page().stdout)}))):
+            with self.subTest(second=second):
+                (flags, why), _ = self.read(flags_page(inline=[inline_node('a')], inline_more='i1'), second)
+                self.assertIsNone(flags)
+                self.assertTrue(why)
+
+    def test_a_next_page_of_inline_comments_without_a_new_cursor_fails(self):
+        for cursor in ('', 'i1'):
+            (flags, why), _ = self.read(flags_page(inline=[inline_node('a')], inline_more='i1'),
+                                        more_comments_page([inline_node('b')], more=cursor))
+            self.assertIsNone(flags, cursor)
+        (flags, why), _ = self.read(flags_page(inline=[inline_node('a')], inline_more=''))
+        self.assertIsNone(flags)
+
+    def test_more_pages_than_the_limit_fail(self):
+        pages = [flags_page(inline=[inline_node('a')], inline_more='i0')] + \
+            [more_comments_page([inline_node('b')], more=f'i{i}') for i in range(1, Q.REVIEW_PAGES + 1)]
+        (flags, why), calls = self.read(*pages)
+        self.assertIsNone(flags)
+        self.assertEqual(len(calls), Q.REVIEW_PAGES)
+        self.assertIn('not all read', why)
+
+    def edited_page(self, change):
+        page = json.loads(flags_page(gh_review('x', 't'), inline=[inline_node('a'), inline_node('b', n=2)]).stdout)
+        change(page['data']['repository']['pullRequest']['reviews']['nodes'])
+        return ok(json.dumps(page))
+
+    def test_an_answer_that_is_not_what_was_asked_for_fails_the_whole_read(self):   # never a comment gone missing
+        def drop(key):
+            return lambda nodes: nodes[1]['comments']['nodes'][0].pop(key)
+
+        def put(key, value):
+            return lambda nodes: nodes[1]['comments']['nodes'][0].update({key: value})
+        changes = [drop(k) for k in ('state', 'body', 'createdAt', 'includesCreatedEdit', 'isMinimized', 'url',
+                                     'authorAssociation')]
+        changes += [put('includesCreatedEdit', None), put('isMinimized', 'no'), put('body', None), put('state', None),
+                    lambda nodes: nodes[1]['comments']['nodes'].append(None),
+                    lambda nodes: nodes[0].pop('comments'), lambda nodes: nodes[0].update(comments=None),
+                    lambda nodes: nodes[0].update(comments={'nodes': []}),
+                    lambda nodes: nodes[1]['comments'].update(nodes=None),
+                    lambda nodes: nodes[1]['comments'].update(pageInfo={'hasNextPage': None}),
+                    lambda nodes: nodes.append(None), lambda nodes: nodes.append('x')]
+        for i, change in enumerate(changes):
+            with self.subTest(i=i):
+                (flags, why), _ = self.read(self.edited_page(change))
+                self.assertIsNone(flags)
+                self.assertIn('GitHub gave no list', why)
+
+    def test_a_deleted_account_and_a_draft_time_are_read_as_they_are(self):
+        def change(nodes):
+            nodes[1]['comments']['nodes'][0].update(author=None, publishedAt=None)
+        (flags, why), _ = self.read(self.edited_page(change))
+        self.assertIsNone(why)
+        self.assertEqual((self.inline[0]['author'], self.inline[0]['createdAt']), (None, '2026-11-01T00:00:00Z'))
+
+    def test_the_inline_comments_of_a_review_without_flags_are_still_read(self):   # gh pr view lists none of them
+        def change(nodes):
+            nodes[1].pop('includesCreatedEdit')
+        (flags, why), _ = self.read(self.edited_page(change))
+        self.assertEqual((set(flags), why, self.bodies()), ({'PRR_1'}, None, ['a', 'b']))
+
+    def test_more_inline_comments_of_a_review_without_an_id_fail(self):   # nothing to ask for the next page with
+        def change(nodes):
+            nodes[1]['comments']['pageInfo'].update(hasNextPage=True, endCursor='i1')
+            nodes[1].pop('id')
+        (flags, why), calls = self.read(self.edited_page(change))
+        self.assertEqual((flags, len(calls)), (None, 1))
+
+    def test_an_unsubmitted_reviews_inline_comment_is_left_out(self):
+        (flags, why), _ = self.read(flags_page(inline=[inline_node('a', state='PENDING'), inline_node('b', n=2)]))
+        self.assertEqual((why, self.bodies()), (None, ['b']))
+
+    def test_no_reviews_at_all_reads_as_none(self):   # empty state
+        (flags, why), calls = self.read(flags_page())
+        self.assertEqual((flags, self.inline, why, len(calls)), ({}, [], None, 1))
 
 
 # --- what the port adds ----------------------------------------------------------------------------------------------
