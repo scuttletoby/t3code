@@ -1,23 +1,28 @@
 # shellcheck shell=bash
 # Sourced by every fork script that calls gh (fork-workflows.sh, fork-follow-guard.sh,
-# fork-follow-report.sh, fork-release.sh). Those scripts change the live repository (they disable
-# workflows, cancel runs, publish releases), so they reach gh only:
+# fork-follow-report.sh, fork-release.sh, fork-interaction-limit.sh). Those scripts change the live
+# repository (they disable workflows, cancel runs, publish releases, set limits), so they reach gh
+# only:
 #   - in a GitHub Actions run (GITHUB_ACTIONS=true) that is not a test, or
+#   - on a person's machine when FORK_GH_LOCAL names the very script that runs (its file name, as
+#     FORK_GH_LOCAL=fork-interaction-limit.sh), so one script is let through on purpose, never all, or
 #   - in a test (FORK_TEST_MODE set, by fork-test-gh.sh) whose gh is the tests' stub: the gh on
 #     PATH is the file FORK_GH_STUB names and carries the stub's marker line, no GitHub token is
 #     set, and GH_HOST is a .invalid host.
 # Anything else refuses: the script exits 1 when it sources this file, before any gh call, and
 # every later call goes through the gh function below, which checks again (a script may change
-# PATH). The marker must match FORK_GH_STUB_MARKER in fork-test-gh.sh. Tests: fork-follow.test.sh
-# and fork-release.test.sh; fork-contracts.test.py requires this file of every script calling gh.
+# PATH). The marker must match FORK_GH_STUB_MARKER in fork-test-gh.sh. Tests: fork-follow.test.sh,
+# fork-release.test.sh and fork-interaction-limit.test.sh; fork-contracts.test.py requires this
+# file of every script calling gh.
 
 FORK_GH_STUB_MARKER="# fork-gh-stub: a test stand-in for gh that never reaches GitHub"
 
 fork_gh_refusal() { # prints why gh may not be called here, or nothing
   local stub
   if [[ -z "${FORK_TEST_MODE:-}" ]]; then
-    [[ "${GITHUB_ACTIONS:-}" == true ]] \
-      || echo "this is neither a GitHub Actions run nor a test under the gh stub (FORK_TEST_MODE). These scripts change the live repository, so they run only in its workflows."
+    [[ "${GITHUB_ACTIONS:-}" == true ]] && return 0
+    [[ -n "${FORK_GH_LOCAL:-}" && "$FORK_GH_LOCAL" == "$(basename "$0")" ]] && return 0
+    echo "this is neither a GitHub Actions run, a local run of the script FORK_GH_LOCAL names, nor a test under the gh stub (FORK_TEST_MODE). These scripts change the live repository, so they run only in its workflows unless a person names one."
     return 0
   fi
   stub="$(type -P gh || true)"
