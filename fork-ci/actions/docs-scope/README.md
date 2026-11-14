@@ -11,7 +11,7 @@ reads, which folders each job builds) is a JSON config in the calling repository
 
 ## Usage
 
-Pin the action by full SHA (the tagged one, so a rebase of this fork cannot orphan it):
+Pin a release commit by its full SHA, never a commit of main ([why](../../README.md#pinning)):
 
 ```yaml
 jobs:
@@ -28,7 +28,7 @@ jobs:
             --jq '.workflow_runs[0].head_sha // ""') || sha=""
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - id: scope
-        uses: scuttletoby/t3code/fork-ci/actions/docs-scope@<full sha> # ci/vN
+        uses: scuttletoby/t3code/fork-ci/actions/docs-scope@<release sha> # ci/vN
         with:
           config: .github/docs-scope.json # default
           base: ${{ steps.green.outputs.sha }} # empty: a full run
@@ -150,7 +150,7 @@ so the "config is never docs" rule cannot be dodged by spelling.
 
 What it cannot stop: a `pull_request` run uses the workflow file from the pull request, so a pull request that edits
 the `uses:` line chooses the code that judges it. That edit is a change to a non-docs file, so every correct version
-runs in full for it; pin only SHAs that this fork's CI tested and tagged.
+runs in full for it; pin only release commits ([`fork-ci/README.md`](../../README.md#pinning)).
 
 ## Fails closed
 
