@@ -245,7 +245,9 @@ The queue needs:
   the plan decides what is re-armed ("The queue");
 - a required `head_check` that fails a head no lens read. The queue only
   touches pull requests that are behind; without that check, a push to an
-  armed pull request that is already up to date merges unread;
+  armed pull request that is already up to date merges unread. The
+  [head-check](../head-check/README.md) action is that check, with the
+  queue's own rules;
 - a run after each push to the base branch and on a timer, so a pull request
   armed while the base is quiet is still picked up;
 - a token that can update branches, comment and merge (a fine-grained personal
