@@ -1,7 +1,8 @@
 /**
- * Fork (waits): register, list, cancel, judge, prune and lost-wait notices over one store file.
- * A change is kept in memory only after its write. With waits off, nothing is read or written
- * except by list and cancel, which never repair. A cancel between a judge and its apply wins.
+ * Fork (waits): register, list, cancel, judge, deliver, prune and lost-wait notices over one store
+ * file. A change is kept in memory only after its write. With waits off, nothing is read or written
+ * except by list and cancel, which never repair. A cancel between a judge and its apply wins. A
+ * message's id is written before its first send, so a retry after a crash finds it again.
  */
 import type { ProjectId, ServerSettings, ThreadId } from "@t3tools/contracts";
 import {
@@ -20,7 +21,12 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   capEndedWaits,
+  deliveryCommandId,
+  type DeliveryGroup,
+  deliveryGroups,
+  deliveryRetryDelayMs,
   ENDED_PER_THREAD_FACTOR,
+  joinedWakeMessage,
   type Judgement,
   MAX_ENDED_WAITS,
   MAX_OPEN_WAITS,
@@ -28,6 +34,7 @@ import {
   shouldPruneWait,
   validateWaitSpec,
   waitDeadline,
+  type WaitEvent,
   waitKey,
   type WaitStateSettings,
   waitTargetText,
@@ -40,16 +47,16 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
-import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import { ServerSettingsService } from "../serverSettings.ts";
+import type { WaitDelivery, WaitDeliveryResult } from "./WaitDelivery.ts";
 import { makeFileJudge, type WaitJudge, type WaitJudges } from "./WaitJudges.ts";
 import * as WaitStore from "./WaitStore.ts";
 
 /** At registration a judge that has not answered by then counts as "not yet" (R5). */
 const REGISTER_JUDGE_LIMIT = "3 seconds";
-/** At most this many judges run at once. */
+/** At most this many judges, and this many sends, run at once. */
 const JUDGE_CONCURRENCY = 4;
 /**
  * A judge in a sweep that has not answered by then counts as a failed read (the error grace and
@@ -65,9 +72,14 @@ function judgeLimit(kind: WaitKind): Duration.Duration {
  * all are late, waits of that kind answer "not yet", never "failed".
  */
 const MAX_RUNNING_JUDGES_PER_KIND = 2;
+const SEND_CONCURRENCY = 4;
+/** A held message to a stopped thread is looked at again this often, to see it run again. */
+const STOPPED_RECHECK_MS = 60_000;
+/** After the store could not be read, or a notice not sent, the next try is this much later. */
+const PROBLEM_RECHECK_MS = 60_000;
 const WAIT_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 
-/** A message to a thread. PR 3 sends it with the thread tools' send; tests use a fake. */
+/** A message to a thread, sent through a `WaitDelivery`. */
 export interface WaitMessage {
   readonly threadId: ThreadId;
   readonly messageId: string;
@@ -75,14 +87,6 @@ export interface WaitMessage {
   readonly commandId: string;
   readonly text: string;
 }
-
-export class WaitSendError extends Schema.TaggedError<WaitSendError>()("WaitSendError", {
-  detail: Schema.String,
-  /** False when the same command can never be accepted (the thread is gone, the id refused). */
-  retry: Schema.Boolean,
-}) {}
-
-export type WaitSend = (message: WaitMessage) => Effect.Effect<void, WaitSendError>;
 
 const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
 
@@ -155,10 +159,13 @@ type Loaded =
 
 export const make = Effect.fn("WaitService.make")(function* (input: {
   readonly filePath: string;
-  readonly send: WaitSend;
+  readonly delivery: WaitDelivery;
   /** Replaces the built-in judge of a kind; tests use slow or scripted ones. */
   readonly judges?: WaitJudges;
+  /** Runs after a register or cancel changed the store, so the sweep looks again at once. */
+  readonly onChange?: Effect.Effect<void>;
 }) {
+  const onChange = input.onChange ?? Effect.void;
   const settingsService = yield* ServerSettingsService;
   const platform = yield* HostProcess.Platform;
   const store = yield* WaitStore.make({ filePath: input.filePath });
@@ -182,6 +189,15 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     judgesChanged = yield* Deferred.make<void>();
     yield* Deferred.succeed(previous, undefined);
   });
+  /** When a message is tried again, by message id; empty after a restart, so all go at once. */
+  const retryAt = new Map<string, number>();
+  /** Tries of a message's current command id that recorded nothing, for its back-off. */
+  const failures = new Map<string, number>();
+  /** Threads that may have been archived or deleted, so their `waiting` waits are looked at. */
+  const receiversToCheck = new Set<ThreadId>();
+  /** The first sweep looks at every thread with a `waiting` wait (events missed while down). */
+  let checkAllReceivers = true;
+  let noticesRetryAt = 0;
 
   const judgeOf = (kind: WaitKind) => judges[kind] as WaitJudge | undefined;
 
@@ -374,6 +390,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         } as WaitRecord;
         yield* commitOrFail({ ...contents, waits: [...contents.waits, record] }, settings.waitFor);
         nextCheckAt.set(record.id, now + intervalMs(record.kind, settings.waitFor));
+        yield* onChange;
         return waitingResult(record, false);
       }),
     );
@@ -465,6 +482,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         if (cancelled.length > 0) {
           yield* commitOrFail({ ...contents, waits }, settings.waitFor);
           for (const id of cancelled) nextCheckAt.delete(id);
+          yield* onChange;
         }
         return { cancelled, notCancelled } satisfies WaitCancelResult;
       }),
@@ -664,7 +682,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     return next === undefined || next <= now || next - now > intervalMs(wait.kind, settings);
   };
 
-  const sweep = Effect.fnUntraced(function* (settings: ServerSettings) {
+  const judgeSweep = Effect.fnUntraced(function* (settings: ServerSettings) {
     const startedAt = yield* Clock.currentTimeMillis;
     const due = yield* lock.withPermits(1)(
       Effect.gen(function* () {
@@ -703,15 +721,265 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   const judgeDue = Effect.fn("WaitService.judgeDue")(function* () {
     const settings = yield* readSettingsOrNull;
     if (settings === null || !settings.waitFor.enabled) return { judged: 0, ended: 0 };
-    const result = yield* Semaphore.withPermitsIfAvailable(sweepLock, 1)(sweep(settings));
+    const result = yield* Semaphore.withPermitsIfAvailable(sweepLock, 1)(judgeSweep(settings));
     return Option.getOrElse(result, () => ({ judged: 0, ended: 0 }));
   });
 
-  /** Removes ended waits older than `keepEndedHours`. Does nothing while waits are off. */
-  const prune = Effect.fn("WaitService.prune")(function* () {
-    const settings = yield* readSettingsOrNull;
-    if (settings === null || !settings.waitFor.enabled) return 0;
+  /** Runs `events` in order on the stored wait; null when none of them changes it. */
+  const applyEvents = (
+    wait: WaitRecord,
+    events: ReadonlyArray<WaitEvent>,
+    now: number,
+    settings: ServerSettings,
+    transitions: WaitTransition[],
+  ): WaitRecord => {
+    let record = wait;
+    for (const event of events) {
+      const transition = nextWaitState(record, event, now, stateSettings(settings));
+      if (transition === null) continue;
+      transitions.push(transition);
+      record = transition.record;
+    }
+    return record;
+  };
+
+  /** Writes the changed waits; false (with a warning) when the write failed. */
+  const commitWaits = (
+    contents: WaitStore.WaitStoreContents,
+    waits: ReadonlyArray<WaitRecord>,
+    what: string,
+    settings: ServerSettings,
+  ) =>
+    commit({ ...contents, waits }, settings.waitFor).pipe(
+      Effect.as(true),
+      Effect.catch((error) =>
+        Effect.logWarning(`waits: ${error.message}; ${what}`).pipe(Effect.as(false)),
+      ),
+    );
+
+  const forgetMessage = (messageId: string) => {
+    retryAt.delete(messageId);
+    failures.delete(messageId);
+  };
+
+  /** The events one send's answer makes for each wait of its message. */
+  const eventsFor = (
+    result: WaitDeliveryResult,
+    wait: WaitRecord,
+    now: number,
+    settings: ServerSettings,
+  ): ReadonlyArray<WaitEvent> => {
+    switch (result.type) {
+      case "delivered":
+        return [{ type: "threadRunning" }, { type: "delivered" }];
+      case "rejected":
+        return [{ type: "threadRunning" }, { type: "rejected" }];
+      case "retry": {
+        // Nothing was recorded, so the same command id is tried again; long after the deadline
+        // it counts as refused, which drops the wait with an error instead of trying forever.
+        const late =
+          now >= Date.parse(wait.deadlineAt) + settings.waitFor.keepEndedHours * 3_600_000;
+        return late ? [{ type: "rejected" }] : [];
+      }
+      case "gone":
+        return [{ type: "threadGone", parentThreadId: result.parentThreadId }];
+      case "stopped":
+        return [{ type: "threadStopped", parentThreadId: result.parentThreadId }];
+    }
+  };
+
+  /** When the message of `group` is tried next after `result`, or null when it is done. */
+  const nextTry = (
+    group: DeliveryGroup,
+    result: WaitDeliveryResult,
+    after: ReadonlyArray<WaitRecord>,
+    now: number,
+    settings: ServerSettings,
+  ): number | null => {
+    const still = after.filter(
+      (wait) => wait.state === "delivering" && wait.messageId === group.messageId,
+    );
+    if (still.length === 0) return null;
+    const attempt = Math.max(...still.map((wait) => wait.attempt));
+    switch (result.type) {
+      case "rejected":
+        return now + deliveryRetryDelayMs(attempt);
+      case "retry": {
+        const tries = (failures.get(group.messageId) ?? 0) + 1;
+        failures.set(group.messageId, tries);
+        return now + deliveryRetryDelayMs(attempt + tries);
+      }
+      case "stopped": {
+        const since = Math.min(
+          ...still.map((wait) =>
+            wait.stoppedSince === undefined ? now : Date.parse(wait.stoppedSince),
+          ),
+        );
+        const handOverAt = since + settings.waitFor.stoppedHandOverHours * 3_600_000;
+        return Math.min(now + STOPPED_RECHECK_MS, Math.max(handOverAt, now));
+      }
+      case "delivered":
+      case "gone":
+        return null;
+    }
+  };
+
+  /**
+   * Sends the message of every `delivering` wait that is due: one message per receiver, its id
+   * written before the first send. Waits of a receiver that is gone go to its parent first.
+   */
+  const deliverSweep = Effect.fnUntraced(function* (settings: ServerSettings) {
+    // 1. Receivers of `waiting` waits that may be gone (archived or deleted since).
+    const toCheck = yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const loaded = yield* ensureLoaded(true);
+        if (!loaded.ok) return [];
+        const threads = new Set<ThreadId>();
+        for (const wait of loaded.contents.waits) {
+          if (wait.state !== "waiting") continue;
+          if (checkAllReceivers || receiversToCheck.has(wait.threadId)) threads.add(wait.threadId);
+        }
+        checkAllReceivers = false;
+        receiversToCheck.clear();
+        return [...threads];
+      }),
+    );
+    const gone = new Map<ThreadId, ThreadId | null>();
+    for (const threadId of toCheck) {
+      const receiver = yield* input.delivery.receiver(threadId);
+      if (receiver === null) receiversToCheck.add(threadId);
+      else if (receiver.type === "gone") gone.set(threadId, receiver.parentThreadId);
+    }
+
+    // 2. Hand over the waits of gone receivers, pick the due messages, write their ids.
+    const startedAt = yield* Clock.currentTimeMillis;
+    const planned = yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const loaded = yield* ensureLoaded(true);
+        if (!loaded.ok) return [];
+        const transitions: WaitTransition[] = [];
+        let waits = loaded.contents.waits.map((wait) => {
+          const parent = gone.get(wait.threadId);
+          return parent === undefined || wait.state !== "waiting"
+            ? wait
+            : applyEvents(
+                wait,
+                [{ type: "threadGone", parentThreadId: parent }],
+                startedAt,
+                settings,
+                transitions,
+              );
+        });
+        const due = deliveryGroups(waits).filter(
+          (group) => (retryAt.get(group.messageId) ?? 0) <= startedAt,
+        );
+        const fresh = new Map<string, string>();
+        for (const group of due) {
+          if (!group.fresh) continue;
+          for (const wait of group.waits) fresh.set(wait.id, group.messageId);
+        }
+        if (fresh.size > 0) {
+          waits = waits.map((wait) => {
+            const messageId = fresh.get(wait.id);
+            return messageId === undefined
+              ? wait
+              : applyEvents(wait, [{ type: "sendStarted", messageId }], startedAt, settings, []);
+          });
+        }
+        if (transitions.length === 0 && fresh.size === 0) return due;
+        const written = yield* commitWaits(loaded.contents, waits, "sent next time.", settings);
+        if (!written) return [];
+        yield* Effect.forEach(transitions, logTransition, { discard: true });
+        // The groups as written, so the waits carry their message id.
+        const byId = new Map(waits.map((wait) => [wait.id, wait]));
+        return due.map((group) => ({
+          ...group,
+          fresh: false,
+          waits: group.waits.map((wait) => byId.get(wait.id) ?? wait),
+        }));
+      }),
+    );
+    if (planned.length === 0) return { sent: 0, ended: 0 };
+
+    // 3. Send, outside the lock: a slow thread never holds up register, list or cancel.
+    const results = yield* Effect.forEach(
+      planned,
+      (group) =>
+        input.delivery
+          .deliver({
+            threadId: group.threadId,
+            messageId: group.messageId,
+            commandId: deliveryCommandId(group),
+            text: joinedWakeMessage(group.waits),
+          })
+          .pipe(Effect.map((result) => [group, result] as const)),
+      { concurrency: SEND_CONCURRENCY },
+    );
+
+    // 4. Write what each send's answer means.
     return yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const loaded = yield* ensureLoaded(true);
+        if (!loaded.ok) return { sent: 0, ended: 0 };
+        const now = yield* Clock.currentTimeMillis;
+        const answers = new Map<string, WaitDeliveryResult>();
+        for (const [group, result] of results) {
+          for (const wait of group.waits) answers.set(wait.id, result);
+          if (result.type === "retry") {
+            yield* Effect.logWarning(
+              `waits: message ${group.messageId} to thread ${group.threadId} not sent yet: ${result.detail}`,
+            );
+          } else if (result.type === "rejected") {
+            yield* Effect.logWarning(
+              `waits: thread ${group.threadId} refused message ${group.messageId}: ${result.detail}`,
+            );
+          }
+        }
+        const transitions: WaitTransition[] = [];
+        const waits = loaded.contents.waits.map((wait) => {
+          const result = answers.get(wait.id);
+          // Only the message that was sent: the wait may have been handed over since.
+          if (result === undefined || wait.state !== "delivering") return wait;
+          const group = planned.find((candidate) => candidate.waits.some((w) => w.id === wait.id));
+          if (group === undefined || wait.messageId !== group.messageId) return wait;
+          return applyEvents(
+            wait,
+            eventsFor(result, wait, now, settings),
+            now,
+            settings,
+            transitions,
+          );
+        });
+        if (transitions.length > 0) {
+          const written = yield* commitWaits(
+            loaded.contents,
+            waits,
+            "answered again next time.",
+            settings,
+          );
+          // Not written: the next sweep finds the message in the thread, or replays its receipt.
+          if (!written) return { sent: 0, ended: 0 };
+          yield* Effect.forEach(transitions, logTransition, { discard: true });
+        }
+        for (const [group, result] of results) {
+          const at = nextTry(group, result, waits, now, settings);
+          if (at === null) forgetMessage(group.messageId);
+          else retryAt.set(group.messageId, at);
+        }
+        const sent = results.filter(([, result]) => result.type === "delivered").length;
+        const ended = transitions.filter((transition) =>
+          ["delivered", "dropped", "thread_gone", "thread_stopped"].includes(
+            transition.record.state,
+          ),
+        ).length;
+        return { sent, ended };
+      }),
+    );
+  });
+
+  /** Removes ended waits older than `keepEndedHours`. Under `sweepLock`. */
+  const pruneSweep = (settings: ServerSettings) =>
+    lock.withPermits(1)(
       Effect.gen(function* () {
         const loaded = yield* ensureLoaded(true);
         if (!loaded.ok) return 0;
@@ -721,25 +989,24 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         );
         const removed = loaded.contents.waits.length - waits.length;
         if (removed === 0) return 0;
-        return yield* commit({ ...loaded.contents, waits }, settings.waitFor).pipe(
-          Effect.as(removed),
-          Effect.catch((error) =>
-            Effect.logWarning(`waits: ${error.message}; pruned next time.`).pipe(Effect.as(0)),
-          ),
-        );
+        const written = yield* commitWaits(loaded.contents, waits, "pruned next time.", settings);
+        return written ? removed : 0;
       }),
     );
+
+  /** Removes ended waits older than `keepEndedHours`. Does nothing while waits are off. */
+  const prune = Effect.fn("WaitService.prune")(function* () {
+    const settings = yield* readSettingsOrNull;
+    if (settings === null || !settings.waitFor.enabled) return 0;
+    return yield* pruneSweep(settings);
   });
 
   /**
    * Sends the notices for waits lost in a bad file. A notice leaves the file once it was sent or
-   * can never be; a resend after a crash has the same command id, so it is one message. Call it
-   * from one place only (PR 3's loop): two calls at once both send every pending notice, and only
-   * the command-id receipt would keep that to one message.
+   * can never be; a resend after a crash has the same command id, so it is one message. It runs
+   * only under `sweepLock` (the sweep, or `sendNotices` when no sweep runs), so two never overlap.
    */
-  const sendNotices = Effect.fn("WaitService.sendNotices")(function* () {
-    const settings = yield* readSettingsOrNull;
-    if (settings === null || !settings.waitFor.enabled) return 0;
+  const noticesSweep = Effect.fnUntraced(function* (settings: ServerSettings) {
     const pending = yield* lock.withPermits(1)(
       ensureLoaded(true).pipe(Effect.map((loaded) => (loaded.ok ? loaded.contents.notices : []))),
     );
@@ -747,23 +1014,32 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     const done = new Set<string>();
     let sent = 0;
     for (const notice of pending) {
-      const result = yield* input
-        .send({
-          threadId: notice.threadId,
-          messageId: notice.messageId,
-          commandId: `${notice.messageId}:0`,
-          text: notice.text,
-        })
-        .pipe(Effect.result);
-      if (result._tag === "Success") {
-        sent += 1;
-        done.add(notice.messageId);
-      } else if (!result.failure.retry) {
-        done.add(notice.messageId);
-        yield* Effect.logError(
-          `waits: thread ${notice.threadId} could not be told its waits were lost: ${result.failure.detail}`,
-        );
+      const result = yield* input.delivery.deliver({
+        threadId: notice.threadId,
+        messageId: notice.messageId,
+        commandId: `${notice.messageId}:0`,
+        text: notice.text,
+      });
+      switch (result.type) {
+        case "delivered":
+          sent += 1;
+          done.add(notice.messageId);
+          break;
+        case "rejected":
+        case "gone":
+          done.add(notice.messageId);
+          yield* Effect.logError(
+            `waits: thread ${notice.threadId} could not be told its waits were lost: ${result.type === "rejected" ? result.detail : "it is archived or deleted"}`,
+          );
+          break;
+        // Held until the thread runs again, or tried again later.
+        case "stopped":
+        case "retry":
+          break;
       }
+    }
+    if (done.size < pending.length) {
+      noticesRetryAt = (yield* Clock.currentTimeMillis) + PROBLEM_RECHECK_MS;
     }
     if (done.size > 0) {
       yield* lock.withPermits(1)(
@@ -782,7 +1058,94 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     return sent;
   });
 
-  return { register, list, cancel, judgeDue, prune, sendNotices };
+  const sendNotices = Effect.fn("WaitService.sendNotices")(function* () {
+    const settings = yield* readSettingsOrNull;
+    if (settings === null || !settings.waitFor.enabled) return 0;
+    // Under the sweep lock, so it never runs beside the sweep's own notices.
+    const result = yield* Semaphore.withPermitsIfAvailable(sweepLock, 1)(noticesSweep(settings));
+    return Option.getOrElse(result, () => 0);
+  });
+
+  /** When the next sweep has work, from what is in memory; Infinity when nothing is open. */
+  const nextDueAt = (settings: ServerSettings, now: number) => {
+    if (current === null) return now + PROBLEM_RECHECK_MS;
+    let next = Infinity;
+    const at = (ms: number) => {
+      next = Math.min(next, ms);
+    };
+    if (current.notices.length > 0) at(Math.max(noticesRetryAt, now));
+    if (receiversToCheck.size > 0) at(now);
+    for (const wait of current.waits) {
+      if (wait.state === "waiting") at(nextCheckAt.get(wait.id) ?? now);
+      else if (wait.state !== "delivering" && wait.endedAt !== undefined) {
+        at(
+          Math.max(
+            Date.parse(wait.endedAt) + settings.waitFor.keepEndedHours * 3_600_000,
+            wait.reservedUntil === undefined ? 0 : Date.parse(wait.reservedUntil),
+          ),
+        );
+      }
+    }
+    for (const group of deliveryGroups(current.waits)) at(retryAt.get(group.messageId) ?? now);
+    return Math.max(next, now);
+  };
+
+  /**
+   * One sweep, in the spec's order: deliver, judge, deliver what that ended, prune, notices.
+   * Returns when the next one has work (for the scheduler's due hint). With waits off it reads
+   * and writes nothing; it never overlaps itself.
+   */
+  const runDue = Effect.fn("WaitService.runDue")(function* () {
+    const settings = yield* readSettingsOrNull;
+    // Settings that cannot be read are tried again on the scheduler's next tick.
+    if (settings === null) return { nextDueAt: 0 };
+    if (!settings.waitFor.enabled) return { nextDueAt: Infinity };
+    const result = yield* Semaphore.withPermitsIfAvailable(
+      sweepLock,
+      1,
+    )(
+      Effect.gen(function* () {
+        yield* deliverSweep(settings);
+        const judged = yield* judgeSweep(settings);
+        if (judged.ended > 0) yield* deliverSweep(settings);
+        yield* pruneSweep(settings);
+        yield* noticesSweep(settings);
+        const now = yield* Clock.currentTimeMillis;
+        return yield* lock.withPermits(1)(
+          Effect.sync(() => ({ nextDueAt: nextDueAt(settings, now) })),
+        );
+      }),
+    );
+    // Another sweep is running; it records its own answer.
+    return Option.getOrElse(result, () => ({ nextDueAt: 0 }));
+  });
+
+  /** Sends the message of every due `delivering` wait. Does nothing while waits are off. */
+  const deliverDue = Effect.fn("WaitService.deliverDue")(function* () {
+    const settings = yield* readSettingsOrNull;
+    if (settings === null || !settings.waitFor.enabled) return { sent: 0, ended: 0 };
+    const result = yield* Semaphore.withPermitsIfAvailable(sweepLock, 1)(deliverSweep(settings));
+    return Option.getOrElse(result, () => ({ sent: 0, ended: 0 }));
+  });
+
+  /** A thread was archived or deleted: its `waiting` waits are looked at in the next sweep. */
+  const receiverChanged = (threadId: ThreadId) =>
+    Effect.sync(() => {
+      // Before the store was read, the first sweep looks at every receiver anyway.
+      if (current !== null) receiversToCheck.add(threadId);
+    });
+
+  return {
+    register,
+    list,
+    cancel,
+    judgeDue,
+    deliverDue,
+    prune,
+    sendNotices,
+    runDue,
+    receiverChanged,
+  };
 });
 
 export type WaitService = Effect.Success<ReturnType<typeof make>>;

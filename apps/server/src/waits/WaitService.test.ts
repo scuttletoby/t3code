@@ -16,6 +16,7 @@ import * as Queue from "effect/Queue";
 import { TestClock } from "effect/testing";
 
 import { ServerSettingsService } from "../serverSettings.ts";
+import type { WaitDelivery, WaitDeliveryResult, WaitReceiver } from "./WaitDelivery.ts";
 import type { WaitJudges } from "./WaitJudges.ts";
 import * as WaitService from "./WaitService.ts";
 import { MAX_STORE_BYTES, WAIT_STORE_FILE } from "./WaitStore.ts";
@@ -138,40 +139,87 @@ const logCollector = () => {
   return { errors, warnings, layer: Logger.layer([logger], { mergeWithExisting: false }) };
 };
 
-/** A fake send that records every message and can be told to fail. */
-const fakeSend = () => {
+type Answer = WaitDeliveryResult | "accepted-then-lost";
+
+/**
+ * A fake delivery that behaves like the real one: it looks for the message in the thread first,
+ * holds messages to stopped receivers and hands gone ones back. `answer` scripts a send's answer;
+ * "accepted-then-lost" puts the message in the thread but answers like a failed read.
+ */
+const fakeDelivery = () => {
+  /** Each message that reached a thread, once. */
   const sent: WaitService.WaitMessage[] = [];
-  let fail: WaitService.WaitSendError | null = null;
-  const send: WaitService.WaitSend = (message) =>
-    fail === null
-      ? Effect.sync(() => {
-          sent.push(message);
-        })
-      : Effect.fail(fail);
+  /** Every call. */
+  const tries: WaitService.WaitMessage[] = [];
+  const inThread = new Set<string>();
+  const receivers = new Map<ThreadId, WaitReceiver>();
+  let answer: ((message: WaitService.WaitMessage) => Answer | null) | null = null;
+  const delivery: WaitDelivery = {
+    receiver: (threadId) => Effect.sync(() => receivers.get(threadId) ?? { type: "ok" }),
+    deliver: (message) =>
+      Effect.sync((): WaitDeliveryResult => {
+        tries.push(message);
+        const key = `${message.threadId} ${message.messageId}`;
+        if (inThread.has(key)) return { type: "delivered" };
+        const receiver = receivers.get(message.threadId);
+        if (receiver !== undefined && receiver.type !== "ok") return receiver;
+        const scripted = answer?.(message) ?? null;
+        if (
+          scripted !== null &&
+          scripted !== "accepted-then-lost" &&
+          scripted.type !== "delivered"
+        ) {
+          return scripted;
+        }
+        inThread.add(key);
+        sent.push(message);
+        return scripted === "accepted-then-lost"
+          ? { type: "retry", detail: "the read after the send failed" }
+          : { type: "delivered" };
+      }),
+  };
   return {
     sent,
-    send,
-    failWith: (error: WaitService.WaitSendError | null) => {
-      fail = error;
+    tries,
+    inThread,
+    receivers,
+    delivery,
+    answer: (next: ((message: WaitService.WaitMessage) => Answer | null) | null) => {
+      answer = next;
     },
   };
 };
 
 const makeService = (input: {
   readonly filePath: string;
-  readonly send?: WaitService.WaitSend;
+  readonly delivery?: WaitDelivery;
   readonly judges?: WaitJudges;
   readonly fs?: FileSystem.FileSystem;
+  readonly onChange?: Effect.Effect<void>;
 }) => {
   const made = WaitService.make({
     filePath: input.filePath,
-    send: input.send ?? fakeSend().send,
+    delivery: input.delivery ?? fakeDelivery().delivery,
     ...(input.judges === undefined ? {} : { judges: input.judges }),
+    ...(input.onChange === undefined ? {} : { onChange: input.onChange }),
   });
   return input.fs === undefined
     ? made
     : made.pipe(Effect.provideService(FileSystem.FileSystem, input.fs));
 };
+
+/** A judge's answer as an earlier sweep stored it. */
+const MET = { outcome: "exists", detail: "Exists.", at: "2026-11-14T11:30:00.000Z" };
+
+/** A wait whose condition was met and whose message is still to be sent. */
+const delivering = (overrides: Record<string, unknown> = {}) =>
+  record({ state: "delivering", result: MET, ...overrides });
+
+const seed = (filePath: string, waits: ReadonlyArray<unknown>) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    yield* fs.writeFileString(filePath, JSON.stringify({ version: 1, waits }));
+  });
 
 const register = (service: WaitService.WaitService, waitInput: WaitForInput, threadId = THREAD) =>
   service.register({ threadId, projectId: PROJECT, input: waitInput });
@@ -199,8 +247,8 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
       const { filePath, watched } = yield* workspace;
       const ready = watched("ready");
       yield* fs.writeFileString(ready, "");
-      const send = fakeSend();
-      const service = yield* makeService({ filePath, send: send.send });
+      const send = fakeDelivery();
+      const service = yield* makeService({ filePath, delivery: send.delivery });
 
       const result = yield* register(service, fileWait(ready));
       assert.strictEqual(result.state, "met");
@@ -281,7 +329,7 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
       const { filePath, watched } = yield* workspace;
       const started = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
-      const send = fakeSend();
+      const send = fakeDelivery();
       const judges: WaitJudges = {
         file: (_target, context) =>
           context.waitId === null
@@ -291,7 +339,7 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
                 Effect.as<Judgement>({ type: "met", outcome: "exists", detail: "Exists." }),
               ),
       };
-      const service = yield* makeService({ filePath, send: send.send, judges });
+      const service = yield* makeService({ filePath, delivery: send.delivery, judges });
       const wait = yield* register(service, fileWait(watched("slow")));
       assert.strictEqual(wait.state, "waiting");
       if (wait.state !== "waiting") return;
@@ -575,8 +623,8 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
         const text = `{"version":1,"waits":[{"threadId":"thread-a"`;
         yield* fs.writeFileString(filePath, text);
         const io = yield* instrumentedFs({ watchedRoot: stateDir });
-        const send = fakeSend();
-        const service = yield* makeService({ filePath, send: send.send, fs: io.fs });
+        const send = fakeDelivery();
+        const service = yield* makeService({ filePath, delivery: send.delivery, fs: io.fs });
 
         const refused = yield* register(service, fileWait(watched("x"))).pipe(Effect.flip);
         assert.strictEqual(refused.code, "waits_off");
@@ -618,8 +666,8 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
           `{"version":1,"waits":[{"id":"w_aaaaaaaaaa","threadId":"thread-a"},{"threadId":"thread-b"`,
         );
         const logs = logCollector();
-        const send = fakeSend();
-        const service = yield* makeService({ filePath, send: send.send });
+        const send = fakeDelivery();
+        const service = yield* makeService({ filePath, delivery: send.delivery });
 
         // Any first use loads (and repairs) the file; the service starts empty.
         const wait = yield* register(service, fileWait(watched("x")), PARENT).pipe(
@@ -636,12 +684,12 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
         );
 
         // The first send fails for a while; the notices stay in the file.
-        send.failWith(new WaitService.WaitSendError({ detail: "busy", retry: true }));
+        send.answer(() => ({ type: "retry", detail: "busy" }));
         assert.strictEqual(yield* service.sendNotices(), 0);
-        send.failWith(null);
+        send.answer(null);
 
         // A restart before they were sent: the new service sends them, with the same ids.
-        const restarted = yield* makeService({ filePath, send: send.send });
+        const restarted = yield* makeService({ filePath, delivery: send.delivery });
         assert.strictEqual(yield* restarted.sendNotices(), 2);
         assert.deepStrictEqual(
           send.sent.map((message) => [message.threadId, message.commandId]),
@@ -665,13 +713,13 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
       const { filePath } = yield* workspace;
       yield* fs.writeFileString(filePath, `{"threadId":"thread-a"`);
       const logs = logCollector();
-      const send = fakeSend();
-      send.failWith(new WaitService.WaitSendError({ detail: "thread deleted", retry: false }));
-      const service = yield* makeService({ filePath, send: send.send });
+      const send = fakeDelivery();
+      send.receivers.set(THREAD, { type: "gone", parentThreadId: null });
+      const service = yield* makeService({ filePath, delivery: send.delivery });
 
       assert.strictEqual(yield* service.sendNotices().pipe(Effect.provide(logs.layer)), 0);
-      assert.isTrue(logs.errors.some((line) => line.includes("thread deleted")));
-      send.failWith(null);
+      assert.isTrue(logs.errors.some((line) => line.includes("archived or deleted")));
+      send.receivers.clear();
       assert.strictEqual(yield* service.sendNotices(), 0);
       assert.deepStrictEqual(send.sent, []);
     }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
@@ -751,6 +799,550 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
         assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
         assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "delivering");
       }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+  it.effect(
+    "a met wait is sent once, its message id written first; running again sends nothing",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath } = yield* workspace;
+        yield* seed(filePath, [delivering({ note: "then deploy" })]);
+        const send = fakeDelivery();
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 1, ended: 1 });
+        assert.deepStrictEqual(
+          send.sent.map((message) => [message.threadId, message.messageId, message.commandId]),
+          [[THREAD, "wait:w_aaaaaaaaaa", "wait:w_aaaaaaaaaa:0"]],
+        );
+        assert.strictEqual(
+          send.sent[0]!.text,
+          "[wait w_aaaaaaaaaa] file /nowhere/ready: exists. Exists.\nNote: then deploy",
+        );
+        const [stored] = yield* storedWaits(filePath);
+        assert.strictEqual(stored?.state, "delivered");
+        assert.strictEqual(stored?.messageId, "wait:w_aaaaaaaaaa");
+        assert.strictEqual(stored?.endedAt, "2026-11-14T12:00:00.000Z");
+
+        yield* TestClock.adjust(MINUTE);
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 0, ended: 0 });
+        // A restart sends nothing either.
+        const restarted = yield* makeService({ filePath, delivery: send.delivery });
+        assert.deepStrictEqual(yield* restarted.deliverDue(), { sent: 0, ended: 0 });
+        assert.strictEqual(send.tries.length, 1);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "stops half-way: after a restart a message sent before the crash is found, one never sent is sent with the same id",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath } = yield* workspace;
+        // Both ids were written; the server died before the first's "delivered" was written,
+        // and before the second was sent at all.
+        yield* seed(filePath, [
+          delivering({ messageId: "wait:w_aaaaaaaaaa" }),
+          delivering({
+            id: "w_bbbbbbbbbb",
+            threadId: OTHER_THREAD,
+            messageId: "wait:w_bbbbbbbbbb",
+          }),
+        ]);
+        const send = fakeDelivery();
+        send.inThread.add(`${THREAD} wait:w_aaaaaaaaaa`);
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 2, ended: 2 });
+        assert.deepStrictEqual(
+          send.sent.map((message) => [message.threadId, message.messageId]),
+          [[OTHER_THREAD, "wait:w_bbbbbbbbbb"]],
+        );
+        assert.deepStrictEqual(send.tries.map((message) => message.commandId).sort(), [
+          "wait:w_aaaaaaaaaa:0",
+          "wait:w_bbbbbbbbbb:0",
+        ]);
+        assert.deepStrictEqual(
+          (yield* storedWaits(filePath)).map((wait) => wait.state),
+          ["delivered", "delivered"],
+        );
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "a failed write after the send: the next sweep finds the message, never sends it twice",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { stateDir, filePath } = yield* workspace;
+        yield* seed(filePath, [delivering()]);
+        let renames = 0;
+        // The first write (the message id) works; the second ("delivered") fails.
+        const io = yield* instrumentedFs({
+          watchedRoot: stateDir,
+          failRenamesTo: filePath,
+          failing: () => {
+            renames += 1;
+            return renames === 2;
+          },
+        });
+        const send = fakeDelivery();
+        const service = yield* makeService({ filePath, delivery: send.delivery, fs: io.fs });
+
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 0, ended: 0 });
+        const [between] = yield* storedWaits(filePath);
+        assert.strictEqual(between?.state, "delivering");
+        assert.strictEqual(between?.messageId, "wait:w_aaaaaaaaaa");
+
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 1, ended: 1 });
+        assert.strictEqual(send.sent.length, 1);
+        assert.strictEqual(send.tries.length, 2);
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "delivered");
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect("a failed write of the message id sends nothing", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const { stateDir, filePath } = yield* workspace;
+      yield* seed(filePath, [delivering()]);
+      let failing = true;
+      const io = yield* instrumentedFs({
+        watchedRoot: stateDir,
+        failRenamesTo: filePath,
+        failing: () => failing,
+      });
+      const send = fakeDelivery();
+      const service = yield* makeService({ filePath, delivery: send.delivery, fs: io.fs });
+
+      assert.deepStrictEqual(yield* service.deliverDue(), { sent: 0, ended: 0 });
+      assert.deepStrictEqual(send.tries, []);
+      assert.isUndefined((yield* storedWaits(filePath))[0]?.messageId);
+      failing = false;
+      assert.deepStrictEqual(yield* service.deliverDue(), { sent: 1, ended: 1 });
+    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "accepted but the answer was lost: the retry finds the message, one message in all",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath } = yield* workspace;
+        yield* seed(filePath, [delivering()]);
+        const send = fakeDelivery();
+        send.answer(() => "accepted-then-lost");
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 0, ended: 0 });
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "delivering");
+        // Not before the pause.
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 0, ended: 0 });
+        assert.strictEqual(send.tries.length, 1);
+
+        yield* TestClock.adjust(10_000);
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 1, ended: 1 });
+        assert.strictEqual(send.sent.length, 1);
+        assert.deepStrictEqual(
+          send.tries.map((message) => message.commandId),
+          ["wait:w_aaaaaaaaaa:0", "wait:w_aaaaaaaaaa:0"],
+        );
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "a refused send tries again with a new command id and the same message id; long refused, it is dropped",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath } = yield* workspace;
+        yield* seed(filePath, [
+          delivering(),
+          // Its deadline passed more than keepEndedHours ago.
+          delivering({
+            id: "w_bbbbbbbbbb",
+            threadId: OTHER_THREAD,
+            deadlineAt: "2026-11-13T11:00:00.000Z",
+          }),
+        ]);
+        const logs = logCollector();
+        const send = fakeDelivery();
+        let refusals = 1;
+        send.answer((message) =>
+          message.threadId === OTHER_THREAD || refusals-- > 0
+            ? { type: "rejected", detail: "Thread is busy." }
+            : null,
+        );
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        const first = yield* service.runDue().pipe(Effect.provide(logs.layer));
+        assert.strictEqual(first.nextDueAt, NOW + 10_000);
+        const [refused, dropped] = yield* storedWaits(filePath);
+        assert.strictEqual(refused?.state, "delivering");
+        assert.strictEqual(refused?.attempt, 1);
+        assert.strictEqual(refused?.messageId, "wait:w_aaaaaaaaaa");
+        assert.strictEqual(dropped?.state, "dropped");
+        assert.isTrue(logs.errors.some((line) => line.includes("refused its message")));
+
+        yield* TestClock.adjust(10_000);
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 1, ended: 1 });
+        assert.deepStrictEqual(
+          send.tries.filter((message) => message.threadId === THREAD).map((m) => m.commandId),
+          ["wait:w_aaaaaaaaaa:0", "wait:w_aaaaaaaaaa:1"],
+        );
+        assert.strictEqual(send.sent[0]?.messageId, "wait:w_aaaaaaaaaa");
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "a send that recorded nothing keeps its command id, waits longer each time, and is dropped long after the deadline",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath } = yield* workspace;
+        yield* seed(filePath, [delivering()]);
+        const logs = logCollector();
+        const send = fakeDelivery();
+        send.answer(() => ({ type: "retry", detail: "The workspace cannot be restored." }));
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        yield* service.deliverDue();
+        yield* TestClock.adjust(10_000);
+        yield* service.deliverDue();
+        // The second failure waits 20 s.
+        yield* TestClock.adjust(10_000);
+        yield* service.deliverDue();
+        assert.strictEqual(send.tries.length, 2);
+        yield* TestClock.adjust(10_000);
+        yield* service.deliverDue();
+        assert.deepStrictEqual(
+          send.tries.map((message) => message.commandId),
+          Array(3).fill("wait:w_aaaaaaaaaa:0"),
+        );
+        const [open] = yield* storedWaits(filePath);
+        assert.strictEqual(open?.state, "delivering");
+        assert.strictEqual(open?.attempt, 0);
+
+        // The deadline was 13:00; a day after it the wait ends with an error.
+        yield* TestClock.adjust(26 * HOUR);
+        yield* service.deliverDue().pipe(Effect.provide(logs.layer));
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "dropped");
+        assert.strictEqual(logs.errors.length, 1);
+        assert.deepStrictEqual(send.sent, []);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "a gone receiver: its message goes to the parent with a new id; with no parent it ends with an error",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath } = yield* workspace;
+        yield* seed(filePath, [
+          delivering({ messageId: "wait:w_aaaaaaaaaa", attempt: 2 }),
+          // A fork: no parent named by the thread or the record.
+          delivering({ id: "w_bbbbbbbbbb", threadId: OTHER_THREAD }),
+        ]);
+        const logs = logCollector();
+        const send = fakeDelivery();
+        send.receivers.set(THREAD, { type: "gone", parentThreadId: PARENT });
+        send.receivers.set(OTHER_THREAD, { type: "gone", parentThreadId: null });
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        assert.deepStrictEqual(
+          yield* service.deliverDue().pipe(Effect.provide(logs.layer)),
+          // A hand-over is not an end: the wait is still being sent.
+          { sent: 0, ended: 1 },
+        );
+        const [handed, ended] = yield* storedWaits(filePath);
+        assert.strictEqual(handed?.state, "delivering");
+        assert.strictEqual(handed?.threadId, PARENT);
+        assert.deepStrictEqual(handed?.via, [THREAD]);
+        assert.strictEqual(handed?.attempt, 0);
+        assert.isUndefined(handed?.messageId);
+        assert.strictEqual(ended?.state, "thread_gone");
+        assert.strictEqual(logs.warnings.filter((line) => line.includes("parent")).length, 1);
+        assert.strictEqual(logs.errors.length, 1);
+        assert.include(logs.errors[0]!, "no parent can take its message");
+
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 1, ended: 1 });
+        assert.deepStrictEqual(
+          send.sent.map((message) => [message.threadId, message.messageId, message.commandId]),
+          [[PARENT, "wait:w_aaaaaaaaaa:via:1", "wait:w_aaaaaaaaaa:via:1:0"]],
+        );
+        assert.include(send.sent[0]!.text, `Thread ${THREAD}, which you started, is gone`);
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "delivered");
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "a stopped receiver: held, sent when it runs again, or handed to the parent after stoppedHandOverHours",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath } = yield* workspace;
+        yield* seed(filePath, [
+          delivering(),
+          delivering({ id: "w_bbbbbbbbbb", threadId: OTHER_THREAD }),
+        ]);
+        const logs = logCollector();
+        const send = fakeDelivery();
+        send.receivers.set(THREAD, { type: "stopped", parentThreadId: PARENT });
+        send.receivers.set(OTHER_THREAD, { type: "stopped", parentThreadId: PARENT });
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        const first = yield* service.runDue().pipe(Effect.provide(logs.layer));
+        assert.strictEqual(first.nextDueAt, NOW + MINUTE);
+        assert.deepStrictEqual(
+          (yield* storedWaits(filePath)).map((wait) => [wait.state, wait.stoppedSince]),
+          [
+            ["delivering", "2026-11-14T12:00:00.000Z"],
+            ["delivering", "2026-11-14T12:00:00.000Z"],
+          ],
+        );
+        assert.deepStrictEqual(send.sent, []);
+
+        // THREAD runs again: its message goes; OTHER_THREAD stays stopped.
+        send.receivers.delete(THREAD);
+        yield* TestClock.adjust(MINUTE);
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 1, ended: 1 });
+        const [sent] = yield* storedWaits(filePath);
+        assert.strictEqual(sent?.state, "delivered");
+        assert.isUndefined(sent?.stoppedSince);
+
+        // A day later OTHER_THREAD is still stopped: the parent gets the wake, with a warning only.
+        yield* TestClock.adjust(24 * HOUR);
+        yield* service.deliverDue().pipe(Effect.provide(logs.layer));
+        const [, handed] = yield* storedWaits(filePath);
+        assert.strictEqual(handed?.threadId, PARENT);
+        assert.strictEqual(handed?.handedOverBecause, "stopped");
+        assert.isUndefined(handed?.stoppedSince);
+        assert.deepStrictEqual(logs.errors, []);
+        yield* service.deliverDue();
+        assert.strictEqual(send.sent.at(-1)?.threadId, PARENT);
+        assert.include(send.sent.at(-1)!.text, "was stopped and has not run again");
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect("a stopped receiver with no parent ends with an error after stoppedHandOverHours", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const { filePath } = yield* workspace;
+      yield* seed(filePath, [delivering({ stoppedSince: "2026-11-13T11:00:00.000Z" })]);
+      const logs = logCollector();
+      const send = fakeDelivery();
+      send.receivers.set(THREAD, { type: "stopped", parentThreadId: null });
+      const service = yield* makeService({ filePath, delivery: send.delivery });
+
+      yield* service.deliverDue().pipe(Effect.provide(logs.layer));
+      assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "thread_stopped");
+      assert.strictEqual(logs.errors.length, 1);
+      assert.include(logs.errors[0]!, "stayed stopped");
+      assert.deepStrictEqual(send.sent, []);
+    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "a waiting wait of an archived thread goes to the parent: on the first sweep, and after an archive event",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath, watched } = yield* workspace;
+        const logs = logCollector();
+        const send = fakeDelivery();
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+        yield* register(service, fileWait(watched("a")));
+        yield* register(service, fileWait(watched("b")), OTHER_THREAD);
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 0, ended: 0 });
+
+        // Archived with no event yet: not looked at.
+        send.receivers.set(THREAD, { type: "gone", parentThreadId: PARENT });
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 0, ended: 0 });
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "waiting");
+
+        yield* service.receiverChanged(THREAD);
+        // Handed over and sent in the same sweep.
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 1, ended: 1 });
+        assert.strictEqual(send.sent[0]?.threadId, PARENT);
+        assert.include(send.sent[0]!.text, "not ended yet");
+        const [handed] = yield* storedWaits(filePath);
+        assert.strictEqual(handed?.state, "delivered");
+        assert.isUndefined(handed?.result);
+
+        // Archived while the server was down, and a fork: the first sweep after the restart ends it.
+        send.receivers.set(OTHER_THREAD, { type: "gone", parentThreadId: null });
+        const restarted = yield* makeService({ filePath, delivery: send.delivery });
+        yield* restarted.deliverDue().pipe(Effect.provide(logs.layer));
+        assert.strictEqual((yield* storedWaits(filePath))[1]?.state, "thread_gone");
+        assert.strictEqual(logs.errors.length, 1);
+        assert.strictEqual(send.sent.length, 1);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect("one message per receiver, at most ten waits each, one marked line per wait", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const { filePath } = yield* workspace;
+      const letters = "abcdefghijkl";
+      yield* seed(filePath, [
+        ...Array.from(letters, (letter, index) =>
+          delivering({
+            id: `w_aaaaaaaaa${letter}`,
+            key: `0123456789abc${index.toString(16).padStart(3, "0")}`,
+            ...(index === 0 ? { note: "first" } : {}),
+          }),
+        ),
+        delivering({ id: "w_zzzzzzzzzz", threadId: OTHER_THREAD }),
+      ]);
+      const send = fakeDelivery();
+      const service = yield* makeService({ filePath, delivery: send.delivery });
+
+      assert.deepStrictEqual(yield* service.deliverDue(), { sent: 3, ended: 13 });
+      const byId = new Map(send.sent.map((message) => [message.messageId, message]));
+      assert.deepStrictEqual([...byId.keys()].sort(), [
+        "wait:w_aaaaaaaaaa:joined:10",
+        "wait:w_aaaaaaaaak:joined:2",
+        "wait:w_zzzzzzzzzz",
+      ]);
+      const lines = byId.get("wait:w_aaaaaaaaaa:joined:10")!.text.split("\n");
+      assert.strictEqual(lines.length, 10);
+      assert.isTrue(lines.every((line) => /^\[wait w_aaaaaaaaa[a-j]\] /u.test(line)));
+      assert.isTrue(lines[0]!.endsWith("Note: first"));
+      assert.isTrue((yield* storedWaits(filePath)).every((wait) => wait.state === "delivered"));
+    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "runDue: a wait met in a sweep is sent in the same sweep; nextDueAt follows the work",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        const { filePath, watched } = yield* workspace;
+        const send = fakeDelivery();
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        // An empty state: nothing to do, nothing written.
+        assert.deepStrictEqual(yield* service.runDue(), { nextDueAt: Infinity });
+        assert.isFalse(yield* fs.exists(filePath));
+
+        const target = watched("ready");
+        yield* register(service, fileWait(target));
+        assert.deepStrictEqual(yield* service.runDue(), { nextDueAt: NOW + 5_000 });
+
+        yield* fs.writeFileString(target, "");
+        yield* TestClock.adjust(5_000);
+        // Ended now; pruned a day later.
+        assert.deepStrictEqual(yield* service.runDue(), { nextDueAt: NOW + 5_000 + 24 * HOUR });
+        assert.strictEqual(send.sent.length, 1);
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "delivered");
+
+        yield* TestClock.adjust(24 * HOUR);
+        assert.deepStrictEqual(yield* service.runDue(), { nextDueAt: Infinity });
+        assert.deepStrictEqual(yield* storedWaits(filePath), []);
+        assert.strictEqual(send.tries.length, 1);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "off: runDue and deliverDue read, write and send nothing; switched on, the wait is sent",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        const { stateDir, filePath } = yield* workspace;
+        yield* seed(filePath, [delivering()]);
+        const before = yield* fs.readFileString(filePath);
+        const io = yield* instrumentedFs({ watchedRoot: stateDir });
+        const send = fakeDelivery();
+        let changes = 0;
+        const service = yield* makeService({
+          filePath,
+          delivery: send.delivery,
+          fs: io.fs,
+          onChange: Effect.sync(() => {
+            changes += 1;
+          }),
+        });
+
+        assert.deepStrictEqual(yield* service.runDue(), { nextDueAt: Infinity });
+        assert.deepStrictEqual(yield* service.deliverDue(), { sent: 0, ended: 0 });
+        yield* service.receiverChanged(THREAD);
+        assert.deepStrictEqual(io.touched, []);
+        assert.deepStrictEqual(send.tries, []);
+        assert.strictEqual(changes, 0);
+        assert.strictEqual(yield* fs.readFileString(filePath), before);
+
+        yield* setEnabled(true);
+        yield* service.runDue();
+        assert.strictEqual(send.sent.length, 1);
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "delivered");
+      }).pipe(Effect.provide(ServerSettingsService.layerTest())),
+  );
+
+  it.effect("runDue on a newer store touches nothing and looks again a minute later", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const fs = yield* FileSystem.FileSystem;
+      const { stateDir, filePath } = yield* workspace;
+      const text = JSON.stringify({ version: 2, waits: [{ id: "w_aaaaaaaaaa", shape: "new" }] });
+      yield* fs.writeFileString(filePath, text);
+      const send = fakeDelivery();
+      const service = yield* makeService({ filePath, delivery: send.delivery });
+
+      assert.deepStrictEqual(yield* service.runDue(), { nextDueAt: NOW + MINUTE });
+      assert.deepStrictEqual(send.tries, []);
+      assert.strictEqual(yield* fs.readFileString(filePath), text);
+      assert.deepStrictEqual(yield* fs.readDirectory(stateDir), [WAIT_STORE_FILE]);
+    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "runDue on a corrupt store moves it aside, tells the lost threads once, then is idle",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath } = yield* workspace;
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(filePath, `{"version":1,"waits":[{"threadId":"thread-a"`);
+        const send = fakeDelivery();
+        const service = yield* makeService({ filePath, delivery: send.delivery });
+
+        assert.deepStrictEqual(yield* service.runDue(), { nextDueAt: Infinity });
+        assert.deepStrictEqual(
+          send.sent.map((message) => message.threadId),
+          [THREAD],
+        );
+        assert.deepStrictEqual(yield* service.runDue(), { nextDueAt: Infinity });
+        assert.strictEqual(send.tries.length, 1);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect("register and cancel that change the store wake the sweep; others do not", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const fs = yield* FileSystem.FileSystem;
+      const { filePath, watched } = yield* workspace;
+      let changes = 0;
+      const service = yield* makeService({
+        filePath,
+        onChange: Effect.sync(() => {
+          changes += 1;
+        }),
+      });
+      const wait = yield* register(service, fileWait(watched("a")));
+      if (wait.state !== "waiting") return assert.fail("not waiting");
+      assert.strictEqual(changes, 1);
+      yield* register(service, fileWait(watched("a")));
+      const ready = watched("ready");
+      yield* fs.writeFileString(ready, "");
+      yield* register(service, fileWait(ready));
+      assert.strictEqual(changes, 1);
+      yield* service.cancel({ projectId: PROJECT, waitId: wait.waitId });
+      assert.strictEqual(changes, 2);
+      yield* service.cancel({ projectId: PROJECT, waitId: wait.waitId });
+      assert.strictEqual(changes, 2);
+    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
   );
 });
 
