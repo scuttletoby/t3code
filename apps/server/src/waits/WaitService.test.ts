@@ -66,7 +66,7 @@ const record = (overrides: Record<string, unknown> = {}) => ({
   id: "w_aaaaaaaaaa",
   threadId: THREAD,
   projectId: PROJECT,
-  key: "0123456789abcdef",
+  key: "0123456789abcdef", // gitleaks:allow (a fake test value, not a key)
   createdAt: "2026-11-14T11:00:00.000Z",
   deadlineAt: "2026-11-14T13:00:00.000Z",
   state: "waiting",
@@ -1175,7 +1175,7 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
         const victim = record({ id: "w_zzzzzzzzzz", deadlineAt: "2026-11-14T12:00:01.000Z" });
         const toCancel = record({
           id: "w_zzzzzzzzzy",
-          key: "fedcba9876543210",
+          key: "fedcba9876543210", // gitleaks:allow (a fake test value, not a key)
           spec: { path: "/nowhere/else", until: "exists" },
         });
         const waits: Array<Record<string, unknown>> = [victim, toCancel];

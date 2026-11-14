@@ -25,7 +25,7 @@ const record = (overrides: Record<string, unknown> = {}) => ({
   id: "w_aaaaaaaaaa",
   threadId: "thread-a",
   projectId: "project-a",
-  key: "0123456789abcdef",
+  key: "0123456789abcdef", // gitleaks:allow (a fake test value, not a key)
   createdAt: "2026-11-14T11:00:00.000Z",
   deadlineAt: "2026-11-15T11:00:00.000Z",
   state: "waiting",

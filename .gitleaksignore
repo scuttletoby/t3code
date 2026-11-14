@@ -1,0 +1,6 @@
+# Fork: findings gitleaks may skip, one fingerprint (commit:file:rule:line) each, with the reason.
+# Fake 16-character test values in the wait store tests, in commits of fork PR #90 before they were marked
+# `gitleaks:allow` (the secret scan reads every commit a PR adds).
+47cd255f192206f56bdd0cd56de7c1509ae35eeb:apps/server/src/waits/WaitStore.test.ts:generic-api-key:18
+47cd255f192206f56bdd0cd56de7c1509ae35eeb:apps/server/src/waits/WaitService.test.ts:generic-api-key:66
+c739cbb3dc50fb8883024f21095c727e4ee2afa1:apps/server/src/waits/WaitService.test.ts:generic-api-key:1178
