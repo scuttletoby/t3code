@@ -231,7 +231,7 @@ How it works:
     would pass, so the input is required.
 - Only three steps touch the key. One makes a token of the gate App (checks
   write, this repository). **start** posts an in-progress check run on the
-  head *before* anything is judged; an in-progress check never passes. Then
+  head _before_ anything is judged; an in-progress check never passes. Then
   **finish** (it runs always, also after a failed or cancelled step) completes
   that check run with the verdict, or with a failure when there is none. The
   ruleset requires the check from that App alone, so a job of a pull
@@ -280,22 +280,22 @@ run on reviews is open:
 
 **Runs again, stops half-way, old state.**
 
-- *Runs again.* Each run judges what GitHub says now. A new run on a head
+- _Runs again._ Each run judges what GitHub says now. A new run on a head
   first posts a new in-progress check run, then completes it. The newest check
   run of that name from the App is the one that counts.
-- *Stops half-way.* A run that stops after start (an API error, a crash, a
+- _Stops half-way._ A run that stops after start (an API error, a crash, a
   timeout, a cancel) leaves its in-progress check run, or finish completes it
   as a failure. Either way an older pass on the head no longer counts, and
   the gate job is red. If start itself cannot post (GitHub refuses or is
   down), nothing on the head changes and the job is red. That is the one case
   where an older verdict still stands: until the next event, or a dispatch.
-- *The head moves.* If the head moves while a run works, that run finds no
+- _The head moves._ If the head moves while a run works, that run finds no
   pull request with its old head and posts nothing. If it was already
   judging, it posts a failure on the old head ("a newer head has its own
   run"), and the new head gets its own run.
-- *A key that is rotated or deleted* makes no token: the job fails and nothing
+- _A key that is rotated or deleted_ makes no token: the job fails and nothing
   is posted, so the required check stays missing or as it was.
-- *Old state.*
+- _Old state._
   - A check run of the same name posted by GitHub Actions (an older,
     non-gate check) does not count once the ruleset binds the check to the
     App.
