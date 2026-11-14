@@ -1,0 +1,490 @@
+/**
+ * Fork: the agent slot gate as a service: what it reads, the `starting` entries between the
+ * dispatch and the child's first visible run, and the state question (runs again, stops half-way,
+ * empty or old state, a restart). The rules themselves are in `shared/agentSlots.test.ts`.
+ */
+import { assert, describe, it } from "@effect/vitest";
+import {
+  type OrchestrationV2ThreadShell,
+  type OrchestrationV2ThreadShellSnapshot,
+  ProviderInstanceId,
+  type ServerSettings as ServerSettingsValue,
+  ServerSettingsError,
+  ThreadId,
+} from "@t3tools/contracts";
+import type { AgentSlotsSettings } from "@t3tools/contracts/waitFor";
+import type { DeepPartial } from "@t3tools/shared/Struct";
+import { DISPATCH_SAFETY_MS } from "@t3tools/shared/agentSlots";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
+import { TestClock } from "effect/testing";
+
+import * as OrchestratorV2 from "../orchestration-v2/Orchestrator.ts";
+import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as HostResources from "../resourceTelemetry/HostResources.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import * as SlotGate from "./SlotGate.ts";
+
+const MAIN = ProviderInstanceId.make("codex");
+const SECOND = ProviderInstanceId.make("claude-second");
+const MB = 1024 * 1024;
+const caller = ThreadId.make("thread:slot-caller");
+
+interface World {
+  /** Threads the projection shows with an active run (id, instance, blocked). */
+  threads: Array<{ id: string; instanceId: string; blocked?: boolean; archived?: boolean }>;
+  snapshotReads: number;
+  memoryReads: number;
+  snapshotFails: boolean;
+  /** The count read never answers (a hung database read). */
+  snapshotHangs: boolean;
+  /** The count read dies (a bug in the read, not a failure). */
+  snapshotDies?: boolean;
+  freeMemoryBytes: number;
+}
+
+const newWorld = (): World => ({
+  threads: [],
+  snapshotReads: 0,
+  memoryReads: 0,
+  snapshotFails: false,
+  snapshotHangs: false,
+  freeMemoryBytes: 16_000 * MB,
+});
+
+const snapshotOf = (world: World): OrchestrationV2ThreadShellSnapshot => {
+  const shells = world.threads.map(
+    (thread) =>
+      ({
+        id: ThreadId.make(thread.id),
+        providerInstanceId: ProviderInstanceId.make(thread.instanceId),
+        activeRunId: `run:${thread.id}`,
+        ...(thread.blocked === undefined ? {} : { blockedOnThreadWait: thread.blocked }),
+      }) as unknown as OrchestrationV2ThreadShell,
+  );
+  return {
+    schemaVersion: 1,
+    snapshotSequence: 1,
+    threads: shells.filter((_, index) => world.threads[index]?.archived !== true),
+    archivedThreads: shells.filter((_, index) => world.threads[index]?.archived === true),
+  };
+};
+
+const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue> | "unreadable") =>
+  SlotGate.layer.pipe(
+    // Merged out too, so a test can change the settings while the gate runs.
+    Layer.provideMerge(
+      Layer.mergeAll(
+        settings === "unreadable"
+          ? Layer.mock(ServerSettings.ServerSettingsService)({
+              getSettings: Effect.fail(
+                new ServerSettingsError({ settingsPath: "settings.json", operation: "read-file" }),
+              ),
+            })
+          : ServerSettings.layerTest(settings),
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getShellSnapshot: (options) =>
+            Effect.gen(function* () {
+              // Settled threads too: settling a thread does not stop its run.
+              assert.deepStrictEqual(options, { activeRunOnly: true });
+              world.snapshotReads += 1;
+              if (world.snapshotHangs) return yield* Effect.never;
+              if (world.snapshotDies) return yield* Effect.die(new Error("corrupt row"));
+              // Lets concurrent callers interleave here, the slow part of a real acquire.
+              yield* Effect.yieldNow;
+              if (world.snapshotFails) {
+                return yield* new OrchestratorV2.OrchestratorProjectionError({ threadId: caller });
+              }
+              return snapshotOf(world);
+            }),
+        }),
+        Layer.mock(HostResources.HostResources)({
+          read: Effect.gen(function* () {
+            yield* Effect.yieldNow;
+            world.memoryReads += 1;
+            return {
+              sampledAt: 0,
+              cpuUtilization: null,
+              cpuCount: 4,
+              availableMemoryBytes: world.freeMemoryBytes,
+              totalMemoryBytes: 32_000 * MB,
+            };
+          }),
+        }),
+      ),
+    ),
+  );
+
+const on = (patch: Partial<AgentSlotsSettings>) => ({ agentSlots: { enabled: true, ...patch } });
+
+const acquire = (targetInstanceId: ProviderInstanceId = MAIN) =>
+  SlotGate.SlotGate.pipe(
+    Effect.flatMap((gate) => gate.acquire({ callerThreadId: caller, targetInstanceId })),
+  );
+
+const run = <A, E>(
+  world: World,
+  settings: DeepPartial<ServerSettingsValue> | "unreadable",
+  body: Effect.Effect<A, E, SlotGate.SlotGate | ServerSettings.ServerSettingsService>,
+) => body.pipe(Effect.provide(layerFor(world, settings)));
+
+describe("SlotGate", () => {
+  it.effect(
+    "off (the default) or with no limit: allows and reads neither projection nor memory",
+    () =>
+      Effect.gen(function* () {
+        for (const settings of [
+          {},
+          { agentSlots: { maxPerMachine: 1, minFreeMemoryMb: 100_000 } },
+          on({}),
+          "unreadable" as const,
+        ]) {
+          const world = newWorld();
+          world.threads = [{ id: "a", instanceId: MAIN }];
+          const outcome = yield* run(world, settings, acquire());
+          assert.deepStrictEqual(outcome, { type: "allow", token: null });
+          assert.strictEqual(world.snapshotReads, 0);
+          assert.strictEqual(world.memoryReads, 0);
+        }
+      }),
+  );
+
+  it.effect("only a memory floor: reads memory, not the projection", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.freeMemoryBytes = 500 * MB;
+      const outcome = yield* run(world, on({ minFreeMemoryMb: 1000 }), acquire());
+      assert.strictEqual(outcome.type, "refuse");
+      if (outcome.type === "refuse")
+        assert.include(outcome.message, "only 500 MB of memory is free");
+      assert.strictEqual(world.snapshotReads, 0);
+      assert.strictEqual(world.memoryReads, 1);
+    }),
+  );
+
+  it.effect("an account limit on another account reads nothing for this target", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const outcome = yield* run(world, on({ maxPerAccount: { [SECOND]: 1 } }), acquire(MAIN));
+      assert.strictEqual(outcome.type, "allow");
+      assert.strictEqual(world.snapshotReads, 0);
+    }),
+  );
+
+  it.effect("counts running agents, archived ones too, less blocked parents (T14)", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [
+        { id: "a", instanceId: MAIN },
+        { id: "b", instanceId: SECOND, archived: true },
+        { id: "parent", instanceId: MAIN, blocked: true },
+        { id: caller, instanceId: MAIN },
+      ];
+      const outcome = yield* run(world, on({ maxPerMachine: 2 }), acquire());
+      assert.strictEqual(outcome.type, "refuse");
+      if (outcome.type === "refuse") {
+        assert.strictEqual(
+          outcome.message,
+          "No free agent slot: 2 agents are running on this machine, and the limit is 2. Try again later. Or do the work yourself.",
+        );
+      }
+    }),
+  );
+
+  it.effect("concurrent callers with 2 free slots: exactly 2 are allowed (T15)", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "a", instanceId: MAIN }];
+      const outcomes = yield* run(
+        world,
+        // The memory floor puts a real wait (the host read) between counting and adding the entry.
+        on({ maxPerMachine: 3, minFreeMemoryMb: 100 }),
+        Effect.all(
+          Array.from({ length: 5 }, () => acquire()),
+          { concurrency: "unbounded" },
+        ),
+      );
+      assert.strictEqual(outcomes.filter((outcome) => outcome.type === "allow").length, 2);
+      const tokens = outcomes.flatMap((outcome) =>
+        outcome.type === "allow" && outcome.token !== null ? [outcome.token] : [],
+      );
+      assert.strictEqual(new Set(tokens).size, 2);
+    }),
+  );
+
+  it.effect("an account limit counts starting entries of that account only", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const outcomes = yield* run(
+        world,
+        on({ maxPerAccount: { [MAIN]: 1 } }),
+        Effect.all([acquire(SECOND), acquire(MAIN), acquire(MAIN)]),
+      );
+      assert.deepStrictEqual(
+        outcomes.map((outcome) => outcome.type),
+        ["allow", "allow", "refuse"],
+      );
+    }),
+  );
+
+  it.effect("runs again: a started child counts once, as running, not also as starting", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      yield* run(
+        world,
+        on({ maxPerMachine: 2 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const first = yield* acquire();
+          assert.strictEqual(first.type, "allow");
+          if (first.type !== "allow") return;
+          yield* gate.started(first.token, ThreadId.make("child-1"));
+          // The same call again before the child is visible: it still counts (1 of 2).
+          yield* gate.started(first.token, ThreadId.make("child-1"));
+          world.threads = [{ id: "child-1", instanceId: MAIN }];
+          // Visible now: counted once, so a second child fits.
+          const second = yield* acquire();
+          assert.strictEqual(second.type, "allow");
+          const third = yield* acquire();
+          assert.strictEqual(third.type, "refuse");
+        }),
+      );
+    }),
+  );
+
+  it.effect(
+    "stops half-way: a released slot is free at once; a lost release ends after the safety time",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          on({ maxPerMachine: 1, startGraceSeconds: 30 }),
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            const first = yield* acquire();
+            assert.strictEqual(first.type, "allow");
+            if (first.type !== "allow") return;
+            assert.strictEqual((yield* acquire()).type, "refuse");
+            // The dispatch failed: the caller releases, and releasing twice is harmless.
+            yield* gate.release(first.token);
+            yield* gate.release(first.token);
+            const second = yield* acquire();
+            assert.strictEqual(second.type, "allow");
+            // Never released (a bug lost it): it ends after the safety time, not the grace.
+            yield* TestClock.adjust(DISPATCH_SAFETY_MS - 1_000);
+            assert.strictEqual((yield* acquire()).type, "refuse");
+            yield* TestClock.adjust("1 second");
+            assert.strictEqual((yield* acquire()).type, "allow");
+          }),
+        );
+      }),
+  );
+
+  it.effect("a dispatch slower than the start grace keeps its slot until it ends", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      yield* run(
+        world,
+        on({ maxPerMachine: 1, startGraceSeconds: 30 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const first = yield* acquire();
+          if (first.type !== "allow") return assert.fail("expected allow");
+          yield* TestClock.adjust("31 seconds");
+          assert.strictEqual((yield* acquire()).type, "refuse");
+          // The dispatch failed after all: free at once.
+          yield* gate.release(first.token);
+          assert.strictEqual((yield* acquire()).type, "allow");
+        }),
+      );
+    }),
+  );
+
+  it.effect("start grace 0: concurrent callers still get only the free slots", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "a", instanceId: MAIN }];
+      const outcomes = yield* run(
+        world,
+        on({ maxPerMachine: 3, startGraceSeconds: 0 }),
+        Effect.all(
+          Array.from({ length: 5 }, () => acquire()),
+          { concurrency: "unbounded" },
+        ),
+      );
+      assert.strictEqual(outcomes.filter((outcome) => outcome.type === "allow").length, 2);
+    }),
+  );
+
+  it.effect(
+    "a started child that never shows a run stops counting a grace after its dispatch",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          on({ maxPerMachine: 1, startGraceSeconds: 10 }),
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            const first = yield* acquire();
+            if (first.type !== "allow") return assert.fail("expected allow");
+            yield* gate.started(first.token, ThreadId.make("child-queued"));
+            // The dispatch (and the child's run preparation) took a minute.
+            yield* TestClock.adjust("60 seconds");
+            assert.strictEqual((yield* acquire()).type, "refuse");
+            yield* gate.release(first.token);
+            // A second release (a finalizer run again) does not restart the grace.
+            yield* TestClock.adjust("5 seconds");
+            yield* gate.release(first.token);
+            assert.strictEqual((yield* acquire()).type, "refuse");
+            yield* TestClock.adjust("5 seconds");
+            assert.strictEqual((yield* acquire()).type, "allow");
+          }),
+        );
+      }),
+  );
+
+  it.effect("a started child that delegates itself is not counted through its entry", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "x", instanceId: MAIN }];
+      yield* run(
+        world,
+        on({ maxPerMachine: 2 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const first = yield* acquire();
+          if (first.type !== "allow") return assert.fail("expected allow");
+          const child = ThreadId.make("thread:child-c");
+          yield* gate.started(first.token, child);
+          yield* gate.release(first.token);
+          world.threads.push({ id: child, instanceId: MAIN });
+          yield* TestClock.adjust("10 seconds");
+          // Running, less the caller: only x (1 of 2).
+          const second = yield* gate.acquire({ callerThreadId: child, targetInstanceId: MAIN });
+          assert.strictEqual(second.type, "allow");
+        }),
+      );
+    }),
+  );
+
+  it.effect(
+    "a child seen with a run never counts through its entry again (blocked, or its run ended)",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          on({ maxPerMachine: 1 }),
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            const first = yield* acquire();
+            if (first.type !== "allow") return assert.fail("expected allow");
+            const child = ThreadId.make("thread:child-b");
+            yield* gate.started(first.token, child);
+            yield* gate.release(first.token);
+            // Its run shows, blocked in a thread wait: not counted, by its run nor its entry.
+            world.threads = [{ id: child, instanceId: MAIN, blocked: true }];
+            const second = yield* acquire();
+            if (second.type !== "allow") return assert.fail("expected allow");
+            yield* gate.release(second.token);
+            // Its run ended inside the grace: the entry is gone for good.
+            world.threads = [];
+            assert.strictEqual((yield* acquire()).type, "allow");
+          }),
+        );
+      }),
+  );
+
+  it.effect(
+    "a hung count read lets the call through after the timeout, even inside an uninterruptible acquire",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotHangs = true;
+        world.threads = [{ id: "a", instanceId: MAIN }];
+        const outcome = yield* run(
+          world,
+          on({ maxPerMachine: 1 }),
+          Effect.gen(function* () {
+            const fiber = yield* Effect.forkChild(Effect.uninterruptible(acquire()));
+            yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
+            return yield* Fiber.join(fiber);
+          }),
+        );
+        assert.strictEqual(outcome.type, "allow");
+      }),
+  );
+
+  it.effect(
+    "a projection that cannot be read lets the delegation through; memory still applies",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotFails = true;
+        world.threads = [{ id: "a", instanceId: MAIN }];
+        const allowed = yield* run(world, on({ maxPerMachine: 1 }), acquire());
+        assert.strictEqual(allowed.type, "allow");
+        world.freeMemoryBytes = 10 * MB;
+        const refused = yield* run(
+          world,
+          on({ maxPerMachine: 1, minFreeMemoryMb: 100 }),
+          acquire(),
+        );
+        assert.strictEqual(refused.type, "refuse");
+        if (refused.type === "refuse") assert.include(refused.message, "memory");
+      }),
+  );
+
+  it.effect("a count read that dies (a bug, not a failure) lets the call through", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.snapshotDies = true;
+      world.threads = [{ id: "a", instanceId: MAIN }];
+      const outcome = yield* run(world, on({ maxPerMachine: 1 }), acquire());
+      assert.strictEqual(outcome.type, "allow");
+    }),
+  );
+
+  it.effect("settings changed while running: off to on takes effect at the next call", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "a", instanceId: MAIN }];
+      yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          assert.strictEqual((yield* acquire()).type, "allow");
+          const settings = yield* ServerSettings.ServerSettingsService;
+          yield* settings.updateSettings({ agentSlots: { enabled: true, maxPerMachine: 1 } });
+          assert.strictEqual((yield* acquire()).type, "refuse");
+          yield* settings.updateSettings({ agentSlots: { enabled: false } });
+          assert.strictEqual((yield* acquire()).type, "allow");
+        }),
+      );
+    }),
+  );
+
+  it.effect("server restart: nothing is kept; the new gate counts from the projection alone", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const settings = on({ maxPerMachine: 2 });
+      const before = yield* run(world, settings, Effect.all([acquire(), acquire(), acquire()]));
+      assert.deepStrictEqual(
+        before.map((outcome) => outcome.type),
+        ["allow", "allow", "refuse"],
+      );
+      // After the restart both children run: still full.
+      world.threads = [
+        { id: "child-1", instanceId: MAIN },
+        { id: "child-2", instanceId: MAIN },
+      ];
+      assert.strictEqual((yield* run(world, settings, acquire())).type, "refuse");
+      // A child whose run is not active yet (queued at the restart) is not counted: accepted.
+      world.threads = [{ id: "child-1", instanceId: MAIN }];
+      assert.strictEqual((yield* run(world, settings, acquire())).type, "allow");
+    }),
+  );
+});
