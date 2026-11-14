@@ -1,0 +1,60 @@
+name: pr-queue
+description: >-
+  A merge queue for a repository whose ruleset requires pull requests to be up to date: each run brings one waiting
+  pull request up to date and turns auto-merge back on only for the head the review read (README.md). Needs a
+  self-hosted runner whose disk outlives the job, with git 2.38+, gh and python3.
+inputs:
+  repo:
+    description: The repository, owner/name.
+    required: false
+    default: ${{ github.repository }}
+  config:
+    description: The queue's JSON config (README.md, "Config").
+    required: true
+  state-file:
+    description: Absolute path, outside the job's workspace, of the plan a stopped run leaves for the next one.
+    required: true
+  cache:
+    description: Absolute path, outside the job's workspace, of the queue's own bare git repository.
+    required: true
+  lock-file:
+    description: Absolute path of the lock that keeps two runs apart (default the state file + .lock).
+    required: false
+    default: ""
+  dry-run:
+    description: true says what a run would do and writes nothing.
+    required: false
+    default: "false"
+  token:
+    description: >-
+      A token that can update branches, comment and merge pull requests. Not the run's GITHUB_TOKEN: a branch update
+      pushed with it starts no workflow, so the updated pull request would never get its checks.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Run the queue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        RUN_TOKEN: ${{ github.token }}
+        REPO: ${{ inputs.repo }}
+        CONFIG: ${{ inputs.config }}
+        STATE_FILE: ${{ inputs.state-file }}
+        CACHE: ${{ inputs.cache }}
+        LOCK_FILE: ${{ inputs.lock-file }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        if [[ -z "$GH_TOKEN" || "$GH_TOKEN" == "$RUN_TOKEN" ]]; then
+          echo "::error::pr-queue: token is empty or the run's GITHUB_TOKEN, whose branch updates start no workflow"
+          exit 2
+        fi
+        unset RUN_TOKEN
+        args=(--repo "$REPO" --config "$CONFIG" --state-file "$STATE_FILE" --cache "$CACHE")
+        if [[ -n "$LOCK_FILE" ]]; then args+=(--lock-file "$LOCK_FILE"); fi
+        case "$DRY_RUN" in
+          true) args+=(--dry-run) ;;
+          false) ;;
+          *) echo "::error::pr-queue: dry-run must be true or false, not '$DRY_RUN'"; exit 2 ;;
+        esac
+        exec python3 -I "$GITHUB_ACTION_PATH/pr_queue.py" "${args[@]}"
