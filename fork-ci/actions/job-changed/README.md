@@ -10,7 +10,7 @@ builds, which docs a build reads) stays in the calling repository: pass folders 
 
 ## Usage
 
-Pin the action by full SHA (the tagged one, so a rebase of this fork cannot orphan it):
+Pin a release commit by its full SHA, never a commit of main ([why](../../README.md#pinning)):
 
 ```yaml
 jobs:
@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@<sha> # the default ref: on pull_request GitHub's merge commit
         with: { fetch-depth: 0 } # the base must be in the checkout
       - id: changed
-        uses: scuttletoby/t3code/fork-ci/actions/job-changed@<full sha> # ci/vN
+        uses: scuttletoby/t3code/fork-ci/actions/job-changed@<release sha> # ci/vN
         with:
           base: ${{ github.event_name == 'pull_request' && 'HEAD^1' || steps.green.outputs.sha }}
           workflow: .github/workflows/ci.yml
