@@ -388,6 +388,9 @@ export const make = Effect.gen(function* () {
   const updaterConfiguredRef = yield* Ref.make(false);
   const lastLoggedDownloadMilestoneRef = yield* Ref.make(-1);
   const notAppliedVersionRef = yield* Ref.make(Option.none<string>());
+  // Whether the autoUpdate setting armed the updater to install a download when the app quits.
+  const autoInstallArmedRef = yield* Ref.make(false);
+  const autoInstallSkipLoggedRef = yield* Ref.make(Option.none<string>());
   // The release a track switch's database check cleared. A build crosses to another track only
   // through such a switch, and never below that release: version order alone cannot tell whether
   // a Stable knows a Nightly's migrations.
@@ -890,9 +893,85 @@ export const make = Effect.gen(function* () {
     };
   });
 
+  // Install-on-quit stops when the setting is off or the track changes: a download from a track
+  // the app no longer follows must not install.
+  // Nothing to remove: the install record is only written when the app quits.
+  const disarmAutoInstall = Effect.gen(function* () {
+    if (!(yield* Ref.getAndSet(autoInstallArmedRef, false))) return;
+    yield* electronUpdater.setAutoInstallOnAppQuit(false);
+    yield* logUpdaterInfo("update no longer installs when the app quits");
+  });
+
+  // Runs as the app's scope closes on quit, before the updater's quit handler installs. It reads
+  // the setting again, so turning it off just before quitting installs nothing. The record is
+  // written only here: a crash before a real quit must not count as an install that did not apply.
+  const finishAutoInstallAtQuit = Effect.gen(function* () {
+    if (!(yield* Ref.get(autoInstallArmedRef))) return;
+    // The Update button's install has already written its own record.
+    const action = yield* activeUpdateAction;
+    if (Option.isSome(action) && action.value === "install") return;
+    const settings = yield* desktopSettings.get;
+    const state = yield* Ref.get(updateStateRef);
+    if (
+      settings.autoUpdate !== true ||
+      state.status !== "downloaded" ||
+      state.downloadedVersion === null
+    ) {
+      yield* disarmAutoInstall;
+      return;
+    }
+    yield* writeInstallRecord(state.downloadedVersion);
+    yield* logUpdaterInfo("installing the update as the app quits", {
+      version: state.downloadedVersion,
+    });
+  }).pipe(
+    Effect.catchCause((cause) =>
+      // Without a record the install still runs; only the "did not apply" report is lost.
+      logUpdaterWarning("Could not finish the automatic install at quit.", {
+        cause: describeUpdateErrorCause(cause),
+      }),
+    ),
+    Effect.withSpan("desktop.updates.autoInstallAtQuit"),
+  );
+
+  // With the autoUpdate setting, a background check that finds a release downloads it, and the
+  // updater installs it when the app quits. The install is recorded at quit like the Update
+  // button's, so one that did not apply is reported at the next start, and that version is then
+  // left to the Update button instead of being tried again on every quit.
+  const autoDownloadAvailableUpdate = Effect.gen(function* () {
+    const settings = yield* desktopSettings.get;
+    if (settings.autoUpdate !== true) {
+      yield* disarmAutoInstall;
+      return;
+    }
+    const current = yield* Ref.get(updateStateRef);
+    if (current.status !== "available") return;
+    const notApplied = yield* Ref.get(notAppliedVersionRef);
+    if (Option.isSome(notApplied) && current.availableVersion === notApplied.value) {
+      const logged = yield* Ref.getAndSet(autoInstallSkipLoggedRef, notApplied);
+      if (!Option.isSome(logged) || logged.value !== notApplied.value) {
+        yield* logUpdaterWarning("not installing automatically: this version did not apply", {
+          version: notApplied.value,
+        });
+      }
+      return;
+    }
+    yield* logUpdaterInfo("downloading update automatically");
+    const result = yield* downloadAvailableUpdate;
+    const state = yield* Ref.get(updateStateRef);
+    if (result.completed && state.status === "downloaded" && state.downloadedVersion !== null) {
+      yield* electronUpdater.setAutoInstallOnAppQuit(true);
+      yield* Ref.set(autoInstallArmedRef, true);
+      yield* logUpdaterInfo("update installs when the app quits", {
+        version: state.downloadedVersion,
+      });
+    }
+  }).pipe(Effect.withSpan("desktop.updates.autoDownload"));
+
   const startUpdatePollers: Effect.Effect<void, never, Scope.Scope> = Effect.gen(function* () {
     yield* Effect.sleep(AUTO_UPDATE_STARTUP_DELAY).pipe(
       Effect.andThen(checkForUpdates("startup")),
+      Effect.andThen(autoDownloadAvailableUpdate),
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
           return Effect.void;
@@ -908,6 +987,7 @@ export const make = Effect.gen(function* () {
     );
     yield* Effect.sleep(AUTO_UPDATE_POLL_INTERVAL).pipe(
       Effect.andThen(checkForUpdates("poll")),
+      Effect.andThen(autoDownloadAvailableUpdate),
       Effect.forever,
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -1163,6 +1243,7 @@ export const make = Effect.gen(function* () {
         return;
       }
       yield* Ref.set(updaterConfiguredRef, true);
+      yield* Effect.addFinalizer(() => finishAutoInstallAtQuit);
 
       yield* electronUpdater.setAutoDownload(false);
       yield* electronUpdater.setAutoInstallOnAppQuit(false);
@@ -1245,6 +1326,7 @@ export const make = Effect.gen(function* () {
           return state;
         }
 
+        yield* disarmAutoInstall;
         yield* desktopSettings.setUpdateChannel(nextChannel).pipe(
           Effect.onError(() => Ref.set(releaseFloorRef, previousFloor)),
           Effect.mapError(
