@@ -118,8 +118,12 @@ The token is in git's environment and `STATE` decides what is re-armed, so run
 the queue on a runner (or runner group) that runs no `pull_request` job and no
 other repository's job, as a user of its own. The `--state-file` and `--cache`
 folders belong to that user alone. git runs with no hooks, no fsmonitor and no
-replace refs, and a cache that is not that user's alone (mode `0700`) or has a
-config the queue did not write is rebuilt, never used.
+replace refs, and a cache that is not that user's alone (mode `0700`), has a
+config the queue did not write, or holds a file that changes what its objects
+say (`info/grafts`, `shallow`, `objects/info/alternates` or
+`objects/info/http-alternates`) is rebuilt, never used. A job of the same user
+can still change the cache between that check and git's next read: only the
+runner rule above stops that.
 
 | Exit | Meaning                                                                                                     |
 | ---- | ----------------------------------------------------------------------------------------------------------- |

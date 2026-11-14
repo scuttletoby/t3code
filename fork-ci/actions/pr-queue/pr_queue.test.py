@@ -847,11 +847,52 @@ class WhoseCommentsCount(Base):
         self.assertEqual((f.armed, f.updated, len(f.comments)), (None, False, 1), out)
         self.assertIn('edited after posting', f.comments[0])
 
-    def test_a_hidden_lens_comment_counts_like_a_deleted_one(self):
+    def test_a_hidden_lens_comment_reads_nothing(self):
         hidden = dict(lens_at('correctness', self.c, '2026-11-07T11:00:00Z'), isMinimized=True)
         f = self.fake(comments=[lens_at('correctness', self.m0), hidden])
         code, out = self.update(f)
         self.assertIsNone(f.armed, 'the hidden read of C counted: ' + out)
+
+    def test_a_lens_comment_whose_author_does_not_count_is_named_in_the_run_log(self):
+        forged = self.stranger(f'{LENS}: correctness · reviewer: x · read at: {self.c}', 'MEMBER')
+        code, out = self.update(self.fake(comments=[lens_at('correctness', self.c), forged]))
+        self.assertIn('author association MEMBER is not one of lens_author_associations (OWNER, COLLABORATOR)', out)
+
+
+class Sec2(Base):
+    """Security review round 2: hidden comments. Hiding old review rounds as Outdated is routine; it must not make a
+    reviewed PR look unreviewed, since the queue vouches for the head of an unreviewed one."""
+
+    def test_all_lens_comments_hidden_as_outdated_does_not_vouch_for_an_unread_push(self):
+        reviewed = self.w.commit({'x.py': lines(extra=['reviewed'], at=20)}, [self.m0])
+        # the lens read `reviewed`; a write-access push made the head C (auto-merge stays on); round 1 is hidden
+        f = self.fake(comments=[dict(lens_at('correctness', reviewed), isMinimized=True)])
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.updated, len(f.comments)), (0, None, False, 1), out)
+        self.assertIn('hidden', f.comments[0])
+        self.assertIn('`tool ready --head <sha>: <why>`', f.comments[0])
+
+    def test_a_hidden_override_does_not_count(self):
+        reviewed = self.w.commit({'x.py': lines(extra=['reviewed'], at=20)}, [self.m0])
+        hidden = dict(override(self.c, '2026-11-07T11:00:00Z'), isMinimized=True)
+        f = self.fake(comments=[lens_at('correctness', reviewed), hidden])
+        code, out = self.update(f)
+        self.assertEqual((f.armed, len(f.comments)), (None, 1), out)
+        self.assertIn('is not exactly the change read', f.comments[0])   # held against the lens's read, not C
+
+
+class Sec1R2(Base):
+    """Security review 1, round 2: an override taken back by hiding it vouches for nothing."""
+
+    def test_a_hidden_override_vouches_for_nothing(self):
+        reviewed = self.w.commit({'x.py': lines(extra=['reviewed'], at=20)}, [self.m0])
+        shown = override(self.c, '2026-11-07T11:00:00Z')
+        f = self.fake(comments=[lens_at('correctness', reviewed), shown])
+        self.assertEqual(self.update(f)[0], 0)
+        self.assertEqual(f.armed, self.up, 'the shown override vouches for C')
+        f = self.fake(comments=[lens_at('correctness', reviewed), dict(shown, isMinimized=True)])
+        code, out = self.update(f)
+        self.assertIsNone(f.armed, 'the hidden override re-armed C: ' + out)
 
 
 class OwnCache(Base):
@@ -881,6 +922,18 @@ class OwnCache(Base):
         got, out = self.fetch(self.up)   # moves refs/queue/pr7: a ref transaction
         self.assertTrue(got, out)
         self.assertFalse(os.path.exists(marker), 'a hook in the cache ran with the token in its environment')
+
+    def test_a_cache_with_grafts_shallow_or_alternates_is_rebuilt(self):   # each changes what the objects say
+        for name in ('info/grafts', 'shallow', 'objects/info/alternates', 'objects/info/http-alternates'):
+            self.assertTrue(self.fetch(self.c)[0])
+            path = os.path.join(self.q.cache, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(f'{self.c} {self.m1}\n' if name in ('info/grafts', 'shallow') else self.w.dir + '\n')
+            got, out = self.fetch(self.up)
+            self.assertTrue(got, out)
+            self.assertIn(f'holds {name}, which the queue never writes: rebuilding it', out)
+            self.assertFalse(os.path.lexists(path), name)
 
     def test_a_cache_with_another_config_or_open_to_others_is_rebuilt(self):
         self.assertTrue(self.fetch(self.c)[0])

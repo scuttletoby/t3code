@@ -50,6 +50,9 @@ GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '--n
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
+# Files git reads that would make the cache's history or objects other than what was fetched from GitHub: grafts and
+# shallow change a commit's parents, alternates adds another repository's objects. The queue never writes any of them.
+UNTRUSTED_FILES = ('info/grafts', 'shallow', 'objects/info/alternates', 'objects/info/http-alternates')
 VIEW = 'number,state,isDraft,autoMergeRequest,mergeStateStatus,headRefOid,baseRefName,comments,reviews,commits'
 LIST = 'number,title,isDraft,autoMergeRequest,mergeStateStatus,createdAt,statusCheckRollup,headRefOid,baseRefName'
 
@@ -163,7 +166,8 @@ class Queue:
     def cache_problem(self):
         """Why the cache is not the one the queue made, or None. git runs there with the token in its environment, and
         its objects decide what is re-armed: only a directory of this user that no one else can enter, whose config is
-        CACHE_CONFIG, and that is a bare repository, counts."""
+        CACHE_CONFIG, that holds none of the files that make git read other objects or history (UNTRUSTED_FILES) and
+        that is a bare repository, counts."""
         try:
             st = os.lstat(self.cache)
             if not stat.S_ISDIR(st.st_mode):
@@ -173,6 +177,9 @@ class Queue:
             with open(os.path.join(self.cache, 'config'), opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
                 if f.read() != CACHE_CONFIG:
                     return 'has a config the queue did not write'
+            for name in UNTRUSTED_FILES:
+                if os.path.lexists(os.path.join(self.cache, name)):
+                    return f'holds {name}, which the queue never writes'
         except (OSError, ValueError) as e:
             return f'cannot be checked ({e})'
         if self.git('rev-parse', '--is-bare-repository').stdout.strip() != 'true':
@@ -294,6 +301,9 @@ class Queue:
                     f'head posts the override `{self.cfg.override_prefix} <sha>: <why>`.')
         if lens.SHORT in why:
             return f'A lens read names the full 40-hex sha ({self.cfg.lens_format_doc}): re-post it with that.'
+        if lens.HIDDEN in why:
+            return ('A hidden lens comment reads nothing: that lens posts a new comment, or someone who read the head '
+                    f'posts the override `{self.cfg.override_prefix} <sha>: <why>` (also for a lens no longer used).')
         return ''
 
     def arm(self, n, head):
