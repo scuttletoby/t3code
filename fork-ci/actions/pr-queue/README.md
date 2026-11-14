@@ -72,7 +72,17 @@ comment: an edit can move `read at` to a head nobody read, and hiding old review
 rounds must not make a reviewed pull request look unreviewed (the queue would
 then vouch for whatever head it found). A lens a later round drops therefore
 needs an override, or its old comment deleted. A hidden override counts
-nothing. GitHub shows no hidden state for reviews, so a review counts as shown.
+nothing.
+
+For reviews (a lens or an override posted as a PR review), `gh pr view` does
+not ask GitHub whether the review was edited or hidden, yet prints
+`includesCreatedEdit: false` for every one (checked with gh 2.102 and
+`GH_DEBUG=api`). The queue never trusts that: it reads each review's
+`includesCreatedEdit`, `isMinimized` and author type with one GraphQL query of
+its own, by pull request, 100 reviews a page, after the view. A review that
+query does not return reads nothing (and is no override). If the query fails,
+nothing about the pull request is decided: the queue leaves it as it is and the
+next run tries again; the head check fails.
 
 The grammar is fixed: a project writes its lens reports this way, it does not
 configure another way. It fails closed. A comment that looks like a lens report
