@@ -66,6 +66,13 @@ UNTRUSTED_FILES = ('info/grafts', 'shallow', 'objects/info/alternates', 'objects
                    'info/attributes')
 VIEW = 'number,state,isDraft,autoMergeRequest,mergeStateStatus,headRefOid,baseRefName,comments,reviews,commits'
 LIST = 'number,title,isDraft,autoMergeRequest,mergeStateStatus,createdAt,statusCheckRollup,headRefOid,baseRefName'
+# What gh pr view never fetches for reviews (gh 2.102 asks only id, author login, authorAssociation, submittedAt, body,
+# state, commit, reactionGroups) yet prints with Go's defaults (`includesCreatedEdit: false`): read with one query of
+# our own, by PR, 100 reviews a page. lens.Review trusts a review's flags only from this answer (lens.REVIEW_FLAGS).
+REVIEW_FLAGS_QUERY = ('query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,'
+                      'name:$name){pullRequest(number:$number){reviews(first:100,after:$after){pageInfo{hasNextPage '
+                      'endCursor} nodes{id includesCreatedEdit isMinimized url author{__typename login}}}}}}')
+REVIEW_PAGES = 50   # 5000 reviews: a PR with more is not read (fails closed)
 
 
 def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
@@ -87,6 +94,41 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
             if m.returncode == 0 and tree and m.stdout.split()[:1] == [tree]:
                 return True
     return False
+
+
+def review_flags(gh, repo, n):
+    """({review node id: {includesCreatedEdit, isMinimized, url, author}}, None) for every review of PR n, read with
+    REVIEW_FLAGS_QUERY page by page; (None, why) when any page fails or is not the shape asked for (then nothing about
+    any review is known, and the caller must not decide). A node without a boolean includesCreatedEdit and isMinimized
+    is left out: lens.Review counts a review it has no flags for as one that reads nothing. Read AFTER gh pr view: a
+    review edited between the two reads then shows here as edited, never as an unedited body that is not the one
+    read."""
+    owner, name = repo.split('/', 1)
+    flags, after = {}, None
+    for _ in range(REVIEW_PAGES):
+        r = gh('api', 'graphql', '-f', f'query={REVIEW_FLAGS_QUERY}', '-f', f'owner={owner}', '-f', f'name={name}',
+               '-F', f'number={n}', *(['-f', f'after={after}'] if after else []))
+        if r.returncode != 0:
+            return None, f'reading the reviews\' edit flags failed: {(r.stderr or r.stdout or "").strip()[:200]}'
+        try:
+            answer = json.loads(r.stdout)
+            reviews = answer['data']['repository']['pullRequest']['reviews']
+            page, nodes = reviews['pageInfo'], reviews['nodes']
+            if answer.get('errors') or not isinstance(nodes, list) or not isinstance(page['hasNextPage'], bool):
+                raise TypeError
+        except (ValueError, KeyError, TypeError):
+            return None, 'reading the reviews\' edit flags: GitHub gave no list of reviews'
+        for node in nodes:
+            if isinstance(node, dict) and isinstance(node.get('id'), str) and node['id'] \
+                    and isinstance(node.get('includesCreatedEdit'), bool) and isinstance(node.get('isMinimized'), bool):
+                flags[node['id']] = {k: node.get(k) for k in ('includesCreatedEdit', 'isMinimized', 'url', 'author')}
+        if not page['hasNextPage']:
+            return flags, None
+        cursor = page.get('endCursor')
+        if not isinstance(cursor, str) or not cursor or cursor == after:
+            return None, 'reading the reviews\' edit flags: GitHub said there are more but gave no next page'
+        after = cursor
+    return None, f'reading the reviews\' edit flags: more than {REVIEW_PAGES * 100} reviews, not all read'
 
 
 def set_aside(path):
@@ -481,12 +523,21 @@ class Queue:
         return waits or (None, None, False)
 
     # --- steps 2-4 --------------------------------------------------------------------------------------------------
-    def view(self, n):
+    def view(self, n, reviews=False):
+        """PR n as gh shows it, or None. reviews: also its reviews' own flags (review_flags, under lens.REVIEW_FLAGS),
+        for the review rules; None when they cannot be read, so nothing is decided on a review nobody could check."""
         r = self.gh('pr', 'view', str(n), '--repo', self.repo, '--json', VIEW)
         try:
-            return json.loads(r.stdout) if r.returncode == 0 else None
+            pr = json.loads(r.stdout) if r.returncode == 0 else None
         except ValueError:
             return None
+        if reviews and isinstance(pr, dict) and pr.get('reviews'):
+            flags, why = review_flags(self.gh, self.repo, n)
+            if flags is None:
+                print(f'#{n}: {why}')
+                return None
+            pr[lens.REVIEW_FLAGS] = flags
+        return pr
 
     def new_head(self, n, old):
         for _ in range(self.cfg.wait_seconds // self.cfg.poll_seconds):
@@ -531,7 +582,7 @@ class Queue:
 
     def update(self, n, dry=False):
         """Bring PR n up to date with its base and re-arm only the change the review read (steps 1-4)."""
-        cur = self.view(n)
+        cur = self.view(n, reviews=True)
         if cur is None:
             print(f'#{n}: gh cannot show it now: nothing changed, the next run tries again')
             return 1
@@ -648,7 +699,7 @@ class Queue:
             print(f'ERROR: {self.state} is the plan of a queue run for {st["repo"]}, not {self.repo}: two repositories '
                   'share one --state-file. Nothing touched; give each its own')
             return 1
-        cur = self.view(n)
+        cur = self.view(n, reviews=True)
         if cur is None:
             print(f'#{n}: a stopped run left it OFF, and gh cannot show it now: trying again next run, no other PR '
                   'meanwhile')
