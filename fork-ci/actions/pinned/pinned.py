@@ -71,13 +71,18 @@ def pin(config):
 
 
 def private(cache):
-    """Make the cache folder (0700) and refuse one another user owns or others can write: there they could plant a
-    symlink or a FIFO that prune or a read would act on. (The bytes run are checked either way.)"""
+    """Make the cache folder 0700: our own folder that others can reach is made 0700 (a umask 002 account makes
+    0775 folders), one another user owns is refused: there they could plant a symlink or a FIFO that prune or a read
+    would act on. (The bytes run are checked either way.)"""
     os.makedirs(cache, mode=0o700, exist_ok=True)
     st = os.stat(cache)
-    if hasattr(os, 'getuid') and (st.st_uid != os.getuid() or st.st_mode & 0o022):
-        raise FetchError(f'cache folder {cache} is not private (owner {st.st_uid}, mode {oct(st.st_mode & 0o777)}): '
-                         'use a folder of your own that only you can write')
+    if not hasattr(os, 'getuid'):
+        return
+    if st.st_uid != os.getuid():
+        raise FetchError(f'cache folder {cache} is owned by another user ({st.st_uid}): pass --cache with a folder '
+                         'of your own')
+    if st.st_mode & 0o077:
+        os.chmod(cache, 0o700)
 
 
 def read_regular(path):

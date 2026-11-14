@@ -257,14 +257,18 @@ class LensFindings(Case):
             self.assertEqual(f.read(), BODY)
 
     @unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
-    def test_a_cache_others_can_write_is_refused(self):
-        os.chmod(self.cache, 0o777)
-        with self.serve(), self.assertRaises(pinned.FetchError):
+    def test_our_own_open_cache_is_made_private_and_used(self):   # a umask 002 account makes 0775 folders
+        os.chmod(self.cache, 0o775)
+        with self.serve():
+            self.assertEqual(self.path(), self.dest)
+        self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o700)
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
+    def test_a_cache_another_user_owns_is_refused(self):
+        with self.serve(), mock.patch.object(pinned.os, 'getuid', lambda: os.stat(self.cache).st_uid + 1), \
+                self.assertRaises(pinned.FetchError):
             self.path()
         self.assertEqual(self.urls, [])
-        os.chmod(self.cache, 0o700)
-        with self.serve():
-            self.path()
 
 
 class Run(Case):
@@ -397,6 +401,61 @@ class Bootstrap(Case):
                 with self.assertRaises(ValueError):
                     self.boot()
         self.assertEqual(self.urls, [])
+
+
+class UmaskAndFifo(Bootstrap):
+    """Lens t3lens94q probes: the private-cache refusal in normal use."""
+    def fresh(self):
+        c = os.path.join(self.root, 'fresh-cache')   # does not exist yet: the README adapter's first run
+        self.cache = c
+        self.pdest = os.path.join(c, SHA, 'pinned', 'pinned.py')
+        return c
+
+    def test_readme_adapter_first_run_under_umask_002(self):
+        # Stock Ubuntu/Debian user (USERGROUPS_ENAB yes): umask 002. The bootstrap makes the cache folder 0775,
+        # then P.load (the README adapter's next line) refuses it as "not private" on this and every later run.
+        self.fresh()
+        old = os.umask(0o002)
+        try:
+            p = self.boot()
+            with mock.patch.object(p.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(BODY)):
+                self.assertEqual(p.load(self.cfg, 'docs-scope', 'docs_scope', self.cache).X, 1)   # red at the head
+        finally:
+            os.umask(old)
+
+    def test_an_existing_cache_of_our_own_made_under_umask_002(self):
+        # The same layout made by the round-1 pinned.py or a project's older copy (os.makedirs, umask 002).
+        self.fresh()
+        old = os.umask(0o002)
+        try:
+            os.makedirs(os.path.join(self.cache, SHA, 'docs-scope'))
+        finally:
+            os.umask(old)
+        with self.serve():
+            self.assertEqual(self.path(), self.dest.replace(os.path.dirname(os.path.dirname(os.path.dirname(self.dest))), self.cache))   # red
+
+    def test_a_symlink_at_dest_is_replaced_not_its_target(self):
+        target = os.path.join(self.root, 'target'); open(target, 'wb').write(b'other')
+        os.makedirs(os.path.dirname(self.dest)); os.symlink(target, self.dest)
+        with self.serve():
+            self.path()
+        self.assertFalse(os.path.islink(self.dest))
+        self.assertEqual(open(target, 'rb').read(), b'other')
+
+    def test_prune_still_removes_real_old_folders_and_parts(self):
+        now = time.time()
+        old = self.put(os.path.join(self.cache, 'b' * 40, 'x', 'y.py'), b'', age=0)
+        t = now - (pinned.CACHE_DAYS + 1) * 86400; os.utime(os.path.join(self.cache, 'b' * 40), (t, t))
+        part = self.put(os.path.join(self.cache, SHA, 'x', '.part-1'), b'', age=7200)
+        pinned.prune(self.cache, SHA, now)
+        self.assertFalse(os.path.exists(old)); self.assertFalse(os.path.exists(part))
+
+
+class BootstrapFifo(Bootstrap):
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs')
+    def test_bootstrap_fetches_over_a_fifo_not_opens_it(self):
+        os.makedirs(os.path.dirname(self.pdest)); os.mkfifo(self.pdest)
+        self.boot()   # red at the head: open(dest, 'rb') waits for a writer forever
 
 
 if __name__ == '__main__':

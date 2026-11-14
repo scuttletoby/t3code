@@ -69,8 +69,9 @@ Callers may import exactly these names; anything else in the module may change i
 | `default_cache()`, `PART_AGE`, `CACHE_DAYS`      | the defaults                                                                       |
 
 `config` is the path of the pin config file. `cache` is the cache folder; a project that used its own cache folder of
-the same layout (`<cache>/<sha>/<action>/<file>`) can pass it, and its checked copies are used as they are. The cache folder must be private: one another user owns
-or others can write is refused (FetchError), and prune never follows a symlink or opens a special file in it.
+the same layout (`<cache>/<sha>/<action>/<file>`) can pass it, and its checked copies are used as they are. The cache folder is kept private: our own folder is made
+0700 on use, one another user owns is refused (FetchError), and prune never follows a symlink or opens a special
+file in it. The bootstrap below makes it 0700 too and reads only a regular file.
 
 ## Loading this module: the bootstrap
 
@@ -82,7 +83,7 @@ module's. `pinned.test.py` runs this exact block.
 <!-- bootstrap:start -->
 
 ```python
-import hashlib, json, os, re, tempfile, types, urllib.request
+import hashlib, json, os, re, stat, tempfile, types, urllib.request
 
 
 def load_pinned(config, cache):
@@ -97,11 +98,13 @@ def load_pinned(config, cache):
             and '..' not in repo.split('/') and isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)
             and isinstance(want, str)):
         raise ValueError(f'{config}: needs "repo", "sha" (40 hex) and "files" with "pinned/pinned.py"')
+    os.makedirs(cache, mode=0o700, exist_ok=True)
     dest = os.path.join(cache, c['sha'], 'pinned', 'pinned.py')
     blob = lambda b: hashlib.sha1(b'blob %d\0' % len(b) + b).hexdigest()
-    try:
-        with open(dest, 'rb') as f:
-            data = f.read()
+    try:   # a regular file only: no symlink followed, no FIFO waited on
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
+        with os.fdopen(os.open(dest, flags), 'rb') as f:
+            data = f.read() if stat.S_ISREG(os.fstat(f.fileno()).st_mode) else None
     except OSError:
         data = None
     if data is None or blob(data) != want:
