@@ -122,7 +122,7 @@ function hasThermalPressure(hostPower: HostPowerSnapshot): boolean {
   return hostPower.thermalState === "serious" || hostPower.thermalState === "critical";
 }
 
-function isHostConstrained(
+export function isHostConstrained(
   hostPower: HostPowerSnapshot,
   settings: ResolvedBackgroundActivitySettings,
 ): boolean {
