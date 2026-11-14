@@ -973,6 +973,22 @@ export const UsagePacingInstanceSettingsPatch = Schema.Struct({
 });
 export type UsagePacingInstanceSettingsPatch = typeof UsagePacingInstanceSettingsPatch.Type;
 
+/**
+ * Fork: what the usage pacing gate does when an agent delegates a task. `off` (the default) changes
+ * nothing and reads no pace. `advise` never changes or refuses a task, it only adds a note.
+ * `enforce` moves a task off an account that is ahead of pace, lowers its effort or holds it.
+ */
+export const UsagePacingGateMode = Schema.Literals(["off", "advise", "enforce"]);
+export type UsagePacingGateMode = typeof UsagePacingGateMode.Type;
+
+/**
+ * Fork: what each effort level turns into while an account is ahead of its even pace and no other
+ * account has room, by level id (`{ "high": "medium", "medium": "medium" }`). A level that is not
+ * listed waits instead. Empty (the default) never lowers an effort.
+ */
+export const UsagePacingLowerEffort = Schema.Record(TrimmedNonEmptyString, TrimmedNonEmptyString);
+export type UsagePacingLowerEffort = typeof UsagePacingLowerEffort.Type;
+
 export const TextGeneratorKind = Schema.Literals(["openaiCompatible", "anthropic"]);
 export type TextGeneratorKind = typeof TextGeneratorKind.Type;
 
@@ -1470,6 +1486,11 @@ export const ServerSettings = Schema.Struct({
   usagePacing: Schema.Record(ProviderInstanceId, UsagePacingInstanceSettings).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
+  /** Fork: the usage pacing gate on agent-delegated tasks; `off` keeps upstream's behaviour. */
+  usagePacingGate: UsagePacingGateMode.pipe(Schema.withDecodingDefault(Effect.succeed("off"))),
+  usagePacingLowerEffort: UsagePacingLowerEffort.pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
   defaultRuntimeMode: RuntimeMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE)),
   ),
@@ -1931,6 +1952,9 @@ export const ServerSettingsPatch = Schema.Struct({
   usagePacing: Schema.optionalKey(
     Schema.Record(ProviderInstanceId, Schema.NullOr(UsagePacingInstanceSettingsPatch)),
   ),
+  usagePacingGate: Schema.optionalKey(UsagePacingGateMode),
+  // Fork: replaced whole, so a level left out of the patch is removed.
+  usagePacingLowerEffort: Schema.optionalKey(UsagePacingLowerEffort),
   /** Replaces each project's override set; null removes it. Omitted providerInstances retains its stored value. */
   projectSettingsOverrides: Schema.optionalKey(
     Schema.Record(

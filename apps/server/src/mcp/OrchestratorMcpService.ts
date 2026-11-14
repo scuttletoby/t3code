@@ -135,6 +135,8 @@ import { isLiveCallerShell, threadNotFound } from "./threadAccess.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
+import * as UsagePacer from "../usage/UsagePacer.ts";
+import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 // Nothing is written while a task wait blocks, and Node fetch drops a silent call at 300 s.
@@ -1203,6 +1205,9 @@ const make = Effect.gen(function* () {
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const remoteDelegation = yield* RemoteDelegation.RemoteDelegation;
+  // Fork: read if the server runs one. Optional, so no test of this service has to provide it;
+  // server.ts refuses to compile without it.
+  const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -1591,6 +1596,96 @@ const make = Effect.gen(function* () {
       modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
       supportedRuntimeModes: provider.supportedRuntimeModes,
     };
+  });
+
+  /**
+   * Fork: the usage pacing gate (`usagePacingGate` setting, off by default) on a task an agent
+   * delegates. A setting or a pace that cannot be read lets the task through as asked.
+   */
+  const paceTarget = Effect.fn("OrchestratorMcpService.paceTarget")(function* (input: {
+    readonly parent: Pick<OrchestrationV2ThreadProjection, "thread">;
+    readonly requested: OrchestratorMcpTarget | undefined;
+    readonly runtimeMode: OrchestratorMcpDelegateTaskInput["runtimeMode"];
+    readonly providers: ReadonlyArray<ServerProvider>;
+    readonly target: ResolvedTarget;
+  }): Effect.fn.Return<
+    { readonly target: ResolvedTarget; readonly note?: string },
+    OrchestratorMcpFailure
+  > {
+    const settings = yield* serverSettings.getSettings.pipe(Effect.option);
+    if (Option.isNone(settings) || settings.value.usagePacingGate === "off") {
+      return { target: input.target };
+    }
+    const { instanceId, model, options } = input.target.modelSelection;
+    const provider = input.providers.find((candidate) => candidate.instanceId === instanceId);
+    const parentMode = input.parent.thread.runtimeMode;
+    const modeOn = (target: ResolvedTarget) =>
+      resolveRuntimeMode(parentMode, input.runtimeMode, target).pipe(Effect.option);
+    const outcome = yield* UsagePacingGate.decide({
+      mode: settings.value.usagePacingGate,
+      lowerEffort: settings.value.usagePacingLowerEffort,
+      nowMs: yield* Clock.currentTimeMillis,
+      instanceId,
+      pinned: input.requested?.providerInstanceId !== undefined,
+      providers: input.providers,
+      descriptors:
+        provider === undefined
+          ? undefined
+          : advertisedModel(provider, model)?.capabilities?.optionDescriptors,
+      options,
+      paceOf: (id) =>
+        Option.match(usagePacer, {
+          onNone: () => Effect.undefined,
+          onSome: (pacer) => pacer.paceOf(id).pipe(Effect.orElseSucceed(() => undefined)),
+        }),
+      // The same model, options and runtime mode on an instance this project may use, or nothing.
+      targetOn: Effect.fnUntraced(function* (candidate) {
+        const enabled = yield* threadManagement.isProviderInstanceEnabledForProject({
+          projectId: input.parent.thread.projectId,
+          instanceId: candidate,
+        });
+        if (!enabled) return undefined;
+        const resolved = yield* resolveTarget({
+          parent: input.parent,
+          target: {
+            providerInstanceId: candidate,
+            model,
+            ...(options === undefined ? {} : { options }),
+          },
+          providers: input.providers,
+        }).pipe(Effect.option);
+        if (Option.isNone(resolved)) return undefined;
+        const modes = yield* Effect.all([modeOn(input.target), modeOn(resolved.value)]);
+        return Option.isSome(modes[1]) && Option.getOrNull(modes[0]) === modes[1].value
+          ? resolved.value
+          : undefined;
+      }),
+    });
+    switch (outcome.action) {
+      case "hold":
+        return yield* failure("usage_pacing_hold", outcome.message);
+      case "switch":
+        return { target: outcome.target, note: outcome.note };
+      case "lowerEffort":
+        return {
+          target: {
+            ...input.target,
+            modelSelection: {
+              ...input.target.modelSelection,
+              options: [
+                ...(options ?? []).filter((option) => option.id !== outcome.step.optionId),
+                { id: outcome.step.optionId, value: outcome.step.to },
+              ],
+            },
+          },
+          note: outcome.note,
+        };
+      case "pass":
+        return {
+          target: input.target,
+          ...(outcome.note === undefined ? {} : { note: outcome.note }),
+        };
+    }
   });
 
   const requestKey = (clientRequestId: string | undefined): Effect.Effect<string> =>
@@ -2597,20 +2692,33 @@ const make = Effect.gen(function* () {
         operation: "delegate-task",
       });
       const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
-      const target = yield* resolveTargetRechecking({
+      const requestedTarget = yield* resolveTargetRechecking({
         parent,
         target: input.target,
         providers,
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
+      // Fork: a request that is invalid anyway fails now, not after a usage hold of hours. The pacer moves a task only
+      // to an account with the same runtime mode, so the check on the requested target holds for the paced one too.
+      yield* resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode, requestedTarget);
+      const interactionMode = yield* resolveInteractionMode(
+        parent.thread.interactionMode,
+        input.interactionMode,
+      );
+      // Fork: a retry of an accepted delegation starts no work, so it is not paced again.
+      const { target, note: usagePacingNote } = isRetryOfAcceptedDelegation
+        ? { target: requestedTarget, note: undefined }
+        : yield* paceTarget({
+            parent,
+            requested: input.target,
+            runtimeMode: input.runtimeMode,
+            providers,
+            target: requestedTarget,
+          });
       const runtimeMode = yield* resolveRuntimeMode(
         parent.thread.runtimeMode,
         input.runtimeMode,
         target,
-      );
-      const interactionMode = yield* resolveInteractionMode(
-        parent.thread.interactionMode,
-        input.interactionMode,
       );
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
@@ -2702,9 +2810,10 @@ const make = Effect.gen(function* () {
         });
       }
 
-      return yield* input.mode === "wait"
+      const task = yield* input.mode === "wait"
         ? awaitTask(scope, taskId, key, input.timeoutMs)
         : readTask(scope, taskId, false, true);
+      return usagePacingNote === undefined ? task : { ...task, usagePacingNote };
     }),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");
