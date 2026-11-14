@@ -60,8 +60,10 @@ GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c'
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
 # Files git reads that would make the cache's history or objects other than what was fetched from GitHub: grafts and
-# shallow change a commit's parents, alternates adds another repository's objects. The queue never writes any of them.
-UNTRUSTED_FILES = ('info/grafts', 'shallow', 'objects/info/alternates', 'objects/info/http-alternates')
+# shallow change a commit's parents, alternates adds another repository's objects, and info/attributes can change how
+# merge-tree merges a file (merge=union, binary). The queue never writes any of them.
+UNTRUSTED_FILES = ('info/grafts', 'shallow', 'objects/info/alternates', 'objects/info/http-alternates',
+                   'info/attributes')
 VIEW = 'number,state,isDraft,autoMergeRequest,mergeStateStatus,headRefOid,baseRefName,comments,reviews,commits'
 LIST = 'number,title,isDraft,autoMergeRequest,mergeStateStatus,createdAt,statusCheckRollup,headRefOid,baseRefName'
 
@@ -273,22 +275,28 @@ class Queue:
 
     # --- which armed PRs wait, and why ------------------------------------------------------------------------------
     def red_checks(self, pr):
-        """{name: rollup item of its newest run} of each required check whose newest run really failed: the rollup
-        lists every run on the head, and an older red must not outvote a newer run (lens.latest_checks). CANCELLED
-        alone is not a failure (a newer push or update cancels the old run), but a red that only a cancelled run
-        followed still stands: nothing ever passed."""
+        """{name: rollup item of its newest run} of each required check whose newest run really failed. The ruleset
+        takes the newest run of a name, whichever workflow ran it (required_now), and the rollup lists every run on the
+        head: an older red must not outvote a newer run. CANCELLED alone is not a failure (a newer push or update
+        cancels the old run), but a red that only cancelled runs followed still stands: nothing passed since it."""
         rollup = pr.get('statusCheckRollup') or []
         name_of = lambda c: c.get('name') or c.get('context')
         state_of = lambda c: (c.get('conclusion') or c.get('state') or '').upper()
-        out = {}
+        when = lambda c: c.get('startedAt') or '9999'
+        newest = {}
         for c in lens.latest_checks(rollup):
             name = name_of(c)
-            if name not in self.cfg.required_checks:
-                continue
-            if state_of(c) in RED_STATES or (state_of(c) == 'CANCELLED' and
-                                             any(name_of(o) == name and state_of(o) in RED_STATES for o in rollup)):
-                if (c.get('startedAt') or '') >= ((out.get(name) or {}).get('startedAt') or ''):
+            if name in self.cfg.required_checks and (name not in newest or when(c) >= when(newest[name])):
+                newest[name] = c
+        out = {}
+        for name, c in newest.items():
+            if state_of(c) == 'CANCELLED':
+                runs = [o for o in rollup if name_of(o) == name]
+                green = max((when(o) for o in runs if lens.check_state(o) == 'ok'), default='')
+                if any(state_of(o) in RED_STATES and when(o) > green for o in runs):
                     out[name] = c
+            elif state_of(c) in RED_STATES:
+                out[name] = c
         return out
 
     def failing(self, pr):
@@ -322,24 +330,30 @@ class Queue:
     def stuck(self, p):
         """An up-to-date armed PR that cannot merge and that nothing moves on any more: (check, what) for a required
         check whose newest run ended without passing and without a red (CANCELLED, STARTUP_FAILURE, STALE...), or that
-        never reported although no workflow runs on the head any more. None: it may still merge (green or running)."""
-        now = self.required_now(p.get('statusCheckRollup') or [])
+        never reported, in both cases only while no workflow runs on the head any more (a newer run queued with no job
+        yet may still report it). None: it may still merge (green or running), or GitHub could not say (printed). A
+        head with no check and no workflow run at all waits: nothing tells "not started yet" from "never starts"
+        (README.md, "The queue")."""
+        rollup = p.get('statusCheckRollup') or []
+        now = self.required_now(rollup)
         ended = sorted((name, state) for name, state in now.items() if state not in ('ok', 'running'))
-        if ended:
-            return ended[0][0], f'ended {ended[0][1]}'
         missing = sorted(self.cfg.required_checks - set(now))
-        if 'running' in now.values() or not missing:
-            return None
-        if not (p.get('statusCheckRollup') or []):
-            print(f'#{p["number"]}: no check has started on its head yet')
+        if 'running' in now.values() or not (ended or missing):
             return None
         head = (p.get('headRefOid') or '').lower()
         runs = self.workflow_runs(head)
         if runs is None:   # unknown is not "nothing runs": wait, and say it
-            print(f'#{p["number"]}: required check {", ".join(missing)} has not reported, and which workflows still '
-                  f'run on {head[:12] or "its head"} is unknown: waiting')
+            what = (f'required check {ended[0][0]} ended {ended[0][1]}' if ended
+                    else f'required check {", ".join(missing)} has not reported')
+            print(f'#{p["number"]}: {what}, and which workflows still run on {head[:12] or "its head"} is unknown: '
+                  'waiting')
             return None
         if any((x.get('status') or '').lower() != 'completed' for x in runs):
+            return None
+        if ended:
+            return ended[0][0], f'ended {ended[0][1]}'
+        if not rollup and not runs:
+            print(f'#{p["number"]}: no check and no workflow run on its head yet: waiting')
             return None
         return missing[0], NEVER
 
@@ -350,13 +364,17 @@ class Queue:
                     'it, so that the current workflows run')
         return 'Nothing re-runs it by itself: re-run the CI run (Actions, "Re-run failed jobs") or push'
 
-    def tell_red(self, n, check, what='is red', fix='Fix the cause and push'):
+    def tell_red(self, n, head, check, what='is red', fix='Fix the cause and push'):
         """An armed PR the queue skips says why on the PR, once per head, check and reason. No answer from GitHub: the
         next run tries again. Told means a comment of the queue's own login (viewerDidAuthor) that starts with the mark:
-        anyone can post a copy of it on a public repository."""
+        anyone can post a copy of it on a public repository. `head` is the head the reason was found on (the list):
+        after a push the reason is not known for the new head, and a mark for it would silence its real notice."""
         pr = self.view(n)
         if not pr:
             print(f'#{n}: could not read it to say why it waits')
+            return
+        if (pr.get('headRefOid') or '').lower() != (head or '').lower():
+            print(f'#{n}: its head moved from {(head or "?")[:12]} since the list: the next run tells it')
             return
         mark = f'required check {check} {what} on {(pr.get("headRefOid") or "?")[:12]}'
         told = f'pr_queue: {mark},'
@@ -430,35 +448,37 @@ class Queue:
         return out
 
     def red_from_old_base(self, p, cache):
-        """A BEHIND PR whose required checks failed only because the base they were tested on was red. (None, None)
-        when, for EVERY red required check C, the base commit its run really merged with (tested_base) has a real
+        """A BEHIND PR whose required checks failed only because the base they were tested on was red. (None, None,
+        False) when, for EVERY red required check C, the base commit its run really merged with (tested_base) has a real
         failure of C (BASE_RED) and the base branch has C green now: an update makes a new merge on that green tip.
-        Otherwise (why not, base_check): base_check names a check that failed on the base too and is still not green
-        there, set only when EVERY red check failed on its tested base (one red of the PR's own, or one nothing proves,
-        means its author fixes it: False), so the PR waits for its base, not for its author. No state and
-        no loop: after the update the next run names a base where C is green, so a red then is the PR's own and it is
-        passed over (told); a re-run of the old merge names the old red base again and is updated, which it needs."""
+        Otherwise (why not, check, base_red): `check` is the check that decided, for the notice (None: no one check
+        did). base_red is True only when EVERY red check failed on its tested base and `check` failed on the base too
+        and is still not green there, so the PR waits for its base, not for its author; one red of the PR's own, or one
+        nothing proves, means its author fixes it, and `check` names that one. No state and no loop: after the update
+        the next run names a base where C is green, so a red then is the PR's own and it is passed over (told); a re-run
+        of the old merge names the old red base again and is updated, which it needs."""
         reds, base = self.red_checks(p), p.get('baseRefName') or ''
         if not re.fullmatch(r'[\w./-]+', base):
-            return 'its base branch is unknown', False
+            return 'its base branch is unknown', None, False
         tip = self.commit_checks(f'refs/heads/{base}', cache)
         if not tip:
-            return f'the checks of {base} are unknown (see above)', False
+            return f'the checks of {base} are unknown (see above)', None, False
         waits = None
         for check, c in sorted(reds.items()):
             tested = self.tested_base(c)
             if not tested:
-                return f'the base its {check} run tested is unknown (see above)', False
+                return f'the base its {check} run tested is unknown (see above)', check, False
             then = self.commit_checks(tested, cache)
             if not then:
-                return f'the checks of {base} commit {tested[:12]} are unknown (see above)', False
+                return f'the checks of {base} commit {tested[:12]} are unknown (see above)', check, False
             was = then[1].get(check, 'not reported')
             if was not in BASE_RED:   # running, ok, cancelled, skipped, stale...: nothing proves the base was red
-                return f'{check} was not red on the {base} commit {tested[:12]} its run tested ({was})', False
+                return f'{check} was not red on the {base} commit {tested[:12]} its run tested ({was})', check, False
             now = tip[1].get(check, 'not reported')
             if now != 'ok' and not waits:   # keep looking: a later red of the PR's own is its author's to fix
-                waits = f'{check} failed on {base} {tested[:12]} too and is not green on {base} now ({now})', check
-        return waits or (None, None)
+                waits = (f'{check} failed on {base} {tested[:12]} too and is not green on {base} now ({now})', check,
+                         True)
+        return waits or (None, None, False)
 
     # --- steps 2-4 --------------------------------------------------------------------------------------------------
     def view(self, n):
@@ -495,8 +515,9 @@ class Queue:
         """The way out when the review names no head, for the queue's comment."""
         if lens.NO_HEADER in why:
             return ('A comment that looks like a lens report counts only with a lens header as its first plain line, '
-                    f'not in a code block ({self.cfg.lens_format_doc}): re-post it that way, or someone who read the '
-                    f'head posts the override `{self.cfg.override_prefix} <sha>: <why>`.')
+                    f'not in a code block ({self.cfg.lens_format_doc}). Posting it again that way does not clear '
+                    f'the old one: {lens.NO_HEADER_WAY_OUT} someone who read the head posts the override '
+                    f'`{self.cfg.override_prefix} <sha>: <why>`.')
         if lens.SHORT in why:
             return f'A lens read names the full 40-hex sha ({self.cfg.lens_format_doc}): re-post it with that.'
         if lens.HIDDEN in why:
@@ -697,6 +718,19 @@ class Queue:
         return self.run(True)
 
     def run(self, dry):
+        """One sweep in age order: update or wait for the first PR that can move. An UNKNOWN merge state (GitHub is
+        still computing it, often for seconds after a push to the base) is listed again every poll_seconds, at most
+        wait_seconds, before the PR is passed over, so a younger PR is not updated ahead of it."""
+        waits = self.cfg.wait_seconds // self.cfg.poll_seconds
+        while True:
+            code = self.sweep(dry, waits > 0)
+            if code is not None:
+                return code
+            waits -= 1
+            self.sleep(self.cfg.poll_seconds)
+
+    def sweep(self, dry, may_wait):
+        """run()'s one look at the list; None: list again (an UNKNOWN merge state, only when may_wait)."""
         limit = self.cfg.list_limit
         r = self.gh('pr', 'list', '--repo', self.repo, '--state', 'open', '--limit', str(limit), '--json', LIST)
         try:
@@ -714,29 +748,34 @@ class Queue:
             n = p['number']
             if p.get('isDraft') or not p.get('autoMergeRequest'):
                 continue
-            bad = self.failing(p)
+            bad, head = self.failing(p), p.get('headRefOid') or ''
             if bad and p.get('mergeStateStatus') == 'BEHIND' and self.cfg.update_when_base_was_red:
                 base = p.get('baseRefName') or 'its base'
-                why, base_check = self.red_from_old_base(p, cache)
+                why, check, base_red = self.red_from_old_base(p, cache)
                 if why is None:
                     reds = ', '.join(sorted(self.red_checks(p)))
                     print(f'update #{n} {(p.get("title") or "")[:70]}: required check {reds} failed on a {base} '
                           f'commit where it failed too, and it is green on {base} now')
                     return self.update(n, dry)
+                bad = check or bad   # the notice names the check that decided, and is keyed by it
                 print(f'skip #{n}: required check {bad} failed and an update would not fix it yet: {why}')
-                if base_check:
+                if base_red:
                     if not dry:
-                        self.tell_red(n, bad, f'failed as on {base}',
-                                      f'{base} failed {base_check} too, so this is not this PR\'s fault: the queue '
-                                      f'updates it by itself once {base_check} is green on {base}')
+                        self.tell_red(n, head, bad, f'failed as on {base}',
+                                      f'{base} failed {bad} too, so this is not this PR\'s fault: the queue '
+                                      f'updates it by itself once {bad} is green on {base}')
                     continue
             elif bad:
                 print(f'skip #{n}: required check {bad} failed (its author fixes it)')
             if bad:
                 if not dry:
-                    self.tell_red(n, bad)
+                    self.tell_red(n, head, bad)
                 continue
             if p.get('mergeStateStatus') != 'BEHIND':
+                if p.get('mergeStateStatus') == 'UNKNOWN' and may_wait:
+                    print(f'#{n}: merge state UNKNOWN (GitHub is still computing it): listing again in '
+                          f'{self.cfg.poll_seconds} s')
+                    return None
                 if p.get('mergeStateStatus') not in WAITS_FOR:
                     print(f'skip #{n}: merge state {p.get("mergeStateStatus")}, not one the queue updates or waits for')
                     continue
@@ -745,7 +784,8 @@ class Queue:
                     print(f'skip #{n}: up to date, but required check {why[0]} {why[1]} and nothing re-runs it: it '
                           'cannot merge, so it does not hold the queue')
                     if not dry:
-                        self.tell_red(n, why[0], why[1], self.stuck_fix(why[1], p.get('baseRefName') or 'its base'))
+                        self.tell_red(n, head, why[0], why[1],
+                                      self.stuck_fix(why[1], p.get('baseRefName') or 'its base'))
                     continue
                 print(f'#{n} is up to date and waiting for its checks: queue is moving')
                 return 0
