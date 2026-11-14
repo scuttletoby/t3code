@@ -137,10 +137,15 @@ jobs:
         ("caller grants write-all -> pass", caller.replace("{actions: read, contents: write}", "write-all"), mid, leaf, False),
         ("only the second level asks more -> fail", grant_write, mid,
          leaf.replace("permissions: {actions: write}", "permissions: {contents: write}"), True),
-        ("callee job without permissions takes the callee's top level (asks more) -> fail", grant_write,
-         "permissions: {actions: write, contents: write, issues: write}\njobs:\n  build:\n" + plain_job, leaf, True),
+        # Proves inheritance on its own: mid's top level fits the grant, so only a job that wrongly took the
+        # caller's write-all grant (instead of mid's top level) would let the leaf's actions: write through.
+        ("callee job without permissions passes on the callee's top level, not the caller's grant -> fail",
+         caller.replace("{actions: read, contents: write}", "write-all"),
+         "permissions: {contents: read}\njobs:\n  build:\n    uses: ./.github/workflows/leaf.yml\n", leaf, True),
         ("callee top level asks more though every job asks less -> fail", grant_write,
          "permissions: {pages: write}\njobs:\n  build:\n    permissions: {contents: read}\n" + plain_job, leaf, True),
+        ("second-level callee top level asks more though its jobs ask less -> fail", grant_write, mid,
+         leaf.replace("permissions: {contents: read}", "permissions: {pages: write}"), True),
         ("job permissions {} grant nothing, not the workflow default -> fail",
          "permissions: write-all\njobs:\n  release:\n    permissions: {}\n    uses: ./.github/workflows/mid.yml\n",
          "jobs:\n  build:\n    permissions: {contents: read}\n" + plain_job, leaf, True),
