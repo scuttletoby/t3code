@@ -15,6 +15,7 @@ import {
   WaitStoreNotice as WaitStoreNoticeSchema,
 } from "@t3tools/contracts/waitFor";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -30,7 +31,11 @@ export const WAIT_STORE_FILE = "waits.json";
 const STORE_VERSION: WaitStoreFile["version"] = 1;
 /** A bad file gives notices to at most this many threads; the rest are named in the log. */
 const MAX_NOTICES = 50;
-/** A bigger write is refused; the record caps keep the file far below this. */
+/**
+ * File size limit. A bigger write first drops the oldest ended waits. The stored byte caps keep
+ * 1000 of the biggest open waits at about 5.0 MB (5,023,036 bytes measured), so ending or
+ * cancelling a wait always saves; open waits and notices that alone do not fit are refused.
+ */
 export const MAX_STORE_BYTES = 8 * 1024 * 1024;
 
 const decodeRecord = Schema.decodeUnknownOption(WaitRecordSchema);
@@ -142,6 +147,65 @@ function salvage(
   return { waits, notices, lost: collectLost(lost), dropped };
 }
 
+const encoder = new TextEncoder();
+
+function serialise(contents: WaitStoreContents): string {
+  const file: WaitStoreFile = {
+    version: STORE_VERSION,
+    waits: contents.waits,
+    ...(contents.notices.length === 0 ? {} : { notices: contents.notices }),
+  };
+  return `${JSON.stringify(file, null, 2)}\n`;
+}
+
+/** What one record adds to the file: its lines indented twice more, and a `,` and line end. */
+function recordBytes(wait: WaitRecord): number {
+  const text = JSON.stringify(wait, null, 2);
+  return encoder.encode(text).byteLength + 4 * text.split("\n").length + 2;
+}
+
+const endedMs = (wait: WaitRecord) => {
+  const ms = wait.endedAt === undefined ? Number.NaN : Date.parse(wait.endedAt);
+  return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+};
+
+/**
+ * The contents as written: when they are over `MAX_STORE_BYTES`, without the oldest ended waits
+ * that make them so. Open waits, notices and a slot wait whose reservation still runs stay.
+ */
+function fitToSize(
+  contents: WaitStoreContents,
+  nowMs: number,
+): { readonly contents: WaitStoreContents; readonly text: string; readonly bytes: number } {
+  let text = serialise(contents);
+  let bytes = encoder.encode(text).byteLength;
+  if (bytes <= MAX_STORE_BYTES) return { contents, text, bytes };
+  // Not `toSorted`: Hermes lacks it.
+  const droppable = contents.waits
+    .filter(
+      (wait) =>
+        !OPEN_STATES.has(wait.state) &&
+        !(wait.reservedUntil !== undefined && Date.parse(wait.reservedUntil) > nowMs),
+    )
+    .sort((a, b) => endedMs(a) - endedMs(b));
+  const drop = new Set<WaitRecord>();
+  let fitted = contents;
+  let next = 0;
+  while (bytes > MAX_STORE_BYTES && next < droppable.length) {
+    // Leave out enough by the estimate, then measure again: one pass in practice.
+    let excess = bytes - MAX_STORE_BYTES;
+    while (excess > 0 && next < droppable.length) {
+      const wait = droppable[next++]!;
+      drop.add(wait);
+      excess -= recordBytes(wait);
+    }
+    fitted = { ...contents, waits: contents.waits.filter((wait) => !drop.has(wait)) };
+    text = serialise(fitted);
+    bytes = encoder.encode(text).byteLength;
+  }
+  return { contents: fitted, text, bytes };
+}
+
 function noticeText(lost: LostThread, copyName: string): string {
   const what =
     lost.waitIds.length === 0
@@ -164,25 +228,23 @@ export const make = Effect.fn("WaitStore.make")(function* (input: { readonly fil
       Effect.provideService(Path.Path, path),
     );
 
-  const write = (contents: WaitStoreContents) => {
-    const file: WaitStoreFile = {
-      version: STORE_VERSION,
-      waits: contents.waits,
-      ...(contents.notices.length === 0 ? {} : { notices: contents.notices }),
-    };
-    const text = `${JSON.stringify(file, null, 2)}\n`;
-    const bytes = new TextEncoder().encode(text).byteLength;
-    if (bytes > MAX_STORE_BYTES) {
-      return Effect.fail(
-        new WaitStoreError({
-          detail: `the file would be ${bytes} bytes, more than the ${MAX_STORE_BYTES} allowed`,
-        }),
-      );
+  /**
+   * Writes `contents` and returns what was written: the same, or without the oldest ended waits
+   * when it would be bigger than `MAX_STORE_BYTES` (see `fitToSize`).
+   */
+  const write = Effect.fnUntraced(function* (contents: WaitStoreContents) {
+    const nowMs = yield* Clock.currentTimeMillis;
+    const fitted = fitToSize(contents, nowMs);
+    if (fitted.bytes > MAX_STORE_BYTES) {
+      return yield* new WaitStoreError({
+        detail: `the file would be ${fitted.bytes} bytes without ended waits, more than the ${MAX_STORE_BYTES} allowed`,
+      });
     }
-    return writeText(filePath, text).pipe(
+    yield* writeText(filePath, fitted.text).pipe(
       Effect.mapError((error) => new WaitStoreError({ detail: error.message })),
     );
-  };
+    return fitted.contents;
+  });
 
   const repair = Effect.fnUntraced(function* (text: string, json: unknown, nowMs: number) {
     // The same bad file gives the same notice ids, so a repair that runs again sends nothing new.
@@ -207,11 +269,12 @@ export const make = Effect.fn("WaitStore.make")(function* (input: { readonly fil
         text: noticeText(lost, path.basename(copyPath)),
       }))
       .filter((notice) => !known.has(notice.messageId));
-    const contents = { waits: kept.waits, notices: [...kept.notices, ...fresh] };
-    const writeError = yield* write(contents).pipe(
-      Effect.as(undefined),
-      Effect.catch((error) => Effect.succeed(error.detail)),
+    const salvaged = { waits: kept.waits, notices: [...kept.notices, ...fresh] };
+    const written = yield* write(salvaged).pipe(
+      Effect.map((contents) => ({ contents, writeError: undefined })),
+      Effect.catch((error) => Effect.succeed({ contents: salvaged, writeError: error.detail })),
     );
+    const { contents, writeError } = written;
     return {
       _tag: "Repaired",
       ...contents,

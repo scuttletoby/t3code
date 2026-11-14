@@ -35,6 +35,7 @@ import {
 } from "@t3tools/shared/waitFor";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -59,11 +60,11 @@ function judgeLimit(kind: WaitKind): Duration.Duration {
   return kind === "file" ? Duration.seconds(10) : Duration.seconds(60);
 }
 /**
- * A judge that did not answer in time keeps running (a `stat` on a dead mount holds a thread of
- * the I/O pool until the system gives up), and its wait gets no second one meanwhile. While this
- * many judges of a kind are still running late, no new judge of that kind starts.
+ * Checks of one kind that have not returned (sweep, late and registration ones). A stuck `stat`
+ * holds a thread of Node's I/O pool, so file checks use at most 2 of its 4 default threads. When
+ * all are late, waits of that kind answer "not yet", never "failed".
  */
-const MAX_LATE_JUDGES_PER_KIND = 2;
+const MAX_RUNNING_JUDGES_PER_KIND = 2;
 const WAIT_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 
 /** A message to a thread. PR 3 sends it with the thread tools' send; tests use a fake. */
@@ -137,6 +138,17 @@ const logTransition = (transition: WaitTransition) =>
       ? Effect.logError(`waits: ${transition.log.message}`)
       : Effect.logWarning(`waits: ${transition.log.message}`);
 
+interface RunningJudge {
+  readonly waitId: string | null;
+  readonly target: string;
+  late: boolean;
+}
+
+interface StartedJudge {
+  readonly fiber: Fiber.Fiber<Judgement>;
+  readonly entry: RunningJudge;
+}
+
 type Loaded =
   | { readonly ok: true; readonly contents: WaitStore.WaitStoreContents }
   | { readonly ok: false; readonly reason: string };
@@ -159,8 +171,17 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   let lastProblem: string | null = null;
   /** When each `waiting` wait is judged next; empty after a restart, so all are judged at once. */
   const nextCheckAt = new Map<string, number>();
-  /** Judges started by a sweep that have not returned, by wait id; `late` once past the limit. */
-  const running = new Map<string, { readonly kind: WaitKind; late: boolean }>();
+  /** Checks that have not returned, per kind; `late` once past their limit. */
+  const running = new Map<WaitKind, Set<RunningJudge>>();
+  /** Kinds whose checks are all stuck, already logged; cleared when one of them returns. */
+  const blockedLogged = new Set<WaitKind>();
+  /** Completed (and replaced) whenever a check starts, returns or turns late. */
+  let judgesChanged = yield* Deferred.make<void>();
+  const signalJudgesChanged = Effect.gen(function* () {
+    const previous = judgesChanged;
+    judgesChanged = yield* Deferred.make<void>();
+    yield* Deferred.succeed(previous, undefined);
+  });
 
   const judgeOf = (kind: WaitKind) => judges[kind] as WaitJudge | undefined;
 
@@ -228,7 +249,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
 
   /**
    * Writes `next` and only then keeps it. Under `lock` only. Leaves out the oldest ended waits
-   * beyond `ENDED_PER_THREAD_FACTOR × maxPerThread` per thread and `MAX_ENDED_WAITS` in all.
+   * beyond `ENDED_PER_THREAD_FACTOR × maxPerThread` per thread and `MAX_ENDED_WAITS` in all, and
+   * beyond the store's size limit.
    */
   const commit = Effect.fnUntraced(function* (
     next: WaitStore.WaitStoreContents,
@@ -243,8 +265,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         now,
       ),
     };
-    yield* store.write(capped);
-    current = capped;
+    // Over the size limit the store also leaves out the oldest ended waits.
+    current = yield* store.write(capped);
   });
 
   const loadedOrFail = (repair: boolean) =>
@@ -312,10 +334,16 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     );
     if (Option.isSome(existing)) return waitingResult(existing.value, true);
 
-    const judgement = yield* judge(target, { waitId: null, now }).pipe(
-      Effect.timeoutOption(REGISTER_JUDGE_LIMIT),
-      Effect.map(Option.getOrElse((): Judgement => ({ type: "notYet" }))),
+    // With no free check of its kind, the first sweep judges it instead.
+    const started = yield* startJudge(target.kind, null, waitTargetText(target), () =>
+      judge(target, { waitId: null, now }),
     );
+    const judgement: Judgement =
+      started === null
+        ? { type: "notYet" }
+        : yield* awaitJudge(started, REGISTER_JUDGE_LIMIT).pipe(
+            Effect.map(Option.getOrElse((): Judgement => ({ type: "notYet" }))),
+          );
     if (judgement.type === "met") {
       return {
         state: "met",
@@ -449,6 +477,96 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     permanent: false,
   });
 
+  const runningOf = (kind: WaitKind) => {
+    let set = running.get(kind);
+    if (set === undefined) {
+      set = new Set();
+      running.set(kind, set);
+    }
+    return set;
+  };
+
+  /**
+   * Starts a check in its own fiber when its kind has a free place (see
+   * `MAX_RUNNING_JUDGES_PER_KIND`), or returns null. The place is freed when the check returns,
+   * however late; a check that never returns keeps it until a restart.
+   */
+  const startJudge = (
+    kind: WaitKind,
+    waitId: string | null,
+    target: string,
+    judge: () => Effect.Effect<Judgement>,
+  ): Effect.Effect<StartedJudge | null> =>
+    Effect.suspend(() => {
+      const set = runningOf(kind);
+      if (set.size >= MAX_RUNNING_JUDGES_PER_KIND) return Effect.succeed(null);
+      const entry: RunningJudge = { waitId, target, late: false };
+      set.add(entry);
+      return Effect.forkDetach(
+        Effect.suspend(judge).pipe(
+          Effect.ensuring(
+            Effect.suspend(() => {
+              set.delete(entry);
+              blockedLogged.delete(kind);
+              return signalJudgesChanged;
+            }),
+          ),
+        ),
+      ).pipe(
+        Effect.tap(() => signalJudgesChanged),
+        Effect.map((fiber) => ({ fiber, entry })),
+      );
+    });
+
+  /**
+   * The check's answer within `limit`, or none. Past the limit (or when the caller stops waiting)
+   * the check is marked late, which is what lets `startJudgeWhenFree` stop waiting for it.
+   */
+  const awaitJudge = (started: StartedJudge, limit: Duration.Input) =>
+    Fiber.join(started.fiber).pipe(
+      Effect.timeoutOption(limit),
+      Effect.onExit((exit) =>
+        exit._tag === "Success" && Option.isSome(exit.value)
+          ? Effect.void
+          : Effect.suspend(() => {
+              if (started.entry.late) return Effect.void;
+              started.entry.late = true;
+              return signalJudgesChanged;
+            }),
+      ),
+    );
+
+  /**
+   * A free place for a check of this kind: waits while a running check may still answer in time,
+   * null at once when every running one is late (stuck), with one error log per stuck spell.
+   */
+  const startJudgeWhenFree = Effect.fn("WaitService.startJudgeWhenFree")(function* (
+    kind: WaitKind,
+    waitId: string,
+    target: string,
+    judge: () => Effect.Effect<Judgement>,
+  ) {
+    for (;;) {
+      const changed = judgesChanged;
+      const started = yield* startJudge(kind, waitId, target, judge);
+      if (started !== null) return started;
+      const set = runningOf(kind);
+      if ([...set].every((entry) => entry.late)) {
+        if (!blockedLogged.has(kind)) {
+          blockedLogged.add(kind);
+          const stuck = [...set].map(
+            (entry) => `${entry.waitId ?? "registration"}: ${entry.target.slice(0, 200)}`,
+          );
+          yield* Effect.logError(
+            `waits: ${set.size} ${kind} checks have not answered (${stuck.join("; ")}). No new ${kind} check starts until one returns; a dead network mount is the usual cause, and a restart clears it.`,
+          );
+        }
+        return null;
+      }
+      yield* Deferred.await(changed);
+    }
+  });
+
   /**
    * One judge for a stored wait, with a time limit. The judge runs in its own fiber, so one that
    * never answers is left running (not started again) instead of holding up the sweep.
@@ -462,59 +580,62 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         detail: `This server cannot judge ${wait.kind} waits.`,
       });
     }
-    if (running.has(wait.id)) {
+    const set = runningOf(wait.kind);
+    if ([...set].some((entry) => entry.waitId === wait.id)) {
       return Effect.succeed(lateJudgement("Its last check has not answered yet."));
-    }
-    const late = [...running.values()].filter(
-      (entry) => entry.kind === wait.kind && entry.late,
-    ).length;
-    if (late >= MAX_LATE_JUDGES_PER_KIND) {
-      return Effect.succeed(
-        lateJudgement(`${late} ${wait.kind} checks have not answered, so no new one was started.`),
-      );
     }
     const limit = judgeLimit(wait.kind);
     return Effect.gen(function* () {
-      const entry = { kind: wait.kind, late: false };
-      running.set(wait.id, entry);
-      const fiber = yield* Effect.forkDetach(
-        judge(targetOf(wait), { waitId: wait.id, now }).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              if (running.get(wait.id) === entry) running.delete(wait.id);
-            }),
-          ),
-        ),
+      const started = yield* startJudgeWhenFree(
+        wait.kind,
+        wait.id,
+        waitTargetText(targetOf(wait)),
+        () => judge(targetOf(wait), { waitId: wait.id, now }),
       );
-      const answer = yield* Fiber.join(fiber).pipe(Effect.timeoutOption(limit));
+      if (started === null) {
+        return {
+          type: "notYet",
+          detail: `Checks are paused: ${set.size} earlier ${wait.kind} checks have not answered.`,
+        } satisfies Judgement;
+      }
+      const answer = yield* awaitJudge(started, limit);
       if (Option.isSome(answer)) return answer.value;
-      entry.late = true;
       return lateJudgement(`The check gave no answer in ${Duration.format(limit)}.`);
     });
   };
 
-  /** Applies one judge's answer and saves it on its own, so a slow wait holds back no other. */
-  const applyJudgement = (id: string, judgement: Judgement, settings: ServerSettings) =>
+  /**
+   * Applies the answers of one pass and saves them in one write. Returns how many waits ended;
+   * none when the write failed (they are judged again next time).
+   */
+  const applyJudgements = (
+    answers: ReadonlyArray<readonly [string, Judgement]>,
+    settings: ServerSettings,
+  ) =>
     lock.withPermits(1)(
       Effect.gen(function* () {
         const loaded = yield* ensureLoaded(true);
-        if (!loaded.ok) return false;
-        const wait = loaded.contents.waits.find((candidate) => candidate.id === id);
-        // Pruned while it was judged.
-        if (wait === undefined) return false;
+        if (!loaded.ok) return 0;
         // The deadline is tested after the judge (R4), at the time of the answer.
         const now = yield* Clock.currentTimeMillis;
-        nextCheckAt.set(id, now + intervalMs(wait.kind, settings.waitFor));
-        // Null when it is no longer `waiting` (a cancel came in between) or nothing changed.
-        const transition = nextWaitState(
-          wait,
-          { type: "judged", judgement },
-          now,
-          stateSettings(settings),
-        );
-        if (transition === null) return false;
-        const waits = loaded.contents.waits.map((candidate) =>
-          candidate.id === id ? transition.record : candidate,
+        const changes = new Map<string, WaitTransition>();
+        for (const [id, judgement] of answers) {
+          const wait = loaded.contents.waits.find((candidate) => candidate.id === id);
+          // Pruned while it was judged.
+          if (wait === undefined) continue;
+          nextCheckAt.set(id, now + intervalMs(wait.kind, settings.waitFor));
+          // Null when it is no longer `waiting` (a cancel came in between) or nothing changed.
+          const transition = nextWaitState(
+            wait,
+            { type: "judged", judgement },
+            now,
+            stateSettings(settings),
+          );
+          if (transition !== null) changes.set(id, transition);
+        }
+        if (changes.size === 0) return 0;
+        const waits = loaded.contents.waits.map(
+          (candidate) => changes.get(candidate.id)?.record ?? candidate,
         );
         const written = yield* commit({ ...loaded.contents, waits }, settings.waitFor).pipe(
           Effect.as(true),
@@ -524,9 +645,13 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             ),
           ),
         );
-        if (!written) return false;
-        yield* logTransition(transition);
-        return transition.record.state !== "waiting";
+        if (!written) return 0;
+        let ended = 0;
+        for (const transition of changes.values()) {
+          yield* logTransition(transition);
+          if (transition.record.state !== "waiting") ended += 1;
+        }
+        return ended;
       }),
     );
 
@@ -557,20 +682,22 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       }),
     );
     if (due.length === 0) return { judged: 0, ended: 0 };
-    const ended = yield* Effect.forEach(
+    // Every judge has a time limit, so the pass ends, and its answers are saved in one write; a
+    // check that answers after its limit is ignored, and its wait is judged again later.
+    const answers = yield* Effect.forEach(
       due,
       (wait) =>
-        judgeStored(wait, startedAt).pipe(
-          Effect.flatMap((judgement) => applyJudgement(wait.id, judgement, settings)),
-        ),
+        judgeStored(wait, startedAt).pipe(Effect.map((judgement) => [wait.id, judgement] as const)),
       { concurrency: JUDGE_CONCURRENCY },
     );
-    return { judged: due.length, ended: ended.filter(Boolean).length };
+    const ended = yield* applyJudgements(answers, settings);
+    return { judged: due.length, ended };
   });
 
   /**
-   * Judges every `waiting` wait that is due, at most `JUDGE_CONCURRENCY` at a time, each within
-   * its kind's `judgeLimit`. Does nothing while waits are off, and never overlaps itself: a call
+   * Judges every `waiting` wait that is due, at most `JUDGE_CONCURRENCY` at a time (and
+   * `MAX_RUNNING_JUDGES_PER_KIND` per kind), each within its kind's `judgeLimit`, and saves the
+   * answers in one write. Does nothing while waits are off, and never overlaps itself: a call
    * during a sweep returns at once.
    */
   const judgeDue = Effect.fn("WaitService.judgeDue")(function* () {

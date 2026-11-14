@@ -14,7 +14,11 @@ import { resolveProjectSettings } from "./projectSettings.ts";
 import { applyServerSettingsPatch } from "./serverSettings.ts";
 import {
   MAX_HAND_OVERS,
+  MAX_NOTE_BYTES,
+  MAX_SPEC_BYTES,
+  MAX_STORED_TEXT_BYTES,
   capEndedWaits,
+  clipStored,
   deliveryCommandId,
   deliveryGroups,
   deliveryRetryDelayMs,
@@ -23,6 +27,7 @@ import {
   joinedWakeMessage,
   nextWaitState,
   shouldPruneWait,
+  storedBytes,
   validateWaitSpec,
   waitDeadline,
   waitKey,
@@ -237,6 +242,85 @@ describe("validateWaitSpec: file paths (lens #90, network and device paths)", ()
     // A drive path is not absolute off Windows, and a rooted path has no drive on Windows.
     expect(file("C:\\builds\\done", "linux")).toMatchObject({ ok: false });
     expect(file("/builds/done", "win32")).toMatchObject({ ok: false });
+  });
+});
+
+describe("validateWaitSpec: Windows device names (lens #90 round 2)", () => {
+  const file = (path: string, platform: NodeJS.Platform) =>
+    validate({ kind: "file", file: { path } }, platform);
+
+  it("refuses a DOS device name as any part of a Windows path", () => {
+    for (const path of [
+      "C:\\temp\\COM1",
+      "C:\\NUL",
+      "C:\\x\\LPT1.txt",
+      "C:\\x\\CONIN$",
+      "C:\\x\\nul .txt",
+      "C:\\x\\aux.\\y",
+      "c:/con/x",
+      "C:\\x\\com\u00b9",
+    ]) {
+      expect(file(path, "win32"), path).toMatchObject({ ok: false, code: "invalid" });
+    }
+  });
+
+  it("accepts names that only look like one, and any name off Windows", () => {
+    for (const path of ["C:\\x\\console", "C:\\x\\com10", "C:\\x\\nullable", "C:\\x\\my.nul"]) {
+      expect(file(path, "win32"), path).toMatchObject({ ok: true });
+    }
+    expect(file("/tmp/NUL", "linux")).toMatchObject({ ok: true });
+  });
+});
+
+describe("stored sizes in bytes (lens #90 round 2)", () => {
+  it("counts bytes as the store file holds them", () => {
+    expect(storedBytes("abc")).toBe(3);
+    expect(storedBytes("\u0001")).toBe(6);
+    expect(storedBytes("\u65e5")).toBe(3);
+    expect(storedBytes('"\\')).toBe(4);
+  });
+
+  it("refuses a target or a note too big as stored, though within its character limit", () => {
+    const tooWide = validate({ kind: "file", file: { path: `/${"\u0001".repeat(400)}` } });
+    expect(tooWide).toMatchObject({ ok: false, code: "invalid" });
+    if (!tooWide.ok) expect(tooWide.message).toContain(`at most ${MAX_SPEC_BYTES}`);
+    expect(validate({ kind: "file", file: { path: `/${"\u65e5".repeat(700)}` } })).toMatchObject({
+      ok: false,
+    });
+    expect(validate({ kind: "file", file: { path: `/${"a".repeat(999)}` } })).toMatchObject({
+      ok: true,
+    });
+    const note = (text: string) => validate({ kind: "file", file: { path: "/x" }, note: text });
+    expect(note("\u0001".repeat(101))).toMatchObject({ ok: false, code: "invalid" });
+    expect(note("\u65e5".repeat(200))).toMatchObject({ ok: true });
+    expect(storedBytes("\u65e5".repeat(200))).toBe(MAX_NOTE_BYTES);
+  });
+
+  it("clips stored text to its byte limit, also where a character takes 6 bytes", () => {
+    expect(clipStored("short")).toBe("short");
+    for (const character of ["x", "\u0001", "\u65e5", "\u{1F600}"]) {
+      const clipped = clipStored(character.repeat(1000));
+      expect(storedBytes(clipped), character).toBeLessThanOrEqual(MAX_STORED_TEXT_BYTES);
+      expect(storedBytes(clipped), character).toBeGreaterThan(MAX_STORED_TEXT_BYTES - 8);
+      expect(clipped.endsWith("…")).toBe(true);
+    }
+  });
+
+  it("clips a stored error and a frozen detail, and a repeated long error writes nothing", () => {
+    const long = `/${"\u0001".repeat(999)}`;
+    const failed = judged({ type: "failed", message: long, permanent: false });
+    const first = nextWaitState(makeWait(), failed, T0, stateSettings);
+    expect(storedBytes(first?.record.lastError ?? "")).toBeLessThanOrEqual(MAX_STORED_TEXT_BYTES);
+    expect(nextWaitState(first!.record, failed, T0 + SECOND, stateSettings)).toBeNull();
+    const met = nextWaitState(
+      makeWait(),
+      judged({ type: "met", outcome: "met", detail: long }),
+      T0,
+      stateSettings,
+    );
+    expect(storedBytes(met?.record.result?.detail ?? "")).toBeLessThanOrEqual(
+      MAX_STORED_TEXT_BYTES,
+    );
   });
 });
 

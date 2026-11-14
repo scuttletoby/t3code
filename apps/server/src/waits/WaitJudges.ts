@@ -22,15 +22,23 @@ export type WaitJudge<K extends WaitKind = WaitKind> = (
 
 export type WaitJudges = { readonly [K in WaitKind]?: WaitJudge<K> };
 
-/** `ENOTDIR`: a folder on the path is now a file, so nothing can be at the path. */
-const isNotADirectory = (error: PlatformError.PlatformError): boolean => {
+/** The system error code (`ENOTDIR`, `EACCES`, ...), when there is one. */
+const errorCode = (error: PlatformError.PlatformError): string | undefined => {
   const cause = error.reason.cause;
-  return (
-    typeof cause === "object" &&
-    cause !== null &&
-    "code" in cause &&
-    (cause as { readonly code: unknown }).code === "ENOTDIR"
-  );
+  const code =
+    typeof cause === "object" && cause !== null && "code" in cause
+      ? (cause as { readonly code: unknown }).code
+      : undefined;
+  return typeof code === "string" && /^[A-Z0-9_]{1,40}$/u.test(code) ? code : undefined;
+};
+
+/**
+ * A failed `stat` without the path: the stored wait and its message already name the path, and
+ * a path repeated in the error would only grow the store.
+ */
+const statErrorText = (error: PlatformError.PlatformError): string => {
+  const code = errorCode(error);
+  return `The file cannot be checked: ${error.reason._tag}${code === undefined ? "" : ` (${code})`}.`;
 };
 
 /**
@@ -44,7 +52,8 @@ export const makeFileJudge = Effect.fn("WaitJudges.makeFileJudge")(function* () 
       Effect.as(true),
       Effect.catchTags({
         PlatformError: (error) =>
-          error.reason._tag === "NotFound" || isNotADirectory(error)
+          // ENOTDIR: a folder on the path is now a file, so nothing can be at the path.
+          error.reason._tag === "NotFound" || errorCode(error) === "ENOTDIR"
             ? Effect.succeed(false)
             : Effect.fail(error),
       }),
@@ -53,13 +62,17 @@ export const makeFileJudge = Effect.fn("WaitJudges.makeFileJudge")(function* () 
           return {
             type: "met",
             outcome: spec.until,
-            detail: exists ? `${spec.path} exists.` : `${spec.path} is gone.`,
+            detail: exists ? "It exists." : "It is gone.",
           };
         }
         return { type: "notYet", detail: exists ? "It still exists." : "It does not exist yet." };
       }),
       Effect.catch((error) =>
-        Effect.succeed<Judgement>({ type: "failed", message: error.message, permanent: false }),
+        Effect.succeed<Judgement>({
+          type: "failed",
+          message: statErrorText(error),
+          permanent: false,
+        }),
       ),
     );
   return judge;

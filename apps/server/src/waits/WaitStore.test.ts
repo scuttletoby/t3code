@@ -1,13 +1,23 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { ThreadId } from "@t3tools/contracts";
+import { WaitRecord } from "@t3tools/contracts/waitFor";
+import {
+  clipStored,
+  MAX_NOTE_BYTES,
+  MAX_OPEN_WAITS,
+  storedBytes,
+  validateWaitSpec,
+} from "@t3tools/shared/waitFor";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Schema from "effect/Schema";
 
 import * as WaitStore from "./WaitStore.ts";
 
+const isWaitRecord = Schema.is(WaitRecord);
 const NOW = Date.parse("2026-11-14T12:00:00.000Z");
 
 /** A stored record as an older run of this version wrote it. */
@@ -348,6 +358,113 @@ it.layer(NodeServices.layer)("WaitStore", (it) => {
         assert.strictEqual(
           (yield* (yield* makeStore(filePath)).load({ nowMs: NOW + 120_000, repair: true }))._tag,
           "Loaded",
+        );
+      }),
+  );
+});
+
+const ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+const idOf = (n: number) =>
+  `w_${Array.from({ length: 10 }, (_, index) => ALPHABET[Math.floor(n / 32 ** (9 - index)) % 32]).join("")}`;
+/** JSON writes it as `\u0001`: 6 bytes for one character. */
+const WIDE = "\u0001";
+
+it.layer(NodeServices.layer)("WaitStore: size (lens #90 round 2)", (it) => {
+  it.effect(
+    "the biggest open record the caps allow fits MAX_OPEN_WAITS times with room to spare",
+    () =>
+      Effect.gen(function* () {
+        const { filePath } = yield* storeFile;
+        const store = yield* makeStore(filePath);
+        // The longest path of 6-byte characters that a wait_for call may store.
+        let length = 1000;
+        const accepted = (path: string, note: string) =>
+          validateWaitSpec({
+            input: { kind: "file", file: { path }, note },
+            checks: {},
+            platform: "linux",
+            accounts: new Set(),
+          }).ok;
+        const note = WIDE.repeat(MAX_NOTE_BYTES / 6);
+        while (!accepted(`/${WIDE.repeat(length)}`, note)) length -= 1;
+        const path = `/${WIDE.repeat(length)}`;
+        const thread = (n: number) => `thread-${String(n).padStart(29, "0")}`; // a UUID's length
+        const biggest = (n: number) => ({
+          ...record({ id: idOf(n), threadId: thread(n), key: n.toString(16).padStart(16, "0") }),
+          projectId: `project-${String(n).padStart(28, "0")}`,
+          note,
+          spec: { path, until: "exists" },
+          state: "delivering",
+          result: {
+            outcome: "check_error",
+            detail: clipStored(WIDE.repeat(5000)),
+            at: "2026-11-14T12:00:00.000Z",
+          },
+          lastError: clipStored(WIDE.repeat(5000)),
+          errorSince: "2026-11-14T12:00:00.000Z",
+          messageId: `wait:${idOf(n)}:${"m".repeat(60)}`,
+          attempt: 999_999,
+          parentThreadId: thread(n + 1),
+          via: [1, 2, 3, 4, 5].map((k) => thread(n + 10 * k)),
+          handedOverBecause: "stopped",
+          stoppedSince: "2026-11-14T12:00:00.000Z",
+          reservedUntil: "2026-11-14T12:00:00.000Z",
+        });
+        const waits = Array.from({ length: MAX_OPEN_WAITS }, (_, n) => biggest(n));
+        // Each is a record the schema reads back.
+        assert.isTrue(isWaitRecord(waits[0]));
+        assert.isAtMost(storedBytes(path), 2048);
+        const written = yield* store.write({ waits: waits as never, notices: [] });
+        assert.strictEqual(written.waits.length, MAX_OPEN_WAITS);
+        const fs = yield* FileSystem.FileSystem;
+        const bytes = new TextEncoder().encode(yield* fs.readFileString(filePath)).byteLength;
+        // 5,023,036 bytes when measured (about 5.0 KB a record) of the 8 MiB (8,388,608) limit.
+        assert.isAtMost(bytes, 0.75 * WaitStore.MAX_STORE_BYTES, `${bytes} bytes`);
+      }),
+  );
+
+  it.effect(
+    "a write over the size limit leaves out the oldest ended waits, never an open one or a held slot",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const { filePath } = yield* storeFile;
+        const store = yield* makeStore(filePath);
+        // Ended waits an older build wrote, each about 1 MB (its last error had no cap).
+        const ended = (n: number, extra: Record<string, unknown> = {}) =>
+          record({
+            id: idOf(n),
+            key: n.toString(16).padStart(16, "0"),
+            state: "delivered",
+            result: { outcome: "exists", detail: "", at: "2026-11-14T10:00:00.000Z" },
+            endedAt: `2026-11-14T10:${String(n).padStart(2, "0")}:00.000Z`,
+            lastError: "x".repeat(1_000_000),
+            ...extra,
+          });
+        const open = record({ id: idOf(100), lastError: "x".repeat(1_000_000) });
+        const heldSlot = ended(0, {
+          kind: "slot",
+          spec: {},
+          // Still held: a slot reservation outlives the store's clock.
+          reservedUntil: "2999-01-01T00:00:00.000Z",
+        });
+        // Newest last; the held slot is the oldest of all.
+        const waits = [heldSlot, open, ...Array.from({ length: 9 }, (_, n) => ended(n + 1))];
+        const written = yield* store.write({ waits: waits as never, notices: [] });
+        const kept = written.waits.map((wait) => wait.id);
+        assert.include(kept, open.id);
+        assert.include(kept, heldSlot.id);
+        // 11 MB in: the oldest unheld ended waits go, as few as needed.
+        assert.deepStrictEqual(
+          kept,
+          [heldSlot, open, ...waits.slice(2 + waits.length - kept.length)].map((wait) => wait.id),
+        );
+        assert.isAtLeast(kept.length, 8);
+        const text = yield* fs.readFileString(filePath);
+        assert.isAtMost(new TextEncoder().encode(text).byteLength, WaitStore.MAX_STORE_BYTES);
+        assert.deepStrictEqual(
+          JSON.parse(text).waits.map((wait: { id: string }) => wait.id),
+          kept,
         );
       }),
   );

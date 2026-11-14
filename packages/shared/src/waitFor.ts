@@ -30,6 +30,18 @@ export const MAX_HAND_OVERS = 5;
 const MAX_JOINED = 10;
 const UNIT_NAME_PATTERN = /^[A-Za-z0-9@_.:][A-Za-z0-9@_.:-]{0,199}$/u;
 const DETAIL_MAX = 300;
+/**
+ * Stored sizes, counted in bytes as the store file holds them (JSON-escaped UTF-8: a control
+ * character takes 6 bytes, a CJK one 3). With these, the biggest open record the caps allow takes
+ * about 5.0 KB, so `MAX_OPEN_WAITS` of them fill about 5.0 MB (5,023,036 bytes measured) of the
+ * store's 8 MiB (8,388,608 bytes).
+ */
+/** A wait's target (`spec`), e.g. a file path or a check's arguments. */
+export const MAX_SPEC_BYTES = 2048;
+/** The caller's note. */
+export const MAX_NOTE_BYTES = 600;
+/** A frozen result's detail and the last failed read (`lastError`) each. */
+export const MAX_STORED_TEXT_BYTES = 600;
 
 const MS_PER_SECOND = 1000;
 const MS_PER_HOUR = 3_600_000;
@@ -63,12 +75,67 @@ const refuse = (code: WaitRefusal["code"], message: string): WaitRefusal => ({
  */
 function isLocalAbsolutePath(path: string, platform: NodeJS.Platform): boolean {
   if (/^[\\/]{2}/u.test(path)) return false;
-  if (platform === "win32") return /^[A-Za-z]:[\\/]/u.test(path);
+  if (platform === "win32") {
+    return /^[A-Za-z]:[\\/]/u.test(path) && !path.split(/[\\/]/u).some(isWindowsDeviceName);
+  }
   return path.startsWith("/");
 }
 
-/** Checks a `wait_for` call and fills in every default, so equal conditions give equal targets. */
-export function validateWaitSpec({
+/**
+ * On Windows `CON`, `NUL`, `COM1`, `LPT1`, `CONIN$` and the like name a device in every folder,
+ * also with an extension or trailing dots and spaces (`C:\x\nul.txt`), so `stat` would touch it.
+ */
+function isWindowsDeviceName(segment: string): boolean {
+  const base = segment.split(".")[0]!.replace(/[ .]+$/u, "");
+  return /^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$|clock\$)$/iu.test(base);
+}
+
+const textEncoder = new TextEncoder();
+
+/** Bytes `text` takes in the store file: JSON-escaped, in UTF-8, without the quotes. */
+export function storedBytes(text: string): number {
+  return textEncoder.encode(JSON.stringify(text)).byteLength - 2;
+}
+
+/** Cuts `text` so it takes at most `maxBytes` in the store file, ending in "…" when cut. */
+export function clipStored(text: string, maxBytes = MAX_STORED_TEXT_BYTES): string {
+  if (storedBytes(text) <= maxBytes) return text;
+  const room = maxBytes - storedBytes("…");
+  let used = 0;
+  let kept = "";
+  for (const character of text) {
+    const size = storedBytes(character);
+    if (used + size > room) break;
+    used += size;
+    kept += character;
+  }
+  return `${kept}…`;
+}
+
+/**
+ * Checks a `wait_for` call and fills in every default, so equal conditions give equal targets. The
+ * target and the note must fit `MAX_SPEC_BYTES` and `MAX_NOTE_BYTES` as stored.
+ */
+export function validateWaitSpec(
+  request: ValidateWaitSpecInput,
+): { readonly ok: true; readonly target: WaitTarget } | WaitRefusal {
+  const note = request.input.note;
+  if (note !== undefined && storedBytes(note) > MAX_NOTE_BYTES) {
+    return refuse("invalid", `The note is too long: at most ${MAX_NOTE_BYTES} bytes as stored.`);
+  }
+  const checked = validateTarget(request);
+  if (!checked.ok) return checked;
+  const specBytes = textEncoder.encode(JSON.stringify(checked.target.spec)).byteLength;
+  if (specBytes > MAX_SPEC_BYTES) {
+    return refuse(
+      "invalid",
+      `The ${checked.target.kind} target is too long: ${specBytes} bytes as stored, at most ${MAX_SPEC_BYTES}.`,
+    );
+  }
+  return checked;
+}
+
+function validateTarget({
   input,
   checks,
   platform,
@@ -437,7 +504,7 @@ function update(
 }
 
 function freeze(wait: WaitRecord, outcome: WaitOutcome, detail: string, now: number): WaitRecord {
-  const result: WaitResult = { outcome, detail: clip(detail), at: iso(now) };
+  const result: WaitResult = { outcome, detail: clipStored(clip(detail)), at: iso(now) };
   return update(wait, { state: "delivering", result }, ["errorSince", "lastError"]);
 }
 
@@ -528,9 +595,10 @@ export function nextWaitState(
         if (now >= deadline) {
           return { record: freeze(wait, "timeout", `Last: ${sentence(judgement.message)}`, now) };
         }
-        return wait.errorSince !== undefined && wait.lastError === judgement.message
+        const lastError = clipStored(judgement.message);
+        return wait.errorSince !== undefined && wait.lastError === lastError
           ? null
-          : { record: update(wait, { errorSince: iso(errorSince), lastError: judgement.message }) };
+          : { record: update(wait, { errorSince: iso(errorSince), lastError }) };
       }
       if (now >= deadline) {
         return {
