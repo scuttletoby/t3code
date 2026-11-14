@@ -152,7 +152,9 @@ class Guard(unittest.TestCase):
                    'repos/octo/demo/environments/gate', 'repos/octo/demo/actions/secrets/X', 'repos/octo/demo/hooks',
                    'repos/octo/demo/keys', 'repos/octo/demo/collaborators/x', 'repos/octo/demo',
                    'repos/octo/demo/actions/runners/1', 'repos/octo/demo/actions/variables/V',
-                   'repos/octo/demo/transfer', 'repos/octo/demo/interaction-limits'):
+                   'repos/octo/demo/transfer', 'repos/octo/demo/interaction-limits',
+                   'repos/octo/demo/actions/oidc/customization/sub', 'repos/octo/demo/actions/runs/7/approve',
+                   'repos/octo/demo/branches/keys/protection'):
             guarded(['api', ep])
             for args in (['-X', 'PATCH'], ['-X', 'DELETE'], ['-f', 'x=y'], ['-X', 'GET', '-H',
                                                                              'X-HTTP-Method-Override: DELETE']):
@@ -228,6 +230,16 @@ class PlainForm(unittest.TestCase):
             for method in ('PATCH', 'GET'):   # refused before any rule, reads too
                 with self.subTest(ep=ep, method=method):
                     self.refused(['api', '-X', method, ep, '-f', 'a=b'])
+
+    def test_files_and_refs_named_like_owner_work_pass(self):
+        """Only the part after repos/OWNER/NAME/ counts, and file paths (contents/) and git refs (git/) are data."""
+        for args in (['repos/octo/demo/contents/src/hooks/use.ts', '-X', 'PUT', '-f', 'message=m', '-f', 'content=eA=='],
+                     ['repos/octo/demo/contents/docs/keys/README.md', '-X', 'PUT', '-f', 'message=m', '-f', 'content=eA=='],
+                     ['repos/octo/demo/git/refs/heads/keys', '-X', 'PATCH', '-f', 'sha=abc'],
+                     ['repos/octo/demo/git/refs', '-f', 'ref=refs/heads/secrets', '-f', 'sha=abc'],
+                     ['repos/octo/demo/actions/runs/7/rerun', '-X', 'POST']):
+            with self.subTest(args=args):
+                guarded(['api'] + args)
 
     def test_a_format_suffix_does_not_hide_owner_work(self):
         for ep in ('repos/octo/demo/rulesets.json', 'repos/octo/demo/branches/main/protection.json',

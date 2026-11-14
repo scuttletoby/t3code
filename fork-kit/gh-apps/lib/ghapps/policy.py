@@ -237,7 +237,10 @@ DISABLE_RE = re.compile(r'(?:^|/)actions/workflows/[^/]+/disable$', re.I)
 PERMISSIONS_RE = re.compile(r'(?:^|/)actions/permissions(?:/|$)', re.I)
 REPO_PERMISSIONS_RE = re.compile(r'^repos/[^/]+/[^/]+/actions/permissions$', re.I)
 OWNER_WORK_RE = re.compile(r'(?:^|/)(?:rulesets|protection|environments|secrets|hooks|keys|collaborators|'
-                           r'invitations|transfer|interaction-limits|actions/runners|actions/variables)(?:/|$)', re.I)
+                           r'invitations|transfer|interaction-limits|actions/runners|actions/variables|actions/oidc|'
+                           r'actions/runs/[^/]+/approve)(?:/|$)', re.I)
+# file paths and git refs are the repository's own data: a folder src/hooks/ or a branch named keys is not a setting
+DATA_TREES = ('contents/', 'git/')
 READ_METHODS = {'GET', 'HEAD'}
 SEGMENT_RE = re.compile(r'[A-Za-z0-9._~+@:-]+')   # (fullmatch: '$' passes a last newline) no %, #, ?, \, space
 QUERY_RE = re.compile(r'[A-Za-z0-9._~+@:%=&,/*()!$\'-]*')   # a query string after ? (reads only)
@@ -430,6 +433,7 @@ def guard(parsed, stdin=None):
             raise Refused(f'a {method} to the Actions permissions: agents only turn Actions back on (one field, '
                           'enabled=true); everything else there is owner work')
         return
-    if OWNER_WORK_RE.search(endpoint):
+    rest = '/'.join(endpoint.split('/')[3:])   # the part after repos/OWNER/NAME/
+    if not rest.lower().startswith(DATA_TREES) and OWNER_WORK_RE.search(rest):
         raise Refused(f'a {method} to {path}: repository settings, rules, secrets, keys and members are owner '
                       'work')

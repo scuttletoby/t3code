@@ -117,8 +117,9 @@ Placeholders in CAPITALS. As root, in a shell no agent sees.
 
    It stores the key, finds the installation, and makes one test token. Run it again with a new key to rotate.
    One App per repository: `add-key` refuses a second App for a repository, and also while a broken app file that
-   is (or may be) for it exists. `gh-as --app NAME` refuses while any other app file is, or could be, for the same
-   repository (a broken one could), so an agent can never pick a stronger App.
+   is (or may be) for it exists. `gh-as` (with `--app` or `--repo`) refuses while any other app file is, or could
+   be, for the same repository, and a broken app file could be for any: one broken file stops every `gh-as` call
+   until the owner fixes or removes it. So an agent can never pick a stronger App.
    `gh-apps-admin list`, `gh-apps-admin remove-app APP_NAME` and `gh-apps-admin self-check` do the rest.
 
 Old copies: the installer removes each agent's old `~/.cache/gh-apps`, `~/.local/bin/gh-as` and
@@ -152,8 +153,8 @@ take away one agent user: uninstall, then install again for each user to keep, t
   what is wrong and stops. Every agent user, the one named now and each one kept from the installed config, is
   checked again on every run: one in group `ghrun` or `ghkeys` (its primary group too) stops the install. One
   broken app file does not lock the owner out: `remove-app` works, `list` names it, and `add-key` works for other
-  repositories (it refuses only while the broken file is, or may be, for the same one). `gh-as --app` refuses
-  while any other app file is broken.
+  repositories (it refuses only while the broken file is, or may be, for the same one). `gh-as` (every call,
+  `--repo` too) refuses while any app file is broken: the owner runs `remove-app` or `add-key` again to fix it.
 - **Self-check as an agent** (`gh-as --self-check`) cannot read the sudoers file; it says so ("not checked")
   instead of passing it silently. `gh-apps-admin self-check` as root checks it.
 - **Empty state:** a fresh machine with zero Apps installs fine; `gh-as` then says no App is set up and fails.
