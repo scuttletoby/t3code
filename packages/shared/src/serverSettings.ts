@@ -422,6 +422,8 @@ export function applyServerSettingsPatch(
     // Merged per entry below; its `null` removals must not reach deepMerge.
     usageLimitSources: usageLimitSourcesPatch,
     usagePacing: usagePacingPatch,
+    // Fork: replaced whole; deepMerge would keep levels the client meant to clear.
+    usagePacingLowerEffort,
     textGenerators: textGeneratorsPatch,
     secretProviders: secretProvidersPatch,
     sourceControlHosts: sourceControlHostsPatch,
@@ -674,6 +676,7 @@ export function applyServerSettingsPatch(
     ...(automaticGitFetchInterval !== undefined ? { automaticGitFetchInterval } : {}),
     ...(providerHealthRefreshInterval !== undefined ? { providerHealthRefreshInterval } : {}),
     ...(headlessUsageRefreshInterval !== undefined ? { headlessUsageRefreshInterval } : {}),
+    ...(usagePacingLowerEffort !== undefined ? { usagePacingLowerEffort } : {}),
   };
   const normalizedBackgroundActivity = normalizeBackgroundActivitySettings(
     nextWithReplacementsBase.backgroundActivity,
