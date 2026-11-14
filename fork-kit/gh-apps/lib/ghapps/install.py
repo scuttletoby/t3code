@@ -1,6 +1,7 @@
 """gh-apps-install: installs, upgrades, checks and removes the gh-apps kit on a Linux host. Runs as root.
 
-  gh-apps-install install --source DIR --sha SHA --agent-user USER [--gh-path /usr/bin/gh]
+  gh-apps-install install --source DIR --sha SHA --agent-user USER [--gh-path PATH]   (default: the installed
+                                                    config's gh path, else /usr/bin/gh)
   gh-apps-install uninstall
   gh-apps-install self-check
 
@@ -8,11 +9,13 @@ Usually started by bootstrap.sh, which first checks that SHA is a commit on the 
 Safe to run again. The steps, in this order (an early stop leaves the old tool working and nothing new reachable;
 no step leaves a key readable by an agent or a broken sudoers file):
 
-  users    the run user (ghrun) and keys user (ghkeys): system users, no login, no home
-  folders  root-owned folders; keys root:ghkeys 750; cache ghkeys 700; run folders ghrun 700; config.json
-  tool     the code in versions/<sha> (copied to a temporary folder, hashed, renamed), then the link current
-           switched in one step, then the fixed links gh-as and gh-mint
-  selftest the installed files against their hashes, and one test token for each app already set up
+  users    the run user (ghrun) and keys user (ghkeys): system users, no login, no password, only their own
+           group; existing ones are reused only when they are like that
+  folders  root-owned folders; keys root:ghkeys 750; cache ghkeys 700; run folders ghrun 700
+  tool     the code in versions/<sha> (copied to a temporary folder, hashed, renamed); not live yet
+  selftest that new version folder against its hashes, and one test token for each app already set up, made by
+           the NEW version's gh-mint; a failure leaves the old version live (on an upgrade) or nothing reachable
+  switch   config.json, then the link current switched in one step, then the fixed links gh-as and gh-mint
   sudoers  one file, checked with visudo -cf before it is moved into place
   wrapper  /usr/local/bin/gh-as
   cleanup  each agent's old copies (~/.cache/gh-apps, ~/.local/bin/gh-as and gh-app-token), removed as that agent;
@@ -27,10 +30,12 @@ import contextlib, grp, hashlib, json, os, pwd, re, shutil, stat, subprocess, sy
 from . import common as c
 from .common import Refused
 
-STEPS = ('users', 'folders', 'tool', 'selftest', 'sudoers', 'wrapper', 'cleanup', 'record')
+STEPS = ('users', 'folders', 'tool', 'selftest', 'switch', 'sudoers', 'wrapper', 'cleanup', 'record')
 VISUDO = '/usr/sbin/visudo'
 USERADD, USERDEL, GROUPDEL = '/usr/sbin/useradd', '/usr/sbin/userdel', '/usr/sbin/groupdel'
 NOLOGIN = '/usr/sbin/nologin'
+NO_LOGIN_SHELLS = {NOLOGIN, '/sbin/nologin', '/usr/bin/nologin', '/bin/false', '/usr/bin/false'}
+SHADOW = '/etc/shadow'
 SOURCE_FILES = ('bin/gh-as', 'libexec/gh-as', 'libexec/gh-mint', 'sbin/gh-apps-admin', 'sbin/gh-apps-install',
                 'lib/ghapps/__init__.py', 'lib/ghapps/common.py', 'lib/ghapps/policy.py', 'lib/ghapps/mint.py',
                 'lib/ghapps/run.py', 'lib/ghapps/wrapper.py', 'lib/ghapps/install.py', 'lib/ghapps/admin.py',
@@ -80,6 +85,32 @@ class Ops:
     def groups_of(self, user):
         pw = pwd.getpwnam(user)
         return {grp.getgrgid(g).gr_name for g in os.getgrouplist(user, pw.pw_gid) if _gr(g)}
+
+    def service_user_problems(self, name):
+        """What is wrong with an existing ghrun or ghkeys for the kit: a login shell, a password, other groups, or
+        other users in its group."""
+        problems = []
+        pw = pwd.getpwnam(name)
+        if pw.pw_shell not in NO_LOGIN_SHELLS:
+            problems.append(f'its shell is {pw.pw_shell}, not {NOLOGIN}')
+        try:
+            with open(SHADOW, encoding='utf-8') as f:
+                entry = next((line.split(':') for line in f if line.split(':', 1)[0] == name), None)
+        except OSError as e:
+            entry, problems = None, problems + [f'cannot read {SHADOW} ({e.strerror})']
+        if entry is None and pw.pw_passwd[:1] not in ('x', '!', '*'):   # no shadow line: the hash is in passwd
+            problems.append('it has a password (or an empty one); a service user needs a locked one (! or *)')
+        if entry is not None and not (len(entry) > 1 and entry[1][:1] in ('!', '*')):
+            problems.append('it has a password (or an empty one); a service user needs a locked one (! or *)')
+        if self.groups_of(name) != {name}:
+            problems.append(f'it is in other groups ({", ".join(sorted(self.groups_of(name) - {name}))})')
+        try:
+            members = set(grp.getgrnam(name).gr_mem) - {name}
+        except KeyError:
+            members, problems = set(), problems + [f'there is no group {name}']
+        if members:
+            problems.append(f'group {name} has other members ({", ".join(sorted(members))})')
+        return problems
 
     def home_of(self, user):
         return pwd.getpwnam(user).pw_dir
@@ -262,9 +293,10 @@ def sudoers_text(agents):
         if not c.USER_RE.match(a):
             raise Refused(f'bad agent user name {a!r}')
     defaults = f'env_reset, !setenv, secure_path="{c.SAFE_PATH}"'
+    # gh-mint prints a token: sudo's I/O logging (log_output), if a host turns it on, must never keep it
     return (f'# gh-apps kit: written by gh-apps-install. Do not edit: run the installer again.\n'
             f'Defaults!{c.PRIV_AS} {defaults}\n'
-            f'Defaults!{c.MINT} {defaults}\n'
+            f'Defaults!{c.MINT} {defaults}, !log_output\n'
             + ''.join(f'{a} ALL=({c.RUN_USER}) NOPASSWD: {c.PRIV_AS}\n' for a in agents)
             + f'{c.RUN_USER} ALL=({c.KEYS_USER}) NOPASSWD: {c.MINT}\n')
 
@@ -330,9 +362,10 @@ def record_rows(sha):
     return rows
 
 
-def self_check():
+def self_check(skipped=None):
     """Problems found (an empty list is a pass). Works as root and as an agent (an agent cannot see or read the
-    sudoers file, so it is checked only by root)."""
+    sudoers file, so it is checked only by root). skipped: a list that gets the paths this user could not check."""
+    skipped = [] if skipped is None else skipped
     path = c.p(c.INSTALLED)
     try:
         c.trusted_chain(path, 'install record')
@@ -353,7 +386,8 @@ def self_check():
             problems.append(f'{rel}: missing')
             continue
         except PermissionError:
-            continue   # an agent cannot see into root-only folders (/etc/sudoers.d is 0750): root checks those
+            skipped.append(rel)   # an agent cannot see into root-only folders (/etc/sudoers.d is 0750)
+            continue
         uid, gid = c.ids(owner)[0] if c.ids(owner) else None, c.gid_of(group)
         if owner == 'root':
             uid = c.ROOT_UID
@@ -372,7 +406,7 @@ def self_check():
                 if sha256_file(real) != check:
                     problems.append(f'{rel}: changed since install')
             except PermissionError:
-                pass   # the sudoers file, read as an agent
+                skipped.append(rel)   # the sudoers file, read as an agent
         if kind == 'tree':
             problems += [f'{rel}: {p_}' for p_ in tree_problems(real)]
             try:
@@ -389,13 +423,16 @@ def self_check():
 
 
 def self_check_main():
-    problems = self_check()
+    skipped = []
+    problems = self_check(skipped)
     if problems:
         for p_ in problems:
             print(f'gh-apps self-check: {p_}', file=sys.stderr)
         return 1
     real = os.path.realpath(c.p(c.CURRENT))
     print(f'gh-apps self-check: ok (version {os.path.basename(real)}; {len(c.app_names())} app(s) set up)')
+    for rel in sorted(set(skipped)):
+        print(f'gh-apps self-check: {rel} not checked (only root can read it: run gh-apps-admin self-check)')
     return 0
 
 
@@ -420,8 +457,13 @@ def check_inputs(ops, source, sha, agent, gh_path):
     c.trusted_chain(c.p(gh_path), 'gh')
 
 
-def install(source, sha, agent, gh_path=c.DEFAULT_GH, ops=None, stop_after=None):
+def install(source, sha, agent, gh_path=None, ops=None, stop_after=None):
+    """gh_path None: keep the installed config's gh path (an upgrade), else /usr/bin/gh."""
     ops = ops or Ops()
+    old = {}
+    with contextlib.suppress(Refused):
+        old = c.load_config() if os.path.lexists(c.p(c.CONFIG)) else {}
+    gh_path = gh_path or old.get('gh_path') or c.DEFAULT_GH
     check_inputs(ops, source, sha, agent, gh_path)
 
     def done(step):
@@ -435,44 +477,63 @@ def install(source, sha, agent, gh_path=c.DEFAULT_GH, ops=None, stop_after=None)
         if not ops.user_exists(name):
             ops.add_system_user(name)
             say(f'made system user {name}')
+        problems = ops.service_user_problems(name)
+        if problems:
+            raise Refused(f'user {name} already exists but is not a plain service user: {"; ".join(problems)}. '
+                          f'Fix it, or remove it (userdel {name}) so the installer makes it again, then run again')
     if ops.groups_of(agent) & {c.RUN_USER, c.KEYS_USER}:
         raise Refused(f'{agent} is in group {c.RUN_USER} or {c.KEYS_USER}: take it out, then run again')
     if done('users'):
         return
-    # folders and config
+    # folders
     for path, owner, group, mode in layout():
         ensure_dir(ops, path, owner, group, mode)
-    old = {}
-    with contextlib.suppress(Refused):
-        old = c.load_config() if os.path.lexists(c.p(c.CONFIG)) else {}
     agents = sorted(set(old.get('agent_users', [])) | {agent})
-    write_file(ops, c.CONFIG, json.dumps({'version': 1, 'gh_path': gh_path, 'agent_users': agents}, indent=2) + '\n')
     if done('folders'):
         return
-    # tool
-    copy_tool(ops, source, sha)
+    # tool: the new version folder, not live yet
+    dest = copy_tool(ops, source, sha)
+    if done('tool'):
+        return
+    # self-test of the new version folder, before anything points at it
+    problems = tree_problems(dest)
+    new_mint = os.path.join(dest, 'libexec', 'gh-mint')
+    for path in (os.path.join(dest, 'libexec', 'gh-as'), new_mint):
+        try:
+            c.trusted_chain(path, 'new program')
+        except Refused as e:
+            problems.append(str(e))
+    live = os.readlink(c.p(c.CURRENT)) if os.path.islink(c.p(c.CURRENT)) else None
+    keep = f'; the live version stays {os.path.basename(live)}' if live and live != f'versions/{sha}' else ''
+    if problems:
+        raise Refused(f'self-test failed, nothing switched, sudoers not changed{keep}: ' + '; '.join(problems))
+    apps = c.app_names()
+    for name in apps:
+        code, _out, err = ops.run_as(c.KEYS_USER, [new_mint, '--app', name, '--check'])
+        if code != 0:
+            raise Refused(f'self-test: app {name} gets no token from the new version, nothing switched, sudoers '
+                          f'not changed{keep}: {c.redact(err).strip()}')
+    if not apps:
+        say('no app set up yet: gh-as will refuse until the owner runs gh-apps-admin add-key (owner step)')
+    if done('selftest'):
+        return
+    # switch: config, then current in one step, then the fixed links
+    write_file(ops, c.CONFIG, json.dumps({'version': 1, 'gh_path': gh_path, 'agent_users': agents}, indent=2) + '\n')
     switch_link(c.CURRENT, f'versions/{sha}')
     for link, target in links()[:3]:   # gh-as, gh-mint (sudo's fixed paths) and the root-only admin command
         switch_link(link, target)
-    if done('tool'):
-        return
-    # self-test
-    problems = tree_problems(os.path.realpath(c.p(c.CURRENT)))
+    problems = []
     for path in (c.PRIV_AS, c.MINT):
         try:
             c.trusted_chain(c.p(path), 'installed program')
         except Refused as e:
             problems.append(str(e))
     if problems:
-        raise Refused('self-test failed, sudoers not placed: ' + '; '.join(problems))
-    apps = c.app_names()
-    for name in apps:
-        code, _out, err = ops.run_as(c.KEYS_USER, [c.p(c.MINT), '--app', name, '--check'])
-        if code != 0:
-            raise Refused(f'self-test: app {name} gets no token, sudoers not placed: {c.redact(err).strip()}')
-    if not apps:
-        say('no app set up yet: gh-as will refuse until the owner runs gh-apps-admin add-key (owner step)')
-    if done('selftest'):
+        if live:
+            switch_link(c.CURRENT, live)
+        raise Refused('the links fail their check after the switch' + (f', switched back to {live}' if live else '')
+                      + ': ' + '; '.join(problems))
+    if done('switch'):
         return
     place_sudoers(ops, agents)
     if done('sudoers'):
@@ -542,7 +603,7 @@ def main(argv):
     i.add_argument('--source', required=True)
     i.add_argument('--sha', required=True)
     i.add_argument('--agent-user', required=True)
-    i.add_argument('--gh-path', default=c.DEFAULT_GH)
+    i.add_argument('--gh-path', default=None, help='default: the installed config\'s gh path, else /usr/bin/gh')
     sub.add_parser('uninstall')
     sub.add_parser('self-check')
     a = ap.parse_args(argv)

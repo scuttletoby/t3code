@@ -23,6 +23,10 @@ class FakeOps(install.Ops):
         self.visudo = lambda path: True
         self.mint = lambda name, flags: ((0, '22\n', '') if flags == ['--find-installation']
                                          else (0, '', f'ok: app {name}, token valid for 60 min'))
+        self.user_problems = {}
+
+    def service_user_problems(self, name):
+        return self.user_problems.get(name, [])
 
     def add_system_user(self, name):
         self.calls.append(('useradd', name))
@@ -46,7 +50,8 @@ class FakeOps(install.Ops):
         self.calls.append(('run_as', user, cmd))
         if cmd[0] == '/bin/rm':
             return subprocess.run(cmd).returncode, '', ''
-        assert cmd[0] == c.p(c.MINT) and cmd[1] == '--app', cmd
+        staged = [c.p(f'{c.VERSIONS}/{sha}/libexec/gh-mint') for sha in (SHA_A, SHA_B)]   # install's self-test
+        assert cmd[0] in [c.p(c.MINT)] + staged and cmd[1] == '--app', cmd
         return self.mint(cmd[2], cmd[3:])
 
 
@@ -112,8 +117,9 @@ class Install(Base):
         text = kf.read(sudoers)
         self.assertIn('agent ALL=(ghrun) NOPASSWD: /usr/local/libexec/gh-apps/gh-as\n', text)
         self.assertIn('ghrun ALL=(ghkeys) NOPASSWD: /usr/local/libexec/gh-apps/gh-mint\n', text)
-        for cmd in (c.PRIV_AS, c.MINT):
-            self.assertIn(f'Defaults!{cmd} env_reset, !setenv, secure_path="{c.SAFE_PATH}"\n', text)
+        self.assertIn(f'Defaults!{c.PRIV_AS} env_reset, !setenv, secure_path="{c.SAFE_PATH}"\n', text)
+        # sudo's I/O logging never keeps the token gh-mint prints
+        self.assertIn(f'Defaults!{c.MINT} env_reset, !setenv, secure_path="{c.SAFE_PATH}", !log_output\n', text)
         self.assertEqual(os.readlink(self.host.path(c.WRAPPER)), self.host.path(c.LIBEXEC) + '/current/bin/gh-as')
         self.assertEqual(json.loads(kf.read(self.host.path(c.CONFIG)))['agent_users'], ['agent'])
         for path, mode in ((c.KEYS, 0o750), (c.CACHE, 0o700), (c.RUN, 0o700), (c.EMPTY, 0o555)):
@@ -170,14 +176,95 @@ class Install(Base):
         self.assertEqual(kf.read(self.host.path(f'{c.APPS}/demo.json')), app)
         self.assertEqual(os.readlink(self.host.path(c.CURRENT)), f'versions/{SHA_B}')
         self.assertEqual(sorted(os.listdir(self.host.path(c.VERSIONS))), [SHA_A, SHA_B])
-        self.assertIn(('run_as', 'ghkeys', [c.p(c.MINT), '--app', 'demo', '--check']), self.ops.calls)
+        # the self-test token comes from the NEW version's gh-mint, before current points at it
+        self.assertIn(('run_as', 'ghkeys', [c.p(f'{c.VERSIONS}/{SHA_B}/libexec/gh-mint'), '--app', 'demo', '--check']),
+                      self.ops.calls)
         self.assertEqual(install.self_check(), [])
+
+    def test_failed_upgrade_self_test_leaves_the_old_version_live(self):
+        self.install()
+        self.add_key()
+        before = snapshot(self.host.root)
+        self.ops.mint = lambda name, flags: (1, '', 'gh-mint: new version broken')
+        with self.assertRaisesRegex(Refused, f'nothing switched, sudoers not changed; the live version stays {SHA_A}'):
+            self.install(sha=SHA_B)
+        self.assertEqual(os.readlink(self.host.path(c.CURRENT)), f'versions/{SHA_A}')
+        after = snapshot(self.host.root)
+        after.pop(os.path.relpath(self.host.path(f'{c.VERSIONS}/{SHA_B}'), self.host.root))
+        after = {k: v for k, v in after.items() if f'versions/{SHA_B}/' not in k}
+        self.assertEqual(after, before, 'only the staged version folder may be new')
+        self.assertEqual(install.self_check(), [])
+
+    def test_changed_staged_version_is_never_switched_to(self):
+        self.install()
+        real = install.copy_tool
+
+        def copy_then_tamper(ops, source, sha):
+            dest = real(ops, source, sha)
+            with open(os.path.join(dest, 'lib/ghapps/run.py'), 'a') as f:
+                f.write('# changed\n')
+            return dest
+        kf.patch(install, copy_tool=copy_then_tamper)
+        try:
+            with self.assertRaisesRegex(Refused, 'self-test failed, nothing switched'):
+                self.install(sha=SHA_B)
+        finally:
+            kf.restore()
+        self.assertEqual(os.readlink(self.host.path(c.CURRENT)), f'versions/{SHA_A}')
+
+    def test_upgrade_keeps_the_gh_path_unless_a_flag_names_one(self):
+        gh2 = self.host.path('/usr/local/bin/gh')
+        shutil.copy(self.host.path('/usr/bin/gh'), gh2)
+        os.chmod(gh2, 0o755)
+        self.install(gh_path='/usr/local/bin/gh')
+        self.install(sha=SHA_B)   # the README's upgrade command: no --gh-path
+        self.assertEqual(json.loads(kf.read(self.host.path(c.CONFIG)))['gh_path'], '/usr/local/bin/gh')
+        self.install(sha=SHA_B, gh_path='/usr/bin/gh')
+        self.assertEqual(json.loads(kf.read(self.host.path(c.CONFIG)))['gh_path'], '/usr/bin/gh')
+
+    def test_reused_service_user_that_is_not_locked_down_is_refused(self):
+        self.host.ids['ghrun'] = (os.getuid(), os.getgid())   # there before the kit
+        self.ops.user_problems = {'ghrun': ['its shell is /bin/bash, not /usr/sbin/nologin']}
+        with self.assertRaisesRegex(Refused, 'user ghrun already exists but is not a plain service user: its shell '
+                                             'is /bin/bash.*userdel ghrun'):
+            self.install()
+        self.assertFalse(self.exists(c.SUDOERS))
+        self.assertFalse(self.exists(c.CURRENT))
+        self.ops.user_problems = {}
+        self.install()
+        self.assertEqual(install.self_check(), [])
+
+    def test_service_user_problems_reads_shell_password_and_groups(self):
+        import types
+        pw = types.SimpleNamespace(pw_shell='/bin/bash', pw_passwd='x', pw_gid=0)
+        shadow = os.path.join(self.host.root, 'shadow')
+        with open(shadow, 'w') as f:
+            f.write('ghrun:$6$salt$hash:19000:0:99999:7:::\nghkeys:!:19000::::::\n')
+
+        class Ops(install.Ops):
+            def groups_of(self, user):
+                return {user, 'docker'} if user == 'ghrun' else {user}
+        kf.patch(install, SHADOW=shadow,
+                 pwd=types.SimpleNamespace(getpwnam=lambda n: pw),
+                 grp=types.SimpleNamespace(getgrnam=lambda n: types.SimpleNamespace(gr_mem=['agent'] if n == 'ghrun'
+                                                                                      else [])))
+        try:
+            bad = Ops().service_user_problems('ghrun')
+            pw.pw_shell = '/usr/sbin/nologin'
+            good = Ops().service_user_problems('ghkeys')
+        finally:
+            kf.restore()
+        self.assertEqual(len(bad), 4, bad)
+        for want in ('shell is /bin/bash', 'has a password', 'other groups (docker)', 'other members (agent)'):
+            self.assertTrue(any(want in p for p in bad), (want, bad))
+        self.assertEqual(good, [])
 
     def test_self_test_failure_never_places_sudoers(self):
         self.install(stop_after='folders')
         self.host.add_app('demo', 'octo/demo')
         self.ops.mint = lambda name, flags: (1, '', 'gh-mint: app demo: GitHub refused the key (401)')
-        with self.assertRaisesRegex(Refused, 'app demo gets no token, sudoers not placed'):
+        with self.assertRaisesRegex(Refused, 'app demo gets no token from the new version, nothing switched, '
+                                             'sudoers not changed'):
             self.install()
         self.assertFalse(self.exists(c.SUDOERS))
         self.assertFalse(self.exists(c.WRAPPER))
@@ -319,8 +406,11 @@ class Install(Base):
         mode = stat.S_IMODE(os.stat(folder).st_mode)
         os.chmod(folder, 0o600)   # like a root-only /etc/sudoers.d seen by an agent: lstat inside it is refused
         try:
-            self.assertEqual(install.self_check(), [])
+            skipped = []
+            self.assertEqual(install.self_check(skipped), [])
+            self.assertEqual(skipped, [c.SUDOERS])
             self.assertEqual(self.quiet(install.self_check_main), 0)
+            self.assertIn(f'{c.SUDOERS} not checked (only root can read it', self.err)
         finally:
             os.chmod(folder, mode)
 
@@ -377,8 +467,24 @@ class Admin(Base):
         self.quiet(admin.remove_app, 'demo')
         self.assertEqual((os.listdir(self.host.path(c.APPS)), os.listdir(self.host.path(c.KEYS)),
                           os.listdir(self.host.path(c.CACHE))), ([], [], []))
-        with self.assertRaises(Refused):
+        with self.assertRaisesRegex(Refused, "no app 'demo'"):
             admin.remove_app('demo')
+        with self.assertRaisesRegex(Refused, 'bad app name'):
+            admin.remove_app('../x')
+
+    def test_one_broken_app_file_does_not_lock_the_owner_out(self):
+        self.add_key(installation_id=5)
+        os.chmod(self.host.path(f'{c.APPS}/demo.json'), 0o666)   # drift: one bad app file
+        self.add_key(name='other', repo='octo/other', installation_id=6)   # the one-app-per-repo scan skips it
+        self.assertIn('skipped a broken app file', self.err)
+        self.quiet(admin.remove_app, 'demo')
+        self.assertFalse(self.exists(f'{c.APPS}/demo.json'))
+        self.assertFalse(self.exists(f'{c.KEYS}/demo.pem'))
+        self.assertTrue(self.exists(f'{c.APPS}/other.json'))
+        with open(self.host.path(f'{c.APPS}/bad.json'), 'w') as f:   # not even JSON, and no key
+            f.write('{')
+        self.quiet(admin.remove_app, 'bad')
+        self.assertFalse(self.exists(f'{c.APPS}/bad.json'))
 
 
 @unittest.skipIf(os.geteuid() == 0, 'as root the real installer would run at the end')
@@ -429,9 +535,11 @@ esac''')
             f.write('#!/bin/sh\n' + body + '\n')
         os.chmod(os.path.join(self.bin, name), 0o755)
 
-    def release(self, protected, status, base):
+    def release(self, protected, status, merge_base):
+        # like GitHub: base_commit is always the sha asked for (SHA_A here), merge_base_commit the shared commit
+        compare = {'status': status, 'base_commit': {'sha': SHA_A}, 'merge_base_commit': {'sha': merge_base}}
         for name, data in (('branch.json', {'name': 'ci-release', 'protected': protected}),
-                           ('compare.json', {'status': status, 'base_commit': {'sha': base}})):
+                           ('compare.json', compare)):
             with open(os.path.join(self.fix, name), 'w') as f:
                 json.dump(data, f)
 
@@ -461,8 +569,9 @@ esac''')
 
     def test_a_sha_that_is_not_a_protected_release_is_refused(self):
         for protected, status, base in ((False, 'ahead', SHA_A), (True, 'diverged', SHA_A), (True, 'behind', SHA_A),
-                                        (True, 'ahead', SHA_B), ('true', 'identical', SHA_A)):
-            with self.subTest(protected=protected, status=status, base=base[:4]):
+                                        (True, 'ahead', SHA_B), ('true', 'identical', SHA_A),
+                                        (True, 'ahead', None)):   # base_commit alone always equals the sha
+            with self.subTest(protected=protected, status=status, base=str(base)[:4]):
                 os.path.exists(self.log) and os.unlink(self.log)
                 self.release(protected, status, base)
                 proc = self.run_it()

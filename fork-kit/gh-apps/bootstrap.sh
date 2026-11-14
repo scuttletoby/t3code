@@ -41,8 +41,10 @@ fetch "$api/repos/$repo/compare/$sha...$branch" "$work/compare.json" || die "can
 python3 -I -B - "$work/branch.json" "$work/compare.json" "$sha" <<'PY' || die "$sha is not a release: it must be a commit on the protected branch $branch"
 import json, sys
 branch, compare = (json.load(open(p, encoding='utf-8')) for p in sys.argv[1:3])
+# base_commit is always the sha asked for; merge_base_commit is the newest commit both share: it is the sha itself
+# only when the sha is on the branch
 ok = (branch.get('protected') is True and compare.get('status') in ('ahead', 'identical')
-      and compare.get('base_commit', {}).get('sha') == sys.argv[3])
+      and (compare.get('merge_base_commit') or {}).get('sha') == sys.argv[3])
 sys.exit(0 if ok else 1)
 PY
 

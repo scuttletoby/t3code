@@ -55,7 +55,15 @@ def add_key(ops, name, app_id, repo, installation_id=None, key_text=None):
     if not os.path.isdir(c.p(c.KEYS)) or c.ids(c.KEYS_USER) is None:
         raise Refused('the gh-apps kit is not installed (run the installer first)')
     key_text = key_text if key_text is not None else read_key()
-    others = [n for n in c.app_names() if n != name and c.load_app(n)['repo'].lower() == repo.lower()]
+    others = []
+    for n in c.app_names():
+        if n == name:
+            continue
+        try:
+            if c.load_app(n)['repo'].lower() == repo.lower():
+                others.append(n)
+        except Refused as e:   # one broken app file must not lock the owner out: report it, go on
+            say(f'skipped a broken app file: {e} (fix it, or gh-apps-admin remove-app {n})')
     if others:
         raise Refused(f'{repo} already has app {others[0]}: one app per repository (remove-app it first)')
     install.write_file(ops, f'{c.KEYS}/{name}.pem', key_text, 'root', c.KEYS_USER, 0o640)
@@ -78,8 +86,13 @@ def add_key(ops, name, app_id, repo, installation_id=None, key_text=None):
 def remove_app(name):
     if os.geteuid() != c.ROOT_UID:
         raise Refused('run this as root')
-    c.load_app(name)
-    for path in (f'{c.APPS}/{name}.json', f'{c.KEYS}/{name}.pem'):
+    if not isinstance(name, str) or not c.NAME_RE.match(name):
+        raise Refused(f'bad app name {name!r} (lower-case letters, digits, - and _)')
+    # no load_app here: a broken app file must still be removable
+    paths = (f'{c.APPS}/{name}.json', f'{c.KEYS}/{name}.pem')
+    if not any(os.path.lexists(c.p(path)) for path in paths):
+        raise Refused(f'no app {name!r} (neither {paths[0]} nor {paths[1]} exists)')
+    for path in paths:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(c.p(path))
     drop_cached_token(name)
