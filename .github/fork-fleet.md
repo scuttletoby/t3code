@@ -35,12 +35,12 @@ route.
 
 A repository variable. If it is unset or empty, the mode is `auto`.
 
-| Value         | Trusted run                                                                                                                                                                                                                                                                                                                                                                         | Untrusted run |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| `auto`        | Each job that will run goes to a pool whose dispatcher reports a free slot. Pools are tried in config order (`pc`, then `vm`), jobs in config order (longest first). The other jobs run GitHub-hosted. A pool counts only with a fresh heartbeat (at most 180 s old). No heartbeat, an old one or an unreadable one means GitHub-hosted, with a note. `auto` never turns a run red. | GitHub-hosted |
-| `fleet`       | Every job that will run goes to the fleet: pools with a free slot first, then the rest queue on the pool marked `waits` (`vm`). A shard whose change gate is off only prints a skip, so it runs GitHub-hosted. A fleet job that waits 2 hours cancels the run with an error.                                                                                                        | GitHub-hosted |
-| `github`      | Everything GitHub-hosted, as before the fleet. Fleet jobs already queued when the setting changed are cancelled and re-run GitHub-hosted by the sweep after 10 minutes.                                                                                                                                                                                                             | GitHub-hosted |
-| anything else | The `Route` step fails, so `changes` and the run are red. A typo must not quietly mean `auto`.                                                                                                                                                                                                                                                                                      | (same)        |
+| Value         | Trusted run                                                                                                                                                                                                                                                                                                                                                                 | Untrusted run |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| `auto`        | Each job that will run goes to a pool whose dispatcher reports a free slot. Pools are tried in config order (`pc`, then `vm`), jobs in config order (longest first). The other jobs run GitHub-hosted. A pool counts only with a fresh heartbeat (at most 180 s old); none: a log line; old or unreadable (dispatcher down, token expired): an error annotation. Never red. | GitHub-hosted |
+| `fleet`       | Every job that will run goes to the fleet: pools with a free slot first, then the rest queue on the pool marked `waits` (`vm`). A shard whose change gate is off only prints a skip, so it runs GitHub-hosted. A fleet job that waits 2 hours cancels the run with an error.                                                                                                | GitHub-hosted |
+| `github`      | Everything GitHub-hosted, as before the fleet. Fleet jobs already queued when the setting changed are cancelled and re-run GitHub-hosted by the sweep after 10 minutes.                                                                                                                                                                                                     | GitHub-hosted |
+| anything else | The `Route` step fails, so `changes` and the run are red. A typo must not quietly mean `auto`.                                                                                                                                                                                                                                                                              | (same)        |
 
 The route calls no API and reads no secret. In `auto` it reads only the pools'
 heartbeat variables (`FLEET_BEACON_PC`, `FLEET_BEACON_VM`), which each
@@ -275,6 +275,37 @@ does leave the marker, and that turns the test red.
 - Upstream-sync runs, and pull requests opened by anyone but `scuttletoby`
   (bots included), always run GitHub-hosted. Allowing them is a change to
   `trusted` and an owner decision.
+
+### Other projects' configs (not used by this fork)
+
+The fork's own config has a hosted label and only dispatcher pools. A project
+that uses the router (or the `fleet-route` action) may also set:
+
+- **`"hosted"`** must be a GitHub-hosted label. The config check, and `route`
+  again at run time, refuse a generic self-hosted label (`self-hosted`,
+  `linux`, `x64`, ...), a static pool's label, a dispatcher pool's label or run
+  label, and a retired label: untrusted runs go to `hosted`.
+- **Static pools** (`"static": true`, runners registered by hand) have no
+  dispatcher and no job-started gate, so a pull request from a fork could edit
+  its workflow to name their labels. They serve **private repositories only**:
+  the config must say `"private": true`, and `route` uses no static pool unless
+  the event says `repository.private: true` (unknown refuses, with an error on
+  the run page). A static pool's labels may not be a dispatcher pool's label or
+  a retired label.
+- **`"hosted": false`** (no GitHub-hosted runners). Each kind then needs a
+  static pool, and `upstream_sync` is refused. Every job that is not routed (a
+  change gate off, a manual, scheduled or bot run, an untrusted run of this
+  repository) goes to that kind's always-on static pool, never to
+  `ubuntu-latest`. A run that may hold another repository's code (a fork's pull
+  request, `pull_request_target` from a fork, `workflow_run`, any other event)
+  turns `route` red with a clear error: it is never skipped and never
+  self-hosted.
+- **`route --with-attempt` and "Re-run failed jobs".** A re-run of failed jobs
+  does not re-run `route`, and a run label serves one attempt only. So `route`
+  also writes `fallback`: the always-on static pool for a trusted run, else
+  where the run's jobs went (`hosted`); never a dispatcher pool's label. A job
+  whose `github.run_attempt` is not the `attempt` output uses `fallback`. The
+  `fleet-route` action's README has the `runs-on` expression.
 
 ## Host setup (VM106, the `vm` pool)
 
