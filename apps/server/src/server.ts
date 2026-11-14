@@ -122,6 +122,7 @@ import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegi
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderUsageLimitsIngestion from "./provider/ProviderUsageLimitsIngestion.ts";
 import * as UsageReadingsHistory from "./usage/UsageReadingsHistory.ts";
+import * as HeadlessUsageRefresher from "./usage/HeadlessUsageRefresher.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
@@ -708,6 +709,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ).pipe(Layer.provide(DelegatedTaskQuestionReactor.layer), Layer.provide(ProjectionStoreV2.layer)),
   ProviderUsageLimitsIngestion.layer,
   UsageReadingsHistory.layer,
+  HeadlessUsageRefresher.layer,
   layerProviderInstallationRefresh,
   ProviderInstallation.layer,
   ReplayMarkers.layer,
