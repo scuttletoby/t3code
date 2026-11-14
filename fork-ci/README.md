@@ -52,14 +52,14 @@ Each action's README has a full example, every input and output, and what happen
   run: ./build.sh
 ```
 
-| Action                                         | What it answers or does                                                        | Key inputs                               | Outputs                               | Config file (in the project)                 |
-| ---------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------- | ------------------------------------- | -------------------------------------------- |
-| [docs-scope](actions/docs-scope/README.md)     | is this change docs-only, and which jobs does it reach                         | `config`, `base`                         | `docs_only`, `jobs`, `reason`         | `.github/docs-scope.json` (rules)            |
-| [job-changed](actions/job-changed/README.md)   | can the change alter what one job of a workflow does                           | `workflow`, `base`, `job`, `paths`       | `changed`, `workflow`, `reason`       | none                                         |
-| [gradle-cache](actions/gradle-cache/README.md) | stages the Maven files a lock lists, sha256-checked, from release assets       | `lock`, `out`, `token`                   | `maven-repo-local`                    | the lock file                                |
-| [fleet-route](actions/fleet-route/README.md)   | which runner each job of a run gets: the project's self-hosted pools or hosted | `config`, `vars`, `mode`, `gates`        | `runners`, `mode`, `attempt`, `watch` | the fleet config (e.g. `.github/fleet.json`) |
-| [head-check](actions/head-check/README.md)     | fails a pull request head that is not the change its review read               | `config`, `required-lenses`, `token`     | `result`                              | the pr-queue config                          |
-| [pr-queue](actions/pr-queue/README.md)         | a merge queue for an up-to-date-required repository (also a reusable workflow) | `config`, `state-file`, `cache`, `token` | none                                  | the pr-queue config                          |
+| Action                                         | What it answers or does                                                        | Key inputs                               | Outputs                                           | Config file (in the project)                 |
+| ---------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------- | ------------------------------------------------- | -------------------------------------------- |
+| [docs-scope](actions/docs-scope/README.md)     | is this change docs-only, and which jobs does it reach                         | `config`, `base`                         | `docs_only`, `jobs`, `reason`                     | `.github/docs-scope.json` (rules)            |
+| [job-changed](actions/job-changed/README.md)   | can the change alter what one job of a workflow does                           | `workflow`, `base`, `job`, `paths`       | `changed`, `workflow`, `reason`                   | none                                         |
+| [gradle-cache](actions/gradle-cache/README.md) | stages the Maven files a lock lists, sha256-checked, from release assets       | `lock`, `out`, `token`                   | `maven-repo-local`                                | the lock file                                |
+| [fleet-route](actions/fleet-route/README.md)   | which runner each job of a run gets: the project's self-hosted pools or hosted | `config`, `vars`, `mode`, `gates`        | `runners`, `mode`, `attempt`, `fallback`, `watch` | the fleet config (e.g. `.github/fleet.json`) |
+| [head-check](actions/head-check/README.md)     | fails a pull request head that is not the change its review read               | `config`, `required-lenses`, `token`     | `result`                                          | the pr-queue config                          |
+| [pr-queue](actions/pr-queue/README.md)         | a merge queue for an up-to-date-required repository (also a reusable workflow) | `config`, `state-file`, `cache`, `token` | none                                              | the pr-queue config                          |
 
 Two habits every action expects:
 

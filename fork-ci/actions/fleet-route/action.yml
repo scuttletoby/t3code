@@ -1,9 +1,13 @@
 name: fleet route
 description: >-
   Where each routed job of this run runs: on the project's own self-hosted runners (its fleet) or GitHub-hosted, from
-  the project's fleet config. Calls no API and needs no token. A pull request whose head is another repository never
-  gets a self-hosted runner. Run it as the last step of a small GitHub-hosted job that the routed jobs need; it fails
-  (red) when the config is missing or broken, and the routed jobs' runs-on then falls back (README, "Usage").
+  the project's fleet config. Calls no API and needs no token. A run that may hold another repository's code (a pull
+  request or pull_request_target whose head is another repository, workflow_run, any event but a push, a pull
+  request, a manual or a scheduled run) never gets a self-hosted runner. Run it as the last step of a small
+  GitHub-hosted job that the routed jobs need. It fails (red) when the config is missing or broken, or with "hosted"
+  false for a run that may hold another repository's code; the routed jobs' runs-on then falls back (README,
+  "Usage"): a self-hosted label only for a push event or a pull_request event whose head is this repository, anything
+  else GitHub-hosted.
 inputs:
   config:
     description: The project's fleet config (README, "Config"), a path in the checkout.
@@ -20,8 +24,8 @@ inputs:
     default: ""
   gates:
     description: >-
-      The change gates as a JSON object (a job whose config "gates" are all "false" only prints a skip and stays
-      GitHub-hosted). Default empty: every routed job counts as running.
+      The change gates as a JSON object (a job whose config "gates" are all "false" only prints a skip: it goes
+      GitHub-hosted, or with "hosted" false to the always-on pool). Default empty: every routed job counts as running.
     required: false
     default: ""
 outputs:
@@ -34,6 +38,11 @@ outputs:
   attempt:
     description: The run attempt these labels were made for; a job of another attempt must not use them.
     value: ${{ steps.route.outputs.attempt }}
+  fallback:
+    description: >-
+      runs-on (JSON) for a job of another attempt (a re-run of failed jobs does not re-run the route job); never a
+      dispatcher pool's label: for a trusted run its kind's always-on static pool if any, else the hosted label.
+    value: ${{ steps.route.outputs.fallback }}
   watch:
     description: true when a job went to a dispatcher or static pool (a job that bounds its wait can then start).
     value: ${{ steps.route.outputs.watch }}
