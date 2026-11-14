@@ -376,7 +376,9 @@ it.layer(NodeServices.layer)("WaitStore: size (lens #90 round 2)", (it) => {
       Effect.gen(function* () {
         const { filePath } = yield* storeFile;
         const store = yield* makeStore(filePath);
-        // The longest path of 6-byte characters that a wait_for call may store.
+        // The longest path and note of the widest characters a wait_for call may store (3 bytes:
+        // the 6-byte control characters are refused in both).
+        const ACCEPTED_WIDE = "\u65e5";
         let length = 1000;
         const accepted = (path: string, note: string) =>
           validateWaitSpec({
@@ -385,9 +387,9 @@ it.layer(NodeServices.layer)("WaitStore: size (lens #90 round 2)", (it) => {
             platform: "linux",
             accounts: new Set(),
           }).ok;
-        const note = WIDE.repeat(MAX_NOTE_BYTES / 6);
-        while (!accepted(`/${WIDE.repeat(length)}`, note)) length -= 1;
-        const path = `/${WIDE.repeat(length)}`;
+        const note = ACCEPTED_WIDE.repeat(MAX_NOTE_BYTES / 3);
+        while (!accepted(`/${ACCEPTED_WIDE.repeat(length)}`, note)) length -= 1;
+        const path = `/${ACCEPTED_WIDE.repeat(length)}`;
         const thread = (n: number) => `thread-${String(n).padStart(29, "0")}`; // a UUID's length
         const biggest = (n: number) => ({
           ...record({ id: idOf(n), threadId: thread(n), key: n.toString(16).padStart(16, "0") }),
@@ -418,7 +420,7 @@ it.layer(NodeServices.layer)("WaitStore: size (lens #90 round 2)", (it) => {
         assert.strictEqual(written.waits.length, MAX_OPEN_WAITS);
         const fs = yield* FileSystem.FileSystem;
         const bytes = new TextEncoder().encode(yield* fs.readFileString(filePath)).byteLength;
-        // 5,023,036 bytes when measured (about 5.0 KB a record) of the 8 MiB (8,388,608) limit.
+        // Under 5 KB a record, well inside the 8 MiB (8,388,608) limit.
         assert.isAtMost(bytes, 0.75 * WaitStore.MAX_STORE_BYTES, `${bytes} bytes`);
       }),
   );
