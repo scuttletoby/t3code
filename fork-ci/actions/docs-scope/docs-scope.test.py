@@ -3,12 +3,15 @@ Real git repos: GitHub's refs/pull/N/merge is a merge commit (HEAD^1 = the base,
 with `git merge --no-ff`. Anything unclear must mean a full run.
 Run: python3 fork-ci/actions/docs-scope/docs-scope.test.py
 """
-import contextlib, json, os, re, shutil, subprocess, sys, tempfile, unittest
+import contextlib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, unittest
 from unittest import mock
 
-sys.dont_write_bytecode = True   # the Globs test imports docs_scope.py: leave no __pycache__ in the action folder
+sys.dont_write_bytecode = True   # the tests import docs_scope.py: leave no __pycache__ in the action folder
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location('docs_scope_api', os.path.join(HERE, 'docs_scope.py'))
+DS = importlib.util.module_from_spec(_spec)   # the Python API (docs_rule, job_rule, rules), as a caller imports it
+_spec.loader.exec_module(DS)
 SCRIPT = os.path.join(HERE, 'docs_scope.py')
 ACTION = os.path.join(HERE, 'action.yml')
 README = os.path.join(HERE, 'README.md')
@@ -130,7 +133,7 @@ class Repo(CleanEnv):
         self.assertEqual(stdout.startswith('docs-only: '), m[1] == 'true', stdout)
         self.assertEqual(m[3], stdout.splitlines()[0])
         for line in stdout.splitlines():   # a file name never starts a line: no ::workflow-command::
-            self.assertRegex(line, r'^(docs-only|full run|scoped run|not docs-only|job [^:]+):', stdout)
+            self.assertRegex(line, r'^(docs-only|full run|scoped run|not docs-only|job [^:]+|no_build):', stdout)
             self.assertTrue(line.isprintable(), repr(line))
         return m[1] == 'true', json.loads(m[2]), stdout
 
@@ -658,6 +661,193 @@ class OtherEvents(Repo):
         docs, jobs, out = self.scope('push', '0' * 40)
         self.assertEqual((docs, jobs), (False, {}), out)
         self.assertIn('not a commit here', out)
+
+
+class NoBuild(Repo):
+    """no_build (#1517): paths that build nothing. Judged at the base like the jobs, never a job output, logged
+    "builds nothing", and they stop "a file no job names runs every job" as a job's paths do."""
+    config = {**CONFIG, 'no_build': ['tools/**', '.github/**', 'scratch.txt']}
+
+    def test_a_no_build_path_runs_no_job_and_is_logged(self):
+        self.pr({'tools/lint.py': 'x', 'scratch.txt': 'y'})
+        docs, jobs, out = self.scope()
+        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'engine': 'false'}), out)
+        self.assertTrue(out.startswith('scoped run: scratch.txt is not a docs file and 1 more'), out)
+        self.assertIn('no_build: scratch.txt builds nothing (matches scratch.txt) and 1 more', out)
+        self.assertNotIn('every job', out)
+
+    def test_it_is_never_a_job_output(self):
+        self.pr({'tools/lint.py': 'x', 'app/Main.java': 'y'})
+        docs, jobs, out = self.scope()
+        self.assertEqual(set(jobs), {'plugins', 'engine'}, out)
+        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'true'}, out)   # app/ is named by nothing: every job
+
+    def test_a_path_a_job_also_names_runs_that_job_and_is_not_logged_as_nothing(self):
+        cfg = {**self.config, 'no_build': ['tools/**', 'engine/docs/**']}
+        self.base = self.commit('engine/docs is no-build', {CONFIG_PATH: json.dumps(cfg)})
+        self.pr({'engine/docs/gen.py': 'x'})
+        docs, jobs, out = self.scope()
+        self.assertEqual(jobs, {'plugins': 'false', 'engine': 'true'}, out)
+        self.assertNotIn('no_build:', out)
+
+    def test_a_registry_entry_beats_no_build(self):   # paths_from names it: the job runs
+        self.pr({REGISTRY_PATH: json.dumps({'modules': REGISTRY['modules'] + [
+            {'id': 't', 'kind': 'engine-module', 'inputs': ['tools/gen']}]}), 'tools/gen/A.java': 'x'})
+        docs, jobs, out = self.scope()
+        self.assertEqual(jobs['engine'], 'true', out)
+
+    def test_docs_stay_docs(self):   # no_build never makes a docs file anything else
+        self.pr({'tools/README.md': 'y'})
+        self.assertTrue(self.scope()[0])
+
+    def test_a_never_docs_md_in_a_no_build_folder_builds_nothing(self):
+        self.pr({'tools/tests/case.md': 'y'})
+        docs, jobs, out = self.scope()
+        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'engine': 'false'}), out)
+        self.assertIn('no_build: tools/tests/case.md builds nothing', out)
+
+    def test_the_config_runs_every_job_even_inside_no_build(self):
+        self.pr({CONFIG_PATH: json.dumps(self.config) + ' '})
+        docs, jobs, out = self.scope()
+        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'true'}, out)
+        self.assertNotIn('no_build:', out)
+
+    def test_it_is_judged_at_the_base(self):   # a PR cannot add itself a no_build glob
+        cfg = {**self.config, 'no_build': self.config['no_build'] + ['app/**']}
+        self.pr({CONFIG_PATH: json.dumps(cfg), 'app/Main.java': 'y'})
+        self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'true'})
+
+    def test_a_wrong_type_is_a_full_run_that_names_it(self):
+        for bad in ('tools/**', [''], [1], {'paths': ['tools/**']}):
+            with self.subTest(bad=bad):
+                self.reset()
+                self.base = self.commit('bad', {CONFIG_PATH: json.dumps({**CONFIG, 'no_build': bad})})
+                self.pr({'tools/lint.py': 'x'})
+                docs, jobs, out = self.scope()
+                self.assertEqual((docs, jobs), (False, {}), out)
+                self.assertIn('no_build must be a list of non-empty strings', out)
+
+
+class NoBuildOldConfig(Repo):
+    """A config with no no_build key works as before: a path no job names runs every job."""
+    def test_an_unnamed_path_still_runs_every_job(self):
+        self.assertNotIn('no_build', CONFIG)
+        self.pr({'tools/lint.py': 'x'})
+        docs, jobs, out = self.scope()
+        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'true'}, out)
+        self.assertNotIn('no_build:', out)
+
+
+class NoBuildBesideAFakeJob(Repo):
+    """A project moving from a fake "no-build" job to the key may have both for a while: the fake job stays a job
+    (an output), the key is not one, and either keeps its paths from running every job."""
+    config = {**CONFIG, 'jobs': {**CONFIG['jobs'], 'no-build': {'paths': ['docs/**']}}, 'no_build': ['tools/**']}
+
+    def test_both_stop_the_full_run(self):
+        self.pr({'docs/gen.py': 'x', 'tools/lint.py': 'y'})
+        docs, jobs, out = self.scope()
+        self.assertEqual(jobs, {'plugins': 'false', 'engine': 'false', 'no-build': 'true'}, out)
+        self.assertIn('job no-build: run (docs/gen.py matches its paths)', out)
+        self.assertIn('no_build: tools/lint.py builds nothing (matches tools/**)', out)
+        self.assertNotIn('docs/gen.py builds nothing', out)
+
+
+class PythonApi(Repo):
+    """docs_rule, job_rule and rules (#1508): the action's own rule about one path, for tools outside a workflow.
+    The agreement tests run the action on a PR of each sample path and ask the helpers the same question."""
+    config = {**CONFIG, 'no_build': ['tools/**']}
+    SAMPLE = ('README.md', 'plugins/a/README.md', 'engine/README.md', 'plugins/a/src/main/resources/x.md',
+              'skills/review/SKILL.md', 'plugins/RELEASE-CLAIMS.md', 'plugins/site/README.md', 'engine/A.java',
+              'plugins/a/A.java', 'plugins/items/common/Item.java', 'app/Main.java', 'tools/lint.py',
+              'tools/tests/x.md', CONFIG_PATH, 'plugins/locale/common/src/main/java/Wire.java',
+              'plugins/locale/common/src/main/java/Other.java', 'plugins/travel/common/src/main/java/a/Leg.java',
+              'notes/line\nbreak.md', 'notes/plain.md')
+
+    def show(self, ref):
+        def read(name):
+            try:
+                return self.git('show', f'{ref}:{name}')
+            except RuntimeError:
+                return None
+        return read
+
+    def ask(self):
+        """(docs_rule, {job: job_rule}) from the base's config, the lists read at the base and the head."""
+        base = self.git('rev-parse', 'HEAD^1')
+        config = self.show(base)(CONFIG_PATH)
+        sides = [self.show(base), self.show('HEAD')]
+        return (DS.docs_rule(config, sides, CONFIG_PATH),
+                {j: DS.job_rule(config, j, sides, CONFIG_PATH) for j in self.config['jobs']})
+
+    def agree(self, path, files=None):
+        self.reset()
+        self.pr(files or {path: f'changed {path}'})
+        docs, jobs, out = self.scope()
+        is_docs, runs = self.ask()
+        self.assertEqual(is_docs(path), docs, out)
+        self.assertEqual({j: 'true' if r(path) else 'false' for j, r in runs.items()}, jobs, out)
+        return docs, jobs
+
+    def test_docs_rule_and_job_rule_agree_with_decide(self):
+        seen = set()
+        for path in self.SAMPLE:
+            with self.subTest(path=path):
+                docs, jobs = self.agree(path)
+                seen.add((docs, tuple(sorted(jobs.items()))))
+        self.assertGreaterEqual(len(seen), 5, 'the sample holds docs, each job alone, every job and none')
+
+    def test_they_agree_on_a_head_only_registry_entry(self):   # an entry at the head adds a job, never cancels every
+        mods = REGISTRY['modules']
+        for path, entry in (('build.gradle', 'build.gradle'), ('plugins/new/X.java', 'plugins/new/X.java')):
+            with self.subTest(path=path):
+                added = {'modules': mods + [{'id': 'n', 'kind': 'engine-module', 'inputs': [entry]}]}
+                self.agree(path, {REGISTRY_PATH: json.dumps(added), path: 'x'})
+
+    def test_they_agree_on_a_never_docs_entry_at_the_head(self):
+        added = {'modules': REGISTRY['modules'] + [{'id': 'n', 'kind': 'plugin', 'inputs': ['notes/kept.md']}]}
+        self.agree('notes/kept.md', {REGISTRY_PATH: json.dumps(added), 'notes/kept.md': 'x'})
+
+    def test_one_reader_and_a_dict_config(self):   # a tool asking about one tree, e.g. a ref of its own
+        reg = json.dumps(REGISTRY)
+        read = lambda name: reg if name == REGISTRY_PATH else None
+        is_docs = DS.docs_rule(self.config, read)
+        self.assertTrue(is_docs('README.md'))
+        self.assertFalse(is_docs('plugins/site/README.md'))
+        self.assertFalse(is_docs('.github/docs-scope.json'), 'the default config path is never docs')
+        engine = DS.job_rule(self.config, 'engine', read)
+        self.assertTrue(engine('plugins/locale/common/src/main/java/Wire.java'))
+        self.assertFalse(engine('tools/lint.py'))
+        self.assertTrue(engine('app/Main.java'), 'a path no job names runs every job')
+        r = DS.rules(self.config, read)
+        self.assertEqual(r.builds_nothing('tools/lint.py'), 'tools/**')
+        self.assertIsNone(r.builds_nothing('engine/A.java'))
+        self.assertEqual(r.not_docs('README.md', plain=False), 'a symlink or submodule, not a plain file')
+        self.assertEqual(self.config, {**CONFIG, 'no_build': ['tools/**']}, "the caller's dict is not changed")
+        self.assertNotIn('docs_only_events', CONFIG, "nor the caller's nested values")
+
+    def test_unreadable_rules_fail_closed(self):   # the action runs in full: nothing is docs, every job runs
+        reg = json.dumps(REGISTRY)
+        for config, read in ((self.config, lambda name: None), (self.config, lambda name: 'not json'),
+                             (self.config, lambda name: json.dumps({'modules': [{'id': 'x'}]})),
+                             ({**CONFIG, 'never_doc': []}, lambda name: reg), ('{not json', lambda name: reg)):
+            with self.subTest(config=str(config)[:40]):
+                self.assertFalse(DS.docs_rule(config, read)('README.md'))
+                self.assertTrue(DS.job_rule(config, 'plugins', read)('README.md'))
+                with self.assertRaises(DS.Unclear):
+                    DS.rules(config, read)
+        self.assertTrue(DS.job_rule(self.config, 'nope', lambda name: reg)('engine/A.java'),
+                        'a job the config does not have reads as "run", as a missing job output does')
+        with self.assertRaisesRegex(DS.Unclear, 'tools/registry.json is not in the tree'):
+            DS.rules(self.config, lambda name: None)
+
+    def test_read_entries_keeps_its_signature(self):   # older callers pass refs and a git runner
+        run = lambda *a: subprocess.run(['git', *a], cwd=self.d, capture_output=True, text=True).stdout or None
+        src = CONFIG['never_docs_from'][0]
+        per = DS.read_entries(src, (self.base,), run)
+        self.assertEqual(DS.union(per), {'plugins/site/README.md': 'site inputs',
+                                         'plugins/locale/common/src/main/java/Wire.java': 'content-locale inputs',
+                                         'plugins/travel/common/src/main/java': 'content-travel inputs'})
+        self.assertTrue(DS.entry_match('plugins/travel/common/src/main/java/a/B.java', DS.union(per)))
 
 
 class Globs(CleanEnv):

@@ -71,6 +71,13 @@ Two habits every action expects:
 
 To move to a new release, change the SHA and the comment together; read the new tag's release notes first.
 
+### Outside a workflow
+
+A project's tools that run outside a workflow (a deploy script, a local check) use the same code from the same
+release through [`actions/pinned`](actions/pinned/README.md): a module and command (not an action) that fetches the
+files a pin config names, checks each by git blob id, caches them and runs the checked bytes. Modules that are meant
+for this say which names callers may import in their README's "Python API" section (docs-scope, gradle-cache).
+
 ## How a release is made
 
 [`.github/workflows/fork-ci-release.yml`](../.github/workflows/fork-ci-release.yml) runs once a day

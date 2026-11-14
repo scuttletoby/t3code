@@ -25,6 +25,7 @@ fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/head-check/head_check.test.py
 fork-ci/actions/job-changed/job-changed.test.py
+fork-ci/actions/pinned/pinned.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
