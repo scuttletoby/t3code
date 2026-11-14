@@ -216,8 +216,13 @@ class Review:
         self.log, self.logged = log, set()
 
     def is_bot(self, post):
-        login = ((post.get('author') or {}).get('login') or '').lower()
-        return login in self.bots or login.endswith('[bot]')
+        """A configured bot login, a login ending in `[bot]` (GitHub's REST API), or an author whose type is Bot
+        (`is_bot` true, or GraphQL's `__typename` Bot). `gh pr view --json comments,reviews` gives only the login, and
+        without the `[bot]` suffix, so through gh only bot_logins (and the author associations) keep bots out."""
+        author = post.get('author') or {}
+        login = (author.get('login') or '').lower()
+        return login in self.bots or login.endswith('[bot]') or author.get('is_bot') is True \
+            or author.get('__typename') == 'Bot'
 
     def counts(self, post):
         """The comment or review takes part in the review at all: GitHub records its author with one of the configured
@@ -318,27 +323,37 @@ class Review:
                 found[key] = ((when, i), None, why) if why else ((when, i), header[1], None)
         return found
 
+    def lens_reads(self, pr):
+        """{lens key: (sha, gap, override)}: what each lens of lens_entries counts as reading, the one rule reviewed_head
+        and the head-check action (../head-check) both use. sha: the full 40-hex sha it read, or the newest override's
+        sha when that override is newer than the lens's newest read (override is then that sha too); None when it reads
+        nothing, and gap then says why (edited, hidden, a short sha, no sha). Empty: no lens comments."""
+        found = self.lens_entries(pr)
+        overrides = [((when, i), sha) for when, i, post in self.lens_posts(pr) for sha in [self.override_sha(post)]
+                     if sha]
+        newest = max(overrides) if overrides else None
+        reads = {}
+        for k, (at, sha, why) in found.items():
+            if newest and at < newest[0]:
+                reads[k] = (newest[1], None, newest[1])
+            elif FULL_SHA.fullmatch(sha or ''):
+                reads[k] = (sha, None, None)
+            else:
+                reads[k] = (None, why or (f'{sha[:12]}: {SHORT}' if sha else 'no sha: no single commit of this PR'), None)
+        return reads
+
     def reviewed_head(self, pr):
         """(reviewed, sha, why). Not reviewed (no lens comments): (False, None, ...). Reviewed: the one full 40-hex sha
         every lens's newest read names. A shorter read names nothing: the queue can only match a prefix against the
         commits GitHub lists now, and after a force-push a new commit can be made to share the prefix of the dropped
         one that was read. A full sha need not be a commit of the PR now (a rebase or force-push drops the read
         commit; GitHub keeps it, and the queue compares content). An override covers each lens whose newest read is
-        older than it. Lenses that name different commits, a short sha or none: sha None."""
-        found = self.lens_entries(pr)
-        overrides = [((when, i), sha) for when, i, post in self.lens_posts(pr) for sha in [self.override_sha(post)]
-                     if sha]
-        if not found:
+        older than it (lens_reads). Lenses that name different commits, a short sha or none: sha None."""
+        reads = self.lens_reads(pr)
+        if not reads:
             return False, None, 'no lens comments'
-        newest = max(overrides) if overrides else None
-        reads = {k: (newest[1] if newest and at < newest[0] else sha if FULL_SHA.fullmatch(sha or '') else None)
-                 for k, (at, sha, _) in found.items()}
-        shas = set(reads.values())
+        shas = {sha for sha, _, _ in reads.values()}
         if len(shas) == 1 and None not in shas:
             return True, shas.pop(), 'every lens read it'
-
-        def gap(k):
-            _, sha, why = found[k]
-            return why or (f'{sha[:12]}: {SHORT}' if sha else 'no sha: no single commit of this PR')
-        listed = ', '.join(f'{k} {v[:12] if v else "(" + gap(k) + ")"}' for k, v in sorted(reads.items()))
+        listed = ', '.join(f'{k} {sha[:12] if sha else "(" + gap + ")"}' for k, (sha, gap, _) in sorted(reads.items()))
         return True, None, f'the lenses did not all read one head: {listed}'

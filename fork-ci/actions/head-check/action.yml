@@ -1,0 +1,60 @@
+name: pr-queue head check
+description: >-
+  Fails a pull request head that is not the change its review read: the merge queue's head_check (pr-queue), with the
+  queue's own lens rules and config. Run it in a job of its own, right after the checkout of GitHub's merge commit
+  with fetch-depth 0, on pull_request events. Reads only and posts nothing. Needs git 2.38+, gh and python3.
+inputs:
+  config:
+    description: The merge queue's JSON config (pr-queue README, "Config"), a path in the repository, read from the base commit.
+    required: true
+  required-lenses:
+    description: Lens names, one per line (a name may hold a comma), that must be among the reads (default none).
+    required: false
+    default: ""
+  pass-drafts:
+    description: true passes a draft without reading its review (run the check again on ready_for_review).
+    required: false
+    default: "false"
+  path:
+    description: Where the merge commit is checked out (actions/checkout's path).
+    required: false
+    default: "."
+  pr:
+    description: The pull request number.
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  repo:
+    description: The repository, owner/name.
+    required: false
+    default: ${{ github.repository }}
+  token:
+    description: A token that can read the pull request's comments and reviews (pull-requests read).
+    required: false
+    default: ${{ github.token }}
+outputs:
+  result:
+    description: pass or fail (empty when the step refused to start).
+    value: ${{ steps.check.outputs.result }}
+runs:
+  using: composite
+  steps:
+    - id: check
+      name: The head is the change the review read
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repo }}
+        PR: ${{ inputs.pr }}
+        CONFIG: ${{ inputs.config }}
+        CHECKOUT_PATH: ${{ inputs.path }}
+        REQUIRED_LENSES: ${{ inputs.required-lenses }}
+        PASS_DRAFTS: ${{ inputs.pass-drafts }}
+      run: |
+        args=(--repo "$REPO" --pr "$PR" --config "$CONFIG" --path "$CHECKOUT_PATH"
+              --required-lenses "$REQUIRED_LENSES")
+        case "$PASS_DRAFTS" in
+          true) args+=(--pass-drafts) ;;
+          false) ;;
+          *) echo "::error::head check: pass-drafts must be true or false"; exit 2 ;;
+        esac
+        exec python3 -I "$GITHUB_ACTION_PATH/head_check.py" "${args[@]}"
