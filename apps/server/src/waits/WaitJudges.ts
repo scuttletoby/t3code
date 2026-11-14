@@ -6,8 +6,9 @@
  * `unit` judge (one `systemctl show`). The `pr` judge comes with its own PR.
  */
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 import type { ProjectId, ThreadId } from "@t3tools/contracts";
-import type { WaitKind, WaitTarget } from "@t3tools/contracts/waitFor";
+import type { WaitCheck, WaitKind, WaitTarget } from "@t3tools/contracts/waitFor";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -16,9 +17,11 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import type * as PlatformError from "effect/PlatformError";
+import type { ServerSettings } from "@t3tools/contracts";
 
 import * as ProcessRunner from "../processRunner.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import { ARG_PATTERN_LIMIT_MS, testArgPattern } from "./argPattern.ts";
 import { WAIT_STAT_PATH_ENV, WAIT_STAT_SCRIPT } from "./waitStatChild.ts";
 
 export interface WaitJudgeContext {
@@ -28,6 +31,11 @@ export interface WaitJudgeContext {
   /** The thread the wait belongs to, and the project it was registered in. */
   readonly threadId: ThreadId;
   readonly projectId: ProjectId;
+  /**
+   * Check waits: where the check runs, worked out by the wait service, which times the run by the
+   * same project's check. Without it the check judge works it out itself.
+   */
+  readonly place?: CheckPlace | undefined;
 }
 
 export type WaitJudge<K extends WaitKind = WaitKind> = (
@@ -253,51 +261,139 @@ function runErrorText(error: ProcessRunner.ProcessRunError): string {
   }
 }
 
+/** A check as it runs now, or the answer of a wait that it can no longer run. */
+export type CheckLookup =
+  | { readonly ok: true; readonly check: WaitCheck }
+  | { readonly ok: false; readonly judgement: Judgement };
+
+/**
+ * The check a stored wait names, in `projectId`'s settings, with the wait's arguments tested again
+ * (the pattern in a worker, see `argPattern.ts`). Removed or narrowed: a permanent error, so the
+ * wait ends and nothing more runs. A pattern too slow to answer: a transient error.
+ */
+export const lookUpCheck: (
+  spec: Extract<WaitTarget, { readonly kind: "check" }>["spec"],
+  projectId: ProjectId,
+  settings: ServerSettings,
+  platform: NodeJS.Platform,
+) => Effect.Effect<CheckLookup> = Effect.fn("WaitJudges.lookUpCheck")(function* (
+  spec: Extract<WaitTarget, { readonly kind: "check" }>["spec"],
+  projectId: ProjectId,
+  settings: ServerSettings,
+  platform: NodeJS.Platform,
+) {
+  const checks = resolveProjectSettings(settings, projectId).settings.waitChecks;
+  const valid = validateWaitSpec({
+    input: { kind: "check", check: spec },
+    checks,
+    platform,
+    accounts: new Set(),
+    testArgPattern: false,
+  });
+  if (!valid.ok) {
+    return {
+      ok: false,
+      judgement: permanent(
+        valid.code === "unknown_check"
+          ? `Check "${spec.name}" is no longer in this project's settings.`
+          : `Check "${spec.name}" was changed in settings and no longer allows this wait: ${valid.message}`,
+      ),
+    } as const;
+  }
+  const check = checks[spec.name]!;
+  const tested = yield* testArgPattern(check.argPattern, spec.args);
+  if (tested.type === "slow") {
+    return {
+      ok: false,
+      judgement: transient(
+        `The argument pattern of check "${spec.name}" gave no answer in ${ARG_PATTERN_LIMIT_MS / 1000}s.`,
+      ),
+    } as const;
+  }
+  if (tested.type === "bad") {
+    return {
+      ok: false,
+      judgement: permanent(
+        // @effect-diagnostics-next-line globalJsonInEffect:off - quotes the argument for the message.
+        `Check "${spec.name}" was changed in settings and no longer allows this wait: argument ${JSON.stringify(messageText(tested.arg, 100))} does not match its pattern.`,
+      ),
+    } as const;
+  }
+  return { ok: true, check } as const;
+});
+
+/**
+ * On Linux a check runs under coreutils `timeout`, so it also ends at its own time limit when the
+ * server that started it is gone (a crash, or a kill that skips the server's clean-up); otherwise
+ * the server is what stops it. It gets this much more time than the server's own limit, so the
+ * server's limit normally comes first.
+ */
+export const CHECK_ORPHAN_EXTRA_SECONDS = 5;
+const TIMEOUT_PROGRAMS = ["/usr/bin/timeout", "/bin/timeout"];
+
+/** The command line a check runs as: under `timeout` when there is one (Linux), else as it is. */
+export function checkCommandLine(
+  check: WaitCheck,
+  args: ReadonlyArray<string>,
+  timeoutProgram: string | null,
+): { readonly command: string; readonly args: ReadonlyArray<string> } {
+  const [command, ...fixed] = check.argv;
+  const all = [...fixed, ...args];
+  if (timeoutProgram === null) return { command: command!, args: all };
+  return {
+    command: timeoutProgram,
+    args: [
+      `--kill-after=2`,
+      `${check.timeoutSeconds + CHECK_ORPHAN_EXTRA_SECONDS}`,
+      command!,
+      ...all,
+    ],
+  };
+}
+
 /**
  * Runs a named check from settings without a shell, in the project's main workspace root, with a
  * timeout and an output cap. The check is looked up again on every run in the thread's current
  * project; a removed or narrowed check is a permanent error. A wait brings no command, cwd or env.
+ * `timeoutProgram` is for tests (null: run without `timeout`).
  */
 export const makeCheckJudge = Effect.fn("WaitJudges.makeCheckJudge")(function* (input: {
   readonly placeOf: (context: WaitJudgeContext) => Effect.Effect<CheckPlace>;
+  readonly timeoutProgram?: string | null;
 }) {
   const settingsService = yield* ServerSettingsService;
   const runner = yield* ProcessRunner.ProcessRunner;
   const platform = yield* HostProcess.Platform;
+  const timeoutProgram =
+    input.timeoutProgram !== undefined
+      ? input.timeoutProgram
+      : platform !== "linux"
+        ? null
+        : (TIMEOUT_PROGRAMS.find((path) => NodeFS.existsSync(path)) ?? null);
   const judge: WaitJudge<"check"> = Effect.fn("WaitJudges.check")(function* ({ spec }, context) {
     const settings = yield* settingsService.getSettings.pipe(Effect.option);
     if (settings._tag === "None") return transient("The settings cannot be read.");
-    const place = yield* input.placeOf(context);
+    const place = context.place ?? (yield* input.placeOf(context));
     if (place.type === "gone") return permanent(place.message);
     if (place.type === "unreadable") return transient(place.message);
-    const checks = resolveProjectSettings(settings.value, place.projectId).settings.waitChecks;
-    const valid = validateWaitSpec({
-      input: { kind: "check", check: spec },
-      checks,
-      platform,
-      accounts: new Set(),
-    });
-    if (!valid.ok) {
-      return permanent(
-        valid.code === "unknown_check"
-          ? `Check "${spec.name}" is no longer in this project's settings.`
-          : `Check "${spec.name}" was changed in settings and no longer allows this wait: ${valid.message}`,
-      );
-    }
-    const check = checks[spec.name]!;
-    const [command, ...fixed] = check.argv;
-    const args = [...fixed, ...spec.args];
+    const found = yield* lookUpCheck(spec, place.projectId, settings.value, platform);
+    if (!found.ok) return found.judgement;
+    const check = found.check;
     // Windows runs a `.cmd` or `.bat` file only through a shell, which would read the arguments.
-    const resolved = yield* resolveSpawnCommand(command!, args);
+    const resolved = yield* resolveSpawnCommand(check.argv[0]!, [
+      ...check.argv.slice(1),
+      ...spec.args,
+    ]);
     if (resolved.shell) {
       return permanent(
         `Check "${spec.name}" names a program that needs a shell (a .cmd or .bat file); checks run without one.`,
       );
     }
+    const line = checkCommandLine(check, spec.args, timeoutProgram);
     return yield* runner
       .run({
-        command: command!,
-        args,
+        command: line.command,
+        args: [...line.args],
         cwd: place.cwd,
         timeout: Duration.seconds(check.timeoutSeconds),
         maxOutputBytes: CHECK_MAX_OUTPUT_BYTES,

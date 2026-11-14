@@ -59,6 +59,11 @@ export interface ValidateWaitSpecInput {
   readonly platform: NodeJS.Platform;
   /** Provider instance ids a slot wait may name. */
   readonly accounts: ReadonlySet<string>;
+  /**
+   * False: a check's `argPattern` is not run here. The server runs an owner's pattern in a worker
+   * with a time limit (a slow pattern could hold the event loop), and tests it there.
+   */
+  readonly testArgPattern?: boolean | undefined;
 }
 
 const refuse = (code: WaitRefusal["code"], message: string): WaitRefusal => ({
@@ -118,6 +123,11 @@ export function clipStored(text: string, maxBytes = MAX_STORED_TEXT_BYTES): stri
   return `${kept}…`;
 }
 
+/** A check's `argPattern` as it is tested: the whole argument must match, whatever anchors it has. */
+export function argPatternRegExp(argPattern: string): RegExp {
+  return new RegExp(`^(?:${argPattern})$`, "u");
+}
+
 /**
  * Checks a `wait_for` call and fills in every default, so equal conditions give equal targets. The
  * target and the note must fit `MAX_SPEC_BYTES` and `MAX_NOTE_BYTES` as stored.
@@ -148,6 +158,7 @@ function validateTarget({
   input,
   checks,
   platform,
+  testArgPattern = true,
   accounts,
 }: ValidateWaitSpecInput): { readonly ok: true; readonly target: WaitTarget } | WaitRefusal {
   const fields = {
@@ -226,10 +237,12 @@ function validateTarget({
       if (args.length > check.maxArgs) {
         return refuse("invalid", `Check "${name}" takes at most ${check.maxArgs} argument(s).`);
       }
-      // The whole argument must match, whatever anchors the pattern has.
-      const pattern = new RegExp(`^(?:${check.argPattern})$`, "u");
+      const pattern = testArgPattern ? argPatternRegExp(check.argPattern) : null;
       const bad = args.find(
-        (arg) => arg.startsWith("-") || HAS_LINE_BREAK_OR_CONTROL.test(arg) || !pattern.test(arg),
+        (arg) =>
+          arg.startsWith("-") ||
+          HAS_LINE_BREAK_OR_CONTROL.test(arg) ||
+          (pattern !== null && !pattern.test(arg)),
       );
       if (bad !== undefined) {
         return refuse(

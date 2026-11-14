@@ -77,14 +77,17 @@ export const layer = Layer.effect(
     const settings = yield* ServerSettingsService;
     const scheduler = yield* Scheduler.Scheduler;
     const due = DueHint.make();
+    const checkPlaceOf = yield* makeCheckPlaceOf();
     const waits = yield* WaitService.make({
       filePath: path.join(config.stateDir, WAIT_STORE_FILE),
       delivery: yield* WaitDelivery.make(),
       judges: {
-        check: yield* makeCheckJudge({ placeOf: yield* makeCheckPlaceOf() }),
+        check: yield* makeCheckJudge({ placeOf: checkPlaceOf }),
         unit: yield* makeUnitJudge(),
       },
       onChange: due.invalidate,
+      // Each run is timed by the project its thread is in now.
+      checkPlaceOf,
     });
     yield* forkParked(
       Stream.runForEach(orchestrator.streamDomainEvents, (event) =>

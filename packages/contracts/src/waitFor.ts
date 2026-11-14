@@ -66,7 +66,12 @@ export const WaitForSettings = Schema.Struct({
 export type WaitForSettings = typeof WaitForSettings.Type;
 
 const WAIT_CHECK_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/u;
-const DEFAULT_WAIT_CHECK_ARG_PATTERN = "^[A-Za-z0-9._:/@=+-]{1,200}$";
+/**
+ * Names, paths, refs and versions. The first character is a letter, digit, `.`, `_`, `:` or `/`:
+ * never `-` (an option), `=`, `@` or `+`, which some programs read as an option, an
+ * assignment, a response file or a command. Checks saved with the older default keep it.
+ */
+export const DEFAULT_WAIT_CHECK_ARG_PATTERN = "^[A-Za-z0-9._:/][A-Za-z0-9._:/@=+-]{0,199}$";
 
 export const WaitCheckName = Schema.String.check(Schema.isPattern(WAIT_CHECK_NAME_PATTERN));
 export type WaitCheckName = typeof WaitCheckName.Type;
@@ -81,7 +86,9 @@ const compiles = (pattern: string): boolean => {
 
 /**
  * One check command. It runs as an argument list without a shell: exit 0 = met, 1 = not yet,
- * anything else = error. Only settings can add or change one.
+ * anything else = error. Only settings can add or change one. It runs unsandboxed, in the project
+ * folder, with the server's environment (its tokens too): use fixed programs that do not run
+ * files from the repository (no test runners, no build or package scripts) and print no secrets.
  */
 export const WaitCheck = Schema.Struct({
   /** Program and fixed arguments. */
@@ -90,7 +97,11 @@ export const WaitCheck = Schema.Struct({
   maxArgs: NonNegativeInt.check(Schema.isLessThanOrEqualTo(20)).pipe(
     Schema.withDecodingDefault(Effect.succeed(0)),
   ),
-  /** Every added argument must match all of it; one starting with `-` is always refused. */
+  /**
+   * Every added argument must match all of it; one starting with `-` is always refused. The
+   * server tests it with a time limit (2 s), so a slow pattern refuses the argument instead of
+   * holding the server.
+   */
   argPattern: Schema.String.check(
     Schema.makeFilter(compiles, { expected: "a valid regular expression" }),
   ).pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_WAIT_CHECK_ARG_PATTERN))),

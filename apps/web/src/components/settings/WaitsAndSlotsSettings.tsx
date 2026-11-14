@@ -196,9 +196,10 @@ const DRAFT_LABELS: Record<WaitCheckDraftField, string> = {
 const DRAFT_HINTS: Partial<Record<WaitCheckDraftField, string>> = {
   name: "What an agent passes, for example build-done.",
   command:
-    "The program, then one fixed argument per line. No shell: pipes and quotes are not read. Exit code 0 means the event happened.",
+    "The program, then one fixed argument per line. No shell: pipes and quotes are not read. Exit code 0 means the event happened. It runs unsandboxed in the project folder with the server's environment, so use a fixed program that does not run files from the repository (no test runners or build scripts).",
   maxArgs: "How many arguments an agent may add after the fixed ones (0 to 20).",
-  argPattern: "Every added argument must match this regular expression.",
+  argPattern:
+    "Every added argument must match this regular expression. Keep it simple: a pattern that takes over 2 seconds refuses the argument. The default refuses a leading -, =, @ or +.",
   intervalSeconds: "How often the command runs, at least 5.",
   timeoutSeconds: "One run is stopped after this long (1 to 600).",
 };

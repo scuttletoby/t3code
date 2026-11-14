@@ -1671,10 +1671,13 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
         yield* TestClock.setTime(NOW);
         const fs = yield* FileSystem.FileSystem;
         const { filePath, watched } = yield* workspace;
+        // A check that cannot be stopped (a read hung in the kernel): cancelling its wait stops
+        // it, but its place stays held until it ends (here: at the end of the test).
+        const hung = yield* Deferred.make<Judgement>();
         const judges: WaitJudges = {
           file: (target, context) =>
             context.waitId !== null && target.spec.path.includes("/dead/")
-              ? Effect.never
+              ? Effect.uninterruptible(Deferred.await(hung))
               : fs.exists(target.spec.path).pipe(
                   Effect.orDie,
                   Effect.map((exists): Judgement =>
@@ -1711,6 +1714,7 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
         const blocked = logs.errors.filter((line) => line.includes("checks have not answered"));
         assert.strictEqual(blocked.length, 1);
         assert.include(blocked[0] ?? "", "dead/a");
+        yield* Deferred.succeed(hung, { type: "notYet" });
       }).pipe(Effect.provide(Layer.merge(logs.layer, ServerSettingsService.layerTest(ON))));
     },
   );

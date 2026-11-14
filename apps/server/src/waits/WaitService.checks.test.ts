@@ -9,6 +9,7 @@ import { ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WaitCheck, WaitRecord } from "@t3tools/contracts/waitFor";
 import type { Judgement } from "@t3tools/shared/waitFor";
 import * as DateTime from "effect/DateTime";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -21,7 +22,14 @@ import { TestClock } from "effect/testing";
 import * as ProcessRunner from "../processRunner.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import type { WaitDelivery } from "./WaitDelivery.ts";
-import { type CheckPlace, makeCheckJudge, makeUnitJudge, type WaitJudges } from "./WaitJudges.ts";
+import { testArgPattern } from "./argPattern.ts";
+import {
+  type CheckPlace,
+  makeCheckJudge,
+  makeUnitJudge,
+  type WaitJudgeContext,
+  type WaitJudges,
+} from "./WaitJudges.ts";
 import * as WaitService from "./WaitService.ts";
 import { memoryFileSystem } from "./WaitService.testkit.ts";
 import { WAIT_STORE_FILE } from "./WaitStore.ts";
@@ -126,6 +134,7 @@ const makeService = (input: {
   readonly judges?: WaitJudges;
   readonly delivery?: WaitDelivery;
   readonly onChange?: Effect.Effect<void>;
+  readonly checkPlaceOf?: (context: WaitJudgeContext) => Effect.Effect<CheckPlace>;
 }) =>
   WaitService.make({
     filePath,
@@ -133,6 +142,7 @@ const makeService = (input: {
     fileChildJudge: null,
     ...(input.judges === undefined ? {} : { judges: input.judges }),
     ...(input.onChange === undefined ? {} : { onChange: input.onChange }),
+    ...(input.checkPlaceOf === undefined ? {} : { checkPlaceOf: input.checkPlaceOf }),
   }).pipe(Effect.provideService(FileSystem.FileSystem, input.store.fs), Effect.provide(Path.layer));
 
 const registerCheck = (service: WaitService.WaitService, name = "build", threadId = THREAD) =>
@@ -419,9 +429,13 @@ it.effect("maxErrorWakesPerSweep sets the cap", () =>
 );
 
 /** The real check judge with a fake process runner; the project root is `/work`. */
-const realCheckJudge = (runner: ReturnType<typeof fakeRunner>) =>
+const realCheckJudge = (
+  runner: ReturnType<typeof fakeRunner>,
+  timeoutProgram: string | null = null,
+) =>
   makeCheckJudge({
     placeOf: () => Effect.succeed<CheckPlace>({ type: "ok", projectId: PROJECT, cwd: "/work" }),
+    timeoutProgram,
   }).pipe(Effect.provide(runner.layer));
 
 it.effect(
@@ -553,4 +567,414 @@ it.effect("a newer or corrupt store runs no check", () =>
       assert.strictEqual(counter.runs, 0);
     }
   }).pipe(Effect.provide(withChecks({ build: check() }))),
+);
+
+// One owner of running checks: each wait has at most one running check, each thread at most one,
+// and a run is stopped when its wait ends, its check goes, or waits go off.
+
+/** A judge that runs until stopped, counting starts, running copies and stops. */
+const tracked = (answer: Effect.Effect<Judgement> = Effect.never) => {
+  const state = { starts: 0, running: 0, most: 0, stopped: 0 };
+  const judge = () =>
+    Effect.sync(() => {
+      state.starts += 1;
+      state.running += 1;
+      state.most = Math.max(state.most, state.running);
+    }).pipe(
+      Effect.andThen(answer),
+      Effect.onInterrupt(() => Effect.sync(() => void (state.stopped += 1))),
+      Effect.ensuring(Effect.sync(() => void (state.running -= 1))),
+    );
+  return { state, judge };
+};
+
+const registerForked = (
+  service: WaitService.WaitService,
+  name: string,
+  threadId: ThreadId = THREAD,
+  args: ReadonlyArray<string> = [],
+) =>
+  Effect.gen(function* () {
+    const fiber = yield* Effect.forkChild(
+      service.register({
+        threadId,
+        projectId: PROJECT,
+        input: { kind: "check", check: { name, args: [...args] } },
+      }),
+    );
+    yield* letFibersRun;
+    yield* stepSeconds(4);
+    return yield* Fiber.join(fiber);
+  });
+
+it.effect("one wait never has two copies of its check running at once", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    const store = memoryStore();
+    const { state, judge } = tracked(
+      Effect.sleep(100 * SECOND).pipe(
+        Effect.as<Judgement>({ type: "met", outcome: "met", detail: "green" }),
+      ),
+    );
+    const service = yield* makeService({ store, judges: { check: judge } });
+    const wait = yield* registerForked(service, "build");
+    assert.strictEqual(wait.state, "waiting");
+    // The run started at registration is the wait's one run: a pass starts no second copy.
+    yield* stepSeconds(30);
+    const pass = yield* Effect.forkChild(service.judgeDue());
+    yield* stepSeconds(5);
+    assert.strictEqual(state.most, 1, "two copies of the same check ran at once");
+    yield* stepSeconds(70);
+    yield* Fiber.join(pass);
+    assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
+    assert.strictEqual(state.starts, 1);
+    assert.strictEqual(store.stored()[0]?.result?.detail, "green");
+  }).pipe(Effect.provide(withChecks({ build: check({ timeoutSeconds: 300 }) }))),
+);
+
+it.effect("a cancelled wait's running check is stopped and frees its place", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    const store = memoryStore();
+    const { state, judge } = tracked();
+    const service = yield* makeService({ store, judges: { check: judge } });
+    const wait = yield* registerForked(service, "build");
+    assert.strictEqual(wait.state, "waiting");
+    assert.strictEqual(state.running, 1);
+    if (wait.state === "waiting")
+      yield* service.cancel({ projectId: PROJECT, waitId: wait.waitId });
+    yield* letFibersRun;
+    assert.strictEqual(state.stopped, 1);
+    assert.strictEqual(state.running, 0);
+  }).pipe(Effect.provide(withChecks({ build: check({ timeoutSeconds: 300 }) }))),
+);
+
+it.effect(
+  "a wait that ends while its check runs (its thread was deleted) has the check stopped",
+  () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const store = memoryStore();
+      store.seed([checkRecord(1)]);
+      const { state, judge } = tracked();
+      let gone = false;
+      const delivery: WaitDelivery = {
+        receiver: () =>
+          Effect.sync(() =>
+            gone ? ({ type: "gone", parentThreadId: null } as const) : ({ type: "ok" } as const),
+          ),
+        deliver: () => Effect.succeed({ type: "delivered" } as const),
+      };
+      const service = yield* makeService({ store, judges: { check: judge }, delivery });
+      const pass = yield* Effect.forkChild(service.judgeDue());
+      yield* stepSeconds(75);
+      yield* Fiber.join(pass);
+      assert.strictEqual(state.running, 1, "carried past the pass");
+      gone = true;
+      yield* service.receiverChanged(THREAD);
+      yield* service.runDue();
+      yield* letFibersRun;
+      assert.notStrictEqual(store.stored()[0]?.state, "waiting");
+      assert.strictEqual(state.running, 0);
+      assert.strictEqual(state.stopped, 1);
+    }).pipe(Effect.provide(withChecks({ build: check({ timeoutSeconds: 300 }) }))),
+);
+
+it.effect("switching waits off stops every running check", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    const store = memoryStore();
+    const { state, judge } = tracked();
+    const service = yield* makeService({ store, judges: { check: judge } });
+    yield* registerForked(service, "build");
+    assert.strictEqual(state.running, 1);
+    const settings = yield* ServerSettingsService;
+    yield* settings.updateSettings({ waitFor: { enabled: false } });
+    yield* service.runDue();
+    yield* letFibersRun;
+    assert.strictEqual(state.running, 0);
+    assert.strictEqual(state.stopped, 1);
+  }).pipe(Effect.provide(withChecks({ build: check({ timeoutSeconds: 300 }) }))),
+);
+
+it.effect(
+  "a check removed while its run is carried ends in check_error, not met, and is stopped",
+  () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const store = memoryStore();
+      store.seed([checkRecord(1)]);
+      const { state, judge } = tracked(
+        Effect.sleep(100 * SECOND).pipe(
+          Effect.as<Judgement>({ type: "met", outcome: "met", detail: "green" }),
+        ),
+      );
+      const service = yield* makeService({ store, judges: { check: judge } });
+      const pass = yield* Effect.forkChild(service.judgeDue());
+      yield* stepSeconds(75);
+      yield* Fiber.join(pass);
+      const settings = yield* ServerSettingsService;
+      yield* settings.updateSettings({ waitChecks: {} });
+      // The next pass stops the run before it can answer met.
+      yield* service.judgeDue();
+      yield* letFibersRun;
+      assert.strictEqual(state.stopped, 1);
+      const [stored] = store.stored();
+      assert.strictEqual(stored?.result?.outcome, "check_error");
+      assert.strictEqual(
+        stored?.result?.detail,
+        `Check "build" is no longer in this project's settings.`,
+      );
+    }).pipe(Effect.provide(withChecks({ build: check({ timeoutSeconds: 300 }) }))),
+);
+
+it.effect("a carried met answer from a check removed meanwhile ends in check_error, not met", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    const store = memoryStore();
+    store.seed([checkRecord(1)]);
+    const service = yield* makeService({
+      store,
+      judges: {
+        check: () =>
+          Effect.sleep(100 * SECOND).pipe(
+            Effect.as<Judgement>({ type: "met", outcome: "met", detail: "green" }),
+          ),
+      },
+    });
+    const pass = yield* Effect.forkChild(service.judgeDue());
+    yield* stepSeconds(75);
+    yield* Fiber.join(pass);
+    // The run answers met first; then the owner removes the check.
+    yield* stepSeconds(30);
+    const settings = yield* ServerSettingsService;
+    yield* settings.updateSettings({ waitChecks: {} });
+    yield* service.judgeDue();
+    assert.strictEqual(store.stored()[0]?.result?.outcome, "check_error");
+  }).pipe(Effect.provide(withChecks({ build: check({ timeoutSeconds: 300 }) }))),
+);
+
+it.effect("a check narrowed so it no longer allows the wait's argument stops its run", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    // The pattern runs in a worker thread (real time); its answers are kept, so this warms them.
+    yield* testArgPattern("^[a-z]+$", ["abc"]);
+    yield* testArgPattern("^[0-9]+$", ["abc"]);
+    const store = memoryStore();
+    const { state, judge } = tracked();
+    const service = yield* makeService({ store, judges: { check: judge } });
+    const wait = yield* registerForked(service, "build", THREAD, ["abc"]);
+    assert.strictEqual(wait.state, "waiting");
+    const settings = yield* ServerSettingsService;
+    yield* settings.updateSettings({
+      waitChecks: { build: check({ maxArgs: 1, argPattern: "^[0-9]+$", timeoutSeconds: 300 }) },
+    });
+    yield* service.judgeDue();
+    yield* letFibersRun;
+    assert.strictEqual(state.stopped, 1);
+    const [stored] = store.stored();
+    assert.strictEqual(stored?.result?.outcome, "check_error");
+    assert.include(stored?.result?.detail ?? "", "no longer allows this wait");
+  }).pipe(Effect.provide(withChecks({ build: check({ maxArgs: 1, timeoutSeconds: 300 }) }))),
+);
+
+it.effect("a thread moved to another project: its check is timed by the check that runs", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    const store = memoryStore();
+    store.seed([checkRecord(1)]);
+    const MOVED = ProjectId.make("project-b");
+    // The real judge, with the thread now in MOVED; its runner takes 40 s, within MOVED's 300 s.
+    const runner = Layer.succeed(ProcessRunner.ProcessRunner, {
+      run: () =>
+        Effect.sleep(40 * SECOND).pipe(
+          Effect.as({
+            stdout: "green\n",
+            stderr: "",
+            code: 0 as ProcessRunner.ProcessRunOutput["code"],
+            timedOut: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutInvalidUtf8: false,
+            stderrInvalidUtf8: false,
+          }),
+        ),
+    });
+    const placeOf = () =>
+      Effect.succeed<CheckPlace>({ type: "ok", projectId: MOVED, cwd: "/work" });
+    const judge = yield* makeCheckJudge({ placeOf, timeoutProgram: null }).pipe(
+      Effect.provide(runner),
+    );
+    const service = yield* makeService({ store, judges: { check: judge }, checkPlaceOf: placeOf });
+    const pass = yield* Effect.forkChild(service.judgeDue());
+    yield* stepSeconds(45);
+    const result = yield* Fiber.join(pass);
+    const [stored] = store.stored();
+    assert.isUndefined(
+      stored?.lastError,
+      `a healthy check counted as failed: ${stored?.lastError}`,
+    );
+    assert.deepStrictEqual(result, { judged: 1, ended: 1 });
+  }).pipe(
+    Effect.provide(
+      ServerSettingsService.layerTest({
+        waitFor: { enabled: true },
+        waitChecks: { build: check({ timeoutSeconds: 20 }) },
+        projectSettingsOverrides: {
+          ["project-b"]: { waitChecks: { build: check({ timeoutSeconds: 300 }) } },
+        },
+      } as never),
+    ),
+  ),
+);
+
+it.effect("a thread moved to another project is judged at that project's interval", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    const store = memoryStore();
+    store.seed([checkRecord(1)]);
+    const { counter, judge } = counting();
+    const placeOf = () =>
+      Effect.succeed<CheckPlace>({ type: "ok", projectId: ProjectId.make("project-b"), cwd: "/w" });
+    const service = yield* makeService({ store, judges: { check: judge }, checkPlaceOf: placeOf });
+    assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 0 });
+    // The stored project's interval (30 s) has passed, the current project's (120 s) has not.
+    yield* TestClock.adjust(60 * SECOND);
+    assert.deepStrictEqual(yield* service.judgeDue(), { judged: 0, ended: 0 });
+    yield* TestClock.adjust(60 * SECOND);
+    assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 0 });
+    assert.strictEqual(counter.runs, 2);
+  }).pipe(
+    Effect.provide(
+      ServerSettingsService.layerTest({
+        waitFor: { enabled: true },
+        waitChecks: { build: check({ intervalSeconds: 30 }) },
+        projectSettingsOverrides: {
+          ["project-b"]: { waitChecks: { build: check({ intervalSeconds: 120 }) } },
+        },
+      } as never),
+    ),
+  ),
+);
+
+// One thread could hold every check place with register + cancel on a slow
+// check, so other threads' check waits were never judged.
+it.effect("one thread's register/cancel loop on a slow check does not starve other threads", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    yield* testArgPattern("^[a-z]+$", ["a"]);
+    yield* testArgPattern("^[a-z]+$", ["b"]);
+    const store = memoryStore();
+    const attacker = ThreadId.make("thread-attacker");
+    const victim = ThreadId.make("thread-victim");
+    let victimRuns = 0;
+    const service = yield* makeService({
+      store,
+      judges: {
+        check: (_target, context) =>
+          context.threadId === attacker
+            ? Effect.never
+            : Effect.sync((): Judgement => {
+                victimRuns += 1;
+                return notYet;
+              }),
+      },
+    });
+    for (const arg of ["a", "b"]) {
+      const wait = yield* registerForked(service, "slow", attacker, [arg]);
+      assert.strictEqual(wait.state, "waiting");
+      if (wait.state === "waiting") {
+        yield* service.cancel({ projectId: PROJECT, waitId: wait.waitId });
+      }
+    }
+    yield* registerForked(service, "build", victim);
+    for (let round = 0; round < 4; round += 1) {
+      const pass = yield* Effect.forkChild(service.judgeDue());
+      yield* letFibersRun;
+      yield* stepSeconds(75);
+      yield* letFibersRun;
+      yield* Fiber.join(pass);
+    }
+    assert.isAtLeast(victimRuns, 2, "the victim's check is judged at registration and after");
+  }).pipe(
+    Effect.provide(
+      withChecks({
+        build: check(),
+        slow: check({ maxArgs: 1, timeoutSeconds: 600, intervalSeconds: 600 }),
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "two slow checks of one thread hold one place; another thread's check runs every interval",
+  () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const store = memoryStore();
+      const busy = ThreadId.make("thread-busy");
+      const other = ThreadId.make("thread-other");
+      let busyRunning = 0;
+      let busyMost = 0;
+      const otherRuns: number[] = [];
+      const service = yield* makeService({
+        store,
+        judges: {
+          check: (_target, context) =>
+            context.threadId === busy
+              ? Effect.sync(() => {
+                  busyRunning += 1;
+                  busyMost = Math.max(busyMost, busyRunning);
+                }).pipe(
+                  Effect.andThen(Effect.never),
+                  Effect.ensuring(Effect.sync(() => void (busyRunning -= 1))),
+                )
+              : Effect.flatMap(Clock.currentTimeMillis, (now) =>
+                  Effect.sync((): Judgement => {
+                    otherRuns.push(now);
+                    return notYet;
+                  }),
+                ),
+        },
+      });
+      assert.strictEqual((yield* registerForked(service, "slow", busy)).state, "waiting");
+      assert.strictEqual((yield* registerForked(service, "slower", busy)).state, "waiting");
+      assert.strictEqual((yield* registerForked(service, "build", other)).state, "waiting");
+      for (let round = 0; round < 4; round += 1) {
+        const pass = yield* Effect.forkChild(service.judgeDue());
+        yield* letFibersRun;
+        yield* stepSeconds(30);
+        yield* Fiber.join(pass);
+      }
+      assert.strictEqual(busyMost, 1, "one thread ran two checks at once");
+      // Judged at registration, then at each pass once its 30 s interval has passed.
+      assert.isAtLeast(otherRuns.length, 4);
+      for (let index = 1; index < otherRuns.length; index += 1) {
+        assert.isAtMost(otherRuns[index]! - otherRuns[index - 1]!, 75 * SECOND);
+      }
+    }).pipe(
+      Effect.provide(
+        withChecks({
+          build: check(),
+          slow: check({ timeoutSeconds: 600 }),
+          slower: check({ timeoutSeconds: 600 }),
+        }),
+      ),
+    ),
+);
+
+it.effect("on Linux a check runs under timeout, so it ends by itself if the server is gone", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(NOW);
+    const store = memoryStore();
+    const runner = fakeRunner(() => ({ code: 1 as ProcessRunner.ProcessRunOutput["code"] }));
+    const service = yield* makeService({
+      store,
+      judges: { check: yield* realCheckJudge(runner, "/usr/bin/timeout") },
+    });
+    yield* registerCheck(service);
+    assert.deepStrictEqual(runner.runs, [
+      ["/usr/bin/timeout", "--kill-after=2", "25", "build-check"],
+    ]);
+  }).pipe(Effect.provide(withChecks({ build: check({ timeoutSeconds: 20 }) }))),
 );
