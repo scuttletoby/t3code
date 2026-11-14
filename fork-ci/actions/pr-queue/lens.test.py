@@ -95,6 +95,19 @@ class Gaps(unittest.TestCase):
         self.assertIn(lens.EMBEDDED, SOURCE.lens_problem(post('Notes\n```\nlens: effaced1\n```')))
 
 
+class Advice(unittest.TestCase):
+    """no_lens_text(keep_markdown=True), for the queue's own advice: the source cleaned it like a gh error, so its
+    `<sha>` placeholder and the backticks around a command were dropped from the comment."""
+    def test_advice_without_a_lens_word_keeps_its_markdown(self):
+        for text in ('push (`tool push`)', 'post the override `tool ready --head <sha>: <why>`.'):
+            self.assertEqual(lens.no_lens_text(text, keep_markdown=True), text)
+            self.assertNotEqual(lens.no_lens_text(text), text, 'the default still cleans it')
+
+    def test_advice_that_holds_a_lens_word_is_cleaned_like_any_text(self):   # also one markdown hides
+        for text, out in (('`lens: x`', 'lens- x'), ('re`ad at`: x', 'read @: x'), ('**safe to merge**', 'safe to land')):
+            self.assertEqual(lens.no_lens_text(text, keep_markdown=True), out)
+
+
 class ProjectRules(unittest.TestCase):
     """What the config changes: the override comment and the bot logins."""
     def test_the_configured_override_prefix_counts_and_another_does_not(self):
