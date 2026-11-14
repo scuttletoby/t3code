@@ -1,4 +1,4 @@
-// Fork only: every `*.test.*` under .github/scripts and fork-ci must be listed in .github/fork-ci-tests.txt.
+// Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit must be listed in .github/fork-ci-tests.txt.
 // A plain entry runs here by its extension (RUNNER); `<test> run by <file>` is run by that file,
 // which must name the test and cannot be a (disabled) upstream workflow. Unlisted or runner-less
 // tests fail; a listed test that is gone fails once the tested history had it, a note before.
@@ -8,7 +8,7 @@ const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "../..");
 const LIST = ".github/fork-ci-tests.txt";
-const TEST_DIRS = [".github/scripts", "fork-ci"];
+const TEST_DIRS = [".github/scripts", "fork-ci", "fork-kit"];
 const TEST_FILE = /\.test\.([^./]+)$/;
 const RUNNER = {
   sh: ["bash"],
