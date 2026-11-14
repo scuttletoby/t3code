@@ -2,6 +2,7 @@ import { CommandId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -29,6 +30,7 @@ import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationServic
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import { WorkAdmission } from "../workAdmission.ts";
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlService.ProviderTurnControlError);
 
@@ -953,6 +955,9 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
     Effect.gen(function* () {
       const worker = yield* OrchestrationEffectWorkerV2;
       const scope = yield* Effect.scope;
+      const admission = yield* WorkAdmission;
+      // Held effects stay pending, unclaimed: startup recovery decides what they become.
+      yield* admission.register("outbox");
       const requestedConcurrency = options.concurrency ?? DEFAULT_EFFECT_WORKER_CONCURRENCY;
       const concurrency = Number.isFinite(requestedConcurrency)
         ? Math.max(1, Math.floor(requestedConcurrency))
@@ -967,14 +972,27 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       // Notifications wake promptly; availableAt persists retry timing, and liveness polling recovers missed wakeups.
       const runWorker = Effect.gen(function* () {
         while (true) {
-          const attempt = yield* worker.runOnce(claimLimits).pipe(
-            Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Orchestration effect worker failed", cause).pipe(
-                Effect.as("failed" as const),
+          // The slot wait starts once the gate admits the claim: a held gate keeps one waiting
+          // claim per slot, not one more per wait.
+          const admitted = yield* Deferred.make<void>();
+          const attempt = yield* admission
+            .admit(
+              Deferred.succeed(admitted, undefined).pipe(
+                Effect.andThen(worker.runOnce(claimLimits)),
               ),
-            ),
-            Effect.forkIn(scope),
+            )
+            .pipe(
+              Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Orchestration effect worker failed", cause).pipe(
+                  Effect.as("failed" as const),
+                ),
+              ),
+              Effect.forkIn(scope),
+            );
+          yield* Effect.raceFirst(
+            Deferred.await(admitted),
+            Fiber.await(attempt).pipe(Effect.asVoid),
           );
           const outcome = yield* Fiber.join(attempt).pipe(
             Effect.timeoutOption(EFFECT_WORKER_SLOT_WAIT),

@@ -42,9 +42,9 @@ import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
-import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -82,6 +82,7 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as RuntimeLayer from "./runtimeLayer.ts";
+import * as WorkAdmission from "../workAdmission.ts";
 import { shellStreamItemFromThreadShell } from "./ShellStream.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -11603,4 +11604,268 @@ it.layer(layerQueueResumeDisabledInstanceTest)(
         }),
     );
   },
+);
+
+it.effect.each([
+  { name: "after an automatic update", marker: true },
+  { name: "after an ordinary restart", marker: false },
+])("work that waited at the closed gate, then restart: $name", ({ marker }) =>
+  Effect.gen(function* () {
+    const store = yield* WorkAdmission.memoryUpdateHoldStore;
+    const gate = yield* WorkAdmission.makeWorkAdmissionGate({ marker: store });
+    yield* Effect.gen(function* () {
+      // Recovery reads the server's gate (the outbox and thread launches register in their own
+      // tests).
+      assert.notInclude(yield* gate.missingConsumers, "recovery");
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      yield* TestClock.setTime(60 * 60_000);
+      // The final quiet check passed: the gate closes and the marker is written.
+      yield* gate.hold;
+      if (marker) {
+        yield* gate.markHeldForUpdate({
+          heldAt: DateTime.formatIso(yield* DateTime.now),
+          targetVersion: "next",
+        });
+      }
+      yield* TestClock.adjust("1 seconds");
+      const arrive = (name: string, createdBy: "user" | "agent", creationSource: "web" | "mcp") =>
+        Effect.gen(function* () {
+          const threadId = ThreadId.make(`update-hold-${name}-${marker}`);
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make(`${threadId}:create`),
+            threadId,
+            projectId: ProjectId.make(`${threadId}:project`),
+            title: "Arrives during the update window",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: process.cwd(),
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy,
+            creationSource,
+            commandId: CommandId.make(`${threadId}:message`),
+            threadId,
+            messageId: MessageId.make(`${threadId}:message`),
+            text: `Sent by ${name} while the server waits for its update`,
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          });
+          return threadId;
+        });
+      const threads = [
+        yield* arrive("user", "user", "web"),
+        // What t3_thread_send dispatches.
+        yield* arrive("agent", "agent", "mcp"),
+      ];
+      // The server stops (SIGTERM) and the new one starts: the gate is open again, the marker
+      // and the database are what the old process left.
+      yield* TestClock.adjust("30 seconds");
+      yield* recovery.reconcile("startup");
+      // Startup starts held work once the launcher committed the update.
+      yield* gate.startHeldWork;
+      for (const threadId of threads) {
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const run = projection.runs[0]!;
+        const restartedAt = DateTime.formatIso(yield* DateTime.now);
+        const effects = [
+          ...(yield* outbox.listByCommandId(CommandId.make(`${threadId}:message`))),
+          ...(yield* outbox.listByCommandId(
+            CommandId.make(`command:update-hold:start:${run.id}:${restartedAt}`),
+          )),
+        ];
+        const pendingStarts = effects.filter(
+          (effect) =>
+            effect.status === "pending" &&
+            effect.request.type === "provider-turn.start" &&
+            effect.request.runId === run.id,
+        );
+        if (marker) {
+          // Neither cancelled nor left in the queue the user has to release: it starts.
+          assert.equal(run.status, "starting", threadId);
+          assert.notEqual(run.queueHeld, true, threadId);
+          assert.lengthOf(pendingStarts, 1, threadId);
+        } else {
+          // Upstream: a user message waits in the held queue, an agent's message is cancelled.
+          assert.isTrue(
+            threadId.includes("-user-") ? run.queueHeld === true : run.status === "cancelled",
+            `${threadId}: ${run.status}`,
+          );
+          assert.lengthOf(pendingStarts, 0, threadId);
+        }
+      }
+    }).pipe(
+      Effect.provide(Layer.fresh(layerTest)),
+      Effect.provideService(WorkAdmission.WorkAdmission, gate),
+    );
+  }),
+);
+
+// The launcher stops the old version, keeps a copy of its database and starts the new version
+// on trial. A trial that fails before the commit gets the copy back and the old version runs
+// again, so work held for the update must reach a provider exactly once over both processes.
+const layerTestAtPath = (dbPath: string) =>
+  Layer.mergeAll(
+    RuntimeLayer.layer,
+    layerProjectionReplayTest,
+    RuntimeLayer.layerEventSink,
+    ProjectStore.layer,
+    ProjectionStore.layer,
+    EffectOutbox.layer,
+    ThreadCommandExecutor.layer,
+  ).pipe(
+    Layer.provide(McpSessionRegistryTestkit.layer),
+    Layer.provide(McpProviderSessions.layer),
+    Layer.provideMerge(
+      SqlitePersistence.layerFromPath(dbPath).pipe(Layer.provide(NodeServices.layer)),
+    ),
+    Layer.provide(layerCheckpointStoreTest),
+    Layer.provide(layerServerConfig),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerTestProviderInstanceRegistry),
+    Layer.provide(layerGitWorkflowTest),
+    Layer.provide(layerProjectServiceTest),
+    Layer.provide(layerPlatformTest),
+  );
+
+it.effect.each([
+  { name: "the trial commits", trial: "commits" },
+  { name: "the trial fails and the launcher restores the database", trial: "rolls back" },
+] as const)("held work starts exactly once when $name", ({ trial }) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "update-hold-" });
+    const dbPath = path.join(directory, "state.sqlite");
+    const backup = path.join(directory, "backup");
+    yield* fs.makeDirectory(backup);
+    const databaseFiles = ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"];
+    const copyDatabase = (from: string, to: string) =>
+      Effect.forEach(databaseFiles, (file) =>
+        Effect.gen(function* () {
+          yield* fs.remove(path.join(to, file), { force: true });
+          if (yield* fs.exists(path.join(from, file))) {
+            yield* fs.copyFile(path.join(from, file), path.join(to, file));
+          }
+        }),
+      );
+    // The marker lives outside the database: the launcher does not restore it.
+    const marker = yield* WorkAdmission.memoryUpdateHoldStore;
+    const runProcess = <A, E, R>(
+      body: (gate: WorkAdmission.WorkAdmissionGate) => Effect.Effect<A, E, R>,
+    ) =>
+      Effect.gen(function* () {
+        const gate = yield* WorkAdmission.makeWorkAdmissionGate({ marker });
+        return yield* body(gate).pipe(
+          Effect.provide(Layer.fresh(layerTestAtPath(dbPath))),
+          Effect.provideService(WorkAdmission.WorkAdmission, gate),
+        );
+      });
+    // Every start written for a held run, whatever happened to it afterwards.
+    const heldStarts = Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const rows = yield* sql<{ readonly payloadJson: string }>`
+        SELECT payload_json AS "payloadJson" FROM orchestration_v2_effect_outbox
+        WHERE effect_type = 'provider-turn.start'
+          AND command_id LIKE 'command:update-hold:start:%'`;
+      return rows.map((row) => (JSON.parse(row.payloadJson) as { runId: string }).runId);
+    });
+    const startup = (gate: WorkAdmission.WorkAdmissionGate, committed: boolean) =>
+      Effect.gen(function* () {
+        const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        yield* recovery.reconcile("startup");
+        // serverRuntimeStartup: held work starts after `launcher.prepareTrial` succeeded.
+        if (committed) yield* gate.startHeldWork;
+        return yield* heldStarts;
+      });
+
+    yield* TestClock.setTime(60 * 60_000);
+    // Old version: the gate closes, two messages arrive, then the marker is written. The
+    // first message is stamped before the marker's hold time.
+    const runIds = yield* runProcess((gate) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* gate.hold;
+        const send = (name: string) =>
+          Effect.gen(function* () {
+            const threadId = ThreadId.make(`update-rollback-${name}-${trial}`);
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              createdBy: "user",
+              creationSource: "web",
+              commandId: CommandId.make(`${threadId}:create`),
+              threadId,
+              projectId: ProjectId.make(`${threadId}:project`),
+              title: "Arrives during the update window",
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: process.cwd(),
+            });
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "user",
+              creationSource: "web",
+              commandId: CommandId.make(`${threadId}:message`),
+              threadId,
+              messageId: MessageId.make(`${threadId}:message`),
+              text: `Sent as ${name} while the server waits for its update`,
+              attachments: [],
+              dispatchMode: { type: "start_immediately" },
+            });
+            return (yield* orchestrator.getThreadProjection(threadId)).runs[0]!.id;
+          });
+        const early = yield* send("early");
+        yield* TestClock.adjust("1 seconds");
+        yield* gate.markHeldForUpdate({
+          heldAt: DateTime.formatIso(yield* DateTime.now),
+          targetVersion: "next",
+        });
+        yield* TestClock.adjust("1 seconds");
+        const late = yield* send("late");
+        return [early, late] as Array<string>;
+      }),
+    );
+    yield* copyDatabase(directory, backup);
+
+    yield* TestClock.adjust("30 seconds");
+    // New version on trial.
+    const trialStarts = yield* runProcess((gate) => startup(gate, trial === "commits"));
+    let laterStarts: ReadonlyArray<string> = [];
+    if (trial === "rolls back") {
+      yield* copyDatabase(backup, directory);
+      yield* TestClock.adjust("30 seconds");
+      // Old version again, on the database it stopped with.
+      laterStarts = yield* runProcess((gate) => startup(gate, true));
+    }
+    // A later restart (or recovery running again) starts nothing new.
+    yield* TestClock.adjust("30 seconds");
+    const finalStarts = yield* runProcess((gate) => startup(gate, true));
+
+    const reachedProvider = trial === "commits" ? finalStarts : [...trialStarts, ...laterStarts];
+    if (trial === "rolls back") {
+      assert.deepEqual(trialStarts, [], "a trial that is rolled back starts nothing");
+    }
+    assert.deepEqual(
+      finalStarts,
+      trial === "commits" ? trialStarts : laterStarts,
+      "a later restart starts nothing new",
+    );
+    for (const runId of runIds) {
+      assert.equal(
+        reachedProvider.filter((started) => started === runId).length,
+        1,
+        `${runId} starts exactly once`,
+      );
+    }
+    assert.isUndefined(yield* marker.read, "the marker is cleared once the held work started");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
