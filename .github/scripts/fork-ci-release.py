@@ -8,7 +8,7 @@ fails every consumer job at "Set up job" on a dangling symlink under .repos/). M
 onto upstream, so only a tag keeps one of its commits alive.
 
 A release commit holds only the files in .github/fork-ci-release.json `paths` (fork-ci/, the
-reusable workflows consumers call, LICENSE), at the same paths as on the source branch, so a
+reusable workflows consumers call, scripts an action runs from outside fork-ci/, LICENSE), at the same paths as on the source branch, so a
 consumer's `uses:` path never changes. It is built with git plumbing from one source-branch commit,
 its parent is the previous release commit, and it is pushed as the branch `branch` (ci-release) and
 the annotated tag <tagPrefix><N> (ci/vN) in ONE atomic push. Consumers pin `@<release sha> # ci/vN`.

@@ -5,5 +5,10 @@
   "branch": "ci-release",
   "tagPrefix": "ci/v",
   "legacyTags": ["ci/v1"],
-  "paths": ["LICENSE", "fork-ci", ".github/workflows/fork-pr-queue.yml"]
+  "paths": [
+    "LICENSE",
+    "fork-ci",
+    ".github/workflows/fork-pr-queue.yml",
+    ".github/scripts/fork-fleet.py"
+  ]
 }
