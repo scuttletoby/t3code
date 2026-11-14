@@ -297,17 +297,30 @@ class WhoCounts(unittest.TestCase):
 
 
 class Reviews(unittest.TestCase):
-    """PR reviews take part like comments (lens_posts): ordered by submittedAt, by the same author rules. gh gives no
-    isMinimized for a review, so a review counts as shown."""
+    """PR reviews take part like comments (lens_posts): ordered by submittedAt, by the same author rules. Their edit and
+    hidden flags come only from the caller's own read (lens.REVIEW_FLAGS): gh pr view never fetches them for reviews
+    and prints `includesCreatedEdit: false` anyway (issue #56)."""
     R = WhoCounts.R
 
     def review(self, body, when='2026-01-02T00:00:00Z', **extra):
-        p = post(body, when=..., **extra)
+        """A review as gh pr view prints it: an id, the unfetched default includesCreatedEdit false, no isMinimized."""
+        self.n = getattr(self, 'n', 0) + 1
+        p = post(body, when=..., **{'id': f'PRR_{self.n}', **extra})
         p['submittedAt'] = when
         return p
 
-    def head(self, comments=(), reviews=()):
-        return self.R.reviewed_head({'headRefOid': SHA_B, 'comments': list(comments), 'reviews': list(reviews)})
+    @staticmethod
+    def read(*reviews, edited=False, hidden=False, typename='User'):
+        """REVIEW_FLAGS as review_flags reads them, the same flags for each review."""
+        return {r['id']: {'includesCreatedEdit': edited, 'isMinimized': hidden, 'url': f'https://x/{r["id"]}',
+                          'author': {'__typename': typename, 'login': 'owner'}} for r in reviews}
+
+    def head(self, comments=(), reviews=(), flags=None):
+        """flags None: the explicit read says every review is unedited and shown; ... leaves REVIEW_FLAGS out."""
+        pr = {'headRefOid': SHA_B, 'comments': list(comments), 'reviews': list(reviews)}
+        if flags is not ...:
+            pr[lens.REVIEW_FLAGS] = self.read(*reviews) if flags is None else flags
+        return self.R.reviewed_head(pr)
 
     def test_a_counted_review_is_a_read(self):
         self.assertEqual(self.head(reviews=[self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}')]),
@@ -320,17 +333,43 @@ class Reviews(unittest.TestCase):
         older = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}', when='2025-12-31T00:00:00Z')
         self.assertEqual(self.head([old], [older]), (True, SHA_A, 'every lens read it'))
 
-    def test_a_review_without_a_hidden_state_counts_as_shown(self):
+    def test_gh_pr_views_unedited_flag_on_a_review_is_never_trusted(self):   # issue #56
         r = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}')
-        self.assertNotIn('isMinimized', r)
-        self.assertEqual(self.head(reviews=[r])[1], SHA_B)
+        self.assertIs(r['includesCreatedEdit'], False)   # what gh prints for an edited review too
+        other = self.review('lgtm')
+        for flags in (..., {}, self.read(other), {r['id']: {'includesCreatedEdit': False}},
+                      {r['id']: {'includesCreatedEdit': 'false', 'isMinimized': False}}, {r['id']: None}, [r['id']]):
+            with self.subTest(flags=flags):
+                reviewed, sha, why = self.head(reviews=[r], flags=flags)
+                self.assertEqual((reviewed, sha), (True, None))
+                self.assertIn(lens.FLAGS_UNREAD, why)
+        no_id = {k: v for k, v in r.items() if k != 'id'}
+        self.assertEqual(self.head(reviews=[no_id], flags={None: self.read(r)[r['id']]})[:2], (True, None))
+        self.assertEqual(self.head(reviews=[r], flags=self.read(r)), (True, SHA_B, 'every lens read it'))
 
-    def test_an_edited_review_reads_nothing(self):
-        for edited in (True, ...):
-            r = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}', includesCreatedEdit=edited)
-            reviewed, sha, why = self.head(reviews=[r])
-            self.assertEqual((reviewed, sha), (True, None), edited)
-            self.assertIn(lens.EDITED, why)
+    def test_an_edited_or_hidden_review_reads_nothing_whatever_gh_printed(self):
+        r = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}')
+        for kw, text in (({'edited': True}, lens.EDITED), ({'hidden': True}, lens.HIDDEN)):
+            reviewed, sha, why = self.head(reviews=[r], flags=self.read(r, **kw))
+            self.assertEqual((reviewed, sha), (True, None), kw)
+            self.assertIn(text, why)
+
+    def test_a_review_override_counts_only_with_its_flags_read_unedited(self):
+        lens_read = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
+        ov = self.review(f'proj ready --head {SHA_B}: read the rest', authorAssociation='OWNER')
+        r = lens.Review((), 'proj ready --head', 'OWNER', ('OWNER',))
+        pr = {'headRefOid': SHA_B, 'comments': [lens_read], 'reviews': [ov]}
+        self.assertEqual(r.reviewed_head(pr), (True, SHA_A, 'every lens read it'))
+        self.assertEqual(r.reviewed_head({**pr, lens.REVIEW_FLAGS: self.read(ov, edited=True)}),
+                         (True, SHA_A, 'every lens read it'))
+        self.assertEqual(r.reviewed_head({**pr, lens.REVIEW_FLAGS: self.read(ov)}), (True, SHA_B, 'every lens read it'))
+
+    def test_a_review_by_a_bot_account_never_counts(self):   # GitHub's author type, whatever the login
+        own = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
+        bot = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}', author={'login': 'helper'})
+        self.assertEqual(self.head([own], [bot], flags=self.read(bot, typename='Bot')),
+                         (True, SHA_A, 'every lens read it'))
+        self.assertEqual(self.head([own], [bot], flags=self.read(bot)), (True, SHA_B, 'every lens read it'))
 
     def test_a_strangers_review_is_ignored(self):
         own = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
