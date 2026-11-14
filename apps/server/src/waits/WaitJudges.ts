@@ -1,24 +1,33 @@
 // @effect-diagnostics nodeBuiltinImport:off -- the file check process is an external runtime boundary.
 /**
  * Fork (waits): the judges, one per kind, that read a condition once. A judge never fails: an error
- * is a `failed` judgement, and the wait service decides what it means. This PR has the `file`
- * judge, in the server and in a short-lived process; the `check`, `unit` and `pr` judges come with
- * their own PRs.
+ * is a `failed` judgement, and the wait service decides what it means. Here: the `file` judge (in
+ * the server and in a short-lived process), the `check` judge (a command from settings) and the
+ * `unit` judge (one `systemctl show`). The `pr` judge comes with its own PR.
  */
 import * as NodeChildProcess from "node:child_process";
+import type { ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WaitKind, WaitTarget } from "@t3tools/contracts/waitFor";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import type { Judgement } from "@t3tools/shared/waitFor";
+import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import { judgeExit, type Judgement, messageText, validateWaitSpec } from "@t3tools/shared/waitFor";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import type * as PlatformError from "effect/PlatformError";
 
+import * as ProcessRunner from "../processRunner.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import { WAIT_STAT_PATH_ENV, WAIT_STAT_SCRIPT } from "./waitStatChild.ts";
 
 export interface WaitJudgeContext {
   /** The stored wait, or null when the condition is read once at registration. */
   readonly waitId: string | null;
   readonly now: number;
+  /** The thread the wait belongs to, and the project it was registered in. */
+  readonly threadId: ThreadId;
+  readonly projectId: ProjectId;
 }
 
 export type WaitJudge<K extends WaitKind = WaitKind> = (
@@ -192,3 +201,202 @@ function parseChildAnswer(
     permanent: false,
   };
 }
+
+/** The most a check or `systemctl` may print on each of stdout and stderr; more is an error. */
+export const CHECK_MAX_OUTPUT_BYTES = 8192;
+/** A `systemctl show` that has not answered by then is killed. */
+export const UNIT_LIMIT_MS = 5_000;
+
+/**
+ * Where a check runs: the project the wait's thread is in now (it follows a thread that moved),
+ * and that project's main workspace root as the working directory.
+ */
+export type CheckPlace =
+  | { readonly type: "ok"; readonly projectId: ProjectId; readonly cwd: string }
+  /** The project is gone, so the check can never run again. */
+  | { readonly type: "gone"; readonly message: string }
+  /** It cannot be read now; tried again next time. */
+  | { readonly type: "unreadable"; readonly message: string };
+
+const transient = (message: string): Judgement => ({ type: "failed", message, permanent: false });
+const permanent = (message: string): Judgement => ({ type: "failed", message, permanent: true });
+
+/** A system error code (`ENOENT`, `EACCES`, ...) somewhere in a spawn error's causes. */
+function causeCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && typeof current === "object" && current !== null; depth += 1) {
+    const code = (current as { readonly code?: unknown }).code;
+    if (typeof code === "string" && /^[A-Z0-9_]{1,40}$/u.test(code)) return code;
+    const reason = (current as { readonly reason?: unknown }).reason;
+    current =
+      typeof reason === "object" && reason !== null && "cause" in reason
+        ? (reason as { readonly cause: unknown }).cause
+        : (current as { readonly cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** Why a process could not be run, without its command line (the record already names it). */
+function runErrorText(error: ProcessRunner.ProcessRunError): string {
+  switch (error._tag) {
+    case "ProcessOutputLimitError":
+      return "Printed too much output.";
+    case "ProcessTimeoutError":
+      return "Timed out.";
+    case "ProcessSpawnError": {
+      const code = causeCode(error.cause);
+      return `It could not start${code === undefined ? "" : ` (${code})`}.`;
+    }
+    case "ProcessReadError":
+    case "ProcessStdinError":
+      return `Its output could not be read (${error._tag}).`;
+  }
+}
+
+/**
+ * Runs a named check from settings without a shell, in the project's main workspace root, with a
+ * timeout and an output cap. The check is looked up again on every run in the thread's current
+ * project; a removed or narrowed check is a permanent error. A wait brings no command, cwd or env.
+ */
+export const makeCheckJudge = Effect.fn("WaitJudges.makeCheckJudge")(function* (input: {
+  readonly placeOf: (context: WaitJudgeContext) => Effect.Effect<CheckPlace>;
+}) {
+  const settingsService = yield* ServerSettingsService;
+  const runner = yield* ProcessRunner.ProcessRunner;
+  const platform = yield* HostProcess.Platform;
+  const judge: WaitJudge<"check"> = Effect.fn("WaitJudges.check")(function* ({ spec }, context) {
+    const settings = yield* settingsService.getSettings.pipe(Effect.option);
+    if (settings._tag === "None") return transient("The settings cannot be read.");
+    const place = yield* input.placeOf(context);
+    if (place.type === "gone") return permanent(place.message);
+    if (place.type === "unreadable") return transient(place.message);
+    const checks = resolveProjectSettings(settings.value, place.projectId).settings.waitChecks;
+    const valid = validateWaitSpec({
+      input: { kind: "check", check: spec },
+      checks,
+      platform,
+      accounts: new Set(),
+    });
+    if (!valid.ok) {
+      return permanent(
+        valid.code === "unknown_check"
+          ? `Check "${spec.name}" is no longer in this project's settings.`
+          : `Check "${spec.name}" was changed in settings and no longer allows this wait: ${valid.message}`,
+      );
+    }
+    const check = checks[spec.name]!;
+    const [command, ...fixed] = check.argv;
+    const args = [...fixed, ...spec.args];
+    // Windows runs a `.cmd` or `.bat` file only through a shell, which would read the arguments.
+    const resolved = yield* resolveSpawnCommand(command!, args);
+    if (resolved.shell) {
+      return permanent(
+        `Check "${spec.name}" names a program that needs a shell (a .cmd or .bat file); checks run without one.`,
+      );
+    }
+    return yield* runner
+      .run({
+        command: command!,
+        args,
+        cwd: place.cwd,
+        timeout: Duration.seconds(check.timeoutSeconds),
+        maxOutputBytes: CHECK_MAX_OUTPUT_BYTES,
+        outputMode: "error",
+        timeoutBehavior: "timedOutResult",
+      })
+      .pipe(
+        Effect.map((result) =>
+          judgeExit({
+            exitCode: result.code === null ? null : Number(result.code),
+            stdout: result.stdout,
+            stderr: result.stderr,
+            timedOut: result.timedOut,
+          }),
+        ),
+        Effect.catch((error) => Effect.succeed(transient(runErrorText(error)))),
+      );
+  });
+  return judge;
+});
+
+/** `systemctl show` lines (`Key=Value`) as a map. */
+function parseShow(stdout: string): ReadonlyMap<string, string> {
+  const values = new Map<string, string>();
+  for (const line of stdout.split(/\r?\n/u)) {
+    const at = line.indexOf("=");
+    if (at > 0) values.set(line.slice(0, at), line.slice(at + 1).trim());
+  }
+  return values;
+}
+
+const UNIT_NOT_AVAILABLE =
+  "Unit waits need systemd on Linux, and it is not available on this server. Use a check command.";
+
+/**
+ * Met (`ended`) when `systemctl [--user] show` says the unit is `inactive` or `failed`. A unit
+ * systemd does not know counts as ended: it forgets a transient unit once it has ended. Off Linux,
+ * without `systemctl`, or on a system not booted with systemd, every answer is the permanent
+ * error "not available", never met. `command` is for tests.
+ */
+export const makeUnitJudge = Effect.fn("WaitJudges.makeUnitJudge")(function* (options?: {
+  readonly command?: string;
+}) {
+  const runner = yield* ProcessRunner.ProcessRunner;
+  const platform = yield* HostProcess.Platform;
+  const command = options?.command ?? "systemctl";
+  const judge: WaitJudge<"unit"> = ({ spec }) => {
+    if (platform !== "linux") return Effect.succeed(permanent(UNIT_NOT_AVAILABLE));
+    const args = [
+      ...(spec.scope === "user" ? ["--user"] : []),
+      "show",
+      "--property=ActiveState,LoadState",
+      "--",
+      spec.name,
+    ];
+    return runner
+      .run({
+        command,
+        args,
+        timeout: Duration.millis(UNIT_LIMIT_MS),
+        maxOutputBytes: CHECK_MAX_OUTPUT_BYTES,
+        outputMode: "error",
+        timeoutBehavior: "timedOutResult",
+      })
+      .pipe(
+        Effect.map((result): Judgement => {
+          if (result.timedOut) return transient("systemctl timed out.");
+          if (/not been booted with systemd|System has not been booted/iu.test(result.stderr)) {
+            return permanent(UNIT_NOT_AVAILABLE);
+          }
+          const values = parseShow(result.stdout);
+          const active = values.get("ActiveState");
+          if (Number(result.code) !== 0 || active === undefined || active === "") {
+            const line = result.stderr.split(/\r?\n/u).find((text) => text.trim() !== "") ?? "";
+            const reason = messageText(line, 200).trim();
+            return transient(
+              `systemctl could not read the unit (exit ${result.code ?? "none"})${reason === "" ? "." : `: ${reason}`}`,
+            );
+          }
+          const unknown = values.get("LoadState") === "not-found";
+          if (active === "inactive" || active === "failed") {
+            return {
+              type: "met",
+              outcome: "ended",
+              detail: unknown
+                ? "systemd does not know this unit (never started, or ended and forgotten)."
+                : `It is ${active}.`,
+            };
+          }
+          return { type: "notYet", detail: `It is ${messageText(active, 40)}.` };
+        }),
+        Effect.catch((error) =>
+          Effect.succeed(
+            error._tag === "ProcessSpawnError" && causeCode(error.cause) === "ENOENT"
+              ? permanent(UNIT_NOT_AVAILABLE)
+              : transient(`systemctl: ${runErrorText(error)}`),
+          ),
+        ),
+      );
+  };
+  return judge;
+});

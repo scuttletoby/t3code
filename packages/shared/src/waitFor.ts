@@ -700,6 +700,95 @@ export function nextWaitState(
   }
 }
 
+const isErrorWake = (transition: WaitTransition) =>
+  transition.record.state === "delivering" && transition.record.result?.outcome === "check_error";
+
+/**
+ * Outage rules for one pass: at most `maxThreads` threads are woken with `check_error`, those
+ * failing longest first (threads woken anyway do not count); the rest stay `waiting` with their
+ * error noted. A woken thread also gets its waits that have failed for half the grace or more.
+ */
+export function limitErrorWakes(input: {
+  /** Every stored wait, before `changes`. */
+  readonly waits: ReadonlyArray<WaitRecord>;
+  /** The pass's changes by wait id, from `nextWaitState`. */
+  readonly changes: ReadonlyMap<string, WaitTransition>;
+  /** The judgement behind each change, so a held wait keeps its error. */
+  readonly judgements: ReadonlyMap<string, Judgement>;
+  readonly now: number;
+  readonly settings: WaitStateSettings;
+  readonly maxThreads: number;
+}): {
+  readonly changes: ReadonlyMap<string, WaitTransition>;
+  readonly heldThreads: number;
+  readonly joined: number;
+} {
+  const { waits, judgements, now, settings } = input;
+  const changes = new Map(input.changes);
+  const byId = new Map(waits.map((wait) => [wait.id, wait]));
+  const woken = new Set<ThreadId>();
+  for (const wait of waits) {
+    if (wait.state === "delivering" && wait.messageId === undefined) woken.add(wait.threadId);
+  }
+  for (const transition of changes.values()) {
+    if (transition.record.state === "delivering" && !isErrorWake(transition)) {
+      woken.add(transition.record.threadId);
+    }
+  }
+  /** Threads with a `check_error` wake, and since when their oldest one has failed. */
+  const failingSince = new Map<ThreadId, number>();
+  for (const [id, transition] of changes) {
+    if (!isErrorWake(transition)) continue;
+    const errorSince = byId.get(id)?.errorSince;
+    const since = errorSince === undefined ? now : Date.parse(errorSince);
+    const threadId = transition.record.threadId;
+    failingSince.set(threadId, Math.min(since, failingSince.get(threadId) ?? since));
+  }
+  const capped = [...failingSince]
+    .filter(([threadId]) => !woken.has(threadId))
+    .sort(([a, aSince], [b, bSince]) => aSince - bSince || (a < b ? -1 : a > b ? 1 : 0));
+  const held = new Set(capped.slice(Math.max(0, input.maxThreads)).map(([threadId]) => threadId));
+  for (const threadId of failingSince.keys()) if (!held.has(threadId)) woken.add(threadId);
+
+  for (const [id, transition] of changes) {
+    if (!isErrorWake(transition) || !held.has(transition.record.threadId)) continue;
+    const wait = byId.get(id)!;
+    const judgement = judgements.get(id);
+    const lastError = clipStored(
+      judgement?.type === "failed" ? judgement.message : (wait.lastError ?? "No good answer."),
+    );
+    const errorSince = wait.errorSince ?? iso(now);
+    if (wait.errorSince === errorSince && wait.lastError === lastError) changes.delete(id);
+    else changes.set(id, { record: update(wait, { errorSince, lastError }) });
+  }
+
+  let joined = 0;
+  const joinAfterMs = (settings.errorGraceSeconds * MS_PER_SECOND) / 2;
+  for (const wait of waits) {
+    if (!woken.has(wait.threadId)) continue;
+    const current = changes.get(wait.id)?.record ?? wait;
+    if (current.state !== "waiting" || current.errorSince === undefined) continue;
+    if (now - Date.parse(current.errorSince) < joinAfterMs) continue;
+    const transition = nextWaitState(
+      current,
+      {
+        type: "judged",
+        judgement: {
+          type: "failed",
+          message: current.lastError ?? "No good answer.",
+          permanent: false,
+        },
+      },
+      now,
+      { ...settings, errorGraceSeconds: 0 },
+    );
+    if (transition === null) continue;
+    changes.set(wait.id, transition);
+    joined += 1;
+  }
+  return { changes, heldThreads: held.size, joined };
+}
+
 /** Ended waits leave the file after `keepEndedHours`, a slot wait not before its reservation. */
 export function shouldPruneWait(
   wait: WaitRecord,

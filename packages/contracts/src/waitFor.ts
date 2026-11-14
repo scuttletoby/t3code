@@ -47,6 +47,12 @@ export const WaitForSettings = Schema.Struct({
   /** A wait whose source fails this long without one good read ends as `check_error`. */
   errorGraceSeconds: nonNegativeIntDefault(900),
   /**
+   * When a source fails for many threads at once, at most this many threads are woken with
+   * `check_error` per sweep; the rest follow in later sweeps. One thread's failing waits are
+   * joined into one message.
+   */
+  maxErrorWakesPerSweep: positiveIntDefault(3),
+  /**
    * Ended waits stay listed this long, then are removed; sooner beyond the caps on `maxPerThread`.
    * The store file is never written above 8 MiB.
    */
@@ -194,6 +200,7 @@ export const WaitForSettingsPatch = Schema.Struct({
   prSweepSeconds: PositiveIntPatch,
   noChecksGraceSeconds: NonNegativeIntPatch,
   errorGraceSeconds: NonNegativeIntPatch,
+  maxErrorWakesPerSweep: PositiveIntPatch,
   keepEndedHours: NonNegativeIntPatch,
   stoppedHandOverHours: PositiveIntPatch,
 } satisfies Record<keyof WaitForSettings, unknown>);

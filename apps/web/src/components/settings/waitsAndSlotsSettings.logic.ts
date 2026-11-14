@@ -93,6 +93,15 @@ export const WAIT_FOR_NUMBER_FIELDS: ReadonlyArray<NumberFieldSpec<NumberKey<Wai
     step: 60,
   },
   {
+    key: "maxErrorWakesPerSweep",
+    title: "Error wakes per sweep",
+    description:
+      "When a source fails for many threads at once, at most this many threads are woken per sweep; the rest follow.",
+    unit: "threads",
+    min: 1,
+    step: 1,
+  },
+  {
     key: "keepEndedHours",
     title: "Keep ended waits",
     description: "Ended waits stay listed for agents this long.",

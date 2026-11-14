@@ -67,6 +67,7 @@ const ADVANCED_WAIT_FOR_KEYS = new Set<string>([
   "prSweepSeconds",
   "noChecksGraceSeconds",
   "errorGraceSeconds",
+  "maxErrorWakesPerSweep",
   "keepEndedHours",
   "stoppedHandOverHours",
 ]);
