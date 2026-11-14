@@ -248,10 +248,14 @@ function checkStatusClass(
   }
 }
 
-/** The newest head seen with every check finished, and when it was first seen so. */
+/**
+ * The newest head seen with every check finished (or with no checks at all, `noChecks`), and when
+ * it was first seen so.
+ */
 export interface PrSeen {
   readonly headSha: string | null;
   readonly finishedAt: number;
+  readonly noChecks?: true;
 }
 
 export type PrJudgement = Judgement & { readonly seen: PrSeen | null };
@@ -266,9 +270,9 @@ function names(checks: ReadonlyArray<PullRequestCheck>): string {
 }
 
 /**
- * Judges one read of a pull request. Checks are met only when every check of one head is finished
- * at two reads at least `prSweepSeconds` apart, because a push with two workflows can look
- * finished between them.
+ * Met only when one head reads all finished (or no checks, after `noChecksGraceSeconds` from when
+ * it was first seen with none) at two reads at least `prSweepSeconds` apart: a fresh push lists
+ * few or no checks until its workflows are queued. A missing `headSha` cannot tell heads apart.
  */
 export function judgePrChecks(input: {
   readonly detail: { readonly state: PullRequestState; readonly headSha?: string | undefined };
@@ -276,7 +280,6 @@ export function judgePrChecks(input: {
   readonly checks: { readonly checks: ReadonlyArray<PullRequestCheck> } | null;
   readonly until: "checks" | "merged";
   readonly seen: PrSeen | null;
-  readonly registeredAt: number;
   readonly now: number;
   readonly settings: Pick<WaitForSettings, "prSweepSeconds" | "noChecksGraceSeconds">;
 }): PrJudgement {
@@ -297,9 +300,18 @@ export function judgePrChecks(input: {
   }
   const checks = input.checks.checks;
   if (checks.length === 0) {
-    return now - input.registeredAt >= settings.noChecksGraceSeconds * MS_PER_SECOND
-      ? { type: "met", outcome: "no_checks", detail: `${head} No checks.`, seen: null }
-      : { type: "notYet", detail: `${head} No checks yet.`, seen: null };
+    if (seen === null || seen.headSha !== headSha || seen.noChecks !== true) {
+      return {
+        type: "notYet",
+        detail: `${head} No checks yet.`,
+        seen: { headSha, finishedAt: now, noChecks: true },
+      };
+    }
+    const settleMs =
+      Math.max(settings.noChecksGraceSeconds, settings.prSweepSeconds) * MS_PER_SECOND;
+    return now - seen.finishedAt >= settleMs
+      ? { type: "met", outcome: "no_checks", detail: `${head} No checks.`, seen }
+      : { type: "notYet", detail: `${head} No checks yet.`, seen };
   }
   const byClass = { pending: [], failed: [], needs_action: [], passed: [] } as Record<
     ReturnType<typeof checkStatusClass>,
@@ -313,7 +325,7 @@ export function judgePrChecks(input: {
       seen: null,
     };
   }
-  if (seen === null || seen.headSha !== headSha) {
+  if (seen === null || seen.headSha !== headSha || seen.noChecks === true) {
     return {
       type: "notYet",
       detail: `${head} All checks finished once.`,

@@ -97,7 +97,6 @@ const judgePr = (input: {
     checks: input.checks === null ? null : { checks: input.checks },
     until: input.until ?? "checks",
     seen: input.seen ?? null,
-    registeredAt: T0,
     now: input.now,
     settings: prSettings,
   });
@@ -328,12 +327,61 @@ describe("judgePrChecks (T12)", () => {
     ).toMatchObject({ type: "notYet", seen: null });
   });
 
-  it("reports no_checks only after the grace from registration (T10)", () => {
-    expect(judgePr({ checks: [], now: T0 + 899 * SECOND })).toMatchObject({ type: "notYet" });
-    expect(judgePr({ checks: [], now: T0 + 900 * SECOND })).toMatchObject({
+  it("reports no_checks only after the grace from when this head was first seen with none (T10)", () => {
+    const first = judgePr({ checks: [], now: T0 + HOUR });
+    expect(first).toMatchObject({
+      type: "notYet",
+      seen: { headSha: "1a2b3c4d5e6f", finishedAt: T0 + HOUR, noChecks: true },
+    });
+    expect(judgePr({ checks: [], seen: first.seen, now: T0 + HOUR + 899 * SECOND })).toMatchObject({
+      type: "notYet",
+    });
+    expect(judgePr({ checks: [], seen: first.seen, now: T0 + HOUR + 900 * SECOND })).toMatchObject({
       type: "met",
       outcome: "no_checks",
+      detail: "Head 1a2b3c4. No checks.",
     });
+  });
+
+  it("does not end on one read of a new head that lists no checks yet (push race)", () => {
+    // Registered 20 min ago; the old head had finished once; a push lands and the host lists no
+    // checks for the new head until its workflows are queued.
+    const read = judgePr({
+      checks: [],
+      seen: { headSha: "aaaaaaaaaaaa", finishedAt: T0 + 19 * 60 * SECOND },
+      headSha: "bbbbbbbbbbbb",
+      now: T0 + 20 * 60 * SECOND,
+    });
+    expect(read).toMatchObject({
+      type: "notYet",
+      seen: { headSha: "bbbbbbbbbbbb", noChecks: true },
+    });
+  });
+
+  it("settles no_checks no sooner than the sweep, even with a shorter grace", () => {
+    const short = (now: number, seen: PrSeen | null) =>
+      judgePrChecks({
+        detail: { state: "open", headSha: "1a2b3c4d5e6f" },
+        checks: { checks: [] },
+        until: "checks",
+        seen,
+        now,
+        settings: { prSweepSeconds: 120, noChecksGraceSeconds: 0 },
+      });
+    const first = short(T0, null);
+    expect(first.type).toBe("notYet");
+    expect(short(T0 + 119 * SECOND, first.seen).type).toBe("notYet");
+    expect(short(T0 + 120 * SECOND, first.seen).type).toBe("met");
+  });
+
+  it("starts the settle again when checks appear on a head that had none", () => {
+    const none = { headSha: "1a2b3c4d5e6f", finishedAt: T0, noChecks: true as const };
+    const read = judgePr({ checks: finished, seen: none, now: T0 + HOUR });
+    expect(read).toMatchObject({
+      type: "notYet",
+      seen: { headSha: "1a2b3c4d5e6f", finishedAt: T0 + HOUR },
+    });
+    expect(read.seen?.noChecks).toBeUndefined();
   });
 
   it("meets merged and closed pull requests at once", () => {
