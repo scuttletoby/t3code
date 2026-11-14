@@ -5,16 +5,6 @@ up to date with their base branch. After each push to the base branch it brings
 exactly one waiting pull request up to date, and it turns auto-merge back on
 only for a head that holds exactly the change the review read.
 
-This folder is built in four stacked pull requests:
-
-1. the review rules and the config (`lens.py`, `config.py`);
-2. the queue itself (`pr_queue.py`, section "The queue");
-3. armed pull requests that cannot merge (a red required check, or one that
-   ended without passing or never reported) are told once and passed over;
-4. the "red only because the base was red" rule, the reusable workflow
-   `.github/workflows/fork-pr-queue.yml`, `action.yml`, `tested-base/` and the
-   usage sections of this file: this part.
-
 ## Config
 
 One JSON file in the project's repository. Unknown keys, a key written twice, a
@@ -93,6 +83,12 @@ heading near the top, or two `covered:`/`checks:` lines. A comment that is no
 report says so on its first line, `not a lens: ...`. That clears it unless one of
 its lines is a lens header or a `lens:` field with a sha.
 
+A comment that looks like a report but is not one valid read is a lens of its
+own, keyed by that comment. Posting the report again the right way adds a new
+read and leaves the old comment blocking, and hiding it is not enough either.
+The ways out: delete it, edit its first line to `not a lens: ...` with no lens
+header line left in it, or post an override for the head.
+
 ## The queue
 
 ```
@@ -109,26 +105,38 @@ first, and acts on the first one it can:
   the way out.
 
 A pull request in a merge state the queue neither updates nor waits for (a
-conflict, `DIRTY`) is passed over, and the run says so.
+conflict, `DIRTY`) is passed over, and the run says so. `UNKNOWN` (GitHub is
+still computing it, often for a few seconds after a push to the base) is listed
+again every `poll_seconds`, for at most `wait_seconds`, before it is passed
+over, so a younger pull request is not updated ahead of it.
 
 An armed pull request that cannot merge does not hold the queue. It is told
 why on the pull request, once per head, check and reason, and passed over:
 
 - a required check whose newest run failed (`FAILURE`, `ERROR`, `TIMED_OUT`,
-  or `CANCELLED` after a red with nothing green since), behind or not. Its
-  author fixes it; nothing in the queue re-runs it.
+  or `CANCELLED` after a red with nothing green since), behind or not. The
+  newest run of the name counts, whichever workflow ran it, as the ruleset
+  reads it. Its author fixes it; nothing in the queue re-runs it.
 - up to date, and a required check's newest run ended without passing and
-  without a red (`CANCELLED`, `STARTUP_FAILURE`, `STALE`, ...): nothing
+  without a red (`CANCELLED`, `STARTUP_FAILURE`, `STALE`, ...), and no
+  workflow runs on the head any more (a newer run may still be queued): nothing
   re-runs it by itself. The comment says to re-run the CI run or push.
 - up to date, and a required check never reported although no workflow runs
-  on the head any more. The comment says to push or merge the base: a re-run
-  repeats the jobs of the workflow files the head was built with, so it cannot
-  add a check those files do not have (one added or renamed since).
+  on the head any more, also when no check at all reported. The comment says
+  to push or merge the base: a re-run repeats the jobs of the workflow files
+  the head was built with, so it cannot add a check those files do not have
+  (one added or renamed since).
+
+A head with no check and no workflow run at all still holds the queue: nothing
+tells "not started yet" from "never starts" (every workflow filtered out by
+its paths) without a clock, and the queue keeps no state for one.
 
 Only the newest run of a check counts, and a check not in `required_checks` is
 ignored. Only the queue's own comment (posted with its token) counts as told:
-a copy of it by anyone else does not silence it. When GitHub cannot say which workflows still run on the head, the
-pull request is not called stuck: it holds the queue, and the run says why.
+a copy of it by anyone else does not silence it. A pull request whose head
+moved between the list and the comment is told by the next run, on its new
+head. When GitHub cannot say which workflows still run on the head, the pull
+request is not called stuck: it holds the queue, and the run says why.
 
 `gh` must be logged in for the repository (`GH_TOKEN`). Git fetches into the
 queue's own bare repository (`--cache`) and gets its login from
@@ -140,8 +148,9 @@ other repository's job, as a user of its own. The `--state-file` and `--cache`
 folders belong to that user alone. git runs with no hooks, no fsmonitor and no
 replace refs, and a cache that is not that user's alone (mode `0700`), has a
 config the queue did not write, or holds a file that changes what its objects
-say (`info/grafts`, `shallow`, `objects/info/alternates` or
-`objects/info/http-alternates`) is rebuilt, never used. A job of the same user
+say or how a merge reads them (`info/grafts`, `shallow`,
+`objects/info/alternates`, `objects/info/http-alternates` or
+`info/attributes`) is rebuilt, never used. A job of the same user
 can still change the cache between that check and git's next read: only the
 runner rule above stops that.
 
@@ -169,7 +178,15 @@ was: give each queue its own `--state-file`. A plan without `repo` (the source
 queue's format) is this repository's. An unreadable plan, or one another user
 could have written (not this user's, or writable by its group or others), is
 kept as `STATE.bad`, the run fails, and every later run warns while that file
-exists.
+exists. A plan does not say who turned auto-merge off: a pull request a person
+disarmed after the stop is re-armed too, if its head holds the change read.
+
+The plan is on disk, and that is why the runner rule above exists. It could
+live in a comment of the queue's own login instead (trusted by
+`viewerDidAuthor`, as the told notices are): the next run reads the review and
+the base from GitHub anyway, and a failed write before the disarm would only
+mean no disarm. That stays open for a queue that moves several pull requests at
+once, and for GitHub-hosted runners.
 
 `--lock-file` (default: `STATE.lock`) keeps two runs from overlapping.
 `--dry-run` takes no lock and writes nothing: no `STATE`, no cache, no comment.
@@ -191,7 +208,10 @@ red required checks is therefore updated when, for every red required check:
 
 When the base tip is not green yet, the pull request is told once, per head
 and check, that it failed as on its base and that the queue updates it by
-itself once the base is green. It does not hold the queue meanwhile. When
+itself once the base is green. The notice names the first check still red on
+the base; when the base fixes that one and another is still red there, a new
+notice names that one. A red of the pull request's own beside a base red is
+named as its own ("fix the cause"). It does not hold the queue meanwhile. When
 anything is unknown (no note among the job's first 100 annotations, a failed read,
 more than 100 checks on a commit), the red counts as the pull request's own, as without
 the rule. There is no state and no loop: after the update the new runs test a
@@ -300,12 +320,14 @@ replaced, and the replaced corpus was checked against the source copy before it
 was committed. A rule change here must keep the corpus green or say in its pull
 request why a recorded answer changes.
 
-The port differs on purpose in three ways, and the replay checks each recorded
+The port differs on purpose in four ways, and the replay checks each recorded
 answer that changes for its reason. The source's repository is private, so its
 comments carry no author association: the replay gives them `OWNER` and
 unedited. A read shorter than 40 hex, and a lens comment edited after posting,
 read nothing here (54 recorded answers). The source's `full_sha`, which matched
-a short read to the pull request's commits, is gone.
+a short read to the pull request's commits, is gone. A hidden (minimized) lens
+comment reads nothing: the source never read `isMinimized`, and no recorded
+call has it, so no recorded answer changes for it.
 
 `pr_queue.py` is a port of the same project's queue, and `pr_queue.test.py`
 holds that project's queue tests with the port's names. What the port changed:
@@ -317,7 +339,12 @@ queue's own advice in a comment keeps its backticks and `<sha>` placeholder
 required check that never reported, the comment says to push or merge the
 base; the source said to re-run, which cannot add a check the head's workflow
 files do not have. With two red checks the comment names the first by name
-(the source named whichever the check list gave first).
+(the source named whichever the check list gave first). A red check is the
+newest run of its name whichever workflow ran it, and a red that a green re-run
+and then a cancelled run followed is not red (the source took the newest run
+per workflow, and counted any red before a cancel). An `UNKNOWN` merge state is
+listed again (the source passed it over at once), and a cancelled check waits
+while a workflow still runs on the head (the source called it stuck at once).
 
 The "base was red" rule is a port of a change proposed to the source queue,
 with its tests. What the port changed: the rule is off unless the config turns
