@@ -56,13 +56,16 @@ export type PaceVerdict = "ahead" | "onPace" | "behind" | "unknown";
 export type PaceUnknownReason =
   /** The instance is not configured (any more). */
   | "noInstance"
-  /** Confirmed: the instance reports no usage limits, or a read that worked found none. */
+  /**
+   * Confirmed: the instance reports no usage limits, or a read that worked found none and no
+   * window was seen in the recent history.
+   */
   | "noLimits"
   /** Not known: no usage was read yet, or the read failed with nothing known before. */
   | "noReading"
   /** Its history file exists but cannot be read. */
   | "historyUnreadable"
-  /** Seen in the recent history, absent now, and no full read since confirmed it gone. */
+  /** Seen in the recent history, absent now, and no non-empty full read since confirmed it gone. */
   | "missing"
   /** Its value was last confirmed longer ago than the stale bound. */
   | "stale"
@@ -197,6 +200,12 @@ function startedAgain(previous: ServerProviderUsageWindow, next: ServerProviderU
 /** A reading that read every window it carries (see `UsageReading.full`). */
 const isFull = (reading: UsageReading) =>
   reading.full === true && reading.unavailable === undefined;
+
+/**
+ * A full read that returned windows proves the ones it lacks are gone. A full read with no windows
+ * proves nothing (an API shape the builders do not know reads as empty), so it drops nothing.
+ */
+const confirmsGone = (reading: UsageReading) => isFull(reading) && reading.windows.length > 0;
 
 /**
  * Walks a series per window id. A full read confirms every window it returned, moved or not. Else a
@@ -457,9 +466,10 @@ export function paceInstance(input: PaceInput): InstancePace {
   }
   for (const [id, track] of tracks) {
     if (newestIds.includes(id)) continue;
-    // A full read after its last sighting confirmed it gone (e.g. extra usage turned off). A
-    // window missing because reads failed or were partial stays unknown: never free.
-    if (series.slice(track.lastIndex + 1).some(isFull)) continue;
+    // A non-empty full read after its last sighting confirmed it gone (e.g. extra usage turned
+    // off). A window missing because reads failed, were partial or came back empty stays
+    // unknown: never free.
+    if (series.slice(track.lastIndex + 1).some(confirmsGone)) continue;
     windows.push(unknownWindow(track.last, "missing", { resetDetectedAt: track.resetAt }));
   }
   return { ...base, ...instanceVerdict(windows, newest), checkedAt: newest.checkedAt, windows };

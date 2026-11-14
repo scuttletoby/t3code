@@ -286,6 +286,12 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       yield* history.record([checked(at(6 * MINUTE), limits(at(6 * MINUTE), 44))]);
       // Full after full with nothing moved adds only time: left to the heartbeat.
       yield* history.record([checked(at(7 * MINUTE), limits(at(7 * MINUTE), 44))]);
+      // A streamed update is recorded (partial); a smaller streamed move after it is not.
+      yield* history.record([checked(at(7 * MINUTE), limits(at(8 * MINUTE), 45))]);
+      yield* history.record([checked(at(7 * MINUTE), limits(at(9 * MINUTE), 45.05))]);
+      // Then a provider check that failed and kept those published limits: only the provider
+      // stamp moved. Not full, so it neither confirms every window nor gets recorded.
+      yield* history.record([checked(at(10 * MINUTE), limits(at(9 * MINUTE), 45.05))]);
 
       const served = yield* history.readings(INSTANCE);
       assert.deepStrictEqual(
@@ -297,6 +303,7 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
           [at(4 * MINUTE), false],
           [at(5 * MINUTE), false],
           [at(6 * MINUTE), true],
+          [at(8 * MINUTE), false],
         ],
       );
     }),

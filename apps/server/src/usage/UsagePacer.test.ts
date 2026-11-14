@@ -436,6 +436,38 @@ describe("UsagePacer guards", () => {
     assert.strictEqual(windowOf(failed, "five_hour").unknownReason, "missing");
   });
 
+  it("a full read with no windows drops nothing: known windows stay unknown, never free", () => {
+    // Claude's rate_limits with null five_hour/seven_day, or a Codex snapshot of another limit id:
+    // the read worked but found no windows. That proves nothing gone (the weekly may sit at 95).
+    const history = [
+      reading(-20 * MINUTE, [weekly(95), session(20)], { full: true }),
+      reading(-10 * MINUTE, [], { full: true }),
+    ];
+    const empty = pace(history, provider(-10 * MINUTE, []));
+    assert.strictEqual(empty.verdict, "unknown");
+    assert.strictEqual(empty.unknownReason, "missing");
+    assert.strictEqual(windowOf(empty, "seven_day").unknownReason, "missing");
+    assert.strictEqual(windowOf(empty, "five_hour").unknownReason, "missing");
+    // Not yet recorded (only live): the same.
+    const live = pace(history.slice(0, 1), provider(-10 * MINUTE, []));
+    assert.strictEqual(live.unknownReason, "missing");
+    // A non-empty full read after the empty one still drops what it lacks (M3).
+    const after = pace(
+      [...history, reading(-5 * MINUTE, [weekly(41)], { full: true })],
+      provider(-5 * MINUTE, [weekly(41)]),
+    );
+    assert.deepStrictEqual(
+      after.windows.map((window) => window.id),
+      ["seven_day"],
+    );
+    assert.strictEqual(after.verdict, "behind");
+    // With no window known in the lookback, an empty read that worked is still no limits.
+    assert.strictEqual(
+      pace([reading(-10 * MINUTE, [], { full: true })], provider(-10 * MINUTE, [])).unknownReason,
+      "noLimits",
+    );
+  });
+
   it("a live snapshot stamped before the history's newest reading is never paced alone", () => {
     // The clock stepped back by a second: the live reading is not recorded until it passes.
     const history = [

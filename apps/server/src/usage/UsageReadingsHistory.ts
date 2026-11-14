@@ -670,6 +670,8 @@ export const layer = Layer.effect(
     const path = yield* Path.Path;
     const registry = yield* ProviderRegistry;
     const history = yield* make({ directory: path.join(config.stateDir, HISTORY_DIRECTORY) });
+    // Known gap (low impact): a snapshot published between `getProviders` and the subscription is
+    // not seen, so a later probe may count as full once; the next read corrects it.
     yield* forkParked(
       history.compact.pipe(
         Effect.andThen(registry.getProviders),
