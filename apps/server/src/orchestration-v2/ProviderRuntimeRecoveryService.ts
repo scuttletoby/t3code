@@ -3,6 +3,7 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   CommandId,
   isProviderNativeSubagentThread,
+  type RunId,
   type OrchestrationV2DomainEvent,
   type ProviderThreadId,
   type RunAttemptId,
@@ -18,6 +19,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -31,6 +33,12 @@ import {
   restartStopRequested,
 } from "./RestartContinuation.ts";
 import { isBufferedProviderNotification } from "./NotificationMailbox.ts";
+import {
+  takeRunsHeldForUpdate,
+  WorkAdmission,
+  type HeldForUpdate,
+  type HeldPreparation,
+} from "../workAdmission.ts";
 import { queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import {
   endOrphanedNativeSubagent,
@@ -196,6 +204,8 @@ export const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
+  const admission = yield* WorkAdmission;
+  yield* admission.register("recovery");
   type RecoverySession = ProjectionStore.ProjectionRuntimeRecoveryState["providerSessions"][number];
   /** Shared sessions stop on their first recovered thread; later threads still decide wakes from pre-recovery liveness. */
   const sessionsLiveAtStart = (
@@ -275,6 +285,7 @@ export const make = Effect.gen(function* () {
       trigger: "startup" | "shutdown",
       continueAfterRestart: boolean,
       stoppedThisPass: ReadonlyMap<string, RecoverySession> = new Map(),
+      heldForUpdate: HeldForUpdate | undefined = undefined,
     ) {
       const now = yield* DateTime.now;
       const projection = yield* rewindUnacceptedRuns(stored);
@@ -429,6 +440,15 @@ export const make = Effect.gen(function* () {
       const bufferedMessageIds = new Set(
         queuedMessages.filter(isBufferedProviderNotification).map((message) => message.id),
       );
+      // Fork: runs held for an automatic update leave the lists here, so nothing below (held
+      // queue, restart resend, cancel) touches them; they start once the update commits.
+      const heldRunsForUpdate = takeRunsHeldForUpdate(heldForUpdate, {
+        stored: stored.runs,
+        runs,
+        unstartedRuns,
+        queuedRuns,
+        bufferedMessageIds,
+      });
       const retryableMessageIds = new Set(
         queuedMessages
           .filter(
@@ -1095,14 +1115,80 @@ export const make = Effect.gen(function* () {
         retiredEffects,
         cancelledEffectIds,
         resends,
+        heldForUpdate: heldRunsForUpdate,
       };
     },
   );
+
+  /** Work the last startup kept for an automatic update, one entry per thread. */
+  interface HeldThreadWork {
+    readonly threadId: ThreadId;
+    readonly runIds: ReadonlyArray<RunId>;
+    readonly starts: ReadonlyArray<RunId>;
+    readonly preparations: ReadonlyArray<HeldPreparation>;
+  }
+  const heldWork = yield* Ref.make<ReadonlyArray<HeldThreadWork> | undefined>(undefined);
+
+  /** Starts the kept work once the update is committed: new start effects (process loss cancelled
+   * the old ones) and held preparations again. Runs are saved as started before their start is
+   * written, so nothing starts twice; a failure keeps the marker so the rest starts later. */
+  const startHeldWork = Effect.gen(function* () {
+    const kept = yield* Ref.get(heldWork);
+    // Startup recovery did not finish: whatever it kept is decided by the next startup.
+    if (kept === undefined) return;
+    let starts = 0;
+    let preparations = 0;
+    for (const thread of kept) {
+      yield* admission.recordHeldRunsStarted(thread.runIds);
+      yield* Ref.update(heldWork, (current) => current?.filter((entry) => entry !== thread));
+      const now = DateTime.formatIso(yield* DateTime.now);
+      for (const runId of thread.starts) {
+        const commandId = CommandId.make(`command:update-hold:start:${runId}:${now}`);
+        yield* eventSink.writeWithEffects({
+          commandId,
+          events: [],
+          effects: [
+            {
+              id: `effect:${commandId}:provider-turn.start:${runId}`,
+              commandId,
+              threadId: thread.threadId,
+              request: { type: "provider-turn.start", runId },
+            },
+          ],
+        });
+        starts += 1;
+      }
+      for (const preparation of thread.preparations) {
+        yield* admission.resumePreparation(preparation);
+        preparations += 1;
+      }
+    }
+    yield* admission.finishHeldWork;
+    if (starts > 0 || preparations > 0) {
+      yield* Effect.logInfo("Started work that waited for the automatic update", {
+        starts,
+        worktreePreparations: preparations,
+      });
+    }
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logError(
+            "Work that waited for the automatic update did not all start; the rest starts on the next startup.",
+            { cause },
+          ),
+    ),
+    Effect.withSpan("ProviderRuntimeRecoveryService.startHeldWork"),
+  );
+  yield* admission.setHeldWorkStarter(startHeldWork);
 
   const reconcile = Effect.fn("ProviderRuntimeRecoveryService.reconcile")(function* (
     trigger: "startup" | "shutdown",
   ) {
     const continueAfterRestart = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
+    const heldForUpdate = yield* admission.heldForUpdate;
+    const keptWork: Array<HeldThreadWork> = [];
     const threadIds = yield* projections
       .getRecoveryThreadIds("runtime")
       .pipe(
@@ -1137,7 +1223,33 @@ export const make = Effect.gen(function* () {
             continueAfterRestart !== null &&
             resolveProjectSettings(continueAfterRestart, projection.thread.projectId).settings
               .continueThreadsAfterServerUpdate;
-          const result = yield* reconcileProjection(projection, trigger, enabled, stoppedThisPass);
+          const result = yield* reconcileProjection(
+            projection,
+            trigger,
+            enabled,
+            stoppedThisPass,
+            heldForUpdate,
+          );
+          if (result.heldForUpdate.length > 0) {
+            keptWork.push({
+              threadId,
+              runIds: result.heldForUpdate.map((held) => held.runId),
+              starts: result.heldForUpdate.flatMap((held) =>
+                held.resume === "start" ? [held.runId] : [],
+              ),
+              preparations: result.heldForUpdate.flatMap((held) =>
+                held.resume === "prepare"
+                  ? [
+                      {
+                        commandId: CommandId.make(`command:update-hold:prepare:${held.runId}`),
+                        threadId,
+                        runId: held.runId,
+                      },
+                    ]
+                  : [],
+              ),
+            });
+          }
           for (const session of projection.providerSessions) {
             if (session.status !== "stopped" && session.status !== "error") {
               stoppedThisPass.set(session.id, session);
@@ -1176,6 +1288,22 @@ export const make = Effect.gen(function* () {
             (cause) => new ProviderRuntimeRecoveryError({ operation: "reconcile", cause }),
           ),
         );
+    }
+    if (trigger === "startup") {
+      // Saved before the update commits: a failed update restores the database this startup
+      // read, so the version that runs next finds the same runs, and later startups after a
+      // commit consider only these.
+      if (heldForUpdate !== undefined) {
+        yield* admission.recordHeldRuns(keptWork.flatMap((thread) => thread.runIds)).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Could not save which runs the update held.", {
+              reason: error.reason,
+            }),
+          ),
+        );
+      }
+      // Started by startup once the update is committed (see `startHeldWork`).
+      yield* Ref.set(heldWork, keptWork);
     }
     return {
       terminalizedRuns,
