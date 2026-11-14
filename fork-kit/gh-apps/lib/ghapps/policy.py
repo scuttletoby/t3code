@@ -10,7 +10,7 @@ Flag specs, one word each: `[s/]long` plus a kind:
   `:field` key=value where `key=@file` reads a file (only `@-` passes; the wrapper turns a path into stdin)
   `:repo` must be the app's repository      `!reason` always refused
 """
-import re
+import json, re
 
 from .common import Refused, norm_repo
 
@@ -119,8 +119,9 @@ TABLE = {cmd: _parse_spec(f'{spec} help' + ('' if cmd in NO_REPO_FLAG else ' R/r
 
 
 class Parsed:
-    def __init__(self, family, flags, positionals, files, stdin_uses):
+    def __init__(self, family, flags, positionals, files, stdin_uses, repo=None):
         self.family = family            # 'pr view', 'api', ...
+        self.repo = repo                # the app's repository: what gh puts in for {owner} and {repo}
         self.flags = flags              # [(long name, value or None)]
         self.positionals = positionals
         self.files = files              # [(index in args, prefix, path)] file values that are not '-'
@@ -224,21 +225,160 @@ def parse(args, repo, mode):
         i += 1
     if stdin_uses > 1:
         raise Refused('only one flag may read a file or stdin per gh-as call')
-    return Parsed(family, flags, positionals, files, stdin_uses)
+    return Parsed(family, flags, positionals, files, stdin_uses, repo)
 
 
 # ---------- the guard: refused even when the app's permissions would allow it
+#
+# The guard checks text that gh and GitHub read again later (gh drops a '#...' part, GitHub decodes '%xx' and JSON
+# '\uXXXX'). So it first brings that text into one plain form and REFUSES anything else, then checks the plain form.
 
-DISABLE_RE = re.compile(r'(?:^|/)actions/workflows/[^/]+/disable/?$', re.I)
+DISABLE_RE = re.compile(r'(?:^|/)actions/workflows/[^/]+/disable$', re.I)
 PERMISSIONS_RE = re.compile(r'(?:^|/)actions/permissions(?:/|$)', re.I)
-REPO_PERMISSIONS_RE = re.compile(r'^repos/[^/]+/[^/]+/actions/permissions/?$', re.I)
+REPO_PERMISSIONS_RE = re.compile(r'^repos/[^/]+/[^/]+/actions/permissions$', re.I)
 OWNER_WORK_RE = re.compile(r'(?:^|/)(?:rulesets|protection|environments|secrets|hooks|keys|collaborators|'
                            r'invitations|transfer|interaction-limits|actions/runners|actions/variables)(?:/|$)', re.I)
-BARE_REPO_RE = re.compile(r'^repos/[^/]+/[^/]+/?$', re.I)
-GRAPHQL_OWNER_RE = re.compile(r'mutation[\s\S]*(?:branchprotection|ruleset|environment|deleterepository|'
-                              r'updaterepository|archiverepository|transferrepository|deploykey|'
-                              r'repositorycollaborator|updatenotification)', re.I)
+BARE_REPO_RE = re.compile(r'^repos/[^/]+/[^/]+$', re.I)
 READ_METHODS = {'GET', 'HEAD'}
+SEGMENT_RE = re.compile(r'[A-Za-z0-9._~+@:-]+')   # (fullmatch: '$' passes a last newline) no %, #, ?, \, space
+QUERY_RE = re.compile(r'[A-Za-z0-9._~+@:%=&,/*()!$\'-]*')   # a query string after ? (reads only)
+PLACEHOLDER_RE = re.compile(r'\{(owner|repo|branch)\}')
+HEADER_NAMES = {'accept', 'x-github-api-version', 'graphql-features', 'if-none-match', 'if-modified-since'}
+GRAPHQL_KEYS = {'query', 'variables', 'operationName'}
+
+
+def _fill(text, repo, what):
+    """gh's own {owner}/{repo} filling (GH_REPO is the app's repository); {branch} needs git, which gh-as has not."""
+    owner, _, name = (repo or '/').partition('/')
+
+    def sub(m):
+        if m.group(1) == 'branch' or not repo:
+            raise Refused(f'{what}: {{branch}} is refused (gh-as runs gh outside any git folder); name the branch')
+        return owner if m.group(1) == 'owner' else name
+    return PLACEHOLDER_RE.sub(sub, text)
+
+
+def endpoint_parts(raw, repo):
+    """(path, query) in plain form: placeholders filled as gh fills them, one leading '/' dropped. Refused: '#',
+    '%', '\\', spaces or control characters, non-ASCII, empty segments ('//', a trailing '/'), '.' or '..'
+    segments, and any '{' or '}' left over."""
+    text = _fill(raw, repo, f'endpoint {raw[:80]!r}')
+    path, q, query = text.partition('?')
+    if path.startswith('/'):
+        path = path[1:]
+    segments = path.split('/')
+    bad = [s for s in segments if s in ('', '.', '..') or not SEGMENT_RE.fullmatch(s)]
+    if bad or (q and not QUERY_RE.fullmatch(query)) or '#' in text:
+        raise Refused(f'endpoint {raw[:80]!r}: write the path plainly (letters, digits and ._~+@:- between single '
+                      'slashes; no %-escapes, #, spaces, empty, . or .. parts); gh-as checks it as written')
+    return path, (query if q else None)
+
+
+def _headers(parsed):
+    names = []
+    for h in parsed.values('--header'):
+        name, colon, _value = h.partition(':')
+        name = name.strip().lower()
+        if not colon or name not in HEADER_NAMES or not h.isprintable():
+            raise Refused(f'header {h[:60]!r}: gh-as allows only the headers {", ".join(sorted(HEADER_NAMES))}')
+        names.append(name)
+    return names
+
+
+# GraphQL: a small lexer (GraphQL spec, 2021), enough to know every name in the document. Strings and comments
+# are skipped as GitHub's parser skips them; anything the lexer does not know is refused.
+GQL_TOKEN = re.compile(r'''
+    (?P<skip>[\s,﻿]+ | \#[^\n\r]*)
+  | (?P<block>"""(?:\\"""|[^"]|"(?!""))*""")
+  | (?P<string>"(?:\\["\\/bfnrt]|\\u[0-9A-Fa-f]{4}|[^"\\\n\r])*")
+  | (?P<name>[_A-Za-z][_0-9A-Za-z]*)
+  | (?P<number>-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)
+  | (?P<punct>\.\.\.|[!$&()\:=@\[\]{|}])
+''', re.X)
+
+
+def graphql_names(doc):
+    names, i = [], 0
+    while i < len(doc):
+        m = GQL_TOKEN.match(doc, i)
+        if not m:
+            raise Refused(f'the GraphQL text cannot be read at {doc[i:i + 20]!r}: refused')
+        if m.lastgroup == 'name':
+            names.append(m.group())
+        i = m.end()
+    return names
+
+
+def check_graphql_text(doc):
+    """Only read operations ('query' or the short '{ ... }' form). Agents write through the gh commands on the
+    list, never through GraphQL mutations or subscriptions."""
+    if not isinstance(doc, str):
+        raise Refused('the GraphQL query must be text')
+    names = graphql_names(doc)
+    if not names:
+        raise Refused('an empty GraphQL query')
+    for n in names:
+        if n.lower() in ('mutation', 'subscription'):
+            raise Refused('gh api graphql: only queries (reads) pass gh-as; a GraphQL mutation or subscription is '
+                          'refused (use the gh command for it, e.g. gh pr comment)')
+
+
+def _strict_json(data):
+    def pairs(items):
+        keys = [k for k, _ in items]
+        if len(keys) != len(set(keys)):
+            raise Refused('the GraphQL body has a key twice: refused')
+        return dict(items)
+
+    def no_constant(word):
+        raise Refused(f'the GraphQL body has {word}: refused')
+    try:
+        text = data.decode('utf-8', 'strict')   # GitHub reads UTF-8; json.loads(bytes) would also guess UTF-16/32
+        if text.startswith('﻿'):
+            raise Refused('the GraphQL body starts with a byte order mark: refused')
+        obj = json.loads(text, object_pairs_hook=pairs, parse_constant=no_constant)
+        json.dumps(obj, ensure_ascii=False).encode('utf-8', 'strict')   # a lone \ud800 would not survive this
+    except (UnicodeError, ValueError, RecursionError):
+        raise Refused('the GraphQL body (--input) is not plain UTF-8 JSON: refused') from None
+    return obj
+
+
+def graphql_texts(parsed, stdin):
+    """Every query text GitHub will run, decoded the way GitHub decodes it."""
+    fields = [(f, v) for f, v in parsed.flags if f in ('--field', '--raw-field')]
+    if parsed.has('--input'):
+        if fields:
+            raise Refused('gh api graphql --input: other fields would go into the URL; put everything in the body')
+        if stdin is None:
+            raise Refused('a GraphQL call that reads stdin, which gh-as has not read first: refused')
+        body = _strict_json(stdin)
+        if not isinstance(body, dict) or not set(body) <= GRAPHQL_KEYS or not isinstance(body.get('query'), str):
+            raise Refused('the GraphQL body must be {"query": "...", "variables": {...}, "operationName": "..."}')
+        return [body['query']]
+    texts = []
+    for flag, value in fields:
+        key, eq, val = value.partition('=')
+        base = re.split(r'[\[\]]', key, maxsplit=1)[0]
+        if base in ('query', 'operationName') and key != base or not eq and base == 'query':
+            raise Refused(f'{flag} {key!r}: write the GraphQL query as query=TEXT')
+        if key != 'query':
+            continue
+        if flag == '--field':
+            if val.startswith('@'):
+                if stdin is None:
+                    raise Refused('a GraphQL call that reads stdin, which gh-as has not read first: refused')
+                try:
+                    val = stdin.decode('utf-8', 'strict')
+                except UnicodeError:
+                    raise Refused('the GraphQL query on stdin is not UTF-8: refused') from None
+            elif val in ('true', 'false', 'null') or re.fullmatch(r'[+-]?[0-9]+', val):
+                raise Refused('the GraphQL query must be text')
+            elif PLACEHOLDER_RE.search(val):
+                raise Refused('{owner}, {repo} or {branch} in a GraphQL query: use -f and a variable instead')
+        texts.append(val)
+    if len(texts) != 1:
+        raise Refused('gh api graphql needs exactly one query=... field (or a JSON body with --input)')
+    return texts
 
 
 def guard(parsed, stdin=None):
@@ -250,19 +390,28 @@ def guard(parsed, stdin=None):
                       'is fine)')
     if parsed.family != 'api':
         return
-    if not parsed.positionals:
-        raise Refused('gh api needs an endpoint')
-    endpoint = parsed.positionals[0].split('?', 1)[0].lstrip('/')
+    if len(parsed.positionals) != 1:
+        raise Refused('gh api needs exactly one endpoint')
+    path, query = endpoint_parts(parsed.positionals[0], parsed.repo)
+    # the rules below match each part without what follows its first dot, so 'rulesets.json' (a format suffix
+    # a router may drop) or 'graphql.json' count as 'rulesets' and 'graphql'
+    endpoint = '/'.join(s.split('.', 1)[0] or s for s in path.split('/'))
+    _headers(parsed)
     methods = [v.upper() for v in parsed.values('--method')]
-    headers = ' '.join(parsed.values('--header')).lower()
     body = parsed.has('--field') or parsed.has('--raw-field') or parsed.has('--input')
     method = methods[-1] if methods else ('POST' if body else 'GET')
-    if 'x-http-method-override' in headers:
-        method = 'OVERRIDE'
     if DISABLE_RE.search(endpoint):
         raise Refused('a call to .../actions/workflows/<id>/disable: agents do not turn workflows off')
+    if endpoint.lower() == 'graphql':
+        if path != 'graphql' or query is not None or method != 'POST':
+            raise Refused('gh api graphql: write it as `graphql`, POST, with no ?query')
+        for text in graphql_texts(parsed, stdin):
+            check_graphql_text(text)
+        return
     if method in READ_METHODS:
         return
+    if query is not None:
+        raise Refused(f'a {method} with a ?query in the endpoint: send the values as fields (-f, -F) instead')
     if PERMISSIONS_RE.search(endpoint):
         fields = dict(f.partition('=')[::2] for f in parsed.values('--field') + parsed.values('--raw-field'))
         reenable = (method == 'PUT' and REPO_PERMISSIONS_RE.match(endpoint) and not parsed.has('--input')
@@ -272,14 +421,5 @@ def guard(parsed, stdin=None):
             raise Refused(f'a {method} to .../actions/permissions: agents do not turn Actions off or limit it')
         return
     if OWNER_WORK_RE.search(endpoint) or BARE_REPO_RE.match(endpoint):
-        raise Refused(f'a {method} to {endpoint}: repository settings, rules, secrets, keys and members are owner '
+        raise Refused(f'a {method} to {path}: repository settings, rules, secrets, keys and members are owner '
                       'work')
-    if endpoint == 'graphql':
-        values = [v.partition('=')[2] for v in parsed.values('--field') + parsed.values('--raw-field')]
-        from_stdin = parsed.has('--input') or any(v.startswith('@') for v in values)
-        if from_stdin:
-            if stdin is None:
-                raise Refused('a GraphQL call that reads stdin, which gh-as has not read first: refused')
-            values.append(stdin.decode('utf-8', 'replace'))
-        if GRAPHQL_OWNER_RE.search(' '.join(values)):
-            raise Refused('a GraphQL mutation of repository settings, rules or members is owner work')

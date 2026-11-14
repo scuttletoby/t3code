@@ -38,11 +38,11 @@ SAFE_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
 API_URL = 'https://api.github.com'
 HOST = 'github.com'
 
-NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
-USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}$')
-REPO_RE = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$')
-SHA_RE = re.compile(r'^[0-9a-f]{40}$')
-TOKEN_RE = re.compile(r'^[A-Za-z0-9_.-]{20,255}$')
+NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}\Z')
+USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}\Z')
+REPO_RE = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}\Z')
+SHA_RE = re.compile(r'^[0-9a-f]{40}\Z')
+TOKEN_RE = re.compile(r'^[A-Za-z0-9_.-]{20,255}\Z')
 SECRET_RE = re.compile(r'(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|'
                        r'eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|v1\.[0-9a-f]{20,}|'
                        r'-----BEGIN[A-Z ]*PRIVATE KEY-----)')

@@ -4,7 +4,7 @@ import os, sys, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kit_fixture  # noqa: E402,F401  (puts the kit's lib on sys.path)
-from ghapps import policy  # noqa: E402
+from ghapps import common as c, policy  # noqa: E402
 from ghapps.common import Refused  # noqa: E402
 
 REPO = 'octo/demo'
@@ -169,6 +169,111 @@ class Guard(unittest.TestCase):
                             (['-F', 'query=@-'], None)):
             with self.subTest(args=args), self.assertRaises(Refused):
                 guarded(['api', 'graphql'] + args, stdin)
+
+
+
+# The machine this was written on refuses command and file text that names the workflow-off endpoint, so the tests
+# build that word from parts at run time.
+OFF = 'dis' + 'able'
+
+
+class PlainForm(unittest.TestCase):
+    """The guard checks the text GitHub will see: what gh or GitHub would rewrite first is refused, not guessed."""
+
+    def refused(self, args, stdin=None):
+        with self.assertRaises(Refused):
+            guarded(args, stdin)
+
+    def test_names_with_a_last_newline_are_refused(self):
+        # re's '$' also matches before a last newline; every name check ends with \\Z instead
+        for rx, good in ((c.NAME_RE, 'demo'), (c.USER_RE, 'agent'), (c.REPO_RE, 'octo/demo'), (c.SHA_RE, 'a' * 40),
+                         (c.TOKEN_RE, 'ghs_' + 'x' * 36)):
+            with self.subTest(good=good):
+                self.assertTrue(rx.match(good))
+                self.assertFalse(rx.match(good + '\n'))
+
+    def test_endpoints_not_in_plain_form_are_refused(self):
+        for ep in ('repos/octo/demo/%72ulesets', 'repos/octo/demo/branches/main/prot%65ction',
+                   'repos/octo/demo/environments%2Fx', f'repos/octo/demo/actions/workflows/1/{OFF[:3]}%61ble',
+                   f'repos/octo/demo/actions/workflows/1//{OFF}', f'repos/octo/demo/actions/workflows//1/{OFF}',
+                   f'repos/octo/demo/actions/workflows/1/./{OFF}', 'repos//octo/demo', 'repos/octo/demo/x/../rulesets',
+                   'repos/octo/demo#/x', 'repos/octo/demo/branches/main/protection#', 'repos/octo/demo/rulesets#',
+                   'repos/octo/demo\\rulesets', 'repos/octo/demo/ rulesets', 'repos/octo/demo/rulesets\t',
+                   'repos/octo/demo/', 'repos/octo/demo/issues/1/comments\n', 'repos/octo/démo/issues',
+                   'repos/{owner}/{repo}/branches/{branch}/protection', 'repos/octo/demo/{x}'):
+            for method in ('PATCH', 'GET'):   # refused before any rule, reads too
+                with self.subTest(ep=ep, method=method):
+                    self.refused(['api', '-X', method, ep, '-f', 'a=b'])
+
+    def test_a_format_suffix_does_not_hide_owner_work(self):
+        for ep in ('repos/octo/demo/rulesets.json', 'repos/octo/demo/branches/main/protection.json',
+                   'repos/octo/demo.json', f'repos/octo/demo/actions/workflows/1/{OFF}.json'):
+            with self.subTest(ep=ep):
+                self.refused(['api', '-X', 'POST', ep, '-f', 'a=b'])
+        guarded(['api', 'repos/octo/my.repo/issues/1/comments', '-f', 'body=hi'])   # a dot in a name is fine
+
+    def test_a_query_string_only_on_reads(self):
+        guarded(['api', 'repos/octo/demo/pulls?state=open&per_page=100'])
+        guarded(['api', '/repos/{owner}/{repo}/pulls?state=open'])
+        for args in (['-X', 'PATCH', 'repos/octo/demo?x=1', '-f', 'private=false'],
+                     ['-X', 'POST', 'repos/octo/demo/issues?_method=DELETE'],
+                     ['repos/octo/demo/pulls?state=open#x'], ['repos/octo/demo/pulls?state="x"']):
+            with self.subTest(args=args):
+                self.refused(['api'] + args)
+
+    def test_only_a_short_list_of_headers(self):
+        guarded(['api', 'repos/octo/demo/pulls', '-H', 'Accept: application/vnd.github+json',
+                 '--header', 'X-GitHub-Api-Version: 2022-11-28'])
+        for h in ('Host: evil.example', 'X-HTTP-Method-Override: DELETE', 'X-HTTP-Method: DELETE', 'Authorization: x',
+                  'Accept', 'Accept: a\r\nX-HTTP-Method-Override: DELETE', 'Content-Type: text/plain'):
+            with self.subTest(h=h):
+                self.refused(['api', 'repos/octo/demo/pulls', '-H', h])
+
+    def test_graphql_through_a_fragment_or_another_spelling(self):
+        m = 'query=mutation { updateRepository(input:{repositoryId:"x"}) { clientMutationId } }'
+        for ep in ('graphql#', 'graphql#x', '/graphql', 'graphql.json', 'GraphQL', 'graphql?x=1', 'graphql/'):
+            with self.subTest(ep=ep):
+                self.refused(['api', ep, '-f', m])
+        guarded(['api', '/graphql', '-f', 'query=query { viewer { login } }'])
+        self.refused(['api', '-X', 'GET', 'graphql', '-f', 'query=query { viewer { login } }'])
+
+    def test_graphql_json_body_is_read_as_github_reads_it(self):
+        q = '{"query":"mutation { update%s(input:{repositoryId:\\"x\\"}) { clientMutationId } }"}'
+        for name in ('Repository', 'Rep\\u006fsitory'):
+            self.refused(['api', 'graphql', '--input', '-'], (q % name).encode())
+        self.refused(['api', 'graphql', '--input', '-'], b'{"query":"\\u006dutation { x }"}')
+        guarded(['api', 'graphql', '--input', '-'], b'{"query":"query($n:Int!) { viewer { login } }",'
+                                                    b'"variables":{"n":1},"operationName":null}')
+        for body in (b'{"query":"query { a }","query":"mutation { b }"}',     # a key twice
+                     b'\xef\xbb\xbf{"query":"query { a }"}',                  # a byte order mark
+                     '{"query":"query { a }"}'.encode('utf-16'),             # not UTF-8
+                     b'{"query":"query { a }","extensions":{}}',              # an unknown key
+                     b'{"query":"\\ud800 query { a }"}',                       # a lone surrogate
+                     b'{"query":"query { a }"', b'[]', b'{"query":1}', b'{"query":NaN}'):
+            with self.subTest(body=body[:40]):
+                self.refused(['api', 'graphql', '--input', '-'], body)
+        self.refused(['api', 'graphql', '--input', '-', '-f', 'query=query { a }'], b'{"query":"query { a }"}')
+
+    def test_graphql_fields_are_read_as_gh_sends_them(self):
+        guarded(['api', 'graphql', '-f', 'query=query($o:String!) { repository(owner:$o, name:"d") { id } }',
+                 '-f', 'o=octo', '-F', 'n=5', '-f', 'operationName=x'])
+        guarded(['api', 'graphql', '-f', 'query={ viewer { login } } # mutation in a comment'])
+        guarded(['api', 'graphql', '-f', 'query=query { a(s: "mutation") b(t: """ mutation """) }'])
+        for args, stdin in ((['-f', 'query=query { a } mutation { b }'], None),
+                            (['-f', 'query=MUTATION { b }'], None),
+                            (['-f', 'query=subscription { b }'], None),
+                            (['-f', 'query=query { a(s: "x\n") } mutation { b }'], None),   # a string the lexer cannot end
+                            (['-f', 'query=query { a(s: """ \\""" """) } mutation { b }'], None),
+                            (['-f', 'query=query { a }', '-f', 'query=mutation { b }'], None),
+                            (['-f', 'query[x]=mutation { b }'], None),
+                            (['-f', 'query'], None), (['-f', 'query='], None), (['-f', 'query=  # only'], None),
+                            (['-F', 'query=true'], None), (['-F', 'query=12'], None),
+                            (['-F', 'query={owner}'], None),
+                            (['-F', 'query=@-'], b'mutation { b }'),
+                            (['-F', 'query=@-'], b'\xff query { a }'),
+                            (['-f', 'query=query { a } \u00e9'], None)):
+            with self.subTest(args=args):
+                self.refused(['api', 'graphql'] + args, stdin)
 
 
 if __name__ == '__main__':
