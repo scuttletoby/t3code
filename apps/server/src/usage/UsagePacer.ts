@@ -35,7 +35,7 @@ const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 /** The owner's reserve is released over a window's last this-many hours. */
-const RESERVE_RELEASE_MS = 12 * HOUR_MS;
+export const RESERVE_RELEASE_MS = 12 * HOUR_MS;
 /** Never trust a value confirmed longer ago than this (the history's heartbeat; 6 UI checks). */
 const STALE_FLOOR_MS = 30 * MINUTE_MS;
 /** A value confirmed this far ahead of the clock came from a clock that was ahead. */
