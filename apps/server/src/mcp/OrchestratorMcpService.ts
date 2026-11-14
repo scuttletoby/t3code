@@ -146,6 +146,7 @@ import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
+import * as SlotGate from "../slots/SlotGate.ts";
 
 // Return recoverable handles before common MCP client timeouts expire.
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
@@ -1370,6 +1371,8 @@ const make = Effect.gen(function* () {
   // Fork: read if the server runs one. Optional, so no test of this service has to provide it;
   // server.ts refuses to compile without it.
   const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
+  // Fork: the agent slot gate, the same way; server.ts asks for it beside /mcp.
+  const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -1852,6 +1855,31 @@ const make = Effect.gen(function* () {
       supportedRuntimeModes: provider.supportedRuntimeModes,
     };
   });
+
+  /**
+   * Fork: the agent slot gate, or `null` (no slot held) on a server without it. The slot is taken
+   * uninterruptibly and released when the call's scope closes, on every exit (failure, defect, a
+   * cancelled call); `releaseSlot` ends it sooner, once the dispatch is done.
+   */
+  const acquireSlot = (callerThreadId: ThreadId, targetInstanceId: ModelSelection["instanceId"]) =>
+    Option.isNone(slotGate)
+      ? Effect.succeed(null)
+      : Effect.acquireRelease(
+          slotGate.value
+            .acquire({ callerThreadId, targetInstanceId })
+            .pipe(
+              Effect.flatMap((outcome) =>
+                outcome.type === "refuse"
+                  ? Effect.fail(failure("slots_full", outcome.message))
+                  : Effect.succeed(outcome.token),
+              ),
+            ),
+          (token) => slotGate.value.release(token),
+        );
+  const releaseSlot = (token: SlotGate.SlotToken | null) =>
+    Option.isNone(slotGate) ? Effect.void : slotGate.value.release(token);
+  const startedSlot = (token: SlotGate.SlotToken | null, childThreadId: ThreadId) =>
+    Option.isNone(slotGate) ? Effect.void : slotGate.value.started(token, childThreadId);
 
   /**
    * Fork: the usage pacing gate (`usagePacingGate` setting, off by default) on a task an agent
@@ -3149,6 +3177,12 @@ const make = Effect.gen(function* () {
         };
       }
       const parentNodeId = parentRun.rootNodeId;
+      // Fork: the agent slot gate (`agentSlots`, off by default) on the final target, last before
+      // the dispatch. It holds the slot until the dispatch and the child's run preparation end; the
+      // call's scope releases it on any other exit. A retry starts no new agent.
+      const slotToken = isRetryOfAcceptedDelegation
+        ? null
+        : yield* acquireSlot(scope.thread.threadId, target.modelSelection.instanceId);
       // The command commits the child's preparing run, which only this call
       // prepares, so a caller that goes away must not stop it in between.
       return yield* Effect.uninterruptibleMask((restore) =>
@@ -3199,6 +3233,7 @@ const make = Effect.gen(function* () {
           }
           const taskId = taskEvent.event.payload.id;
           const childThreadId = taskEvent.event.payload.childThreadId;
+          if (childThreadId !== null) yield* startedSlot(slotToken, childThreadId);
           const childRunEvent = result.storedEvents.find(
             (stored) =>
               stored.event.type === "run.created" && stored.event.threadId === childThreadId,
@@ -3214,13 +3249,15 @@ const make = Effect.gen(function* () {
               runId: childRunEvent.event.payload.id,
             });
           }
+          // Fork: the dispatch is done; a named child keeps counting until its run shows.
+          yield* releaseSlot(slotToken);
           const task = yield* input.mode === "wait"
             ? awaitTask(scope, taskId, key, input.timeoutMs, restore)
             : restore(readTask(scope, taskId, false, true));
           return usagePacingNote === undefined ? task : { ...task, usagePacingNote };
         }),
       );
-    }),
+    }, Effect.scoped), // Fork: the agent slot gate's finalizer (a call that stops half-way).
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");
       return yield* readTask(scope, taskId, false, true);
