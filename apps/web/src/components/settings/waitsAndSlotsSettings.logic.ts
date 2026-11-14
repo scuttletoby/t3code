@@ -87,7 +87,8 @@ export const WAIT_FOR_NUMBER_FIELDS: ReadonlyArray<NumberFieldSpec<NumberKey<Wai
   {
     key: "errorGraceSeconds",
     title: "Give up after errors",
-    description: "A wait whose source fails this long without one good read ends with an error.",
+    description:
+      "A wait whose source fails this long without one good read ends with an error. When its thread is woken anyway, a wait failing for half this long ends in the same message.",
     unit: "seconds",
     min: 0,
     step: 60,

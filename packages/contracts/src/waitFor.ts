@@ -44,7 +44,10 @@ export const WaitForSettings = Schema.Struct({
   prSweepSeconds: positiveIntDefault(120),
   /** A head with no checks at all is reported as `no_checks` after this long. */
   noChecksGraceSeconds: nonNegativeIntDefault(900),
-  /** A wait whose source fails this long without one good read ends as `check_error`. */
+  /**
+   * A wait whose source fails this long without one good read ends as `check_error`. When its thread is
+   * woken anyway, a wait failing for half this long ends in the same message (one wake, all bad news).
+   */
   errorGraceSeconds: nonNegativeIntDefault(900),
   /**
    * When a source fails for many threads at once, at most this many threads are woken with
