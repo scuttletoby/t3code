@@ -140,11 +140,8 @@ another passing job with the required check's name. GitHub's "require
 workflows to pass" ruleset rule would close that, but it is for organizations
 on paid plans only, not for user-owned repositories. Until there is a better
 way, a person reads every pull request that changes `.github/workflows/` or
-this action's files. The real fix is future work: a `pull_request_target` job
-that runs code pinned on the base branch, posts its result through a separate
-GitHub App (its key in an environment only the base branch can use), and a
-required check bound to that App as its only allowed source. Tracked in
-[issue 34](https://github.com/scuttletoby/t3code/issues/34).
+this action's files. The gate below closes that: the same rules, run from the
+default branch and posted by an App that only the default branch can use.
 
 ### Inputs
 
@@ -185,9 +182,86 @@ but missing).
 | 1    | Fail, also when GitHub or the checkout cannot say.                               |
 | 2    | Refused to start (config, arguments, git or checkout); read nothing from GitHub. |
 
+## The gate
+
+The same check as a gate no pull request can rewrite: the reusable workflow
+[`.github/workflows/fork-head-gate.yml`](../../../.github/workflows/fork-head-gate.yml)
+(script `head_gate.py`). Use it instead of the action when the check must be
+trusted, not only helpful ([issue 34](https://github.com/scuttletoby/t3code/issues/34)).
+
+How it works:
+
+- A caller on the default branch ([`gate-caller.example.yml`](gate-caller.example.yml))
+  runs on `pull_request_target`, `issue_comment` and `workflow_dispatch`.
+  GitHub always takes that file from the default branch, so a pull request
+  that edits it changes nothing for its own run.
+- The gate's code comes from the workflow's own pinned release commit, never
+  from the caller's tree. Nothing of the pull request is checked out: the
+  head and the base tip are read from the API and fetched by sha into a new
+  bare repository, and `head_check.decide` (the same rule code as the action,
+  in bare mode) judges them. The config is read from the base tip.
+- The guard job (no Environment) refuses unless the App key can only be the
+  Environment's: no repository or organisation secret of its name, the
+  Environment exists, and its deployment branches are exactly one rule, the
+  default branch. The gate job checks the Environment again right before the
+  token is made.
+- Only the gate job's last two steps touch the key: one makes a token of the
+  gate App (checks write, this repository), the other posts one completed
+  check run on the head it judged. The ruleset requires the check from that
+  App alone, so a job of a pull request's own workflow with the same name does
+  not count.
+- A dispatch without a pull request number judges every open pull request
+  (the backfill, at most 256; more is refused).
+
+Setup (the repository owner's steps; nothing here creates them):
+
+1. Create a GitHub App with one permission, Checks: read and write, and no
+   webhook. Make a private key.
+2. Install it on the repository only.
+3. Create an Environment (default name `head-gate`) whose deployment branches
+   are one rule: the default branch. Add the variable `HEAD_GATE_APP_ID` and
+   the secret `HEAD_GATE_APP_KEY`. Keep no repository or organisation secret of
+   that name: the guard refuses one.
+4. Copy the example caller to `.github/workflows/` on the default branch, fill
+   in the check name, config path and required lenses, and pin the release.
+5. Dispatch it once without a number (the backfill), so open pull requests get
+   the check under its name.
+6. Bind the required check to the App: in a ruleset, the required status
+   check's `integration_id` is the App's id; in classic branch protection, its
+   `app_id`. The gate warns (never fails) when the base branch does not bind it.
+7. Set the queue config's `head_check_app` to the App's id
+   ([pr-queue](../pr-queue/README.md)), so the queue counts only that App's
+   check runs. Release the code first, then bump the pins, then add the key:
+   an older queue refuses a key it does not know.
+
+**Run again after a review.** Reviews and inline diff comments
+(`pull_request_review`, `pull_request_review_comment`) do not start the gate:
+`pull_request_target` has no such types. After a lens posts as a review or on
+a line of the diff, post an issue comment on the pull request or dispatch the
+gate with its number. A new push, a draft change, a base change and any issue
+comment start it anyway.
+
+**Runs again, stops half-way, old state.** Each run judges what GitHub says
+now and posts one new check run; the newest check run of that name from the
+App is the one that counts. A run stopped before the post leaves nothing;
+the post is the only write. If the head moves while a run works, that run
+posts a failure on the old head ("a newer head has its own run") and the new
+head gets its own run. A rotated or deleted key makes no token: the job fails
+and nothing is posted, so the required check stays missing or red.
+
+**What it does not stop.** Anyone who can change the default branch (or the
+Environment, the App or the ruleset) can change the gate. A lens comment is
+still only as good as the people allowed to post it (the config's
+`lens_author_associations`). And the gate judges the comments that exist when
+it runs: until it runs again after a review, the check shows the older answer.
+
 ## Tests
 
 `python3 fork-ci/actions/head-check/head_check.test.py`: real commits (a
 local bare repository stands in for GitHub, the checkout is a merge commit as
 GitHub makes it) and a fake `gh`; it fails the run if anything starts the real
 `gh`.
+`python3 fork-ci/actions/head-check/head_gate.test.py`: the gate's steps with
+a fake `gh`, and its judge on the same real commits in bare mode. The workflow
+itself: `.github/scripts/fork-head-gate-workflow.test.py` and the head-gate
+section of `.github/scripts/fork-contracts.test.py`.

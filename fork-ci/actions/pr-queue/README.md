@@ -42,6 +42,7 @@ an error: the queue then exits non-zero and touches no pull request.
 | `poll_seconds`             | no       | How often to look meanwhile (default 5).                                                                                                                                                                                                                                                       |
 | `list_limit`               | no       | How many open pull requests to read (default 50).                                                                                                                                                                                                                                              |
 | `update_when_base_was_red` | no       | `true` updates a behind pull request whose required checks failed only because the base commit they tested failed them too (section "The base was red"). Set it only when the job of every required check runs the `tested-base` action. Default `false`.                                      |
+| `head_check_app`           | no       | The id of the GitHub App that alone posts `head_check` (the head gate, `../head-check/README.md`, "The gate"). The queue then counts only that App's newest check run of that name and ignores a job or commit status of the same name from anyone else; it skips a pull request whose gate check it cannot read. Add it only after every queue that reads this config runs a release that knows it: an older release refuses an unknown key. |
 
 ## Lens comments
 

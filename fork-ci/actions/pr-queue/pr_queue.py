@@ -33,7 +33,7 @@ Exit codes: 0 done; 1 a step failed, the next run tries again; 2 refused to star
 and no comment says so yet (STATE stays, the next run finishes it).
     pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 """
-import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, time
+import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, time, urllib.parse
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -412,6 +412,32 @@ class Queue:
     def failing(self, pr):
         return next(iter(sorted(self.red_checks(pr))), None)
 
+    def gate_rollup(self, rollup, head, n):
+        """The rollup with only the gate App's runs of head_check (config head_check_app), or None when they could not
+        be read (printed). GitHub's rollup names no App, so a job or a commit status of that name from anyone else
+        would count by name: every head_check item is dropped and the App's newest run, read by app id, put in its
+        place. Without the key the rollup is returned as it is."""
+        app, name = self.cfg.head_check_app, self.cfg.head_check
+        if not app:
+            return rollup
+        if not SHA.fullmatch(head or ''):
+            print(f'#{n}: no head to read the {name} check of')
+            return None
+        q = urllib.parse.urlencode({'check_name': name, 'app_id': app, 'filter': 'latest', 'per_page': 100})
+        r = self.gh('api', f'repos/{self.repo}/commits/{head}/check-runs?{q}')
+        try:
+            runs = json.loads(r.stdout)['check_runs'] if r.returncode == 0 else None
+            if not isinstance(runs, list) or not all(isinstance(c, dict) for c in runs):
+                raise TypeError
+        except (ValueError, KeyError, TypeError):
+            print(f'#{n}: reading the {name} check of App {app} failed: {r.stderr.strip()[:200] or "no check_runs"}')
+            return None
+        mine = [{'__typename': 'CheckRun', 'name': name, 'status': (c.get('status') or '').upper(),
+                 'conclusion': (c.get('conclusion') or '').upper() or None, 'startedAt': c.get('started_at'),
+                 'workflowName': ''} for c in runs
+                if c.get('name') == name and (c.get('app') or {}).get('id') == app]
+        return [c for c in rollup or [] if (c.get('name') or c.get('context')) != name] + mine
+
     def required_now(self, rollup):
         """lens.check_state of each required check's newest run, by name: the ruleset takes the newest run of a name,
         whichever workflow ran it."""
@@ -551,7 +577,7 @@ class Queue:
         owner, name = self.repo.split('/')
         q = ('query($owner:String!,$name:String!,$expr:String!){repository(owner:$owner,name:$name){object(expression:'
              '$expr){... on Commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename '
-             '... on CheckRun{name status conclusion startedAt checkSuite{workflowRun{workflow{name}}}} '
+             '... on CheckRun{name status conclusion startedAt checkSuite{app{databaseId} workflowRun{workflow{name}}}} '
              '... on StatusContext{context state}}}}}}}}')
         r = self.gh('api', 'graphql', '-f', f'query={q}', '-f', f'owner={owner}', '-f', f'name={name}',
                     '-f', f'expr={expr}')
@@ -568,6 +594,10 @@ class Queue:
             else:
                 rollup = [{**x, 'workflowName': (((x.get('checkSuite') or {}).get('workflowRun') or {}).get('workflow')
                                                  or {}).get('name') or ''} for x in contexts.get('nodes') or []]
+                if self.cfg.head_check_app:   # only the gate App's runs of head_check count (gate_rollup)
+                    rollup = [x for x in rollup if (x.get('name') or x.get('context')) != self.cfg.head_check
+                              or (x.get('__typename') == 'CheckRun' and ((x.get('checkSuite') or {}).get('app')
+                                                                         or {}).get('databaseId') == self.cfg.head_check_app)]
                 out = (commit['oid'], self.required_now(rollup))
         except (ValueError, KeyError, TypeError, AttributeError):
             print(f'the checks of {expr[:40]}: GitHub gave no commit')
@@ -910,6 +940,11 @@ class Queue:
             if p.get('isDraft') or not p.get('autoMergeRequest'):
                 continue
             head = p.get('headRefOid') or ''
+            rollup = self.gate_rollup(p.get('statusCheckRollup'), head.lower(), n)
+            if rollup is None:
+                print(f'skip #{n}: its {self.cfg.head_check} check from the gate App is unknown (see above)')
+                continue
+            p = {**p, 'statusCheckRollup': rollup}
             if p.get('mergeStateStatus') == 'DIRTY':   # before its checks: only a push ends a conflict, and a red
                 base = p.get('baseRefName') or ''      # check of this head goes with the head
                 base = base if re.fullmatch(r'[\w./-]+', base) else 'its base'

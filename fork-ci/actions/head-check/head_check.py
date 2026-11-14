@@ -26,6 +26,10 @@ commit into the job's own checkout aside) and posts nothing: a re-run on the sam
 run stopped half-way leaves nothing behind.
 Exit codes: 0 pass, 1 fail, 2 refused to start (every reason printed at once).
     head_check.py --repo OWNER/NAME --pr N --config FILE [--path DIR] [--required-lenses TEXT] [--pass-drafts]
+    head_check.py ... --bare --path BARE_REPO --base SHA --head SHA [--remote URL]
+Bare mode is the same rules on a bare repository the gate (head_gate.py) fetched the base tip and the head into by sha,
+for a check that runs where nothing of the pull request is ever checked out (fork-head-gate.yml); only where base and
+head come from differs (Checkout).
 `--required-lenses` takes one lens name per line (a name may hold a comma: `data-integrity (DI-1, DI-2)`).
 """
 import argparse, json, os, re, subprocess, sys, tempfile, time
@@ -47,32 +51,53 @@ GIT_SAFE = (*pr_queue.GIT_SAFE, '-c', 'core.attributesFile=/dev/null')
 
 
 class Checkout:
-    """The job's checkout of GitHub's merge commit, read with git (`run` replaces git in tests)."""
+    """What the check reads with git (`run` replaces git in tests), in one of two modes around the same rules:
+    - checkout: the job's checkout of GitHub's merge commit (`path` holds `.git`); base and head are its two parents.
+    - bare (`bare=(base, head)`): a bare repository the gate fetched the base tip and the head into (head_gate.py),
+      objects only: no work tree, no hooks, no submodules, and nothing of the pull request's is ever checked out. Base
+      and head are the shas the gate read from GitHub's API."""
 
-    def __init__(self, path, run=None):
-        self.git_dir = os.path.join(os.path.abspath(path), '.git')
-        self.run = run
+    def __init__(self, path, run=None, bare=None, remote='origin'):
+        self.bare = tuple(bare) if bare else None
+        self.git_dir = os.path.abspath(path) if self.bare else os.path.join(os.path.abspath(path), '.git')
+        self.run, self.remote = run, remote
+        self.holder = 'the gate fetched' if self.bare else 'the checkout merges'
+        # Bare, git logs in the way the queue does (gh's login, GH_TOKEN), never with a helper of the machine's config.
+        self.auth = pr_queue.GIT_AUTH if self.bare else ()
 
     def git(self, *a):
         if self.run:
             return self.run(*a)
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
-            return subprocess.run(['git', *GIT_SAFE, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
+            return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
                                   capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
                                                             'GIT_ATTR_NOSYSTEM': '1'})
 
     def problem(self):
-        """Why the checkout cannot be read as git made it, or None: not a .git folder, shallow (the base's history is
-        needed), or holding a file that changes what its objects or merges say (pr_queue.UNTRUSTED_FILES)."""
+        """Why the repository cannot be read as git made it, or None: not a git folder, shallow (the base's history is
+        needed), holding a file that changes what its objects or merges say (pr_queue.UNTRUSTED_FILES), or, bare,
+        without the base or the head."""
         if not os.path.isdir(self.git_dir):
+            if self.bare:
+                return f'{self.git_dir} is no git folder: fetch the base and the head into a bare repository first'
             return f'{self.git_dir} is no git folder: check out the pull request first (actions/checkout)'
         if os.path.lexists(os.path.join(self.git_dir, 'shallow')):
-            return 'the checkout is shallow: check it out with fetch-depth: 0'
+            return ('the bare repository is shallow: fetch the full history' if self.bare
+                    else 'the checkout is shallow: check it out with fetch-depth: 0')
         bad = [f for f in pr_queue.UNTRUSTED_FILES if os.path.lexists(os.path.join(self.git_dir, f))]
-        return f'the checkout holds {", ".join(bad)}, which a checkout never writes' if bad else None
+        if bad:
+            return f'the {"bare repository" if self.bare else "checkout"} holds {", ".join(bad)}, which a fetch never writes'
+        if self.bare:
+            missing = [f'{what} {sha[:12]}' for what, sha in zip(('base', 'head'), self.bare) if not self.has(sha)]
+            if missing:
+                return f'the bare repository does not hold the {" or the ".join(missing)}'
+        return None
 
     def merge_parents(self):
-        """(base, head) of HEAD when it is a two-parent merge commit, else None."""
+        """(base, head): bare, the two shas the gate fetched; else HEAD's parents when it is a two-parent merge commit,
+        else None."""
+        if self.bare:
+            return self.bare
         r = self.git('rev-list', '--parents', '-n', '1', 'HEAD')
         line = r.stdout.split() if r.returncode == 0 else []
         return (line[1], line[2]) if len(line) == 3 and all(SHA.fullmatch(s) for s in line) else None
@@ -81,9 +106,10 @@ class Checkout:
         return self.git('cat-file', '-e', sha + '^{commit}').returncode == 0
 
     def fetch(self, sha):
-        """A read commit no ref of the checkout reaches (a force-push dropped it; GitHub keeps it), from origin with the
-        credentials actions/checkout stored (none with persist-credentials: false: a private repository then fails)."""
-        return self.git('fetch', '-q', '--no-tags', 'origin', sha).returncode == 0 and self.has(sha)
+        """A read commit no ref of the repository reaches (a force-push dropped it; GitHub keeps it), from origin with the
+        credentials the checkout stored or the gate's environment gives (none: a private repository then fails)."""
+        return self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha).returncode == 0 \
+            and self.has(sha)
 
 
 def required_names(text):
@@ -138,13 +164,13 @@ def same_change(checkout, head, read):
         return False, "HEAD is not GitHub's two-parent merge commit, so the pull request head is unknown"
     base, merged = parents
     if merged != head:
-        return False, (f'the checkout merges {merged[:12]} but GitHub says the head is {head[:12]}: '
+        return False, (f'{checkout.holder} {merged[:12]} but GitHub says the head is {head[:12]}: '
                        'a newer head has its own run')
     if head == read:
         return True, f'{head[:12]} is the commit read'
     if not (checkout.has(read) or checkout.fetch(read)):
-        return False, (f'the read commit {read[:12]} is not in the checkout and could not be fetched from origin '
-                       '(GitHub no longer has it, or the checkout kept no credentials: persist-credentials: false)')
+        return False, (f'the read commit {read[:12]} is not in the repository and could not be fetched from origin '
+                       '(GitHub no longer has it, or the fetch had no credentials: persist-credentials: false)')
     if pr_queue.holds(checkout.git, head, read, pr_queue.UPDATES, base):
         return True, f'{head[:12]} is {read[:12]} merged with the base, nothing else'
     return False, f'{head[:12]} is not the change read at {read[:12]}, nor that change merged with the base'
@@ -216,6 +242,35 @@ def gh_run(*a):
     return subprocess.run(['gh', *a], text=True, capture_output=True)
 
 
+def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out, problems):
+    """The one rule path of both modes: (code, ok, reason, rows). code is REFUSED (every problem printed at once, before
+    GitHub is read), 1 for a failed head (or a pull request GitHub would not give), 0 for a pass."""
+    cfg = None
+    if not problems:
+        cfg = base_config(checkout, config_path, problems)
+    if problems:
+        out('::error::head check refused to start: ' + escape('; '.join(problems)))
+        return REFUSED, False, '; '.join(problems), []
+    pr, why = read_pr(repo, n, gh, sleep)
+    if pr is None:
+        return 1, False, f'could not read the pull request from GitHub after {ATTEMPTS} tries: {why}', []
+    review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association, cfg.lens_author_associations,
+                         log=lambda text: out(escape(text)))
+    ok, reason, rows = verdict(pr, review, checkout, required, pass_drafts)
+    return (0 if ok else 1), ok, reason, rows
+
+
+def argument_problems(repo, n, required_text):
+    """(required, problems) for the arguments both modes take."""
+    problems = []
+    if not pr_queue.REPO_RE.fullmatch(repo):
+        problems.append(f'--repo {repo!r} is not owner/name')
+    if not re.fullmatch(r'[1-9][0-9]{0,9}', n):
+        problems.append(f'--pr {n!r} is not a pull request number (run it on a pull_request event)')
+    required, bad = required_names(required_text)
+    return required, problems + bad
+
+
 def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
     env = os.environ if env is None else env
     p = argparse.ArgumentParser(prog='head_check.py', description=__doc__.split('\n')[0])
@@ -223,35 +278,30 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
     p.add_argument('--pr', required=True, help='the pull request number')
     p.add_argument('--config', required=True, help="the merge queue's JSON config (../pr-queue/README.md, Config): a "
                    'path in the repository, read from the base commit the merge commit tests')
-    p.add_argument('--path', default='.', help="the checkout of GitHub's merge commit (fetch-depth: 0)")
+    p.add_argument('--path', default='.', help="the checkout of GitHub's merge commit (fetch-depth: 0); with --bare, "
+                   'the bare repository holding --base and --head')
     p.add_argument('--required-lenses', default='', help='lens names, one per line, that must read the head')
     p.add_argument('--pass-drafts', action='store_true', help='pass a draft without reading its review')
+    p.add_argument('--bare', action='store_true', help='read a bare repository (head_gate.py) instead of a checkout')
+    p.add_argument('--base', default='', help='with --bare: the base tip the config is read from')
+    p.add_argument('--head', default='', help='with --bare: the head GitHub named when the base was read')
+    p.add_argument('--remote', default='origin', help='with --bare: where a missing read commit is fetched from')
     a = p.parse_args(argv)
-    problems = []
-    if not pr_queue.REPO_RE.fullmatch(a.repo):
-        problems.append(f'--repo {a.repo!r} is not owner/name')
-    if not re.fullmatch(r'[1-9][0-9]{0,9}', a.pr):
-        problems.append(f'--pr {a.pr!r} is not a pull request number (run it on a pull_request event)')
-    required, bad = required_names(a.required_lenses)
-    problems += bad
-    checkout = Checkout(a.path, git)
+    required, problems = argument_problems(a.repo, a.pr, a.required_lenses)
+    bare = None
+    if a.bare:
+        bare = (a.base.lower(), a.head.lower())
+        problems += [f'--{k} {v!r} is not a full commit sha' for k, v in zip(('base', 'head'), bare)
+                     if not SHA.fullmatch(v)]
+    elif a.base or a.head:
+        problems.append('--base and --head need --bare (a checkout names its own through its merge commit)')
+    checkout = Checkout(a.path, git, bare=bare, remote=a.remote)
     if git is None:
         problems += filter(None, [pr_queue.git_problem(), checkout.problem()])
-    cfg = None
-    if not problems:
-        cfg = base_config(checkout, a.config, problems)
-    if problems:
-        out('::error::head check refused to start: ' + escape('; '.join(problems)))
-        return REFUSED
-    pr, why = read_pr(a.repo, a.pr, gh, sleep)
-    if pr is None:
-        report(False, f'could not read the pull request from GitHub after {ATTEMPTS} tries: {why}', [], a.pr, env, out)
-        return 1
-    review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association, cfg.lens_author_associations,
-                         log=lambda text: out(escape(text)))
-    ok, reason, rows = verdict(pr, review, checkout, required, a.pass_drafts)
-    report(ok, reason, rows, a.pr, env, out)
-    return 0 if ok else 1
+    code, ok, reason, rows = decide(a.repo, a.pr, a.config, checkout, required, a.pass_drafts, gh, sleep, out, problems)
+    if code != REFUSED:
+        report(ok, reason, rows, a.pr, env, out)
+    return code
 
 
 def base_config(checkout, path, problems):
@@ -261,6 +311,8 @@ def base_config(checkout, path, problems):
     if not parents:
         problems.append("HEAD is not GitHub's two-parent merge commit (check out the pull_request event's default ref)")
         return None
+    # Bare, the base is the tip the gate read from GitHub's API, fetched by sha: what the pull request's branch says
+    # about its own config is never read.
     rel = path[2:] if path.startswith('./') else path
     r = checkout.git('show', f'{parents[0]}:{rel}')
     if r.returncode != 0:
