@@ -276,6 +276,37 @@ does leave the marker, and that turns the test red.
   (bots included), always run GitHub-hosted. Allowing them is a change to
   `trusted` and an owner decision.
 
+### Other projects' configs (not used by this fork)
+
+The fork's own config has a hosted label and only dispatcher pools. A project
+that uses the router (or the `fleet-route` action) may also set:
+
+- **`"hosted"`** must be a GitHub-hosted label. The config check, and `route`
+  again at run time, refuse a generic self-hosted label (`self-hosted`,
+  `linux`, `x64`, ...), a static pool's label, a dispatcher pool's label or run
+  label, and a retired label: untrusted runs go to `hosted`.
+- **Static pools** (`"static": true`, runners registered by hand) have no
+  dispatcher and no job-started gate, so a pull request from a fork could edit
+  its workflow to name their labels. They serve **private repositories only**:
+  the config must say `"private": true`, and `route` uses no static pool unless
+  the event says `repository.private: true` (unknown refuses, with an error on
+  the run page). A static pool's labels may not be a dispatcher pool's label or
+  a retired label.
+- **`"hosted": false`** (no GitHub-hosted runners). Each kind then needs a
+  static pool, and `upstream_sync` is refused. Every job that is not routed (a
+  change gate off, a manual, scheduled or bot run, an untrusted run of this
+  repository) goes to that kind's always-on static pool, never to
+  `ubuntu-latest`. A run that may hold another repository's code (a fork's pull
+  request, `pull_request_target` from a fork, `workflow_run`, any other event)
+  turns `route` red with a clear error: it is never skipped and never
+  self-hosted.
+- **`route --with-attempt` and "Re-run failed jobs".** A re-run of failed jobs
+  does not re-run `route`, and a run label serves one attempt only. So `route`
+  also writes `fallback`: the always-on static pool for a trusted run, else
+  where the run's jobs went (`hosted`); never a dispatcher pool's label. A job
+  whose `github.run_attempt` is not the `attempt` output uses `fallback`. The
+  `fleet-route` action's README has the `runs-on` expression.
+
 ## Host setup (VM106, the `vm` pool)
 
 Run as root on the host. Nothing here prints a secret. Use the `main` commit

@@ -5,7 +5,8 @@ Every fact about the repository and its fleet is in one file, .github/fork-fleet
 owner steps, the design and the failure table: .github/fork-fleet.md.
 
   python3 -I fork-fleet.py route     the last step of fork-tests.yml's `changes` job (GitHub-hosted). Writes to
-                                     $GITHUB_OUTPUT: runners=<JSON {job key: runs-on}>, mode, attempt, watch.
+                                     $GITHUB_OUTPUT: runners=<JSON {job key: runs-on}>, mode, attempt, watch,
+                                     fallback=<JSON runs-on for a job of another attempt (a re-run of failed jobs)>.
                                      A job key is the job id, or <id>-<shard> for a sharded job.
   python3 -I fork-fleet.py watch     fork-tests.yml's `fleet_watch` job (GitHub-hosted, actions: write): a fleet job of
                                      its run that waits too long for a runner cancels the run with an error.
@@ -23,6 +24,10 @@ The setting, repository variable CONFIG["variable"] (route and sweep read it fro
                      expired) with an error annotation, so it is never silent. auto never makes a run red.
   fleet              every job that runs goes to the fleet, pools with a free slot first, the rest queue on the pool
                      marked `waits`. A job that only prints a skip stays GitHub-hosted. Untrusted runs go hosted.
+With "hosted": false (no GitHub-hosted runners) every job that would go GitHub-hosted goes to the always-on (static)
+pool for its kind of run instead, and a run that may hold code from another repository fails red. A static pool
+(runners registered by hand) has no dispatcher and no job-started hook, so it is only for a private repository: the
+config must say "private": true, and route refuses static pools unless the event says the repository is private.
   github             every job GitHub-hosted, as before the fleet.
 
 No fleet runner waits for work. The dispatcher makes a one-job (JIT) runner for one queued job at a time, and only when:
@@ -51,7 +56,8 @@ VARIABLE = re.compile(r'(?!GITHUB_)[A-Z][A-Z0-9_]{0,99}')
 JOB_ID = re.compile(r'[a-z0-9_]{1,40}')
 POOL = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
 KINDS = ('push', 'draft', 'ready')   # a pool's `takes`: pushes, draft pull requests, pull requests ready for review
-OUTSIDE = 'ubuntu-latest'            # with "hosted": false, where a run that may not use the fleet goes
+# Events whose code and workflow are this repository's own (a pull request event: only when head and base are too).
+OWN_EVENTS = ('push', 'workflow_dispatch', 'schedule')
 # The run's label for one job: <pool label>-<job key>-<16 hex, made by route>-a<attempt, added by the job's runs-on>.
 NONCE = re.compile(r'(?P<key>[a-z0-9_]{1,40}(?:-[0-9]{1,3})?)-[0-9a-f]{16}-a(?P<attempt>[1-9][0-9]{0,4})')
 VERSION = re.compile(r'v?([0-9]{1,5})\.([0-9]{1,5})\.([0-9]{1,5})')
@@ -101,6 +107,16 @@ def check_config(cfg):
     hosted = cfg['hosted']
     if not (hosted is False or isinstance(hosted, str) and re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,62}', hosted)):
         out.append('hosted must be a GitHub-hosted runner label, or false for none')
+    elif hosted is not False and self_hosted(cfg, hosted):
+        out.append(f'hosted is {hosted!r}, a self-hosted, pool or retired label: untrusted runs go there')
+    if hosted is False and 'upstream_sync' in cfg:
+        out.append('upstream_sync needs a hosted label: upstream code runs on GitHub-hosted runners only')
+    if any(p.get('static') for p in pools) and cfg.get('private') is not True:
+        out.append('a static pool needs "private": true: its runners have no job-started hook, so on a public '
+                   'repository a pull request from a fork could name their labels (static pools: private repositories '
+                   'only)')
+    if 'private' in cfg and not isinstance(cfg['private'], bool):
+        out.append('private must be true or false')
     for key in ('stuck_seconds', 'fleet_stuck_seconds') + (('beacon_fresh_seconds',) if launched else ()):
         if not positive(cfg[key]):
             out.append(f'{key} must be a positive whole number')
@@ -137,6 +153,8 @@ def check_config(cfg):
             if not (isinstance(got, list) and got and all(isinstance(x, str) and LABEL.fullmatch(x) for x in got)
                     and set(got) - GENERIC):
                 out.append(f'{who}: runs_on must list its runners\' labels, one of them not one of {sorted(GENERIC)}')
+            elif any(dispatcher_or_retired(cfg, x) for x in got if x not in GENERIC):
+                out.append(f'{who}: runs_on names a dispatcher pool\'s or a retired label')
             continue
         if not (isinstance(p.get('label'), str) and LABEL.fullmatch(p['label']) and p['label'] not in GENERIC):
             out.append(f'{who}: label must be one label of its own (a-z, 0-9, -), none of {sorted(GENERIC)}')
@@ -148,6 +166,9 @@ def check_config(cfg):
     for kind in KINDS:
         if sum(1 for p in pools if p.get('waits') is True and kind in takes_of(p)) != 1:
             out.append(f'exactly one pool with "waits": true must take {kind} runs (where fleet mode queues them)')
+        if hosted is False and not any(p.get('static') and kind in takes_of(p) for p in pools):
+            out.append(f'with "hosted": false a static pool must take {kind} runs (where jobs that are not routed, '
+                       're-runs of failed jobs and runs the dispatchers refuse go)')
     for j in cfg['jobs']:
         if not (isinstance(j.get('job'), str) and JOB_ID.fullmatch(j['job'])):
             out.append(f'job {j.get("job")!r}: the id must be a-z, 0-9 and _')
@@ -161,6 +182,22 @@ def check_config(cfg):
     if len(set(keys)) != len(keys):
         out.append('a job key twice')
     return out
+
+
+def dispatcher_or_retired(cfg, label):
+    """Is this a dispatcher pool's label, one of its run labels, or a retired label (or a run label of one)?"""
+    retired = cfg.get('retired_labels')
+    names = [p.get('label') for p in cfg.get('pools') or [] if not p.get('static')] + (
+        retired if isinstance(retired, list) else [])
+    return any(isinstance(n, str) and (label == n or label.startswith(n + '-')) for n in names)
+
+
+def self_hosted(cfg, label):
+    """Could a self-hosted runner of this fleet have this label: a generic one, a static pool's, a dispatcher pool's (or
+    a run label of one) or a retired one? `hosted` must be none of them."""
+    static = {x for p in cfg.get('pools') or [] if p.get('static') and isinstance(p.get('runs_on'), list)
+              for x in p['runs_on']}
+    return label in GENERIC or label in static or dispatcher_or_retired(cfg, label)
 
 
 def takes_of(pool):
@@ -441,34 +478,113 @@ def mode_in(cfg, value):
 
 
 def kind_of(env, event):
-    """One of KINDS for a run `refused` let through (a push or a pull request of this repository)."""
-    if env.get('GITHUB_EVENT_NAME') == 'push':
+    """One of KINDS for a run of this repository (`outside` let it through): any event but a pull request is a push."""
+    if env.get('GITHUB_EVENT_NAME') not in ('pull_request', 'pull_request_target'):
         return 'push'
     return 'draft' if (event.get('pull_request') or {}).get('draft') is True else 'ready'
 
 
+def outside(cfg, env, event):
+    """Why this run may hold code or a workflow from another repository, or None: a push, a manual or a scheduled run
+    of this repository, or a pull request (or pull_request_target) whose head and base are this repository. Wider than
+    the trust rule (`refused`): any actor, branch and workflow of this repository passes."""
+    repo = cfg['repository']
+    if env.get('GITHUB_REPOSITORY') != repo:
+        return f'repository {env.get("GITHUB_REPOSITORY")!r}, not {repo}'
+    if not isinstance(event, dict):
+        return 'no event payload'
+    kind = env.get('GITHUB_EVENT_NAME')
+    if kind in ('pull_request', 'pull_request_target'):
+        pr = event.get('pull_request') or {}
+        for side in ('head', 'base'):
+            got = ((pr.get(side) or {}).get('repo') or {}).get('full_name')
+            if got != repo:
+                return f'a pull request whose {side} is {got!r}'
+        return None
+    if kind not in OWN_EVENTS:
+        return f'a {kind!r} event (it may carry code from another repository)'
+    got = (event.get('repository') or {}).get('full_name')
+    return None if got == repo else f'a {kind} event of repository {got!r}'
+
+
+def static_refused(cfg, event):
+    """Why no static pool may take this run, or None. Their runners are always there and have no job-started hook, so
+    a workflow a pull request changed could name their labels: they serve a private repository only. Unknown refuses."""
+    if not any(p.get('static') for p in cfg['pools']):
+        return None
+    got = ((event or {}).get('repository') or {}).get('private') if isinstance(event, dict) else None
+    if got is not True:
+        return f'the event does not say the repository is private (repository.private: {got!r})'
+    return None
+
+
+def hosted_of(cfg):
+    """The hosted label (or False), checked again here: a config route is handed need not have passed `load`."""
+    hosted = cfg['hosted']
+    if hosted is not False and (not isinstance(hosted, str) or self_hosted(cfg, hosted)):
+        raise ValueError(f'hosted is {hosted!r}: not a GitHub-hosted label (a self-hosted, pool or retired one)')
+    return hosted
+
+
+def always_on(cfg, kind, static_why):
+    """The static pool that takes `kind` runs (the one that waits first), or None (none, or static pools refused)."""
+    if static_why:
+        return None
+    pools = [p for p in cfg['pools'] if p.get('static') and kind in takes_of(p)]
+    return next(iter(sorted(pools, key=lambda p: not p['waits'])), None)
+
+
 def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt=None):
-    """(mode, {key: runs-on}). Raises only for a broken setting or CONFIG; it calls no API (a push: one anonymous
-    git ls-remote, made_by_the_sync). With `attempt`, a run label ends with -a<attempt> already. Every runs-on is the
-    hosted label (with "hosted": false, OUTSIDE), a static pool's runs_on, or a dispatcher pool's label plus this run's
-    own label: never a label that nothing serves."""
+    """(mode, {key: runs-on}); route_all without the fallback."""
+    return route_all(cfg, env, event, mode_value, gates, now, nonce, attempt)[:2]
+
+
+def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt=None):
+    """(mode, {key: runs-on}, fallback). Raises for a broken setting or CONFIG, and with "hosted": false for a run that
+    may hold another repository's code or that no static pool may take (red: nothing can run it). It calls no API (a
+    push: one anonymous git ls-remote, made_by_the_sync). With `attempt`, a run label ends with -a<attempt> already.
+    Every runs-on is the hosted label, a static pool's runs_on, or a dispatcher pool's label plus this run's own label:
+    never a label that nothing serves. `fallback` is the runs-on for a job of another attempt (a re-run of failed jobs
+    does not re-run route, and a run label serves one attempt only): the always-on pool for a trusted run, else where
+    this run's jobs went; never a dispatcher pool's label."""
     mode = mode_in(cfg, mode_value)
-    hosted = cfg['hosted'] or OUTSIDE
-    out = {key: hosted for key, _ in job_keys(cfg)}
+    hosted = hosted_of(cfg)
+    keys = [key for key, _ in job_keys(cfg)]
+    foreign = outside(cfg, env, event)
+    if foreign:
+        if hosted is False:
+            raise ValueError(f'this run may hold code from another repository ({foreign}): it may never use a '
+                             'self-hosted runner, and the config has no GitHub-hosted one ("hosted": false), so no job '
+                             'of it can run')
+        say(f'::notice::fork-fleet: GitHub-hosted for every job: {foreign} (only trusted runs may use the fleet; '
+            f'never a self-hosted runner for a run that may hold another repository\'s code, in any mode: {hosted})')
+        return mode, {key: hosted for key in keys}, hosted
+    kind = kind_of(env, event)
+    static_why = static_refused(cfg, event)
+    if static_why:
+        say(f'::error::fork-fleet: no static pool is used: {static_why} (static pools serve private repositories only)')
+    home = always_on(cfg, kind, static_why)
+    spare = hosted or (list(home['runs_on']) if home else None)
+    if spare is None:
+        raise ValueError(f'no runner may take this {kind} run: the config has no GitHub-hosted one ("hosted": false), '
+                         f'and {static_why or "no static pool takes it"}')
+    there = 'GitHub-hosted' if hosted else f'pool {home["name"]} (always there)'
+    out = {key: spare for key in keys}
     if mode == 'github':
         say('GitHub-hosted for every job: the setting is github')
-        return mode, out
+        return mode, out, spare
     why = refused(cfg, env, event)
     if why:
-        say(f'::notice::fork-fleet: GitHub-hosted for every job: {why} (only trusted runs may use the fleet; '
-            f'never a self-hosted runner for them, in any mode: {hosted})')
-        return mode, out
+        say(f'::notice::fork-fleet: {there} for every job: {why} (only trusted runs may use the fleet; '
+            + (f'never a self-hosted runner for them, in any mode: {hosted})' if hosted else
+               'a run of this repository, and the config has no GitHub-hosted runner)'))
+        return mode, out, spare
+    fallback = list(home['runs_on']) if home else spare
     wanted = [key for key, job in job_keys(cfg) if runs(job, gates)]
     if not wanted:
-        say(f'GitHub-hosted for every job: no routed job runs for this change ({hosted})')
-        return mode, out
+        say(f'{there} for every job: no routed job runs for this change')
+        return mode, out, fallback
     nonce = nonce or secrets.token_hex(8)   # this run's own label: no runner exists for it until the dispatcher makes one
-    kind = kind_of(env, event)
 
     def labels(pool, key):
         if pool.get('static'):
@@ -478,6 +594,8 @@ def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt
     for pool in cfg['pools']:
         if kind not in takes_of(pool):
             say(f'pool {pool["name"]}: does not take {kind} runs')
+            continue
+        if pool.get('static') and static_why:
             continue
         free, why = (pool['slots'], None) if pool.get('static') else beacon_free(cfg, pool, env, t)
         if why:
@@ -496,14 +614,14 @@ def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt
             out[key] = labels(pool, key)
             say(f'{key}: pool {pool["name"]} ' + ('(always there)' if pool.get('static') else
                                                   '(its dispatcher reports a free slot)'))
-    if mode == 'fleet':
-        waiting = next(p for p in cfg['pools'] if p['waits'] and kind in takes_of(p))
+    waiting = next(p for p in cfg['pools'] if p['waits'] and kind in takes_of(p))
+    if mode == 'fleet' and todo and not (waiting.get('static') and static_why):
         for key in todo:
             out[key] = labels(waiting, key)
             say(f'{key}: queues on pool {waiting["name"]} (fleet mode waits for a fleet runner)')
     elif todo:
-        say(f'GitHub-hosted, no free fleet slot left: {", ".join(todo)}')
-    return mode, out
+        say(f'{there}, no free fleet slot left: {", ".join(todo)}')
+    return mode, out, fallback
 
 
 def with_vars(cfg, env):
@@ -539,10 +657,10 @@ def cmd_route(cfg, env, with_attempt=False):
     except ValueError:
         say('::warning::fork-fleet: the changes outputs cannot be read: every routed job counts as running')
     attempt = env.get('GITHUB_RUN_ATTEMPT') or '1'
-    mode, out = route(cfg, env, event, env.get('FLEET_MODE'), gates, attempt=with_attempt and int(attempt))
+    mode, out, fallback = route_all(cfg, env, event, env.get('FLEET_MODE'), gates, attempt=with_attempt and int(attempt))
     fleet = sum(1 for v in out.values() if not isinstance(v, str))
     lines = [f'runners={json.dumps(out, separators=(",", ":"))}', f'mode={mode}', f'attempt={attempt}',
-             f'watch={"true" if fleet else "false"}']
+             f'watch={"true" if fleet else "false"}', f'fallback={json.dumps(fallback, separators=(",", ":"))}']
     with open(env['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
         f.write(''.join(f'{line}\n' for line in lines))
     where = {}
@@ -1045,7 +1163,9 @@ def main(argv=None, env=None):
     ap.add_argument('--config', default=CONFIG)
     sub = ap.add_subparsers(dest='cmd', required=True)
     sub.add_parser('route').add_argument('--with-attempt', action='store_true',
-                                         help="end each run label with -a<this attempt> (the job's runs-on does not)")
+                                         help="end each run label with -a<this attempt> (the job's runs-on does "
+                                              "not). A job whose github.run_attempt is not the attempt output (a re-run "
+                                              "of failed jobs) must use the fallback output instead")
     sub.add_parser('gate')
     sub.add_parser('watch')
     sub.add_parser('sweep')

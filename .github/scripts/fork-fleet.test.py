@@ -2383,7 +2383,7 @@ class Wiring(unittest.TestCase):
 
 # A project with no GitHub-hosted runners: a PC whose dispatcher makes one-job runners (one job of a run at most, pushes
 # and draft pull requests only), an always-on build runner, and an always-on runner for pull requests ready for review.
-GEN = {'repository': REPO, 'hosted': False, 'trusted': CFG['trusted'], 'stuck_seconds': 900,
+GEN = {'repository': REPO, 'private': True, 'hosted': False, 'trusted': CFG['trusted'], 'stuck_seconds': 900,
        'fleet_stuck_seconds': 7200, 'beacon_fresh_seconds': 180, 'dispatch': CFG['dispatch'],
        'retired_labels': ['proj-old'],
        'pools': [{'name': 'pc', 'label': 'proj-pc', 'slots': 2, 'per_run': 1, 'beacon': 'PROJ_BEACON_PC',
@@ -2395,6 +2395,9 @@ GEN = {'repository': REPO, 'hosted': False, 'trusted': CFG['trusted'], 'stuck_se
        'jobs': [{'job': 'plugins', 'memory_mb': 4000}, {'job': 'engine', 'memory_mb': 3000},
                 {'job': 'docs', 'memory_mb': 500, 'gates': ['docs']}]}
 GEN_PC = ['proj-pc', 'proj-pc-{}-' + NONCE]
+BUILD, READY = ['self-hosted', 'proj-build'], ['self-hosted', 'proj-ready']   # GEN's always-on pools
+GEN_HOSTED = {**GEN, 'hosted': 'ubuntu-24.04'}   # the same fleet with GitHub-hosted runners
+PRIVATE = {'full_name': REPO, 'private': True}   # the event's repository, as a private repository's event has it
 
 
 def draft(is_draft, **kw):
@@ -2403,13 +2406,21 @@ def draft(is_draft, **kw):
     return event
 
 
+def private(event):
+    """The event as a private repository's run has it (GitHub puts the repository in every event payload)."""
+    return dict(event, repository=dict(event.get('repository') or {}, **PRIVATE)) if isinstance(event, dict) else event
+
+
 class AnyRepository(unittest.TestCase):
-    def route(self, cfg=GEN, mode='', pc=None, e=None, event=PUSH, attempt=None, now=T0):
+    def route(self, cfg=GEN, mode='', pc=None, e=None, event=PUSH, attempt=None, now=T0, gates=None, own=True,
+              fallback=False):
+        """own: the event as a private repository's (GEN's static pools need it)."""
         e = dict(e or env())
         if pc is not None:
             e['PROJ_BEACON_PC'] = pc
-        (mode, out), log = quiet(ff.route, cfg, e, event, mode, None, now=lambda: now, nonce=NONCE, attempt=attempt)
-        return mode, out, log
+        got, log = quiet(ff.route_all, cfg, e, private(event) if own else event, mode, gates, now=lambda: now,
+                         nonce=NONCE, attempt=attempt)
+        return (*got, log) if fallback else (*got[:2], log)
 
     def test_a_route_only_config_is_valid(self):
         self.assertEqual(ff.check_config(GEN), [])
@@ -2486,33 +2497,168 @@ class AnyRepository(unittest.TestCase):
         self.assertEqual(out['engine'], ['self-hosted', 'proj-build'])
 
     def test_a_pull_request_from_another_repository_never_gets_a_self_hosted_runner(self):
-        """head.repo != base.repo: GitHub-hosted (with "hosted": false, ubuntu-latest), in every mode, whatever the
-        heartbeats say, never a skip (a skipped required check counts as passed)."""
+        """head.repo != base.repo: GitHub-hosted in every mode, whatever the heartbeats say, never a skip (a skipped
+        required check counts as passed). With "hosted": false there is no runner for it: route fails red."""
         fresh = {p['beacon']: beacon(5) for p in CFG['pools']}
         fresh['PROJ_BEACON_PC'] = beacon(5)
         events = {'fork head': pr(head='someone/t3code'), 'other base': pr(base='someone/t3code'),
                   'fork draft': draft(True, head='someone/t3code'), 'no payload': None}
-        for cfg, hosted in ((CFG, HOSTED), (GEN, ff.OUTSIDE)):
+        for cfg in (CFG, GEN_HOSTED, GEN):
             for mode in ff.MODES:
                 for name, event in events.items():
                     with self.subTest(cfg=cfg['hosted'], mode=mode, event=name):
-                        _, out, _ = self.route(cfg, mode, e=env(**PR_ENV, **fresh), event=event)
-                        self.assertEqual(set(out.values()), {hosted})
+                        if cfg['hosted'] is False:
+                            with self.assertRaisesRegex(ValueError, 'another repository.*no job of it can run'):
+                                self.route(cfg, mode, e=env(**PR_ENV, **fresh), event=event)
+                            continue
+                        _, out, fallback, _ = self.route(cfg, mode, e=env(**PR_ENV, **fresh), event=event,
+                                                         fallback=True)
+                        self.assertEqual(set(out.values()) | {fallback}, {cfg['hosted']})
 
     def test_every_label_put_out_is_one_something_serves(self):
-        """The hosted label, ubuntu-latest, a static pool's runs_on, or a dispatcher pool's label with a run label it
-        parses back: never a label nothing serves."""
+        """A static pool's runs_on, or a dispatcher pool's label with a run label it parses back: never ubuntu-latest
+        or a label nothing serves, for jobs that run and jobs whose change gate is off (they only print a skip)."""
         static = [tuple(p['runs_on']) for p in GEN['pools'] if p.get('static')]
         for mode in ff.MODES:
             for kind, (e, event) in {'push': (env(), PUSH), 'draft': (env(**PR_ENV), draft(True)),
                                      'ready': (env(**PR_ENV), draft(False))}.items():
                 for pc in (None, beacon(0), beacon(1), beacon(9), beacon(9, at=T0 - 999)):
-                    with self.subTest(mode=mode, kind=kind, pc=pc):
-                        _, out, _ = self.route(mode=mode, pc=pc, e=e, event=event, attempt=2)
-                        for key, got in out.items():
-                            self.assertIsInstance(got, list)
-                            if tuple(got) not in static:
-                                self.assertEqual(ff.fleet_job(GEN, got)[1:], (key, 2))
+                    for gates in (None, {'docs': 'false'}, {'docs': 'true'}):
+                        with self.subTest(mode=mode, kind=kind, pc=pc, gates=gates):
+                            _, out, fallback, _ = self.route(mode=mode, pc=pc, e=e, event=event, attempt=2,
+                                                             gates=gates, fallback=True)
+                            self.assertIn(tuple(fallback), static)
+                            for key, got in out.items():
+                                self.assertIsInstance(got, list)
+                                if tuple(got) not in static:
+                                    self.assertEqual(ff.fleet_job(GEN, got)[1:], (key, 2))
+
+    def test_hosted_never_names_a_self_hosted_pool_or_retired_label(self):
+        """Lens #53 security, major 1: untrusted runs go to `hosted`, so it must be a GitHub-hosted label. The config check
+        refuses it, and route checks it again (a config handed to it need not have passed load)."""
+        for cfg in (GEN_HOSTED, CFG):
+            bad = ['self-hosted', 'linux', 'x64'] + [p['label'] for p in ff.dispatched(cfg)] + \
+                [p['label'] + '-plugins-' + NONCE for p in ff.dispatched(cfg)] + \
+                [x for p in cfg['pools'] if p.get('static') for x in p['runs_on']] + cfg.get('retired_labels', [])
+            for label in bad:
+                with self.subTest(repository=cfg['hosted'], hosted=label):
+                    wrong = dict(cfg, hosted=label)
+                    self.assertTrue(any('hosted' in p for p in ff.check_config(wrong)), ff.check_config(wrong))
+                    with self.assertRaisesRegex(ValueError, 'not a GitHub-hosted label'):
+                        quiet(ff.route, wrong, env(**PR_ENV), pr(head='someone/t3code'), 'auto', None)
+        self.assertEqual(ff.check_config(GEN_HOSTED), [])
+
+    def test_static_pools_serve_a_private_repository_only(self):
+        """Lens #53 security, major 2: a static runner has no job-started hook, so a workflow a pull request changed
+        could name its labels. The config must say the repository is private, and route uses no static pool unless the
+        event says so too (unknown refuses)."""
+        public = dict(GEN)
+        public.pop('private')
+        for cfg in (public, dict(GEN, private=False), dict(GEN_HOSTED, private=False)):
+            self.assertTrue(any('private' in p for p in ff.check_config(cfg)), ff.check_config(cfg))
+        static = {x for p in GEN['pools'] if p.get('static') for x in p['runs_on']} - ff.GENERIC
+        for name, repository in {'public': {'full_name': REPO, 'private': False}, 'not said': {'full_name': REPO},
+                                 'a string': {'full_name': REPO, 'private': 'true'}}.items():
+            for kind, (e, event) in {'push': (env(), {'repository': repository}),
+                                     'ready': (env(**PR_ENV), dict(draft(False), repository=repository))}.items():
+                for mode in ff.MODES:
+                    with self.subTest(name, kind=kind, mode=mode):
+                        with self.assertRaisesRegex(ValueError, 'no runner may take'):
+                            self.route(GEN, mode, pc=beacon(2), e=e, event=event, own=False)
+                        _, out, fallback, log = self.route(GEN_HOSTED, mode, pc=beacon(2), e=e, event=event,
+                                                           own=False, fallback=True)
+                        put = {x for v in [*out.values(), fallback] for x in ([v] if isinstance(v, str) else v)}
+                        self.assertFalse(put & static, out)
+                        self.assertIn('::error::fork-fleet: no static pool is used', log)
+
+    def test_a_static_label_is_never_a_dispatcher_or_retired_label(self):
+        """Lens #53 security minor and correctness minor: a static runner with a dispatcher pool's label is a rival of
+        every one-job runner (the dispatcher never starts one) and may be given a job its gate kills."""
+        for label in ('proj-pc', 'proj-pc-plugins-' + NONCE + '-a1', 'proj-old'):
+            with self.subTest(label):
+                bad = copy.deepcopy(GEN)
+                bad['pools'][1]['runs_on'] = ['self-hosted', label]
+                self.assertTrue(any('runs_on names a dispatcher' in p for p in ff.check_config(bad)),
+                                ff.check_config(bad))
+
+    def test_without_hosted_runners_nothing_goes_to_ubuntu_latest(self):
+        """Lens #53 correctness, major 1: with "hosted": false, a job whose change gate is off, a run where no routed
+        job runs, a manual or scheduled run, a dependency bot's pull request and an untrusted re-run all go to the
+        always-on pool of their kind; a run that may hold another repository's code is red (never skipped, never
+        self-hosted)."""
+        off = {'docs': 'false'}
+        nothing = copy.deepcopy(GEN)
+        nothing['jobs'] = [dict(j, gates=['docs']) for j in GEN['jobs']]
+        bot = 'dependabot[bot]'
+        same = {
+            'gate off': (GEN, env(), PUSH, BUILD),
+            'gate off, ready pull request': (GEN, env(**PR_ENV), draft(False), READY),
+            'no routed job runs': (nothing, env(), PUSH, BUILD),
+            'manual': (GEN, env(GITHUB_EVENT_NAME='workflow_dispatch'), PUSH, BUILD),
+            'scheduled': (GEN, env(GITHUB_EVENT_NAME='schedule'), PUSH, BUILD),
+            'dependency bot': (GEN, env(**PR_ENV, GITHUB_ACTOR=bot, GITHUB_TRIGGERING_ACTOR=bot), pr(user=bot), READY),
+            'untrusted re-run': (GEN, env(GITHUB_TRIGGERING_ACTOR='someone'), PUSH, BUILD),
+            'another workflow': (GEN, env(GITHUB_WORKFLOW_REF=f'{REPO}/.github/workflows/x.yml@refs/heads/main'),
+                                 PUSH, BUILD),
+            'own pull_request_target': (GEN, env(GITHUB_EVENT_NAME='pull_request_target'), draft(True), BUILD),
+        }
+        for name, (cfg, e, event, home) in same.items():
+            for mode in ff.MODES:
+                with self.subTest(name, mode=mode):
+                    _, out, fallback, log = self.route(cfg, mode, pc=beacon(0), e=e, event=event, gates=off,
+                                                       fallback=True)
+                    self.assertEqual(out['docs'], home)
+                    self.assertEqual(fallback, home)
+                    self.assertNotIn('ubuntu', json.dumps(out))
+        _, _, log = self.route(GEN, e=env(GITHUB_EVENT_NAME='schedule'))
+        self.assertIn('pool build (always there) for every job: a \'schedule\' event (only trusted runs may use the '
+                      'fleet; a run of this repository', log)
+        foreign = {
+            'fork pull request': (env(**PR_ENV), pr(head='someone/t3code')),
+            'fork pull_request_target': (env(GITHUB_EVENT_NAME='pull_request_target'), pr(head='someone/t3code')),
+            'workflow_run': (env(GITHUB_EVENT_NAME='workflow_run'), PUSH),
+            'issue_comment': (env(GITHUB_EVENT_NAME='issue_comment'), PUSH),
+            'another repository': (env(GITHUB_REPOSITORY='someone/t3code'), PUSH),
+            'a push event of another repository': (env(), {'repository': {'full_name': 'someone/t3code',
+                                                                           'private': True}}),
+        }
+        for name, (e, event) in foreign.items():
+            with self.subTest(name):
+                event = event if 'repository' in event else private(event)
+                with self.assertRaisesRegex(ValueError, 'another repository'):
+                    self.route(GEN, pc=beacon(2), e=e, event=event, gates=off, own=False)
+                _, out, fallback, _ = self.route(GEN_HOSTED, pc=beacon(2), e=e, event=event, gates=off, own=False,
+                                                 fallback=True)
+                self.assertEqual(set(out.values()) | {fallback}, {'ubuntu-24.04'})
+
+    def test_hosted_false_needs_a_static_pool_for_each_kind_and_no_upstream_sync(self):
+        no_ready = copy.deepcopy(GEN)
+        no_ready['pools'][2] = {'name': 'ready', 'label': 'proj-ready', 'slots': 1, 'beacon': 'PROJ_BEACON_READY',
+                                'launch': ['launch'], 'waits': True, 'takes': ['ready']}
+        self.assertTrue(any('static pool must take ready' in p for p in ff.check_config(no_ready)))
+        self.assertEqual(ff.check_config(dict(no_ready, hosted='ubuntu-24.04')), [])
+        self.assertTrue(any('upstream_sync needs a hosted' in p for p in
+                            ff.check_config(dict(GEN, upstream_sync={'tag_prefix': 'synced/'}))))
+
+    def test_a_re_run_of_failed_jobs_falls_back_to_a_runner_that_exists(self):
+        """Lens #53 correctness major 2 / security minor: a re-run of failed jobs does not re-run route, and a run label
+        serves one attempt. The fallback output, for a job of another attempt, is never a dispatcher pool's label: the
+        always-on pool for a run of this repository, GitHub-hosted for the fork's own config (it has none)."""
+        with tempfile.TemporaryDirectory() as d:
+            cases = {'GEN': (GEN, private(PUSH), BUILD), 'GEN ready': (GEN, private(draft(False)), READY),
+                     'the fork': (CFG, PUSH, HOSTED), 'GEN hosted': (GEN_HOSTED, private(PUSH), BUILD)}
+            for name, (cfg, event, want) in cases.items():
+                with self.subTest(name):
+                    out, path = os.path.join(d, name), os.path.join(d, 'event')
+                    with open(path, 'w') as f:
+                        json.dump(event, f)
+                    e = env(**({} if 'pull_request' not in event else PR_ENV), GITHUB_OUTPUT=out, GITHUB_EVENT_PATH=path,
+                            FLEET_MODE='fleet', PROJ_BEACON_PC=beacon(2, at=int(ff.time.time())))
+                    quiet(ff.cmd_route, cfg, e, True)
+                    with open(out) as f:
+                        got = dict(line.split('=', 1) for line in f.read().splitlines())
+                    self.assertEqual(json.loads(got['fallback']), want)
+                    self.assertIsNone(ff.fleet_job(cfg, want if isinstance(want, list) else [want]))
 
     def test_with_attempt_the_run_label_is_complete_and_without_it_the_fork_wiring_adds_it(self):
         _, out, _ = self.route(pc=beacon(1), attempt=3)
@@ -2557,7 +2703,7 @@ class AnyRepository(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out, event = os.path.join(d, 'out'), os.path.join(d, 'event')
             with open(event, 'w') as f:
-                json.dump(PUSH, f)
+                json.dump(private(PUSH), f)
             e = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'GH_CONFIG_DIR': d, 'GITHUB_OUTPUT': out,
                  'GITHUB_EVENT_PATH': event, **env()}
             got = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'fork-fleet.py'), '--config', config,
@@ -2569,7 +2715,8 @@ class AnyRepository(unittest.TestCase):
         return got, written
 
     def test_a_missing_or_broken_config_fails_red_and_puts_out_nothing(self):
-        """The caller's runs-on then falls back to its always-on pool (same repository) or ubuntu-latest."""
+        """The caller's runs-on then falls back: the always-on pool only for a push or a pull request of this
+        repository (fleet-route's README), otherwise GitHub-hosted."""
         with tempfile.TemporaryDirectory() as d:
             broken = os.path.join(d, 'fleet.json')
             with open(broken, 'w') as f:
@@ -2671,7 +2818,7 @@ class Vars(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out, event = os.path.join(d, 'out'), os.path.join(d, 'event')
             with open(event, 'w') as f:
-                json.dump(PUSH, f)
+                json.dump(private(PUSH), f)
             e = env(GITHUB_OUTPUT=out, GITHUB_EVENT_PATH=event, **over)
             got, log = quiet(ff.cmd_route, self.CFG, e)
             self.assertEqual(got, 0)
