@@ -336,7 +336,17 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
-        run: bash .github/scripts/fork-secret-scan.sh
+          GH_TOKEN: ${{ github.token }}
+        # A push leaves out the commits upstream (this fork's parent, as in fork-follow.yml)
+        # already has. Parent not readable: UPSTREAM stays empty and the full range is scanned.
+        run: |
+          set -euo pipefail
+          UPSTREAM=""
+          if [[ "$EVENT_NAME" == push ]]; then
+            UPSTREAM="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty' || true)"
+          fi
+          export UPSTREAM
+          bash .github/scripts/fork-secret-scan.sh
 
   lint:
     name: Lint
