@@ -89,6 +89,8 @@ import {
 } from "./toolkits/device/tools.ts";
 import * as HtmlHandlers from "./toolkits/html/handlers.ts";
 import { MessageToolkit } from "./toolkits/message/tools.ts";
+import * as WaitsHandlers from "./toolkits/waits/handlers.ts";
+import { WaitsToolkit } from "./toolkits/waits/tools.ts";
 import * as MessageHandlers from "./toolkits/message/handlers.ts";
 import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
 import { MCP_HTTP_PATH } from "../httpCors.ts";
@@ -1432,4 +1434,12 @@ export const layerToolSearch = Layer.mergeAll(
   layerDeferredListing,
 ).pipe(Layer.provide(layerToolExposure));
 
-export const layer = layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch));
+/**
+ * Fork: every tool the fork adds. Advertised like `layerTools`, but measured by
+ * ForkAgentContextBudget.test.ts, so upstream's budget file stays upstream's.
+ */
+export const layerForkTools = Layer.mergeAll(
+  toolkitRegistration(WaitsToolkit, WaitsHandlers.layer),
+);
+
+export const layer = layerMcpTransport(Layer.mergeAll(layerTools, layerForkTools, layerToolSearch));
