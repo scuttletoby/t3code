@@ -1,7 +1,8 @@
 /**
  * Fork (usage pacing part 3): how far each provider instance's usage runs ahead of an even pace,
  * from its live snapshot and the readings history (`UsageReadingsHistory`). Reads only; nothing
- * acts on a verdict yet. Anything it cannot know is `unknown`, never free.
+ * acts on a verdict yet. Anything it cannot know is `unknown`, never free: "no limits" comes only
+ * from the owner's per-instance setting (`usagePacing[id].noLimits`), never from a reading.
  */
 import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
@@ -57,10 +58,16 @@ export type PaceUnknownReason =
   /** The instance is not configured (any more). */
   | "noInstance"
   /**
-   * Confirmed: the provider marks the account `unsupported` (upstream's only marker for an account
-   * without usage limits). Nothing else ever gives this reason, whatever the history holds.
+   * The owner's setting `usagePacing[id].noLimits` says this instance has no limits (API key, pay
+   * per use). Nothing else gives this reason: no reading, however empty, ever means "free".
    */
   | "noLimits"
+  /**
+   * Not known: the provider marks the newest reading `unsupported`. Upstream sets it when it
+   * cannot read this account's limits (managed ChatGPT sharing, a failed Codex `config/read`, a
+   * Cursor reply with no windows), so it never means the account has none.
+   */
+  | "unreadable"
   /** Not known: no usage was read yet, or the read failed with nothing known before. */
   | "noReading"
   /**
@@ -71,7 +78,10 @@ export type PaceUnknownReason =
   | "emptyRead"
   /** Its history file exists but cannot be read. */
   | "historyUnreadable"
-  /** Seen in the recent history, absent now, and no non-empty full read since confirmed it gone. */
+  /**
+   * Seen in the current series, absent now, and not confirmed gone: a main window never is; an
+   * add-on window (`mayDisappear`) only by a later non-empty full read. Keeps its last value.
+   */
   | "missing"
   /** Its value was last confirmed longer ago than the stale bound. */
   | "stale"
@@ -116,6 +126,8 @@ export interface InstancePace {
   readonly unknownReason?: PaceUnknownReason;
   readonly reservePercent: number;
   readonly burnFirst: boolean;
+  /** The owner's setting: this instance has no limits (verdict `unknown`, reason `noLimits`). */
+  readonly noLimits: boolean;
   /** The stamp of the newest usage reading (live, or recorded after the live one was taken). */
   readonly checkedAt: string | null;
   readonly windows: ReadonlyArray<WindowPace>;
@@ -208,17 +220,32 @@ const isFull = (reading: UsageReading) =>
   reading.full === true && reading.unavailable === undefined;
 
 /**
- * A full read that returned windows proves the ones it lacks are gone. A full read with no windows
- * proves nothing (an API shape the builders do not know reads as empty), so it drops nothing.
+ * Add-on windows that may legitimately go (upstream builders): Claude `monthly_spend` and scoped
+ * `seven_day_<model>`, Codex `individual`. Any other id is a main window and is never confirmed
+ * gone, since a builder skips a main window it cannot read. Unlisted stays `missing` (safe side).
+ */
+const ADD_ON_WINDOW_IDS: ReadonlySet<string> = new Set(["monthly_spend", "individual"]);
+const SCOPED_WINDOW_PREFIX = "seven_day_";
+
+export const mayDisappear = (window: Pick<ServerProviderUsageWindow, "id">) =>
+  ADD_ON_WINDOW_IDS.has(window.id) || window.id.startsWith(SCOPED_WINDOW_PREFIX);
+
+/**
+ * A full read that returned windows proves an add-on window it lacks is gone. A full read with no
+ * windows proves nothing (an API shape the builders do not know reads as empty), so it drops
+ * nothing; a main window is never proven gone (see `mayDisappear`).
  */
 const confirmsGone = (reading: UsageReading) => isFull(reading) && reading.windows.length > 0;
 
 /**
- * Walks a series per window id. A full read confirms every window it returned, moved or not. Else a
- * reading confirms a window whose value changed there, or all when none changed (a re-read). Where
- * only other windows moved, it may be a streamed update carrying this one's old value: no proof.
+ * Per window id: a full read confirms all it returned; else a changed value, or all on a re-read
+ * (a streamed update may carry another window's old value). The first reading confirms only if
+ * full after a cut (clock step back, account swap); at the timeline's start it always does.
  */
-function trackWindows(series: ReadonlyArray<UsageReading>): Map<string, WindowTrack> {
+function trackWindows(
+  series: ReadonlyArray<UsageReading>,
+  afterCut: boolean,
+): Map<string, WindowTrack> {
   const tracks = new Map<string, WindowTrack>();
   series.forEach((reading, index) => {
     const previous = index > 0 ? series[index - 1] : undefined;
@@ -231,14 +258,16 @@ function trackWindows(series: ReadonlyArray<UsageReading>): Map<string, WindowTr
       seen.add(window.id);
       const track = tracks.get(window.id);
       const before = previous?.windows.find((entry) => entry.id === window.id);
-      const confirms = full || reread || before === undefined || !sameValue(before, window);
+      const confirms =
+        index === 0
+          ? full || !afterCut
+          : full || reread || before === undefined || !sameValue(before, window);
+      const point = { ms: msOf(reading), at: reading.checkedAt, usedPercent: window.usedPercent };
       if (track === undefined) {
         tracks.set(window.id, {
           last: window,
           lastIndex: index,
-          confirmed: [
-            { ms: msOf(reading), at: reading.checkedAt, usedPercent: window.usedPercent },
-          ],
+          confirmed: confirms ? [point] : [],
           resetAt: null,
         });
         continue;
@@ -249,13 +278,7 @@ function trackWindows(series: ReadonlyArray<UsageReading>): Map<string, WindowTr
       }
       track.last = window;
       track.lastIndex = index;
-      if (confirms) {
-        track.confirmed.push({
-          ms: msOf(reading),
-          at: reading.checkedAt,
-          usedPercent: window.usedPercent,
-        });
-      }
+      if (confirms) track.confirmed.push(point);
     }
   });
   return tracks;
@@ -370,7 +393,10 @@ function paceWindow(
   };
 }
 
-/** Ahead wins; then unknown; then on pace; then behind. Windows without a reset clock never pace. */
+/**
+ * Ahead wins; then unknown (an `unsupported` newest reading first); then on pace; then behind.
+ * Windows without a reset clock never pace. No reading ever gives `noLimits` (only the setting).
+ */
 function instanceVerdict(
   windows: ReadonlyArray<WindowPace>,
   newest: UsageReading,
@@ -380,16 +406,13 @@ function instanceVerdict(
 } {
   const timed = windows.filter((window) => window.unknownReason !== "noResetClock");
   if (timed.some((window) => window.verdict === "ahead")) return { verdict: "ahead" };
+  if (newest.unavailable === "unsupported")
+    return { verdict: "unknown", unknownReason: "unreadable" };
   const unknown = timed.find((window) => window.verdict === "unknown");
   if (unknown !== undefined) return { verdict: "unknown", unknownReason: unknown.unknownReason! };
   if (timed.length === 0) {
-    // No limits only from the provider's own marker; an empty or failed read is never free.
-    const none =
-      newest.unavailable === "unsupported"
-        ? "noLimits"
-        : newest.unavailable === undefined
-          ? "emptyRead"
-          : "noReading";
+    // An empty or failed read is never free, whatever the history holds.
+    const none = newest.unavailable === undefined ? "emptyRead" : "noReading";
     return { verdict: "unknown", unknownReason: windows.length > 0 ? "noResetClock" : none };
   }
   if (timed.some((window) => window.verdict === "onPace")) return { verdict: "onPace" };
@@ -399,7 +422,12 @@ function instanceVerdict(
 /** Pace of one instance. Pure: the clock, settings and history come in through `input`. */
 export function paceInstance(input: PaceInput): InstancePace {
   const { instanceId, provider, pacing } = input;
-  const base = { instanceId, reservePercent: pacing.reservePercent, burnFirst: pacing.burnFirst };
+  const base = {
+    instanceId,
+    reservePercent: pacing.reservePercent,
+    burnFirst: pacing.burnFirst,
+    noLimits: pacing.noLimits,
+  };
   if (provider === undefined) {
     return {
       ...base,
@@ -410,13 +438,22 @@ export function paceInstance(input: PaceInput): InstancePace {
     };
   }
   const live = liveReading(provider);
-  if (live === undefined || live.unavailable === "unsupported") {
+  if (pacing.noLimits) {
+    // The owner's word, whatever the readings say; the only way to `noLimits`.
     return {
       ...base,
       verdict: "unknown",
-      // Unsupported is confirmed; no usage at all is not read yet, so not known to be free.
-      unknownReason: live === undefined ? "noReading" : "noLimits",
+      unknownReason: "noLimits",
       checkedAt: live?.checkedAt ?? null,
+      windows: [],
+    };
+  }
+  if (live === undefined) {
+    return {
+      ...base,
+      verdict: "unknown",
+      unknownReason: "noReading",
+      checkedAt: null,
       windows: [],
     };
   }
@@ -461,11 +498,10 @@ export function paceInstance(input: PaceInput): InstancePace {
   }
   // The newest reading: the live snapshot, unless the history already holds it (then a reading
   // recorded after it, if any, is newer). The history records live only when it changed enough.
-  const series = currentSeries(
-    last === undefined || liveMs > msOf(last) ? [...recorded, live] : recorded,
-  );
+  const timeline = last === undefined || liveMs > msOf(last) ? [...recorded, live] : recorded;
+  const series = currentSeries(timeline);
   const newest = series.at(-1)!;
-  const tracks = trackWindows(series);
+  const tracks = trackWindows(series, series.length < timeline.length);
   const newestIds = newest.windows.map((window) => window.id);
   const windows: Array<WindowPace> = [];
   for (const window of newest.windows) {
@@ -478,11 +514,18 @@ export function paceInstance(input: PaceInput): InstancePace {
   }
   for (const [id, track] of tracks) {
     if (newestIds.includes(id)) continue;
-    // A non-empty full read after its last sighting confirmed it gone (e.g. extra usage turned
-    // off). A window missing because reads failed, were partial or came back empty stays
-    // unknown: never free.
-    if (series.slice(track.lastIndex + 1).some(confirmsGone)) continue;
-    windows.push(unknownWindow(track.last, "missing", { resetDetectedAt: track.resetAt }));
+    // An add-on window a non-empty full read after its last sighting no longer returned is gone
+    // (e.g. extra usage turned off). A main window, or one missing because reads failed, were
+    // partial or came back empty, stays unknown with its last value: never free.
+    if (mayDisappear(track.last) && series.slice(track.lastIndex + 1).some(confirmsGone)) continue;
+    windows.push(
+      unknownWindow(track.last, "missing", {
+        usedPercent: track.last.usedPercent,
+        resetsAt: track.last.resetsAt ?? null,
+        checkedAt: track.confirmed.at(-1)?.at ?? null,
+        resetDetectedAt: track.resetAt,
+      }),
+    );
   }
   return { ...base, ...instanceVerdict(windows, newest), checkedAt: newest.checkedAt, windows };
 }

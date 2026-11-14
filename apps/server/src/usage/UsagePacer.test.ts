@@ -27,6 +27,8 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { TestClock } from "effect/testing";
 
+import { claudeUsageResponseToLimits } from "../provider/claudeUsageLimits.ts";
+import { codexRateLimitsToLimits } from "../provider/codexUsageLimits.ts";
 import * as ProviderRegistryMock from "../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
 import {
@@ -41,6 +43,7 @@ import {
   DEFAULT_PACING,
   type InstancePace,
   make,
+  mayDisappear,
   paceInstance,
   staleAfterMs,
   type WindowPace,
@@ -237,7 +240,8 @@ describe("UsagePacer failure table", () => {
       reading(-90 * MINUTE, [weekly(40)]),
       // Stamped by a clock that was ahead, then corrected; thinning may hide the step.
       reading(-5 * MINUTE, [weekly(58)]),
-      reading(-50 * MINUTE, [weekly(55)]),
+      // A full read starts the new series (a streamed one would confirm nothing: fix round 4).
+      reading(-50 * MINUTE, [weekly(55)], { full: true }),
       reading(-40 * MINUTE, [weekly(56)]),
     ];
     const window = windowOf(pace(history, provider(-MINUTE, [weekly(57)])), "seven_day");
@@ -373,13 +377,14 @@ describe("UsagePacer guards", () => {
     assert.strictEqual(windowOf(result, "seven_day").unknownReason, "stale");
   });
 
-  it("an unsupported provider has no limits to pace", () => {
+  it("an unsupported provider cannot be read: unknown, never no limits", () => {
     const result = pace([], provider(-MINUTE, [], { unavailable: "unsupported" }));
-    assert.strictEqual(result.unknownReason, "noLimits");
+    assert.strictEqual(result.verdict, "unknown");
+    assert.strictEqual(result.unknownReason, "unreadable");
   });
 
-  it("no limits is told apart from no reading: a failed first read is not free", () => {
-    // Confirmed only by unsupported (above). A read that worked but reported no windows is not.
+  it("no reading is told apart from an empty read: neither is free", () => {
+    // A read that worked but reported no windows is not free either.
     assert.strictEqual(pace([], provider(-MINUTE, [])).unknownReason, "emptyRead");
     // Not read: the first read failed, or the instance has reported no usage at all.
     const failed = pace([], provider(-MINUTE, [], { unavailable: "probeFailed" }));
@@ -417,6 +422,7 @@ describe("UsagePacer guards", () => {
     );
     assert.strictEqual(dropped.verdict, "behind");
     // A clocked window (five_hour) gone from a full read is dropped as well.
+    // A main window (five_hour) gone from a full read is never dropped (fix round 4).
     const sessionGone = pace(
       [
         reading(-20 * MINUTE, [weekly(40), session(10)], { full: true }),
@@ -424,7 +430,8 @@ describe("UsagePacer guards", () => {
       ],
       provider(-10 * MINUTE, [weekly(41)]),
     );
-    assert.strictEqual(sessionGone.verdict, "behind");
+    assert.strictEqual(sessionGone.verdict, "unknown");
+    assert.strictEqual(windowOf(sessionGone, "five_hour").unknownReason, "missing");
 
     // The read failed: no windows came back, so every window is unknown, never free.
     const failed = pace(
@@ -439,8 +446,9 @@ describe("UsagePacer guards", () => {
   it("a full read with no windows drops nothing: known windows stay unknown, never free", () => {
     // Claude's rate_limits with null five_hour/seven_day, or a Codex snapshot of another limit id:
     // the read worked but found no windows. That proves nothing gone (the weekly may sit at 95).
+    const spend = open(10, "monthly_spend", "monthly");
     const history = [
-      reading(-20 * MINUTE, [weekly(95), session(20)], { full: true }),
+      reading(-20 * MINUTE, [weekly(95), session(20), spend], { full: true }),
       reading(-10 * MINUTE, [], { full: true }),
     ];
     const empty = pace(history, provider(-10 * MINUTE, []));
@@ -451,14 +459,14 @@ describe("UsagePacer guards", () => {
     // Not yet recorded (only live): the same.
     const live = pace(history.slice(0, 1), provider(-10 * MINUTE, []));
     assert.strictEqual(live.unknownReason, "missing");
-    // A non-empty full read after the empty one still drops what it lacks (M3).
+    // A non-empty full read after the empty one still drops an add-on window it lacks (M3).
     const after = pace(
-      [...history, reading(-5 * MINUTE, [weekly(41)], { full: true })],
-      provider(-5 * MINUTE, [weekly(41)]),
+      [...history, reading(-5 * MINUTE, [weekly(41), session(21)], { full: true })],
+      provider(-5 * MINUTE, [weekly(41), session(21)]),
     );
     assert.deepStrictEqual(
       after.windows.map((window) => window.id),
-      ["seven_day"],
+      ["seven_day", "five_hour"],
     );
     assert.strictEqual(after.verdict, "behind");
     // With no window known in the lookback, an empty read that worked is still not free.
@@ -467,7 +475,7 @@ describe("UsagePacer guards", () => {
     assert.strictEqual(alone.unknownReason, "emptyRead");
   });
 
-  describe("no limits only from the provider's unsupported marker (fix round 3)", () => {
+  describe("an empty read is never free (fix round 3)", () => {
     const notFree = (result: InstancePace, reason: string) => {
       assert.strictEqual(result.verdict, "unknown");
       assert.strictEqual(result.unknownReason, reason);
@@ -496,19 +504,246 @@ describe("UsagePacer guards", () => {
       notFree(pace([reading(-MINUTE, [], { full: true })], provider(-MINUTE, [])), "emptyRead");
     });
 
-    it("an unsupported account is no limits, also after a series with windows", () => {
-      notFree(pace([], provider(-MINUTE, [], { unavailable: "unsupported" })), "noLimits");
-      // Swapped to an account without a subscription: upstream's own marker says so.
-      const history = [reading(-20 * MINUTE, [weekly(95)], { full: true })];
-      notFree(pace(history, provider(-MINUTE, [], { unavailable: "unsupported" })), "noLimits");
+    it("an unsupported account is unreadable, also after a series with windows", () => {
+      notFree(pace([], provider(-MINUTE, [], { unavailable: "unsupported" })), "unreadable");
       // The newest reading is a recorded unsupported one (recorded after the live snapshot).
       notFree(
         pace(
           [reading(-10 * MINUTE, []), reading(-2 * MINUTE, [], { unavailable: "unsupported" })],
           provider(-10 * MINUTE, []),
         ),
-        "noLimits",
+        "unreadable",
       );
+    });
+  });
+
+  describe("no limits only from the owner's setting (fix round 4)", () => {
+    const notFree = (result: InstancePace, reason: string) => {
+      assert.strictEqual(result.verdict, "unknown");
+      assert.strictEqual(result.unknownReason, reason);
+    };
+    const unsupported = (offsetMs: number) =>
+      provider(offsetMs, [], { unavailable: "unsupported" });
+
+    it("managed or unsupported with a known weekly at 95 is unknown, never free (P1)", () => {
+      // Managed ChatGPT sharing always reads `unsupported`; plain Codex does after a failed
+      // config/read. The weekly sat at 95 ten minutes ago.
+      const history = [reading(-10 * MINUTE, [weekly(95), session(40)], { full: true })];
+      const result = pace(history, unsupported(-MINUTE));
+      notFree(result, "unreadable");
+      // The known windows stay, with their last values.
+      assert.strictEqual(windowOf(result, "seven_day").unknownReason, "missing");
+      assert.strictEqual(windowOf(result, "seven_day").usedPercent, 95);
+      // Recorded too, after a working read.
+      notFree(
+        pace(
+          [...history, reading(-2 * MINUTE, [], { unavailable: "unsupported" })],
+          unsupported(-2 * MINUTE),
+        ),
+        "unreadable",
+      );
+    });
+
+    it("an unsupported reading stamped days ago is unknown (P2)", () => {
+      notFree(pace([], unsupported(-3 * DAY)), "unreadable");
+      notFree(
+        pace([reading(-3 * DAY, [], { unavailable: "unsupported" })], unsupported(-3 * DAY)),
+        "unreadable",
+      );
+    });
+
+    it("the setting on gives no limits whatever the readings say", () => {
+      const noLimits = { pacing: { noLimits: true } } as const;
+      const cases: ReadonlyArray<[ReadonlyArray<UsageReading> | "unreadable", ServerProvider]> = [
+        [[], provider(-MINUTE, [weekly(95), session(99)])],
+        [[], unsupported(-MINUTE)],
+        [[], provider(-MINUTE, [])],
+        [[], provider(-MINUTE, [], { unavailable: "probeFailed" })],
+        ["unreadable", provider(-MINUTE, [weekly(10)])],
+        [[reading(-10 * MINUTE, [weekly(95)], { full: true })], provider(-MINUTE, [])],
+        [[reading(-MINUTE, [weekly(40)])], provider(-2 * MINUTE, [weekly(40)])],
+      ];
+      for (const [history, live] of cases) {
+        const result = pace(history, live, noLimits);
+        notFree(result, "noLimits");
+        assert.isTrue(result.noLimits);
+        assert.deepStrictEqual(result.windows, []);
+      }
+      const { usageLimits: _none, ...unread } = provider(-MINUTE, []);
+      notFree(pace([], unread, noLimits), "noLimits");
+      // A removed instance is still gone.
+      notFree(pace([], undefined, noLimits), "noInstance");
+    });
+
+    it("the setting off or absent never gives no limits", () => {
+      const lives = [
+        provider(-MINUTE, [weekly(40)]),
+        provider(-MINUTE, [weekly(95)]),
+        provider(-MINUTE, []),
+        provider(-3 * DAY, []),
+        unsupported(-MINUTE),
+        unsupported(-3 * DAY),
+        provider(-MINUTE, [], { unavailable: "probeFailed" }),
+        provider(-MINUTE, [open(10, "monthly_spend", "monthly")]),
+      ];
+      const histories: ReadonlyArray<ReadonlyArray<UsageReading> | "unreadable"> = [
+        [],
+        "unreadable",
+        [reading(-20 * MINUTE, [weekly(95)], { full: true })],
+        [reading(-20 * MINUTE, [], { full: true })],
+        [reading(-20 * MINUTE, [], { unavailable: "unsupported" })],
+        [
+          reading(-20 * MINUTE, [weekly(95)], { full: true, account: "aaaa" }),
+          reading(-15 * MINUTE, [], { full: true, account: "bbbb" }),
+        ],
+      ];
+      for (const pacing of [{}, { noLimits: false }]) {
+        for (const history of histories) {
+          for (const live of lives) {
+            const result = pace(history, live, { pacing });
+            assert.notStrictEqual(result.unknownReason, "noLimits");
+            assert.isFalse(result.noLimits);
+          }
+        }
+      }
+    });
+  });
+
+  describe("main windows are never confirmed gone (fix round 4)", () => {
+    it("a main window missing from a non-empty full read stays missing with its last value (P3)", () => {
+      // A reply shape change (e.g. `seven_day` renamed): the builder skips the weekly at 95.
+      const history = [
+        reading(-20 * MINUTE, [weekly(95), session(40)], { full: true }),
+        reading(-10 * MINUTE, [session(40)], { full: true }),
+      ];
+      const result = pace(history, provider(-10 * MINUTE, [session(40)]));
+      assert.strictEqual(result.verdict, "unknown");
+      assert.strictEqual(result.unknownReason, "missing");
+      const gone = windowOf(result, "seven_day");
+      assert.strictEqual(gone.unknownReason, "missing");
+      assert.strictEqual(gone.usedPercent, 95);
+      assert.strictEqual(gone.checkedAt, at(-20 * MINUTE));
+      assert.strictEqual(gone.resetsAt, weekly(95).resetsAt);
+      // Codex's main windows too.
+      const codex = (id: string, used: number) => ({ ...session(used), id });
+      const codexGone = pace(
+        [
+          reading(-20 * MINUTE, [codex("primary", 10), codex("secondary", 90)], { full: true }),
+          reading(-10 * MINUTE, [codex("primary", 11)], { full: true }),
+        ],
+        provider(-10 * MINUTE, [codex("primary", 11)]),
+      );
+      assert.strictEqual(windowOf(codexGone, "secondary").unknownReason, "missing");
+      assert.strictEqual(codexGone.verdict, "unknown");
+    });
+
+    it("an add-on window gone from a non-empty full read is dropped", () => {
+      const scoped = weekly(30, 3.5 * DAY, { id: "seven_day_opus", label: "Weekly · Opus" });
+      const credit = { ...open(20, "individual", "monthly"), resetsAt: at(10 * DAY) };
+      const history = [
+        reading(-20 * MINUTE, [weekly(40), scoped, credit, open(10, "monthly_spend", "monthly")], {
+          full: true,
+        }),
+        reading(-10 * MINUTE, [weekly(41)], { full: true }),
+      ];
+      const result = pace(history, provider(-10 * MINUTE, [weekly(41)]));
+      assert.deepStrictEqual(
+        result.windows.map((window) => window.id),
+        ["seven_day"],
+      );
+      assert.strictEqual(result.verdict, "behind");
+    });
+
+    it("upstream's builders: main windows stay, add-on windows may disappear", () => {
+      const claude = claudeUsageResponseToLimits({
+        checkedAt: at(0),
+        response: {
+          rate_limits_available: true,
+          rate_limits: {
+            five_hour: { utilization: 54, resets_at: at(HOUR) },
+            seven_day: { utilization: 18, resets_at: at(DAY) },
+            ...({
+              model_scoped: [{ display_name: "Fable", utilization: 73, resets_at: at(DAY) }],
+              spend: {
+                enabled: true,
+                used: { amount_minor: 4_631, currency: "USD", exponent: 2 },
+                limit: { amount_minor: 50_000, currency: "USD", exponent: 2 },
+              },
+            } as object),
+          },
+        },
+      }).limits.windows;
+      const codex = codexRateLimitsToLimits({
+        checkedAt: at(0),
+        snapshot: {
+          limitId: "codex",
+          planType: "team",
+          primary: { usedPercent: 10, resetsAt: 1_784_000_000, windowDurationMins: 300 },
+          secondary: { usedPercent: 40, resetsAt: 1_784_500_000, windowDurationMins: 10080 },
+          individualLimit: { remainingPercent: 80, resetsAt: 1_796_083_200 },
+        },
+      }).windows;
+      const classified = (windows: ReadonlyArray<ServerProviderUsageWindow>) =>
+        Object.fromEntries(windows.map((window) => [window.id, mayDisappear(window)]));
+      assert.deepStrictEqual(classified(claude), {
+        five_hour: false,
+        seven_day: false,
+        seven_day_fable: true,
+        monthly_spend: true,
+      });
+      assert.deepStrictEqual(classified(codex), {
+        primary: false,
+        secondary: false,
+        individual: true,
+      });
+    });
+  });
+
+  describe("the first reading after a cut confirms only when full (fix round 4)", () => {
+    it("a clock step back: a streamed first reading leaves carried windows stale (P4)", () => {
+      // Full read 60 min ago; since then only session updates streamed in, carrying the weekly.
+      const before = [
+        reading(-60 * MINUTE, [weekly(40), session(10)], { full: true }),
+        reading(-20 * MINUTE, [weekly(40), session(20)]),
+      ];
+      const steady = [...before, reading(-10 * MINUTE, [weekly(40), session(25)])];
+      const plain = pace(steady, provider(-10 * MINUTE, [weekly(40), session(25)]));
+      assert.strictEqual(windowOf(plain, "seven_day").unknownReason, "stale");
+      // The same streamed update stamped by a clock that stepped back.
+      const stepped = [...before, reading(-30 * MINUTE, [weekly(40), session(25)])];
+      const result = pace(stepped, provider(-30 * MINUTE, [weekly(40), session(25)]));
+      assert.strictEqual(windowOf(result, "seven_day").unknownReason, "stale");
+      assert.isNull(windowOf(result, "seven_day").checkedAt);
+      assert.strictEqual(result.verdict, "unknown");
+      // A streamed update after it confirms the window it moved.
+      const moved = pace(
+        [...stepped, reading(-25 * MINUTE, [weekly(40), session(30)])],
+        provider(-25 * MINUTE, [weekly(40), session(30)]),
+      );
+      assert.strictEqual(windowOf(moved, "five_hour").verdict, "behind");
+      assert.strictEqual(windowOf(moved, "seven_day").unknownReason, "stale");
+      // A full first reading after the step confirms what it carries.
+      const full = [...before, reading(-30 * MINUTE, [weekly(40), session(25)], { full: true })];
+      const confirmed = pace(full, provider(-30 * MINUTE, [weekly(40), session(25)]));
+      assert.strictEqual(windowOf(confirmed, "seven_day").checkedAt, at(-30 * MINUTE));
+      assert.strictEqual(confirmed.verdict, "behind");
+    });
+
+    it("an account swap: a streamed first reading confirms nothing; the history's first does", () => {
+      const swapped = pace(
+        [
+          reading(-40 * MINUTE, [weekly(70)], { full: true, account: "aaaa" }),
+          reading(-10 * MINUTE, [weekly(10)], { account: "bbbb" }),
+        ],
+        provider(-10 * MINUTE, [weekly(10)]),
+      );
+      assert.strictEqual(windowOf(swapped, "seven_day").unknownReason, "stale");
+      // No cut: the history's (or the live snapshot's) first reading keeps today's rule.
+      const first = pace(
+        [reading(-10 * MINUTE, [weekly(10)])],
+        provider(-10 * MINUTE, [weekly(10)]),
+      );
+      assert.strictEqual(windowOf(first, "seven_day").verdict, "behind");
     });
   });
 
@@ -549,7 +784,8 @@ describe("UsagePacer guards", () => {
   it("an account swap starts a new series", () => {
     const history = [
       reading(-40 * MINUTE, [weekly(70)], { account: "aaaa" }),
-      reading(-20 * MINUTE, [weekly(10)], { account: "bbbb" }),
+      // The swap's probe is a full read (a streamed first reading confirms nothing: fix round 4).
+      reading(-20 * MINUTE, [weekly(10)], { full: true, account: "bbbb" }),
     ];
     const window = windowOf(pace(history, provider(-MINUTE, [weekly(11)])), "seven_day");
     assert.isNull(window.resetDetectedAt);
@@ -677,6 +913,36 @@ describe("UsagePacer reserve and verdicts", () => {
 describe("UsagePacer settings", () => {
   const decodeSettings = Schema.decodeUnknownSync(ServerSettings);
   const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+  const encodeSettings = Schema.encodeSync(ServerSettings);
+  const decodeEncoded = Schema.decodeSync(ServerSettings);
+
+  it("old settings files without noLimits decode it off (fix round 4)", () => {
+    const old = decodeSettings({
+      usagePacing: { [INSTANCE]: { reservePercent: 20, burnFirst: true } },
+    });
+    assert.deepStrictEqual(old.usagePacing[INSTANCE], {
+      reservePercent: 20,
+      burnFirst: true,
+      noLimits: false,
+    });
+    assert.isFalse(DEFAULT_PACING.noLimits);
+    const on = applyServerSettingsPatch(
+      old,
+      decodePatch({ usagePacing: { [INSTANCE]: { noLimits: true } } }),
+    );
+    assert.deepStrictEqual(on.usagePacing[INSTANCE], {
+      reservePercent: 20,
+      burnFirst: true,
+      noLimits: true,
+    });
+    const kept = applyServerSettingsPatch(
+      on,
+      decodePatch({ usagePacing: { [INSTANCE]: { reservePercent: 5 } } }),
+    );
+    assert.isTrue(kept.usagePacing[INSTANCE]!.noLimits);
+    assert.isTrue(decodeEncoded(encodeSettings(kept)).usagePacing[INSTANCE]!.noLimits);
+    assert.throws(() => decodePatch({ usagePacing: { [INSTANCE]: { noLimits: "yes" } } }));
+  });
 
   it("old settings files decode to no pacing; an entry fills its defaults", () => {
     assert.deepStrictEqual(decodeSettings({}).usagePacing, {});
@@ -695,8 +961,16 @@ describe("UsagePacer settings", () => {
       added,
       decodePatch({ usagePacing: { [GONE]: { burnFirst: true } } }),
     );
-    assert.deepStrictEqual(both.usagePacing[INSTANCE], { reservePercent: 20, burnFirst: false });
-    assert.deepStrictEqual(both.usagePacing[GONE], { reservePercent: 0, burnFirst: true });
+    assert.deepStrictEqual(both.usagePacing[INSTANCE], {
+      reservePercent: 20,
+      burnFirst: false,
+      noLimits: false,
+    });
+    assert.deepStrictEqual(both.usagePacing[GONE], {
+      reservePercent: 0,
+      burnFirst: true,
+      noLimits: false,
+    });
     const removed = applyServerSettingsPatch(both, decodePatch({ usagePacing: { [GONE]: null } }));
     assert.deepStrictEqual(Object.keys(removed.usagePacing), [INSTANCE]);
     const unrelated = applyServerSettingsPatch(
@@ -715,12 +989,20 @@ describe("UsagePacer settings", () => {
       reserved,
       decodePatch({ usagePacing: { [INSTANCE]: { burnFirst: true } } }),
     );
-    assert.deepStrictEqual(burning.usagePacing[INSTANCE], { reservePercent: 20, burnFirst: true });
+    assert.deepStrictEqual(burning.usagePacing[INSTANCE], {
+      reservePercent: 20,
+      burnFirst: true,
+      noLimits: false,
+    });
     const lowered = applyServerSettingsPatch(
       burning,
       decodePatch({ usagePacing: { [INSTANCE]: { reservePercent: 5 } } }),
     );
-    assert.deepStrictEqual(lowered.usagePacing[INSTANCE], { reservePercent: 5, burnFirst: true });
+    assert.deepStrictEqual(lowered.usagePacing[INSTANCE], {
+      reservePercent: 5,
+      burnFirst: true,
+      noLimits: false,
+    });
     assert.throws(() => decodePatch({ usagePacing: { [INSTANCE]: { reservePercent: 101 } } }));
     assert.throws(() => decodePatch({ usagePacing: { [INSTANCE]: { burnFirst: "yes" } } }));
   });
@@ -796,7 +1078,7 @@ it.layer(NodeServices.layer)("UsagePacer service", (it) => {
         readings: (instanceId) =>
           Effect.fail(new UsageHistoryUnreadable({ instanceId, detail: "permission denied" })),
         getSettings: Effect.succeed(
-          settingsWith({ [GONE]: { reservePercent: 10, burnFirst: false } }),
+          settingsWith({ [GONE]: { reservePercent: 10, burnFirst: false, noLimits: false } }),
         ),
       });
       const all = yield* pacer.paceAll;
@@ -832,6 +1114,24 @@ it.layer(NodeServices.layer)("UsagePacer service", (it) => {
       const result = yield* pacer.paceOf(INSTANCE);
       assert.strictEqual(result.verdict, "unknown");
       assert.strictEqual(result.unknownReason, "emptyRead");
+    }),
+  );
+
+  it.effect("the owner's no-limits setting reaches the pacer from the settings (fix round 4)", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const pacer = (noLimits: boolean) =>
+        make({
+          getProviders: Effect.succeed([provider(-MINUTE, [weekly(95)])]),
+          readings: () => Effect.succeed([]),
+          getSettings: Effect.succeed(
+            settingsWith({ [INSTANCE]: { ...DEFAULT_PACING, noLimits } }),
+          ),
+        });
+      const on = yield* pacer(true).paceOf(INSTANCE);
+      assert.strictEqual(on.unknownReason, "noLimits");
+      const off = yield* pacer(false).paceOf(INSTANCE);
+      assert.strictEqual(off.verdict, "ahead");
     }),
   );
 

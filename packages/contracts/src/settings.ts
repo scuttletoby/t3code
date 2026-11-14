@@ -944,18 +944,25 @@ export const UsagePacingInstanceSettings = Schema.Struct({
   reservePercent: UsagePacingReservePercent.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   /** Spend this instance first: no even pace, only the reserve holds agents back. */
   burnFirst: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * The owner says this instance has no usage limits (an API key, pay per use). The only source
+   * of "no limits": no reading ever means it, since upstream's `unsupported` means "cannot read".
+   */
+  noLimits: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type UsagePacingInstanceSettings = typeof UsagePacingInstanceSettings.Type;
 
 export const DEFAULT_USAGE_PACING_INSTANCE_SETTINGS: UsagePacingInstanceSettings = {
   reservePercent: 0,
   burnFirst: false,
+  noLimits: false,
 };
 
 /** Fork: a patch of one instance's pacing; a field left out keeps its stored value. */
 export const UsagePacingInstanceSettingsPatch = Schema.Struct({
   reservePercent: Schema.optionalKey(UsagePacingReservePercent),
   burnFirst: Schema.optionalKey(Schema.Boolean),
+  noLimits: Schema.optionalKey(Schema.Boolean),
 });
 export type UsagePacingInstanceSettingsPatch = typeof UsagePacingInstanceSettingsPatch.Type;
 
