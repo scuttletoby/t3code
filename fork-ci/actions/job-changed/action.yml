@@ -1,0 +1,56 @@
+name: job-changed
+description: >-
+  Can the change from base to HEAD change what one job of a workflow does? Compares the job's
+  parsed block, every job it needs and the workflow-level on/env/defaults/permissions; optional
+  path expressions count too. Anything unclear means changed. Usage: README.md next to this file.
+inputs:
+  base:
+    description: >-
+      The commit to compare with (pull_request on GitHub's merge commit: HEAD^1; push: the last
+      commit whose push run passed, see README). Empty or not in the checkout: changed.
+    required: false
+    default: ""
+  head:
+    description: The commit to judge (default HEAD, the checkout).
+    required: false
+    default: HEAD
+  workflow:
+    description: The workflow file, a path in the repository (e.g. .github/workflows/ci.yml).
+    required: true
+  job:
+    description: The job id whose part of the workflow counts.
+    required: false
+    default: ${{ github.job }}
+  paths:
+    description: >-
+      Optional. One Python regular expression per line (re.search on each changed path, # comments
+      allowed); a changed file one finds makes the job changed. The workflow file is never matched
+      here: only its job compare counts.
+    required: false
+    default: ""
+outputs:
+  changed:
+    description: "'false' only when neither the workflow part nor a path counts; test != 'false'."
+    value: ${{ steps.changed.outputs.changed }}
+  workflow:
+    description: "The workflow part alone: 'false' only when the workflow change cannot reach the job."
+    value: ${{ steps.changed.outputs.workflow }}
+  reason:
+    description: One line saying why.
+    value: ${{ steps.changed.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    # Only code from this action's folder (the caller's pinned SHA) runs, and the workflow is read
+    # from git objects (git show <commit>:<path>), never from the working tree.
+    - id: changed
+      shell: bash
+      env:
+        BASE: ${{ inputs.base }}
+        HEAD: ${{ inputs.head }}
+        WORKFLOW: ${{ inputs.workflow }}
+        JOB: ${{ inputs.job }}
+        PATHS: ${{ inputs.paths }}
+      run: >-
+        python3 -I "$GITHUB_ACTION_PATH/job_changed.py" --base="$BASE" --head="$HEAD"
+        --workflow="$WORKFLOW" --job="$JOB" --paths="$PATHS"
