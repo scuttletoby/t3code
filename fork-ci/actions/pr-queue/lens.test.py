@@ -95,6 +95,57 @@ class Gaps(unittest.TestCase):
         self.assertIn(lens.EMBEDDED, SOURCE.lens_problem(post('Notes\n```\nlens: effaced1\n```')))
 
 
+class Markdown(unittest.TestCase):
+    """clean_inline keeps the source's answers (`</?[A-Za-z][^>]*>` tags, `!?\\[([^\\]]*)\\]\\([^)]*\\)` links) in linear time."""
+
+    def test_a_tag_with_a_lt_in_a_quoted_attribute_still_hides_nothing(self):   # GitHub renders it as a header
+        body = f'lens<a title="<">: correctness · read at<a title="<">: {SHA_A}\n\nsafe<a title="<"> to merge: no'
+        self.assertEqual(lens.clean_inline('lens<a title="<">: x'), 'lens: x')
+        pr = {'comments': [post(body)], 'reviews': []}
+        self.assertEqual(SOURCE.reviewed_head(pr)[:2], (True, None),
+                         'never unseen: the source reading shows a header, the narrow one none, so it reads nothing')
+
+    def test_a_header_only_the_narrow_reading_shows_is_still_read(self):   # GitHub renders it as visible text
+        old = '1234567' + 'a' * 33   # a digit first: `<1234567...>` is no tag either way
+        valid = post(f'lens: correctness · reviewer: x · read at: {SHA_B}', when='2026-01-01T00:00:00Z')
+        for body in (f'<lens: security · reviewer: x · read at: <{old}></b>',
+                     f'note x<y lens: security · reviewer: x · read at: <{old}> <br>'):
+            with self.subTest(body):
+                stale = post(body, when='2026-01-01T00:01:00Z')
+                self.assertIsNotNone(SOURCE.lens_problem(stale), 'one reading shows a header, the other none')
+                self.assertEqual(SOURCE.reviewed_head(pr(valid, stale, commits=(old, SHA_B)))[:2], (True, None),
+                                 'a lens that read nothing: the PR is not reviewed at its head')
+        self.assertEqual(SOURCE.reviewed_head(pr(valid, commits=(old, SHA_B)))[:2], (True, SHA_B))
+
+    def test_a_comment_counts_only_when_both_readings_give_the_same_header(self):
+        both = post(f'lens: <b>correctness</b> · reviewer: x · read at: {SHA_B}')
+        self.assertIsNone(SOURCE.lens_problem(both))
+        self.assertEqual(lens.lens_header(both['body']), lens.lens_header(both['body'], narrow=True))
+        one = post(f'lens<a title="<">: correctness · read at<a title="<">: {SHA_B}')
+        self.assertIsNone(lens.lens_header(one['body'], narrow=True))
+        self.assertIn('depending on how its HTML', SOURCE.lens_problem(one), 'the other way round: flagged too')
+
+    def test_a_second_header_only_the_source_reading_shows_is_still_flagged(self):
+        """The wide (source) reading's own problem check: main's narrow reading sees one header here, the source two."""
+        old = 'c' * 40
+        body = (f'lens: tests · reviewer: x · read at: {SHA_B}\n\n'
+                f'lens<a title="<">: correctness · read at<a title="<">: {old}')
+        self.assertIsNone(SOURCE.read_problem(body, narrow=True), 'the narrow reading alone sees nothing wrong')
+        self.assertIn('2 times', SOURCE.lens_problem(post(body)))
+        self.assertEqual(SOURCE.reviewed_head(pr(post(body), commits=(old, SHA_B)))[:2], (True, None))
+
+    def test_the_scans_give_the_source_regexes_answers(self):
+        import random
+        tag, link = re.compile(r'</?[A-Za-z][^>]*>'), re.compile(r'!?\[([^\]]*)\]\([^)]*\)')
+        rnd = random.Random(7)
+        parts = ['<', '>', '[', ']', '(', ')', '!', '/', 'a', 'B', ' ', '"', '*', '`', '|', '_', 'lens', ':', '](', '<a', '</b>', '![']
+        for _ in range(100000):
+            s = ''.join(rnd.choice(parts) for _ in range(rnd.randint(0, 16)))
+            want = re.sub(r'[*`]', '', link.sub(r'\1', tag.sub('', s))).replace('|', ' ')
+            want = re.sub(r'(?<![^\W_])_+|_+(?![^\W_])', '', want)
+            self.assertEqual(lens.clean_inline(s), want, repr(s))
+
+
 class Advice(unittest.TestCase):
     """no_lens_text(keep_markdown=True), for the queue's own advice: the source cleaned it like a gh error, so its
     `<sha>` placeholder and the backticks around a command were dropped from the comment."""
