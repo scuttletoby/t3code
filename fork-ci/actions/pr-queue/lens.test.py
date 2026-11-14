@@ -208,6 +208,41 @@ class WhoCounts(unittest.TestCase):
                 self.head(self.OWN, who)
                 self.assertLess(time.monotonic() - start, 5, (body[:20], who.get('authorAssociation')))
 
+    def test_a_trusted_authors_long_blank_or_marker_runs_cost_no_time(self):   # r4 sec: 30-60 s each before
+        import time
+        shapes = ('lens: a' + ' ' * 65536 + 'b',                                   # FIELD_RE: one blank run per start
+                  f'lens: a · read at: {SHA_A}\nread at' + ' ' * 65536 + 'x',      # READ_AT_RE: \\s*:?\\s* split a run
+                  f'lens: a · read at: {SHA_A}\nread at' + '\u00a0' * 65536 + 'x',
+                  'lens: a' + ' r1' * 21000, 'lens: a' + ' lens' * 13000)           # lens_key: one pass per marker
+        for body in shapes:
+            start = time.monotonic()
+            self.head(post(body))
+            self.assertLess(time.monotonic() - start, 5, body[:20])
+
+    def test_many_capped_stranger_posts_cost_no_time(self):   # r4 sec: 0.76 s per 4096-char post before
+        import time
+        body = 'lens: a' + ' ' * (lens.STRANGER_SCAN - 9) + 'b'
+        posts = [stranger(body, url=f'https://github.test/pr/7#c{i}') for i in range(20)]
+        start = time.monotonic()
+        self.assertEqual(self.head(self.OWN, *posts), (True, SHA_A, 'every lens read it'))
+        self.assertLess(time.monotonic() - start, 5)
+
+    def test_a_malformed_lens_comment_blocks_until_deleted_edited_or_overridden(self):
+        # r3: the advice "re-post it" could not work: the malformed comment is its own entry, keyed by the comment
+        fence = '`' * 3
+        bad = post(f'{fence}\nlens: correctness · reviewer: x · read at: {SHA_A}\n{fence}', url='https://github.test/c1')
+        good = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-02T00:00:00Z')
+        self.assertEqual(self.head(bad, good)[:2], (True, None), 'a correct re-post leaves the old one in force')
+        self.assertEqual(self.head(dict(bad, isMinimized=True), good)[:2], (True, None), 'hiding is not enough')
+        self.assertEqual(self.head(good), (True, SHA_A, 'every lens read it'), 'deleted')
+        edited = dict(bad, body='not a lens: an old draft, see the next comment', includesCreatedEdit=True)
+        self.assertEqual(self.head(edited, good), (True, SHA_A, 'every lens read it'), 'its first line edited')
+        kept = dict(bad, body=f'not a lens: draft\nlens: correctness · reviewer: x · read at: {SHA_A}')
+        self.assertEqual(self.head(kept, good)[:2], (True, None), 'the opt-out does not clear a header line left in it')
+        over = post(f'tool ready --head {SHA_A}: read it', when='2026-01-03T00:00:00Z')
+        self.assertEqual(self.head(bad, good, over), (True, SHA_A, 'every lens read it'), 'a newer override')
+        self.assertIn('delete that comment (hiding it is not enough)', lens.NO_HEADER_WAY_OUT)
+
     def test_a_lens_comment_whose_author_does_not_count_is_logged(self):
         # a wrong lens_author_associations makes reviewed PRs look unreviewed: the run log must say why
         lines = []
@@ -250,6 +285,55 @@ class WhoCounts(unittest.TestCase):
         lens_post = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', authorAssociation='COLLABORATOR')
         over = post(f'tool ready --head {SHA_B}: read the rest', when='2026-01-02T00:00:00Z')
         self.assertEqual(r.reviewed_head(pr(lens_post, over)), (True, SHA_B, 'every lens read it'))
+
+
+class Reviews(unittest.TestCase):
+    """PR reviews take part like comments (lens_posts): ordered by submittedAt, by the same author rules. gh gives no
+    isMinimized for a review, so a review counts as shown."""
+    R = WhoCounts.R
+
+    def review(self, body, when='2026-01-02T00:00:00Z', **extra):
+        p = post(body, when=..., **extra)
+        p['submittedAt'] = when
+        return p
+
+    def head(self, comments=(), reviews=()):
+        return self.R.reviewed_head({'headRefOid': SHA_B, 'comments': list(comments), 'reviews': list(reviews)})
+
+    def test_a_counted_review_is_a_read(self):
+        self.assertEqual(self.head(reviews=[self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}')]),
+                         (True, SHA_B, 'every lens read it'))
+
+    def test_the_newest_of_comments_and_reviews_counts_by_submitted_at(self):
+        old = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
+        newer = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}', when='2026-01-02T00:00:00Z')
+        self.assertEqual(self.head([old], [newer]), (True, SHA_B, 'every lens read it'))
+        older = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}', when='2025-12-31T00:00:00Z')
+        self.assertEqual(self.head([old], [older]), (True, SHA_A, 'every lens read it'))
+
+    def test_a_review_without_a_hidden_state_counts_as_shown(self):
+        r = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}')
+        self.assertNotIn('isMinimized', r)
+        self.assertEqual(self.head(reviews=[r])[1], SHA_B)
+
+    def test_an_edited_review_reads_nothing(self):
+        for edited in (True, ...):
+            r = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}', includesCreatedEdit=edited)
+            reviewed, sha, why = self.head(reviews=[r])
+            self.assertEqual((reviewed, sha), (True, None), edited)
+            self.assertIn(lens.EDITED, why)
+
+    def test_a_strangers_review_is_ignored(self):
+        own = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
+        forged = self.review(f'lens: correctness · reviewer: x · read at: {SHA_B}', authorAssociation='NONE')
+        self.assertEqual(self.head([own], [forged]), (True, SHA_A, 'every lens read it'))
+        self.assertEqual(self.head(reviews=[forged]), (False, None, 'no lens comments'))
+
+    def test_a_counted_authors_look_alike_review_blocks(self):
+        own = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
+        reviewed, sha, why = self.head([own], [self.review('lgtm, safe to merge')])
+        self.assertEqual((reviewed, sha), (True, None))
+        self.assertIn(lens.NO_HEADER, why)
 
 
 class Config(unittest.TestCase):
