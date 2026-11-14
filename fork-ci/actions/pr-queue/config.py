@@ -36,6 +36,7 @@ class Config:
     wait_seconds: int = 60
     poll_seconds: int = 5
     list_limit: int = 50
+    update_when_base_was_red: bool = False
 
     def ready(self, n):
         """The command that re-arms PR n after a lens read, as the project writes it."""
@@ -84,6 +85,8 @@ KEYS = {
     'wait_seconds': (False, _int(5, 600), 'whole seconds, 5-600'),
     'poll_seconds': (False, _int(1, 60), 'whole seconds, 1-60'),
     'list_limit': (False, _int(1, 100), 'how many open PRs the queue reads, 1-100'),
+    'update_when_base_was_red': (False, lambda v: isinstance(v, bool),
+                                 'true only when every required check\'s job runs the tested-base action, else false'),
 }
 
 
