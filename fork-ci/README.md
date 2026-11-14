@@ -16,6 +16,14 @@ Find it on the [`ci-release`](https://github.com/scuttletoby/t3code/tree/ci-rele
 `git ls-remote https://github.com/scuttletoby/t3code.git 'refs/tags/ci/v*'` (the `^{}` line is the
 commit to pin).
 
+Pin only a `ci/*` tag whose commit is on `ci-release`. Anyone with push rights can create a new
+`ci/*` tag, and the rulesets below keep even a stray one from being deleted. Check before pinning
+(replace `vN`; `ahead` or `identical` means the tag is on the branch, anything else means do not pin it):
+
+```sh
+curl -s https://api.github.com/repos/scuttletoby/t3code/compare/ci/vN...ci-release | jq -r .status
+```
+
 **Never pin a commit of `main`.** For a `uses:` line GitHub downloads the whole repository at the
 pinned commit. Main also holds upstream T3 Code, and its tree has a dangling symlink that makes every
 job fail at "Set up job" (`Could not find file '.../.repos/...'`). Main is also rebased onto

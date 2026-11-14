@@ -273,20 +273,60 @@ q = World("checks")
 for verdict, want in (("pending", "none"), ("failure", "refused"), ("success", "ok")):
     kind, msg = q.run(required=lambda sha, v=verdict: (v, f"fork-ci-result {v}"))
     check(f"required check {verdict}: {want}", kind == want, str(msg))
-run = lambda i, status, conclusion, slug="github-actions", t="2026-11-14T00:00:0": {  # noqa: E731
+PUSH, DISPATCH = 501, 502  # check suite ids of a push run and a workflow_dispatch run of the same commit
+wf_runs = [{"id": 1, "event": "push", "check_suite_id": PUSH},
+           {"id": 2, "event": "workflow_dispatch", "check_suite_id": DISPATCH},
+           {"id": 3, "event": "pull_request", "check_suite_id": 503},
+           {"id": 4, "event": "merge_group", "check_suite_id": 504}]
+check("trusted suites: only push and merge_group workflow runs", rel.trusted_suites(wf_runs) == {PUSH, 504},
+      str(rel.trusted_suites(wf_runs)))
+run = lambda i, status, conclusion, slug="github-actions", suite=PUSH, t="2026-11-14T00:00:0": {  # noqa: E731
     "id": i, "name": "fork-ci-result", "status": status, "conclusion": conclusion, "started_at": f"{t}{i}Z",
-    "app": {"slug": slug}}
+    "app": {"slug": slug}, "check_suite": {"id": suite}}
 for label, runs, want in (
         ("none at all is pending", [], "pending"),
-        ("the newest run decides (an old failure, a new pass)",
-         [run(1, "completed", "failure"), run(2, "completed", "success")], "success"),
-        ("the newest run decides (an old pass, a new failure)",
-         [run(1, "completed", "success"), run(2, "completed", "failure")], "failure"),
-        ("a newest run in progress is pending", [run(1, "completed", "success"), run(2, "in_progress", None)], "pending"),
+        ("a push run that passed is green", [run(1, "completed", "success")], "success"),
+        ("a newer passing workflow_dispatch run does not hide an older failed push run",
+         [run(1, "completed", "failure"), run(2, "completed", "success", suite=DISPATCH)], "failure"),
+        ("only workflow_dispatch runs (even green) are not green: pending",
+         [run(1, "completed", "success", suite=DISPATCH)], "pending"),
+        ("a pull_request run does not count", [run(1, "completed", "success", suite=503)], "pending"),
+        ("any failed push run refuses, even under a newer pass (a re-run)",
+         [run(1, "completed", "failure"), run(2, "completed", "success")], "failure"),
+        ("an old pass, a new failure", [run(1, "completed", "success"), run(2, "completed", "failure")], "failure"),
+        ("a push run in progress is pending", [run(1, "completed", "success"), run(2, "in_progress", None)], "pending"),
         ("a cancelled run is not a pass", [run(1, "completed", "cancelled")], "failure"),
         ("a check of the same name from another app does not count", [run(1, "completed", "success", "evil")], "pending")):
-    got, _ = rel.check_verdict(runs, "fork-ci-result")
-    check(f"check verdict: {label}", got == want, got)
+    got, why = rel.check_verdict(runs, "fork-ci-result", rel.trusted_suites(wf_runs))
+    check(f"check verdict: {label}", got == want, f"{got}: {why}")
+
+# The same through main(): the API answers come from the fake gh_get, so the wiring (check runs
+# matched to the commit's push workflow runs) is what decides.
+g = World("gate")
+gate_sha = sh(g.remote, "rev-parse", "main")
+for label, checks_, want in (
+        ("main(): a green dispatch run over a red push run refuses",
+         [run(1, "completed", "failure"), run(2, "completed", "success", suite=DISPATCH)], 1),
+        ("main(): only a green dispatch run does nothing (pending)", [run(2, "completed", "success", suite=DISPATCH)], 0),
+        ("main(): a green push run plans the release", [run(1, "completed", "success")], 0)):
+    asked = []
+
+    def fake_gh_get(path, checks_=checks_):
+        asked.append(path)
+        if "/check-runs?" in path:
+            return {"check_runs": checks_}
+        if "/actions/runs?" in path:
+            return {"workflow_runs": wf_runs}
+        raise AssertionError(path)
+    real, rel.gh_get = rel.gh_get, fake_gh_get
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = rel.main(["plan", "--require-check", "--remote", g.url, "--repo", "o/r", "--source", gate_sha])
+    finally:
+        rel.gh_get = real
+    check(label, code == want and any(f"head_sha={gate_sha}" in x for x in asked)
+          and ("release:" in out.getvalue()) == (label.endswith("plans the release")), f"{code} {out.getvalue()} {asked}")
 
 # --- verify-download (the consumer smoke test's check) -------------------------------------------
 v = World("verify")

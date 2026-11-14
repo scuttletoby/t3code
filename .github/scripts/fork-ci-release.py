@@ -23,7 +23,8 @@ reason on stderr and in $GITHUB_STEP_SUMMARY) on:
     not), a branch head that no ci/vN tag names (branch pushed, tag not), tags but no branch;
   - a release tree that would hold a symlink, a submodule, anything but a plain file, a missing
     path, or a workflow that starts on anything but workflow_call;
-  - a source whose required check (fork-ci-result) failed (--require-check);
+  - a source whose required check (fork-ci-result) failed in any push run of it (--require-check;
+    only runs a push or merge queue started count, never a workflow_dispatch);
   - a push the remote refused (nothing is half-written: the push is atomic).
 They do nothing and exit 0 when the source branch has moved past --source (the run for the newer
 commit releases it), when the required check has not finished yet, and when the release tree is the
@@ -215,29 +216,58 @@ def write_tree(repo, entries):
 
 
 # --- the required check ------------------------------------------------------------------------
-def check_verdict(runs, name):
-    """'success', 'pending' or 'failure' from the GitHub Actions check runs named NAME of a commit
-    (the newest run decides; none at all is pending)."""
-    mine = [r for r in runs if r.get("name") == name and (r.get("app") or {}).get("slug") == "github-actions"]
+# Only check runs of workflow runs that a push to the source branch (or a merge queue) started count.
+# A workflow_dispatch of fork-tests.yml with `ref=<other commit>` runs on the source tip's SHA (GitHub
+# records the dispatching branch's head) but tests another commit, so its fork-ci-result says nothing
+# about the tip; pull_request runs test a merge commit. Those are matched by check suite and ignored.
+TRUSTED_EVENTS = ("push", "merge_group")
+
+
+def check_verdict(runs, name, suites):
+    """'success', 'pending' or 'failure' from the check runs named NAME of a commit. Only GitHub
+    Actions check runs whose check suite is in SUITES (the suites of the commit's push and merge_group
+    workflow runs, see trusted_suites) count. Any counted failure (or cancel) is a failure, even when a
+    newer counted run passed: a re-run that went green does not hide a red push run (the next commit
+    on the source branch releases instead). Otherwise any counted run still going is pending, and no
+    counted run at all is pending too: a commit tested only by hand (workflow_dispatch) is not green,
+    and its push run may not have started yet, so the next scheduled run looks again."""
+    mine = [r for r in runs if r.get("name") == name and (r.get("app") or {}).get("slug") == "github-actions"
+            and (r.get("check_suite") or {}).get("id") in suites]
     if not mine:
-        return "pending", f"no {name} check on it yet"
-    newest = max(mine, key=lambda r: (r.get("started_at") or "", r.get("id") or 0))
-    if newest.get("status") != "completed":
-        return "pending", f"{name} is {newest.get('status')}"
-    if newest.get("conclusion") == "success":
-        return "success", f"{name} passed"
-    return "failure", f"{name} ended {newest.get('conclusion')}"
+        others = sum(1 for r in runs if r.get("name") == name)
+        return "pending", (f"no {name} check from a push run on it yet"
+                           + (f" ({others} from other runs, e.g. workflow_dispatch, do not count)" if others else ""))
+    bad = [r for r in mine if r.get("status") == "completed" and r.get("conclusion") != "success"]
+    if bad:
+        return "failure", f"{name} ended {bad[0].get('conclusion')} in a push run (check run {bad[0].get('id')})"
+    going = [r for r in mine if r.get("status") != "completed"]
+    if going:
+        return "pending", f"{name} is {going[0].get('status')}"
+    return "success", f"{name} passed"
 
 
-def fetch_check_runs(repo_name, sha, name):
+def trusted_suites(workflow_runs):
+    """The check suite ids of the workflow runs that TRUSTED_EVENTS started."""
+    return {r.get("check_suite_id") for r in workflow_runs
+            if r.get("event") in TRUSTED_EVENTS and r.get("check_suite_id") is not None}
+
+
+def gh_get(path):
     api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-    req = urllib.request.Request(f"{api}/repos/{repo_name}/commits/{sha}/check-runs?check_name={name}&per_page=100",
-                                 headers={"Accept": "application/vnd.github+json"})
+    req = urllib.request.Request(f"{api}{path}", headers={"Accept": "application/vnd.github+json"})
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp).get("check_runs", [])
+        return json.load(resp)
+
+
+def fetch_check_runs(repo_name, sha, name):
+    return gh_get(f"/repos/{repo_name}/commits/{sha}/check-runs?check_name={name}&per_page=100").get("check_runs", [])
+
+
+def fetch_workflow_runs(repo_name, sha):
+    return gh_get(f"/repos/{repo_name}/actions/runs?head_sha={sha}&per_page=100").get("workflow_runs", [])
 
 
 def repo_name_of(remote):
@@ -397,8 +427,9 @@ def main(argv=None):
             name = a.repo or repo_name_of(a.remote)
             if not name:
                 raise Refuse(f"cannot tell OWNER/NAME from {a.remote}; pass --repo")
-            required = lambda sha: check_verdict(fetch_check_runs(name, sha, cfg["requiredCheck"]),  # noqa: E731
-                                                 cfg["requiredCheck"])
+            required = lambda sha: check_verdict(  # noqa: E731
+                fetch_check_runs(name, sha, cfg["requiredCheck"]), cfg["requiredCheck"],
+                trusted_suites(fetch_workflow_runs(name, sha)))
         result = release(a.remote, a.source, cfg, write=a.cmd == "release", required=required)
     except Skip as e:
         result = {"action": "none", "tag": "", "sha": "", "source": a.source, "parent": "", "reason": str(e)}
