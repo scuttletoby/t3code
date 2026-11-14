@@ -59,6 +59,7 @@ import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import { DispatchModeLimit } from "./DispatchModeLimit.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import { WorkAdmission } from "../workAdmission.ts";
 
 // The agent waits for its branch name; a rate-limited provider would hold it for minutes.
 const BRANCH_NAME_TIMEOUT = "20 seconds";
@@ -272,6 +273,7 @@ const make = Effect.gen(function* () {
   const setupScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const admission = yield* WorkAdmission;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
@@ -1187,14 +1189,20 @@ const make = Effect.gen(function* () {
         );
       yield* Effect.raceFirst(prepare, interruption);
     });
-    yield* preparation.pipe(
+    // A preparation still waiting at a held gate when the server stops is not a failure: the
+    // run stays preparing and startup recovery starts it again (WorkAdmission).
+    const admitted = yield* Ref.make(false);
+    yield* admission.admit(Ref.set(admitted, true).pipe(Effect.andThen(preparation))).pipe(
       Effect.onError((cause) =>
-        failPreparedRun(
-          input,
-          threadId,
-          runId,
-          Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
-        ),
+        Effect.gen(function* () {
+          if (Cause.hasInterruptsOnly(cause) && !(yield* Ref.get(admitted))) return;
+          yield* failPreparedRun(
+            input,
+            threadId,
+            runId,
+            Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
+          );
+        }),
       ),
       Effect.ignoreCause,
       Effect.ensuring(releasePreparation(input.commandId)),
@@ -1550,6 +1558,8 @@ const make = Effect.gen(function* () {
     );
   });
 
+  yield* admission.register("thread-launch");
+  yield* admission.setPreparationResumer(prepareRun);
   return ThreadLaunchService.of({
     launch,
     checkWorktreeBase,
