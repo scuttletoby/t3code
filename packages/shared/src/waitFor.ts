@@ -656,7 +656,7 @@ export function deliveryCommandId(group: DeliveryGroup): string {
 }
 
 /** The kind and target as people read them, such as `pr 123 checks`. */
-function waitTargetText(target: WaitTarget): string {
+export function waitTargetText(target: WaitTarget): string {
   switch (target.kind) {
     case "pr":
       return `pr ${target.spec.repository === undefined ? "" : `${target.spec.repository}#`}${target.spec.number} ${target.spec.until}`;

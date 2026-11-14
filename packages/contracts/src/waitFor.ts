@@ -316,10 +316,22 @@ export type WaitRecord = typeof WaitRecord.Type;
 
 const WAIT_STORE_VERSION = 1;
 
+/**
+ * A message the server still owes a thread whose waits were lost in a store file that could not be
+ * read. Kept in the file until it is sent, so a restart before the send does not lose it.
+ */
+export const WaitStoreNotice = Schema.Struct({
+  threadId: ThreadId,
+  messageId: TrimmedNonEmptyString,
+  text: Schema.String,
+});
+export type WaitStoreNotice = typeof WaitStoreNotice.Type;
+
 /** `<stateDir>/waits.json`. A file with a higher version is neither read nor written. */
 export const WaitStoreFile = Schema.Struct({
   version: Schema.Literal(WAIT_STORE_VERSION),
   waits: Schema.Array(WaitRecord),
+  notices: Schema.optionalKey(Schema.Array(WaitStoreNotice)),
 });
 export type WaitStoreFile = typeof WaitStoreFile.Type;
 
