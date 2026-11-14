@@ -20,6 +20,7 @@
 .github/scripts/fork-workflow-triggers.test.cjs
 fork-ci/actions/docs-scope/docs-scope.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
+fork-ci/actions/head-check/head_check.test.py
 fork-ci/actions/job-changed/job-changed.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
