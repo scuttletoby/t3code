@@ -14,6 +14,11 @@ import { resolveProjectSettings } from "./projectSettings.ts";
 import { applyServerSettingsPatch } from "./serverSettings.ts";
 import {
   MAX_HAND_OVERS,
+  MAX_NOTE_BYTES,
+  MAX_SPEC_BYTES,
+  MAX_STORED_TEXT_BYTES,
+  capEndedWaits,
+  clipStored,
   deliveryCommandId,
   deliveryGroups,
   deliveryRetryDelayMs,
@@ -22,6 +27,7 @@ import {
   joinedWakeMessage,
   nextWaitState,
   shouldPruneWait,
+  storedBytes,
   validateWaitSpec,
   waitDeadline,
   waitKey,
@@ -191,6 +197,191 @@ describe("validateWaitSpec (T9)", () => {
       code: "invalid",
     });
     expect(validate({ kind: "pr" })).toMatchObject({ code: "invalid" });
+  });
+});
+
+describe("validateWaitSpec: file paths (lens #90, network and device paths)", () => {
+  const file = (path: string, platform: NodeJS.Platform) =>
+    validate({ kind: "file", file: { path } }, platform);
+  const PLATFORMS: ReadonlyArray<NodeJS.Platform> = ["linux", "darwin", "win32"];
+
+  it("refuses UNC shares, device and pipe paths and drive-relative paths on every OS", () => {
+    const refused = [
+      "\\\\attacker.example\\share\\x",
+      "//attacker.example/share/x",
+      "\\/attacker.example/share",
+      "/\\attacker.example\\share",
+      "\\\\?\\UNC\\host\\share\\x",
+      "\\\\?\\C:\\x",
+      "\\\\.\\pipe\\some-pipe",
+      "\\\\.\\C:\\x",
+      "//./pipe/some-pipe",
+      "//?/UNC/host/share",
+      "\\??\\UNC\\host\\share",
+      "C:relative\\x",
+      "C:",
+      "\\rooted-on-the-current-drive",
+      "relative/x",
+      "",
+    ];
+    for (const platform of PLATFORMS) {
+      for (const path of refused) {
+        expect(file(path, platform), `${platform} ${JSON.stringify(path)}`).toMatchObject({
+          ok: false,
+          code: "invalid",
+        });
+      }
+    }
+  });
+
+  it("accepts a local absolute path for the OS", () => {
+    expect(file("/var/run/build/done", "linux")).toMatchObject({ ok: true });
+    expect(file("/Users/x/done", "darwin")).toMatchObject({ ok: true });
+    expect(file("C:\\builds\\done", "win32")).toMatchObject({ ok: true });
+    expect(file("d:/builds/done", "win32")).toMatchObject({ ok: true });
+    // A drive path is not absolute off Windows, and a rooted path has no drive on Windows.
+    expect(file("C:\\builds\\done", "linux")).toMatchObject({ ok: false });
+    expect(file("/builds/done", "win32")).toMatchObject({ ok: false });
+  });
+});
+
+describe("validateWaitSpec: Windows device names (lens #90 round 2)", () => {
+  const file = (path: string, platform: NodeJS.Platform) =>
+    validate({ kind: "file", file: { path } }, platform);
+
+  it("refuses a DOS device name as any part of a Windows path", () => {
+    for (const path of [
+      "C:\\temp\\COM1",
+      "C:\\NUL",
+      "C:\\x\\LPT1.txt",
+      "C:\\x\\CONIN$",
+      "C:\\x\\nul .txt",
+      "C:\\x\\aux.\\y",
+      "c:/con/x",
+      "C:\\x\\com\u00b9",
+    ]) {
+      expect(file(path, "win32"), path).toMatchObject({ ok: false, code: "invalid" });
+    }
+  });
+
+  it("accepts names that only look like one, and any name off Windows", () => {
+    for (const path of ["C:\\x\\console", "C:\\x\\com10", "C:\\x\\nullable", "C:\\x\\my.nul"]) {
+      expect(file(path, "win32"), path).toMatchObject({ ok: true });
+    }
+    expect(file("/tmp/NUL", "linux")).toMatchObject({ ok: true });
+  });
+});
+
+describe("stored sizes in bytes (lens #90 round 2)", () => {
+  it("counts bytes as the store file holds them", () => {
+    expect(storedBytes("abc")).toBe(3);
+    expect(storedBytes("\u0001")).toBe(6);
+    expect(storedBytes("\u65e5")).toBe(3);
+    expect(storedBytes('"\\')).toBe(4);
+  });
+
+  it("refuses a target or a note too big as stored, though within its character limit", () => {
+    const tooWide = validate({ kind: "file", file: { path: `/${"\u0001".repeat(400)}` } });
+    expect(tooWide).toMatchObject({ ok: false, code: "invalid" });
+    if (!tooWide.ok) expect(tooWide.message).toContain(`at most ${MAX_SPEC_BYTES}`);
+    expect(validate({ kind: "file", file: { path: `/${"\u65e5".repeat(700)}` } })).toMatchObject({
+      ok: false,
+    });
+    expect(validate({ kind: "file", file: { path: `/${"a".repeat(999)}` } })).toMatchObject({
+      ok: true,
+    });
+    const note = (text: string) => validate({ kind: "file", file: { path: "/x" }, note: text });
+    expect(note("\u0001".repeat(101))).toMatchObject({ ok: false, code: "invalid" });
+    expect(note("\u65e5".repeat(200))).toMatchObject({ ok: true });
+    expect(storedBytes("\u65e5".repeat(200))).toBe(MAX_NOTE_BYTES);
+  });
+
+  it("clips stored text to its byte limit, also where a character takes 6 bytes", () => {
+    expect(clipStored("short")).toBe("short");
+    for (const character of ["x", "\u0001", "\u65e5", "\u{1F600}"]) {
+      const clipped = clipStored(character.repeat(1000));
+      expect(storedBytes(clipped), character).toBeLessThanOrEqual(MAX_STORED_TEXT_BYTES);
+      expect(storedBytes(clipped), character).toBeGreaterThan(MAX_STORED_TEXT_BYTES - 8);
+      expect(clipped.endsWith("…")).toBe(true);
+    }
+  });
+
+  it("clips a stored error and a frozen detail, and a repeated long error writes nothing", () => {
+    const long = `/${"\u0001".repeat(999)}`;
+    const failed = judged({ type: "failed", message: long, permanent: false });
+    const first = nextWaitState(makeWait(), failed, T0, stateSettings);
+    expect(storedBytes(first?.record.lastError ?? "")).toBeLessThanOrEqual(MAX_STORED_TEXT_BYTES);
+    expect(nextWaitState(first!.record, failed, T0 + SECOND, stateSettings)).toBeNull();
+    const met = nextWaitState(
+      makeWait(),
+      judged({ type: "met", outcome: "met", detail: long }),
+      T0,
+      stateSettings,
+    );
+    expect(storedBytes(met?.record.result?.detail ?? "")).toBeLessThanOrEqual(
+      MAX_STORED_TEXT_BYTES,
+    );
+  });
+});
+
+describe("capEndedWaits (lens #90, store size)", () => {
+  const ended = (id: string, threadId: string, endedHour: number, extra = {}) =>
+    makeWait({
+      id,
+      threadId,
+      state: "cancelled",
+      endedAt: iso(T0 + endedHour * HOUR),
+      ...extra,
+    });
+
+  it("keeps the newest ended waits per thread and in all; open waits always stay", () => {
+    const open = makeWait({ id: "w_oooooooooo", threadId: "a" });
+    const waits = [
+      ended("w_aaaaaaaaa7", "a", 1),
+      open,
+      ended("w_aaaaaaaaa3", "a", 3),
+      ended("w_aaaaaaaaa2", "a", 2),
+      ended("w_bbbbbbbbb2", "b", 1),
+      ended("w_bbbbbbbbb5", "b", 5),
+      ended("w_ccccccccc4", "c", 4),
+    ];
+    const ids = (kept: ReadonlyArray<WaitRecord>) => kept.map((wait) => wait.id);
+    // Order kept; per thread the two newest ended ones.
+    expect(ids(capEndedWaits(waits, { perThread: 2, total: 100 }, T0))).toEqual([
+      "w_oooooooooo",
+      "w_aaaaaaaaa3",
+      "w_aaaaaaaaa2",
+      "w_bbbbbbbbb2",
+      "w_bbbbbbbbb5",
+      "w_ccccccccc4",
+    ]);
+    // In all the three newest ended ones.
+    expect(ids(capEndedWaits(waits, { perThread: 100, total: 3 }, T0))).toEqual([
+      "w_oooooooooo",
+      "w_aaaaaaaaa3",
+      "w_bbbbbbbbb5",
+      "w_ccccccccc4",
+    ]);
+    // Under the caps nothing changes (the same array).
+    expect(capEndedWaits(waits, { perThread: 100, total: 100 }, T0)).toBe(waits);
+  });
+
+  it("never drops a slot wait whose reservation is still running", () => {
+    const reserved = ended("w_ssssssssss", "a", 0, {
+      kind: "slot",
+      spec: {},
+      state: "delivered",
+      reservedUntil: iso(T0 + 10 * HOUR),
+    });
+    const waits = [reserved, ended("w_aaaaaaaaa7", "a", 1), ended("w_aaaaaaaaa2", "a", 2)];
+    expect(capEndedWaits(waits, { perThread: 1, total: 100 }, T0).map((w) => w.id)).toEqual([
+      "w_ssssssssss",
+      "w_aaaaaaaaa2",
+    ]);
+    // Once the reservation is over it is the oldest and goes first.
+    expect(
+      capEndedWaits(waits, { perThread: 1, total: 100 }, T0 + 11 * HOUR).map((w) => w.id),
+    ).toEqual(["w_aaaaaaaaa2"]);
   });
 });
 

@@ -33,7 +33,10 @@ export const WaitForSettings = Schema.Struct({
   defaultTimeoutHours: positiveIntDefault(24),
   /** Largest deadline a caller may ask for. */
   maxTimeoutHours: positiveIntDefault(168),
-  /** Open waits per thread. */
+  /**
+   * Open waits per thread. The server also holds at most 1000 open waits in all, and keeps at most
+   * 2 × this many ended waits per thread and 1000 in all (the oldest go first).
+   */
   maxPerThread: positiveIntDefault(20),
   fileSweepSeconds: positiveIntDefault(5),
   unitSweepSeconds: positiveIntDefault(15),
@@ -43,7 +46,10 @@ export const WaitForSettings = Schema.Struct({
   noChecksGraceSeconds: nonNegativeIntDefault(900),
   /** A wait whose source fails this long without one good read ends as `check_error`. */
   errorGraceSeconds: nonNegativeIntDefault(900),
-  /** Ended waits stay listed this long, then are removed. */
+  /**
+   * Ended waits stay listed this long, then are removed; sooner beyond the caps on `maxPerThread`.
+   * The store file is never written above 8 MiB.
+   */
   keepEndedHours: nonNegativeIntDefault(24),
   /**
    * A thread a person stopped is not woken. Still stopped this long after it was first seen
@@ -327,10 +333,22 @@ export type WaitRecord = typeof WaitRecord.Type;
 
 const WAIT_STORE_VERSION = 1;
 
+/**
+ * A message the server still owes a thread whose waits were lost in a store file that could not be
+ * read. Kept in the file until it is sent, so a restart before the send does not lose it.
+ */
+export const WaitStoreNotice = Schema.Struct({
+  threadId: ThreadId,
+  messageId: TrimmedNonEmptyString,
+  text: Schema.String,
+});
+export type WaitStoreNotice = typeof WaitStoreNotice.Type;
+
 /** `<stateDir>/waits.json`. A file with a higher version is neither read nor written. */
 export const WaitStoreFile = Schema.Struct({
   version: Schema.Literal(WAIT_STORE_VERSION),
   waits: Schema.Array(WaitRecord),
+  notices: Schema.optionalKey(Schema.Array(WaitStoreNotice)),
 });
 export type WaitStoreFile = typeof WaitStoreFile.Type;
 

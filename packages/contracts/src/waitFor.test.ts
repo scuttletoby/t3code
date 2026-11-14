@@ -180,6 +180,14 @@ describe("WaitStoreFile", () => {
     expect(decodeStore({ version: 1, waits: [] })).toEqual({ version: 1, waits: [] });
   });
 
+  it("keeps the notices for lost waits, and refuses one without a message id", () => {
+    const notice = { threadId: "thread-a", messageId: "wait-store:abc:thread-a", text: "Lost." };
+    expect(decodeStore({ version: 1, waits: [], notices: [notice] }).notices).toEqual([notice]);
+    expect(() =>
+      decodeStore({ version: 1, waits: [], notices: [{ ...notice, messageId: " " }] }),
+    ).toThrow();
+  });
+
   it("refuses a store written by a newer version", () => {
     expect(() => decodeStore({ version: 2, waits: [] })).toThrow();
   });
