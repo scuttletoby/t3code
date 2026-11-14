@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -8,7 +9,10 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import { TestClock } from "effect/testing";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -23,6 +27,8 @@ import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterReg
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as WaitDelivery from "./WaitDelivery.ts";
+import * as WaitService from "./WaitService.ts";
+import { WAIT_STORE_FILE } from "./WaitStore.ts";
 
 /** The real send path: thread tools, orchestrator and receipts over an in-memory database. */
 const instanceId = ProviderInstanceId.make("codex");
@@ -277,4 +283,95 @@ it.effect("a stopped thread holds the message; a busy one queues it behind its t
     );
     assert.strictEqual(yield* copies(stoppedThreadId, "wait:w_jjjjjjjjjj"), 0);
   }).pipe(Effect.provide(layerTest)),
+);
+
+/** Waits on, over the real send path and the real file system. */
+const layerWaitsOn = ThreadManagementService.layer.pipe(
+  Layer.provideMerge(
+    Layer.mergeAll(
+      layerDatabase,
+      ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
+      EventStore.layer.pipe(Layer.provide(layerDatabase)),
+      EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
+      ProviderReplayHarness.layerWithRegistry(
+        { name: "wait-delivery-crash" },
+        ProviderAdapterRegistry.layerFromAdapters([adapter]),
+        { databaseLayer: layerDatabase, runEffectWorker: false },
+      ),
+    ),
+  ),
+  Layer.provideMerge(ServerSettings.layerTest({ waitFor: { enabled: true } })),
+  Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+  Layer.provideMerge(NodeServices.layer),
+);
+
+it.effect(
+  "T3: a crash at each step of a send, then a restart, leaves exactly one message per wait",
+  () =>
+    Effect.gen(function* () {
+      const NOW = Date.parse("2026-11-14T12:00:00.000Z");
+      yield* TestClock.setTime(NOW);
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "wait-crash-" });
+      const filePath = path.join(root, WAIT_STORE_FILE);
+      const delivery = yield* WaitDelivery.make();
+
+      // One thread per crash point, so no two messages are joined.
+      const points = ["judged", "started", "sent", "delivered"] as const;
+      const threadOf = (point: string) => ThreadId.make(`thread:wait-crash-${point}`);
+      const idOf = (point: string) => `w_${point.padEnd(10, "x").slice(0, 10)}`;
+      for (const point of points) yield* createThread(threadOf(point));
+      const wait = (point: (typeof points)[number], extra: Record<string, unknown>) => ({
+        id: idOf(point),
+        threadId: threadOf(point),
+        projectId: PROJECT,
+        key: "0123456789abcdef",
+        createdAt: "2026-11-14T11:00:00.000Z",
+        deadlineAt: "2026-11-14T13:00:00.000Z",
+        attempt: 0,
+        kind: "file",
+        spec: { path: "/nowhere/ready", until: "exists" },
+        result: { outcome: "exists", detail: "Exists.", at: "2026-11-14T11:30:00.000Z" },
+        ...extra,
+      });
+      // The server died: after the judge (no id yet), after the id was written, after the send,
+      // and after "delivered" was written.
+      yield* delivery.deliver(wake(threadOf("sent"), `wait:${idOf("sent")}`));
+      yield* delivery.deliver(wake(threadOf("delivered"), `wait:${idOf("delivered")}`));
+      yield* fs.writeFileString(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          waits: [
+            wait("judged", { state: "delivering" }),
+            wait("started", { state: "delivering", messageId: `wait:${idOf("started")}` }),
+            wait("sent", { state: "delivering", messageId: `wait:${idOf("sent")}` }),
+            wait("delivered", {
+              state: "delivered",
+              messageId: `wait:${idOf("delivered")}`,
+              endedAt: "2026-11-14T11:31:00.000Z",
+            }),
+          ],
+        }),
+      );
+
+      const first = yield* WaitService.make({ filePath, delivery });
+      yield* first.runDue();
+      // Runs again in the same server, then after a restart.
+      yield* first.runDue();
+      const restarted = yield* WaitService.make({ filePath, delivery: yield* WaitDelivery.make() });
+      yield* restarted.runDue();
+
+      for (const point of points) {
+        assert.strictEqual(yield* copies(threadOf(point), `wait:${idOf(point)}`), 1, point);
+      }
+      const stored = JSON.parse(yield* fs.readFileString(filePath)).waits as ReadonlyArray<{
+        readonly state: string;
+      }>;
+      assert.deepStrictEqual(
+        stored.map((record) => record.state),
+        ["delivered", "delivered", "delivered", "delivered"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerWaitsOn)),
 );
