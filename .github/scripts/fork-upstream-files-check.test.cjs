@@ -17,8 +17,6 @@ const configured = (workflow) => parseList([workflow.match(CONFIG_LINE)?.[1] ?? 
 const LISTED = configured(fs.readFileSync(WORKFLOW, "utf8"));
 const OTHER = "apps/server/src/feature/Store.ts";
 
-// --- The judgement, on fake trees -------------------------------------------------------------
-
 const entries = (files) => (file) => files[file];
 const judge = (changed, base, head) =>
   findUpstreamFileChanges(["a.ts", "b.json"], changed, {
@@ -48,20 +46,28 @@ test("a branch that carries main's copy of a listed file is not refused", () => 
   assert.deepEqual(judge(["a.ts"], BASE, BASE), []);
 });
 
+test("a listed directory fails closed: edits inside it are not one changed path", () => {
+  const reasons = judge(["a.ts/x.ts"], { ...BASE, "a.ts": "040000 tree 1" }, BASE);
+  assert.equal(reasons.length, 1);
+  assert.match(reasons[0], /^a\.ts: listed, but on main it is not a file/);
+});
+
 test("a listed file main does not have fails closed, whatever the branch does", () => {
   const reasons = judge([], { "a.ts": BASE["a.ts"] }, BASE);
   assert.equal(reasons.length, 1);
   assert.match(reasons[0], /^b\.json: listed, but main does not have it/);
 });
 
-// --- The workflow -----------------------------------------------------------------------------
-
-test("the config line lists the upstream files, and each one exists in this repository", () => {
-  assert.deepEqual(LISTED, [
-    "apps/server/src/orchestration-v2/Orchestrator.ts",
-    "apps/server/src/provider/agentContextBudget.json",
-  ]);
-  for (const file of LISTED) assert.ok(fs.existsSync(path.join(REPO_ROOT, file)), file);
+// Read from git, not the disk: CI's lint job checks out only some folders.
+test("the config line lists files that this commit has", () => {
+  assert.ok(LISTED.length > 0);
+  for (const file of LISTED) {
+    const entry = execFileSync("git", ["ls-tree", "--full-tree", "HEAD", "--", file], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    });
+    assert.match(entry, /^\d+ blob [0-9a-f]+\t/, file);
+  }
 });
 
 // Why the workflow does not run the check as intended; empty when it does.
@@ -130,8 +136,6 @@ test("the check's own files are guarded by the schema check (a PR cannot weaken 
     assert.ok(CHECK_FILES.includes(path.relative(REPO_ROOT, file)), file);
   }
 });
-
-// --- End to end: the real git in a scratch repository, the way CI calls the check -------------
 
 function scratchRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-upstream-files-check-"));

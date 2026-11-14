@@ -1,11 +1,7 @@
-// Refuses fork changes to listed upstream files: the fork's add-ons live in files and layers of their
-// own, so these files stay exactly upstream's and every upstream sync applies to them cleanly.
-// Usage: fork-upstream-files-check.cjs <base> <head> <files>. <files> is the list, separated by
-// whitespace (fork-checks.yml passes its one config line). Judged like fork-schema-check.cjs: the
-// diff from the merge-base of <base> and <head> to <head>, so upstream's own changes, which reach
-// <base> through fork-follow's rebase, are never the branch's. A listed file is refused when the
-// branch changes it in any way (edit, delete, rename away, mode) and its copy at <head> is not the
-// one <base> has. Files are read as git tree entries; nothing is checked out or run.
+// Refuses fork changes to listed upstream files, so every upstream sync applies to them cleanly.
+// Usage: fork-upstream-files-check.cjs <base> <head> <files>. Judged like fork-schema-check.cjs: the
+// diff from the merge-base of <base> and <head>, so upstream changes that reach <base> through
+// fork-follow's rebase are never the branch's. Files are read as git tree entries; nothing runs.
 
 const { execFileSync } = require("node:child_process");
 const { parseRawDiff } = require("./fork-schema-check.cjs");
@@ -42,6 +38,14 @@ function findUpstreamFileChanges(listed, changed, { atBase, atHead }) {
       reasons.push(
         `${file}: listed, but main does not have it (upstream moved or removed it?). Update the ` +
           "list in .github/workflows/fork-checks.yml; only the owner may do that.",
+      );
+      continue;
+    }
+    // A directory (or submodule) never shows up as one changed path, so edits inside it would pass.
+    if (base.split(" ")[1] !== "blob") {
+      reasons.push(
+        `${file}: listed, but on main it is not a file. List files only, in ` +
+          ".github/workflows/fork-checks.yml; only the owner may do that.",
       );
       continue;
     }

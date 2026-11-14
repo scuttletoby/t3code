@@ -23,8 +23,8 @@ permissions:
 # request". A head repository GitHub no longer knows reads as "another fork". Test:
 # fork-contracts.test.py.
 jobs:
-  # It also refuses changes to the upstream files listed in its last step. The name stays, because
-  # rulesets require the check by this name.
+  # It also refuses changes to the upstream files listed in its last step. Keep the name: it is what
+  # a ruleset would require.
   no_schema_changes:
     name: No database schema changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
