@@ -934,6 +934,17 @@ export const UsageLimitSourceConfig = Schema.Struct({
 });
 export type UsageLimitSourceConfig = typeof UsageLimitSourceConfig.Type;
 
+/** Fork: how agents pace one provider instance's usage limits. The defaults change nothing. */
+export const UsagePacingInstanceSettings = Schema.Struct({
+  /** Points of each window kept free for the owner, released over the window's last 12 hours. */
+  reservePercent: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 100 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(0)),
+  ),
+  /** Spend this instance first: no even pace, only the reserve holds agents back. */
+  burnFirst: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+});
+export type UsagePacingInstanceSettings = typeof UsagePacingInstanceSettings.Type;
+
 export const TextGeneratorKind = Schema.Literals(["openaiCompatible", "anthropic"]);
 export type TextGeneratorKind = typeof TextGeneratorKind.Type;
 
@@ -1413,6 +1424,10 @@ export const ServerSettings = Schema.Struct({
   fallbackModelSelection: Schema.NullOr(ModelSelection).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  /** Fork: usage pacing per provider instance; an instance without an entry has no reserve. */
+  usagePacing: Schema.Record(ProviderInstanceId, UsagePacingInstanceSettings).pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
   defaultRuntimeMode: RuntimeMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE)),
   ),
@@ -1860,6 +1875,10 @@ export const ServerSettingsPatch = Schema.Struct({
   defaultModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   defaultRuntimeMode: Schema.optionalKey(RuntimeMode),
   fallbackModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+  // Fork: merged per instance like usageLimitSources; null removes an entry.
+  usagePacing: Schema.optionalKey(
+    Schema.Record(ProviderInstanceId, Schema.NullOr(UsagePacingInstanceSettings)),
+  ),
   /** Replaces each project's override set; null removes it. Omitted providerInstances retains its stored value. */
   projectSettingsOverrides: Schema.optionalKey(
     Schema.Record(

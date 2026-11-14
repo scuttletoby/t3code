@@ -30,8 +30,8 @@ export const UsageReading = Schema.Struct({
   windows: Schema.Array(ServerProviderUsageWindow),
   /**
    * Limits UI account as hashed `<base>` or `<base>.<workspace>`; a failed probe keeps the last
-   * known one (`resolveAccount`). Absent = never identified. Swap = a change between two present
-   * values, except `<base>` -> `<base>.<workspace>` (the workspace became known).
+   * known one (`resolveAccount`). Absent = never identified. Swap: see `isAccountSwap`; a change
+   * between `<base>` and `<base>.<workspace>` of one base, or to or from a borrowed one, is none.
    */
   account: Schema.optional(TrimmedNonEmptyString),
   /**
@@ -107,6 +107,24 @@ export function accountOf(provider: ServerProvider): string | undefined {
 
 const baseOf = (account: string) => account.split(".")[0];
 const hasWorkspace = (account: string) => account.includes(".");
+
+/**
+ * Whether two readings of one instance belong to different accounts, so a meter series must not
+ * run across them. Knowing less (no account, no workspace, a borrowed workspace) is no swap.
+ */
+export function isAccountSwap(
+  previous: Pick<UsageReading, "account" | "borrowed">,
+  next: Pick<UsageReading, "account" | "borrowed">,
+): boolean {
+  if (previous.account === undefined || next.account === undefined) return false;
+  if (baseOf(previous.account) !== baseOf(next.account)) return true;
+  if (previous.borrowed === true || next.borrowed === true) return false;
+  return (
+    hasWorkspace(previous.account) &&
+    hasWorkspace(next.account) &&
+    previous.account !== next.account
+  );
+}
 
 interface ResolvedAccount {
   readonly account: string | undefined;
