@@ -48,6 +48,7 @@ import { resolveSymlinkTarget } from "@t3tools/shared/symlink";
 import * as ServerConfig from "./config.ts";
 import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
+import { renameRetiredAutoUpdateKeys } from "./cloud/autoUpdateSettings.ts";
 import {
   applyServerSettingsPatch,
   deriveLegacyProjectOverrides,
@@ -794,7 +795,9 @@ const make = Effect.gen(function* () {
       const parsed = decodeSettingsFileJsonExit(raw);
       const decoded = Exit.isFailure(parsed)
         ? parsed
-        : decodePersistedServerSettingsExit(managed.withDefaults(parsed.value));
+        : decodePersistedServerSettingsExit(
+            managed.withDefaults(renameRetiredAutoUpdateKeys(parsed.value)),
+          );
       const legacySettings = decodeLegacyProviderSettingsJsonExit(raw);
       if (legacySettings._tag === "Success") {
         legacyProviders = legacySettings.value.providers;
