@@ -369,7 +369,8 @@ export type WaitEvent =
   | { readonly type: "rejected" }
   /**
    * The receiver is archived or deleted. `parentThreadId` is the parent its lineage names now
-   * (subagent parents only; a fork has none), or null when unknown.
+   * (subagent parents only; a fork has none), or null when unknown. An open wait goes to the
+   * parent at once: a `waiting` one as a wake that says it had not ended, and is judged no more.
    */
   | { readonly type: "threadGone"; readonly parentThreadId: ThreadId | null }
   /** The receiver's latest run was stopped by a person or its parent. */
@@ -456,11 +457,18 @@ function handOver(
     };
   }
   return {
-    // The receiver's own stop starts its own limit, and its own sends start from attempt 0.
+    // The receiver's own stop starts its own limit, and its own sends start from attempt 0. A
+    // wait still `waiting` is sent now without a result ("not ended yet") and judged no more.
     record: update(
       wait,
-      { threadId: parent, via: [...via, wait.threadId], handedOverBecause: because, attempt: 0 },
-      ["messageId", "stoppedSince", "parentThreadId"],
+      {
+        state: "delivering",
+        threadId: parent,
+        via: [...via, wait.threadId],
+        handedOverBecause: because,
+        attempt: 0,
+      },
+      ["messageId", "stoppedSince", "parentThreadId", "errorSince", "lastError"],
     ),
     log: {
       level: "warn",
@@ -559,7 +567,7 @@ export function nextWaitState(
       return { record: update(wait, { attempt: wait.attempt + 1 }) };
     }
     case "threadGone":
-      return wait.state === "delivering" ? handOver(wait, "gone", event.parentThreadId, now) : null;
+      return isOpenWait(wait.state) ? handOver(wait, "gone", event.parentThreadId, now) : null;
     case "threadStopped": {
       if (wait.state !== "delivering") return null;
       if (wait.stoppedSince === undefined) {
@@ -673,7 +681,7 @@ function wakeLine(wait: WaitRecord): string {
         : `Thread ${last}, which you started, is gone (archived or deleted), so its wait comes to you${registeredBy}: `;
   const result =
     wait.result === undefined
-      ? "not ended yet."
+      ? "not ended yet. This wait ends here; check it yourself if you still need it."
       : `${wait.result.outcome}.${wait.result.detail === "" ? "" : ` ${clip(wait.result.detail)}`}`;
   return `[wait ${wait.id}] ${handedOver}${waitTargetText(wait)}: ${result}`;
 }

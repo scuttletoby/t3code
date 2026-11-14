@@ -560,6 +560,69 @@ describe("nextWaitState: hand-over (T24)", () => {
     );
   });
 
+  it("hands a gone thread's still-open wait to its parent at once, marked not ended (check note 3.3)", () => {
+    const waiting = makeWait({
+      parentThreadId: "thread-parent",
+      errorSince: iso(T0),
+      lastError: "gh: timeout",
+    });
+    const next = nextWaitState(
+      waiting,
+      { type: "threadGone", parentThreadId: thread("thread-parent") },
+      T0 + HOUR,
+      stateSettings,
+    )!;
+    expect(next.record).toMatchObject({
+      state: "delivering",
+      threadId: "thread-parent",
+      via: ["thread-child"],
+      handedOverBecause: "gone",
+      attempt: 0,
+    });
+    expect(next.record.result).toBeUndefined();
+    expect(next.record.errorSince).toBeUndefined();
+    expect(next.record.lastError).toBeUndefined();
+    expect(next.log?.level).toBe("warn");
+    expect(wakeMessage(next.record)).toBe(
+      "[wait w_aaaaaaaaaa] Thread thread-child, which you started, is gone (archived or deleted), so its wait comes to you: check lease-free: not ended yet. This wait ends here; check it yourself if you still need it.",
+    );
+    // It is judged no more, and it is delivered like any other wake.
+    expect(
+      nextWaitState(
+        next.record,
+        { type: "judged", judgement: { type: "met", outcome: "met", detail: "" } },
+        T0 + HOUR,
+        stateSettings,
+      ),
+    ).toBeNull();
+    expect(
+      nextWaitState(next.record, { type: "delivered" }, T0 + HOUR, stateSettings)?.record.state,
+    ).toBe("delivered");
+  });
+
+  it("ends a gone thread's still-open wait as thread_gone when there is no parent", () => {
+    const next = nextWaitState(
+      makeWait(),
+      { type: "threadGone", parentThreadId: null },
+      T0,
+      stateSettings,
+    )!;
+    expect(next.record).toMatchObject({ state: "thread_gone", endedAt: iso(T0) });
+    expect(next.log?.level).toBe("error");
+  });
+
+  it("leaves an ended wait alone when its thread is gone", () => {
+    const cancelled = makeWait({ state: "cancelled", endedAt: iso(T0) });
+    expect(
+      nextWaitState(
+        cancelled,
+        { type: "threadGone", parentThreadId: thread("p") },
+        T0,
+        stateSettings,
+      ),
+    ).toBeNull();
+  });
+
   it("uses the parent kept at registration when the child's lineage is gone", () => {
     const next = nextWaitState(
       delivering({ parentThreadId: "thread-parent" }),
