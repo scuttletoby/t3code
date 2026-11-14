@@ -109,7 +109,8 @@ const provider = (
   ...(supportedRuntimeModes === undefined ? {} : { supportedRuntimeModes }),
 });
 
-const main = (usedPercent: number) => provider(MAIN, "main@example.com", [weekly(usedPercent)]);
+const main = (usedPercent: number, modes?: ReadonlyArray<RuntimeMode>) =>
+  provider(MAIN, "main@example.com", [weekly(usedPercent)], modes);
 const second = (usedPercent: number, modes?: ReadonlyArray<RuntimeMode>) =>
   provider(SECOND, "second@example.com", [weekly(usedPercent)], modes);
 
@@ -185,6 +186,8 @@ const delegate = (input: {
   readonly target?: OrchestratorMcpTarget;
   readonly disabledForProject?: ReadonlyArray<ProviderInstanceId>;
   readonly retryOfAccepted?: boolean;
+  readonly runtimeMode?: RuntimeMode;
+  readonly settingsUnreadable?: boolean;
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
@@ -282,7 +285,13 @@ const delegate = (input: {
       Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
       Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
       Layer.mock(GitVcsDriver.GitVcsDriver)({}),
-      ServerSettings.layerTest(input.settings ?? {}),
+      input.settingsUnreadable === true
+        ? Layer.mock(ServerSettings.ServerSettingsService)({
+            getSettings: Effect.fail(
+              new ServerSettingsError({ settingsPath: "settings.json", operation: "read-file" }),
+            ),
+          })
+        : ServerSettings.layerTest(input.settings ?? {}),
       layerPacer,
     );
     const result = yield* Effect.gen(function* () {
@@ -291,6 +300,7 @@ const delegate = (input: {
         .delegateTask(scope, {
           task: "Review the change.",
           ...(input.target === undefined ? {} : { target: input.target }),
+          ...(input.runtimeMode === undefined ? {} : { runtimeMode: input.runtimeMode }),
           mode: "async",
           clientRequestId: "usage-gate-1",
         })
@@ -417,6 +427,35 @@ describe("OrchestratorMcpService usage pacing gate", () => {
       assert.strictEqual(result.failure.code, "usage_pacing_hold");
       assert.include(result.failure.message, `clears at ${at(505 * MINUTE)} at the earliest`);
       assert.deepStrictEqual(dispatched, []);
+    }),
+  );
+
+  it.effect("enforce: a request that is invalid anyway fails at once, not after a hold", () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* delegate({
+        settings: enforce,
+        providers: [main(60, ["approval-required"]), second(70)],
+        runtimeMode: "full-access",
+        pacer: "untouched",
+      });
+      assert.isTrue(result._tag === "Failure");
+      if (result._tag !== "Failure") return;
+      assert.strictEqual(result.failure.code, "invalid_request");
+      assert.deepStrictEqual(dispatched, []);
+    }),
+  );
+
+  it.effect("settings that cannot be read count as off: the task runs as asked", () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* delegate({
+        providers: [main(100), second(10)],
+        pacer: "untouched",
+        settingsUnreadable: true,
+      });
+      assert.isTrue(result._tag === "Success");
+      if (result._tag !== "Success") return;
+      assert.isUndefined(result.success.usagePacingNote);
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: MAIN, model: MODEL });
     }),
   );
 

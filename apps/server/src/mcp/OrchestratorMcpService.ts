@@ -2698,6 +2698,13 @@ const make = Effect.gen(function* () {
         providers,
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
+      // Fork: a request that is invalid anyway fails now, not after a usage hold of hours. The pacer moves a task only
+      // to an account with the same runtime mode, so the check on the requested target holds for the paced one too.
+      yield* resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode, requestedTarget);
+      const interactionMode = yield* resolveInteractionMode(
+        parent.thread.interactionMode,
+        input.interactionMode,
+      );
       // Fork: a retry of an accepted delegation starts no work, so it is not paced again.
       const { target, note: usagePacingNote } = isRetryOfAcceptedDelegation
         ? { target: requestedTarget, note: undefined }
@@ -2712,10 +2719,6 @@ const make = Effect.gen(function* () {
         parent.thread.runtimeMode,
         input.runtimeMode,
         target,
-      );
-      const interactionMode = yield* resolveInteractionMode(
-        parent.thread.interactionMode,
-        input.interactionMode,
       );
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
