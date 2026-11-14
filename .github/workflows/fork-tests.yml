@@ -837,8 +837,11 @@ jobs:
         env:
           T3CODE_TRANSFER_BUDGET_REPORT_PATH: ${{ runner.temp }}/t3code-transfer-budget.md
           T3CODE_TRANSFER_BUDGET_RESULT_PATH: ${{ runner.temp }}/thread-transfer-result.json
+          T3CODE_TRANSFER_BUDGET_SCENARIOS_PATH: ${{ runner.temp }}/thread-transfer-scenarios.json
+        # As upstream: one process per file spends ~2s starting before its tests run; one file per
+        # vCPU overlaps that.
         run: >-
-          vp run test:cached -- --shard ${{ matrix.shard }}/${{ strategy.job-total }}
+          vp run test:cached -- --shard ${{ matrix.shard }}/${{ strategy.job-total }} --concurrency 4
           --uncached apps/server/integration/transferBudgetV2.integration.test.ts
           --verify-hits 1 apps/server
 
@@ -875,7 +878,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: thread-transfer-results
-          path: ${{ runner.temp }}/thread-transfer-result.json
+          path: |
+            ${{ runner.temp }}/thread-transfer-result.json
+            ${{ runner.temp }}/thread-transfer-scenarios.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -898,8 +903,9 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           components: rustfmt
 
       - name: Check Rust formatting
