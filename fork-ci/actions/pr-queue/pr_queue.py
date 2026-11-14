@@ -46,6 +46,7 @@ GONE_RE = re.compile(r"not our ref|unadvertised object|couldn't find remote ref|
 RED_STATES = ('FAILURE', 'ERROR', 'TIMED_OUT')
 WAITS_FOR = ('BLOCKED', 'UNSTABLE', 'CLEAN', 'HAS_HOOKS')   # up-to-date merge states whose checks the queue waits for
 NEVER = 'never reported'
+GATE_NOT_YET = 'not posted by the gate App yet'
 TESTED_BASE = 'pr_queue tested base'   # the annotation title the tested-base action writes (tested_base.py)
 BASE_RED = ('FAILURE', 'ERROR')   # "the base was red": a real failure. CANCELLED, STALE, STARTUP_FAILURE, TIMED_OUT,
 # SKIPPED, not reported or running say nothing about the base's code (a busy runner times out or cancels base runs)
@@ -491,9 +492,17 @@ class Queue:
         if not rollup and not runs:
             print(f'#{p["number"]}: no check and no workflow run on its head yet: waiting')
             return None
-        return missing[0], NEVER
+        gate = self.cfg.head_check if self.cfg.head_check_app else None
+        if missing == [gate]:   # no workflow of the head posts it: the gate's run lists on the default branch
+            return gate, GATE_NOT_YET
+        return next(m for m in missing if m != gate), NEVER
 
     def stuck_fix(self, what, base):
+        if what == GATE_NOT_YET:   # the head gate's App posts it from a run of the default branch, not of this head
+            return ('The head gate posts it as its App, from a run of the default branch: on the next push, '
+                    'ready-for-review, base change or issue comment, and after any earlier gate run on the same head. '
+                    'If none comes, dispatch the gate with this pull request number (Actions, the gate caller, '
+                    '"Run workflow")')
         if what == NEVER:   # a re-run repeats the run's own workflow file, which has no job for this check
             return (f'A re-run cannot add it: a re-run repeats the jobs of the workflow files this head was built '
                     f'with, and none of them reported it. Push again (`{self.cfg.push_command}`) or merge {base} into '

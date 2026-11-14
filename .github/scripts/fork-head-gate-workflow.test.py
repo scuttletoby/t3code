@@ -4,7 +4,7 @@ the step scripts are run as Actions runs them, the wiring is read from the files
     python3 .github/scripts/fork-head-gate-workflow.test.py
 
 Needs PyYAML and bash. Each check prints ok/FAIL; any FAIL exits 1. Nothing here starts gh or the gate: a fake
-python3 stands in for head_gate.py. What makes the key reachable only by the gate's last step is checked here and,
+python3 stands in for head_gate.py. What makes the key reachable only by the start and finish steps is checked here and,
 against every fork workflow, in fork-contracts.test.py (head-gate).
 """
 
@@ -50,10 +50,11 @@ on = wf.get(True, wf.get("on"))  # YAML 1.1 reads the key `on` as true
 check("it is only a reusable workflow (workflow_call): no event of its own starts it", set(on) == {"workflow_call"},
       str(set(on)))
 inputs = (on.get("workflow_call") or {}).get("inputs") or {}
-check("inputs: pr, config, check-name, required-lenses, pass-drafts, environment",
-      set(inputs) == {"pr", "config", "check-name", "required-lenses", "pass-drafts", "environment"}, str(set(inputs)))
-check("config and check-name must be given; the Environment defaults to head-gate",
-      inputs.get("config", {}).get("required") is True and inputs.get("check-name", {}).get("required") is True
+check("inputs: pr, config, check-name, required-lenses, environment (no pass-drafts: a draft is never posted for)",
+      set(inputs) == {"pr", "config", "check-name", "required-lenses", "environment"}, str(set(inputs)))
+check("config, check-name and required-lenses must be given (no default lens list); the Environment defaults to head-gate",
+      all(inputs.get(k, {}).get("required") is True and "default" not in inputs.get(k, {})
+          for k in ("config", "check-name", "required-lenses"))
       and inputs.get("environment", {}).get("default") == "head-gate")
 check("it takes no secrets of its own: the key is the Environment's (secrets: inherit only lets the guard look)",
       "secrets" not in (on.get("workflow_call") or {}))
@@ -72,12 +73,12 @@ check("the gate job runs only after the guard job passed, and only when there is
       f"{gate.get('needs')} {gate_if}")
 check("only the gate job uses the Environment, the caller's input",
       gate.get("environment") == "${{ inputs.environment }}")
-check("one gate job per pull request, from the guard job's list; one failing does not stop the others",
-      (gate.get("strategy") or {}).get("matrix") == {"pr": "${{ fromJSON(needs.guard.outputs.prs) }}"}
+check("one gate job per head, from the guard job's list of {pr, sha}; one failing does not stop the others",
+      (gate.get("strategy") or {}).get("matrix") == {"include": "${{ fromJSON(needs.guard.outputs.prs) }}"}
       and (gate.get("strategy") or {}).get("fail-fast") is False)
 conc = gate.get("concurrency") or {}
-check("one gate run per pull request at a time, never cancelled half-way (the waiting one reads the newest state)",
-      "github.repository" in str(conc.get("group")) and "matrix.pr" in str(conc.get("group"))
+check("one gate run per HEAD at a time (a check run belongs to the commit), never cancelled half-way",
+      conc.get("group") == "head-gate-${{ github.repository }}-${{ matrix.sha }}"
       and conc.get("cancel-in-progress") is False, str(conc))
 check("the guard job hands on only the list", guard.get("outputs") == {"prs": "${{ steps.prs.outputs.prs }}"})
 
@@ -88,8 +89,8 @@ check("every run step is bash", all(s.get("shell") == "bash" for s in gsteps + t
 check("guard steps: find the toolkit, check it out, guard, list",
       [s.get("id") for s in gsteps] == ["toolkit", None, None, "prs"] and len(gsteps) == 4,
       ", ".join(str(s.get("name")) for s in gsteps))
-check("gate steps: find the toolkit, check it out, guard the Environment, judge, drift, token, post",
-      [s.get("id") for s in tsteps] == ["toolkit", None, None, "judge", None, "token", None] and len(tsteps) == 7,
+check("gate steps: find the toolkit, check it out, guard the Environment, target, drift, token, start, judge, finish",
+      [s.get("id") for s in tsteps] == ["toolkit", None, None, "target", None, "token", "start", "judge", "finish"],
       ", ".join(str(s.get("name")) for s in tsteps))
 
 # --- the toolkit: this workflow's own commit, never the caller's tree -----------------------------------------------
@@ -161,28 +162,43 @@ check("prs: the event comes from the run and the number from the caller",
       (prs.get("env") or {}).get("EVENT") == "${{ github.event_name }}" and (prs.get("env") or {}).get("PR")
       == "${{ inputs.pr }}")
 
-eguard, judge, drift, token, post = (tsteps + [{}] * 7)[2:7]
+eguard, target, drift, token, start, judge, finish = (tsteps + [{}] * 9)[2:9]
 check("gate: the Environment is checked again right before the token, without the secret's presence",
       "--environment-only" in str(eguard.get("run")) and "REPO_SECRET_PRESENT" not in (eguard.get("env") or {})
       and "secrets." not in str(eguard))
-jenv = judge.get("env") or {}
-check("judge: the pull request is the matrix's, the rest the caller's inputs; it reads with the job's token",
-      jenv == {"GH_TOKEN": "${{ github.token }}", "REPO": "${{ github.repository }}", "PR": "${{ matrix.pr }}",
-               "CONFIG": "${{ inputs.config }}", "REQUIRED_LENSES": "${{ inputs.required-lenses }}",
-               "PASS_DRAFTS": "${{ inputs.pass-drafts }}"}, str(jenv))
+RUN_ENV = {"GH_TOKEN": "${{ github.token }}", "REPO": "${{ github.repository }}", "SHA": "${{ matrix.sha }}",
+           "REQUIRED_LENSES": "${{ inputs.required-lenses }}", "CALLER_REF": "${{ github.workflow_ref }}",
+           "CALLER_SHA": "${{ github.workflow_sha }}", "GATE_REPO": "${{ steps.toolkit.outputs.repo }}",
+           "GATE_SHA": "${{ steps.toolkit.outputs.sha }}", "RUN_ATTEMPT": "${{ github.run_attempt }}"}
+check("target: the head is the matrix's, the caller and gate commits and the attempt the run's; the job's token reads",
+      (target.get("env") or {}) == RUN_ENV and "if" not in target, str(target.get("env")))
+check("judge: the same, plus the config; the job's token reads",
+      (judge.get("env") or {}) == {**RUN_ENV, "CONFIG": "${{ inputs.config }}"}, str(judge.get("env")))
 lenses = "correctness\ndata-integrity (DI-1, DI-2)"
-base = ("-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py", "judge", "--repo", "o/p", "--pr", "7",
-        "--config", ".github/q.json", "--required-lenses", lenses)
-tail = ("--work", "/rt", "--verdict", "/rt/head-gate-verdict.json")
-for drafts, extra in (("true", ("--pass-drafts",)), ("false", ()), ("", ()), ("True", ())):
-    r = run(judge, REPO="o/p", PR="7", CONFIG=".github/q.json", REQUIRED_LENSES=lenses, PASS_DRAFTS=drafts)
-    check(f"judge: pass-drafts {drafts!r} {'adds' if extra else 'adds no'} --pass-drafts; every input is one argument",
-          r.returncode == 0 and r.stdout.startswith(args(*base, *extra, *tail) + "\n"), r.stdout + r.stderr)
-check("drift, token and post run only when judge wrote a verdict",
-      all(s.get("if") == "steps.judge.outputs.post == 'true'" for s in (drift, token, post)))
+SHA_H = "ab" * 20
+renv = dict(REPO="o/p", SHA=SHA_H, REQUIRED_LENSES=lenses, CALLER_REF="o/p/.github/workflows/g.yml@refs/heads/main",
+            CALLER_SHA="cd" * 20, GATE_REPO="t/k", GATE_SHA="ef" * 20, RUN_ATTEMPT="1")
+run_args_ = ("--repo", "o/p", "--sha", SHA_H, "--required-lenses", lenses, "--caller-ref", renv["CALLER_REF"],
+             "--caller-sha", "cd" * 20, "--gate-repo", "t/k", "--gate-sha", "ef" * 20, "--run-attempt", "1")
+r = run(target, **renv)
+check("target: every input is one argument",
+      r.returncode == 0 and r.stdout.startswith(args("-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py",
+                                                     "target", *run_args_) + "\n"), r.stdout + r.stderr)
+r = run(judge, CONFIG=".github/q.json", **renv)
+check("judge: every input is one argument; the verdict goes to the runner temp for finish",
+      r.returncode == 0 and r.stdout.startswith(args(
+          "-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py", "judge", "--repo", "o/p", "--sha", SHA_H,
+          "--config", ".github/q.json", *run_args_[4:], "--work", "/rt", "--verdict", "/rt/head-gate-verdict.json")
+          + "\n"), r.stdout + r.stderr)
+check("drift, token and start run only when target says to post (never for a draft, another base or a re-run)",
+      all(s.get("if") == "steps.target.outputs.post == 'true'" for s in (drift, token, start)))
+check("judge runs only after start posted its in-progress check run",
+      judge.get("if") == "steps.start.outputs.id != ''")
+check("finish runs whenever start posted, whatever happened after (always()): a stop leaves a failure, never an old pass",
+      finish.get("if") == "always() && steps.start.outputs.id != ''")
 check("drift only warns: it cannot fail the job, and has no secret",
       drift.get("continue-on-error") is True and "secrets." not in str(drift)
-      and (drift.get("env") or {}).get("BRANCH") == "${{ steps.judge.outputs.base }}"
+      and (drift.get("env") or {}).get("BRANCH") == "${{ steps.target.outputs.base }}"
       and (drift.get("env") or {}).get("APP_ID") == "${{ vars.HEAD_GATE_APP_ID }}")
 tw = token.get("with") or {}
 check("token: the App token is made pinned by commit, for this repository only, with checks write only",
@@ -190,17 +206,28 @@ check("token: the App token is made pinned by commit, for this repository only, 
       and tw == {"app-id": "${{ vars.HEAD_GATE_APP_ID }}", "private-key": "${{ secrets.HEAD_GATE_APP_KEY }}",
                  "owner": "${{ github.repository_owner }}", "repositories": "${{ github.event.repository.name }}",
                  "permission-checks": "write"}, str(tw))
-check("post: the App token reaches only the post step",
-      (post.get("env") or {}).get("GH_TOKEN") == "${{ steps.token.outputs.token }}"
-      and text.count("steps.token.outputs.token") == 1)
+check("start and finish: the App token reaches only these two steps; judge reads with the job's token",
+      (start.get("env") or {}).get("GH_TOKEN") == "${{ steps.token.outputs.token }}"
+      and (finish.get("env") or {}).get("GH_TOKEN") == "${{ steps.token.outputs.token }}"
+      and text.count("steps.token.outputs.token") == 2)
 check("the key is named twice only: the guard's presence test and the token step",
       text.count("secrets.") == 2 and text.count("secrets.HEAD_GATE_APP_KEY") == 2)
-r = run(post, GH_TOKEN="app-token", REPO="o/p", CHECK_NAME="review-check")
-check("post: it posts the verdict judge wrote, with the App token",
+r = run(start, GH_TOKEN="app-token", REPO="o/p", SHA=SHA_H, CHECK_NAME="review-check")
+check("start: it posts the in-progress check run on the matrix's head, with the App token",
       r.returncode == 0 and r.stdout.startswith(args("-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py",
-                                                     "post", "--repo", "o/p", "--check-name", "review-check",
+                                                     "start", "--repo", "o/p", "--sha", SHA_H, "--check-name",
+                                                     "review-check") + "\n")
+      and "GH_TOKEN=app-token" in r.stdout, r.stdout)
+check("finish: the check run is start's, the head the matrix's",
+      (finish.get("env") or {}) == {"GH_TOKEN": "${{ steps.token.outputs.token }}", "REPO": "${{ github.repository }}",
+                                    "SHA": "${{ matrix.sha }}", "CHECK_RUN": "${{ steps.start.outputs.id }}"})
+r = run(finish, GH_TOKEN="app-token", REPO="o/p", SHA=SHA_H, CHECK_RUN="42")
+check("finish: it completes that check run with the verdict judge wrote, with the App token",
+      r.returncode == 0 and r.stdout.startswith(args("-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py",
+                                                     "finish", "--repo", "o/p", "--sha", SHA_H, "--id", "42",
                                                      "--verdict", "/rt/head-gate-verdict.json") + "\n")
       and "GH_TOKEN=app-token" in r.stdout, r.stdout)
+
 
 # --- the example caller ---------------------------------------------------------------------------------------------
 ex = yaml.safe_load(EXAMPLE.read_text())
@@ -222,8 +249,11 @@ uses = str(ejob.get("uses"))
 check("example: it calls this workflow of the fork, pinned by a release (never a branch)",
       uses.startswith("scuttletoby/t3code/.github/workflows/fork-head-gate.yml@")
       and not re.search(r"@(main|master|ci-release|ci/v\d+)$", uses), uses)
-check("example: secrets: inherit (so the guard can see a repository secret of the key's name)",
-      ejob.get("secrets") == "inherit")
+check("example: secrets: inherit (so the guard can see a repository secret of the key's name), and says why",
+      ejob.get("secrets") == "inherit" and "secrets: inherit" in EXAMPLE.read_text()
+      and "Needed:" in EXAMPLE.read_text())
+check("example: no pass-drafts anywhere (a draft's check run would count for a ready pull request at its head)",
+      "pass-drafts" not in EXAMPLE.read_text() and "pass-drafts" not in text)
 check("example: an issue comment that is not on a pull request starts nothing",
       ejob.get("if") == "github.event_name != 'issue_comment' || github.event.issue.pull_request")
 ew = ejob.get("with") or {}

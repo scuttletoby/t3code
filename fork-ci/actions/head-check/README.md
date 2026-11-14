@@ -193,25 +193,52 @@ How it works:
 
 - A caller on the default branch ([`gate-caller.example.yml`](gate-caller.example.yml))
   runs on `pull_request_target`, `issue_comment` and `workflow_dispatch`.
-  GitHub always takes that file from the default branch, so a pull request
-  that edits it changes nothing for its own run.
+  For a pull request into the default branch GitHub takes that file from the
+  default branch, so a pull request that edits it changes nothing for its own
+  run. The caller passes `secrets: inherit` (see "What it does not stop").
 - The gate's code comes from the workflow's own pinned release commit, never
   from the caller's tree. Nothing of the pull request is checked out: the
   head and the base tip are read from the API and fetched by sha into a new
   bare repository, and `head_check.decide` (the same rule code as the action,
   in bare mode) judges them. The config is read from the base tip.
+- **A check run belongs to a commit, not to a pull request.** The newest check
+  run of the name on a head counts for every pull request with that head. So
+  the gate judges a head, never one pull request alone:
+  - Only open, ready pull requests into the default branch are judged. A
+    draft, or a pull request into any other branch, gets nothing posted, ever
+    (there is no "pass drafts" in the gate). A draft is judged when it is
+    marked ready.
+  - Every open, ready pull request into the default branch with the head is
+    judged in the same run, and the head passes only when all of them pass:
+    the strictest verdict wins.
+  - Runs on one head wait for each other (concurrency per head), and each
+    reads every such pull request again when it starts. So the newest check
+    run on a head always comes from the newest complete read.
 - The guard job (no Environment) refuses unless the App key can only be the
   Environment's: no repository or organisation secret of its name, the
   Environment exists, and its deployment branches are exactly one rule, the
   default branch. The gate job checks the Environment again right before the
   token is made.
-- Only the gate job's last two steps touch the key: one makes a token of the
-  gate App (checks write, this repository), the other posts one completed
-  check run on the head it judged. The ruleset requires the check from that
-  App alone, so a job of a pull request's own workflow with the same name does
-  not count.
-- A dispatch without a pull request number judges every open pull request
-  (the backfill, at most 256; more is refused).
+- Before any token, the gate job refuses, and posts nothing, when:
+  - the run is a re-run (attempt 2 or later). A re-run runs the caller and
+    gate release of its first attempt, and a re-run of the gate job alone
+    skips the guard job. Dispatch the gate with the pull request number
+    instead.
+  - the caller is not the default branch's current one: the caller file
+    changed since the event, or it no longer pins this gate release. A run
+    can wait a long time for an earlier run on the same head.
+  - the required lenses name no lens. With none, a head with no lens comment
+    would pass, so the input is required.
+- Only three steps touch the key. One makes a token of the gate App (checks
+  write, this repository). **start** posts an in-progress check run on the
+  head *before* anything is judged; an in-progress check never passes. Then
+  **finish** (it runs always, also after a failed or cancelled step) completes
+  that check run with the verdict, or with a failure when there is none. The
+  ruleset requires the check from that App alone, so a job of a pull
+  request's own workflow with the same name does not count.
+- A dispatch without a pull request number judges the head of every open,
+  ready pull request into the default branch (the backfill, each head once,
+  at most 256; more is refused).
 
 Setup (the repository owner's steps; nothing here creates them):
 
@@ -223,7 +250,8 @@ Setup (the repository owner's steps; nothing here creates them):
    the secret `HEAD_GATE_APP_KEY`. Keep no repository or organisation secret of
    that name: the guard refuses one.
 4. Copy the example caller to `.github/workflows/` on the default branch, fill
-   in the check name, config path and required lenses, and pin the release.
+   in the check name, config path and required lenses (at least one), and pin
+   the release.
 5. Dispatch it once without a number (the backfill), so open pull requests get
    the check under its name.
 6. Bind the required check to the App: in a ruleset, the required status
@@ -234,26 +262,61 @@ Setup (the repository owner's steps; nothing here creates them):
    check runs. Release the code first, then bump the pins, then add the key:
    an older queue refuses a key it does not know.
 
+After a change to the caller or a new pin, dispatch the backfill again: a run
+that started before the change is refused, and nothing else judges the open
+pull requests again.
+
 **Run again after a review.** Reviews and inline diff comments
-(`pull_request_review`, `pull_request_review_comment`) do not start the gate:
-`pull_request_target` has no such types. After a lens posts as a review or on
-a line of the diff, post an issue comment on the pull request or dispatch the
-gate with its number. A new push, a draft change, a base change and any issue
-comment start it anyway.
+(`pull_request_review`, `pull_request_review_comment`) do not start the gate,
+though the rules count them (a lens may post as a review or on a line). GitHub
+runs those two events from the pull request's own merge commit, not from the
+default branch: the pull request's copy of the caller runs, the Environment
+(default branch only) refuses it, and it could never post. After a lens posts
+as a review or on a line of the diff, or deletes one, post an issue comment on
+the pull request or dispatch the gate with its number. A new push, ready or
+draft, a base change and any issue comment start it anyway. A trusted way to
+run on reviews is open:
+[issue 88](https://github.com/scuttletoby/t3code/issues/88).
 
-**Runs again, stops half-way, old state.** Each run judges what GitHub says
-now and posts one new check run; the newest check run of that name from the
-App is the one that counts. A run stopped before the post leaves nothing;
-the post is the only write. If the head moves while a run works, that run
-posts a failure on the old head ("a newer head has its own run") and the new
-head gets its own run. A rotated or deleted key makes no token: the job fails
-and nothing is posted, so the required check stays missing or red.
+**Runs again, stops half-way, old state.**
 
-**What it does not stop.** Anyone who can change the default branch (or the
-Environment, the App or the ruleset) can change the gate. A lens comment is
-still only as good as the people allowed to post it (the config's
-`lens_author_associations`). And the gate judges the comments that exist when
-it runs: until it runs again after a review, the check shows the older answer.
+- *Runs again.* Each run judges what GitHub says now. A new run on a head
+  first posts a new in-progress check run, then completes it. The newest check
+  run of that name from the App is the one that counts.
+- *Stops half-way.* A run that stops after start (an API error, a crash, a
+  timeout, a cancel) leaves its in-progress check run, or finish completes it
+  as a failure. Either way an older pass on the head no longer counts, and
+  the gate job is red. If start itself cannot post (GitHub refuses or is
+  down), nothing on the head changes and the job is red. That is the one case
+  where an older verdict still stands: until the next event, or a dispatch.
+- *The head moves.* If the head moves while a run works, that run finds no
+  pull request with its old head and posts nothing. If it was already
+  judging, it posts a failure on the old head ("a newer head has its own
+  run"), and the new head gets its own run.
+- *A key that is rotated or deleted* makes no token: the job fails and nothing
+  is posted, so the required check stays missing or as it was.
+- *Old state.*
+  - A check run of the same name posted by GitHub Actions (an older,
+    non-gate check) does not count once the ruleset binds the check to the
+    App.
+  - A head shared by two pull requests is judged for both (above).
+  - A repository without the Environment is refused by the guard before any
+    token is made.
+
+**What it does not stop.**
+
+- Anyone who can change the default branch (or the Environment, the App or
+  the ruleset) can change the gate.
+- A lens comment is still only as good as the people allowed to post it (the
+  config's `lens_author_associations`).
+- The gate judges the comments that exist when it runs. Between a change (a
+  deleted comment, a sibling pull request marked ready) and the start of the
+  run it triggers, the check shows the older answer. A run waiting for an
+  earlier one on the same head extends that window.
+- The caller must pass `secrets: inherit`. Without it, the guard sees no
+  repository or organisation secret of the key's name, so it cannot refuse
+  one. Nothing in the gate can check what the caller passes; the Environment
+  rule (default branch only) still holds the key.
 
 ## Tests
 

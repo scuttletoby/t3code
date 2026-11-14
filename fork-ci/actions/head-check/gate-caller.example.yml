@@ -1,6 +1,7 @@
 # An example caller of the head gate (README.md, "The gate"). Copy it to .github/workflows/ on the project's default
 # branch and fill in the CAPITALS. It runs from the default branch's copy whatever a pull request changes, and gives
-# the pull request to the gate as a number, nothing more.
+# the pull request to the gate as a number, nothing more. Reviews and inline review comments start no run (README.md,
+# "Run again after a review"): an issue comment, a push or a dispatch does.
 name: Head gate
 
 on:
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: A pull request number; empty = every open pull request (the backfill).
+        description: A pull request number; empty = every open, ready pull request into the default branch (the backfill).
         type: string
         default: ""
 
@@ -26,11 +27,12 @@ jobs:
       contents: read
       pull-requests: read
       actions: read
-    secrets: inherit # lets the guard see a repository secret of the key's name, which it refuses
+    # Needed: without it the guard sees no repository or organisation secret of the key's name and cannot refuse one.
+    # The gate's own key comes from the Environment either way. Nothing can check that a caller passes it.
+    secrets: inherit
     with:
       pr: ${{ format('{0}', github.event.pull_request.number || github.event.issue.number || inputs.pr) }}
       config: .github/pr-queue.json
       check-name: CHECK_NAME
-      required-lenses: |
+      required-lenses: | # one lens name per line; none = the gate refuses
         LENS_NAME
-      pass-drafts: true

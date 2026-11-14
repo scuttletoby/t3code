@@ -19,7 +19,8 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                the caller's tree or a pull request), puts no expression in a run script, every job only
                reads, every action is pinned by commit, only the gate job (after the guard job) names an
                Environment, the App key is named only by the guard's presence test and the one token
-               step, and that token reaches only the post step. No other fork workflow names the key.
+               step, and that token reaches only the start step right after it and the finish step
+               (the last). No other fork workflow names the key.
   removed      .github/fork-removed-workflows.txt (the upstream workflows the fork deletes, kept
                deleted by fork-follow.sh) is there, every line is an upstream workflow path, none of
                them is in the tree, and it names the files the owner decided to delete.
@@ -810,13 +811,15 @@ def head_gate_problems(wfs):
                 problems.append(f"{label}: the App token is not the gate's checks-write token")
     gate_steps = gate.get("steps") or []
     makers = [s for s in gate_steps if str(s.get("uses", "")).startswith("actions/create-github-app-token@")]
-    if len(makers) != 1 or gate_steps[-2:-1] != makers:
-        problems.append("gate: not exactly one token step, right before the last step")
-    if tokens != [f"gate/{gate_steps[-1].get('name')}" if gate_steps else "-"]:
-        problems.append(f"the App token reaches {tokens}, not only the last gate step")
+    at = next((i for i, s in enumerate(gate_steps) if s in makers), -1)
+    after = gate_steps[at + 1] if 0 <= at < len(gate_steps) - 1 else {}
+    if len(makers) != 1 or after.get("id") != "start":
+        problems.append("gate: not exactly one token step, right before the start step")
+    if not gate_steps or tokens != [f"gate/{after.get('name')}", f"gate/{gate_steps[-1].get('name')}"] \
+            or gate_steps[-1].get("id") != "finish":
+        problems.append(f"the App token reaches {tokens}, not only the start step and the finish step (the last)")
     text = yaml.safe_dump(wf)
-    if text.count("secrets.") != 2 or text.count(GATE_KEY) != 2 \
-            or (gate_steps[-2:-1] and GATE_KEY not in str(gate_steps[-2])):
+    if text.count("secrets.") != 2 or text.count(GATE_KEY) != 2 or (makers and GATE_KEY not in str(makers[0])):
         problems.append(f"the key is named {text.count(GATE_KEY)} times, other secrets {text.count('secrets.')}")
     for name, other in wfs.items():
         if name != GATE_FILE and ("HEAD_GATE_APP_KEY" in yaml.safe_dump(other)):
@@ -824,7 +827,7 @@ def head_gate_problems(wfs):
     return problems
 
 
-check("head-gate: fork-head-gate.yml keeps the App key and its token to the gate's last two steps",
+check("head-gate: fork-head-gate.yml keeps the App key and its token to the token, start and finish steps",
       not head_gate_problems(real), "; ".join(head_gate_problems(real)))
 
 
@@ -855,15 +858,19 @@ gate_mutants = {
     "the toolkit at the caller's ref": lambda wf, _: gate_step(wf, "gate", "Check out")["with"].__setitem__(
         "ref", "${{ github.sha }}"),
     "an expression in a run script": lambda wf, _: gate_step(wf, "gate", "Judge").__setitem__(
-        "run", gate_step(wf, "gate", "Judge")["run"].replace('"$PR"', '"${{ matrix.pr }}"')),
+        "run", gate_step(wf, "gate", "Judge")["run"].replace('"$SHA"', '"${{ matrix.sha }}"')),
     "an action pinned by tag": lambda wf, _: gate_step(wf, "gate", "token").__setitem__(
         "uses", "actions/create-github-app-token@v3"),
     "the token with more permissions": lambda wf, _: gate_step(wf, "gate", "token")["with"].__setitem__(
         "permission-contents", "write"),
     "the token handed to judge": lambda wf, _: gate_step(wf, "gate", "Judge")["env"].__setitem__(
         "GH_TOKEN", "${{ steps.token.outputs.token }}"),
-    "the token made before judge": lambda wf, _: wf["jobs"]["gate"]["steps"].insert(
+    "the token handed to target": lambda wf, _: gate_step(wf, "gate", "find what to judge")["env"].__setitem__(
+        "GH_TOKEN", "${{ steps.token.outputs.token }}"),
+    "the token made before target": lambda wf, _: wf["jobs"]["gate"]["steps"].insert(
         3, wf["jobs"]["gate"]["steps"].pop(5)),
+    "a step after finish": lambda wf, _: wf["jobs"]["gate"]["steps"].append({"name": "x", "run": "true"}),
+    "finish without the token": lambda wf, _: gate_step(wf, "gate", "Complete")["env"].pop("GH_TOKEN"),
     "the key in the judge step": lambda wf, _: gate_step(wf, "gate", "Judge")["env"].__setitem__(
         "KEY", "${{ secrets.HEAD_GATE_APP_KEY }}"),
     "another secret": lambda wf, _: gate_step(wf, "gate", "Judge")["env"].__setitem__("T", "${{ secrets.OTHER }}"),

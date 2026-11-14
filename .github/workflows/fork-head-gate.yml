@@ -5,7 +5,10 @@
 # example caller, gate-caller.example.yml) and passes `secrets: inherit`. The gate's code comes from this workflow's
 # own commit (job.workflow_repository and job.workflow_sha), never from the caller's tree, and nothing of the pull
 # request is ever checked out: the pull request is data. Only the gate job may use the Environment that holds the App
-# key, only after the guard job proved that key can be nowhere else, and only its last step gets a token, for one call.
+# key, only after the guard job proved that key can be nowhere else. A check run belongs to a head, not to a pull
+# request, so a gate job judges one head: every open, ready pull request into the default branch with it (drafts and
+# other bases are never posted for). Its token reaches two steps: start (an in-progress check run, before anything is
+# judged, so a run that stops leaves "not passed") and finish (that check run completed, always, also on a stop).
 # Tests: .github/scripts/fork-head-gate-workflow.test.py and fork-contracts.test.py (head-gate).
 name: Fork head gate
 
@@ -13,7 +16,7 @@ on:
   workflow_call:
     inputs:
       pr:
-        description: The pull request to judge; empty on a workflow_dispatch = every open pull request (the backfill).
+        description: The pull request whose head to judge; empty on a workflow_dispatch = every head of an open, ready pull request into the default branch (the backfill).
         type: string
         default: ""
       config:
@@ -25,13 +28,9 @@ on:
         type: string
         required: true
       required-lenses:
-        description: Lens names, one per line, that must have read the head (the caller's; never from the pull request).
+        description: Lens names, one per line, that must have read the head (the caller's; never from the pull request). None = refused.
         type: string
-        default: ""
-      pass-drafts:
-        description: Pass a draft without reading its review (it is judged again when it is marked ready).
-        type: boolean
-        default: false
+        required: true
       environment:
         description: The Environment that holds the variable HEAD_GATE_APP_ID and the secret HEAD_GATE_APP_KEY; only the default branch may deploy to it.
         type: string
@@ -107,10 +106,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pr: ${{ fromJSON(needs.guard.outputs.prs) }}
+        include: ${{ fromJSON(needs.guard.outputs.prs) }}
     concurrency:
-      group: head-gate-${{ github.repository }}-${{ matrix.pr }}
-      cancel-in-progress: false # one run works, one waits, and the waiting one reads the newest state
+      group: head-gate-${{ github.repository }}-${{ matrix.sha }}
+      cancel-in-progress: false # one run per head works, one waits, and the waiting one reads the newest state
     steps:
       - name: Find this workflow's own commit
         id: toolkit
@@ -143,36 +142,37 @@ jobs:
           REPO: ${{ github.repository }}
           ENVIRONMENT: ${{ inputs.environment }}
         run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py guard --environment-only --repo "$REPO" --environment "$ENVIRONMENT"
-      - name: Judge the head
-        id: judge
+      - name: Refuse a re-run or an old caller, and find what to judge
+        id: target
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR: ${{ matrix.pr }}
-          CONFIG: ${{ inputs.config }}
+          SHA: ${{ matrix.sha }}
           REQUIRED_LENSES: ${{ inputs.required-lenses }}
-          PASS_DRAFTS: ${{ inputs.pass-drafts }}
+          CALLER_REF: ${{ github.workflow_ref }}
+          CALLER_SHA: ${{ github.workflow_sha }}
+          GATE_REPO: ${{ steps.toolkit.outputs.repo }}
+          GATE_SHA: ${{ steps.toolkit.outputs.sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          drafts=()
-          [[ "$PASS_DRAFTS" != true ]] || drafts=(--pass-drafts)
-          python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py judge --repo "$REPO" --pr "$PR" \
-            --config "$CONFIG" --required-lenses "$REQUIRED_LENSES" "${drafts[@]}" \
-            --work "$RUNNER_TEMP" --verdict "$RUNNER_TEMP/head-gate-verdict.json"
+          python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py target --repo "$REPO" --sha "$SHA" \
+            --required-lenses "$REQUIRED_LENSES" --caller-ref "$CALLER_REF" --caller-sha "$CALLER_SHA" \
+            --gate-repo "$GATE_REPO" --gate-sha "$GATE_SHA" --run-attempt "$RUN_ATTEMPT"
       - name: Warn when the required check is not bound to the gate App
-        if: steps.judge.outputs.post == 'true'
+        if: steps.target.outputs.post == 'true'
         continue-on-error: true
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          BRANCH: ${{ steps.judge.outputs.base }}
+          BRANCH: ${{ steps.target.outputs.base }}
           CHECK_NAME: ${{ inputs.check-name }}
           APP_ID: ${{ vars.HEAD_GATE_APP_ID }}
         run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py drift --repo "$REPO" --branch "$BRANCH" --check-name "$CHECK_NAME" --app-id "$APP_ID"
       - name: Make the gate App's token (checks write, this repository)
         id: token
-        if: steps.judge.outputs.post == 'true'
+        if: steps.target.outputs.post == 'true'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.HEAD_GATE_APP_ID }}
@@ -180,11 +180,43 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-checks: write
-      - name: Post the check run
-        if: steps.judge.outputs.post == 'true'
+      - name: Post an in-progress check run before judging
+        id: start
+        if: steps.target.outputs.post == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           REPO: ${{ github.repository }}
+          SHA: ${{ matrix.sha }}
           CHECK_NAME: ${{ inputs.check-name }}
-        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py post --repo "$REPO" --check-name "$CHECK_NAME" --verdict "$RUNNER_TEMP/head-gate-verdict.json"
+        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py start --repo "$REPO" --sha "$SHA" --check-name "$CHECK_NAME"
+      - name: Judge the head
+        id: judge
+        if: steps.start.outputs.id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ matrix.sha }}
+          CONFIG: ${{ inputs.config }}
+          REQUIRED_LENSES: ${{ inputs.required-lenses }}
+          CALLER_REF: ${{ github.workflow_ref }}
+          CALLER_SHA: ${{ github.workflow_sha }}
+          GATE_REPO: ${{ steps.toolkit.outputs.repo }}
+          GATE_SHA: ${{ steps.toolkit.outputs.sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py judge --repo "$REPO" --sha "$SHA" \
+            --config "$CONFIG" --required-lenses "$REQUIRED_LENSES" --caller-ref "$CALLER_REF" \
+            --caller-sha "$CALLER_SHA" --gate-repo "$GATE_REPO" --gate-sha "$GATE_SHA" --run-attempt "$RUN_ATTEMPT" \
+            --work "$RUNNER_TEMP" --verdict "$RUNNER_TEMP/head-gate-verdict.json"
+      - name: Complete the check run with the verdict (a failure when there is none)
+        id: finish
+        if: always() && steps.start.outputs.id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ matrix.sha }}
+          CHECK_RUN: ${{ steps.start.outputs.id }}
+        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py finish --repo "$REPO" --sha "$SHA" --id "$CHECK_RUN" --verdict "$RUNNER_TEMP/head-gate-verdict.json"

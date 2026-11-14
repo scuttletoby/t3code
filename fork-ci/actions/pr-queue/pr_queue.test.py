@@ -1366,6 +1366,8 @@ class StuckUpToDate(unittest.TestCase):
             if a[:2] == ('run', 'list'):
                 self.asked.append(a[a.index('--commit') + 1])
                 return failed('boom') if runs_fail else ok(runs)
+            if a[0] == 'api' and '/check-runs?' in a[1] and self.q.cfg.head_check_app:   # the gate App's: none
+                return ok('{"total_count": 0, "check_runs": []}')
             raise AssertionError(a)
         self.q.gh = gh
         self.q.update = lambda n, d: self.updated.append(n) or 0
@@ -1431,6 +1433,19 @@ class StuckUpToDate(unittest.TestCase):
         code, out = self.sweep(self.checks(test=None), runs='[{"status": "completed", "workflowName": "ci"}]')
         self.assertEqual((self.asked, self.updated, len(self.posted)), ([self.H1], [2], 1), out)
         self.assertIn('required check test never reported', self.posted[0])
+
+    def test_a_missing_gate_check_is_told_the_gate_posts_it(self):   # PR #85 corr note: the gate is queued
+        # The head gate's runs belong to the default branch, so none lists on the head: while the gate waits (for an
+        # earlier run on the head, or a runner) every workflow of the head has ended and the check is missing. Push
+        # again is the wrong advice: the gate App posts it, and a dispatch starts it.
+        self.q.cfg = config.parse(json.dumps({**CFG_RAW, 'head_check_app': 4242}))
+        self.sweep(self.checks(review_check=None), runs='[{"status": "completed", "workflowName": "ci"}]')
+        told = self.posted[0]
+        self.assertIn('required check review-check not posted by the gate App yet', told)
+        self.assertIn('dispatch the gate', told)
+        self.assertNotIn('Push again', told)
+        self.sweep(self.checks(test=None, review_check=None), runs='[{"status": "completed", "workflowName": "ci"}]')
+        self.assertIn('required check test never reported', self.posted[0], 'a workflow check missing too: as before')
 
     def test_a_check_that_never_reported_is_not_told_to_re_run(self):   # the source told it to re-run
         # A re-run repeats the jobs of the workflow files the head was built with: a check added to the workflows
