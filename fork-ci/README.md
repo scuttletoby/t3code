@@ -30,7 +30,8 @@ job fail at "Set up job" (`Could not find file '.../.repos/...'`). Main is also 
 upstream, so its old commits disappear. `ci/v1` is such a main commit: it is kept for history, but
 do not use it.
 
-A release commit holds only what consumers use: `LICENSE`, `fork-ci/`, the scripts an action runs from
+A release commit holds only what consumers use: `LICENSE`, `fork-ci/`, the host kits in `fork-kit/`
+(installed only from a release commit, [fork-kit/README.md](../fork-kit/README.md)), the scripts an action runs from
 outside `fork-ci/` (fleet-route runs `.github/scripts/fork-fleet.py`) and the reusable workflows that start
 only on `workflow_call` (the list is `paths` in
 [`.github/fork-ci-release.json`](../.github/fork-ci-release.json)). The paths are the same as on main.
