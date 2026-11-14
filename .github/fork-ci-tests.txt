@@ -11,6 +11,7 @@
 .github/scripts/fork-follow.test.sh
 .github/scripts/fork-interaction-limit.test.sh
 .github/scripts/fork-pr-queue-workflow.test.py
+.github/scripts/fork-ci-release.test.py
 .github/scripts/fork-release-workflow.test.py
 .github/scripts/fork-release.test.sh
 .github/scripts/fork-schema-check.test.cjs
