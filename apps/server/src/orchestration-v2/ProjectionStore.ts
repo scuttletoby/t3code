@@ -449,6 +449,11 @@ export interface ShellSnapshotOptions {
   readonly projectId?: ProjectId;
   readonly unsettledOnly?: boolean;
   /**
+   * Fork: only threads with an active run, settled or not (settling does not stop a run). The
+   * agent slot gate counts these.
+   */
+  readonly activeRunOnly?: boolean;
+  /**
    * Only the threads sharing this thread's `lineage.rootThreadId`: the root, its forks, and their
    * subagent trees. The thread may be deleted: forks keep a deleted source's root.
    */
@@ -7656,6 +7661,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         location,
         projectId,
         unsettledOnly = false,
+        activeRunOnly = false,
         familyOf,
         worktreePath,
         threadIds,
@@ -7856,7 +7862,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               unsettledOnly
                 ? sql` AND json_extract(t.payload_json, '$.settledAt') IS NULL AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'`
                 : sql``
-            }${
+            }${activeRunOnly ? sql` AND active.run_id IS NOT NULL` : sql``}${
               familyOf === undefined
                 ? sql``
                 : sql` AND CASE WHEN json_valid(t.payload_json)
