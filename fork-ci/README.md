@@ -30,10 +30,45 @@ job fail at "Set up job" (`Could not find file '.../.repos/...'`). Main is also 
 upstream, so its old commits disappear. `ci/v1` is such a main commit: it is kept for history, but
 do not use it.
 
-A release commit holds only what consumers use: `LICENSE`, `fork-ci/` and the reusable workflows
-that start only on `workflow_call` (the list is `paths` in
+A release commit holds only what consumers use: `LICENSE`, `fork-ci/`, the scripts an action runs from
+outside `fork-ci/` (fleet-route runs `.github/scripts/fork-fleet.py`) and the reusable workflows that start
+only on `workflow_call` (the list is `paths` in
 [`.github/fork-ci-release.json`](../.github/fork-ci-release.json)). The paths are the same as on main.
 Release commits contain no symlinks and no workflow that starts by itself.
+
+## Using the actions
+
+Every action is used the same way: a `uses:` line pinned to a release commit with its tag as a comment (see
+"Pinning"), its inputs under `with:`, and its outputs read as `steps.<id>.outputs.<name>`. A project's own facts
+(its repository, folders, runner labels, jobs) live in a config file in the project's repository, never in fork-ci.
+Each action's README has a full example, every input and output, and what happens when something is unclear.
+
+```yaml
+- id: scope
+  uses: scuttletoby/t3code/fork-ci/actions/docs-scope@<release sha> # ci/vN
+  with:
+    config: .github/docs-scope.json
+- if: steps.scope.outputs.docs_only != 'true'
+  run: ./build.sh
+```
+
+| Action                                         | What it answers or does                                                        | Key inputs                               | Outputs                                           | Config file (in the project)                 |
+| ---------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------- | ------------------------------------------------- | -------------------------------------------- |
+| [docs-scope](actions/docs-scope/README.md)     | is this change docs-only, and which jobs does it reach                         | `config`, `base`                         | `docs_only`, `jobs`, `reason`                     | `.github/docs-scope.json` (rules)            |
+| [job-changed](actions/job-changed/README.md)   | can the change alter what one job of a workflow does                           | `workflow`, `base`, `job`, `paths`       | `changed`, `workflow`, `reason`                   | none                                         |
+| [gradle-cache](actions/gradle-cache/README.md) | stages the Maven files a lock lists, sha256-checked, from release assets       | `lock`, `out`, `token`                   | `maven-repo-local`                                | the lock file                                |
+| [fleet-route](actions/fleet-route/README.md)   | which runner each job of a run gets: the project's self-hosted pools or hosted | `config`, `vars`, `mode`, `gates`        | `runners`, `mode`, `attempt`, `fallback`, `watch` | the fleet config (e.g. `.github/fleet.json`) |
+| [head-check](actions/head-check/README.md)     | fails a pull request head that is not the change its review read               | `config`, `required-lenses`, `token`     | `result`                                          | the pr-queue config                          |
+| [pr-queue](actions/pr-queue/README.md)         | a merge queue for an up-to-date-required repository (also a reusable workflow) | `config`, `state-file`, `cache`, `token` | none                                              | the pr-queue config                          |
+
+Two habits every action expects:
+
+- **A gate output is tested for "do not run", never for "run"** (`!= 'false'`, `!= 'true'` as its README says): a
+  failed step leaves the output empty, and empty must mean the safe choice (run the job).
+- **A job that others `need` must not skip them on failure:** GitHub counts a skipped required job as passing. Give
+  the dependent job `if: ${{ !cancelled() }}` and a fallback for an empty output (fleet-route's README shows one).
+
+To move to a new release, change the SHA and the comment together; read the new tag's release notes first.
 
 ## How a release is made
 
