@@ -27,10 +27,17 @@ LENS_RE = re.compile(r'lens\s*:\s*(.*)', re.I)
 # The name ends at the first field: ` · reviewer:` or ` · read at:` (also `read at <hex>`; the separator may also be
 # `,` `—` or none). A bare `reviewer` or `read at` stays in the name (`data-integrity reviewer 1` and `... 2` are two
 # lenses).
-FIELD_RE = re.compile(r'\s*(?:[·,—]\s*)?\b(?:reviewer\s*:|read[\s-]*at\b\s*(?::|[0-9a-f]{7}))', re.I)
-READ_AT_RE = re.compile(r'\bread[\s-]*at\b\s*:?\s*([0-9a-f]{7,40})\b', re.I)
+# Every pattern here runs in time linear in the line, also for a trusted author's 64 KB comment: a blank run is tried
+# once, from its start ((?<!\s)), and `\s*(?::\s*)?` never splits one blank run between two `\s*`.
+FIELD_RE = re.compile(r'(?<!\s)\s*(?:[·,—]\s*)?\b(?:reviewer\s*:|read[\s-]*at\b\s*(?::|[0-9a-f]{7}))', re.I)
+READ_AT_RE = re.compile(r'\bread[\s-]*at\b\s*(?::\s*)?([0-9a-f]{7,40})\b', re.I)
 FULL_SHA = re.compile(r'[0-9a-f]{40}')
 NO_HEADER = 'comment without a first-line lens header'
+# The ways out of a NO_HEADER entry (lens_entries), for the queue's advice. A correct re-post adds a new entry and
+# leaves the old one; hiding the old one is not enough either.
+# The queue posts this text, so it never holds the lens marker with its colon (no_lens_text).
+NO_HEADER_WAY_OUT = ('delete that comment (hiding it is not enough), or edit it to start with `not a lens` and a colon '
+                     'and hold no lens header line, or')
 EDITED = 'edited after posting: post a new comment instead'
 HIDDEN = 'hidden: post a new comment instead'
 SHORT = 'not a full 40-hex sha'
@@ -84,12 +91,25 @@ def lens_key(name):
     marker (`r2`, `re-check`, `lens`) and Markdown emphasis around it. Everything else is the lens's identity:
     'data-integrity (DI-1)' and 'data-integrity (DI-2)' are different lenses; 'data-integrity DI-1 r2' =
     'Data-integrity DI-1'."""
-    n, prev = name.lower(), None
-    while n != prev:
-        prev = n
-        n = ' '.join(n.split()).strip('*_`')
-        n = re.sub(r'\s+(r\d+|lens|re-?check)$', '', n)
-    return n or 'unnamed'
+    # The old loop (join the words, strip `*_\`` from both ends, drop one trailing ` <marker>`, until nothing changes)
+    # copied the whole name per pass: minutes for a 64 KB name of 13 K markers. The same steps on a word list, where a
+    # word stripped empty at an end stays as the blank in front of a marker until the next pass, as in the text.
+    words = name.lower().split()
+    lo, hi = 0, len(words)
+    while True:
+        while lo < hi and not words[lo]:
+            lo += 1
+        while lo < hi and not words[hi - 1]:
+            hi -= 1
+        if lo == hi:
+            return 'unnamed'
+        before = (words[lo], words[hi - 1], hi)
+        words[lo] = words[lo].lstrip('*_`')
+        words[hi - 1] = words[hi - 1].rstrip('*_`')
+        if hi - lo >= 2 and words[hi - 1] and re.fullmatch(r'r\d+|lens|re-?check', words[hi - 1]):
+            hi -= 1
+        if (words[lo], words[hi - 1], hi) == before:
+            return ' '.join(w for w in words[lo:hi] if w) or 'unnamed'
 
 
 def names_a_lens(name):
@@ -266,11 +286,12 @@ class Review:
     def lens_entries(self, pr):
         """{lens key: ((when, index), sha or None, why or None)}: each lens's NEWEST header, from the posts that count
         (counts). A comment that looks like a lens report but is not one valid read (lens_problem) is an entry of its
-        own with no sha: it read nothing until it is re-posted as one comment per lens with a first-line header, or an
-        override covers it. A lens comment edited after posting (includesCreatedEdit not false: GitHub records that it
-        changed, not what) or hidden (minimized) read nothing until that lens posts a new comment. A lens-looking post
-        that does not count is logged (log only, never a comment), so a wrong lens_author_associations shows in the
-        run."""
+        own, keyed by the comment, with no sha: a correct new post of that lens does not replace it, and hiding it
+        does not clear it. It reads nothing until it is deleted, its first line is edited to `not a lens: ...` with no
+        lens header line left in it, or a newer override covers it (NO_HEADER_WAY_OUT). A lens comment edited after
+        posting (includesCreatedEdit not false: GitHub records that it changed, not what) or hidden (minimized) reads
+        nothing until that lens posts a new comment. A lens-looking post that does not count is logged (log only, never
+        a comment), so a wrong lens_author_associations shows in the run."""
         found = {}
         for when, i, post in self.lens_posts(pr):
             where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
