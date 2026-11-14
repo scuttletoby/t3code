@@ -304,6 +304,8 @@ for label, runs, want in (
 # matched to the commit's push workflow runs) is what decides.
 g = World("gate")
 gate_sha = sh(g.remote, "rev-parse", "main")
+gate_cfg = g.dir / "release.json"  # the world's paths, not the real config's (it may list files the world lacks)
+gate_cfg.write_text(json.dumps(CFG))
 for label, checks_, want in (
         ("main(): a green dispatch run over a red push run refuses",
          [run(1, "completed", "failure"), run(2, "completed", "success", suite=DISPATCH)], 1),
@@ -322,7 +324,8 @@ for label, checks_, want in (
     out = io.StringIO()
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            code = rel.main(["plan", "--require-check", "--remote", g.url, "--repo", "o/r", "--source", gate_sha])
+            code = rel.main(["plan", "--require-check", "--config", str(gate_cfg), "--remote", g.url, "--repo", "o/r",
+                             "--source", gate_sha])
     finally:
         rel.gh_get = real
     check(label, code == want and any(f"head_sha={gate_sha}" in x for x in asked)
