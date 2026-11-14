@@ -57,12 +57,18 @@ export type PaceUnknownReason =
   /** The instance is not configured (any more). */
   | "noInstance"
   /**
-   * Confirmed: the instance reports no usage limits, or a read that worked found none and no
-   * window was seen in the recent history.
+   * Confirmed: the provider marks the account `unsupported` (upstream's only marker for an account
+   * without usage limits). Nothing else ever gives this reason, whatever the history holds.
    */
   | "noLimits"
   /** Not known: no usage was read yet, or the read failed with nothing known before. */
   | "noReading"
+  /**
+   * Not known: a read worked but returned no windows (a reply shape the builders do not know), with
+   * no window known in the current series. Never free: a new instance, an account swap or a clock
+   * step back starts with nothing known, and the account's limits may still be near full.
+   */
+  | "emptyRead"
   /** Its history file exists but cannot be read. */
   | "historyUnreadable"
   /** Seen in the recent history, absent now, and no non-empty full read since confirmed it gone. */
@@ -377,7 +383,13 @@ function instanceVerdict(
   const unknown = timed.find((window) => window.verdict === "unknown");
   if (unknown !== undefined) return { verdict: "unknown", unknownReason: unknown.unknownReason! };
   if (timed.length === 0) {
-    const none = newest.unavailable === undefined ? "noLimits" : "noReading";
+    // No limits only from the provider's own marker; an empty or failed read is never free.
+    const none =
+      newest.unavailable === "unsupported"
+        ? "noLimits"
+        : newest.unavailable === undefined
+          ? "emptyRead"
+          : "noReading";
     return { verdict: "unknown", unknownReason: windows.length > 0 ? "noResetClock" : none };
   }
   if (timed.some((window) => window.verdict === "onPace")) return { verdict: "onPace" };

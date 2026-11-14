@@ -379,8 +379,8 @@ describe("UsagePacer guards", () => {
   });
 
   it("no limits is told apart from no reading: a failed first read is not free", () => {
-    // Confirmed: unsupported (above), or a read that worked and reported no windows.
-    assert.strictEqual(pace([], provider(-MINUTE, [])).unknownReason, "noLimits");
+    // Confirmed only by unsupported (above). A read that worked but reported no windows is not.
+    assert.strictEqual(pace([], provider(-MINUTE, [])).unknownReason, "emptyRead");
     // Not read: the first read failed, or the instance has reported no usage at all.
     const failed = pace([], provider(-MINUTE, [], { unavailable: "probeFailed" }));
     assert.strictEqual(failed.verdict, "unknown");
@@ -461,11 +461,55 @@ describe("UsagePacer guards", () => {
       ["seven_day"],
     );
     assert.strictEqual(after.verdict, "behind");
-    // With no window known in the lookback, an empty read that worked is still no limits.
-    assert.strictEqual(
-      pace([reading(-10 * MINUTE, [], { full: true })], provider(-10 * MINUTE, [])).unknownReason,
-      "noLimits",
-    );
+    // With no window known in the lookback, an empty read that worked is still not free.
+    const alone = pace([reading(-10 * MINUTE, [], { full: true })], provider(-10 * MINUTE, []));
+    assert.strictEqual(alone.verdict, "unknown");
+    assert.strictEqual(alone.unknownReason, "emptyRead");
+  });
+
+  describe("no limits only from the provider's unsupported marker (fix round 3)", () => {
+    const notFree = (result: InstancePace, reason: string) => {
+      assert.strictEqual(result.verdict, "unknown");
+      assert.strictEqual(result.unknownReason, reason);
+    };
+
+    it("an account swap: the new account's empty first read is not free", () => {
+      // Account A sat at 95; account B's first read worked but came back empty.
+      const history = [
+        reading(-20 * MINUTE, [weekly(95)], { full: true, account: "aaaa" }),
+        reading(-10 * MINUTE, [], { full: true, account: "bbbb" }),
+      ];
+      notFree(pace(history, provider(-10 * MINUTE, [])), "emptyRead");
+    });
+
+    it("a clock step back: an empty read after the backwards stamp is not free", () => {
+      const history = [
+        reading(-20 * MINUTE, [weekly(95)], { full: true }),
+        reading(-30 * MINUTE, [], { full: true }),
+      ];
+      notFree(pace(history, provider(-30 * MINUTE, [])), "emptyRead");
+    });
+
+    it("a new instance or an empty history: the first empty read is not free", () => {
+      notFree(pace([], provider(-MINUTE, [])), "emptyRead");
+      notFree(pace([reading(-MINUTE, [])], provider(-MINUTE, [])), "emptyRead");
+      notFree(pace([reading(-MINUTE, [], { full: true })], provider(-MINUTE, [])), "emptyRead");
+    });
+
+    it("an unsupported account is no limits, also after a series with windows", () => {
+      notFree(pace([], provider(-MINUTE, [], { unavailable: "unsupported" })), "noLimits");
+      // Swapped to an account without a subscription: upstream's own marker says so.
+      const history = [reading(-20 * MINUTE, [weekly(95)], { full: true })];
+      notFree(pace(history, provider(-MINUTE, [], { unavailable: "unsupported" })), "noLimits");
+      // The newest reading is a recorded unsupported one (recorded after the live snapshot).
+      notFree(
+        pace(
+          [reading(-10 * MINUTE, []), reading(-2 * MINUTE, [], { unavailable: "unsupported" })],
+          provider(-10 * MINUTE, []),
+        ),
+        "noLimits",
+      );
+    });
   });
 
   it("a live snapshot stamped before the history's newest reading is never paced alone", () => {
@@ -764,6 +808,30 @@ it.layer(NodeServices.layer)("UsagePacer service", (it) => {
         ],
       );
       assert.strictEqual(all[1]!.reservePercent, 10);
+    }),
+  );
+
+  it.effect("eight days of empty reads never make an account with a known weekly free", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      // The weekly sat at 95, then the reply shape changed and every read since came back empty.
+      // Once the 95 leaves the 8-day lookback, only empty reads are left (every 12 h, the last
+      // 12 h ago): still unknown.
+      const all: Array<UsageReading> = [
+        reading(-9 * DAY, [weekly(95, -2 * DAY)], { full: true }),
+        ...Array.from({ length: 17 }, (_, step) =>
+          reading(-9 * DAY + (step + 1) * 12 * HOUR, [], { full: true }),
+        ),
+      ];
+      const pacer = make({
+        getProviders: Effect.succeed([provider(-10 * MINUTE, [])]),
+        readings: (_instanceId, { sinceMs }) =>
+          Effect.succeed(all.filter((entry) => Date.parse(entry.checkedAt) >= sinceMs)),
+        getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+      });
+      const result = yield* pacer.paceOf(INSTANCE);
+      assert.strictEqual(result.verdict, "unknown");
+      assert.strictEqual(result.unknownReason, "emptyRead");
     }),
   );
 
