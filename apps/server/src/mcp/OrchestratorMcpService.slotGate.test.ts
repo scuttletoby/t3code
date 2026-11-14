@@ -24,7 +24,9 @@ import {
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type { DeepPartial } from "@t3tools/shared/Struct";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import { TestClock } from "effect/testing";
 
@@ -151,6 +153,12 @@ interface World {
   freeMemoryBytes: number;
   /** The next dispatches fail (a rejected command). */
   failDispatches: number;
+  /** The next dispatches take this long each (ms), in order. */
+  readonly dispatchDelaysMs: Array<number>;
+  /** The next dispatches return no task event. */
+  noTaskEvents: number;
+  /** Done when a dispatch began (a test waits on a slow one). */
+  readonly dispatchBegun: Deferred.Deferred<void>;
   /** Requests whose delegation was accepted before (their receipt exists). */
   readonly accepted: Set<string>;
 }
@@ -163,6 +171,9 @@ const newWorld = (): World => ({
   memoryReads: 0,
   freeMemoryBytes: 16_000 * MB,
   failDispatches: 0,
+  dispatchDelaysMs: [],
+  noTaskEvents: 0,
+  dispatchBegun: Deferred.makeUnsafe<void>(),
   accepted: new Set(),
 });
 
@@ -196,8 +207,9 @@ const serverLayer = (
         ),
       isProviderInstanceEnabledForProject: () => Effect.succeed(true),
       assertProviderInstanceEnabled: () => Effect.void,
-      getShellSnapshot: () =>
+      getShellSnapshot: (options) =>
         Effect.gen(function* () {
+          assert.deepStrictEqual(options, { activeRunOnly: true });
           world.snapshotReads += 1;
           yield* Effect.yieldNow;
           return {
@@ -218,6 +230,13 @@ const serverLayer = (
         Effect.gen(function* () {
           // Lets concurrent calls interleave between the gate and the dispatch.
           yield* Effect.yieldNow;
+          yield* Deferred.succeed(world.dispatchBegun, undefined);
+          const delayMs = world.dispatchDelaysMs.shift();
+          if (delayMs !== undefined) yield* Effect.sleep(delayMs);
+          if (world.noTaskEvents > 0) {
+            world.noTaskEvents -= 1;
+            return { sequence: 0, storedEvents: [] } as never;
+          }
           if (world.failDispatches > 0) {
             world.failDispatches -= 1;
             return yield* new ThreadManagementService.ThreadManagementProviderInstanceDisabledError(
@@ -459,6 +478,53 @@ describe("OrchestratorMcpService agent slot gate", () => {
         assert.strictEqual(failureOf(yield* delegate("slot-fail-3")).code, "slots_full");
         yield* TestClock.adjust("30 seconds");
         assert.strictEqual((yield* delegate("slot-fail-4"))._tag, "Success");
+      }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)));
+    }),
+  );
+
+  it.effect("a dispatch slower than the start grace keeps its slot until it ends", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.dispatchDelaysMs.push(60_000);
+      yield* Effect.gen(function* () {
+        const slow = yield* Effect.forkChild(delegate("slot-slow"));
+        yield* Deferred.await(world.dispatchBegun);
+        yield* TestClock.adjust("31 seconds");
+        // The first child is not dispatched yet, but it holds the one slot.
+        assert.strictEqual(world.dispatched.length, 0);
+        assert.strictEqual(failureOf(yield* delegate("slot-slow-2")).code, "slots_full");
+        yield* TestClock.adjust("29 seconds");
+        assert.strictEqual((yield* Fiber.join(slow))._tag, "Success");
+      }).pipe(
+        Effect.provide(
+          serverLayer(world, slots({ maxPerMachine: 1, startGraceSeconds: 30 }), roomy),
+        ),
+      );
+    }),
+  );
+
+  it.effect("stops half-way: a call cancelled during the dispatch gives its slot back", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.dispatchDelaysMs.push(60_000);
+      yield* Effect.gen(function* () {
+        const cancelled = yield* Effect.forkChild(delegate("slot-cancel"));
+        yield* Deferred.await(world.dispatchBegun);
+        yield* TestClock.adjust("1 second");
+        assert.strictEqual(failureOf(yield* delegate("slot-cancel-2")).code, "slots_full");
+        yield* Fiber.interrupt(cancelled);
+        assert.strictEqual((yield* delegate("slot-cancel-3"))._tag, "Success");
+      }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)));
+    }),
+  );
+
+  it.effect("stops half-way: a dispatch without a task event gives its slot back", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.noTaskEvents = 1;
+      yield* Effect.gen(function* () {
+        assert.strictEqual(failureOf(yield* delegate("slot-no-task")).code, "orchestration_error");
+        assert.strictEqual((yield* delegate("slot-no-task-2"))._tag, "Success");
       }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)));
     }),
   );

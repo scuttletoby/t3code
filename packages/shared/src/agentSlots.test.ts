@@ -3,6 +3,7 @@ import type { AgentSlotsSettings } from "@t3tools/contracts/waitFor";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  DISPATCH_SAFETY_MS,
   effectiveSlotLimits,
   limitsCount,
   liveStarting,
@@ -13,6 +14,7 @@ import {
   type SlotLimits,
   type SlotThread,
   type StartingEntry,
+  visibleRunThreadIds,
 } from "./agentSlots.ts";
 
 const MB = 1024 * 1024;
@@ -109,28 +111,59 @@ describe("runningAgents (T14)", () => {
 });
 
 describe("liveStarting", () => {
-  const entry = (token: number, atMs: number, childThreadId?: string): StartingEntry => ({
+  const entry = (
+    token: number,
+    atMs: number,
+    options: { readonly child?: string; readonly endedAtMs?: number } = {},
+  ): StartingEntry => ({
     token,
     instanceId: MAIN,
     atMs,
-    ...(childThreadId === undefined ? {} : { childThreadId }),
+    ...(options.child === undefined ? {} : { childThreadId: options.child }),
+    ...(options.endedAtMs === undefined ? {} : { endedAtMs: options.endedAtMs }),
+  });
+  const none = new Set<string>();
+
+  it("keeps an entry while its dispatch runs, however long and whatever the grace", () => {
+    const entries = [entry(1, 0), entry(2, 0, { child: "child-2" })];
+    for (const grace of [0, 30_000]) {
+      expect(liveStarting(entries, none, 5 * 60_000, grace).map((e) => e.token)).toEqual([1, 2]);
+    }
   });
 
-  it("keeps an entry for the start grace, then drops it (a missed release ends here)", () => {
-    const entries = [entry(1, 0), entry(2, 10_000)];
-    expect(liveStarting(entries, [], 29_999, 30_000).map((e) => e.token)).toEqual([1, 2]);
-    expect(liveStarting(entries, [], 30_000, 30_000).map((e) => e.token)).toEqual([2]);
-    expect(liveStarting(entries, [], 40_000, 30_000)).toEqual([]);
+  it("ends a dispatch that never ended after the safety time (a lost release)", () => {
+    expect(liveStarting([entry(1, 0)], none, DISPATCH_SAFETY_MS - 1, 0)).toHaveLength(1);
+    expect(liveStarting([entry(1, 0)], none, DISPATCH_SAFETY_MS, 0)).toEqual([]);
   });
 
-  it("drops an entry once its child is counted as running, so the child counts once", () => {
-    const entries = [entry(1, 0, "child-1"), entry(2, 0, "child-2"), entry(3, 0)];
-    const running = [{ threadId: "child-1", instanceId: MAIN }];
-    expect(liveStarting(entries, running, 1_000, 30_000).map((e) => e.token)).toEqual([2, 3]);
+  it("after the dispatch, keeps a child with no run for the start grace from the dispatch end", () => {
+    const ended = [entry(1, 0, { child: "child-1", endedAtMs: 50_000 })];
+    expect(liveStarting(ended, none, 79_999, 30_000)).toHaveLength(1);
+    expect(liveStarting(ended, none, 80_000, 30_000)).toEqual([]);
+    // A start grace of 0 ends it with the dispatch; while the dispatch ran it still counted.
+    expect(liveStarting(ended, none, 50_000, 0)).toEqual([]);
   });
 
-  it("counts nothing with a start grace of 0", () => {
-    expect(liveStarting([entry(1, 0)], [], 0, 0)).toEqual([]);
+  it("drops an entry once its child shows a run, so the child counts once", () => {
+    const entries = [
+      entry(1, 0, { child: "child-1" }),
+      entry(2, 0, { child: "child-2", endedAtMs: 0 }),
+      entry(3, 0, { child: "child-3" }),
+      entry(4, 0),
+    ];
+    const visible = new Set(["child-1", "child-2"]);
+    expect(liveStarting(entries, visible, 1_000, 30_000).map((e) => e.token)).toEqual([3, 4]);
+  });
+});
+
+describe("visibleRunThreadIds", () => {
+  it("names every thread with an active run, blocked ones and any caller too", () => {
+    const threads = [
+      shell("a", MAIN),
+      shell("blocked", MAIN, { blocked: true }),
+      shell("idle", MAIN, { active: false }),
+    ];
+    expect([...visibleRunThreadIds(threads)]).toEqual(["a", "blocked"]);
   });
 });
 

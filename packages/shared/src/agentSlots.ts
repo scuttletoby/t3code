@@ -75,32 +75,49 @@ export function runningAgents(
 }
 
 /**
+ * Every thread with an active run, the caller and blocked threads too: a started child that shows
+ * a run is visible, even when it is the caller now or waits on a thread, so its entry ends.
+ */
+export const visibleRunThreadIds = (threads: ReadonlyArray<SlotThread>): ReadonlySet<string> =>
+  new Set(threads.flatMap((thread) => (thread.activeRunId === null ? [] : [thread.id])));
+
+/**
+ * How long an entry whose dispatch never ended still counts. The caller ends it on every exit
+ * (an Effect finalizer), so this only catches a lost end; it does not depend on the start grace.
+ */
+export const DISPATCH_SAFETY_MS = 10 * 60 * 1000;
+
+/**
  * A delegation the gate let through whose child may not show a run yet. `childThreadId` is set
- * once the dispatch named the child.
+ * once the dispatch named the child; `endedAtMs` once the dispatch ended (the start grace runs
+ * from there).
  */
 export interface StartingEntry {
   readonly token: number;
   readonly instanceId: string;
   readonly atMs: number;
   readonly childThreadId?: string;
+  readonly endedAtMs?: number;
 }
 
 /**
- * Entries that still count: younger than the start grace, and whose child is not counted as
- * running yet. A missed release ends here, after the grace.
+ * Entries that still count. An entry ends as soon as its child shows a run (it counts as running
+ * then, once). Until its dispatch ends it counts whatever the start grace, so concurrent callers
+ * never get more slots than are free (a lost end stops after `DISPATCH_SAFETY_MS`). After the
+ * dispatch, a child that shows no run yet (a queued run) counts for the start grace.
  */
 export function liveStarting(
   entries: ReadonlyArray<StartingEntry>,
-  running: ReadonlyArray<RunningAgent>,
+  visibleRunIds: ReadonlySet<string>,
   nowMs: number,
   startGraceMs: number,
 ): ReadonlyArray<StartingEntry> {
-  const runningIds = new Set(running.map((agent) => agent.threadId));
-  return entries.filter(
-    (entry) =>
-      nowMs - entry.atMs < startGraceMs &&
-      (entry.childThreadId === undefined || !runningIds.has(entry.childThreadId)),
-  );
+  return entries.filter((entry) => {
+    if (entry.childThreadId !== undefined && visibleRunIds.has(entry.childThreadId)) return false;
+    return entry.endedAtMs === undefined
+      ? nowMs - entry.atMs < DISPATCH_SAFETY_MS
+      : nowMs - entry.endedAtMs < startGraceMs;
+  });
 }
 
 export type SlotRule = "machine" | "account" | "memory";

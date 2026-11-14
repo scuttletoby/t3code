@@ -145,7 +145,11 @@ export const WaitChecksFromSettingsFile = Schema.Record(Schema.String, Schema.Un
   ),
 );
 
-/** Server-wide agent slot limits. `enabled: false` leaves `delegate_task` as upstream's. */
+/**
+ * Server-wide agent slot limits. `enabled: false` leaves `delegate_task` as upstream's. Only
+ * `delegate_task` is refused; threads started by `t3_thread_launch` or `create_threads` are counted
+ * once they run, but never refused.
+ */
 export const AgentSlotsSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Most running agents on this server; 0 = no limit. */
@@ -158,7 +162,10 @@ export const AgentSlotsSettings = Schema.Struct({
   minFreeMemoryMb: nonNegativeIntDefault(0),
   /** How long a woken slot wait keeps its slot. */
   reserveSeconds: nonNegativeIntDefault(120),
-  /** How long an accepted delegation counts as running before its run is visible. */
+  /**
+   * How long an accepted delegation still counts after its dispatch ended while its child shows no
+   * run (a queued run). While the dispatch runs it always counts, so 0 still never lets more in.
+   */
   startGraceSeconds: nonNegativeIntDefault(30),
 });
 export type AgentSlotsSettings = typeof AgentSlotsSettings.Type;
