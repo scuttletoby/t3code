@@ -15,7 +15,9 @@ name: Fork interaction limit
 #
 # Repository variables (optional): FORK_INTERACTION_LIMIT (default collaborators_only; one of
 # existing_users, contributors_only, collaborators_only) and FORK_INTERACTION_LIMIT_DAYS (default 30).
-# No pull request starts this workflow, so the secret never meets pull request code.
+# No pull request starts this workflow, so the secret never meets pull request code, and the
+# token is read only on main: a manual run on another branch stops red before it (no issue either).
+# The owner's renewal timer runs `renew --if-under 75` monthly (75 = this margin, 30, plus a month).
 # Script and tests: .github/scripts/fork-interaction-limit.sh, fork-interaction-limit.test.sh.
 on:
   schedule:
@@ -37,6 +39,16 @@ jobs:
       contents: read
       issues: write
     steps:
+      # The read token is only for the reviewed code on main. A manual run on another branch stops
+      # here, red, before any step that sees the token or touches an issue.
+      - name: Only on main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::notice::This workflow reads the interaction limit only on main (this run is on $REF); skipped."
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -47,6 +59,7 @@ jobs:
 
       # Only this step sees the read token, and only through GH_TOKEN; the result goes to a file.
       - name: Read the interaction limit
+        if: github.ref == 'refs/heads/main'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.FORK_INTERACTION_LIMIT_TOKEN }}
@@ -65,7 +78,9 @@ jobs:
 
       # With the workflow token (issues: write). Fails the run when the check did not pass.
       - name: Issue and the run's status
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          LIMIT: ${{ vars.FORK_INTERACTION_LIMIT || 'collaborators_only' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: bash .github/scripts/fork-interaction-limit.sh report "$RUNNER_TEMP/interaction-limit.txt"
+        run: bash .github/scripts/fork-interaction-limit.sh report "$RUNNER_TEMP/interaction-limit.txt" --limit "$LIMIT"

@@ -5,7 +5,9 @@
 # only:
 #   - in a GitHub Actions run (GITHUB_ACTIONS=true) that is not a test, or
 #   - on a person's machine when FORK_GH_LOCAL names the very script that runs (its file name, as
-#     FORK_GH_LOCAL=fork-interaction-limit.sh), so one script is let through on purpose, never all, or
+#     FORK_GH_LOCAL=fork-interaction-limit.sh), that name is in FORK_GH_LOCAL_SCRIPTS below, and the
+#     running file, symlinks resolved, is the file of that name beside this guard. So only a script
+#     listed here runs on a person's machine, one at a time and on purpose; every other refuses, or
 #   - in a test (FORK_TEST_MODE set, by fork-test-gh.sh) whose gh is the tests' stub: the gh on
 #     PATH is the file FORK_GH_STUB names and carries the stub's marker line, no GitHub token is
 #     set, and GH_HOST is a .invalid host.
@@ -16,13 +18,27 @@
 # file of every script calling gh.
 
 FORK_GH_STUB_MARKER="# fork-gh-stub: a test stand-in for gh that never reaches GitHub"
+# The only scripts FORK_GH_LOCAL may name (space separated file names). Add one only when a person
+# has to run it by hand, and say why in its header.
+FORK_GH_LOCAL_SCRIPTS="fork-interaction-limit.sh"
+
+# Where the running script and this guard really are (symlinks resolved), taken once when sourced
+# so a later cd cannot change the answer.
+fork_gh_self="$(realpath "$0" 2> /dev/null || true)"
+fork_gh_guard_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}" 2> /dev/null || echo /nonexistent/x)")"
+
+fork_gh_local_ok() { # true when FORK_GH_LOCAL lets the running script through
+  local name="${FORK_GH_LOCAL:-}"
+  [[ -n "$name" && " $FORK_GH_LOCAL_SCRIPTS " == *" $name "* && "$name" == "$(basename "$0")" ]] || return 1
+  [[ -n "$fork_gh_self" && -f "$fork_gh_self" && "$fork_gh_self" == "$fork_gh_guard_dir/$name" ]]
+}
 
 fork_gh_refusal() { # prints why gh may not be called here, or nothing
   local stub
   if [[ -z "${FORK_TEST_MODE:-}" ]]; then
     [[ "${GITHUB_ACTIONS:-}" == true ]] && return 0
-    [[ -n "${FORK_GH_LOCAL:-}" && "$FORK_GH_LOCAL" == "$(basename "$0")" ]] && return 0
-    echo "this is neither a GitHub Actions run, a local run of the script FORK_GH_LOCAL names, nor a test under the gh stub (FORK_TEST_MODE). These scripts change the live repository, so they run only in its workflows unless a person names one."
+    fork_gh_local_ok && return 0
+    echo "this is neither a GitHub Actions run, a local run of a script FORK_GH_LOCAL may name (${FORK_GH_LOCAL_SCRIPTS}) naming the running file, nor a test under the gh stub (FORK_TEST_MODE). These scripts change the live repository, so they run only in its workflows unless a person names one."
     return 0
   fi
   stub="$(type -P gh || true)"
