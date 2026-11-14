@@ -253,6 +253,24 @@ describe("UsagePacer failure table", () => {
     );
   });
 
+  it("clock step back hidden from the history's answer (#52 r5): a new series number starts a series", () => {
+    // The readings stamped by the clock that was ahead are hidden (stamped after now), so every stamp
+    // served goes forward; only the history's series number shows the step.
+    const inSegment = (entry: UsageReading, segment: number) => ({ ...entry, segment });
+    const history = [
+      inSegment(reading(-90 * MINUTE, [weekly(40)]), 0),
+      inSegment(reading(-70 * MINUTE, [weekly(45)]), 0),
+      inSegment(reading(-50 * MINUTE, [weekly(55)], { full: true }), 1),
+      inSegment(reading(-40 * MINUTE, [weekly(56)]), 1),
+    ];
+    assert.deepStrictEqual(
+      currentSeries(history).map((entry) => entry.checkedAt),
+      [at(-50 * MINUTE), at(-40 * MINUTE)],
+    );
+    const window = windowOf(pace(history, provider(-MINUTE, [weekly(57)])), "seven_day");
+    near(window.burnPercentPerHour, (2 / 49) * 60);
+  });
+
   it("restart: a snapshot restored with its old stamp is stale until a fresh read", () => {
     const old = reading(-3 * HOUR, [weekly(40), session(10)]);
     const restored = pace([old], provider(-3 * HOUR, [weekly(40), session(10)]));

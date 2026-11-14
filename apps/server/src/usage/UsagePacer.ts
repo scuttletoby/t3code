@@ -182,16 +182,27 @@ function liveReading(provider: ServerProvider): UsageReading | undefined {
   };
 }
 
+/** The history's series number of a recorded reading; undefined for a live one. */
+const segmentOf = (reading: UsageReading): number | undefined => {
+  const segment = (reading as { readonly segment?: unknown }).segment;
+  return typeof segment === "number" ? segment : undefined;
+};
+
 /**
  * The readings of the current series: the trailing run with no stamp going backwards (a clock
- * change, also one that thinning hid) and no account swap. Pace never runs across either.
+ * change, also one that thinning hid), no change of the history's series number (a step back the
+ * history saw though the readings that showed it are hidden as stamped ahead of now) and no account
+ * swap. Pace never runs across any of them.
  */
 export function currentSeries(readings: ReadonlyArray<UsageReading>): ReadonlyArray<UsageReading> {
   let start = readings.length - 1;
   while (start > 0) {
     const previous = readings[start - 1]!;
     const next = readings[start]!;
-    if (msOf(next) < msOf(previous) || isAccountSwap(previous, next)) break;
+    const before = segmentOf(previous);
+    const after = segmentOf(next);
+    const newSegment = before !== undefined && after !== undefined && before !== after;
+    if (msOf(next) < msOf(previous) || newSegment || isAccountSwap(previous, next)) break;
     start -= 1;
   }
   return readings.slice(Math.max(0, start));
