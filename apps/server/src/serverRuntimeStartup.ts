@@ -50,6 +50,7 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { getServerOwners } from "./telemetry/Identify.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import { WorkAdmission } from "./workAdmission.ts";
 import { formatHeadlessServeOutput, issueHeadlessServeAccessInfo } from "./startupAccess.ts";
 
 export class ServerRuntimeStartupError extends Schema.TaggedError<ServerRuntimeStartupError>()(
@@ -449,6 +450,7 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
   const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
   const random = yield* SecureRandom.SecureRandom;
   const launcher = yield* ServiceLauncherClient.ServiceLauncherClient;
+  const admission = yield* WorkAdmission;
 
   const commandGate = yield* makeCommandGate;
   const httpListening = yield* Deferred.make<void>();
@@ -634,6 +636,9 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
     yield* runStartupPhase("auxiliary-roots.parked", options?.awaitAuxiliaryParked ?? Effect.void);
 
     const updateOutcome = yield* launcher.prepareTrial({ baseDir: serverConfig.baseDir });
+    // Work an automatic update held starts only now: a trial that fails before the launcher
+    // commits restores the database, and the version that runs next starts it instead.
+    yield* admission.startHeldWork;
 
     yield* Effect.logDebug("startup phase: publishing welcome event", {
       environmentId: environment.environmentId,

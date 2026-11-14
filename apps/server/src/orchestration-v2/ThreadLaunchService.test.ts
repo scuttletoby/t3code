@@ -37,6 +37,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -61,6 +62,7 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
+import { makeWorkAdmissionGate, WorkAdmission } from "../workAdmission.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
@@ -289,6 +291,8 @@ function makeHarness(options: HarnessOptions = {}) {
       layerOutbox,
       layerDatabase,
       layerExternalServices,
+      // The held-preparation tests build a second launch service on the same event sink.
+      layerOrchestrator,
     ),
     createWorktree,
     removeWorktree,
@@ -996,6 +1000,88 @@ it.effect("records the checkout's branch on a root launch that names none", () =
     const threads = yield* ThreadManagement.ThreadManagementService;
     const { thread } = yield* threads.getThreadProjection(launched.threadId);
     assert.equal(thread.branch, "fix/checkout-total");
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("waits at a closed work gate to prepare a worktree, then prepares it", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const gate = yield* makeWorkAdmissionGate();
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      // The launch service says it prepares through this gate.
+      assert.notInclude(yield* gate.missingConsumers, "thread-launch");
+      yield* gate.hold;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "command:launch:held-preparation",
+          thread: "thread:launch:held-preparation",
+          message: "Build it after the update",
+          workspace: worktreeStrategy,
+        }),
+      );
+      for (let i = 0; i < 200; i++) yield* Effect.yieldNow;
+      // Held, not failed: nothing prepared, the run still waits to be prepared.
+      assert.equal(harness.createWorktree.mock.calls.length, 0);
+      const held = yield* threads.getThreadProjection(launched.threadId);
+      assert.equal(held.runs[0]?.status, "preparing");
+      yield* gate.release;
+      const prepared = yield* preparationSettled(launched.threadId);
+      assert.equal(harness.createWorktree.mock.calls.length, 1);
+      assert.equal(prepared.runs[0]?.status, "starting");
+    }).pipe(Effect.provide(harness.layer), Effect.provideService(WorkAdmission, gate));
+  });
+});
+
+it.effect("keeps a preparation held when the server stops, and the next server prepares it", () => {
+  const harness = makeHarness();
+  // One thread-launch service per server process, both on the same database.
+  const launchLayer = Layer.fresh(
+    ThreadLaunch.layer.pipe(
+      Layer.provide(Layer.mergeAll(CommandReceiptStore.layer, IdAllocator.layer)),
+    ),
+  );
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const stopping = yield* makeWorkAdmissionGate();
+    const firstProcess = yield* Scope.make();
+    const first = yield* Layer.buildWithScope(launchLayer, firstProcess).pipe(
+      Effect.provideService(WorkAdmission, stopping),
+    );
+    yield* stopping.hold;
+    const launched = yield* Effect.gen(function* () {
+      return yield* (yield* ThreadLaunch.ThreadLaunchService).launch(
+        launchInput({
+          command: "command:launch:held-at-stop",
+          thread: "thread:launch:held-at-stop",
+          message: "Build it after the update",
+          workspace: worktreeStrategy,
+        }),
+      );
+    }).pipe(Effect.provide(first));
+    for (let i = 0; i < 200; i++) yield* Effect.yieldNow;
+    // The server stops while the preparation waits at the gate: held, not failed.
+    yield* Scope.close(firstProcess, Exit.void);
+    for (let i = 0; i < 200; i++) yield* Effect.yieldNow;
+    const held = yield* threads.getThreadProjection(launched.threadId);
+    assert.equal(held.runs[0]?.status, "preparing");
+    assert.equal(harness.createWorktree.mock.calls.length, 0);
+    // The next server's recovery starts it through its own gate.
+    const restarted = yield* makeWorkAdmissionGate();
+    const secondProcess = yield* Scope.make();
+    yield* Layer.buildWithScope(launchLayer, secondProcess).pipe(
+      Effect.provideService(WorkAdmission, restarted),
+    );
+    yield* restarted.resumePreparation({
+      commandId: CommandId.make(`command:update-hold:prepare:${held.runs[0]!.id}`),
+      threadId: launched.threadId,
+      runId: held.runs[0]!.id,
+    });
+    const prepared = yield* preparationSettled(launched.threadId);
+    assert.equal(harness.createWorktree.mock.calls.length, 1);
+    assert.equal(prepared.runs[0]?.status, "starting");
+    yield* Scope.close(secondProcess, Exit.void);
   }).pipe(Effect.provide(harness.layer));
 });
 

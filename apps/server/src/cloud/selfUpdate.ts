@@ -72,6 +72,9 @@ export class ServerSelfUpdate extends Context.Service<
       requestId: string,
       onHandoffAccepted?: () => Effect.Effect<void>,
     ) => Effect.Effect<never, ServerSelfUpdateError>;
+    /** The launcher accepted a handoff but this process is still running past it: allow the
+     * next update (the button's or an automatic one) to start. */
+    readonly resetAfterDroppedHandoff: Effect.Effect<void>;
   }
 >()("t3/cloud/selfUpdate/ServerSelfUpdate") {}
 
@@ -349,6 +352,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
 
   return ServerSelfUpdate.of({
     update,
+    resetAfterDroppedHandoff: Ref.set(inFlight, false),
     commitDesktopUpdate: Effect.fn("ServerSelfUpdate.commitDesktopUpdate")(
       function (requestId, onHandoffAccepted) {
         return desktopAppUpdate.commit(requestId, onHandoffAccepted);

@@ -28,6 +28,7 @@ import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationServic
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import { WorkAdmission } from "../workAdmission.ts";
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlService.ProviderTurnControlError);
 
@@ -948,6 +949,9 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
   Effect.scoped(
     Effect.gen(function* () {
       const worker = yield* OrchestrationEffectWorkerV2;
+      const admission = yield* WorkAdmission;
+      // Held effects stay pending, unclaimed: startup recovery decides what they become.
+      yield* admission.register("outbox");
       const requestedConcurrency = options.concurrency ?? DEFAULT_EFFECT_WORKER_CONCURRENCY;
       const concurrency = Number.isFinite(requestedConcurrency)
         ? Math.max(1, Math.floor(requestedConcurrency))
@@ -962,7 +966,7 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       // Notifications wake promptly; availableAt persists retry timing, and liveness polling recovers missed wakeups.
       const runWorker = Effect.gen(function* () {
         while (true) {
-          const outcome = yield* worker.runOnce(claimLimits).pipe(
+          const outcome = yield* admission.admit(worker.runOnce(claimLimits)).pipe(
             Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
             Effect.catchCause((cause) =>
               Effect.logWarning("Orchestration effect worker failed", cause).pipe(

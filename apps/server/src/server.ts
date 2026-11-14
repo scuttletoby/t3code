@@ -181,6 +181,8 @@ import {
 } from "./cloud/managedTunnelStartup.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as CloudCliState from "./cloud/CliState.ts";
+import * as ServerAutoUpdate from "./cloud/autoUpdate.ts";
+import * as WorkAdmission from "./workAdmission.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as DesktopAppUpdate from "./desktopUpdate/DesktopAppUpdate.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
@@ -820,6 +822,8 @@ const layerMakeRoutes = Layer.mergeAll(
   Layer.effectDiscard(
     RemoteDelegation.RemoteDelegation.pipe(Effect.flatMap((remote) => remote.start())),
   ),
+  // Off unless automaticUpdates is on; shares the Update button's ServerSelfUpdate below.
+  ServerAutoUpdate.layer,
 ).pipe(
   Layer.provide(
     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
@@ -867,6 +871,13 @@ const layerMakeServer = Layer.unwrap(
     const activation = yield* Deferred.make<void>();
     const awaitActivation = Deferred.await(activation);
     const layerActivation = Layer.succeed(ServerActivation.ServerActivation, awaitActivation);
+    // One gate for the whole server: automatic updates hold new work until the restart.
+    const layerWorkAdmission = Layer.succeed(
+      WorkAdmission.WorkAdmission,
+      yield* WorkAdmission.makeWorkAdmissionGate({
+        marker: yield* WorkAdmission.makeFileUpdateHoldStore(config.baseDir),
+      }),
+    );
     const runtimeStateParked = yield* Deferred.make<void>();
     const tailscaleParked = yield* Deferred.make<void>();
     const cloudLinkParked = yield* Deferred.make<void>();
@@ -1223,7 +1234,7 @@ const layerMakeServer = Layer.unwrap(
           Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),
         ),
       ),
-      Layer.provide(layerActivation),
+      Layer.provide(Layer.merge(layerActivation, layerWorkAdmission)),
       Layer.provideMerge(
         RelayTracing.layerServerRelayBroker.pipe(Layer.provide(ManagedPolicy.layer)),
       ),
