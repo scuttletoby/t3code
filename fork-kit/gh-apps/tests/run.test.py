@@ -70,6 +70,26 @@ class Run(unittest.TestCase):
         self.assertIn(b'runs only as ghrun', proc.stderr)
         self.assertFalse(self.gh_ran())
 
+    def test_app_by_name_refused_while_another_app_file_is_or_could_be_for_the_repo(self):
+        """Lens round 2: two App files for one repository (one was broken when the second was added, then fixed)
+        let the agent pick the stronger one with --app. gh-as refuses while any other file is, or could be, for
+        the same repository; a broken file could be."""
+        self.host.add_app('strong', 'octo/demo', app_id=12, installation_id=23)
+        for name in ('demo', 'strong'):
+            proc = kf.drive(self.host, 'run', ['--app', name, '--repo', 'octo/demo', '--', 'gh', 'pr', 'list'])
+            self.assertEqual(proc.returncode, 1, name)
+            self.assertIn(b'one app per repository', proc.stderr)
+        os.unlink(self.host.path(f'{c.APPS}/strong.json'))
+        self.host.add_app('broken', 'octo/other', app_id=13)
+        os.chmod(self.host.path(f'{c.APPS}/broken.json'), 0o666)   # drift: its repo cannot be trusted
+        proc = kf.drive(self.host, 'run', ARGS + ['pr', 'list'])
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b'broken (broken)', proc.stderr)
+        self.assertFalse(self.gh_ran())
+        os.unlink(self.host.path(f'{c.APPS}/broken.json'))
+        self.host.add_app('other', 'octo/other', app_id=13)          # another repository's App is fine
+        self.assertEqual(kf.drive(self.host, 'run', ARGS + ['pr', 'list']).returncode, 0)
+
     def test_gh_must_be_trusted(self):
         os.chmod(self.host.path('/usr/bin'), 0o777)
         proc = kf.drive(self.host, 'run', ARGS + ['pr', 'list'])

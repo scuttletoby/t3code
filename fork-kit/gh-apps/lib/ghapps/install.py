@@ -105,7 +105,9 @@ class Ops:
         if self.groups_of(name) != {name}:
             problems.append(f'it is in other groups ({", ".join(sorted(self.groups_of(name) - {name}))})')
         try:
-            members = set(grp.getgrnam(name).gr_mem) - {name}
+            group = grp.getgrnam(name)
+            # listed members, and users whose primary group it is (those are not listed in gr_mem)
+            members = (set(group.gr_mem) | {u.pw_name for u in pwd.getpwall() if u.pw_gid == group.gr_gid}) - {name}
         except KeyError:
             members, problems = set(), problems + [f'there is no group {name}']
         if members:
@@ -481,14 +483,19 @@ def install(source, sha, agent, gh_path=None, ops=None, stop_after=None):
         if problems:
             raise Refused(f'user {name} already exists but is not a plain service user: {"; ".join(problems)}. '
                           f'Fix it, or remove it (userdel {name}) so the installer makes it again, then run again')
-    if ops.groups_of(agent) & {c.RUN_USER, c.KEYS_USER}:
-        raise Refused(f'{agent} is in group {c.RUN_USER} or {c.KEYS_USER}: take it out, then run again')
+    agents = sorted(set(old.get('agent_users', [])) | {agent})
+    for user in agents:   # the one named now and every one kept from the installed config
+        try:
+            groups = ops.groups_of(user)   # with its primary group
+        except KeyError:
+            continue   # a kept agent user that no longer exists can reach nothing
+        if groups & {c.RUN_USER, c.KEYS_USER}:
+            raise Refused(f'agent user {user} is in group {c.RUN_USER} or {c.KEYS_USER}: take it out, then run again')
     if done('users'):
         return
     # folders
     for path, owner, group, mode in layout():
         ensure_dir(ops, path, owner, group, mode)
-    agents = sorted(set(old.get('agent_users', [])) | {agent})
     if done('folders'):
         return
     # tool: the new version folder, not live yet
@@ -518,6 +525,10 @@ def install(source, sha, agent, gh_path=None, ops=None, stop_after=None):
     if done('selftest'):
         return
     # switch: config, then current in one step, then the fixed links
+    old_config = None
+    with contextlib.suppress(FileNotFoundError):
+        with open(c.p(c.CONFIG), encoding='utf-8') as f:
+            old_config = f.read()
     write_file(ops, c.CONFIG, json.dumps({'version': 1, 'gh_path': gh_path, 'agent_users': agents}, indent=2) + '\n')
     switch_link(c.CURRENT, f'versions/{sha}')
     for link, target in links()[:3]:   # gh-as, gh-mint (sudo's fixed paths) and the root-only admin command
@@ -529,8 +540,10 @@ def install(source, sha, agent, gh_path=None, ops=None, stop_after=None):
         except Refused as e:
             problems.append(str(e))
     if problems:
-        if live:
+        if live:   # back to the old version and the config it ran with
             switch_link(c.CURRENT, live)
+            if old_config is not None:
+                write_file(ops, c.CONFIG, old_config)
         raise Refused('the links fail their check after the switch' + (f', switched back to {live}' if live else '')
                       + ': ' + '; '.join(problems))
     if done('switch'):

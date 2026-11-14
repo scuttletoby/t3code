@@ -9,7 +9,7 @@ add-key stores the key as /etc/gh-apps/keys/APP_NAME.pem (root:ghkeys 640) and t
 /etc/gh-apps/apps/APP_NAME.json (root, 644; agents read it to pick the app), finds the installation id if none is
 given, drops the app's cached token and makes one test token. Run it again with a new key to rotate.
 """
-import contextlib, json, os, re, sys
+import contextlib, json, os, re, stat, sys
 
 from . import common as c, install
 from .common import Refused
@@ -43,6 +43,25 @@ def drop_cached_token(name):
         os.unlink(c.p(f'{c.CACHE}/{name}.token'))   # unlink never follows a link, so the folder owner cannot aim it
 
 
+def raw_repo(name):
+    """The repo a (broken) app file names, read without the owner and mode checks: no link, only a small regular
+    file. None when it cannot be read that way."""
+    try:
+        fd = os.open(c.p(f'{c.APPS}/{name}.json'), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = json.loads(os.read(fd, 64 * 1024).decode('utf-8'))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+    repo = data.get('repo') if isinstance(data, dict) else None
+    return repo if isinstance(repo, str) else None
+
+
 def add_key(ops, name, app_id, repo, installation_id=None, key_text=None):
     if not c.NAME_RE.match(name or ''):
         raise Refused(f'bad app name {name!r} (lower-case letters, digits, - and _)')
@@ -62,8 +81,14 @@ def add_key(ops, name, app_id, repo, installation_id=None, key_text=None):
         try:
             if c.load_app(n)['repo'].lower() == repo.lower():
                 others.append(n)
-        except Refused as e:   # one broken app file must not lock the owner out: report it, go on
-            say(f'skipped a broken app file: {e} (fix it, or gh-apps-admin remove-app {n})')
+        except Refused as e:
+            # one broken app file must not lock the owner out, but it must not let a second App in for its
+            # repository either: once its drift is fixed it loads again. Read its repo as root, without the checks.
+            named = raw_repo(n)
+            if named is None or named.lower() == repo.lower():
+                raise Refused(f'app file {n} is broken ({e}) and may be for {repo}: fix it, or gh-apps-admin '
+                              f'remove-app {n}, then run add-key again') from None
+            say(f'skipped a broken app file (it names {named}): {e} (fix it, or gh-apps-admin remove-app {n})')
     if others:
         raise Refused(f'{repo} already has app {others[0]}: one app per repository (remove-app it first)')
     install.write_file(ops, f'{c.KEYS}/{name}.pem', key_text, 'root', c.KEYS_USER, 0o640)

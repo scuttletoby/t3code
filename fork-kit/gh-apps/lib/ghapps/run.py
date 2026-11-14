@@ -243,6 +243,7 @@ def main(argv):
         app = c.load_app(app_name)
         if (c.norm_repo(repo) or '').lower() != app['repo'].lower():
             raise Refused(f'app {app_name} is for {app["repo"]}, not {repo}')
+        c.require_only_app(app)
         parsed = policy.parse(args, app['repo'], 'run')
         data = read_stdin() if parsed.stdin_uses else None
         policy.guard(parsed, data)

@@ -118,6 +118,7 @@ def main(argv):
             app = c.load_app(app_name)
         else:
             app = c.app_for_repo(repo or origin_repo(os.getcwd()))
+        c.require_only_app(app)   # gh-as checks it again; refused here first, with the same words
         parsed = policy.parse(args, app['repo'], 'wrapper')
         fd = None
         if parsed.files:

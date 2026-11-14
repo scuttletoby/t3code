@@ -27,7 +27,10 @@ agent user                 ghrun (sudo, one fixed command)           ghkeys (sud
 - **ghrun** runs the privileged `gh-as` and `gh`. It refuses every file path (only stdin), every command that is
   not on the list in `lib/ghapps/policy.py`, unknown flags, full URLs, `--hostname`, `--verbose`, jq that reads
   the environment, and owner work (rulesets, branch protection, Environments, secrets, collaborators, disabling
-  workflows or Actions). The token is in `gh`'s environment only; anything that looks like a token or key is
+  workflows or Actions). Every `gh api` write must go to a path inside the App's own repository
+  (`repos/OWNER/NAME/...`): never the repository itself, its numeric alias `repositories/ID`, or org, team, user or
+  member endpoints. The one write to Actions settings that passes turns Actions back on (`enabled=true` and no
+  other field). The token is in `gh`'s environment only; anything that looks like a token or key is
   replaced by `[redacted]` in the output.
 - **Plain text only.** The guard checks what GitHub will see, so it refuses anything gh or GitHub would rewrite
   first: a `gh api` endpoint with `%`, `\`, `#`, spaces, an empty, `.` or `..` part, `{branch}`, or a query string
@@ -113,6 +116,9 @@ Placeholders in CAPITALS. As root, in a shell no agent sees.
    ```
 
    It stores the key, finds the installation, and makes one test token. Run it again with a new key to rotate.
+   One App per repository: `add-key` refuses a second App for a repository, and also while a broken app file that
+   is (or may be) for it exists. `gh-as --app NAME` refuses while any other app file is, or could be, for the same
+   repository (a broken one could), so an agent can never pick a stronger App.
    `gh-apps-admin list`, `gh-apps-admin remove-app APP_NAME` and `gh-apps-admin self-check` do the rest.
 
 Old copies: the installer removes each agent's old `~/.cache/gh-apps`, `~/.local/bin/gh-as` and
@@ -122,7 +128,8 @@ are **not** imported, only reported. Make new keys (step 2), delete the old ones
 Upgrade: run the bootstrap again with the new sha. Keys, apps and config (the gh path and the agent users) stay
 unless a flag names a new value. The new version is copied in next to the old one and self-tested (its files
 against their hashes, and one test token per App from the new `gh-mint`) before `current` switches to it in one
-step; if the self-test fails, the old version stays live. The old version folder stays for rollback (run the
+step; if the self-test fails, the old version stays live (and if the links fail their check right after the
+switch, `current` and `config.json` both go back). The old version folder stays for rollback (run the
 bootstrap with the old sha). Remove: `gh-apps-install uninstall` (from `/usr/local/libexec/gh-apps/current/sbin/`)
 removes the sudoers file first, then everything above, keys included, and the two users. There is no command to
 take away one agent user: uninstall, then install again for each user to keep, then add the keys again.
@@ -141,8 +148,12 @@ take away one agent user: uninstall, then install again for each user to keep, t
 - **Old state:** see "Old copies" above. Existing keys, apps and agent users in `/etc/gh-apps` are kept. A link
   or file where the kit expects its own folder or link is refused with a message, never overwritten. Existing
   `ghrun` or `ghkeys` users are reused only if they are plain service users (a no-login shell, a locked password,
-  only their own group, no other members); otherwise the installer says what is wrong and stops. One broken app
-  file does not lock the owner out: `remove-app` and `add-key` still work, and `list` names it.
+  only their own group, no other members, counting users whose primary group it is); otherwise the installer says
+  what is wrong and stops. Every agent user, the one named now and each one kept from the installed config, is
+  checked again on every run: one in group `ghrun` or `ghkeys` (its primary group too) stops the install. One
+  broken app file does not lock the owner out: `remove-app` works, `list` names it, and `add-key` works for other
+  repositories (it refuses only while the broken file is, or may be, for the same one). `gh-as --app` refuses
+  while any other app file is broken.
 - **Self-check as an agent** (`gh-as --self-check`) cannot read the sudoers file; it says so ("not checked")
   instead of passing it silently. `gh-apps-admin self-check` as root checks it.
 - **Empty state:** a fresh machine with zero Apps installs fine; `gh-as` then says no App is set up and fails.

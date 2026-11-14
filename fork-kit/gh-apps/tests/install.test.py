@@ -244,20 +244,68 @@ class Install(Base):
         class Ops(install.Ops):
             def groups_of(self, user):
                 return {user, 'docker'} if user == 'ghrun' else {user}
+        users = [types.SimpleNamespace(pw_name='ghrun', pw_gid=900),
+                 types.SimpleNamespace(pw_name='ghkeys', pw_gid=901)]
         kf.patch(install, SHADOW=shadow,
-                 pwd=types.SimpleNamespace(getpwnam=lambda n: pw),
-                 grp=types.SimpleNamespace(getgrnam=lambda n: types.SimpleNamespace(gr_mem=['agent'] if n == 'ghrun'
-                                                                                      else [])))
+                 pwd=types.SimpleNamespace(getpwnam=lambda n: pw, getpwall=lambda: users),
+                 grp=types.SimpleNamespace(getgrnam=lambda n: types.SimpleNamespace(
+                     gr_mem=['agent'] if n == 'ghrun' else [], gr_gid=900 if n == 'ghrun' else 901)))
         try:
             bad = Ops().service_user_problems('ghrun')
             pw.pw_shell = '/usr/sbin/nologin'
             good = Ops().service_user_problems('ghkeys')
+            # lens round 2: a user whose PRIMARY group is ghkeys is not listed in gr_mem, but is a member
+            users.append(types.SimpleNamespace(pw_name='sneaky', pw_gid=901))
+            primary = Ops().service_user_problems('ghkeys')
         finally:
             kf.restore()
         self.assertEqual(len(bad), 4, bad)
         for want in ('shell is /bin/bash', 'has a password', 'other groups (docker)', 'other members (agent)'):
             self.assertTrue(any(want in p for p in bad), (want, bad))
         self.assertEqual(good, [])
+        self.assertEqual(primary, ['group ghkeys has other members (sneaky)'])
+
+    def test_agent_users_kept_from_the_old_config_are_checked_again(self):
+        """Lens round 2: only the --agent-user of this run was checked for the ghrun/ghkeys groups; the agent users
+        kept from the installed config were not."""
+        self.host.ids['agent2'] = (os.getuid() + 54322, os.getgid() + 54322)
+        self.ops.groups['agent2'] = {'agent2'}
+        self.ops.homes['agent2'] = self.host.path('/home/agent')
+        self.install()
+        self.install(agent='agent2')
+        self.assertEqual(json.loads(kf.read(self.host.path(c.CONFIG)))['agent_users'], ['agent', 'agent2'])
+        self.ops.groups['agent'] = {'agent', c.KEYS_USER}   # e.g. its primary group changed to ghkeys since
+        before = kf.read(self.host.path(c.SUDOERS))
+        with self.assertRaisesRegex(Refused, 'agent user agent is in group ghrun or ghkeys'):
+            self.install(sha=SHA_B, agent='agent2')
+        self.assertEqual(os.readlink(self.host.path(c.CURRENT)), f'versions/{SHA_A}')
+        self.assertEqual(kf.read(self.host.path(c.SUDOERS)), before)
+        del self.ops.groups['agent']                        # a kept agent user that no longer exists
+        self.install(sha=SHA_B, agent='agent2')
+
+    def test_failed_link_check_after_the_switch_puts_the_old_config_back_too(self):
+        """Lens round 2: when the links fail their check after the switch, current went back, config.json not."""
+        self.install()
+        config = kf.read(self.host.path(c.CONFIG))
+        real = c.trusted_chain
+
+        def failing(path, what, *a, **kw):
+            if what == 'installed program':
+                raise Refused(f'{what} {path}: made to fail')
+            return real(path, what, *a, **kw)
+        self.host.ids['agent2'] = (os.getuid() + 54322, os.getgid() + 54322)
+        self.ops.groups['agent2'] = {'agent2'}
+        kf.patch(c, trusted_chain=failing)
+        try:
+            with self.assertRaisesRegex(Refused, f'fail their check after the switch, switched back to '
+                                                 f'versions/{SHA_A}'):
+                self.install(sha=SHA_B, agent='agent2')   # the new config would name agent2
+        finally:
+            kf.restore()
+            kf.patch(c, PREFIX=self.host.root, ROOT_UID=os.getuid(), FAKE_IDS=self.host.ids)
+        self.assertEqual(os.readlink(self.host.path(c.CURRENT)), f'versions/{SHA_A}')
+        self.assertEqual(kf.read(self.host.path(c.CONFIG)), config)
+        self.assertEqual(install.self_check(), [])
 
     def test_self_test_failure_never_places_sudoers(self):
         self.install(stop_after='folders')
@@ -476,15 +524,31 @@ class Admin(Base):
         self.add_key(installation_id=5)
         os.chmod(self.host.path(f'{c.APPS}/demo.json'), 0o666)   # drift: one bad app file
         self.add_key(name='other', repo='octo/other', installation_id=6)   # the one-app-per-repo scan skips it
-        self.assertIn('skipped a broken app file', self.err)
+        self.assertIn('skipped a broken app file (it names octo/demo)', self.err)
         self.quiet(admin.remove_app, 'demo')
         self.assertFalse(self.exists(f'{c.APPS}/demo.json'))
         self.assertFalse(self.exists(f'{c.KEYS}/demo.pem'))
         self.assertTrue(self.exists(f'{c.APPS}/other.json'))
         with open(self.host.path(f'{c.APPS}/bad.json'), 'w') as f:   # not even JSON, and no key
             f.write('{')
+        with self.assertRaisesRegex(Refused, 'app file bad is broken .* and may be for octo/third'):
+            self.add_key(name='third', repo='octo/third')             # its repo cannot be read: it could be
+        self.assertFalse(self.exists(f'{c.APPS}/third.json'))
         self.quiet(admin.remove_app, 'bad')
         self.assertFalse(self.exists(f'{c.APPS}/bad.json'))
+
+    def test_a_broken_app_file_for_the_same_repo_blocks_a_second_app(self):
+        """Lens round 2: add-key skipped a broken app file even when it was for the SAME repo; once its drift was
+        fixed, two Apps loaded for one repo and gh-as --app let the agent pick the stronger one."""
+        self.add_key(name='weak', installation_id=5)
+        os.chmod(self.host.path(f'{c.APPS}/weak.json'), 0o666)        # drift
+        with self.assertRaisesRegex(Refused, 'app file weak is broken .* and may be for octo/demo.*remove-app weak'):
+            self.add_key(name='strong', installation_id=6)
+        self.assertFalse(self.exists(f'{c.APPS}/strong.json'))
+        self.assertFalse(self.exists(f'{c.KEYS}/strong.pem'))
+        os.chmod(self.host.path(f'{c.APPS}/weak.json'), 0o644)        # the owner fixes the drift
+        loadable = [n for n in c.app_names() if c.load_app(n)['repo'] == 'octo/demo']
+        self.assertEqual(loadable, ['weak'])
 
 
 @unittest.skipIf(os.geteuid() == 0, 'as root the real installer would run at the end')

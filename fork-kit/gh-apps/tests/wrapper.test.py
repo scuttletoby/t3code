@@ -115,6 +115,21 @@ class Wrapper(unittest.TestCase):
             code, _ = self.call('--repo', 'octo/demo', *args)
             self.assertEqual((code, self.launched), (1, []), args)
 
+    def test_app_by_name_refused_while_another_app_file_is_or_could_be_for_the_repo(self):
+        self.host.add_app('strong', 'octo/demo', app_id=12, installation_id=23)
+        code, err = self.call('--app', 'strong', 'gh', 'pr', 'list')
+        self.assertEqual((code, self.launched), (1, []))
+        self.assertIn('one app per repository', err)
+        os.unlink(self.host.path(f'{c.APPS}/strong.json'))
+        self.host.add_app('broken', 'octo/other', app_id=13)
+        os.chmod(self.host.path(f'{c.APPS}/broken.json'), 0o666)
+        code, err = self.call('--app', 'demo', 'gh', 'pr', 'list')
+        self.assertEqual((code, self.launched), (1, []))
+        self.assertIn('broken (broken)', err)
+        os.chmod(self.host.path(f'{c.APPS}/broken.json'), 0o644)
+        code, err = self.call('--app', 'demo', 'gh', 'pr', 'list')
+        self.assertEqual(code, 0, err)
+
     def test_usage(self):
         for args in ([], ['pr', 'list'], ['--repo', 'octo/demo', '--app', 'demo', 'gh', 'pr', 'list']):
             code, _ = self.call(*args)

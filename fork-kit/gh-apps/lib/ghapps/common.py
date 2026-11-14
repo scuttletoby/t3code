@@ -202,6 +202,24 @@ def norm_repo(text):
     return r if REPO_RE.match(r) else None
 
 
+def require_only_app(app):
+    """One App per repository, so an agent can never pick a stronger one: refused when any other app file is for
+    the same repository, or is broken, so that it could be (a broken file loads again once its drift is fixed)."""
+    others = []
+    for n in app_names():
+        if n == app['name']:
+            continue
+        try:
+            if load_app(n)['repo'].lower() == app['repo'].lower():
+                others.append(n)
+        except Refused:
+            others.append(f'{n} (broken)')
+    if others:
+        raise Refused(f'app {app["name"]}: another app file is, or could be, for {app["repo"]} '
+                      f'({", ".join(others)}); one app per repository, so gh-as refuses until the owner removes '
+                      'or fixes it (gh-apps-admin list, remove-app)')
+
+
 def app_for_repo(repo):
     want = norm_repo(repo)
     if not want:
