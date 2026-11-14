@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -108,6 +109,36 @@ test("the composite actions' tests under fork-ci are found too, and a missing fo
     assert.deepEqual(presentTests(root), files.slice(0, 2));
     fs.rmSync(path.join(root, "fork-ci"), { recursive: true });
     assert.deepEqual(presentTests(root), files.slice(0, 1));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an unlisted test under .github/scripts or fork-ci fails the run", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-tests-"));
+  try {
+    const write = (file, text) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    };
+    const script = fs.readFileSync(require.resolve("./fork-ci-tests.cjs"));
+    write(".github/scripts/fork-ci-tests.cjs", script);
+    write(".github/fork-ci-tests.txt", "# nothing listed\n");
+    write(".github/scripts/s.test.sh", "");
+    write("fork-ci/actions/x/a.test.py", "");
+    const env = { ...process.env };
+    delete env.GITHUB_STEP_SUMMARY;
+    const run = childProcess.spawnSync("node", [".github/scripts/fork-ci-tests.cjs"], {
+      cwd: root,
+      env,
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    for (const file of [".github/scripts/s.test.sh", "fork-ci/actions/x/a.test.py"])
+      assert.ok(
+        run.stdout.includes(`${file} is not in .github/fork-ci-tests.txt`),
+        `${file} not reported: ${run.stdout}`,
+      );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
