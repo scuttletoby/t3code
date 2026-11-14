@@ -36,15 +36,15 @@ agent user                 ghrun (sudo, one fixed command)           ghkeys (sud
 
 ## What it stops, and what it does not
 
-| What an agent tries | With gh-apps |
-|---|---|
-| Read an App key or a cached token | **no**: root:ghkeys 0640 and ghkeys 0700; the agent is in neither group |
-| Change the tool, its config or the guard | **no**: everything is root-owned; `gh-as --self-check` reports drift |
+| What an agent tries                                                                        | With gh-apps                                                                                    |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| Read an App key or a cached token                                                          | **no**: root:ghkeys 0640 and ghkeys 0700; the agent is in neither group                         |
+| Change the tool, its config or the guard                                                   | **no**: everything is root-owned; `gh-as --self-check` reports drift                            |
 | Run `gh-mint`, or sudo with its own environment (`LD_PRELOAD`, `GH_*`, `GIT_*`, `PYTHON*`) | **no**: one sudoers line, `env_reset`, `!setenv`, fixed `secure_path`, Python started with `-I` |
-| Plant a `git` or `gh` in `PATH` | **no effect**: fixed paths only |
-| Upload the key through a file flag (`--body-file /etc/gh-apps/keys/x.pem`) | **no**: the agent itself opens the file, and cannot read it |
-| Use a token on another repository or host | **no**: one-repository tokens, `GH_HOST` fixed, `-R` must name the App's repository |
-| Rulesets, protection, Environments, secrets, members, disabling workflows | **no**, through `gh-as` |
+| Plant a `git` or `gh` in `PATH`                                                            | **no effect**: fixed paths only                                                                 |
+| Upload the key through a file flag (`--body-file /etc/gh-apps/keys/x.pem`)                 | **no**: the agent itself opens the file, and cannot read it                                     |
+| Use a token on another repository or host                                                  | **no**: one-repository tokens, `GH_HOST` fixed, `-R` must name the App's repository             |
+| Rulesets, protection, Environments, secrets, members, disabling workflows                  | **no**, through `gh-as`                                                                         |
 
 What it does **not** stop:
 
@@ -62,20 +62,20 @@ What it does **not** stop:
 
 ## Files on the host
 
-| Path | Owner, mode | What |
-|---|---|---|
-| `/usr/local/bin/gh-as` | link | the wrapper the agent runs |
-| `/usr/local/libexec/gh-apps/versions/<sha>/` | root 755 | the code of one release, with `MANIFEST.sha256` |
-| `/usr/local/libexec/gh-apps/current` | link | the release in use (switched in one step on upgrade) |
-| `/usr/local/libexec/gh-apps/gh-as`, `gh-mint` | links | the two commands sudo allows |
-| `/usr/local/sbin/gh-apps-admin` | link | the owner's command (root) |
-| `/etc/gh-apps/config.json` | root 644 | `gh` path and the agent users |
-| `/etc/gh-apps/apps/<name>.json` | root 644 | app id, installation id, repository |
-| `/etc/gh-apps/keys/<name>.pem` | root:ghkeys 640 (folder 750) | App private keys |
-| `/etc/gh-apps/installed.tsv` | root 644 | every path, owner, mode and hash (what self-check reads) |
-| `/etc/sudoers.d/gh-apps` | root 440 | the one sudoers file |
-| `/var/cache/gh-apps/` | ghkeys 700 | cached tokens (renewed when under 45 minutes are left) |
-| `/var/lib/gh-apps/run/`, `empty/` | ghrun 700, root 555 | per-call folders, and gh's working folder |
+| Path                                          | Owner, mode                  | What                                                     |
+| --------------------------------------------- | ---------------------------- | -------------------------------------------------------- |
+| `/usr/local/bin/gh-as`                        | link                         | the wrapper the agent runs                               |
+| `/usr/local/libexec/gh-apps/versions/<sha>/`  | root 755                     | the code of one release, with `MANIFEST.sha256`          |
+| `/usr/local/libexec/gh-apps/current`          | link                         | the release in use (switched in one step on upgrade)     |
+| `/usr/local/libexec/gh-apps/gh-as`, `gh-mint` | links                        | the two commands sudo allows                             |
+| `/usr/local/sbin/gh-apps-admin`               | link                         | the owner's command (root)                               |
+| `/etc/gh-apps/config.json`                    | root 644                     | `gh` path and the agent users                            |
+| `/etc/gh-apps/apps/<name>.json`               | root 644                     | app id, installation id, repository                      |
+| `/etc/gh-apps/keys/<name>.pem`                | root:ghkeys 640 (folder 750) | App private keys                                         |
+| `/etc/gh-apps/installed.tsv`                  | root 644                     | every path, owner, mode and hash (what self-check reads) |
+| `/etc/sudoers.d/gh-apps`                      | root 440                     | the one sudoers file                                     |
+| `/var/cache/gh-apps/`                         | ghkeys 700                   | cached tokens (renewed when under 45 minutes are left)   |
+| `/var/lib/gh-apps/run/`, `empty/`             | ghrun 700, root 555          | per-call folders, and gh's working folder                |
 
 ## Owner steps
 

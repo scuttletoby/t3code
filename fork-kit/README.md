@@ -13,6 +13,6 @@ Every kit follows the same pattern:
 - safe to run again, and safe to stop at any step;
 - an uninstall that leaves nothing.
 
-| Kit | What |
-|---|---|
+| Kit                          | What                                                                                 |
+| ---------------------------- | ------------------------------------------------------------------------------------ |
 | [gh-apps](gh-apps/README.md) | GitHub App tokens for agents through `gh-as`, without giving agents the keys (Linux) |

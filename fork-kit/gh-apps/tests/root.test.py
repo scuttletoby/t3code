@@ -3,7 +3,7 @@
     sudo env GH_APPS_ROOT_TESTS=1 GITHUB_ACTIONS=true python3 -I -B fork-kit/gh-apps/tests/root.test.py
 
 It refuses to run anywhere else (it adds users, writes /etc/sudoers.d and removes them again). A fake gh in
-/opt/gh-apps-fake prints its arguments, environment and stdin; no request reaches GitHub except one test token
+/usr/lib/gh-apps-fake prints its arguments, environment and stdin; no request reaches GitHub except one test token
 for a made-up App, which GitHub refuses. As the agent: reading keys or cache fails, writing tool or guard files
 fails, gh-mint fails, sudo -l shows one command, LD_PRELOAD, GH_*, GIT_* and PYTHON* do not pass, stdin through
 the wrapper works. The installer: zero Apps, run twice, bad sudoers never placed, uninstall leaves nothing."""
@@ -16,7 +16,7 @@ from ghapps.common import Refused  # noqa: E402
 
 AGENT = 'ghagent'
 SHA = '0' * 40
-FAKE_DIR = '/opt/gh-apps-fake'
+FAKE_DIR = '/usr/lib/gh-apps-fake'   # the installer wants a root-only path chain (/opt is not, on runners)
 FAKE_GH = FAKE_DIR + '/gh'
 TOKEN = 'ghs_' + 'R00tT3st' * 4 + 'xyzw'
 INSTALLER = [sys.executable, '-I', '-B', os.path.join(KIT, 'sbin', 'gh-apps-install')]
