@@ -389,6 +389,8 @@ export function applyServerSettingsPatch(
     providerModelPreferences,
     automaticGitFetchInterval,
     providerHealthRefreshInterval,
+    // Fork: a Duration is replaced whole; deepMerge would turn it into a plain object.
+    headlessUsageRefreshInterval,
     backgroundActivityProfile,
     backgroundActivity,
     worktreeCleanup: worktreeCleanupPatch,
@@ -642,6 +644,7 @@ export function applyServerSettingsPatch(
       : {}),
     ...(automaticGitFetchInterval !== undefined ? { automaticGitFetchInterval } : {}),
     ...(providerHealthRefreshInterval !== undefined ? { providerHealthRefreshInterval } : {}),
+    ...(headlessUsageRefreshInterval !== undefined ? { headlessUsageRefreshInterval } : {}),
   };
   const normalizedBackgroundActivity = normalizeBackgroundActivitySettings(
     nextWithReplacementsBase.backgroundActivity,

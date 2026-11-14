@@ -1083,6 +1083,8 @@ export interface BranchNamingOptions {
 
 export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.seconds(30);
 export const DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL = Duration.minutes(5);
+/** Fork: how often usage limits refresh while no client watches; 0 turns it off. */
+const DEFAULT_HEADLESS_USAGE_REFRESH_INTERVAL = Duration.minutes(10);
 
 export const BackgroundActivityProfile = Schema.Literals([
   "balanced",
@@ -1478,6 +1480,12 @@ export const ServerSettings = Schema.Struct({
   providerHealthRefreshInterval: Schema.DurationFromMillis.pipe(
     Schema.withDecodingDefault(
       Effect.succeed(Duration.toMillis(DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL)),
+    ),
+  ),
+  /** Fork: never more often than `providerHealthRefreshInterval`; 0 turns it off. */
+  headlessUsageRefreshInterval: Schema.DurationFromMillis.pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed(Duration.toMillis(DEFAULT_HEADLESS_USAGE_REFRESH_INTERVAL)),
     ),
   ),
   backgroundActivityProfile: BackgroundActivityProfile.pipe(
@@ -1896,6 +1904,7 @@ export const ServerSettingsPatch = Schema.Struct({
   ),
   automaticGitFetchInterval: Schema.optionalKey(Schema.DurationFromMillis),
   providerHealthRefreshInterval: Schema.optionalKey(Schema.DurationFromMillis),
+  headlessUsageRefreshInterval: Schema.optionalKey(Schema.DurationFromMillis),
   backgroundActivityProfile: Schema.optionalKey(BackgroundActivityProfile),
   environmentIcon: Schema.optionalKey(Schema.NullOr(EnvironmentMachineKind)),
   defaultThreadEnvMode: Schema.optionalKey(Schema.NullOr(ThreadEnvMode)),
