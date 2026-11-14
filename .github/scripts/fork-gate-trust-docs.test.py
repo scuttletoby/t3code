@@ -450,7 +450,7 @@ code_r, _, _, _, tmp_r = run(b["environment-rules"], {**empty_state(), "envs": {
 shown = (tmp_r / "stdout.txt").read_text().splitlines()
 check(said == "fail" and shown == ["101 branch main"],
       f"protected branches: the guard fails ({said}) while the read-back shows only the good line ({shown})")
-check(all(w in widened_text for w in ("protected branches", "Run step 3 again", "may post nothing")),
+check(all(w in widened_text for w in ("protected branches", "step 3's first line", "may post nothing")),
       "rotation: 'Environment widened' sends 'protected branches' to step 3 again and says the gate may post nothing")
 
 # Step 4: a failed download never runs an older script left by an earlier try; a good one runs the new script.
@@ -458,11 +458,13 @@ m = re.search(r"\*\*4\. Host install\*\*.*?```sh\n(.*?)```", PAGE.read_text(), r
 block4 = m.group(1) if m else ""
 
 
-def run_step4(download_ok):
+def run_step4(download_ok, partial=False):
     tmp = pathlib.Path(tempfile.mkdtemp(dir=BASE.name))
     (tmp / "bin").mkdir()
     curl = ('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
             f"echo \"touch '{tmp}/NEW_SCRIPT_RAN'\" > \"$out\"\n") if download_ok else \
+        ('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+         f"echo \"touch '{tmp}/OLD_SCRIPT_RAN'\" > \"$out\"\nexit 18\n") if partial else \
         "#!/bin/sh\necho 'curl: (22) The requested URL returned error: 404' >&2\nexit 22\n"
     (tmp / "bin/curl").write_text(curl)
     (tmp / "bin/curl").chmod(0o755)
@@ -478,6 +480,17 @@ def run_step4(download_ok):
 check(block4 and run_step4(False) == (False, False),
       "step 4: a failed download runs nothing, not an older script left at the same path")
 check(block4 and run_step4(True) == (False, True), "step 4: a good download runs the new script, not the old one")
+check(block4 and run_step4(False, partial=True) == (False, False),
+      "step 4: a download that stops half-way (curl exit 18, partial file kept) runs nothing")
+
+# Repairs after a deleted or widened Environment (lens t3lens87q findings 1-2).
+deleted_text = " ".join(re.search(r"^- \*\*Environment deleted(.*?)(?=^- |^#|\Z)", PAGE.read_text(), re.S | re.M).group(1).split())
+check("new key" in deleted_text and "Gate key" in deleted_text,
+      "Environment deleted: its key secret goes with it and the .pem was deleted, so the repair makes a new key first")
+check("step 3's first line" in widened_text and "Run step 3 again" not in widened_text,
+      "Environment widened: the repair names step 3's first line only (the key line needs the deleted .pem)")
+again_text = " ".join(re.search(r"^- \*\*App made again(.*?)(?=^- |^#|\Z)", PAGE.read_text(), re.S | re.M).group(1).split())
+check("do not follow it" in again_text, "App made again: the expected drift warning between step 6 and the switch is named")
 
 # --- step 6: bind the check in a ruleset ---------------------------------------------------------------------------
 blk = b["bind-ruleset"]

@@ -267,20 +267,25 @@ for the gate App's check.
   new head waits; a failure the new App posts blocks the merge. Merge the step 7 config change by hand
   once the new App's check on it is green. The other order (switch first, bind later) is **not** fail
   closed: until the bind, the new App's failures count nowhere and an old pass of the old App still
-  merges.
+  merges. From step 6 until `HEAD_GATE_APP_ID` is switched, the gate log warns that the required check
+  wants the new App and says to set the old id on it: that warning is expected in this window; do not
+  follow it (it would undo step 6).
 - **Agent App keys** (host kit): the next token request fails with a clear error naming the App; a
   cached token works until it ends (at most one hour). Rotate as in step 5.
 - **Environment widened** (a second branch rule, a tag or pattern rule, or "protected branches"): the
   guard refuses and the gate posts a failure on every head it runs for until the one default-branch
-  rule is back. Run step 3 again (its first line turns "protected branches" off, which the read-back
-  cannot show), then its read-back and delete. Then dispatch the backfill. With "protected branches"
+  rule is back. Run step 3's first line again (the PUT; it turns "protected branches" off, which the
+  read-back cannot show; the key secret is still there, so skip the key line), then its read-back and
+  delete. Then dispatch the backfill. With "protected branches"
   on, the gate may post nothing instead of failures: when GitHub does not count the default branch as
   protected, the gate job is refused the Environment (the README's "No token can be made"), and as
   with a deleted key, a head that already passed stays passed.
 - **Environment deleted, or the guard cannot see it:** the guard job fails and nothing is posted (a
   gate job that named a missing Environment would make GitHub create it, open to every branch). As
-  with a deleted key, a head that already passed stays passed. Deleted: make it again (step 3), then
-  dispatch the backfill. Not seen (GitHub does not answer, or a rate limit): once GitHub answers
+  with a deleted key, a head that already passed stays passed. Deleted: deleting an Environment
+  deletes its key secret too, and step 3 told you to delete the `.pem`, so first add a new key in the
+  App's page (as in **Gate key**), then run step 3 with it, dispatch the backfill, and delete the old
+  key. Not seen (GitHub does not answer, or a rate limit): once GitHub answers
   again, comment on the pull request or dispatch the gate (the README's "Stops before start").
 
 ## General vs project
