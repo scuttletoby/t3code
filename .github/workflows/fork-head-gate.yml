@@ -1,0 +1,249 @@
+# Fork only. The head check as a gate (fork-ci/actions/head-check/README.md, "The gate"): head_check's rules on a bare
+# repository, posted as one check run of the project's own gate App, so a ruleset can require that check from that
+# App alone and no workflow file of a pull request can meet it.
+# A caller on the default branch runs it on pull_request_target, issue_comment and workflow_dispatch (the README's
+# example caller, gate-caller.example.yml) and passes `secrets: inherit`. The gate's code comes from this workflow's
+# own commit (job.workflow_repository and job.workflow_sha), never from the caller's tree, and nothing of the pull
+# request is ever checked out: the pull request is data. Only the gate job may use the Environment that holds the App
+# key, only after the guard job proved that key can be nowhere else. A check run belongs to a head, not to a pull
+# request, so a gate job judges one head: every open, ready pull request into the default branch with it (drafts and
+# other bases are never judged; their heads get a failure). Its token reaches two steps: start (an in-progress check
+# run, before anything is judged, so a run that stops leaves "not passed") and finish (that check run completed, always,
+# also on a stop). A run that may not judge (the guard refused, a re-run, an old caller) posts a failure, never a pass.
+# Tests: .github/scripts/fork-head-gate-workflow.test.py and fork-contracts.test.py (head-gate).
+name: Fork head gate
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: The pull request whose head to judge; empty on a workflow_dispatch = every head of an open, ready pull request into the default branch (the backfill).
+        type: string
+        default: ""
+      config:
+        description: Path of the merge queue's JSON config in the caller's repository, read from the base tip only.
+        type: string
+        required: true
+      check-name:
+        description: The check run's name, the one the ruleset requires from the gate App.
+        type: string
+        required: true
+      required-lenses:
+        description: Lens names, one per line, that must have read the head (the caller's; never from the pull request). None = refused.
+        type: string
+        required: true
+      environment:
+        description: The Environment that holds the variable HEAD_GATE_APP_ID and the secret HEAD_GATE_APP_KEY; only the default branch may deploy to it.
+        type: string
+        default: head-gate
+
+permissions: {}
+
+jobs:
+  guard:
+    name: Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      prs: ${{ steps.prs.outputs.prs }}
+      guard: ${{ steps.guard.outputs.guard }}
+    steps:
+      - name: Find this workflow's own commit
+        id: toolkit
+        shell: bash
+        env:
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          read -r repo sha < <(python3 -I -c 'import json, os
+          job = json.loads(os.environ["JOB_CONTEXT"] or "{}")
+          print(job.get("workflow_repository") or "-", job.get("workflow_sha") or "-")') || true
+          if ! [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::head gate: the runner does not say which commit this reusable workflow is (job.workflow_repository, job.workflow_sha; runner 2.334.0 or newer), so it will not guess which gate to run"
+            exit 1
+          fi
+          echo "head gate from $repo at $sha"
+          { echo "repo=$repo"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+      # No persist-credentials: false: its cleanup runs `git submodule foreach`, which stops at the vendored gitlinks
+      # under .repos (no .gitmodules entry), so the step would fail (fork-contracts.test.py, checkout). Nothing runs
+      # git in this checkout; the job's read-only token it keeps is the one GH_TOKEN already gives the steps.
+      - name: Check out the gate at this workflow's own commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ steps.toolkit.outputs.repo }}
+          ref: ${{ steps.toolkit.outputs.sha }}
+          path: toolkit
+          sparse-checkout: |
+            fork-ci/actions/head-check
+            fork-ci/actions/pr-queue
+      - name: Refuse to judge unless the App key can only be the Environment's
+        id: guard
+        continue-on-error: true # guard=fail: the gate still posts failures (they never pass); no output: no key at all
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          REPO_SECRET_PRESENT: ${{ secrets.HEAD_GATE_APP_KEY != '' }}
+        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py guard --repo "$REPO" --environment "$ENVIRONMENT"
+      - name: List the pull requests to judge
+        id: prs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ inputs.pr }}
+          EVENT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py prs --repo "$REPO" --event "$EVENT" --pr "$PR" --event-sha "$EVENT_SHA"
+      - name: Fail when no token can be made (no Environment)
+        if: steps.guard.outputs.guard == ''
+        shell: bash
+        run: |
+          echo "::error::head gate: the guard found no Environment (or could not run), so nothing can be posted; an older check run on the head stays until the Environment and its key are back and the gate is dispatched again"
+          exit 1
+
+  gate:
+    name: Gate (#${{ matrix.pr }})
+    needs: guard
+    if: needs.guard.result == 'success' && needs.guard.outputs.prs != '[]' && needs.guard.outputs.guard != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.guard.outputs.prs) }}
+    concurrency:
+      # Per check name too: concurrency groups are repository-wide, and a newly queued job cancels the one pending in
+      # its group, so two gates (two check names) on one head must never share a group.
+      group: head-gate-${{ github.repository }}-${{ inputs.check-name }}-${{ matrix.sha }}
+      cancel-in-progress: false # one run per head works, one waits, and the waiting one reads the newest state
+    steps:
+      - name: Find this workflow's own commit
+        id: toolkit
+        shell: bash
+        env:
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          read -r repo sha < <(python3 -I -c 'import json, os
+          job = json.loads(os.environ["JOB_CONTEXT"] or "{}")
+          print(job.get("workflow_repository") or "-", job.get("workflow_sha") or "-")') || true
+          if ! [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::head gate: the runner does not say which commit this reusable workflow is (job.workflow_repository, job.workflow_sha; runner 2.334.0 or newer), so it will not guess which gate to run"
+            exit 1
+          fi
+          echo "head gate from $repo at $sha"
+          { echo "repo=$repo"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+      # No persist-credentials: false: its cleanup runs `git submodule foreach`, which stops at the vendored gitlinks
+      # under .repos (no .gitmodules entry), so the step would fail (fork-contracts.test.py, checkout). Nothing runs
+      # git in this checkout; the job's read-only token it keeps is the one GH_TOKEN already gives the steps.
+      - name: Check out the gate at this workflow's own commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ steps.toolkit.outputs.repo }}
+          ref: ${{ steps.toolkit.outputs.sha }}
+          path: toolkit
+          sparse-checkout: |
+            fork-ci/actions/head-check
+            fork-ci/actions/pr-queue
+      - name: Refuse to judge unless only the default branch may use the Environment
+        id: envguard
+        continue-on-error: true # guard=fail: only a failure is posted
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py guard --environment-only --repo "$REPO" --environment "$ENVIRONMENT"
+      - name: Fail a re-run or an old caller, and find what to judge
+        id: target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ matrix.sha }}
+          REQUIRED_LENSES: ${{ inputs.required-lenses }}
+          CALLER_REF: ${{ github.workflow_ref }}
+          CALLER_SHA: ${{ github.workflow_sha }}
+          GATE_REPO: ${{ steps.toolkit.outputs.repo }}
+          GATE_SHA: ${{ steps.toolkit.outputs.sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GUARD: ${{ needs.guard.outputs.guard }}
+          ENVIRONMENT_GUARD: ${{ steps.envguard.outputs.guard }}
+        run: |
+          python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py target --repo "$REPO" --sha "$SHA" \
+            --required-lenses "$REQUIRED_LENSES" --caller-ref "$CALLER_REF" --caller-sha "$CALLER_SHA" \
+            --gate-repo "$GATE_REPO" --gate-sha "$GATE_SHA" --run-attempt "$RUN_ATTEMPT" \
+            --guard "$GUARD" --environment-guard "$ENVIRONMENT_GUARD"
+      - name: Warn when the required check is not bound to the gate App
+        if: steps.target.outputs.base != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.target.outputs.base }}
+          CHECK_NAME: ${{ inputs.check-name }}
+          APP_ID: ${{ vars.HEAD_GATE_APP_ID }}
+        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py drift --repo "$REPO" --branch "$BRANCH" --check-name "$CHECK_NAME" --app-id "$APP_ID"
+      - name: Make the gate App's token (checks write, this repository)
+        id: token
+        if: steps.target.outputs.post == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.HEAD_GATE_APP_ID }}
+          private-key: ${{ secrets.HEAD_GATE_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+      - name: Post an in-progress check run before judging
+        id: start
+        if: steps.target.outputs.post == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ matrix.sha }}
+          CHECK_NAME: ${{ inputs.check-name }}
+        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py start --repo "$REPO" --sha "$SHA" --check-name "$CHECK_NAME"
+      - name: Judge the head
+        id: judge
+        if: steps.start.outputs.id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ matrix.sha }}
+          CONFIG: ${{ inputs.config }}
+          REQUIRED_LENSES: ${{ inputs.required-lenses }}
+          CALLER_REF: ${{ github.workflow_ref }}
+          CALLER_SHA: ${{ github.workflow_sha }}
+          GATE_REPO: ${{ steps.toolkit.outputs.repo }}
+          GATE_SHA: ${{ steps.toolkit.outputs.sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GUARD: ${{ needs.guard.outputs.guard }}
+          ENVIRONMENT_GUARD: ${{ steps.envguard.outputs.guard }}
+        run: |
+          python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py judge --repo "$REPO" --sha "$SHA" \
+            --config "$CONFIG" --required-lenses "$REQUIRED_LENSES" --caller-ref "$CALLER_REF" \
+            --caller-sha "$CALLER_SHA" --gate-repo "$GATE_REPO" --gate-sha "$GATE_SHA" --run-attempt "$RUN_ATTEMPT" \
+            --guard "$GUARD" --environment-guard "$ENVIRONMENT_GUARD" \
+            --work "$RUNNER_TEMP" --verdict "$RUNNER_TEMP/head-gate-verdict.json"
+      - name: Complete the check run with the verdict (a failure when there is none)
+        id: finish
+        if: always() && steps.start.outputs.id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ matrix.sha }}
+          CHECK_RUN: ${{ steps.start.outputs.id }}
+        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py finish --repo "$REPO" --sha "$SHA" --id "$CHECK_RUN" --verdict "$RUNNER_TEMP/head-gate-verdict.json"

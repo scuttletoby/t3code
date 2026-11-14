@@ -1,7 +1,9 @@
 # fork-ci: CI actions for other repositories
 
-Composite actions under [`actions/`](actions/) and the reusable workflow
-[`.github/workflows/fork-pr-queue.yml`](../.github/workflows/fork-pr-queue.yml), for any
+Composite actions under [`actions/`](actions/) and the reusable workflows
+[`.github/workflows/fork-pr-queue.yml`](../.github/workflows/fork-pr-queue.yml) and
+[`.github/workflows/fork-head-gate.yml`](../.github/workflows/fork-head-gate.yml) (the head
+check as a gate App's check, [head-check](actions/head-check/README.md#the-gate)), for any
 repository to use. Each action's README says what it does and what it needs.
 
 ## Pinning
@@ -30,7 +32,8 @@ job fail at "Set up job" (`Could not find file '.../.repos/...'`). Main is also 
 upstream, so its old commits disappear. `ci/v1` is such a main commit: it is kept for history, but
 do not use it.
 
-A release commit holds only what consumers use: `LICENSE`, `fork-ci/`, the scripts an action runs from
+A release commit holds only what consumers use: `LICENSE`, `fork-ci/`, the host kits in `fork-kit/`
+(installed only from a release commit, [fork-kit/README.md](../fork-kit/README.md)), the scripts an action runs from
 outside `fork-ci/` (fleet-route runs `.github/scripts/fork-fleet.py`) and the reusable workflows that start
 only on `workflow_call` (the list is `paths` in
 [`.github/fork-ci-release.json`](../.github/fork-ci-release.json)). The paths are the same as on main.
@@ -69,6 +72,13 @@ Two habits every action expects:
   the dependent job `if: ${{ !cancelled() }}` and a fallback for an empty output (fleet-route's README shows one).
 
 To move to a new release, change the SHA and the comment together; read the new tag's release notes first.
+
+### Outside a workflow
+
+A project's tools that run outside a workflow (a deploy script, a local check) use the same code from the same
+release through [`actions/pinned`](actions/pinned/README.md): a module and command (not an action) that fetches the
+files a pin config names, checks each by git blob id, caches them and runs the checked bytes. Modules that are meant
+for this say which names callers may import in their README's "Python API" section (docs-scope, gradle-cache).
 
 ## How a release is made
 
