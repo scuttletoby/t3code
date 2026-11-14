@@ -18,9 +18,9 @@ owner steps, the design and the failure table: .github/fork-fleet.md.
                                      breaks the rule has its Runner.Worker killed before the job's first step.
 
 The setting, repository variable CONFIG["variable"] (route and sweep read it from $FLEET_MODE):
-  auto (also unset)  a job goes to a pool whose dispatcher reports a free slot, GitHub-hosted otherwise. Anything
-                     unclear (no heartbeat, an old or unreadable one) is GitHub-hosted with a note: auto never makes a
-                     run red.
+  auto (also unset)  a job goes to a pool whose dispatcher reports a free slot, GitHub-hosted otherwise. No heartbeat
+                     is GitHub-hosted with a log line; an old or unreadable one (the dispatcher is down, its token
+                     expired) with an error annotation, so it is never silent. auto never makes a run red.
   fleet              every job that runs goes to the fleet, pools with a free slot first, the rest queue on the pool
                      marked `waits`. A job that only prints a skip stays GitHub-hosted. Untrusted runs go hosted.
   github             every job GitHub-hosted, as before the fleet.
@@ -50,6 +50,8 @@ LABEL = re.compile(r'[a-z0-9][a-z0-9-]{0,62}')
 VARIABLE = re.compile(r'(?!GITHUB_)[A-Z][A-Z0-9_]{0,99}')
 JOB_ID = re.compile(r'[a-z0-9_]{1,40}')
 POOL = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
+KINDS = ('push', 'draft', 'ready')   # a pool's `takes`: pushes, draft pull requests, pull requests ready for review
+OUTSIDE = 'ubuntu-latest'            # with "hosted": false, where a run that may not use the fleet goes
 # The run's label for one job: <pool label>-<job key>-<16 hex, made by route>-a<attempt, added by the job's runs-on>.
 NONCE = re.compile(r'(?P<key>[a-z0-9_]{1,40}(?:-[0-9]{1,3})?)-[0-9a-f]{16}-a(?P<attempt>[1-9][0-9]{0,4})')
 VERSION = re.compile(r'v?([0-9]{1,5})\.([0-9]{1,5})\.([0-9]{1,5})')
@@ -86,43 +88,66 @@ def positive(x):
 
 def check_config(cfg):
     out = []
-    for key in ('repository', 'variable', 'hosted', 'trusted', 'upstream_sync', 'pools', 'jobs', 'stuck_seconds',
-                'fleet_stuck_seconds', 'beacon_fresh_seconds', 'dispatch'):
+    for key in ('repository', 'hosted', 'trusted', 'pools', 'jobs', 'stuck_seconds', 'fleet_stuck_seconds'):
         if key not in cfg:
             out.append(f'no {key!r}')
+    pools = cfg.get('pools') or []
+    launched = [p for p in pools if not p.get('static')]
+    for key in ('beacon_fresh_seconds', 'dispatch') if launched else ():
+        if key not in cfg:
+            out.append(f'no {key!r} (a pool without "static": true has a dispatcher)')
     if out:
         return out
-    for key in ('stuck_seconds', 'fleet_stuck_seconds', 'beacon_fresh_seconds'):
+    hosted = cfg['hosted']
+    if not (hosted is False or isinstance(hosted, str) and re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,62}', hosted)):
+        out.append('hosted must be a GitHub-hosted runner label, or false for none')
+    for key in ('stuck_seconds', 'fleet_stuck_seconds') + (('beacon_fresh_seconds',) if launched else ()):
         if not positive(cfg[key]):
             out.append(f'{key} must be a positive whole number')
-    for key in ('every_seconds', 'beacon_seconds', 'idle_passes'):
+    for key in ('every_seconds', 'beacon_seconds', 'idle_passes') if launched else ():
         if not positive((cfg['dispatch'] or {}).get(key)):
             out.append(f'dispatch.{key} must be a positive whole number')
-    prefix = (cfg['upstream_sync'] or {}).get('tag_prefix')
-    if not (isinstance(prefix, str) and TAG_PREFIX.fullmatch(prefix)):
-        out.append('upstream_sync.tag_prefix must be a tag name prefix ending in / (a-z, 0-9, /, _ and -)')
-    pools = cfg['pools']
-    for field in ('name', 'label', 'beacon'):
-        got = [p.get(field) for p in pools]
+    if 'upstream_sync' in cfg:
+        prefix = (cfg['upstream_sync'] or {}).get('tag_prefix')
+        if not (isinstance(prefix, str) and TAG_PREFIX.fullmatch(prefix)):
+            out.append('upstream_sync.tag_prefix must be a tag name prefix ending in / (a-z, 0-9, /, _ and -)')
+    retired = cfg.get('retired_labels', [])
+    if not (isinstance(retired, list) and all(isinstance(x, str) and LABEL.fullmatch(x) and x not in GENERIC
+                                              for x in retired)):
+        out.append(f'retired_labels must be a list of labels, none of {sorted(GENERIC)}')
+    for field, among in (('name', pools), ('label', launched), ('beacon', launched)):
+        got = [p.get(field) for p in among]
         if len(set(map(str, got))) != len(got):
             out.append(f'two pools with one {field}')
     for p in pools:
         who = f'pool {p.get("name")!r}'
         if not (isinstance(p.get('name'), str) and POOL.fullmatch(p['name'])):
             out.append(f'{who}: name must be a-z, 0-9, _ and - (it names the dispatcher\'s lock file)')
-        if not (isinstance(p.get('label'), str) and LABEL.fullmatch(p['label']) and p['label'] not in GENERIC):
-            out.append(f'{who}: label must be one label of its own (a-z, 0-9, -), none of {sorted(GENERIC)}')
         if not positive(p.get('slots')):
             out.append(f'{who}: slots must be a positive whole number')
+        if not isinstance(p.get('waits'), bool):
+            out.append(f'{who}: waits must be true or false')
+        takes = p.get('takes', list(KINDS))
+        if not (isinstance(takes, list) and takes and all(x in KINDS for x in takes)):
+            out.append(f'{who}: takes must list some of {list(KINDS)}')
+        if 'per_run' in p and (p.get('waits') is not False or not positive(p['per_run'])):
+            out.append(f'{who}: per_run must be a positive whole number, on a pool that does not wait')
+        if p.get('static'):
+            got = p.get('runs_on')
+            if not (isinstance(got, list) and got and all(isinstance(x, str) and LABEL.fullmatch(x) for x in got)
+                    and set(got) - GENERIC):
+                out.append(f'{who}: runs_on must list its runners\' labels, one of them not one of {sorted(GENERIC)}')
+            continue
+        if not (isinstance(p.get('label'), str) and LABEL.fullmatch(p['label']) and p['label'] not in GENERIC):
+            out.append(f'{who}: label must be one label of its own (a-z, 0-9, -), none of {sorted(GENERIC)}')
         if not (isinstance(p.get('beacon'), str) and VARIABLE.fullmatch(p['beacon'])):
             out.append(f'{who}: beacon must be a repository variable name (A-Z, 0-9, _; not GITHUB_)')
         launch = p.get('launch')
         if not (isinstance(launch, list) and launch and all(isinstance(x, str) and x for x in launch)):
             out.append(f'{who}: launch must be a command list')
-        if not isinstance(p.get('waits'), bool):
-            out.append(f'{who}: waits must be true or false')
-    if sum(1 for p in pools if p.get('waits') is True) != 1:
-        out.append('exactly one pool must have "waits": true (where fleet mode queues)')
+    for kind in KINDS:
+        if sum(1 for p in pools if p.get('waits') is True and kind in takes_of(p)) != 1:
+            out.append(f'exactly one pool with "waits": true must take {kind} runs (where fleet mode queues them)')
     for j in cfg['jobs']:
         if not (isinstance(j.get('job'), str) and JOB_ID.fullmatch(j['job'])):
             out.append(f'job {j.get("job")!r}: the id must be a-z, 0-9 and _')
@@ -136,6 +161,11 @@ def check_config(cfg):
     if len(set(keys)) != len(keys):
         out.append('a job key twice')
     return out
+
+
+def takes_of(pool):
+    got = pool.get('takes', KINDS)
+    return got if isinstance(got, list) else KINDS
 
 
 def job_keys(cfg):
@@ -159,8 +189,16 @@ def stamp(text):
     return calendar.timegm(time.strptime(text, '%Y-%m-%dT%H:%M:%SZ')) if text else None
 
 
+def dispatched(cfg):
+    """The pools a dispatcher serves; a "static" pool's runners are registered by hand and always there."""
+    return [p for p in cfg['pools'] if not p.get('static')]
+
+
 def fleet_labels(cfg):
-    return {p['label'] for p in cfg['pools']}
+    """Labels that mark a job as the fleet's: the watch and the sweep handle a job asking for one. retired_labels keep
+    a job queued on a pool's old label (a run routed before the change) handled until it is gone."""
+    return ({p['label'] for p in dispatched(cfg)} | set(cfg.get('retired_labels', []))
+            | {x for p in cfg['pools'] if p.get('static') for x in p['runs_on'] if x not in GENERIC})
 
 
 def is_fleet(cfg, job):
@@ -212,6 +250,8 @@ def made_by_the_sync(cfg, sha, run=subprocess.run):
     author, files, a branch or pull request upstream) makes or removes one. And a tag only ever sends a run to
     GitHub-hosted runners, so the worst a stray tag does is that. Read anonymously (the job hook has no token); any
     doubt (no full sha, git failing, a timeout) refuses."""
+    if 'upstream_sync' not in cfg:
+        return None   # this repository has no upstream sync
     if not (isinstance(sha, str) and SHA.fullmatch(sha)):
         return f'the pushed commit {sha!r} is not a full sha, so whether the upstream sync made it cannot be told'
     ref = f'refs/tags/{cfg["upstream_sync"]["tag_prefix"]}{sha}'
@@ -388,44 +428,76 @@ def beacon_free(cfg, pool, env, now):
     return max(free, 0), None
 
 
-def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None):
+def mode_in(cfg, value):
+    """The setting as route, watch and sweep apply it: with no GitHub-hosted runners ("hosted": false), auto and github
+    act as fleet, so a job always has a runner of the fleet's to wait for."""
+    mode = mode_of(value)
+    if cfg['hosted'] is False and mode != 'fleet':
+        if mode == 'github':
+            say('::error::fork-fleet: the setting is github, but this repository has no GitHub-hosted runners '
+                '("hosted": false in the fleet config): fleet mode instead')
+        return 'fleet'
+    return mode
+
+
+def kind_of(env, event):
+    """One of KINDS for a run `refused` let through (a push or a pull request of this repository)."""
+    if env.get('GITHUB_EVENT_NAME') == 'push':
+        return 'push'
+    return 'draft' if (event.get('pull_request') or {}).get('draft') is True else 'ready'
+
+
+def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt=None):
     """(mode, {key: runs-on}). Raises only for a broken setting or CONFIG; it calls no API (a push: one anonymous
-    git ls-remote, made_by_the_sync)."""
-    mode = mode_of(mode_value)
-    hosted = cfg['hosted']
+    git ls-remote, made_by_the_sync). With `attempt`, a run label ends with -a<attempt> already. Every runs-on is the
+    hosted label (with "hosted": false, OUTSIDE), a static pool's runs_on, or a dispatcher pool's label plus this run's
+    own label: never a label that nothing serves."""
+    mode = mode_in(cfg, mode_value)
+    hosted = cfg['hosted'] or OUTSIDE
     out = {key: hosted for key, _ in job_keys(cfg)}
     if mode == 'github':
         say('GitHub-hosted for every job: the setting is github')
         return mode, out
     why = refused(cfg, env, event)
     if why:
-        say(f'::notice::fork-fleet: GitHub-hosted for every job: {why} (only trusted runs may use the fleet)')
+        say(f'::notice::fork-fleet: GitHub-hosted for every job: {why} (only trusted runs may use the fleet; '
+            f'never a self-hosted runner for them, in any mode: {hosted})')
         return mode, out
     wanted = [key for key, job in job_keys(cfg) if runs(job, gates)]
     if not wanted:
-        say('GitHub-hosted for every job: no routed job runs for this change')
+        say(f'GitHub-hosted for every job: no routed job runs for this change ({hosted})')
         return mode, out
     nonce = nonce or secrets.token_hex(8)   # this run's own label: no runner exists for it until the dispatcher makes one
+    kind = kind_of(env, event)
 
     def labels(pool, key):
-        return [pool['label'], f'{pool["label"]}-{key}-{nonce}']
+        if pool.get('static'):
+            return list(pool['runs_on'])
+        return [pool['label'], f'{pool["label"]}-{key}-{nonce}' + (f'-a{int(attempt)}' if attempt else '')]
     todo, t = list(wanted), now()
     for pool in cfg['pools']:
-        free, why = beacon_free(cfg, pool, env, t)
+        if kind not in takes_of(pool):
+            say(f'pool {pool["name"]}: does not take {kind} runs')
+            continue
+        free, why = (pool['slots'], None) if pool.get('static') else beacon_free(cfg, pool, env, t)
         if why:
             # A pool its dispatcher closed (a new actions/runner release: the owner refreshes the template) or reports
-            # down, or a heartbeat gone stale: a notice on the run page, or auto would go hosted unseen for days. A pool
-            # with no heartbeat at all was never set up: a log line.
-            seen = '::notice::fork-fleet: ' if env.get(pool['beacon']) else ''
-            say(f'{seen}pool {pool["name"]}: no free slot counted: {why}')
-        for _ in range(free):
+            # down: a notice. A heartbeat gone stale or garbled (the dispatcher is down, its token expired or was
+            # revoked): an error on the run page, or the jobs would go elsewhere unseen for days. A pool with no
+            # heartbeat at all was never set up: a log line.
+            seen = ('' if not env.get(pool['beacon']) else '::notice::fork-fleet: '
+                    if why.startswith('its dispatcher says') else '::error::fork-fleet: ')
+            say(f'{seen}pool {pool["name"]}: no free slot counted: {why}'
+                + (' (is its dispatcher running, with a valid token? .github/fork-fleet.md)' if 'error' in seen else ''))
+        for _ in range(min(free, pool.get('per_run', free))):
             if not todo:
                 break
             key = todo.pop(0)
             out[key] = labels(pool, key)
-            say(f'{key}: pool {pool["name"]} (its dispatcher reports a free slot)')
+            say(f'{key}: pool {pool["name"]} ' + ('(always there)' if pool.get('static') else
+                                                  '(its dispatcher reports a free slot)'))
     if mode == 'fleet':
-        waiting = next(p for p in cfg['pools'] if p['waits'])
+        waiting = next(p for p in cfg['pools'] if p['waits'] and kind in takes_of(p))
         for key in todo:
             out[key] = labels(waiting, key)
             say(f'{key}: queues on pool {waiting["name"]} (fleet mode waits for a fleet runner)')
@@ -434,15 +506,40 @@ def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None):
     return mode, out
 
 
-def cmd_route(cfg, env):
+def with_vars(cfg, env):
+    """env, with the setting and each dispatcher pool's heartbeat also read from $FLEET_VARS, the repository variables
+    as one JSON object (the fleet-route action's `vars` input, toJSON(vars)). A variable set in env itself wins."""
+    raw = env.get('FLEET_VARS')
+    if not raw:
+        return env
+    try:
+        got = json.loads(raw)
+        if not isinstance(got, dict):
+            raise ValueError(raw)
+    except ValueError:
+        say('::error::fork-fleet: the vars input is not a JSON object of repository variables: no heartbeat and no '
+            'setting are read from it')
+        return env
+    env = dict(env)
+    names = [p['beacon'] for p in dispatched(cfg)] + ([cfg['variable']] if cfg.get('variable') else [])
+    for name in names:
+        if not env.get(name) and isinstance(got.get(name), str):
+            env[name] = got[name]
+    if not env.get('FLEET_MODE') and cfg.get('variable'):
+        env['FLEET_MODE'] = env.get(cfg['variable']) or ''
+    return env
+
+
+def cmd_route(cfg, env, with_attempt=False):
+    env = with_vars(cfg, env)
     event, _ = read_event(env)
     gates = None
     try:
         gates = json.loads(env.get('GATES') or 'null')
     except ValueError:
         say('::warning::fork-fleet: the changes outputs cannot be read: every routed job counts as running')
-    mode, out = route(cfg, env, event, env.get('FLEET_MODE'), gates)
     attempt = env.get('GITHUB_RUN_ATTEMPT') or '1'
+    mode, out = route(cfg, env, event, env.get('FLEET_MODE'), gates, attempt=with_attempt and int(attempt))
     fleet = sum(1 for v in out.values() if not isinstance(v, str))
     lines = [f'runners={json.dumps(out, separators=(",", ":"))}', f'mode={mode}', f'attempt={attempt}',
              f'watch={"true" if fleet else "false"}']
@@ -450,7 +547,13 @@ def cmd_route(cfg, env):
         f.write(''.join(f'{line}\n' for line in lines))
     where = {}
     for key, labels in out.items():
-        where.setdefault(labels if isinstance(labels, str) else f'pool label {labels[0]}', []).append(key)
+        if isinstance(labels, str):
+            shown = labels
+        elif len(labels) == 2 and labels[1].startswith(labels[0] + '-'):
+            shown = f'pool label {labels[0]}'
+        else:
+            shown = ', '.join(labels)
+        where.setdefault(shown, []).append(key)
     summary(env, [f'### Runners ({mode}, attempt {attempt})', '', '| Runs on | Jobs |', '| --- | --- |']
             + [f'| `{w}` | {", ".join(keys)} |' for w, keys in where.items()])
     return 0
@@ -468,7 +571,7 @@ def summary(env, lines):
 def watch(cfg, env, gh, now=time.time, sleep=time.sleep):
     """Bounds this run's wait for fleet runners: a fleet job queued stuck_seconds (fleet mode: fleet_stuck_seconds)
     cancels the run with an error; in auto the sweep then re-runs it GitHub-hosted."""
-    mode = mode_of(env.get('FLEET_MODE'))
+    mode = mode_in(cfg, env.get('FLEET_MODE'))
     bound = cfg['fleet_stuck_seconds'] if mode == 'fleet' else cfg['stuck_seconds']
     rid, attempt = int(env['GITHUB_RUN_ID']), int(env.get('GITHUB_RUN_ATTEMPT') or 1)
     try:
@@ -539,7 +642,7 @@ def fleet_jobs_of(cfg, gh, run_id):
 def sweep(cfg, env, gh, now=time.time, sleep=time.sleep):
     # Fleet mode re-runs nothing; it only cancels, with an error, a run whose fleet job waited past
     # fleet_stuck_seconds (the run's own watch does that too, but a re-run of failed jobs has no watch).
-    fleet = mode_of(env.get('FLEET_MODE')) == 'fleet'
+    fleet = mode_in(cfg, env.get('FLEET_MODE')) == 'fleet'
     bound = cfg['fleet_stuck_seconds'] if fleet else cfg['stuck_seconds']
     workflow = os.path.basename(cfg['trusted']['workflows'][0])
     since = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now() - WINDOW))
@@ -650,7 +753,7 @@ def fleet_job(cfg, labels):
     if len(labels) != 2 or labels[0] == labels[1]:
         return None
     keys = {k for k, _ in job_keys(cfg)}
-    for pool in cfg['pools']:
+    for pool in dispatched(cfg):
         if pool['label'] not in labels:
             continue
         other = labels[1] if labels[0] == pool['label'] else labels[0]
@@ -911,14 +1014,14 @@ def take_locks(lock_dir, names):
 
 
 def cmd_dispatch(cfg, args, sleep=time.sleep):
-    names = args.pool or [p['name'] for p in cfg['pools']]
-    unknown = sorted(set(names) - {p['name'] for p in cfg['pools']})
+    names = args.pool or [p['name'] for p in dispatched(cfg)]
+    unknown = sorted(set(names) - {p['name'] for p in dispatched(cfg)})
     if unknown:
-        raise ValueError(f'no pool {unknown} in the config')
+        raise ValueError(f'no pool {", ".join(unknown)} with a dispatcher in the config')
     token = read_token(args.token_file)
     locks = take_locks(args.lock_dir, names)
     gh = GitHub(token, cfg['repository'])
-    hosts = {p['name']: Host(p) for p in cfg['pools'] if p['name'] in names}
+    hosts = {p['name']: Host(p) for p in dispatched(cfg) if p['name'] in names}
     state = new_state()
     while True:
         try:
@@ -941,7 +1044,8 @@ def main(argv=None, env=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--config', default=CONFIG)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    sub.add_parser('route')
+    sub.add_parser('route').add_argument('--with-attempt', action='store_true',
+                                         help="end each run label with -a<this attempt> (the job's runs-on does not)")
     sub.add_parser('gate')
     sub.add_parser('watch')
     sub.add_parser('sweep')
@@ -955,7 +1059,7 @@ def main(argv=None, env=None):
     if args.cmd == 'gate':
         return gate(cfg, env)
     if args.cmd == 'route':
-        return cmd_route(cfg, env)
+        return cmd_route(cfg, env, args.with_attempt)
     if args.cmd == 'dispatch':
         return cmd_dispatch(cfg, args)
     gh = GitHub(env.get('GITHUB_TOKEN'), cfg['repository'])

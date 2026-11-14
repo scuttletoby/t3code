@@ -221,7 +221,7 @@ class Config(unittest.TestCase):
             'a job id with a dash': (lambda c: c['jobs'][0].__setitem__('job', 'a-b'), 'id'),
             'a dispatcher pace of 0': (lambda c: c['dispatch'].__setitem__('every_seconds', 0), 'every_seconds'),
             'no stuck bound': (lambda c: c.pop('stuck_seconds'), 'stuck_seconds'),
-            'no upstream sync tag prefix': (lambda c: c.pop('upstream_sync'), 'upstream_sync'),
+            'an upstream sync with no tag prefix': (lambda c: c['upstream_sync'].pop('tag_prefix'), 'upstream_sync'),
             'a sync tag prefix without its /': (lambda c: c['upstream_sync'].__setitem__('tag_prefix', 'synced'),
                                                 'tag_prefix'),
         }
@@ -602,7 +602,7 @@ class Route(unittest.TestCase):
         self.assertEqual(self.fleet(out), {})
         self.assertIn(f'::notice::fork-fleet: pool {FIRST}: no free slot counted: its dispatcher says: the runner '
                       'template is actions/runner 2.329.9, older than the newest release 2.330.0', log)
-        self.assertRegex(log, rf'::notice::fork-fleet: pool {SECOND}: no free slot counted: .* s old')
+        self.assertRegex(log, rf'::error::fork-fleet: pool {SECOND}: no free slot counted: .* s old')
         _, _, log = self.route()   # never set up: a log line, no notice
         self.assertIn(f'pool {FIRST}: no free slot counted: no heartbeat', log)
         self.assertNotIn('::notice::', log)
@@ -2377,6 +2377,330 @@ class Wiring(unittest.TestCase):
     def test_the_hook_runs_the_installed_gate_isolated(self):
         self.assertIn('exec /usr/bin/python3 -I "$(dirname -- "$0")/fork-fleet.py" '
                       '--config "$(dirname -- "$0")/fork-fleet.json" gate', self.hook)
+
+
+# ---------------------------------------------------------------- any repository's config (fork-ci/actions/fleet-route)
+
+# A project with no GitHub-hosted runners: a PC whose dispatcher makes one-job runners (one job of a run at most, pushes
+# and draft pull requests only), an always-on build runner, and an always-on runner for pull requests ready for review.
+GEN = {'repository': REPO, 'hosted': False, 'trusted': CFG['trusted'], 'stuck_seconds': 900,
+       'fleet_stuck_seconds': 7200, 'beacon_fresh_seconds': 180, 'dispatch': CFG['dispatch'],
+       'retired_labels': ['proj-old'],
+       'pools': [{'name': 'pc', 'label': 'proj-pc', 'slots': 2, 'per_run': 1, 'beacon': 'PROJ_BEACON_PC',
+                  'launch': ['launch'], 'waits': False, 'takes': ['push', 'draft']},
+                 {'name': 'build', 'static': True, 'runs_on': ['self-hosted', 'proj-build'], 'slots': 1,
+                  'waits': True, 'takes': ['push', 'draft']},
+                 {'name': 'ready', 'static': True, 'runs_on': ['self-hosted', 'proj-ready'], 'slots': 1,
+                  'waits': True, 'takes': ['ready']}],
+       'jobs': [{'job': 'plugins', 'memory_mb': 4000}, {'job': 'engine', 'memory_mb': 3000},
+                {'job': 'docs', 'memory_mb': 500, 'gates': ['docs']}]}
+GEN_PC = ['proj-pc', 'proj-pc-{}-' + NONCE]
+
+
+def draft(is_draft, **kw):
+    event = pr(**kw)
+    event['pull_request']['draft'] = is_draft
+    return event
+
+
+class AnyRepository(unittest.TestCase):
+    def route(self, cfg=GEN, mode='', pc=None, e=None, event=PUSH, attempt=None, now=T0):
+        e = dict(e or env())
+        if pc is not None:
+            e['PROJ_BEACON_PC'] = pc
+        (mode, out), log = quiet(ff.route, cfg, e, event, mode, None, now=lambda: now, nonce=NONCE, attempt=attempt)
+        return mode, out, log
+
+    def test_a_route_only_config_is_valid(self):
+        self.assertEqual(ff.check_config(GEN), [])
+        only_static = copy.deepcopy(GEN)
+        only_static['pools'].pop(0)
+        for key in ('beacon_fresh_seconds', 'dispatch'):
+            only_static.pop(key)   # no dispatcher: no heartbeat and no dispatcher settings
+        self.assertEqual(ff.check_config(only_static), [])
+
+    def test_broken_configs_are_refused(self):
+        cases = {
+            'a hosted label with a space': (lambda c: c.__setitem__('hosted', 'ubuntu latest'), 'hosted'),
+            'hosted: true': (lambda c: c.__setitem__('hosted', True), 'hosted'),
+            'a static pool of generic labels only': (lambda c: c['pools'][1].__setitem__('runs_on', ['self-hosted']),
+                                                     'runs_on'),
+            'per_run on the pool that waits': (lambda c: c['pools'][1].__setitem__('per_run', 1), 'per_run'),
+            'per_run of 0': (lambda c: c['pools'][0].__setitem__('per_run', 0), 'per_run'),
+            'takes an unknown kind': (lambda c: c['pools'][0].__setitem__('takes', ['merged']), 'takes'),
+            'takes nothing': (lambda c: c['pools'][0].__setitem__('takes', []), 'takes'),
+            'no pool waits for ready pull requests': (lambda c: c['pools'][2].__setitem__('waits', False), 'ready'),
+            'two pools wait for pushes': (lambda c: c['pools'][2].__setitem__('takes', ['push', 'ready']), 'push'),
+            'a dispatcher pool, no dispatch settings': (lambda c: c.pop('dispatch'), 'dispatch'),
+            'a generic retired label': (lambda c: c.__setitem__('retired_labels', ['self-hosted']), 'retired'),
+        }
+        for name, (change, word) in cases.items():
+            with self.subTest(name):
+                bad = copy.deepcopy(GEN)
+                change(bad)
+                problems = ff.check_config(bad)
+                self.assertTrue(any(word in p for p in problems), problems)
+
+    def test_one_heavy_job_per_run_on_the_pc_the_rest_on_the_always_on_pool(self):
+        mode, out, log = self.route(pc=beacon(2))
+        self.assertEqual(mode, 'fleet')   # no GitHub-hosted runners: auto is fleet
+        self.assertEqual(out, {'plugins': [GEN_PC[0], GEN_PC[1].format('plugins')],   # config order: heaviest first
+                               'engine': ['self-hosted', 'proj-build'], 'docs': ['self-hosted', 'proj-build']})
+        self.assertNotIn('::error::', log)
+
+    def test_pool_by_draft_state(self):
+        _, out, _ = self.route(pc=beacon(2), e=env(**PR_ENV), event=draft(True))
+        self.assertEqual(out['plugins'][0], 'proj-pc')
+        _, out, log = self.route(pc=beacon(2), e=env(**PR_ENV), event=draft(False))
+        self.assertEqual(set(map(tuple, out.values())), {('self-hosted', 'proj-ready')})
+        self.assertIn('pool pc: does not take ready runs', log)
+        _, out, _ = self.route(pc=beacon(2), e=env(**PR_ENV), event=pr())   # no draft field: ready
+        self.assertEqual(set(map(tuple, out.values())), {('self-hosted', 'proj-ready')})
+
+    def test_an_unreachable_pc_is_red_and_falls_back_to_the_always_on_pool(self):
+        """Old bug 1280 (OldBugs): an expired or revoked dispatcher token stops its heartbeat; that must never be silent."""
+        for name, value in {'stale': beacon(2, at=T0 - 181), 'garbled': '{"at": '}.items():
+            with self.subTest(name):
+                _, out, log = self.route(pc=value)
+                self.assertEqual(set(map(tuple, out.values())), {('self-hosted', 'proj-build')})
+                self.assertRegex(log, r'::error::fork-fleet: pool pc: no free slot counted: .*valid token')
+        _, _, log = self.route(CFG, pc=None, e=env(**{POOLS[FIRST]['beacon']: beacon(1, at=T0 - 10_000)}))
+        self.assertIn(f'::error::fork-fleet: pool {FIRST}', log)   # the fork's own auto mode: red too, then hosted
+
+    def test_a_dispatcher_whose_token_is_refused_writes_no_heartbeat_and_route_turns_red(self):
+        """Old bug 1280 end to end: the dispatcher's pass stops on the 401, so its heartbeat ages and route says so."""
+        gh = FakeGitHub()
+        gh.trouble.append((r'GET actions/runs\?status=\w+', http_error(401)))
+        fake = FakeLauncher(WAITING)
+        with self.assertRaises(urllib.error.HTTPError):
+            quiet(ff.dispatch_pass, CFG, gh, {WAITING: ff.Host(POOLS[WAITING], run=fake.run)}, ff.new_state(),
+                  now=lambda: T0)
+        self.assertEqual(gh.variables, {})
+        _, _, log = self.route(CFG, mode='fleet', e=env(**{POOLS[WAITING]['beacon']: beacon(2, at=T0 - 600)}))
+        self.assertIn(f'::error::fork-fleet: pool {WAITING}', log)
+
+    def test_github_mode_without_hosted_runners_is_red_and_fleet(self):
+        mode, out, log = self.route(mode='github', pc=beacon(1))
+        self.assertEqual(mode, 'fleet')
+        self.assertIn('::error::', log)
+        self.assertEqual(out['engine'], ['self-hosted', 'proj-build'])
+
+    def test_a_pull_request_from_another_repository_never_gets_a_self_hosted_runner(self):
+        """head.repo != base.repo: GitHub-hosted (with "hosted": false, ubuntu-latest), in every mode, whatever the
+        heartbeats say, never a skip (a skipped required check counts as passed)."""
+        fresh = {p['beacon']: beacon(5) for p in CFG['pools']}
+        fresh['PROJ_BEACON_PC'] = beacon(5)
+        events = {'fork head': pr(head='someone/t3code'), 'other base': pr(base='someone/t3code'),
+                  'fork draft': draft(True, head='someone/t3code'), 'no payload': None}
+        for cfg, hosted in ((CFG, HOSTED), (GEN, ff.OUTSIDE)):
+            for mode in ff.MODES:
+                for name, event in events.items():
+                    with self.subTest(cfg=cfg['hosted'], mode=mode, event=name):
+                        _, out, _ = self.route(cfg, mode, e=env(**PR_ENV, **fresh), event=event)
+                        self.assertEqual(set(out.values()), {hosted})
+
+    def test_every_label_put_out_is_one_something_serves(self):
+        """The hosted label, ubuntu-latest, a static pool's runs_on, or a dispatcher pool's label with a run label it
+        parses back: never a label nothing serves."""
+        static = [tuple(p['runs_on']) for p in GEN['pools'] if p.get('static')]
+        for mode in ff.MODES:
+            for kind, (e, event) in {'push': (env(), PUSH), 'draft': (env(**PR_ENV), draft(True)),
+                                     'ready': (env(**PR_ENV), draft(False))}.items():
+                for pc in (None, beacon(0), beacon(1), beacon(9), beacon(9, at=T0 - 999)):
+                    with self.subTest(mode=mode, kind=kind, pc=pc):
+                        _, out, _ = self.route(mode=mode, pc=pc, e=e, event=event, attempt=2)
+                        for key, got in out.items():
+                            self.assertIsInstance(got, list)
+                            if tuple(got) not in static:
+                                self.assertEqual(ff.fleet_job(GEN, got)[1:], (key, 2))
+
+    def test_with_attempt_the_run_label_is_complete_and_without_it_the_fork_wiring_adds_it(self):
+        _, out, _ = self.route(pc=beacon(1), attempt=3)
+        self.assertEqual(out['plugins'][1], GEN_PC[1].format('plugins') + '-a3')
+        self.assertEqual(ff.fleet_job(GEN, out['plugins'])[1:], ('plugins', 3))
+        _, out, _ = self.route(pc=beacon(1))
+        self.assertIsNone(ff.fleet_job(GEN, out['plugins']))
+
+    def test_the_dispatcher_and_its_default_pools_leave_static_pools_alone(self):
+        self.assertIsNone(ff.fleet_job(GEN, ['self-hosted', 'proj-build']))
+        self.assertEqual([p['name'] for p in ff.dispatched(GEN)], ['pc'])
+        with self.assertRaisesRegex(ValueError, 'no pool build with a dispatcher'):
+            ff.cmd_dispatch(GEN, ff.argparse.Namespace(pool=['build'], token_file='/nonexistent', lock_dir='/nonexistent',
+                                                       once=True))
+
+    def test_no_upstream_sync_means_no_sync_check(self):
+        cfg = copy.deepcopy(GEN)
+        self.assertIsNone(ff.made_by_the_sync(cfg, 'not a sha'))
+        cfg['upstream_sync'] = {'tag_prefix': 'synced/'}
+        self.assertIn('not a full sha', ff.made_by_the_sync(cfg, 'not a sha'))
+
+    def test_a_job_queued_on_a_retired_or_static_label_is_still_the_sweeps(self):
+        """A run routed before a pool's label changed queues on the old label: the watch and sweep keep handling it."""
+        for got in (['proj-old', 'proj-old-x'], ['self-hosted', 'proj-build']):
+            self.assertTrue(ff.is_fleet(GEN, {'labels': got}))
+        self.assertFalse(ff.is_fleet(GEN, {'labels': ['self-hosted']}))
+        gh = FakeGitHub()
+        gh.add(a_run(status='in_progress'), a_job(11, ['proj-old', 'proj-old-lint']))
+        gh.branches['main'] = SHA
+        waits = []
+
+        def sleep(s):   # the fake run never ends: a sweep that waits for it (auto mode) fails here, never hangs
+            waits.append(s)
+            if len(waits) > 50:
+                raise AssertionError('the sweep waits for the cancelled run: it took the setting as auto')
+        _, log = quiet(ff.sweep, GEN, {}, gh, now=lambda: T0 + GEN['fleet_stuck_seconds'], sleep=sleep)
+        self.assertEqual([p for _, p in gh.writes()], ['actions/runs/5/cancel'])
+        self.assertIn('::error::', log)
+
+    def run_script(self, config, extra=()):
+        """The script as the action runs it: no token, no gh config, a broken or missing config."""
+        with tempfile.TemporaryDirectory() as d:
+            out, event = os.path.join(d, 'out'), os.path.join(d, 'event')
+            with open(event, 'w') as f:
+                json.dump(PUSH, f)
+            e = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'GH_CONFIG_DIR': d, 'GITHUB_OUTPUT': out,
+                 'GITHUB_EVENT_PATH': event, **env()}
+            got = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'fork-fleet.py'), '--config', config,
+                                  'route', *extra], env=e, capture_output=True, text=True, timeout=60)
+            written = ''
+            if os.path.exists(out):
+                with open(out, encoding='utf-8') as f:
+                    written = f.read()
+        return got, written
+
+    def test_a_missing_or_broken_config_fails_red_and_puts_out_nothing(self):
+        """The caller's runs-on then falls back to its always-on pool (same repository) or ubuntu-latest."""
+        with tempfile.TemporaryDirectory() as d:
+            broken = os.path.join(d, 'fleet.json')
+            with open(broken, 'w') as f:
+                json.dump(dict(GEN, hosted=True), f)
+            for config in (os.path.join(d, 'missing.json'), broken):
+                with self.subTest(config):
+                    got, written = self.run_script(config)
+                    self.assertEqual(got.returncode, 1)
+                    self.assertIn('::error::fork-fleet:', got.stdout)
+                    self.assertEqual(written, '')
+            good = os.path.join(d, 'good.json')
+            with open(good, 'w') as f:
+                json.dump(GEN, f)
+            got, written = self.run_script(good, ['--with-attempt'])
+            self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+            self.assertIn('runners={"plugins":["self-hosted","proj-build"]', written)
+
+
+class OldBugs(unittest.TestCase):
+    """Bugs of a project's own router, kept as tests of this one."""
+
+    def setUp(self):
+        self.gh = FakeGitHub()
+        self.gh.branches['main'] = SHA
+
+    def sweep(self):
+        got, log = quiet(ff.sweep, CFG, {}, self.gh, now=lambda: T0 + 800, sleep=lambda s: None)
+        return got, [p for _, p in self.gh.writes()], log
+
+    def cut_off(self, rid=5, **kw):
+        """A completed run whose fleet job lost its runner, and a job that needs it (cancelled with it)."""
+        return self.gh.add(a_run(rid, status='completed', conclusion='failure', **kw),
+                           a_job(11, labels(WAITING, 'lint'), status='completed', conclusion='failure',
+                                 runner='fleet-vm-11', completed=T0 + 300, steps=[{'conclusion': 'cancelled'}]),
+                           a_job(12, [HOSTED], status='completed', conclusion='skipped', name='needs lint'))
+
+    def test_1388_a_re_run_covers_dependents_without_reading_the_workflow(self):
+        """The router never parses the workflow's needs: it re-runs the whole run, so every dependent runs again."""
+        self.cut_off()
+        _, posts, _ = self.sweep()
+        self.assertEqual(posts, ['actions/runs/5/rerun'])
+        self.assertFalse([p for _, p, _ in self.gh.calls if 'contents' in p or 'workflows/' in p and 'runs' not in p])
+
+    def test_1348_a_cut_off_pull_request_run_is_re_run_not_only_main(self):
+        self.gh.own_pr()
+        self.gh.branches['fork/x'] = SHA
+        self.cut_off(event='pull_request', branch='fork/x', prs=[7])
+        _, posts, _ = self.sweep()
+        self.assertEqual(posts, ['actions/runs/5/rerun'])
+        self.gh.branches['fork/x'] = 'f' * 40   # a newer push replaced it: that run is moot
+        self.gh.calls.clear()
+        _, posts, log = self.sweep()
+        self.assertEqual(posts, [])
+        self.assertIn('moved on', log)
+
+    def test_1279_a_re_run_that_does_not_start_is_red_and_the_next_sweep_starts_it(self):
+        """No waiting for a re-run that never comes: the failed POST is red now, and the sweep keeps no state, so the
+        next one re-runs it. Once re-run (attempt 2, by github-actions), later sweeps leave it alone."""
+        self.cut_off()
+        self.gh.trouble.append((r'POST actions/runs/5/rerun', http_error(500)))
+        got, posts, log = self.sweep()
+        self.assertEqual((got, posts), (1, ['actions/runs/5/rerun']))
+        self.assertIn('::warning::', log)
+        self.gh.trouble.clear()
+        got, posts, _ = self.sweep()
+        self.assertEqual((got, posts), (0, ['actions/runs/5/rerun'] * 2))
+        self.gh.runs[5].update(run_attempt=2, triggering_actor={'login': 'github-actions[bot]'})
+        self.gh.calls.clear()
+        self.assertEqual(self.sweep()[:2], (0, []))
+
+    def test_running_the_dispatcher_twice_deletes_only_offline_leftovers_once(self):
+        fake = FakeLauncher(WAITING)
+        hosts = {WAITING: ff.Host(POOLS[WAITING], run=fake.run)}
+        label = POOLS[WAITING]['label']
+
+        def reg(jid, status='offline', busy=False):
+            self.gh.runners.append({'id': jid, 'name': f'{label}-{jid}', 'status': status, 'busy': busy,
+                                    'labels': [{'name': label}]})
+        reg(40)                          # its job ended, its unit is gone: a leftover
+        reg(41)                          # its unit is starting: kept
+        fake.units.add(f'{label}-41')
+        reg(42, status='online', busy=True)
+        self.gh.runners.append({'id': 77, 'name': 'someone-else-3', 'status': 'offline', 'busy': False, 'labels': []})
+        other = POOLS[FIRST if WAITING != FIRST else SECOND]['label']
+        self.gh.runners.append({'id': 78, 'name': f'{other}-78', 'status': 'offline', 'busy': False, 'labels': []})
+        state = ff.new_state()
+        for _ in range(2):
+            quiet(ff.dispatch_pass, CFG, self.gh, hosts, state, now=lambda: T0)
+        deletes = [p for m, p in self.gh.writes() if m == 'DELETE']
+        self.assertEqual(deletes, ['actions/runners/40'])
+        self.assertEqual(sorted(r['id'] for r in self.gh.runners), [41, 42, 77, 78])
+
+
+class Vars(unittest.TestCase):
+    """The fleet-route action passes the repository variables as one JSON object ($FLEET_VARS)."""
+    CFG = {**GEN, 'variable': 'PROJ_RUNNERS'}
+
+    def outputs(self, **over):
+        with tempfile.TemporaryDirectory() as d:
+            out, event = os.path.join(d, 'out'), os.path.join(d, 'event')
+            with open(event, 'w') as f:
+                json.dump(PUSH, f)
+            e = env(GITHUB_OUTPUT=out, GITHUB_EVENT_PATH=event, **over)
+            got, log = quiet(ff.cmd_route, self.CFG, e)
+            self.assertEqual(got, 0)
+            with open(out) as f:
+                return dict(line.split('=', 1) for line in f.read().splitlines()), log
+
+    def test_the_heartbeat_and_setting_come_from_vars(self):
+        beat = beacon(2, at=int(ff.time.time()))
+        lines, _ = self.outputs(FLEET_VARS=json.dumps({'PROJ_BEACON_PC': beat, 'OTHER': 'x'}))
+        self.assertEqual(json.loads(lines['runners'])['plugins'][0], 'proj-pc')
+        lines, _ = self.outputs(FLEET_VARS='{}')   # no heartbeat: the always-on pool
+        self.assertEqual(json.loads(lines['runners'])['plugins'], ['self-hosted', 'proj-build'])
+
+    def test_a_setting_in_vars_is_checked_and_env_wins(self):
+        with self.assertRaises(ValueError):   # a typo is red, never auto
+            self.outputs(FLEET_VARS=json.dumps({'PROJ_RUNNERS': 'fleeet'}))
+        lines, _ = self.outputs(FLEET_VARS=json.dumps({'PROJ_RUNNERS': 'fleeet'}), FLEET_MODE='fleet')
+        self.assertEqual(lines['mode'], 'fleet')
+        stale = beacon(2, at=1)
+        lines, _ = self.outputs(FLEET_VARS=json.dumps({'PROJ_BEACON_PC': beacon(2, at=int(ff.time.time()))}),
+                                PROJ_BEACON_PC=stale)
+        self.assertEqual(json.loads(lines['runners'])['plugins'], ['self-hosted', 'proj-build'])
+
+    def test_unreadable_vars_are_red(self):
+        for raw in ('{', '[]', '"x"'):
+            with self.subTest(raw):
+                lines, log = self.outputs(FLEET_VARS=raw)
+                self.assertIn('::error::fork-fleet: the vars input', log)
+                self.assertEqual(json.loads(lines['runners'])['plugins'], ['self-hosted', 'proj-build'])
 
 
 if __name__ == '__main__':
