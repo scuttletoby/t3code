@@ -18,8 +18,11 @@ All of them are the queue's, imported from `../pr-queue`, never copied:
   override comment's sha. Only comments and reviews by the config's
   `lens_author_associations` count, and bots never do. A lens comment edited
   after posting or hidden (minimized), a short sha, and a comment that only
-  looks like a lens report read nothing. The pr-queue README, section "Lens
-  comments", has the full grammar.
+  looks like a lens report read nothing. A review's edited and hidden flags
+  come from the queue's own GraphQL query, never from `gh pr view` (which
+  prints `includesCreatedEdit: false` for every review without asking GitHub);
+  if that query fails after the retries, the check fails. The pr-queue README,
+  section "Lens comments", has the full grammar.
 - **One lens name, one read:** each lens name counts once, by its newest
   comment, whoever posted it. If two reviewers post under the same name, the
   newer one wins: the check can pass on a head only the second one read. Two
