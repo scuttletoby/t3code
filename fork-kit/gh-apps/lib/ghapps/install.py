@@ -92,9 +92,14 @@ class Ops:
         os.chown(path, uid, gid, follow_symlinks=False)
 
     def visudo_ok(self, path):
-        args = [VISUDO, '-c', '-q'] + (['-f', path] if path else [])
-        return subprocess.run(args, env={'PATH': c.SAFE_PATH}, stdin=subprocess.DEVNULL,
-                              capture_output=True).returncode == 0
+        args = [VISUDO, '-c'] + (['-f', path] if path else [])
+        proc = subprocess.run(args, env={'PATH': c.SAFE_PATH, 'LANG': 'C'}, stdin=subprocess.DEVNULL,
+                              capture_output=True)
+        if proc.returncode != 0:   # visudo's own words, so the owner sees which file and line it refused
+            for line in (proc.stdout + proc.stderr).decode('utf-8', 'replace').splitlines()[-20:]:
+                if line.strip() and not line.endswith(': parsed OK'):
+                    say(f'visudo: {line.strip()}')
+        return proc.returncode == 0
 
     def run_as(self, user, cmd):
         """Run cmd as user (its own groups only), clean environment, from /. Returns (code, stdout, stderr)."""

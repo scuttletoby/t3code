@@ -66,6 +66,8 @@ class RealHost(unittest.TestCase):
                 raise RuntimeError(f'user {name} already exists: this is not a throw-away runner')
         if os.path.lexists(c.ETC) or os.path.lexists(c.SUDOERS):
             raise RuntimeError('gh-apps is already installed here: this is not a throw-away runner')
+        before = run(['/usr/sbin/visudo', '-c'])   # the runner's own sudo config, for the log
+        print(f'visudo -c before the install: exit {before.returncode}\n{before.stdout}{before.stderr}', file=sys.stderr)
         run(['/usr/sbin/useradd', '--create-home', '--shell', '/bin/sh', AGENT], check=True)
         cls.home = pwd.getpwnam(AGENT).pw_dir
         os.makedirs(FAKE_DIR, mode=0o755)
