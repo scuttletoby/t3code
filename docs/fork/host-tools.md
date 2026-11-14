@@ -1585,10 +1585,10 @@ scrubbed of every secret value: things that need **your** secrets (a deploy with
 need no ask because you wrote or approved them, and they run from a frozen copy (§4.3 rule 4): a deploy from a repo
 runs at the commit you approved; a new commit is one ask showing the commit and the diff since the last approved one.
 
-The first named command under this rule (secrets are used only through named commands, never shown) is the GitHub
-App tool `gh-apps` (`gh-as`, from the host install kit, not in the fork yet): agents use the Apps' keys only through
-it, a separate system user holds the keys, and no command prints a key or a token. Its threat model and the owner's
-steps: [Gate trust](gate-trust.md).
+The first tool under this rule (secrets are used only through named commands, never shown) is the GitHub App tool
+`gh-apps` (`gh-as`, from the host install kit, not in the fork yet). Unlike the named commands above, it does not run
+as you: a separate system user holds the Apps' keys, agents use them only through it, and no command prints a key or
+a token. Its threat model and the owner's steps: [Gate trust](gate-trust.md).
 
 ## 10. Network, auth and links
 

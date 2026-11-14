@@ -6,8 +6,9 @@ The commands live only in that page. Each block marked `<!-- owner-step: NAME --
 written, its CAPITAL placeholders are filled in, and bash runs it with a fake `gh` first in PATH that
 answers like GitHub from a JSON state and logs every call. So the `jq` parts and the `gh` calls the owner
 pastes are the ones tested. Each block is run twice (safe to run again), on old shapes (no rule, two
-rules, a check bound to another App, a placeholder left in) and with a GitHub read that fails.
-Then: every relative link of the fork pages this touches resolves (anchors too), the page names nothing
+rules, a check bound to another App, a placeholder left in, an Environment with other rules) and with a
+GitHub read that fails. The page's claims of what the gate posts (Environment widened, deleted, key
+deleted first, classic protection) are checked against head_gate's own guard and drift. Then: every relative link of the fork pages this touches resolves (anchors too), the page names nothing
 personal, and no other page carries a copy of the commands.
 
 Needs bash and jq. Reaches no network and no GitHub. Each check prints ok/FAIL; any FAIL exits 1.
@@ -68,7 +69,7 @@ def fields(args):
     return out
 
 if argv[:1] == ["api"]:
-    args, method, path, inp = argv[1:], None, None, None
+    args, method, path, inp, jq = argv[1:], None, None, None, None
     i = 0
     rest = []
     while i < len(args):
@@ -77,6 +78,8 @@ if argv[:1] == ["api"]:
             method = args[i + 1]; i += 2
         elif a == "--input":
             inp = args[i + 1]; i += 2
+        elif a == "--jq":
+            jq = args[i + 1]; i += 2
         elif a in ("-f", "-F"):
             rest += args[i:i + 2]; i += 2
         elif a.startswith("-"):
@@ -88,6 +91,28 @@ if argv[:1] == ["api"]:
     entry.update(method=method, path=path)
     if path in state.get("fail", []):
         done(1, err="HTTP 404: Not Found (" + path + ")")
+    if "/deployment-branch-policies" in path:
+        env = path.split("/environments/")[1].split("/")[0]
+        pols = state["envs"].get(env, {}).get("policies")
+        if method == "GET" and path.endswith("/deployment-branch-policies") and pols is not None:
+            state["paths"][path] = {"total_count": len(pols), "branch_policies": pols}
+        if method == "DELETE":
+            pid = path.rsplit("/", 1)[1]
+            if pols is None or pid not in [str(p["id"]) for p in pols]:
+                done(1, err="HTTP 404: Not Found (" + path + ")")
+            pols[:] = [p for p in pols if str(p["id"]) != pid]
+            done(0)
+    if method == "GET" and jq is not None and path in state["paths"]:
+        import subprocess
+        r = subprocess.run(["jq", "-r", jq], input=json.dumps(state["paths"][path]), capture_output=True, text=True)
+        entry["jq"] = jq
+        with open(log_file, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+    if jq is not None:
+        done(2, err="fake gh: --jq only on a GET here")
     if method == "GET":
         if path not in state["paths"]:
             done(1, err="HTTP 404: Not Found (" + path + ")")
@@ -119,7 +144,8 @@ if argv[:1] == ["api"]:
         pols = state["envs"].setdefault(env, {}).setdefault("policies", [])
         if f.get("name") in [p["name"] for p in pols]:
             done(1, err="HTTP 303: a policy with this name pattern exists")
-        pols.append({"name": f["name"], "type": f.get("type")})
+        state["next_id"] = state.get("next_id", 100) + 1
+        pols.append({"id": state["next_id"], "name": f["name"], "type": f.get("type")})
         done(0, out=pols[-1])
     if "/environments/" in path and method == "PUT":
         env = path.split("/environments/")[1]
@@ -153,6 +179,7 @@ def blocks():
 
 SUBS = [  # placeholder -> value, as the owner fills them in
     ("OWNER/REPO", "acme/widgets"),
+    ("POLICY_ID", "0"),
     ("DEFAULT_BRANCH", "main"),
     ("BRANCH", "main"),
     ("RULESET_ID", "42"),
@@ -160,7 +187,7 @@ SUBS = [  # placeholder -> value, as the owner fills them in
     ("ANY_SOURCE_APP_ID", "15368"),
     ("APP_ID", "777777"),
 ]
-NOT_PLACEHOLDERS = {"HEAD_GATE_APP_ID", "HEAD_GATE_APP_KEY", "GET", "PUT", "POST", "PATCH"}
+NOT_PLACEHOLDERS = {"HEAD_GATE_APP_ID", "HEAD_GATE_APP_KEY", "GET", "PUT", "POST", "PATCH", "DELETE"}
 
 
 def fill(block, subs):
@@ -174,7 +201,8 @@ def leftover(block):
 
 
 def run(block, state, subs=SUBS, tmp=None):
-    """Run one filled-in block with the fake gh; returns (exit code, stderr, calls, state after)."""
+    """Run one filled-in block with the fake gh; returns (exit code, stderr, calls, state after, its folder), and
+    keeps what it printed in the folder's stdout.txt."""
     tmp = pathlib.Path(tmp or tempfile.mkdtemp(dir=BASE.name))
     (tmp / "bin").mkdir(exist_ok=True)
     gh = tmp / "bin/gh"
@@ -192,6 +220,7 @@ def run(block, state, subs=SUBS, tmp=None):
            "FAKE_GH_STATE": str(sf), "FAKE_GH_LOG": str(lf), "LC_ALL": "C.UTF-8"}
     p = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=tmp, env=env,
                        capture_output=True, text=True, timeout=60)
+    (tmp / "stdout.txt").write_text(p.stdout)
     calls = [json.loads(line) for line in lf.read_text().splitlines()]
     return p.returncode, p.stderr, calls, json.loads(sf.read_text()), tmp
 
@@ -234,8 +263,8 @@ def rsc_of(body):
 
 
 b = blocks()
-check(set(b) == {"environment", "bind-ruleset", "bind-classic"},
-      f"the page marks the three tested blocks (found {sorted(b)})")
+check(set(b) == {"environment", "environment-rules", "environment-rule-delete", "bind-ruleset", "bind-classic",
+                 "classic-check"}, f"the page marks the six tested blocks (found {sorted(b)})")
 check(shutil.which("jq") is not None and shutil.which("bash") is not None, "jq and bash are on PATH")
 
 # Every placeholder the tested blocks use is filled in by the test and listed in the page's placeholder table.
@@ -248,13 +277,17 @@ for name, block in b.items():
     check(not leftover(fill(block, SUBS + [("PATH_TO_DOWNLOADED_KEY", "/k")])),
           f"{name}: the test fills in every placeholder (left {leftover(fill(block, SUBS + [('PATH_TO_DOWNLOADED_KEY', '/k')]))})")
 
+every_block = re.findall(r"```sh\n(.*?)```", PAGE.read_text(), re.S)
+unlisted = sorted({p for block in every_block for p in leftover(block)} - listed)
+check(not unlisted, f"every placeholder of every command block on the page is in its table (missing {unlisted})")
+
 # --- step 3: Environment, App id and key ---------------------------------------------------------------------------
 code, err, calls, st, tmp = run(b["environment"], empty_state())
 check(code == 0, f"environment: runs clean ({err.strip()[:200]})")
 env = st["envs"].get("head-gate", {})
 check(env.get("deployment_branch_policy") == {"protected_branches": False, "custom_branch_policies": True},
       f"environment: custom branch rules only, not 'protected branches' ({env.get('deployment_branch_policy')})")
-check(env.get("policies") == [{"name": "main", "type": "branch"}],
+check([{k: p[k] for k in ("name", "type")} for p in env.get("policies", [])] == [{"name": "main", "type": "branch"}],
       f"environment: exactly one deployment rule, the default branch as a branch ({env.get('policies')})")
 check(st["vars"] == {"head-gate/HEAD_GATE_APP_ID": "777777"}, f"environment: the App id variable ({st['vars']})")
 check(st["secrets"] == {"head-gate/HEAD_GATE_APP_KEY": (tmp / "key.pem").read_text()},
@@ -265,6 +298,96 @@ code2, err2, calls2, st2, _ = run(b["environment"], st)
 check(st2 == st, "environment: run twice, same state (still one deployment rule)")
 check([c["argv"] for c in calls2] == [c["argv"] for c in calls],
       "environment: run twice, the same four calls; a refused second POST stops nothing after it")
+
+# Step 3 on an Environment that already had other rules (finding 4): they stay, the read-back shows them, the delete
+# by id removes them, and the read-back's "exactly one line, branch DEFAULT_BRANCH" is the guard's own rule.
+sys.path.insert(0, str(root / "fork-ci/actions/head-check"))
+import types  # noqa: E402
+
+import head_gate  # noqa: E402
+
+ENV_PATH = "repos/acme/widgets/environments/head-gate"
+
+
+def guard_says(env_state):
+    """head_gate.guard on the fake state's Environment (None: it does not exist): its GITHUB_OUTPUT guard= answer and
+    its log."""
+    routes = {"repos/acme/widgets": {"default_branch": "main"}}
+    if env_state is not None:
+        pols = env_state.get("policies", [])
+        routes[ENV_PATH] = {"name": "head-gate", "deployment_branch_policy": env_state.get("deployment_branch_policy")}
+        routes[ENV_PATH + "/deployment-branch-policies?per_page=100"] = {"total_count": len(pols),
+                                                                         "branch_policies": pols}
+
+    def gh(*a, stdin=None):
+        if a[0] == "api" and len(a) == 2 and a[1] in routes:
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(routes[a[1]]), stderr="")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="HTTP 404: Not Found")
+
+    with tempfile.NamedTemporaryFile("r", dir=BASE.name) as o:
+        log = []
+        head_gate.guard("acme/widgets", "head-gate", "HEAD_GATE_APP_KEY", "false", False, gh, log.append,
+                        {"GITHUB_OUTPUT": o.name})
+        return dict(line.split("=", 1) for line in o.read().splitlines()).get("guard"), "\n".join(log)
+
+
+def with_policy(pid):
+    return [("POLICY_ID", pid) if k == "POLICY_ID" else (k, v) for k, v in SUBS]
+
+
+widened = empty_state()
+widened["envs"]["head-gate"] = {"deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True},
+                                "policies": [{"id": 7, "name": "release/*", "type": "branch"},
+                                             {"id": 8, "name": "v*", "type": "tag"}]}
+code, err, calls, st, _ = run(b["environment"], widened)
+check(code == 0, f"environment, existing rules: runs clean ({err.strip()[:200]})")
+code_r, err_r, calls_r, st_r, tmp_r = run(b["environment-rules"], st)
+lines = (tmp_r / "stdout.txt").read_text().splitlines()
+check(code_r == 0 and not writes(calls_r) and st_r["envs"] == st["envs"],
+      f"environment-rules: a read only ({code_r}, {err_r.strip()[:200]})")
+check(sorted(line.split(" ", 1)[1] for line in lines) == ["branch main", "branch release/*", "tag v*"]
+      and all(line.split(" ", 1)[0].isdigit() for line in lines),
+      f"environment, existing rules: step 3 keeps them and the read-back lists each with its id ({lines})")
+said, log = guard_says(st["envs"]["head-gate"])
+check(said == "fail" and "posts a failure on every head" in log,
+      f"environment, existing rules: the guard refuses and the gate posts failures, as the page says ({said})")
+for line in lines:
+    pid, kind, name = line.split(" ", 2)
+    if (kind, name) != ("branch", "main"):
+        code_d, err_d, calls_d, st, _ = run(b["environment-rule-delete"], st, subs=with_policy(pid))
+        check(code_d == 0 and [c.get("path") for c in calls_d] == [ENV_PATH + "/deployment-branch-policies/" + pid],
+              f"environment-rule-delete: deletes rule {pid}, in the right repository ({err_d.strip()[:200]})")
+pols = st["envs"]["head-gate"]["policies"]
+check([(p["type"], p["name"]) for p in pols] == [("branch", "main")], f"environment: after the deletes, one rule ({pols})")
+said, log = guard_says(st["envs"]["head-gate"])
+check(said == "ok", f"environment: the read-back's one line 'branch main' is what the guard passes ({said}: {log[:200]})")
+code_d, err_d, calls_d, st2, _ = run(b["environment-rule-delete"], st, subs=with_policy("424242"))
+check(code_d != 0 and st2["envs"] == st["envs"], "environment-rule-delete: an unknown id deletes nothing")
+
+
+def bullet(start):
+    """The text of the page's list item that starts with `start`, up to the next item or heading."""
+    found = re.search(r"^- " + re.escape(start) + r"(.*?)(?=^- |^#|\Z)", PAGE.read_text(), re.S | re.M)
+    return " ".join(found.group(1).split()) if found else ""
+
+
+# The page's claims about what is posted are the code's (the lens's two must-fix findings were wrong claims here).
+widened_text = bullet("**Environment widened**")
+check("posts a failure on every head" in widened_text and "nothing" not in widened_text,
+      f"rotation: 'Environment widened' says a failure is posted on every head, as the guard does ({widened_text[:120]})")
+said, log = guard_says(None)
+deleted_text = bullet("**Environment deleted")
+check(said is None and "nothing is posted" in deleted_text and "stays passed" in deleted_text,
+      f"rotation: a missing Environment gives no guard output, and the page says nothing is posted ({said})")
+key_text = bullet("**Gate key:**")
+readme = (root / "fork-ci/actions/head-check/README.md").read_text()
+check("**not** fail closed" in key_text and "stays passed" in key_text and "No token can be made" in readme
+      and "Stops before start" in key_text and "Stops before start" in readme,
+      "rotation: a key deleted first is not fail closed (the README's no-post case), and an old pass stays")
+again_text = bullet("**App made again**")
+check(all(w in again_text for w in ("install", "HEAD_GATE_APP_ID", "HEAD_GATE_APP_KEY", "step 6", "step 7",
+                                    "then delete the old App")),
+      f"rotation: 'App made again' installs the new App and sets its id and key before deleting the old one")
 
 # --- step 6: bind the check in a ruleset ---------------------------------------------------------------------------
 blk = b["bind-ruleset"]
@@ -344,6 +467,19 @@ code, err, calls, _, _ = run(blk, empty_state({CL: cold}, fail=[CL]))
 check(code != 0 and not writes(calls), "classic: no protection to read: nothing written")
 code, err, calls, _, _ = run(blk, empty_state({CL: {"url": "x", "strict": False, "contexts": ["ci"]}}))
 check(code != 0 and not writes(calls), "classic: an answer without a checks list: nothing written")
+
+# The by-hand classic check reads, never writes, and shows the gate's entry with its app_id.
+code, err, calls, st, tmp = run(b["classic-check"], empty_state({CL: cold}))
+shown = json.loads((tmp / "stdout.txt").read_text() or "null")
+check(code == 0 and not writes(calls) and shown == cold["checks"],
+      f"classic-check: a read only, showing each check with its app_id ({code}, {err.strip()[:200]})")
+warned = []
+head_gate.drift("acme/widgets", "main", GATE, "777777",
+                lambda *a, stdin=None: types.SimpleNamespace(returncode=0, stdout="[]", stderr=""),
+                warned.append, {})
+check(any("::warning::" in w and "classic branch protection cannot be read" in w for w in warned)
+      and "cannot be read" in PAGE.read_text().split("<!-- owner-step: classic-check -->")[0][-400:],
+      f"classic: the gate warns that it cannot read classic protection, as the page says ({warned})")
 
 # --- links, public safety, one copy ----------------------------------------------------------------------------------
 def slugs(md):

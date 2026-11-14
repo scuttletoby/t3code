@@ -25,8 +25,10 @@ check runs (`head_check_app`, [pr-queue](../../fork-ci/actions/pr-queue/README.m
   pull request's own workflow reports as the GitHub Actions App (id 15368), not as the gate App.
 - **Only the default branch could make the App's token.** The App key is a secret of an Environment
   that only the default branch may deploy to. A run for a pull request branch is refused the
-  Environment and its secrets. The guard job refuses to run when a repository or organisation
-  secret of the key's name exists, or when the Environment allows more than the default branch.
+  Environment and its secrets. When a repository or organisation secret of the key's name exists
+  (the guard sees one only because the caller passes `secrets: inherit`), or the Environment allows
+  more than the default branch, the guard refuses and the gate posts only failures, on every head
+  it runs for.
 - **The judged head is the change the review read**, by the same rules as the head-check action
   (the README's "The rules").
 
@@ -92,6 +94,11 @@ agent sees (not a terminal an agent can read).
 | `RULESET_ID`               | the id of the ruleset that requires the check (`gh api repos/OWNER/REPO/rulesets`)        |
 | `ANY_SOURCE_APP_ID`        | classic protection only: `15368` (GitHub Actions) or `-1` (keep "any source"), see step 6 |
 | `PATH_TO_DOWNLOADED_KEY`   | the `.pem` file the App's page downloaded                                                 |
+| `POLICY_ID`                | step 3 on an existing Environment: the id of a deployment rule to delete                  |
+| `FORK_OWNER/FORK`          | step 4: the fork that ships the host install kit                                          |
+| `RELEASE_SHA`, `KIT_PATH`  | step 4: the kit's release commit and its folder in the fork                               |
+| `AGENT_USER`               | step 4: the system user the agents run as                                                 |
+| `APP_NAME`, `AGENT_APP_ID` | step 5: an agent App's name and its App ID                                                |
 
 **1. Make the gate App** (browser): Settings, Developer settings, GitHub Apps, New GitHub App. Name
 `GATE_APP_NAME`; webhook off; repository permission **Checks: Read and write** and nothing else;
@@ -102,8 +109,9 @@ downloads).
 installed on several repositories: it can only write check runs.
 
 **3. Environment, App id and key.** The Environment's deployment branches are one rule, the default
-branch; the guard job refuses anything else. Safe to run again: the second `POST` finds the rule already there (GitHub
-answers with the existing one or an error, and adds nothing), and the other lines set the same values.
+branch; for anything else the guard refuses and the gate posts only failures. Safe to run again:
+the second `POST` finds the rule already there (GitHub answers with the existing one or an error,
+and adds nothing), and the other lines set the same values.
 
 <!-- owner-step: environment -->
 
@@ -113,6 +121,25 @@ gh api -X PUT repos/OWNER/REPO/environments/head-gate \
 gh api -X POST repos/OWNER/REPO/environments/head-gate/deployment-branch-policies -f name=DEFAULT_BRANCH -f type=branch
 gh variable set HEAD_GATE_APP_ID --env head-gate --repo OWNER/REPO --body APP_ID
 gh secret set HEAD_GATE_APP_KEY --env head-gate --repo OWNER/REPO < PATH_TO_DOWNLOADED_KEY
+```
+
+These lines add, they never delete: on an Environment that already existed, other rules (a
+pattern, a tag, a second branch) stay, and the guard then posts a failure on every head. Read the
+rules back; the answer must be exactly one line, `branch DEFAULT_BRANCH`:
+
+<!-- owner-step: environment-rules -->
+
+```sh
+gh api repos/OWNER/REPO/environments/head-gate/deployment-branch-policies \
+  --jq '.branch_policies[] | "\(.id) \(.type) \(.name)"'
+```
+
+Delete every other line's rule by its id (the first number), one at a time:
+
+<!-- owner-step: environment-rule-delete -->
+
+```sh
+gh api -X DELETE repos/OWNER/REPO/environments/head-gate/deployment-branch-policies/POLICY_ID
 ```
 
 Then delete the downloaded `.pem`. Keep no repository or organisation secret named
@@ -180,12 +207,23 @@ jq --arg check 'CHECK_NAME' --argjson app APP_ID --argjson other ANY_SOURCE_APP_
 gh api -X PATCH repos/OWNER/REPO/branches/BRANCH/protection/required_status_checks --input "$d/new.json"
 ```
 
-The next gate run's log says the check is bound to the gate App; until then it warns. Roll back: run
-the block again with the old source, or remove the entry in the settings page.
+With a ruleset, the next gate run's log says the check is bound to the gate App; until then it
+warns. Classic branch protection cannot be read with the gate's job token, so with it the log always
+warns, also after this step. Check it by hand: the gate's entry must show `app_id` `APP_ID`:
+
+<!-- owner-step: classic-check -->
+
+```sh
+gh api repos/OWNER/REPO/branches/BRANCH/protection/required_status_checks --jq '.checks'
+```
+
+Roll back: run the block again with the old source, or remove the entry in the settings page.
 
 **7. The queue key.** Set `head_check_app` to `APP_ID` in the queue config, in a pull request, after
-the fork release that knows the key is pinned everywhere (an older queue refuses a key it does not
-know).
+the queue's `head_check` names `CHECK_NAME` (Rollout order step 4) and after the fork release that
+knows the key is pinned everywhere (an older queue refuses a key it does not know). With
+`head_check` still on the old name, the queue counts only the gate App's runs of that old name,
+finds none, and stops merging: it fails closed, but looks broken.
 
 **Later decision: stage 2.** Take the owner's broad login off the agent user (2a: a fine-grained
 token without Administration, Secrets and Environments rights, and no admin bypass; 2b: App tokens
@@ -203,17 +241,31 @@ Roll back at any point: remove the one ruleset or protection entry.
 
 ## Rotation and repair
 
-- **Gate key:** in the App's page add a new key; set the Environment secret again (step 3's last
-  line); dispatch the gate for one pull request and see it green; then delete the old key. If the old
-  key is deleted first, no token is made, no check is posted and merges wait (fail closed); the job's
-  error says why. Old check runs stay valid: they belong to the App, not to the key.
+- **Gate key:** add first, then delete. In the App's page add a new key; set the Environment secret
+  again (step 3's last line); dispatch the backfill and see the check on every open pull request;
+  then delete the old key. The wrong order is **not** fail closed: with the old key deleted first, no
+  token is made and nothing is posted (the README's "Stops before start"). New heads get no check and
+  wait, but a head that already passed stays passed, even after an event that should fail it (a
+  deleted override or lens comment), until the gate can post again and the backfill has run. Old
+  check runs stay valid: they belong to the App, not to the key.
 - **App reinstalled:** fine, the installation is looked up on every run.
-- **App made again:** a new App has a new id. Merges wait until the variable `HEAD_GATE_APP_ID`, the
-  ruleset or protection entry (step 6) and `head_check_app` name the new id.
+- **App made again** (a new App has a new id), in this order: make the new App and install it
+  (steps 1 and 2); set `HEAD_GATE_APP_ID` and `HEAD_GATE_APP_KEY` to the new App's (step 3's last
+  two lines); dispatch the backfill; bind the check to the new id (step 6); set `head_check_app` to
+  the new id (step 7); then delete the old App. Until step 6 names the new id, the old App's passes
+  still count and the old App can no longer post, so a head it passed stays passed even after an
+  event that should fail it: keep that window short and merge nothing in it. Until step 7, the queue
+  counts only the old App's runs, finds none on a new head and waits; merge that one config change
+  by hand once the new App's check on it is green.
 - **Agent App keys** (host kit): the next token request fails with a clear error naming the App; a
   cached token works until it ends (at most one hour). Rotate as in step 5.
-- **Environment widened** (a second branch rule, or "protected branches"): the guard job refuses and
-  nothing is posted. Put back the one default-branch rule.
+- **Environment widened** (a second branch rule, a tag or pattern rule, or "protected branches"):
+  the guard refuses and the gate posts a failure on every head it runs for until the one
+  default-branch rule is back (step 3's read-back and delete). Then dispatch the backfill.
+- **Environment deleted, or the guard cannot see it:** the guard job fails and nothing is posted (a
+  gate job that named a missing Environment would make GitHub create it, open to every branch). As
+  with a deleted key, a head that already passed stays passed: make it again (step 3), then dispatch
+  the backfill.
 
 ## General vs project
 
