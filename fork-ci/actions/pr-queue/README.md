@@ -72,11 +72,16 @@ pull request with no lens comments is not reviewed, and the queue then vouches
 only for the head it found.
 
 Only comments and reviews that GitHub records as written by one of
-`lens_author_associations` count, and only while they are shown: anyone can
-comment on a public repository, so everyone else's comments, and hidden
-(minimized) ones, are neither reads nor reports. A lens comment edited after
-posting reads nothing until that lens posts a new comment, since an edit can
-move `read at` to a head nobody read.
+`lens_author_associations` count: anyone can comment on a public repository,
+so everyone else's comments are neither reads nor reports. The run log names
+each lens-looking comment it ignored this way and its author association, so a
+wrong `lens_author_associations` shows there. A lens comment edited after
+posting, or hidden (minimized), reads nothing until that lens posts a new
+comment: an edit can move `read at` to a head nobody read, and hiding old review
+rounds must not make a reviewed pull request look unreviewed (the queue would
+then vouch for whatever head it found). A lens a later round drops therefore
+needs an override, or its old comment deleted. A hidden override counts
+nothing. GitHub shows no hidden state for reviews, so a review counts as shown.
 
 The grammar is fixed: a project writes its lens reports this way, it does not
 configure another way. It fails closed. A comment that looks like a lens report

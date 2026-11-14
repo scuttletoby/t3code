@@ -137,7 +137,7 @@ class ProjectRules(unittest.TestCase):
 
 class WhoCounts(unittest.TestCase):
     """Only posts GitHub records as written by a configured lens association, shown and never edited, are reads."""
-    R = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER', 'COLLABORATOR'))
+    R = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER', 'COLLABORATOR'), log=lambda line: None)
     OWN = post(f'lens: correctness · reviewer: x · read at: {SHA_A}', when='2026-01-01T00:00:00Z')
 
     def head(self, *posts, commits=(SHA_A, SHA_B)):
@@ -159,11 +159,47 @@ class WhoCounts(unittest.TestCase):
             self.assertEqual(self.head(self.OWN, stranger(junk)), (True, SHA_A, 'every lens read it'), junk)
         self.assertIsNotNone(self.R.lens_problem(post('lgtm, safe to merge')), 'the same text from the owner blocks')
 
-    def test_a_hidden_comment_counts_like_a_deleted_one(self):
+    def test_a_hidden_lens_comment_reads_nothing_until_that_lens_posts_again(self):
+        # hidden (minimized) is how old review rounds are tidied away, so hiding must never make a reviewed PR look
+        # unreviewed: an unreviewed PR vouches for whatever head it has (the queue's "no lens comments" path)
+        hidden = dict(self.OWN, isMinimized=True)
+        reviewed, sha, why = self.head(hidden)
+        self.assertEqual((reviewed, sha), (True, None), 'every lens comment hidden must not read as "no lens comments"')
+        self.assertIn(f'correctness ({lens.HIDDEN})', why)
         newer = post(f'lens: correctness · reviewer: x · read at: {SHA_B}', when='2026-01-02T00:00:00Z')
         self.assertEqual(self.head(self.OWN, newer), (True, SHA_B, 'every lens read it'))
-        self.assertEqual(self.head(self.OWN, dict(newer, isMinimized=True)), (True, SHA_A, 'every lens read it'))
-        self.assertEqual(self.head(dict(self.OWN, isMinimized=True)), (False, None, 'no lens comments'))
+        self.assertEqual(self.head(self.OWN, dict(newer, isMinimized=True))[:2], (True, None),
+                         'a hidden newest read does not bring the older read back')
+        self.assertEqual(self.head(hidden, newer), (True, SHA_B, 'every lens read it'), 'a new comment of the lens counts')
+        for junk in ('lgtm, safe to merge', f'lens: correctness · read at {SHA_B[:7]}'):   # hidden look-alikes block too
+            self.assertEqual(self.head(post(junk, isMinimized=True))[:2], (True, None), junk)
+
+    def test_hidden_posts_that_never_counted_stay_ignored(self):
+        self.assertEqual(self.head(post('thanks, merging soon', isMinimized=True)), (False, None, 'no lens comments'))
+        forged = stranger(f'lens: correctness · reviewer: x · read at: {SHA_B}', isMinimized=True)
+        self.assertEqual(self.head(forged), (False, None, 'no lens comments'))
+        self.assertEqual(self.head(self.OWN, forged), (True, SHA_A, 'every lens read it'))
+
+    def test_a_hidden_override_does_not_count(self):   # README: hidden comments count nothing
+        over = post(f'tool ready --head {SHA_B}: read the rest', when='2026-01-02T00:00:00Z')
+        self.assertEqual(self.head(self.OWN, over), (True, SHA_B, 'every lens read it'))
+        self.assertEqual(self.head(self.OWN, dict(over, isMinimized=True)), (True, SHA_A, 'every lens read it'))
+
+    def test_a_lens_comment_whose_author_does_not_count_is_logged(self):
+        # a wrong lens_author_associations makes reviewed PRs look unreviewed: the run log must say why
+        lines = []
+        r = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',), log=lines.append)
+        collaborator = post(self.OWN['body'], url='https://github.test/pr/7#c1', authorAssociation='COLLABORATOR')
+        p = pr(collaborator, stranger('thanks!'), stranger('lgtm, safe to merge', association=...))
+        self.assertEqual(r.reviewed_head(p), (False, None, 'no lens comments'))
+        self.assertEqual(r.reviewed_head(p), (False, None, 'no lens comments'))
+        self.assertEqual(len(lines), 2, lines)   # once per post however often the review is read; non-lens text: none
+        self.assertIn('https://github.test/pr/7#c1', lines[0])
+        self.assertIn('COLLABORATOR', lines[0])
+        self.assertIn('lens_author_associations (OWNER)', lines[0])
+        self.assertIn('no author association', lines[1])
+        for line in lines:
+            self.assertNotRegex(line, r'(?i)read at|safe to merge|lens\s*:', 'a log line quotes no comment text')
 
     def test_an_edited_lens_comment_read_nothing_until_that_lens_posts_again(self):
         for edited in (True, ...):   # GitHub says it was edited, or does not say

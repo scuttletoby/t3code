@@ -11,10 +11,10 @@ which logins are bots), and the override comment (`<prefix> <40-hex sha>: ...`, 
 association and never edited) that vouches for a head when the lenses read older commits.
 
 Only what GitHub records decides who wrote a comment: one by an account without a configured lens association (anyone
-can comment on a public repository), by a bot, or hidden (minimized) is ignored entirely, neither a read nor a lens
-that read nothing. Among the rest, fail closed throughout: a comment that LOOKS like a lens report but is not exactly
-one valid read, or a lens comment edited after posting, counts as a lens that read nothing, so the queue never takes a
-reviewed PR for an unreviewed one. A read is a full 40-hex sha: a shorter one could be matched by a commit pushed later.
+can comment on a public repository) or by a bot is ignored entirely, neither a read nor a lens that read nothing (the
+run log names each such lens-looking comment). Among the rest, fail closed throughout: a comment that LOOKS like a lens
+report but is not exactly one valid read, or a lens comment edited after posting or hidden (minimized), counts as a
+lens that read nothing, so the queue never takes a reviewed PR for an unreviewed one. A hidden override counts nothing. A read is a full 40-hex sha: a shorter one could be matched by a commit pushed later.
 """
 import re
 
@@ -32,6 +32,7 @@ READ_AT_RE = re.compile(r'\bread[\s-]*at\b\s*:?\s*([0-9a-f]{7,40})\b', re.I)
 FULL_SHA = re.compile(r'[0-9a-f]{40}')
 NO_HEADER = 'comment without a first-line lens header'
 EDITED = 'edited after posting: post a new comment instead'
+HIDDEN = 'hidden: post a new comment instead'
 EMBEDDED = 'holds a lens header line'   # lens_problem: `not a lens:` cannot clear it
 # What a lens report looks like (ONE rule on normalised lines): on a plain line (outside code blocks and quotes) a
 # `lens:`, a `read at:` or `read at <hex>`, `safe to merge`, or in its first TOP_LINES plain lines a Markdown heading
@@ -180,11 +181,12 @@ def latest_checks(rollup):
 class Review:
     """The rules that read a PR's comments, with the project's bot logins and override comment (config.py)."""
 
-    def __init__(self, bot_logins, override_prefix, override_association, lens_associations):
+    def __init__(self, bot_logins, override_prefix, override_association, lens_associations, log=print):
         self.bots = tuple(b.lower() for b in bot_logins)
         self.override_re = re.compile(re.escape(override_prefix) + r' ([0-9a-f]{40}):')
         self.override_association = override_association
         self.lens_associations = tuple(lens_associations)
+        self.log, self.logged = log, set()
 
     def is_bot(self, post):
         login = ((post.get('author') or {}).get('login') or '').lower()
@@ -192,16 +194,22 @@ class Review:
 
     def counts(self, post):
         """The comment or review takes part in the review at all: GitHub records its author with one of the configured
-        lens associations, and it is not hidden (minimized; gh gives no isMinimized for reviews, so a review counts as
-        shown). Everyone else's posts are ignored entirely: a stranger's lens-looking comment neither vouches for a
-        head nor blocks one. A hidden comment is treated like a deleted one: whoever can hide it can delete it."""
-        return post.get('authorAssociation') in self.lens_associations and post.get('isMinimized') is not True
+        lens associations. Everyone else's posts are ignored entirely: a stranger's lens-looking comment neither
+        vouches for a head nor blocks one. Hidden (minimized) posts of these authors still take part, as lenses that
+        read nothing (lens_entries): hiding old rounds is routine, and must not make a reviewed PR look unreviewed."""
+        return post.get('authorAssociation') in self.lens_associations
+
+    @staticmethod
+    def hidden(post):
+        """Hidden (minimized). gh gives no isMinimized for reviews, so a review counts as shown."""
+        return post.get('isMinimized') is True
 
     def override_sha(self, post):
         """The sha a valid override comment vouches for, else None. Text proves nothing, so only what GitHub itself
-        records counts: written by an account with the configured author association and never edited since
-        (includesCreatedEdit false). A missing field counts as not valid."""
-        if post.get('authorAssociation') != self.override_association or post.get('includesCreatedEdit') is not False:
+        records counts: written by an account with the configured author association, never edited since
+        (includesCreatedEdit false) and not hidden. A missing includesCreatedEdit counts as not valid."""
+        if post.get('authorAssociation') != self.override_association or post.get('includesCreatedEdit') is not False \
+                or self.hidden(post):
             return None
         m = self.override_re.match(post.get('body') or '')
         return m.group(1) if m else None
@@ -253,23 +261,32 @@ class Review:
         (counts). A comment that looks like a lens report but is not one valid read (lens_problem) is an entry of its
         own with no sha: it read nothing until it is re-posted as one comment per lens with a first-line header, or an
         override covers it. A lens comment edited after posting (includesCreatedEdit not false: GitHub records that it
-        changed, not what) read nothing until that lens posts a new comment."""
+        changed, not what) or hidden (minimized) read nothing until that lens posts a new comment. A lens-looking post
+        that does not count is logged (log only, never a comment), so a wrong lens_author_associations shows in the
+        run."""
         found = {}
         for when, i, post in self.lens_posts(pr):
-            if not self.counts(post):
-                continue
+            where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
             problem = self.lens_problem(post)
-            if problem:
-                where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
-                found[f'{NO_HEADER} ({where}, {problem})'] = ((when, i), None, None)
+            header = None if problem else lens_header(post.get('body') or '')
+            if not self.counts(post):
+                if (problem or header) and where not in self.logged:
+                    self.logged.add(where)
+                    association = post.get('authorAssociation')
+                    self.log(f'ignored a lens-looking post {where}: '
+                             f'{"author association " + association if association else "no author association"} '
+                             f'is not one of lens_author_associations ({", ".join(self.lens_associations)})')
                 continue
-            header = lens_header(post.get('body') or '')
+            if problem:
+                hidden = ', hidden' if self.hidden(post) else ''
+                found[f'{NO_HEADER} ({where}, {problem}{hidden})'] = ((when, i), None, None)
+                continue
             if not header:
                 continue
             key = lens_key(header[0])
             if key not in found or (when, i) >= found[key][0]:
-                edited = post.get('includesCreatedEdit') is not False
-                found[key] = ((when, i), None, EDITED) if edited else ((when, i), header[1], None)
+                why = HIDDEN if self.hidden(post) else EDITED if post.get('includesCreatedEdit') is not False else None
+                found[key] = ((when, i), None, why) if why else ((when, i), header[1], None)
         return found
 
     def reviewed_head(self, pr):
