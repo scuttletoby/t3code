@@ -338,9 +338,15 @@ const WAIT_STORE_VERSION = 1;
  * read. Kept in the file until it is sent, so a restart before the send does not lose it.
  */
 export const WaitStoreNotice = Schema.Struct({
+  /** The thread it goes to; after a hand-over, the parent that took it. */
   threadId: ThreadId,
   messageId: TrimmedNonEmptyString,
   text: Schema.String,
+  /** Threads that could not take it, oldest first; the first one lost the waits. */
+  via: Schema.optionalKey(Schema.Array(ThreadId)),
+  handedOverBecause: Schema.optionalKey(Schema.Literals(["gone", "stopped"])),
+  /** When the receiver was seen stopped (its latest stop); the notice is held from then. */
+  stoppedSince: Schema.optionalKey(IsoDateTime),
 });
 export type WaitStoreNotice = typeof WaitStoreNotice.Type;
 
