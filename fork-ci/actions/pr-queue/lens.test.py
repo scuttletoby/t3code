@@ -140,6 +140,15 @@ class ProjectRules(unittest.TestCase):
             self.assertEqual(r.reviewed_head(pr(post(body, login=login))), (False, None, 'no lens comments'), login)
         self.assertEqual(r.reviewed_head(pr(post(body))), (True, SHA_A, 'every lens read it'))
 
+    def test_an_author_whose_type_is_bot_never_counts(self):   # GraphQL drops the `[bot]` suffix from the login
+        r = lens.Review((), 'tool ready --head', 'OWNER', ('OWNER',))
+        body = f'lens: correctness · reviewer: x · read at: {SHA_A}'
+        for author in ({'login': 'helper', 'is_bot': True}, {'login': 'helper', '__typename': 'Bot'}):
+            p = pr(post(body, author=author))
+            self.assertEqual(r.reviewed_head(p), (False, None, 'no lens comments'), author)
+        for author in ({'login': 'helper', 'is_bot': False}, {'login': 'helper', '__typename': 'User'}):
+            self.assertEqual(r.reviewed_head(pr(post(body, author=author))), (True, SHA_A, 'every lens read it'))
+
     def test_lenses_that_read_different_heads_name_no_head(self):
         p = pr(post(f'lens: correctness · reviewer: x · read at: {SHA_A}'),
                post(f'lens: data-integrity · reviewer: y · read at: {SHA_B}'))

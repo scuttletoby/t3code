@@ -71,7 +71,7 @@ KEYS = {
     'merge_method': (True, lambda v: v in MERGE_METHODS, f'one of {", ".join(MERGE_METHODS)}'),
     'delete_branch': (True, lambda v: isinstance(v, bool), 'true or false'),
     'bot_logins': (True, lambda v: isinstance(v, list) and all(map(_text, v)),
-                   'a list of logins whose comments never count as a lens (may be empty; `*[bot]` always counts as a bot)'),
+                   'a list of logins whose comments never count as a lens (may be empty; list every bot: gh drops `[bot]`)'),
     'lens_author_associations': (True, _associations, f'a non-empty list of distinct author associations from '
                                  f'{", ".join(ASSOCIATIONS)}: only their comments count as lens comments'),
     'override': (True, lambda v: isinstance(v, dict) and set(v) == {'prefix', 'author_association'}
