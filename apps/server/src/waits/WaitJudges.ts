@@ -7,6 +7,7 @@ import type { WaitKind, WaitTarget } from "@t3tools/contracts/waitFor";
 import type { Judgement } from "@t3tools/shared/waitFor";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import type * as PlatformError from "effect/PlatformError";
 
 export interface WaitJudgeContext {
   /** The stored wait, or null when the condition is read once at registration. */
@@ -21,7 +22,21 @@ export type WaitJudge<K extends WaitKind = WaitKind> = (
 
 export type WaitJudges = { readonly [K in WaitKind]?: WaitJudge<K> };
 
-/** Exists or gone, as `stat` sees it: a link to nothing is gone. */
+/** `ENOTDIR`: a folder on the path is now a file, so nothing can be at the path. */
+const isNotADirectory = (error: PlatformError.PlatformError): boolean => {
+  const cause = error.reason.cause;
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    (cause as { readonly code: unknown }).code === "ENOTDIR"
+  );
+};
+
+/**
+ * Exists or gone, as `stat` sees it: a link to nothing is gone, and so is a path whose parent
+ * folder was replaced by a file.
+ */
 export const makeFileJudge = Effect.fn("WaitJudges.makeFileJudge")(function* () {
   const fs = yield* FileSystem.FileSystem;
   const judge: WaitJudge<"file"> = ({ spec }) =>
@@ -29,7 +44,9 @@ export const makeFileJudge = Effect.fn("WaitJudges.makeFileJudge")(function* () 
       Effect.as(true),
       Effect.catchTags({
         PlatformError: (error) =>
-          error.reason._tag === "NotFound" ? Effect.succeed(false) : Effect.fail(error),
+          error.reason._tag === "NotFound" || isNotADirectory(error)
+            ? Effect.succeed(false)
+            : Effect.fail(error),
       }),
       Effect.map((exists): Judgement => {
         if (exists === (spec.until === "exists")) {

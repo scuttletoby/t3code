@@ -2,7 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WaitForInput, WaitRecord } from "@t3tools/contracts/waitFor";
-import type { Judgement } from "@t3tools/shared/waitFor";
+import { type Judgement, MAX_OPEN_WAITS } from "@t3tools/shared/waitFor";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -739,5 +739,220 @@ it.layer(NodeServices.layer)("WaitService", (it) => {
         assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
         assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "delivering");
       }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+});
+
+/** The real file system; `saved` completes at the first store rename once `arm()` was called. */
+const saveSignal = (filePath: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const saved = yield* Deferred.make<void>();
+    let armed = false;
+    const signalling: FileSystem.FileSystem = {
+      ...fs,
+      rename: (from, to) =>
+        fs
+          .rename(from, to)
+          .pipe(
+            Effect.tap(() =>
+              armed && to === filePath ? Deferred.succeed(saved, undefined) : Effect.void,
+            ),
+          ),
+    };
+    return {
+      fs: signalling,
+      saved,
+      arm: () => {
+        armed = true;
+      },
+    };
+  });
+
+it.layer(NodeServices.layer)("WaitService: lens findings on #90", (it) => {
+  it.effect(
+    "a judge that never answers holds back no other wait: each answer is saved on its own, the late one is a failed read",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath, watched } = yield* workspace;
+        const hung = watched("on-a-dead-mount");
+        const hungStarted = yield* Deferred.make<void>();
+        const judges: WaitJudges = {
+          file: (target, context) =>
+            context.waitId === null
+              ? Effect.succeed<Judgement>({ type: "notYet" })
+              : target.spec.path === hung
+                ? Deferred.succeed(hungStarted, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed<Judgement>({ type: "met", outcome: "exists", detail: "Exists." }),
+        };
+        const signal = yield* saveSignal(filePath);
+        const service = yield* makeService({ filePath, judges, fs: signal.fs });
+        yield* register(service, fileWait(hung));
+        yield* register(service, fileWait(watched("fine")), OTHER_THREAD);
+        signal.arm();
+        yield* TestClock.adjust(5_000);
+        const first = yield* Effect.forkChild(service.judgeDue());
+        yield* Deferred.await(hungStarted);
+
+        // Saved while the other judge still hangs, before any time limit.
+        yield* Deferred.await(signal.saved);
+        const other = (yield* storedWaits(filePath)).find((wait) => wait.threadId === OTHER_THREAD);
+        assert.strictEqual(other?.state, "delivering");
+        // A later sweep while this one waits on its limit does not overlap it.
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 0, ended: 0 });
+
+        yield* TestClock.adjust(10_000);
+        assert.deepStrictEqual(yield* Fiber.join(first), { judged: 2, ended: 1 });
+        const hungWait = (yield* storedWaits(filePath)).find((wait) => wait.threadId === THREAD);
+        assert.strictEqual(hungWait?.state, "waiting");
+        assert.include(hungWait?.lastError ?? "", "no answer in");
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "a late judge is not started again until it returns, its deadline still ends the wait, and two late ones stop new judges of that kind",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath, watched } = yield* workspace;
+        const starts = new Map<string, number>();
+        const release = yield* Deferred.make<void>();
+        const judges: WaitJudges = {
+          file: (target, context) => {
+            if (context.waitId === null) return Effect.succeed<Judgement>({ type: "notYet" });
+            const name = target.spec.path.slice(target.spec.path.lastIndexOf("/") + 1);
+            starts.set(name, (starts.get(name) ?? 0) + 1);
+            return name.startsWith("hung")
+              ? Deferred.await(release).pipe(Effect.as<Judgement>({ type: "notYet" }))
+              : Effect.succeed<Judgement>({ type: "notYet" });
+          },
+        };
+        const service = yield* makeService({ filePath, judges });
+        yield* register(service, fileWait(watched("hung-a"), { timeoutMinutes: 2 }));
+        yield* register(service, fileWait(watched("hung-b")));
+        yield* TestClock.adjust(5_000);
+        const first = yield* Effect.forkChild(service.judgeDue());
+        yield* TestClock.adjust(10_000);
+        assert.deepStrictEqual(yield* Fiber.join(first), { judged: 2, ended: 0 });
+
+        // Two file judges run late: a new file wait is not judged, and the late ones not again.
+        yield* register(service, fileWait(watched("fresh")));
+        yield* TestClock.adjust(5_000);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 3, ended: 0 });
+        assert.deepStrictEqual(Object.fromEntries(starts), { "hung-a": 1, "hung-b": 1 });
+        const byName = (waits: ReadonlyArray<WaitRecord>, name: string) =>
+          waits.find(
+            (wait) => wait.kind === "file" && wait.spec.path.endsWith(`/${name}`),
+          ) as Extract<WaitRecord, { kind: "file" }>;
+        let stored = yield* storedWaits(filePath);
+        assert.strictEqual(
+          byName(stored, "hung-a").lastError,
+          "Its last check has not answered yet.",
+        );
+        assert.include(byName(stored, "fresh").lastError ?? "", "2 file checks have not answered");
+
+        // Past its deadline the late wait ends as a timeout, with no judge started.
+        yield* TestClock.adjust(2 * MINUTE);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 3, ended: 1 });
+        stored = yield* storedWaits(filePath);
+        assert.strictEqual(byName(stored, "hung-a").result?.outcome, "timeout");
+        assert.deepStrictEqual(Object.fromEntries(starts), { "hung-a": 1, "hung-b": 1 });
+
+        // Once the late judges return, judging starts again.
+        yield* Deferred.succeed(release, undefined);
+        yield* TestClock.adjust(5_000);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 2, ended: 0 });
+        assert.deepStrictEqual(Object.fromEntries(starts), {
+          "hung-a": 1,
+          "hung-b": 2,
+          fresh: 1,
+        });
+        stored = yield* storedWaits(filePath);
+        assert.isUndefined(byName(stored, "fresh").lastError);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect("a clock set back an hour does not stop judging for an hour", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const fs = yield* FileSystem.FileSystem;
+      const { filePath, watched } = yield* workspace;
+      const target = watched("ready");
+      const service = yield* makeService({ filePath });
+      yield* register(service, fileWait(target));
+      yield* TestClock.setTime(NOW - HOUR); // a time sync step or a restored snapshot
+      yield* fs.writeFileString(target, "");
+      yield* TestClock.adjust(MINUTE);
+      assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
+    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "register and cancel in a loop keep at most 2 x maxPerThread ended waits per thread",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath, watched } = yield* workspace;
+        const service = yield* makeService({ filePath });
+        const open = yield* register(service, fileWait(watched("kept-open")));
+        const ids: string[] = [];
+        for (let index = 0; index < 100; index += 1) {
+          yield* TestClock.adjust(1_000);
+          const wait = yield* register(service, fileWait(watched(`churn-${index}`)));
+          if (wait.state !== "waiting") return assert.fail("not waiting");
+          ids.push(wait.waitId);
+          yield* service.cancel({ projectId: PROJECT, waitId: wait.waitId });
+        }
+        const stored = yield* storedWaits(filePath);
+        // maxPerThread is 20 by default: the open one and the 40 newest cancelled ones.
+        assert.strictEqual(stored.length, 41);
+        assert.strictEqual(
+          stored.find((wait) => wait.state === "waiting")?.id,
+          open.state === "waiting" ? open.waitId : "",
+        );
+        assert.deepStrictEqual(
+          stored.filter((wait) => wait.state === "cancelled").map((wait) => wait.id),
+          ids.slice(-40),
+        );
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "register refuses beyond the server's open-wait cap, whatever maxPerThread allows",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        const { filePath, watched } = yield* workspace;
+        const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+        const waits = Array.from({ length: MAX_OPEN_WAITS }, (_, index) =>
+          record({
+            id: `w_aaaaaaa${alphabet[(index >> 10) & 31]}${alphabet[(index >> 5) & 31]}${alphabet[index & 31]}`,
+            threadId: `thread-${index}`,
+            key: index.toString(16).padStart(16, "0"),
+          }),
+        );
+        yield* fs.writeFileString(filePath, JSON.stringify({ version: 1, waits }));
+        const service = yield* makeService({ filePath });
+        const refused = yield* register(service, fileWait(watched("one-more"))).pipe(Effect.flip);
+        assert.strictEqual(refused.code, "too_many");
+        assert.include(refused.message, `${MAX_OPEN_WAITS} open waits`);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect("a path whose parent folder was replaced by a file counts as gone", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const fs = yield* FileSystem.FileSystem;
+      const { filePath, watched } = yield* workspace;
+      yield* fs.writeFileString(watched("was-a-folder"), "");
+      const service = yield* makeService({ filePath });
+      const result = yield* register(service, {
+        kind: "file",
+        file: { path: `${watched("was-a-folder")}/lock`, until: "gone" },
+      });
+      assert.strictEqual(result.state, "met");
+      assert.strictEqual(result.state === "met" ? result.outcome : null, "gone");
+    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
   );
 });

@@ -55,8 +55,15 @@ const refuse = (code: WaitRefusal["code"], message: string): WaitRefusal => ({
   message,
 });
 
-function isAbsolutePath(path: string, platform: NodeJS.Platform): boolean {
-  if (platform === "win32") return /^(?:[A-Za-z]:[\\/]|\\\\)/u.test(path);
+/**
+ * An absolute path on this machine. On every OS a path that starts with two separators is
+ * refused: `\\host\share` and `//host/share` reach another host (on Windows a `stat` on one sends
+ * the user's credentials there), and `\\?\` and `\\.\` name devices and pipes. On Windows only a
+ * drive path with its separator (`C:\`) is absolute; `C:foo` is relative to that drive.
+ */
+function isLocalAbsolutePath(path: string, platform: NodeJS.Platform): boolean {
+  if (/^[\\/]{2}/u.test(path)) return false;
+  if (platform === "win32") return /^[A-Za-z]:[\\/]/u.test(path);
   return path.startsWith("/");
 }
 
@@ -101,8 +108,11 @@ export function validateWaitSpec({
     case "file": {
       if (input.file === undefined) return refuse("invalid", 'Kind "file" needs "file": {path}.');
       const { path, until } = input.file;
-      if (path.includes("\0") || !isAbsolutePath(path, platform)) {
-        return refuse("invalid", "The file path must be absolute.");
+      if (path.includes("\0") || !isLocalAbsolutePath(path, platform)) {
+        return refuse(
+          "invalid",
+          "The file path must be an absolute path on this machine, not a network or device path.",
+        );
       }
       return { ok: true, target: { kind: "file", spec: { path, until: until ?? "exists" } } };
     }
@@ -595,6 +605,49 @@ export function shouldPruneWait(
   if (!isEndedWait(wait.state) || wait.endedAt === undefined) return false;
   if (wait.reservedUntil !== undefined && Date.parse(wait.reservedUntil) > now) return false;
   return now - Date.parse(wait.endedAt) >= settings.keepEndedHours * MS_PER_HOUR;
+}
+
+/** The server holds at most this many open waits in all, whatever `maxPerThread` allows. */
+export const MAX_OPEN_WAITS = 1000;
+/** Ended waits kept in all; per thread at most `ENDED_PER_THREAD_FACTOR × maxPerThread`. */
+export const MAX_ENDED_WAITS = 1000;
+export const ENDED_PER_THREAD_FACTOR = 2;
+
+/**
+ * Drops the oldest ended waits beyond `perThread` per thread and `total` in all, so a loop of
+ * register and cancel cannot grow the store. A slot wait whose reservation has not ended is kept
+ * (and still counts). Open waits are never dropped. The order of the rest is kept.
+ */
+export function capEndedWaits(
+  waits: ReadonlyArray<WaitRecord>,
+  limits: { readonly perThread: number; readonly total: number },
+  now: number,
+): ReadonlyArray<WaitRecord> {
+  // Not `toSorted`: Hermes lacks it.
+  const ended = waits
+    .filter((wait) => isEndedWait(wait.state))
+    .sort((a, b) => endedAtMs(b) - endedAtMs(a));
+  if (ended.length <= Math.min(limits.perThread, limits.total)) return waits;
+  const drop = new Set<WaitRecord>();
+  const perThread = new Map<string, number>();
+  let kept = 0;
+  for (const wait of ended) {
+    const count = perThread.get(wait.threadId) ?? 0;
+    const reserved = wait.reservedUntil !== undefined && Date.parse(wait.reservedUntil) > now;
+    if (!reserved && (count >= limits.perThread || kept >= limits.total)) {
+      drop.add(wait);
+      continue;
+    }
+    perThread.set(wait.threadId, count + 1);
+    kept += 1;
+  }
+  return drop.size === 0 ? waits : waits.filter((wait) => !drop.has(wait));
+}
+
+/** Newest first; a record without a parseable `endedAt` counts as oldest. */
+function endedAtMs(wait: WaitRecord): number {
+  const ms = wait.endedAt === undefined ? Number.NaN : Date.parse(wait.endedAt);
+  return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
 }
 
 /** The pause before the next try after `attempt` refused sends. */

@@ -14,6 +14,7 @@ import { resolveProjectSettings } from "./projectSettings.ts";
 import { applyServerSettingsPatch } from "./serverSettings.ts";
 import {
   MAX_HAND_OVERS,
+  capEndedWaits,
   deliveryCommandId,
   deliveryGroups,
   deliveryRetryDelayMs,
@@ -191,6 +192,112 @@ describe("validateWaitSpec (T9)", () => {
       code: "invalid",
     });
     expect(validate({ kind: "pr" })).toMatchObject({ code: "invalid" });
+  });
+});
+
+describe("validateWaitSpec: file paths (lens #90, network and device paths)", () => {
+  const file = (path: string, platform: NodeJS.Platform) =>
+    validate({ kind: "file", file: { path } }, platform);
+  const PLATFORMS: ReadonlyArray<NodeJS.Platform> = ["linux", "darwin", "win32"];
+
+  it("refuses UNC shares, device and pipe paths and drive-relative paths on every OS", () => {
+    const refused = [
+      "\\\\attacker.example\\share\\x",
+      "//attacker.example/share/x",
+      "\\/attacker.example/share",
+      "/\\attacker.example\\share",
+      "\\\\?\\UNC\\host\\share\\x",
+      "\\\\?\\C:\\x",
+      "\\\\.\\pipe\\some-pipe",
+      "\\\\.\\C:\\x",
+      "//./pipe/some-pipe",
+      "//?/UNC/host/share",
+      "\\??\\UNC\\host\\share",
+      "C:relative\\x",
+      "C:",
+      "\\rooted-on-the-current-drive",
+      "relative/x",
+      "",
+    ];
+    for (const platform of PLATFORMS) {
+      for (const path of refused) {
+        expect(file(path, platform), `${platform} ${JSON.stringify(path)}`).toMatchObject({
+          ok: false,
+          code: "invalid",
+        });
+      }
+    }
+  });
+
+  it("accepts a local absolute path for the OS", () => {
+    expect(file("/var/run/build/done", "linux")).toMatchObject({ ok: true });
+    expect(file("/Users/x/done", "darwin")).toMatchObject({ ok: true });
+    expect(file("C:\\builds\\done", "win32")).toMatchObject({ ok: true });
+    expect(file("d:/builds/done", "win32")).toMatchObject({ ok: true });
+    // A drive path is not absolute off Windows, and a rooted path has no drive on Windows.
+    expect(file("C:\\builds\\done", "linux")).toMatchObject({ ok: false });
+    expect(file("/builds/done", "win32")).toMatchObject({ ok: false });
+  });
+});
+
+describe("capEndedWaits (lens #90, store size)", () => {
+  const ended = (id: string, threadId: string, endedHour: number, extra = {}) =>
+    makeWait({
+      id,
+      threadId,
+      state: "cancelled",
+      endedAt: iso(T0 + endedHour * HOUR),
+      ...extra,
+    });
+
+  it("keeps the newest ended waits per thread and in all; open waits always stay", () => {
+    const open = makeWait({ id: "w_oooooooooo", threadId: "a" });
+    const waits = [
+      ended("w_aaaaaaaaa7", "a", 1),
+      open,
+      ended("w_aaaaaaaaa3", "a", 3),
+      ended("w_aaaaaaaaa2", "a", 2),
+      ended("w_bbbbbbbbb2", "b", 1),
+      ended("w_bbbbbbbbb5", "b", 5),
+      ended("w_ccccccccc4", "c", 4),
+    ];
+    const ids = (kept: ReadonlyArray<WaitRecord>) => kept.map((wait) => wait.id);
+    // Order kept; per thread the two newest ended ones.
+    expect(ids(capEndedWaits(waits, { perThread: 2, total: 100 }, T0))).toEqual([
+      "w_oooooooooo",
+      "w_aaaaaaaaa3",
+      "w_aaaaaaaaa2",
+      "w_bbbbbbbbb2",
+      "w_bbbbbbbbb5",
+      "w_ccccccccc4",
+    ]);
+    // In all the three newest ended ones.
+    expect(ids(capEndedWaits(waits, { perThread: 100, total: 3 }, T0))).toEqual([
+      "w_oooooooooo",
+      "w_aaaaaaaaa3",
+      "w_bbbbbbbbb5",
+      "w_ccccccccc4",
+    ]);
+    // Under the caps nothing changes (the same array).
+    expect(capEndedWaits(waits, { perThread: 100, total: 100 }, T0)).toBe(waits);
+  });
+
+  it("never drops a slot wait whose reservation is still running", () => {
+    const reserved = ended("w_ssssssssss", "a", 0, {
+      kind: "slot",
+      spec: {},
+      state: "delivered",
+      reservedUntil: iso(T0 + 10 * HOUR),
+    });
+    const waits = [reserved, ended("w_aaaaaaaaa7", "a", 1), ended("w_aaaaaaaaa2", "a", 2)];
+    expect(capEndedWaits(waits, { perThread: 1, total: 100 }, T0).map((w) => w.id)).toEqual([
+      "w_ssssssssss",
+      "w_aaaaaaaaa2",
+    ]);
+    // Once the reservation is over it is the oldest and goes first.
+    expect(
+      capEndedWaits(waits, { perThread: 1, total: 100 }, T0 + 11 * HOUR).map((w) => w.id),
+    ).toEqual(["w_aaaaaaaaa2"]);
   });
 });
 

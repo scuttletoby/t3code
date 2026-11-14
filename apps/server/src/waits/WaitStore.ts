@@ -1,7 +1,7 @@
 /**
- * Fork (waits): the stored waits file. Missing or blank is empty; a newer version is never read
- * or written; a bad file is copied aside first, then replaced by what still decodes, with a
- * notice (kept until sent, same id on a rerun) for each thread that lost an open wait.
+ * Fork (waits): the stored waits file. Missing is empty; a newer version is never read or written;
+ * a bad file (also an empty or blank one) is copied aside first, then replaced by what still
+ * decodes, with a notice (kept until sent, same id on a rerun) per thread that lost an open wait.
  */
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- The notice ids must be a deterministic digest.
 import * as NodeCrypto from "node:crypto";
@@ -23,9 +23,15 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 export const WAIT_STORE_FILE = "waits.json";
+/**
+ * Once a build that reads this file is released, any new field, state or outcome must raise it:
+ * an older build drops what it cannot decode when it rewrites the file.
+ */
 const STORE_VERSION: WaitStoreFile["version"] = 1;
 /** A bad file gives notices to at most this many threads; the rest are named in the log. */
 const MAX_NOTICES = 50;
+/** A bigger write is refused; the record caps keep the file far below this. */
+export const MAX_STORE_BYTES = 8 * 1024 * 1024;
 
 const decodeRecord = Schema.decodeUnknownOption(WaitRecordSchema);
 const decodeNotice = Schema.decodeUnknownOption(WaitStoreNoticeSchema);
@@ -104,7 +110,7 @@ function salvage(
   }
   const waits: WaitRecord[] = [];
   const seen = new Set<string>();
-  const lost: Array<{ threadId: unknown; waitId?: string }> = [];
+  const maybeLost: Array<{ threadId: unknown; waitId?: string }> = [];
   let dropped = 0;
   for (const entry of entries) {
     const decoded = decodeRecord(entry);
@@ -117,13 +123,13 @@ function salvage(
     if (!isObject(entry)) continue;
     // An ended wait has nothing left to send; only one that was open is lost.
     if (typeof entry.state === "string" && !OPEN_STATES.has(entry.state)) continue;
-    // A second record with a kept id is not lost: the first one is still there.
-    if (typeof entry.id === "string" && seen.has(entry.id)) continue;
-    lost.push({
+    maybeLost.push({
       threadId: entry.threadId,
       ...(typeof entry.id === "string" ? { waitId: entry.id } : {}),
     });
   }
+  // A bad copy of a kept id is not lost, wherever the good copy stands in the file.
+  const lost = maybeLost.filter((entry) => entry.waitId === undefined || !seen.has(entry.waitId));
   const notices: WaitStoreNotice[] = [];
   const rawNotices = isObject(json) ? json.notices : undefined;
   if (rawNotices !== undefined) {
@@ -164,7 +170,16 @@ export const make = Effect.fn("WaitStore.make")(function* (input: { readonly fil
       waits: contents.waits,
       ...(contents.notices.length === 0 ? {} : { notices: contents.notices }),
     };
-    return writeText(filePath, `${JSON.stringify(file, null, 2)}\n`).pipe(
+    const text = `${JSON.stringify(file, null, 2)}\n`;
+    const bytes = new TextEncoder().encode(text).byteLength;
+    if (bytes > MAX_STORE_BYTES) {
+      return Effect.fail(
+        new WaitStoreError({
+          detail: `the file would be ${bytes} bytes, more than the ${MAX_STORE_BYTES} allowed`,
+        }),
+      );
+    }
+    return writeText(filePath, text).pipe(
       Effect.mapError((error) => new WaitStoreError({ detail: error.message })),
     );
   };
@@ -215,17 +230,21 @@ export const make = Effect.fn("WaitStore.make")(function* (input: { readonly fil
     readonly nowMs: number;
     readonly repair: boolean;
   }) {
-    const text = yield* fs.readFileString(filePath).pipe(
+    const read = yield* fs.readFileString(filePath).pipe(
+      Effect.asSome,
       Effect.catchTags({
         PlatformError: (error) =>
           error.reason._tag === "NotFound"
-            ? Effect.succeed("")
+            ? Effect.succeedNone
             : Effect.fail(new WaitStoreError({ detail: error.message })),
       }),
     );
-    if (text.trim() === "") {
+    if (Option.isNone(read)) {
       return { _tag: "Loaded", waits: [], notices: [] } satisfies WaitStoreLoad;
     }
+    // This store never writes an empty or blank file, so one is damage (a power cut after the
+    // rename but before the data reached the disk), not "no waits": it is copied aside and logged.
+    const text = read.value;
     const json = Option.getOrUndefined(parseJson(text));
     // The version is read before anything else, so a newer file is never taken for a bad one.
     const version = isObject(json) ? json.version : undefined;

@@ -64,7 +64,7 @@ const makeStore = (filePath: string, fs?: FileSystem.FileSystem) =>
     : WaitStore.make({ filePath }).pipe(Effect.provideService(FileSystem.FileSystem, fs));
 
 it.layer(NodeServices.layer)("WaitStore", (it) => {
-  it.effect("a missing, empty or blank file has no waits and is not created or changed", () =>
+  it.effect("a missing file has no waits and is not created", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const { root, filePath } = yield* storeFile;
@@ -73,14 +73,76 @@ it.layer(NodeServices.layer)("WaitStore", (it) => {
       const missing = yield* store.load({ nowMs: NOW, repair: true });
       assert.deepStrictEqual(missing, { _tag: "Loaded", waits: [], notices: [] });
       assert.isFalse(yield* fs.exists(filePath));
-
-      for (const text of ["", "  \n\t\n"]) {
-        yield* fs.writeFileString(filePath, text);
-        const loaded = yield* store.load({ nowMs: NOW, repair: true });
-        assert.deepStrictEqual(loaded, { _tag: "Loaded", waits: [], notices: [] });
-        assert.strictEqual(yield* fs.readFileString(filePath), text);
-      }
       assert.deepStrictEqual(yield* listCopies(root), []);
+    }),
+  );
+
+  it.effect(
+    "an empty or blank file (a power cut after the rename) is damage: copied aside, no notices",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const { root, filePath } = yield* storeFile;
+        const store = yield* makeStore(filePath);
+
+        for (const [index, text] of ["", "  \n\t\n", "\u0000".repeat(64)].entries()) {
+          yield* fs.writeFileString(filePath, text);
+          // Waits off: reported, nothing changed.
+          assert.deepStrictEqual(yield* store.load({ nowMs: NOW, repair: false }), {
+            _tag: "Damaged",
+          });
+          assert.strictEqual(yield* fs.readFileString(filePath), text);
+
+          const loaded = yield* store.load({ nowMs: NOW + index * 1000, repair: true });
+          assert.strictEqual(loaded._tag, "Repaired", JSON.stringify(text));
+          if (loaded._tag !== "Repaired") return;
+          assert.deepStrictEqual([loaded.waits, loaded.notices, loaded.lost], [[], [], []]);
+          assert.strictEqual(yield* fs.readFileString(loaded.copyPath), text);
+          assert.deepStrictEqual(JSON.parse(yield* fs.readFileString(filePath)), {
+            version: 1,
+            waits: [],
+          });
+        }
+        assert.strictEqual((yield* listCopies(root)).length, 3);
+      }),
+  );
+
+  it.effect("a write over the size cap is refused and leaves the file as it was", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { filePath } = yield* storeFile;
+      const store = yield* makeStore(filePath);
+      yield* store.write({ waits: [record()] as never, notices: [] });
+      const before = yield* fs.readFileString(filePath);
+
+      const huge = {
+        threadId: "thread-b",
+        messageId: "wait-store:x:thread-b",
+        text: "x".repeat(WaitStore.MAX_STORE_BYTES),
+      };
+      const error = yield* store
+        .write({ waits: [record()] as never, notices: [huge] as never })
+        .pipe(Effect.flip);
+      assert.include(error.detail, `more than the ${WaitStore.MAX_STORE_BYTES} allowed`);
+      assert.strictEqual(yield* fs.readFileString(filePath), before);
+    }),
+  );
+
+  it.effect("a bad copy BEFORE a good record of the same id is not reported as lost", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { filePath } = yield* storeFile;
+      const good = record();
+      yield* fs.writeFileString(
+        filePath,
+        JSON.stringify({ version: 1, waits: [{ ...good, kind: "nonsense" }, good] }),
+      );
+      const loaded = yield* (yield* makeStore(filePath)).load({ nowMs: NOW, repair: true });
+      assert.strictEqual(loaded._tag, "Repaired");
+      if (loaded._tag !== "Repaired") return;
+      assert.deepStrictEqual(loaded.waits, [good] as never);
+      assert.deepStrictEqual(loaded.lost, []);
+      assert.deepStrictEqual(loaded.notices, []);
     }),
   );
 
