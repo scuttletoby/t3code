@@ -30,6 +30,18 @@ export const MAX_HAND_OVERS = 5;
 const MAX_JOINED = 10;
 const UNIT_NAME_PATTERN = /^[A-Za-z0-9@_.:][A-Za-z0-9@_.:-]{0,199}$/u;
 const DETAIL_MAX = 300;
+/**
+ * Stored sizes, counted in bytes as the store file holds them (JSON-escaped UTF-8: a control
+ * character takes 6 bytes, a CJK one 3). With these, the biggest open record the caps allow takes
+ * about 5.0 KB, so `MAX_OPEN_WAITS` of them fill about 5.0 MB (5,023,036 bytes measured) of the
+ * store's 8 MiB (8,388,608 bytes).
+ */
+/** A wait's target (`spec`), e.g. a file path or a check's arguments. */
+export const MAX_SPEC_BYTES = 2048;
+/** The caller's note. */
+export const MAX_NOTE_BYTES = 600;
+/** A frozen result's detail and the last failed read (`lastError`) each. */
+export const MAX_STORED_TEXT_BYTES = 600;
 
 const MS_PER_SECOND = 1000;
 const MS_PER_HOUR = 3_600_000;
@@ -55,13 +67,75 @@ const refuse = (code: WaitRefusal["code"], message: string): WaitRefusal => ({
   message,
 });
 
-function isAbsolutePath(path: string, platform: NodeJS.Platform): boolean {
-  if (platform === "win32") return /^(?:[A-Za-z]:[\\/]|\\\\)/u.test(path);
+/**
+ * An absolute path on this machine. On every OS a path that starts with two separators is
+ * refused: `\\host\share` and `//host/share` reach another host (on Windows a `stat` on one sends
+ * the user's credentials there), and `\\?\` and `\\.\` name devices and pipes. On Windows only a
+ * drive path with its separator (`C:\`) is absolute; `C:foo` is relative to that drive.
+ */
+function isLocalAbsolutePath(path: string, platform: NodeJS.Platform): boolean {
+  if (/^[\\/]{2}/u.test(path)) return false;
+  if (platform === "win32") {
+    return /^[A-Za-z]:[\\/]/u.test(path) && !path.split(/[\\/]/u).some(isWindowsDeviceName);
+  }
   return path.startsWith("/");
 }
 
-/** Checks a `wait_for` call and fills in every default, so equal conditions give equal targets. */
-export function validateWaitSpec({
+/**
+ * On Windows `CON`, `NUL`, `COM1`, `LPT1`, `CONIN$` and the like name a device in every folder,
+ * also with an extension or trailing dots and spaces (`C:\x\nul.txt`), so `stat` would touch it.
+ */
+function isWindowsDeviceName(segment: string): boolean {
+  const base = segment.split(".")[0]!.replace(/[ .]+$/u, "");
+  return /^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$|clock\$)$/iu.test(base);
+}
+
+const textEncoder = new TextEncoder();
+
+/** Bytes `text` takes in the store file: JSON-escaped, in UTF-8, without the quotes. */
+export function storedBytes(text: string): number {
+  return textEncoder.encode(JSON.stringify(text)).byteLength - 2;
+}
+
+/** Cuts `text` so it takes at most `maxBytes` in the store file, ending in "…" when cut. */
+export function clipStored(text: string, maxBytes = MAX_STORED_TEXT_BYTES): string {
+  if (storedBytes(text) <= maxBytes) return text;
+  const room = maxBytes - storedBytes("…");
+  let used = 0;
+  let kept = "";
+  for (const character of text) {
+    const size = storedBytes(character);
+    if (used + size > room) break;
+    used += size;
+    kept += character;
+  }
+  return `${kept}…`;
+}
+
+/**
+ * Checks a `wait_for` call and fills in every default, so equal conditions give equal targets. The
+ * target and the note must fit `MAX_SPEC_BYTES` and `MAX_NOTE_BYTES` as stored.
+ */
+export function validateWaitSpec(
+  request: ValidateWaitSpecInput,
+): { readonly ok: true; readonly target: WaitTarget } | WaitRefusal {
+  const note = request.input.note;
+  if (note !== undefined && storedBytes(note) > MAX_NOTE_BYTES) {
+    return refuse("invalid", `The note is too long: at most ${MAX_NOTE_BYTES} bytes as stored.`);
+  }
+  const checked = validateTarget(request);
+  if (!checked.ok) return checked;
+  const specBytes = textEncoder.encode(JSON.stringify(checked.target.spec)).byteLength;
+  if (specBytes > MAX_SPEC_BYTES) {
+    return refuse(
+      "invalid",
+      `The ${checked.target.kind} target is too long: ${specBytes} bytes as stored, at most ${MAX_SPEC_BYTES}.`,
+    );
+  }
+  return checked;
+}
+
+function validateTarget({
   input,
   checks,
   platform,
@@ -101,8 +175,11 @@ export function validateWaitSpec({
     case "file": {
       if (input.file === undefined) return refuse("invalid", 'Kind "file" needs "file": {path}.');
       const { path, until } = input.file;
-      if (path.includes("\0") || !isAbsolutePath(path, platform)) {
-        return refuse("invalid", "The file path must be absolute.");
+      if (path.includes("\0") || !isLocalAbsolutePath(path, platform)) {
+        return refuse(
+          "invalid",
+          "The file path must be an absolute path on this machine, not a network or device path.",
+        );
       }
       return { ok: true, target: { kind: "file", spec: { path, until: until ?? "exists" } } };
     }
@@ -427,7 +504,7 @@ function update(
 }
 
 function freeze(wait: WaitRecord, outcome: WaitOutcome, detail: string, now: number): WaitRecord {
-  const result: WaitResult = { outcome, detail: clip(detail), at: iso(now) };
+  const result: WaitResult = { outcome, detail: clipStored(clip(detail)), at: iso(now) };
   return update(wait, { state: "delivering", result }, ["errorSince", "lastError"]);
 }
 
@@ -518,9 +595,10 @@ export function nextWaitState(
         if (now >= deadline) {
           return { record: freeze(wait, "timeout", `Last: ${sentence(judgement.message)}`, now) };
         }
-        return wait.errorSince !== undefined && wait.lastError === judgement.message
+        const lastError = clipStored(judgement.message);
+        return wait.errorSince !== undefined && wait.lastError === lastError
           ? null
-          : { record: update(wait, { errorSince: iso(errorSince), lastError: judgement.message }) };
+          : { record: update(wait, { errorSince: iso(errorSince), lastError }) };
       }
       if (now >= deadline) {
         return {
@@ -597,6 +675,49 @@ export function shouldPruneWait(
   return now - Date.parse(wait.endedAt) >= settings.keepEndedHours * MS_PER_HOUR;
 }
 
+/** The server holds at most this many open waits in all, whatever `maxPerThread` allows. */
+export const MAX_OPEN_WAITS = 1000;
+/** Ended waits kept in all; per thread at most `ENDED_PER_THREAD_FACTOR × maxPerThread`. */
+export const MAX_ENDED_WAITS = 1000;
+export const ENDED_PER_THREAD_FACTOR = 2;
+
+/**
+ * Drops the oldest ended waits beyond `perThread` per thread and `total` in all, so a loop of
+ * register and cancel cannot grow the store. A slot wait whose reservation has not ended is kept
+ * (and still counts). Open waits are never dropped. The order of the rest is kept.
+ */
+export function capEndedWaits(
+  waits: ReadonlyArray<WaitRecord>,
+  limits: { readonly perThread: number; readonly total: number },
+  now: number,
+): ReadonlyArray<WaitRecord> {
+  // Not `toSorted`: Hermes lacks it.
+  const ended = waits
+    .filter((wait) => isEndedWait(wait.state))
+    .sort((a, b) => endedAtMs(b) - endedAtMs(a));
+  if (ended.length <= Math.min(limits.perThread, limits.total)) return waits;
+  const drop = new Set<WaitRecord>();
+  const perThread = new Map<string, number>();
+  let kept = 0;
+  for (const wait of ended) {
+    const count = perThread.get(wait.threadId) ?? 0;
+    const reserved = wait.reservedUntil !== undefined && Date.parse(wait.reservedUntil) > now;
+    if (!reserved && (count >= limits.perThread || kept >= limits.total)) {
+      drop.add(wait);
+      continue;
+    }
+    perThread.set(wait.threadId, count + 1);
+    kept += 1;
+  }
+  return drop.size === 0 ? waits : waits.filter((wait) => !drop.has(wait));
+}
+
+/** Newest first; a record without a parseable `endedAt` counts as oldest. */
+function endedAtMs(wait: WaitRecord): number {
+  const ms = wait.endedAt === undefined ? Number.NaN : Date.parse(wait.endedAt);
+  return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+}
+
 /** The pause before the next try after `attempt` refused sends. */
 export function deliveryRetryDelayMs(attempt: number): number {
   return Math.min(5_000 * 2 ** Math.min(attempt, 10), 300_000);
@@ -656,7 +777,7 @@ export function deliveryCommandId(group: DeliveryGroup): string {
 }
 
 /** The kind and target as people read them, such as `pr 123 checks`. */
-function waitTargetText(target: WaitTarget): string {
+export function waitTargetText(target: WaitTarget): string {
   switch (target.kind) {
     case "pr":
       return `pr ${target.spec.repository === undefined ? "" : `${target.spec.repository}#`}${target.spec.number} ${target.spec.until}`;
