@@ -125,6 +125,15 @@ class Markdown(unittest.TestCase):
         self.assertIsNone(lens.lens_header(one['body'], narrow=True))
         self.assertIn('depending on how its HTML', SOURCE.lens_problem(one), 'the other way round: flagged too')
 
+    def test_a_second_header_only_the_source_reading_shows_is_still_flagged(self):
+        """The wide (source) reading's own problem check: main's narrow reading sees one header here, the source two."""
+        old = 'c' * 40
+        body = (f'lens: tests · reviewer: x · read at: {SHA_B}\n\n'
+                f'lens<a title="<">: correctness · read at<a title="<">: {old}')
+        self.assertIsNone(SOURCE.read_problem(body, narrow=True), 'the narrow reading alone sees nothing wrong')
+        self.assertIn('2 times', SOURCE.lens_problem(post(body)))
+        self.assertEqual(SOURCE.reviewed_head(pr(post(body), commits=(old, SHA_B)))[:2], (True, None))
+
     def test_the_scans_give_the_source_regexes_answers(self):
         import random
         tag, link = re.compile(r'</?[A-Za-z][^>]*>'), re.compile(r'!?\[([^\]]*)\]\([^)]*\)')
