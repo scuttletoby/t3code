@@ -24,6 +24,13 @@ import {
 } from "./baseSchemas.ts";
 import { UsageLimitSourceId } from "./usageLimitSourceId.ts";
 import { UsageModelFilter } from "./usage.ts";
+import {
+  AgentSlotsSettings,
+  AgentSlotsSettingsPatch,
+  WaitChecks,
+  WaitForSettings,
+  WaitForSettingsPatch,
+} from "./waitFor.ts";
 import { SecretProviderId, SecretProviderSlug } from "./secretReference.ts";
 import { SettingsSecretValue } from "./settingsSecretValue.ts";
 import { EnvironmentMachineKind, ThreadEnvMode, WorktreeSubmodules } from "./environment.ts";
@@ -1246,6 +1253,8 @@ export const PROJECT_SCOPED_SERVER_SETTING_KEYS = [
   "continueThreadsAfterServerUpdate",
   "responseStreamingMode",
   "speechProjectCustomWords",
+  // Fork: a project lists every check it uses; its map replaces the server's.
+  "waitChecks",
 ] as const;
 export type ProjectScopedServerSettingKey = (typeof PROJECT_SCOPED_SERVER_SETTING_KEYS)[number];
 
@@ -1284,6 +1293,7 @@ export const ProjectSettingsOverrides = Schema.Struct({
   continueThreadsAfterServerUpdate: Schema.optionalKey(Schema.Boolean),
   responseStreamingMode: Schema.optionalKey(ResponseStreamingMode),
   speechProjectCustomWords: Schema.optionalKey(SpeechCustomWords),
+  waitChecks: Schema.optionalKey(WaitChecks),
   providerInstances: Schema.optionalKey(
     Schema.Record(ProviderInstanceId, ProjectProviderInstanceOverride),
   ),
@@ -1490,6 +1500,16 @@ export const ServerSettings = Schema.Struct({
   usagePacingGate: UsagePacingGateMode.pipe(Schema.withDecodingDefault(Effect.succeed("off"))),
   usagePacingLowerEffort: UsagePacingLowerEffort.pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
+  ),
+  /** Fork: waits (`wait_for`); off by default. */
+  waitFor: WaitForSettings.pipe(
+    Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(WaitForSettings)({}))),
+  ),
+  /** Fork: named check commands for waits; only settings can add one. */
+  waitChecks: WaitChecks.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  /** Fork: agent slot limits on `delegate_task`; off by default. */
+  agentSlots: AgentSlotsSettings.pipe(
+    Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(AgentSlotsSettings)({}))),
   ),
   defaultRuntimeMode: RuntimeMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE)),
@@ -1955,6 +1975,10 @@ export const ServerSettingsPatch = Schema.Struct({
   usagePacingGate: Schema.optionalKey(UsagePacingGateMode),
   // Fork: replaced whole, so a level left out of the patch is removed.
   usagePacingLowerEffort: Schema.optionalKey(UsagePacingLowerEffort),
+  // Fork: merged per field; `agentSlots.maxPerAccount` and `waitChecks` are replaced whole.
+  waitFor: Schema.optionalKey(WaitForSettingsPatch),
+  waitChecks: Schema.optionalKey(WaitChecks),
+  agentSlots: Schema.optionalKey(AgentSlotsSettingsPatch),
   /** Replaces each project's override set; null removes it. Omitted providerInstances retains its stored value. */
   projectSettingsOverrides: Schema.optionalKey(
     Schema.Record(
