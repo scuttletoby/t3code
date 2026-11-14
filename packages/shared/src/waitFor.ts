@@ -9,6 +9,8 @@ import type {
   PullRequestCheckStatus,
   PullRequestState,
   ThreadId,
+} from "@t3tools/contracts";
+import type {
   WaitChecks,
   WaitForInput,
   WaitForSettings,
@@ -18,7 +20,7 @@ import type {
   WaitState,
   WaitTarget,
   WaitToolFailureCode,
-} from "@t3tools/contracts";
+} from "@t3tools/contracts/waitFor";
 import * as DateTime from "effect/DateTime";
 import * as Hex from "effect/encoding/Hex";
 

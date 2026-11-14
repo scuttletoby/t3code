@@ -3,11 +3,9 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
-  WaitChecks,
-  WaitRecord,
   type PullRequestCheck,
-  type WaitForInput,
 } from "@t3tools/contracts";
+import { WaitChecks, WaitRecord, type WaitForInput } from "@t3tools/contracts/waitFor";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
