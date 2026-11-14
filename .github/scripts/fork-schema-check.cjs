@@ -20,6 +20,8 @@ const CHECK_FILES = [
   CHECK_SCRIPT,
   ".github/scripts/fork-schema-check.test.cjs",
   ".github/workflows/fork-checks.yml",
+  ".github/scripts/fork-upstream-files-check.cjs",
+  ".github/scripts/fork-upstream-files-check.test.cjs",
 ];
 const GITATTRIBUTES = /(^|\/)\.gitattributes$/;
 
