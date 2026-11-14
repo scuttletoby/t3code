@@ -17,8 +17,9 @@ import { TestClock } from "effect/testing";
 
 import { ServerSettingsService } from "../serverSettings.ts";
 import type { WaitDelivery, WaitDeliveryResult, WaitReceiver } from "./WaitDelivery.ts";
-import type { WaitJudges } from "./WaitJudges.ts";
+import type { WaitJudge, WaitJudges } from "./WaitJudges.ts";
 import * as WaitService from "./WaitService.ts";
+import { memoryFileSystem } from "./WaitService.testkit.ts";
 import { MAX_STORE_BYTES, WAIT_STORE_FILE } from "./WaitStore.ts";
 
 const NOW = Date.parse("2026-11-14T12:00:00.000Z");
@@ -194,12 +195,15 @@ const makeService = (input: {
   readonly filePath: string;
   readonly delivery?: WaitDelivery;
   readonly judges?: WaitJudges;
+  /** None by default, so a stuck file judge stays stuck; tests of the process fallback set one. */
+  readonly fileChildJudge?: WaitJudge<"file"> | null;
   readonly fs?: FileSystem.FileSystem;
   readonly onChange?: Effect.Effect<void>;
 }) => {
   const made = WaitService.make({
     filePath: input.filePath,
     delivery: input.delivery ?? fakeDelivery().delivery,
+    fileChildJudge: input.fileChildJudge ?? null,
     ...(input.judges === undefined ? {} : { judges: input.judges }),
     ...(input.onChange === undefined ? {} : { onChange: input.onChange }),
   });
@@ -1377,7 +1381,7 @@ const saveSignal = (filePath: string) =>
 
 it.layer(NodeServices.layer)("WaitService: lens findings on #90", (it) => {
   it.effect(
-    "a judge that never answers holds back no other wait: the pass ends at the limit and saves its answers in one write, the late one is a failed read",
+    "a judge that never answers holds back no other wait: the pass ends at the limit, the met one is saved at once and the late one (a failed read) at the end",
     () =>
       Effect.gen(function* () {
         yield* TestClock.setTime(NOW);
@@ -1406,7 +1410,7 @@ it.layer(NodeServices.layer)("WaitService: lens findings on #90", (it) => {
         // Time goes on in small steps, as under the real loop.
         yield* stepSeconds(11);
         assert.deepStrictEqual(yield* Fiber.join(first), { judged: 2, ended: 1 });
-        assert.strictEqual(signal.saves(), 1, "one write for the pass");
+        assert.strictEqual(signal.saves(), 2, "the met wait at once, the rest at the pass end");
         const other = (yield* storedWaits(filePath)).find((wait) => wait.threadId === OTHER_THREAD);
         assert.strictEqual(other?.state, "delivering");
         const hungWait = (yield* storedWaits(filePath)).find((wait) => wait.threadId === THREAD);
@@ -1625,7 +1629,7 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
   );
 
   it.effect(
-    "a check at registration counts too: with its kind full, register stores the wait without one",
+    "a check at registration counts too: with its kind full, register waits up to its 3 s limit, then stores the wait without one",
     () =>
       Effect.gen(function* () {
         yield* TestClock.setTime(NOW);
@@ -1643,11 +1647,10 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
           const fiber = yield* Effect.forkChild(
             register(service, fileWait(watched(`dead-mount/r-${index}`))),
           );
-          // The first two start a check and give up on it at the 3 s limit; the rest start none.
-          if (index < 2) {
-            yield* Queue.take(starts);
-            yield* stepSeconds(4);
-          }
+          // The first two start a check and give up on it at the 3 s limit; the rest find both
+          // places held (on time, then stuck) and start none.
+          if (index < 2) yield* Queue.take(starts);
+          yield* stepSeconds(4);
           const result = yield* Fiber.join(fiber);
           assert.strictEqual(result.state, "waiting");
         }
@@ -1712,20 +1715,47 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
     },
   );
 
-  it.effect("the answers of one pass are saved in one write", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(NOW);
-      const fs = yield* FileSystem.FileSystem;
-      const { filePath, watched } = yield* workspace;
-      const signal = yield* saveSignal(filePath);
-      const service = yield* makeService({ filePath, fs: signal.fs });
-      for (const name of ["a", "b", "c"]) yield* register(service, fileWait(watched(name)));
-      for (const name of ["a", "b", "c"]) yield* fs.writeFileString(watched(name), "");
-      signal.arm();
-      yield* TestClock.adjust(5_000);
-      assert.deepStrictEqual(yield* service.judgeDue(), { judged: 3, ended: 3 });
-      assert.strictEqual(signal.saves(), 1);
-    }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  it.effect(
+    "an answer that ends its wait is saved at once; the other answers of a pass in one write",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        const { filePath, watched } = yield* workspace;
+        const signal = yield* saveSignal(filePath);
+        // A failed read does not end a wait (it is held against it only after the grace).
+        const judges: WaitJudges = {
+          file: (target, context) =>
+            context.waitId !== null && target.spec.path.includes("broken")
+              ? Effect.succeed<Judgement>({ type: "failed", message: "No.", permanent: false })
+              : fs.exists(target.spec.path).pipe(
+                  Effect.orDie,
+                  Effect.map((exists): Judgement =>
+                    exists
+                      ? { type: "met", outcome: "exists", detail: "It exists." }
+                      : { type: "notYet" },
+                  ),
+                ),
+        };
+        const service = yield* makeService({ filePath, judges, fs: signal.fs });
+        const names = ["a", "b", "c", "broken-1", "broken-2"];
+        for (const name of names) yield* register(service, fileWait(watched(name)));
+        for (const name of ["a", "b", "c"]) yield* fs.writeFileString(watched(name), "");
+        signal.arm();
+        yield* TestClock.adjust(5_000);
+        // All five in one pass (two places, quick checks), three ended.
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 5, ended: 3 });
+        assert.strictEqual(signal.saves(), 4, "three at once, then one for the two failed reads");
+        const stored = yield* storedWaits(filePath);
+        assert.deepStrictEqual(
+          stored.map((wait) => wait.state),
+          ["delivering", "delivering", "delivering", "waiting", "waiting"],
+        );
+        assert.deepStrictEqual(
+          stored.map((wait) => wait.lastError),
+          [undefined, undefined, undefined, "No.", "No."],
+        );
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
   );
 
   it.effect("a failed stat stores its error without the path", () =>
@@ -2202,5 +2232,214 @@ it.layer(NodeServices.layer)("WaitService: lens findings on #91", (it) => {
       assert.include(send.sent[0]!.text, "is gone (archived or deleted)");
       assert.deepStrictEqual(yield* storedNotices(filePath), []);
     }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+});
+
+it.layer(NodeServices.layer)("WaitService: carry from #90 (fix round 2 on #91)", (it) => {
+  const ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+  const idOf = (n: number) =>
+    `w_${Array.from({ length: 10 }, (_, index) => ALPHABET[Math.floor(n / 32 ** (9 - index)) % 32]).join("")}`;
+  // The store lives in memory (see `memoryFileSystem`), so every write answers at once and a
+  // few turns let the forked passes catch up with the test clock.
+  const filePath = `/waits/state/${WAIT_STORE_FILE}`;
+  const watched = (name: string) => `/waits/${name}`;
+  const letFibersRun = Effect.gen(function* () {
+    for (let turn = 0; turn < 20; turn += 1) yield* Effect.yieldNow;
+  });
+  const inMemory = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs));
+  const unitWait = (n: number) =>
+    record({
+      id: idOf(100 + n),
+      key: (100 + n).toString(16).padStart(16, "0"),
+      kind: "unit",
+      spec: { name: `u${n}.service`, scope: "user" },
+    });
+
+  it.effect(
+    "a sweep starts checks for 10 s at most: waits whose kind stays full go first in the next pass",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        yield* seed(filePath, [0, 1, 2, 3, 4, 5].map(unitWait));
+        const starts: string[] = [];
+        // Healthy but slow: 20 s, under the 60 s limit.
+        const judges: WaitJudges = {
+          unit: (target) =>
+            Effect.sync(() => starts.push(target.spec.name)).pipe(
+              Effect.andThen(Effect.sleep(20_000)),
+              Effect.as<Judgement>({ type: "notYet" }),
+            ),
+        };
+        const service = yield* makeService({ filePath, judges });
+        const first = yield* Effect.forkChild(service.judgeDue());
+        yield* letFibersRun;
+        yield* stepSeconds(25);
+        yield* letFibersRun;
+        assert.isDefined(first.pollUnsafe(), "the pass ended with its own checks");
+        assert.deepStrictEqual(yield* Fiber.join(first), { judged: 2, ended: 0 });
+        assert.deepStrictEqual(starts, ["u0.service", "u1.service"]);
+
+        const second = yield* Effect.forkChild(service.judgeDue());
+        yield* letFibersRun;
+        assert.deepStrictEqual(starts.slice(2), ["u2.service", "u3.service"]);
+        yield* stepSeconds(25);
+        yield* letFibersRun;
+        assert.isDefined(second.pollUnsafe());
+      }).pipe(inMemory, Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "register waits for a place that frees in time, so its first check is not skipped",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const ready = watched("ready");
+        let slowStarts = 0;
+        // In memory, so the answers keep to the test clock.
+        const judges: WaitJudges = {
+          file: (target, context) =>
+            context.waitId !== null && target.spec.path.includes("slow")
+              ? Effect.sync(() => (slowStarts += 1)).pipe(
+                  Effect.andThen(Effect.sleep(2_000)),
+                  Effect.as<Judgement>({ type: "notYet" }),
+                )
+              : Effect.succeed<Judgement>(
+                  target.spec.path === ready
+                    ? { type: "met", outcome: "exists", detail: "It exists." }
+                    : { type: "notYet" },
+                ),
+        };
+        const service = yield* makeService({ filePath, judges });
+        yield* register(service, fileWait(watched("slow-1")));
+        yield* register(service, fileWait(watched("slow-2")));
+        yield* TestClock.adjust(5_000);
+        const sweep = yield* Effect.forkChild(service.judgeDue());
+        yield* letFibersRun;
+        // Both file places are held by the sweep's slow (healthy) checks.
+        const registering = yield* Effect.forkChild(
+          register(service, fileWait(ready), OTHER_THREAD),
+        );
+        yield* stepSeconds(3);
+        yield* letFibersRun;
+        const result = yield* Fiber.join(registering);
+        assert.strictEqual(result.state, "met");
+        yield* letFibersRun;
+        yield* Fiber.join(sweep);
+      }).pipe(inMemory, Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
+    "when every file check is stuck, file checks run in their own process: a healthy wait is met, logged once",
+    () => {
+      const logs = logCollector();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        const exists = (path: string) =>
+          fs.exists(path).pipe(
+            Effect.orDie,
+            Effect.map((found): Judgement =>
+              found ? { type: "met", outcome: "exists", detail: "It exists." } : { type: "notYet" },
+            ),
+          );
+        const judges: WaitJudges = {
+          file: (target, context) =>
+            context.waitId !== null && target.spec.path.includes("/dead/")
+              ? Effect.never
+              : exists(target.spec.path),
+        };
+        let childChecks = 0;
+        const fileChildJudge: WaitJudge<"file"> = (target) =>
+          Effect.sync(() => (childChecks += 1)).pipe(Effect.andThen(exists(target.spec.path)));
+        const service = yield* makeService({ filePath, judges, fileChildJudge });
+        yield* register(service, fileWait(watched("dead/a")));
+        yield* register(service, fileWait(watched("dead/b")));
+        yield* TestClock.adjust(5_000);
+        const first = yield* Effect.forkChild(service.judgeDue());
+        yield* stepSeconds(15);
+        yield* Fiber.join(first);
+        assert.strictEqual(childChecks, 0);
+
+        const healthy = watched("healthy");
+        yield* register(service, fileWait(healthy), OTHER_THREAD);
+        assert.strictEqual(childChecks, 1, "its registration check ran in a process");
+        yield* fs.writeFileString(healthy, "");
+        yield* TestClock.adjust(10_000);
+        yield* service.judgeDue();
+        const other = (yield* storedWaits(filePath)).find((wait) => wait.threadId === OTHER_THREAD);
+        assert.strictEqual(other?.state, "delivering");
+        const stuck = logs.errors.filter((line) => line.includes("file checks have not answered"));
+        assert.strictEqual(stuck.length, 1);
+        assert.include(stuck[0] ?? "", "its own process");
+      }).pipe(
+        inMemory,
+        Effect.provide(Layer.merge(logs.layer, ServerSettingsService.layerTest(ON))),
+      );
+    },
+  );
+
+  it.effect(
+    "when the file check processes are stuck too, file checks pause, and each stuck place is logged once",
+    () => {
+      const logs = logCollector();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const judges: WaitJudges = {
+          file: (_target, context) =>
+            context.waitId === null ? Effect.succeed<Judgement>({ type: "notYet" }) : Effect.never,
+        };
+        const service = yield* makeService({
+          filePath,
+          judges,
+          fileChildJudge: () => Effect.never,
+        });
+        for (const name of ["a", "b", "c", "d"])
+          yield* register(service, fileWait(watched(`dead/${name}`)));
+        yield* TestClock.adjust(5_000);
+        // a and b hold the file places until they turn late at 10 s, when this pass stops
+        // starting checks; c and d are left for the next one.
+        const first = yield* Effect.forkChild(service.judgeDue());
+        yield* stepSeconds(15);
+        yield* letFibersRun;
+        assert.isDefined(first.pollUnsafe(), "the pass ended");
+        assert.deepStrictEqual(yield* Fiber.join(first), { judged: 2, ended: 0 });
+        // There both places are stuck, so c and d go to processes, which never answer either.
+        yield* TestClock.adjust(5_000);
+        const second = yield* Effect.forkChild(service.judgeDue());
+        yield* stepSeconds(15);
+        yield* letFibersRun;
+        assert.isDefined(second.pollUnsafe(), "the second pass ended");
+        assert.deepStrictEqual(yield* Fiber.join(second), { judged: 4, ended: 0 });
+        const stored = yield* storedWaits(filePath);
+        assert.deepStrictEqual(
+          stored.map((wait) => wait.lastError),
+          [
+            "Its last check has not answered yet.",
+            "Its last check has not answered yet.",
+            "The check gave no answer in 12s.",
+            "The check gave no answer in 12s.",
+          ],
+        );
+
+        // A new wait finds both places stuck: no check starts, and the sweep pauses it.
+        const late = yield* register(service, fileWait(watched("dead/e")), OTHER_THREAD);
+        assert.strictEqual(late.state, "waiting");
+        yield* TestClock.adjust(10_000);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 5, ended: 0 });
+        assert.strictEqual(
+          logs.errors.filter((line) => line.includes("file checks have not answered")).length,
+          1,
+        );
+        assert.strictEqual(
+          logs.errors.filter((line) => line.includes("file check processes have not answered"))
+            .length,
+          1,
+        );
+      }).pipe(
+        inMemory,
+        Effect.provide(Layer.merge(logs.layer, ServerSettingsService.layerTest(ON))),
+      );
+    },
   );
 });
