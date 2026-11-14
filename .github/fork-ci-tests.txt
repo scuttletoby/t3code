@@ -21,6 +21,7 @@
 .github/scripts/fork-secret-scan.test.sh
 .github/scripts/fork-test-shards.test.cjs
 .github/scripts/fork-tests-drift.test.cjs
+.github/scripts/fork-upstream-files-check.test.cjs
 .github/scripts/fork-workflow-triggers.test.cjs
 fork-ci/actions/docs-scope/docs-scope.test.py
 fork-ci/actions/fleet-route/fleet_route.test.py
