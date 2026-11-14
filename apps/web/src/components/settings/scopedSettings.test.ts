@@ -934,3 +934,64 @@ describe("model selection patches at project scope", () => {
     ).toEqual({ ...saved, options });
   });
 });
+
+// Fork: waits. A project lists every check it uses; its map replaces the environment's.
+describe("wait checks at project scope", () => {
+  const environmentId = EnvironmentId.make("laptop");
+  const projectId = ProjectId.make("fleet");
+  const scope = {
+    kind: "project" as const,
+    group: {} as never,
+    environmentId: null,
+    label: "fleet",
+    members: [{ id: projectId, environmentId } as never],
+    environmentIds: [environmentId],
+  };
+  const check = (program: string) => ({
+    argv: [program],
+    maxArgs: 0,
+    argPattern: "^[a-z]+$",
+    intervalSeconds: 30,
+    timeoutSeconds: 20,
+    description: "",
+  });
+  const withSettings = (settings: Partial<ServerSettings>) => [
+    {
+      environmentId,
+      label: "Laptop",
+      connection: { phase: "connected" as const },
+      serverConfig: { settings: { ...DEFAULT_SERVER_SETTINGS, ...settings } },
+    },
+  ];
+
+  it("stores the edited map whole, so a check removed in the project does not come back", () => {
+    const environments = withSettings({
+      waitChecks: { build: check("build"), deploy: check("deploy") },
+    });
+    const plan = planScopedSettingsPatch(scope, environments, {
+      waitChecks: { build: check("build") },
+    });
+    expect(plan.serverWrites[0]?.patch).toEqual({
+      projectSettingsOverrides: { [projectId]: { waitChecks: { build: check("build") } } },
+    });
+  });
+
+  it("stores an empty map as a project with no checks", () => {
+    const environments = withSettings({ waitChecks: { build: check("build") } });
+    const plan = planScopedSettingsPatch(scope, environments, { waitChecks: {} });
+    expect(plan.serverWrites[0]?.patch).toEqual({
+      projectSettingsOverrides: { [projectId]: { waitChecks: {} } },
+    });
+  });
+
+  it("refuses the environment-wide wait and slot settings at project scope", () => {
+    const environments = withSettings({});
+    for (const patch of [{ waitFor: { enabled: true } }, { agentSlots: { enabled: true } }]) {
+      const plan = planScopedSettingsPatch(scope, environments, patch);
+      expect(plan.serverWrites).toEqual([]);
+      expect(plan.unavailableReason).toBe(
+        "This setting is environment-wide and cannot be overridden by a project.",
+      );
+    }
+  });
+});

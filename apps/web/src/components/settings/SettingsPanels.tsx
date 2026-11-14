@@ -80,6 +80,7 @@ import {
   usePrimaryEnvironmentId,
 } from "../../state/environments";
 import { EMPTY_SERVER_PROVIDERS } from "../../state/server";
+import { WaitsAndSlotsSettings } from "./WaitsAndSlotsSettings";
 import { Button } from "../ui/button";
 import { DraftInput } from "../ui/draft-input";
 import { Input } from "../ui/input";
@@ -1880,6 +1881,8 @@ export function ThreadsSettingsPanel() {
           }
         />
       </SettingsSection>
+
+      {hasServerTargets ? <WaitsAndSlotsSettings isProjectScope={isProjectScope} /> : null}
 
       {hasServerTargets ? (
         <SettingsSection id="auto-settle" title="Auto-settle">
