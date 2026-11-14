@@ -287,8 +287,12 @@ jobs:
     name: Release
     needs: [plan]
     if: needs.plan.outputs.action == 'release' || needs.plan.outputs.action == 'rebase'
+    # A called workflow's job may not ask for more than this grants, even a skipped one, or GitHub
+    # refuses the whole run at start-up: fork-release.yml's tests job asks for actions: write
+    # (fork-tests.yml's fleet_watch). fork-release.yml's top level keeps its other jobs at read.
+    # Test: fork-reusable-permissions.test.py.
     permissions:
-      actions: read
+      actions: write
       contents: write
     uses: ./.github/workflows/fork-release.yml
     # By name, only what fork-release.yml declares (release-desktop.yml's signing secrets).
