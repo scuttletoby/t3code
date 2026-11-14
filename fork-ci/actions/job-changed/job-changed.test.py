@@ -352,7 +352,8 @@ class Paths(Repo):
         self.assertIn('git diff', lines[0])
 
     def test_workflow_alone_for_a_test_scope_caller(self):
-        # SkyRPG #1422: a test-scope step needs "does the workflow change reach this job", apart from the build paths.
+        # A test-scope step needs "does the workflow change reach this job", apart from the build paths (a caller's
+        # test scope widened to every test on any edit of the workflow file).
         self.commit({CI: FIXTURE.replace('python3 tests.py', 'python3 tests.py -v'), 'src/A.java': 'class A { int x; }'})
         o = self.outputs('plugins', paths='^src/')
         self.assertEqual((o['changed'], o['workflow']), ('true', 'false'))
