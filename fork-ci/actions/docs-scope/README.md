@@ -4,7 +4,8 @@ A composite action that answers two questions about the change a CI run tests:
 
 - **Is it docs-only?** Then the build and test jobs can pass at once.
 - **Which jobs does it reach?** A job runs when a changed file that is not docs matches its paths. A file that is
-  not docs but that no job names (a root build file, a workflow), or a change to the config, runs every job.
+  not docs but that no job names (a root build file, a workflow), or a change to the config, runs every job, unless
+  the config's `no_build` says it builds nothing.
 
 It is the general half of a docs-only gate. The project half (which files are docs, which docs a build or test
 reads, which folders each job builds) is a JSON config in the calling repository.
@@ -104,6 +105,7 @@ the diff to commits a passing push run already tested.
     }
   ],
   "docs_only_events": ["pull_request"],
+  "no_build": [".github/ISSUE_TEMPLATE/**", "tools/notes/**"],
   "jobs": {
     "engine": {
       "paths": ["engine/**", "shared/items/**"],
@@ -137,6 +139,12 @@ the diff to commits a passing push run already tested.
 - `docs_only_events`: events that may be docs-only (default `["pull_request"]`).
 - `jobs`: per job, `paths` globs and `paths_from` lists. Docs files never run a job; a `never_docs` file does. A
   file that is not docs and that no job names runs every job, and so does a change to the config.
+- `no_build`: globs of files that are not docs but that no job builds (an issue template, a tool's notes). Such a
+  file no longer runs every job, exactly as a file a job names no longer does; it is never a job output, and the
+  log says `no_build: <file> builds nothing (matches <glob>)`. A file a job names still runs that job. It is read
+  from the base like every other rule, so a pull request cannot add its own files to it. Default `[]`: a config
+  without the key behaves as before. A release older than the one that added `no_build` reads the key as unknown,
+  which is a full run: bump the pin before adding the key.
 
 Unknown keys and wrong types are an error (a typo such as `never_doc` must not drop a rule quietly), and an error
 means a full run that names it. The `config` input must be a plain repository path (no `./`, `..` or leading `/`),
@@ -162,6 +170,35 @@ path that is not plain, no config at the base, a config that does not parse or h
 that is not a plain path). Any other error is caught too and gives a full run with its message, never a step without
 outputs. A symlink or submodule is never docs, and the diff uses `--ignore-submodules=none`, so neither
 `ignore = all` in `.gitmodules` nor the runner's `diff.ignoreSubmodules` can hide a gitlink bump.
+
+## Python API
+
+Tools outside a workflow (a local check, a deploy script) ask the same rules about one path. Run the module from
+the release the project pins, checked by blob id ([`pinned`](../pinned/README.md):
+`load(config, 'docs-scope', 'docs_scope')`). Callers may import exactly these names; anything else may change in
+any release.
+
+| Name                                                                         | What it does                                                                        |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `docs_rule(config, read, config_path=DEFAULT_CONFIG)`                        | `is_docs(path) -> bool`, the action's rule; unreadable config or list: always False |
+| `job_rule(config, job, read, config_path=...)`                               | `runs(path) -> bool` for one job, as `decide()` answers it; unreadable: always True |
+| `rules(config, read, config_path=...)`                                       | a `Rules` object; raises `Unclear` when the config or a list cannot be read         |
+| `Rules.not_docs(path, plain=True)`                                           | `None` for docs, else why not (`plain=False`: a symlink or submodule)               |
+| `Rules.job_runs(job, path)`, `Rules.job_hit(job, path)`                      | why a change of path runs the job (or `None`); why the job's paths name it          |
+| `Rules.runs_every_job(path)`, `Rules.builds_nothing(path)`                   | the "no job names it" rule; the `no_build` glob that matches, if no job names it    |
+| `decide(event, config_path, head, base, run, sha, event_path)`               | the action's whole answer: `(docs_only, jobs, reason lines)`                        |
+| `the_change(event, head, base, run, sha, event_path)`                        | `(rows, base commit, what was compared)`: the change as the action computes it      |
+| `glob_re(pattern)`, `PLAIN_MODES`, `git(*args)`, `Unclear`, `DEFAULT_CONFIG` | the glob rule, file modes, the git runner, the error, the default path              |
+
+- `config` is the config as a dict or its JSON text, checked as the action checks it (a typo is `Unclear`). The
+  caller's dict is never changed.
+- `read(file)` returns a `*_from` file's text, or `None` when it does not exist. Pass one reader (the working tree)
+  or a list `[base, head]` as the action reads them: an entry at either counts, and "no job names it" is judged by
+  the first alone. No fake ref is needed.
+- `decide()` runs on the same `Rules`, so the answers cannot differ (`docs-scope.test.py`, `PythonApi`, checks them
+  side by side on a sample of paths).
+- Kept for older callers, to be dropped later: `read_entries(src, refs, run)`, `union(...)`, `entry_match(...)`.
+  Use `rules()` instead.
 
 ## Tests
 
