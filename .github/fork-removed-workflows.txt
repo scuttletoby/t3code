@@ -12,3 +12,5 @@
 # workflow_run on a workflow named "CI": an outside pull request can add a workflow of that name.
 .github/workflows/thread-transfer-report.yml
 .github/workflows/mobile-fingerprint-label.yml
+# issues (opened, reopened): anyone who may open an issue starts it; upstream added it in 2026-11.
+.github/workflows/issue-vouch.yml
