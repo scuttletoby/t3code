@@ -9,6 +9,10 @@
 #   HEAD_SHA     pull_request: the PR head
 #   BEFORE       push: the branch tip before the push (all zeros when the branch is new)
 #   AFTER        push: the branch tip after the push
+#   UPSTREAM     push: owner/name of the repository this fork follows (the workflow reads this
+#                fork's parent, as fork-follow.yml does); empty when it could not be read
+#   UPSTREAM_URL push: git URL of upstream (default https://github.com/$UPSTREAM.git, as in
+#                fork-follow.sh)
 #
 # Ranges:
 #   pull_request   BASE_SHA..HEAD_SHA: every commit the PR adds, merges of the base branch
@@ -20,6 +24,13 @@
 #                  only AFTER itself, with a warning. Everything before it is history this fork
 #                  already had (upstream's, or scanned by earlier runs), and there is no older tip
 #                  to tell new commits from old ones.
+#   push, upstream  every push range leaves out the commits upstream's default branch or one of its
+#                  v* tags holds. A fork-follow rebase force-pushes the series onto a newer upstream
+#                  tag, so BEFORE..AFTER would otherwise hold hundreds of upstream's commits (and
+#                  upstream's own test fixtures); only the commits this fork adds are its business.
+#                  Upstream is fetched read-only, commits only, into refs/scan-upstream/*, which
+#                  each run empties first. Fail closed: when UPSTREAM is empty or the fetch fails,
+#                  nothing is left out (the full range, with a warning).
 # Merge commits are diffed with --remerge-diff: only what the merge itself changed beyond an
 # automatic merge of its parents (a conflict resolution, or a file added in the merge). Without it
 # git log shows merges with no diff at all, so gitleaks would never read them.
@@ -41,6 +52,17 @@ fetch() {
   have "$1"
 }
 zero() { [[ -z "$1" || "$1" =~ ^0+$ ]]; }
+# Upstream's default branch and v* tags (the same tags fork-follow.sh reads), commits only, into
+# refs/scan-upstream/*. Refs from an earlier run go first, so a tag upstream has deleted since is
+# not left out. A failed fetch adds no exclusion at all.
+fetch_upstream() {
+  git for-each-ref --format='delete %(refname)' refs/scan-upstream/ | git update-ref --stdin || return 1
+  [[ -n "${UPSTREAM:-}" ]] || return 1
+  local url="${UPSTREAM_URL:-https://github.com/$UPSTREAM.git}"
+  timeout 600 git fetch --quiet --no-tags --filter=blob:none "$url" \
+    "+HEAD:refs/scan-upstream/head" "+refs/tags/v*:refs/scan-upstream/tags/v*" >&2 || return 1
+  git rev-parse --quiet --verify refs/scan-upstream/head > /dev/null
+}
 summary() { if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; fi; }
 
 warning=""
@@ -74,6 +96,21 @@ case "$EVENT_NAME" in
         warning="the earlier tip ${BEFORE:0:12} cannot be fetched (force push?), so only the newest commit ${AFTER:0:12} is scanned"
       fi
       what="the pushed commit ${AFTER:0:12}"
+    fi
+    # Leave out upstream's commits (see the header). --glob takes every ref under the prefix.
+    if fetch_upstream; then
+      full="$range"
+      range="$range --not --glob=refs/scan-upstream"
+      opts="--remerge-diff $range"
+      # shellcheck disable=SC2086
+      what="$what, minus the $(( $(git rev-list --count $full) - $(git rev-list --count $range) )) commit(s) upstream $UPSTREAM already has"
+    else
+      if [[ -z "${UPSTREAM:-}" ]]; then
+        reason="upstream is not known (UPSTREAM is empty)"
+      else
+        reason="upstream $UPSTREAM could not be fetched"
+      fi
+      warning="${warning:+$warning; }$reason, so its commits in the range are scanned too"
     fi
     ;;
   *)
