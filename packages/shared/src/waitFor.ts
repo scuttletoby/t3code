@@ -91,6 +91,11 @@ function isWindowsDeviceName(segment: string): boolean {
 }
 
 const textEncoder = new TextEncoder();
+/**
+ * Text that goes into a message (a note, a path, a repository, a check argument) is refused with
+ * any of these; `messageText` also turns them into spaces for records stored before this check.
+ */
+const HAS_LINE_BREAK_OR_CONTROL = /[\p{Cc}\p{Zl}\p{Zp}]/u;
 
 /** Bytes `text` takes in the store file: JSON-escaped, in UTF-8, without the quotes. */
 export function storedBytes(text: string): number {
@@ -122,6 +127,9 @@ export function validateWaitSpec(
   const note = request.input.note;
   if (note !== undefined && storedBytes(note) > MAX_NOTE_BYTES) {
     return refuse("invalid", `The note is too long: at most ${MAX_NOTE_BYTES} bytes as stored.`);
+  }
+  if (note !== undefined && HAS_LINE_BREAK_OR_CONTROL.test(note)) {
+    return refuse("invalid", "The note must be one line, without control characters.");
   }
   const checked = validateTarget(request);
   if (!checked.ok) return checked;
@@ -160,6 +168,9 @@ function validateTarget({
     case "pr": {
       if (input.pr === undefined) return refuse("invalid", 'Kind "pr" needs "pr": {number}.');
       const { number, repository, until } = input.pr;
+      if (repository !== undefined && HAS_LINE_BREAK_OR_CONTROL.test(repository)) {
+        return refuse("invalid", "The repository must be one line, without control characters.");
+      }
       return {
         ok: true,
         target: {
@@ -175,7 +186,10 @@ function validateTarget({
     case "file": {
       if (input.file === undefined) return refuse("invalid", 'Kind "file" needs "file": {path}.');
       const { path, until } = input.file;
-      if (path.includes("\0") || !isLocalAbsolutePath(path, platform)) {
+      if (HAS_LINE_BREAK_OR_CONTROL.test(path)) {
+        return refuse("invalid", "The file path must be one line, without control characters.");
+      }
+      if (!isLocalAbsolutePath(path, platform)) {
         return refuse(
           "invalid",
           "The file path must be an absolute path on this machine, not a network or device path.",
@@ -213,7 +227,9 @@ function validateTarget({
       }
       // The whole argument must match, whatever anchors the pattern has.
       const pattern = new RegExp(`^(?:${check.argPattern})$`, "u");
-      const bad = args.find((arg) => arg.startsWith("-") || !pattern.test(arg));
+      const bad = args.find(
+        (arg) => arg.startsWith("-") || HAS_LINE_BREAK_OR_CONTROL.test(arg) || !pattern.test(arg),
+      );
       if (bad !== undefined) {
         return refuse(
           "invalid",
@@ -440,8 +456,11 @@ export type WaitEvent =
   /** The sweep gave a `waiting` slot wait a free slot. */
   | { readonly type: "slotGranted"; readonly detail: string }
   | { readonly type: "cancel" }
-  /** Written before the first send to the current receiver. */
-  | { readonly type: "sendStarted"; readonly messageId: string }
+  /**
+   * Written before the first send to the current receiver. `replaces` names an id the wait has
+   * that was never sent (see `DeliveryGroup.replaces`).
+   */
+  | { readonly type: "sendStarted"; readonly messageId: string; readonly replaces?: string }
   /** The send was accepted or replayed, or the message was found in the thread. */
   | { readonly type: "delivered" }
   /** The command id was refused; the next try needs a new one. */
@@ -452,8 +471,16 @@ export type WaitEvent =
    * parent at once: a `waiting` one as a wake that says it had not ended, and is judged no more.
    */
   | { readonly type: "threadGone"; readonly parentThreadId: ThreadId | null }
-  /** The receiver's latest run was stopped by a person or its parent. */
-  | { readonly type: "threadStopped"; readonly parentThreadId: ThreadId | null }
+  /**
+   * The receiver's latest run was stopped by a person or its parent. `stoppedAt` is when that
+   * run last started or ended, if known: a time after `stoppedSince` means it ran and was stopped
+   * again since, and the hold starts again from then.
+   */
+  | {
+      readonly type: "threadStopped";
+      readonly parentThreadId: ThreadId | null;
+      readonly stoppedAt?: number;
+    }
   /** The receiver has run since it was stopped. */
   | { readonly type: "threadRunning" };
 
@@ -618,7 +645,9 @@ export function nextWaitState(
         ? { record: update(wait, { state: "cancelled", endedAt: iso(now) }) }
         : null;
     case "sendStarted":
-      return wait.state === "delivering" && wait.messageId === undefined
+      return wait.state === "delivering" &&
+        (wait.messageId === undefined ||
+          (event.replaces !== undefined && wait.messageId === event.replaces))
         ? { record: update(wait, { messageId: event.messageId }) }
         : null;
     case "delivered": {
@@ -653,7 +682,13 @@ export function nextWaitState(
       if (wait.stoppedSince === undefined) {
         return { record: update(wait, { stoppedSince: iso(now) }) };
       }
-      return now - Date.parse(wait.stoppedSince) >= settings.stoppedHandOverHours * MS_PER_HOUR
+      const since = Date.parse(wait.stoppedSince);
+      const latest = event.stoppedAt === undefined ? null : Math.min(event.stoppedAt, now);
+      // Stopped again after it ran: the hold counts from the latest stop.
+      if (latest !== null && latest > since) {
+        return { record: update(wait, { stoppedSince: iso(latest) }) };
+      }
+      return now - since >= settings.stoppedHandOverHours * MS_PER_HOUR
         ? handOver(wait, "stopped", event.parentThreadId, now)
         : null;
     }
@@ -728,6 +763,12 @@ export interface DeliveryGroup {
   readonly messageId: string;
   /** Not yet written on the waits: the caller writes it (`sendStarted`) before it sends. */
   readonly fresh: boolean;
+  /**
+   * A fresh group of waits that carry this message id already, but did not fit in its message
+   * (more than `MAX_JOINED` on one id, which only a store written by hand can hold). That message
+   * was never sent, since it cannot be built, so `sendStarted` may replace the id.
+   */
+  readonly replaces?: string;
   readonly waits: ReadonlyArray<WaitRecord>;
 }
 
@@ -740,17 +781,35 @@ export function deliveryGroups(waits: ReadonlyArray<WaitRecord>): ReadonlyArray<
     .filter((wait) => wait.state === "delivering")
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const groups: DeliveryGroup[] = [];
+  // By receiver and message id: a message goes to one thread only.
   const started = new Map<string, WaitRecord[]>();
   const fresh = new Map<ThreadId, WaitRecord[]>();
   for (const wait of delivering) {
     if (wait.messageId !== undefined) {
-      started.set(wait.messageId, [...(started.get(wait.messageId) ?? []), wait]);
+      const key = JSON.stringify([wait.threadId, wait.messageId]);
+      started.set(key, [...(started.get(key) ?? []), wait]);
     } else {
       fresh.set(wait.threadId, [...(fresh.get(wait.threadId) ?? []), wait]);
     }
   }
-  for (const [messageId, members] of started) {
-    groups.push({ threadId: members[0]!.threadId, messageId, fresh: false, waits: members });
+  for (const members of started.values()) {
+    const { threadId, messageId } = members[0]!;
+    groups.push({
+      threadId,
+      messageId: messageId!,
+      fresh: false,
+      waits: members.slice(0, MAX_JOINED),
+    });
+    // More than fit in one message: the rest get messages of their own, with ids of their own.
+    for (let index = MAX_JOINED; index < members.length; index += MAX_JOINED) {
+      groups.push({
+        threadId,
+        messageId: `${messageId}:split:${index / MAX_JOINED}`,
+        fresh: true,
+        replaces: messageId!,
+        waits: members.slice(index, index + MAX_JOINED),
+      });
+    }
   }
   for (const [threadId, members] of fresh) {
     for (let index = 0; index < members.length; index += MAX_JOINED) {
@@ -792,8 +851,23 @@ export function waitTargetText(target: WaitTarget): string {
   }
 }
 
+/** The most of a wait's target, and of its note, that one message line shows. */
+const TARGET_TEXT_MAX = 300;
+const NOTE_TEXT_MAX = 200;
+/** Line breaks, other control characters and invisible format characters (such as bidi marks). */
+const NOT_ONE_LINE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+
+/**
+ * `text` as one line of at most `max` characters: every line break, control and format character
+ * becomes a space. Text a thread or a store controls goes through here before it is put into a
+ * message, so it can never start a line of its own (such as a forged `[wait …]` line).
+ */
+export function messageText(text: string, max: number): string {
+  return clip(text.replace(NOT_ONE_LINE, " "), max);
+}
+
 function wakeLine(wait: WaitRecord): string {
-  const via = wait.via ?? [];
+  const via = (wait.via ?? []).map((threadId) => messageText(threadId, 200));
   const last = via.at(-1);
   const registeredBy = via.length > 1 ? ` (registered by ${via[0]})` : "";
   const handedOver =
@@ -805,14 +879,31 @@ function wakeLine(wait: WaitRecord): string {
   const result =
     wait.result === undefined
       ? "not ended yet. This wait ends here; check it yourself if you still need it."
-      : `${wait.result.outcome}.${wait.result.detail === "" ? "" : ` ${clip(wait.result.detail)}`}`;
-  return `[wait ${wait.id}] ${handedOver}${waitTargetText(wait)}: ${result}`;
+      : `${wait.result.outcome}.${wait.result.detail === "" ? "" : ` ${messageText(wait.result.detail, DETAIL_MAX)}`}`;
+  return `[wait ${wait.id}] ${handedOver}${messageText(waitTargetText(wait), TARGET_TEXT_MAX)}: ${result}`;
 }
 
-/** One wait's message: `[wait <id>] <target>: <outcome>. <detail>`, and its note on a new line. */
+/**
+ * The note as one line, marked as the words of the thread that registered the wait when the
+ * message goes to another thread (a parent after a hand-over).
+ */
+function noteText(wait: WaitRecord): string | null {
+  if (wait.note === undefined) return null;
+  const note = messageText(wait.note, NOTE_TEXT_MAX);
+  const registeredBy = wait.via?.[0];
+  return registeredBy === undefined
+    ? `Note: ${note}`
+    : `Note from thread ${messageText(registeredBy, 200)}: ${note}`;
+}
+
+/**
+ * One wait's message: `[wait <id>] <target>: <outcome>. <detail>`, and its note on a new line.
+ * Every field is one line (`messageText`), so only the first line starts with a marker.
+ */
 export function wakeMessage(wait: WaitRecord): string {
   const line = wakeLine(wait);
-  return wait.note === undefined ? line : `${line}\nNote: ${wait.note}`;
+  const note = noteText(wait);
+  return note === null ? line : `${line}\n${note}`;
 }
 
 /** Several waits for one receiver, one line each; every line starts with its own marker. */
@@ -824,7 +915,8 @@ export function joinedWakeMessage(waits: ReadonlyArray<WaitRecord>): string {
   return waits
     .map((wait) => {
       const line = wakeLine(wait);
-      return wait.note === undefined ? line : `${line} Note: ${wait.note}`;
+      const note = noteText(wait);
+      return note === null ? line : `${line} ${note}`;
     })
     .join("\n");
 }

@@ -13,6 +13,7 @@ import {
   type WaitKind,
   type WaitListResult,
   type WaitRecord,
+  type WaitStoreNotice,
   type WaitTarget,
   WaitToolFailure,
   type WaitToolFailureCode,
@@ -29,7 +30,9 @@ import {
   joinedWakeMessage,
   type Judgement,
   MAX_ENDED_WAITS,
+  MAX_HAND_OVERS,
   MAX_OPEN_WAITS,
+  messageText,
   nextWaitState,
   shouldPruneWait,
   validateWaitSpec,
@@ -40,6 +43,7 @@ import {
   waitTargetText,
   type WaitTransition,
 } from "@t3tools/shared/waitFor";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -73,6 +77,14 @@ function judgeLimit(kind: WaitKind): Duration.Duration {
  */
 const MAX_RUNNING_JUDGES_PER_KIND = 2;
 const SEND_CONCURRENCY = 4;
+/**
+ * A send, or a look at a receiver, that has not answered by then counts as "try again later". The
+ * late send is stopped in the background, and its message is not sent again while it still runs;
+ * the next try looks for the message in the thread and for its receipt before it sends.
+ */
+const SEND_LIMIT = Duration.seconds(60);
+/** The most of a lost-wait notice's text that a message shows. */
+const NOTICE_TEXT_MAX = 1000;
 /** A held message to a stopped thread is looked at again this often, to see it run again. */
 const STOPPED_RECHECK_MS = 60_000;
 /** After the store could not be read, or a notice not sent, the next try is this much later. */
@@ -96,6 +108,24 @@ const failure = (code: WaitToolFailureCode, message: string) =>
 const targetOf = (wait: WaitRecord) => ({ kind: wait.kind, spec: wait.spec }) as WaitTarget;
 
 const isOpen = (wait: WaitRecord) => wait.state === "waiting" || wait.state === "delivering";
+
+/** A crash as one short line for a log or a stored error. */
+const causeText = (cause: Cause.Cause<unknown>) => messageText(Cause.pretty(cause), 300);
+
+/**
+ * A lost-wait notice as its receiver reads it: one line, and after a hand-over it says whose it
+ * was. Its text comes from a store file, so it goes through `messageText` like every wait field.
+ */
+function noticeMessage(notice: WaitStoreNotice): string {
+  const text = messageText(notice.text, NOTICE_TEXT_MAX);
+  const last = notice.via?.at(-1);
+  if (last === undefined) return text;
+  const what =
+    notice.handedOverBecause === "stopped"
+      ? "was stopped and has not run again"
+      : "is gone (archived or deleted)";
+  return `Thread ${messageText(last, 200)}, which you started, ${what}, so this notice for it comes to you: ${text}`;
+}
 
 function newWaitId(taken: ReadonlySet<string>): string {
   for (;;) {
@@ -198,6 +228,10 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   /** The first sweep looks at every thread with a `waiting` wait (events missed while down). */
   let checkAllReceivers = true;
   let noticesRetryAt = 0;
+  /** Sends that have not returned, by message id, each with its own token. */
+  const sending = new Map<string, object>();
+  /** Messages whose send crashed or ran late, already logged; cleared when the message is done. */
+  const sendTroubleLogged = new Set<string>();
 
   const judgeOf = (kind: WaitKind) => judges[kind] as WaitJudge | undefined;
 
@@ -214,6 +248,76 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       ),
     ),
   );
+
+  /** Read again before each step that writes a result or sends, so "off" stops a running sweep. */
+  const stillOn = readSettingsOrNull.pipe(
+    Effect.map((settings) => settings !== null && settings.waitFor.enabled),
+  );
+
+  const logSendTrouble = (messageId: string, line: string) =>
+    Effect.suspend(() => {
+      if (sendTroubleLogged.has(messageId)) return Effect.void;
+      sendTroubleLogged.add(messageId);
+      return Effect.logError(`waits: ${line}`);
+    });
+
+  /**
+   * One send, in its own fiber, within `SEND_LIMIT`. A crash or a late answer is "try again
+   * later" (logged once per message), so one thread's send never holds up or stops the others. A
+   * late send is stopped in the background; until it has stopped, its message is not sent again.
+   */
+  const send = Effect.fn("WaitService.send")(function* (message: WaitMessage) {
+    if (sending.has(message.messageId)) {
+      return { type: "retry", detail: "Its last send has not answered yet." } as const;
+    }
+    const token = {};
+    sending.set(message.messageId, token);
+    const fiber = yield* Effect.forkDetach(
+      Effect.suspend(() => input.delivery.deliver(message)).pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) =>
+            logSendTrouble(
+              message.messageId,
+              `the send of message ${message.messageId} to thread ${message.threadId} crashed; it is tried again later: ${causeText(cause)}`,
+            ).pipe(
+              Effect.as<WaitDeliveryResult>({
+                type: "retry",
+                detail: `The send crashed: ${causeText(cause)}`,
+              }),
+            ),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (sending.get(message.messageId) === token) sending.delete(message.messageId);
+          }),
+        ),
+      ),
+    );
+    const answer = yield* Fiber.join(fiber).pipe(Effect.timeoutOption(SEND_LIMIT));
+    if (Option.isSome(answer)) return answer.value;
+    yield* Effect.forkDetach(Fiber.interrupt(fiber));
+    const detail = `The send gave no answer in ${Duration.format(SEND_LIMIT)}.`;
+    yield* logSendTrouble(
+      message.messageId,
+      `the send of message ${message.messageId} to thread ${message.threadId} gave no answer in ${Duration.format(SEND_LIMIT)}; it is stopped and tried again later.`,
+    );
+    return { type: "retry", detail } as const;
+  });
+
+  /** The receiver within `SEND_LIMIT`; null (look again next sweep) when late or crashed. */
+  const receiverOf = (threadId: ThreadId) =>
+    Effect.suspend(() => input.delivery.receiver(threadId)).pipe(
+      Effect.timeoutOption(SEND_LIMIT),
+      Effect.map(Option.getOrNull),
+      Effect.catchCauseIf(
+        (cause) => !Cause.hasInterruptsOnly(cause),
+        (cause) =>
+          Effect.logError(
+            `waits: thread ${threadId} could not be looked at: ${causeText(cause)}`,
+          ).pipe(Effect.as(null)),
+      ),
+    );
 
   const unavailable = Effect.fnUntraced(function* (reason: string) {
     if (reason !== lastProblem) {
@@ -522,6 +626,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       set.add(entry);
       return Effect.forkDetach(
         Effect.suspend(judge).pipe(
+          // A check that crashes is a failed read of its own wait, never of the sweep.
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterruptsOnly(cause),
+            (cause) => Effect.succeed(lateJudgement(`The check crashed: ${causeText(cause)}`)),
+          ),
           Effect.ensuring(
             Effect.suspend(() => {
               set.delete(entry);
@@ -705,9 +814,17 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     const answers = yield* Effect.forEach(
       due,
       (wait) =>
-        judgeStored(wait, startedAt).pipe(Effect.map((judgement) => [wait.id, judgement] as const)),
+        judgeStored(wait, startedAt).pipe(
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterruptsOnly(cause),
+            (cause) => Effect.succeed(lateJudgement(`The check crashed: ${causeText(cause)}`)),
+          ),
+          Effect.map((judgement) => [wait.id, judgement] as const),
+        ),
       { concurrency: JUDGE_CONCURRENCY },
     );
+    // Switched off while the checks ran: nothing more is written or sent.
+    if (!(yield* stillOn)) return { judged: 0, ended: 0 };
     const ended = yield* applyJudgements(answers, settings);
     return { judged: due.length, ended };
   });
@@ -760,6 +877,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   const forgetMessage = (messageId: string) => {
     retryAt.delete(messageId);
     failures.delete(messageId);
+    sendTroubleLogged.delete(messageId);
   };
 
   /** The events one send's answer makes for each wait of its message. */
@@ -784,7 +902,13 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       case "gone":
         return [{ type: "threadGone", parentThreadId: result.parentThreadId }];
       case "stopped":
-        return [{ type: "threadStopped", parentThreadId: result.parentThreadId }];
+        return [
+          {
+            type: "threadStopped",
+            parentThreadId: result.parentThreadId,
+            ...(result.stoppedAt === undefined ? {} : { stoppedAt: result.stoppedAt }),
+          },
+        ];
     }
   };
 
@@ -846,7 +970,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     );
     const gone = new Map<ThreadId, ThreadId | null>();
     for (const threadId of toCheck) {
-      const receiver = yield* input.delivery.receiver(threadId);
+      const receiver = yield* receiverOf(threadId);
       if (receiver === null) receiversToCheck.add(threadId);
       else if (receiver.type === "gone") gone.set(threadId, receiver.parentThreadId);
     }
@@ -873,17 +997,23 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         const due = deliveryGroups(waits).filter(
           (group) => (retryAt.get(group.messageId) ?? 0) <= startedAt,
         );
-        const fresh = new Map<string, string>();
+        const fresh = new Map<string, DeliveryGroup>();
         for (const group of due) {
           if (!group.fresh) continue;
-          for (const wait of group.waits) fresh.set(wait.id, group.messageId);
+          for (const wait of group.waits) fresh.set(wait.id, group);
         }
         if (fresh.size > 0) {
           waits = waits.map((wait) => {
-            const messageId = fresh.get(wait.id);
-            return messageId === undefined
-              ? wait
-              : applyEvents(wait, [{ type: "sendStarted", messageId }], startedAt, settings, []);
+            const group = fresh.get(wait.id);
+            if (group === undefined) return wait;
+            const { messageId, replaces } = group;
+            return applyEvents(
+              wait,
+              [{ type: "sendStarted", messageId, ...(replaces === undefined ? {} : { replaces }) }],
+              startedAt,
+              settings,
+              [],
+            );
           });
         }
         if (transitions.length === 0 && fresh.size === 0) return due;
@@ -901,20 +1031,40 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     );
     if (planned.length === 0) return { sent: 0, ended: 0 };
 
-    // 3. Send, outside the lock: a slow thread never holds up register, list or cancel.
-    const results = yield* Effect.forEach(
+    // 3. Send, outside the lock: a slow thread never holds up register, list or cancel. Each
+    // message on its own: a crash or a late answer is "try again later" for that message only.
+    // Switched off meanwhile: the rest are not sent (and nothing is recorded for them).
+    const tried = yield* Effect.forEach(
       planned,
       (group) =>
-        input.delivery
-          .deliver({
+        Effect.gen(function* () {
+          if (!(yield* stillOn)) return null;
+          const result = yield* send({
             threadId: group.threadId,
             messageId: group.messageId,
             commandId: deliveryCommandId(group),
             text: joinedWakeMessage(group.waits),
-          })
-          .pipe(Effect.map((result) => [group, result] as const)),
+          });
+          return [group, result] as const;
+        }).pipe(
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterruptsOnly(cause),
+            (cause) =>
+              logSendTrouble(
+                group.messageId,
+                `message ${group.messageId} to thread ${group.threadId} cannot be built; it is tried again later: ${causeText(cause)}`,
+              ).pipe(
+                Effect.as([
+                  group,
+                  { type: "retry", detail: `It cannot be built: ${causeText(cause)}` },
+                ] as const),
+              ),
+          ),
+        ),
       { concurrency: SEND_CONCURRENCY },
     );
+    const results = tried.filter((entry) => entry !== null);
+    if (results.length === 0) return { sent: 0, ended: 0 };
 
     // 4. Write what each send's answer means.
     return yield* lock.withPermits(1)(
@@ -1002,9 +1152,36 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   });
 
   /**
-   * Sends the notices for waits lost in a bad file. A notice leaves the file once it was sent or
-   * can never be; a resend after a crash has the same command id, so it is one message. It runs
-   * only under `sweepLock` (the sweep, or `sendNotices` when no sweep runs), so two never overlap.
+   * The notice for the receiver's parent, or null when no parent can take it (none, a loop, or
+   * `MAX_HAND_OVERS` reached), the same rule as a wait's hand-over.
+   */
+  const handOverNotice = (
+    notice: WaitStoreNotice,
+    because: "gone" | "stopped",
+    parent: ThreadId | null,
+  ): WaitStoreNotice | null => {
+    const via = notice.via ?? [];
+    if (
+      parent === null ||
+      parent === notice.threadId ||
+      via.includes(parent) ||
+      via.length >= MAX_HAND_OVERS
+    ) {
+      return null;
+    }
+    return {
+      threadId: parent,
+      messageId: `${notice.messageId}:via:${via.length + 1}`,
+      text: notice.text,
+      via: [...via, notice.threadId],
+      handedOverBecause: because,
+    };
+  };
+
+  /**
+   * Sends the lost-wait notices; one leaves the file once sent or never sendable (same command id
+   * on a resend). Gone receiver: to its parent; stopped: held `stoppedHandOverHours` from its latest
+   * stop, then to its parent, like a wait. Only under `sweepLock`, so two never overlap.
    */
   const noticesSweep = Effect.fnUntraced(function* (settings: ServerSettings) {
     const pending = yield* lock.withPermits(1)(
@@ -1012,13 +1189,39 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     );
     if (pending.length === 0) return 0;
     const done = new Set<string>();
+    /** The notice that takes the place of one, by its message id (a hand-over, or a hold). */
+    const replaced = new Map<string, WaitStoreNotice>();
+    let held = false;
     let sent = 0;
     for (const notice of pending) {
-      const result = yield* input.delivery.deliver({
+      if (!(yield* stillOn)) {
+        held = true;
+        break;
+      }
+      const result = yield* send({
         threadId: notice.threadId,
         messageId: notice.messageId,
         commandId: `${notice.messageId}:0`,
-        text: notice.text,
+        text: noticeMessage(notice),
+      });
+      const now = yield* Clock.currentTimeMillis;
+      const handOver = Effect.fnUntraced(function* (
+        because: "gone" | "stopped",
+        parent: ThreadId | null,
+        why: string,
+      ) {
+        const next = handOverNotice(notice, because, parent);
+        if (next === null) {
+          done.add(notice.messageId);
+          yield* Effect.logError(
+            `waits: thread ${notice.threadId} could not be told its waits were lost: ${why}, and no parent can take it.`,
+          );
+          return;
+        }
+        replaced.set(notice.messageId, next);
+        yield* Effect.logWarning(
+          `waits: thread ${notice.threadId} ${why}; its lost-wait notice goes to parent ${next.threadId}.`,
+        );
       });
       switch (result.type) {
         case "delivered":
@@ -1026,27 +1229,44 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           done.add(notice.messageId);
           break;
         case "rejected":
-        case "gone":
           done.add(notice.messageId);
           yield* Effect.logError(
-            `waits: thread ${notice.threadId} could not be told its waits were lost: ${result.type === "rejected" ? result.detail : "it is archived or deleted"}`,
+            `waits: thread ${notice.threadId} could not be told its waits were lost: ${result.detail}`,
           );
           break;
-        // Held until the thread runs again, or tried again later.
-        case "stopped":
+        case "gone":
+          yield* handOver("gone", result.parentThreadId, "it is archived or deleted");
+          break;
+        case "stopped": {
+          const since = notice.stoppedSince === undefined ? null : Date.parse(notice.stoppedSince);
+          const latest = result.stoppedAt === undefined ? null : Math.min(result.stoppedAt, now);
+          // Held from its latest stop: seen stopped for the first time, or stopped again since.
+          if (since === null || (latest !== null && latest > since)) {
+            const from = since === null ? now : latest!;
+            replaced.set(notice.messageId, { ...notice, stoppedSince: iso(from) });
+            held = true;
+          } else if (now - since >= settings.waitFor.stoppedHandOverHours * 3_600_000) {
+            yield* handOver("stopped", result.parentThreadId, "stayed stopped");
+          } else {
+            held = true;
+          }
+          break;
+        }
+        // Tried again later.
         case "retry":
+          held = true;
           break;
       }
     }
-    if (done.size < pending.length) {
-      noticesRetryAt = (yield* Clock.currentTimeMillis) + PROBLEM_RECHECK_MS;
-    }
-    if (done.size > 0) {
+    noticesRetryAt = held ? (yield* Clock.currentTimeMillis) + PROBLEM_RECHECK_MS : 0;
+    if (done.size > 0 || replaced.size > 0) {
       yield* lock.withPermits(1)(
         Effect.gen(function* () {
           if (current === null) return;
           const contents = current;
-          const notices = contents.notices.filter((notice) => !done.has(notice.messageId));
+          const notices = contents.notices
+            .filter((notice) => !done.has(notice.messageId))
+            .map((notice) => replaced.get(notice.messageId) ?? notice);
           yield* commit({ ...contents, notices }, settings.waitFor).pipe(
             Effect.catch((error) =>
               Effect.logWarning(`waits: ${error.message}; the notices are sent again next time.`),
@@ -1055,6 +1275,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         }),
       );
     }
+    for (const messageId of done) sendTroubleLogged.delete(messageId);
     return sent;
   });
 
@@ -1091,29 +1312,66 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   };
 
   /**
-   * One sweep, in the spec's order: deliver, judge, deliver what that ended, prune, notices.
-   * Returns when the next one has work (for the scheduler's due hint). With waits off it reads
-   * and writes nothing; it never overlaps itself.
+   * One step of a sweep with the settings read again: null when waits are off or the settings
+   * cannot be read (the sweep stops there). A step that fails or crashes is logged and gives
+   * `fallback`, so one bad step never stops the sweep or the job.
+   */
+  const phase = Effect.fn("WaitService.phase")(function* <A, E>(
+    name: string,
+    run: (settings: ServerSettings) => Effect.Effect<A, E>,
+    fallback: A,
+  ) {
+    const settings = yield* readSettingsOrNull;
+    if (settings === null || !settings.waitFor.enabled) return null;
+    return yield* Effect.suspend(() => run(settings)).pipe(
+      Effect.catchCauseIf(
+        (cause) => !Cause.hasInterruptsOnly(cause),
+        (cause) =>
+          Effect.logError(`waits: the ${name} step failed: ${causeText(cause)}`).pipe(
+            Effect.as(fallback),
+          ),
+      ),
+    );
+  });
+
+  /**
+   * One sweep: deliver, judge, deliver what that ended, prune, notices; returns when the next one
+   * has work. Settings are read again before each step, so "off" stops it at the next step; a
+   * failing step is logged and skipped. It never overlaps itself.
    */
   const runDue = Effect.fn("WaitService.runDue")(function* () {
     const settings = yield* readSettingsOrNull;
     // Settings that cannot be read are tried again on the scheduler's next tick.
     if (settings === null) return { nextDueAt: 0 };
     if (!settings.waitFor.enabled) return { nextDueAt: Infinity };
+    const stopped = { nextDueAt: Infinity };
     const result = yield* Semaphore.withPermitsIfAvailable(
       sweepLock,
       1,
     )(
       Effect.gen(function* () {
-        yield* deliverSweep(settings);
-        const judged = yield* judgeSweep(settings);
-        if (judged.ended > 0) yield* deliverSweep(settings);
-        yield* pruneSweep(settings);
-        yield* noticesSweep(settings);
+        const none = { sent: 0, ended: 0 };
+        if ((yield* phase("deliver", deliverSweep, none)) === null) return stopped;
+        const judged = yield* phase("judge", judgeSweep, { judged: 0, ended: 0 });
+        if (judged === null) return stopped;
+        if (judged.ended > 0 && (yield* phase("deliver", deliverSweep, none)) === null) {
+          return stopped;
+        }
+        if ((yield* phase("prune", pruneSweep, 0)) === null) return stopped;
+        if ((yield* phase("notices", noticesSweep, 0)) === null) return stopped;
+        const latest = (yield* readSettingsOrNull) ?? settings;
         const now = yield* Clock.currentTimeMillis;
-        return yield* lock.withPermits(1)(
-          Effect.sync(() => ({ nextDueAt: nextDueAt(settings, now) })),
-        );
+        return yield* lock
+          .withPermits(1)(Effect.sync(() => ({ nextDueAt: nextDueAt(latest, now) })))
+          .pipe(
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              (cause) =>
+                Effect.logError(
+                  `waits: the next sweep time could not be worked out: ${causeText(cause)}`,
+                ).pipe(Effect.as({ nextDueAt: now + PROBLEM_RECHECK_MS })),
+            ),
+          );
       }),
     );
     // Another sweep is running; it records its own answer.

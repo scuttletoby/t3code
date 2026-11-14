@@ -9,6 +9,7 @@ import {
   type OrchestrationV2ThreadShell,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
@@ -21,8 +22,15 @@ export type WaitReceiver =
   | { readonly type: "ok" }
   /** Archived, deleted or unknown. */
   | { readonly type: "gone"; readonly parentThreadId: ThreadId | null }
-  /** Its latest run was stopped by a person or its parent; its messages are held. */
-  | { readonly type: "stopped"; readonly parentThreadId: ThreadId | null };
+  /**
+   * Its latest run was stopped by a person or its parent; its messages are held. `stoppedAt`
+   * (epoch ms) is when that run last started or ended, if the shell says.
+   */
+  | {
+      readonly type: "stopped";
+      readonly parentThreadId: ThreadId | null;
+      readonly stoppedAt?: number;
+    };
 
 export type WaitDeliveryResult =
   /** The message is in the thread: sent now, sent before, or replayed from its receipt. */
@@ -46,7 +54,16 @@ function receiverOf(shell: OrchestrationV2ThreadShell | null): WaitReceiver {
   if (shell === null || shell.deletedAt !== null || shell.archivedAt !== null) {
     return { type: "gone", parentThreadId: parentOf(shell) };
   }
-  if (shell.status === "interrupted") return { type: "stopped", parentThreadId: parentOf(shell) };
+  if (shell.status === "interrupted") {
+    const times = [shell.latestRunStartedAt, shell.latestRunCompletedAt]
+      .filter((time) => time !== undefined && time !== null)
+      .map((time) => DateTime.toEpochMillis(time));
+    return {
+      type: "stopped",
+      parentThreadId: parentOf(shell),
+      ...(times.length === 0 ? {} : { stoppedAt: Math.max(...times) }),
+    };
+  }
   return { type: "ok" };
 }
 
@@ -130,11 +147,14 @@ export const make = Effect.fn("WaitDelivery.make")(function* () {
     const already = yield* found(message);
     if (already === null) return { type: "retry", detail: "The thread's messages cannot be read." };
     if (already) return { type: "delivered" };
-    const state = receiverOf(shell);
-    if (state.type !== "ok") return state;
-    // Replays of an accepted command answer from the receipt; a refused one stays refused.
+    // Replays of an accepted command answer from the receipt; a refused one stays refused. Read
+    // before the receiver's state, so a message accepted just before the thread was archived,
+    // deleted or stopped counts as delivered (also if its message rows were removed).
     const receipt = yield* receiptOf(message);
     if (receipt === null) return { type: "retry", detail: "The command receipt cannot be read." };
+    if (receipt !== "none" && receipt.type === "delivered") return receipt;
+    const state = receiverOf(shell);
+    if (state.type !== "ok") return state;
     if (receipt !== "none") return receipt;
     // shell is not null here: receiverOf answers "gone" for null.
     const projectId = shell!.projectId;

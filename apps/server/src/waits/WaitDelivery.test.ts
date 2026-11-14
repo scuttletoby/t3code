@@ -275,14 +275,49 @@ it.effect("a stopped thread holds the message; a busy one queues it behind its t
       commandId: CommandId.make("stop:wait-stopped"),
       threadId: stoppedThreadId,
     });
-    const stopped = { type: "stopped", parentThreadId: null } as const;
-    assert.deepStrictEqual(yield* delivery.receiver(stoppedThreadId), stopped);
+    const stopped = yield* delivery.receiver(stoppedThreadId);
+    assert.deepStrictEqual(stopped, {
+      type: "stopped",
+      parentThreadId: null,
+      // When the stopped run last started or ended: the hold counts from the latest stop.
+      stoppedAt: (stopped as { readonly stoppedAt: number }).stoppedAt,
+    });
+    assert.isNumber((stopped as { readonly stoppedAt?: number }).stoppedAt);
     assert.deepStrictEqual(
       yield* delivery.deliver(wake(stoppedThreadId, "wait:w_jjjjjjjjjj")),
-      stopped,
+      stopped as WaitDelivery.WaitDeliveryResult,
     );
     assert.strictEqual(yield* copies(stoppedThreadId, "wait:w_jjjjjjjjjj"), 0);
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "a message accepted just before its thread was archived counts as delivered, not handed over",
+  () =>
+    Effect.gen(function* () {
+      const parentThreadId = ThreadId.make("thread:wait-receipt-parent");
+      yield* createThread(parentThreadId);
+      yield* userSend(parentThreadId, "start");
+      const childThreadId = yield* delegate(parentThreadId, "receipt child task");
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const delivery = yield* WaitDelivery.make();
+      // Accepted (its message is under another id, as if its rows were gone); then archived.
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("wait:w_kkkkkkkkkk:0"),
+        threadId: childThreadId,
+        messageId: MessageId.make("message:receipt-elsewhere"),
+        text: "sent before the archive",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      yield* archive(childThreadId);
+      assert.deepStrictEqual(yield* delivery.deliver(wake(childThreadId, "wait:w_kkkkkkkkkk")), {
+        type: "delivered",
+      });
+    }).pipe(Effect.provide(layerTest)),
 );
 
 /** Waits on, over the real send path and the real file system. */
