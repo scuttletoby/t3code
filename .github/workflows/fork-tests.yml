@@ -14,10 +14,21 @@ name: Fork tests
 # Require only `fork-ci-result` in a ruleset: it needs every other job, so jobs
 # can be added, split or resharded without touching the ruleset.
 #
-# Runners: GitHub-hosted only, Ubuntu 24.04 like upstream's runners, so an OS
-# upgrade is a reviewed change here, not a surprise from ubuntu-latest. Never
-# add a self-hosted runner to this workflow: this repository is public, so a
-# pull request from any fork would run its code on that machine.
+# Runners: the `route` step of `changes` picks, per Linux job, this
+# repository's own fleet or GitHub-hosted Ubuntu 24.04 (like upstream's runners,
+# so an OS upgrade is a reviewed change here, not a surprise from
+# ubuntu-latest). The setting is the repository variable CI_RUNNERS: auto
+# (unset too), fleet or github; facts about the fleet are in
+# .github/fork-fleet.json, the runbook in .github/fork-fleet.md. Only trusted
+# runs may use the fleet (pushes to main and the owner's own pull requests from
+# this repository): this repository is public, and a pull request from a fork
+# must never run its code on a fleet machine. No fleet runner waits for work: a
+# dispatcher on each fleet host reads GitHub's record of a run and starts a
+# one-job runner only for a queued job of a trusted run that asks for the
+# random label `route` made for it. So a changed workflow that names a fleet
+# label finds no runner, and each runner's job-started hook kills any job but
+# the one it was made for. The macOS job and the short jobs before and after the
+# tests stay GitHub-hosted.
 #
 # Two modes:
 # - pull_request / push to main: CI. Jobs a change cannot affect are skipped by
@@ -98,6 +109,11 @@ jobs:
       rust: ${{ steps.release.outputs.rust || steps.detect.outputs.rust }}
       release_smoke: ${{ steps.release.outputs.release_smoke || steps.detect.outputs.release_smoke }}
       mobile_native: ${{ steps.release.outputs.mobile_native || steps.fork.outputs.mobile_native }}
+      # Where each Linux job runs (the `route` step; empty in a release run, which is GitHub-hosted).
+      runners: ${{ steps.route.outputs.runners }}
+      fleet_mode: ${{ steps.route.outputs.mode }}
+      fleet_attempt: ${{ steps.route.outputs.attempt }}
+      fleet_watch: ${{ steps.route.outputs.watch || 'false' }}
     steps:
       - name: Checkout
         if: inputs.ref == ''
@@ -110,6 +126,8 @@ jobs:
             /.github/actions/ci-changes/
             /*/package.json
             /*/*/package.json
+            /.github/fork-fleet.json
+            /.github/scripts/fork-fleet.py
             !/.repos/
           sparse-checkout-cone-mode: false
 
@@ -165,6 +183,52 @@ jobs:
           echo "test_packages=" >> "$GITHUB_OUTPUT"
           echo "mobile_native=false" >> "$GITHUB_OUTPUT"
 
+      # Where each Linux job below runs (.github/scripts/fork-fleet.py route). It
+      # calls no API and never fails for the fleet: a pool counts only with a
+      # fresh heartbeat (a repository variable its dispatcher writes), anything
+      # unclear is GitHub-hosted with a note. A failed step fails `changes`; an
+      # empty answer means GitHub-hosted. A re-run of failed jobs keeps this
+      # answer only while the setting is still fleet; otherwise it is GitHub-hosted.
+      # Each pool's heartbeat is passed by name: a toJSON of all variables would print the rest.
+      - name: Route
+        id: route
+        if: inputs.ref == ''
+        env:
+          FLEET_MODE: ${{ vars.CI_RUNNERS }}
+          FLEET_BEACON_PC: ${{ vars.FLEET_BEACON_PC }}
+          FLEET_BEACON_VM: ${{ vars.FLEET_BEACON_VM }}
+          GATES: ${{ toJSON(steps.detect.outputs) }}
+        run: python3 -I .github/scripts/fork-fleet.py route
+
+  # A fleet job that waits too long for its runner cancels the run with an
+  # error (.github/scripts/fork-fleet.py watch): 10 minutes in auto mode (the
+  # sweep then re-runs it GitHub-hosted), 120 in fleet mode. Only in a run
+  # that sent a job to the fleet.
+  fleet_watch:
+    name: Fleet watch
+    needs: changes
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (needs.changes.outputs.fleet_watch == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 125
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: |
+            /.github/fork-fleet.json
+            /.github/scripts/fork-fleet.py
+          sparse-checkout-cone-mode: false
+
+      - name: Cancel the run if a fleet job waits too long
+        env:
+          FLEET_MODE: ${{ needs.changes.outputs.fleet_mode }}
+          FLEET_RUNNERS: ${{ needs.changes.outputs.runners }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/fork-fleet.py watch
+
   # A broken fork workflow is red on its own pull request, and the fork copy
   # must follow upstream's test jobs: the drift check lists every job and step
   # upstream changed since the copy was last recorded.
@@ -211,6 +275,17 @@ jobs:
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
           node .github/scripts/fork-ci-tests.cjs
+
+      # The fleet launcher with real runner users (created and deleted by the test):
+      # one slot's user cannot read another's copy, nothing a job leaves (files in
+      # HOME, a running process) reaches the next job, root deletes nothing in a
+      # directory a runner user can write, and check-net proves a runner's network
+      # with real namespaces and the real nft table (hence nftables).
+      - name: Install nftables for the launcher's network test
+        run: command -v nft >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq nftables; }
+
+      - name: Fleet launcher as root
+        run: sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot
 
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
@@ -265,9 +340,10 @@ jobs:
 
   lint:
     name: Lint
-    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
-    runs-on: ubuntu-24.04
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['lint'][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')['lint'][0], fromJSON(needs.changes.outputs.runners || '{}')['lint'][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -316,7 +392,8 @@ jobs:
     name: Build and Typecheck
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false')) }}
-    runs-on: ubuntu-24.04
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['build'][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')['build'][0], fromJSON(needs.changes.outputs.runners || '{}')['build'][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -334,14 +411,24 @@ jobs:
       - name: Start installing browser secret helper build libraries
         if: needs.changes.outputs.build != 'false'
         run: |
-          (
-            set +e
-            sudo apt-get update -o Acquire::Languages=none \
-              -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
-              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false &&
-              sudo apt-get install -y libsecret-1-dev pkg-config xvfb
-            echo "$?" > "$RUNNER_TEMP/apt-status"
-          ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
+          # A fleet runner has no sudo: its host must have the packages already.
+          if [[ "$RUNNER_ENVIRONMENT" == self-hosted ]]; then
+            if pkg-config --exists libsecret-1 && command -v xvfb-run >/dev/null; then
+              echo 0 > "$RUNNER_TEMP/apt-status"
+            else
+              echo "This fleet runner's host lacks some of: libsecret-1-dev pkg-config xvfb (.github/fork-fleet.md)" > "$RUNNER_TEMP/apt.log"
+              echo 1 > "$RUNNER_TEMP/apt-status"
+            fi
+          else
+            (
+              set +e
+              sudo apt-get update -o Acquire::Languages=none \
+                -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
+                -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false &&
+                sudo apt-get install -y libsecret-1-dev pkg-config xvfb
+              echo "$?" > "$RUNNER_TEMP/apt-status"
+            ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
+          fi
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
@@ -465,7 +552,8 @@ jobs:
     name: Test ${{ matrix.shard }}
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test != 'false') }}
-    runs-on: ubuntu-24.04
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test-{0}', matrix.shard)][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')[format('test-{0}', matrix.shard)][0], fromJSON(needs.changes.outputs.runners || '{}')[format('test-{0}', matrix.shard)][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -498,14 +586,24 @@ jobs:
       - name: Start installing browser secret helper build libraries
         if: steps.shard.outputs.any == 'true'
         run: |
-          (
-            set +e
-            sudo apt-get update -o Acquire::Languages=none \
-              -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
-              -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false &&
-              sudo apt-get install -y libsecret-1-dev pkg-config
-            echo "$?" > "$RUNNER_TEMP/apt-status"
-          ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
+          # A fleet runner has no sudo: its host must have the packages already.
+          if [[ "$RUNNER_ENVIRONMENT" == self-hosted ]]; then
+            if pkg-config --exists libsecret-1; then
+              echo 0 > "$RUNNER_TEMP/apt-status"
+            else
+              echo "This fleet runner's host lacks some of: libsecret-1-dev pkg-config (.github/fork-fleet.md)" > "$RUNNER_TEMP/apt.log"
+              echo 1 > "$RUNNER_TEMP/apt-status"
+            fi
+          else
+            (
+              set +e
+              sudo apt-get update -o Acquire::Languages=none \
+                -o Acquire::IndexTargets::deb::DEP-11::DefaultEnabled=false \
+                -o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false &&
+                sudo apt-get install -y libsecret-1-dev pkg-config
+              echo "$?" > "$RUNNER_TEMP/apt-status"
+            ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
+          fi
 
       - name: Setup Vite+
         if: steps.shard.outputs.any == 'true'
@@ -582,7 +680,8 @@ jobs:
     name: Test Web ${{ matrix.shard }}
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.test_web != 'false') }}
-    runs-on: ubuntu-24.04
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)][0], fromJSON(needs.changes.outputs.runners || '{}')[format('test_web-{0}', matrix.shard)][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -645,9 +744,10 @@ jobs:
   # release run's resolved commit (seconds; every other job waits for it too).
   test_server:
     name: Test Server ${{ matrix.shard }}
-    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
-    runs-on: ubuntu-24.04
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][0], fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -783,7 +883,8 @@ jobs:
     name: Rust
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.rust != 'false') }}
-    runs-on: ubuntu-24.04
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['rust'][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')['rust'][0], fromJSON(needs.changes.outputs.runners || '{}')['rust'][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -850,7 +951,8 @@ jobs:
     name: Release Smoke
     needs: changes
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && needs.changes.outputs.release_smoke != 'false') }}
-    runs-on: ubuntu-24.04
+    # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
+    runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')['release_smoke'][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')['release_smoke'][0], fromJSON(needs.changes.outputs.runners || '{}')['release_smoke'][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -886,6 +988,7 @@ jobs:
       [
         outside_pr,
         changes,
+        fleet_watch,
         workflows,
         secrets,
         lint,
@@ -922,7 +1025,8 @@ jobs:
               else "no native mobile source, Brewfile or CI workflow changed" end),
             release_smoke: "the change does not affect scripts/",
             secrets: "release run: the commit was scanned on its way to main",
-            outside_pr: "not a pull request from another fork"
+            outside_pr: "not a pull request from another fork",
+            fleet_watch: "no job of this run went to the fleet"
           }'
           {
             echo "### fork-ci-result"
