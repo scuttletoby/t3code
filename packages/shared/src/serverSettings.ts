@@ -3,6 +3,7 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_TEXT_GENERATION_MODEL,
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
+  DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   defaultInstanceIdForDriver,
   globalIdleCompaction,
   type IdleCompactionMode,
@@ -250,6 +251,22 @@ function mergeSettingsEntries<Value>(
   return Object.fromEntries(next);
 }
 
+/** Fork: per instance and per field; a field left out keeps its stored value (or default). */
+function mergeUsagePacing(
+  current: ServerSettings["usagePacing"],
+  patch: NonNullable<ServerSettingsPatch["usagePacing"]>,
+): ServerSettings["usagePacing"] {
+  const next = new Map(Object.entries(current));
+  for (const [id, entry] of Object.entries(patch)) {
+    if (entry === null) {
+      next.delete(id);
+    } else {
+      next.set(id, { ...DEFAULT_USAGE_PACING_INSTANCE_SETTINGS, ...next.get(id), ...entry });
+    }
+  }
+  return Object.fromEntries(next);
+}
+
 // Secret persistence keys tokens by trimmed, lowercased host, so merge on the same key.
 const byHost = (tokens: unknown) =>
   Object.fromEntries(
@@ -404,6 +421,7 @@ export function applyServerSettingsPatch(
     worktreeCleanup: worktreeCleanupPatch,
     // Merged per entry below; its `null` removals must not reach deepMerge.
     usageLimitSources: usageLimitSourcesPatch,
+    usagePacing: usagePacingPatch,
     textGenerators: textGeneratorsPatch,
     secretProviders: secretProvidersPatch,
     sourceControlHosts: sourceControlHostsPatch,
@@ -621,6 +639,9 @@ export function applyServerSettingsPatch(
             usageLimitSourcesPatch,
           ),
         }
+      : {}),
+    ...(usagePacingPatch !== undefined
+      ? { usagePacing: mergeUsagePacing(current.usagePacing, usagePacingPatch) }
       : {}),
     ...(textGeneratorsPatch !== undefined
       ? { textGenerators: mergeSettingsEntries(current.textGenerators, textGeneratorsPatch) }

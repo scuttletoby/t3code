@@ -741,7 +741,7 @@ export function paceOf(window: ServerProviderUsageWindow, now: number): LimitPac
   return elapsed === null ? null : paceOfShares(window.usedPercent, elapsed);
 }
 
-function paceOfShares(usedPercent: number, elapsed: number): LimitPace {
+export function paceOfShares(usedPercent: number, elapsed: number): LimitPace {
   const gap = usedPercent - elapsed * 100;
   if (gap > 5) return "ahead";
   if (gap < -5) return "under";
