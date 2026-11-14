@@ -1,0 +1,51 @@
+name: fleet route
+description: >-
+  Where each routed job of this run runs: on the project's own self-hosted runners (its fleet) or GitHub-hosted, from
+  the project's fleet config. Calls no API and needs no token. A pull request whose head is another repository never
+  gets a self-hosted runner. Run it as the last step of a small GitHub-hosted job that the routed jobs need; it fails
+  (red) when the config is missing or broken, and the routed jobs' runs-on then falls back (README, "Usage").
+inputs:
+  config:
+    description: The project's fleet config (README, "Config"), a path in the checkout.
+    required: true
+  vars:
+    description: >-
+      The repository variables as a JSON object, ${{ toJSON(vars) }}: the setting (config "variable") and each pool's
+      heartbeat are read from it. Default none: every dispatcher pool counts no free slot.
+    required: false
+    default: "{}"
+  mode:
+    description: auto, fleet or github; overrides the setting read from vars (default empty, the setting).
+    required: false
+    default: ""
+  gates:
+    description: >-
+      The change gates as a JSON object (a job whose config "gates" are all "false" only prints a skip and stays
+      GitHub-hosted). Default empty: every routed job counts as running.
+    required: false
+    default: ""
+outputs:
+  runners:
+    description: A JSON object, job key (the job id, or <id>-<shard>) -> runs-on (a label, or a list of labels).
+    value: ${{ steps.route.outputs.runners }}
+  mode:
+    description: The mode applied (fleet when the config has "hosted" false).
+    value: ${{ steps.route.outputs.mode }}
+  attempt:
+    description: The run attempt these labels were made for; a job of another attempt must not use them.
+    value: ${{ steps.route.outputs.attempt }}
+  watch:
+    description: true when a job went to a dispatcher or static pool (a job that bounds its wait can then start).
+    value: ${{ steps.route.outputs.watch }}
+runs:
+  using: composite
+  steps:
+    - id: route
+      name: Route the jobs
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        FLEET_VARS: ${{ inputs.vars }}
+        FLEET_MODE: ${{ inputs.mode }}
+        GATES: ${{ inputs.gates }}
+      run: exec python3 -I "$GITHUB_ACTION_PATH/../../../.github/scripts/fork-fleet.py" --config="$CONFIG" route --with-attempt
