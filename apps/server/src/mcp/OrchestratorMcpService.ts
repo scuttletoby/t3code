@@ -137,6 +137,7 @@ import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
+import * as SlotGate from "../slots/SlotGate.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 // Nothing is written while a task wait blocks, and Node fetch drops a silent call at 300 s.
@@ -1208,6 +1209,8 @@ const make = Effect.gen(function* () {
   // Fork: read if the server runs one. Optional, so no test of this service has to provide it;
   // server.ts refuses to compile without it.
   const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
+  // Fork: the agent slot gate, the same way; server.ts asks for it beside /mcp.
+  const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -1597,6 +1600,21 @@ const make = Effect.gen(function* () {
       supportedRuntimeModes: provider.supportedRuntimeModes,
     };
   });
+
+  /** Fork: the agent slot gate, or `null` (no slot held) on a server without it. */
+  const acquireSlot = Effect.fn("OrchestratorMcpService.acquireSlot")(function* (
+    callerThreadId: ThreadId,
+    targetInstanceId: ModelSelection["instanceId"],
+  ) {
+    if (Option.isNone(slotGate)) return null;
+    const outcome = yield* slotGate.value.acquire({ callerThreadId, targetInstanceId });
+    if (outcome.type === "refuse") return yield* failure("slots_full", outcome.message);
+    return outcome.token;
+  });
+  const releaseSlot = (token: SlotGate.SlotToken | null) =>
+    Option.isNone(slotGate) ? Effect.void : slotGate.value.release(token);
+  const startedSlot = (token: SlotGate.SlotToken | null, childThreadId: ThreadId) =>
+    Option.isNone(slotGate) ? Effect.void : slotGate.value.started(token, childThreadId);
 
   /**
    * Fork: the usage pacing gate (`usagePacingGate` setting, off by default) on a task an agent
@@ -2750,6 +2768,11 @@ const make = Effect.gen(function* () {
         }
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
+      // Fork: the agent slot gate (`agentSlots`, off by default) on the final target, last before
+      // the dispatch so nothing else can fail while it holds a slot. A retry starts no new agent.
+      const slotToken = isRetryOfAcceptedDelegation
+        ? null
+        : yield* acquireSlot(scope.thread.threadId, target.modelSelection.instanceId);
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
@@ -2782,6 +2805,7 @@ const make = Effect.gen(function* () {
                   `Unable to create delegated task: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
                 ),
           ),
+          Effect.tapError(() => releaseSlot(slotToken)),
         );
       const taskEvent = result.storedEvents.find(
         (stored) =>
@@ -2795,6 +2819,7 @@ const make = Effect.gen(function* () {
       }
       const taskId = taskEvent.event.payload.id;
       const childThreadId = taskEvent.event.payload.childThreadId;
+      if (childThreadId !== null) yield* startedSlot(slotToken, childThreadId);
       const childRunEvent = result.storedEvents.find(
         (stored) => stored.event.type === "run.created" && stored.event.threadId === childThreadId,
       );

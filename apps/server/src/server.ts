@@ -124,6 +124,7 @@ import * as ProviderUsageLimitsIngestion from "./provider/ProviderUsageLimitsIng
 import * as UsageReadingsHistory from "./usage/UsageReadingsHistory.ts";
 import * as HeadlessUsageRefresher from "./usage/HeadlessUsageRefresher.ts";
 import * as UsagePacer from "./usage/UsagePacer.ts";
+import * as SlotGate from "./slots/SlotGate.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
@@ -713,6 +714,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ).pipe(Layer.provide(DelegatedTaskQuestionReactor.layer), Layer.provide(ProjectionStoreV2.layer)),
   ProviderUsageLimitsIngestion.layer,
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
+  SlotGate.layer,
   HeadlessUsageRefresher.layer,
   layerProviderInstallationRefresh,
   ProviderInstallation.layer,
@@ -848,9 +850,11 @@ const layerMakeRoutes = Layer.mergeAll(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
-  // Fork: /mcp reads the usage pacer only if it is there (the usage pacing gate). Asking for it
-  // here, beside /mcp, makes a server wired without it a type error instead of a silent gate.
+  // Fork: /mcp reads the usage pacer and the slot gate only if they are there (the usage pacing
+  // gate, agentSlots). Asking for them here, beside /mcp, makes a server wired without one a type
+  // error instead of a silent gate.
   Layer.effectDiscard(UsagePacer.UsagePacer.pipe(Effect.asVoid)),
+  Layer.effectDiscard(SlotGate.SlotGate.pipe(Effect.asVoid)),
   // Follows delegated tasks running in linked environments, including after a restart.
   Layer.effectDiscard(
     RemoteDelegation.RemoteDelegation.pipe(Effect.flatMap((remote) => remote.start())),

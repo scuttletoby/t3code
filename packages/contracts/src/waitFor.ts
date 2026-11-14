@@ -150,7 +150,7 @@ export const AgentSlotsSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Most running agents on this server; 0 = no limit. */
   maxPerMachine: nonNegativeIntDefault(0),
-  /** Most running agents per provider instance; a missing instance has no limit. */
+  /** Most running agents per provider instance; a missing instance or 0 has no limit. */
   maxPerAccount: Schema.Record(ProviderInstanceId, NonNegativeInt).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
