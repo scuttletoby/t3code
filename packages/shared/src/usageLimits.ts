@@ -253,6 +253,18 @@ function accountKeyResolver(reports: Iterable<AccountReport>) {
   };
 }
 
+/**
+ * The account a provider's limits belong to, in the parts the Limits UI keys accounts by: `base`
+ * (driver + email, or the credential fingerprint) and the workspace when reported; null when unknown.
+ */
+export function providerAccountIdentity(
+  provider: ServerProvider,
+): { readonly base: string; readonly workspaceId: string | undefined } | null {
+  const report = nativeReport(provider);
+  const base = accountKey(report.driver, report.email, report.usageLimits);
+  return base === null ? null : { base, workspaceId: report.workspaceId || undefined };
+}
+
 const hubAccountName = (account: { readonly id: string }) => account.id.replace(/\.json$/i, "");
 
 // Source ids are environment-local, so only a remote endpoint names the same hub across environments.
