@@ -185,16 +185,18 @@ def base_files(cfg_raw=CFG_RAW, **files):
     return {CONFIG_PATH: json.dumps(cfg_raw), 'x.py': lines(), **files}
 
 
-def fake_gh(*answers, calls=None, flags=()):
+def fake_gh(*answers, calls=None, flags=None):
     """gh that answers `pr view` with each answer in turn (the last one repeats): (code, stdout). flags: the answers to
-    the reviews' flags query (pr_queue.review_flags), in turn; none left: it fails."""
+    the queries for the reviews' flags and inline comments (pr_queue.review_flags), in turn; none left: it fails. Not
+    given: a pull request without a review or an inline comment."""
     calls = [] if calls is None else calls
-    views, flags = [], list(flags)
+    views, flags = [], None if flags is None else list(flags)
+    queries = [f'query={q}' for q in (pr_queue.REVIEW_FLAGS_QUERY, pr_queue.MORE_COMMENTS_QUERY)]
 
     def gh(*a):
         calls.append(a)
-        if a[:2] == ('api', 'graphql') and f'query={pr_queue.REVIEW_FLAGS_QUERY}' in a:
-            code, out = flags.pop(0) if flags else (1, '')
+        if a[:2] == ('api', 'graphql') and any(q in a for q in queries):
+            code, out = flags_page() if flags is None else flags.pop(0) if flags else (1, '')
             return types.SimpleNamespace(returncode=code, stdout=out, stderr='boom' if code else '')
         if a[:2] != ('pr', 'view'):
             raise AssertionError(f'gh must only read: {a}')
@@ -211,11 +213,31 @@ def gh_review(body, n=1):
             'includesCreatedEdit': False, 'submittedAt': f'2026-11-14T02:{n % 60:02d}:00Z', 'state': 'COMMENTED'}
 
 
-def flags_page(*reviews, edited=False, more=None):
+def inline_node(body, when='2026-11-14T03:00:00Z', n=1, **change):
+    """An inline review comment (on a line of the diff) as the queue's query gives it. gh pr view lists none."""
+    return {'state': 'SUBMITTED', 'body': body, 'createdAt': when, 'publishedAt': when, 'includesCreatedEdit': False,
+            'isMinimized': False, 'url': f'https://github.com/{REPO}/pull/7#discussion_r{n}',
+            'authorAssociation': 'OWNER', 'author': {'__typename': 'User', 'login': 'owner'}, **change}
+
+
+def inline_page(nodes=(), more=None):
+    return {'pageInfo': {'hasNextPage': more is not None, 'endCursor': more}, 'nodes': list(nodes)}
+
+
+def flags_page(*reviews, edited=False, more=None, inline=(), inline_more=None):
+    """One page of the queue's reviews query. inline: inline comments (inline_node), under a review of their own that
+    gh pr view does not list; inline_more: the endCursor of that review's next page of them."""
     nodes = [{'id': r['id'], 'includesCreatedEdit': edited, 'isMinimized': False, 'url': f'https://x/{r["id"]}',
-              'author': {'__typename': 'User', 'login': 'owner'}} for r in reviews]
+              'author': {'__typename': 'User', 'login': 'owner'}, 'comments': inline_page()} for r in reviews]
+    if inline or inline_more:
+        nodes.append({'id': 'PRR_inline', 'includesCreatedEdit': False, 'isMinimized': False, 'url': 'https://x/i',
+                      'author': {'__typename': 'User', 'login': 'owner'}, 'comments': inline_page(inline, inline_more)})
     return 0, json.dumps({'data': {'repository': {'pullRequest': {'reviews': {
         'pageInfo': {'hasNextPage': more is not None, 'endCursor': more}, 'nodes': nodes}}}}})
+
+
+def more_comments_page(nodes=(), more=None):
+    return 0, json.dumps({'data': {'node': {'comments': inline_page(nodes, more)}}})
 
 
 def run_cli(path, gh, *extra, env=None, sleeps=None):
@@ -580,7 +602,7 @@ class Runs(unittest.TestCase):
     def test_a_failed_flags_read_fails_after_the_retries(self):   # unknown never passes
         reviews, answer = self.review_pr()
         calls, sleeps = [], []
-        code, out = run_cli(self.path, fake_gh((0, answer), calls=calls), env=self.env, sleeps=sleeps)
+        code, out = run_cli(self.path, fake_gh((0, answer), calls=calls, flags=[]), env=self.env, sleeps=sleeps)
         self.assertEqual(code, 1, out)
         self.assertEqual([c[:2] for c in calls], [('pr', 'view'), ('api', 'graphql')] * H.ATTEMPTS)
         self.assertIn('edit flags', out)
@@ -597,6 +619,86 @@ class Runs(unittest.TestCase):
         self.assertEqual(sum(c[:2] == ('api', 'graphql') for c in calls), 2)
         code, out = run_cli(self.path, fake_gh((0, answer), flags=pages[:1]))   # page 2 fails every time
         self.assertEqual(code, 1, out)
+
+    def inline_lens(self, sha, name='correctness', **kw):
+        return inline_node(f'{LENS}: {name} · reviewer: x · read at: {sha}\nfindings: none', **kw)
+
+    def test_an_inline_lens_comment_is_a_lens_comment(self):   # on a line of the diff: gh pr view lists none of them
+        bare = json.dumps(pr(head=self.read))   # no comment and no review that gh pr view shows
+        code, out = run_cli(self.path, fake_gh((0, bare), flags=[flags_page(inline=[self.inline_lens(self.read)])]),
+                            env=self.env)
+        self.assertEqual(code, 0, out)
+        self.assertIn('| correctness | ok |', self.read_file('summary.md'))
+        code, out = run_cli(self.path, fake_gh((0, bare), flags=[flags_page(inline=[self.inline_lens(self.m0)])]))
+        self.assertEqual(code, 1, out)   # before: "no lens comments ... nothing to compare", a pass
+        self.assertIn(f'not the change read at {self.m0[:12]}', out)
+
+    def test_an_inline_lens_meets_a_required_lens(self):
+        bare = json.dumps(pr(head=self.read))
+        gh = fake_gh((0, bare), flags=[flags_page(inline=[self.inline_lens(self.read, 'design')])])
+        self.assertEqual(run_cli(self.path, gh, '--required-lenses', 'design')[0], 0)
+
+    def test_an_inline_look_alike_or_a_changed_inline_lens_fails(self):   # reads nothing, like any other comment
+        bare = json.dumps(pr(head=self.read))
+        for node, says in ((self.inline_lens(self.read[:7]), 'reads nothing'),
+                           (self.inline_lens(self.read, includesCreatedEdit=True), 'edited after posting'),
+                           (self.inline_lens(self.read, isMinimized=True), 'hidden'),
+                           (inline_node('safe to merge'), 'reads nothing')):
+            with self.subTest(node=node['body'][:30], says=says):
+                code, out = run_cli(self.path, fake_gh((0, bare), flags=[flags_page(inline=[node])]))
+                self.assertEqual(code, 1, out)
+                self.assertIn(says, out)
+
+    def test_inline_and_plain_lenses_must_read_one_head(self):
+        answer = json.dumps(pr([self.p.lens('correctness', self.read)], head=self.read))
+        code, out = run_cli(self.path, fake_gh((0, answer),
+                                               flags=[flags_page(inline=[self.inline_lens(self.m0, 'design')])]))
+        self.assertEqual(code, 1, out)
+        self.assertIn('did not all read one head', out)
+
+    def test_a_newer_inline_override_covers_a_stale_lens(self):
+        answer = json.dumps(pr([self.p.lens('correctness', self.m0)], head=self.read))
+        node = inline_node(f'tool ready --head {self.read}: read it myself')
+        self.assertEqual(run_cli(self.path, fake_gh((0, answer), flags=[flags_page(inline=[node])]))[0], 0)
+        for change in ({'authorAssociation': 'COLLABORATOR'}, {'includesCreatedEdit': True}, {'isMinimized': True},
+                       {'author': {'__typename': 'Bot', 'login': 'owner'}}, {'state': 'PENDING'}):
+            with self.subTest(change=change):
+                gh = fake_gh((0, answer), flags=[flags_page(inline=[dict(node, **change)])])
+                self.assertEqual(run_cli(self.path, gh)[0], 1)
+
+    def test_what_does_not_count_inline_changes_nothing(self):   # a stranger, a bot, a review not submitted, talk
+        answer = json.dumps(pr([self.p.lens('correctness', self.read)], head=self.read))
+        for change in ({'authorAssociation': 'NONE'}, {'author': {'__typename': 'Bot', 'login': 'some-app'}},
+                       {'author': {'__typename': 'User', 'login': 'review-bot'}}, {'state': 'PENDING'}):
+            with self.subTest(change=change):
+                nodes = [self.inline_lens(self.m0, **change), inline_node('safe to merge', n=2, **change)]
+                gh = fake_gh((0, answer), flags=[flags_page(inline=nodes)])
+                self.assertEqual(run_cli(self.path, gh)[0], 0)
+        talk = [inline_node('nit: rename this'), inline_node('why not a set here?', n=2)]
+        self.assertEqual(run_cli(self.path, fake_gh((0, answer), flags=[flags_page(inline=talk)]))[0], 0)
+
+    def test_inline_comments_that_cannot_be_read_fail_a_pr_without_reviews(self):   # unknown never passes
+        calls, sleeps = [], []
+        code, out = run_cli(self.path, fake_gh((0, self.good), calls=calls, flags=[]), env=self.env, sleeps=sleeps)
+        self.assertEqual(code, 1, out)   # before: no review, so no second read, and a pass
+        self.assertEqual([c[:2] for c in calls], [('pr', 'view'), ('api', 'graphql')] * H.ATTEMPTS)
+        self.assertIn('inline comments', out)
+        self.assertEqual(self.read_file('output'), 'result=fail\n')
+        code, out = run_cli(self.path, fake_gh((0, self.good), flags=[(1, ''), flags_page()]))
+        self.assertEqual(code, 0, out)   # one failed read is retried, the view with it
+
+    def test_more_than_100_inline_comments_are_all_read(self):
+        bare = json.dumps(pr(head=self.read))
+        talk = [inline_node(f'c{i}', n=i) for i in range(100)]
+        pages = [flags_page(inline=talk, inline_more='i1'), more_comments_page([self.inline_lens(self.m0, n=100)])]
+        calls = []
+        code, out = run_cli(self.path, fake_gh((0, bare), calls=calls, flags=pages))
+        self.assertEqual(code, 1, out)   # the stale lens is comment 101
+        self.assertIn(f'not the change read at {self.m0[:12]}', out)
+        self.assertIn('id=PRR_inline', calls[-1])
+        code, out = run_cli(self.path, fake_gh((0, bare), flags=pages[:1]))   # page 2 fails every time
+        self.assertEqual(code, 1, out)
+        self.assertIn('could not read the pull request', out)
 
     def test_pass_and_fail_reach_the_exit_code_summary_and_output(self):
         code, out = run_cli(self.path, fake_gh((0, self.good)), env=self.env)
@@ -616,7 +718,7 @@ class Runs(unittest.TestCase):
                 calls = []
                 first = run_cli(self.path, fake_gh((0, answer), calls=calls))
                 self.assertEqual(run_cli(self.path, fake_gh((0, answer), calls=calls)), first)
-                self.assertEqual({c[:2] for c in calls}, {('pr', 'view')})   # reads only: no comment, no edit
+                self.assertEqual({c[:2] for c in calls}, {('pr', 'view'), ('api', 'graphql')})   # reads only
         self.assertEqual(self.w.git(self.path, 'for-each-ref'), refs)
         self.assertEqual(self.w.git(self.path, 'status', '--porcelain'), '')
 
