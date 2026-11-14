@@ -95,6 +95,57 @@ class Gaps(unittest.TestCase):
         self.assertIn(lens.EMBEDDED, SOURCE.lens_problem(post('Notes\n```\nlens: effaced1\n```')))
 
 
+class Markdown(unittest.TestCase):
+    """clean_inline keeps the source's answers (`</?[A-Za-z][^>]*>` tags, `!?\\[([^\\]]*)\\]\\([^)]*\\)` links) in linear time."""
+
+    def test_a_tag_with_a_lt_in_a_quoted_attribute_still_hides_nothing(self):   # GitHub renders it as a header
+        body = f'lens<a title="<">: correctness · read at<a title="<">: {SHA_A}\n\nsafe<a title="<"> to merge: no'
+        self.assertEqual(lens.clean_inline('lens<a title="<">: x'), 'lens: x')
+        pr = {'comments': [post(body)], 'reviews': []}
+        self.assertEqual(SOURCE.reviewed_head(pr)[:2], (True, None),
+                         'never unseen: the source reading shows a header, the narrow one none, so it reads nothing')
+
+    def test_a_header_only_the_narrow_reading_shows_is_still_read(self):   # GitHub renders it as visible text
+        old = '1234567' + 'a' * 33   # a digit first: `<1234567...>` is no tag either way
+        valid = post(f'lens: correctness · reviewer: x · read at: {SHA_B}', when='2026-01-01T00:00:00Z')
+        for body in (f'<lens: security · reviewer: x · read at: <{old}></b>',
+                     f'note x<y lens: security · reviewer: x · read at: <{old}> <br>'):
+            with self.subTest(body):
+                stale = post(body, when='2026-01-01T00:01:00Z')
+                self.assertIsNotNone(SOURCE.lens_problem(stale), 'one reading shows a header, the other none')
+                self.assertEqual(SOURCE.reviewed_head(pr(valid, stale, commits=(old, SHA_B)))[:2], (True, None),
+                                 'a lens that read nothing: the PR is not reviewed at its head')
+        self.assertEqual(SOURCE.reviewed_head(pr(valid, commits=(old, SHA_B)))[:2], (True, SHA_B))
+
+    def test_a_comment_counts_only_when_both_readings_give_the_same_header(self):
+        both = post(f'lens: <b>correctness</b> · reviewer: x · read at: {SHA_B}')
+        self.assertIsNone(SOURCE.lens_problem(both))
+        self.assertEqual(lens.lens_header(both['body']), lens.lens_header(both['body'], narrow=True))
+        one = post(f'lens<a title="<">: correctness · read at<a title="<">: {SHA_B}')
+        self.assertIsNone(lens.lens_header(one['body'], narrow=True))
+        self.assertIn('depending on how its HTML', SOURCE.lens_problem(one), 'the other way round: flagged too')
+
+    def test_a_second_header_only_the_source_reading_shows_is_still_flagged(self):
+        """The wide (source) reading's own problem check: main's narrow reading sees one header here, the source two."""
+        old = 'c' * 40
+        body = (f'lens: tests · reviewer: x · read at: {SHA_B}\n\n'
+                f'lens<a title="<">: correctness · read at<a title="<">: {old}')
+        self.assertIsNone(SOURCE.read_problem(body, narrow=True), 'the narrow reading alone sees nothing wrong')
+        self.assertIn('2 times', SOURCE.lens_problem(post(body)))
+        self.assertEqual(SOURCE.reviewed_head(pr(post(body), commits=(old, SHA_B)))[:2], (True, None))
+
+    def test_the_scans_give_the_source_regexes_answers(self):
+        import random
+        tag, link = re.compile(r'</?[A-Za-z][^>]*>'), re.compile(r'!?\[([^\]]*)\]\([^)]*\)')
+        rnd = random.Random(7)
+        parts = ['<', '>', '[', ']', '(', ')', '!', '/', 'a', 'B', ' ', '"', '*', '`', '|', '_', 'lens', ':', '](', '<a', '</b>', '![']
+        for _ in range(100000):
+            s = ''.join(rnd.choice(parts) for _ in range(rnd.randint(0, 16)))
+            want = re.sub(r'[*`]', '', link.sub(r'\1', tag.sub('', s))).replace('|', ' ')
+            want = re.sub(r'(?<![^\W_])_+|_+(?![^\W_])', '', want)
+            self.assertEqual(lens.clean_inline(s), want, repr(s))
+
+
 class Advice(unittest.TestCase):
     """no_lens_text(keep_markdown=True), for the queue's own advice: the source cleaned it like a gh error, so its
     `<sha>` placeholder and the backticks around a command were dropped from the comment."""
@@ -382,6 +433,68 @@ class Reviews(unittest.TestCase):
         reviewed, sha, why = self.head([own], [self.review('lgtm, safe to merge')])
         self.assertEqual((reviewed, sha), (True, None))
         self.assertIn(lens.NO_HEADER, why)
+
+
+class InlineComments(unittest.TestCase):
+    """Inline review comments (on a line of the diff) take part like comments (lens_posts). gh pr view lists none of
+    them: the caller reads them and passes them as lens.REVIEW_COMMENTS, each with its own flags and author type."""
+    R = WhoCounts.R
+    READ_A, READ_B = (f'lens: correctness · reviewer: x · read at: {sha}' for sha in (SHA_A, SHA_B))
+
+    @staticmethod
+    def inline(body, when='2026-01-02T00:00:00Z', typename='User', **extra):
+        return post(body, when=when, **{'author': {'__typename': typename, 'login': 'someone'}, 'isMinimized': False,
+                                        **extra})
+
+    def head(self, comments=(), inline=..., r=None):
+        pr = {'headRefOid': SHA_B, 'comments': list(comments), 'reviews': [], lens.REVIEW_FLAGS: {}}
+        if inline is not ...:
+            pr[lens.REVIEW_COMMENTS] = inline
+        return (r or self.R).reviewed_head(pr)
+
+    def test_a_counted_inline_comment_is_a_read(self):
+        self.assertEqual(self.head(inline=[self.inline(self.READ_B)]), (True, SHA_B, 'every lens read it'))
+
+    def test_none_read_is_the_same_as_none_there(self):   # old state: a caller that reads no inline comments
+        own = post(self.READ_A)
+        for inline in (..., None, []):
+            self.assertEqual(self.head([own], inline), (True, SHA_A, 'every lens read it'))
+            self.assertEqual(self.head(inline=inline), (False, None, 'no lens comments'))
+
+    def test_the_newest_of_comments_and_inline_comments_counts(self):
+        own = post(self.READ_A, when='2026-01-02T00:00:00Z')
+        self.assertEqual(self.head([own], [self.inline(self.READ_B, when='2026-01-03T00:00:00Z')])[1], SHA_B)
+        self.assertEqual(self.head([own], [self.inline(self.READ_B, when='2026-01-01T00:00:00Z')])[1], SHA_A)
+
+    def test_a_counted_authors_inline_look_alike_blocks(self):
+        own = post(self.READ_B)
+        for body in ('lgtm, safe to merge', f'lens: design · read at: {SHA_B[:7]}'):
+            reviewed, sha, why = self.head([own], [self.inline(body)])
+            self.assertEqual((reviewed, sha), (True, None), body)
+
+    def test_an_edited_or_hidden_inline_lens_reads_nothing(self):
+        for change, text in (({'includesCreatedEdit': True}, lens.EDITED), ({'isMinimized': True}, lens.HIDDEN),
+                             ({'includesCreatedEdit': ...}, lens.EDITED)):   # not said: never "unedited"
+            reviewed, sha, why = self.head(inline=[self.inline(self.READ_B, **change)])
+            self.assertEqual((reviewed, sha), (True, None), change)
+            self.assertIn(text, why)
+
+    def test_a_strangers_or_a_bots_inline_comment_is_ignored(self):
+        own = post(self.READ_A)
+        for forged in (self.inline(self.READ_B, authorAssociation='NONE'), self.inline(self.READ_B, typename='Bot'),
+                       self.inline('safe to merge', authorAssociation='CONTRIBUTOR'),
+                       self.inline('safe to merge', typename='Bot')):
+            self.assertEqual(self.head([own], [forged]), (True, SHA_A, 'every lens read it'))
+            self.assertEqual(self.head(inline=[forged]), (False, None, 'no lens comments'))
+
+    def test_an_inline_override_vouches_like_any_other(self):
+        r = lens.Review((), 'proj ready --head', 'OWNER', ('OWNER',))
+        own = post(self.READ_A)
+        ov = self.inline(f'proj ready --head {SHA_B}: read the rest')
+        self.assertEqual(self.head([own], [ov], r), (True, SHA_B, 'every lens read it'))
+        for change in ({'includesCreatedEdit': True}, {'isMinimized': True}, {'authorAssociation': 'MEMBER'},
+                       {'when': '2025-12-31T00:00:00Z'}):
+            self.assertEqual(self.head([own], [self.inline(ov['body'], **change)], r)[1], SHA_A, change)
 
 
 class Config(unittest.TestCase):
