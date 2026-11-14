@@ -10,7 +10,7 @@ FORK_GH_STUB_MARKER="# fork-gh-stub: a test stand-in for gh that never reaches G
 
 fork_test_gh() {
   local dir="$1"
-  unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GITHUB_ACTIONS
+  unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GITHUB_ACTIONS FORK_GH_LOCAL
   mkdir -p "$dir" "$dir/gh-config"
   export GH_HOST=gh-stub.invalid GH_CONFIG_DIR="$dir/gh-config" GH_PROMPT_DISABLED=1 \
     GH_NO_UPDATE_NOTIFIER=1 FORK_TEST_MODE=1
