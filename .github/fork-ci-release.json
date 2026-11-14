@@ -1,0 +1,9 @@
+{
+  "_comment": "The fork-ci release (.github/scripts/fork-ci-release.py, fork-ci/README.md). paths: the only files a release commit holds, at the same paths as on sourceBranch. legacyTags: tags made before release commits existed (they name a sourceBranch commit, not a release commit, and stay where they are).",
+  "sourceBranch": "main",
+  "requiredCheck": "fork-ci-result",
+  "branch": "ci-release",
+  "tagPrefix": "ci/v",
+  "legacyTags": ["ci/v1"],
+  "paths": ["LICENSE", "fork-ci", ".github/workflows/fork-pr-queue.yml"]
+}
