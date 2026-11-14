@@ -459,6 +459,31 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/threads",
     searchTerms: ["usage quota rate limit reset recover continue"],
   },
+  // Fork: waits and agent slots.
+  {
+    id: "wait-for",
+    title: "Let agents wait for events",
+    to: "/settings/threads",
+    searchTerms: ["wait_for wake pull request checks merged file service unit timeout"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
+    id: "wait-checks",
+    title: "Wait checks",
+    to: "/settings/threads",
+    searchTerms: ["wait_for check command exit code poll condition"],
+    environmentOnly: true,
+    scope: "project-defaults",
+  },
+  {
+    id: "agent-slots",
+    title: "Limit running agents",
+    to: "/settings/threads",
+    searchTerms: ["agent slots delegate_task subagents limit memory per account machine"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
   {
     id: "working-shelf",
     title: msg("Working section"),

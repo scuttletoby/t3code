@@ -13,12 +13,15 @@ export function IntervalSecondsField({
   value,
   min,
   step,
+  unit = "seconds",
   onCommit,
 }: {
   label: string;
   value: number;
   min: number;
   step: number;
+  /** Fork: the field's unit for its accessible name; seconds unless given. */
+  unit?: string;
   onCommit: (seconds: number, options: { onFailed: () => void }) => void;
 }) {
   const [field, setField] = useState({
@@ -68,7 +71,7 @@ export function IntervalSecondsField({
       <NumberFieldGroup>
         <NumberFieldDecrement aria-label={`Decrease ${label}`} />
         <NumberFieldInput
-          aria-label={`${label.charAt(0).toUpperCase()}${label.slice(1)} in seconds`}
+          aria-label={`${label.charAt(0).toUpperCase()}${label.slice(1)} in ${unit}`}
         />
         <NumberFieldIncrement aria-label={`Increase ${label}`} />
       </NumberFieldGroup>
