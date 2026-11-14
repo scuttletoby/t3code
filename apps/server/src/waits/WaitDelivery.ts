@@ -46,7 +46,8 @@ export interface WaitDelivery {
   readonly deliver: (message: WaitMessage) => Effect.Effect<WaitDeliveryResult>;
 }
 
-const parentOf = (shell: OrchestrationV2ThreadShell | null): ThreadId | null =>
+/** A thread's subagent parent from its lineage; the only source of a wait's parent. */
+export const parentOf = (shell: OrchestrationV2ThreadShell | null): ThreadId | null =>
   shell?.lineage.relationshipToParent === "subagent" ? shell.lineage.parentThreadId : null;
 
 /** The receiver as its shell shows it; null is a deleted or never-known thread. */
