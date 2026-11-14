@@ -27,10 +27,19 @@ agent user                 ghrun (sudo, one fixed command)           ghkeys (sud
 - **ghrun** runs the privileged `gh-as` and `gh`. It refuses every file path (only stdin), every command that is
   not on the list in `lib/ghapps/policy.py`, unknown flags, full URLs, `--hostname`, `--verbose`, jq that reads
   the environment, and owner work (rulesets, branch protection, Environments, secrets, collaborators, disabling
-  workflows or Actions, the same through GraphQL). The token is in `gh`'s environment only; anything that looks
-  like a token or key is replaced by `[redacted]` in the output.
+  workflows or Actions). The token is in `gh`'s environment only; anything that looks like a token or key is
+  replaced by `[redacted]` in the output.
+- **Plain text only.** The guard checks what GitHub will see, so it refuses anything gh or GitHub would rewrite
+  first: a `gh api` endpoint with `%`, `\`, `#`, spaces, an empty, `.` or `..` part, `{branch}`, or a query string
+  on a write; any `-H` header but `Accept`, `X-GitHub-Api-Version`, `GraphQL-Features`, `If-None-Match` and
+  `If-Modified-Since`.
+- **GraphQL: queries only.** The agent tools only read through GraphQL (review threads, pull request and check
+  state); every write goes through a listed `gh` command. The body is decoded the way GitHub reads it (`-f`/`-F`
+  fields, or strict JSON from `--input` with `\u` escapes decoded) and every `mutation` or `subscription` is
+  refused; a body that cannot be decoded that way is refused too.
 - **ghkeys** owns the token cache and is the only user (besides root) that can read the keys. Agents cannot run
-  `gh-mint`; ghrun can, but it only gets a token on stdout, never the key.
+  `gh-mint`; ghrun can, but it only gets a token on stdout, never the key. sudo's I/O logging is off for `gh-mint`
+  (`!log_output`), so a token never lands in a sudo log.
 - Each call runs in its own folder under `/var/lib/gh-apps/run`, locked by an open file that `gh` holds too, so
   killing the wrapper (even with `kill -9`) never lets a later call delete a folder `gh` still uses.
 
@@ -56,7 +65,10 @@ What it does **not** stop:
 - **git push.** git cannot use these tokens yet; it stays on whatever login the agent user has.
 - **Root.** Anyone with root on the host can read the keys. Run the install and `gh-apps-admin` in a shell no
   agent sees.
-- **The App's permissions.** gh-as limits commands, not the App. Give each App only what agents need.
+- **The App's permissions.** gh-as limits commands, not the App: each token gets all of the App's permissions
+  (on one repository). Give each App only what agents need.
+- **One agent user from another.** Every agent user named at install can use every App set up on the host. Keep
+  agents that must not share an App on different hosts.
 - **Comments and reviews as the App.** An agent can post as the App bot on the App's repository. Rules that
   trust a comment must look at who posted it (the gate does).
 
@@ -107,23 +119,32 @@ Old copies: the installer removes each agent's old `~/.cache/gh-apps`, `~/.local
 `~/.local/bin/gh-app-token`. Keys in `~/.config/gh-apps` were readable by the agent, so they count as leaked: they
 are **not** imported, only reported. Make new keys (step 2), delete the old ones on GitHub, then the folder.
 
-Upgrade: run the bootstrap again with the new sha. Keys, apps and config stay; the old version folder stays for
-rollback (run the bootstrap with the old sha). Remove: `gh-apps-install uninstall` (from
-`/usr/local/libexec/gh-apps/current/sbin/`) removes the sudoers file first, then everything above, keys included,
-and the two users.
+Upgrade: run the bootstrap again with the new sha. Keys, apps and config (the gh path and the agent users) stay
+unless a flag names a new value. The new version is copied in next to the old one and self-tested (its files
+against their hashes, and one test token per App from the new `gh-mint`) before `current` switches to it in one
+step; if the self-test fails, the old version stays live. The old version folder stays for rollback (run the
+bootstrap with the old sha). Remove: `gh-apps-install uninstall` (from `/usr/local/libexec/gh-apps/current/sbin/`)
+removes the sudoers file first, then everything above, keys included, and the two users. There is no command to
+take away one agent user: uninstall, then install again for each user to keep, then add the keys again.
 
 ## Safe to run again, stopped half-way, old or empty state
 
 - **Runs again:** every step checks what is there and only fixes what differs. A second run changes nothing
   (the sudoers file is not even rewritten).
-- **Stops half-way:** the steps run in this order: users, folders, tool, self-test, sudoers, wrapper, cleanup,
-  record. The sudoers file, the only thing that lets an agent reach the tool, is placed only after the self-test
-  passed, and only after `visudo -cf` accepts it (then `visudo -c` for the whole config, or it is removed again).
+- **Stops half-way:** the steps run in this order: users, folders, tool, self-test, switch, sudoers, wrapper,
+  cleanup, record. Nothing points at a new version until its self-test passed, so a stop or a failed self-test
+  during an upgrade leaves the old version live. The sudoers file, the only thing that lets an agent reach the
+  tool, is placed only after the self-test passed, and only after `visudo -cf` accepts it (then `visudo -c` for the whole config, or it is removed again).
   If sudo's config already fails `visudo -c` before the kit touches it (another file is wrong), the installer
   shows visudo's message and places nothing. Files are written to a temporary name and renamed; a version folder is copied to a temporary folder and renamed;
   a half-copied or changed version folder is made again. Running the same command again finishes the job.
 - **Old state:** see "Old copies" above. Existing keys, apps and agent users in `/etc/gh-apps` are kept. A link
-  or file where the kit expects its own folder or link is refused with a message, never overwritten.
+  or file where the kit expects its own folder or link is refused with a message, never overwritten. Existing
+  `ghrun` or `ghkeys` users are reused only if they are plain service users (a no-login shell, a locked password,
+  only their own group, no other members); otherwise the installer says what is wrong and stops. One broken app
+  file does not lock the owner out: `remove-app` and `add-key` still work, and `list` names it.
+- **Self-check as an agent** (`gh-as --self-check`) cannot read the sudoers file; it says so ("not checked")
+  instead of passing it silently. `gh-apps-admin self-check` as root checks it.
 - **Empty state:** a fresh machine with zero Apps installs fine; `gh-as` then says no App is set up and fails.
 - **Rotated key:** gh-mint fails with a message that names the App and says to run `add-key`; a token already
   cached keeps working until it is within 45 minutes of its end (at most 1 hour).
