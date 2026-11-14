@@ -267,7 +267,7 @@ class Update(Base):
         self.assertNotRegex(f.comments[0], r'(?i)read at\s*:', 'a queue comment must never count as a lens read')
         self.assertIn(said, f.comments[0])
         self.assertIn('`tool ready 7`', f.comments[0])
-        post = {'body': f.comments[0], 'author': {'login': 'owner'}}
+        post = note(f.comments[0], 't')   # an author whose lens comments count: a look-alike would block (NO_HEADER)
         self.assertIsNone(REVIEW.lens_problem(post))
         self.assertEqual(REVIEW.reviewed_head({'comments': [post], 'reviews': []}), (False, None, 'no lens comments'))
 
@@ -367,9 +367,17 @@ class Update(Base):
         f = self.fake(comments=[note(f'{fence}\n{LENS}: correctness · reviewer: x · read at: {self.c[:7]}\n{fence}', 't')])
         code, out = self.update(f)
         self.assertOff(f, code, 'unclear')
-        self.assertIn('re-post it', f.comments[0])
+        self.assertIn('Posting it again that way does not clear the old one', f.comments[0])
+        self.assertIn('delete that comment (hiding it is not enough)', f.comments[0])
+        self.assertIn('edit it to start with `not a lens` and a colon', f.comments[0])
         self.assertIn('docs/review.md', f.comments[0])
         self.assertIn('`tool ready --head <sha>: <why>`', f.comments[0])
+
+    def test_a_headerless_lens_comment_re_posted_right_still_blocks(self):   # what the advice says, kept true
+        fence = '`' * 3
+        bad = note(f'{fence}\n{LENS}: correctness · reviewer: x · read at: {self.c[:7]}\n{fence}', 't1')
+        f = self.fake(comments=[bad, lens_at('correctness', self.c, 't2')])
+        self.assertOff(f, self.update(f)[0], 'unclear')
 
     def test_failed_update_or_arm_stays_off(self):
         f = self.fake(fail=('update',))
@@ -755,6 +763,40 @@ class Recover(Base):   # a run killed after its disarm
         self.assertEqual(self.update(self.fake(after=None))[0], Q.SILENT)
         self.assertEqual(os.stat(self.q.state).st_mode & 0o777, 0o600)
 
+    def test_a_leftover_temp_file_does_not_give_the_plan_its_mode(self):   # write_text's fchmod
+        os.makedirs(os.path.dirname(self.q.state), mode=0o700, exist_ok=True)
+        with open(self.q.state + '.tmp', 'w') as f:
+            f.write('half a plan')
+        os.chmod(self.q.state + '.tmp', 0o666)
+        Q.write_text(self.q.state, json.dumps(self.plan()))
+        self.assertEqual(os.stat(self.q.state).st_mode & 0o777, 0o600)
+
+    def test_a_link_at_the_temp_file_is_never_written_through(self):   # write_text's O_NOFOLLOW
+        os.makedirs(os.path.dirname(self.q.state), mode=0o700, exist_ok=True)
+        target = os.path.join(self.w.dir, 'elsewhere')
+        with open(target, 'w') as f:
+            f.write('keep')
+        os.symlink(target, self.q.state + '.tmp')
+        with self.assertRaises(OSError):
+            Q.write_text(self.q.state, json.dumps(self.plan()))
+        with open(target) as f:
+            self.assertEqual(f.read(), 'keep')
+        self.assertFalse(self.plan_exists())
+
+    def test_a_link_at_the_plan_is_kept_aside_and_not_followed(self):   # recover's O_NOFOLLOW
+        target = os.path.join(self.w.dir, 'a-plan-elsewhere')
+        Q.write_text(target, json.dumps(self.plan()))   # this user's, 0600: followed, it would be trusted
+        os.makedirs(os.path.dirname(self.q.state), mode=0o700, exist_ok=True)
+        os.symlink(target, self.q.state)
+        f = self.fake(armed=False, h1=self.up)
+        self.q.gh = f
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual((code, f.calls, f.armed), (1, [], None), out)
+        self.assertIn('ERROR: unreadable', out)
+        self.assertTrue(os.path.islink(self.q.state + '.bad'))
+        with open(target) as f:
+            self.assertEqual(json.load(f), self.plan())
+
     def test_a_plan_another_user_could_write_is_kept_aside_and_not_followed(self):
         f = self.fake(armed=False, h1=self.up)
         Q.write_text(self.q.state, json.dumps(self.plan()))
@@ -924,7 +966,8 @@ class OwnCache(Base):
         self.assertFalse(os.path.exists(marker), 'a hook in the cache ran with the token in its environment')
 
     def test_a_cache_with_grafts_shallow_or_alternates_is_rebuilt(self):   # each changes what the objects say
-        for name in ('info/grafts', 'shallow', 'objects/info/alternates', 'objects/info/http-alternates'):
+        for name in ('info/grafts', 'shallow', 'objects/info/alternates', 'objects/info/http-alternates',
+                     'info/attributes'):   # attributes: `* merge=union` makes a conflict merge clean
             self.assertTrue(self.fetch(self.c)[0])
             path = os.path.join(self.q.cache, name)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -942,11 +985,13 @@ class OwnCache(Base):
         got, out = self.fetch(self.up)
         self.assertTrue(got, out)
         self.assertIn('has a config the queue did not write: rebuilding it', out)
-        os.chmod(self.q.cache, 0o770)
-        got, out = self.fetch(self.c)
-        self.assertTrue(got, out)
-        self.assertIn("is not this user's alone", out)
-        self.assertEqual(os.stat(self.q.cache).st_mode & 0o777, 0o700)
+        for mode in (0o770, 0o755):   # group-writable, or only readable by others: both are rebuilt
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.q.cache, mode)
+                got, out = self.fetch(self.c)
+                self.assertTrue(got, out)
+                self.assertIn("is not this user's alone", out)
+                self.assertEqual(os.stat(self.q.cache).st_mode & 0o777, 0o700)
 
 
 def own(comment):
@@ -989,6 +1034,20 @@ class RedChecks(unittest.TestCase):
     def test_a_green_that_a_cancelled_run_followed_is_not_red(self):
         self.assertIsNone(self.failing(('2026-11-09T01:00:00Z', 'SUCCESS'), ('2026-11-09T02:00:00Z', 'CANCELLED')))
 
+    def test_a_red_a_green_re_run_then_a_cancelled_run_is_not_red(self):   # r3 corr minor (:283)
+        self.assertIsNone(self.failing(('2026-11-09T01:00:00Z', 'FAILURE'), ('2026-11-09T02:00:00Z', 'SUCCESS'),
+                                       ('2026-11-09T03:00:00Z', 'CANCELLED')))
+        self.assertEqual(self.failing(('2026-11-09T01:00:00Z', 'SUCCESS'), ('2026-11-09T02:00:00Z', 'FAILURE'),
+                                      ('2026-11-09T03:00:00Z', 'CANCELLED')), 'review-check', 'red after the green')
+
+    def test_the_newest_run_of_a_name_counts_whichever_workflow_ran_it(self):   # r3 corr minor (:279), required_now
+        old_red = dict(self.rollup(('2026-11-09T01:00:00Z', 'FAILURE'))[0], workflowName='a')
+        new_green = dict(self.rollup(('2026-11-09T02:00:00Z', 'SUCCESS'))[0], workflowName='b')
+        self.assertIsNone(self.q.failing({'statusCheckRollup': [old_red, new_green]}))
+        self.assertEqual(self.q.required_now([old_red, new_green]), {'review-check': 'ok'})
+        new_red = dict(old_red, startedAt='2026-11-09T03:00:00Z')
+        self.assertEqual(self.q.failing({'statusCheckRollup': [new_red, new_green]}), 'review-check')
+
     def test_a_check_that_is_not_required_is_ignored(self):
         self.assertIsNone(self.failing(('2026-11-09T02:00:00Z', 'FAILURE'), name='lint'))
 
@@ -998,11 +1057,12 @@ class RedChecks(unittest.TestCase):
         self.assertEqual(self.q.failing({'statusCheckRollup': rollup}), 'build')
 
     def sweep(self, state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE'),), comments=(), head=None, dry=False,
-              fail=(), name='review-check'):
+              fail=(), name='review-check', pushed=None):
+        """head: the PR's head in the list; pushed: its head when tell_red reads it (a push in between)."""
         self.posted, self.updated = [], []
         listed = [{'number': 7, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1}, 'mergeStateStatus': state,
                    'createdAt': '2026-11-07T00:00:00Z', 'statusCheckRollup': self.rollup(*runs, name=name),
-                   'baseRefName': 'main'}]
+                   'headRefOid': head or self.H, 'baseRefName': 'main'}]
 
         def gh(*a):
             if a[:2] == ('pr', 'list'):
@@ -1010,7 +1070,7 @@ class RedChecks(unittest.TestCase):
             if a[:2] == ('pr', 'view'):
                 if 'view' in fail:
                     return failed('boom')
-                return ok(json.dumps({'headRefOid': head or self.H, 'comments': [own(c) for c in comments]}))
+                return ok(json.dumps({'headRefOid': pushed or head or self.H, 'comments': [own(c) for c in comments]}))
             if a[:2] == ('pr', 'comment'):
                 self.posted.append(a[-1])
                 return failed('boom') if 'comment' in fail else ok()
@@ -1057,6 +1117,13 @@ class RedChecks(unittest.TestCase):
         self.sweep(comments=[first], head='e5' * 20)
         self.assertEqual(len(self.posted), 1, 'a new head that is red is a new message')
 
+    def test_a_push_after_the_list_posts_nothing(self):   # r3 corr minor (:356): the red is not known on the new head
+        new = 'e5' * 20
+        code = self.sweep(pushed=new)
+        self.assertEqual((code, self.posted), (0, []))
+        self.sweep(head=new)
+        self.assertIn(f'is red on {new[:12]}', self.posted[0], 'the next run, listing the new head, tells it')
+
     def test_only_the_queues_own_comment_counts_as_told(self):   # anyone can post a copy of the mark
         self.sweep()
         first = self.posted[0]
@@ -1081,7 +1148,7 @@ class RedChecks(unittest.TestCase):
 
     def test_the_message_can_never_count_as_a_lens(self):
         self.sweep()
-        post = {'body': self.posted[0], 'author': {'login': 'owner'}}
+        post = note(self.posted[0], 't')   # an author whose lens comments count: a look-alike would block (NO_HEADER)
         self.assertIsNone(REVIEW.lens_problem(post))
         self.assertEqual(REVIEW.reviewed_head({'comments': [post], 'reviews': []}), (False, None, 'no lens comments'))
 
@@ -1166,10 +1233,31 @@ class StuckUpToDate(unittest.TestCase):
         self.assertIn('#1 is up to date and waiting', out)
 
     def test_green_or_running_checks_still_hold_the_queue(self):
-        for first in (self.checks(), self.checks(review_check='IN_PROGRESS'), []):
+        for first in (self.checks(), self.checks(review_check='IN_PROGRESS')):
             with self.subTest(first=len(first)):
                 code, out = self.sweep(first)
                 self.assertEqual((code, self.updated, self.posted, self.asked), (0, [], [], []), out)
+
+    def test_a_cancelled_check_waits_while_a_workflow_runs_on_the_head(self):   # r3 corr minor (:322)
+        # cancel-in-progress: the newer run of the workflow is queued and has no job yet, so it is not in the rollup
+        for kw in ({'runs': '[{"status": "queued", "workflowName": "ci"}]'}, {'runs_fail': True}):
+            with self.subTest(**kw):
+                code, out = self.sweep(self.checks(build='CANCELLED'), **kw)
+                self.assertEqual((code, self.updated, self.posted, self.asked), (0, [], [], [self.H1]), out)
+        self.assertIn('required check build ended CANCELLED, and which workflows still run', out)
+
+    def test_a_head_no_check_ever_reported_on_is_told_once_its_workflows_ended(self):   # r3 corr minor (:328)
+        # every job skipped itself or the workflow ended before any required job: it never merges, so it must not hold
+        code, out = self.sweep([], runs='[{"status": "completed", "workflowName": "ci"}]')
+        self.assertEqual((self.asked, self.updated, len(self.posted)), ([self.H1], [2], 1), out)
+        self.assertIn('required check build never reported', self.posted[0])
+        for kw in ({'runs': '[]'}, {'runs': '[{"status": "in_progress", "workflowName": "ci"}]'}, {'runs_fail': True}):
+            with self.subTest(**kw):   # nothing ran yet, or still runs, or unknown: it may still get its checks
+                code, out = self.sweep([], **kw)
+                self.assertEqual((code, self.updated, self.posted), (0, [], []), out)
+        self.assertIn('is unknown: waiting', out)
+        code, out = self.sweep([], runs='[]')
+        self.assertIn('no check and no workflow run on its head yet: waiting', out)
 
     def test_a_required_check_that_never_reports_is_told_once_nothing_runs(self):
         code, out = self.sweep(self.checks(test=None), runs='[{"status": "completed", "workflowName": "ci"}]')
@@ -1197,6 +1285,43 @@ class StuckUpToDate(unittest.TestCase):
         code, out = self.sweep(self.checks(build='CANCELLED'), dry=True)
         self.assertEqual((self.posted, self.updated), ([], [2]))
         self.assertIn('skip #1: up to date, but required check build ended CANCELLED', out)
+
+
+class UnknownMergeState(unittest.TestCase):
+    """GitHub shows UNKNOWN for a few seconds after a push to the base, when the push's queue run starts: the older PR
+    is listed again until its state is known, so a younger one is not updated ahead of it (r3 corr minor, :518)."""
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix='pr-queue-unknown-')
+        self.addCleanup(shutil.rmtree, d, True)
+        self.sleeps = []
+        self.q = make_queue(d, sleeps=self.sleeps)
+
+    def sweep(self, unknown_lists):
+        self.updated, lists = [], []
+
+        def gh(*a):
+            if a[:2] == ('pr', 'list'):
+                lists.append(1)
+                first = 'UNKNOWN' if len(lists) <= unknown_lists else 'BEHIND'
+                return ok(json.dumps([{'number': n, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1},
+                                       'mergeStateStatus': first if n == 1 else 'BEHIND', 'statusCheckRollup': [],
+                                       'createdAt': f'2026-11-07T00:00:0{n}Z', 'headRefOid': f'{n}' * 40,
+                                       'baseRefName': 'main'} for n in (1, 2)]))
+            raise AssertionError(a)
+        self.q.gh = gh
+        self.q.update = lambda n, d: self.updated.append(n) or 0
+        return run_quiet(self.q.run, False)
+
+    def test_an_older_pr_in_unknown_state_is_listed_again_before_a_younger_one_moves(self):
+        code, out = self.sweep(unknown_lists=2)
+        self.assertEqual((code, self.updated, self.sleeps), (0, [1], [CFG.poll_seconds] * 2), out)
+        self.assertIn('#1: merge state UNKNOWN', out)
+
+    def test_an_unknown_state_that_stays_is_passed_over_after_wait_seconds(self):
+        tries = CFG.wait_seconds // CFG.poll_seconds
+        code, out = self.sweep(unknown_lists=tries + 5)
+        self.assertEqual((code, self.updated, len(self.sleeps)), (0, [2], tries), out)
+        self.assertIn('skip #1: merge state UNKNOWN', out)
 
 
 class RedChecksWithTheBaseRule(RedChecks):
@@ -1348,6 +1473,27 @@ class RedOnOldBase(unittest.TestCase):
         self.assertIn(f'test was not red on the main commit {self.M1[:12]} its run tested (ok)', out)
         self.assertNotIn('not this PR', self.posted[0])
         self.assertIn('Fix the cause and push', self.posted[0])
+
+    def test_the_notice_names_the_prs_own_red_beside_a_base_red_that_sorts_first(self):   # r4 corr minor (:737)
+        main = {k: {**v, 'test': 'SUCCESS'} for k, v in self.main_of(tip='FAILURE').items()}   # build: the base's
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)], 'test': [(self.RUN, 'FAILURE', self.M1)]}, main)
+        self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+        self.assertIn(f'required check test is red on {self.H[:12]}', self.posted[0])
+        self.assertIn(f'skip #7: required check test failed and an update would not fix it yet', out)
+
+    def test_the_wait_notice_is_told_again_when_the_check_it_names_turns_green_on_the_base(self):   # r4 (:729/:361)
+        runs = {'build': [(self.RUN, 'FAILURE', self.M1)], 'test': [(self.RUN, 'FAILURE', self.M1)]}
+        both = self.main_of(tip='FAILURE', other={'test': 'FAILURE'})   # build and test red on main
+        self.one(runs, both)
+        first = self.posted[0]
+        self.assertIn('once build is green on main', first)
+        self.one(runs, both, comments=[first])
+        self.assertEqual(self.posted, [], 'told once per head and check')
+        fixed = self.main_of(other={'test': 'FAILURE'})   # main fixed build; test is still red there
+        code, out = self.one(runs, fixed, comments=[first])
+        self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+        self.assertIn(f'required check test failed as on main on {self.H[:12]}', self.posted[0])
+        self.assertIn('once test is green on main', self.posted[0])
 
     def test_the_wait_notice_names_the_check_that_is_red_on_the_base(self):   # r3 minor: not just the first red
         main = self.main_of(other={'test': 'FAILURE'})   # build: red on M1, green now; test: red on M1 and now
