@@ -34,13 +34,26 @@ export const UsageReading = Schema.Struct({
    * values, except `<base>` -> `<base>.<workspace>` (the workspace became known).
    */
   account: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * The workspace in `account` was taken from another instance of the same login in the same
+   * snapshot, as the Limits UI groups it. Such an account is never carried as last known.
+   */
+  borrowed: Schema.optional(Schema.Literal(true)),
   unavailable: Schema.optional(Schema.Literals(["unsupported", "probeFailed"])),
 });
 export type UsageReading = typeof UsageReading.Type;
 
+/**
+ * A served reading, in append order. `segment` goes up by one at each reading stamped earlier than
+ * the one appended before it (the clock changed). Part 3 computes pace per segment, never across a
+ * break. Numbers count per instance and may shift after compaction: compare within one result.
+ */
+export type HistoryReading = UsageReading & { readonly segment: number };
+
 export interface AccountReading {
   readonly instanceId: ProviderInstanceId;
-  readonly reading: UsageReading;
+  /** `segment` counts within `instanceId`'s history. */
+  readonly reading: HistoryReading;
 }
 
 /** A history file exists but could not be read; it is left untouched. */
@@ -95,38 +108,43 @@ export function accountOf(provider: ServerProvider): string | undefined {
 const baseOf = (account: string) => account.split(".")[0];
 const hasWorkspace = (account: string) => account.includes(".");
 
+interface ResolvedAccount {
+  readonly account: string | undefined;
+  readonly borrowed: boolean;
+}
+
 /**
- * The account recorded for a report (`own`). A report that knows less than the instance's last
- * known account does not make it another account: with no identity it keeps the last known one;
- * with no workspace it keeps the last known one of the same base, or else takes the one workspace
- * other instances of that base report in the same snapshot, as the Limits UI does.
+ * The account recorded for `own`. Knowing less is not another account: no identity keeps
+ * `lastKnown` (never a borrowed one); no workspace keeps `lastKnown` of the same base, or else
+ * borrows the workspace the snapshot reports for that base, as the Limits UI does, only if it
+ * reports exactly one: two workspaces never merge.
  */
 function resolveAccount(
   own: string | undefined,
   lastKnown: string | undefined,
   snapshot: ReadonlyArray<string>,
-): string | undefined {
-  if (own === undefined) return lastKnown;
-  if (hasWorkspace(own)) return own;
+): ResolvedAccount {
+  if (own === undefined) return { account: lastKnown, borrowed: false };
+  if (hasWorkspace(own)) return { account: own, borrowed: false };
   if (lastKnown !== undefined && hasWorkspace(lastKnown) && baseOf(lastKnown) === own) {
-    return lastKnown;
+    return { account: lastKnown, borrowed: false };
   }
   const workspaces = new Set(
     snapshot.filter((account) => hasWorkspace(account) && baseOf(account) === own),
   );
-  return workspaces.size === 1 ? [...workspaces][0] : own;
+  return workspaces.size === 1
+    ? { account: [...workspaces][0], borrowed: true }
+    : { account: own, borrowed: false };
 }
 
-function readingOf(
-  provider: ServerProvider,
-  account: string | undefined,
-): UsageReading | undefined {
+function readingOf(provider: ServerProvider, resolved: ResolvedAccount): UsageReading | undefined {
   const limits = provider.usageLimits;
   if (limits === undefined) return undefined;
   return {
     checkedAt: limits.checkedAt,
     windows: limits.windows.map((window) => ({ ...window })),
-    ...(account === undefined ? {} : { account }),
+    ...(resolved.account === undefined ? {} : { account: resolved.account }),
+    ...(resolved.account !== undefined && resolved.borrowed ? { borrowed: true as const } : {}),
     ...(limits.unavailable === undefined ? {} : { unavailable: limits.unavailable.reason }),
   };
 }
@@ -157,6 +175,7 @@ function windowsChanged(previous: UsageReading, next: UsageReading, meterStep: n
 /** Changes other than meter moves: account, availability, windows or their resets. */
 const structureChanged = (previous: UsageReading, next: UsageReading) =>
   previous.account !== next.account ||
+  previous.borrowed !== next.borrowed ||
   previous.unavailable !== next.unavailable ||
   windowsChanged(previous, next, Number.POSITIVE_INFINITY);
 
@@ -186,14 +205,11 @@ interface HistoryLine {
 }
 
 /**
- * Lines of one history file, oldest first; torn lines dropped, undecodable ones kept as text.
- * Appends follow the server's clock, so a line stamped later than a later append came from a clock
- * that was ahead and is dropped for good. An uncontradicted line ahead of now stays, unused.
+ * Lines of one history file in append order; torn lines dropped, undecodable ones kept as text.
+ * No line is dropped or hidden because its stamp disagrees with another line or with the clock:
+ * either clock may be the wrong one. Stamps that go backwards start a new segment instead.
  */
-function parseHistory(contents: string): {
-  readonly lines: Array<HistoryLine>;
-  readonly fromClockAhead: number;
-} {
+function parseHistory(contents: string): Array<HistoryLine> {
   const lines: Array<HistoryLine> = [];
   for (const raw of contents.split("\n")) {
     const text = raw.trim();
@@ -214,22 +230,26 @@ function parseHistory(contents: string): {
     const ms = typeof checkedAt === "string" ? Date.parse(checkedAt) : Number.NaN;
     if (Number.isFinite(ms)) lines.push({ ms, text, reading: undefined });
   }
-  // Walking back from the last append, keep a line only if no later append is stamped earlier.
-  const kept: Array<HistoryLine> = [];
-  let earliestAfter = Number.POSITIVE_INFINITY;
-  for (const line of lines.toReversed()) {
-    if (line.ms > earliestAfter) continue;
-    earliestAfter = line.ms;
-    kept.push(line);
-  }
-  return { lines: kept.toReversed(), fromClockAhead: lines.length - kept.length };
+  return lines;
 }
 
-/** Readings the history serves: decoded and not stamped ahead of the clock. */
-const usableReadings = (lines: ReadonlyArray<HistoryLine>, nowMs: number) =>
-  lines.flatMap((line) =>
-    line.reading !== undefined && line.ms <= nowMs + FUTURE_TOLERANCE_MS ? [line.reading] : [],
-  );
+/** The segment of `reading` appended after `previous` (see `HistoryReading`). */
+const segmentAfter = (previous: HistoryReading | undefined, reading: UsageReading) =>
+  previous === undefined ? 0 : previous.segment + (msOf(reading) < msOf(previous) ? 1 : 0);
+
+/** Decoded readings of a history, in append order, with their segments. */
+function segmented(lines: ReadonlyArray<HistoryLine>): Array<HistoryReading> {
+  const readings: Array<HistoryReading> = [];
+  for (const line of lines) {
+    if (line.reading === undefined) continue;
+    readings.push({ ...line.reading, segment: segmentAfter(readings.at(-1), line.reading) });
+  }
+  return readings;
+}
+
+/** Readers use a reading only once the clock has reached its stamp; it stays stored meanwhile. */
+const notAhead = (nowMs: number) => (reading: UsageReading) =>
+  msOf(reading) <= nowMs + FUTURE_TOLERANCE_MS;
 
 interface RetentionRules {
   readonly retentionMs: number;
@@ -253,11 +273,13 @@ function retainLines(
     if (line.ms < baseMs - rules.retentionMs) continue;
     if (line.reading !== undefined && line.ms < baseMs - rules.thinAfterMs) {
       const previous = lastThinned?.reading;
+      // A stamp before the last kept one starts a new segment; thinning starts again there.
+      const gap = lastThinned === undefined ? Number.NaN : line.ms - lastThinned.ms;
       if (
-        lastThinned !== undefined &&
         previous !== undefined &&
         !structureChanged(previous, line.reading) &&
-        line.ms - lastThinned.ms < rules.thinIntervalMs
+        gap >= 0 &&
+        gap < rules.thinIntervalMs
       ) {
         continue;
       }
@@ -278,20 +300,28 @@ export class UsageReadingsHistory extends Context.Service<
   {
     /** Appends each instance's reading when it changed, or when the heartbeat is due. */
     readonly record: (providers: ReadonlyArray<ServerProvider>) => Effect.Effect<void>;
-    /** Readings of one instance, oldest first, served from memory; empty when there is none. */
+    /**
+     * Readings of one instance in append order, with their clock segments (`HistoryReading`),
+     * served from memory; empty when there is none. Readings stamped ahead of the clock are left
+     * out until the clock reaches them.
+     */
     readonly readings: (
       instanceId: ProviderInstanceId,
       options?: { readonly sinceMs?: number },
-    ) => Effect.Effect<ReadonlyArray<UsageReading>, UsageHistoryUnreadable>;
+    ) => Effect.Effect<ReadonlyArray<HistoryReading>, UsageHistoryUnreadable>;
     /**
-     * Readings of one account (`accountOf`) across every loaded instance, oldest first. After an
+     * Readings of one account (`accountOf`) across every loaded instance, by stamp. After an
      * account swap an instance's readings move to the new account, so each account is one series.
+     * Pace is computed per instance and segment.
      */
     readonly readingsOfAccount: (
       account: string,
       options?: { readonly sinceMs?: number },
     ) => Effect.Effect<ReadonlyArray<AccountReading>>;
-    /** Applies retention and thinning to every history file; also drops torn lines. */
+    /**
+     * Applies retention, the cap and thinning to every history file, counted from the newest
+     * reading; also drops torn lines. Nothing else is ever deleted.
+     */
     readonly compact: Effect.Effect<void>;
   }
 >()("t3/usage/UsageReadingsHistory") {}
@@ -317,12 +347,12 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
     maxReadings: options.maxReadingsPerInstance ?? DEFAULT_MAX_READINGS_PER_INSTANCE,
   };
   const lock = yield* Semaphore.make(1);
-  /** Loaded histories, oldest first. An instance is absent until its file was read. */
-  const histories = new Map<ProviderInstanceId, Array<UsageReading>>();
+  /** Loaded histories, in append order. An instance is absent until its file was read. */
+  const histories = new Map<ProviderInstanceId, Array<HistoryReading>>();
   /** Instances whose file is known to end with a newline, so an append needs none first. */
   const cleanEnd = new Set<ProviderInstanceId>();
   const appendsSinceCompaction = new Map<ProviderInstanceId, number>();
-  /** Instances whose last pass failed; their next failures are not logged until one succeeds. */
+  /** Instances whose last pass failed; their next failures are not logged until a read or write works. */
   const failing = new Set<ProviderInstanceId>();
   let newestMs = Number.NEGATIVE_INFINITY;
 
@@ -340,38 +370,52 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
       }),
     );
 
-  const remember = (instanceId: ProviderInstanceId, readings: Array<UsageReading>) => {
+  /** Keeps a history in memory; `newestMs` only counts readings the clock has reached. */
+  const remember = (
+    instanceId: ProviderInstanceId,
+    readings: Array<HistoryReading>,
+    nowMs: number,
+  ) => {
     histories.set(instanceId, readings);
-    const last = readings.at(-1);
-    if (last !== undefined) newestMs = Math.max(newestMs, msOf(last));
+    for (const reading of readings) {
+      if (notAhead(nowMs)(reading)) newestMs = Math.max(newestMs, msOf(reading));
+    }
   };
 
-  const warnFuture = Effect.fnUntraced(function* (
+  const warnAhead = Effect.fnUntraced(function* (
     instanceId: ProviderInstanceId,
-    parsed: ReturnType<typeof parseHistory>,
+    lines: ReadonlyArray<HistoryLine>,
+    nowMs: number,
   ) {
-    const nowMs = yield* Clock.currentTimeMillis;
-    const ahead = parsed.lines.filter((line) => line.ms > nowMs + FUTURE_TOLERANCE_MS).length;
-    if (ahead > 0 || parsed.fromClockAhead > 0) {
-      yield* Effect.logWarning("usage readings: readings stamped ahead of the clock ignored", {
-        instanceId,
-        ahead,
-        fromClockAhead: parsed.fromClockAhead,
-      });
+    const ahead = lines.filter((line) => line.ms > nowMs + FUTURE_TOLERANCE_MS).length;
+    if (ahead > 0) {
+      yield* Effect.logWarning(
+        "usage readings: readings stamped ahead of the clock kept, not used until it gets there",
+        { instanceId, ahead },
+      );
     }
   });
+
+  const recovered = (instanceId: ProviderInstanceId) =>
+    Effect.suspend(() =>
+      failing.delete(instanceId)
+        ? Effect.logInfo("usage readings: recording works again", { instanceId })
+        : Effect.void,
+    );
 
   const load = Effect.fnUntraced(function* (instanceId: ProviderInstanceId) {
     const loaded = histories.get(instanceId);
     if (loaded !== undefined) return loaded;
     const contents = yield* readContents(instanceId);
-    const parsed = parseHistory(contents);
-    const lines = parsed.lines;
-    yield* warnFuture(instanceId, parsed);
+    // A file that could not be read now can be: a real read worked.
+    yield* recovered(instanceId);
+    const lines = parseHistory(contents);
+    const nowMs = yield* Clock.currentTimeMillis;
+    yield* warnAhead(instanceId, lines, nowMs);
     if (contents.length === 0 || contents.endsWith("\n")) cleanEnd.add(instanceId);
     else cleanEnd.delete(instanceId);
-    const readings = usableReadings(lines, yield* Clock.currentTimeMillis);
-    remember(instanceId, readings);
+    const readings = segmented(lines);
+    remember(instanceId, readings, nowMs);
     return readings;
   });
 
@@ -394,7 +438,7 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
       );
     }
     cleanEnd.add(instanceId);
-    histories.set(instanceId, usableReadings(kept, nowMs));
+    histories.set(instanceId, segmented(kept));
   });
 
   const logFailure = (operation: string, instanceId?: ProviderInstanceId) =>
@@ -402,7 +446,7 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
       Effect.logWarning(`usage readings: ${operation} failed`, { instanceId, cause }),
     );
 
-  /** Logs the first failure of an instance; later ones stay quiet until a pass succeeds. */
+  /** Logs the first failure of an instance; later ones stay quiet until `recovered`. */
   const logFailureOnce = (operation: string, instanceId: ProviderInstanceId) =>
     Effect.catchCause((cause) => {
       if (failing.has(instanceId)) return Effect.void;
@@ -412,13 +456,6 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
         { instanceId, cause },
       );
     });
-
-  const recovered = (instanceId: ProviderInstanceId) =>
-    Effect.suspend(() =>
-      failing.delete(instanceId)
-        ? Effect.logInfo("usage readings: recording works again", { instanceId })
-        : Effect.void,
-    );
 
   /** Removes temp folders a crash during compaction left; only compaction (under the lock) makes them. */
   const removeCompactionLeftovers = (names: ReadonlyArray<string>) =>
@@ -455,10 +492,11 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
         yield* readContents(id).pipe(
           Effect.flatMap((contents) =>
             Effect.gen(function* () {
-              const history = parseHistory(contents);
-              yield* warnFuture(id, history);
-              remember(id, usableReadings(history.lines, nowMs));
-              parsed.push([id, history.lines]);
+              yield* recovered(id);
+              const lines = parseHistory(contents);
+              yield* warnAhead(id, lines, nowMs);
+              remember(id, segmented(lines), nowMs);
+              parsed.push([id, lines]);
             }),
           ),
           logFailureOnce("compaction read", id),
@@ -472,7 +510,7 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
 
   const compactInstance = (instanceId: ProviderInstanceId) =>
     readContents(instanceId).pipe(
-      Effect.flatMap((contents) => writeCompacted(instanceId, parseHistory(contents).lines)),
+      Effect.flatMap((contents) => writeCompacted(instanceId, parseHistory(contents))),
     );
 
   const record = (providers: ReadonlyArray<ServerProvider>) => {
@@ -485,20 +523,16 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
             if (provider.usageLimits === undefined) return;
             const instanceId = provider.instanceId;
             const history = yield* load(instanceId);
-            // The clock stepped back: a reading now ahead of it must not block recording.
-            const nowMs = yield* Clock.currentTimeMillis;
-            for (
-              let last = history.at(-1);
-              last !== undefined && msOf(last) > nowMs + FUTURE_TOLERANCE_MS;
-              last = history.at(-1)
-            ) {
-              history.pop();
-            }
-            const lastKnown = history.findLast((entry) => entry.account !== undefined)?.account;
-            const account = resolveAccount(accountOf(provider), lastKnown, snapshotAccounts);
-            const reading = readingOf(provider, account);
+            const lastKnown = history.findLast(
+              (entry) => entry.account !== undefined && entry.borrowed !== true,
+            )?.account;
+            const resolved = resolveAccount(accountOf(provider), lastKnown, snapshotAccounts);
+            const reading = readingOf(provider, resolved);
             if (reading === undefined) return;
-            if (!shouldRecord(history.at(-1), reading, heartbeatMs)) return;
+            // Compared with the last reading the clock has reached: a reading stamped ahead of it
+            // (the clock stepped back) must not block recording. It stays; a segment starts here.
+            const nowMs = yield* Clock.currentTimeMillis;
+            if (!shouldRecord(history.findLast(notAhead(nowMs)), reading, heartbeatMs)) return;
             yield* fs.makeDirectory(options.directory, { recursive: true });
             // A torn last line (crash or partial write) must not swallow this reading.
             const separator = cleanEnd.has(instanceId) ? "" : "\n";
@@ -507,24 +541,23 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
               flag: "a",
             });
             cleanEnd.add(instanceId);
-            history.push(reading);
+            yield* recovered(instanceId);
+            history.push({ ...reading, segment: segmentAfter(history.at(-1), reading) });
             newestMs = Math.max(newestMs, msOf(reading));
             const appends = (appendsSinceCompaction.get(instanceId) ?? 0) + 1;
             appendsSinceCompaction.set(instanceId, appends);
             if (appends >= appendsBetweenCompactions) {
               yield* compactInstance(instanceId).pipe(logFailure("compaction", instanceId));
             }
-          }).pipe(
-            Effect.andThen(recovered(provider.instanceId)),
-            logFailureOnce("append", provider.instanceId),
-          ),
+          }).pipe(logFailureOnce("append", provider.instanceId)),
         { discard: true },
       ),
     );
   };
 
-  const since = (sinceMs: number | undefined) => (reading: UsageReading) =>
-    msOf(reading) >= (sinceMs ?? Number.NEGATIVE_INFINITY);
+  /** What a reader is served: reached by the clock and not before `sinceMs`. */
+  const served = (nowMs: number, sinceMs: number | undefined) => (reading: UsageReading) =>
+    notAhead(nowMs)(reading) && msOf(reading) >= (sinceMs ?? Number.NEGATIVE_INFINITY);
 
   const readings = (
     instanceId: ProviderInstanceId,
@@ -534,20 +567,25 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
     // Loaded histories are served from memory, without waiting for a write in progress.
     const all =
       loaded !== undefined ? Effect.succeed(loaded) : lock.withPermits(1)(load(instanceId));
-    return all.pipe(Effect.map((history) => history.filter(since(readOptions?.sinceMs))));
+    return Effect.all([all, Clock.currentTimeMillis]).pipe(
+      Effect.map(([history, nowMs]) => history.filter(served(nowMs, readOptions?.sinceMs))),
+    );
   };
 
   const readingsOfAccount = (account: string, readOptions?: { readonly sinceMs?: number }) =>
-    Effect.sync(() =>
-      [...histories]
-        .flatMap(([instanceId, history]) =>
-          history
-            .filter(
-              (reading) => reading.account === account && since(readOptions?.sinceMs)(reading),
-            )
-            .map((reading): AccountReading => ({ instanceId, reading })),
-        )
-        .toSorted((left, right) => msOf(left.reading) - msOf(right.reading)),
+    Clock.currentTimeMillis.pipe(
+      Effect.map((nowMs) =>
+        [...histories]
+          .flatMap(([instanceId, history]) =>
+            history
+              .filter(
+                (reading) =>
+                  reading.account === account && served(nowMs, readOptions?.sinceMs)(reading),
+              )
+              .map((reading): AccountReading => ({ instanceId, reading })),
+          )
+          .toSorted((left, right) => msOf(left.reading) - msOf(right.reading)),
+      ),
     );
 
   return UsageReadingsHistory.of({ record, readings, readingsOfAccount, compact });

@@ -29,6 +29,7 @@ import * as UsageReadingsHistory from "./UsageReadingsHistory.ts";
 import {
   accountOf,
   DEFAULT_RETENTION_MS,
+  type HistoryReading,
   make,
   shouldRecord,
   type UsageReading,
@@ -97,6 +98,9 @@ const reading = (
 
 const percents = (readings: ReadonlyArray<UsageReading>) =>
   readings.map((entry) => entry.windows[0]?.usedPercent);
+
+const segments = (readings: ReadonlyArray<HistoryReading>) =>
+  readings.map((entry) => entry.segment);
 
 const historyDirectory = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -176,6 +180,9 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
     assert.isTrue(shouldRecord(first, reading(at(MINUTE), 41)));
     assert.isTrue(shouldRecord(first, reading(at(30 * MINUTE), 40)));
     assert.isTrue(shouldRecord(first, reading(at(MINUTE), 40, { account: "other" })));
+    // The same account, now reported by the instance itself instead of borrowed.
+    const borrowed = reading(at(0), 40, { account: "a", borrowed: true });
+    assert.isTrue(shouldRecord(borrowed, reading(at(MINUTE), 40, { account: "a" })));
     assert.isTrue(shouldRecord(first, { ...reading(at(MINUTE), 40), windows: [] }));
     // The same probe republished, or an older one arriving late, is not history.
     assert.isFalse(shouldRecord(first, reading(at(0), 55)));
@@ -260,7 +267,7 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
     }),
   );
 
-  it.effect("drops a reading appended before an earlier-stamped one: its clock was ahead", () =>
+  it.effect("keeps a reading from a clock that was ahead and starts a segment after it", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(NOW_MS + 2 * MINUTE);
       const directory = yield* historyDirectory;
@@ -271,24 +278,86 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
         jsonLines([reading(at(0), 40), reading(at(2 * DAY), 90), reading(at(MINUTE), 45)]),
       );
       const history = yield* make({ directory });
-      assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 45]);
       yield* history.compact;
-      assert.strictEqual((yield* fileLines(file)).length, 2);
+      yield* history.compact;
+      // Not served while ahead of the clock, but never deleted.
+      const now = yield* history.readings(INSTANCE);
+      assert.deepStrictEqual(percents(now), [40, 45]);
+      assert.deepStrictEqual(segments(now), [0, 1]);
+      assert.strictEqual((yield* fileLines(file)).length, 3);
 
-      // Even once the clock passes its stamp, the ahead reading does not mix back in.
-      yield* seedHistory(
-        directory,
-        INSTANCE,
-        jsonLines([reading(at(0), 40), reading(at(2 * DAY), 90), reading(at(MINUTE), 45)]),
-      );
+      // Once the clock passes its stamp it is served, in append order, before the break.
       yield* TestClock.setTime(NOW_MS + 3 * DAY);
       const later = yield* make({ directory });
-      assert.deepStrictEqual(percents(yield* later.readings(INSTANCE)), [40, 45]);
+      yield* later.compact;
+      const all = yield* later.readings(INSTANCE);
+      assert.deepStrictEqual(percents(all), [40, 90, 45]);
+      assert.deepStrictEqual(segments(all), [0, 0, 1]);
+      assert.strictEqual((yield* fileLines(file)).length, 3);
+    }),
+  );
+
+  it.effect("one reading from a clock years behind, then a restart, keeps the whole history", () =>
+    Effect.gen(function* () {
+      const directory = yield* historyDirectory;
+      // Ten days of hourly readings from a correct clock.
+      const days = Array.from({ length: 10 * 24 }, (_, hour) =>
+        reading(at(-10 * DAY + hour * HOUR), hour % 100),
+      );
+      const file = yield* seedHistory(directory, INSTANCE, jsonLines(days));
+      // The device starts with its clock years behind and records one reading.
+      const behindMs = Date.parse("2001-01-01T00:00:00.000Z");
+      yield* TestClock.setTime(behindMs);
+      const behind = yield* make({ directory });
+      yield* behind.compact;
+      yield* behind.record([
+        provider(limits(DateTime.formatIso(DateTime.makeUnsafe(behindMs)), 55)),
+      ]);
+      assert.deepStrictEqual(percents(yield* behind.readings(INSTANCE)), [55]);
+      assert.strictEqual((yield* fileLines(file)).length, days.length + 1);
+
+      // Restart with the clock right: compaction keeps every real reading; the 2001 one is old.
+      yield* TestClock.setTime(NOW_MS);
+      const restarted = yield* make({ directory });
+      yield* restarted.compact;
+      const served = yield* restarted.readings(INSTANCE);
+      assert.deepStrictEqual(percents(served), percents(days));
+      assert.strictEqual((yield* fileLines(file)).length, days.length);
+      assert.deepStrictEqual(new Set(segments(served)), new Set([0]));
+    }),
+  );
+
+  it.effect("compaction of a file with backwards stamps thins each segment on its own", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const directory = yield* historyDirectory;
+      const start = -3 * DAY;
+      // One reading a minute for an hour, three days ago; then the clock was set back an hour
+      // and the same hour was read again. Both hours are older than `thinAfterMs`.
+      const hour = (percent: number) =>
+        Array.from({ length: 60 }, (_, minute) => reading(at(start + minute * MINUTE), percent));
+      const file = yield* seedHistory(
+        directory,
+        INSTANCE,
+        jsonLines([...hour(40), ...hour(50), reading(at(-MINUTE), 60)]),
+      );
+      const history = yield* make({ directory, thinAfterMs: DAY, thinIntervalMs: 15 * MINUTE });
+      yield* history.compact;
+
+      const kept = yield* history.readings(INSTANCE);
+      const minutes = kept.map(
+        (entry) => (Date.parse(entry.checkedAt) - (NOW_MS + start)) / MINUTE,
+      );
+      // Thinning alone: minutes 0, 15, 30 and 45 of each pass; the recent reading stays.
+      assert.deepStrictEqual(minutes.slice(0, 8), [0, 15, 30, 45, 0, 15, 30, 45]);
+      assert.deepStrictEqual(percents(kept), [40, 40, 40, 40, 50, 50, 50, 50, 60]);
+      assert.deepStrictEqual(segments(kept), [0, 0, 0, 0, 1, 1, 1, 1, 1]);
+      assert.strictEqual((yield* fileLines(file)).length, 9);
     }),
   );
 
   it.effect(
-    "keeps readings ahead of a clock that is behind until a later append contradicts them",
+    "keeps readings ahead of a clock that is behind and serves them once it is put right",
     () =>
       Effect.gen(function* () {
         yield* TestClock.setTime(NOW_MS);
@@ -412,15 +481,17 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       assert.strictEqual((yield* fileLines(file)).length, 2);
       yield* history.record([provider(limits(at(MINUTE), 45))]);
       assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 45]);
-      // The append after it shows that reading came from a clock that was ahead: compaction drops it.
+      assert.deepStrictEqual(segments(yield* history.readings(INSTANCE)), [0, 1]);
+      // Nothing is deleted for the clock disagreement.
       yield* history.compact;
-      assert.strictEqual((yield* fileLines(file)).length, 2);
-      assert.notInclude((yield* fileLines(file)).join("\n"), at(2 * DAY));
+      assert.strictEqual((yield* fileLines(file)).length, 3);
 
-      // The clock steps back while running: the last reading is now ahead of it.
+      // The clock steps back while running: every reading is now ahead of it.
       yield* TestClock.setTime(NOW_MS - DAY);
       yield* history.record([provider(limits(at(-DAY + MINUTE), 30))]);
       assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [30]);
+      assert.deepStrictEqual(segments(yield* history.readings(INSTANCE)), [2]);
+      assert.strictEqual((yield* fileLines(file)).length, 4);
     }),
   );
 
@@ -470,7 +541,10 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       }
       assert.strictEqual(logs.warnings.length, 1);
 
+      // The file can be read again: that is a real read, even with nothing new to write.
       denied = false;
+      yield* history.record([provider(limits(at(-MINUTE), 40))]);
+      assert.strictEqual(logs.infos.length, 1);
       yield* history.record([provider(limits(at(3 * MINUTE), 50))]);
       assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 50]);
       assert.strictEqual(logs.infos.length, 1);
@@ -481,6 +555,39 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
         yield* history.record([provider(limits(at(step * MINUTE), 50 + step))]);
       }
       assert.strictEqual(logs.warnings.length, 2);
+    }).pipe(Effect.provide(logs.layer));
+  });
+
+  it.effect("logs that recording works again only after a real write", () => {
+    const logs = logCollector();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + 10 * MINUTE);
+      const directory = yield* historyDirectory;
+      let appendsFail = false;
+      const real = yield* FileSystem.FileSystem;
+      const fs: FileSystem.FileSystem = {
+        ...real,
+        writeFileString: (filePath, data, writeOptions) =>
+          appendsFail && writeOptions?.flag === "a"
+            ? Effect.fail(diskFull(filePath))
+            : real.writeFileString(filePath, data, writeOptions),
+      };
+      const history = yield* make({ directory }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+      );
+      yield* history.record([provider(limits(at(0), 40))]);
+      // The disk fills. The meter moves away and back: back at 40 there is nothing to write.
+      appendsFail = true;
+      for (let step = 1; step <= 6; step++) {
+        yield* history.record([provider(limits(at(step * MINUTE), step % 2 === 1 ? 45 : 40))]);
+      }
+      assert.strictEqual(logs.warnings.length, 1);
+      assert.strictEqual(logs.infos.length, 0);
+
+      appendsFail = false;
+      yield* history.record([provider(limits(at(7 * MINUTE), 45))]);
+      assert.deepStrictEqual(logs.infos, ["usage readings: recording works again"]);
+      assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 45]);
     }).pipe(Effect.provide(logs.layer));
   });
 
@@ -823,6 +930,107 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       const swapped = (yield* history.readings(codex)).at(-1)?.account;
       assert.isString(swapped);
       assert.notStrictEqual(swapped, known);
+    }),
+  );
+
+  it.effect("a borrowed workspace is never carried as the instance's own account", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + 10 * MINUTE);
+      const directory = yield* historyDirectory;
+      const history = yield* make({ directory });
+      const team = ProviderInstanceId.make("codex_team");
+      const personal = ProviderInstanceId.make("codex_personal");
+      const email = "person@example.com";
+      const codexAt = (
+        instanceId: ProviderInstanceId,
+        offset: number,
+        percent: number,
+        auth: Partial<ServerProviderAuth>,
+      ) => provider(limits(at(offset), percent), instanceId, { driver: CODEX, auth });
+      const teamAuth = { email, workspaceId: "workspace-team" };
+
+      // The personal instance reports no workspace while the team one is there: grouped with it.
+      yield* history.record([codexAt(team, 0, 70, teamAuth), codexAt(personal, 0, 20, { email })]);
+      // The team instance leaves; the personal one still reports no workspace, then nothing.
+      yield* history.record([codexAt(personal, MINUTE, 21, { email })]);
+      yield* history.record([codexAt(personal, 2 * MINUTE, 22, {})]);
+      // Then its own workspace is known.
+      const personalAuth = { email, workspaceId: "workspace-personal" };
+      yield* history.record([codexAt(personal, 3 * MINUTE, 23, personalAuth)]);
+
+      const teamAccount = accountOf(codexAt(team, 0, 70, teamAuth));
+      const base = accountOf(codexAt(personal, 0, 20, { email }));
+      const own = accountOf(codexAt(personal, 0, 20, personalAuth));
+      const accounts = (readings: ReadonlyArray<UsageReading>) =>
+        readings.map((entry) => [entry.account, entry.borrowed]);
+      assert.deepStrictEqual(accounts(yield* history.readings(personal)), [
+        [teamAccount, true],
+        [base, undefined],
+        [base, undefined],
+        [own, undefined],
+      ]);
+      assert.deepStrictEqual(
+        (yield* history.readingsOfAccount(teamAccount!)).map((entry) => entry.instanceId),
+        [team, personal],
+      );
+
+      // After a restart the borrowed account is still not the last known one.
+      const restarted = yield* make({ directory });
+      yield* restarted.record([codexAt(team, 4 * MINUTE, 71, teamAuth)]);
+      const fresh = ProviderInstanceId.make("codex_fresh");
+      yield* restarted.record([
+        codexAt(fresh, 5 * MINUTE, 5, { email }),
+        codexAt(team, 5 * MINUTE, 71, teamAuth),
+      ]);
+      yield* restarted.record([codexAt(fresh, 6 * MINUTE, 6, {})]);
+      assert.deepStrictEqual(accounts(yield* restarted.readings(fresh)), [
+        [teamAccount, true],
+        [undefined, undefined],
+      ]);
+    }),
+  );
+
+  it.effect("two workspaces of one login never merge", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const directory = yield* historyDirectory;
+      const history = yield* make({ directory });
+      const first = ProviderInstanceId.make("codex_first");
+      const second = ProviderInstanceId.make("codex_second");
+      const third = ProviderInstanceId.make("codex_third");
+      const fourth = ProviderInstanceId.make("codex_fourth");
+      const email = "person@example.com";
+      const codexAt = (
+        instanceId: ProviderInstanceId,
+        offset: number,
+        auth: Partial<ServerProviderAuth>,
+      ) => provider(limits(at(offset), 30), instanceId, { driver: CODEX, auth });
+      const one = { email, workspaceId: "workspace-one" };
+      const two = { email, workspaceId: "workspace-two" };
+
+      // Two workspaces of the login in one snapshot: one with no workspace borrows neither.
+      yield* history.record([
+        codexAt(first, 0, one),
+        codexAt(second, 0, two),
+        codexAt(third, 0, { email }),
+        codexAt(fourth, 0, two),
+      ]);
+      // One workspace in the snapshot: an instance whose own workspace is another keeps its own.
+      yield* history.record([codexAt(first, MINUTE, one), codexAt(fourth, MINUTE, { email })]);
+
+      const accounts = (readings: ReadonlyArray<UsageReading>) =>
+        readings.map((entry) => entry.account);
+      const accountTwo = accountOf(codexAt(second, 0, two));
+      assert.deepStrictEqual(accounts(yield* history.readings(third)), [
+        accountOf(codexAt(third, 0, { email })),
+      ]);
+      assert.deepStrictEqual(accounts(yield* history.readings(fourth)), [accountTwo]);
+      assert.deepStrictEqual(
+        (yield* history.readingsOfAccount(accountOf(codexAt(first, 0, one))!)).map(
+          (entry) => entry.instanceId,
+        ),
+        [first],
+      );
     }),
   );
 
