@@ -158,8 +158,10 @@ test("refuses changes to the check itself and to .gitattributes once the base ha
     changed(file, "a", "b"),
   );
   const reasons = findSchemaChanges(changes, noClosure);
-  assert.equal(reasons.length, 5);
-  for (const reason of reasons.slice(0, 3)) assert.match(reason, /Only the owner may do that/);
+  assert.equal(reasons.length, CHECK_FILES.length + 2);
+  for (const reason of reasons.slice(0, CHECK_FILES.length)) {
+    assert.match(reason, /Only the owner may do that/);
+  }
   // The series that first adds the check (base is an upstream tag) may add its files.
   assert.equal(findSchemaChanges(changes, { closure: new Set(), baseHasCheck: false }).length, 2);
 });
