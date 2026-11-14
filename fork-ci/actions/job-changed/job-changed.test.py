@@ -243,6 +243,12 @@ class Workflow(Repo):
                 self.commit({CI: doc(v, tail)})
                 self.assertEqual(self.builds(), NONE)
 
+    def test_a_nan_that_stays_builds_nothing(self):   # .nan != .nan in Python, yet the same text and type
+        with_env = lambda tail: FIXTURE.replace('ciJars\n', 'ciJars\n        env: { X: .nan }\n', 1) + tail
+        self.base = self.commit({CI: with_env('')})
+        self.commit({CI: with_env('# a note\n').replace('python3 tests.py', 'python3 tests.py -v')})
+        self.assertEqual(self.builds(), NONE)
+
     def test_a_side_only_the_typed_view_cannot_read_builds(self):
         # BaseLoader reads 2026-13-45, !custom and !!int x as text; the typed view cannot build them. The edit is in the
         # tooling job, which the heavy jobs do not need, so only the fail-closed rule makes them build.
@@ -327,7 +333,7 @@ class Paths(Repo):
 
     def test_a_rename_out_of_the_matched_folder_builds(self):   # rename detection would list only the new path
         self.commit({'src/A.java': None, 'docs/A.java': 'class A {}'})
-        self.assertEqual(self.runs('plugins', paths='^src/'), 'true')
+        self.assertEqual(self.outputs('plugins', paths='^src/')['reason'], 'changed: src/A.java matches ^src/')
 
     def test_a_bad_expression_builds(self):
         self.commit({'docs/README.md': 'new text'})
