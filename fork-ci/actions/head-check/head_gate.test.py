@@ -26,6 +26,8 @@ import head_gate as G  # noqa: E402
 
 REPO, ENV_NAME, KEY = T.REPO, 'head-gate', 'HEAD_GATE_APP_KEY'
 CHECK = 'review-check'
+PAUSES = []   # every pause between two tries of a read: none is slept in a test
+G.pause = PAUSES.append
 
 
 def answer(code=0, out='', err=''):
@@ -34,6 +36,10 @@ def answer(code=0, out='', err=''):
 
 def not_found():
     return answer(1, '', 'gh: Not Found (HTTP 404)')
+
+
+class Seq(list):
+    """A route that answers in turn: each call takes the next answer, the last one stays."""
 
 
 class Api:
@@ -47,6 +53,8 @@ class Api:
         self.calls.append((a, stdin))
         if a[0] == 'api' and len(a) == 2 and a[1] in self.routes:
             v = self.routes[a[1]]
+            if isinstance(v, Seq):
+                v = v.pop(0) if len(v) > 1 else v[0]
             return v if isinstance(v, types.SimpleNamespace) else answer(0, json.dumps(v))
         if a[:2] == ('api', '--paginate') and a[3:] == ('--jq', G.LIST_JQ) and a[2] in self.lists:
             v = self.lists[a[2]]   # the open pull requests: (number, draft, head sha, base ref), one JSON line each
@@ -103,17 +111,23 @@ class Guard(Files, unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn('Only main may deploy to head-gate', out)
 
+    def test_only_the_default_branch_and_no_repository_secret_says_ok(self):   # the gate may judge
+        code, out, _ = self.guard()
+        self.assertEqual((code, self.outputs()), (0, {'guard': 'ok'}), out)
+
     def test_a_repository_or_organisation_secret_of_the_keys_name_is_refused(self):   # any branch's workflow reads it
         code, out, gh = self.guard(secret='true')
-        self.assertEqual((code, gh.calls), (1, []), out)
+        self.assertEqual((code, self.outputs()), (1, {'guard': 'fail'}), out)   # only failures are posted
         self.assertIn(f'secret named {KEY} exists', out)
         self.assertIn('Delete it', self.file('summary.md'))
+        self.assertIn('posts a failure on every head', out)
 
     def test_an_unknown_secret_answer_is_refused(self):   # the workflow did not pass it: never read as "none"
         for secret in ('', 'True', 'false\n::warning::x'):
             with self.subTest(secret=secret):
                 code, out, gh = self.guard(secret=secret)
-                self.assertEqual((code, gh.calls), (1, []), out)
+                self.assertEqual((code, self.outputs()), (1, {'guard': 'fail'}), out)
+                os.remove(self.env['GITHUB_OUTPUT'])
                 self.assertIn('could not tell whether a repository secret', out)
                 self.assertTrue(all(not line.startswith('::') or line.startswith('::error::head gate')
                                     for line in out.splitlines()), out)
@@ -123,14 +137,19 @@ class Guard(Files, unittest.TestCase):
         self.assertEqual(code, 0, out)
 
     def test_a_missing_environment_is_refused_with_the_steps(self):
-        code, out, _ = self.guard(env=not_found())
-        self.assertEqual(code, 1, out)
-        self.assertIn('does not exist', out)
-        self.assertIn('HEAD_GATE_APP_ID', out)
+        # No output at all: the gate job must not run, as naming the Environment would create it open to all branches.
+        for secret in ('false', 'true'):
+            with self.subTest(secret=secret):
+                code, out, _ = self.guard(env=not_found(), secret=secret)
+                self.assertEqual((code, self.file('output')), (1, None), out)
+                self.assertIn('does not exist', out)
+                self.assertIn('HEAD_GATE_APP_ID', out)
+        code, out, _ = self.guard(env=not_found(), environment_only=True)   # the gate job: it exists by then
+        self.assertEqual((code, self.outputs()), (1, {'guard': 'fail'}), out)
 
     def test_an_environment_any_branch_may_use_is_refused(self):   # no deployment branch rule at all
         code, out, _ = self.guard(policy=None)
-        self.assertEqual(code, 1, out)
+        self.assertEqual((code, self.outputs()), (1, {'guard': 'fail'}), out)
         self.assertIn('Any branch may deploy', out)
 
     def test_protected_branches_or_an_unknown_policy_is_refused(self):   # cannot be proved to mean only main
@@ -163,13 +182,36 @@ class Guard(Files, unittest.TestCase):
         code, out, _ = self.guard(repo={'default_branch': 'm[a]in'}, rules=[{'name': 'm[a]in', 'type': 'branch'}])
         self.assertEqual(code, 1, out)
 
-    def test_unreadable_answers_are_refused(self):   # unknown never makes a token
+    def test_unreadable_answers_are_refused(self):   # unknown never judges: the gate posts only failures
         for kw in ({'repo': {}}, {'repo': answer(1, '', 'HTTP 502')}, {'env': answer(1, '', 'HTTP 502')},
-                   {'rules': answer(1, '', 'HTTP 403')}, {'rules': answer(0, 'not json')}):
+                   {'rules': answer(1, '', 'HTTP 403')}, {'rules': answer(0, 'not json')},
+                   {'env': answer(1, '', 'gh: API rate limit exceeded (HTTP 403)')}):
             with self.subTest(kw=str(kw)[:60]):
                 code, out, _ = self.guard(**kw)
-                self.assertEqual(code, 1, out)
+                self.assertEqual((code, self.outputs()), (1, {'guard': 'fail'}), out)
+                os.remove(self.env['GITHUB_OUTPUT'])
                 self.assertIn('::error::head gate:', out)
+
+    def test_a_5xx_or_a_rate_limit_is_read_again(self):   # round 2: one API error no longer decides the run
+        routes = self.routes()
+        env = routes[self.ENV_PATH]
+        routes[self.ENV_PATH] = Seq([answer(1, '', 'gh: Server Error (HTTP 502)'),
+                                     answer(1, '', 'gh: API rate limit exceeded for installation (HTTP 403)'), env])
+        gh, out = Api(routes), []
+        del PAUSES[:]
+        code = G.guard(REPO, ENV_NAME, KEY, 'false', False, gh, out.append, self.env)
+        self.assertEqual((code, self.outputs()), (0, {'guard': 'ok'}), out)
+        self.assertEqual((gh.paths().count(self.ENV_PATH), PAUSES), (3, list(G.READ_BACKOFF)))
+
+    def test_reads_are_tried_at_most_three_times_and_only_on_a_5xx_or_a_rate_limit(self):
+        for err, calls in (('gh: Server Error (HTTP 503)', 3), ('HTTP 429: too many', 3),
+                           ('gh: You have exceeded a secondary rate limit (HTTP 403)', 3),
+                           ('gh: Resource not accessible by integration (HTTP 403)', 1), ('HTTP 401', 1)):
+            with self.subTest(err=err):
+                gh = Api(self.routes(env=answer(1, '', err)))
+                code = G.guard(REPO, ENV_NAME, KEY, 'false', False, gh, lambda *_: None, self.env)
+                self.assertEqual((code, self.outputs(), gh.paths().count(self.ENV_PATH)), (1, {'guard': 'fail'}, calls))
+                os.remove(self.env['GITHUB_OUTPUT'])
 
     def test_a_rerun_reads_again_and_writes_nothing(self):   # reads only: the same answer twice
         first = self.guard()
@@ -191,13 +233,25 @@ def caller_file(text=CALLER_TEXT, blob='b1'):
     return {'sha': blob, 'encoding': 'base64', 'content': base64.b64encode(text.encode()).decode()}
 
 
+def gate_routes(ref, workflow='g1', head_check='t1', pr_queue='t2'):
+    """The gate's own files at `ref` (a local gate compares them with the tip): the workflow's blob, the folders' trees."""
+    folders = [{'name': name, 'type': 'dir', 'sha': sha} for name, sha in (('head-check', head_check),
+                                                                          ('pr-queue', pr_queue)) if sha]
+    return {f'repos/{REPO}/contents/.github/workflows/fork-head-gate.yml?ref={ref}':
+            {'sha': workflow} if isinstance(workflow, str) else workflow,
+            f'repos/{REPO}/contents/fork-ci/actions?ref={ref}': [{'name': 'README.md', 'type': 'file', 'sha': 'r'},
+                                                                 *folders]}
+
+
 def run_routes(tip, caller_sha=None, now=None, then=None):
     """What GitHub says about the default branch and the caller: the caller ran at `caller_sha` (default: the tip);
-    `then` and `now` are its file there and at the tip (default: the same file)."""
+    `then` and `now` are its file there and at the tip (default: the same file). The gate's own files are the same
+    at both (gate_routes)."""
     caller_sha = caller_sha or tip
     routes = {f'repos/{REPO}': {'default_branch': 'main'},
               f'repos/{REPO}/git/ref/heads/main': {'object': {'sha': tip}},
-              f'repos/{REPO}/contents/{CALLER}?ref={caller_sha}': caller_file() if then is None else then}
+              f'repos/{REPO}/contents/{CALLER}?ref={caller_sha}': caller_file() if then is None else then,
+              **gate_routes(tip), **gate_routes(caller_sha)}
     if caller_sha != tip:
         routes[f'repos/{REPO}/contents/{CALLER}?ref={tip}'] = caller_file() if now is None else now
     return routes
@@ -205,7 +259,8 @@ def run_routes(tip, caller_sha=None, now=None, then=None):
 
 def run_args(sha, **kw):
     a = {'repo': REPO, 'sha': sha, 'required_lenses': 'correctness', 'caller_ref': CALLER_REF, 'caller_sha': None,
-         'gate_repo': GATE_REPO, 'gate_sha': GATE_SHA, 'run_attempt': '1', **kw}
+         'gate_repo': GATE_REPO, 'gate_sha': GATE_SHA, 'run_attempt': '1', 'guard': 'ok', 'environment_guard': 'ok',
+         **kw}
     return a
 
 
@@ -219,16 +274,16 @@ def run_argv(sha, tip, **kw):
 class Prs(Files, unittest.TestCase):
     H, H2 = 'a1' * 20, 'b2' * 20
 
-    def prs(self, event, pr='', pull=None, listing=None, repo=None):
-        routes = {f'repos/{REPO}': {'default_branch': 'main'} if repo is None else repo}
+    def prs(self, event, pr='', pull=None, listing=None, event_sha='', git_head=None):
+        routes = {}
         if pull is not None:
             routes[f'repos/{REPO}/pulls/{pr}'] = pull
         gh, out = Api(routes, lists={f'repos/{REPO}/pulls?state=open&per_page=100': listing or []}), []
-        code = G.prs(REPO, event, pr, gh, out.append, self.env)
+        code = G.prs(REPO, event, pr, gh, out.append, self.env, event_sha, git_head)
         return code, '\n'.join(out), gh
 
-    def pull(self, head=None, draft=False, base='main', state='open'):
-        return {'state': state, 'draft': draft, 'head': {'sha': head or self.H}, 'base': {'ref': base}}
+    def pull(self, head=None, draft=False, base='main', state='open', merged=False):
+        return {'state': state, 'draft': draft, 'merged': merged, 'head': {'sha': head or self.H}, 'base': {'ref': base}}
 
     def found(self):
         found = json.loads(self.outputs().get('prs', 'null'))
@@ -241,31 +296,65 @@ class Prs(Files, unittest.TestCase):
                 code, out, _ = self.prs(event, '7', self.pull())
                 self.assertEqual((code, self.found()), (0, [{'pr': 7, 'sha': self.H}]), out)
 
-    def test_a_closed_or_missing_pull_request_judges_nothing(self):   # green: nothing to post on
-        for pull in (self.pull(state='closed'), not_found()):
+    def test_a_merged_or_missing_pull_request_judges_nothing(self):   # its head is on the default branch now
+        for pull in (self.pull(state='closed', merged=True), not_found()):
             with self.subTest(pull=str(pull)[:30]):
                 code, out, _ = self.prs('issue_comment', '7', pull)
                 self.assertEqual((code, self.found()), (0, []), out)
                 self.assertIn('nothing to judge', out)
 
-    def test_a_draft_judges_nothing(self):   # lens finding 1: a check run on its head counts for a ready one too
-        code, out, _ = self.prs('pull_request_target', '7', self.pull(draft=True))
-        self.assertEqual((code, self.found()), (0, []), out)
-        self.assertIn('is a draft', out)
+    def test_a_draft_another_base_or_a_closed_one_gets_its_head_failed(self):   # round 2: a revoked pass never waits
+        # A draft (or a pull request into another branch, or a closed one) is never judged, but a pass its head had
+        # must not survive until it is ready, retargeted or reopened: target fails the head (no ready one has it).
+        for pull in (self.pull(draft=True), self.pull(base='loose'), self.pull(base=None), self.pull(state='closed')):
+            with self.subTest(pull=pull):
+                code, out, _ = self.prs('pull_request_target', '7', pull)
+                self.assertEqual((code, self.found()), (0, [{'pr': 7, 'sha': self.H}]), out)
 
-    def test_a_pull_request_into_another_branch_judges_nothing(self):   # lens finding 2: its author picks that base
-        for base in ('loose', 'Main', None):
-            with self.subTest(base=base):
-                code, out, _ = self.prs('issue_comment', '7', self.pull(base=base))
-                self.assertEqual((code, self.found()), (0, []), out)
-                self.assertIn('not the default branch main', out)
-
-    def test_an_unreadable_answer_is_refused(self):
-        for kw in ({'pull': answer(1, '', 'HTTP 502')}, {'pull': self.pull(), 'repo': answer(1, '', 'HTTP 502')},
-                   {'pull': {**self.pull(), 'head': {'sha': 'abc'}}}):
-            with self.subTest(kw=str(kw)[:40]):
-                code, out, _ = self.prs('pull_request_target', '7', **kw)
+    def test_an_unreadable_pull_request_is_refused_only_when_its_head_is_unknown(self):
+        for pull in (answer(1, '', 'HTTP 502'), {**self.pull(), 'head': {'sha': 'abc'}}):
+            with self.subTest(pull=str(pull)[:40]):
+                code, out, gh = self.prs('issue_comment', '7', pull)
                 self.assertEqual((code, self.file('output')), (1, None), out)
+                self.assertIn('Its head is unknown', out)
+        self.assertEqual(gh.paths().count(f'repos/{REPO}/pulls/7'), 1, 'a 200 is never read again')
+
+    def test_a_pull_request_read_that_fails_every_try_falls_back_to_the_head_it_knows(self):   # round 2
+        down = Seq([answer(1, '', 'gh: Server Error (HTTP 502)')])
+        code, out, gh = self.prs('pull_request_target', '7', down, event_sha=self.H.upper())
+        self.assertEqual((code, self.found()), (0, [{'pr': 7, 'sha': self.H}]), out)
+        self.assertEqual(gh.paths().count(f'repos/{REPO}/pulls/7'), G.READ_TRIES)
+        self.assertIn('the head the event carries', out)
+        asked = []
+        code, out, _ = self.prs('issue_comment', '7', down, git_head=lambda *a: asked.append(a) or (self.H, None))
+        self.assertEqual((code, self.found(), asked), (0, [{'pr': 7, 'sha': self.H}], [(REPO, '7', self.env)]), out)
+        self.assertIn('refs/pull/7/head by git', out)
+        code, out, _ = self.prs('issue_comment', '7', down, git_head=lambda *a: (None, 'git ls-remote: down'))
+        self.assertEqual((code, self.file('output')), (1, None), out)   # GitHub is down: start could not post either
+        self.assertIn('git ls-remote: down', out)
+
+    def test_one_5xx_on_the_pull_request_read_is_read_again(self):   # round 2 (corr85r, sec85r): no fallback needed
+        pull = Seq([answer(1, '', 'gh: Server Error (HTTP 502)'), self.pull()])
+        code, out, gh = self.prs('issue_comment', '7', pull)
+        self.assertEqual((code, self.found()), (0, [{'pr': 7, 'sha': self.H}]), out)
+        self.assertEqual(gh.paths().count(f'repos/{REPO}/pulls/7'), 2)
+
+    def test_the_head_is_read_by_git_without_the_token_on_the_command_line(self):
+        seen = []
+
+        def run(argv, **kw):
+            seen.append((argv, kw['env']))
+            return answer(0, f'{self.H}\trefs/pull/7/head\n')
+        with unittest.mock.patch.object(G.subprocess, 'run', run):
+            self.assertEqual(G.pull_head_by_git(REPO, '7', {'GH_TOKEN': 'secret-token'}), (self.H, None))
+        argv, env = seen[0]
+        self.assertEqual(argv[-3:], ['--', f'https://github.com/{REPO}.git', 'refs/pull/7/head'])
+        self.assertNotIn('secret-token', ' '.join(argv))
+        self.assertEqual((env['GIT_CONFIG_KEY_0'], env['GIT_TERMINAL_PROMPT']), ('http.extraheader', '0'))
+        self.assertIn(base64.b64encode(b'x-access-token:secret-token').decode(), env['GIT_CONFIG_VALUE_0'])
+        for said in ('', f'{self.H}\trefs/pull/8/head\n', 'abc\trefs/pull/7/head\n'):
+            with self.subTest(said=said), unittest.mock.patch.object(G.subprocess, 'run', lambda *a, **k: answer(0, said)):
+                self.assertIsNone(G.pull_head_by_git(REPO, '7', {})[0])
 
     def test_other_events_and_bad_numbers_are_refused(self):
         for event, pr in (('pull_request', '7'), ('push', ''), ('', '7'), ('workflow_dispatch', '7; x'),
@@ -274,11 +363,12 @@ class Prs(Files, unittest.TestCase):
                 code, out, gh = self.prs(event, pr)
                 self.assertEqual((code, gh.calls, self.file('output')), (1, [], None), out)
 
-    def test_the_backfill_judges_each_head_of_a_ready_pull_request_into_the_default_branch_once(self):
-        listing = [(9, False, self.H, 'main'), (3, False, self.H, 'main'), (4, True, self.H2, 'main'),
-                   (5, False, self.H2, 'loose'), (6, False, 'c3' * 20, 'main')]
+    def test_the_backfill_takes_each_head_of_an_open_pull_request_once(self):   # drafts' and other bases' get failed
+        listing = [(9, False, self.H, 'main'), (3, False, self.H, 'main'), (5, False, self.H2, 'loose'),
+                   (4, True, self.H2, 'main'), (6, False, 'c3' * 20, 'main'), (8, True, 'd4' * 20, 'main')]
         code, out, gh = self.prs('workflow_dispatch', '', listing=listing)
-        self.assertEqual((code, self.found()), (0, [{'pr': 3, 'sha': self.H}, {'pr': 6, 'sha': 'c3' * 20}]), out)
+        self.assertEqual((code, self.found()), (0, [{'pr': 3, 'sha': self.H}, {'pr': 4, 'sha': self.H2},
+                                                    {'pr': 6, 'sha': 'c3' * 20}, {'pr': 8, 'sha': 'd4' * 20}]), out)
         call = gh.calls[-1][0]
         self.assertEqual(call[:3], ('api', '--paginate', f'repos/{REPO}/pulls?state=open&per_page=100'))
         code, out, _ = self.prs('workflow_dispatch', '', listing=[])
@@ -317,28 +407,50 @@ class Target(Files, unittest.TestCase):
         self.assertIn('#7', out)
         self.assertTrue(all(a[0] == 'api' and '-X' not in a for a, _ in gh.calls), 'target only reads')
 
-    def test_a_head_only_a_draft_or_another_base_has_posts_nothing(self):   # lens findings 1 and 2
+    def failed(self, out, says):
+        """target let the run post, with nothing to judge: judge writes a failure (the run's preflight again)."""
+        self.assertEqual(self.outputs(), {'post': 'true', 'base': ''}, out)
+        self.assertIn('the head gets a failed check', out)
+        self.assertIn(says, out)
+        os.remove(self.env['GITHUB_OUTPUT'])
+
+    def test_a_head_only_a_draft_or_another_base_has_gets_a_failure(self):   # round 2: a revoked pass never waits
         for listing in ([], [(7, True, self.H, 'main')], [(7, False, self.H, 'loose')], [(7, False, 'b2' * 20, 'main')]):
             with self.subTest(listing=listing):
                 code, out, _ = self.target(listing)
-                self.assertEqual((code, self.outputs()), (0, {'post': 'false'}), out)
-                os.remove(self.env['GITHUB_OUTPUT'])
+                self.assertEqual(code, 0, out)
+                self.failed(out, 'no open, ready pull request into main has the head')
 
-    def test_a_re_run_is_refused_before_github_is_read(self):   # finding F3 and the guard a gate-job re-run skips
+    def test_a_guard_that_did_not_pass_gets_a_failure_before_github_is_read(self):   # round 2: guard=fail
+        for guard, environment_guard in (('fail', 'ok'), ('', 'ok'), ('ok', 'fail'), ('ok', ''), ('OK', 'ok')):
+            with self.subTest(guard=guard, environment_guard=environment_guard):
+                code, out, gh = self.target(guard=guard, environment_guard=environment_guard)
+                self.assertEqual((code, gh.calls), (0, []), out)
+                self.failed(out, 'the guard did not pass')
+
+    def test_a_re_run_gets_a_failure_before_github_is_read(self):   # finding F3; round 2: posts, never silent
         for attempt in ('2', '10', '', '1 '):
             with self.subTest(attempt=attempt):
                 code, out, gh = self.target(run_attempt=attempt)
-                self.assertEqual((code, gh.calls, self.file('output')), (1, [], None), out)
-                self.assertIn('dispatch the gate with the pull request number', out)
+                self.assertEqual((code, gh.calls), (0, []), out)
+                self.failed(out, 'dispatch the gate with the pull request number')
 
-    def test_no_required_lens_is_refused_before_github_is_read(self):   # lens minor: none would pass a bare head
+    def test_no_required_lens_gets_a_failure_before_github_is_read(self):   # lens minor: none would pass a bare head
         for lenses in ('', '\n \n', '<LENS_NAME>', 'r4'):
             with self.subTest(lenses=lenses):
                 code, out, gh = self.target(required_lenses=lenses)
-                self.assertEqual((code, gh.calls, self.file('output')), (1, [], None), out)
-                self.assertIn('required-lenses names no lens', out)
+                self.assertEqual((code, gh.calls), (0, []), out)
+                self.failed(out, 'required-lenses names no lens')
 
-    def test_a_caller_the_default_branch_no_longer_has_is_refused(self):   # finding F3: old code never posts
+    def test_bad_arguments_post_nothing(self):   # no head to post on
+        for sha, kw in (('ab', {}), (self.H, {'repo': 'not a repo'})):
+            with self.subTest(sha=sha, **kw):
+                gh, out = Api(), []
+                code = G.cli(['target', *run_argv(sha, self.TIP, **kw)], env=self.env, gh=gh, out=out.append)
+                self.assertEqual((code, gh.calls, self.outputs()), (1, [], {'post': 'false'}), out)
+                os.remove(self.env['GITHUB_OUTPUT'])
+
+    def test_a_caller_the_default_branch_no_longer_has_gets_a_failure(self):   # F3; round 2 (corr85r): not silence
         old = 'd4' * 20
         moved = caller_file(CALLER_TEXT.replace(GATE_SHA, 'c1' * 20), blob='b2')
         cases = {'the caller file changed': run_routes(self.TIP, old, now=caller_file(CALLER_TEXT + '#\n', 'b2')),
@@ -347,28 +459,43 @@ class Target(Files, unittest.TestCase):
         for name, routes in cases.items():
             with self.subTest(name):
                 code, out, gh = self.target(routes=routes, caller_sha=old if 'pins' not in name else None)
-                self.assertEqual((code, self.file('output')), (1, None), out)
-                self.assertIn("not the default branch's current gate", out)
+                self.assertEqual(code, 0, out)
+                self.failed(out, "not the default branch's current gate")
                 self.assertNotIn(LISTED, [a[2] for a, _ in gh.calls if len(a) > 2])
         for ref in (f'{REPO}/{CALLER}@refs/heads/loose', f'other/repo/{CALLER}@refs/heads/main',
                     f'{REPO}/x.yml@refs/heads/main', 'nonsense'):
             with self.subTest(ref=ref):
                 code, out, _ = self.target(caller_ref=ref)
-                self.assertEqual((code, self.file('output')), (1, None), out)
+                self.assertEqual(code, 0, out)
+                self.failed(out, "not the default branch's current gate")
 
     def test_a_caller_unchanged_since_the_event_still_counts(self):   # the tip moved, the caller file did not
         code, out, _ = self.target(routes=run_routes(self.TIP, 'd4' * 20), caller_sha='d4' * 20)
-        self.assertEqual((code, self.outputs().get('post')), (0, 'true'), out)
+        self.assertEqual((code, self.outputs()), (0, {'post': 'true', 'base': 'main'}), out)
 
-    def test_a_local_gate_counts_only_at_the_tip(self):   # the gate repository calling its own workflow
-        tip = self.TIP
+    def test_a_local_gate_counts_while_its_own_files_are_the_same_at_the_tip(self):   # round 2 (corr85r, sec85r)
+        # The gate repository calls its own workflow. The tip moving (any merge) changes nothing the gate runs; only
+        # a change to the gate's own files (the workflow, head-check, pr-queue) makes the run an old gate.
+        tip, old = self.TIP, 'd4' * 20
         routes = {**run_routes(tip), f'repos/{REPO}/contents/{CALLER}?ref={tip}': caller_file('uses: ./x\n')}
         code, out, _ = self.target(routes=routes, gate_repo=REPO, gate_sha=tip)
-        self.assertEqual((code, self.outputs().get('post')), (0, 'true'), out)
+        self.assertEqual((code, self.outputs()), (0, {'post': 'true', 'base': 'main'}), out)
         os.remove(self.env['GITHUB_OUTPUT'])
-        routes = run_routes(tip, 'd4' * 20)
-        code, out, _ = self.target(routes=routes, gate_repo=REPO, gate_sha='d4' * 20, caller_sha='d4' * 20)
-        self.assertEqual(code, 1, out)
+        code, out, _ = self.target(routes=run_routes(tip, old), gate_repo=REPO, gate_sha=old, caller_sha=old)
+        self.assertEqual((code, self.outputs()), (0, {'post': 'true', 'base': 'main'}), out)
+        self.assertIn('judging', out)
+        os.remove(self.env['GITHUB_OUTPUT'])
+        for name, changed, says in (('the workflow', {'workflow': 'g2'}, 'fork-head-gate.yml changed'),
+                                    ('head-check', {'head_check': 't9'}, 'fork-ci/actions/head-check changed'),
+                                    ('pr-queue', {'pr_queue': 't9'}, 'fork-ci/actions/pr-queue changed'),
+                                    ('gone', {'pr_queue': None}, 'not all on'),
+                                    ('workflow gone', {'workflow': not_found()}, 'not all on'),
+                                    ('unreadable', {'workflow': answer(1, '', 'HTTP 502')}, 'could not read the gate')):
+            with self.subTest(name):
+                code, out, _ = self.target(routes={**run_routes(tip, old), **gate_routes(tip, **changed)},
+                                           gate_repo=REPO, gate_sha=old, caller_sha=old)
+                self.assertEqual(code, 0, out)
+                self.failed(out, says)
 
     def test_an_unknown_answer_posts_so_that_judge_fails_the_head(self):   # never leave an older pass by silence
         routes = run_routes(self.TIP)
@@ -376,9 +503,8 @@ class Target(Files, unittest.TestCase):
         for kw in ({'routes': routes}, {'listing': answer(1, '', 'HTTP 502')}):
             with self.subTest(kw=list(kw)):
                 code, out, _ = self.target(**kw)
-                self.assertEqual((code, self.outputs().get('post')), (0, 'true'), out)
-                self.assertIn('the head gets a failed check', out)
-                os.remove(self.env['GITHUB_OUTPUT'])
+                self.assertEqual(code, 0, out)
+                self.failed(out, 'HTTP 502')
 
 
 # --- judge ----------------------------------------------------------------------------------------------------------
@@ -782,6 +908,149 @@ class StartFinish(Files, unittest.TestCase):
         self.assertLessEqual((len(title), len(text)), (G.TITLE_MAX, G.SUMMARY_MAX))
         self.assertTrue(title.startswith('fail: '))
         self.assertIn('(cut: the run log has every row)', text)
+
+
+# --- the workflow, step by step ------------------------------------------------------------------------------------
+class Workflow(Files, unittest.TestCase):
+    """fork-head-gate.yml's steps and their conditions (fork-head-gate-workflow.test.py checks the file says the same):
+    guard job: guard (continue-on-error), prs, a failing step when guard said nothing; gate job when the guard job
+    passed and listed heads: guard --environment-only (continue-on-error), target, (token), start when post=true,
+    judge when start posted, finish always after start. Round 2's rule: every way a run ends leaves the head "not
+    passed" unless it judged and passed. Each case: run 1 passes H (an owner override), the override is deleted,
+    run 2 meets the case, and H must not show run 1's pass."""
+    H, TIP, OLD = 'a1' * 20, 'e5' * 20, 'd4' * 20
+    ENV_PATH = Guard.ENV_PATH
+
+    def routes(self, pull=None, env=None, tip=None, caller_sha=None, **kw):
+        routes = {**Guard.routes(self, env=env), **run_routes(tip or self.TIP, caller_sha, **kw)}
+        routes[f'repos/{REPO}/pulls/7'] = pull or {'state': 'open', 'draft': False, 'merged': False,
+                                                   'head': {'sha': self.H}, 'base': {'ref': 'main'}}
+        return routes
+
+    def step(self, name):
+        self.env['GITHUB_OUTPUT'] = os.path.join(self.files, name)
+        if os.path.exists(self.env['GITHUB_OUTPUT']):   # each run's step has its own outputs
+            os.remove(self.env['GITHUB_OUTPUT'])
+        return lambda: dict(line.split('=', 1) for line in (self.file(name) or '').splitlines())
+
+    def run_workflow(self, checks, routes, passes, event='issue_comment', listing=None, secret='false',
+                     event_sha='', git_head=None, **kw):
+        """One run of the reusable workflow; returns what happened, step by step."""
+        listing = [(7, False, self.H, 'main')] if listing is None else listing
+        gh, out, did = Api(routes, lists={LISTED: listing}), [], []
+        guard = self.step('guard')
+        G.guard(REPO, ENV_NAME, KEY, secret, False, gh, out.append, self.env)
+        listed = self.step('prs')
+        prs_code = G.prs(REPO, event, '7', gh, out.append, self.env, event_sha, git_head)
+        guard_said = guard().get('guard', '')
+        if prs_code != 0 or guard_said == '':
+            return did + ['guard job failed'], '\n'.join(out)
+        heads = json.loads(listed().get('prs', '[]'))
+        if not heads:
+            return did + ['nothing to judge'], '\n'.join(out)
+        for head in heads:
+            envguard = self.step('envguard-' + head['sha'])
+            G.guard(REPO, ENV_NAME, KEY, '', True, gh, out.append, self.env)
+            argv = run_argv(head['sha'], kw.pop('tip', self.TIP), guard=guard_said,
+                            environment_guard=envguard().get('guard', ''), **kw)
+            target = self.step('target-' + head['sha'])
+            G.cli(['target', *argv], env=self.env, gh=gh, out=out.append)
+            if target().get('post') != 'true':
+                did.append('posted nothing')
+                continue
+            start = self.step('start-' + head['sha'])
+            G.start(REPO, head['sha'], CHECK, checks, out.append, self.env, lambda s: None)
+            run = start().get('id', '')
+            if not run:
+                did.append('start failed')
+                continue
+            verdict = os.path.join(self.files, 'verdict.json')
+            work = tempfile.mkdtemp(dir=self.files)
+            decide = lambda *a: (0 if passes else 1, passes, 'override' if passes else 'no lens read the head', [])
+            with unittest.mock.patch.object(G, 'fetch', lambda *a: None):
+                G.cli(['judge', *argv, '--config', 'c', '--work', work, '--verdict', verdict], env=self.env, gh=gh,
+                      out=out.append, decide=decide, sleep=lambda s: None)
+            G.finish(REPO, head['sha'], run, verdict, checks, out.append, self.env, lambda s: None)
+            did.append(checks.newest(head['sha']))
+        return did, '\n'.join(out)
+
+    def revoke(self, routes, **kw):
+        """Run 1 passes H; run 2 (the override deleted) meets `routes`/`kw`. H's newest check run after run 2."""
+        checks = Checks()
+        did, out = self.run_workflow(checks, self.routes(), True)
+        self.assertEqual((did, checks.newest(self.H)), (['success'], 'success'), 'control: run 1 passes H\n' + out)
+        did, out = self.run_workflow(checks, routes, False, **kw)
+        return checks.newest(self.H), did, out
+
+    def test_a_revocation_is_judged(self):   # control: nothing in the way, the deletion fails H
+        newest, did, out = self.revoke(self.routes())
+        self.assertEqual((newest, did), ('failure', ['failure']), out)
+
+    def test_one_5xx_or_rate_limit_in_the_guard_job_is_read_again(self):   # corr85r (c), sec85r R1: retried
+        for path in (f'repos/{REPO}/pulls/7', Guard.ENV_PATH):
+            with self.subTest(path=path):
+                routes = self.routes()
+                routes[path] = Seq([answer(1, '', 'gh: Server Error (HTTP 502)'),
+                                    answer(1, '', 'gh: API rate limit exceeded (HTTP 403)'), routes[path]])
+                newest, did, out = self.revoke(routes)
+                self.assertEqual((newest, did), ('failure', ['failure']), out)
+
+    def test_a_guard_that_cannot_prove_the_key_still_posts_a_failure(self):   # sec85r R1: rate limited every try
+        for env in (answer(1, '', 'gh: API rate limit exceeded (HTTP 403)'),
+                    {'name': ENV_NAME, 'deployment_branch_policy': None}):
+            with self.subTest(env=str(env)[:40]):
+                newest, did, out = self.revoke(self.routes(env=env))
+                self.assertEqual(newest, 'failure', out)
+                self.assertIn('the guard did not pass', out)
+        newest, did, out = self.revoke(self.routes(), secret='true')   # a repository secret appeared
+        self.assertEqual(newest, 'failure', out)
+
+    def test_a_pull_request_read_that_fails_every_try_still_finds_the_head(self):   # corr85r (c): fallbacks
+        down = Seq([answer(1, '', 'gh: Server Error (HTTP 502)')])
+        newest, did, out = self.revoke(self.routes(pull=down), git_head=lambda *a: (self.H, None))
+        self.assertEqual(newest, 'failure', out)
+        newest, did, out = self.revoke(self.routes(pull=down), event='pull_request_target', event_sha=self.H)
+        self.assertEqual(newest, 'failure', out)
+
+    def test_a_local_gate_is_judged_when_only_other_files_changed_on_main(self):   # corr85r (a), sec85r target
+        routes = self.routes(caller_sha=self.OLD)
+        newest, did, out = self.revoke(routes, gate_repo=REPO, gate_sha=self.OLD, caller_sha=self.OLD)
+        self.assertEqual((newest, did), ('failure', ['failure']), out)
+        self.assertIn('judging', out)
+        routes = {**self.routes(caller_sha=self.OLD), **gate_routes(self.TIP, head_check='t9')}
+        newest, did, out = self.revoke(routes, gate_repo=REPO, gate_sha=self.OLD, caller_sha=self.OLD)
+        self.assertEqual(newest, 'failure', out)   # the gate itself changed: a failure, not judged
+        self.assertIn('fork-ci/actions/head-check changed', out)
+
+    def test_an_old_caller_or_a_re_run_posts_a_failure(self):   # corr85r (b): a failure never passes
+        routes = self.routes(caller_sha=self.OLD, now=caller_file(CALLER_TEXT + '# new lens\n', 'b2'))
+        for name, kw in (('the caller changed', {'routes': routes, 'caller_sha': self.OLD}),
+                         ('a re-run', {'run_attempt': '2'})):
+            with self.subTest(name):
+                newest, did, out = self.revoke(kw.pop('routes', self.routes()), **kw)
+                self.assertEqual((newest, did), ('failure', ['failure']), out)
+
+    def test_a_revocation_while_a_draft_fails_the_head(self):   # corr85r (d): ready starts from red
+        for event in ('pull_request_target', 'issue_comment'):
+            with self.subTest(event=event):
+                draft = {'state': 'open', 'draft': True, 'merged': False, 'head': {'sha': self.H},
+                         'base': {'ref': 'main'}}
+                newest, did, out = self.revoke(self.routes(pull=draft), event=event,
+                                               listing=[(7, True, self.H, 'main')])
+                self.assertEqual(newest, 'failure', out)
+                self.assertIn('no open, ready pull request into main has the head', out)
+
+    def test_the_cases_that_post_nothing_are_only_those_that_cannot(self):   # the README's list, exactly
+        newest, did, out = self.revoke(self.routes(env=not_found()))   # no Environment: no key, no token
+        self.assertEqual((newest, did), ('success', ['guard job failed']), out)
+        down = Seq([answer(1, '', 'gh: Server Error (HTTP 502)')])   # GitHub's API and git both down
+        newest, did, out = self.revoke(self.routes(pull=down), git_head=lambda *a: (None, 'git ls-remote: down'))
+        self.assertEqual((newest, did), ('success', ['guard job failed']), out)
+        checks = Checks()   # the first write fails every try
+        self.run_workflow(checks, self.routes(), True)
+        checks.down = 3
+        did, out = self.run_workflow(checks, self.routes(), False)
+        self.assertEqual((did, checks.newest(self.H)), (['start failed'], 'success'), out)
 
 
 # --- drift ----------------------------------------------------------------------------------------------------------

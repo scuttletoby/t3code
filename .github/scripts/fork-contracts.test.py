@@ -805,6 +805,8 @@ def head_gate_problems(wfs):
         if "steps.token" in str(step):
             tokens.append(label)
         if uses.startswith("actions/create-github-app-token@"):
+            if "continue-on-error" in step:
+                problems.append(f"{label}: no token must fail the job visibly")
             if job_id != "gate" or step.get("id") != "token" \
                     or {k for k in (step.get("with") or {}) if k.startswith("permission-")} != {"permission-checks"} \
                     or (step.get("with") or {}).get("permission-checks") != "write":
@@ -869,6 +871,8 @@ gate_mutants = {
         "GH_TOKEN", "${{ steps.token.outputs.token }}"),
     "the token made before target": lambda wf, _: wf["jobs"]["gate"]["steps"].insert(
         3, wf["jobs"]["gate"]["steps"].pop(5)),
+    "a token step that hides its failure": lambda wf, _: gate_step(wf, "gate", "token").__setitem__(
+        "continue-on-error", True),
     "a step after finish": lambda wf, _: wf["jobs"]["gate"]["steps"].append({"name": "x", "run": "true"}),
     "finish without the token": lambda wf, _: gate_step(wf, "gate", "Complete")["env"].pop("GH_TOKEN"),
     "the key in the judge step": lambda wf, _: gate_step(wf, "gate", "Judge")["env"].__setitem__(

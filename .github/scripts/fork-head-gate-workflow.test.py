@@ -68,9 +68,9 @@ check("no token by default; each job only reads (the write is the App token's)",
 # --- the guard job --------------------------------------------------------------------------------------------------
 check("the guard job has no Environment: it never sees the key", "environment" not in guard)
 gate_if = str(gate.get("if"))
-check("the gate job runs only after the guard job passed, and only when there is a pull request to judge",
-      gate.get("needs") == "guard" and gate_if == "needs.guard.result == 'success' && needs.guard.outputs.prs != '[]'",
-      f"{gate.get('needs')} {gate_if}")
+check("the gate job runs only after the guard job passed, when there is a head to judge and the guard answered",
+      gate.get("needs") == "guard" and gate_if == "needs.guard.result == 'success' && needs.guard.outputs.prs != '[]'"
+      " && needs.guard.outputs.guard != ''", f"{gate.get('needs')} {gate_if}")
 check("only the gate job uses the Environment, the caller's input",
       gate.get("environment") == "${{ inputs.environment }}")
 check("one gate job per head, from the guard job's list of {pr, sha}; one failing does not stop the others",
@@ -80,18 +80,30 @@ conc = gate.get("concurrency") or {}
 check("one gate run per HEAD at a time (a check run belongs to the commit), never cancelled half-way",
       conc.get("group") == "head-gate-${{ github.repository }}-${{ matrix.sha }}"
       and conc.get("cancel-in-progress") is False, str(conc))
-check("the guard job hands on only the list", guard.get("outputs") == {"prs": "${{ steps.prs.outputs.prs }}"})
+check("the guard job hands on the list and the guard's answer (ok or fail: fail = the gate posts only failures)",
+      guard.get("outputs") == {"prs": "${{ steps.prs.outputs.prs }}", "guard": "${{ steps.guard.outputs.guard }}"})
 
 gsteps, tsteps = guard.get("steps") or [], gate.get("steps") or []
 injected = [s.get("name") for s in gsteps + tsteps if "${{" in str(s.get("run", ""))]
 check("no expression inside a run script (inputs reach it as env only)", not injected, ", ".join(map(str, injected)))
 check("every run step is bash", all(s.get("shell") == "bash" for s in gsteps + tsteps if "run" in s))
-check("guard steps: find the toolkit, check it out, guard, list",
-      [s.get("id") for s in gsteps] == ["toolkit", None, None, "prs"] and len(gsteps) == 4,
+check("guard steps: find the toolkit, check it out, guard, list, fail when the guard said nothing",
+      [s.get("id") for s in gsteps] == ["toolkit", None, "guard", "prs", None] and len(gsteps) == 5,
       ", ".join(str(s.get("name")) for s in gsteps))
 check("gate steps: find the toolkit, check it out, guard the Environment, target, drift, token, start, judge, finish",
-      [s.get("id") for s in tsteps] == ["toolkit", None, None, "target", None, "token", "start", "judge", "finish"],
+      [s.get("id") for s in tsteps] == ["toolkit", None, "envguard", "target", None, "token", "start", "judge", "finish"],
       ", ".join(str(s.get("name")) for s in tsteps))
+# Round 2: a guard that refuses no longer stops the run (an older pass would stay): the gate posts a failure instead.
+check("both guards go on when they refuse (their answer, guard=fail, makes the gate post only failures)",
+      all(s.get("continue-on-error") is True for s in (gsteps + [{}] * 3)[2:3] + (tsteps + [{}] * 3)[2:3]))
+check("no other step of the guard job or before finish in the gate job goes on after a failure (a failure is seen)",
+      all("continue-on-error" not in s for i, s in enumerate(gsteps) if i != 2)
+      and all("continue-on-error" not in s for i, s in enumerate(tsteps) if i not in (2, 4)))
+last = (gsteps + [{}] * 5)[4]
+r = bash(last.get("run", "exit 0"), {})
+check("guard job: no answer from the guard (no Environment, or it crashed) fails the job visibly: no token, no post",
+      last.get("if") == "steps.guard.outputs.guard == ''" and r.returncode == 1 and "::error::head gate" in r.stdout
+      and "dispatched again" in r.stdout, f"{last.get('if')} {r.returncode} {r.stdout}")
 
 # --- the toolkit: this workflow's own commit, never the caller's tree -----------------------------------------------
 SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -156,11 +168,17 @@ check("guard: it runs the whole guard",
 r = run(prs, REPO="o/p", EVENT="workflow_dispatch", PR="")
 check("prs: the event and the number go on as they are (an empty number is the backfill)",
       r.returncode == 0 and r.stdout.startswith(args("-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py",
-                                                     "prs", "--repo", "o/p", "--event", "workflow_dispatch", "--pr", "")),
-      r.stdout)
+                                                     "prs", "--repo", "o/p", "--event", "workflow_dispatch", "--pr", "",
+                                                     "--event-sha", "") + "\n"), r.stdout)
+r = run(prs, REPO="o/p", EVENT="pull_request_target", PR="7", EVENT_SHA="ab" * 20)
+check("prs: the head the event carries goes on too (used only when the pull request read fails every try)",
+      r.returncode == 0 and r.stdout.startswith(args("-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py",
+                                                     "prs", "--repo", "o/p", "--event", "pull_request_target", "--pr",
+                                                     "7", "--event-sha", "ab" * 20) + "\n"), r.stdout)
 check("prs: the event comes from the run and the number from the caller",
-      (prs.get("env") or {}).get("EVENT") == "${{ github.event_name }}" and (prs.get("env") or {}).get("PR")
-      == "${{ inputs.pr }}")
+      (prs.get("env") or {}) == {"GH_TOKEN": "${{ github.token }}", "REPO": "${{ github.repository }}",
+                                 "EVENT": "${{ github.event_name }}", "PR": "${{ inputs.pr }}",
+                                 "EVENT_SHA": "${{ github.event.pull_request.head.sha }}"}, str(prs.get("env")))
 
 eguard, target, drift, token, start, judge, finish = (tsteps + [{}] * 9)[2:9]
 check("gate: the Environment is checked again right before the token, without the secret's presence",
@@ -169,7 +187,8 @@ check("gate: the Environment is checked again right before the token, without th
 RUN_ENV = {"GH_TOKEN": "${{ github.token }}", "REPO": "${{ github.repository }}", "SHA": "${{ matrix.sha }}",
            "REQUIRED_LENSES": "${{ inputs.required-lenses }}", "CALLER_REF": "${{ github.workflow_ref }}",
            "CALLER_SHA": "${{ github.workflow_sha }}", "GATE_REPO": "${{ steps.toolkit.outputs.repo }}",
-           "GATE_SHA": "${{ steps.toolkit.outputs.sha }}", "RUN_ATTEMPT": "${{ github.run_attempt }}"}
+           "GATE_SHA": "${{ steps.toolkit.outputs.sha }}", "RUN_ATTEMPT": "${{ github.run_attempt }}",
+           "GUARD": "${{ needs.guard.outputs.guard }}", "ENVIRONMENT_GUARD": "${{ steps.envguard.outputs.guard }}"}
 check("target: the head is the matrix's, the caller and gate commits and the attempt the run's; the job's token reads",
       (target.get("env") or {}) == RUN_ENV and "if" not in target, str(target.get("env")))
 check("judge: the same, plus the config; the job's token reads",
@@ -177,9 +196,11 @@ check("judge: the same, plus the config; the job's token reads",
 lenses = "correctness\ndata-integrity (DI-1, DI-2)"
 SHA_H = "ab" * 20
 renv = dict(REPO="o/p", SHA=SHA_H, REQUIRED_LENSES=lenses, CALLER_REF="o/p/.github/workflows/g.yml@refs/heads/main",
-            CALLER_SHA="cd" * 20, GATE_REPO="t/k", GATE_SHA="ef" * 20, RUN_ATTEMPT="1")
+            CALLER_SHA="cd" * 20, GATE_REPO="t/k", GATE_SHA="ef" * 20, RUN_ATTEMPT="1", GUARD="ok",
+            ENVIRONMENT_GUARD="fail")
 run_args_ = ("--repo", "o/p", "--sha", SHA_H, "--required-lenses", lenses, "--caller-ref", renv["CALLER_REF"],
-             "--caller-sha", "cd" * 20, "--gate-repo", "t/k", "--gate-sha", "ef" * 20, "--run-attempt", "1")
+             "--caller-sha", "cd" * 20, "--gate-repo", "t/k", "--gate-sha", "ef" * 20, "--run-attempt", "1",
+             "--guard", "ok", "--environment-guard", "fail")
 r = run(target, **renv)
 check("target: every input is one argument",
       r.returncode == 0 and r.stdout.startswith(args("-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py",
@@ -190,8 +211,9 @@ check("judge: every input is one argument; the verdict goes to the runner temp f
           "-I", "-B", "toolkit/fork-ci/actions/head-check/head_gate.py", "judge", "--repo", "o/p", "--sha", SHA_H,
           "--config", ".github/q.json", *run_args_[4:], "--work", "/rt", "--verdict", "/rt/head-gate-verdict.json")
           + "\n"), r.stdout + r.stderr)
-check("drift, token and start run only when target says to post (never for a draft, another base or a re-run)",
-      all(s.get("if") == "steps.target.outputs.post == 'true'" for s in (drift, token, start)))
+check("token and start run when target says to post (a judged head, or a failure: re-run, old caller, guard)",
+      all(s.get("if") == "steps.target.outputs.post == 'true'" for s in (token, start)))
+check("drift runs only for a judged head (target names its base)", drift.get("if") == "steps.target.outputs.base != ''")
 check("judge runs only after start posted its in-progress check run",
       judge.get("if") == "steps.start.outputs.id != ''")
 check("finish runs whenever start posted, whatever happened after (always()): a stop leaves a failure, never an old pass",

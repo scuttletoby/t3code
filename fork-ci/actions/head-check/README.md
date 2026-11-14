@@ -204,31 +204,47 @@ How it works:
 - **A check run belongs to a commit, not to a pull request.** The newest check
   run of the name on a head counts for every pull request with that head. So
   the gate judges a head, never one pull request alone:
-  - Only open, ready pull requests into the default branch are judged. A
-    draft, or a pull request into any other branch, gets nothing posted, ever
-    (there is no "pass drafts" in the gate). A draft is judged when it is
-    marked ready.
+  - Only open, ready pull requests into the default branch are judged. A head
+    that only drafts, closed pull requests or pull requests into another
+    branch have gets a failure (there is no "pass drafts" in the gate), so a
+    pass it had cannot survive to a later ready, reopen or retarget. A draft
+    is judged when it is marked ready.
   - Every open, ready pull request into the default branch with the head is
     judged in the same run, and the head passes only when all of them pass:
     the strictest verdict wins.
   - Runs on one head wait for each other (concurrency per head), and each
     reads every such pull request again when it starts. So the newest check
     run on a head always comes from the newest complete read.
-- The guard job (no Environment) refuses unless the App key can only be the
+- Every GitHub read tries again on a 5xx or a rate limit (3 tries, 3 and 10
+  seconds apart). When the pull request read still fails, the head comes from
+  the event (`pull_request_target`) or from git (`refs/pull/N/head`, not under
+  the REST API's rate limit).
+- The guard job (no Environment) checks that the App key can only be the
   Environment's: no repository or organisation secret of its name, the
   Environment exists, and its deployment branches are exactly one rule, the
   default branch. The gate job checks the Environment again right before the
-  token is made.
-- Before any token, the gate job refuses, and posts nothing, when:
+  token is made. When a check fails, or GitHub does not answer, the gate posts
+  only failures: a failure never passes, whoever could reach the key. When the
+  Environment does not exist, the guard job fails and the gate job never
+  starts (a job that named a missing Environment would make GitHub create it,
+  open to every branch).
+- The gate posts a failure instead of judging when:
+  - the guard did not pass (above).
   - the run is a re-run (attempt 2 or later). A re-run runs the caller and
     gate release of its first attempt, and a re-run of the gate job alone
     skips the guard job. Dispatch the gate with the pull request number
     instead.
   - the caller is not the default branch's current one: the caller file
     changed since the event, or it no longer pins this gate release. A run
-    can wait a long time for an earlier run on the same head.
+    can wait a long time for an earlier run on the same head. A repository
+    that calls its own `fork-head-gate.yml` (a local gate) counts while the
+    gate's own files (that workflow, `fork-ci/actions/head-check` and
+    `fork-ci/actions/pr-queue`) are the same on the default branch tip; any
+    other merge changes nothing it runs.
   - the required lenses name no lens. With none, a head with no lens comment
     would pass, so the input is required.
+  - no open, ready pull request into the default branch has the head now.
+  - GitHub did not answer a read it needs, after the tries.
 - Only three steps touch the key. One makes a token of the gate App (checks
   write, this repository). **start** posts an in-progress check run on the
   head _before_ anything is judged; an in-progress check never passes. Then
@@ -236,9 +252,9 @@ How it works:
   that check run with the verdict, or with a failure when there is none. The
   ruleset requires the check from that App alone, so a job of a pull
   request's own workflow with the same name does not count.
-- A dispatch without a pull request number judges the head of every open,
-  ready pull request into the default branch (the backfill, each head once,
-  at most 256; more is refused).
+- A dispatch without a pull request number judges the head of every open
+  pull request (the backfill, each head once, at most 256; more is refused).
+  Heads no open, ready pull request into the default branch has get a failure.
 
 Setup (the repository owner's steps; nothing here creates them):
 
@@ -263,8 +279,8 @@ Setup (the repository owner's steps; nothing here creates them):
    an older queue refuses a key it does not know.
 
 After a change to the caller or a new pin, dispatch the backfill again: a run
-that started before the change is refused, and nothing else judges the open
-pull requests again.
+that started before the change posts a failure, and nothing else judges the
+open pull requests again.
 
 **Run again after a review.** Reviews and inline diff comments
 (`pull_request_review`, `pull_request_review_comment`) do not start the gate,
@@ -278,30 +294,59 @@ draft, a base change and any issue comment start it anyway. A trusted way to
 run on reviews is open:
 [issue 88](https://github.com/scuttletoby/t3code/issues/88).
 
-**Runs again, stops half-way, old state.**
+**Runs again, stops half-way, old state.** Every way a run can end leaves the
+head "not passed" unless it judged the head and the head passed.
 
 - _Runs again._ Each run judges what GitHub says now. A new run on a head
   first posts a new in-progress check run, then completes it. The newest check
   run of that name from the App is the one that counts.
-- _Stops half-way._ A run that stops after start (an API error, a crash, a
+- _Stops after start._ A run that stops after start (an API error, a crash, a
   timeout, a cancel) leaves its in-progress check run, or finish completes it
   as a failure. Either way an older pass on the head no longer counts, and
-  the gate job is red. If start itself cannot post (GitHub refuses or is
-  down), nothing on the head changes and the job is red. That is the one case
-  where an older verdict still stands: until the next event, or a dispatch.
-- _The head moves._ If the head moves while a run works, that run finds no
-  pull request with its old head and posts nothing. If it was already
-  judging, it posts a failure on the old head ("a newer head has its own
-  run"), and the new head gets its own run.
-- _A key that is rotated or deleted_ makes no token: the job fails and nothing
-  is posted, so the required check stays missing or as it was.
+  the gate job is red. A runner that dies after start leaves the check in
+  progress, so the queue waits on that head until the next event or a
+  dispatch (it fails closed).
+- _Stops before start._ The run posts nothing, and an older check run on the
+  head stays the newest, in exactly these cases (each one leaves a red job or
+  a run that never started):
+  - start's write fails all its tries (GitHub refuses or is down). This is
+    the accepted gap: the gate cannot post without its first write.
+  - No token can be made: the App key or id is gone or wrong, the App is not
+    installed, or the Environment does not let the default branch deploy.
+    The gate job fails. Fix: put the App, key and Environment back (setup
+    steps 1 to 3), then dispatch the backfill.
+  - The Environment does not exist: the guard job fails. Fix: setup step 3,
+    then dispatch the backfill.
+  - The head is unknown: on an issue comment or a dispatch with a number, the
+    pull request read and git's `refs/pull/N/head` both fail every try.
+  - The backfill cannot list the open pull requests after its tries, or finds
+    more than 256 heads. Dispatch again (or once per pull request).
+  - The run never reaches start: GitHub does not start the workflow, or the
+    runner dies, times out or is cancelled before start. A run waiting on the
+    same head that a newer one replaces is the exception that does no harm:
+    the newer run posts.
+  - There is no head to judge: the event names no pull request, or one that
+    is merged or deleted, or the workflow passes target a bad repository or
+    sha (a fault in the workflow).
+- _The head moves._ A run whose head no open, ready pull request has any more
+  posts a failure on the old head ("not passed until one has it"), and the new
+  head gets its own run.
+- _A sibling moves on._ When two pull requests share a head and one gets a
+  new push, the other keeps the shared verdict, which can be a failure only
+  the moved one caused: it stays red until its next event or a dispatch (it
+  fails closed).
 - _Old state._
+  - An older pass on a head stops counting as soon as a later run on that
+    head posts its in-progress check run.
+  - A pull request that turns draft (or changes its base, or closes) gets a
+    failure on its head, so a revoked pass is not still green when it is
+    marked ready.
   - A check run of the same name posted by GitHub Actions (an older,
     non-gate check) does not count once the ruleset binds the check to the
     App.
   - A head shared by two pull requests is judged for both (above).
-  - A repository without the Environment is refused by the guard before any
-    token is made.
+  - A repository without the Environment: the guard job fails before any
+    token is made, and nothing is posted (above).
 
 **What it does not stop.**
 
