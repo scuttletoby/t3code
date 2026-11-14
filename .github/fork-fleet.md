@@ -139,7 +139,7 @@ Two more things limit what a job can do:
   still write: a copy is removed only once no unit can write it. The launcher
   refuses two slots that are one user, or a runner user in any other group or
   lingering.
-- **Network:** the `vm` pool runs on VM106, the owner's workspace, not on a VM
+- **Network:** the `vm` pool runs on the owner's workspace machine, not on a machine
   of its own. So each runner user has a network namespace of its own
   (`fork-fleet-<user>`) with its own loopback: a job reaches none of the host's
   loopback services (T3's server, web GUIs, databases) and no abstract socket of
@@ -307,10 +307,10 @@ that uses the router (or the `fleet-route` action) may also set:
   whose `github.run_attempt` is not the `attempt` output uses `fallback`. The
   `fleet-route` action's README has the `runs-on` expression.
 
-## Host setup (VM106, the `vm` pool)
+## Host setup (the workspace machine, the `vm` pool)
 
 Run as root on the host. Nothing here prints a secret. Use the `main` commit
-that has this change. VM106 is the owner's workspace, not a VM of its own: the
+that has this change. This host is the owner's workspace, not a machine of its own: the
 runners' network (step 1b, the launcher, step 6) is what keeps jobs off its
 services and its LAN. Steps 1b to 3 each run in a subshell with
 `set -euo pipefail`, so the first failing command stops that step (and leaves
@@ -505,7 +505,7 @@ private repository** under the owner's account, never the public fork with a
 stranger. Creating that repository is the owner's call. Its only collaborator is
 the owner.
 
-Set it up on VM106 next to the real install, with its own paths:
+Set it up on the workspace machine next to the real install, with its own paths:
 
 - Install the same four files under `/opt/fork-fleet-proof/`. In its
   `fork-fleet.json`, set `repository` to the proof repository, keep one pool
@@ -662,6 +662,6 @@ dispatcher keeps only pacing in memory, so a restart starts over cleanly.
 | Host setup  | Step 1b, 2 or 3 fails half-way (a download, the checksum, a check)                                                            | The step stops at that command (`set -euo pipefail`). Step 2 has not touched the running template or the dispatcher yet; step 3 has installed nothing and not written `SOURCE`.                                                                                                                           |
 | Host setup  | Step 6 says a service is reachable from inside                                                                                | Do not use the pool: stop the dispatcher until step 6 passes.                                                                                                                                                                                                                                             |
 | Old state   | Leftover copies or environment files from an old install                                                                      | `prune` removes any whose unit is gone, on every pass.                                                                                                                                                                                                                                                    |
-| Old state   | Old `FLEET_RUNNERS_TOKEN` secret, or a standing runner from the first design (`vm106-t3code`)                                 | Unused. Delete both. A standing runner is what this design removes, because any job asking for its labels can reach it. The fork has no runners today.                                                                                                                                                    |
+| Old state   | Old `FLEET_RUNNERS_TOKEN` secret, or a standing runner from the first design (a `<host>-t3code` runner)                       | Unused. Delete both. A standing runner is what this design removes, because any job asking for its labels can reach it. The fork has no runners today.                                                                                                                                                    |
 | Old state   | Installed copy older than `main`                                                                                              | It applies the old rule until re-installed (host step 3). `SOURCE` names the commit.                                                                                                                                                                                                                      |
 | Empty state | No runs, no runners, no variables yet                                                                                         | The dispatcher creates the heartbeat variables on its first pass. `route` counts no slot until then.                                                                                                                                                                                                      |
