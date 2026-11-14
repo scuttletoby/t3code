@@ -273,6 +273,11 @@ export function planScopedSettingsPatch(
                   delete next[key];
                   continue;
                 }
+                // Fork: a project's check map replaces the environment's whole, so a removed check stays removed.
+                if (key === "waitChecks") {
+                  next[key] = value;
+                  continue;
+                }
                 const base: unknown = effective[key as keyof ServerSettings];
                 // A new model must not inherit the previous model's options.
                 if (
