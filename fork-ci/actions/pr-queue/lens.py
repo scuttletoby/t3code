@@ -1,6 +1,7 @@
 """Which head a pull request's review vouched for: the lens-comment rules of the merge queue (pr_queue.py).
 
-A lens is one review angle, posted as one PR comment whose FIRST line is its header:
+A lens is one review angle, posted as one PR comment whose FIRST line is its header (a PR review and an inline review
+comment, on a line of the diff, are comments too: REVIEW_COMMENTS):
 
     lens: <name> · reviewer: <who> · read at: <sha>
 
@@ -43,6 +44,10 @@ EDITED = 'edited after posting: post a new comment instead'
 # review_flags). gh pr view never fetches them for reviews but prints `includesCreatedEdit: false` anyway, so a review
 # takes its flags from here only; one this does not hold reads nothing (FLAGS_UNREAD).
 REVIEW_FLAGS = 'reviewFlags'
+# The PR's inline review comments (on a line of the diff), which gh pr view does not list at all: the caller reads
+# them with the same query and puts them here, each as a post like a PR comment (pr_queue inline_post), with its own
+# edit and hidden flags and GitHub's author type. They are comments like any other (lens_posts).
+REVIEW_COMMENTS = 'reviewComments'
 FLAGS_UNREAD = 'a review whose edit and hidden flags were not read from GitHub: re-run, or post a new comment'
 UNREAD = '_flagsUnread'   # the mark review_post puts on such a review
 HIDDEN = 'hidden: post a new comment instead'
@@ -369,11 +374,14 @@ class Review:
         return post
 
     def lens_posts(self, pr):
-        """[(when, index, post)] of the PR's comments and reviews, bots skipped. Reviews carry the flags read for them
-        (review_post)."""
+        """[(when, index, post)] of the PR's comments, reviews and inline review comments (REVIEW_COMMENTS), bots
+        skipped. Reviews carry the flags read for them (review_post). Every rule reads all three alike: an inline
+        comment can be a lens read, a lens that read nothing, or an override, and resolving its thread changes nothing
+        (a resolved thread is not a hidden comment)."""
         flags = pr.get(REVIEW_FLAGS)
         posts = [(c.get('createdAt') or '', c) for c in pr.get('comments') or []]
         posts += [(r.get('submittedAt') or '', self.review_post(r, flags)) for r in pr.get('reviews') or []]
+        posts += [(c.get('createdAt') or '', c) for c in pr.get(REVIEW_COMMENTS) or []]
         return [(when, i, post) for i, (when, post) in enumerate(posts) if not self.is_bot(post)]
 
     def lens_entries(self, pr):
