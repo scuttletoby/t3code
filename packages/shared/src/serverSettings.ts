@@ -3,6 +3,7 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_TEXT_GENERATION_MODEL,
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
+  DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   defaultInstanceIdForDriver,
   globalIdleCompaction,
   type IdleCompactionMode,
@@ -237,6 +238,22 @@ function mergeSettingsEntries<Value>(
       next.delete(id);
     } else {
       next.set(id, config);
+    }
+  }
+  return Object.fromEntries(next);
+}
+
+/** Fork: per instance and per field; a field left out keeps its stored value (or default). */
+function mergeUsagePacing(
+  current: ServerSettings["usagePacing"],
+  patch: NonNullable<ServerSettingsPatch["usagePacing"]>,
+): ServerSettings["usagePacing"] {
+  const next = new Map(Object.entries(current));
+  for (const [id, entry] of Object.entries(patch)) {
+    if (entry === null) {
+      next.delete(id);
+    } else {
+      next.set(id, { ...DEFAULT_USAGE_PACING_INSTANCE_SETTINGS, ...next.get(id), ...entry });
     }
   }
   return Object.fromEntries(next);
@@ -616,7 +633,7 @@ export function applyServerSettingsPatch(
         }
       : {}),
     ...(usagePacingPatch !== undefined
-      ? { usagePacing: mergeSettingsEntries(current.usagePacing, usagePacingPatch) }
+      ? { usagePacing: mergeUsagePacing(current.usagePacing, usagePacingPatch) }
       : {}),
     ...(textGeneratorsPatch !== undefined
       ? { textGenerators: mergeSettingsEntries(current.textGenerators, textGeneratorsPatch) }

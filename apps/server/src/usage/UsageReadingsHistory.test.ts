@@ -187,6 +187,11 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
     // The same probe republished, or an older one arriving late, is not history.
     assert.isFalse(shouldRecord(first, reading(at(0), 55)));
     assert.isFalse(shouldRecord(first, reading(at(-MINUTE), 55)));
+    // A full read is recorded even when nothing moved: it confirms every window it returned.
+    // An unchanged full read is recorded only after a known partial one.
+    assert.isFalse(shouldRecord(first, reading(at(MINUTE), 40, { full: true })));
+    assert.isTrue(shouldRecord(first, reading(at(MINUTE), 40, { full: true }), undefined, true));
+    assert.isFalse(shouldRecord(first, reading(at(0), 40, { full: true })));
   });
 
   it("records a move of at least 0.1 point, in either direction, and nothing smaller", () => {
@@ -236,7 +241,8 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
 
       yield* history.record([provider(limits(at(0), 40)), provider(undefined, SECOND)]);
       yield* history.record([provider(limits(at(0), 40))]);
-      yield* history.record([provider(limits(at(MINUTE), 40))]);
+      // A new usage stamp with no provider check (not a full read) and no move is not history.
+      yield* history.record([{ ...provider(limits(at(MINUTE), 40)), checkedAt: at(0) }]);
       yield* history.record([provider(limits(at(2 * MINUTE), 42))]);
 
       assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 42]);
@@ -247,6 +253,52 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       );
       const fs = yield* FileSystem.FileSystem;
       assert.deepStrictEqual(yield* fs.readDirectory(directory), [`${INSTANCE}.jsonl`]);
+    }),
+  );
+
+  it.effect("marks a reading full only when a provider check brought new limits", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const directory = yield* historyDirectory;
+      const history = yield* make({ directory });
+      const checked = (providerAt: string, usage: ServerProviderUsageLimits): ServerProvider => ({
+        ...provider(usage),
+        checkedAt: providerAt,
+      });
+
+      // First sight after start: nothing to compare with, so not known to be full.
+      yield* history.record([checked(at(0), limits(at(0), 40))]);
+      // A streamed update: the usage stamp moves, the provider check does not.
+      yield* history.record([checked(at(0), limits(at(MINUTE), 41))]);
+      // A provider check with new limits, nothing moved: full, and recorded after the partial one.
+      yield* history.record([checked(at(2 * MINUTE), limits(at(2 * MINUTE), 41))]);
+      // A provider check that kept the published limits (same usage stamp): nothing new.
+      yield* history.record([checked(at(3 * MINUTE), limits(at(2 * MINUTE), 41))]);
+      // A provider check whose usage read failed: not full.
+      yield* history.record([
+        checked(
+          at(4 * MINUTE),
+          limits(at(4 * MINUTE), 41, { unavailable: { reason: "probeFailed" } }),
+        ),
+      ]);
+      // A provider check after a streamed update in between: full again.
+      yield* history.record([checked(at(4 * MINUTE), limits(at(5 * MINUTE), 43))]);
+      yield* history.record([checked(at(6 * MINUTE), limits(at(6 * MINUTE), 44))]);
+      // Full after full with nothing moved adds only time: left to the heartbeat.
+      yield* history.record([checked(at(7 * MINUTE), limits(at(7 * MINUTE), 44))]);
+
+      const served = yield* history.readings(INSTANCE);
+      assert.deepStrictEqual(
+        served.map((entry) => [entry.checkedAt, entry.full === true]),
+        [
+          [at(0), false],
+          [at(MINUTE), false],
+          [at(2 * MINUTE), true],
+          [at(4 * MINUTE), false],
+          [at(5 * MINUTE), false],
+          [at(6 * MINUTE), true],
+        ],
+      );
     }),
   );
 

@@ -29,7 +29,12 @@ import { TestClock } from "effect/testing";
 
 import * as ProviderRegistryMock from "../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
-import { effectiveIntervalMs, REFRESH_TIMEOUT_MS } from "./HeadlessUsageRefresher.ts";
+import {
+  backoffMs,
+  effectiveIntervalMs,
+  oneFailureGapMs,
+  REFRESH_TIMEOUT_MS,
+} from "./HeadlessUsageRefresher.ts";
 import * as UsagePacer from "./UsagePacer.ts";
 import {
   currentSeries,
@@ -373,6 +378,83 @@ describe("UsagePacer guards", () => {
     assert.strictEqual(result.unknownReason, "noLimits");
   });
 
+  it("no limits is told apart from no reading: a failed first read is not free", () => {
+    // Confirmed: unsupported (above), or a read that worked and reported no windows.
+    assert.strictEqual(pace([], provider(-MINUTE, [])).unknownReason, "noLimits");
+    // Not read: the first read failed, or the instance has reported no usage at all.
+    const failed = pace([], provider(-MINUTE, [], { unavailable: "probeFailed" }));
+    assert.strictEqual(failed.verdict, "unknown");
+    assert.strictEqual(failed.unknownReason, "noReading");
+    const { usageLimits: _none, ...unread } = provider(-MINUTE, []);
+    assert.strictEqual(pace([], unread).unknownReason, "noReading");
+  });
+
+  it("a full read confirms every window it returned, also one that did not move", () => {
+    // Probes every 5 min while working: the session moves, Codex's integer weekly stays at 50.
+    const history = Array.from({ length: 9 }, (_, step) =>
+      reading((step - 8) * 5 * MINUTE - MINUTE, [weekly(50), session(10 + step * 4)], {
+        full: true,
+      }),
+    );
+    const live = provider(-MINUTE, [weekly(50), session(42)]);
+    const result = pace(history, live, { staleAfterMs: STALE });
+    assert.strictEqual(windowOf(result, "seven_day").checkedAt, at(-MINUTE));
+    assert.strictEqual(windowOf(result, "seven_day").verdict, "onPace");
+    assert.notStrictEqual(result.verdict, "unknown");
+  });
+
+  it("a window gone from a full read is dropped; gone after a failed read it stays unknown", () => {
+    // Extra usage turned off: monthly_spend (no reset clock) leaves the next full read.
+    const spend = open(10, "monthly_spend", "monthly");
+    const history = [
+      reading(-20 * MINUTE, [weekly(40), spend], { full: true }),
+      reading(-10 * MINUTE, [weekly(41)], { full: true }),
+    ];
+    const dropped = pace(history, provider(-10 * MINUTE, [weekly(41)]));
+    assert.deepStrictEqual(
+      dropped.windows.map((window) => window.id),
+      ["seven_day"],
+    );
+    assert.strictEqual(dropped.verdict, "behind");
+    // A clocked window (five_hour) gone from a full read is dropped as well.
+    const sessionGone = pace(
+      [
+        reading(-20 * MINUTE, [weekly(40), session(10)], { full: true }),
+        reading(-10 * MINUTE, [weekly(41)], { full: true }),
+      ],
+      provider(-10 * MINUTE, [weekly(41)]),
+    );
+    assert.strictEqual(sessionGone.verdict, "behind");
+
+    // The read failed: no windows came back, so every window is unknown, never free.
+    const failed = pace(
+      [reading(-20 * MINUTE, [weekly(40), session(10)], { full: true })],
+      provider(-MINUTE, [], { unavailable: "probeFailed" }),
+    );
+    assert.strictEqual(failed.verdict, "unknown");
+    assert.strictEqual(windowOf(failed, "seven_day").unknownReason, "missing");
+    assert.strictEqual(windowOf(failed, "five_hour").unknownReason, "missing");
+  });
+
+  it("a live snapshot stamped before the history's newest reading is never paced alone", () => {
+    // The clock stepped back by a second: the live reading is not recorded until it passes.
+    const history = [
+      reading(-10 * MINUTE, [weekly(40), session(10)]),
+      reading(-2 * MINUTE, [weekly(41)]),
+    ];
+    const stepped = pace(history, provider(-2 * MINUTE - 1000, [weekly(41)]));
+    assert.strictEqual(stepped.verdict, "unknown");
+    assert.strictEqual(windowOf(stepped, "seven_day").verdict, "unknown");
+
+    // The history recorded a newer reading after the live one was taken: pace the newest.
+    const newer = pace(
+      [reading(-10 * MINUTE, [weekly(40)]), reading(-2 * MINUTE, [weekly(45)])],
+      provider(-10 * MINUTE, [weekly(40)]),
+    );
+    assert.strictEqual(windowOf(newer, "seven_day").usedPercent, 45);
+    assert.strictEqual(windowOf(newer, "seven_day").checkedAt, at(-2 * MINUTE));
+  });
+
   it("burn rate needs ten minutes of cover and never goes negative", () => {
     const short = pace([reading(-6 * MINUTE, [weekly(40)])], provider(-MINUTE, [weekly(42)]));
     assert.isNull(windowOf(short, "seven_day").burnPercentPerHour);
@@ -463,6 +545,32 @@ describe("UsagePacer reserve and verdicts", () => {
     assert.strictEqual(windowOf(reserved, "seven_day").verdict, "ahead");
   });
 
+  it("the pace band never eats the reserve: at or over the ceiling is ahead", () => {
+    const verdict = (
+      used: number,
+      pacing: Partial<UsagePacingInstanceSettings>,
+      resetIn?: number,
+    ) =>
+      windowOf(pace([], provider(-MINUTE, [weekly(used, resetIn)]), { pacing }), "seven_day")
+        .verdict;
+    // Burn first with a reserve of 20 stops at 80, not at 85.
+    assert.strictEqual(verdict(84, { burnFirst: true, reservePercent: 20 }), "ahead");
+    assert.strictEqual(verdict(80, { burnFirst: true, reservePercent: 20 }), "ahead");
+    assert.strictEqual(verdict(79, { burnFirst: true, reservePercent: 20 }), "behind");
+    // A small reserve still holds.
+    assert.strictEqual(verdict(100, { burnFirst: true, reservePercent: 4 }), "ahead");
+    assert.strictEqual(verdict(96, { burnFirst: true, reservePercent: 4 }), "ahead");
+    // A full window is never on pace, with or without burn first.
+    assert.strictEqual(verdict(100, { burnFirst: true }), "ahead");
+    assert.strictEqual(verdict(100, {}, 2 * HOUR), "ahead");
+    // Late in the window the ceiling (90) is under the pace (~96): it holds without a band.
+    assert.strictEqual(verdict(92, { reservePercent: 20 }, 6 * HOUR), "ahead");
+    assert.strictEqual(verdict(89, { reservePercent: 20 }, 6 * HOUR), "behind");
+    // While the pace is under the ceiling, upstream's band still applies to the pace.
+    assert.strictEqual(verdict(54, { reservePercent: 20 }), "onPace");
+    assert.strictEqual(verdict(56, { reservePercent: 20 }), "ahead");
+  });
+
   it("a window without a reset clock cannot pace and does not decide the instance", () => {
     const other = open(99, "other", "other");
     const mixed = pace([], provider(-MINUTE, [weekly(40), other]));
@@ -474,9 +582,9 @@ describe("UsagePacer reserve and verdicts", () => {
     assert.strictEqual(alone.unknownReason, "noResetClock");
     const reserved = pace([], provider(-MINUTE, [other]), { pacing: { reservePercent: 10 } });
     assert.isNull(windowOf(reserved, "other").effectiveReservePercent);
-    // Burning first with no reserve needs no clock: the ceiling is 100%.
+    // Burning first with no reserve needs no clock: the ceiling is 100%, and 99 is under it.
     const burn = pace([], provider(-MINUTE, [other]), { pacing: { burnFirst: true } });
-    assert.strictEqual(windowOf(burn, "other").verdict, "onPace");
+    assert.strictEqual(windowOf(burn, "other").verdict, "behind");
   });
 
   it("ahead outranks unknown, unknown outranks on pace", () => {
@@ -522,7 +630,42 @@ describe("UsagePacer settings", () => {
     assert.deepStrictEqual(unrelated.usagePacing, removed.usagePacing);
   });
 
-  it("stale bound: two refresh intervals plus a timeout, never under 30 minutes", () => {
+  it("a patch of one field keeps the other (#54)", () => {
+    const reserved = applyServerSettingsPatch(
+      DEFAULT_SERVER_SETTINGS,
+      decodePatch({ usagePacing: { [INSTANCE]: { reservePercent: 20 } } }),
+    );
+    const burning = applyServerSettingsPatch(
+      reserved,
+      decodePatch({ usagePacing: { [INSTANCE]: { burnFirst: true } } }),
+    );
+    assert.deepStrictEqual(burning.usagePacing[INSTANCE], { reservePercent: 20, burnFirst: true });
+    const lowered = applyServerSettingsPatch(
+      burning,
+      decodePatch({ usagePacing: { [INSTANCE]: { reservePercent: 5 } } }),
+    );
+    assert.deepStrictEqual(lowered.usagePacing[INSTANCE], { reservePercent: 5, burnFirst: true });
+    assert.throws(() => decodePatch({ usagePacing: { [INSTANCE]: { reservePercent: 101 } } }));
+    assert.throws(() => decodePatch({ usagePacing: { [INSTANCE]: { burnFirst: "yes" } } }));
+  });
+
+  it("stale bound: one failed refresh and its backed-off retry fit inside it", () => {
+    const hourly = {
+      ...DEFAULT_SERVER_SETTINGS,
+      headlessUsageRefreshInterval: Duration.minutes(60),
+    };
+    const interval = effectiveIntervalMs(hourly)!;
+    // Due an interval after the last good read, fails, retries after its backoff, may time out.
+    assert.isAtLeast(staleAfterMs(hourly), interval + backoffMs(interval, 1) + REFRESH_TIMEOUT_MS);
+    const tenMinutes = {
+      ...DEFAULT_SERVER_SETTINGS,
+      headlessUsageRefreshInterval: Duration.minutes(10),
+    };
+    const short = effectiveIntervalMs(tenMinutes)!;
+    assert.isAtLeast(staleAfterMs(tenMinutes), short + backoffMs(short, 1) + REFRESH_TIMEOUT_MS);
+  });
+
+  it("stale bound: the refresher's one-failure gap, never under 30 minutes", () => {
     const off = { ...DEFAULT_SERVER_SETTINGS, headlessUsageRefreshInterval: Duration.zero };
     assert.strictEqual(staleAfterMs(off), STALE);
     const hourly = {
@@ -532,7 +675,7 @@ describe("UsagePacer settings", () => {
     const interval = effectiveIntervalMs(hourly);
     assert.isNotNull(interval);
     assert.isAtLeast(interval!, HOUR);
-    assert.strictEqual(staleAfterMs(hourly), 2 * interval! + REFRESH_TIMEOUT_MS);
+    assert.strictEqual(staleAfterMs(hourly), oneFailureGapMs(interval!));
   });
 });
 
