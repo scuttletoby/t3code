@@ -89,6 +89,12 @@ const make = Effect.gen(function* () {
           Effect.as(undefined),
         ),
       ),
+      // A bug in the count read (a defect, not a failure) must not refuse every delegation either.
+      Effect.catchDefect((defect) =>
+        Effect.logWarning("agent slots: counting running agents crashed", { defect }).pipe(
+          Effect.as(undefined),
+        ),
+      ),
     );
 
   const acquire = Effect.fn("SlotGate.acquire")(

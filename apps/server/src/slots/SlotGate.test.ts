@@ -39,6 +39,8 @@ interface World {
   snapshotFails: boolean;
   /** The count read never answers (a hung database read). */
   snapshotHangs: boolean;
+  /** The count read dies (a bug in the read, not a failure). */
+  snapshotDies?: boolean;
   freeMemoryBytes: number;
 }
 
@@ -88,6 +90,7 @@ const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue> | "un
               assert.deepStrictEqual(options, { activeRunOnly: true });
               world.snapshotReads += 1;
               if (world.snapshotHangs) return yield* Effect.never;
+              if (world.snapshotDies) return yield* Effect.die(new Error("corrupt row"));
               // Lets concurrent callers interleave here, the slow part of a real acquire.
               yield* Effect.yieldNow;
               if (world.snapshotFails) {
@@ -433,6 +436,16 @@ describe("SlotGate", () => {
         assert.strictEqual(refused.type, "refuse");
         if (refused.type === "refuse") assert.include(refused.message, "memory");
       }),
+  );
+
+  it.effect("a count read that dies (a bug, not a failure) lets the call through", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.snapshotDies = true;
+      world.threads = [{ id: "a", instanceId: MAIN }];
+      const outcome = yield* run(world, on({ maxPerMachine: 1 }), acquire());
+      assert.strictEqual(outcome.type, "allow");
+    }),
   );
 
   it.effect("settings changed while running: off to on takes effect at the next call", () =>

@@ -158,7 +158,11 @@ export const AgentSlotsSettings = Schema.Struct({
   maxPerAccount: Schema.Record(ProviderInstanceId, NonNegativeInt).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
-  /** Refuse a new child below this much available memory; 0 = off. */
+  /**
+   * Refuse a new child below this much available memory; 0 = off. Set it together with the count
+   * limits: when the running agents cannot be counted in time (an overloaded machine), the counts
+   * let the call through and only this floor still holds.
+   */
   minFreeMemoryMb: nonNegativeIntDefault(0),
   /** How long a woken slot wait keeps its slot. */
   reserveSeconds: nonNegativeIntDefault(120),
