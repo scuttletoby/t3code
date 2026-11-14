@@ -424,6 +424,9 @@ export function applyServerSettingsPatch(
     usagePacing: usagePacingPatch,
     // Fork: replaced whole; deepMerge would keep levels the client meant to clear.
     usagePacingLowerEffort,
+    // Fork: replaced whole; deepMerge would keep checks and account limits the client removed.
+    waitChecks,
+    agentSlots: agentSlotsPatch,
     textGenerators: textGeneratorsPatch,
     secretProviders: secretProvidersPatch,
     sourceControlHosts: sourceControlHostsPatch,
@@ -677,6 +680,10 @@ export function applyServerSettingsPatch(
     ...(providerHealthRefreshInterval !== undefined ? { providerHealthRefreshInterval } : {}),
     ...(headlessUsageRefreshInterval !== undefined ? { headlessUsageRefreshInterval } : {}),
     ...(usagePacingLowerEffort !== undefined ? { usagePacingLowerEffort } : {}),
+    ...(waitChecks !== undefined ? { waitChecks } : {}),
+    ...(agentSlotsPatch !== undefined
+      ? { agentSlots: { ...current.agentSlots, ...agentSlotsPatch } }
+      : {}),
   };
   const normalizedBackgroundActivity = normalizeBackgroundActivitySettings(
     nextWithReplacementsBase.backgroundActivity,
