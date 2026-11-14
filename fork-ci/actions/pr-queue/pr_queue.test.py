@@ -151,10 +151,12 @@ class QueueGh:
     """`gh` for one armed PR #7 that is BEHIND main, at head `h1` (real commits of World `w`). update-branch makes the
     PR head `after` (GitHub shows it after `polls` more views). `fail`: kinds whose gh call fails; `kill_at`: the kind
     where the process dies ('poll': the first view after update-branch)."""
-    def __init__(self, w, h1, after, comments=(), polls=0, fail=(), armed=True, behind=True, kill_at=None):
+    def __init__(self, w, h1, after, comments=(), polls=0, fail=(), armed=True, behind=True, kill_at=None, reviews=(),
+                 flags=()):
         self.w = w
         self.head, self.after, self.armed, self.behind, self.updated = h1, after, (h1 if armed else None), behind, False
         self.on_pr, self.polls, self.fail, self.kill_at = list(comments), polls, set(fail), kill_at
+        self.reviews, self.flags = list(reviews), list(flags)   # flags: the answers to review_flags' pages, in turn
         self.calls, self.comments = [], []
         w.set('refs/pull/7/head', h1)
 
@@ -167,8 +169,8 @@ class QueueGh:
         return {'number': 7, 'state': 'OPEN', 'isDraft': False, 'baseRefName': 'main', 'headRefOid': self.head,
                 'autoMergeRequest': {'mergeMethod': 'SQUASH'} if self.armed else None,
                 'mergeStateStatus': 'BEHIND' if self.behind and not self.updated else 'BLOCKED', 'title': 't',
-                'createdAt': '2026-11-07T00:00:00Z', 'statusCheckRollup': [], 'comments': self.on_pr, 'reviews': [],
-                'commits': self.commits(), 'labels': []}
+                'createdAt': '2026-11-07T00:00:00Z', 'statusCheckRollup': [], 'comments': self.on_pr,
+                'reviews': self.reviews, 'commits': self.commits(), 'labels': []}
 
     def commits(self):   # the PR's commits as GitHub lists them: head's history that main lacks
         out = self.w.git(self.w.remote, 'rev-list', self.head, '^refs/heads/main')
@@ -190,6 +192,8 @@ class QueueGh:
             return failed('HTTP 502, read at: ' + 'c3' * 20)
         if kind == 'view':
             return ok(json.dumps(self.view()))
+        if kind == 'api graphql' and f'query={Q.REVIEW_FLAGS_QUERY}' in a:
+            return self.flags.pop(0) if self.flags else failed('no more pages')
         if kind == 'list':
             return ok(json.dumps([self.view()]))
         if kind == 'disarm':
@@ -216,6 +220,21 @@ def note(body, when, login='owner', association='OWNER', edited=False):
 
 def lens_at(name, sha, when='2026-11-07T10:00:00Z'):
     return note(f'{LENS}: {name} · reviewer: x · read at: {sha}\nfindings: none', when)
+
+
+def gh_review(body, when, n=1, login='owner', association='OWNER'):
+    """A review as gh pr view prints it: includesCreatedEdit false whether or not it was edited (gh never fetches
+    it for reviews), no isMinimized, no url."""
+    return {'id': f'PRR_{n}', 'body': body, 'submittedAt': when, 'author': {'login': login},
+            'authorAssociation': association, 'includesCreatedEdit': False, 'state': 'COMMENTED'}
+
+
+def flags_page(*reviews, edited=False, hidden=False, more=None, typename='User'):
+    """One page of REVIEW_FLAGS_QUERY's answer; more: the endCursor of a next page."""
+    nodes = [{'id': r['id'], 'includesCreatedEdit': edited, 'isMinimized': hidden, 'url': f'https://x/{r["id"]}',
+              'author': {'__typename': typename, 'login': 'owner'}} for r in reviews]
+    page = {'hasNextPage': more is not None, 'endCursor': more}
+    return ok(json.dumps({'data': {'repository': {'pullRequest': {'reviews': {'pageInfo': page, 'nodes': nodes}}}}}))
 
 
 def override(sha, when):   # an override comment as the project's ready command posts it
@@ -435,6 +454,115 @@ class Update(Base):
     def test_the_read_head_itself_is_the_same_change(self):   # recover: the run died before update-branch
         self.assertTrue(self.q.same_change('main', 7, self.c, self.c))
         self.assertFalse(self.q.same_change('main', 7, self.c, self.c[:7]), 'only full shas')
+
+
+class ReviewFlags(Base):   # issue #56: gh pr view prints includesCreatedEdit false for every review
+    def lens_review(self, sha, n=1):
+        return gh_review(f'{LENS}: correctness · reviewer: x · read at: {sha}\nfindings: none', '2026-11-07T10:00:00Z',
+                         n)
+
+    def test_a_review_read_unedited_by_the_flags_query_rearms(self):
+        r = self.lens_review(self.c)
+        f = self.fake(reviews=[r], flags=[flags_page(r)])
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+        query = [a for a in f.calls if QueueGh.kind(a) == 'api graphql']
+        self.assertEqual(len(query), 1)
+        self.assertIn('number=7', query[0])
+        self.assertLess(f.calls.index(next(a for a in f.calls if QueueGh.kind(a) == 'view')), f.calls.index(query[0]),
+                        'the flags are read after the view')
+
+    def test_an_edited_review_is_not_trusted_although_gh_says_unedited(self):
+        r = self.lens_review(self.c)
+        f = self.fake(reviews=[r], flags=[flags_page(r, edited=True)])
+        code, out = self.update(f)
+        self.assertIsNone(f.armed, out)
+        self.assertNotIn('arm', f.order())
+        self.assertIn(lens.EDITED.split(':')[0], ' '.join(f.comments))
+
+    def test_a_failed_flags_read_changes_nothing(self):   # unknown: never decide; the next run tries again
+        r = self.lens_review(self.c)
+        for answer in (failed('HTTP 502'), ok('not json'), ok('{"data": {"repository": {"pullRequest": null}}}'),
+                       ok(json.dumps({'errors': [{'message': 'x'}], 'data': {'repository': {'pullRequest': {
+                           'reviews': {'pageInfo': {'hasNextPage': False}, 'nodes': []}}}}}))):
+            with self.subTest(answer=answer):
+                f = self.fake(reviews=[r], flags=[answer])
+                code, out = self.update(f)
+                self.assertEqual((code, f.order(), f.armed, f.comments), (1, ['api graphql'], self.c, []), out)
+                self.assertIn('nothing changed', out)
+                self.assertFalse(self.plan_exists())
+
+    def test_a_pr_without_reviews_needs_no_flags_read(self):
+        f = self.fake(comments=[lens_at('correctness', self.c)])
+        self.assertEqual(self.update(f)[0], 0)
+        self.assertNotIn('api graphql', f.order())
+
+    def test_a_stopped_run_rereads_the_flags_before_it_rearms(self):   # STATE from a run killed after the disarm
+        r = self.lens_review(self.c)
+        f = self.fake(reviews=[r], flags=[flags_page(r)], kill_at='update')
+        with self.assertRaises(Killed):
+            self.update(f)
+        self.assertTrue(self.plan_exists())
+        f.kill_at, f.flags = None, [failed('HTTP 502')]   # the next run cannot read the flags: nothing is decided
+        code, out = run_quiet(self.q.recover)
+        self.assertIsNone(f.armed, out)
+        self.assertNotIn('arm', f.order())
+        f.flags = [flags_page(r)]
+        f.comments.clear()
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual(f.armed, self.c, out)
+
+
+class ReviewFlagsQuery(unittest.TestCase):
+    """review_flags alone: every page, by PR, and any doubt is a failure."""
+    def read(self, *answers):
+        calls, answers = [], list(answers)
+
+        def gh(*a):
+            calls.append(a)
+            return answers.pop(0) if answers else failed('no more pages')
+        return Q.review_flags(gh, REPO, 7), calls
+
+    def test_more_than_100_reviews_are_read_page_by_page(self):
+        reviews = [gh_review('x', 't', n) for n in range(1, 251)]
+        (flags, why), calls = self.read(flags_page(*reviews[:100], more='c1'), flags_page(*reviews[100:200], more='c2'),
+                                        flags_page(*reviews[200:]))
+        self.assertIsNone(why)
+        self.assertEqual(set(flags), {r['id'] for r in reviews})
+        self.assertEqual([next((x for x in c if x.startswith('after=')), None) for c in calls],
+                         [None, 'after=c1', 'after=c2'])
+        self.assertTrue(all('owner=owner' in c and 'name=proj' in c and 'number=7' in c for c in calls))
+
+    def test_any_page_that_fails_fails_the_whole_read(self):
+        r = gh_review('x', 't')
+        for second in (failed('HTTP 502'), ok('{}'), ok('[]'), ok('null')):
+            with self.subTest(second=second):
+                (flags, why), _ = self.read(flags_page(r, more='c1'), second)
+                self.assertIsNone(flags)
+                self.assertTrue(why)
+
+    def test_a_next_page_without_a_new_cursor_fails(self):
+        r = gh_review('x', 't')
+        for cursor in ('', 'c1'):
+            (flags, why), _ = self.read(flags_page(r, more='c1'), flags_page(r, more=cursor))
+            self.assertIsNone(flags, cursor)
+        (flags, why), _ = self.read(flags_page(r, more=''))
+        self.assertIsNone(flags)
+
+    def test_more_pages_than_the_limit_fail(self):
+        r = gh_review('x', 't')
+        pages = [flags_page(r, more=f'c{i}') for i in range(Q.REVIEW_PAGES + 1)]
+        (flags, why), calls = self.read(*pages)
+        self.assertIsNone(flags)
+        self.assertEqual(len(calls), Q.REVIEW_PAGES)
+        self.assertIn('not all read', why)
+
+    def test_a_node_without_both_flags_is_left_out(self):   # lens.Review then counts it as read nothing
+        good, bad = gh_review('x', 't', 1), gh_review('x', 't', 2)
+        page = json.loads(flags_page(good, bad).stdout)
+        page['data']['repository']['pullRequest']['reviews']['nodes'][1].pop('includesCreatedEdit')
+        (flags, why), _ = self.read(ok(json.dumps(page)))
+        self.assertEqual((set(flags), why), ({'PRR_1'}, None))
 
 
 class Main(Base):

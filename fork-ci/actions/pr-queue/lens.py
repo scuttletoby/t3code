@@ -39,6 +39,12 @@ NO_HEADER = 'comment without a first-line lens header'
 NO_HEADER_WAY_OUT = ('delete that comment (hiding it is not enough), or edit it to start with `not a lens` and a colon '
                      'and hold no lens header line, or')
 EDITED = 'edited after posting: post a new comment instead'
+# A review's edit and hidden flags, by review node id, as the caller read them with a query of its own (pr_queue
+# review_flags). gh pr view never fetches them for reviews but prints `includesCreatedEdit: false` anyway, so a review
+# takes its flags from here only; one this does not hold reads nothing (FLAGS_UNREAD).
+REVIEW_FLAGS = 'reviewFlags'
+FLAGS_UNREAD = 'a review whose edit and hidden flags were not read from GitHub: re-run, or post a new comment'
+UNREAD = '_flagsUnread'   # the mark review_post puts on such a review
 HIDDEN = 'hidden: post a new comment instead'
 SHORT = 'not a full 40-hex sha'
 EMBEDDED = 'holds a lens header line'   # lens_problem: `not a lens:` cannot clear it
@@ -218,7 +224,8 @@ class Review:
     def is_bot(self, post):
         """A configured bot login, a login ending in `[bot]` (GitHub's REST API), or an author whose type is Bot
         (`is_bot` true, or GraphQL's `__typename` Bot). `gh pr view --json comments,reviews` gives only the login, and
-        without the `[bot]` suffix, so through gh only bot_logins (and the author associations) keep bots out."""
+        without the `[bot]` suffix, so for comments only bot_logins (and the author associations) keep bots out; a
+        review gets its author type from REVIEW_FLAGS (review_post)."""
         author = post.get('author') or {}
         login = (author.get('login') or '').lower()
         return login in self.bots or login.endswith('[bot]') or author.get('is_bot') is True \
@@ -233,7 +240,7 @@ class Review:
 
     @staticmethod
     def hidden(post):
-        """Hidden (minimized). gh gives no isMinimized for reviews, so a review counts as shown."""
+        """Hidden (minimized). A review's isMinimized comes from REVIEW_FLAGS (lens_posts), never from gh pr view."""
         return post.get('isMinimized') is True
 
     def override_sha(self, post):
@@ -282,10 +289,30 @@ class Review:
             return start
         return None
 
+    @staticmethod
+    def review_post(review, flags):
+        """A review with the flags the caller read for it (REVIEW_FLAGS), never the ones gh pr view printed: gh does not
+        fetch includesCreatedEdit or isMinimized for reviews and prints its defaults (false). No flags read for it: not
+        unedited (includesCreatedEdit None, FLAGS_UNREAD), so it reads nothing and is no override."""
+        own = flags.get(review.get('id')) if isinstance(flags, dict) and isinstance(review.get('id'), str) else None
+        post = {**review, 'includesCreatedEdit': None, 'isMinimized': None, UNREAD: True}
+        if isinstance(own, dict) and isinstance(own.get('includesCreatedEdit'), bool) \
+                and isinstance(own.get('isMinimized'), bool):
+            post.update(includesCreatedEdit=own['includesCreatedEdit'], isMinimized=own['isMinimized'])
+            del post[UNREAD]
+            if isinstance(own.get('url'), str) and own['url']:
+                post['url'] = own['url']
+            author = own.get('author') if isinstance(own.get('author'), dict) else {}
+            if author.get('__typename'):   # GitHub's own author type: a Bot is a bot whatever its login
+                post['author'] = {**(review.get('author') or {}), '__typename': author['__typename']}
+        return post
+
     def lens_posts(self, pr):
-        """[(when, index, post)] of the PR's comments and reviews, bots skipped."""
+        """[(when, index, post)] of the PR's comments and reviews, bots skipped. Reviews carry the flags read for them
+        (review_post)."""
+        flags = pr.get(REVIEW_FLAGS)
         posts = [(c.get('createdAt') or '', c) for c in pr.get('comments') or []]
-        posts += [(r.get('submittedAt') or '', r) for r in pr.get('reviews') or []]
+        posts += [(r.get('submittedAt') or '', self.review_post(r, flags)) for r in pr.get('reviews') or []]
         return [(when, i, post) for i, (when, post) in enumerate(posts) if not self.is_bot(post)]
 
     def lens_entries(self, pr):
@@ -295,8 +322,9 @@ class Review:
         does not clear it. It reads nothing until it is deleted, its first line is edited to `not a lens: ...` with no
         lens header line left in it, or a newer override covers it (NO_HEADER_WAY_OUT). A lens comment edited after
         posting (includesCreatedEdit not false: GitHub records that it changed, not what) or hidden (minimized) reads
-        nothing until that lens posts a new comment. A lens-looking post that does not count is logged (log only, never
-        a comment), so a wrong lens_author_associations shows in the run."""
+        nothing until that lens posts a new comment; so does a review whose flags were not read (FLAGS_UNREAD). A
+        lens-looking post that does not count is logged (log only, never a comment), so a wrong lens_author_associations
+        shows in the run."""
         found = {}
         for when, i, post in self.lens_posts(pr):
             where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
@@ -319,7 +347,8 @@ class Review:
                 continue
             key = lens_key(header[0])
             if key not in found or (when, i) >= found[key][0]:
-                why = HIDDEN if self.hidden(post) else EDITED if post.get('includesCreatedEdit') is not False else None
+                why = FLAGS_UNREAD if post.get(UNREAD) else HIDDEN if self.hidden(post) \
+                    else EDITED if post.get('includesCreatedEdit') is not False else None
                 found[key] = ((when, i), None, why) if why else ((when, i), header[1], None)
         return found
 
