@@ -433,7 +433,9 @@ class Queue:
         """A BEHIND PR whose required checks failed only because the base they were tested on was red. (None, None)
         when, for EVERY red required check C, the base commit its run really merged with (tested_base) has a real
         failure of C (BASE_RED) and the base branch has C green now: an update makes a new merge on that green tip.
-        Otherwise (why not, base_is_why): base_is_why says the PR waits for its base, not for its author. No state and
+        Otherwise (why not, base_check): base_check names a check that failed on the base too and is still not green
+        there, set only when EVERY red check failed on its tested base (one red of the PR's own, or one nothing proves,
+        means its author fixes it: False), so the PR waits for its base, not for its author. No state and
         no loop: after the update the next run names a base where C is green, so a red then is the PR's own and it is
         passed over (told); a re-run of the old merge names the old red base again and is updated, which it needs."""
         reds, base = self.red_checks(p), p.get('baseRefName') or ''
@@ -442,6 +444,7 @@ class Queue:
         tip = self.commit_checks(f'refs/heads/{base}', cache)
         if not tip:
             return f'the checks of {base} are unknown (see above)', False
+        waits = None
         for check, c in sorted(reds.items()):
             tested = self.tested_base(c)
             if not tested:
@@ -453,9 +456,9 @@ class Queue:
             if was not in BASE_RED:   # running, ok, cancelled, skipped, stale...: nothing proves the base was red
                 return f'{check} was not red on the {base} commit {tested[:12]} its run tested ({was})', False
             now = tip[1].get(check, 'not reported')
-            if now != 'ok':
-                return f'{check} failed on {base} {tested[:12]} too and is not green on {base} now ({now})', True
-        return None, None
+            if now != 'ok' and not waits:   # keep looking: a later red of the PR's own is its author's to fix
+                waits = f'{check} failed on {base} {tested[:12]} too and is not green on {base} now ({now})', check
+        return waits or (None, None)
 
     # --- steps 2-4 --------------------------------------------------------------------------------------------------
     def view(self, n):
@@ -714,18 +717,18 @@ class Queue:
             bad = self.failing(p)
             if bad and p.get('mergeStateStatus') == 'BEHIND' and self.cfg.update_when_base_was_red:
                 base = p.get('baseRefName') or 'its base'
-                why, base_is_why = self.red_from_old_base(p, cache)
+                why, base_check = self.red_from_old_base(p, cache)
                 if why is None:
                     reds = ', '.join(sorted(self.red_checks(p)))
                     print(f'update #{n} {(p.get("title") or "")[:70]}: required check {reds} failed on a {base} '
                           f'commit where it failed too, and it is green on {base} now')
                     return self.update(n, dry)
                 print(f'skip #{n}: required check {bad} failed and an update would not fix it yet: {why}')
-                if base_is_why:
+                if base_check:
                     if not dry:
                         self.tell_red(n, bad, f'failed as on {base}',
-                                      f'{base} failed {bad} too, so this is not this PR\'s fault: the queue updates it '
-                                      f'by itself once {bad} is green on {base}')
+                                      f'{base} failed {base_check} too, so this is not this PR\'s fault: the queue '
+                                      f'updates it by itself once {base_check} is green on {base}')
                     continue
             elif bad:
                 print(f'skip #{n}: required check {bad} failed (its author fixes it)')

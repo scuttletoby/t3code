@@ -1341,6 +1341,20 @@ class RedOnOldBase(unittest.TestCase):
         self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
         self.assertIn(f'test was not red on the main commit {self.M1[:12]} its run tested (ok)', out)
 
+    def test_a_red_of_its_own_beside_a_base_still_red_is_its_authors(self):   # r3 major: never "not this PR's fault"
+        main = {k: {**v, 'test': 'SUCCESS'} for k, v in self.main_of(tip='FAILURE').items()}
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)], 'test': [(self.RUN, 'FAILURE', self.M1)]}, main)
+        self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+        self.assertIn(f'test was not red on the main commit {self.M1[:12]} its run tested (ok)', out)
+        self.assertNotIn('not this PR', self.posted[0])
+        self.assertIn('Fix the cause and push', self.posted[0])
+
+    def test_the_wait_notice_names_the_check_that_is_red_on_the_base(self):   # r3 minor: not just the first red
+        main = self.main_of(other={'test': 'FAILURE'})   # build: red on M1, green now; test: red on M1 and now
+        code, out = self.one({'build': [(self.RUN, 'FAILURE', self.M1)], 'test': [(self.RUN, 'FAILURE', self.M1)]}, main)
+        self.assertEqual((self.updated, len(self.posted)), ([], 1), out)
+        self.assertIn('updates it by itself once test is green on main', self.posted[0])
+
     def test_an_unknown_tested_base_or_base_is_said_and_skipped(self):   # unknown is never "the base was red"
         for kw, base, said in (({}, None, 'tested is unknown'), ({'notes_fail': True}, self.M1, 'HTTP 502'),
                                ({'main_fails': True}, self.M1, 'HTTP 502'), ({}, 'ff' * 20, 'are unknown'),
