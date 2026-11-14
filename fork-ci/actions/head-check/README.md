@@ -140,11 +140,8 @@ another passing job with the required check's name. GitHub's "require
 workflows to pass" ruleset rule would close that, but it is for organizations
 on paid plans only, not for user-owned repositories. Until there is a better
 way, a person reads every pull request that changes `.github/workflows/` or
-this action's files. The real fix is future work: a `pull_request_target` job
-that runs code pinned on the base branch, posts its result through a separate
-GitHub App (its key in an environment only the base branch can use), and a
-required check bound to that App as its only allowed source. Tracked in
-[issue 34](https://github.com/scuttletoby/t3code/issues/34).
+this action's files. The gate below closes that: the same rules, run from the
+default branch and posted by an App that only the default branch can use.
 
 ### Inputs
 
@@ -185,9 +182,239 @@ but missing).
 | 1    | Fail, also when GitHub or the checkout cannot say.                               |
 | 2    | Refused to start (config, arguments, git or checkout); read nothing from GitHub. |
 
+## The gate
+
+The same check as a gate no pull request can rewrite: the reusable workflow
+[`.github/workflows/fork-head-gate.yml`](../../../.github/workflows/fork-head-gate.yml)
+(script `head_gate.py`). Use it instead of the action when the check must be
+trusted, not only helpful ([issue 34](https://github.com/scuttletoby/t3code/issues/34)).
+
+How it works:
+
+- A caller on the default branch ([`gate-caller.example.yml`](gate-caller.example.yml))
+  runs on `pull_request_target`, `issue_comment` and `workflow_dispatch`.
+  For a pull request into the default branch GitHub takes that file from the
+  default branch, so a pull request that edits it changes nothing for its own
+  run. The caller passes `secrets: inherit` (see "What it does not stop").
+- The gate's code comes from the workflow's own pinned release commit, never
+  from the caller's tree. Nothing of the pull request is checked out: the
+  head and the base tip are read from the API and fetched by sha into a new
+  bare repository, and `head_check.decide` (the same rule code as the action,
+  in bare mode) judges them. The config is read from the base tip.
+- **A check run belongs to a commit, not to a pull request.** The newest check
+  run of the name on a head counts for every pull request with that head. So
+  the gate judges a head, never one pull request alone:
+  - Only open, ready pull requests into the default branch are judged. A head
+    that only drafts, closed pull requests or pull requests into another
+    branch have gets a failure when a run reaches it (there is no "pass
+    drafts" in the gate; a close or a base change starts no such run, see
+    "Old state"). Ready, reopen and a retarget to the default branch each
+    start a run that judges the head again.
+  - Every open, ready pull request into the default branch with the head is
+    judged in the same run, and the head passes only when all of them pass:
+    the strictest verdict wins.
+  - Runs on one head wait for each other (concurrency per head and check
+    name, so two gates in one repository never cancel each other's runs), and
+    each reads every such pull request again when it starts. So the newest
+    check run on a head always comes from the newest complete read.
+- Every GitHub read tries again on a 5xx or a rate limit (3 tries, 3 and 10
+  seconds apart). When the pull request read still fails, the head comes from
+  the event (`pull_request_target`) or from git (`refs/pull/N/head`, not under
+  the REST API's rate limit).
+- The guard job (no Environment) checks that the App key can only be the
+  Environment's: no repository or organisation secret of its name, the
+  Environment exists, and its deployment branches are exactly one rule, the
+  default branch. The gate job checks the Environment again right before the
+  token is made. When a check fails, or GitHub does not answer, the gate posts
+  only failures: a failure never passes, whoever could reach the key. When the
+  Environment does not exist, or the guard job cannot see that it exists, the
+  guard job fails and the gate job never starts (a job that named a missing
+  Environment would make GitHub create it, open to every branch).
+- The gate posts a failure instead of judging when:
+  - the guard did not pass (above).
+  - the run is a re-run (attempt 2 or later). A re-run runs the caller and
+    gate release of its first attempt, and a re-run of the gate job alone
+    skips the guard job. Dispatch the gate with the pull request number
+    instead.
+  - the caller is not the default branch's current one: the caller file
+    changed since the event, or it no longer pins this gate release. A run
+    can wait a long time for an earlier run on the same head. A repository
+    that calls its own `fork-head-gate.yml` (a local gate) counts while the
+    gate's own files (that workflow, `fork-ci/actions/head-check` and
+    `fork-ci/actions/pr-queue`) are the same on the default branch tip; any
+    other merge changes nothing it runs.
+  - the required lenses name no lens. With none, a head with no lens comment
+    would pass, so the input is required.
+  - no open, ready pull request into the default branch has the head now.
+  - GitHub did not answer a read it needs, after the tries.
+- Only three steps touch the key. One makes a token of the gate App (checks
+  write, this repository). **start** posts an in-progress check run on the
+  head _before_ anything is judged; an in-progress check never passes. Then
+  **finish** (it runs always, also after a failed or cancelled step) completes
+  that check run with the verdict, or with a failure when there is none. The
+  ruleset requires the check from that App alone, so a job of a pull
+  request's own workflow with the same name does not count.
+- A dispatch without a pull request number judges the head of every open
+  pull request (the backfill, each head once, at most 256; more is refused).
+  Heads no open, ready pull request into the default branch has get a failure.
+
+Setup (the repository owner's steps; nothing here creates them):
+
+1. Create a GitHub App with one permission, Checks: read and write, and no
+   webhook. Make a private key.
+2. Install it on the repository only.
+3. Create an Environment (default name `head-gate`) whose deployment branches
+   are one rule: the default branch. Add the variable `HEAD_GATE_APP_ID` and
+   the secret `HEAD_GATE_APP_KEY`. Keep no repository or organisation secret of
+   that name: the guard refuses one.
+4. Copy the example caller to `.github/workflows/` on the default branch, fill
+   in the check name, config path and required lenses (at least one), and pin
+   the release.
+5. Dispatch it once without a number (the backfill), so open pull requests get
+   the check under its name.
+6. Bind the required check to the App: in a ruleset, the required status
+   check's `integration_id` is the App's id; in classic branch protection, its
+   `app_id`. The gate warns (never fails) when the base branch does not bind it.
+7. Set the queue config's `head_check_app` to the App's id
+   ([pr-queue](../pr-queue/README.md)), so the queue counts only that App's
+   check runs. Release the code first, then bump the pins, then add the key:
+   an older queue refuses a key it does not know.
+
+After a change to the caller, a new pin, or a change to the queue config or
+the lens rules on the default branch, dispatch the backfill again: it judges
+every open pull request again. A run that started before a caller or pin
+change posts a failure, and a config change judges nothing by itself, so a
+pass judged under the old config stays until the next event on that pull
+request.
+
+**Run again after a review.** Reviews and inline diff comments
+(`pull_request_review`, `pull_request_review_comment`) do not start the gate,
+though the rules count them (a lens may post as a review or on a line). GitHub
+runs those two events from the pull request's own merge commit, not from the
+default branch: the pull request's copy of the caller runs, the Environment
+(default branch only) refuses it, and it could never post. After a lens posts
+as a review or on a line of the diff, or deletes one, post an issue comment on
+the pull request or dispatch the gate with its number. A new push, ready or
+draft, a base change and any issue comment start it anyway. A trusted way to
+run on reviews is open:
+[issue 88](https://github.com/scuttletoby/t3code/issues/88).
+
+**Runs again, stops half-way, old state.** Every way a run can end leaves the
+head "not passed" unless it judged the head and the head passed.
+
+- _Runs again._ Each run judges what GitHub says now. A new run on a head
+  first posts a new in-progress check run, then completes it. The newest check
+  run of that name from the App is the one that counts.
+- _Stops after start._ A run that stops after start (an API error, a crash, a
+  timeout, a cancel) leaves its in-progress check run, or finish completes it
+  as a failure. Either way an older pass on the head no longer counts, and
+  the gate job is red. A runner that dies after start leaves the check in
+  progress, so the queue waits on that head until the next event or a
+  dispatch (it fails closed).
+- _Stops before start._ The run posts nothing, and an older check run on the
+  head stays the newest, in exactly these cases (each one leaves a red job or
+  a run that never started):
+  - start's write fails all its tries (GitHub refuses or is down). This is
+    the accepted gap: the gate cannot post without its first write.
+  - No token can be made: the App key or id is gone or wrong, the App is not
+    installed, or the Environment does not let the default branch deploy.
+    The gate job fails. Fix: put the App, key and Environment back (setup
+    steps 1 to 3), then dispatch the backfill.
+  - The Environment does not exist: the guard job fails. Fix: setup step 3,
+    then dispatch the backfill.
+  - The guard job cannot see that the Environment exists: the REST read
+    fails every try, and after a 5xx or a rate limit GraphQL (which has its
+    own rate limit) does not name it either. Comment spam can spend the job
+    token's hourly REST limit; while GraphQL still names the Environment the
+    gate posts failures instead. The gate job does not start, as the
+    Environment may not exist and naming it would create it. Fix: once GitHub
+    answers again, post an issue comment on the pull request or dispatch the
+    gate.
+  - The head is unknown: on an issue comment or a dispatch with a number, the
+    pull request read and git's `refs/pull/N/head` both fail every try.
+  - The backfill cannot list the open pull requests after its tries, or finds
+    more than 256 heads. Dispatch again (or once per pull request).
+  - A step before start fails for a reason of GitHub or the runner, never
+    of the pull request: the toolkit checkout after its own retries, the
+    runner does not say the workflow's own commit (`job.workflow_sha`), or
+    the guard or target step crashes without an answer (in either job). The
+    run's log says which.
+  - The run never reaches start: GitHub does not start the workflow, or the
+    runner dies, times out or is cancelled before start. A run waiting on the
+    same head and check name that a newer one replaces is the exception that
+    does no harm: the newer run posts.
+  - There is no head to judge: the event names no pull request, or one that
+    is merged or deleted, or the workflow passes target a bad repository or
+    sha (a fault in the workflow).
+- _The head moves._ A run whose head no open, ready pull request has any more
+  posts a failure on the old head ("not passed until one has it"), and the new
+  head gets its own run.
+- _A sibling moves on._ When two pull requests share a head and one gets a
+  new push, the other keeps the shared verdict, which can be a failure only
+  the moved one caused: it stays red until its next event or a dispatch (it
+  fails closed).
+- _Old state._
+  - An older pass on a head stops counting as soon as a later run on that
+    head posts its in-progress check run.
+  - A pull request that turns draft gets a failure on its head, so a revoked
+    pass is not still green when it is marked ready.
+  - A pull request that closes, or changes its base to another branch, starts
+    no run that can post: `closed` is no trigger, and a base change runs the
+    new base's copy of the caller, which the Environment refuses (or there is
+    none). A pass on its head stays; it counts only where a ruleset of that
+    other branch requires the same check from the App. Reopening or changing
+    the base back judges the head again; an issue comment or a dispatch fails
+    it at once.
+  - A check run of the same name posted by GitHub Actions (an older,
+    non-gate check) does not count once the ruleset binds the check to the
+    App.
+  - A head shared by two pull requests is judged for both (above).
+  - A repository without the Environment: the guard job fails before any
+    token is made, and nothing is posted (above).
+
+**Where it blocks more than needed (it fails closed).**
+
+- Comment spam can spend the job token's hourly rate limit. Reads that fail
+  every try make the gate post failures (or nothing, when the guard job cannot
+  see the Environment at all: "Stops before start"). After posted failures
+  the pull request stays red until its next event or a dispatch after the
+  limit resets; when nothing is posted, an older pass on the same head stays
+  (see "What it does not stop").
+- A stranger's open, ready pull request with the same head blocks it: the
+  strictest verdict wins until that pull request closes or turns draft. An
+  interaction limit on the repository keeps strangers out.
+- A sibling that moves on leaves a shared failure (above), a runner that dies
+  after start leaves the check in progress, and a re-run or a run of an older
+  caller posts a failure. Each one waits for the next event or a dispatch.
+
+**What it does not stop.**
+
+- Anyone who can change the default branch (or the Environment, the App or
+  the ruleset) can change the gate.
+- A lens comment is still only as good as the people allowed to post it (the
+  config's `lens_author_associations`).
+- The gate judges the comments that exist when it runs. Between a change (a
+  deleted comment, a sibling pull request marked ready) and the start of the
+  run it triggers, the check shows the older answer. A run waiting for an
+  earlier one on the same head extends that window.
+- Spam that spends both the job token's REST and GraphQL rate limits makes a
+  run that should revoke a pass (a new NOT SAFE lens comment, a deleted
+  override, a switch to draft) post nothing. An older pass on the same head
+  then stays green, and the merge queue can merge on it. This needs about a
+  thousand events in an hour from people allowed to comment; a new head never
+  reuses an older pass.
+- The caller must pass `secrets: inherit`. Without it, the guard sees no
+  repository or organisation secret of the key's name, so it cannot refuse
+  one. Nothing in the gate can check what the caller passes; the Environment
+  rule (default branch only) still holds the key.
+
 ## Tests
 
 `python3 fork-ci/actions/head-check/head_check.test.py`: real commits (a
 local bare repository stands in for GitHub, the checkout is a merge commit as
 GitHub makes it) and a fake `gh`; it fails the run if anything starts the real
 `gh`.
+`python3 fork-ci/actions/head-check/head_gate.test.py`: the gate's steps with
+a fake `gh`, and its judge on the same real commits in bare mode. The workflow
+itself: `.github/scripts/fork-head-gate-workflow.test.py` and the head-gate
+section of `.github/scripts/fork-contracts.test.py`.

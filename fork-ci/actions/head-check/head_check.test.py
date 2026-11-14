@@ -47,6 +47,7 @@ import json, subprocess, types, unittest, unittest.mock  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import head_check as H  # noqa: E402
+import head_gate  # noqa: E402
 import config  # noqa: E402  (../pr-queue, put on the path by head_check)
 import lens  # noqa: E402
 import pr_queue  # noqa: E402
@@ -96,6 +97,8 @@ def pr(comments=(), head=A, draft=False, reviews=()):
 class FakeCheckout:
     """A checkout whose HEAD merges `head` into `base` and that knows no history: every git call fails, so only a head
     that is the read commit itself can pass (pr_queue.holds finds no tree and no parents)."""
+    holder = 'the checkout merges'
+
     def __init__(self, head=A, base=C, parents=None):
         self.parents = parents if parents is not None else (base, head)
 
@@ -118,10 +121,16 @@ def lines(n=30, extra=None, at=None):
     return '\n'.join(out) + '\n'
 
 
+LOCATIONS = {}   # path -> the arguments that name it: a checkout (--path) or, bare, the gate's repository (--bare ...)
+
+
 class World:
-    """"GitHub" (a bare repository that serves any commit by sha), a work clone that builds commits, and the job's
-    checkout: GitHub's merge commit of a head into a base, fetched and checked out as actions/checkout does."""
-    def __init__(self):
+    """"GitHub" (a bare repository that serves any commit by sha), a work clone that builds commits, and what the check
+    reads: the job's checkout (GitHub's merge commit of a head into a base, fetched and checked out as actions/checkout
+    does) or, `bare`, the gate's bare repository (head_gate.py fetched the base and the head into it by sha). Every rule
+    test runs in both modes (the *Bare classes): one rule path, two ways to reach the commits."""
+    def __init__(self, bare=False):
+        self.bare = bare
         self.dir = tempfile.mkdtemp(prefix='head-check-world-')
         self.remote, self.work = os.path.join(self.dir, 'github.git'), os.path.join(self.dir, 'work')
         self.co = os.path.join(self.dir, 'checkout')
@@ -169,7 +178,15 @@ class World:
 
     def checkout(self, base, head):
         """The job's checkout: GitHub's merge commit (parents base, head), with base and head's history and nothing
-        else (no ref reaches a commit the head dropped). Returns the checkout's path."""
+        else (no ref reaches a commit the head dropped). Returns the checkout's path. Bare: the gate's repository with
+        base and head fetched by sha, as head_gate.judge makes it."""
+        if self.bare:
+            path, why = head_gate.bare_repository(self.dir, 'gate')
+            assert path, why
+            why = head_gate.fetch(H.Checkout(path, bare=(base, head), remote=self.remote), base, head)
+            assert why is None, why
+            LOCATIONS[path] = ['--bare', '--path', path, '--base', base, '--head', head, '--remote', self.remote]
+            return path
         tree = self.git(self.work, 'merge-tree', '--write-tree', '--allow-unrelated-histories', base, head).split()[0]
         merge = self.git(self.work, 'commit-tree', tree, '-p', base, '-p', head, '-m', 'GitHub merge')
         self.git(self.work, 'push', '-q', '-f', 'origin', f'{merge}:refs/pull/7/merge')
@@ -178,7 +195,11 @@ class World:
         self.git(self.co, 'remote', 'add', 'origin', self.remote)
         self.git(self.co, 'fetch', '-q', '--no-tags', 'origin', '+refs/pull/7/merge:refs/remotes/pull/7/merge')
         self.git(self.co, 'checkout', '-q', '--detach', merge)
+        LOCATIONS[self.co] = ['--path', self.co]
         return self.co
+
+    def git_dir(self, path):
+        return path if self.bare else os.path.join(path, '.git')
 
 
 def base_files(cfg_raw=CFG_RAW, **files):
@@ -242,7 +263,7 @@ def more_comments_page(nodes=(), more=None):
 
 def run_cli(path, gh, *extra, env=None, sleeps=None):
     out = []
-    code = H.cli(['--repo', REPO, '--pr', '7', '--config', CONFIG_PATH, '--path', path, *extra], env=env or {}, gh=gh,
+    code = H.cli(['--repo', REPO, '--pr', '7', '--config', CONFIG_PATH, *LOCATIONS[path], *extra], env=env or {}, gh=gh,
                  sleep=(sleeps.append if sleeps is not None else lambda s: None), out=out.append)
     return code, '\n'.join(out)
 
@@ -420,10 +441,12 @@ class Rules(unittest.TestCase):
 
 # --- the same change: real commits ------------------------------------------------------------------------------
 class SameChange(unittest.TestCase):
-    """GitHub's merge commit is the checkout; the read commit, the base and the head are real commits."""
+    """GitHub's merge commit is the checkout (SameChangeBare: the gate's bare repository); the read commit, the base and
+    the head are real commits."""
+    BARE = False
 
     def setUp(self):
-        self.w = World()
+        self.w = World(self.BARE)
         self.addCleanup(self.w.close)
         self.p = Posts()
         self.m0 = self.w.commit(base_files())
@@ -517,11 +540,12 @@ class SameChange(unittest.TestCase):
         self.assertIn('has no config', out)
 
     def test_a_shallow_or_tampered_checkout_is_refused(self):
-        for name, text, says in (('shallow', self.m1 + '\n', 'fetch-depth: 0'), ('info/grafts', '', 'info/grafts'),
+        shallow = 'full history' if self.BARE else 'fetch-depth: 0'
+        for name, text, says in (('shallow', self.m1 + '\n', shallow), ('info/grafts', '', 'info/grafts'),
                                  ('objects/info/alternates', '', 'alternates')):
             with self.subTest(name=name):
                 path = self.w.checkout(self.m1, self.read)
-                target = os.path.join(path, '.git', name)
+                target = os.path.join(self.w.git_dir(path), name)
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with open(target, 'w') as f:
                     f.write(text)
@@ -532,6 +556,8 @@ class SameChange(unittest.TestCase):
                 self.assertEqual(calls, [])
 
     def test_a_checkout_that_is_not_a_merge_commit_is_refused(self):   # refused (2) before GitHub is read, not failed
+        if self.BARE:
+            self.skipTest('a checkout only: bare, base and head are named (test_a_base_or_head_not_fetched_is_refused)')
         path = self.w.checkout(self.m1, self.read)
         self.w.git(path, 'checkout', '-q', '--detach', self.read)
         calls = []
@@ -542,10 +568,45 @@ class SameChange(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class SameChangeBare(SameChange):
+    BARE = True
+
+    def test_a_base_or_head_not_fetched_is_refused(self):   # refused (2) before GitHub is read, not failed
+        path = self.w.checkout(self.m1, self.read)
+        for base, head, says in ((self.m1, 'e' * 40, f'does not hold the head {"e" * 12}'),
+                                 ('f' * 40, self.read, f'does not hold the base {"f" * 12}'),
+                                 (self.m1, 'xyz', "--head 'xyz' is not a full commit sha")):
+            with self.subTest(says=says):
+                calls, out = [], []
+                code = H.cli(['--repo', REPO, '--pr', '7', '--config', CONFIG_PATH, '--bare', '--path', path,
+                              '--base', base, '--head', head], env={}, gh=fake_gh((0, json.dumps(pr([]))), calls=calls),
+                             out=out.append)
+                self.assertEqual((code, calls), (H.REFUSED, []), out)
+                self.assertIn(says, '\n'.join(out))
+
+    def test_base_and_head_need_the_bare_mode(self):   # a checkout names its own: never two answers to one question
+        path = self.w.checkout(self.m1, self.read)
+        out = []
+        code = H.cli(['--repo', REPO, '--pr', '7', '--config', CONFIG_PATH, '--path', path, '--base', self.m1,
+                      '--head', self.read], env={}, gh=fake_gh((0, json.dumps(pr([])))), out=out.append)
+        self.assertEqual(code, H.REFUSED)
+        self.assertIn('--base and --head need --bare', out[0])
+
+    def test_the_bare_config_comes_from_the_named_base_not_the_heads_tree(self):
+        # The head's own config lets anyone vouch; bare, the check reads the base it was given, whatever the head holds.
+        head = self.w.commit(base_files(cfg_raw={**CFG_RAW, 'bot_logins': ['owner']},
+                                        **{'x.py': lines(extra=['unread'], at=20)}), [self.read])
+        path = self.w.checkout(self.m1, head)
+        stale = json.dumps(pr([self.p.lens('correctness', self.read)], head=head))
+        self.assertEqual(run_cli(path, fake_gh((0, stale)))[0], 1)
+
+
 # --- reading GitHub, the outputs, re-runs and stops -------------------------------------------------------------
 class Runs(unittest.TestCase):
+    BARE = False
+
     def setUp(self):
-        self.w = World()
+        self.w = World(self.BARE)
         self.addCleanup(self.w.close)
         self.p = Posts()
         self.m0 = m0 = self.w.commit(base_files())
@@ -720,7 +781,8 @@ class Runs(unittest.TestCase):
                 self.assertEqual(run_cli(self.path, fake_gh((0, answer), calls=calls)), first)
                 self.assertEqual({c[:2] for c in calls}, {('pr', 'view'), ('api', 'graphql')})   # reads only
         self.assertEqual(self.w.git(self.path, 'for-each-ref'), refs)
-        self.assertEqual(self.w.git(self.path, 'status', '--porcelain'), '')
+        if not self.BARE:   # a bare repository has no work tree to change
+            self.assertEqual(self.w.git(self.path, 'status', '--porcelain'), '')
 
     def test_a_run_stopped_before_the_answer_leaves_nothing(self):
         def dies(*a):
@@ -733,7 +795,7 @@ class Runs(unittest.TestCase):
     def test_refusals_touch_nothing_and_name_every_reason(self):
         calls = []
         out = []
-        code = H.cli(['--repo', 'not a repo', '--pr', '', '--config', CONFIG_PATH, '--path', self.path,
+        code = H.cli(['--repo', 'not a repo', '--pr', '', '--config', CONFIG_PATH, *LOCATIONS[self.path],
                       '--required-lenses', '<name>'], env=self.env, gh=fake_gh((0, self.good), calls=calls),
                      out=out.append)
         self.assertEqual(code, H.REFUSED)
@@ -759,6 +821,10 @@ class Runs(unittest.TestCase):
         code, out = run_cli(self.path, fake_gh((0, answer)))
         self.assertTrue(all(not line.startswith('::') or line.startswith('::error::#7') for line in out.splitlines()),
                         out)
+
+
+class RunsBare(Runs):
+    BARE = True
 
 
 # --- the action -------------------------------------------------------------------------------------------------
