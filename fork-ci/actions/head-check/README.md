@@ -20,9 +20,11 @@ All of them are the queue's, imported from `../pr-queue`, never copied:
   after posting or hidden (minimized), a short sha, and a comment that only
   looks like a lens report read nothing. A review's edited and hidden flags
   come from the queue's own GraphQL query, never from `gh pr view` (which
-  prints `includesCreatedEdit: false` for every review without asking GitHub);
-  if that query fails after the retries, the check fails. The pr-queue README,
-  section "Lens comments", has the full grammar.
+  prints `includesCreatedEdit: false` for every review without asking GitHub).
+  The same query reads the inline review comments (on a line of the diff),
+  which `gh pr view` does not list and which count like any other comment. It
+  runs for every pull request; if it fails after the retries, the check
+  fails. The pr-queue README, section "Lens comments", has the full grammar.
 - **One lens name, one read:** each lens name counts once, by its newest
   comment, whoever posted it. If two reviewers post under the same name, the
   newer one wins: the check can pass on a head only the second one read. Two
