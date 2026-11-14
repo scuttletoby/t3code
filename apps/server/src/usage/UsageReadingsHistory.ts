@@ -9,7 +9,7 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
-import { providerAccountKey } from "@t3tools/shared/usageLimits";
+import { providerAccountIdentity } from "@t3tools/shared/usageLimits";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -29,9 +29,9 @@ export const UsageReading = Schema.Struct({
   checkedAt: IsoDateTime,
   windows: Schema.Array(ServerProviderUsageWindow),
   /**
-   * Short hash of the account the Limits UI groups the instance under (driver + email +
-   * workspace, or the credential fingerprint). A new value means another account now sits behind
-   * the instance; two instances with one value share one account.
+   * Limits UI account as hashed `<base>` or `<base>.<workspace>`; a failed probe keeps the last
+   * known one (`resolveAccount`). Absent = never identified. Swap = a change between two present
+   * values, except `<base>` -> `<base>.<workspace>` (the workspace became known).
    */
   account: Schema.optional(TrimmedNonEmptyString),
   unavailable: Schema.optional(Schema.Literals(["unsupported", "probeFailed"])),
@@ -79,17 +79,50 @@ const METER_STEP = 0.1;
 const RESET_STEP_MS = MINUTE_MS;
 const FLOAT_SLACK = 1e-9;
 
-/** Hashed account key of a provider, so no email or workspace id lands on disk. */
+const shortHash = (text: string) =>
+  NodeCrypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
+
+/** Hashed account of one provider report, so no email or workspace id lands on disk. */
 export function accountOf(provider: ServerProvider): string | undefined {
-  const key = providerAccountKey(provider);
-  if (key === null) return undefined;
-  return NodeCrypto.createHash("sha256").update(key).digest("hex").slice(0, 16);
+  const identity = providerAccountIdentity(provider);
+  if (identity === null) return undefined;
+  const base = shortHash(identity.base);
+  return identity.workspaceId === undefined
+    ? base
+    : `${base}.${shortHash(`${identity.base}:${identity.workspaceId}`)}`;
 }
 
-function readingOf(provider: ServerProvider): UsageReading | undefined {
+const baseOf = (account: string) => account.split(".")[0];
+const hasWorkspace = (account: string) => account.includes(".");
+
+/**
+ * The account recorded for a report (`own`). A report that knows less than the instance's last
+ * known account does not make it another account: with no identity it keeps the last known one;
+ * with no workspace it keeps the last known one of the same base, or else takes the one workspace
+ * other instances of that base report in the same snapshot, as the Limits UI does.
+ */
+function resolveAccount(
+  own: string | undefined,
+  lastKnown: string | undefined,
+  snapshot: ReadonlyArray<string>,
+): string | undefined {
+  if (own === undefined) return lastKnown;
+  if (hasWorkspace(own)) return own;
+  if (lastKnown !== undefined && hasWorkspace(lastKnown) && baseOf(lastKnown) === own) {
+    return lastKnown;
+  }
+  const workspaces = new Set(
+    snapshot.filter((account) => hasWorkspace(account) && baseOf(account) === own),
+  );
+  return workspaces.size === 1 ? [...workspaces][0] : own;
+}
+
+function readingOf(
+  provider: ServerProvider,
+  account: string | undefined,
+): UsageReading | undefined {
   const limits = provider.usageLimits;
   if (limits === undefined) return undefined;
-  const account = accountOf(provider);
   return {
     checkedAt: limits.checkedAt,
     windows: limits.windows.map((window) => ({ ...window })),
@@ -153,10 +186,14 @@ interface HistoryLine {
 }
 
 /**
- * Lines of one history file, oldest first. Torn lines are dropped. A complete line that no longer
- * decodes (written by another T3 version) is kept as text, so compaction does not delete it.
+ * Lines of one history file, oldest first; torn lines dropped, undecodable ones kept as text.
+ * Appends follow the server's clock, so a line stamped later than a later append came from a clock
+ * that was ahead and is dropped for good. An uncontradicted line ahead of now stays, unused.
  */
-function parseHistory(contents: string): Array<HistoryLine> {
+function parseHistory(contents: string): {
+  readonly lines: Array<HistoryLine>;
+  readonly fromClockAhead: number;
+} {
   const lines: Array<HistoryLine> = [];
   for (const raw of contents.split("\n")) {
     const text = raw.trim();
@@ -177,7 +214,15 @@ function parseHistory(contents: string): Array<HistoryLine> {
     const ms = typeof checkedAt === "string" ? Date.parse(checkedAt) : Number.NaN;
     if (Number.isFinite(ms)) lines.push({ ms, text, reading: undefined });
   }
-  return lines.toSorted((left, right) => left.ms - right.ms);
+  // Walking back from the last append, keep a line only if no later append is stamped earlier.
+  const kept: Array<HistoryLine> = [];
+  let earliestAfter = Number.POSITIVE_INFINITY;
+  for (const line of lines.toReversed()) {
+    if (line.ms > earliestAfter) continue;
+    earliestAfter = line.ms;
+    kept.push(line);
+  }
+  return { lines: kept.toReversed(), fromClockAhead: lines.length - kept.length };
 }
 
 /** Readings the history serves: decoded and not stamped ahead of the clock. */
@@ -225,6 +270,8 @@ function retainLines(
 
 const encodeLine = (reading: UsageReading) => `${JSON.stringify(reading)}\n`;
 const HISTORY_FILE = /^(.+)\.jsonl$/;
+/** The temp folder `writeFileStringAtomically` makes beside a history file. */
+const COMPACTION_TEMP = /^(.+)\.jsonl\.[^.]+$/;
 
 export class UsageReadingsHistory extends Context.Service<
   UsageReadingsHistory,
@@ -275,6 +322,8 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
   /** Instances whose file is known to end with a newline, so an append needs none first. */
   const cleanEnd = new Set<ProviderInstanceId>();
   const appendsSinceCompaction = new Map<ProviderInstanceId, number>();
+  /** Instances whose last pass failed; their next failures are not logged until one succeeds. */
+  const failing = new Set<ProviderInstanceId>();
   let newestMs = Number.NEGATIVE_INFINITY;
 
   const fileOf = (instanceId: ProviderInstanceId) =>
@@ -299,14 +348,15 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
 
   const warnFuture = Effect.fnUntraced(function* (
     instanceId: ProviderInstanceId,
-    lines: ReadonlyArray<HistoryLine>,
+    parsed: ReturnType<typeof parseHistory>,
   ) {
     const nowMs = yield* Clock.currentTimeMillis;
-    const ahead = lines.filter((line) => line.ms > nowMs + FUTURE_TOLERANCE_MS).length;
-    if (ahead > 0) {
+    const ahead = parsed.lines.filter((line) => line.ms > nowMs + FUTURE_TOLERANCE_MS).length;
+    if (ahead > 0 || parsed.fromClockAhead > 0) {
       yield* Effect.logWarning("usage readings: readings stamped ahead of the clock ignored", {
         instanceId,
         ahead,
+        fromClockAhead: parsed.fromClockAhead,
       });
     }
   });
@@ -315,8 +365,9 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
     const loaded = histories.get(instanceId);
     if (loaded !== undefined) return loaded;
     const contents = yield* readContents(instanceId);
-    const lines = parseHistory(contents);
-    yield* warnFuture(instanceId, lines);
+    const parsed = parseHistory(contents);
+    const lines = parsed.lines;
+    yield* warnFuture(instanceId, parsed);
     if (contents.length === 0 || contents.endsWith("\n")) cleanEnd.add(instanceId);
     else cleanEnd.delete(instanceId);
     const readings = usableReadings(lines, yield* Clock.currentTimeMillis);
@@ -351,10 +402,47 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
       Effect.logWarning(`usage readings: ${operation} failed`, { instanceId, cause }),
     );
 
+  /** Logs the first failure of an instance; later ones stay quiet until a pass succeeds. */
+  const logFailureOnce = (operation: string, instanceId: ProviderInstanceId) =>
+    Effect.catchCause((cause) => {
+      if (failing.has(instanceId)) return Effect.void;
+      failing.add(instanceId);
+      return Effect.logWarning(
+        `usage readings: ${operation} failed; not logged again until it works`,
+        { instanceId, cause },
+      );
+    });
+
+  const recovered = (instanceId: ProviderInstanceId) =>
+    Effect.suspend(() =>
+      failing.delete(instanceId)
+        ? Effect.logInfo("usage readings: recording works again", { instanceId })
+        : Effect.void,
+    );
+
+  /** Removes temp folders a crash during compaction left; only compaction (under the lock) makes them. */
+  const removeCompactionLeftovers = (names: ReadonlyArray<string>) =>
+    Effect.forEach(
+      names,
+      (name) => {
+        const match = COMPACTION_TEMP.exec(name);
+        if (match === null || decodeInstanceId(match[1])._tag !== "Some") return Effect.void;
+        const leftover = path.join(options.directory, name);
+        return fs.stat(leftover).pipe(
+          Effect.flatMap((info) =>
+            info.type === "Directory" ? fs.remove(leftover, { recursive: true }) : Effect.void,
+          ),
+          logFailure("removing a compaction leftover"),
+        );
+      },
+      { discard: true },
+    );
+
   const compact = lock.withPermits(1)(
     Effect.gen(function* () {
       yield* fs.makeDirectory(options.directory, { recursive: true });
       const names = yield* fs.readDirectory(options.directory);
+      yield* removeCompactionLeftovers(names);
       const nowMs = yield* Clock.currentTimeMillis;
       // Read every history before writing any: retention counts back from the newest of all.
       const parsed: Array<readonly [ProviderInstanceId, Array<HistoryLine>]> = [];
@@ -367,13 +455,13 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
         yield* readContents(id).pipe(
           Effect.flatMap((contents) =>
             Effect.gen(function* () {
-              const lines = parseHistory(contents);
-              yield* warnFuture(id, lines);
-              remember(id, usableReadings(lines, nowMs));
-              parsed.push([id, lines]);
+              const history = parseHistory(contents);
+              yield* warnFuture(id, history);
+              remember(id, usableReadings(history.lines, nowMs));
+              parsed.push([id, history.lines]);
             }),
           ),
-          logFailure("compaction read", id),
+          logFailureOnce("compaction read", id),
         );
       }
       for (const [instanceId, lines] of parsed) {
@@ -384,17 +472,17 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
 
   const compactInstance = (instanceId: ProviderInstanceId) =>
     readContents(instanceId).pipe(
-      Effect.flatMap((contents) => writeCompacted(instanceId, parseHistory(contents))),
+      Effect.flatMap((contents) => writeCompacted(instanceId, parseHistory(contents).lines)),
     );
 
-  const record = (providers: ReadonlyArray<ServerProvider>) =>
-    lock.withPermits(1)(
+  const record = (providers: ReadonlyArray<ServerProvider>) => {
+    const snapshotAccounts = providers.flatMap((provider) => accountOf(provider) ?? []);
+    return lock.withPermits(1)(
       Effect.forEach(
         providers,
         (provider) =>
           Effect.gen(function* () {
-            const reading = readingOf(provider);
-            if (reading === undefined) return;
+            if (provider.usageLimits === undefined) return;
             const instanceId = provider.instanceId;
             const history = yield* load(instanceId);
             // The clock stepped back: a reading now ahead of it must not block recording.
@@ -406,6 +494,10 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
             ) {
               history.pop();
             }
+            const lastKnown = history.findLast((entry) => entry.account !== undefined)?.account;
+            const account = resolveAccount(accountOf(provider), lastKnown, snapshotAccounts);
+            const reading = readingOf(provider, account);
+            if (reading === undefined) return;
             if (!shouldRecord(history.at(-1), reading, heartbeatMs)) return;
             yield* fs.makeDirectory(options.directory, { recursive: true });
             // A torn last line (crash or partial write) must not swallow this reading.
@@ -422,10 +514,14 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
             if (appends >= appendsBetweenCompactions) {
               yield* compactInstance(instanceId).pipe(logFailure("compaction", instanceId));
             }
-          }).pipe(logFailure("append", provider.instanceId)),
+          }).pipe(
+            Effect.andThen(recovered(provider.instanceId)),
+            logFailureOnce("append", provider.instanceId),
+          ),
         { discard: true },
       ),
     );
+  };
 
   const since = (sinceMs: number | undefined) => (reading: UsageReading) =>
     msOf(reading) >= (sinceMs ?? Number.NEGATIVE_INFINITY);

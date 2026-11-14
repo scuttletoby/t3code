@@ -9,11 +9,14 @@ import {
   type ServerProviderUsageLimits,
   type ServerProviderUsageWindow,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
@@ -123,13 +126,13 @@ const fileLines = (file: string) =>
   });
 
 /** The real file system, except that reads of `unreadable` fail as if access were denied. */
-const failingReadsOf = (unreadable: string) =>
+const failingReadsOf = (unreadable: string, denied: () => boolean = () => true) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const faulty: FileSystem.FileSystem = {
       ...fs,
       readFileString: (filePath, encoding) =>
-        filePath === unreadable
+        filePath === unreadable && denied()
           ? Effect.fail(
               PlatformError.systemError({
                 _tag: "PermissionDenied",
@@ -141,6 +144,27 @@ const failingReadsOf = (unreadable: string) =>
           : fs.readFileString(filePath, encoding),
     };
     return faulty;
+  });
+
+/** Collects warning and info messages logged by the effect it is provided to. */
+const logCollector = () => {
+  const warnings: Array<string> = [];
+  const infos: Array<string> = [];
+  const logger = Logger.make(({ logLevel, message }) => {
+    const text = String(Array.isArray(message) ? message[0] : message);
+    if (logLevel === "Warn") warnings.push(text);
+    if (logLevel === "Info") infos.push(text);
+  });
+  return { warnings, infos, layer: Logger.layer([logger], { mergeWithExisting: false }) };
+};
+
+const diskFull = (filePath: string) =>
+  PlatformError.systemError({
+    _tag: "Unknown",
+    module: "FileSystem",
+    method: "writeFileString",
+    description: "disk full",
+    pathOrDescriptor: filePath,
   });
 
 it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
@@ -179,6 +203,15 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
     assert.isFalse(shouldRecord(first, next({ resetsAt: "2026-11-20T13:00:00.400Z" })));
     assert.isTrue(shouldRecord(first, next({ windowDurationMins: 10_080 })));
     assert.isTrue(shouldRecord(first, reading(at(MINUTE), 40, { unavailable: "probeFailed" })));
+    // A reset that disappears or appears, a window of another kind, a window under another id.
+    const noReset = (checkedAt: string): UsageReading => ({
+      checkedAt,
+      windows: [{ id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 40 }],
+    });
+    assert.isTrue(shouldRecord(first, noReset(at(MINUTE))));
+    assert.isTrue(shouldRecord(noReset(at(0)), reading(at(MINUTE), 40)));
+    assert.isTrue(shouldRecord(first, next({ kind: "session" })));
+    assert.isTrue(shouldRecord(first, next({ id: "seven_day_opus" })));
   });
 
   it("compares windows by id, whatever order they arrive in", () => {
@@ -227,21 +260,56 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
     }),
   );
 
-  it.effect("finds the last reading by time when lines are out of order", () =>
+  it.effect("drops a reading appended before an earlier-stamped one: its clock was ahead", () =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(NOW_MS);
+      yield* TestClock.setTime(NOW_MS + 2 * MINUTE);
       const directory = yield* historyDirectory;
+      // Appended in this order: the clock jumped two days ahead for one reading, then was corrected.
+      const file = yield* seedHistory(
+        directory,
+        INSTANCE,
+        jsonLines([reading(at(0), 40), reading(at(2 * DAY), 90), reading(at(MINUTE), 45)]),
+      );
+      const history = yield* make({ directory });
+      assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 45]);
+      yield* history.compact;
+      assert.strictEqual((yield* fileLines(file)).length, 2);
+
+      // Even once the clock passes its stamp, the ahead reading does not mix back in.
       yield* seedHistory(
         directory,
         INSTANCE,
-        jsonLines([reading(at(2 * MINUTE), 50), reading(at(0), 40)]),
+        jsonLines([reading(at(0), 40), reading(at(2 * DAY), 90), reading(at(MINUTE), 45)]),
       );
-      const history = yield* make({ directory });
-      assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 50]);
-      // Older than the newest reading on disk, so it is not history.
-      yield* history.record([provider(limits(at(MINUTE), 45))]);
-      assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 50]);
+      yield* TestClock.setTime(NOW_MS + 3 * DAY);
+      const later = yield* make({ directory });
+      assert.deepStrictEqual(percents(yield* later.readings(INSTANCE)), [40, 45]);
     }),
+  );
+
+  it.effect(
+    "keeps readings ahead of a clock that is behind until a later append contradicts them",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW_MS);
+        const directory = yield* historyDirectory;
+        // Real readings; the clock is now a day behind them and nothing was appended since.
+        const file = yield* seedHistory(
+          directory,
+          INSTANCE,
+          jsonLines([reading(at(DAY), 40), reading(at(DAY + MINUTE), 41)]),
+        );
+        const history = yield* make({ directory });
+        yield* history.compact;
+        yield* history.compact;
+        assert.deepStrictEqual(yield* history.readings(INSTANCE), []);
+        assert.strictEqual((yield* fileLines(file)).length, 2);
+
+        // The clock is put right: the readings are served again.
+        yield* TestClock.setTime(NOW_MS + DAY + 2 * MINUTE);
+        const restarted = yield* make({ directory });
+        assert.deepStrictEqual(percents(yield* restarted.readings(INSTANCE)), [40, 41]);
+      }),
   );
 
   it.effect("drops a line torn by a crash and keeps appending after it", () =>
@@ -344,6 +412,10 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       assert.strictEqual((yield* fileLines(file)).length, 2);
       yield* history.record([provider(limits(at(MINUTE), 45))]);
       assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 45]);
+      // The append after it shows that reading came from a clock that was ahead: compaction drops it.
+      yield* history.compact;
+      assert.strictEqual((yield* fileLines(file)).length, 2);
+      assert.notInclude((yield* fileLines(file)).join("\n"), at(2 * DAY));
 
       // The clock steps back while running: the last reading is now ahead of it.
       yield* TestClock.setTime(NOW_MS - DAY);
@@ -372,6 +444,45 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       assert.strictEqual(read._tag, "UsageHistoryUnreadable");
     }),
   );
+
+  it.effect("logs a failing history once per instance until it works again", () => {
+    const logs = logCollector();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const directory = yield* historyDirectory;
+      const file = yield* seedHistory(directory, INSTANCE, jsonLines([reading(at(-MINUTE), 40)]));
+      let denied = true;
+      let appendsFail = false;
+      const readsDenied = yield* failingReadsOf(file, () => denied);
+      const fs: FileSystem.FileSystem = {
+        ...readsDenied,
+        writeFileString: (filePath, data, writeOptions) =>
+          appendsFail && writeOptions?.flag === "a"
+            ? Effect.fail(diskFull(filePath))
+            : readsDenied.writeFileString(filePath, data, writeOptions),
+      };
+      const history = yield* make({ directory }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+      );
+      yield* history.compact;
+      for (let step = 0; step < 3; step++) {
+        yield* history.record([provider(limits(at(step * MINUTE), 45 + step))]);
+      }
+      assert.strictEqual(logs.warnings.length, 1);
+
+      denied = false;
+      yield* history.record([provider(limits(at(3 * MINUTE), 50))]);
+      assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 50]);
+      assert.strictEqual(logs.infos.length, 1);
+
+      // Appends fail as on a full disk: one warning for the run of failures, not one per update.
+      appendsFail = true;
+      for (let step = 4; step < 7; step++) {
+        yield* history.record([provider(limits(at(step * MINUTE), 50 + step))]);
+      }
+      assert.strictEqual(logs.warnings.length, 2);
+    }).pipe(Effect.provide(logs.layer));
+  });
 
   it.effect("keeps lines that no longer decode, and skips them one by one", () =>
     Effect.gen(function* () {
@@ -549,6 +660,169 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
         assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 45]);
       }
       assert.strictEqual(fileReads, readsAfterStart);
+    }),
+  );
+
+  it.effect("a reading torn by a failed append in a running server does not swallow the next", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const directory = yield* historyDirectory;
+      const real = yield* FileSystem.FileSystem;
+      let tearNextAppend = false;
+      const fs: FileSystem.FileSystem = {
+        ...real,
+        writeFileString: (filePath, data, writeOptions) => {
+          if (!tearNextAppend || writeOptions?.flag !== "a") {
+            return real.writeFileString(filePath, data, writeOptions);
+          }
+          tearNextAppend = false;
+          // Half the line lands, then the disk is full.
+          return real
+            .writeFileString(filePath, data.slice(0, data.length / 2), writeOptions)
+            .pipe(Effect.andThen(Effect.fail(diskFull(filePath))));
+        },
+      };
+      const history = yield* make({ directory }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+      );
+      yield* history.record([provider(limits(at(0), 40))]);
+      tearNextAppend = true;
+      yield* history.record([provider(limits(at(MINUTE), 45))]);
+      yield* history.record([provider(limits(at(2 * MINUTE), 50))]);
+
+      const restarted = yield* make({ directory });
+      assert.deepStrictEqual(percents(yield* restarted.readings(INSTANCE)), [40, 50]);
+    }),
+  );
+
+  it.effect("removes a temp folder left by a crash during compaction and keeps the history", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* historyDirectory;
+      yield* seedHistory(directory, INSTANCE, jsonLines([reading(at(-MINUTE), 40)]));
+      // What writeFileStringAtomically leaves when killed before its rename.
+      const leftover = path.join(directory, `${INSTANCE}.jsonl.Ab12Cd`);
+      yield* fs.makeDirectory(leftover);
+      yield* fs.writeFileString(path.join(leftover, "contents.tmp"), '{"checkedAt":');
+      // Not a leftover: a file of that shape is left alone.
+      yield* fs.writeFileString(path.join(directory, `${SECOND}.jsonl.note`), "keep\n");
+
+      const history = yield* make({ directory });
+      yield* history.compact;
+
+      assert.deepStrictEqual((yield* fs.readDirectory(directory)).toSorted(), [
+        `${INSTANCE}.jsonl`,
+        `${SECOND}.jsonl.note`,
+      ]);
+      assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40]);
+    }),
+  );
+
+  it.effect("reads each history file once, and a read does not wait behind a write", () =>
+    TestClock.withLive(
+      Effect.gen(function* () {
+        const directory = yield* historyDirectory;
+        const real = yield* FileSystem.FileSystem;
+        let fileReads = 0;
+        const writeStarted = yield* Deferred.make<void>();
+        const releaseWrite = yield* Deferred.make<void>();
+        let holdNextAppend = false;
+        const fs: FileSystem.FileSystem = {
+          ...real,
+          readFileString: (filePath, encoding) => {
+            fileReads++;
+            return real.readFileString(filePath, encoding);
+          },
+          writeFileString: (filePath, data, writeOptions) => {
+            if (!holdNextAppend || writeOptions?.flag !== "a") {
+              return real.writeFileString(filePath, data, writeOptions);
+            }
+            holdNextAppend = false;
+            return Deferred.succeed(writeStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseWrite)),
+              Effect.andThen(real.writeFileString(filePath, data, writeOptions)),
+            );
+          },
+        };
+        const history = yield* make({ directory }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fs),
+        );
+        const nowMs = yield* Clock.currentTimeMillis;
+        const stamp = (offsetMs: number) =>
+          DateTime.formatIso(DateTime.makeUnsafe(nowMs + offsetMs));
+        for (let step = 0; step < 5; step++) {
+          yield* history.record([provider(limits(stamp(step * MINUTE - HOUR), 40 + step))]);
+        }
+        // One read when the instance was first seen, none for each later snapshot.
+        assert.strictEqual(fileReads, 1);
+
+        holdNextAppend = true;
+        const writing = yield* Effect.forkChild(
+          history.record([provider(limits(stamp(-MINUTE), 50))]),
+        );
+        yield* Deferred.await(writeStarted).pipe(Effect.timeout("5 seconds"));
+        // The write holds the lock; a read of a loaded history is served at once.
+        const during = yield* history.readings(INSTANCE).pipe(Effect.timeout("2 seconds"));
+        assert.deepStrictEqual(percents(during), [40, 41, 42, 43, 44]);
+        yield* Deferred.succeed(releaseWrite, undefined);
+        yield* Fiber.join(writing);
+        assert.deepStrictEqual(
+          percents(yield* history.readings(INSTANCE)),
+          [40, 41, 42, 43, 44, 50],
+        );
+        assert.strictEqual(fileReads, 1);
+      }),
+    ),
+  );
+
+  it.effect("a probe that reports less of the account keeps the known account", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const directory = yield* historyDirectory;
+      const history = yield* make({ directory });
+      const codex = ProviderInstanceId.make("codex_work");
+      const second = ProviderInstanceId.make("codex_second");
+      const email = "person@example.com";
+      const full = { email, workspaceId: "workspace-a" };
+      const codexAt = (
+        offset: number,
+        percent: number,
+        auth: Partial<ServerProviderAuth>,
+        instanceId: ProviderInstanceId = codex,
+        overrides?: Partial<ServerProviderUsageLimits>,
+      ) => provider(limits(at(offset), percent, overrides), instanceId, { driver: CODEX, auth });
+
+      yield* history.record([codexAt(0, 40, full)]);
+      // The rate-limit read failed, so no workspace id came with the email.
+      yield* history.record([
+        codexAt(MINUTE, 40, { email }, codex, {
+          windows: [],
+          unavailable: { reason: "probeFailed" },
+        }),
+      ]);
+      yield* history.record([codexAt(2 * MINUTE, 41, full)]);
+      // The auth probe failed too: no identity at all.
+      yield* history.record([codexAt(3 * MINUTE, 42, {})]);
+      // Another instance on the same login that reports no workspace joins the same account.
+      yield* history.record([
+        codexAt(4 * MINUTE, 43, full),
+        codexAt(4 * MINUTE, 10, { email }, second),
+      ]);
+
+      const known = accountOf(codexAt(0, 40, full));
+      const accounts = (readings: ReadonlyArray<UsageReading>) =>
+        readings.map((entry) => entry.account);
+      assert.deepStrictEqual(accounts(yield* history.readings(codex)), Array(5).fill(known));
+      assert.deepStrictEqual(accounts(yield* history.readings(second)), [known]);
+      assert.strictEqual((yield* history.readingsOfAccount(known!)).length, 6);
+
+      // Another login on the instance is still another account.
+      yield* history.record([codexAt(5 * MINUTE, 43, { email: "other@example.com" })]);
+      const swapped = (yield* history.readings(codex)).at(-1)?.account;
+      assert.isString(swapped);
+      assert.notStrictEqual(swapped, known);
     }),
   );
 
