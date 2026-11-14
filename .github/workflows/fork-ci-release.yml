@@ -1,0 +1,278 @@
+name: Fork CI release
+
+# Fork only. Releases fork-ci/ as commits other repositories can pin: only fork-ci/, the reusable
+# workflows consumers call and LICENSE, never upstream's tree (.github/scripts/fork-ci-release.py says
+# why and how; fork-ci/README.md says how to pin; .github/fork-ci-release.json lists the files).
+# Runs daily and by hand; it releases only main's tip, only once fork-ci-result passed on it, and only
+# when the release files changed:
+# - plan: no token, writes nothing. Says release or none (and why), or refuses a half state.
+# - guard, release: only when the plan says release. FORK_PUSH_TOKEN from the Environment fork-push
+#   (GITHUB_TOKEN may not push commits that hold a workflow file), guarded exactly as fork-follow.yml
+#   guards it (fork-follow-guard.sh). One atomic push: the branch ci-release and the tag ci/vN.
+# - smoke: downloads the action the way a consumer does, a remote `uses:` (not ./) of the branch
+#   ci-release, whose head is the newest release commit, runs it, and checks that the runner unpacked
+#   exactly that commit's files. ci/v1 (a main commit) failed exactly here for every consumer.
+#   Dispatch with smoke-only to test the current release without releasing.
+# The smoke `uses:` names this repository literally: a `uses:` ref cannot be an expression.
+# Tests: .github/scripts/fork-ci-release.test.py.
+
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+    inputs:
+      smoke-only:
+        description: Only run the consumer smoke test of the current release; release nothing
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One release at a time; a cancel would only be a stop half-way.
+concurrency:
+  group: fork-ci-release
+  cancel-in-progress: false
+
+env:
+  # Must match `environment:` of the release job (an expression there cannot read env).
+  FORK_PUSH_ENVIRONMENT: fork-push
+  # The only branch the Environment may deploy to (fork-follow-guard.sh checks it).
+  SERIES_BRANCH: main
+
+jobs:
+  plan:
+    name: Plan
+    if: ${{ !inputs.smoke-only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      checks: read
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ github.sha }}
+          HISTORY: tip
+          SPARSE: /.github/
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
+
+      - id: plan
+        name: Plan the release (writes nothing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -I .github/scripts/fork-ci-release.py plan --require-check
+          --remote "https://github.com/$GITHUB_REPOSITORY.git" --repo "$GITHUB_REPOSITORY" --source "$GITHUB_SHA"
+
+  # No Environment here, so the FORK_PUSH_TOKEN secret seen here can only be a repository or
+  # organisation secret. Only whether it is empty reaches the step, never the value.
+  guard:
+    name: Guard the token
+    needs: [plan]
+    if: needs.plan.outputs.action == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      # Set only once the guard passed: a re-run of failed jobs keeps an earlier attempt's result.
+      attempt: ${{ steps.passed.outputs.attempt }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ github.sha }}
+          HISTORY: tip
+          SPARSE: /.github/scripts/
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
+
+      - name: Refuse unless only the Environment holds FORK_PUSH_TOKEN, for main only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SECRET_PRESENT: ${{ secrets.FORK_PUSH_TOKEN != '' }}
+          REPORT: ${{ runner.temp }}/reports/guard.md
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          bash .github/scripts/fork-follow-guard.sh
+
+      - id: passed
+        name: Note the attempt the guard passed in
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Release
+    needs: [plan, guard]
+    if: needs.guard.outputs.attempt == github.run_attempt
+    environment: fork-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ github.sha }}
+          HISTORY: tip
+          SPARSE: /.github/
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
+
+      - name: Check FORK_PUSH_TOKEN
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+          REPORT: ${{ runner.temp }}/reports/token.md
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          bash .github/scripts/fork-follow-push.sh check
+
+      - name: Re-check the Environment right before the push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ runner.temp }}/reports/guard-again.md
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          bash .github/scripts/fork-follow-guard.sh --environment-only
+
+      # The token reaches git as an HTTP header in GIT_CONFIG_* variables (as fork-follow-push.sh
+      # passes it): never in a URL, a command line or a config file.
+      - id: release
+        name: Release fork-ci (branch ci-release, tag ci/vN, one atomic push)
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898583+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898583+github-actions[bot]@users.noreply.github.com
+        run: |
+          header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$FORK_PUSH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$header"
+          unset FORK_PUSH_TOKEN
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="$header"
+          export GIT_TERMINAL_PROMPT=0
+          python3 -I .github/scripts/fork-ci-release.py release --require-check \
+            --remote "https://github.com/$GITHUB_REPOSITORY.git" --repo "$GITHUB_REPOSITORY" --source "$GITHUB_SHA"
+
+  smoke:
+    name: Consumer smoke test
+    needs: [plan, guard, release]
+    if: >-
+      !cancelled() &&
+      contains(fromJSON('["success", "skipped"]'), needs.plan.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.guard.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.release.result)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          REF: ${{ github.sha }}
+          HISTORY: tip
+          SPARSE: /.github/
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
+
+      # GitHub downloads the whole tree of the ref at "Set up job", as for any consumer: a tree the
+      # runner cannot unpack fails the job before this step.
+      - id: action
+        name: Run a released action from a remote ref, as a consumer does
+        uses: scuttletoby/t3code/fork-ci/actions/job-changed@ci-release
+        with:
+          base: HEAD
+          head: HEAD
+          workflow: .github/workflows/fork-ci-release.yml
+          job: smoke
+
+      - name: Check the runner unpacked exactly the release commit
+        env:
+          CHANGED: ${{ steps.action.outputs.changed }}
+          REASON: ${{ steps.action.outputs.reason }}
+          RELEASED: ${{ needs.release.outputs.sha }}
+        run: |
+          [[ "$CHANGED" == true || "$CHANGED" == false ]] \
+            || { echo "::error::the released action ran but gave no answer (changed='$CHANGED')"; exit 1; }
+          echo "The action ran: changed=$CHANGED ($REASON)"
+          git fetch -q --no-tags --depth=1 origin refs/heads/ci-release
+          head="$(git rev-parse FETCH_HEAD)"
+          if [[ -n "$RELEASED" && "$RELEASED" != "$head" ]]; then
+            echo "::error::ci-release is at $head, not at this run's release $RELEASED (another release since?)"
+            exit 1
+          fi
+          dir="$(dirname "$RUNNER_WORKSPACE")/_actions/scuttletoby/t3code/ci-release"
+          python3 -I .github/scripts/fork-ci-release.py verify-download --dir "$dir" --commit "$head"
