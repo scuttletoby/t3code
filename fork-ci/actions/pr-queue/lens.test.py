@@ -95,6 +95,27 @@ class Gaps(unittest.TestCase):
         self.assertIn(lens.EMBEDDED, SOURCE.lens_problem(post('Notes\n```\nlens: effaced1\n```')))
 
 
+class Markdown(unittest.TestCase):
+    """clean_inline keeps the source's answers (`</?[A-Za-z][^>]*>` tags, `!?\\[([^\\]]*)\\]\\([^)]*\\)` links) in linear time."""
+
+    def test_a_tag_with_a_lt_in_a_quoted_attribute_still_hides_nothing(self):   # GitHub renders it as a header
+        body = f'lens<a title="<">: correctness · read at<a title="<">: {SHA_A}\n\nsafe<a title="<"> to merge: no'
+        self.assertEqual(lens.clean_inline('lens<a title="<">: x'), 'lens: x')
+        pr = {'comments': [post(body)], 'reviews': []}
+        self.assertEqual(SOURCE.reviewed_head(pr)[:2], (True, SHA_A), 'a stale lens hidden this way must still be read')
+
+    def test_the_scans_give_the_source_regexes_answers(self):
+        import random
+        tag, link = re.compile(r'</?[A-Za-z][^>]*>'), re.compile(r'!?\[([^\]]*)\]\([^)]*\)')
+        rnd = random.Random(7)
+        parts = ['<', '>', '[', ']', '(', ')', '!', '/', 'a', 'B', ' ', '"', '*', '`', '|', '_', 'lens', ':', '](', '<a', '</b>', '![']
+        for _ in range(100000):
+            s = ''.join(rnd.choice(parts) for _ in range(rnd.randint(0, 16)))
+            want = re.sub(r'[*`]', '', link.sub(r'\1', tag.sub('', s))).replace('|', ' ')
+            want = re.sub(r'(?<![^\W_])_+|_+(?![^\W_])', '', want)
+            self.assertEqual(lens.clean_inline(s), want, repr(s))
+
+
 class Advice(unittest.TestCase):
     """no_lens_text(keep_markdown=True), for the queue's own advice: the source cleaned it like a gh error, so its
     `<sha>` placeholder and the backticks around a command were dropped from the comment."""

@@ -66,13 +66,56 @@ OK_CONCLUSIONS = ('SUCCESS', 'SKIPPED', 'NEUTRAL')
 STRANGER_SCAN = 4096   # characters of a post that does not count read to decide whether to log it
 
 
+_TAG_OPEN = re.compile(r'</?[A-Za-z]')
+
+
+def _strip_tags(text):
+    """re.sub(r'</?[A-Za-z][^>]*>', '', text) in linear time: each tag runs to the first `>` after its start (a `<` inside
+    a quoted attribute stays inside the tag, as GitHub renders it). No `>` left: no later tag can close either."""
+    out, pos = [], 0
+    for m in _TAG_OPEN.finditer(text):
+        if m.start() < pos:
+            continue
+        end = text.find('>', m.end())
+        if end < 0:
+            break
+        out.append(text[pos:m.start()])
+        pos = end + 1
+    out.append(text[pos:])
+    return ''.join(out)
+
+
+def _strip_links(text):
+    """re.sub(r'!?\\[([^\\]]*)\\]\\([^)]*\\)', r'\\1', text) in linear time. Every `[` before a `]` shares that `]`; no `]`
+    or no `)` left: no later link can close either."""
+    out, pos, i = [], 0, text.find('[')
+    while i >= 0:
+        close = text.find(']', i + 1)
+        if close < 0:
+            break
+        if text[close + 1:close + 2] != '(':
+            i = text.find('[', close + 1)
+            continue
+        end = text.find(')', close + 2)
+        if end < 0:
+            break
+        start = i - 1 if i > pos and text[i - 1] == '!' else i
+        out += [text[pos:start], text[i + 1:close]]
+        pos = end + 1
+        i = text.find('[', pos)
+    out.append(text[pos:])
+    return ''.join(out)
+
+
+
 def clean_inline(text):
     """Markdown that can hide a word, gone: HTML tags (`<b>`, also a `<name>` placeholder), links `[x](y)` -> x, `*` and
     backticks, `|` -> space, `_` at a word edge (`_lens_` -> lens; `pr_queue` stays)."""
-    # [^<>] and [^\[\]] / [^()]: a match cannot start inside another one, so unclosed brackets cost linear time, not
-    # time that grows with the square of the text (an unclosed `[` x 64 KB took minutes)
-    text = re.sub(r'</?[A-Za-z][^<>]*>', '', text)
-    text = re.sub(r'!?\[([^\[\]]*)\]\([^()]*\)', r'\1', text)
+    # The source's regexes `</?[A-Za-z][^>]*>` and `!?\[([^\]]*)\]\([^)]*\)`, as linear scans: the regexes took time
+    # that grows with the square of the text (an unclosed `[` x 64 KB took minutes), and the earlier fix ([^<>],
+    # [^\[\]], [^()]) changed the answers: `lens<a title="<">: x · read at<a title="<">: <sha>` renders as a lens header
+    # but read as none, so a stale lens went unseen.
+    text = _strip_links(_strip_tags(text))
     text = re.sub(r'[*`]', '', text).replace('|', ' ')
     return re.sub(r'(?<![^\W_])_+|_+(?![^\W_])', '', text)
 
