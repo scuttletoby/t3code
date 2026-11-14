@@ -7,6 +7,7 @@
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs
 .github/scripts/fork-contracts.test.py
+.github/scripts/fork-fleet.test.py
 .github/scripts/fork-follow.test.sh
 .github/scripts/fork-release-workflow.test.py
 .github/scripts/fork-release.test.sh
