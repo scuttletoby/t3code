@@ -312,6 +312,19 @@ class Install(Base):
                 self.assertEqual(self.quiet(install.self_check_main), 1)
 
 
+    @unittest.skipIf(os.geteuid() == 0, 'root sees into every folder')
+    def test_self_check_as_an_agent_skips_what_it_cannot_see(self):
+        self.install()
+        folder = self.host.path(os.path.dirname(c.SUDOERS))
+        mode = stat.S_IMODE(os.stat(folder).st_mode)
+        os.chmod(folder, 0o600)   # like a root-only /etc/sudoers.d seen by an agent: lstat inside it is refused
+        try:
+            self.assertEqual(install.self_check(), [])
+            self.assertEqual(self.quiet(install.self_check_main), 0)
+        finally:
+            os.chmod(folder, mode)
+
+
 class Admin(Base):
     def setUp(self):
         super().setUp()

@@ -331,8 +331,8 @@ def record_rows(sha):
 
 
 def self_check():
-    """Problems found (an empty list is a pass). Works as root and as an agent (an agent cannot read the sudoers
-    file, so its hash is checked only by root)."""
+    """Problems found (an empty list is a pass). Works as root and as an agent (an agent cannot see or read the
+    sudoers file, so it is checked only by root)."""
     path = c.p(c.INSTALLED)
     try:
         c.trusted_chain(path, 'install record')
@@ -352,6 +352,8 @@ def self_check():
         except FileNotFoundError:
             problems.append(f'{rel}: missing')
             continue
+        except PermissionError:
+            continue   # an agent cannot see into root-only folders (/etc/sudoers.d is 0750): root checks those
         uid, gid = c.ids(owner)[0] if c.ids(owner) else None, c.gid_of(group)
         if owner == 'root':
             uid = c.ROOT_UID
