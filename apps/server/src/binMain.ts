@@ -5,6 +5,12 @@ import { enableCliCompileCache } from "./cliCompileCache.ts";
 // paths dispatch before the full CLI module graph (seconds of evaluation) loads.
 export async function runCliCommand() {
   const command = process.argv[2];
+  // Fork (waits): a file check in its own process; it needs nothing else loaded.
+  if (command === "__wait-stat") {
+    const { runWaitStat } = await import("./waits/waitStatChild.ts");
+    runWaitStat();
+    return;
+  }
   // Install the socket guard before importing code that can open outbound connections.
   const { ignoreMacosTypeOfServiceEinval } = await import("./outboundHttp.ts");
   ignoreMacosTypeOfServiceEinval();
