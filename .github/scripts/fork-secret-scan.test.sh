@@ -25,7 +25,7 @@ git config --global user.name test
 git config --global user.email test@example.invalid
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
-unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL
 
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   gitleaks="$(realpath "$GITLEAKS_BIN")"
@@ -234,6 +234,65 @@ cd "$root"
 wide_status=1; [[ -z "${GITLEAKS_BIN:-}" ]] || wide_status=2
 PATH="$root/straygit:$PATH" BASE_SHA="$base" HEAD_SHA="$wide" \
   check "pull request: a stray git stderr line that hides a key in a wide commit fails" "$wide_status"
+
+# A fork-follow rebase: the series (one fork commit) moves from upstream v1.0.0 onto a newer
+# upstream tip whose own commits hold a key (a test fixture). The force push's BEFORE..AFTER holds
+# those upstream commits; the scan leaves them out when upstream can be fetched, and only then.
+git init -q --bare "$root/up.git"
+git -C "$root/up.git" config uploadpack.allowFilter true
+git init -q "$root/up"
+cd "$root/up"
+commit up.txt "up v1" "up 1"
+git tag v1.0.0
+commit fixture.txt "deviceKey=$key" "up 2: a test fixture with a key"
+commit up.txt "up v3" "up 3"
+git tag v1.1.0-nightly.1
+# A stable tag on a release branch the default branch does not have, with a key of its own.
+git checkout -q -b release/1.0 v1.0.0
+commit hotfix.txt "token=$key" "up release 1.0.1: a fixture with a key"
+git tag v1.0.1
+git checkout -q main
+git push -q "$root/up.git" main release/1.0 --tags
+
+git init -q --bare "$root/fork.git"
+git -C "$root/fork.git" config uploadpack.allowFilter true
+git -C "$root/fork.git" config uploadpack.allowAnySHA1InWant true
+cd "$root/up"
+git checkout -q -b series v1.0.0
+commit fork.txt "fork v1" "fork 1: the series"
+old_series=$(git rev-parse HEAD)
+git push -q "$root/fork.git" "HEAD:refs/heads/old-series"
+git checkout -q -b rebased v1.1.0-nightly.1
+commit fork.txt "fork v1" "fork 1: the series, rebased"
+rebased=$(git rev-parse HEAD)
+commit leak.txt "aws_access_key_id=$key" "fork 2: a key in the fork's own commit"
+rebased_leaky=$(git rev-parse HEAD)
+git checkout -q -b stable v1.0.1
+commit fork.txt "fork v1" "fork 1: the series, on the stable tag"
+stable=$(git rev-parse HEAD)
+git push -q -f "$root/fork.git" "$rebased:refs/heads/main" "$rebased_leaky:refs/heads/leaky" "$stable:refs/heads/stable"
+cd "$root"
+clone="$root/clone-follow"
+git clone -q --filter=blob:none --no-checkout "file://$root/fork.git" "$clone"
+
+export EVENT_NAME=push BASE_SHA="" HEAD_SHA="" UPSTREAM=up/t3code UPSTREAM_URL="file://$root/up.git"
+BEFORE="$old_series" AFTER="$rebased" \
+  check "force push onto newer upstream: upstream's own commits with a key are left out" 0 "upstream up/t3code already has"
+BEFORE="$old_series" AFTER="$rebased_leaky" \
+  check "force push onto newer upstream: a key in a fork commit of the same push is found" 1
+BEFORE="$old_series" AFTER="$stable" \
+  check "force push onto an upstream tag off its default branch: the tag's commits are left out" 0
+BEFORE="0000000000000000000000000000000000000000" AFTER="$(git -C "$root/up" rev-parse v1.1.0-nightly.1~1)" \
+  check "push of a new branch whose tip is upstream's commit with a key: left out" 0 "::warning.*new branch"
+BEFORE="$rebased" AFTER="$rebased_leaky" check "push after the rebase: the fork's new commit is scanned" 1 "pushed after"
+# Fail closed: no upstream, nothing left out, even in a clone where an earlier run fetched upstream.
+UPSTREAM_URL="file://$root/no-such-upstream.git" BEFORE="$old_series" AFTER="$rebased" \
+  check "force push, upstream cannot be fetched: the full range, with a warning" 1 "::warning.*could not be fetched"
+UPSTREAM="" BEFORE="$old_series" AFTER="$rebased" \
+  check "force push, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
+BEFORE="$old_series" AFTER="$rebased" \
+  check "force push: upstream reachable again, the scan passes again" 0
+unset UPSTREAM UPSTREAM_URL
 
 if [[ "$failures" -ne 0 ]]; then
   echo "$failures check(s) failed"
