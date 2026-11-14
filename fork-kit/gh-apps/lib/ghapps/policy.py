@@ -238,7 +238,6 @@ PERMISSIONS_RE = re.compile(r'(?:^|/)actions/permissions(?:/|$)', re.I)
 REPO_PERMISSIONS_RE = re.compile(r'^repos/[^/]+/[^/]+/actions/permissions$', re.I)
 OWNER_WORK_RE = re.compile(r'(?:^|/)(?:rulesets|protection|environments|secrets|hooks|keys|collaborators|'
                            r'invitations|transfer|interaction-limits|actions/runners|actions/variables)(?:/|$)', re.I)
-BARE_REPO_RE = re.compile(r'^repos/[^/]+/[^/]+$', re.I)
 READ_METHODS = {'GET', 'HEAD'}
 SEGMENT_RE = re.compile(r'[A-Za-z0-9._~+@:-]+')   # (fullmatch: '$' passes a last newline) no %, #, ?, \, space
 QUERY_RE = re.compile(r'[A-Za-z0-9._~+@:%=&,/*()!$\'-]*')   # a query string after ? (reads only)
@@ -412,14 +411,25 @@ def guard(parsed, stdin=None):
         return
     if query is not None:
         raise Refused(f'a {method} with a ?query in the endpoint: send the values as fields (-f, -F) instead')
+    # every write goes to something inside the App's own repository, written as repos/OWNER/NAME/...: not the
+    # repository itself (its settings), not the numeric alias repositories/ID, not orgs/..., users/..., teams/...
+    # (members, teams, org settings). The token carries the App's org permissions too, so this is not left to it.
+    owner, _, name = (parsed.repo or '/').partition('/')
+    parts = path.split('/')
+    if not (len(parts) > 3 and parts[0] == 'repos' and owner and name and parts[1].lower() == owner.lower()
+            and parts[2].lower() == name.lower()):
+        raise Refused(f'a {method} to {path}: gh-as writes only inside the App\'s own repository, as '
+                      f'repos/{parsed.repo}/...; repository, org, team and member settings are owner work')
     if PERMISSIONS_RE.search(endpoint):
-        fields = dict(f.partition('=')[::2] for f in parsed.values('--field') + parsed.values('--raw-field'))
+        # the one exception turns Actions back on: exactly one field, enabled=true, and nothing else (allowed_actions
+        # or any other field could widen which actions may run)
+        fields = parsed.values('--field') + parsed.values('--raw-field')
         reenable = (method == 'PUT' and REPO_PERMISSIONS_RE.match(endpoint) and not parsed.has('--input')
-                    and fields.get('enabled', '').lower() == 'true'
-                    and set(fields) <= {'enabled', 'allowed_actions'} and fields.get('allowed_actions', 'all') == 'all')
+                    and fields == ['enabled=true'])
         if not reenable:
-            raise Refused(f'a {method} to .../actions/permissions: agents do not turn Actions off or limit it')
+            raise Refused(f'a {method} to the Actions permissions: agents only turn Actions back on (one field, '
+                          'enabled=true); everything else there is owner work')
         return
-    if OWNER_WORK_RE.search(endpoint) or BARE_REPO_RE.match(endpoint):
+    if OWNER_WORK_RE.search(endpoint):
         raise Refused(f'a {method} to {path}: repository settings, rules, secrets, keys and members are owner '
                       'work')

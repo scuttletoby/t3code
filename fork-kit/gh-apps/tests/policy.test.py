@@ -129,9 +129,15 @@ class Guard(unittest.TestCase):
     def test_actions_permissions(self):
         guarded(['api', 'repos/octo/demo/actions/permissions'])
         guarded(['api', '-X', 'PUT', 'repos/octo/demo/actions/permissions', '-F', 'enabled=true'])
-        guarded(['api', '-X', 'PUT', 'repos/{owner}/{repo}/actions/permissions', '-F', 'enabled=true', '-f',
-                 'allowed_actions=all'])
+        guarded(['api', '-X', 'PUT', 'repos/{owner}/{repo}/actions/permissions', '-F', 'enabled=true'])
         for args in (['-X', 'PUT', 'repos/octo/demo/actions/permissions', '-F', 'enabled=false'],
+                     # only the exact re-enable call: allowed_actions (even "all") could widen what may run
+                     ['-X', 'PUT', 'repos/{owner}/{repo}/actions/permissions', '-F', 'enabled=true', '-f',
+                      'allowed_actions=all'],
+                     ['-X', 'PUT', 'repos/octo/demo/actions/permissions', '-F', 'enabled=true', '-F', 'enabled=true'],
+                     ['-X', 'PUT', 'repos/octo/demo/actions/permissions', '-F', 'enabled=true', '-f', 'sha_pinning=x'],
+                     ['-X', 'PUT', 'repos/octo/demo/actions/permissions', '-F', 'enabled=TRUE'],
+                     ['-X', 'PUT', 'repos/octo/other/actions/permissions', '-F', 'enabled=true'],
                      ['-X', 'PUT', 'repos/octo/demo/actions/permissions', '-F', 'enabled=true', '-f',
                       'allowed_actions=selected'],
                      ['-X', 'PUT', 'repos/octo/demo/actions/permissions', '--input', '-'],
@@ -156,7 +162,25 @@ class Guard(unittest.TestCase):
     def test_ordinary_writes_pass(self):
         guarded(['api', 'repos/octo/demo/issues/1/comments', '-f', 'body=hi'])
         guarded(['api', '-X', 'POST', 'repos/octo/demo/check-runs', '-f', 'name=x'])
+        guarded(['api', '-X', 'POST', '/repos/{owner}/{repo}/issues/1/labels', '-f', 'labels[]=x'])
+        guarded(['api', '-X', 'PATCH', 'repos/Octo/Demo/issues/1', '-f', 'state=closed'])   # GitHub ignores case
         guarded(['pr', 'merge', '1', '--squash'])
+
+    def test_writes_only_inside_the_apps_own_repository(self):
+        """Lens round 2: repositories/<id> is GitHub's numeric alias for a repository, and org member and team
+        endpoints had no rule (README: members: no). Every write must be under repos/<the App's repo>/."""
+        for method, ep in (('PATCH', 'repositories/123'), ('DELETE', 'repositories/123'),
+                           ('POST', 'repositories/123/issues'), ('PUT', 'repositories/123/collaborators/u'),
+                           ('PUT', 'orgs/octo/memberships/someone'), ('DELETE', 'orgs/octo/members/someone'),
+                           ('PUT', 'orgs/octo/teams/t/repos/octo/demo'), ('PUT', 'orgs/octo/outside_collaborators/u'),
+                           ('PATCH', 'orgs/octo'), ('POST', 'user/repos'), ('PUT', 'teams/1/memberships/u'),
+                           ('POST', 'repos/octo/other/issues'), ('POST', 'repos/octo/demo.git/issues'),
+                           ('PATCH', 'repos/octo/demo'), ('DELETE', 'repos/{owner}/{repo}'), ('POST', 'markdown'),
+                           ('POST', 'Repos/octo/demo/issues')):
+            with self.subTest(method=method, ep=ep), self.assertRaises(Refused):
+                guarded(['api', '-X', method, ep, '-f', 'a=b'])
+        for ep in ('orgs/octo/members', 'repositories/123', 'user'):   # reads keep their rules
+            guarded(['api', ep])
 
     def test_graphql(self):
         guarded(['api', 'graphql', '-f', 'query=query { viewer { login } }'])
@@ -210,7 +234,9 @@ class PlainForm(unittest.TestCase):
                    'repos/octo/demo.json', f'repos/octo/demo/actions/workflows/1/{OFF}.json'):
             with self.subTest(ep=ep):
                 self.refused(['api', '-X', 'POST', ep, '-f', 'a=b'])
-        guarded(['api', 'repos/octo/my.repo/issues/1/comments', '-f', 'body=hi'])   # a dot in a name is fine
+        # a dot in a name is fine
+        policy.guard(policy.parse(['api', 'repos/octo/my.repo/issues/1/comments', '-f', 'body=hi'], 'octo/my.repo',
+                                  'run'))
 
     def test_a_query_string_only_on_reads(self):
         guarded(['api', 'repos/octo/demo/pulls?state=open&per_page=100'])
