@@ -10,6 +10,7 @@
     "fork-ci",
     "fork-kit",
     ".github/workflows/fork-pr-queue.yml",
+    ".github/workflows/fork-head-gate.yml",
     ".github/scripts/fork-fleet.py"
   ]
 }
