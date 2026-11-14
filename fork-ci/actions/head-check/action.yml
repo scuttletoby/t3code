@@ -8,7 +8,7 @@ inputs:
     description: The merge queue's JSON config (pr-queue README, "Config"), a path in the repository, read from the base commit.
     required: true
   required-lenses:
-    description: Lens names, one per line or comma, that must be among the reads (default none).
+    description: Lens names, one per line (a name may hold a comma), that must be among the reads (default none).
     required: false
     default: ""
   pass-drafts:
@@ -55,6 +55,6 @@ runs:
         case "$PASS_DRAFTS" in
           true) args+=(--pass-drafts) ;;
           false) ;;
-          *) echo "::error::head check: pass-drafts must be true or false, not '$PASS_DRAFTS'"; exit 2 ;;
+          *) echo "::error::head check: pass-drafts must be true or false"; exit 2 ;;
         esac
         exec python3 -I "$GITHUB_ACTION_PATH/head_check.py" "${args[@]}"

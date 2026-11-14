@@ -227,16 +227,35 @@ class Rules(unittest.TestCase):
         ok, why, rows = self.verdict([], required='correctness')
         self.assertFalse(ok)
         self.assertIn('correctness', why)
-        self.assertEqual(rows, [('correctness', False, 'required: no lens comment of a counted author')])
+        self.assertEqual(rows, [('correctness', False,
+                                 'required: no lens comment of a counted author has this name (lenses found: none)')])
 
     def test_a_required_lens_must_be_among_the_reads(self):
-        ok, why, _ = self.verdict([self.p.lens('correctness', A)], required='correctness, security')
+        ok, why, _ = self.verdict([self.p.lens('correctness', A)], required='correctness\nsecurity')
         self.assertFalse(ok)
         self.assertIn('security', why)
         ok, why, rows = self.verdict([self.p.lens('Correctness r2', A), self.p.lens('security', A)],
                                      required='correctness\nsecurity')
         self.assertTrue(ok, why)
         self.assertIn(('correctness (required)', True), [(n, g) for n, g, _ in rows])
+
+    def test_a_required_lens_name_may_hold_a_comma(self):   # one name per line, trimmed, blank lines skipped
+        names, problems = H.required_names('\n  data-integrity (DI-1, DI-2)  \r\n\n security\n')
+        self.assertEqual((names, problems), ({'data-integrity (di-1, di-2)': 'data-integrity (DI-1, DI-2)',
+                                              'security': 'security'}, []))
+        ok, why, _ = self.verdict([self.p.lens('data-integrity (DI-1, DI-2)', A), self.p.lens('security', A)],
+                                  required='data-integrity (DI-1, DI-2)\nsecurity')
+        self.assertTrue(ok, why)
+
+    def test_a_required_name_no_comment_has_is_named_with_the_lenses_found(self):   # a typo fails, and says why
+        ok, why, rows = self.verdict([self.p.lens('correctness', A), self.p.lens('security', A)],
+                                     required='correctness\nsecurty')
+        self.assertFalse(ok)
+        self.assertIn('required lens without a read: securty', why)
+        self.assertIn('one name per line', why)
+        self.assertIn('lenses found: correctness, security', why)
+        self.assertEqual(rows[0], ('securty', False, 'required: no lens comment of a counted author has this name '
+                                                     '(lenses found: correctness, security)'))
 
     def test_a_required_lens_that_reads_nothing_fails(self):
         ok, _, rows = self.verdict([self.p.lens('correctness', A[:12])], required='correctness')
@@ -425,7 +444,8 @@ class SameChange(unittest.TestCase):
     def test_a_read_commit_github_does_not_have_fails(self):
         code, out = self.check(self.w.merge(self.read, self.m1), read='e' * 40)
         self.assertEqual(code, 1, out)
-        self.assertIn('neither in the checkout nor on GitHub', out)
+        self.assertIn('could not be fetched from origin', out)
+        self.assertIn('persist-credentials: false', out)
 
     def test_the_pull_requests_gitattributes_cannot_make_a_conflict_clean(self):
         # The read change and the base both change line 20; the read commit also asks for merge=union. The queue's
@@ -468,11 +488,15 @@ class SameChange(unittest.TestCase):
                 self.assertIn(says, out)
                 self.assertEqual(calls, [])
 
-    def test_a_checkout_that_is_not_a_merge_commit_is_refused(self):
+    def test_a_checkout_that_is_not_a_merge_commit_is_refused(self):   # refused (2) before GitHub is read, not failed
         path = self.w.checkout(self.m1, self.read)
         self.w.git(path, 'checkout', '-q', '--detach', self.read)
-        code, out = run_cli(path, fake_gh((0, json.dumps(pr([])))))
+        calls = []
+        code, out = run_cli(path, fake_gh((0, json.dumps(pr([self.p.lens('c', self.read)], head=self.read))),
+                                          calls=calls))
         self.assertEqual(code, H.REFUSED, out)
+        self.assertIn("not GitHub's two-parent merge commit", out)
+        self.assertEqual(calls, [])
 
 
 # --- reading GitHub, the outputs, re-runs and stops -------------------------------------------------------------
@@ -614,12 +638,44 @@ class Action(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn('::error::', r.stdout)
 
+    def test_the_refusal_does_not_echo_the_pass_drafts_value(self):   # a newline in it could start a command
+        r = self.run_step(PASS_DRAFTS='yes\n::warning::forged')
+        self.assertEqual(r.returncode, 2)
+        self.assertNotIn('forged', r.stdout + r.stderr)
+
     def test_the_defaults_are_the_pull_request_events(self):
         inputs = self.action['inputs']
         self.assertEqual(inputs['pr']['default'], '${{ github.event.pull_request.number }}')
         self.assertEqual(inputs['pass-drafts']['default'], 'false')
         self.assertTrue(inputs['config']['required'])
         self.assertEqual(self.action['outputs']['result']['value'], '${{ steps.check.outputs.result }}')
+
+
+class ReadmeExample(unittest.TestCase):
+    """README.md's usage example: the triggers a base change needs, and the action pinned by sha."""
+
+    def setUp(self):
+        import re, yaml
+        with open(os.path.join(HERE, 'README.md')) as f:
+            text = f.read()
+        blocks = re.findall(r'```yaml\n(.*?)```', text, re.S)
+        self.assertEqual(len(blocks), 1)
+        self.example = yaml.safe_load(blocks[0])
+        self.text = blocks[0]
+
+    def test_the_triggers_rerun_it_on_a_base_change_and_on_ready(self):
+        types = self.example[True]['pull_request']['types']   # yaml reads `on` as True
+        for kind in ('opened', 'synchronize', 'reopened', 'ready_for_review', 'edited'):
+            self.assertIn(kind, types)
+
+    def test_the_action_is_pinned_by_a_full_sha_never_by_a_local_path(self):
+        import re
+        uses = [s['uses'] for job in self.example['jobs'].values() for s in job['steps'] if 'uses' in s]
+        mine = [u for u in uses if 'head-check' in u]
+        self.assertEqual(len(mine), 1, uses)
+        self.assertRegex(mine[0], r'^[^./][^@]*/fork-ci/actions/head-check@<release sha of ci/vN>$')
+        self.assertNotIn('uses: ./', self.text)
+        self.assertTrue(re.search(r'head-check@<release sha of ci/vN> # ci/vN', self.text))
 
 
 if __name__ == '__main__':

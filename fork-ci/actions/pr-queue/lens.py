@@ -216,8 +216,13 @@ class Review:
         self.log, self.logged = log, set()
 
     def is_bot(self, post):
-        login = ((post.get('author') or {}).get('login') or '').lower()
-        return login in self.bots or login.endswith('[bot]')
+        """A configured bot login, a login ending in `[bot]` (GitHub's REST API), or an author whose type is Bot
+        (`is_bot` true, or GraphQL's `__typename` Bot). `gh pr view --json comments,reviews` gives only the login, and
+        without the `[bot]` suffix, so through gh only bot_logins (and the author associations) keep bots out."""
+        author = post.get('author') or {}
+        login = (author.get('login') or '').lower()
+        return login in self.bots or login.endswith('[bot]') or author.get('is_bot') is True \
+            or author.get('__typename') == 'Bot'
 
     def counts(self, post):
         """The comment or review takes part in the review at all: GitHub records its author with one of the configured

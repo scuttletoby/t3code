@@ -15,12 +15,15 @@ same people and override, and a pull request cannot change them for its own chec
 
 Pass: every lens read the head (or a newer override vouches for it), and every required lens is there; a pull
 request with no lens comments and no required lens (nothing to compare); a draft, with --pass-drafts only. Fail,
-never pass, when anything is unknown: GitHub unreadable after ATTEMPTS, a malformed answer, a checkout that is not
-GitHub's two-parent merge commit of the head GitHub reports, a shallow or tampered checkout, a read commit neither in
-the checkout nor on GitHub. Reads only (a fetch of a missing read commit into the job's own checkout aside) and posts
-nothing: a re-run on the same head gives the same answer, and a run stopped half-way leaves nothing behind.
-Exit codes: 0 pass, 1 fail, 2 refused to start (a config or argument error; every reason printed at once).
+never pass, when anything is unknown: GitHub unreadable after ATTEMPTS, a malformed answer, a checkout whose merge
+commit merges another head than the one GitHub reports, a read commit that is not in the checkout and cannot be fetched.
+Refuse to start (exit 2, before GitHub is read) on a config or argument error, a git older than 2.38, and a checkout
+that is not GitHub's two-parent merge commit, is shallow or is tampered with. Reads only (a fetch of a missing read
+commit into the job's own checkout aside) and posts nothing: a re-run on the same head gives the same answer, and a
+run stopped half-way leaves nothing behind.
+Exit codes: 0 pass, 1 fail, 2 refused to start (every reason printed at once).
     head_check.py --repo OWNER/NAME --pr N --config FILE [--path DIR] [--required-lenses TEXT] [--pass-drafts]
+`--required-lenses` takes one lens name per line (a name may hold a comma: `data-integrity (DI-1, DI-2)`).
 """
 import argparse, json, os, re, subprocess, sys, tempfile, time
 
@@ -75,14 +78,16 @@ class Checkout:
         return self.git('cat-file', '-e', sha + '^{commit}').returncode == 0
 
     def fetch(self, sha):
-        """A read commit no ref of the checkout reaches (a force-push dropped it; GitHub keeps it), from origin."""
+        """A read commit no ref of the checkout reaches (a force-push dropped it; GitHub keeps it), from origin with the
+        credentials actions/checkout stored (none with persist-credentials: false: a private repository then fails)."""
         return self.git('fetch', '-q', '--no-tags', 'origin', sha).returncode == 0 and self.has(sha)
 
 
 def required_names(text):
-    """{lens key: name as written} from one lens name per line or comma; (keys, problems)."""
+    """{lens key: name as written} from one lens name per line, blank lines skipped; (keys, problems). Lines only, never
+    commas: a lens name may hold one (`data-integrity (DI-1, DI-2)`)."""
     names, problems = {}, []
-    for name in (n.strip() for n in re.split(r'[\n,]', text or '')):
+    for name in (n.strip() for n in (text or '').splitlines()):
         if not name:
             continue
         if not lens.names_a_lens(name):
@@ -116,7 +121,8 @@ def read_pr(repo, n, gh, sleep):
 
 def same_change(checkout, head, read):
     """(True, how) when the checkout's merge commit merges `head` and head holds `read`'s change (pr_queue.holds),
-    else (False, why). Only the checkout's own commits and GitHub's (a fetch of a missing read) are looked at."""
+    else (False, why). Only the checkout's own commits and GitHub's (a fetch of a missing read) are looked at. cli
+    refuses a checkout that is no merge commit before this runs (base_config); the check here is for other callers."""
     parents = checkout.merge_parents()
     if not parents:
         return False, "HEAD is not GitHub's two-parent merge commit, so the pull request head is unknown"
@@ -127,7 +133,8 @@ def same_change(checkout, head, read):
     if head == read:
         return True, f'{head[:12]} is the commit read'
     if not (checkout.has(read) or checkout.fetch(read)):
-        return False, f'the read commit {read[:12]} is neither in the checkout nor on GitHub'
+        return False, (f'the read commit {read[:12]} is not in the checkout and could not be fetched from origin '
+                       '(GitHub no longer has it, or the checkout kept no credentials: persist-credentials: false)')
     if pr_queue.holds(checkout.git, head, read, pr_queue.UPDATES, base):
         return True, f'{head[:12]} is {read[:12]} merged with the base, nothing else'
     return False, f'{head[:12]} is not the change read at {read[:12]}, nor that change merged with the base'
@@ -144,10 +151,12 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False):
     reads = review.lens_reads(pr)
     reviewed, read, why = review.reviewed_head(pr)
     missing = [name for key, name in required.items() if key not in reads]
+    found = ', '.join(sorted(reads)) or 'none'
     if not reads and not required:
         return True, 'no lens comments and no required lens: nothing to compare', []
     ok, how = same_change(checkout, head, read) if reviewed and read else (False, None)
-    rows = [(name, False, 'required: no lens comment of a counted author') for name in missing]
+    rows = [(name, False, f'required: no lens comment of a counted author has this name (lenses found: {found})')
+            for name in missing]
     for key, (sha, gap, override) in sorted(reads.items()):
         if not sha:
             text = f'reads nothing: {gap}'
@@ -157,7 +166,8 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False):
             text = f'{"override " if override else "read "}{sha[:12]}: {how}'
         rows.append(((f'{key} (required)' if key in required else key), bool(sha and read and ok), text))
     if missing:
-        return False, f'required lens without a read: {", ".join(missing)}', rows
+        return False, (f'required lens without a read: {", ".join(missing)}. No counted lens comment has that name: '
+                       f'check it in required-lenses (one name per line); lenses found: {found}'), rows
     if not read:
         return False, why, rows
     return ok, how, rows
@@ -204,7 +214,7 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
     p.add_argument('--config', required=True, help="the merge queue's JSON config (../pr-queue/README.md, Config): a "
                    'path in the repository, read from the base commit the merge commit tests')
     p.add_argument('--path', default='.', help="the checkout of GitHub's merge commit (fetch-depth: 0)")
-    p.add_argument('--required-lenses', default='', help='lens names, one per line or comma, that must read the head')
+    p.add_argument('--required-lenses', default='', help='lens names, one per line, that must read the head')
     p.add_argument('--pass-drafts', action='store_true', help='pass a draft without reading its review')
     a = p.parse_args(argv)
     problems = []
