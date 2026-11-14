@@ -4,3 +4,7 @@
 47cd255f192206f56bdd0cd56de7c1509ae35eeb:apps/server/src/waits/WaitStore.test.ts:generic-api-key:18
 47cd255f192206f56bdd0cd56de7c1509ae35eeb:apps/server/src/waits/WaitService.test.ts:generic-api-key:66
 c739cbb3dc50fb8883024f21095c727e4ee2afa1:apps/server/src/waits/WaitService.test.ts:generic-api-key:1178
+# Same fake 16-character test values in fork PR #91 (wait delivery and service tests).
+597bb9fa10e1789d4b00311c4856b185f8f38b1b:apps/server/src/waits/WaitDelivery.test.ts:generic-api-key:329
+c28991334481fca3bc6b96b62b1b764bb45a8848:apps/server/src/waits/WaitService.test.ts:generic-api-key:1946
+c28991334481fca3bc6b96b62b1b764bb45a8848:apps/server/src/waits/WaitService.test.ts:generic-api-key:2014
