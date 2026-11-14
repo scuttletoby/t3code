@@ -1,7 +1,9 @@
 # fork-ci: CI actions for other repositories
 
-Composite actions under [`actions/`](actions/) and the reusable workflow
-[`.github/workflows/fork-pr-queue.yml`](../.github/workflows/fork-pr-queue.yml), for any
+Composite actions under [`actions/`](actions/) and the reusable workflows
+[`.github/workflows/fork-pr-queue.yml`](../.github/workflows/fork-pr-queue.yml) and
+[`.github/workflows/fork-head-gate.yml`](../.github/workflows/fork-head-gate.yml) (the head
+check as a gate App's check, [head-check](actions/head-check/README.md#the-gate)), for any
 repository to use. Each action's README says what it does and what it needs.
 
 ## Pinning
