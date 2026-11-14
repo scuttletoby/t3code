@@ -10,11 +10,10 @@ This folder is built in four stacked pull requests:
 1. the review rules and the config (`lens.py`, `config.py`);
 2. the queue itself (`pr_queue.py`, section "The queue");
 3. armed pull requests that cannot merge (a red required check, or one that
-   ended without passing or never reported) are told once and passed over:
-   this part;
+   ended without passing or never reported) are told once and passed over;
 4. the "red only because the base was red" rule, the reusable workflow
-   `.github/workflows/fork-pr-queue.yml`, `action.yml` and the usage sections
-   of this file.
+   `.github/workflows/fork-pr-queue.yml`, `action.yml`, `tested-base/` and the
+   usage sections of this file: this part.
 
 ## Config
 
@@ -52,6 +51,7 @@ an error: the queue then exits non-zero and touches no pull request.
 | `wait_seconds`             | no       | How long to wait for GitHub to show the updated head (default 60).                                                                                                                                                                                                                             |
 | `poll_seconds`             | no       | How often to look meanwhile (default 5).                                                                                                                                                                                                                                                       |
 | `list_limit`               | no       | How many open pull requests to read (default 50).                                                                                                                                                                                                                                              |
+| `update_when_base_was_red` | no       | `true` updates a behind pull request whose required checks failed only because the base commit they tested failed them too (section "The base was red"). Set it only when the job of every required check runs the `tested-base` action. Default `false`.                                      |
 
 ## Lens comments
 
@@ -174,6 +174,122 @@ exists.
 `--lock-file` (default: `STATE.lock`) keeps two runs from overlapping.
 `--dry-run` takes no lock and writes nothing: no `STATE`, no cache, no comment.
 
+## The base was red
+
+A `pull_request` run tests GitHub's merge of the head into the base as the
+base was when the run started. When that base commit failed the same check,
+the red says nothing about the pull request, and nothing runs the check again
+on a newer base. With `update_when_base_was_red`, a behind pull request with
+red required checks is therefore updated when, for every red required check:
+
+- the job of the check's newest run names the base commit it tested (the
+  `tested-base` action's note);
+- that base commit has a real failure of the same check (`FAILURE` or
+  `ERROR`: a cancel, a time-out, a skip or no result says nothing about the
+  base's code); and
+- the base branch's tip has the check green now.
+
+When the base tip is not green yet, the pull request is told once, per head
+and check, that it failed as on its base and that the queue updates it by
+itself once the base is green. It does not hold the queue meanwhile. When
+anything is unknown (no note among the job's first 100 annotations, a failed read,
+more than 100 checks on a commit), the red counts as the pull request's own, as without
+the rule. There is no state and no loop: after the update the new runs test a
+green base, so a red then is the pull request's own. A re-run of the old merge
+names the old red base again and is updated, which it needs.
+
+The base branch's pushes must run the required checks under the same names,
+or every base commit has "no result" and no red is ever the base's. The rule
+reads the tested base from the job, never from a clock: a job that starts late
+or a re-run of an old merge still tests the base its merge commit holds.
+
+The note is an annotation on the job, titled `pr_queue tested base`, whose
+message is the merge commit's first parent. `tested-base/` writes it only on a
+`pull_request` run whose checkout is exactly the run's merge commit (`HEAD` is
+`GITHUB_SHA`, with two parents, the second the event's pull request head).
+Otherwise it writes a warning and no note. It never fails the job, and a
+depth-1 checkout is enough. The pull request's own code runs in that job and
+could write such a note too. A forged note can only get a red pull request
+updated, or told that its base is the reason; it never re-arms one, because
+the re-arm still needs exactly the change the lenses read.
+
+## Use it
+
+The queue needs:
+
+- a self-hosted runner whose disk outlives the job, with git 2.38+, `gh` and
+  `python3`: the plan in `--state-file` and the cache must be there for the
+  next run. That runner (or runner group) runs no `pull_request` job and no
+  other repository's job, as a user of its own, and the state and cache
+  folders are that user's alone: the token is in git's environment there, and
+  the plan decides what is re-armed ("The queue");
+- a required `head_check` that fails a head no lens read. The queue only
+  touches pull requests that are behind; without that check, a push to an
+  armed pull request that is already up to date merges unread;
+- a run after each push to the base branch and on a timer, so a pull request
+  armed while the base is quiet is still picked up;
+- a token that can update branches, comment and merge (a fine-grained personal
+  access token or a GitHub App token with contents, pull requests and issues
+  write). Not the run's `GITHUB_TOKEN`: a branch update pushed with it starts
+  no workflow, so the updated pull request would never get its checks. The
+  action refuses it.
+
+### The reusable workflow
+
+```yaml
+name: PR queue
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+permissions: {}
+jobs:
+  queue:
+    permissions:
+      contents: read
+    uses: OWNER/REPO/.github/workflows/fork-pr-queue.yml@<40-hex sha>
+    with:
+      runs-on: '["self-hosted", "queue"]'
+      config: .github/pr-queue.json
+      state-file: /srv/pr-queue/plan.json
+      cache: /srv/pr-queue/cache.git
+    secrets:
+      token: ${{ secrets.PR_QUEUE_TOKEN }}
+```
+
+It runs only on `push`, `schedule` and `workflow_dispatch`, so the code that
+merges pull requests never runs for a pull request. It checks out only the
+config file from the caller, and the queue from the workflow's own repository
+and commit (`job.workflow_repository`, `job.workflow_sha`, runner 2.334.0 or
+newer): the queue that runs is the one the caller pinned. One run per
+repository at a time, never cancelled half-way. Inputs: `runs-on`, `config`,
+`state-file`, `cache`, `lock-file` and `dry-run`, as in "The queue".
+
+### The actions
+
+A project that writes its own job can use the action directly, after a
+checkout of its config:
+
+```yaml
+- uses: OWNER/REPO/fork-ci/actions/pr-queue@<40-hex sha>
+  with:
+    config: .github/pr-queue.json
+    state-file: /srv/pr-queue/plan.json
+    cache: /srv/pr-queue/cache.git
+    token: ${{ secrets.PR_QUEUE_TOKEN }}
+```
+
+With `update_when_base_was_red`, the job of every required check runs
+`tested-base` right after its checkout of the merge commit (`path` is the
+checkout's path, default `.`):
+
+```yaml
+- uses: actions/checkout@<sha>
+- uses: OWNER/REPO/fork-ci/actions/pr-queue/tested-base@<40-hex sha>
+```
+
 ## Where the rules come from
 
 `lens.py` is a port of a production queue's review rules, behaviour for
@@ -202,3 +318,12 @@ required check that never reported, the comment says to push or merge the
 base; the source said to re-run, which cannot add a check the head's workflow
 files do not have. With two red checks the comment names the first by name
 (the source named whichever the check list gave first).
+
+The "base was red" rule is a port of a change proposed to the source queue,
+with its tests. What the port changed: the rule is off unless the config turns
+it on; the note is written by a general action (`tested-base/`) that also
+checks the checkout is the run's merge commit, where the source had a step in
+the project's own CI; a job's annotations are read 100 to a page (the source
+read GitHub's default page of 30) and a commit with more than 100 checks is
+unknown (the source read the first 100 as all); and red checks are looked at
+in name order, so a run names the same reason each time.
