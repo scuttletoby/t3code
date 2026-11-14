@@ -102,6 +102,22 @@ names the rows that have no `release` of their own; set the lock's `release` bac
 | `cache dir ... must be an absolute path`                                                                   | `cache-dir` is relative (it would be a folder in the checkout, wiped on every run).                                                                                        | Use an absolute path or `~/...`.                                                                                                                                                                                                       |
 | `WARN: cache ... cannot be used / read / written`                                                          | The cache dir is another user's, read-only, or the disk is full. Stage still works.                                                                                        | Fix the folder's owner or free space; until then every run downloads.                                                                                                                                                                  |
 
+## Python API
+
+A project's tool outside a workflow (a deploy script that stages the same jars) loads this module from the release
+it pins, checked by blob id ([`pinned`](../pinned/README.md): `load(config, 'gradle-cache', 'gradle_cache')`).
+Callers may import exactly these names; anything else may change in any release.
+
+| Name                                                                 | What it does                                                                          |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `stage(lock_file, out, gh, cache=CACHE, max_age_days=30, say=print)` | the `stage` step: every lock file into the empty folder `out`, whole or not at all    |
+| `check(lock_file, gh, say=print)`                                    | the `check` command: every lock row is a listed, finished asset that matches          |
+| `GitHub(token, repo)`                                                | the `gh` argument: the two read calls, with a token that can read the repo's releases |
+| `Refused`                                                            | the error for anything that is not as the lock says (nothing is staged)               |
+| `CACHE`                                                              | the default cache folder (`$XDG_CACHE_HOME/fork-ci-gradle-cache`)                     |
+
+`publish` and `prune` are commands only: run them with `python3 -I gradle_cache.py ...` (or `pinned.py run`).
+
 ## Tests
 
 ```bash
