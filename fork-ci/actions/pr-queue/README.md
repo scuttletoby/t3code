@@ -31,7 +31,7 @@ an error: the queue then exits non-zero and touches no pull request.
 | `required_checks`          | yes      | Exactly the checks the branch ruleset requires. Not empty.                                                                                                                                                                                                                                     |
 | `merge_method`             | yes      | `merge`, `squash` or `rebase`: how auto-merge is turned back on.                                                                                                                                                                                                                               |
 | `delete_branch`            | yes      | Whether auto-merge deletes the branch after merging.                                                                                                                                                                                                                                           |
-| `bot_logins`               | yes      | Logins whose comments never count as a lens. Any login ending in `[bot]` is a bot too. May be empty.                                                                                                                                                                                           |
+| `bot_logins`               | yes      | Logins whose comments never count as a lens. May be empty. A login ending in `[bot]` or an author of type Bot is a bot too, but gh gives only the login, without `[bot]`: list every bot here.                                                                                                 |
 | `lens_author_associations` | yes      | Whose comments count as lens comments: GitHub's author association of the comment, from `OWNER`, `MEMBER`, `COLLABORATOR`. Everyone else's comments are ignored (Lens comments). `MEMBER` and `COLLABORATOR` do not mean write access: list only those whose holders may all vouch for a head. |
 | `override`                 | yes      | The comment that vouches for a head when the lenses read older commits: `<prefix> <40-hex sha>: <why>`, posted with this author association (`OWNER`, `MEMBER` or `COLLABORATOR`, with the same caveat) and never edited.                                                                      |
 | `ready_command`            | yes      | The command people run to re-arm a pull request after a lens read; `{pr}` is the number. Only quoted in the queue's comments.                                                                                                                                                                  |
@@ -245,7 +245,9 @@ The queue needs:
   the plan decides what is re-armed ("The queue");
 - a required `head_check` that fails a head no lens read. The queue only
   touches pull requests that are behind; without that check, a push to an
-  armed pull request that is already up to date merges unread;
+  armed pull request that is already up to date merges unread. The
+  [head-check](../head-check/README.md) action is that check, with the
+  queue's own rules;
 - a run after each push to the base branch and on a timer, so a pull request
   armed while the base is quiet is still picked up;
 - a token that can update branches, comment and merge (a fine-grained personal
