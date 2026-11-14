@@ -1,0 +1,86 @@
+name: Fork interaction limit
+
+# Fork only. A public repository whose issues people (or agents) read as trusted needs its
+# interaction limit, and GitHub ends every limit after six months at most. Each week this reads
+# the limit and fails when it is missing, not the configured one, or ends within the margin; it
+# then opens one issue, "Interaction limit needs attention" (or comments on the open one), and
+# closes that issue on the next good run. It never sets the limit: that needs the repository's
+# Administration write permission, which this workflow does not hold. Renew it with
+# `fork-interaction-limit.sh renew` where gh is logged in as an administrator (the issue says how).
+#
+# GitHub's workflow token cannot read interaction limits at all (REST answers 403, and GraphQL's
+# interactionAbility reads null, the same as "no limit"). So the read uses the repository secret
+# FORK_INTERACTION_LIMIT_TOKEN: a fine-grained token for this repository with Administration
+# read-only and nothing else. Without it every run fails and says so.
+#
+# Repository variables (optional): FORK_INTERACTION_LIMIT (default collaborators_only; one of
+# existing_users, contributors_only, collaborators_only) and FORK_INTERACTION_LIMIT_DAYS (default 30).
+# No pull request starts this workflow, so the secret never meets pull request code, and the
+# token is read only on main: a manual run on another branch stops red before it (no issue either).
+# The owner's renewal timer runs `renew --if-under 75` monthly (75 = this margin, 30, plus a month).
+# Script and tests: .github/scripts/fork-interaction-limit.sh, fork-interaction-limit.test.sh.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: fork-interaction-limit
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the interaction limit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # The read token is only for the reviewed code on main. A manual run on another branch stops
+      # here, red, before any step that sees the token or touches an issue.
+      - name: Only on main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::notice::This workflow reads the interaction limit only on main (this run is on $REF); skipped."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: |
+            /.github/scripts/fork-gh-guard.sh
+            /.github/scripts/fork-interaction-limit.sh
+          sparse-checkout-cone-mode: false
+
+      # Only this step sees the read token, and only through GH_TOKEN; the result goes to a file.
+      - name: Read the interaction limit
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.FORK_INTERACTION_LIMIT_TOKEN }}
+          LIMIT: ${{ vars.FORK_INTERACTION_LIMIT || 'collaborators_only' }}
+          DAYS: ${{ vars.FORK_INTERACTION_LIMIT_DAYS || '30' }}
+          RESULT: ${{ runner.temp }}/interaction-limit.txt
+        run: |
+          set -uo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            msg="The repository secret FORK_INTERACTION_LIMIT_TOKEN is not set, so the interaction limit of $GITHUB_REPOSITORY could not be read (GitHub's workflow token cannot read it). Add a fine-grained token for this repository with Administration read-only."
+            printf 'error\n%s\n' "$msg" > "$RESULT"
+            echo "::error::$msg"
+            exit 2
+          fi
+          bash .github/scripts/fork-interaction-limit.sh check --limit "$LIMIT" --days "$DAYS" --out "$RESULT"
+
+      # With the workflow token (issues: write). Fails the run when the check did not pass.
+      - name: Issue and the run's status
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LIMIT: ${{ vars.FORK_INTERACTION_LIMIT || 'collaborators_only' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .github/scripts/fork-interaction-limit.sh report "$RUNNER_TEMP/interaction-limit.txt" --limit "$LIMIT"
