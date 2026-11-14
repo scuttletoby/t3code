@@ -122,7 +122,9 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.guard.outputs.prs) }}
     concurrency:
-      group: head-gate-${{ github.repository }}-${{ matrix.sha }}
+      # Per check name too: concurrency groups are repository-wide, and a newly queued job cancels the one pending in
+      # its group, so two gates (two check names) on one head must never share a group.
+      group: head-gate-${{ github.repository }}-${{ inputs.check-name }}-${{ matrix.sha }}
       cancel-in-progress: false # one run per head works, one waits, and the waiting one reads the newest state
     steps:
       - name: Find this workflow's own commit

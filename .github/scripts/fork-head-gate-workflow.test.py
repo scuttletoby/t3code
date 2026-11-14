@@ -77,9 +77,39 @@ check("one gate job per head, from the guard job's list of {pr, sha}; one failin
       (gate.get("strategy") or {}).get("matrix") == {"include": "${{ fromJSON(needs.guard.outputs.prs) }}"}
       and (gate.get("strategy") or {}).get("fail-fast") is False)
 conc = gate.get("concurrency") or {}
-check("one gate run per HEAD at a time (a check run belongs to the commit), never cancelled half-way",
-      conc.get("group") == "head-gate-${{ github.repository }}-${{ matrix.sha }}"
+check("one gate run per check name and HEAD at a time (a check run belongs to the commit), never cancelled half-way",
+      conc.get("group") == "head-gate-${{ github.repository }}-${{ inputs.check-name }}-${{ matrix.sha }}"
       and conc.get("cancel-in-progress") is False, str(conc))
+
+
+def render(expr, ctx):
+    return re.sub(r"\$\{\{\s*([^}]+?)\s*\}\}", lambda m: str(ctx.get(m.group(1), "")), expr)
+
+
+def cancelled_by_queue(jobs):
+    """GitHub's rule: per group (repository-wide) one running job and one pending; a newly queued job cancels the
+    pending one of its group. `jobs` is a list of (job, group) in queue order; returns the cancelled jobs."""
+    running, pending, cancelled = {}, {}, []
+    for job, group in jobs:
+        if group not in running:
+            running[group] = job
+            continue
+        if group in pending:
+            cancelled.append(pending[group])
+        pending[group] = job
+    return cancelled
+
+
+# corr85r2 L1: two gates in one repository (two callers, or one with two check names) on one head. An issue comment
+# queues both gates' runs while earlier ones still run: neither may cancel the other's pending (revoking) run.
+H = "a1" * 20
+def group(name):
+    return render(str(conc.get("group", "")), {"github.repository": "o/p", "matrix.sha": H, "inputs.check-name": name})
+lost = cancelled_by_queue([(("push", "correctness-gate"), group("correctness-gate")),
+                           (("push", "security-gate"), group("security-gate")),
+                           (("revoke", "correctness-gate"), group("correctness-gate")),
+                           (("revoke", "security-gate"), group("security-gate"))])
+check("two gates (two check names) on one head never cancel each other's pending run", lost == [], str(lost))
 check("the guard job hands on the list and the guard's answer (ok or fail: fail = the gate posts only failures)",
       guard.get("outputs") == {"prs": "${{ steps.prs.outputs.prs }}", "guard": "${{ steps.guard.outputs.guard }}"})
 
