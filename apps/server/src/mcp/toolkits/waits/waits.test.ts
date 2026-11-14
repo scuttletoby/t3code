@@ -715,4 +715,37 @@ it.layer(NodeServices.layer)("wait tools", (it) => {
         }).pipe(Effect.provide(toolsLayer({ filePath })));
       }),
   );
+
+  // A delivering wait cannot be cancelled, so it must not make a narrower child's own cancel refused.
+  it.effect("cancel by own threadId ignores a handed-over wait that is delivering", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const { filePath } = yield* workspace;
+      yield* seed(filePath, {
+        version: 1,
+        waits: [
+          oldRecord({
+            id: "w_handedaaaa",
+            threadId: PARENT,
+            via: [CALLER],
+            handedOverBecause: "stopped",
+            state: "delivering",
+            key: "4444444444444444", // gitleaks:allow (a fake test value, not a key)
+          }),
+          oldRecord({ id: "w_ownwaitbbb", threadId: CALLER }),
+        ],
+      });
+      const shells = new Map([
+        [CALLER, callerShell({ runtimeMode: "approval-required" })],
+        [PARENT, McpToolAccessTestkit.liveThreadShell(PARENT)],
+      ]);
+      yield* Effect.gen(function* () {
+        const result = yield* call("wait_cancel", { threadId: CALLER });
+        expect(succeeded(result)).toEqual({
+          cancelled: ["w_ownwaitbbb"],
+          notCancelled: [{ waitId: "w_handedaaaa", state: "delivering" }],
+        });
+      }).pipe(Effect.provide(toolsLayer({ filePath, settings: ON, shells })));
+    }),
+  );
 });

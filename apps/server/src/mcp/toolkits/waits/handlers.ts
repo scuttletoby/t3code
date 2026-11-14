@@ -85,8 +85,10 @@ const handlers = {
           projectId,
           scope: "project",
         });
+        // Only a waiting wait can be cancelled; a delivering one must not make the call refused.
         const holders = new Set(
           open.waits
+            .filter((wait) => wait.state === "waiting")
             .filter((wait) =>
               input.waitId !== undefined
                 ? wait.waitId === input.waitId
