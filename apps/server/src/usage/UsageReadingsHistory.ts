@@ -1,3 +1,6 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The account hash must be a deterministic digest.
+import * as NodeCrypto from "node:crypto";
+
 import {
   IsoDateTime,
   ProviderInstanceId,
@@ -6,6 +9,7 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
+import { providerAccountKey } from "@t3tools/shared/usageLimits";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -24,53 +28,104 @@ import { forkParked } from "../serverActivation.ts";
 export const UsageReading = Schema.Struct({
   checkedAt: IsoDateTime,
   windows: Schema.Array(ServerProviderUsageWindow),
-  /** A new fingerprint means another account now sits behind the instance. */
-  credentialFingerprint: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * Short hash of the account the Limits UI groups the instance under (driver + email +
+   * workspace, or the credential fingerprint). A new value means another account now sits behind
+   * the instance; two instances with one value share one account.
+   */
+  account: Schema.optional(TrimmedNonEmptyString),
   unavailable: Schema.optional(Schema.Literals(["unsupported", "probeFailed"])),
 });
 export type UsageReading = typeof UsageReading.Type;
 
-const decodeReadingLine = Schema.decodeUnknownOption(Schema.fromJsonString(UsageReading));
+export interface AccountReading {
+  readonly instanceId: ProviderInstanceId;
+  readonly reading: UsageReading;
+}
+
+/** A history file exists but could not be read; it is left untouched. */
+export class UsageHistoryUnreadable extends Schema.TaggedError<UsageHistoryUnreadable>()(
+  "UsageHistoryUnreadable",
+  { instanceId: Schema.String, detail: Schema.String },
+) {
+  override get message(): string {
+    return `usage readings of ${this.instanceId} cannot be read: ${this.detail}`;
+  }
+}
+
+const decodeReading = Schema.decodeUnknownOption(UsageReading);
 const decodeInstanceId = Schema.decodeUnknownOption(ProviderInstanceId);
 
 const HISTORY_DIRECTORY = "usage-readings";
-const DAY_MS = 24 * 60 * 60 * 1000;
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
 /** Covers a monthly window plus its predecessor's last days. */
 export const DEFAULT_RETENTION_MS = 35 * DAY_MS;
 /** An unchanged meter is still recorded this often, so the history shows it was read. */
-const DEFAULT_HEARTBEAT_MS = 30 * 60 * 1000;
+const DEFAULT_HEARTBEAT_MS = 30 * MINUTE_MS;
 /** Hard bound per instance; compaction keeps the newest. */
-const MAX_READINGS_PER_INSTANCE = 20_000;
-const APPENDS_BETWEEN_COMPACTIONS = 1_000;
+const DEFAULT_MAX_READINGS_PER_INSTANCE = 20_000;
+const DEFAULT_APPENDS_BETWEEN_COMPACTIONS = 1_000;
+/** Readings older than this are thinned at compaction... */
+const DEFAULT_THIN_AFTER_MS = 2 * DAY_MS;
+/** ...to one per this interval, plus every reading that changed more than the meter. */
+const DEFAULT_THIN_INTERVAL_MS = 15 * MINUTE_MS;
+/** A reading stamped further ahead of the clock than this is not used until the clock gets there. */
+const FUTURE_TOLERANCE_MS = 5 * MINUTE_MS;
+/** A meter move smaller than this is jitter; pacing acts on whole points. */
+const METER_STEP = 0.1;
+/** Reset times that differ by less than this are the same reset. */
+const RESET_STEP_MS = MINUTE_MS;
+const FLOAT_SLACK = 1e-9;
+
+/** Hashed account key of a provider, so no email or workspace id lands on disk. */
+export function accountOf(provider: ServerProvider): string | undefined {
+  const key = providerAccountKey(provider);
+  if (key === null) return undefined;
+  return NodeCrypto.createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
 
 function readingOf(provider: ServerProvider): UsageReading | undefined {
   const limits = provider.usageLimits;
   if (limits === undefined) return undefined;
+  const account = accountOf(provider);
   return {
     checkedAt: limits.checkedAt,
     windows: limits.windows.map((window) => ({ ...window })),
-    ...(limits.credentialFingerprint === undefined
-      ? {}
-      : { credentialFingerprint: limits.credentialFingerprint }),
+    ...(account === undefined ? {} : { account }),
     ...(limits.unavailable === undefined ? {} : { unavailable: limits.unavailable.reason }),
   };
 }
 
-// Stream updates carry fractional percentages; a tenth of a point is below anything pacing acts on.
-const meterSignature = (reading: UsageReading): string =>
-  JSON.stringify([
-    reading.credentialFingerprint ?? null,
-    reading.unavailable ?? null,
-    reading.windows
-      .map((window) => [
-        window.id,
-        window.kind,
-        Math.round(window.usedPercent * 10),
-        window.resetsAt ?? null,
-        window.windowDurationMins ?? null,
-      ])
-      .toSorted((left, right) => String(left[0]).localeCompare(String(right[0]))),
-  ]);
+const msOf = (reading: UsageReading) => Date.parse(reading.checkedAt);
+
+function resetMoved(previous: string | undefined, next: string | undefined): boolean {
+  if (previous === undefined || next === undefined) return previous !== next;
+  return Math.abs(Date.parse(next) - Date.parse(previous)) >= RESET_STEP_MS;
+}
+
+/** Window set, kind, length or reset changed, or a meter moved by at least `meterStep` points. */
+function windowsChanged(previous: UsageReading, next: UsageReading, meterStep: number): boolean {
+  if (previous.windows.length !== next.windows.length) return true;
+  const before = new Map(previous.windows.map((window) => [window.id, window]));
+  return next.windows.some((window) => {
+    const old = before.get(window.id);
+    return (
+      old === undefined ||
+      old.kind !== window.kind ||
+      (old.windowDurationMins ?? null) !== (window.windowDurationMins ?? null) ||
+      resetMoved(old.resetsAt, window.resetsAt) ||
+      Math.abs(window.usedPercent - old.usedPercent) >= meterStep - FLOAT_SLACK
+    );
+  });
+}
+
+/** Changes other than meter moves: account, availability, windows or their resets. */
+const structureChanged = (previous: UsageReading, next: UsageReading) =>
+  previous.account !== next.account ||
+  previous.unavailable !== next.unavailable ||
+  windowsChanged(previous, next, Number.POSITIVE_INFINITY);
 
 /** Whether `next` adds information to a history that ends with `previous`. */
 export function shouldRecord(
@@ -79,34 +134,93 @@ export function shouldRecord(
   heartbeatMs: number = DEFAULT_HEARTBEAT_MS,
 ): boolean {
   if (previous === undefined) return true;
-  const previousMs = Date.parse(previous.checkedAt);
-  const nextMs = Date.parse(next.checkedAt);
+  const previousMs = msOf(previous);
+  const nextMs = msOf(next);
   // A republished or older snapshot (cache hydration, out-of-order events) is never history.
   if (!(nextMs > previousMs)) return false;
-  return meterSignature(previous) !== meterSignature(next) || nextMs - previousMs >= heartbeatMs;
-}
-
-/** Valid readings of one history file, oldest first. Torn or foreign lines are skipped. */
-function parseHistory(contents: string): Array<UsageReading> {
-  const readings: Array<UsageReading> = [];
-  for (const line of contents.split("\n")) {
-    if (line.trim().length === 0) continue;
-    const decoded = decodeReadingLine(line);
-    if (decoded._tag === "Some") readings.push(decoded.value);
-  }
-  return readings.toSorted(
-    (left, right) => Date.parse(left.checkedAt) - Date.parse(right.checkedAt),
+  return (
+    structureChanged(previous, next) ||
+    windowsChanged(previous, next, METER_STEP) ||
+    nextMs - previousMs >= heartbeatMs
   );
 }
 
-/** Readings inside the retention window, at most `MAX_READINGS_PER_INSTANCE`, newest kept. */
-function retainReadings(
-  readings: ReadonlyArray<UsageReading>,
-  nowMs: number,
-  retentionMs: number,
-): Array<UsageReading> {
-  const kept = readings.filter((reading) => Date.parse(reading.checkedAt) >= nowMs - retentionMs);
-  return kept.slice(Math.max(0, kept.length - MAX_READINGS_PER_INSTANCE));
+/** One line of a history file; `reading` is absent when the line no longer decodes. */
+interface HistoryLine {
+  readonly ms: number;
+  readonly text: string;
+  readonly reading: UsageReading | undefined;
+}
+
+/**
+ * Lines of one history file, oldest first. Torn lines are dropped. A complete line that no longer
+ * decodes (written by another T3 version) is kept as text, so compaction does not delete it.
+ */
+function parseHistory(contents: string): Array<HistoryLine> {
+  const lines: Array<HistoryLine> = [];
+  for (const raw of contents.split("\n")) {
+    const text = raw.trim();
+    if (text.length === 0) continue;
+    let json: unknown;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    const decoded = decodeReading(json);
+    if (decoded._tag === "Some") {
+      lines.push({ ms: msOf(decoded.value), text, reading: decoded.value });
+      continue;
+    }
+    const checkedAt =
+      typeof json === "object" && json !== null && "checkedAt" in json ? json.checkedAt : undefined;
+    const ms = typeof checkedAt === "string" ? Date.parse(checkedAt) : Number.NaN;
+    if (Number.isFinite(ms)) lines.push({ ms, text, reading: undefined });
+  }
+  return lines.toSorted((left, right) => left.ms - right.ms);
+}
+
+/** Readings the history serves: decoded and not stamped ahead of the clock. */
+const usableReadings = (lines: ReadonlyArray<HistoryLine>, nowMs: number) =>
+  lines.flatMap((line) =>
+    line.reading !== undefined && line.ms <= nowMs + FUTURE_TOLERANCE_MS ? [line.reading] : [],
+  );
+
+interface RetentionRules {
+  readonly retentionMs: number;
+  readonly thinAfterMs: number;
+  readonly thinIntervalMs: number;
+  readonly maxReadings: number;
+}
+
+/**
+ * Lines to keep, oldest first. Ages count back from `baseMs`, the newest reading of any instance
+ * (or now, if earlier), so a clock that is far ahead at start cannot age the whole history out.
+ */
+function retainLines(
+  lines: ReadonlyArray<HistoryLine>,
+  baseMs: number,
+  rules: RetentionRules,
+): Array<HistoryLine> {
+  const kept: Array<HistoryLine> = [];
+  let lastThinned: HistoryLine | undefined;
+  for (const line of lines) {
+    if (line.ms < baseMs - rules.retentionMs) continue;
+    if (line.reading !== undefined && line.ms < baseMs - rules.thinAfterMs) {
+      const previous = lastThinned?.reading;
+      if (
+        lastThinned !== undefined &&
+        previous !== undefined &&
+        !structureChanged(previous, line.reading) &&
+        line.ms - lastThinned.ms < rules.thinIntervalMs
+      ) {
+        continue;
+      }
+      lastThinned = line;
+    }
+    kept.push(line);
+  }
+  return kept.slice(Math.max(0, kept.length - rules.maxReadings));
 }
 
 const encodeLine = (reading: UsageReading) => `${JSON.stringify(reading)}\n`;
@@ -117,12 +231,20 @@ export class UsageReadingsHistory extends Context.Service<
   {
     /** Appends each instance's reading when it changed, or when the heartbeat is due. */
     readonly record: (providers: ReadonlyArray<ServerProvider>) => Effect.Effect<void>;
-    /** Readings of one instance, oldest first; empty when there is no history. */
+    /** Readings of one instance, oldest first, served from memory; empty when there is none. */
     readonly readings: (
       instanceId: ProviderInstanceId,
       options?: { readonly sinceMs?: number },
-    ) => Effect.Effect<ReadonlyArray<UsageReading>>;
-    /** Applies retention to every history file; also drops torn lines left by a crash. */
+    ) => Effect.Effect<ReadonlyArray<UsageReading>, UsageHistoryUnreadable>;
+    /**
+     * Readings of one account (`accountOf`) across every loaded instance, oldest first. After an
+     * account swap an instance's readings move to the new account, so each account is one series.
+     */
+    readonly readingsOfAccount: (
+      account: string,
+      options?: { readonly sinceMs?: number },
+    ) => Effect.Effect<ReadonlyArray<AccountReading>>;
+    /** Applies retention and thinning to every history file; also drops torn lines. */
     readonly compact: Effect.Effect<void>;
   }
 >()("t3/usage/UsageReadingsHistory") {}
@@ -131,50 +253,97 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
   readonly directory: string;
   readonly retentionMs?: number;
   readonly heartbeatMs?: number;
+  readonly maxReadingsPerInstance?: number;
+  readonly appendsBetweenCompactions?: number;
+  readonly thinAfterMs?: number;
+  readonly thinIntervalMs?: number;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
   const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const appendsBetweenCompactions =
+    options.appendsBetweenCompactions ?? DEFAULT_APPENDS_BETWEEN_COMPACTIONS;
+  const rules: RetentionRules = {
+    retentionMs: options.retentionMs ?? DEFAULT_RETENTION_MS,
+    thinAfterMs: options.thinAfterMs ?? DEFAULT_THIN_AFTER_MS,
+    thinIntervalMs: options.thinIntervalMs ?? DEFAULT_THIN_INTERVAL_MS,
+    maxReadings: options.maxReadingsPerInstance ?? DEFAULT_MAX_READINGS_PER_INSTANCE,
+  };
   const lock = yield* Semaphore.make(1);
-  const latest = new Map<ProviderInstanceId, UsageReading>();
+  /** Loaded histories, oldest first. An instance is absent until its file was read. */
+  const histories = new Map<ProviderInstanceId, Array<UsageReading>>();
+  /** Instances whose file is known to end with a newline, so an append needs none first. */
+  const cleanEnd = new Set<ProviderInstanceId>();
   const appendsSinceCompaction = new Map<ProviderInstanceId, number>();
+  let newestMs = Number.NEGATIVE_INFINITY;
 
   const fileOf = (instanceId: ProviderInstanceId) =>
     path.join(options.directory, `${instanceId}.jsonl`);
 
-  const readFile = (instanceId: ProviderInstanceId) =>
+  /** File contents; a missing file is empty, any other read error is not. */
+  const readContents = (instanceId: ProviderInstanceId) =>
     fs.readFileString(fileOf(instanceId)).pipe(
-      Effect.map(parseHistory),
       Effect.catchTags({
         PlatformError: (error) =>
           error.reason._tag === "NotFound"
-            ? Effect.succeed<Array<UsageReading>>([])
-            : Effect.logWarning("usage readings: history unreadable", {
-                instanceId,
-                error: error.message,
-              }).pipe(Effect.as<Array<UsageReading>>([])),
+            ? Effect.succeed("")
+            : Effect.fail(new UsageHistoryUnreadable({ instanceId, detail: error.message })),
       }),
     );
 
-  const compactInstance = Effect.fnUntraced(function* (instanceId: ProviderInstanceId) {
+  const remember = (instanceId: ProviderInstanceId, readings: Array<UsageReading>) => {
+    histories.set(instanceId, readings);
+    const last = readings.at(-1);
+    if (last !== undefined) newestMs = Math.max(newestMs, msOf(last));
+  };
+
+  const warnFuture = Effect.fnUntraced(function* (
+    instanceId: ProviderInstanceId,
+    lines: ReadonlyArray<HistoryLine>,
+  ) {
     const nowMs = yield* Clock.currentTimeMillis;
-    const kept = retainReadings(yield* readFile(instanceId), nowMs, retentionMs);
-    appendsSinceCompaction.set(instanceId, 0);
-    const last = kept.at(-1);
-    if (last === undefined) {
-      latest.delete(instanceId);
-      yield* fs.remove(fileOf(instanceId), { force: true });
-      return;
+    const ahead = lines.filter((line) => line.ms > nowMs + FUTURE_TOLERANCE_MS).length;
+    if (ahead > 0) {
+      yield* Effect.logWarning("usage readings: readings stamped ahead of the clock ignored", {
+        instanceId,
+        ahead,
+      });
     }
-    latest.set(instanceId, last);
-    yield* writeFileStringAtomically({
-      filePath: fileOf(instanceId),
-      contents: kept.map(encodeLine),
-    }).pipe(
-      Effect.provideService(FileSystem.FileSystem, fs),
-      Effect.provideService(Path.Path, path),
-    );
+  });
+
+  const load = Effect.fnUntraced(function* (instanceId: ProviderInstanceId) {
+    const loaded = histories.get(instanceId);
+    if (loaded !== undefined) return loaded;
+    const contents = yield* readContents(instanceId);
+    const lines = parseHistory(contents);
+    yield* warnFuture(instanceId, lines);
+    if (contents.length === 0 || contents.endsWith("\n")) cleanEnd.add(instanceId);
+    else cleanEnd.delete(instanceId);
+    const readings = usableReadings(lines, yield* Clock.currentTimeMillis);
+    remember(instanceId, readings);
+    return readings;
+  });
+
+  const writeCompacted = Effect.fnUntraced(function* (
+    instanceId: ProviderInstanceId,
+    lines: ReadonlyArray<HistoryLine>,
+  ) {
+    const nowMs = yield* Clock.currentTimeMillis;
+    const kept = retainLines(lines, Math.min(nowMs, newestMs), rules);
+    appendsSinceCompaction.set(instanceId, 0);
+    if (kept.length === 0) {
+      yield* fs.remove(fileOf(instanceId), { force: true });
+    } else {
+      yield* writeFileStringAtomically({
+        filePath: fileOf(instanceId),
+        contents: kept.map((line) => `${line.text}\n`),
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.provideService(Path.Path, path),
+      );
+    }
+    cleanEnd.add(instanceId);
+    histories.set(instanceId, usableReadings(kept, nowMs));
   });
 
   const logFailure = (operation: string, instanceId?: ProviderInstanceId) =>
@@ -186,14 +355,37 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
     Effect.gen(function* () {
       yield* fs.makeDirectory(options.directory, { recursive: true });
       const names = yield* fs.readDirectory(options.directory);
+      const nowMs = yield* Clock.currentTimeMillis;
+      // Read every history before writing any: retention counts back from the newest of all.
+      const parsed: Array<readonly [ProviderInstanceId, Array<HistoryLine>]> = [];
       for (const name of names) {
         const match = HISTORY_FILE.exec(name);
         const instanceId = match ? decodeInstanceId(match[1]) : null;
         if (instanceId?._tag !== "Some") continue;
-        yield* compactInstance(instanceId.value).pipe(logFailure("compaction", instanceId.value));
+        const id = instanceId.value;
+        // An unreadable file is skipped, never treated as empty: compaction would delete it.
+        yield* readContents(id).pipe(
+          Effect.flatMap((contents) =>
+            Effect.gen(function* () {
+              const lines = parseHistory(contents);
+              yield* warnFuture(id, lines);
+              remember(id, usableReadings(lines, nowMs));
+              parsed.push([id, lines]);
+            }),
+          ),
+          logFailure("compaction read", id),
+        );
+      }
+      for (const [instanceId, lines] of parsed) {
+        yield* writeCompacted(instanceId, lines).pipe(logFailure("compaction", instanceId));
       }
     }).pipe(logFailure("compaction")),
   );
+
+  const compactInstance = (instanceId: ProviderInstanceId) =>
+    readContents(instanceId).pipe(
+      Effect.flatMap((contents) => writeCompacted(instanceId, parseHistory(contents))),
+    );
 
   const record = (providers: ReadonlyArray<ServerProvider>) =>
     lock.withPermits(1)(
@@ -204,33 +396,65 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
             const reading = readingOf(provider);
             if (reading === undefined) return;
             const instanceId = provider.instanceId;
-            if (!latest.has(instanceId)) {
-              const last = (yield* readFile(instanceId)).at(-1);
-              if (last !== undefined) latest.set(instanceId, last);
+            const history = yield* load(instanceId);
+            // The clock stepped back: a reading now ahead of it must not block recording.
+            const nowMs = yield* Clock.currentTimeMillis;
+            for (
+              let last = history.at(-1);
+              last !== undefined && msOf(last) > nowMs + FUTURE_TOLERANCE_MS;
+              last = history.at(-1)
+            ) {
+              history.pop();
             }
-            if (!shouldRecord(latest.get(instanceId), reading, heartbeatMs)) return;
+            if (!shouldRecord(history.at(-1), reading, heartbeatMs)) return;
             yield* fs.makeDirectory(options.directory, { recursive: true });
-            yield* fs.writeFileString(fileOf(instanceId), encodeLine(reading), { flag: "a" });
-            latest.set(instanceId, reading);
+            // A torn last line (crash or partial write) must not swallow this reading.
+            const separator = cleanEnd.has(instanceId) ? "" : "\n";
+            cleanEnd.delete(instanceId);
+            yield* fs.writeFileString(fileOf(instanceId), separator + encodeLine(reading), {
+              flag: "a",
+            });
+            cleanEnd.add(instanceId);
+            history.push(reading);
+            newestMs = Math.max(newestMs, msOf(reading));
             const appends = (appendsSinceCompaction.get(instanceId) ?? 0) + 1;
             appendsSinceCompaction.set(instanceId, appends);
-            if (appends >= APPENDS_BETWEEN_COMPACTIONS) yield* compactInstance(instanceId);
+            if (appends >= appendsBetweenCompactions) {
+              yield* compactInstance(instanceId).pipe(logFailure("compaction", instanceId));
+            }
           }).pipe(logFailure("append", provider.instanceId)),
         { discard: true },
       ),
     );
 
+  const since = (sinceMs: number | undefined) => (reading: UsageReading) =>
+    msOf(reading) >= (sinceMs ?? Number.NEGATIVE_INFINITY);
+
   const readings = (
     instanceId: ProviderInstanceId,
     readOptions?: { readonly sinceMs?: number },
   ) => {
-    const sinceMs = readOptions?.sinceMs ?? Number.NEGATIVE_INFINITY;
-    return lock
-      .withPermits(1)(readFile(instanceId))
-      .pipe(Effect.map((all) => all.filter((reading) => Date.parse(reading.checkedAt) >= sinceMs)));
+    const loaded = histories.get(instanceId);
+    // Loaded histories are served from memory, without waiting for a write in progress.
+    const all =
+      loaded !== undefined ? Effect.succeed(loaded) : lock.withPermits(1)(load(instanceId));
+    return all.pipe(Effect.map((history) => history.filter(since(readOptions?.sinceMs))));
   };
 
-  return UsageReadingsHistory.of({ record, readings, compact });
+  const readingsOfAccount = (account: string, readOptions?: { readonly sinceMs?: number }) =>
+    Effect.sync(() =>
+      [...histories]
+        .flatMap(([instanceId, history]) =>
+          history
+            .filter(
+              (reading) => reading.account === account && since(readOptions?.sinceMs)(reading),
+            )
+            .map((reading): AccountReading => ({ instanceId, reading })),
+        )
+        .toSorted((left, right) => msOf(left.reading) - msOf(right.reading)),
+    );
+
+  return UsageReadingsHistory.of({ record, readings, readingsOfAccount, compact });
 });
 
 /** Compacts once at start, then records every provider snapshot change. */

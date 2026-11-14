@@ -246,6 +246,12 @@ function accountKeyResolver(reports: Iterable<AccountReport>) {
   };
 }
 
+/** The account a provider's limits belong to, keyed as the Limits UI groups accounts; null when unknown. */
+export function providerAccountKey(provider: ServerProvider): string | null {
+  const report = nativeReport(provider);
+  return accountKeyResolver([report])(report);
+}
+
 const hubAccountName = (account: { readonly id: string }) => account.id.replace(/\.json$/i, "");
 
 export interface LimitAccount {
