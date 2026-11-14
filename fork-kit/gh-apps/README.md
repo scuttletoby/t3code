@@ -119,7 +119,8 @@ and the two users.
 - **Stops half-way:** the steps run in this order: users, folders, tool, self-test, sudoers, wrapper, cleanup,
   record. The sudoers file, the only thing that lets an agent reach the tool, is placed only after the self-test
   passed, and only after `visudo -cf` accepts it (then `visudo -c` for the whole config, or it is removed again).
-  Files are written to a temporary name and renamed; a version folder is copied to a temporary folder and renamed;
+  If sudo's config already fails `visudo -c` before the kit touches it (another file is wrong), the installer
+  shows visudo's message and places nothing. Files are written to a temporary name and renamed; a version folder is copied to a temporary folder and renamed;
   a half-copied or changed version folder is made again. Running the same command again finishes the job.
 - **Old state:** see "Old copies" above. Existing keys, apps and agent users in `/etc/gh-apps` are kept. A link
   or file where the kit expects its own folder or link is refused with a message, never overwritten.

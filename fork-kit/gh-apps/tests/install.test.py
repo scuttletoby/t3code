@@ -184,13 +184,24 @@ class Install(Base):
 
     def test_bad_sudoers_is_never_placed(self):
         self.install(stop_after='selftest')
-        self.ops.visudo = lambda path: False
+        self.ops.visudo = lambda path: path is None   # the config is fine, the new file is not
         with self.assertRaisesRegex(Refused, 'did not pass visudo -cf; nothing was placed'):
             self.install()
         self.assertEqual(os.listdir(self.host.path('/etc/sudoers.d')), [])
-        self.ops.visudo = lambda path: path is not None   # the file alone passes, the whole config does not
-        with self.assertRaisesRegex(Refused, 'whole configuration'):
+        whole = iter((True, False))   # the whole config passes before, and fails with the new file in place
+        self.ops.visudo = lambda path: path is not None or next(whole)
+        with self.assertRaisesRegex(Refused, 'whole configuration did not pass visudo -c with the new file'):
             self.install()
+        self.assertEqual(os.listdir(self.host.path('/etc/sudoers.d')), [])
+        self.assertFalse(self.exists(c.WRAPPER))
+
+    def test_sudo_config_that_is_already_broken_is_named_and_nothing_placed(self):
+        self.install(stop_after='selftest')
+        self.ops.visudo = lambda path: path is not None   # another file in sudo's config is already wrong
+        self.ops.calls.clear()
+        with self.assertRaisesRegex(Refused, 'already fails visudo -c, before gh-apps changes it'):
+            self.install()
+        self.assertEqual([x for x in self.ops.calls if x[0] == 'visudo'], [('visudo', None)])
         self.assertEqual(os.listdir(self.host.path('/etc/sudoers.d')), [])
         self.assertFalse(self.exists(c.WRAPPER))
 

@@ -66,8 +66,17 @@ class RealHost(unittest.TestCase):
                 raise RuntimeError(f'user {name} already exists: this is not a throw-away runner')
         if os.path.lexists(c.ETC) or os.path.lexists(c.SUDOERS):
             raise RuntimeError('gh-apps is already installed here: this is not a throw-away runner')
-        before = run(['/usr/sbin/visudo', '-c'])   # the runner's own sudo config, for the log
-        print(f'visudo -c before the install: exit {before.returncode}\n{before.stdout}{before.stderr}', file=sys.stderr)
+        # GitHub's runner image ships /etc/sudoers.d/runner with a mode visudo -c refuses (the installer rightly
+        # refuses to add to a config that already fails). Fixed here, on the throw-away runner only.
+        for name in os.listdir('/etc/sudoers.d'):
+            path = os.path.join('/etc/sudoers.d', name)
+            st = os.lstat(path)
+            if st.st_uid == 0 and os.path.isfile(path) and not os.path.islink(path) and st.st_mode & 0o777 != 0o440:
+                print(f'runner fix: chmod 0440 {path} (was {oct(st.st_mode & 0o777)})', file=sys.stderr)
+                os.chmod(path, 0o440)
+        before = run(['/usr/sbin/visudo', '-c'])
+        if before.returncode != 0:
+            raise RuntimeError(f'the runner\'s sudo config fails visudo -c: {before.stdout}{before.stderr}')
         run(['/usr/sbin/useradd', '--create-home', '--shell', '/bin/sh', AGENT], check=True)
         cls.home = pwd.getpwnam(AGENT).pw_dir
         os.makedirs(FAKE_DIR, mode=0o755)

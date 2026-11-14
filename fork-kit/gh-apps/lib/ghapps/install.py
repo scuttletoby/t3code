@@ -289,6 +289,9 @@ def place_sudoers(ops, agents):
         with open(real, encoding='utf-8') as f:
             if f.read() == text:
                 return
+    if not ops.visudo_ok(None):   # sudo's config is already broken: say so, rather than blame the new file later
+        raise Refused('sudo\'s configuration already fails visudo -c, before gh-apps changes it (visudo\'s words '
+                      'above); fix that first and run again. Nothing was placed')
     new = real + '.new'   # sudo never reads a file whose name has a dot in it
     with contextlib.suppress(FileNotFoundError):
         os.unlink(new)
