@@ -63,6 +63,11 @@ The repository is public, so a pull request from another fork would otherwise
 run its own code on the owner's machines. Owner rule: pull requests from outside
 the fork never run on the fleet.
 
+The trust rule decides where a run's jobs run, not what may merge. Merging is
+decided by required checks; the one a pull request cannot rewrite is the head
+gate ([Gate trust](../docs/fork/gate-trust.md)). The gate always runs
+GitHub-hosted, so its App key is never on a fleet host.
+
 **The upstream sync's push runs GitHub-hosted.** Owner decision: upstream's
 code runs on GitHub-hosted runners only. The daily sync (`fork-follow.yml`)
 moves `main` with `FORK_PUSH_TOKEN`, the owner's own token, so the push run that
