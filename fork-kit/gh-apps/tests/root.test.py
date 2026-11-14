@@ -42,6 +42,11 @@ def as_agent(cmd, input=None, env=None, cwd=None):
                env={**base, **(env or {})}, input=input)
 
 
+def read(path):
+    with open(path, encoding='utf-8') as f:
+        return f.read()
+
+
 def user_gone(name):
     try:
         pwd.getpwnam(name)
@@ -74,6 +79,18 @@ class RealHost(unittest.TestCase):
             if st.st_uid == 0 and os.path.isfile(path) and not os.path.islink(path) and st.st_mode & 0o777 != 0o440:
                 print(f'runner fix: chmod 0440 {path} (was {oct(st.st_mode & 0o777)})', file=sys.stderr)
                 os.chmod(path, 0o440)
+        # Same for system folders the kit installs into: on the runner image some are writable by other users,
+        # which the kit's self-check (rightly) reports and an agent could use to swap its own wrapper link.
+        for folder in ('/usr', '/usr/local', '/usr/local/bin', '/usr/local/sbin', '/usr/local/libexec', '/usr/lib',
+                       '/etc', '/var', '/var/lib', '/var/cache'):
+            if not os.path.isdir(folder):
+                continue
+            st = os.lstat(folder)
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                print(f'runner fix: {folder} root-owned, not group/other-writable (was uid {st.st_uid}, '
+                      f'{oct(st.st_mode & 0o7777)})', file=sys.stderr)
+                os.chown(folder, 0, 0)
+                os.chmod(folder, st.st_mode & 0o7755)
         before = run(['/usr/sbin/visudo', '-c'])
         if before.returncode != 0:
             raise RuntimeError(f'the runner\'s sudo config fails visudo -c: {before.stdout}{before.stderr}')
@@ -146,11 +163,11 @@ class RealHost(unittest.TestCase):
         keys = pwd.getpwnam(c.KEYS_USER)
         os.chown(cache, keys.pw_uid, keys.pw_gid)
         os.chmod(cache, 0o600)
-        before = open(c.SUDOERS).read()
+        before = read(c.SUDOERS)
         proc = self.installer()   # run twice: the self-test now makes a token (from the cache) as ghkeys
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn('no app set up yet', proc.stderr)
-        self.assertEqual(open(c.SUDOERS).read(), before)
+        self.assertEqual(read(c.SUDOERS), before)
         self.assertEqual(install.self_check(), [])
 
     def test_4_agent_cannot_read_keys_or_cache_or_write_tool_files(self):
@@ -233,7 +250,7 @@ class RealHost(unittest.TestCase):
         self.assertEqual(as_agent([c.WRAPPER, '--self-check']).returncode, 0)
 
     def test_9a_bad_sudoers_is_never_placed(self):
-        before = open(c.SUDOERS).read()
+        before = read(c.SUDOERS)
         saved = install.sudoers_text
         install.sudoers_text = lambda agents: 'this is not sudoers syntax (((\n'
         try:
@@ -241,7 +258,7 @@ class RealHost(unittest.TestCase):
                 install.place_sudoers(install.Ops(), [AGENT])
         finally:
             install.sudoers_text = saved
-        self.assertEqual(open(c.SUDOERS).read(), before)
+        self.assertEqual(read(c.SUDOERS), before)
         self.assertFalse(os.path.lexists(c.SUDOERS + '.new'))
 
     def test_9b_uninstall_leaves_nothing(self):
