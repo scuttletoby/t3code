@@ -18,7 +18,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "6e4f4d400d7166d3"
+          "digest": "8652e29628b0a175"
         },
         {
           "name": "Detect affected jobs",
@@ -31,7 +31,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "b209d3ae4e2481dd"
+          "digest": "83c850d3098c06ef"
         },
         {
           "name": "Reject repository-owned PR assets",
@@ -43,7 +43,7 @@
         },
         {
           "name": "Cache Electron download",
-          "digest": "353e0a76c1955ee0"
+          "digest": "afdb0006e143d466"
         },
         {
           "name": "Ensure Electron runtime is installed",
@@ -72,7 +72,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "b209d3ae4e2481dd"
+          "digest": "83c850d3098c06ef"
         },
         {
           "name": "./.github/actions/setup-apt-mirrors",
@@ -88,7 +88,7 @@
         },
         {
           "name": "Cache Electron download",
-          "digest": "353e0a76c1955ee0"
+          "digest": "afdb0006e143d466"
         },
         {
           "name": "Ensure Electron runtime is installed",
@@ -116,7 +116,7 @@
         },
         {
           "name": "Upload desktop launch check",
-          "digest": "898b201dd5ae5f71"
+          "digest": "a4a89585b70cb0ab"
         },
         {
           "name": "Resolve Playwright version",
@@ -124,7 +124,7 @@
         },
         {
           "name": "Cache Chromium",
-          "digest": "404b1c6c70f7eab0"
+          "digest": "e360c1d7fd178302"
         },
         {
           "name": "Install Chromium for the built web client boot check",
@@ -149,7 +149,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "b209d3ae4e2481dd"
+          "digest": "83c850d3098c06ef"
         },
         {
           "name": "./.github/actions/setup-apt-mirrors",
@@ -165,7 +165,7 @@
         },
         {
           "name": "Cache Electron download",
-          "digest": "353e0a76c1955ee0"
+          "digest": "afdb0006e143d466"
         },
         {
           "name": "Ensure Electron runtime is installed",
@@ -194,7 +194,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "b209d3ae4e2481dd"
+          "digest": "83c850d3098c06ef"
         },
         {
           "name": "Setup Vite+",
@@ -206,7 +206,7 @@
         },
         {
           "name": "Cache Chromium",
-          "digest": "a26f01a6a03f3797"
+          "digest": "1f1fc75ded1851fa"
         },
         {
           "name": "Install Chromium for web browser tests",
@@ -227,7 +227,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "b300e7178ac6e5a0"
+          "digest": "414d9a1fa4fc85aa"
         },
         {
           "name": "Detect affected jobs",
@@ -243,7 +243,7 @@
         },
         {
           "name": "Cache Chromium",
-          "digest": "c11a7e038f53f2e0"
+          "digest": "410bccdc89e0ac7a"
         },
         {
           "name": "Install Chromium for server browser integration tests",
@@ -255,15 +255,15 @@
         },
         {
           "name": "Restore Vitest module cache",
-          "digest": "a9f2e0ea95ad6af3"
+          "digest": "ff42f8291600b670"
         },
         {
           "name": "Test",
-          "digest": "937c849dc92283cb"
+          "digest": "decbf8244ff65ce6"
         },
         {
           "name": "Save Vitest module cache",
-          "digest": "2af919f0e9798f00"
+          "digest": "896fd32a4db7dfa1"
         },
         {
           "name": "Detect transfer budget report",
@@ -275,7 +275,7 @@
         },
         {
           "name": "Upload thread transfer result",
-          "digest": "f063a55279351e0c"
+          "digest": "5d3c9cb05591e5a4"
         }
       ]
     },
@@ -284,11 +284,11 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "b209d3ae4e2481dd"
+          "digest": "83c850d3098c06ef"
         },
         {
           "name": "Setup Rust",
-          "digest": "7e4bade2fcac6c02"
+          "digest": "2b52d15a8560e03c"
         },
         {
           "name": "Check Rust formatting",
@@ -301,15 +301,15 @@
       ]
     },
     "mobile_native_static_analysis": {
-      "header": "8b1472b3fce2c1bf",
+      "header": "22a9dc11965bee9b",
       "steps": [
         {
           "name": "Checkout",
-          "digest": "3ac69f008422eb40"
+          "digest": "559b4f87dd8f2003"
         },
         {
           "name": "Setup Vite+",
-          "digest": "6e158a8bbd17c378"
+          "digest": "289f30a413b55820"
         },
         {
           "name": "Install mobile native static analysis tools",
@@ -326,7 +326,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "b209d3ae4e2481dd"
+          "digest": "83c850d3098c06ef"
         },
         {
           "name": "Setup Vite+",
@@ -347,7 +347,7 @@
         },
         {
           "name": "Require transfer measurements",
-          "digest": "67ca47d5bd5ffc3d"
+          "digest": "716bb52251949aaf"
         }
       ]
     }
@@ -371,7 +371,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "6c2d53c2bffa53dd"
+          "digest": "a5e723e41f37b298"
         },
         {
           "name": "Setup dependencies",
@@ -396,7 +396,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "6c2d53c2bffa53dd"
+          "digest": "a5e723e41f37b298"
         },
         {
           "name": "Setup dependencies",
@@ -425,7 +425,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "6c2d53c2bffa53dd"
+          "digest": "a5e723e41f37b298"
         },
         {
           "name": "Setup dependencies",
@@ -437,7 +437,7 @@
         },
         {
           "name": "Cache Chromium",
-          "digest": "a26f01a6a03f3797"
+          "digest": "1f1fc75ded1851fa"
         },
         {
           "name": "Install Chromium for web browser tests",
@@ -462,7 +462,7 @@
       "steps": [
         {
           "name": "Checkout",
-          "digest": "6c2d53c2bffa53dd"
+          "digest": "a5e723e41f37b298"
         },
         {
           "name": "Setup dependencies",
