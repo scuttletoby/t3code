@@ -68,6 +68,9 @@ def walk(root, rel, granted, chain, problems, seen):
     seen.add(key)
     wf = load(root, rel)
     top = normalise(wf.get("permissions"))
+    if chain:  # a called workflow's own top level may not ask for more than the caller grants either
+        for item in excess(top, granted):
+            problems.append(f"{' -> '.join(chain + [rel])} top-level permissions ask {item} (caller grants less)")
     for job_id, job in (wf.get("jobs") or {}).items():
         if not isinstance(job, dict):
             continue
@@ -82,6 +85,9 @@ def walk(root, rel, granted, chain, problems, seen):
             if not (root / callee).is_file():
                 problems.append(f"{rel} job {job_id} calls missing {callee}")
                 continue
+            if effective is UNKNOWN:  # the repository default applies: nothing here can be checked
+                problems.append(f"{rel} job {job_id} calls {callee} without permissions (set them on the job or workflow)")
+                continue
             walk(root, callee, effective, chain + [f"{rel}:{job_id}"], problems, seen)
 
 
@@ -93,7 +99,7 @@ def check_tree(root):
 
 
 def selftest():
-    """The check must catch the bug it exists for, nested and with skipped jobs, and pass the fix."""
+    """The check must catch each rule it exists for and pass the fixed shapes."""
     caller = """
 permissions: {contents: read}
 jobs:
@@ -122,23 +128,36 @@ jobs:
     runs-on: ubuntu-latest
     steps: [{run: "true"}]
 """
+    grant_write = caller.replace("actions: read, contents: write", "actions: write, contents: write")
+    plain_job = "    runs-on: ubuntu-latest\n    steps: [{run: \"true\"}]\n"
     cases = [
-        ("caller grants actions: read, nested job asks write -> fail", caller, True),
-        ("caller grants actions: write -> pass", caller.replace("actions: read, contents: write", "actions: write, contents: write"), False),
-        ("caller grants nothing ({}) -> fail", caller.replace("{actions: read, contents: write}", "{}"), True),
-        ("caller grants write-all -> pass", caller.replace("{actions: read, contents: write}", "write-all"), False),
+        # (name, caller, mid, leaf, want_fail)
+        ("first level asks more than the caller grants -> fail", caller, mid, leaf, True),
+        ("caller grants enough at every level -> pass", grant_write, mid, leaf, False),
+        ("caller grants write-all -> pass", caller.replace("{actions: read, contents: write}", "write-all"), mid, leaf, False),
+        ("only the second level asks more -> fail", grant_write, mid,
+         leaf.replace("permissions: {actions: write}", "permissions: {contents: write}"), True),
+        ("callee job without permissions takes the callee's top level (asks more) -> fail", grant_write,
+         "permissions: {actions: write, contents: write, issues: write}\njobs:\n  build:\n" + plain_job, leaf, True),
+        ("callee top level asks more though every job asks less -> fail", grant_write,
+         "permissions: {pages: write}\njobs:\n  build:\n    permissions: {contents: read}\n" + plain_job, leaf, True),
+        ("job permissions {} grant nothing, not the workflow default -> fail",
+         "permissions: write-all\njobs:\n  release:\n    permissions: {}\n    uses: ./.github/workflows/mid.yml\n",
+         "jobs:\n  build:\n    permissions: {contents: read}\n" + plain_job, leaf, True),
+        ("caller with no permissions anywhere calls a workflow -> fail",
+         "jobs:\n  release:\n    uses: ./.github/workflows/mid.yml\n", mid, leaf, True),
     ]
     ok = True
-    for name, text, want_fail in cases:
+    for name, top_text, mid_text, leaf_text, want_fail in cases:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             (root / ".github/workflows").mkdir(parents=True)
-            (root / ".github/workflows/fork-a.yml").write_text(text)
-            (root / ".github/workflows/mid.yml").write_text(mid)
-            (root / ".github/workflows/leaf.yml").write_text(leaf)
-            got_fail = bool(check_tree(root))
-        good = got_fail == want_fail
-        print(("ok   " if good else "FAIL ") + "selftest: " + name)
+            (root / ".github/workflows/fork-a.yml").write_text(top_text)
+            (root / ".github/workflows/mid.yml").write_text(mid_text)
+            (root / ".github/workflows/leaf.yml").write_text(leaf_text)
+            problems = check_tree(root)
+        good = bool(problems) == want_fail
+        print(("ok   " if good else "FAIL ") + "selftest: " + name + ("" if good else f"\n     | {problems}"))
         ok &= good
     return ok
 
