@@ -33,6 +33,7 @@ FULL_SHA = re.compile(r'[0-9a-f]{40}')
 NO_HEADER = 'comment without a first-line lens header'
 EDITED = 'edited after posting: post a new comment instead'
 HIDDEN = 'hidden: post a new comment instead'
+SHORT = 'not a full 40-hex sha'
 EMBEDDED = 'holds a lens header line'   # lens_problem: `not a lens:` cannot clear it
 # What a lens report looks like (ONE rule on normalised lines): on a plain line (outside code blocks and quotes) a
 # `lens:`, a `read at:` or `read at <hex>`, `safe to merge`, or in its first TOP_LINES plain lines a Markdown heading
@@ -148,13 +149,16 @@ def loose_header(line):
     return bool(m and HEX_RE.search(m.group(1)))
 
 
-def no_lens_text(text):
+def no_lens_text(text, keep_markdown=False):
     """Text that can never count as a lens read, name a lens or look like a lens report (lens_problem), for anything
-    the queue quotes into a comment (gh errors): no `read at`, no `lens:`, no `safe to merge`."""
-    text = clean_inline(text)
-    text = re.sub(r'\bread([\s-]*)at\b', r'read\1@', text, flags=re.I)
-    text = re.sub(r'\bsafe(\s+)to(\s+)merge\b', r'safe\1to\2land', text, flags=re.I)
-    return re.sub(r'\blens(\s*):', r'lens\1-', text, flags=re.I)
+    the queue quotes into a comment (gh errors): no `read at`, no `lens:`, no `safe to merge`. keep_markdown: the
+    queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown,
+    it holds none of these; otherwise it is cleaned like any other text."""
+    plain = clean_inline(text)
+    out = re.sub(r'\bread([\s-]*)at\b', r'read\1@', plain, flags=re.I)
+    out = re.sub(r'\bsafe(\s+)to(\s+)merge\b', r'safe\1to\2land', out, flags=re.I)
+    out = re.sub(r'\blens(\s*):', r'lens\1-', out, flags=re.I)
+    return text if keep_markdown and out == plain else out
 
 
 def check_state(c):
@@ -314,6 +318,6 @@ class Review:
 
         def gap(k):
             _, sha, why = found[k]
-            return why or (f'{sha[:12]}: not a full 40-hex sha' if sha else 'no sha: no single commit of this PR')
+            return why or (f'{sha[:12]}: {SHORT}' if sha else 'no sha: no single commit of this PR')
         listed = ', '.join(f'{k} {v[:12] if v else "(" + gap(k) + ")"}' for k, v in sorted(reads.items()))
         return True, None, f'the lenses did not all read one head: {listed}'
