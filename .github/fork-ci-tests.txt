@@ -8,6 +8,7 @@
 .github/scripts/fork-ci-tests.test.cjs
 .github/scripts/fork-contracts.test.py
 .github/scripts/fork-fleet.test.py
+.github/scripts/fork-head-gate-workflow.test.py
 .github/scripts/fork-follow.test.sh
 .github/scripts/fork-interaction-limit.test.sh
 .github/scripts/fork-pr-queue-workflow.test.py
@@ -24,6 +25,7 @@ fork-ci/actions/docs-scope/docs-scope.test.py
 fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/head-check/head_check.test.py
+fork-ci/actions/head-check/head_gate.test.py
 fork-ci/actions/job-changed/job-changed.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
