@@ -376,8 +376,10 @@ head "not passed" unless it judged the head and the head passed.
 
 - Comment spam can spend the job token's hourly rate limit. Reads that fail
   every try make the gate post failures (or nothing, when the guard job cannot
-  see the Environment at all: "Stops before start"), and the pull request
-  stays red until its next event or a dispatch after the limit resets.
+  see the Environment at all: "Stops before start"). After posted failures
+  the pull request stays red until its next event or a dispatch after the
+  limit resets; when nothing is posted, an older pass on the same head stays
+  (see "What it does not stop").
 - A stranger's open, ready pull request with the same head blocks it: the
   strictest verdict wins until that pull request closes or turns draft. An
   interaction limit on the repository keeps strangers out.
@@ -395,6 +397,12 @@ head "not passed" unless it judged the head and the head passed.
   deleted comment, a sibling pull request marked ready) and the start of the
   run it triggers, the check shows the older answer. A run waiting for an
   earlier one on the same head extends that window.
+- Spam that spends both the job token's REST and GraphQL rate limits makes a
+  run that should revoke a pass (a new NOT SAFE lens comment, a deleted
+  override, a switch to draft) post nothing. An older pass on the same head
+  then stays green, and the merge queue can merge on it. This needs about a
+  thousand events in an hour from people allowed to comment; a new head never
+  reuses an older pass.
 - The caller must pass `secrets: inherit`. Without it, the guard sees no
   repository or organisation secret of the key's name, so it cannot refuse
   one. Nothing in the gate can check what the caller passes; the Environment

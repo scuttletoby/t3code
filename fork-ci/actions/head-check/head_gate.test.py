@@ -1142,5 +1142,23 @@ class Drift(Files, unittest.TestCase):
         self.assertIn('HEAD_GATE_APP_ID', out)
 
 
+class ReadmeSpentLimitsTest(unittest.TestCase):
+    """The post-nothing case keeps an older pass on the same head: the README must not call it red (lens85q L1)."""
+    text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'README.md'), encoding='utf-8').read()
+
+    def _section(self, start, end):
+        i = self.text.rindex(start)
+        return self.text[i:self.text.index(end, i + len(start))]
+
+    def test_fails_closed_bullet_does_not_call_post_nothing_red(self):
+        blocks = self._section('**Where it blocks more than needed', '**What it does not stop.**')
+        spam = next(b for b in blocks.split('\n- ') if 'Comment spam' in b)
+        self.assertIn('older pass', spam)
+
+    def test_what_it_does_not_stop_names_spent_limits(self):
+        self.assertRegex(self._section('**What it does not stop.**', '## Tests'),
+                         r'(?s)GraphQL rate\s+limits.*older pass on the same head')
+
+
 if __name__ == '__main__':
     unittest.main()
