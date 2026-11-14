@@ -18,6 +18,7 @@
 .github/scripts/fork-workflow-triggers.test.cjs
 fork-ci/actions/docs-scope/docs-scope.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
+fork-ci/actions/job-changed/job-changed.test.py
 
 # Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
 .github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml
