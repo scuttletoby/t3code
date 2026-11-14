@@ -169,6 +169,17 @@ class Workflow(Repo):
         self.assertEqual(self.builds(), BOTH)
         self.assertEqual(self.runs('tooling'), 'false')
 
+    def test_needs_through_a_merge_key_builds(self):   # the text view keeps `<<` as a key: only the typed view sees it
+        plain = ('  build:\n    needs: route\n', '  plugins:\n    needs: [route]\n')
+        for build, plugins in ((('  build:\n    <<: { needs: route }\n', plain[1])),
+                               ('  build:\n    <<: &needroute { needs: route }\n', '  plugins:\n    <<: *needroute\n')):
+            with self.subTest(build=build, plugins=plugins):
+                text = FIXTURE.replace(plain[0], build, 1).replace(plain[1], plugins, 1)
+                self.base = self.commit({CI: text})
+                self.commit({CI: text.replace('python3 route.py', 'python3 route.py --pc')})
+                self.assertEqual(self.builds(), BOTH)
+                self.assertEqual(self.runs('tooling'), 'false')
+
     def test_workflow_env_permissions_and_on_build_both(self):
         for old, new in (('BASE: x', 'BASE: y'), ('contents: read', 'contents: write'),
                          ('branches: [main]', 'branches: [main, next]'),
@@ -401,6 +412,15 @@ class Units(unittest.TestCase):
         self.assertEqual(job_changed.needed(jobs, 'a'), {'a', 'b', 'c'})
         with self.assertRaises(KeyError):
             job_changed.needed({'a': {'needs': 'gone'}}, 'a')
+
+    def test_an_option_like_base_or_head_builds(self):   # never handed to git, even where git would take it
+        def anything(*a):
+            return 'x'
+        for base, head in (('--output=/tmp/x', 'HEAD'), ('HEAD', '-p')):
+            with self.subTest(base=base, head=head):
+                changed, _, lines = job_changed.decide(base, head, CI, 'build', [], run=anything)
+                self.assertTrue(changed)
+                self.assertIn('is not a commit', lines[0])
 
     def test_deep_nesting_counts(self):
         deep = 'jobs:\n  a:\n    env: ' + '[' * 3000 + ']' * 3000 + '\n'

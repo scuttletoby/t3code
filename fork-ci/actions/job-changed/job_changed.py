@@ -2,7 +2,7 @@
 """Can the change BASE..HEAD change what one job of a workflow does?
 
 A change of the workflow file counts for the job only when it can change what the job does: the job's own block, the
-block of every job it needs (directly or not: their outputs and results feed it) or the workflow's on, env, defaults
+block of every job it needs (directly or not, also through a `<<:` merge key: their outputs and results feed it) or the workflow's on, env, defaults
 or permissions differ, compared PARSED (PyYAML: comments, blank lines, key order and quoting that keeps the type
 ('x' -> "x" -> x) never count; aliases are resolved first). A part counts as changed when either of two views differs:
 its text (every scalar as written, so 1 -> true or 0755 -> 493 counts) or its types (3.10 -> '3.10' is the number 3.1
@@ -112,8 +112,8 @@ def workflow_reason(old_text, new_text, job):
         if key == 'jobs' or key in IGNORED or not differs(lambda d: d.get(key)):
             continue
         return f'workflow-level {key} changed' if key in SHARED else f'the top-level key {key!r}, unknown here, changed'
-    try:
-        names = needed(old['jobs'], job) | needed(new['jobs'], job)
+    try:   # both views: the text view keeps a `<<:` merge key as a key, so `needs` that comes through it is only typed
+        names = set().union(*(needed(o['jobs'], job) | needed(n['jobs'], job) for o, n in views))
     except (KeyError, TypeError) as e:
         return f'job {e} is missing on one side (renamed, new or deleted) or not a mapping'
     for name in sorted(names, key=str):

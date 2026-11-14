@@ -86,6 +86,15 @@ count. Aliases are resolved first, so an anchor edited in another job reaches ev
 
 `paths` never matches the workflow file itself: only its job compare decides about it.
 
+**What only `paths` sees.** The action compares one workflow file. Anything else the job runs counts only when a
+`paths` line finds it: local actions (`uses: ./...`), local reusable workflows it calls, and scripts or config files
+its steps run. Inside a reusable workflow, edits in the calling workflow (its `with:`, `secrets:`, the calling job's
+`if:` or `needs`) never reach the called file's compare: add the caller's file to `paths`, or run the check in the
+calling workflow.
+
+**Typed values.** The typed view is PyYAML's YAML 1.1 reading. Where it and GitHub's reader may differ (for example
+an unquoted `0o17`, which PyYAML reads as text and GitHub may read as a number), quote the value.
+
 ## Fails closed
 
 `changed=true` (and `workflow=true`), with the reason in the log and in `reason`, for: an empty `base`, a base or
