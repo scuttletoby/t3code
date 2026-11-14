@@ -247,7 +247,8 @@ class RealHost(unittest.TestCase):
             self.assertEqual(proc.returncode, 1, path)
             self.assertIn('file paths are refused here', proc.stderr)
             self.assertNotIn(TOKEN, proc.stdout + proc.stderr)
-        self.assertEqual(as_agent([c.WRAPPER, '--self-check']).returncode, 0)
+        proc = as_agent([c.WRAPPER, '--self-check'])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_9a_bad_sudoers_is_never_placed(self):
         before = read(c.SUDOERS)
