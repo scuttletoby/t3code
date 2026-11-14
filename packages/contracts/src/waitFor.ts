@@ -111,6 +111,10 @@ export const WaitCheck = Schema.Struct({
   intervalSeconds: Schema.Int.check(Schema.isGreaterThanOrEqualTo(5)).pipe(
     Schema.withDecodingDefault(Effect.succeed(30)),
   ),
+  /**
+   * One run is stopped after this long. After a server crash, only Linux (`timeout`, when it takes
+   * `-k`) still ends the run, a few seconds later; on macOS and Windows it runs until it ends.
+   */
   timeoutSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 600 })).pipe(
     Schema.withDecodingDefault(Effect.succeed(20)),
   ),

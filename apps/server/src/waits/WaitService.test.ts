@@ -1629,6 +1629,55 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
   );
 
   it.effect(
+    "a hung file check keeps its place when stopped: cancel, waits off and on, or its wait ending never let a 3rd stat start",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { filePath, watched } = yield* workspace;
+        // Like Node's I/O pool threads: a hung stat is not freed by an interrupt.
+        let live = 0;
+        let mostLive = 0;
+        const judges: WaitJudges = {
+          file: (_target, context) =>
+            context.waitId === null
+              ? Effect.succeed<Judgement>({ type: "notYet" })
+              : Effect.sync(() => {
+                  live += 1;
+                  mostLive = Math.max(mostLive, live);
+                }).pipe(Effect.andThen(Effect.never)),
+        };
+        const service = yield* makeService({ filePath, judges });
+        const settings = yield* ServerSettingsService;
+        const sweep = Effect.gen(function* () {
+          yield* TestClock.adjust(5_000);
+          const fiber = yield* Effect.forkChild(service.judgeDue());
+          yield* stepSeconds(15);
+          return yield* Fiber.join(fiber);
+        });
+        // An agent waits for files on a dead network mount, gives up (cancel), and tries again;
+        // then waits are switched off and on; then the waits end at their deadline.
+        for (let round = 0; round < 3; round += 1) {
+          for (const name of ["a", "b"]) {
+            yield* register(service, fileWait(watched(`dead/${round}-${name}`)));
+          }
+          yield* sweep;
+          yield* service.cancel({ projectId: PROJECT, threadId: THREAD });
+        }
+        yield* register(service, fileWait(watched("dead/off-a")));
+        yield* settings.updateSettings({ waitFor: { enabled: false } });
+        yield* sweep;
+        yield* settings.updateSettings({ waitFor: { enabled: true } });
+        yield* register(service, fileWait(watched("dead/on-a"), { timeoutMinutes: 5 }));
+        yield* sweep;
+        yield* TestClock.adjust(6 * MINUTE);
+        yield* sweep;
+        yield* register(service, fileWait(watched("dead/after-end")));
+        yield* sweep;
+        assert.strictEqual(mostLive, 2, `${mostLive} hung stats hold Node's I/O threads at once`);
+      }).pipe(Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+
+  it.effect(
     "a check at registration counts too: with its kind full, register waits up to its 3 s limit, then stores the wait without one",
     () =>
       Effect.gen(function* () {
@@ -1671,13 +1720,17 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
         yield* TestClock.setTime(NOW);
         const fs = yield* FileSystem.FileSystem;
         const { filePath, watched } = yield* workspace;
-        // A check that cannot be stopped (a read hung in the kernel): cancelling its wait stops
-        // it, but its place stays held until it ends (here: at the end of the test).
-        const hung = yield* Deferred.make<Judgement>();
+        // Like a `stat` on a dead network mount: its fiber can be interrupted, but the I/O thread
+        // under it stays held (counted here), so cancelling its wait must not free its place.
+        let live = 0;
+        let mostLive = 0;
         const judges: WaitJudges = {
           file: (target, context) =>
             context.waitId !== null && target.spec.path.includes("/dead/")
-              ? Effect.uninterruptible(Deferred.await(hung))
+              ? Effect.sync(() => {
+                  live += 1;
+                  mostLive = Math.max(mostLive, live);
+                }).pipe(Effect.andThen(Effect.never))
               : fs.exists(target.spec.path).pipe(
                   Effect.orDie,
                   Effect.map((exists): Judgement =>
@@ -1714,7 +1767,7 @@ it.layer(NodeServices.layer)("WaitService: lens round 2 on #90", (it) => {
         const blocked = logs.errors.filter((line) => line.includes("checks have not answered"));
         assert.strictEqual(blocked.length, 1);
         assert.include(blocked[0] ?? "", "dead/a");
-        yield* Deferred.succeed(hung, { type: "notYet" });
+        assert.strictEqual(mostLive, 2);
       }).pipe(Effect.provide(Layer.merge(logs.layer, ServerSettingsService.layerTest(ON))));
     },
   );

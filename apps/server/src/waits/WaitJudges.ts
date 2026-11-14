@@ -302,11 +302,13 @@ export const lookUpCheck: (
   }
   const check = checks[spec.name]!;
   const tested = yield* testArgPattern(check.argPattern, spec.args);
-  if (tested.type === "slow") {
+  if (tested.type === "slow" || tested.type === "failed") {
     return {
       ok: false,
       judgement: transient(
-        `The argument pattern of check "${spec.name}" gave no answer in ${ARG_PATTERN_LIMIT_MS / 1000}s.`,
+        tested.type === "failed"
+          ? `Check "${spec.name}": ${tested.message}`
+          : `The argument pattern of check "${spec.name}" gave no answer in ${ARG_PATTERN_LIMIT_MS / 1000}s.`,
       ),
     } as const;
   }
@@ -323,13 +325,18 @@ export const lookUpCheck: (
 });
 
 /**
- * On Linux a check runs under coreutils `timeout`, so it also ends at its own time limit when the
- * server that started it is gone (a crash, or a kill that skips the server's clean-up); otherwise
- * the server is what stops it. It gets this much more time than the server's own limit, so the
- * server's limit normally comes first.
+ * On Linux a check runs under `timeout`, so it also ends at its own time limit when the server that
+ * started it is gone (a crash, or a kill that skips the server's clean-up); otherwise the server is
+ * what stops it. It gets this much more time than the server's own limit, so the server's limit
+ * normally comes first.
  */
 export const CHECK_ORPHAN_EXTRA_SECONDS = 5;
-const TIMEOUT_PROGRAMS = ["/usr/bin/timeout", "/bin/timeout"];
+export const TIMEOUT_PROGRAMS: ReadonlyArray<string> = ["/usr/bin/timeout", "/bin/timeout"];
+/** `timeout` options that GNU coreutils and BusyBox (1.36 and later) both take. */
+const timeoutOptions = (seconds: number) => ["-k", "2", `${seconds}`];
+/** The exit code the `timeout` test run asks for, so a usage error (exit 1) cannot pass it. */
+const TIMEOUT_TEST_EXIT = 42;
+const TIMEOUT_TEST_LIMIT_MS = 5_000;
 
 /** The command line a check runs as: under `timeout` when there is one (Linux), else as it is. */
 export function checkCommandLine(
@@ -342,34 +349,73 @@ export function checkCommandLine(
   if (timeoutProgram === null) return { command: command!, args: all };
   return {
     command: timeoutProgram,
-    args: [
-      `--kill-after=2`,
-      `${check.timeoutSeconds + CHECK_ORPHAN_EXTRA_SECONDS}`,
-      command!,
-      ...all,
-    ],
+    args: [...timeoutOptions(check.timeoutSeconds + CHECK_ORPHAN_EXTRA_SECONDS), command!, ...all],
   };
 }
+
+/**
+ * Whether `program` runs a command with the options `checkCommandLine` gives and passes its exit
+ * code back. An older BusyBox `timeout` refuses `-k` with exit 1, which a check would read as "not
+ * yet" for ever, so such a program is not used.
+ */
+export const timeoutProgramWorks = (program: string): Effect.Effect<boolean> =>
+  Effect.callback<boolean>((resume) => {
+    let child: NodeChildProcess.ChildProcess;
+    try {
+      child = NodeChildProcess.execFile(
+        program,
+        [...timeoutOptions(10), "/bin/sh", "-c", `exit ${TIMEOUT_TEST_EXIT}`],
+        { timeout: TIMEOUT_TEST_LIMIT_MS, killSignal: "SIGKILL", windowsHide: true },
+        (error) =>
+          resume(
+            Effect.succeed(
+              (error as { readonly code?: unknown } | null)?.code === TIMEOUT_TEST_EXIT,
+            ),
+          ),
+      );
+    } catch {
+      resume(Effect.succeed(false));
+      return;
+    }
+    return Effect.sync(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    });
+  });
+
+/** The first of `programs` that exists and works as `timeoutProgramWorks` tests it; else null. */
+export const findTimeoutProgram = Effect.fnUntraced(function* (programs: ReadonlyArray<string>) {
+  for (const program of programs) {
+    if (!NodeFS.existsSync(program)) continue;
+    if (yield* timeoutProgramWorks(program)) return program;
+    yield* Effect.logWarning(
+      `waits: ${program} does not take "${timeoutOptions(1).slice(0, 2).join(" ")}", so checks run without it; a check left behind by a server crash runs until it ends by itself.`,
+    );
+  }
+  return null;
+});
 
 /**
  * Runs a named check from settings without a shell, in the project's main workspace root, with a
  * timeout and an output cap. The check is looked up again on every run in the thread's current
  * project; a removed or narrowed check is a permanent error. A wait brings no command, cwd or env.
- * `timeoutProgram` is for tests (null: run without `timeout`).
+ * For tests: `timeoutProgram` (used as is), `timeoutPrograms` (looked for and tested on Linux).
  */
 export const makeCheckJudge = Effect.fn("WaitJudges.makeCheckJudge")(function* (input: {
   readonly placeOf: (context: WaitJudgeContext) => Effect.Effect<CheckPlace>;
   readonly timeoutProgram?: string | null;
+  readonly timeoutPrograms?: ReadonlyArray<string>;
 }) {
   const settingsService = yield* ServerSettingsService;
   const runner = yield* ProcessRunner.ProcessRunner;
   const platform = yield* HostProcess.Platform;
-  const timeoutProgram =
+  // Looked for and tested at the first check, once.
+  const timeoutProgram = yield* Effect.cached(
     input.timeoutProgram !== undefined
-      ? input.timeoutProgram
+      ? Effect.succeed(input.timeoutProgram)
       : platform !== "linux"
-        ? null
-        : (TIMEOUT_PROGRAMS.find((path) => NodeFS.existsSync(path)) ?? null);
+        ? Effect.succeed(null)
+        : findTimeoutProgram(input.timeoutPrograms ?? TIMEOUT_PROGRAMS),
+  );
   const judge: WaitJudge<"check"> = Effect.fn("WaitJudges.check")(function* ({ spec }, context) {
     const settings = yield* settingsService.getSettings.pipe(Effect.option);
     if (settings._tag === "None") return transient("The settings cannot be read.");
@@ -389,7 +435,7 @@ export const makeCheckJudge = Effect.fn("WaitJudges.makeCheckJudge")(function* (
         `Check "${spec.name}" names a program that needs a shell (a .cmd or .bat file); checks run without one.`,
       );
     }
-    const line = checkCommandLine(check, spec.args, timeoutProgram);
+    const line = checkCommandLine(check, spec.args, yield* timeoutProgram);
     return yield* runner
       .run({
         command: line.command,

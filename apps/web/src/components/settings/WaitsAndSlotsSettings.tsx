@@ -201,7 +201,8 @@ const DRAFT_HINTS: Partial<Record<WaitCheckDraftField, string>> = {
   argPattern:
     "Every added argument must match this regular expression. Keep it simple: a pattern that takes over 2 seconds refuses the argument. The default refuses a leading -, =, @ or +.",
   intervalSeconds: "How often the command runs, at least 5.",
-  timeoutSeconds: "One run is stopped after this long (1 to 600).",
+  timeoutSeconds:
+    "One run is stopped after this long (1 to 600). If the server crashes, Linux still ends the run about 7 seconds after this; on macOS and Windows it runs until it ends by itself.",
 };
 
 function WaitCheckDialog({

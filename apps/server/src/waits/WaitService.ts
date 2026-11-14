@@ -96,7 +96,8 @@ const CHECK_KILL_GRACE_MS = 5_000;
 const SWEEP_ANSWER_WINDOW_MS = 70_000;
 /**
  * Checks of one kind running at once. A stuck `stat` holds one of Node's 4 I/O threads, so file
- * checks use at most 2 (then a short-lived process). Other kinds answer "not yet" when all are late.
+ * checks use at most 2 (then a short-lived process); a stopped one keeps its place until its `stat`
+ * returns. Other kinds answer "not yet" when all are late.
  * A thread runs at most one `check` at a time, so one agent cannot hold every place.
  */
 const MAX_RUNNING_JUDGES_PER_KIND = 2;
@@ -232,6 +233,14 @@ const logTransition = (transition: WaitTransition) =>
 
 /** The places checks run in: one per kind, and one for file checks in their own process. */
 type JudgePool = WaitKind | "fileChild";
+
+/**
+ * Places whose checks run in a process: stopping one kills its process group, so its place is free
+ * at once. The others run in the server (a file check's `stat` holds one of Node's few I/O threads
+ * until the kernel answers, and nothing can stop it), so a stopped one answers its waiter at once
+ * but keeps its place until it really returns: stuck ones never pass `MAX_RUNNING_JUDGES_PER_KIND`.
+ */
+const STOPPABLE_POOLS: ReadonlySet<JudgePool> = new Set<JudgePool>(["check", "unit", "fileChild"]);
 
 /** Who a check runs for, and (check waits) which check in which project. */
 interface JudgeRun {
@@ -586,6 +595,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           `The argument pattern of check "${name}" gave no answer in ${ARG_PATTERN_LIMIT_MS / 1000}s. Try again later; if it keeps happening, ask the owner to make the pattern simpler.`,
         );
       }
+      if (tested.type === "failed") {
+        return yield* failure("invalid", `Check "${name}": ${tested.message} Try again later.`);
+      }
     }
     const now = yield* Clock.currentTimeMillis;
     const deadline = waitDeadline(now, request.input.timeoutMinutes, settings.waitFor);
@@ -829,8 +841,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   const allRunning = () => [...running.values()].flatMap((set) => [...set]);
 
   /**
-   * Stops the running checks of these waits (of all, for null): each process group is killed and
-   * the check answers `judgement`. Their slots are free once the processes are gone.
+   * Stops the running checks of these waits (of all, for null): each answers `judgement` at once.
+   * A check process has its group killed, and its slot is free once it is gone; a check in the
+   * server cannot be stopped, so it keeps its slot until it returns (see `STOPPABLE_POOLS`).
    */
   const stopRuns = (waitIds: ReadonlySet<string> | null, judgement: Judgement) =>
     Effect.forEach(
@@ -872,30 +885,37 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           lateAt: now + limitMs,
         };
         set.add(entry);
-        // The check itself can still be stopped; only taking the slot and starting it is one step.
-        const fiber = yield* Effect.forkIn(
-          Effect.interruptible(
-            Effect.raceFirst(
-              Effect.suspend(judge).pipe(
-                // A check that crashes is a failed read of its own wait, never of the sweep.
-                Effect.catchCauseIf(
-                  (cause) => !Cause.hasInterruptsOnly(cause),
-                  (cause) =>
-                    Effect.succeed(lateJudgement(`The check crashed: ${causeText(cause)}`)),
-                ),
-              ),
-              // Stopped: the judge is interrupted, which kills its process group.
-              Deferred.await(entry.stop),
-            ),
-          ).pipe(
-            Effect.ensuring(
-              Effect.suspend(() => {
-                set.delete(entry);
-                blockedLogged.delete(pool);
-                return signalJudgesChanged;
-              }),
-            ),
+        const checked = Effect.suspend(judge).pipe(
+          // A check that crashes is a failed read of its own wait, never of the sweep.
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterruptsOnly(cause),
+            (cause) => Effect.succeed(lateJudgement(`The check crashed: ${causeText(cause)}`)),
           ),
+        );
+        const release = Effect.suspend(() => {
+          set.delete(entry);
+          blockedLogged.delete(pool);
+          return signalJudgesChanged;
+        });
+        // The check itself can still be stopped; only taking the slot and starting it is one step.
+        if (STOPPABLE_POOLS.has(pool)) {
+          const fiber = yield* Effect.forkIn(
+            // Stopped: the judge is interrupted, which kills its process group, and frees the slot.
+            Effect.interruptible(Effect.raceFirst(checked, Deferred.await(entry.stop))).pipe(
+              Effect.ensuring(release),
+            ),
+            runScope,
+          );
+          return { type: "started", started: { fiber, entry } } as const;
+        }
+        // In the server: stopped, it answers at once, but the slot is freed only when the check
+        // itself returns (or the service stops), since its thread is held until then.
+        const own = yield* Effect.forkIn(
+          Effect.interruptible(checked).pipe(Effect.ensuring(release)),
+          runScope,
+        );
+        const fiber = yield* Effect.forkIn(
+          Effect.interruptible(Effect.raceFirst(Fiber.join(own), Deferred.await(entry.stop))),
           runScope,
         );
         return { type: "started", started: { fiber, entry } } as const;

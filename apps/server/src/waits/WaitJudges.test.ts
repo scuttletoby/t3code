@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - looks for a BusyBox on the test machine.
+import * as NodeFS from "node:fs";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId, ThreadId } from "@t3tools/contracts";
@@ -14,9 +17,12 @@ import * as ProcessRunner from "../processRunner.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import {
   type CheckPlace,
+  checkCommandLine,
+  findTimeoutProgram,
   makeCheckJudge,
   makeChildFileJudge,
   makeUnitJudge,
+  timeoutProgramWorks,
 } from "./WaitJudges.ts";
 
 const fileTarget = (path: string) => ({ kind: "file", spec: { path, until: "exists" } }) as const;
@@ -325,5 +331,111 @@ describe("WaitJudges: the unit judge reads systemd", () => {
       const tooMuch = yield* loud(unitTarget("x.service"), context);
       assert.isTrue(tooMuch.type === "failed" && !tooMuch.permanent);
     }).pipe(Effect.scoped, Effect.provide(runnerLayer)),
+  );
+});
+
+describe("WaitJudges: a check runs under timeout only where timeout works", () => {
+  /** Like GNU coreutils `timeout`: takes `-k N` and `--kill-after=N`, marks that it ran. */
+  const GNU_LIKE = `#!/bin/sh
+touch "$0.used"
+case "$1" in
+  -k) shift 2 ;;
+  --kill-after=*) shift ;;
+  *) echo "timeout: invalid option" >&2; exit 125 ;;
+esac
+shift
+exec "$@"
+`;
+  /** Like an older BusyBox `timeout` (\`-t SECS\`, no \`-k\`): its usage error exits 1. */
+  const OLD_BUSYBOX_LIKE = `#!/bin/sh
+touch "$0.used"
+if [ "$1" = "-t" ]; then shift 2; exec "$@"; fi
+echo "timeout: unrecognized option '$1'" >&2
+echo "Usage: timeout [-t SECS] [-s SIG] PROG ARGS" >&2
+exit 1
+`;
+  const check = (argv: ReadonlyArray<string>): WaitCheck => ({
+    argv: [...argv],
+    maxArgs: 0,
+    argPattern: "^[a-z]+$",
+    intervalSeconds: 30,
+    timeoutSeconds: 20,
+    description: "",
+  });
+  const layer = Layer.mergeAll(
+    runnerLayer,
+    ServerSettingsService.layerTest({
+      waitChecks: {
+        yes: check(["/bin/sh", "-c", "exit 0"]),
+        no: check(["/bin/sh", "-c", "exit 1"]),
+      },
+    }),
+  );
+  const fakes = Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "wait-timeout-" });
+    const write = (name: string, script: string) =>
+      Effect.gen(function* () {
+        const file = path.join(root, name);
+        yield* fs.writeFileString(file, script);
+        yield* fs.chmod(file, 0o755);
+        return file;
+      });
+    return {
+      gnu: yield* write("gnu-timeout", GNU_LIKE),
+      old: yield* write("old-busybox-timeout", OLD_BUSYBOX_LIKE),
+      used: (file: string) => fs.exists(`${file}.used`),
+    };
+  });
+  const place = () => Effect.succeed<CheckPlace>({ type: "ok", projectId: PROJECT, cwd: "/" });
+
+  // The fakes are shell scripts; the judge is told it runs on Linux, where it uses `timeout`.
+  const SH = NodeFS.existsSync("/bin/sh");
+  it.live.skipIf(!SH)(
+    "a timeout that refuses -k is not used, so a check that exits 0 is met, never 'not yet'",
+    () =>
+      Effect.gen(function* () {
+        const { gnu, old, used } = yield* fakes;
+        assert.isTrue(yield* timeoutProgramWorks(gnu));
+        assert.isFalse(yield* timeoutProgramWorks(old));
+        assert.strictEqual(yield* findTimeoutProgram([old, gnu]), gnu);
+        assert.isNull(yield* findTimeoutProgram([old, "/nonexistent/timeout"]));
+
+        const plain = yield* makeCheckJudge({ placeOf: place, timeoutPrograms: [old] });
+        assert.strictEqual((yield* plain(checkTarget("yes"), context)).type, "met");
+        assert.strictEqual((yield* plain(checkTarget("no"), context)).type, "notYet");
+
+        const wrapped = yield* makeCheckJudge({ placeOf: place, timeoutPrograms: [old, gnu] });
+        assert.strictEqual((yield* wrapped(checkTarget("yes"), context)).type, "met");
+        assert.strictEqual((yield* wrapped(checkTarget("no"), context)).type, "notYet");
+        assert.isTrue(yield* used(gnu), "the check ran under the working timeout");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layer),
+        Effect.provideService(HostProcess.Platform, "linux"),
+      ),
+  );
+
+  const BUSYBOX = ["/usr/bin/busybox", "/bin/busybox"].find((file) => NodeFS.existsSync(file));
+  it.live.skipIf(!SH || BUSYBOX === undefined)(
+    "BusyBox's own timeout runs a check, and a check that exits 0 is met",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "wait-busybox-" });
+        const timeout = path.join(root, "timeout");
+        yield* fs.symlink(BUSYBOX!, timeout);
+        const judge = yield* makeCheckJudge({ placeOf: place, timeoutPrograms: [timeout] });
+        assert.strictEqual((yield* judge(checkTarget("yes"), context)).type, "met");
+        assert.strictEqual((yield* judge(checkTarget("no"), context)).type, "notYet");
+        const line = checkCommandLine(check(["/bin/sh", "-c", "exit 0"]), [], timeout);
+        assert.deepStrictEqual(line.args.slice(0, 3), ["-k", "2", "25"]);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layer),
+        Effect.provideService(HostProcess.Platform, "linux"),
+      ),
   );
 });

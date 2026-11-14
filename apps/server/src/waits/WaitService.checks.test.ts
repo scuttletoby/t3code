@@ -973,8 +973,6 @@ it.effect("on Linux a check runs under timeout, so it ends by itself if the serv
       judges: { check: yield* realCheckJudge(runner, "/usr/bin/timeout") },
     });
     yield* registerCheck(service);
-    assert.deepStrictEqual(runner.runs, [
-      ["/usr/bin/timeout", "--kill-after=2", "25", "build-check"],
-    ]);
+    assert.deepStrictEqual(runner.runs, [["/usr/bin/timeout", "-k", "2", "25", "build-check"]]);
   }).pipe(Effect.provide(withChecks({ build: check({ timeoutSeconds: 20 }) }))),
 );
