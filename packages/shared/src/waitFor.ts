@@ -83,10 +83,11 @@ function isLocalAbsolutePath(path: string, platform: NodeJS.Platform): boolean {
 
 /**
  * On Windows `CON`, `NUL`, `COM1`, `LPT1`, `CONIN$` and the like name a device in every folder,
- * also with an extension or trailing dots and spaces (`C:\x\nul.txt`), so `stat` would touch it.
+ * also with an extension, a colon (`NUL:`, `con:x`), or trailing dots and spaces
+ * (`C:\x\nul.txt`), so `stat` would touch it. The name is the part before the first `.` or `:`.
  */
 function isWindowsDeviceName(segment: string): boolean {
-  const base = segment.split(".")[0]!.replace(/[ .]+$/u, "");
+  const base = segment.split(/[.:]/u)[0]!.replace(/[ .]+$/u, "");
   return /^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$|clock\$)$/iu.test(base);
 }
 

@@ -271,6 +271,22 @@ describe("validateWaitSpec: Windows device names (lens #90 round 2)", () => {
     }
     expect(file("/tmp/NUL", "linux")).toMatchObject({ ok: true });
   });
+
+  it("refuses a device name followed by a colon (carry from #90 round 3)", () => {
+    for (const path of [
+      "C:\\x\\NUL:",
+      "C:\\x\\con:x",
+      "C:\\x\\COM1:",
+      "C:\\x\\NUL:.txt",
+      "C:\\x\\LPT1:.txt",
+      "C:\\x\\nul.txt",
+    ]) {
+      expect(file(path, "win32"), path).toMatchObject({ ok: false, code: "invalid" });
+    }
+    for (const path of ["C:\\x\\console:x", "C:\\x\\com10:", "C:\\x\\ nul:"]) {
+      expect(file(path, "win32"), path).toMatchObject({ ok: true });
+    }
+  });
 });
 
 describe("stored sizes in bytes (lens #90 round 2)", () => {
