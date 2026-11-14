@@ -49,13 +49,16 @@ TOP_LINES = 5
 # Any hex sha with a digit (7-40 hex, not part of a longer word): `abc1234`, never `defaced` or `facade1x`.
 HEX_RE = re.compile(r'(?<![0-9a-z])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}(?![0-9a-z])', re.I)
 OK_CONCLUSIONS = ('SUCCESS', 'SKIPPED', 'NEUTRAL')
+STRANGER_SCAN = 4096   # characters of a post that does not count read to decide whether to log it
 
 
 def clean_inline(text):
     """Markdown that can hide a word, gone: HTML tags (`<b>`, also a `<name>` placeholder), links `[x](y)` -> x, `*` and
     backticks, `|` -> space, `_` at a word edge (`_lens_` -> lens; `pr_queue` stays)."""
-    text = re.sub(r'</?[A-Za-z][^>]*>', '', text)
-    text = re.sub(r'!?\[([^\]]*)\]\([^)]*\)', r'\1', text)
+    # [^<>] and [^\[\]] / [^()]: a match cannot start inside another one, so unclosed brackets cost linear time, not
+    # time that grows with the square of the text (an unclosed `[` x 64 KB took minutes)
+    text = re.sub(r'</?[A-Za-z][^<>]*>', '', text)
+    text = re.sub(r'!?\[([^\[\]]*)\]\([^()]*\)', r'\1', text)
     text = re.sub(r'[*`]', '', text).replace('|', ' ')
     return re.sub(r'(?<![^\W_])_+|_+(?![^\W_])', '', text)
 
@@ -267,16 +270,17 @@ class Review:
         found = {}
         for when, i, post in self.lens_posts(pr):
             where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
-            problem = self.lens_problem(post)
-            header = None if problem else lens_header(post.get('body') or '')
-            if not self.counts(post):
-                if (problem or header) and where not in self.logged:
+            if not self.counts(post):   # the author first: a stranger's text is only ever read in part, for the log
+                head = {**post, 'body': (post.get('body') or '')[:STRANGER_SCAN]}
+                if where not in self.logged and (self.lens_problem(head) or lens_header(head['body'])):
                     self.logged.add(where)
                     association = post.get('authorAssociation')
                     self.log(f'ignored a lens-looking post {where}: '
                              f'{"author association " + association if association else "no author association"} '
                              f'is not one of lens_author_associations ({", ".join(self.lens_associations)})')
                 continue
+            problem = self.lens_problem(post)
+            header = None if problem else lens_header(post.get('body') or '')
             if problem:
                 hidden = ', hidden' if self.hidden(post) else ''
                 found[f'{NO_HEADER} ({where}, {problem}{hidden})'] = ((when, i), None, None)

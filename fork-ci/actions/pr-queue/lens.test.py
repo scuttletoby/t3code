@@ -185,6 +185,16 @@ class WhoCounts(unittest.TestCase):
         self.assertEqual(self.head(self.OWN, over), (True, SHA_B, 'every lens read it'))
         self.assertEqual(self.head(self.OWN, dict(over, isMinimized=True)), (True, SHA_A, 'every lens read it'))
 
+    def test_a_strangers_huge_comment_costs_no_time(self):   # SEC-2 r3 major: anyone can post 64 KB of `[`
+        import time
+        shapes = ('[' * 65536, '<a' * 32768, '[x](' * 16384, '![' * 32768, ('[' * 1000 + '](') * 60,
+                  'lens: correctness · read at: ' + '[' * 65000)
+        for body in shapes:
+            for who in (stranger(body), post(body)):   # never parsed in full / parsed in linear time
+                start = time.monotonic()
+                self.head(self.OWN, who)
+                self.assertLess(time.monotonic() - start, 5, (body[:20], who.get('authorAssociation')))
+
     def test_a_lens_comment_whose_author_does_not_count_is_logged(self):
         # a wrong lens_author_associations makes reviewed PRs look unreviewed: the run log must say why
         lines = []
