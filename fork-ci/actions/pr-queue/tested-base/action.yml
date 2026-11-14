@@ -1,0 +1,19 @@
+name: pr-queue tested base
+description: >-
+  On a pull_request run, notes the base commit this job tests (the first parent of GitHub's merge commit) as an
+  annotation that pr-queue reads (config update_when_base_was_red). Run it right after the checkout of the merge
+  commit, in the job of every required check. Writes no note on other events or another checkout. Needs git and
+  python3.
+inputs:
+  path:
+    description: Where the merge commit is checked out (actions/checkout's path).
+    required: false
+    default: "."
+runs:
+  using: composite
+  steps:
+    - name: Note the base this run tests
+      shell: bash
+      env:
+        CHECKOUT_PATH: ${{ inputs.path }}
+      run: python3 -I "$GITHUB_ACTION_PATH/tested_base.py" --path "$CHECKOUT_PATH"
