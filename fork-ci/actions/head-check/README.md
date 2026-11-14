@@ -141,7 +141,11 @@ workflows to pass" ruleset rule would close that, but it is for organizations
 on paid plans only, not for user-owned repositories. Until there is a better
 way, a person reads every pull request that changes `.github/workflows/` or
 this action's files. The gate below closes that: the same rules, run from the
-default branch and posted by an App that only the default branch can use.
+default branch and posted by an App that only the default branch can use. On a
+self-hosted runner that reuses its workspace, an earlier job of the same pull
+request can also leave `.git/config` entries that run its code inside this
+check ([issue 83](https://github.com/scuttletoby/t3code/issues/83)); the gate
+fetches into a new bare repository on a GitHub-hosted runner instead.
 
 ### Inputs
 
@@ -258,7 +262,9 @@ How it works:
   pull request (the backfill, each head once, at most 256; more is refused).
   Heads no open, ready pull request into the default branch has get a failure.
 
-Setup (the repository owner's steps; nothing here creates them):
+Setup (the repository owner's steps; nothing here creates them). The
+paste-ready commands for steps 3 and 6, each safe to run twice, are in
+[Gate trust](../../../docs/fork/gate-trust.md#owner-steps-paste-ready), and only there:
 
 1. Create a GitHub App with one permission, Checks: read and write, and no
    webhook. Make a private key.
@@ -388,7 +394,9 @@ head "not passed" unless it judged the head and the head passed.
 **What it does not stop.**
 
 - Anyone who can change the default branch (or the Environment, the App or
-  the ruleset) can change the gate.
+  the ruleset) can change the gate. An agent that works with an admin login
+  can do all of this; the full list, and what an agent can still do at each
+  stage, is in [Gate trust](../../../docs/fork/gate-trust.md).
 - A lens comment is still only as good as the people allowed to post it (the
   config's `lens_author_associations`).
 - The gate judges the comments that exist when it runs. Between a change (a

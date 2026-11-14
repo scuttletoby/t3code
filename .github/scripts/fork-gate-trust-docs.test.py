@@ -1,0 +1,401 @@
+"""Tests docs/fork/gate-trust.md: the owner's paste commands, run for real against a fake `gh`.
+
+    python3 .github/scripts/fork-gate-trust-docs.test.py
+
+The commands live only in that page. Each block marked `<!-- owner-step: NAME -->` is taken from it as
+written, its CAPITAL placeholders are filled in, and bash runs it with a fake `gh` first in PATH that
+answers like GitHub from a JSON state and logs every call. So the `jq` parts and the `gh` calls the owner
+pastes are the ones tested. Each block is run twice (safe to run again), on old shapes (no rule, two
+rules, a check bound to another App, a placeholder left in) and with a GitHub read that fails.
+Then: every relative link of the fork pages this touches resolves (anchors too), the page names nothing
+personal, and no other page carries a copy of the commands.
+
+Needs bash and jq. Reaches no network and no GitHub. Each check prints ok/FAIL; any FAIL exits 1.
+"""
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+root = pathlib.Path(__file__).resolve().parents[2]
+PAGE = root / "docs/fork/gate-trust.md"
+failures = []
+BASE = tempfile.TemporaryDirectory(prefix="gate-trust-")  # every run's folder, removed at exit
+
+
+def check(cond, what):
+    print(("ok   " if cond else "FAIL ") + what)
+    if not cond:
+        failures.append(what)
+
+
+# --- the fake gh -------------------------------------------------------------------------------------------------
+# State (FAKE_GH_STATE, a JSON file): {"paths": {path: body}, "fail": [path, ...], "envs": {...}, "vars": {...},
+# "secrets": {...}}. Every call is appended to FAKE_GH_LOG as one JSON line: argv, method, path, body, stdin.
+FAKE_GH = r'''#!/usr/bin/env python3
+import json, os, sys
+state_file, log_file = os.environ["FAKE_GH_STATE"], os.environ["FAKE_GH_LOG"]
+state = json.load(open(state_file))
+argv = sys.argv[1:]
+entry = {"argv": argv}
+
+def done(code, out=None, err=None):
+    with open(log_file, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    json.dump(state, open(state_file, "w"))
+    if out is not None:
+        print(json.dumps(out))
+    if err:
+        print(err, file=sys.stderr)
+    sys.exit(code)
+
+def fields(args):
+    out, i = {}, 0
+    while i < len(args):
+        if args[i] in ("-f", "-F"):
+            k, v = args[i + 1].split("=", 1)
+            if args[i] == "-F" and v in ("true", "false"):
+                v = v == "true"
+            out[k] = v
+            i += 2
+        else:
+            i += 1
+    return out
+
+if argv[:1] == ["api"]:
+    args, method, path, inp = argv[1:], None, None, None
+    i = 0
+    rest = []
+    while i < len(args):
+        a = args[i]
+        if a == "-X":
+            method = args[i + 1]; i += 2
+        elif a == "--input":
+            inp = args[i + 1]; i += 2
+        elif a in ("-f", "-F"):
+            rest += args[i:i + 2]; i += 2
+        elif a.startswith("-"):
+            done(2, err="fake gh: flag not known here: " + a)
+        else:
+            path = a; i += 1
+    f = fields(rest)
+    method = method or ("POST" if f or inp else "GET")
+    entry.update(method=method, path=path)
+    if path in state.get("fail", []):
+        done(1, err="HTTP 404: Not Found (" + path + ")")
+    if method == "GET":
+        if path not in state["paths"]:
+            done(1, err="HTTP 404: Not Found (" + path + ")")
+        done(0, out=state["paths"][path])
+    if inp is not None:
+        text = sys.stdin.read() if inp == "-" else open(inp).read()
+        try:
+            body = json.loads(text)
+        except ValueError:
+            done(1, err="HTTP 400: Problems parsing JSON")
+        entry["body"] = body
+    if "/rulesets/" in path and method == "PUT":
+        allowed = {"name", "target", "enforcement", "conditions", "bypass_actors", "rules"}
+        if not isinstance(body, dict) or set(body) - allowed:
+            done(1, err="HTTP 422: Invalid request (keys %s)" % sorted(set(body) - allowed))
+        new = dict(state["paths"][path]); new.update(body)
+        state["paths"][path] = new
+        done(0, out=new)
+    if path.endswith("/protection/required_status_checks") and method == "PATCH":
+        if not isinstance(body, dict) or set(body) - {"strict", "checks"}:
+            done(1, err="HTTP 422: Invalid request")
+        old = state["paths"][path]
+        new = {"url": old.get("url"), "strict": body["strict"], "contexts": [c["context"] for c in body["checks"]],
+               "checks": body["checks"]}
+        state["paths"][path] = new
+        done(0, out=new)
+    if path.endswith("/deployment-branch-policies") and method == "POST":
+        env = path.split("/environments/")[1].split("/")[0]
+        pols = state["envs"].setdefault(env, {}).setdefault("policies", [])
+        if f.get("name") in [p["name"] for p in pols]:
+            done(1, err="HTTP 303: a policy with this name pattern exists")
+        pols.append({"name": f["name"], "type": f.get("type")})
+        done(0, out=pols[-1])
+    if "/environments/" in path and method == "PUT":
+        env = path.split("/environments/")[1]
+        e = state["envs"].setdefault(env, {})
+        e["deployment_branch_policy"] = {k[len("deployment_branch_policy["):-1]: v for k, v in f.items()
+                                         if k.startswith("deployment_branch_policy[")}
+        done(0, out={"name": env})
+    done(1, err="fake gh: no route for %s %s" % (method, path))
+
+if argv[:2] in (["variable", "set"], ["secret", "set"]):
+    name, args = argv[2], argv[3:]
+    opts = dict(zip(args[0::2], args[1::2]))
+    if "--body" in opts:
+        value = opts["--body"]
+    else:
+        value = sys.stdin.read()
+        entry["stdin_len"] = len(value)
+    kind = "vars" if argv[0] == "variable" else "secrets"
+    state[kind][opts["--env"] + "/" + name] = value
+    done(0)
+
+done(2, err="fake gh: command not known here: %s" % argv)
+'''
+
+
+def blocks():
+    text = PAGE.read_text()
+    return {m.group(1): m.group(2) for m in
+            re.finditer(r"<!-- owner-step: (\S+) -->\s*\n```sh\n(.*?)```", text, re.S)}
+
+
+SUBS = [  # placeholder -> value, as the owner fills them in
+    ("OWNER/REPO", "acme/widgets"),
+    ("DEFAULT_BRANCH", "main"),
+    ("BRANCH", "main"),
+    ("RULESET_ID", "42"),
+    ("CHECK_NAME", "Head gate / review"),
+    ("ANY_SOURCE_APP_ID", "15368"),
+    ("APP_ID", "777777"),
+]
+NOT_PLACEHOLDERS = {"HEAD_GATE_APP_ID", "HEAD_GATE_APP_KEY", "GET", "PUT", "POST", "PATCH"}
+
+
+def fill(block, subs):
+    for k, v in subs:
+        block = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(k) + r"(?![A-Za-z0-9_])", v, block)
+    return block
+
+
+def leftover(block):
+    return sorted(set(re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", block)) - NOT_PLACEHOLDERS)
+
+
+def run(block, state, subs=SUBS, tmp=None):
+    """Run one filled-in block with the fake gh; returns (exit code, stderr, calls, state after)."""
+    tmp = pathlib.Path(tmp or tempfile.mkdtemp(dir=BASE.name))
+    (tmp / "bin").mkdir(exist_ok=True)
+    gh = tmp / "bin/gh"
+    gh.write_text(FAKE_GH)
+    gh.chmod(0o755)
+    (tmp / "key.pem").write_text("-----FAKE KEY-----\nnot a real key\n")
+    sf, lf = tmp / "state.json", tmp / "log.jsonl"
+    sf.write_text(json.dumps(state))
+    lf.write_text("")
+    subs = [(k, str(tmp / "key.pem") if k == "PATH_TO_DOWNLOADED_KEY" else v) for k, v in subs]
+    if not any(k == "PATH_TO_DOWNLOADED_KEY" for k, _ in subs):
+        subs.append(("PATH_TO_DOWNLOADED_KEY", str(tmp / "key.pem")))
+    script = fill(block, subs)
+    env = {"PATH": f"{tmp / 'bin'}:/usr/local/bin:/usr/bin:/bin", "HOME": str(tmp), "TMPDIR": str(tmp),
+           "FAKE_GH_STATE": str(sf), "FAKE_GH_LOG": str(lf), "LC_ALL": "C.UTF-8"}
+    p = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=tmp, env=env,
+                       capture_output=True, text=True, timeout=60)
+    calls = [json.loads(line) for line in lf.read_text().splitlines()]
+    return p.returncode, p.stderr, calls, json.loads(sf.read_text()), tmp
+
+
+def writes(calls):
+    return [c for c in calls if c.get("method") in ("PUT", "PATCH", "POST")]
+
+
+def empty_state(paths=None, fail=()):
+    return {"paths": paths or {}, "fail": list(fail), "envs": {}, "vars": {}, "secrets": {}}
+
+
+RS = "repos/acme/widgets/rulesets/42"
+CL = "repos/acme/widgets/branches/main/protection/required_status_checks"
+GATE = "Head gate / review"
+
+
+def ruleset(checks=None, rsc_rules=1, bypass=True):
+    rules = [{"type": "deletion"},
+             {"type": "pull_request", "parameters": {"required_approving_review_count": 0,
+                                                     "dismiss_stale_reviews_on_push": False}}]
+    for _ in range(rsc_rules):
+        rules.append({"type": "required_status_checks", "parameters": {
+            "strict_required_status_checks_policy": True, "do_not_enforce_on_create": False,
+            "required_status_checks": checks if checks is not None else
+            [{"context": "ci-result", "integration_id": 15368}, {"context": GATE}]}})
+    r = {"id": 42, "name": "main: CI before merge", "target": "branch", "source_type": "Repository",
+         "source": "acme/widgets", "enforcement": "active",
+         "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}, "rules": rules,
+         "node_id": "RRS_x", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+         "_links": {"self": {"href": "https://api.github.com/" + RS}}, "current_user_can_bypass": "always"}
+    if bypass:
+        r["bypass_actors"] = [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+    return r
+
+
+def rsc_of(body):
+    return [r["parameters"]["required_status_checks"] for r in body["rules"]
+            if r["type"] == "required_status_checks"]
+
+
+b = blocks()
+check(set(b) == {"environment", "bind-ruleset", "bind-classic"},
+      f"the page marks the three tested blocks (found {sorted(b)})")
+check(shutil.which("jq") is not None and shutil.which("bash") is not None, "jq and bash are on PATH")
+
+# Every placeholder the tested blocks use is filled in by the test and listed in the page's placeholder table.
+table = PAGE.read_text().split("| Placeholder", 1)[1].split("\n\n", 1)[0]
+listed = set(re.findall(r"`([A-Z][A-Z0-9_/]+)`", table))
+listed = {part for item in listed for part in item.split("/")}
+for name, block in b.items():
+    used = set(leftover(block))
+    check(used <= listed, f"{name}: every placeholder is in the page's table (missing {sorted(used - listed)})")
+    check(not leftover(fill(block, SUBS + [("PATH_TO_DOWNLOADED_KEY", "/k")])),
+          f"{name}: the test fills in every placeholder (left {leftover(fill(block, SUBS + [('PATH_TO_DOWNLOADED_KEY', '/k')]))})")
+
+# --- step 3: Environment, App id and key ---------------------------------------------------------------------------
+code, err, calls, st, tmp = run(b["environment"], empty_state())
+check(code == 0, f"environment: runs clean ({err.strip()[:200]})")
+env = st["envs"].get("head-gate", {})
+check(env.get("deployment_branch_policy") == {"protected_branches": False, "custom_branch_policies": True},
+      f"environment: custom branch rules only, not 'protected branches' ({env.get('deployment_branch_policy')})")
+check(env.get("policies") == [{"name": "main", "type": "branch"}],
+      f"environment: exactly one deployment rule, the default branch as a branch ({env.get('policies')})")
+check(st["vars"] == {"head-gate/HEAD_GATE_APP_ID": "777777"}, f"environment: the App id variable ({st['vars']})")
+check(st["secrets"] == {"head-gate/HEAD_GATE_APP_KEY": (tmp / "key.pem").read_text()},
+      "environment: the key secret is the file's text, in the Environment")
+check(not any("not a real key" in a for c in calls for a in c["argv"]),
+      "environment: the key text is never an argument (stdin only)")
+code2, err2, calls2, st2, _ = run(b["environment"], st)
+check(st2 == st, "environment: run twice, same state (still one deployment rule)")
+check([c["argv"] for c in calls2] == [c["argv"] for c in calls],
+      "environment: run twice, the same four calls; a refused second POST stops nothing after it")
+
+# --- step 6: bind the check in a ruleset ---------------------------------------------------------------------------
+blk = b["bind-ruleset"]
+old = ruleset()
+code, err, calls, st, _ = run(blk, empty_state({RS: old}))
+put = [c for c in calls if c.get("method") == "PUT"]
+check(code == 0 and len(put) == 1, f"ruleset: one PUT ({code}, {err.strip()[:300]})")
+body = put[0]["body"] if put else {}
+check(set(body) == {"name", "target", "enforcement", "conditions", "bypass_actors", "rules"},
+      f"ruleset: the PUT holds only the writable fields ({sorted(body)})")
+check(body.get("rules", [])[:2] == old["rules"][:2], "ruleset: the other rules are unchanged")
+check(body and rsc_of(body) == [[{"context": "ci-result", "integration_id": 15368},
+                                 {"context": GATE, "integration_id": 777777}]],
+      f"ruleset: the gate entry is bound to the App, the other check unchanged ({body and rsc_of(body)})")
+check(body and [r for r in body["rules"] if r["type"] == "required_status_checks"][0]["parameters"][
+    "strict_required_status_checks_policy"] is True, "ruleset: the rule's other parameters stay")
+check(body.get("bypass_actors") == old["bypass_actors"] and body.get("conditions") == old["conditions"],
+      "ruleset: bypass list and conditions are kept as they were")
+
+code2, err2, calls2, st2, _ = run(blk, st)
+put2 = [c for c in calls2 if c.get("method") == "PUT"]
+check(code2 == 0 and len(put2) == 1 and put2[0]["body"] == body and st2 == st,
+      "ruleset: run twice, the same PUT and the same ruleset")
+
+code, err, calls, st, _ = run(blk, empty_state({RS: ruleset(checks=[{"context": "ci-result"}])}))
+put = [c for c in calls if c.get("method") == "PUT"]
+check(code == 0 and put and rsc_of(put[0]["body"]) == [[{"context": "ci-result"},
+                                                        {"context": GATE, "integration_id": 777777}]],
+      "ruleset: a ruleset without the check gets it, bound; an unbound other check stays unbound")
+
+code, err, calls, st, _ = run(blk, empty_state({RS: ruleset(checks=[
+    {"context": GATE, "integration_id": 15368}, {"context": "lint"}, {"context": GATE}])}))
+put = [c for c in calls if c.get("method") == "PUT"]
+check(code == 0 and put and rsc_of(put[0]["body"]) == [[{"context": "lint"},
+                                                        {"context": GATE, "integration_id": 777777}]],
+      "ruleset: the gate's name bound to another App, twice: one entry, bound to the gate App")
+
+code, err, calls, _, _ = run(blk, empty_state({RS: ruleset(rsc_rules=0)}))
+check(code != 0 and not writes(calls) and "exactly one required status checks rule" in err,
+      f"ruleset: no required-checks rule: refused, nothing written ({code}, {err.strip()[:200]})")
+code, err, calls, _, _ = run(blk, empty_state({RS: ruleset(rsc_rules=2)}))
+check(code != 0 and not writes(calls) and "exactly one required status checks rule" in err,
+      "ruleset: two required-checks rules: refused, nothing written")
+code, err, calls, _, _ = run(blk, empty_state({RS: ruleset(bypass=False)}))
+check(code != 0 and not writes(calls) and "bypass_actors" in err,
+      f"ruleset: bypass list not shown (not an admin): refused, nothing written ({err.strip()[:200]})")
+code, err, calls, _, _ = run(blk, empty_state({RS: ruleset()}, fail=[RS]))
+check(code != 0 and not writes(calls), "ruleset: the read fails: nothing written")
+code, err, calls, _, _ = run(blk, empty_state({RS: ruleset()}), subs=[s for s in SUBS if s[0] != "APP_ID"])
+check(code != 0 and not writes(calls), "ruleset: APP_ID left as a placeholder: nothing written")
+
+# --- step 6: bind the check in classic branch protection -------------------------------------------------------------
+blk = b["bind-classic"]
+cold = {"url": "https://api.github.com/" + CL, "strict": True, "contexts": ["ci", "lint", GATE, "third"],
+        "contexts_url": "https://api.github.com/" + CL + "/contexts",
+        "checks": [{"context": "ci", "app_id": 15368}, {"context": "lint", "app_id": None},
+                   {"context": GATE, "app_id": None}, {"context": "third", "app_id": 9999}]}
+code, err, calls, st, _ = run(blk, empty_state({CL: cold}))
+patch = [c for c in calls if c.get("method") == "PATCH"]
+check(code == 0 and len(patch) == 1, f"classic: one PATCH ({code}, {err.strip()[:300]})")
+body = patch[0]["body"] if patch else {}
+check(body == {"strict": True, "checks": [{"context": "ci", "app_id": 15368}, {"context": "lint", "app_id": 15368},
+                                          {"context": "third", "app_id": 9999},
+                                          {"context": GATE, "app_id": 777777}]},
+      f"classic: gate bound, any-source pinned to the given id, bound checks and strict kept ({body})")
+code2, err2, calls2, st2, _ = run(blk, st)
+patch2 = [c for c in calls2 if c.get("method") == "PATCH"]
+check(code2 == 0 and len(patch2) == 1 and patch2[0]["body"] == body and st2 == st,
+      "classic: run twice, the same PATCH and the same protection")
+
+anysrc = [s if s[0] != "ANY_SOURCE_APP_ID" else ("ANY_SOURCE_APP_ID", "-1") for s in SUBS]
+code, err, calls, _, _ = run(blk, empty_state({CL: cold}), subs=anysrc)
+patch = [c for c in calls if c.get("method") == "PATCH"]
+check(code == 0 and patch and patch[0]["body"]["checks"][1] == {"context": "lint", "app_id": -1},
+      "classic: ANY_SOURCE_APP_ID -1 keeps 'any source'")
+code, err, calls, _, _ = run(blk, empty_state({CL: cold}, fail=[CL]))
+check(code != 0 and not writes(calls), "classic: no protection to read: nothing written")
+code, err, calls, _, _ = run(blk, empty_state({CL: {"url": "x", "strict": False, "contexts": ["ci"]}}))
+check(code != 0 and not writes(calls), "classic: an answer without a checks list: nothing written")
+
+# --- links, public safety, one copy ----------------------------------------------------------------------------------
+def slugs(md):
+    out = set(re.findall(r'<a id="([^"]+)"', md))
+    for h in re.findall(r"^#{1,6} (.+)$", md, re.M):
+        s = re.sub(r"[^\w\- ]", "", h.strip().lower().replace("`", "")).replace(" ", "-")
+        out.add(s)
+    return out
+
+
+PAGES = [PAGE, root / "fork-ci/actions/head-check/README.md", root / ".github/fork-fleet.md",
+         root / "docs/fork/host-tools.md"]
+for page in PAGES:
+    md = page.read_text()
+    md_nocode = re.sub(r"```.*?```", "", md, flags=re.S)
+    bad = []
+    for target in re.findall(r"\]\(([^)\s]+)\)", md_nocode):
+        if re.match(r"[a-z]+:", target):
+            continue
+        path, _, anchor = target.partition("#")
+        dest = (page.parent / path).resolve() if path else page
+        if not dest.exists():
+            bad.append(target)
+        elif anchor and dest.suffix == ".md" and anchor not in slugs(dest.read_text()):
+            bad.append(target)
+    check(not bad, f"{page.relative_to(root)}: every relative link resolves ({bad})")
+
+for page in PAGES[2:]:
+    check("gate-trust.md" in page.read_text(), f"{page.relative_to(root)} links to the gate-trust page")
+
+text = PAGE.read_text()
+personal = {
+    "home folder": r"/home/|/Users/|~/",
+    "IPv4 address": r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+    "VM id": r"\b(?:VM|vm|qm \w+) ?\d{2,}\b",
+    "token or key": r"gh[pousr]_[A-Za-z0-9]{10,}|github_pat_|BEGIN [A-Z ]*PRIVATE KEY",
+    "email address": r"[\w.+-]+@[\w-]+\.[\w.]+",
+    "ruleset id": r"rulesets/\d+",
+}
+for what, pat in personal.items():
+    hits = re.findall(pat, text)
+    check(not hits, f"the page names no {what} ({hits[:3]})")
+
+copies = []
+for f in [*root.glob("docs/**/*.md"), *root.glob("fork-ci/**/*.md"), *root.glob(".github/*.md"),
+          *root.glob("fork-ci/**/*.yml")]:
+    if f == PAGE:
+        continue
+    t = f.read_text(errors="replace")
+    if re.search(r"integration_id: ?\$app|deployment-branch-policies -f name|gh secret set HEAD_GATE_APP_KEY", t):
+        copies.append(str(f.relative_to(root)))
+check(not copies, f"the owner's commands live only in the gate-trust page ({copies})")
+
+print(f"\n{len(failures)} failed" if failures else "\nall ok")
+sys.exit(1 if failures else 0)
