@@ -818,6 +818,8 @@ class PythonApi(Repo):
         self.assertTrue(engine('plugins/locale/common/src/main/java/Wire.java'))
         self.assertFalse(engine('tools/lint.py'))
         self.assertTrue(engine('app/Main.java'), 'a path no job names runs every job')
+        self.assertTrue(DS.job_rule(self.config, 'renamed', read)('README.md'),
+                        'a job the config does not have runs, even for docs (the action leaves it out of jobs)')
         r = DS.rules(self.config, read)
         self.assertEqual(r.builds_nothing('tools/lint.py'), 'tools/**')
         self.assertIsNone(r.builds_nothing('engine/A.java'))

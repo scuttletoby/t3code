@@ -69,7 +69,8 @@ Callers may import exactly these names; anything else in the module may change i
 | `default_cache()`, `PART_AGE`, `CACHE_DAYS`      | the defaults                                                                       |
 
 `config` is the path of the pin config file. `cache` is the cache folder; a project that used its own cache folder of
-the same layout (`<cache>/<sha>/<action>/<file>`) can pass it, and its checked copies are used as they are.
+the same layout (`<cache>/<sha>/<action>/<file>`) can pass it, and its checked copies are used as they are. The cache folder must be private: one another user owns
+or others can write is refused (FetchError), and prune never follows a symlink or opens a special file in it.
 
 ## Loading this module: the bootstrap
 
@@ -89,8 +90,11 @@ def load_pinned(config, cache):
     Raises OSError (no network, no good copy) or ValueError (a bad config, or bytes that are not the config's)."""
     with open(config, encoding='utf-8') as f:
         c = json.load(f)
-    want = (c.get('files') or {}).get('pinned/pinned.py')
-    if not (re.fullmatch(r'[\w.-]+/[\w.-]+', c.get('repo') or '') and re.fullmatch(r'[0-9a-f]{40}', c.get('sha') or '')
+    if not isinstance(c, dict) or not isinstance(c.get('files'), dict):
+        raise ValueError(f'{config}: not a pin config object with "files"')
+    want, repo, sha = c['files'].get('pinned/pinned.py'), c.get('repo'), c.get('sha')
+    if not (isinstance(repo, str) and re.fullmatch(r'[\w.-]+/[\w.-]+', repo) and '.' not in repo.split('/')
+            and '..' not in repo.split('/') and isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)
             and isinstance(want, str)):
         raise ValueError(f'{config}: needs "repo", "sha" (40 hex) and "files" with "pinned/pinned.py"')
     dest = os.path.join(cache, c['sha'], 'pinned', 'pinned.py')

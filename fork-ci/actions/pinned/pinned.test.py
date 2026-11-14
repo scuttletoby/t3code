@@ -210,6 +210,63 @@ class Fetch(Case):
         pinned.prune(self.cfg, SHA)   # a file, not a folder
 
 
+class LensFindings(Case):
+    """PR 94 lens findings (minors): files() checks the config, names end at the name, the cache stays private."""
+    def test_files_checks_repo_and_full_sha_before_any_fetch(self):
+        for c in ({'repo': 'owner/repo', 'sha': 'main', 'files': self.FILES},          # a branch name, not a sha
+                  {'repo': '../..', 'sha': SHA, 'files': self.FILES},                 # dot segments in the URL path
+                  {'sha': SHA, 'files': self.FILES}, ['not', 'an', 'object'],         # tracebacks before
+                  {'repo': 'owner/repo', 'sha': SHA, 'files': ['docs-scope/docs_scope.py']}):
+            with self.subTest(config=c):
+                self.config(c)
+                with self.serve(), self.assertRaises(pinned.FetchError):
+                    pinned.files(self.cfg)
+                out = io.StringIO()
+                with self.serve(), contextlib.redirect_stderr(out):
+                    self.assertEqual(pinned.main(['--config', self.cfg, 'files']), 1)
+                self.assertTrue(out.getvalue().startswith('pinned: '), out.getvalue())
+        self.assertEqual(self.urls, [])
+
+    def test_pin_refuses_dot_segment_repos(self):
+        for repo in ('../..', './x', 'x/..'):
+            with self.subTest(repo=repo):
+                self.config({'repo': repo, 'sha': SHA, 'files': self.FILES})
+                with self.serve(), self.assertRaises(pinned.FetchError):
+                    self.path()
+        self.assertEqual(self.urls, [])
+
+    def test_a_name_with_a_trailing_newline_is_not_plain(self):
+        self.assertIsNone(pinned.NAME.match('docs_scope.py\n'))
+        with self.serve(), self.assertRaises(pinned.FetchError):
+            pinned.path(self.cfg, 'docs-scope', 'docs_scope.py\n', self.cache)
+
+    def test_prune_never_follows_a_symlink_out_of_the_cache(self):
+        outside = os.path.join(self.root, 'outside')
+        victim = self.put(os.path.join(outside, '.part-keepme'), b'', age=7200)
+        os.symlink(outside, os.path.join(self.cache, 'b' * 40))
+        pinned.prune(self.cache, SHA)
+        self.assertTrue(os.path.exists(victim), 'prune followed a symlinked sha folder out of the cache')
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs')
+    def test_a_fifo_in_place_of_the_cached_file_is_fetched_over_not_opened(self):
+        os.makedirs(os.path.dirname(self.dest))
+        os.mkfifo(self.dest)   # opening it to read would wait for a writer forever
+        with self.serve():
+            self.assertEqual(self.path(), self.dest)
+        with open(self.dest, 'rb') as f:
+            self.assertEqual(f.read(), BODY)
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
+    def test_a_cache_others_can_write_is_refused(self):
+        os.chmod(self.cache, 0o777)
+        with self.serve(), self.assertRaises(pinned.FetchError):
+            self.path()
+        self.assertEqual(self.urls, [])
+        os.chmod(self.cache, 0o700)
+        with self.serve():
+            self.path()
+
+
 class Run(Case):
     def test_run_executes_the_verified_bytes_even_if_the_cache_file_changes_after_the_check(self):
         body = b'print("good")\n'
@@ -333,7 +390,8 @@ class Bootstrap(Case):
 
     def test_a_bad_config_is_refused_before_any_fetch(self):
         for c in ({'repo': 'owner/repo', 'sha': '../' * 13 + 'x', 'files': {'pinned/pinned.py': '0' * 40}},
-                  {'repo': 'owner/repo', 'sha': SHA, 'files': {}}, {'repo': 'a b', 'sha': SHA}):
+                  {'repo': 'owner/repo', 'sha': SHA, 'files': {}}, {'repo': 'a b', 'sha': SHA},
+                  ['not', 'an', 'object'], {'repo': '../..', 'sha': SHA, 'files': {'pinned/pinned.py': '0' * 40}}):
             with self.subTest(config=c):
                 self.config(c)
                 with self.assertRaises(ValueError):

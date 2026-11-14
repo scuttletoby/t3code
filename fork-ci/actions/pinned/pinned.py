@@ -22,9 +22,9 @@ runs that pinned script (python3 -I) with the arguments after its name, from a p
 prints the "files" map at the config's sha (fetched, not checked): for a pin bump, move "sha" and "tag", paste it.
 README.md next to this file: the Python API and the bootstrap a project copies to load this module.
 """
-import argparse, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, types, urllib.request
+import argparse, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, types, urllib.request
 
-NAME = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]*$')
+NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._-]*\Z')   # \Z: no trailing newline
 SHA = re.compile(r'[0-9a-f]{40}')
 PART_AGE = 3600     # seconds: an older .part- file is a killed fetch (a live one takes seconds)
 CACHE_DAYS = 14     # another sha's folder that nothing used for this long goes (a rerun of an old run fetches again)
@@ -42,20 +42,52 @@ class Unreachable(FetchError):
     """The fetch itself failed (no network, GitHub down, HTTP error): not a wrong blob id."""
 
 
-def pin(config):
-    """{"repo", "sha", "tag", "files"} from the pin config file (a path)."""
+def good_repo(repo):
+    """owner/name, neither part '.' or '..' (it goes into a URL path)."""
+    return (isinstance(repo, str) and re.fullmatch(r'[\w.-]+/[\w.-]+', repo) is not None
+            and not any(part in ('.', '..') for part in repo.split('/')))
+
+
+def repo_and_sha(config):
+    """The pin config (a path) as a dict with a good "repo" and a 40-hex "sha" (a full commit sha, never a name)."""
     try:
         with open(config, encoding='utf-8') as f:
             c = json.load(f)
     except (OSError, ValueError) as e:
         raise FetchError(f'{config}: cannot be read as JSON ({e})')
-    if not (isinstance(c, dict) and isinstance(c.get('repo'), str) and isinstance(c.get('sha'), str)
-            and re.fullmatch(r'[\w.-]+/[\w.-]+', c['repo']) and SHA.fullmatch(c['sha'])):
+    if not (isinstance(c, dict) and good_repo(c.get('repo')) and isinstance(c.get('sha'), str)
+            and SHA.fullmatch(c['sha'])):
         raise FetchError(f'{config}: needs "repo" (owner/name) and "sha" (40 hex)')
+    return c
+
+
+def pin(config):
+    """{"repo", "sha", "tag", "files"} from the pin config file (a path)."""
+    c = repo_and_sha(config)
     files = c.get('files')
     if not (isinstance(files, dict) and all(isinstance(v, str) and SHA.fullmatch(v) for v in files.values())):
         raise FetchError(f'{config}: needs "files", {{"<action>/<file>": "<git blob id>"}} (pinned.py files prints it)')
     return c
+
+
+def private(cache):
+    """Make the cache folder (0700) and refuse one another user owns or others can write: there they could plant a
+    symlink or a FIFO that prune or a read would act on. (The bytes run are checked either way.)"""
+    os.makedirs(cache, mode=0o700, exist_ok=True)
+    st = os.stat(cache)
+    if hasattr(os, 'getuid') and (st.st_uid != os.getuid() or st.st_mode & 0o022):
+        raise FetchError(f'cache folder {cache} is not private (owner {st.st_uid}, mode {oct(st.st_mode & 0o777)}): '
+                         'use a folder of your own that only you can write')
+
+
+def read_regular(path):
+    """The bytes of path if it is a regular file (no symlink followed, no FIFO or device opened), else None."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+                 | getattr(os, 'O_BINARY', 0))
+    with os.fdopen(fd, 'rb') as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return None
+        return f.read()
 
 
 def blob_id(data):
@@ -84,13 +116,15 @@ def prune(cache, keep, now=None):
     for sha in shas:
         top = os.path.join(cache, sha)
         try:
+            if not stat.S_ISDIR(os.lstat(top).st_mode):   # a symlink is never followed out of the cache
+                continue
             if sha != keep and SHA.fullmatch(sha) and now - os.stat(top).st_mtime > CACHE_DAYS * 86400:
                 shutil.rmtree(top, ignore_errors=True)
                 continue
             for folder, _, names in os.walk(top):
                 for n in names:
                     f = os.path.join(folder, n)
-                    if n.startswith('.part-') and now - os.stat(f).st_mtime > PART_AGE:
+                    if n.startswith('.part-') and now - os.lstat(f).st_mtime > PART_AGE:
                         os.remove(f)
         except OSError:
             continue
@@ -106,14 +140,14 @@ def verified(config, action, name, cache=None):
         raise FetchError(f'{action}/{name} is not in {config} "files" (its blob id: pinned.py --config {config} '
                          'files, after adding the name)')
     cache = cache or default_cache()
+    private(cache)
     prune(cache, c['sha'])
     top = os.path.join(cache, c['sha'])
     folder = os.path.join(top, action)
     dest = os.path.join(folder, name)
     try:
-        with open(dest, 'rb') as f:
-            data = f.read()
-        if blob_id(data) == want:
+        data = read_regular(dest)
+        if data is not None and blob_id(data) == want:
             os.utime(top)   # in use: prune keeps it
             return dest, data
     except OSError:
@@ -168,14 +202,14 @@ def run(config, action, name, args=(), cache=None, runner=None):
 
 
 def files(config):
-    """The "files" map at the config's sha: each named file fetched and hashed (for a pin bump: nothing is checked)."""
-    try:
-        with open(config, encoding='utf-8') as f:
-            c = json.load(f)
-    except (OSError, ValueError) as e:
-        raise FetchError(f'{config}: cannot be read as JSON ({e})')
+    """The "files" map at the config's sha: each named file fetched and hashed (for a pin bump: the blob ids are not
+    checked, the repo and the full sha are)."""
+    c = repo_and_sha(config)
+    names = c.get('files') or {}
+    if not isinstance(names, dict):
+        raise FetchError(f'{config}: "files" is not a map of "<action>/<file>" names')
     out = {}
-    for k in c.get('files') or {}:
+    for k in names:
         action, _, name = k.partition('/')
         if not (NAME.match(action) and NAME.match(name)):
             raise FetchError(f'{config}: "files" key {k!r} is not <action>/<file>')

@@ -328,10 +328,10 @@ class Rules:
     def job_runs(self, name, path, plain=True):
         """Why a change of path alone runs job name, as decide() says it, or None (the job is skipped). A job the
         config does not have runs (the action leaves it out of `jobs`, and callers read a missing job as "run")."""
+        if name not in self.jobs:   # first: even for a docs path (the action leaves it out of `jobs`: it runs)
+            return f'{name} is not a job of the config (a missing job reads as "run")'
         if self.not_docs(path, plain) is None:
             return None
-        if name not in self.jobs:
-            return f'{name} is not a job of the config (a missing job reads as "run")'
         if self.runs_every_job(path):
             return f'every job runs for {path}'
         hit = self.job_hit(name, path)
