@@ -1,9 +1,14 @@
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   DEFAULT_SERVER_SETTINGS,
   PROJECT_SCOPED_SERVER_SETTING_KEYS,
+  ProjectSettingsOverrides,
   ServerSettings,
   ServerSettingsPatch,
 } from "./settings.ts";
@@ -98,6 +103,75 @@ describe("WaitCheck", () => {
     expect(Object.keys(decodeChecks({ "lease-free": { argv: ["x"] } }))).toEqual(["lease-free"]);
     expect(() => decodeChecks({ "Lease Free": { argv: ["x"] } })).toThrow();
     expect(() => decodeChecks({ "-lease": { argv: ["x"] } })).toThrow();
+  });
+});
+
+describe("bad checks in the settings file (read drops, save refuses)", () => {
+  const good = { argv: ["/usr/bin/true"] };
+  const bad = [
+    ["a bad name", "Lease_Free", good],
+    ["an interval below 5", "lease-short", { argv: ["/bin/true"], intervalSeconds: 3 }],
+    ["a pattern that does not compile", "lease-regex", { argv: ["/bin/true"], argPattern: "([" }],
+  ] as const;
+
+  /** Decodes like the server's read and returns the exit and the warnings it logged. */
+  const decodeLogged = Effect.fn("decodeLogged")(function* <A>(
+    schema: Schema.Codec<A, unknown>,
+    input: unknown,
+  ) {
+    const warnings: Array<unknown> = [];
+    const logger = Logger.make(({ logLevel, message }) => {
+      if (logLevel === "Warn") warnings.push(message);
+    });
+    const exit = yield* Schema.decodeUnknownEffect(schema)(input).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.exit,
+    );
+    return { exit, warnings };
+  });
+
+  for (const [what, name, check] of bad) {
+    effectIt.effect(`drops ${what} with a warning; the other settings and checks load`, () =>
+      Effect.gen(function* () {
+        const { exit, warnings } = yield* decodeLogged(ServerSettings, {
+          enableProviderUpdateChecks: false,
+          waitChecks: { "lease-free": good, [name]: check },
+        });
+        expect(Exit.isSuccess(exit)).toBe(true);
+        const settings = Exit.isSuccess(exit) ? exit.value : undefined;
+        expect(settings?.enableProviderUpdateChecks).toBe(false);
+        expect(Object.keys(settings?.waitChecks ?? {})).toEqual(["lease-free"]);
+        expect(JSON.stringify(warnings)).toContain(name);
+      }),
+    );
+  }
+
+  effectIt.effect("drops a bad check of a project override the same way", () =>
+    Effect.gen(function* () {
+      const { exit, warnings } = yield* decodeLogged(ProjectSettingsOverrides, {
+        waitChecks: { "lease-free": good, Lease_Free: good },
+      });
+      expect(Exit.isSuccess(exit) ? Object.keys(exit.value.waitChecks ?? {}) : null).toEqual([
+        "lease-free",
+      ]);
+      expect(warnings).toHaveLength(1);
+    }),
+  );
+
+  effectIt.effect("logs nothing when every check is good", () =>
+    Effect.gen(function* () {
+      const { warnings } = yield* decodeLogged(ServerSettings, {
+        waitChecks: { "lease-free": good },
+      });
+      expect(warnings).toEqual([]);
+    }),
+  );
+
+  it.each(bad)("refuses %s in a settings patch", (_, name, check) => {
+    expect(() => decodePatch({ waitChecks: { [name]: check } })).toThrow();
+    expect(() =>
+      decodePatch({ projectSettingsOverrides: { "project-a": { waitChecks: { [name]: check } } } }),
+    ).toThrow();
   });
 });
 

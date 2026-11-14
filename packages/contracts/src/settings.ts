@@ -28,6 +28,7 @@ import {
   AgentSlotsSettings,
   AgentSlotsSettingsPatch,
   WaitChecks,
+  WaitChecksFromSettingsFile,
   WaitForSettings,
   WaitForSettingsPatch,
 } from "./waitFor.ts";
@@ -1293,7 +1294,8 @@ export const ProjectSettingsOverrides = Schema.Struct({
   continueThreadsAfterServerUpdate: Schema.optionalKey(Schema.Boolean),
   responseStreamingMode: Schema.optionalKey(ResponseStreamingMode),
   speechProjectCustomWords: Schema.optionalKey(SpeechCustomWords),
-  waitChecks: Schema.optionalKey(WaitChecks),
+  // Fork: bad entries are dropped on read; the settings patch refuses them.
+  waitChecks: Schema.optionalKey(WaitChecksFromSettingsFile),
   providerInstances: Schema.optionalKey(
     Schema.Record(ProviderInstanceId, ProjectProviderInstanceOverride),
   ),
@@ -1506,7 +1508,7 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(WaitForSettings)({}))),
   ),
   /** Fork: named check commands for waits; only settings can add one. */
-  waitChecks: WaitChecks.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  waitChecks: WaitChecksFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   /** Fork: agent slot limits on `delegate_task`; off by default. */
   agentSlots: AgentSlotsSettings.pipe(
     Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(AgentSlotsSettings)({}))),
@@ -1988,6 +1990,8 @@ export const ServerSettingsPatch = Schema.Struct({
           Schema.Struct({
             ...ProjectSettingsOverrides.fields,
             sourceControlWritingStyle: Schema.optionalKey(SourceControlWritingStyleSettings),
+            // Fork: a save refuses a bad check (reading the file drops it with a warning).
+            waitChecks: Schema.optionalKey(WaitChecks),
           }),
         ),
       ),

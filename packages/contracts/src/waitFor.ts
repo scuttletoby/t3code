@@ -6,7 +6,9 @@
  * This file holds the settings, the stored record and the tool schemas only.
  */
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
   IsoDateTime,
@@ -93,8 +95,9 @@ export const WaitCheck = Schema.Struct({
 export type WaitCheck = typeof WaitCheck.Type;
 
 /**
- * By name. A project override replaces the whole map. A bad name fails the decode: a record with a
- * key pattern would drop the check without a word.
+ * By name. A project override replaces the whole map. Strict: a bad name or entry fails the decode,
+ * so a save (settings patch) refuses it. Reading the settings file uses
+ * {@link WaitChecksFromSettingsFile} instead.
  */
 export const WaitChecks = Schema.Record(Schema.String, WaitCheck).check(
   Schema.makeFilter(
@@ -104,6 +107,43 @@ export const WaitChecks = Schema.Record(Schema.String, WaitCheck).check(
   ),
 );
 export type WaitChecks = typeof WaitChecks.Type;
+
+const decodeWaitCheckOption = Schema.decodeUnknownOption(WaitCheck);
+
+/**
+ * The settings file's check map. One bad entry (name, field or pattern) is dropped with a warning
+ * and the rest load, so a typo in a hand-edited file cannot fail the whole settings decode. A
+ * dropped check is answered as `unknown_check` with the list of names, and the next settings save
+ * leaves it out of the file, like upstream's forward-compatible fields.
+ */
+export const WaitChecksFromSettingsFile = Schema.Record(Schema.String, Schema.Unknown).pipe(
+  Schema.decodeTo(
+    Schema.toType(WaitChecks),
+    SchemaTransformation.transformEffect({
+      decode: Effect.fn("WaitChecksFromSettingsFile.decode")(function* (raw: {
+        readonly [name: string]: unknown;
+      }) {
+        const checks: Record<string, WaitCheck> = {};
+        const dropped: Array<string> = [];
+        for (const [name, value] of Object.entries(raw)) {
+          const check = WAIT_CHECK_NAME_PATTERN.test(name)
+            ? decodeWaitCheckOption(value)
+            : Option.none();
+          if (Option.isSome(check)) checks[name] = check.value;
+          else dropped.push(name);
+        }
+        if (dropped.length > 0) {
+          yield* Effect.logWarning(
+            "settings: invalid wait checks dropped; the next settings save removes them from the file",
+            { dropped },
+          );
+        }
+        return checks as WaitChecks;
+      }),
+      encode: (checks) => Effect.succeed(checks as Record<string, unknown>),
+    }),
+  ),
+);
 
 /** Server-wide agent slot limits. `enabled: false` leaves `delegate_task` as upstream's. */
 export const AgentSlotsSettings = Schema.Struct({
