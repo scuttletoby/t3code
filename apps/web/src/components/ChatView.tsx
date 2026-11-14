@@ -37,7 +37,11 @@ import { ThreadFind, ThreadFindCanvas } from "./chat/ThreadFindProvider";
 import { closeThreadFind, openThreadFind, useThreadFindOpen } from "./chat/threadFindStore";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
-import { resolveDraftHeroState } from "./ChatView.logic";
+import {
+  promptHasFileReferences,
+  resolveAutomaticEnvironment,
+  resolveDraftHeroState,
+} from "./ChatView.logic";
 import { useQueuedRunEdit } from "./chat/useQueuedRunEdit";
 import { recallCheckoutIsRepo, rememberCheckoutIsRepo } from "./ChatView.logic";
 import { useLogicalProjectEnvironments } from "../hooks/useLogicalProjectEnvironments";
@@ -609,6 +613,9 @@ export default function ChatView(props: ChatViewProps) {
     const draft = store.getComposerDraft(composerDraftTarget);
     return (draft?.images.length ?? 0) > 0 || (draft?.files.length ?? 0) > 0;
   });
+  const composerHasFileReferences = useComposerDraftStore((store) =>
+    promptHasFileReferences(store.getComposerDraft(composerDraftTarget)?.prompt ?? ""),
+  );
   const referencedThreadContexts = useComposerDraftStore(
     useShallow((store) => {
       const draft = store.getComposerDraft(composerDraftTarget);
@@ -1203,7 +1210,6 @@ export default function ChatView(props: ChatViewProps) {
     activeProjectIsScratch && draftId !== null,
   );
   const hasMultipleEnvironments = logicalProjectEnvironments.length > 1;
-  const canAutoBalanceEnvironments = hasMultipleEnvironments && !activeProjectIsScratch;
   const activeEnvironmentOption =
     logicalProjectEnvironments.find(
       (environment) => environment.environmentId === activeThread?.environmentId,
@@ -1283,17 +1289,15 @@ export default function ChatView(props: ChatViewProps) {
     loadBalancingEnabled: settings.loadBalancingEnabled,
     loadBalancingWeights: settings.loadBalancingWeights,
   }));
-  const automaticEnvironment = Boolean(
-    clientSettingsHydrated &&
-    draftId &&
-    !envLocked &&
-    canAutoBalanceEnvironments &&
-    loadBalancingSettings.loadBalancingEnabled &&
-    draftThread?.environmentSelection !== "manual" &&
-    (!composerHasAttachments || Boolean(draftThread?.loadBalancedEnvironmentId)) &&
-    (!draftThread?.branch || draftThread.environmentSelection === "auto") &&
-    !draftThread?.worktreePath,
-  );
+  const automaticEnvironment = resolveAutomaticEnvironment({
+    ready: clientSettingsHydrated && draftId !== null && !envLocked,
+    hasMultipleEnvironments,
+    loadBalancingEnabled: loadBalancingSettings.loadBalancingEnabled,
+    isScratch: activeProjectIsScratch,
+    hasAttachments: composerHasAttachments,
+    hasFileReferences: composerHasFileReferences,
+    draft: draftThread,
+  });
   const autoUpdateEnvironments = automaticEnvironment
     ? logicalProjectEnvironments.flatMap(({ environmentId }) => {
         const environment = environmentById.get(environmentId);
@@ -3786,7 +3790,7 @@ export default function ChatView(props: ChatViewProps) {
                                   onAutoEnvironment={
                                     draftId &&
                                     !envLocked &&
-                                    canAutoBalanceEnvironments &&
+                                    hasMultipleEnvironments &&
                                     loadBalancingSettings.loadBalancingEnabled
                                       ? onAutoEnvironmentStable
                                       : undefined
@@ -3884,7 +3888,7 @@ export default function ChatView(props: ChatViewProps) {
                   onAutoEnvironment={
                     draftId &&
                     !envLocked &&
-                    canAutoBalanceEnvironments &&
+                    hasMultipleEnvironments &&
                     loadBalancingSettings.loadBalancingEnabled
                       ? onAutoEnvironmentStable
                       : undefined
