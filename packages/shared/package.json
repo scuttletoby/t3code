@@ -167,6 +167,14 @@
       "types": "./src/serverSettings.ts",
       "import": "./src/serverSettings.ts"
     },
+    "./waitFor": {
+      "types": "./src/waitFor.ts",
+      "import": "./src/waitFor.ts"
+    },
+    "./agentSlots": {
+      "types": "./src/agentSlots.ts",
+      "import": "./src/agentSlots.ts"
+    },
     "./backgroundActivitySettings": {
       "types": "./src/backgroundActivitySettings.ts",
       "import": "./src/backgroundActivitySettings.ts"

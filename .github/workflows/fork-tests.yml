@@ -240,7 +240,7 @@ jobs:
     timeout-minutes: 5
     steps:
       # scripts/: some tests are run by a script there (.github/fork-ci-tests.txt).
-      # fork-ci/: the composite actions and their tests.
+      # fork-ci/: the composite actions and their tests. fork-kit/: host kits and their tests.
       # docs/fork/: the fork's pages whose commands and links a test runs (fork-gate-trust-docs.test.py).
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -250,6 +250,7 @@ jobs:
             /.github/
             /docs/fork/
             /fork-ci/
+            /fork-kit/
             /scripts/
           sparse-checkout-cone-mode: false
 
@@ -267,7 +268,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
 
-      # Every test under .github/scripts and fork-ci, checked against .github/fork-ci-tests.txt:
+      # Every test under .github/scripts, fork-ci and fork-kit, checked against .github/fork-ci-tests.txt:
       # the fork's tests run here, the others must be named by the job or script
       # that runs them. An unlisted test, or a listed one deleted from history,
       # fails; a listed one whose pull request has not merged yet is a note.
@@ -288,6 +289,14 @@ jobs:
 
       - name: Fleet launcher as root
         run: sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot
+
+      # The gh-apps host kit installed for real (fork-kit/gh-apps/README.md): real service
+      # users, the real sudoers file and sudo, an agent user that tries to reach the keys,
+      # the token cache, gh-mint and the environment. It creates and deletes its users and
+      # refuses to run anywhere but a throw-away runner. sudo drops GITHUB_ACTIONS, so it is
+      # passed on again.
+      - name: gh-apps kit as root
+        run: sudo env GH_APPS_ROOT_TESTS=1 GITHUB_ACTIONS="$GITHUB_ACTIONS" python3 -I -B fork-kit/gh-apps/tests/root.test.py
 
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs

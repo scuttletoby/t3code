@@ -1,5 +1,5 @@
 {
-  "_comment": "The fork-ci release (.github/scripts/fork-ci-release.py, fork-ci/README.md). paths: the only files a release commit holds, at the same paths as on sourceBranch. legacyTags: tags made before release commits existed (they name a sourceBranch commit, not a release commit, and stay where they are).",
+  "_comment": "The fork-ci release (.github/scripts/fork-ci-release.py, fork-ci/README.md). paths: the only files a release commit holds (fork-kit: host kits, installed from a release commit), at the same paths as on sourceBranch. legacyTags: tags made before release commits existed (they name a sourceBranch commit, not a release commit, and stay where they are).",
   "sourceBranch": "main",
   "requiredCheck": "fork-ci-result",
   "branch": "ci-release",
@@ -8,6 +8,7 @@
   "paths": [
     "LICENSE",
     "fork-ci",
+    "fork-kit",
     ".github/workflows/fork-pr-queue.yml",
     ".github/workflows/fork-head-gate.yml",
     ".github/scripts/fork-fleet.py"

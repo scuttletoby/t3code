@@ -1,4 +1,4 @@
-# Every test file under .github/scripts and fork-ci (*.test.*, subdirectories included) and
+# Every test file under .github/scripts, fork-ci and fork-kit (*.test.*, subdirectories included) and
 # where it runs (.github/scripts/fork-ci-tests.cjs checks this list).
 #   <test>                  run by the workflows job, by extension (sh, py, cjs, mjs, js)
 #   <test> run by <file>    run by <file>, which must name the test's path (not one
@@ -31,6 +31,13 @@ fork-ci/actions/job-changed/job-changed.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
+fork-kit/gh-apps/tests/install.test.py
+fork-kit/gh-apps/tests/mint.test.py
+fork-kit/gh-apps/tests/policy.test.py
+fork-kit/gh-apps/tests/run.test.py
+fork-kit/gh-apps/tests/wrapper.test.py
+# Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
+fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
 
 # Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
 .github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml

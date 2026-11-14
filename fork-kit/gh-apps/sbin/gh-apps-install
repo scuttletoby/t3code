@@ -1,0 +1,8 @@
+#!/usr/bin/python3 -IB
+"""gh-apps-install: install, uninstall, self-check, as root (lib/ghapps/install.py).
+-I: no environment variable, user site folder or current folder changes what Python loads. The code is loaded
+only from this file's real folder (a root-owned version folder once installed)."""
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+from ghapps import install  # noqa: E402
+sys.exit(install.main(sys.argv[1:]))

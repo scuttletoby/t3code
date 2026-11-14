@@ -953,6 +953,8 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "target_required",
       // Fork: the usage pacing gate held a delegated task; the message says until when.
       "usage_pacing_hold",
+      // Fork: the agent slot gate refused a new delegated agent; the message names the rule.
+      "slots_full",
     ]),
     message: Schema.String,
   },
