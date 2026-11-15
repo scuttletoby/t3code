@@ -1,0 +1,52 @@
+# Fork only: the fleet host's runner template refresh (fork-fleet-launch.sh refresh). Install as
+# /etc/systemd/system/t3code-fleet-refresh.service with its timer (.github/fork-fleet.md, host step 7); not as
+# fork-fleet-*, the runner units' prefix. Safe to start by hand: a second refresh waits for the first (refresh.lock),
+# then finds the template new already.
+#
+# Root, sandboxed. Root because the template must be root's (each job hard-links it, and start refuses one anyone
+# else owns or may write). The sandbox lets it write only the template's own folder (/opt/fork-fleet/template, where
+# the new template is unpacked and swapped in, and whose folder is its refresh lock; refresh refuses to run when
+# anything else is in it, so none of the files the dispatcher runs as root is writable here). /run/fork-fleet, where
+# the root launcher keeps its launch lock and the jobs' environment files, is read-only here (no RuntimeDirectory=):
+# refresh only opens the launch lock the dispatcher's first prune or start made. It reaches the network by IP only (no
+# unix socket: no way to ask systemd or the bus for an unsandboxed unit), makes no device, setuid or setgid file, keeps
+# one capability (CAP_DAC_OVERRIDE, so a leftover folder without owner write can still be removed) and has a memory,
+# CPU and task limit (a hostile tarball cannot starve the host's jobs). With TEMPLATE elsewhere (launch.conf), add a
+# drop-in: [Service] ReadWritePaths=<the template's own folder>.
+[Unit]
+Description=t3code fork fleet: refresh the runner template
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fork-fleet/fork-fleet-launch.sh refresh
+TimeoutStartSec=50min
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+ProtectSystem=strict
+# The launcher's default TEMPLATE is /opt/fork-fleet/template/runner-template. "-": when the folder is missing, refresh
+# says so (it makes it when run by hand, host step 7).
+ReadWritePaths=-/opt/fork-fleet/template
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+MemoryMax=1G
+MemorySwapMax=0
+CPUQuota=100%
+TasksMax=64
