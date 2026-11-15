@@ -1,0 +1,16 @@
+# Fork only: THE list of this host's system paths every fleet job sees, read-only, one per line. The only place of
+# this rule: fork-fleet-launch.sh (job_fs) gives a job's unit these paths and nothing else of the host's files (its own
+# copy, the hook, resolv.conf, and systemd's own /proc, /sys, /dev and memory file systems aside), and the per-OS walls
+# read it through the launcher (`paths`). A path this host does not have is skipped; a symlink here (/bin -> usr/bin)
+# is the same symlink in the unit; any other path is bound from its real path (links above it resolved); each is one
+# mount, without what is mounted under it. A host's own extra (a tool cache) goes in launch.conf's ALLOW_PATHS, not
+# here. Never a path that holds data: the launcher refuses /home, /root, /mnt, /media and /srv (also through a link),
+# and the per-OS walls refuse a share.
+/usr
+/etc
+/bin
+/sbin
+/lib
+/lib32
+/lib64
+/libx32
