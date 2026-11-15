@@ -2499,4 +2499,46 @@ it.layer(NodeServices.layer)("WaitService: carry from #90 (fix round 2 on #91)",
       );
     },
   );
+
+  it.effect(
+    "a stopped file check process keeps its place until it ends, so cancelling never lets a 3rd start (#107)",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        let childLive = 0;
+        let mostChildLive = 0;
+        const judges: WaitJudges = {
+          file: (_target, context) =>
+            context.waitId === null ? Effect.succeed<Judgement>({ type: "notYet" }) : Effect.never,
+        };
+        // Like a process in `D` state on a dead network mount: killed, it stays until it ends.
+        const fileChildJudge: WaitJudge<"file"> = (_target, context) =>
+          context.waitId === null
+            ? Effect.succeed<Judgement>({ type: "notYet" })
+            : Effect.sync(() => {
+                childLive += 1;
+                mostChildLive = Math.max(mostChildLive, childLive);
+              }).pipe(Effect.andThen(Effect.never));
+        const service = yield* makeService({ filePath, judges, fileChildJudge });
+        const sweep = Effect.gen(function* () {
+          yield* TestClock.adjust(5_000);
+          const fiber = yield* Effect.forkChild(service.judgeDue());
+          yield* stepSeconds(80);
+          yield* Fiber.join(fiber);
+        });
+        // Two stats hang and turn late; from then on file checks run in processes.
+        yield* register(service, fileWait(watched("dead/s1")));
+        yield* register(service, fileWait(watched("dead/s2")));
+        yield* sweep;
+        yield* service.cancel({ projectId: PROJECT, threadId: THREAD });
+        for (let round = 0; round < 3; round += 1) {
+          yield* register(service, fileWait(watched(`dead/${round}-a`)));
+          yield* register(service, fileWait(watched(`dead/${round}-b`)));
+          yield* sweep;
+          yield* service.cancel({ projectId: PROJECT, threadId: THREAD });
+        }
+        assert.isAtLeast(mostChildLive, 1, "file checks reached their own processes");
+        assert.strictEqual(mostChildLive, 2, "never more stuck file check processes than places");
+      }).pipe(inMemory, Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
 });
