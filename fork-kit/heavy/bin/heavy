@@ -40,6 +40,8 @@ FORWARD = (signal.SIGUSR1, signal.SIGUSR2)                               # only 
 RERAISE = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGKILL, signal.SIGPIPE, signal.SIGUSR1,
            signal.SIGUSR2, signal.SIGALRM}
 PR_SET_PDEATHSIG = 1
+PR_SET_NAME = 15
+PROBE_NAME = b'grp-sigprobe'   # no 'heavy' in it: `pkill heavy` / `killall heavy` must not signal the probe too
 MAX_NAMES = 5
 # Python sets these to SIG_IGN at startup, and SIG_IGN survives exec: put them back before the command starts
 # (subprocess does the same for its children)
@@ -292,6 +294,7 @@ class GroupProbe:
                             pass
                 if prctl is not None:
                     prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+                    prctl(PR_SET_NAME, PROBE_NAME, 0, 0, 0)
                 while os.read(r_cmd, 1):                      # 'd': drain; end of file: heavy is done
                     while signal.sigtimedwait(signals, 0) is not None:
                         pass

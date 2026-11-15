@@ -369,6 +369,26 @@ class Heavy(unittest.TestCase):
         out, err = p.communicate(timeout=60)
         self.assertEqual((p.returncode, out), (0, 'int=1 usr1=2\n'), err)
 
+    def test_name_based_kills_do_not_reach_the_signal_probe(self):
+        # `pkill -INT heavy` / `killall heavy` signal every process named heavy. Had the probe that name too, the signal
+        # would look like a group signal and heavy would not pass it on (the command got nothing until the grace ran out)
+        p = self.start(self.counter(2), env=dict(self.env, HEAVY_GRACE='10'))
+        self.wait_ready(p)
+        kids = [int(n) for n in os.listdir('/proc') if n.isdigit() and self.ppid(int(n)) == p.pid]
+        names = [comm(k) for k in kids]
+        p.send_signal(signal.SIGINT)
+        out, err = p.communicate(timeout=60)
+        self.assertIn('grp-sigprobe', names, err)
+        self.assertEqual([n for n in names if n and 'heavy' in n], [], err)
+
+    @staticmethod
+    def ppid(pid):
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                return int(f.read().rsplit(')', 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+
     def test_timeout_signal_to_heavy_and_its_group_counts_once(self):
         # timeout(1) sends the signal to heavy, then to its whole process group: one event, not a second signal
         r = subprocess.run(['timeout', '-s', 'INT', '1', HEAVY, self.counter(3)], capture_output=True, text=True,

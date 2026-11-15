@@ -15,12 +15,12 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 
 ## Use
 
-| Command                      | What happens                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------------- |
-| `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends      |
-| `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)             |
-| `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files         |
-| `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                                   |
+| Command                      | What happens                                                                                 |
+| ---------------------------- | -------------------------------------------------------------------------------------------- |
+| `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends |
+| `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)        |
+| `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files    |
+| `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                              |
 
 The command gets the same folder, environment, stdin, stdout, stderr and open files. heavy exits with the command's
 exit code, or dies of the same signal (a shell sees `128+N`), so scripts and `make` see what they saw before. The
@@ -57,7 +57,11 @@ up and prints the one line. With `HEAVY_KEEP=1`, the inner one gets a scope of i
 `HEAVY_CONFIG` names another file; `HEAVY_SLICE` and `HEAVY_GRACE` override one value (tests use them;
 `HEAVY_SYSTEMCTL` names another systemctl). Without a config file the defaults above apply. `grace_seconds` is how
 long a command gets after a signal, and leftovers after TERM, before KILL. If the last check of the scope fails (an
-overloaded host: systemctl errors or times out), heavy says it could not check for leftovers, never nothing. The limits live in the slice unit, not here: either a unit you already have
+overloaded host: systemctl errors or times out), heavy says it could not check for leftovers, never nothing.
+heavy tells a signal sent to its whole process group from one sent to heavy alone with a small helper
+process named `grp-sigprobe`. When a service manager stops a service that heavy runs in, it signals each process
+of that service one by one; the command, in its own scope, then gets TERM only when the grace time ends.
+The limits live in the slice unit, not here: either a unit you already have
 (for example `~/.config/systemd/user/heavy.slice`), or one the installer writes to `/etc/systemd/user/` when given
 limit options. A user's own unit in `~/.config/systemd/user/` wins over the one in `/etc/systemd/user/`.
 
