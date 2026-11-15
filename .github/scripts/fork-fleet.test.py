@@ -1773,6 +1773,35 @@ class Launcher(unittest.TestCase):
         os.chmod(self.path('pub'), 0o1777)   # sticky: only a link's owner may swap it, and that is this user (root)
         self.start(self.NAME)
 
+    def test_a_link_in_a_folder_another_user_owns_or_its_group_may_write_is_refused(self):
+        """Fix round 1 (#213 S7, C5): a root link is safe only in root's folder that only root may write (or a sticky
+        one): the folder's owner may remove any link in it, and a group-writable folder lets every member swap it.
+        Through start and through `paths`, as the doc says (step 1b: "in a folder only its owner may write")."""
+        os.makedirs(self.path('real/hook'), 0o755)
+        os.chmod(self.path('real/hook'), 0o755)
+        self.write('real/hook/hook.sh', '#!/bin/sh\n', 0o755)
+        os.mkdir(self.path('grp'))
+        os.symlink(self.path('real/hook'), self.path('grp/hl'))
+        self.conf(HOOK=self.path('grp/hl/hook.sh'))
+        for mode in (0o775, 0o2775, 0o770, 0o730):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path('grp'), mode)
+                self.refused(f'goes through {self.path("grp/hl")}, in {self.path("grp")}, which others may write')
+        os.chmod(self.path('grp'), 0o755)
+        # The folder another user owns (a stat that says so: the tests cannot chown), sticky or not: that user may
+        # remove the link and make another.
+        self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in */grp) echo 4242; exit 0;; esac\n'
+                   'exec /usr/bin/stat "$@"\n', 0o755)
+        for mode in (0o755, 0o1777):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path('grp'), mode)
+                self.refused(f'goes through {self.path("grp/hl")}, in {self.path("grp")}, a folder of uid 4242')
+        os.remove(self.path('bin/stat'))
+        for mode, name in ((0o755, 'fleet-vm-t3code-11'), (0o1775, 'fleet-vm-t3code-12')):   # its owner's, or sticky
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path('grp'), mode)
+                self.start(name)
+
     def walls_root(self, conf, files=(), links=(), dirs=()):
         """A fake machine for `paths` (FORK_FLEET_WALLS_ROOT): its launch.conf, files, folders and links (relative,
         so they resolve inside it, as on the machine)."""
@@ -1788,6 +1817,8 @@ class Launcher(unittest.TestCase):
         for link, to in links:
             os.makedirs(os.path.dirname(root + link), exist_ok=True)
             os.symlink(to, root + link)
+        for folder, _, _ in os.walk(root):   # as installed, any umask: a link's folder is its owner's alone
+            os.chmod(folder, 0o755)
         return root
 
     def paths(self, root, conf='/etc/fork-fleet/launch.conf'):
@@ -1832,6 +1863,17 @@ class Launcher(unittest.TestCase):
                 self.assertNotEqual(got.returncode, 0)
                 self.assertIn(word, got.stderr)
                 self.assertEqual(got.stdout, '')
+
+    def test_paths_refuses_a_link_in_a_folder_its_group_may_write(self):
+        """Fix round 1 (#213 S7): `paths` (what the walls read) refuses what start refuses: the hook through a root
+        link in a folder its group may write, which any member could swap between the check and the job."""
+        root = self.walls_root('HOOK=/opt/shared/hl/hook.sh\n', files=(('/opt/ff/hook.sh', ''),),
+                               links=(('/opt/shared/hl', '../ff'),))
+        self.assertEqual(self.paths(root).returncode, 0)
+        os.chmod(root + '/opt/shared', 0o775)
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('/opt/shared/hl, in /opt/shared, which others may write', got.stderr)
 
     def test_paths_refuses_a_bound_path_that_holds_data(self):
         """Fix round 3 (#191 re-check, correctness): the hook, its two files, WORK_ROOT and resolv.conf are bound into

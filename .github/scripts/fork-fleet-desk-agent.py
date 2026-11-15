@@ -15,9 +15,10 @@ environment (PATH and LC_ALL only: the launcher and the walls read their own set
 limit (fork-fleet-desk-wire.py, "Time") is killed with its process group and answered 75 (UNKNOWN); when the session
 ends, every running verb is killed. The launcher's own 75 is answered 1. At most MAX_VERBS run at once; at most OUT_MAX
 frames wait to be sent (an always-on host that stops reading ends the session). Verbs the machine runs only itself
-(wire.LOCAL_ONLY: check-net, refresh, paths) never come over the link. Time counts a sleep (Clock): CLOCK_BOOTTIME, plus
-any forward step of the wall clock against it (on WSL2 Windows' sleep pauses the distro, so BOOTTIME may not move and
-only the wall clock is stepped on resume): a desktop that wakes finds its link and its verbs past their time at once.
+(wire.LOCAL_ONLY: check-net, refresh, paths, tools) never come over the link. Time counts a sleep (Clock):
+CLOCK_BOOTTIME, plus any forward step of the wall clock against it (on WSL2 Windows' sleep pauses the distro, so
+BOOTTIME may not move and only the wall clock is stepped on resume): a desktop that wakes finds its link and its verbs
+past their time at once.
 
 The link drops (sleep, network, the always-on host restarts): the agent dials again after FIRST s, then BASE s
 doubling to MAX s, each with jitter; a wake from sleep dials at once. A wrong wire version (ssh exit 76, or a frame of
@@ -136,6 +137,10 @@ def load(path):
         raise Bad(f'{path}: PORT is 1 to 65535')
     owned_safe(conf['KEY'], 'file', private=True)
     owned_safe(conf['KNOWN_HOSTS'], 'file')
+    # The kit is fixed here, once: WALLS in its real path, and the launcher beside it. A link above WALLS (a `current`
+    # an upgrade repoints) would otherwise lead each walls run to the new kit while the agent starts the old launcher.
+    # After an upgrade the agent runs the kit it started with, whole, until it is restarted.
+    conf['WALLS'] = os.path.realpath(conf['WALLS'])
     conf['LAUNCH'] = kit_launcher(path, conf)
     return conf
 
@@ -144,7 +149,7 @@ def kit_launcher(path, conf):
     """The launcher the agent runs: the one beside WALLS (in its folder's real path, as fork-fleet-walls.py finds
     its own), the one those walls read. A LAUNCH setting (old settings files) must lead to it: a launcher elsewhere,
     say an old copy, would run behind walls that never read it."""
-    launch = os.path.join(os.path.realpath(os.path.dirname(conf['WALLS'])), KIT_LAUNCHER)
+    launch = os.path.join(os.path.dirname(conf['WALLS']), KIT_LAUNCHER)   # WALLS: its real path (load)
     if 'LAUNCH' in conf and os.path.realpath(conf['LAUNCH']) != launch:
         raise Bad(f'{path}: LAUNCH={conf["LAUNCH"]} is not {launch}, the launcher beside WALLS that its walls read: '
                   'the walls and the launcher are one kit; drop the LAUNCH line')

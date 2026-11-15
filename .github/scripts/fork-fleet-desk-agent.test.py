@@ -247,6 +247,28 @@ class Desk(unittest.TestCase):
         conf = self.file('desk.conf', text, 0o600)
         self.assertEqual(A.load(conf)['LAUNCH'], os.path.join(os.path.realpath(kit), 'fork-fleet-launch.sh'))
 
+    def test_one_kit_even_when_an_upgrade_repoints_a_link_above_it(self):
+        """Fix round 1 (#213 S6): WALLS through a `current` link to a version folder. The agent fixes the kit once, at
+        load: the walls it runs and the launcher it starts are both in the folder `current` led to then. An upgrade
+        that repoints `current` while the agent runs does not split them (the walls of the new kit reading the new
+        launcher while the agent starts the old one); the agent runs the old kit, whole, until it is restarted."""
+        t = os.path.realpath(self.tmp)
+        for v in ('v1', 'v2'):
+            os.makedirs(f'{t}/{v}/kit', 0o755)
+            for name in ('fork-fleet-launch.sh', 'fork-fleet-walls.py'):
+                self.file(f'{v}/kit/{name}', LAUNCHER, 0o755)
+        os.symlink(f'{t}/v1', f'{t}/current')
+        with open(self.settings()) as f:
+            text = f.read().replace(f'{self.tmp}/fork-fleet-walls.py', f'{t}/current/kit/fork-fleet-walls.py')
+        self.assertIn('/current/kit/', text)
+        conf = A.load(self.file('desk.conf', text, 0o600))
+        os.remove(f'{t}/current')
+        os.symlink(f'{t}/v2', f'{t}/current')   # the upgrade, while the agent runs
+        self.assertEqual((conf['WALLS'], conf['LAUNCH']),
+                         (f'{t}/v1/kit/fork-fleet-walls.py', f'{t}/v1/kit/fork-fleet-launch.sh'))
+        A.owned_safe(conf['WALLS'], 'file')   # what child() checks before each walls run
+        self.assertEqual(os.path.dirname(os.path.realpath(conf['WALLS'])), os.path.dirname(conf['LAUNCH']))
+
     def test_an_unsafe_launcher_is_not_run(self):
         os.chmod(os.path.join(self.tmp, 'fork-fleet-launch.sh'), 0o777)
         self.linked()

@@ -179,6 +179,23 @@
         "mnt/tools/": ""
       }
     ],
+    "job-units": [
+      {
+        "etc/systemd/system/service.d/10-x.conf": "[Service]\nPrivateDevices=no\n"
+      },
+      {
+        "run/systemd/system/fork-fleet-.service.d/10-gpu.conf": "[Service]\nBindReadOnlyPaths=/run/WSL:/run/WSL\n"
+      },
+      {
+        "usr/lib/systemd/system/fork-.service.d/x.conf": "[Service]\nSystemCallFilter=\n"
+      },
+      {
+        "etc/systemd/system/fork-fleet-ci-1.service.d/x.conf": "[Service]\nIPAddressDeny=\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "SYSTEMD_RUN=/usr/local/sbin/run-with-gpu\n"
+      }
+    ],
     "etc-secrets": [
       {
         "etc/fstab": "UUID=0 / ext4 defaults 0 1\n//nas.example/share /srv/share cifs username=u,password=hunter2 0 0\n"

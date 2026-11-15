@@ -43,6 +43,9 @@ def build(root, files):
         with open(full, 'w', encoding='utf-8') as f:
             f.write(text)
         os.chmod(full, int(value['mode'], 8) if isinstance(value, dict) else 0o644)   # as installed, whatever the umask
+    for folder, _, _ in os.walk(root):   # folders too: a link in a group-writable one is refused (links_owned)
+        if folder != root:
+            os.chmod(folder, 0o755)
     return root
 
 
@@ -639,6 +642,126 @@ class EveryWallsFile(Case):
             with self.subTest(name):
                 self.assertTrue(self.etc_secrets(change).startswith('FAIL'), name)
 
+    def test_linux_etc_secrets_by_name_and_value_shape(self):
+        """PR #213 lenses S4 and C1: a secret's name in any case and as one word (main's rule read them; the word rule
+        of #211 lost db_pass, api_key and DJANGO_SECRETKEY) FAILS; a name whose secret word is followed by one that
+        says the value is about it (DB_PASSWORD_FILE, TOKEN_TTL, PASSWORD_MIN_LENGTH, RESTIC_PASSWORD_COMMAND), a
+        value that is systemd's %d path or a number, and fish's set -q and set -e (which set nothing) pass: the
+        pattern systemd documents for credentials, which this wall's own advice points to, must not fail it."""
+        pw = 'Hunter2-correct-horse'   # no known token's shape: found by its name only
+        fails = {
+            'lower case _pass': {'etc/profile.d/x.sh': f'db_pass={pw}\n'},
+            'lower case _key': {'etc/profile.d/x.sh': f'export api_key={pw}\n'},
+            'fish, lower case': {'etc/fish/conf.d/x.fish': f'set -gx smtp_pass {pw}\n'},
+            'one word': {'etc/environment': f'DJANGO_SECRETKEY={pw}\n'},
+            'secret word not last': {'etc/environment': f'SECRET_KEY_BASE={pw}\n'},
+            'a long number': {'etc/environment': 'DB_PASSWORD=12345678\n'},
+            'fish set after a query': {'etc/fish/conf.d/x.fish': f'set -q GH_TOKEN; or set -gx GH_TOKEN {pw}\n'},
+        }
+        for name, change in fails.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('FAIL'), name)
+        u = '[Service]\nExecStart=/usr/bin/app\n'
+        passes = {
+            'a credential by %d, as the advice says': {
+                'etc/systemd/system/app.service':
+                    u + 'LoadCredential=db:/etc/app/db-password\nEnvironment=DB_PASSWORD_FILE=%d/db\n',
+                'etc/app/db-password': {'text': 'hunter2\n', 'mode': '600'}},
+            'a password command': {
+                'etc/systemd/system/backup.service':
+                    u + 'LoadCredential=restic:/etc/restic/pw\n'
+                        'Environment="RESTIC_PASSWORD_COMMAND=cat ${CREDENTIALS_DIRECTORY}/restic"\n',
+                'etc/restic/pw': {'text': 'hunter2\n', 'mode': '600'}},
+            'a time and a length': {'etc/environment.d/30-app.conf': 'TOKEN_TTL=3600\nPASSWORD_MIN_LENGTH=12\n'},
+            'a %d value under a secret name': {'etc/systemd/system/app.service': u + 'Environment=DB_PASSWORD=%d/db\n'},
+            'a short number': {'etc/environment': 'SMTP_PASS=0\n'},
+            'fish: query and erase': {'etc/fish/conf.d/gh.fish':
+                                      'set -q GH_TOKEN GITHUB_TOKEN; or echo no token\nset -e GH_TOKEN  # forget it\n'
+                                      'set --erase GITHUB_TOKEN\nset -nS api_key x\n'},
+            'csh setenv, a comment': {'etc/csh.cshrc': 'setenv GH_TOKEN # set by the login\n'},
+            'words that only hold KEY or PASS': {'etc/environment': 'HOTKEY=x1\nBYPASS=x1\nKEYMAP=x1\n'},
+        }
+        for name, change in passes.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('PASS'), name)
+
+    def test_linux_etc_secrets_reads_wildcards_specifiers_credstores_and_usr(self):
+        """PR #213 lenses S5 and S8: systemd reads EnvironmentFile= as a wildcard, a template's path with a specifier
+        (%i) on each instance, and a LoadCredential= by name from /etc/credstore; fish and systemd read the packages'
+        login files in /usr (vendor_conf.d, /usr/lib/environment.d), which jobs see. A secret others can read in any
+        of them FAILS; the same files only root reads pass."""
+        pw = 'Hunter2-correct-horse'
+        u = '[Service]\nExecStart=/usr/bin/app\n'
+        fails = {
+            'EnvironmentFile= a wildcard': {'etc/systemd/system/app.service': u + 'EnvironmentFile=/etc/app/*.env\n',
+                                            'etc/app/app.env': f'DB_PASSWORD={pw}\n'},
+            'EnvironmentFile= a specifier': {'etc/systemd/system/app@.service': u + 'EnvironmentFile=/etc/app/%i.env\n',
+                                             'etc/app/main.env': f'DB_PASSWORD={pw}\n'},
+            'LoadCredential= a specifier': {'etc/systemd/system/app@.service': u + 'LoadCredential=db:/etc/app/%i.pw\n',
+                                            'etc/app/main.pw': f'{pw}\n'},
+            '/etc/credstore': {'etc/systemd/system/app.service': u + 'LoadCredential=db-password\n',
+                               'etc/credstore/db-password': f'{pw}\n'},
+            '/usr/lib/credstore': {'usr/lib/credstore/db-password': f'{pw}\n'},
+            'fish vendor_conf.d': {'usr/share/fish/vendor_conf.d/x.fish': f'set -gx DB_PASSWORD {pw}\n'},
+            '/usr/lib/environment.d': {'usr/lib/environment.d/90-x.conf': f'DB_PASSWORD={pw}\n'},
+        }
+        for name, change in fails.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('FAIL'), name)
+        passes = {
+            'EnvironmentFile= a wildcard, root only': {
+                'etc/systemd/system/app.service': u + 'EnvironmentFile=/etc/app/*.env\n',
+                'etc/app/app.env': {'text': f'DB_PASSWORD={pw}\n', 'mode': '600'}},
+            'a specifier naming nothing': {'etc/systemd/system/x@.service': u + 'EnvironmentFile=-/etc/x/%i.env\n'},
+            '/etc/credstore, root only': {'etc/credstore/db-password': {'text': f'{pw}\n', 'mode': '600'}},
+            'stock /usr/lib/environment.d': {'usr/lib/environment.d/990-snapd.conf':
+                                             'PATH=$PATH:/snap/bin\nXDG_DATA_DIRS=${XDG_DATA_DIRS}:/snap/share\n'},
+        }
+        for name, change in passes.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('PASS'), name)
+
+    def test_linux_job_units_reads_dropins_and_the_launchers_tools(self):
+        """PR #213 lenses S1, C3 and S2: systemd adds every drop-in that applies to a job's unit (service.d, the
+        fork-/fork-fleet- prefix folders, its own folder; in /etc, /run and /usr) to what the launcher's systemd-run
+        asks, and a launch.conf SYSTEMD_RUN starts the units with another program: each turns a wall off where the
+        launcher cannot see it, and FAILS job-units (the fixtures' failing changes have more). What changes no wall
+        passes: a distro's timeout drop-in, the launcher's own IPAddressDeny (refresh-net's set-property), another
+        service's drop-in, systemd's own programs."""
+        safe = '# created by systemctl set-property\n[Service]\nIPAddressDeny=203.0.113.7/32\n'
+        fails = {
+            'set-property, a wall off': ({'run/systemd/system.control/fork-fleet-ci-1.service.d/50-x.conf':
+                                          '[Service]\nPrivateDevices=no\n'}, {}),
+            'attached, all services': ({'run/systemd/system.attached/service.d/x.conf':
+                                        '[Service]\nRestrictAddressFamilies=\n'}, {}),
+            'generator, a prefix': ({'run/systemd/generator/fork-fleet-ci-.service.d/x.conf':
+                                     '[Service]\nNetworkNamespacePath=\n'}, {}),
+            'a safe key, then an unsafe one': ({'usr/lib/systemd/system/service.d/10-timeout-abort.conf':
+                                                '[Service]\nTimeoutStopFailureMode=abort\nProtectProc=default\n'}, {}),
+            'FORK_FLEET_LAUNCH_CONF': ({'etc/fork-fleet-proof/launch.conf': 'SYSTEMCTL=/opt/x/systemctl\n'},
+                                       {'FORK_FLEET_LAUNCH_CONF': '/etc/fork-fleet-proof/launch.conf'}),
+            'a drop-in that cannot be read': ({'etc/systemd/system/service.d/x.conf': {'text': '', 'mode': '000'}},
+                                              {}),
+        }
+        passes = {
+            "a distro's timeout drop-in": {'usr/lib/systemd/system/service.d/10-timeout-abort.conf':
+                                           '[Service]\nTimeoutStopFailureMode=abort\n'},
+            "the launcher's own IPAddressDeny": {
+                'run/systemd/system.control/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf': safe},
+            "another service's drop-in": {'etc/systemd/system/ssh.service.d/x.conf': '[Service]\nPrivateDevices=no\n',
+                                          'etc/systemd/system/forkd.service.d/x.conf': '[Service]\nUser=x\n'},
+            'a description': {'etc/systemd/system/fork-fleet-.service.d/x.conf': '[Unit]\nDescription=CI job\n'},
+            "systemd's own programs": {'etc/fork-fleet/launch.conf':
+                                       'SYSTEMD_RUN=/usr/bin/systemd-run\nSYSTEMCTL=systemctl\n'},
+        }
+        for name, (change, env) in fails.items():
+            with self.subTest(name):
+                p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)), **env)
+                self.assertIn('FAIL  job-units', p.stdout, name)
+        for name, change in passes.items():
+            with self.subTest(name):
+                self.assertNotIn('job-units', self.walls('linux', 'describe', self.root(overlay(LINUX, change)))[1])
+
     def test_linux_etc_secrets_advice_fits_the_file(self):
         """Issue #211: a file every login reads (/etc/environment, a shell's start file, fish's) cannot be made
         private: the advice is to move the secret out of it, never to chmod it 0600. A file only a service or
@@ -687,8 +810,9 @@ class EveryWallsFile(Case):
         """One rule and one conf lookup (fix round 2): the walls hold what jobs see to `fork-fleet-launch.sh paths`,
         which reads FORK_FLEET_LAUNCH_CONF when set, as `start` does. Through the dispatcher too."""
         linux = slurp(os.path.join(FOLDER, 'linux'))
-        self.assertIn("[LAUNCHER, 'paths']", linux)
-        self.assertNotIn('launch.conf', linux)   # no second copy of the conf lookup
+        self.assertIn("[LAUNCHER, verb]", linux)
+        self.assertIn("ask('paths'", linux)
+        self.assertNotIn('launch.conf', linux)   # no second copy of the conf lookup (job-units asks `tools`)
         other = {'etc/fork-fleet-proof/launch.conf': 'ALLOW_PATHS=/c\n', 'c/': ''}
         root = self.root(overlay(LINUX, other))
         self.assertNotIn('mounts', self.walls('linux', 'check', root)[1])   # the default conf: no /c
@@ -723,7 +847,8 @@ class EveryWallsFile(Case):
                 links = {k: v for k, v in change.items() if v and not k.endswith('/') and v.startswith('..')}
                 root = self.root(overlay(LINUX, {k: v for k, v in change.items() if k not in links}))
                 for path, target in links.items():
-                    os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+                    os.makedirs(os.path.dirname(os.path.join(root, path)), mode=0o755, exist_ok=True)
+                    os.chmod(os.path.dirname(os.path.join(root, path)), 0o755)   # any umask: root's alone
                     os.symlink(target, os.path.join(root, path))
                 self.assertIn('mounts', self.walls('linux', 'check', root)[1], c_on_9p)
                 if name == 'a link to /home':   # refused outright: a refusal is never read as "nothing to bind"

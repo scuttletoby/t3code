@@ -4,7 +4,7 @@ wsl2.fixture.json): that its reading of the launcher's sandbox() fits the real l
 sandbox() that opens a wall (a fixture changes the fake machine only, and the launcher is the kit's, beside the walls
 folder), that it takes every linux wall from the linux file, and that it runs the linux file only from a source no
 more open than itself. Run: python3 <this>. Linux only."""
-import importlib.util, json, os, re, shutil, signal, subprocess, sys, tempfile, unittest
+import hashlib, importlib.util, json, os, re, shutil, signal, subprocess, sys, tempfile, unittest
 from importlib._bootstrap_external import _code_to_timestamp_pyc
 
 sys.dont_write_bytecode = True
@@ -17,6 +17,18 @@ LAUNCHER = os.path.join(HERE, 'fork-fleet-launch.sh')
 def slurp(path):
     with open(path, encoding='utf-8') as f:
         return f.read()
+
+
+def sha(launcher_text):
+    return hashlib.sha256(launcher_text.encode('utf-8')).hexdigest()
+
+
+def pinned(launcher_text):
+    """The LAUNCHER_SHA256 line of wsl2 for this launcher text."""
+    return f"LAUNCHER_SHA256 = '{sha(launcher_text)}'"
+
+
+PIN = re.compile(r"^LAUNCHER_SHA256 = '[0-9a-f]{64}'$", re.M)
 
 
 def load(name, root=''):
@@ -46,9 +58,10 @@ class Case(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp)
         return tmp
 
-    def copy(self, linux_mode=0o755, wsl2_mode=0o755, linux_text=None, launcher_text=None):
+    def copy(self, linux_mode=0o755, wsl2_mode=0o755, linux_text=None, launcher_text=None, pin=True):
         """A walls folder of its own (wsl2, linux; the launcher and its allow list one folder up, as an install has
-        them): its wsl2's path. launcher_text: the launcher's text instead (None: the real one)."""
+        them): its wsl2's path. launcher_text: the launcher's text instead (None: the real one), and wsl2 pinned to it
+        (pin; False: wsl2 keeps the real launcher's pin, as a launcher changed on the machine finds it)."""
         kit = self.tmp()
         folder = os.path.join(kit, 'fork-fleet-walls')
         os.mkdir(folder, 0o755)
@@ -67,6 +80,11 @@ class Case(unittest.TestCase):
             if name == 'linux' and linux_text is not None:
                 with open(os.path.join(folder, name), 'w', encoding='utf-8') as f:
                     f.write(linux_text)
+            if name == 'wsl2' and launcher_text is not None and pin:
+                text = slurp(os.path.join(folder, name))
+                self.assertEqual(len(PIN.findall(text)), 1)
+                with open(os.path.join(folder, name), 'w', encoding='utf-8') as f:
+                    f.write(PIN.sub(pinned(launcher_text), text))
             os.chmod(os.path.join(folder, name), mode)
         return os.path.join(folder, 'wsl2')
 
@@ -103,6 +121,7 @@ def walls_with(test, root, launcher_text=None):
     launcher's text; None: the real one)."""
     kit = os.path.dirname(os.path.dirname(test.copy(launcher_text=launcher_text)))
     m = load('wsl2', root)
+    m.LAUNCHER_SHA256 = sha(slurp(LAUNCHER) if launcher_text is None else launcher_text)
     m.LINUX = load('linux', root)
     m.LINUX.KIT, m.LINUX.LAUNCHER = kit, os.path.join(kit, 'fork-fleet-launch.sh')
     # The walls hand FORK_FLEET_WALLS_ROOT to the launcher when they run it (job_view), not only at load: keep it set
@@ -261,6 +280,44 @@ class Launcher(Case):
                 for wall in (m.sockets_wall, m.userns_wall):
                     with self.assertRaises((ValueError, OSError)):
                         wall()
+
+    def test_the_pin_is_the_launchers(self):   # change the launcher, read it again, then change the pin
+        self.assertEqual(wsl2.LAUNCHER_SHA256, sha(slurp(LAUNCHER)), 'fork-fleet-launch.sh changed: read its job '
+                         'units again (unit_props) and set LAUNCHER_SHA256 in fork-fleet-walls/wsl2 to its sha256')
+        self.assertEqual(len(PIN.findall(slurp(os.path.join(FOLDER, 'wsl2')))), 1)
+
+    def test_any_other_launcher_cannot_be_told(self):
+        """No reading of bash follows every way a changed launcher could start a job unit with more (a plain
+        systemd-run, a helper, eval, source, printf -v): a launcher that is not the pinned one FAILs sockets with
+        "cannot tell", whatever it changed, directly and as the pool runs it."""
+        real = slurp(LAUNCHER)
+        bad = '-p BindReadOnlyPaths=/run/WSL:/run/WSL -p PrivateDevices=no -- "$dir/run.sh"'
+        at = '\nstart() {\n'
+        self.assertEqual((real.count(RUN), real.count(at)), (1, 1))
+        anchor = '  b=$real\n  resolv_bind=$b:$resolv\n'
+        self.assertEqual((real.count(anchor), real.count('  job_view\n  rm -rf')), (1, 1))
+        for name, text in (
+                ('a plain systemd-run', real.replace(RUN, f'  systemd-run --quiet --uid "$user" {bad}\n' + RUN)),
+                ('a helper with "$SYSTEMD_RUN"',
+                 real.replace(at, f'\nside_unit() {{\n  "$SYSTEMD_RUN" --quiet {bad}\n}}\n' + at)
+                 .replace(RUN, '  side_unit\n' + RUN)),
+                ('eval', real.replace(RUN, "  eval 'pro''ps+=(-p PrivateDevices=no)'\n" + RUN)),
+                ('a quoted #', real.replace(RUN, '  : " #"; props+=(-p PrivateDevices=no)\n' + RUN)),
+                ('sandbox() again after a quoted #',
+                 real.replace(at, '\n: " #"; sandbox() { props=(-p PrivateDevices=no); }\n' + at)),
+                ('view_ro grown in job_fs',
+                 real.replace('  job_view\n  rm -rf', '  job_view\n  view_ro+=(/run/WSL)\n  rm -rf')),
+                ('b set twice', real.replace(anchor, '  b=$real\n  b=/run/WSL/1_interop\n  resolv_bind=$b:$resolv\n')),
+                ('a comment only', real + '# a comment\n')):
+            with self.subTest(name):
+                for run in (self.run_wsl2, self.run_dispatcher):
+                    p = run(self.copy(launcher_text=text, pin=False), self.fake(), 'check')
+                    self.assertEqual(p.returncode, 1, p.stderr)
+                    self.assertEqual([line.split()[1] for line in p.stdout.splitlines()], ['sockets'], p.stdout)
+                    self.assertIn('cannot tell (ValueError: ', p.stdout)
+                    self.assertIn('is not the launcher these walls were checked against', p.stdout)
+        for run in (self.run_wsl2, self.run_dispatcher):   # the same text pinned: the comment changes nothing
+            self.assertEqual(run(self.copy(launcher_text=real + '# a comment\n'), self.fake(), 'check').returncode, 0)
 
     def test_words(self):
         """unit_props reads the job units' properties as bash and systemd-run get them, or cannot tell."""
