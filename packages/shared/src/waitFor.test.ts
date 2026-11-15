@@ -738,6 +738,50 @@ describe("nextWaitState: judging", () => {
       shouldPruneWait({ ...sent, reservedUntil: iso(T0 + 30 * HOUR) }, T0 + 25 * HOUR, settings),
     ).toBe(false);
   });
+
+  it("holds a slot only for a granted slot wait, and drops it once used (rows 9, 15)", () => {
+    const slot = makeWait({ kind: "slot", spec: {} });
+    // Timed out, or handed over before a grant: delivered, but nothing is held.
+    const timedOut = nextWaitState(
+      { ...slot, deadlineAt: iso(T0) },
+      { type: "judged", judgement: { type: "notYet" } },
+      T0,
+      stateSettings,
+    )!.record;
+    expect(timedOut.result?.outcome).toBe("timeout");
+    const timedOutSent = nextWaitState(timedOut, { type: "delivered" }, T0, stateSettings)!.record;
+    expect(timedOutSent.state).toBe("delivered");
+    expect(timedOutSent.reservedUntil).toBeUndefined();
+    // `reserveSeconds: 0` holds nothing either.
+    const granted = nextWaitState(
+      slot,
+      { type: "slotGranted", detail: "" },
+      T0,
+      stateSettings,
+    )!.record;
+    expect(
+      nextWaitState(granted, { type: "delivered" }, T0, { ...stateSettings, reserveSeconds: 0 })!
+        .record.reservedUntil,
+    ).toBeUndefined();
+    const sent = nextWaitState(granted, { type: "delivered" }, T0, stateSettings)!.record;
+    expect(nextWaitState(granted, { type: "slotUsed" }, T0, stateSettings)).toBeNull();
+    const used = nextWaitState(sent, { type: "slotUsed" }, T0 + SECOND, stateSettings)!.record;
+    expect(used).toMatchObject({ state: "delivered", endedAt: sent.endedAt });
+    expect(used.reservedUntil).toBeUndefined();
+    // Used again (a second delegation): nothing changes and nothing is written.
+    expect(nextWaitState(used, { type: "slotUsed" }, T0 + SECOND, stateSettings)).toBeNull();
+    // Granted, then its thread was archived: the parent gets the message, but no slot is held.
+    const handed = nextWaitState(
+      { ...granted, parentThreadId: ThreadId.make("thread:parent") },
+      { type: "threadGone", parentThreadId: null },
+      T0,
+      stateSettings,
+    )!.record;
+    expect(handed).toMatchObject({ state: "delivering", threadId: "thread:parent" });
+    const handedSent = nextWaitState(handed, { type: "delivered" }, T0, stateSettings)!.record;
+    expect(handedSent.state).toBe("delivered");
+    expect(handedSent.reservedUntil).toBeUndefined();
+  });
 });
 
 describe("nextWaitState: delivery", () => {
