@@ -64,7 +64,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.t = os.path.realpath(tempfile.mkdtemp(prefix='seed-test-'))
         self.addCleanup(shutil.rmtree, self.t, True)
-        for d in ('files', 'run', 'src'):
+        for d in ('files', f'files/{POOL}', 'run', 'src'):
             os.mkdir(os.path.join(self.t, d), 0o755)
         self.config(SEEDS)
 
@@ -75,8 +75,8 @@ class Base(unittest.TestCase):
             json.dump(cfg, f)
 
     def make(self, name, members, mtime=None):
-        """FILES/NAME.tar of `members` ({path: bytes}), made as a project would: a temp file, then a rename."""
-        tmp = os.path.join(self.t, 'files', f'.{name}.tmp')
+        """FILES/POOL/NAME.tar of `members` ({path: bytes}), made as a project would: a temp file, then a rename."""
+        tmp = os.path.join(self.t, 'files', POOL, f'.{name}.tmp')
         with tarfile.open(tmp, 'w', format=tarfile.PAX_FORMAT) as tar:
             for path, data in members.items():
                 info = tarfile.TarInfo(path)
@@ -85,9 +85,12 @@ class Base(unittest.TestCase):
         if mtime is not None:
             os.utime(tmp, (mtime, mtime))
         os.chmod(tmp, 0o644)
-        os.replace(tmp, os.path.join(self.t, 'files', f'{name}.tar'))
-        with open(os.path.join(self.t, 'files', f'{name}.tar'), 'rb') as f:
+        os.replace(tmp, self.tar(name))
+        with open(self.tar(name), 'rb') as f:
             return f.read()
+
+    def tar(self, name):
+        return os.path.join(self.t, 'files', POOL, f'{name}.tar')
 
     def offer(self, command, **kw):
         r, w = os.pipe()
@@ -126,7 +129,7 @@ class Host(Base):
         got = json.loads(out)
         self.assertEqual(got['v'], 1)
         m2, npm = got['seeds']
-        st = os.stat(os.path.join(self.t, 'files', 'm2.tar'))
+        st = os.stat(self.tar('m2'))
         self.assertEqual(m2, {'name': 'm2', 'everyHours': 6, 'maxAgeHours': 1000, 'maxMb': 2, 'bytes': st.st_size,
                               'made': int(st.st_mtime)})
         self.assertNotIn('made', npm)
@@ -137,7 +140,7 @@ class Host(Base):
         code, out, err = self.offer('seed m2')
         self.assertEqual(code, 0, err)
         self.assertEqual(out, data)
-        st = os.stat(os.path.join(self.t, 'files', 'm2.tar'))
+        st = os.stat(self.tar('m2'))
         self.assertEqual(err, f'seed m2 {len(data)} {hashlib.sha256(data).hexdigest()} {int(st.st_mtime)}\n')
 
     def test_other_commands_and_names_are_refused_and_send_nothing(self):
@@ -149,13 +152,15 @@ class Host(Base):
                 self.assertEqual((code, out), (2, b''), err)
 
     def test_a_file_that_may_not_be_sent_is_exit_4(self):
-        files = os.path.join(self.t, 'files')
+        top, files = os.path.join(self.t, 'files'), os.path.join(self.t, 'files', POOL)
         now = time.time()
         cases = {'missing': lambda: None,
                  'a link': lambda: os.symlink(os.path.join(self.t, 'src', 'x.tar'), f'{files}/m2.tar'),
                  'group-writable': lambda: (self.make('m2', {'a': b'x'}), os.chmod(f'{files}/m2.tar', 0o664)),
                  'too big': lambda: self.make('m2', {'a': os.urandom(3 << 20)}),
                  'too old': lambda: self.make('m2', {'a': b'x'}, mtime=now - 1001 * 3600),
+                 'dated in the future': lambda: self.make('m2', {'a': b'x'}, mtime=now + 10 * 365 * 86400),
+                 'the files folder others write': lambda: (self.make('m2', {'a': b'x'}), os.chmod(top, 0o777)),
                  'a folder': lambda: os.mkdir(f'{files}/m2.tar'),
                  'folder others write': lambda: (self.make('m2', {'a': b'x'}), os.chmod(files, 0o777))}
         with open(os.path.join(self.t, 'src', 'x.tar'), 'wb') as f:
@@ -167,6 +172,7 @@ class Host(Base):
                 code, out, err = self.offer('seed m2')
                 self.assertEqual((code, out), (4, b''), err)
                 os.chmod(files, 0o755)
+                os.chmod(top, 0o755)
                 p = f'{files}/m2.tar'
                 if os.path.isdir(p) and not os.path.islink(p):
                     os.rmdir(p)
@@ -182,16 +188,68 @@ class Host(Base):
 
     def test_a_file_changed_while_sent_is_exit_4(self):
         self.make('m2', {'a': b'x' * 3000})
-        path, send = os.path.join(self.t, 'files', 'm2.tar'), seed.send
+        path, send = self.tar('m2'), seed.send
 
-        def changing(fd, out):
+        def changing(fd, out, size):
             with open(path, 'ab') as f:   # made in place, not by rename
                 f.write(b'\0' * 512)
-            return send(fd, out)
+            return send(fd, out, size)
         with mock.patch.object(seed, 'send', changing):
+            code, out, err = self.offer('seed m2')
+        self.assertEqual(code, 4)
+        self.assertIn('changed while it was sent', err)
+        self.assertEqual(len(out), os.stat(path).st_size - 512)   # cut at the size that was checked
+
+    def test_a_same_size_rewrite_with_its_old_date_put_back_is_exit_4(self):
+        self.make('m2', {'a': b'x' * 3000})
+        path, send = self.tar('m2'), seed.send
+
+        def rewriting(fd, out, size):
+            st = os.stat(path)
+            with open(path, 'r+b') as f:   # in place, same size, the old mtime put back: only ctime tells
+                f.write(b'y' * 512)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return send(fd, out, size)
+        with mock.patch.object(seed, 'send', rewriting):
             code, _, err = self.offer('seed m2')
         self.assertEqual(code, 4)
         self.assertIn('changed while it was sent', err)
+
+    def test_a_desktop_that_stops_reading_lets_the_lock_go(self):
+        self.make('m2', {'a': os.urandom(1 << 20)})
+        r, w = os.pipe()   # nobody reads r: the pipe fills and the write waits
+        err = io.StringIO()
+        try:
+            with mock.patch.object(seed, 'STALL', 1):
+                t = time.monotonic()
+                code = seed.offer(POOL, 'seed m2', os.path.join(self.t, 'run'), out=w, err=err,
+                                  config=os.path.join(self.t, 'fork-fleet.json'), files=os.path.join(self.t, 'files'))
+            self.assertLess(time.monotonic() - t, 30)
+        finally:
+            os.close(r)
+            os.close(w)
+        self.assertEqual(code, 1)
+        self.assertIn('took nothing for 1 seconds', err.getvalue())
+        self.assertEqual(self.offer('seed m2')[0], 0)   # the pool's lock was let go
+
+    def test_pools_never_share_a_seed_file(self):
+        cfg = json.loads(json.dumps(CONFIG))
+        cfg['pools'][0]['seeds'] = SEEDS
+        cfg['pools'].append({**cfg['pools'][0], 'name': 'other-pool'})
+        with open(os.path.join(self.t, 'fork-fleet.json'), 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        self.make('m2', {'a': b'x'})
+        os.mkdir(os.path.join(self.t, 'files', 'other-pool'), 0o755)
+        r, w = os.pipe()
+        err = io.StringIO()
+        try:
+            code = seed.offer('other-pool', 'seed m2', os.path.join(self.t, 'run'), out=w, err=err,
+                              config=os.path.join(self.t, 'fork-fleet.json'), files=os.path.join(self.t, 'files'))
+        finally:
+            os.close(w)
+            os.close(r)
+        self.assertEqual(code, 4)
+        self.assertIn('not made yet', err.getvalue())
 
     def test_never_as_root_and_a_bad_config_is_exit_2(self):
         with mock.patch.object(seed.os, 'geteuid', return_value=0):
@@ -217,6 +275,14 @@ class Host(Base):
                              stdin=subprocess.DEVNULL)
         self.assertEqual((got.returncode, got.stdout), (2, ''))
         self.assertFalse(os.path.exists(os.path.join(self.t, 'run2', f'{POOL}.sock')))   # no session was served
+        for command in ('seeds x', 'seed', 'seedsx', 'seeds  '):
+            with self.subTest(command):
+                got = subprocess.run([sys.executable, '-I', '-B', desk, 'serve', POOL], capture_output=True,
+                                     text=True, env={**base, 'SSH_ORIGINAL_COMMAND': command}, timeout=30,
+                                     stdin=subprocess.DEVNULL)
+                self.assertEqual((got.returncode, got.stdout), (2, ''), got.stderr)
+                self.assertIn('fork-fleet-desk seed: refused', got.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.t, 'run2', f'{POOL}.sock')))
 
 
 class Desktop(Base):

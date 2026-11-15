@@ -8,7 +8,8 @@ NAMES='example-game example-editor'
 at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 running=$(ps -e -o comm=) || { echo '{"v": 1, "free": false, "reason": "ps failed", "at": "'"$at"'"}'; exit 1; }
 for name in $NAMES; do
-  if printf '%s\n' "$running" | grep -qxF -- "$name"; then
+  short=$(printf '%.15s' "$name")   # the kernel keeps only the first 15 characters of a process name
+  if printf '%s\n' "$running" | grep -qxF -- "$short"; then
     echo '{"v": 1, "free": false, "reason": "'"$name"' is running", "at": "'"$at"'"}'
     exit 75
   fi

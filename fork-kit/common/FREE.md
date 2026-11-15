@@ -7,12 +7,15 @@ One small contract for every tool that asks whether a machine may take more work
 ## The script
 
 - Called with **no arguments**, by its **absolute path**, stdin empty, a plain environment (`PATH`, `LANG`),
-  from `/`. It answers within **3 seconds** or counts as not available; its whole process group is then ended.
+  from `/`. It answers within **3 seconds** or counts as not available; its whole process group is then ended,
+  and so is any process that still holds its stdout. It leaves nothing running: a child that leaves the group
+  (`setsid`) and closes stdout is not seen and not ended.
 - It and every folder above it belong to root (or to the user the consumer runs as) and no one else can change
-  them (a sticky folder such as `/tmp` is fine). Otherwise it is not run.
+  them (a sticky folder such as `/tmp` is fine). Otherwise it is not run. A link is judged and run by the file it
+  leads to. Only the mode bits are read: an ACL that lets others write is not seen, so do not set one.
 - **The exit code is the verdict:** `0` free, `75` busy. Anything else, a timeout, output that is not one JSON
-  object, a higher `v`, a `free` that disagrees with the exit code, or facts more than 60 seconds from now = **not
-  available**. Busy and not available both count as **not free**.
+  object (`NaN` and `Infinity` are not JSON), a higher `v`, a `free` that disagrees with the exit code, or facts
+  more than 60 seconds from now = **not available**. Busy and not available both count as **not free**.
 - **stdout is the detail:** one JSON object of at most 4096 bytes. Unknown fields are ignored.
 
 | Field       | Required             | What                                                                     |
@@ -55,9 +58,10 @@ size as busy. An answer without `memory.freeMb` makes no memory claim; the consu
 - [free-fixtures.json](free-fixtures.json): the cases every reader, in any language, must agree on.
 - Examples in [free/](free/):
   - [memory](free/memory): busy under memory pressure or with swap nearly full. The desk kit installs it as
-    `/opt/fork-fleet/free-memory`.
+    `/opt/fork-fleet/free-memory`. Pressure is "all tasks stalled" over 10 seconds, which can stay low while the
+    machine swaps hard; the swap rule is there for that.
   - [busy-while-running](free/busy-while-running): busy while a named program runs (a game, say). Copy it and put
-    your programs in it.
+    your programs in it. It sees the processes of its own system only: in WSL, Windows programs are not visible.
 
 Several conditions in one script: call the others from it and answer busy when one is busy.
 

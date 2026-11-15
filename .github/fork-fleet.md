@@ -698,16 +698,21 @@ ready-made caches the desktop keeps and its jobs start from:
 least `every_hours`) the age, from when it was made, at which it is dropped,
 `max_mb` its largest size. Nothing in the fleet makes a seed: on the always-on
 host the project's own timer or job writes a tar of a cache folder's contents
-to `/var/lib/fork-fleet/seed-files/NAME.tar`, by a temp file and a rename (a
-file changed while it is sent is refused). That folder and its files are
-root's (or the project's), readable by the desk-link user and writable by no
-one else; never put a secret in a seed: every job of the pool reads it.
+to `/var/lib/fork-fleet/seed-files/POOL/NAME.tar` (a folder per pool, so two
+pools never share a file), by a temp file and a rename. A file changed while it
+is sent (size, mtime or ctime), dated more than five minutes in the future, older
+than `max_age_hours` or above `max_mb` is refused. Both folders and the files are
+root's (or the project's), readable by the desk-link user and writable by no one
+else (the owner itself is not checked, only that no one else may write); never
+put a secret in a seed: every job of the pool reads it.
 
 The desktop asks for them with the desk link's key, in an ssh session of its
-own: the same forced command answers `seeds` with the pool's list and
+own: the same forced command sends every command that starts with `seed` to
+`fork-fleet-desk-seed.py` (which step 3 installs; its header has the exit
+codes), never to a session. It answers `seeds` with the pool's list and
 `seed NAME` with that one file, only a name of that list, and a trailer with its
-size and SHA-256 (`fork-fleet-desk-seed.py`, which step 3 installs; its header
-has the exit codes).
+size and SHA-256; anything else is refused. One stream per pool at a time; a
+desktop that takes nothing for two minutes is cut off and the next one may go.
 
 The desktop's side is the same script's `run`, hourly from
 `t3code-fleet-seed.timer` (the desk kit installs both). Each new seed is
