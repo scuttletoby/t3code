@@ -908,7 +908,7 @@ def new_state():
     """Kept between passes only to pace heartbeats, idle checks, retries, messages and the newest runner release.
     GitHub (runs, jobs, runner registrations) and the host (units) hold everything else, so a restarted dispatcher
     picks up where one stopped."""
-    return {'beacon': {}, 'idle': {}, 'tries': {}, 'said': set(), 'newest': None}
+    return {'beacon': {}, 'idle': {}, 'tries': {}, 'said': set(), 'newest': None, 'down': {}}
 
 
 RELEASE_EVERY = 3600   # seconds between reads of the newest actions/runner release
@@ -933,6 +933,24 @@ def newest_runner(gh, state, now):
     return state['newest'][0]
 
 
+DOWN_EVERY = 600   # seconds between "still left alone" lines of a pool that stays down for the same reason
+
+
+def say_down(state, pool, why, t):
+    """A pool's host failed: said at once; while it keeps failing for the same reason (a desktop asleep all night),
+    again only every DOWN_EVERY s, with the count of passes."""
+    downs = state.setdefault('down', {})
+    last = downs.get(pool)
+    if last and last['why'] == why:
+        last['passes'] += 1
+        if t - last['said'] >= DOWN_EVERY:
+            last['said'] = t
+            say(f'::warning::fork-fleet: {why}; pool {pool} is still left alone ({last["passes"]} passes in a row)')
+        return
+    downs[pool] = {'why': why, 'passes': 1, 'said': t}
+    say(f'::warning::fork-fleet: {why}; pool {pool} is left alone for this pass, the other pools go on')
+
+
 def once(state, key, msg):
     if key not in state['said']:
         state['said'].add(key)
@@ -952,7 +970,7 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
             return getattr(hosts[p['name']], verb)(*args)
         except HostError as e:
             down[p['name']] = str(e)
-            say(f'::warning::fork-fleet: {e}; pool {p["name"]} is left alone for this pass, the other pools go on')
+            say_down(state, p['name'], str(e), now())
             return None
 
     runs = {}
@@ -1092,6 +1110,10 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
             continue
         set_variable(gh, p['beacon'], json.dumps(beat, separators=(',', ':')))
         state['beacon'][p['name']] = ((free, why), t)
+    for p in pools:
+        gone = p['name'] not in down and state.setdefault('down', {}).pop(p['name'], None)
+        if gone and gone['passes'] > 1:
+            say(f'fork-fleet: pool {p["name"]} answers again, after {gone["passes"]} passes left alone')
     return 0
 
 
