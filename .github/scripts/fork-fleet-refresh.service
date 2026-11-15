@@ -4,11 +4,13 @@
 # then finds the template new already.
 #
 # Root, sandboxed. Root because the template must be root's (each job hard-links it, and start refuses one anyone
-# else owns or may write). The sandbox lets it write only the template's folder (/opt/fork-fleet, where the new
-# template is unpacked and swapped in) and its locks (/run/fork-fleet), reach the network only by IP and local
-# sockets, make no device, setuid or setgid file, and keep one capability: CAP_DAC_OVERRIDE, so a leftover folder
-# without owner write can still be removed. With TEMPLATE or RUN_DIR elsewhere (launch.conf), add a drop-in:
-# [Service] ReadWritePaths=<the template's folder> <RUN_DIR>.
+# else owns or may write). The sandbox lets it write only the template's own folder (/opt/fork-fleet/template, where
+# the new template is unpacked and swapped in; refresh refuses to run when anything else is in it, so none of the files
+# the dispatcher runs as root is writable here) and its locks (/run/fork-fleet). It reaches the network by IP only (no
+# unix socket: no way to ask systemd or the bus for an unsandboxed unit), makes no device, setuid or setgid file, keeps
+# one capability (CAP_DAC_OVERRIDE, so a leftover folder without owner write can still be removed) and has a memory,
+# CPU and task limit (a hostile tarball cannot starve the host's jobs). With TEMPLATE or RUN_DIR elsewhere
+# (launch.conf), add a drop-in: [Service] ReadWritePaths=<the template's own folder> <RUN_DIR>.
 [Unit]
 Description=t3code fork fleet: refresh the runner template
 Wants=network-online.target
@@ -22,7 +24,9 @@ Nice=10
 IOSchedulingClass=idle
 UMask=0077
 ProtectSystem=strict
-ReadWritePaths=/opt/fork-fleet
+# The launcher's default TEMPLATE is /opt/fork-fleet/template/runner-template. "-": when the folder is missing, refresh
+# says so (it makes it when run by hand, host step 7).
+ReadWritePaths=-/opt/fork-fleet/template
 # The launcher's RUN_DIR (the dispatcher's locks live there too): made if missing, never removed.
 RuntimeDirectory=fork-fleet
 RuntimeDirectoryMode=0700
@@ -32,7 +36,7 @@ PrivateTmp=yes
 PrivateDevices=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6
 RestrictNamespaces=yes
 CapabilityBoundingSet=CAP_DAC_OVERRIDE
 ProtectKernelTunables=yes
@@ -44,3 +48,7 @@ ProtectHostname=yes
 LockPersonality=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
+MemoryMax=1G
+MemorySwapMax=0
+CPUQuota=100%
+TasksMax=64

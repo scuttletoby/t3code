@@ -359,8 +359,9 @@ done
 
 # 2. The runner template: an unconfigured actions/runner release, owned by root. The launcher's `refresh` makes it,
 #    checked by sha256, and keeps it new (step 7, right after step 4: it needs the launcher and its settings). Until
-#    then the pool stays closed ("there is no runner template"). /opt and /var/lib must be on one filesystem: each
-#    copy hard-links the template (the launcher checks it).
+#    then the pool stays closed ("there is no runner template"). It lives alone in a folder of its own,
+#    /opt/fork-fleet/template/runner-template (the launcher's default TEMPLATE): the refresh service may write only
+#    that folder. /opt and /var/lib must be on one filesystem: each copy hard-links the template (the launcher checks it).
 
 # 3. The fleet files, from one pinned main commit. All six are fetched first and installed only when each came;
 #    SOURCE is written last, so it never names a commit whose files are not all in place.
@@ -394,12 +395,13 @@ python3 -I /opt/fork-fleet/fork-fleet.py --config /opt/fork-fleet/fork-fleet.jso
 
 # 4. The launcher's settings and the dispatcher's token (root only).
 install -d -m 700 /etc/fork-fleet
-printf 'RUNNER_USERS=fork-runner-1,fork-runner-2\nTEMPLATE=/opt/fork-fleet/runner-template\n' > /etc/fork-fleet/launch.conf
+printf 'RUNNER_USERS=fork-runner-1,fork-runner-2\n' > /etc/fork-fleet/launch.conf
 chmod 600 /etc/fork-fleet/launch.conf
 ( umask 077; read -rsp 'token: ' t; printf '%s\n' "$t" > /etc/fork-fleet/token ); echo
 # RUNNER_USERS: one user per slot of the pool (step 1). WORK_ROOT (/var/lib/fork-fleet/runners): the launcher makes
 # it 0711. Every directory above it must let the runner users through (o+x), or no runner can reach its copy.
-# NET_BASE (10.204) and RESOLV_CONF (/etc/fork-fleet/resolv.conf): add a line only to change one (step 1b).
+# NET_BASE (10.204), RESOLV_CONF (/etc/fork-fleet/resolv.conf), TEMPLATE (/opt/fork-fleet/template/runner-template)
+# and RUNNER_MIN (none: the oldest runner version refresh may install): add a line only to change one (step 1b).
 
 # 5. The dispatcher, for the vm pool only.
 cat > /etc/systemd/system/t3code-fleet-dispatcher.service <<'EOF'
@@ -438,17 +440,27 @@ mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
 #    failure leaves the old template. The same version: nothing (one API call). Safe to run by hand at any time (a
 #    second refresh waits for the first). The timer runs it every hour at a random minute in the first 10, and after
 #    boot when a run was missed; a failed run is tried again the next hour. The service is sandboxed: it writes only
-#    /opt/fork-fleet and /run/fork-fleet (with TEMPLATE or RUN_DIR elsewhere, add a drop-in: the unit file says how).
+#    the template's own folder /opt/fork-fleet/template and /run/fork-fleet (with TEMPLATE or RUN_DIR elsewhere, add a
+#    drop-in: the unit file says how), reaches the network by IP only, and has 1 GiB of memory, one CPU and 64 tasks.
+#    refresh refuses a template whose folder holds anything else (such as the launcher: root runs it).
 #    The tarball is treated as hostile even after its sha256 passed (a compromised release would pass it): refresh
-#    refuses absolute names, "..", links that lead outside, device files, FIFOs and sockets, and a tarball over 4 GiB
-#    or 100000 entries; it strips setuid, setgid and group/other write. `start` refuses such files in a template too.
+#    refuses absolute names, "..", links that lead outside, device files, FIFOs, sockets and sparse files, a tarball
+#    over 4 GiB or 100000 entries, headers over 64 KiB, names over 4096 and links that take too long to follow; it
+#    strips setuid, setgid and group/other write. `start` refuses such files in a template too.
 #    Versions: only forward, and by at most one major version at a time (a bigger jump is refused: no real release
-#    does that). A template NEWER than the newest release (one GitHub withdrew) is rolled back to it by the next run.
-#    Roll back or jump by hand (the pool is closed in between; running jobs keep their copies):
-#      rm -rf --one-file-system /opt/fork-fleet/runner-template && /opt/fork-fleet/fork-fleet-launch.sh refresh
+#    does that). A template NEWER than the newest release (one GitHub withdrew) is rolled back to it by the next run,
+#    but never below the version it replaced (.fork-fleet-floor; without one, one major version down) nor below
+#    RUNNER_MIN (step 4). After a rollback the dispatcher may still hold the withdrawn version for up to an hour (it
+#    reads the newest release hourly): the pool stays closed until its next read.
+#    Roll back further or jump by hand (the pool is closed in between; running jobs keep their copies):
+#      rm -rf --one-file-system /opt/fork-fleet/template/runner-template && /opt/fork-fleet/fork-fleet-launch.sh refresh
 #    Re-run the two install lines after step 3 brings new unit files.
-/opt/fork-fleet/fork-fleet-launch.sh refresh                   # the first template, or the newest one now
-/opt/fork-fleet/runner-template/bin/installdependencies.sh     # once, and again if a release needs new libraries:
+#    A host set up before the template had its own folder (TEMPLATE=/opt/fork-fleet/runner-template in launch.conf):
+#    refresh refuses it ("not only the template") until it is moved, once; start and ready keep working meanwhile.
+#    Under the launch lock, so no runner copies it half-way (a start in that second fails once and is started again):
+#      install -d -m 755 /opt/fork-fleet/template && flock /run/fork-fleet/launch.lock sh -c 'mv -T /opt/fork-fleet/runner-template /opt/fork-fleet/template/runner-template && sed -i /^TEMPLATE=/d /etc/fork-fleet/launch.conf'
+/opt/fork-fleet/fork-fleet-launch.sh refresh                   # the first template (and its folder), or the newest one now
+/opt/fork-fleet/template/runner-template/bin/installdependencies.sh   # once, and again if a release needs new libraries:
                                                                # refresh installs no system packages
 install -o root -g root -m 644 /opt/fork-fleet/fork-fleet-refresh.service /etc/systemd/system/t3code-fleet-refresh.service
 install -o root -g root -m 644 /opt/fork-fleet/fork-fleet-refresh.timer /etc/systemd/system/t3code-fleet-refresh.timer
@@ -521,7 +533,7 @@ Set it up on the workspace machine next to the real install, with its own paths:
   `["/usr/bin/env", "FORK_FLEET_LAUNCH_CONF=/etc/fork-fleet-proof/launch.conf", "/opt/fork-fleet-proof/fork-fleet-launch.sh"]`,
   and one job `{"job": "lint", "memory_mb": 1024}`.
 - In `/etc/fork-fleet-proof/launch.conf`, set `RUNNER_USERS=fork-runner-1,fork-runner-2`,
-  `TEMPLATE=/opt/fork-fleet/runner-template`,
+  `TEMPLATE=/opt/fork-fleet/template/runner-template`,
   `WORK_ROOT=/var/lib/fork-fleet-proof/runners`, `RUN_DIR=/run/fork-fleet-proof`
   and `HOOK=/opt/fork-fleet-proof/hook.sh`.
 - Store a token for the proof repository at `/etc/fork-fleet-proof/token`, with
@@ -653,7 +665,11 @@ dispatcher keeps only pacing in memory, so a restart starts over cleanly.
 | Gate        | Broken installed config                                                                                                       | It refuses every job, failing closed. The dispatcher stops too. Re-install from `main`.                                                                                                                                                                                                                   |
 | Gate        | Installed script that does not even start (a syntax error)                                                                    | The dispatcher fails on start too, so no runner starts. Restart the dispatcher after each re-install, so it never runs an older copy than the hook.                                                                                                                                                       |
 | Gate        | No `FORK_FLEET_RUN` (a runner not made by the dispatcher)                                                                     | Refused.                                                                                                                                                                                                                                                                                                  |
-| Launcher    | Template configured (`.env` and the like), a symlink, or writable by others                                                   | It refuses to start a runner, and the dispatcher logs the reason.                                                                                                                                                                                                                                         |
+| Launcher    | Template configured (`.env` and the like, even a symlink to nothing), a symlink, or writable by others                        | It refuses to start a runner, and the dispatcher logs the reason.                                                                                                                                                                                                                                         |
+| Refresh     | The template's folder holds anything else (a host set up before it had a folder of its own)                                   | Refused before any download; `start` and `ready` keep working. Host step 7 gives the one-time move.                                                                                                                                                                                                       |
+| Refresh     | The newest release is below the template's floor (`.fork-fleet-floor`, or one major version down) or `RUNNER_MIN`             | Refused; the template stays. Host step 7 says how to take it by hand.                                                                                                                                                                                                                                     |
+| Refresh     | A hostile tarball: fanned-out symlinks, a huge long-name or pax header, a sparse file, a name over 4096                       | Refused quickly, before the header is read into memory. The service also has `MemoryMax=1G`, `CPUQuota=100%`, `TasksMax=64`.                                                                                                                                                                              |
+| Dispatcher  | Template rolled back (a withdrawn release)                                                                                    | The dispatcher may still hold the withdrawn version for up to an hour: no runner starts on that pool until its next hourly read. Heals by itself.                                                                                                                                                         |
 | Launcher    | `launch.conf` or the hook writable by anyone but root                                                                         | It refuses.                                                                                                                                                                                                                                                                                               |
 | Launcher    | Bad input (an extra line, a key twice, a malformed value)                                                                     | It refuses before touching anything.                                                                                                                                                                                                                                                                      |
 | Launcher    | A name that ran already                                                                                                       | It refuses. `prune` removes the old copy once its unit is gone.                                                                                                                                                                                                                                           |

@@ -2,8 +2,8 @@
 """Tests of fork-fleet-launch.sh refresh (the runner template's refresh) and its timer, fork-fleet-refresh.timer.
 A fake https release server on 127.0.0.1 (a certificate made here) and temp folders only: nothing is downloaded from
 GitHub, nothing runs as root. Run: python3 <this>. Linux only; needs curl, openssl, tar and flock."""
-import configparser, hashlib, http.server, io, json, os, platform, re, shutil, signal, ssl, stat, subprocess, sys
-import tarfile, tempfile, threading, time, unittest
+import configparser, hashlib, http.server, io, json, os, platform, re, resource, shutil, signal, ssl, stat, subprocess
+import sys, tarfile, tempfile, threading, time, unittest
 
 sys.dont_write_bytecode = True
 
@@ -14,10 +14,10 @@ PLATFORM = {'x86_64': 'linux-x64', 'aarch64': 'linux-arm64', 'arm64': 'linux-arm
             'armv7l': 'linux-arm'}.get(platform.machine())
 
 
-def hostile(members, version=None):
+def hostile(members, version=None, fmt=tarfile.DEFAULT_FORMAT):
     """A runner-like tarball (gzip) with extra tarfile members: (TarInfo, data or None) pairs."""
     out = io.BytesIO()
-    with tarfile.open(fileobj=out, mode='w:gz') as t:
+    with tarfile.open(fileobj=out, mode='w:gz', format=fmt) as t:
         for d in ('./', './bin/'):
             info = tarfile.TarInfo(d)
             info.type, info.mode = tarfile.DIRTYPE, 0o755
@@ -33,6 +33,12 @@ def hostile(members, version=None):
     return out.getvalue()
 
 
+def unpack_code():
+    """The launcher's own unpacker (UNPACK_PY)."""
+    with open(LAUNCH) as f:
+        return f.read().split("read -r -d '' UNPACK_PY <<'EOF' || true\n", 1)[1].split('\nEOF\n', 1)[0]
+
+
 def member(name, kind=tarfile.REGTYPE, mode=0o644, link=''):
     info = tarfile.TarInfo(name)
     info.type, info.mode, info.linkname = kind, mode, link
@@ -41,8 +47,12 @@ def member(name, kind=tarfile.REGTYPE, mode=0o644, link=''):
 
 def tarball(version, extra=None):
     """An actions/runner-like release tarball (gzip): run.sh, bin/Runner.Listener and a file naming its version."""
-    files = {'run.sh': (b'#!/bin/sh\n', 0o755), 'bin/Runner.Listener': (b'x', 0o755),
-             'bin/version.txt': (version.encode(), 0o644), **(extra or {})}
+    return layout({'run.sh': (b'#!/bin/sh\n', 0o755), 'bin/Runner.Listener': (b'x', 0o755),
+                   'bin/version.txt': (version.encode(), 0o644), **(extra or {})})
+
+
+def layout(files):
+    """A tarball (gzip) of ./, ./bin/ and `files` ({name: (data, mode)})."""
     out = io.BytesIO()
     with tarfile.open(fileobj=out, mode='w:gz') as t:
         for d in ('./', './bin/'):
@@ -128,7 +138,7 @@ class Refresh(unittest.TestCase):
         cls.cert = os.path.join(cls.certs, 'cert.pem')
         key = os.path.join(cls.certs, 'key.pem')
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cls.cert,
-                        '-days', '1', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'],
+                        '-days', '1', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost'],
                        check=True, capture_output=True)
         cls.server = Server()
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -206,6 +216,10 @@ class Refresh(unittest.TestCase):
         with open(f'{self.template}/.fork-fleet-version') as f:
             return f.read()
 
+    def floor(self):
+        with open(f'{self.template}/.fork-fleet-floor') as f:
+            return f.read()
+
     def leftovers(self):
         return sorted(n for n in os.listdir(self.path('opt')) if n != 'runner-template')
 
@@ -265,19 +279,63 @@ class Refresh(unittest.TestCase):
         self.assertEqual(os.stat(self.template).st_ino, ino)
 
     def test_a_template_newer_than_the_newest_release_is_rolled_back(self):
-        """A release GitHub withdrew (say a compromised v99999.0.0) must not stay, nor make every later one older."""
-        for have in ('2.331.1', '3.0.0', '99999.0.0'):
-            with self.subTest(have):
+        """A release GitHub withdrew (say a compromised v99999.0.0) must not stay, nor make every later one older:
+        back to its floor (the version it replaced), or without a floor file one major version down."""
+        for have, floor in (('2.331.1', None), ('3.0.0', None), ('99999.0.0', '2.330.0'), ('2.331.1', NEW)):
+            with self.subTest(have=have, floor=floor):
                 self.old_template()
                 self.write('opt/runner-template/.fork-fleet-version', f'{have}\n')
+                if floor:
+                    self.write('opt/runner-template/.fork-fleet-floor', f'{floor}\n')
                 got = self.launch('refresh')
                 try:
                     self.assertEqual(got.returncode, 0, got.stderr)
                     self.assertIn(f'newer than the newest release {NEW}', got.stderr)
                     self.assertIn(f'rolling it back to {NEW}', got.stderr)
                     self.assertEqual(self.version(), f'{NEW}\n')
+                    self.assertEqual(self.floor(), f'{NEW}\n')   # no second step back below it
                 finally:
                     shutil.rmtree(self.template, True)
+
+    def test_a_rollback_never_goes_below_the_floor(self):
+        """An old release marked "latest" by mistake (or by someone with write access) is not installed by itself:
+        not below the version the template replaced, not more than one major version down without a floor file, never
+        below RUNNER_MIN (first templates too)."""
+        ino = self.old_template()   # 2.330.0, no floor file
+        got = self.launch('refresh')   # forward to 2.331.0: its floor is 2.330.0
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual((self.version(), self.floor()), (f'{NEW}\n', f'{OLD}\n'))
+        self.offer(OLD)   # 2.331.0 withdrawn: back to 2.330.0, the floor
+        got = self.launch('refresh')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual((self.version(), self.floor()), (f'{OLD}\n', f'{OLD}\n'))
+        ino = os.stat(self.template).st_ino
+        for newest in ('2.329.9', '1.0.0'):   # below the floor
+            with self.subTest(newest):
+                self.offer(newest)
+                self.server.asked.clear()
+                self.assert_kept(self.launch('refresh'), f'older than {OLD}, the oldest it may go back to', ino)
+                self.assertEqual(self.downloads(), [])
+        os.remove(f'{self.template}/.fork-fleet-floor')   # an older template: one major version down at most
+        self.write('opt/runner-template/.fork-fleet-version', '3.0.0\n')
+        self.offer('1.999.0')
+        got = self.launch('refresh')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('older than 2.0.0, the oldest it may go back to', got.stderr)
+        self.write('opt/runner-template/.fork-fleet-version', f'{OLD}\n')
+        self.conf(RUNNER_MIN='2.332.0')   # RUNNER_MIN: never below it, forward or back
+        self.offer(NEW)
+        self.assert_kept(self.launch('refresh'), 'older than RUNNER_MIN 2.332.0', ino)
+        shutil.rmtree(self.template)
+        got = self.launch('refresh')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('older than RUNNER_MIN 2.332.0', got.stderr)
+        self.assertFalse(os.path.exists(self.template))
+        self.conf(RUNNER_MIN=NEW)
+        got = self.launch('refresh')   # a first template: taken, and no floor (nothing it replaced)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(self.version(), f'{NEW}\n')
+        self.assertFalse(os.path.exists(f'{self.template}/.fork-fleet-floor'))
 
     def test_a_jump_of_more_than_one_major_version_is_refused(self):
         ino = self.old_template()   # 2.330.0
@@ -356,12 +414,17 @@ class Refresh(unittest.TestCase):
         self.assert_kept(self.launch('refresh'), 'could not read the newest release', ino)
 
     def test_a_tarball_that_is_no_runner_is_refused(self):
-        for name, data in (('not a tarball', b'not gzip'),
-                           ('configured', tarball(NEW, {'.runner': (b'{}', 0o644)}))):
+        no_runner = 'has no run.sh or bin/Runner.Listener'
+        for name, data, word in (('not a tarball', b'not gzip', 'did not unpack'),
+                                 ('configured', tarball(NEW, {'.runner': (b'{}', 0o644)}), 'has a .runner'),
+                                 ('no run.sh', layout({'bin/Runner.Listener': (b'x', 0o755)}), no_runner),
+                                 ('no Listener', layout({'run.sh': (b'#!/bin/sh\n', 0o755)}), no_runner),
+                                 ('run.sh not executable', layout({'run.sh': (b'#!/bin/sh\n', 0o644),
+                                                                   'bin/Runner.Listener': (b'x', 0o755)}), no_runner)):
             with self.subTest(name):
                 ino = self.old_template()
                 self.offer(NEW, data)
-                self.assert_kept(self.launch('refresh'), 'refresh:', ino)
+                self.assert_kept(self.launch('refresh'), word, ino)
                 shutil.rmtree(self.template)
 
     def test_a_failed_swap_keeps_the_old_template(self):
@@ -467,7 +530,9 @@ class Refresh(unittest.TestCase):
                  'are https URLs'),
                 ('http download', dict(RUNNER_DOWNLOAD='http://127.0.0.1/download'), 'are https URLs'),
                 ('relative template', dict(TEMPLATE='opt/runner-template'), 'not a plain absolute path'),
-                ('template with a space', dict(TEMPLATE=self.path('opt/a b')), 'not a setting')):
+                ('template with a space', dict(TEMPLATE=self.path('opt/a b')), 'not a setting'),
+                ('template in the root', dict(TEMPLATE='/runner-template'), 'not a plain absolute path in a folder'),
+                ('RUNNER_MIN not a version', dict(RUNNER_MIN='2.x'), 'RUNNER_MIN is not a version')):
             with self.subTest(name):
                 self.conf(**conf)
                 got = self.launch('refresh')
@@ -478,7 +543,8 @@ class Refresh(unittest.TestCase):
         got = self.launch('refresh')
         self.assertIn('must be writable by its owner only', got.stderr)
         os.chmod(self.path('opt'), 0o755)
-        link = self.path('opt/link')
+        os.mkdir(self.path('links'), 0o755)
+        link = self.path('links/link')
         os.symlink(self.template, link)
         self.conf(TEMPLATE=link)
         self.assertIn('missing or a symlink', self.launch('refresh').stderr)
@@ -530,6 +596,8 @@ class Refresh(unittest.TestCase):
             'version file a symlink': ([(lambda v: member('./.fork-fleet-version', sym, link=v), None)],
                                        'has a .fork-fleet-version of its own'),
             'version file': ([(member('./.fork-fleet-version'), b'9.9.9\n')], 'has a .fork-fleet-version of its own'),
+            # the floor decides how far back a later refresh may roll: the release must not set it
+            'floor file': ([(member('./.fork-fleet-floor'), b'0.0.1\n')], 'has a .fork-fleet-floor of its own'),
             'absolute name': ([(lambda v: member(v), b'x')], 'is an absolute path'),
             'dot-dot name': ([(member('./bin/../../victim'), b'x')], 'has a ".."'),
             'symlink to an absolute path': ([(lambda v: member('./bin/out', sym, link=v), None)], 'leads outside'),
@@ -593,13 +661,51 @@ class Refresh(unittest.TestCase):
                 with open(src, 'wb') as f:
                     f.write(hostile(members))
                 os.mkdir(dest)
-                got = subprocess.run(['python3', '-I', '-c', code, src, dest, NEW], capture_output=True, text=True,
-                                     timeout=60)
+                got = subprocess.run(['python3', '-I', '-c', code, src, dest, NEW, ''], capture_output=True,
+                                     text=True, timeout=60)
                 if word:
                     self.assertNotEqual(got.returncode, 0)
                     self.assertIn(word, got.stderr)
                 else:
                     self.assertEqual(got.returncode, 0, got.stderr)
+
+    def test_the_unpacker_bounds_memory_and_time(self):
+        """A compromised release cannot hold root's refresh for minutes or take the host's memory: fanned-out
+        symlinks (link k goes through link k-1 four times: 4**k steps unbounded), a GNU long-name or pax header of
+        1 MiB (tarfile would read it whole, however big), a GNU sparse file (chained headers), a name over 4096. Each is refused
+        quickly, under a 192 MiB address-space limit."""
+        sym = tarfile.SYMTYPE
+        fan = []
+        for k in range(30):
+            fan.append(member(f'./l{k}', sym, link='bin' if k == 0 else '/../'.join([f'l{k - 1}'] * 4)))
+        cases = {
+            'fanned-out symlinks': (hostile([(m, None) for m in fan]), 'steps to follow'),
+            'GNU long name': (hostile([(member('./bin/' + 'a' * (1 << 20)), b'')], fmt=tarfile.GNU_FORMAT),
+                              'a header of'),
+            'pax header': (hostile([(member('./bin/' + 'a' * (1 << 20)), b'')], fmt=tarfile.PAX_FORMAT),
+                           'a header of'),
+            'sparse file': (hostile([(member('./bin/s', tarfile.GNUTYPE_SPARSE), b'')], fmt=tarfile.GNU_FORMAT),
+                            'is a sparse file'),
+            'long name': (hostile([(member('./bin/' + 'a' * 5000), b'')], fmt=tarfile.PAX_FORMAT),
+                          'longer than 4096'),
+            'long link target': (hostile([(member('./bin/l', sym, link='a/' * 2500), None)], fmt=tarfile.PAX_FORMAT),
+                                 'longer than 4096'),
+        }
+        limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (192 << 20, 192 << 20))
+        for name, (data, word) in cases.items():
+            with self.subTest(name):
+                src, dest = self.write('t.tar.gz', ''), self.path(f'new-{name.replace(" ", "-")}')
+                with open(src, 'wb') as f:
+                    f.write(data)
+                os.mkdir(dest)
+                t = time.monotonic()
+                got = subprocess.run(['python3', '-I', '-c', unpack_code(), src, dest, NEW, ''], capture_output=True,
+                                     text=True, timeout=60, preexec_fn=limit)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn(word, got.stderr)
+                self.assertNotIn('MemoryError', got.stderr)
+                self.assertLess(time.monotonic() - t, 20)
+                self.assertEqual(os.listdir(dest), [])
 
     def test_start_refuses_what_refresh_refuses(self):
         """Defence in depth: start's own check of the template (a template made by hand, or an older refresh)."""
@@ -621,6 +727,86 @@ class Refresh(unittest.TestCase):
                 self.assertNotEqual(got.returncode, 0)
                 self.assertIn(word, got.stderr)
                 self.assertIn('bin/bad', got.stderr)
+
+    def test_start_refuses_a_configured_template_even_as_a_dangling_link(self):
+        """start tests .env, .runner and the like as refresh does: a symlink to nothing counts too."""
+        self.old_template()
+        for f in ('.runner', '.env', '.credentials'):
+            with self.subTest(f):
+                os.symlink('/nonexistent/x', f'{self.template}/{f}')
+                try:
+                    got = subprocess.run(['bash', LAUNCH, 'start', 'fleet-vm-t3code-1'], env=self.env(),
+                                         input='ACTIONS_RUNNER_INPUT_JITCONFIG=abc\nFORK_FLEET_RUN=1\n'
+                                               'FORK_FLEET_ATTEMPT=1\n', capture_output=True, text=True, timeout=60)
+                finally:
+                    os.remove(f'{self.template}/{f}')
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn(f'{self.template}/{f} exists', got.stderr)
+
+    def test_a_template_in_a_shared_folder_is_refused_until_moved(self):
+        """The service may write the template's own folder only. A template set up before (beside the launcher, the
+        trust config and the job hook, which root runs) is refused by refresh, before any download, and keeps
+        working for ready and start; the runbook's move (host step 7) makes refresh work again."""
+        ino = self.old_template()
+        for f in ('fork-fleet-launch.sh', 'hook.sh', 'fork-fleet.json'):
+            self.write(f'opt/{f}', 'root runs this\n', 0o755)
+        self.offer(OLD)
+        self.assertEqual(self.launch('ready', OLD).returncode, 0)
+        self.offer(NEW)
+        got = self.launch('refresh')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('not only the template: the template must have a folder of its own', got.stderr)
+        self.assertIn('host step 7', got.stderr)
+        self.assertEqual(self.server.asked, [])
+        self.assertEqual(os.stat(self.template).st_ino, ino)
+        self.assertEqual(sorted(os.listdir(self.path('opt'))),
+                         ['fork-fleet-launch.sh', 'fork-fleet.json', 'hook.sh', 'runner-template'])
+        # The move, as the runbook gives it: a folder of its own, the template into it, launch.conf after.
+        os.mkdir(self.path('opt/template'), 0o755)
+        os.rename(self.template, self.path('opt/template/runner-template'))
+        self.template = self.path('opt/template/runner-template')
+        self.conf()
+        got = self.launch('refresh')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(self.version(), f'{NEW}\n')
+        self.assertEqual(sorted(os.listdir(self.path('opt/template'))), ['runner-template'])
+
+    def test_the_templates_folder_is_made_on_the_first_run(self):
+        self.template = self.path('opt/fresh/runner-template')
+        self.conf()
+        got = self.launch('refresh')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('opt/fresh')).st_mode), 0o755)
+        self.assertEqual(self.version(), f'{NEW}\n')
+        self.template = self.path('opt/missing/deeper/runner-template')   # only the template's own folder is made
+        self.conf()
+        got = self.launch('refresh')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('missing or a symlink', got.stderr)
+
+    def test_refresh_needs_no_unix_socket(self):
+        """The service's RestrictAddressFamilies (no AF_UNIX: no way to ask systemd or the bus for a unit) and its
+        limits, for real, as a user unit (seccomp needs no root): a refresh that resolves a name still works."""
+        if not shutil.which('systemd-run'):
+            self.skipTest('no systemd-run')
+        service = unit('fork-fleet-refresh.service')['Service']
+        props = [f'{k}={service[k]}' for k in ('RestrictAddressFamilies', 'SystemCallArchitectures', 'TasksMax',
+                                                 'MemoryMax', 'CPUQuota', 'NoNewPrivileges')]
+        run = ['systemd-run', '--user', '--wait', '--pipe', '--quiet', '--collect'] + [
+            a for p in props for a in ('-p', p)]
+        probe = subprocess.run(run + ['--', 'python3', '-c', 'import socket; socket.socket(socket.AF_UNIX)'],
+                               capture_output=True, text=True, timeout=60)
+        if 'Address family not supported' not in probe.stderr:
+            self.skipTest(f'this user manager applies no seccomp filter: {probe.stderr.strip()[-200:]}')
+        self.old_template()
+        port = self.server.server_address[1]
+        self.conf(RUNNER_RELEASE=f'https://localhost:{port}/release', RUNNER_DOWNLOAD=f'https://localhost:{port}/download')
+        cmd = list(run)
+        for k, v in self.env().items():
+            cmd += ['--setenv', f'{k}={v}']
+        got = subprocess.run(cmd + ['--', 'bash', LAUNCH, 'refresh'], capture_output=True, text=True, timeout=300)
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        self.assertEqual(self.version(), f'{NEW}\n')
 
     def test_a_real_run_in_the_services_sandbox(self):
         """The service's sandbox (as a transient user unit) lets a real refresh through. Only the places differ: the
@@ -659,12 +845,20 @@ def unit(name):
     return p
 
 
-# The service's sandbox: it may write the template's folder and its locks only, make no device, setuid or setgid file
-# and reach the network by IP only (a compromised release unpacked by a bug in refresh still cannot reach the host).
-SANDBOX = {'ProtectSystem': 'strict', 'ReadWritePaths': '/opt/fork-fleet', 'RuntimeDirectory': 'fork-fleet',
+# The service's sandbox: it may write the template's own folder and its locks only, make no device, setuid or setgid
+# file, reach the network by IP only (no unix socket: systemd and the bus are out of reach) and use 1 GiB of memory, one
+# CPU and 64 tasks at most (a compromised release unpacked by a bug in refresh still cannot reach the host).
+SANDBOX = {'ProtectSystem': 'strict', 'ReadWritePaths': '-/opt/fork-fleet/template', 'RuntimeDirectory': 'fork-fleet',
            'RuntimeDirectoryMode': '0700', 'RuntimeDirectoryPreserve': 'yes', 'ProtectHome': 'yes',
            'PrivateTmp': 'yes', 'PrivateDevices': 'yes', 'NoNewPrivileges': 'yes', 'RestrictSUIDSGID': 'yes',
-           'RestrictAddressFamilies': 'AF_INET AF_INET6 AF_UNIX', 'CapabilityBoundingSet': 'CAP_DAC_OVERRIDE'}
+           'RestrictAddressFamilies': 'AF_INET AF_INET6', 'CapabilityBoundingSet': 'CAP_DAC_OVERRIDE',
+           'MemoryMax': '1G', 'MemorySwapMax': '0', 'CPUQuota': '100%', 'TasksMax': '64'}
+
+
+def default_template():
+    """The launcher's default TEMPLATE (the one place the template's path is set)."""
+    with open(LAUNCH) as f:
+        return re.search(r"^RUNNER_USERS='' TEMPLATE=(\S+) ", f.read(), re.M).group(1)
 
 
 class Timer(unittest.TestCase):
@@ -707,6 +901,21 @@ class Timer(unittest.TestCase):
         self.assertEqual({k: service.get(k) for k in SANDBOX}, SANDBOX)
         # RUN_DIR is the dispatcher's lock folder too: the unit must never remove it when it stops.
         self.assertEqual(service['RuntimeDirectoryPreserve'], 'yes')
+
+    def test_the_service_writes_the_templates_own_folder_only(self):
+        """The writable folder is the default template's own folder, and none of the files root runs (the launcher,
+        the dispatcher, its trust config, the job hook, the pc wrapper) is in it or under it."""
+        service = unit('fork-fleet-refresh.service')['Service']
+        rw = [p.lstrip('-') for p in service['ReadWritePaths'].split()]
+        self.assertEqual(rw, [os.path.dirname(default_template())])
+        root_dir = os.path.dirname(service['ExecStart'].split()[0])
+        for f in ('fork-fleet-launch.sh', 'fork-fleet.py', 'fork-fleet.json', 'hook.sh', 'launch-pc', 'SOURCE'):
+            path = f'{root_dir}/{f}'
+            self.assertFalse(any(path == w or path.startswith(w.rstrip('/') + '/') for w in rw), path)
+        self.assertNotIn('AF_UNIX', service['RestrictAddressFamilies'].split())
+        with open(os.path.join(os.path.dirname(HERE), 'fork-fleet.md')) as f:
+            runbook = f.read()
+        self.assertIn(f'mv -T /opt/fork-fleet/runner-template {default_template()}', runbook)   # the move, once
 
     def test_systemd_rates_the_sandbox_ok(self):
         """systemd-analyze security, offline (reads the file only): exposure 4.0 or less, "OK"."""
