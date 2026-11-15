@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# One issue for a scheduled job's result (tests: fork-run-alert.test.sh). A failed schedule run
+# alerts no one (GitHub mails only the user who last edited the cron line), so a workflow's last
+# job runs this with the result of the job it watches:
+#
+#   fork-run-alert.sh --title TITLE --result RESULT [--message TEXT] [--repo OWNER/NAME]
+#
+# RESULT is a job result as `needs.<job>.result` gives it. success: closes the open issue named
+# TITLE, if any, and exits 0. Anything else (failure, cancelled, skipped, empty): opens that issue,
+# or comments on it when it is open already (one issue, a comment per failed run), and exits 1, so
+# the run stays red. It only ever touches an open issue GitHub Actions itself opened with exactly
+# that title, never one someone else opened. RUN_URL (optional) goes into the issue. The issue
+# body is TEXT, then the result and the run. OWNER/NAME: --repo, or else GITHUB_REPOSITORY.
+# Needs gh (with a token that has issues: write) and jq. fork-interaction-limit.sh's `report` does
+# the same for its own check.
+set -uo pipefail
+# Refuses outside a GitHub Actions run or a test under the gh stub (fork-gh-guard.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
+
+# The issue author: `gh issue list --author` needs the bot's user login, while gh's JSON names it
+# app/github-actions. Both are checked; a person cannot take a login with brackets.
+BOT_AUTHOR="github-actions[bot]"
+BOT_LOGIN="app/github-actions"
+
+die() { echo "fork-run-alert: $*" >&2; exit 2; }
+title="" result="" message="" repo="${GITHUB_REPOSITORY:-}"
+result_given=""
+while (( $# )); do
+  case "$1" in
+    --title) title="${2-}"; shift ;;
+    --result) result="${2-}"; result_given=1; shift ;;
+    --message) message="${2-}"; shift ;;
+    --repo) repo="${2-}"; shift ;;
+    *) die "unknown argument: $1 (see the header of $0)" ;;
+  esac
+  shift || die "a value is missing after the last option"
+done
+[[ -n "$title" && -n "$result_given" ]] || die "--title and --result are required (see the header of $0)"
+[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "no repository: pass --repo OWNER/NAME"
+
+failed=true
+[[ "$result" == success ]] && failed=false
+body="$(mktemp)"
+trap 'rm -f "$body"' EXIT
+{
+  if [[ "$failed" == true ]]; then
+    echo "**${message:-The watched job did not succeed.}**"
+    echo
+    echo "Result: \`${result:-none}\`."
+  else
+    echo "The watched job succeeded again (result: \`success\`)."
+  fi
+  [[ -z "${RUN_URL:-}" ]] || { echo; echo "Run: $RUN_URL"; }
+} > "$body"
+
+note=""
+issue=""
+# The list itself, not search (its index can lag), and only issues GitHub Actions opened.
+if ! issue="$(gh issue list --repo "$repo" --state open --author "$BOT_AUTHOR" --limit 100 \
+  --json number,title,author \
+  --jq ".[] | select(.title == $(jq -Rn --arg t "$title" '$t') and .author.login == \"$BOT_LOGIN\") | .number" | head -n1)"; then
+  note="Could not list the issues of $repo, so no issue was opened, updated or closed."
+  failed=true
+elif [[ "$failed" == true && -n "$issue" ]]; then
+  gh issue comment "$issue" --repo "$repo" --body-file "$body" > /dev/null \
+    && note="Commented on issue #$issue." || note="Could not comment on issue #$issue."
+elif [[ "$failed" == true ]]; then
+  if url="$(gh issue create --repo "$repo" --title "$title" --body-file "$body")"; then
+    note="Opened $url."
+  else
+    note="Could not open an issue."
+  fi
+elif [[ -n "$issue" ]]; then
+  gh issue close "$issue" --repo "$repo" --comment "$(cat "$body")" > /dev/null \
+    && note="Closed issue #$issue." || { note="Could not close issue #$issue."; failed=true; }
+fi
+{
+  cat "$body"
+  [[ -z "$note" ]] || printf '\n%s\n' "$note"
+} >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+if [[ "$failed" == true ]]; then
+  if [[ "$result" == success ]]; then echo "::error::$note" >&2
+  else echo "::error::${message:-The watched job did not succeed} (result: ${result:-none}). $note" >&2; fi
+  exit 1
+fi
+echo "$title: the watched job succeeded. $note"
+exit 0
