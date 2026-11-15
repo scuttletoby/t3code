@@ -1,0 +1,140 @@
+// Fork: every setting this fork adds, with its default, the reason and where it was decided. A
+// machine whose file never names one must behave as upstream's T3 Code: nothing changes unasked.
+// forkDefaults.test.ts fails while a setting marked `Fork:` in settings.ts has no row here, or a
+// row's default is not the code's. See docs/fork/updates.md.
+
+import * as Schema from "effect/Schema";
+
+import { ClientSettingsSchema, ProjectSettingsOverrides, ServerSettings } from "./settings.ts";
+
+/** Which settings object holds the key: the server's file, one project's overrides, or a client. */
+export type ForkSettingScope = "server" | "projectOverride" | "client";
+
+export interface ForkSettingDefault {
+  readonly scope: ForkSettingScope;
+  readonly key: string;
+  /**
+   * The default as the settings file writes it (a duration in milliseconds); `undefined` when the
+   * key is absent by default. With `fields`, only the fields named here are pinned.
+   */
+  readonly default: unknown;
+  /**
+   * For a settings group with an `enabled` switch: pin only the fields in `default` (the switch),
+   * since the group's other fields are tuning that does nothing while it is off.
+   */
+  readonly fields?: true;
+  /** True when the default leaves the machine as upstream's would be; false says why not in `reason`. */
+  readonly off: boolean;
+  readonly reason: string;
+  /** The fork pull request or issue that decided it. */
+  readonly decidedIn: string;
+}
+
+export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
+  {
+    scope: "server",
+    key: "automaticUpdates",
+    default: false,
+    off: true,
+    reason:
+      "A machine never updates itself unless its owner turned this on. Upstream's setting of the same name defaults on; the fork keeps false through every sync.",
+    decidedIn: "#41",
+  },
+  {
+    scope: "server",
+    key: "automaticUpdatesQuietCommand",
+    default: "",
+    off: true,
+    reason: "No command is run before an automatic update.",
+    decidedIn: "#5",
+  },
+  {
+    scope: "server",
+    key: "usagePacing",
+    default: {},
+    off: true,
+    reason: "No provider instance keeps a reserve, so pacing holds nothing back.",
+    decidedIn: "#52",
+  },
+  {
+    scope: "server",
+    key: "usagePacingGate",
+    default: "off",
+    off: true,
+    reason: "Delegated tasks start as upstream's do; no pace is read.",
+    decidedIn: "#73",
+  },
+  {
+    scope: "server",
+    key: "usagePacingLowerEffort",
+    default: {},
+    off: true,
+    reason: "The pacing gate never lowers a task's effort.",
+    decidedIn: "#73",
+  },
+  {
+    scope: "server",
+    key: "waitFor",
+    default: { enabled: false },
+    fields: true,
+    off: true,
+    reason: "Waits judge and deliver nothing until switched on.",
+    decidedIn: "#84",
+  },
+  {
+    scope: "server",
+    key: "waitChecks",
+    default: {},
+    off: true,
+    reason: "No named check commands; only the settings file can add one.",
+    decidedIn: "#84",
+  },
+  {
+    scope: "server",
+    key: "agentSlots",
+    default: { enabled: false },
+    fields: true,
+    off: true,
+    reason: "delegate_task is never refused for slots until switched on.",
+    decidedIn: "#84",
+  },
+  {
+    scope: "server",
+    key: "headlessUsageRefreshInterval",
+    default: 600_000,
+    off: false,
+    reason:
+      "On by default: usage limits are read every 10 minutes while no client watches, so pacing has current numbers. Read-only: it changes no thread, setting or install. 0 turns it off.",
+    decidedIn: "#42",
+  },
+  {
+    scope: "projectOverride",
+    key: "waitChecks",
+    default: undefined,
+    off: true,
+    reason: "A project without its own list uses the server's checks.",
+    decidedIn: "#84",
+  },
+];
+
+const FIELDS: Readonly<Record<ForkSettingScope, Readonly<Record<string, Schema.Top>>>> = {
+  server: ServerSettings.fields,
+  projectOverride: ProjectSettingsOverrides.fields,
+  client: ClientSettingsSchema.fields,
+};
+
+/** A decoded value of the row's setting as the settings file writes it. */
+export function forkSettingAsSaved(row: ForkSettingDefault, value: unknown): unknown {
+  const field = FIELDS[row.scope][row.key];
+  if (field === undefined || value === undefined) return undefined;
+  return Schema.encodeUnknownSync(field as Schema.Codec<unknown, unknown>)(value);
+}
+
+/** The part of a saved value the row pins: the whole value, or only the fields `default` names. */
+export function pinnedPart(row: ForkSettingDefault, saved: unknown): unknown {
+  if (row.fields !== true || typeof saved !== "object" || saved === null) return saved;
+  const record = saved as Readonly<Record<string, unknown>>;
+  return Object.fromEntries(
+    Object.keys(row.default as object).map((field) => [field, record[field]]),
+  );
+}
