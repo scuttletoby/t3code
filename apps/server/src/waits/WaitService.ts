@@ -653,6 +653,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       return { type: "notYet", detail: "Older slot waits go first." } satisfies Judgement;
     }
     const [grant] = yield* gate.grant([{ key: waitId, threadId, account: spec.account }]);
+    // Met at once, nothing to write: the slot the thread held before moves to this answer now.
+    if (grant?.type === "granted") yield* gate.keep([waitId]);
     return grant === undefined
       ? ({ type: "notYet" } satisfies Judgement)
       : slotJudgement(grant, settings, true);
@@ -671,6 +673,28 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       );
     }),
   );
+
+  /**
+   * A judge fixed a stored wait's target (`WaitJudgeContext.pin`): written only while waits are on
+   * and the wait is still waiting with the target that was judged, so a cancel, an end or another
+   * pin in between wins. A failed write is pinned again at the next read.
+   */
+  const pinStored = (id: string, judged: WaitTarget, pinned: WaitTarget) =>
+    lock.withPermits(1)(
+      Effect.gen(function* () {
+        const settings = yield* readSettingsOrNull;
+        if (settings === null || !settings.waitFor.enabled) return;
+        const loaded = yield* ensureLoaded(true);
+        if (!loaded.ok) return;
+        const wait = loaded.contents.waits.find((candidate) => candidate.id === id);
+        if (wait === undefined || wait.state !== "waiting" || wait.kind !== pinned.kind) return;
+        if (waitKey(wait.threadId, targetOf(wait)) !== waitKey(wait.threadId, judged)) return;
+        const waits = loaded.contents.waits.map((candidate) =>
+          candidate.id === id ? ({ ...candidate, spec: pinned.spec } as WaitRecord) : candidate,
+        );
+        yield* commitWaits(loaded.contents, waits, "it is pinned at its next read.", settings);
+      }),
+    );
 
   /** The gate let a holder start its agent: its wait's `reservedUntil` is cleared (row 15). */
   const useStoredSlot = (key: string) =>
@@ -787,11 +811,21 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     let started: StartedJudge | null = null;
     /** Set once the stored wait owns the run; until then the run ends with the call. */
     let adopted = false;
+    /** The target the judge fixed (`WaitJudgeContext.pin`) before the wait was stored. */
+    let pinned: WaitTarget | null = null;
 
     return yield* Effect.gen(function* () {
       // Waits for a free place within its limit; with none, the next sweep judges it first.
       const until = now + REGISTER_JUDGE_LIMIT_MS;
-      const context: WaitJudgeContext = { waitId: null, now, threadId, projectId };
+      const context: WaitJudgeContext = {
+        waitId: null,
+        now,
+        threadId,
+        projectId,
+        // Stored with the wait; a run that answers after it was stored writes it then.
+        pin: (next) =>
+          adopted ? pinStored(waitId, target, next) : Effect.sync(() => void (pinned = next)),
+      };
       // A slot wait asks the gate instead, which holds a slot it grants at once.
       started =
         slotGate !== undefined
@@ -851,7 +885,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             state: "waiting",
             attempt: 0,
             ...(parentThreadId === undefined ? {} : { parentThreadId }),
-            ...target,
+            // The key stays the asked target's, so asking the same again finds this wait.
+            ...(pinned ?? target),
           } as WaitRecord;
           yield* commitOrFail(
             { ...contents, waits: [...contents.waits, record] },
@@ -1292,6 +1327,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       now,
       threadId: wait.threadId,
       projectId: wait.projectId,
+      pin: (next) => pinStored(wait.id, target, next),
     };
     let context = base;
     let checkRun: JudgeRun["check"];
@@ -1685,7 +1721,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       yield* gate.drop(freed.map(([id]) => id));
       return 0;
     }
-    const granted = yield* applyGrants(new Map(freed), settings);
+    const kept = yield* applyGrants(new Map(freed), settings);
+    // Written: the slots their threads held before are used up now, outside the lock (the gate
+    // clears them in the store through it).
+    yield* gate.keep(kept);
+    const granted = kept.length;
     return (
       granted +
       (yield* applyJudgements(
@@ -1695,11 +1735,14 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     );
   });
 
-  /** Writes the slots granted; a grant not kept (cancelled meanwhile, or not written) holds nothing. */
+  /**
+   * Writes the slots granted and returns the ids written; a grant not kept (cancelled meanwhile,
+   * or not written) holds nothing, and a slot its thread held before counts again.
+   */
   const applyGrants = (granted: ReadonlyMap<string, string>, settings: ServerSettings) =>
     lock.withPermits(1)(
       Effect.gen(function* () {
-        if (granted.size === 0) return 0;
+        if (granted.size === 0) return [];
         const loaded = yield* ensureLoaded(true);
         const now = yield* Clock.currentTimeMillis;
         const changes = new Map<string, WaitTransition>();
@@ -1732,7 +1775,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           nextCheckAt.delete(id);
           yield* logTransition(transition);
         }
-        return kept.size;
+        return [...kept.keys()];
       }),
     );
 
