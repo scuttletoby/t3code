@@ -15,16 +15,16 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 
 ## Use
 
-| Command                      | What happens                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------------- |
-| `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends      |
-| `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)             |
-| `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files         |
-| `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                                   |
-| `heavy sweep [--dry-run]`    | one leftover sweep (below); the user timer runs it every 5 minutes                                |
-| `heavy sweep --json`         | looks only: what a sweep would stop or report, as JSON                                            |
-| `heavy docker-label`         | the owner label for a container a test starts (below)                                             |
-| `heavy -- <command>`         | runs a command named like one of the words above                                                  |
+| Command                      | What happens                                                                                 |
+| ---------------------------- | -------------------------------------------------------------------------------------------- |
+| `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends |
+| `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)        |
+| `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files    |
+| `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                              |
+| `heavy sweep [--dry-run]`    | one leftover sweep (below); the user timer runs it every 5 minutes                           |
+| `heavy sweep --json`         | looks only: what a sweep would stop or report, as JSON                                       |
+| `heavy docker-label`         | the owner label for a container a test starts (below)                                        |
+| `heavy -- <command>`         | runs a command named like one of the words above                                             |
 
 The command gets the same folder, environment, stdin, stdout, stderr and open files. heavy exits with the command's
 exit code, or dies of the same signal (a shell sees `128+N`), so scripts and `make` see what they saw before. The
@@ -81,6 +81,7 @@ It finds:
    **A busy test detached without heavy** (`nohup python3 -m pytest &`, `setsid ./run.test.sh`) is stopped once
    it is older than `minAgeSeconds` (10 minutes by default) and stopping is on. Run long tests under heavy, or
    in a unit listed in `knownUnits`.
+
 2. **Heavy scopes whose heavy is gone:** stopped as a whole (as heavy itself would have done). A scope kept with
    `HEAVY_KEEP=1` is never stopped; its busy or long-lived processes are reported. heavy names kept scopes
    `heavy-keep-<name>-<random>.scope` and all others never so (a command named `keep` gets `heavy-keep_-...`).
@@ -120,16 +121,16 @@ The sweep reads the `heavy` section of the machine file (`/etc/fork-kit/machine.
 wrong type or a newer `version`: the sweep checks and stops nothing, prints why, and exits 1. An empty `sweep`
 object uses the defaults below (a dry run that reports).
 
-| Key                | Default                      | What                                                            |
-| ------------------ | ---------------------------- | --------------------------------------------------------------- |
-| `stop`             | `false`                      | `true`: stop and remove; `false`: dry run                       |
-| `minAgeSeconds`    | `600`                        | younger processes, scopes and containers are left alone (>= 60) |
-| `longLivedSeconds` | `7200`                       | older than this counts as long-lived (>= 60)                    |
-| `busyCpuPercent`   | `20`                         | more CPU than this (100 = one core) counts as busy              |
-| `report`           | `~/.local/state/heavy-sweep` | folder for `sweep.log`, `last-report.txt` and the lock          |
-| `knownUnits`       | `[]`                         | unit name globs whose processes are never touched               |
-| `knownContainers`  | `[]`                         | container name globs never touched or reported                  |
-| `testPatterns`     | `[]`                         | regular expressions; a match on the own command = test-shaped   |
+| Key                | Default                      | What                                                              |
+| ------------------ | ---------------------------- | ----------------------------------------------------------------- |
+| `stop`             | `false`                      | `true`: stop and remove; `false`: dry run                         |
+| `minAgeSeconds`    | `600`                        | younger processes, scopes and containers are left alone (>= 60)   |
+| `longLivedSeconds` | `7200`                       | older than this counts as long-lived (>= 60)                      |
+| `busyCpuPercent`   | `20`                         | more CPU than this (100 = one core) counts as busy                |
+| `report`           | `~/.local/state/heavy-sweep` | folder for `sweep.log`, `last-report.txt` and the lock            |
+| `knownUnits`       | `[]`                         | unit name globs whose processes are never touched                 |
+| `knownContainers`  | `[]`                         | container name globs never touched or reported                    |
+| `testPatterns`     | `[]`                         | regular expressions; a match on the own command = test-shaped     |
 | `ignorePatterns`   | tmux, screen, login shells   | regular expressions on the whole command line; a match = left out |
 
 The default `ignorePatterns` are `^(tmux|screen|SCREEN)( |:|$)` and `^-` (a login shell). The code never stops a
@@ -178,7 +179,7 @@ the owner as gone).
 | a scope that does not stop                                                 | its processes are stopped one by one; any still running is a problem (exit 1) |
 | a report folder that is a link, a file, another user's or group-writable   | refused; nothing checked or stopped                                           |
 | a detached heavy (`nohup heavy ...`) of any age, its scope live            | never stopped or reported                                                     |
-| an install stopped half-way, or a rollback to a release without the sweep  | the timer is written only after the new release is in use, and runs the      |
+| an install stopped half-way, or a rollback to a release without the sweep  | the timer is written only after the new release is in use, and runs the       |
 |                                                                            | sweep of the release in use; a release without one skips it (below)           |
 
 ## Settings
