@@ -97,8 +97,14 @@ class Prepare(unittest.TestCase):
         self.assertIsNone(walls(self.root).interop_wall())
 
     def live(self, env=None):
+        # a wslinfo that answers nat first on PATH: inside a WSL with mirrored networking the real one would answer
+        fake = os.path.join(self.root, 'nat-bin')
+        if not os.path.exists(fake):
+            os.makedirs(fake)
+            put(fake + '/wslinfo', '#!/bin/sh\necho nat\n')
+            os.chmod(fake + '/wslinfo', 0o755)
         r = subprocess.run(['bash', '-s'], input=prepare('Live') + '\n# end\r\n', text=True, capture_output=True,
-                           env={'PATH': '/usr/bin:/bin', 'ROOT': self.root, **(env or {})})
+                           env={'PATH': fake + ':/usr/bin:/bin', 'ROOT': self.root, **(env or {})})
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
@@ -126,6 +132,14 @@ class Prepare(unittest.TestCase):
         put(fake + '/wslinfo', '#!/bin/sh\necho mirrored\n')
         os.chmod(fake + '/wslinfo', 0o755)
         self.assertIn('the networking mode is mirrored, not nat', self.live({'PATH': fake + ':/usr/bin:/bin'}))
+
+    def test_a_mounted_windows_drive_restarts(self):
+        os.makedirs(self.root + '/proc/1')
+        put(self.root + '/proc/1/comm', 'systemd\n')
+        put(self.root + '/proc/mounts', 'none /usr/lib/wsl/drivers 9p ro 0 0\n/dev/sdc / ext4 rw 0 0\n')
+        self.assertEqual(self.live(), '')   # WSL's own driver share is not a Windows drive
+        put(self.root + '/proc/mounts', 'C:\\134 /mnt/c 9p rw 0 0\n')
+        self.assertIn('restart: Windows drives are mounted under /mnt', self.live())
 
     def test_a_resolv_conf_of_its_own_is_kept(self):
         put(self.root + '/etc/resolv.conf', 'nameserver 192.0.2.1\n')
@@ -161,11 +175,63 @@ class Script(unittest.TestCase):
     def test_a_distro_it_did_not_make_is_named_and_must_be_typed(self):
         src = text().decode('ascii')
         body = src[src.index('try {'):]
-        ask = body.index("if ($have -and -not $ours)")
+        ask = body.index("if ($have -and -not $ours) {\n    Write-Host")
         self.assertLess(ask, body.index('wsl.exe --install'))
         self.assertIn("-cne $Distro", body[ask:ask + 800])
         self.assertIn('/etc/wsl.conf is REPLACED', body[ask:ask + 800])
         self.assertIn('/etc/fork-kit/desk-distro', prepare())   # the mark of a distro it made or took over
+
+    def test_wsl1_is_refused_before_anything_changes_and_a_new_distro_is_wsl2(self):
+        src = text().decode('ascii')
+        body = src[src.index('try {'):]
+        install = [x for x in body.splitlines() if 'wsl.exe --install' in x]
+        self.assertEqual(len(install), 1)
+        self.assertIn('--version 2', install[0])
+        refuse = body.index('if ($have -and $version -ne 2) { throw')
+        for later in ("Read-Host 'Type yes", 'Merge-WslConfig $WslConfig', 'wsl.exe --shutdown', 'Mark $Made',
+                      "InDistro \"the distro's settings\""):
+            self.assertLess(refuse, body.index(later), later)
+        self.assertLess(body.index('wsl.exe --install'), body.index('if ($version -ne 2) { throw'))
+        self.assertLess(body.index('if ($version -ne 2) { throw'), body.index('wsl.exe --shutdown'))
+        self.assertIn('WslVersion @(wsl.exe -l -v) $Distro', body)
+        self.assertNotIn('wsl.exe -l -q', body)
+
+    def test_inputs_are_checked_before_the_question(self):
+        src = text().decode('ascii')
+        body = src[src.index('if (-not $MachineFile)'):]
+        ask = min(body.index("Read-Host 'Type yes"), body.index('Read-Host "Type the distro'))
+        self.assertLess(body.index('Test-Path -LiteralPath $MachineFile -PathType Leaf'), ask)
+        self.assertLess(body.index('Test-Path -LiteralPath $FleetConfig -PathType Leaf'), ask)
+        self.assertIn("-cmatch '^[0-9a-f]{40}$'", src.split('try {')[0])   # an uppercase -Sha is refused too
+
+    def test_a_stopped_run_keeps_its_marks(self):
+        src = text().decode('ascii')
+        body = src[src.index('try {'):]
+        self.assertLess(body.index('Mark $Made'), body.index('wsl.exe --install'))
+        self.assertIn('Merge-WslConfig $WslConfig $want { Mark $Owed }', body)
+        self.assertIn('& $before', wslconfig_part())
+        self.assertLess(wslconfig_part().index('& $before'), wslconfig_part().index('WriteAllLines'))
+        shutdown = body.index('Run \'wsl --shutdown\'')
+        self.assertLess(body.index('if (Test-Path -LiteralPath $Owed)'), shutdown)
+        self.assertGreater(body.index('Remove-Item -LiteralPath $Owed -ErrorAction'), shutdown)
+        self.assertIn('wsl --unregister $Distro (removes it and all in it)', body)
+        uninstall = body[body.index('if ($Uninstall)'):]
+        self.assertLess(uninstall.index('Stop-ScheduledTask'), uninstall.index('Unregister-ScheduledTask'))
+        self.assertIn('.wslconfig as it was before the first run', uninstall)
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_wsl_version_is_read_from_the_list(self):
+        d = tempfile.mkdtemp(prefix='desk-wslversion-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        script = os.path.join(d, 'v.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + '\n$l = @("  NAME      STATE    VERSION", "* Ubuntu    Running  2", '
+                    '"  fork-desk Stopped  1")\n"$(WslVersion $l fork-desk) $(WslVersion $l Ubuntu) '
+                    '$(WslVersion $l none)"\n')
+        r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script], capture_output=True,
+                           text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.strip(), '1 2 0')
 
     def test_wslconfig_is_utf8_without_a_bom_never_ascii(self):
         src = text().decode('ascii')
