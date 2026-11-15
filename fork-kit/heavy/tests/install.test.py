@@ -121,13 +121,14 @@ class Install(unittest.TestCase):
                 with open(self.path('/usr/local/bin/heavy'), 'wb') as f:
                     f.write(OLD_WRAPPER)
                 os.chmod(self.path('/usr/local/bin/heavy'), 0o755)
-                code, _, _ = self.install('--memory-high', '5G', stop_after=step)
+                code, _, _ = self.install('--memory-high', '5G', '--sweep-timer', stop_after=step)
                 self.assertEqual(code, f'stopped after {step} (test)')
                 # until the links step, the old wrapper is what runs
                 if self.m.STEPS.index(step) < self.m.STEPS.index('links'):
                     self.assertFalse(os.path.islink(self.path('/usr/local/bin/heavy')))
-                code, _, err = self.install('--memory-high', '5G')
+                code, _, err = self.install('--memory-high', '5G', '--sweep-timer')
                 self.assertEqual(code, 0, err)
+                self.assertTrue(os.path.isfile(self.path('/etc/systemd/user/heavy-sweep.timer')))
                 self.assertEqual(self.run_main('self-check')[0], 0)
                 self.assertEqual(len(os.listdir(self.path('/usr/local/libexec/heavy/replaced'))), 1)
 
@@ -150,6 +151,8 @@ class Install(unittest.TestCase):
         self.assertEqual(self.install()[0], 0)
         src = os.path.join(self.root, 'src')
         shutil.copytree(KIT, src, ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(os.path.join(os.path.dirname(KIT), 'common'), os.path.join(self.root, 'common'),
+                        ignore=shutil.ignore_patterns('__pycache__'))
         with open(os.path.join(src, 'bin', 'heavy'), 'w') as f:
             f.write('this is not python\n')
         code, _, err = self.install(sha=SHA2, source=src)
@@ -200,6 +203,56 @@ class Install(unittest.TestCase):
                 self.assertEqual(code, 1, err)
         self.assertEqual(self.install(sha='abc')[0], 1)
         self.assertFalse(os.path.exists(self.path('/etc/heavy')))
+
+    def test_installed_version_runs_the_sweep_from_its_own_copy_of_common(self):
+        self.assertEqual(self.install()[0], 0)
+        version = self.path(f'/usr/local/libexec/heavy/versions/{SHA1}')
+        self.assertTrue(os.path.isfile(os.path.join(version, 'common', 'machine_file.py')))
+        self.assertTrue(os.path.isfile(os.path.join(version, 'lib', 'heavy_sweep.py')))
+        moved = os.path.join(self.root, 'elsewhere')   # nothing of the repository next to it
+        shutil.copytree(version, moved)
+        for args in (['sweep', '--help'], ['docker-label', '--value']):
+            r = subprocess.run([sys.executable, '-I', '-B', os.path.join(moved, 'bin', 'heavy'), *args],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r'^uid=\d+,(pid=\d+,start=\d+|scope=heavy-.+\.scope)\n$')
+
+    def test_sweep_timer_units_written_kept_and_removed(self):
+        units = [self.path('/etc/systemd/user/heavy-sweep.service'), self.path('/etc/systemd/user/heavy-sweep.timer')]
+        code, out, err = self.install('--sweep-timer')
+        self.assertEqual(code, 0, err)
+        self.assertIn('systemctl --user enable --now heavy-sweep.timer', out)
+        with open(units[0]) as f:
+            self.assertIn('ExecStart=/usr/local/bin/heavy sweep\n', f.read())
+        with open(units[1]) as f:
+            self.assertIn('WantedBy=timers.target\n', f.read())
+        self.assertTrue(self.config()['sweep_timer'])
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        before = self.snapshot()
+        self.assertEqual(self.install(sha=SHA1)[0], 0)              # again, without the option: kept
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.install(sha=SHA2)[0], 0)              # upgrade keeps it
+        self.assertTrue(all(os.path.isfile(u) for u in units))
+        self.assertEqual(self.install('--no-sweep-timer', sha=SHA2)[0], 0)
+        self.assertFalse(any(os.path.exists(u) for u in units))
+        self.assertNotIn('sweep_timer', self.config())
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        self.assertEqual(self.install('--sweep-timer', sha=SHA2)[0], 0)
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertFalse(any(os.path.exists(u) for u in units))
+
+    def test_sweep_units_someone_else_wrote_are_refused_and_kept(self):
+        os.makedirs(self.path('/etc/systemd/user'))
+        with open(self.path('/etc/systemd/user/heavy-sweep.timer'), 'w') as f:
+            f.write('[Timer]\nOnCalendar=daily\n')
+        code, _, err = self.install('--sweep-timer')
+        self.assertEqual(code, 1)
+        self.assertIn('was not written by this kit', err)
+        self.assertFalse(os.path.exists(self.path('/etc/heavy')))
+        self.assertEqual(self.install()[0], 0)                      # without the option it is left alone
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        with open(self.path('/etc/systemd/user/heavy-sweep.timer')) as f:
+            self.assertEqual(f.read(), '[Timer]\nOnCalendar=daily\n')
 
     def test_not_root_is_refused(self):
         self.m.ROOT_UID = os.geteuid() + 1

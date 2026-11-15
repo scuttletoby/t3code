@@ -3,16 +3,19 @@
 
   heavy-install install --source KIT_FOLDER --sha RELEASE_SHA [--slice NAME] [--grace SECONDS]
                         [--memory-high SIZE] [--memory-max SIZE] [--swap-max SIZE] [--cpu-weight N]
+                        [--sweep-timer | --no-sweep-timer]
   heavy-install uninstall
   heavy-install self-check
 
-install copies bin/heavy, sbin/heavy-install and README.md of one release into
-/usr/local/libexec/heavy/versions/<sha>/ (with MANIFEST.sha256), checks the copy, switches the link `current` to it,
+install copies bin/heavy, sbin/heavy-install, lib/, systemd/, README.md and fork-kit/common/machine_file.py of one
+release into /usr/local/libexec/heavy/versions/<sha>/ (with MANIFEST.sha256), checks the copy, switches the link `current` to it,
 writes /etc/heavy/config.json and links /usr/local/bin/heavy and /usr/local/sbin/heavy-install to it. An old
 /usr/local/bin/heavy that is a plain file (a copy from before this kit) is kept in /usr/local/libexec/heavy/replaced/
 and put back by uninstall. With a --memory-*, --swap-max or --cpu-weight option it also writes the slice unit
 /etc/systemd/user/<slice> (every user's manager reads it after `systemctl --user daemon-reload`; a user's own
-~/.config/systemd/user/<slice> wins over it). Safe to run again, and to stop at any step.
+~/.config/systemd/user/<slice> wins over it). With --sweep-timer it also writes the user units heavy-sweep.service
+and heavy-sweep.timer to /etc/systemd/user/ (each user enables the timer); --no-sweep-timer removes them. Safe to
+run again, and to stop at any step.
 """
 import argparse, contextlib, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
@@ -31,7 +34,10 @@ INSTALLER = '/usr/local/sbin/heavy-install'
 UNIT_DIR = '/etc/systemd/user'
 LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install'}
 
-SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md')
+SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'common/machine_file.py',
+                'systemd/heavy-sweep.service', 'systemd/heavy-sweep.timer')
+SWEEP_UNITS = ('heavy-sweep.service', 'heavy-sweep.timer')
+UNIT_HEADER = '# heavy kit: written by heavy-install.'
 EXECUTABLE = {'bin/heavy', 'sbin/heavy-install'}
 DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 30}
 SHA_RE = re.compile(r'^[0-9a-f]{40}\Z')
@@ -39,7 +45,7 @@ SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 SIZE_RE = re.compile(r'^(?:[0-9]+[KMGT]?|[0-9]{1,3}%|infinity)\Z')
 LIMITS = {'memory_high': 'MemoryHigh', 'memory_max': 'MemoryMax', 'swap_max': 'MemorySwapMax',
           'cpu_weight': 'CPUWeight'}
-STEPS = ('check', 'folders', 'copy', 'self-test', 'config', 'slice-unit', 'switch', 'links', 'record')
+STEPS = ('check', 'folders', 'copy', 'self-test', 'config', 'slice-unit', 'sweep-units', 'switch', 'links', 'record')
 
 
 class Refused(Exception):
@@ -48,6 +54,14 @@ class Refused(Exception):
 
 def p(path):
     return PREFIX + path
+
+
+def source_file(source, rel):
+    """Where a kit file is in the source: common/ is shared by the kits and sits next to them (fork-kit/common);
+    a source folder that has its own common/ (a copy) is used as it is."""
+    if rel.startswith('common/') and not os.path.isfile(os.path.join(source, rel)):
+        return os.path.join(os.path.dirname(os.path.normpath(source)), rel)
+    return os.path.join(source, rel)
 
 
 def say(msg):
@@ -162,7 +176,7 @@ def copy_tool(source, sha):
     for rel in sorted(SOURCE_FILES):
         dst = os.path.join(tmp, rel)
         os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
-        with open(os.path.join(source, rel), 'rb') as f:
+        with open(source_file(source, rel), 'rb') as f:
             data = f.read()
         with open(dst, 'wb') as f:
             f.write(data)
@@ -203,7 +217,7 @@ def check_options(a):
     if not SHA_RE.match(a.sha or ''):
         raise Refused('--sha must be the full 40-character release commit')
     for rel in SOURCE_FILES:
-        if not os.path.isfile(os.path.join(a.source or '', rel)):
+        if not os.path.isfile(source_file(a.source or '', rel)):
             raise Refused(f'--source {a.source}: {rel} is missing (point it at the fork-kit/heavy folder)')
     if a.slice is not None and not SLICE_RE.match(a.slice):
         raise Refused(f'bad --slice {a.slice!r} (a unit name ending in .slice)')
@@ -262,7 +276,20 @@ def keep_old_wrapper():
     return dest
 
 
-def record_rows(sha, unit_path):
+def sweep_unit_paths():
+    return [f'{UNIT_DIR}/{name}' for name in SWEEP_UNITS]
+
+
+def ours_unit(path):
+    """A unit file this kit wrote (its first line says so)."""
+    try:
+        with open(p(path), encoding='utf-8') as f:
+            return f.readline().startswith(UNIT_HEADER)
+    except OSError:
+        return False
+
+
+def record_rows(sha, unit_path, sweep_timer=False):
     rows = [(path, 'link', target) for path, target in sorted(LINKS.items())]
     rows.append((CURRENT, 'link', f'{VERSIONS}/{sha}'))
     folder = p(f'{VERSIONS}/{sha}')
@@ -271,6 +298,8 @@ def record_rows(sha, unit_path):
     rows.append((CONFIG, 'file', sha256_file(p(CONFIG))))
     if unit_path:
         rows.append((unit_path, 'file', sha256_file(p(unit_path))))
+    if sweep_timer:
+        rows += [(path, 'file', sha256_file(p(path))) for path in sweep_unit_paths()]
     return rows
 
 
@@ -284,6 +313,10 @@ def install(a, stop_after=None):
     limits = check_options(a)
     check_old_state()
     old = read_config()
+    sweep_timer = a.sweep_timer if a.sweep_timer is not None else bool(old.get('sweep_timer'))
+    foreign = [u for u in sweep_unit_paths() if os.path.lexists(p(u)) and not ours_unit(u)]
+    if sweep_timer and foreign:
+        raise Refused(f'{foreign[0]} exists and was not written by this kit: remove it and run again')
     done('check')
     for path in (ETC, LIBEXEC, VERSIONS):
         ensure_dir(path)
@@ -291,10 +324,11 @@ def install(a, stop_after=None):
     dest = copy_tool(os.path.realpath(a.source), a.sha)
     done('copy')
     problems = tree_problems(dest)
-    r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', 'heavy'), '--help'],
-                       capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
-    if r.returncode != 0 or 'heavy' not in r.stdout:
-        problems.append(f'bin/heavy --help failed: {(r.stderr or r.stdout).strip()[:200]}')
+    for args in (['--help'], ['sweep', '--help']):
+        r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', 'heavy'), *args],
+                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        if r.returncode != 0 or 'heavy' not in r.stdout:
+            problems.append(f'bin/heavy {" ".join(args)} failed: {(r.stderr or r.stdout).strip()[:200]}')
     if problems:
         raise Refused('the new copy failed its self-test (the version in use is unchanged):\n  ' + '\n  '.join(problems))
     done('self-test')
@@ -307,6 +341,8 @@ def install(a, stop_after=None):
         unit_path = f'{UNIT_DIR}/{cfg["slice"]}'
     if unit_path:
         cfg['slice_unit'] = unit_path
+    if sweep_timer:
+        cfg['sweep_timer'] = True
     write_file(CONFIG, json.dumps(cfg, indent=2, sort_keys=True) + '\n')
     done('config')
     if limits:
@@ -319,17 +355,31 @@ def install(a, stop_after=None):
     if old.get('slice_unit') and old['slice_unit'] != unit_path:
         say(f'note: {old["slice_unit"]} (written by an earlier install) is no longer used: remove it by hand')
     done('slice-unit')
+    for name, path in zip(SWEEP_UNITS, sweep_unit_paths()):
+        if sweep_timer:
+            if os.path.lexists(p(path)) and not ours_unit(path):
+                raise Refused(f'{path} exists and was not written by this kit: remove it and run again')
+            os.makedirs(p(UNIT_DIR), mode=0o755, exist_ok=True)
+            with open(os.path.join(dest, 'systemd', name), encoding='utf-8') as f:
+                if write_file(path, f.read()):
+                    say(f'wrote {path}: each user runs `systemctl --user daemon-reload && '
+                        f'systemctl --user enable --now heavy-sweep.timer`')
+        elif ours_unit(path):
+            os.unlink(p(path))
+            say(f'removed {path} (users run `systemctl --user disable --now heavy-sweep.timer`)')
+    done('sweep-units')
     switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
     done('switch')
     keep_old_wrapper()
     for path, target in LINKS.items():
         switch_link(path, target)
     done('links')
-    rows = record_rows(a.sha, unit_path)
+    rows = record_rows(a.sha, unit_path, sweep_timer)
     write_file(INSTALLED, '# path\tkind\twant (written by heavy-install; read by heavy --self-check)\n'
                + ''.join('\t'.join(r) + '\n' for r in rows))
     done('record')
-    say(f'installed release {a.sha}: slice {cfg["slice"]}, grace {cfg["grace_seconds"]:g}s')
+    say(f'installed release {a.sha}: slice {cfg["slice"]}, grace {cfg["grace_seconds"]:g}s'
+        + (', sweep timer units written' if sweep_timer else ''))
     for path, kind, want in rows:
         say(f'  {path}  {kind}  {want}')
     return 0
@@ -353,6 +403,10 @@ def uninstall():
         shutil.copy2(backups[-1], tmp)
         os.replace(tmp, p(WRAPPER))
         say(f'put the old {WRAPPER} back')
+    for path in sweep_unit_paths():
+        if ours_unit(path):
+            os.unlink(p(path))
+            say(f'removed {path} (users run `systemctl --user disable --now heavy-sweep.timer`)')
     unit = cfg.get('slice_unit')
     if unit and unit.startswith(UNIT_DIR + '/') and os.path.isfile(p(unit)):
         with open(p(unit), encoding='utf-8') as f:
@@ -402,6 +456,8 @@ def main(argv, stop_after=None):
     i.add_argument('--grace')
     for key in LIMITS:
         i.add_argument('--' + key.replace('_', '-'), dest=key)
+    i.add_argument('--sweep-timer', dest='sweep_timer', action='store_true', default=None)
+    i.add_argument('--no-sweep-timer', dest='sweep_timer', action='store_false')
     sub.add_parser('uninstall')
     sub.add_parser('self-check')
     a = ap.parse_args(argv)

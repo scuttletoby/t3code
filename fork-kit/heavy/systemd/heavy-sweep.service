@@ -1,0 +1,10 @@
+# heavy kit: written by heavy-install. Do not edit: run the installer again.
+[Unit]
+Description=heavy leftover sweep (fork-kit/heavy)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/heavy sweep
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=10min

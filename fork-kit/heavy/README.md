@@ -15,12 +15,16 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 
 ## Use
 
-| Command                      | What happens                                                                                 |
-| ---------------------------- | -------------------------------------------------------------------------------------------- |
-| `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends |
-| `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)        |
-| `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files    |
-| `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                              |
+| Command                      | What happens                                                                                      |
+| ---------------------------- | ------------------------------------------------------------------------------------------------- |
+| `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends      |
+| `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)             |
+| `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files         |
+| `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                                   |
+| `heavy sweep [--dry-run]`    | one leftover sweep (below); the user timer runs it every 5 minutes                                |
+| `heavy sweep --json`         | looks only: what a sweep would stop or report, as JSON                                            |
+| `heavy docker-label`         | the owner label for a container a test starts (below)                                             |
+| `heavy -- <command>`         | runs a command named like one of the words above                                                  |
 
 The command gets the same folder, environment, stdin, stdout, stderr and open files. heavy exits with the command's
 exit code, or dies of the same signal (a shell sees `128+N`), so scripts and `make` see what they saw before. The
@@ -36,7 +40,7 @@ command that handles Ctrl-C, a REPL or a server saving its data, has time) for t
 scope (TERM, then KILL after the grace time again). A second signal stops it at once. A command that handles the
 signal and exits keeps its own exit code. USR1 and USR2 are passed on. If heavy is killed with
 `kill -9`, the command is killed with it (as before, when heavy and the command were one process); anything the
-command had started keeps running in its scope (the leftover sweep of issue #159 is for that case).
+command had started keeps running in its scope (the leftover sweep below is for that case).
 
 **Never uncapped.** heavy refuses (exit 1, the reason on stderr, the command not run) when the systemd user
 manager cannot be reached, when the slice has no unit file (systemd would make an empty one up on the fly, with no
@@ -45,6 +49,91 @@ limits), or when the slice has neither `MemoryMax` nor `MemoryHigh`.
 **Nested.** `heavy` inside a `heavy` command runs the inner command in the outer scope; the outer heavy cleans it
 up and prints the one line. With `HEAVY_KEEP=1`, the inner one gets a scope of its own (outside the outer one).
 `HEAVY_KEEP` is in the command's environment, so commands it starts that also use heavy keep their leftovers too.
+
+## Leftover sweep
+
+heavy cleans up after its own command. Some things still escape: what a command left after heavy was killed with
+`kill -9`, test runs started without heavy, and Docker containers (the Docker daemon starts them, so they are never
+in heavy's scope). `heavy sweep` finds them. A user timer (`heavy-sweep.timer`, installed with `--sweep-timer`)
+runs it every 5 minutes for each user who enables it. It only ever looks at the processes and containers of the
+user it runs as.
+
+It finds:
+
+1. **Processes whose owner is gone:** reparented to the user manager (or pid 1), not the main or control process
+   of a unit, not in a `knownUnits` unit, not in a live heavy scope, older than `minAgeSeconds`, and busy (over
+   `busyCpuPercent` in a one-second sample) or long-lived (older than `longLivedSeconds`). One whose command line
+   matches a `testPatterns` entry is **stopped**, with everything it started (TERM, then KILL after 5 seconds).
+   All others are **only reported**. `ignorePatterns` are left out altogether.
+2. **Heavy scopes whose heavy is gone:** stopped as a whole (as heavy itself would have done). A scope kept with
+   `HEAVY_KEEP=1` (named `heavy-keep-*`) is never stopped; its busy or long-lived processes are reported.
+3. **Empty heavy scopes** (a heavy killed while it started): stopped.
+4. **Docker containers** with the owner label (below) of this user whose owner is gone: **removed** with their
+   anonymous volumes (`docker rm -f -v`). Running containers without the label are **only reported**, never
+   touched, unless their name matches `knownContainers`.
+
+Before every signal it checks that the pid still belongs to the same process (start time and user, through a
+pidfd), so a reused pid is never hit. It never touches itself or the processes that started it.
+
+Each sweep appends to `<report>/sweep.log` (rotated at 1 MiB) and writes a short `<report>/last-report.txt`:
+
+```
+heavy sweep 2026-01-01T12:00:00Z, stopping: 2 processes stopped, 1 containers removed, 1 reported
+  stopped: pid 4012 python3 (25m old, cpu 97%, unit app.service): python3 -m pytest tests/ (+1 it started); busy; test-shaped ('pytest')
+  removed: container 3f2a9c1b7d4e test-db (mariadb:11, 3h10m old, running); owner pid 3990 is gone
+  report only: pid 5120 java (3h0m old, cpu 140%, unit app.service): java -jar server.jar; busy and long-lived; not test-shaped
+```
+
+**Dry run first.** Until the owner sets `"stop": true`, a sweep stops and removes nothing and says what it would
+do (`would stop`, `would remove`). `heavy sweep --dry-run` does the same whatever the setting. Read a few reports,
+add what is yours to `knownUnits`, `knownContainers` or `ignorePatterns`, then turn stopping on.
+
+### Sweep settings
+
+The sweep reads the `heavy` section of the machine file (`/etc/fork-kit/machine.json`, see
+[common/README.md](../common/README.md)), key `sweep`. No file, no `heavy` or `sweep` section, an unknown key, a
+wrong type or a newer `version`: the sweep checks and stops nothing, prints why, and exits 1. An empty `sweep`
+object uses the defaults below (a dry run that reports).
+
+| Key                | Default                      | What                                                            |
+| ------------------ | ---------------------------- | --------------------------------------------------------------- |
+| `stop`             | `false`                      | `true`: stop and remove; `false`: dry run                       |
+| `minAgeSeconds`    | `600`                        | younger processes, scopes and containers are left alone (>= 60) |
+| `longLivedSeconds` | `7200`                       | older than this counts as long-lived (>= 60)                    |
+| `busyCpuPercent`   | `20`                         | more CPU than this (100 = one core) counts as busy              |
+| `report`           | `~/.local/state/heavy-sweep` | folder for `sweep.log`, `last-report.txt` and the lock          |
+| `knownUnits`       | `[]`                         | unit name globs whose processes are never touched               |
+| `knownContainers`  | `[]`                         | container name globs never touched or reported                  |
+| `testPatterns`     | `[]`                         | regular expressions; a match on the command line = test-shaped  |
+| `ignorePatterns`   | `[]`                         | regular expressions; a match = left out of stop and report      |
+
+### Owner label for test containers
+
+A test that starts a Docker container labels it with its owner, so the sweep can remove the container once the
+owner is gone (and leaves it alone while the owner runs):
+
+```
+docker run -d --label "$(heavy docker-label)" mariadb:11
+```
+
+`heavy docker-label` prints `fork-kit.heavy.owner=<owner>`; `--value` prints only the value (for an API such as
+Testcontainers' `withLabel("fork-kit.heavy.owner", value)`). The owner is the heavy scope when the test runs
+under heavy (heavy passes the scope name to the command as `HEAVY_SCOPE`), else the calling process with its
+start time; `--pid PID` names another owner process. A container whose label names another user is never touched.
+
+### The sweep runs again, stops half-way, or meets old or empty state
+
+| Case                                                                       | What happens                                                                  |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| two sweeps at once                                                         | the second finds the lock held, says so, does nothing, exits 0                |
+| a sweep killed half-way                                                    | what it did is in the log; the next sweep finds the rest and finishes         |
+| a pid reused before the stop                                               | the start time differs: not signalled, reported as reused                     |
+| a container already gone                                                   | reported as already gone, not a problem                                       |
+| no Docker, or the daemon down                                              | a note in the report; processes are still swept                               |
+| no machine file, a broken one, no section, an unknown key, a newer version | refused with the reason; nothing checked or stopped; exit 1                   |
+| the timer fires before the file exists                                     | the same refusal, every 5 minutes, until the owner writes it                  |
+| the systemd user manager unreachable                                       | refused; nothing stopped                                                      |
+| a scope that does not stop                                                 | its processes are stopped one by one; any still running is a problem (exit 1) |
 
 ## Settings
 
@@ -67,16 +156,19 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 
 ## Files on the host
 
-| Path                                       | What                                                                      |
-| ------------------------------------------ | ------------------------------------------------------------------------- |
-| `/usr/local/bin/heavy`                     | link to `current/bin/heavy`                                               |
-| `/usr/local/sbin/heavy-install`            | link to `current/sbin/heavy-install`                                      |
-| `/usr/local/libexec/heavy/versions/<sha>/` | the code of one release, with `MANIFEST.sha256` (root 755)                |
-| `/usr/local/libexec/heavy/current`         | link to the release in use (switched in one step)                         |
-| `/usr/local/libexec/heavy/replaced/`       | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
-| `/etc/heavy/config.json`                   | slice name and grace time                                                 |
-| `/etc/heavy/installed.tsv`                 | every installed path with its link target or hash (`--self-check`)        |
-| `/etc/systemd/user/<slice>`                | only with limit options: the slice unit                                   |
+| Path                                            | What                                                                      |
+| ----------------------------------------------- | ------------------------------------------------------------------------- |
+| `/usr/local/bin/heavy`                          | link to `current/bin/heavy`                                               |
+| `/usr/local/sbin/heavy-install`                 | link to `current/sbin/heavy-install`                                      |
+| `/usr/local/libexec/heavy/versions/<sha>/`      | the code of one release, with `MANIFEST.sha256` (root 755)                |
+| `/usr/local/libexec/heavy/current`              | link to the release in use (switched in one step)                         |
+| `/usr/local/libexec/heavy/replaced/`            | a plain `/usr/local/bin/heavy` from before the kit, put back on uninstall |
+| `/etc/heavy/config.json`                        | slice name and grace time                                                 |
+| `/etc/heavy/installed.tsv`                      | every installed path with its link target or hash (`--self-check`)        |
+| `/etc/systemd/user/<slice>`                     | only with limit options: the slice unit                                   |
+| `/etc/systemd/user/heavy-sweep.{service,timer}` | only with `--sweep-timer`: the leftover sweep (each user enables it)      |
+| `/etc/fork-kit/machine.json`                    | written by the owner, never the kit: sweep settings                       |
+| `~/.local/state/heavy-sweep/`                   | each user's sweep log, last report and lock                               |
 
 ## Install (owner, as root)
 
@@ -89,7 +181,9 @@ sha=$(git ls-remote https://github.com/FORK_OWNER/FORK refs/heads/ci-release | c
 
 It prints the sha, the hash of the download and every installed path. Add `--slice NAME`, `--grace SECONDS`, or
 `--memory-high 5G --memory-max 6G --swap-max 1G --cpu-weight 40` to have it write the slice unit (then each user
-runs `systemctl --user daemon-reload`). Upgrade: the same line again. Remove:
+runs `systemctl --user daemon-reload`). Add `--sweep-timer` to install the leftover sweep's user units (each user
+then runs `systemctl --user daemon-reload && systemctl --user enable --now heavy-sweep.timer`; `--no-sweep-timer`
+removes them again). Upgrade: the same line again. Remove:
 `/usr/local/sbin/heavy-install uninstall` (puts an old plain `/usr/local/bin/heavy` back). Check:
 `heavy --self-check` (as the user: config, slice and files) or `heavy-install self-check` (files only).
 
@@ -108,6 +202,10 @@ runs `systemctl --user daemon-reload`). Upgrade: the same line again. Remove:
   has a unit with a memory limit (install with limit options, or add the unit).
 
 ## Tests
+
+`python3 -I -B fork-kit/heavy/tests/sweep.test.py`: the sweep on a fake host (a fake `/proc`, fake `systemctl`
+and `docker` from `tests/fake_tools.py`, a temporary machine file), no root and nothing real swept. Its red check
+breaks each stop and report rule in a copy of the sweep and shows the test for that rule then fails.
 
 `python3 -I -B fork-kit/heavy/tests/install.test.py` (the installer on a fake host in a temporary folder, no root)
 and `python3 -I -B fork-kit/heavy/tests/heavy.test.py` (the wrapper with the real systemd user manager and a slice
