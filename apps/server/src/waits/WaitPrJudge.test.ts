@@ -23,7 +23,9 @@ import * as Path from "effect/Path";
 import { TestClock } from "effect/testing";
 
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
+import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import type { WaitDelivery } from "./WaitDelivery.ts";
@@ -102,6 +104,7 @@ const fakeHost = () => {
   const prs = new Map<string, PrState>();
   const reads: string[] = [];
   const lookups: string[] = [];
+  const refreshes: string[] = [];
   const projects = new Map<ProjectId, OrchestrationProjectShell>([
     [PROJECT, shell(PROJECT, "acme/widgets")],
     [BARE_PROJECT, shell(BARE_PROJECT, null)],
@@ -118,7 +121,7 @@ const fakeHost = () => {
       if (pr === undefined) return Effect.fail(providerError("not-found", "Could not resolve."));
       return pr.error === undefined ? Effect.succeed(pr) : Effect.fail(pr.error);
     });
-  const layer = Layer.mergeAll(
+  const services = Layer.mergeAll(
     Layer.mock(PullRequestService.PullRequestService)({
       detail: (ref) =>
         find(ref, "detail").pipe(
@@ -144,12 +147,49 @@ const fakeHost = () => {
     Layer.mock(ProjectService.ProjectService)({
       getShell: (projectId) => Effect.succeed(Option.fromNullishOr(projects.get(projectId))),
     }),
+  );
+  const layer = Layer.merge(
+    services,
     Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({
       readRepositoryIdentity: (workspaceRoot) =>
         Effect.sync(() => (lookups.push(workspaceRoot), remotes.get(workspaceRoot) ?? null)),
+      refreshRepositoryIdentity: (workspaceRoot) =>
+        Effect.sync(() => void refreshes.push(workspaceRoot)),
     }),
   );
-  return { prs, reads, lookups, projects, remotes, layer };
+  return { prs, reads, lookups, refreshes, projects, remotes, services, layer };
+};
+
+/**
+ * T3's own project enrichment over a remote lookup that timed out once: like the real resolver,
+ * it then answers "none" from its cache for a minute unless asked to look again (`refresh`).
+ */
+const timedOutOnceRemote = (repository: string) => {
+  const calls: string[] = [];
+  let cachedNone = false;
+  const resolver = Layer.succeed(RepositoryIdentityResolver.RepositoryIdentityResolver, {
+    resolve: (workspaceRoot, options) =>
+      Effect.sync(() => {
+        const refresh = options?.refresh === true;
+        calls.push(refresh ? "refresh" : "read");
+        if (calls.length === 1) {
+          cachedNone = true;
+          return null;
+        }
+        if (cachedNone && !refresh) return null;
+        cachedNone = false;
+        return { ...identityOf(repository), rootPath: workspaceRoot };
+      }),
+  });
+  const favicons = Layer.succeed(ProjectFaviconResolver.ProjectFaviconResolver, {
+    invalidate: () => Effect.void,
+    resolvePath: () => Effect.succeed(null),
+  });
+  const layer = Layer.effect(
+    ProjectEnrichmentService.ProjectEnrichmentService,
+    ProjectEnrichmentService.make(),
+  ).pipe(Layer.provide(Layer.merge(resolver, favicons)));
+  return { calls, layer };
 };
 
 /** Records each message; every thread is there. */
@@ -421,7 +461,10 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
           assert.notMatch(refused.message, /\bpass\b/iu);
         }
         assert.deepStrictEqual(host.reads, []);
-        assert.deepStrictEqual(host.lookups, [`/work/${BARE_PROJECT}`, `/work/${BARE_PROJECT}`]);
+        // Each new wait looked again past the cached "none" before it was refused.
+        const bare = `/work/${BARE_PROJECT}`;
+        assert.deepStrictEqual(host.lookups, [bare, bare, bare, bare]);
+        assert.deepStrictEqual(host.refreshes, [bare, bare]);
 
         yield* register(service, prWait({ number: 7, until: "merged" }));
         host.projects.delete(PROJECT);
@@ -611,5 +654,156 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
         Layer.merge(host.layer, ServerSettingsService.layerTest({ waitFor: { enabled: false } })),
       ),
     );
+  });
+  it.effect(
+    "a new wait looks past a timed-out remote lookup: it is not refused as having no remote",
+    () => {
+      const host = fakeHost();
+      const remote = timedOutOnceRemote("acme/widgets");
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+        host.projects.set(PROJECT, shell(PROJECT, null));
+        // Something read the remote first and its `git` lookup timed out: "none" is cached.
+        const enrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
+        assert.isNull(yield* enrichment.readRepositoryIdentity(`/work/${PROJECT}`));
+        const filePath = yield* storePath;
+        const service = yield* makeService(filePath, yield* makePrJudge());
+
+        yield* TestClock.adjust(10_000);
+        const result = yield* register(service, prWait({ number: 7 }));
+        assert.strictEqual(result.state, "waiting");
+        assert.deepStrictEqual(remote.calls, ["read", "refresh", "read"]);
+        assert.deepStrictEqual(host.reads.slice(0, 1), [
+          "detail github.com acme/widgets#7 stale:false",
+        ]);
+        // Asked again: the same wait, and the remote, now known, is not looked up past the cache.
+        assert.strictEqual((yield* register(service, prWait({ number: 7 }))).state, "waiting");
+        assert.deepStrictEqual(remote.calls, ["read", "refresh", "read"]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(host.services, remote.layer, ServerSettingsService.layerTest(ON)),
+        ),
+      );
+    },
+  );
+
+  it.effect(
+    "a wait keeps the repository and host of its first read: a changed remote never ends it from another pull request",
+    () => {
+      const host = fakeHost();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+        const filePath = yield* storePath;
+        const service = yield* makeService(filePath, yield* makePrJudge());
+        const made = yield* register(service, prWait({ number: 7, until: "merged" }));
+        assert.strictEqual(made.state, "waiting");
+        const [stored] = yield* storedWaits(filePath);
+        assert.deepStrictEqual(stored?.spec, {
+          number: 7,
+          repository: "acme/widgets",
+          host: "github.com",
+          until: "merged",
+        });
+
+        // The project's remote flips to upstream, where the same number is merged.
+        host.projects.set(PROJECT, shell(PROJECT, "upstream/widgets"));
+        host.remotes.set(`/work/${PROJECT}`, identityOf("upstream/widgets"));
+        host.prs.set("upstream/widgets#7", { state: "merged", headSha: HEAD_B });
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 0 });
+        assert.isFalse(host.reads.some((read) => read.includes("upstream/")));
+        // Asking the same again finds this wait (its key is the asked one), not a new one.
+        const again = yield* register(service, prWait({ number: 7, until: "merged" }));
+        assert.strictEqual(
+          again.state === "waiting" ? again.waitId : null,
+          made.state === "waiting" ? made.waitId : "",
+        );
+
+        host.prs.set("acme/widgets#7", { state: "merged", headSha: HEAD_A });
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.result?.outcome, "merged");
+      }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
+
+  it.effect(
+    "a wait stored before the pin gets it at its first read after the upgrade, and keeps it after a restart",
+    () => {
+      const host = fakeHost();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+        host.prs.set("acme/widgets#8", { state: "open", headSha: HEAD_A });
+        const filePath = yield* storePath;
+        const before = yield* makeService(filePath, yield* makePrJudge());
+        yield* register(before, prWait({ number: 7, until: "merged" }));
+        yield* register(before, prWait({ number: 8, repository: "Acme/Widgets", until: "merged" }));
+        // As an older build stored them: only what was asked, no host and no resolved repository.
+        const file = JSON.parse(yield* fs.readFileString(filePath));
+        file.waits[0].spec = { number: 7, until: "merged" };
+        file.waits[1].spec = { number: 8, repository: "Acme/Widgets", until: "merged" };
+        yield* fs.writeFileString(filePath, JSON.stringify(file));
+
+        const after = yield* makeService(filePath, yield* makePrJudge());
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* after.judgeDue(), { judged: 2, ended: 0 });
+        assert.deepStrictEqual(
+          (yield* storedWaits(filePath)).map((wait) => wait.spec),
+          [
+            { number: 7, repository: "acme/widgets", host: "github.com", until: "merged" },
+            { number: 8, repository: "acme/widgets", host: "github.com", until: "merged" },
+          ],
+        );
+
+        // Restart, and the remote flips: the pinned waits still read acme/widgets.
+        host.projects.set(PROJECT, shell(PROJECT, "upstream/widgets"));
+        host.remotes.set(`/work/${PROJECT}`, identityOf("upstream/widgets"));
+        host.prs.set("upstream/widgets#7", { state: "merged", headSha: HEAD_B });
+        const restarted = yield* makeService(filePath, yield* makePrJudge());
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* restarted.judgeDue(), { judged: 2, ended: 0 });
+        assert.isFalse(host.reads.some((read) => read.includes("upstream/")));
+      }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
+
+  it.effect("a pin never overwrites a wait cancelled while it was read", () => {
+    const host = fakeHost();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+      const filePath = yield* storePath;
+      const fs = yield* FileSystem.FileSystem;
+      const first = yield* makeService(filePath, yield* makePrJudge());
+      const made = yield* register(first, prWait({ number: 7, until: "merged" }));
+      const waitId = made.state === "waiting" ? made.waitId : "";
+      // Stored by an older build, without the pin.
+      const file = JSON.parse(yield* fs.readFileString(filePath));
+      file.waits[0].spec = { number: 7, until: "merged" };
+      yield* fs.writeFileString(filePath, JSON.stringify(file));
+
+      // The read sees the wait waiting; it is cancelled before the read's pin is written.
+      const prJudge = yield* makePrJudge();
+      const holder: { service?: WaitService.WaitService } = {};
+      const cancelFirst: WaitJudge<"pr"> = (target, context) =>
+        prJudge(target, {
+          ...context,
+          pin: (next) =>
+            holder
+              .service!.cancel({ projectId: PROJECT, waitId })
+              .pipe(Effect.ignore, Effect.andThen(context.pin!(next))),
+        });
+      const service = yield* makeService(filePath, cancelFirst);
+      holder.service = service;
+      yield* TestClock.adjust(SWEEP);
+      yield* service.judgeDue();
+      const [cancelled] = yield* storedWaits(filePath);
+      assert.strictEqual(cancelled?.state, "cancelled");
+      assert.deepStrictEqual(cancelled?.spec, { number: 7, until: "merged" });
+    }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
   });
 });
