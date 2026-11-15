@@ -382,7 +382,7 @@ const seed = async (root: string) => {
           id: "w_abcdefghij",
           threadId: "thread:hold-work:mid-turn",
           projectId,
-          key: "0123456789abcdef",
+          key: "0123456789abcdef", // gitleaks:allow (a fake test value, not a key)
           createdAt: iso(-60 * 60_000),
           deadlineAt: iso(23 * 60 * 60_000),
           state: "waiting",
