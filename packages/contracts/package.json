@@ -22,6 +22,10 @@
     "./waitFor": {
       "types": "./src/waitFor.ts",
       "import": "./src/waitFor.ts"
+    },
+    "./forkDefaults": {
+      "types": "./src/forkDefaults.ts",
+      "import": "./src/forkDefaults.ts"
     }
   },
   "scripts": {
