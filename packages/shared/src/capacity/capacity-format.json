@@ -1,0 +1,218 @@
+{
+  "format": "capacity-format/1",
+  "//": "The shape of capacity-rule.json and capacity-vectors.json, in a small language every evaluator checks the same way (README.md beside this file). A key ending in ? is optional; keys starting with // are notes. Agreement rules (every language): a boolean is never a number; uint is a finite number with no fraction, 0 to 9007199254740991 (2048.0 and 1e3 are uints); NaN, Infinity and numbers too large for a double (1e400) are refused, also by the parser. The cases below hold every evaluator to these rules.",
+  "types": {
+    "nonneg": "number>=0",
+    "kindSpec": {
+      "object": {
+        "group": "=agent|=job",
+        "startMb": "uint",
+        "startCentiCores": "uint",
+        "maxAtOnce?": "uint",
+        "plusDeclared?": "bool",
+        "declaredFallbackMb?": "uint"
+      }
+    },
+    "rule": {
+      "object": {
+        "format": "=capacity-rule/1",
+        "margin": {
+          "object": { "minMb": "uint", "totalPercent": "uint", "noSwapOrNoCapsPercent": "uint" }
+        },
+        "readingBounds": {
+          "object": { "minTotalMb": "uint", "maxTotalMb": "uint", "maxCpuCores": "uint" }
+        },
+        "kinds": { "map": "@kindSpec" },
+        "unknownKinds": { "object": { "jobPrefix": "string", "job": "string", "other": "string" } },
+        "learnedBounds": { "object": { "minPercent": "uint", "maxPercent": "uint" } },
+        "jobCoresPercent": "uint",
+        "writers": {
+          "object": {
+            "kind": "string",
+            "buildKind": "string",
+            "perBuildThatFits": "uint",
+            "min": "uint"
+          }
+        },
+        "floors": "@perGroup",
+        "ceilings": "@perGroup",
+        "pressure": {
+          "object": {
+            "elevated": {
+              "object": {
+                "psiSomeAvg10Pct": "@nonneg",
+                "psiFullAvg10Pct": "@nonneg",
+                "availableBelowMarginPercent": "uint",
+                "swapFreeBelowPercent": "uint"
+              }
+            },
+            "severe": {
+              "object": { "psiFullAvg10Pct": "@nonneg", "availableBelowMarginPercent": "uint" }
+            },
+            "calm": {
+              "object": {
+                "psiSomeAvg10Pct": "@nonneg",
+                "psiFullAvg10Pct": "@nonneg",
+                "availableAtLeastMarginPercent": "uint",
+                "swapFreeAtLeastPercent": "uint"
+              }
+            },
+            "elevatedClearSeconds": "uint",
+            "severeClearSeconds": "uint"
+          }
+        }
+      }
+    },
+    "perGroup": { "object": { "agent": "uint", "job": "uint" } },
+    "level": "=ok|=elevated|=severe",
+    "reason": "=fits|=floor|=unreadable|=ceiling|=severe|=elevated|=kind-limit|=writers|=cores|=budget",
+    "facts": {
+      "object": {
+        "totalMb?": "any",
+        "availableMb?": "any",
+        "cpuCores?": "any",
+        "pieceCaps": "bool",
+        "swap?": "any",
+        "psi?": "any",
+        "boxPsi?": "any",
+        "osLevel?": "any",
+        "pieces?": "any",
+        "reservations?": "any"
+      }
+    },
+    "factsPatch": {
+      "object": {
+        "totalMb?": "any",
+        "availableMb?": "any",
+        "cpuCores?": "any",
+        "pieceCaps?": "bool",
+        "swap?": "any",
+        "psi?": "any",
+        "boxPsi?": "any",
+        "osLevel?": "any",
+        "pieces?": "any",
+        "reservations?": "any"
+      }
+    },
+    "pressureState": { "object": { "level": "@level", "calmSinceMs": "number|null" } },
+    "learned": { "map": { "object": { "mb": "any", "centiCores?": "any" } } },
+    "vector": {
+      "object": {
+        "name": "string",
+        "why": "string",
+        "facts": "string|@facts",
+        "patch?": "@factsPatch",
+        "ask?": { "object": { "kind": "string", "declaredMb?": "any" } },
+        "fill?": {
+          "array": { "object": { "kind": "string", "count": "uint", "declaredMb?": "any" } }
+        },
+        "previous?": "@pressureState|null",
+        "nowMs?": "number",
+        "learned?": "@learned",
+        "floors?": "@perGroup",
+        "ceilings?": "@perGroup",
+        "expect": {
+          "object": {
+            "admit?": "bool",
+            "reason?": "@reason",
+            "level?": "@level",
+            "calmSinceMs?": "number|null",
+            "freeMb?": "number|null",
+            "marginMb?": "number|null",
+            "owedMb?": "number|null",
+            "reservedMb?": "number|null",
+            "costMb?": "number|null",
+            "admitted?": { "array": "uint" },
+            "stoppedBy?": { "array": "@reason|null" }
+          }
+        }
+      }
+    },
+    "vectors": {
+      "object": {
+        "format": "=capacity-vectors/1",
+        "factSets": { "map": "@facts" },
+        "vectors": { "array": "@vector", "minItems": 1 }
+      }
+    }
+  },
+  "cases": [
+    { "spec": "uint", "json": "2048", "ok": true, "why": "a whole number" },
+    {
+      "spec": "uint",
+      "json": "2048.0",
+      "ok": true,
+      "why": "a whole number written with a fraction is that number (Python parses it as a float)"
+    },
+    {
+      "spec": "uint",
+      "json": "1e3",
+      "ok": true,
+      "why": "an exponent is fine when the value is whole"
+    },
+    { "spec": "uint", "json": "-0.0", "ok": true, "why": "minus zero is zero" },
+    { "spec": "uint", "json": "9007199254740991", "ok": true, "why": "the largest uint, 2^53-1" },
+    {
+      "spec": "uint",
+      "json": "9007199254740992",
+      "ok": false,
+      "why": "above 2^53-1: JavaScript cannot hold it exactly"
+    },
+    { "spec": "uint", "json": "2048.5", "ok": false, "why": "a fraction" },
+    { "spec": "uint", "json": "-1", "ok": false, "why": "below 0" },
+    {
+      "spec": "uint",
+      "json": "true",
+      "ok": false,
+      "why": "a boolean is not a number (Python's bool is an int)"
+    },
+    { "spec": "uint", "json": "false", "ok": false, "why": "a boolean is not a number" },
+    { "spec": "uint", "json": "\"2048\"", "ok": false, "why": "a string is not a number" },
+    { "spec": "number", "json": "true", "ok": false, "why": "a boolean is not a number" },
+    {
+      "spec": "number",
+      "json": "NaN",
+      "ok": false,
+      "why": "not JSON (Python's json module accepts it unless told not to)"
+    },
+    { "spec": "number", "json": "Infinity", "ok": false, "why": "not JSON" },
+    { "spec": "number", "json": "-Infinity", "ok": false, "why": "not JSON" },
+    {
+      "spec": "number",
+      "json": "1e400",
+      "ok": false,
+      "why": "too large for a double: JavaScript and Python parse it as infinity"
+    },
+    { "spec": "number", "json": "-12.5", "ok": true, "why": "any finite number" },
+    { "spec": "number>=0", "json": "-0.5", "ok": false, "why": "below 0" },
+    { "spec": "number>=0", "json": "0", "ok": true, "why": "0 is allowed" },
+    { "spec": "number|null", "json": "null", "ok": true, "why": "an alternative" },
+    { "spec": "bool", "json": "1", "ok": false, "why": "1 is not a boolean" },
+    { "spec": "bool", "json": "0", "ok": false, "why": "0 is not a boolean" },
+    { "spec": "bool", "json": "true", "ok": true, "why": "a boolean" },
+    {
+      "spec": "@perGroup",
+      "json": "{\"agent\": true, \"job\": 1}",
+      "ok": false,
+      "why": "a boolean inside an object"
+    },
+    {
+      "spec": "@perGroup",
+      "json": "{\"agent\": 2.0, \"job\": 1}",
+      "ok": true,
+      "why": "a whole number with a fraction inside an object"
+    },
+    {
+      "spec": "@perGroup",
+      "json": "{\"agent\": 2, \"job\": 1, \"//\": \"a note\"}",
+      "ok": true,
+      "why": "notes are skipped"
+    },
+    {
+      "spec": "@perGroup",
+      "json": "{\"agent\": 2, \"job\": 1, \"jobs\": 1}",
+      "ok": false,
+      "why": "an unknown key"
+    }
+  ]
+}
