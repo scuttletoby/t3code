@@ -36,6 +36,10 @@ fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 fork-kit/common/tests/machine_file.test.py
+fork-kit/golive/tests/check.test.py
+# Reads server source; red until the fork PR "read-only report command" (apps/server/src/golive) is on main.
+fork-kit/golive/tests/contract.test.py
+fork-kit/golive/tests/journal.test.py
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py
 fork-kit/gh-apps/tests/policy.test.py
