@@ -11,9 +11,14 @@
 #                never deletes anything in a directory a runner user can write. The environment (the JIT config, the
 #                run it is for, HOME, TMPDIR and the job-started hook) comes from a root-only file, so nothing a
 #                runner user can write decides it.
-#   ready NEWEST exit 0 when the template's runner version (TEMPLATE/.fork-fleet-version, written by the runbook) is
+#   ready NEWEST exit 0 when the template's runner version (TEMPLATE/.fork-fleet-version, written by refresh) is
 #                not older than NEWEST, the newest actions/runner release. An older runner would update itself in
-#                its copy before the job, which this fleet refuses: the owner refreshes the template instead.
+#                its copy before the job, which this fleet refuses: refresh renews the template instead.
+#   refresh      makes TEMPLATE the newest actions/runner release when it differs or is missing (the hourly timer
+#                fork-fleet-refresh.timer, or by hand): reads the release, downloads its linux tarball, checks the
+#                release's sha256 before unpacking, unpacks it (refusing anything a runner release never has) beside
+#                TEMPLATE and swaps the two by one rename under the launch lock. Running jobs keep their copies; any
+#                failure leaves the old template. Below.
 #   active       the NAME of every fork-fleet-* unit that is loaded (starting, running or stopping).
 #   fits MB      exit 0 when MemAvailable minus RESERVE_MB leaves MB megabytes.
 #   stop NAME    stops that unit (a job on it fails: its runner is gone).
@@ -44,14 +49,17 @@
 # allows (an allow list: a disk or share mounted anywhere else is not in the unit).
 #
 # Settings: /etc/fork-fleet/launch.conf (or $FORK_FLEET_LAUNCH_CONF), KEY=value lines, owned by this user and
-# writable by it alone. RUNNER_USERS (user names, comma-separated: at least the pool's slots) and TEMPLATE (an
-# unconfigured actions/runner, owned by this user, on WORK_ROOT's filesystem) are required; WORK_ROOT, RUN_DIR, HOOK,
-# LINGER_DIR, RESERVE_MB, MAX_SECONDS, MEMINFO, NET_BASE (10.N: the runners' 10.N.0.0/16, one /30 per user from its
-# uid, unused by anything else on the host), RESOLV_CONF (the jobs' resolv.conf: public nameservers, as this host's
-# own resolver is on its loopback), OWN_ADDRESS_URLS (https URLs, comma-separated, that answer with the address
-# they see: every public address they give is blocked, at least one must answer), JOB_PATHS (the system paths every
-# job sees: fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only,
-# comma-separated, say a tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN and SYSTEMCTL have defaults below.
+# writable by it alone. RUNNER_USERS (user names, comma-separated: at least the pool's slots) is required. TEMPLATE
+# (an unconfigured actions/runner, owned by this user, on WORK_ROOT's filesystem, alone in a folder of its own: the
+# only folder the refresh service may write, fork-fleet-refresh.service), WORK_ROOT, RUN_DIR, HOOK, LINGER_DIR,
+# RESERVE_MB, MAX_SECONDS, MEMINFO, NET_BASE (10.N: the runners' 10.N.0.0/16, one /30 per user from its uid, unused by
+# anything else on the host), RESOLV_CONF (the jobs' resolv.conf: public nameservers, as this host's own resolver is on
+# its loopback), OWN_ADDRESS_URLS (https URLs, comma-separated, that answer with the address they see: every public
+# address they give is blocked, at least one must answer), JOB_PATHS (the system paths every job sees:
+# fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only, comma-separated, say a
+# tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an https
+# URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
+# empty for none) have defaults below.
 # FORK_FLEET_WALLS_ROOT: the walls' test knob (fork-fleet-walls.py), `paths` only and never as root: a fake machine
 # whose launch.conf and paths it reads.
 set -euo pipefail
@@ -82,12 +90,13 @@ conf=${FORK_FLEET_LAUNCH_CONF:-/etc/fork-fleet/launch.conf}
 # paths on a host not set up yet (no conf at all): what jobs would see with the defaults below.
 conf_file=/dev/null
 [[ ${1-} == paths && ! -e $ROOT$conf && ! -L $ROOT$conf ]] || { owned_safe "$ROOT$conf" && conf_file=$ROOT$conf; }
-RUNNER_USERS='' TEMPLATE='' WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
+RUNNER_USERS='' TEMPLATE=/opt/fork-fleet/template/runner-template WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
 SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com ALLOW_PATHS=''
-JOB_PATHS=''
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|JOB_PATHS|ALLOW_PATHS)=([^[:space:]]*)$'
+JOB_PATHS='' RUNNER_RELEASE=https://api.github.com/repos/actions/runner/releases/latest
+RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download RUNNER_MIN=''
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|JOB_PATHS|ALLOW_PATHS|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -130,8 +139,37 @@ setup() {
   WORK_ROOT=$(real_path "$WORK_ROOT")
   chmod 0711 -- "$WORK_ROOT"
   chmod 0700 -- "$RUN_DIR"
-  exec {lock}>"$RUN_DIR/launch.lock"
+  launch_lock
+}
+
+# The launch lock alone (RUN_DIR made and checked already).
+launch_lock() {
+  launch_lock_open
   flock -w 100 "$lock" || die "another launcher holds $RUN_DIR/launch.lock"
+}
+
+# Opens RUN_DIR/launch.lock read-only (flock needs no more) as $lock, never through a link: root runs this outside any
+# sandbox, and a plain `>` would truncate whatever a link planted there points to (the job hook, launch.conf). Made
+# empty when missing (noclobber: O_EXCL, which a dangling link fails too); a link or anything but a plain file is
+# refused. The sandboxed refresh service cannot write RUN_DIR: it only opens the file the dispatcher's first prune or
+# start made (or a refresh by hand).
+launch_lock_open() {
+  local path=$RUN_DIR/launch.lock outcome=${1:-nothing changed}
+  if [[ ! -e $path && ! -L $path ]]; then
+    (set -o noclobber && : >"$path") 2>/dev/null || [[ -e $path || -L $path ]] ||
+      die "there is no $path yet and this launcher may not make it (the refresh service only reads $RUN_DIR): the" \
+        "dispatcher's next prune or start makes it; $outcome"
+  fi
+  [[ -f $path && ! -L $path ]] ||
+    die "$path is a symlink or not a plain file: refused (only root writes $RUN_DIR: find out who made it); $outcome"
+  exec {lock}<"$path"
+}
+
+# The first file under $1 that a template must not have: one not this user's, one others may write, a special file
+# (device, FIFO, socket) or a setuid, setgid or sticky one. Empty when there is none. (A runner release has none: the
+# template is hard-linked into every job's copy, and a device node there would be a way out of the job's sandbox.)
+unsafe_file() {
+  find "$1" \( ! -uid "$EUID" -o \( ! -type f ! -type d ! -type l \) -o \( ! -type l -perm /7022 \) \) -print -quit
 }
 
 VERSION='^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$'
@@ -139,30 +177,417 @@ VERSION='^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$'
 template_version() {
   local v
   [[ -f $TEMPLATE/.fork-fleet-version && ! -L $TEMPLATE/.fork-fleet-version ]] ||
-    die "$TEMPLATE has no .fork-fleet-version: refresh the template (.github/fork-fleet.md, host step 2)"
+    die "$TEMPLATE has no .fork-fleet-version: refresh the template (.github/fork-fleet.md, host step 7)"
   v=$(<"$TEMPLATE/.fork-fleet-version")
-  [[ $v =~ $VERSION ]] || die "$TEMPLATE/.fork-fleet-version is not a version: refresh the template (host step 2)"
+  [[ $v =~ $VERSION ]] || die "$TEMPLATE/.fork-fleet-version is not a version: refresh the template (host step 7)"
   printf '%s\n' "$v"
 }
 
 # Exit 0 when the template's runner is not older than NEWEST. A JIT runner older than the newest release updates
-# itself in its copy before the job; this fleet does not rely on that, so it starts no runner until the owner
-# refreshes the template.
+# itself in its copy before the job; this fleet does not rely on that, so it starts no runner until refresh (its
+# timer, or by hand) renews the template.
 ready() {
-  local have i
-  local -a a b
+  local have
   [[ $1 =~ $VERSION ]] || die "ready: not a version: $1"
+  [[ -e $TEMPLATE || -L $TEMPLATE ]] ||
+    die "there is no runner template ($TEMPLATE): no runner starts until \`fork-fleet-launch.sh refresh\` makes one" \
+      "(.github/fork-fleet.md, host step 7)"
   owned_safe "$TEMPLATE"
   have=$(template_version)
-  IFS=. read -ra a <<<"$have"
-  IFS=. read -ra b <<<"$1"
+  if older "$have" "$1"; then
+    die "the runner template is actions/runner $have, older than the newest release $1: no runner starts until" \
+      "\`fork-fleet-launch.sh refresh\` refreshes the template (its timer, or by hand:" \
+      ".github/fork-fleet.md, host step 7)"
+  fi
+}
+
+# Exit 0 when version $1 is older than version $2 (both x.y.z).
+older() {
+  local i
+  local -a a b
+  IFS=. read -ra a <<<"$1"
+  IFS=. read -ra b <<<"$2"
   for i in 0 1 2; do
-    ((10#${a[i]} > 10#${b[i]})) && return 0
-    ((10#${a[i]} < 10#${b[i]})) &&
-      die "the runner template is actions/runner $have, older than the newest release $1: no runner starts until" \
-        "the owner refreshes the template (.github/fork-fleet.md, host step 2)"
+    if ((10#${a[i]} != 10#${b[i]})); then
+      ((10#${a[i]} < 10#${b[i]}))
+      return
+    fi
   done
-  return 0
+  return 1
+}
+
+# refresh's reader of the release record (stdin; $1 the platform, like linux-x64): prints "VERSION SHA256" of the
+# tarball actions-runner-PLATFORM-VERSION.tar.gz. The sha256 is the asset's digest and the one the release notes give
+# (<!-- BEGIN SHA PLATFORM -->); at least one must be there, and the two must agree.
+read -r -d '' RELEASE_PY <<'EOF' || true
+import json, re, sys
+plat = sys.argv[1]
+try:
+    r = json.load(sys.stdin)
+except ValueError:
+    sys.exit('the release record is not JSON')
+tag = r.get('tag_name') if isinstance(r, dict) else None
+m = re.fullmatch(r'v?([0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5})', str(tag))
+if not m:
+    sys.exit(f'the newest release is {tag!r}, not a version')
+v = m.group(1)
+name = f'actions-runner-{plat}-{v}.tar.gz'
+assets = [a for a in r.get('assets') or [] if isinstance(a, dict) and a.get('name') == name]
+if not assets:
+    sys.exit(f'release {v} has no {name}')
+sums = set()
+for a in assets:
+    if a.get('digest') is not None:
+        d = re.fullmatch(r'sha256:([0-9a-f]{64})', str(a['digest']))
+        if not d:
+            sys.exit(f'release {v}: the digest of {name} is not a sha256')
+        sums.add(d.group(1))
+p = re.escape(plat)
+for d in re.findall(rf'<!-- BEGIN SHA {p} -->(.*?)<!-- END SHA {p} -->', str(r.get('body') or ''), re.S):
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', d.strip()):
+        sys.exit(f'release {v}: the sha256 of {name} in its notes is not one')
+    sums.add(d.strip().lower())
+if len(sums) != 1:
+    sys.exit(f'release {v} gives ' + ('no sha256' if not sums else 'two different sha256') + f' for {name}')
+print(v, sums.pop())
+EOF
+
+# renameat2(RENAME_EXCHANGE): the two directories swap names in one step, or nothing changes. (mv --exchange is
+# coreutils 9.5, newer than some hosts have.)
+read -r -d '' EXCHANGE_PY <<'EOF' || true
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 2) != 0:
+    sys.exit(os.strerror(ctypes.get_errno()))
+EOF
+
+# refresh's unpacker (fork-fleet-unpack): $1 the tarball (sha256 checked), $2 the empty folder to fill, $3 the version,
+# $4 the floor (the oldest version a later refresh may roll this template back to).
+# The tarball is treated as hostile (a compromised release passes the sha256 check): read once, checked whole, then
+# written by this same reader (no second parser to disagree with). Refused: an absolute name, a "..", a name twice, a
+# name under a symlink or a file, a symlink or hard link that leads outside the folder, a device, FIFO, sparse or other
+# special file, a .fork-fleet-* name of its own, more than MAX_ENTRIES entries or MAX_BYTES of files, a long-name or pax
+# header over MAX_HEADER bytes (refused before it is read into memory), a name or link target over MAX_NAME, symlinks
+# that take more than MAX_STEPS steps to follow (fanned-out links would take hours). Stripped (as tar's
+# --no-same-owner --no-same-permissions would): owner (all root's), setuid, setgid, sticky and group/other write, and
+# every directory is 0755. Files are created with O_EXCL|O_NOFOLLOW and symlinks last, so nothing is ever written
+# through a link; the version and floor files too.
+read -r -d '' UNPACK_PY <<'EOF' || true
+# fork-fleet-unpack
+import os, posixpath, sys, tarfile, zlib
+src, dest, version, floor = sys.argv[1:5]
+MAX_ENTRIES, MAX_BYTES = 100000, 4 << 30
+MAX_HEADER, MAX_NAME, MAX_STEPS = 65536, 4096, 1000000
+NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+os.umask(0o022)
+
+
+def no(why):
+    sys.exit(f'refused: {why}')
+
+
+def parts(name):
+    if name.startswith('/'):
+        no(f'{name!r} is an absolute path')
+    p = [c for c in name.split('/') if c not in ('', '.')]
+    if '..' in p:
+        no(f'{name!r} has a ".."')
+    return p
+
+
+class Capped(tarfile.TarInfo):
+    """Refuses a GNU long name or pax header over MAX_HEADER bytes before tarfile reads it whole into memory, and a
+    GNU sparse file (its chained headers are read into memory too; a runner release has none)."""
+
+    def _proc_member(self, tar):
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            no(f'{self.name!r} is a sparse file')
+        if self.type in (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.XGLTYPE,
+                         tarfile.SOLARIS_XHDTYPE) and self.size > MAX_HEADER:
+            no(f'a header of {self.size} bytes (more than {MAX_HEADER})')
+        return super()._proc_member(tar)
+
+
+try:
+    tar = tarfile.open(src, 'r:gz', tarinfo=Capped)
+    members = []
+    for m in tar:
+        # Each name as it is read: many long names would fill memory before a check after the loop.
+        if len(m.name) > MAX_NAME or len(m.linkname) > MAX_NAME:
+            no(f'a name or link target longer than {MAX_NAME}: {m.name[:100]!r}')
+        members.append(m)
+        if len(members) > MAX_ENTRIES:
+            no(f'more than {MAX_ENTRIES} entries')
+except (tarfile.TarError, OSError, EOFError, zlib.error) as e:
+    sys.exit(f'not a gzip tarball: {e}')
+
+kinds, links, order, plan, total = {}, {}, {}, [], 0
+for i, m in enumerate(members):
+    p = parts(m.name)
+    if m.isdir():
+        kind = 'dir'
+    elif m.issym():
+        kind = 'symlink'
+    elif m.islnk():
+        kind = 'hardlink'
+    elif m.isreg():
+        kind = 'file'
+    else:
+        what = 'device' if m.ischr() or m.isblk() else 'FIFO' if m.isfifo() else 'special'
+        no(f'{m.name!r} is a {what} file')
+    if not p:
+        if kind != 'dir':
+            no(f'{m.name!r}, the top, is not a directory')
+        continue
+    path = '/'.join(p)
+    if p[0].startswith('.fork-fleet-'):
+        no(f'it has a {p[0]} of its own')
+    if path in kinds and not (kind == 'dir' == kinds[path]):
+        no(f'{path!r} twice')
+    kinds[path], order[path] = kind, i
+    if kind == 'file':
+        total += m.size
+        if total > MAX_BYTES:
+            no(f'more than {MAX_BYTES} bytes of files')
+    elif kind == 'symlink':
+        links[path] = m.linkname
+    plan.append((path, kind, m))
+
+
+steps = 0
+
+
+def resolve(link, depth=0):
+    """Where symlink `link` leads, as a list of names under dest, following the tarball's own symlinks; None when
+    it leads outside (or loops). All calls together take at most MAX_STEPS steps."""
+    global steps
+    target = links[link]
+    if depth > 40 or not target or target.startswith('/'):
+        return None
+    at = link.split('/')[:-1]
+    for c in target.split('/'):
+        steps += 1
+        if steps > MAX_STEPS:
+            no(f'its symlinks take more than {MAX_STEPS} steps to follow')
+        if c in ('', '.'):
+            continue
+        if c == '..':
+            if not at:
+                return None
+            at.pop()
+            continue
+        at.append(c)
+        if kinds.get('/'.join(at)) == 'symlink':
+            at = resolve('/'.join(at), depth + 1)
+            if at is None:
+                return None
+    return at
+
+
+for path, kind, m in plan:
+    p = path.split('/')
+    for n in range(1, len(p)):
+        if kinds.get('/'.join(p[:n]), 'dir') != 'dir':
+            no(f'{path!r} is under {"/".join(p[:n])!r}, which is no directory')
+    if kind == 'symlink' and resolve(path) is None:
+        no(f'the symlink {path!r} -> {m.linkname!r} leads outside')
+    if kind == 'hardlink':
+        t = '/'.join(parts(m.linkname))
+        if kinds.get(t) != 'file' or order[t] > order[path]:
+            no(f'the hard link {path!r} -> {m.linkname!r} is not to a file before it')
+
+
+def at(path):
+    return os.path.join(dest, path)
+
+
+try:
+    dirs, written = [], 0
+    for path, kind, m in plan:
+        up = posixpath.dirname(path)
+        if up:
+            os.makedirs(at(up), 0o755, exist_ok=True)   # no symlink exists yet: they come last
+        if kind == 'dir':
+            if not os.path.isdir(at(path)):
+                os.mkdir(at(path), 0o700)
+            dirs.append(path)
+        elif kind == 'file':
+            fd = os.open(at(path), NEW, 0o600)
+            with os.fdopen(fd, 'wb') as out:
+                data = tar.extractfile(m)
+                while chunk := data.read(1 << 20):
+                    written += len(chunk)
+                    if written > MAX_BYTES:
+                        no(f'more than {MAX_BYTES} bytes of files')
+                    out.write(chunk)
+                os.fchmod(out.fileno(), m.mode & 0o755)
+        elif kind == 'hardlink':
+            os.link(at('/'.join(parts(m.linkname))), at(path), follow_symlinks=False)
+    for path in reversed(dirs):
+        fd = os.open(at(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fchmod(fd, 0o755)   # every runner user passes through
+        finally:
+            os.close(fd)
+    for path, kind, m in plan:
+        if kind == 'symlink':
+            os.symlink(m.linkname, at(path))
+    for name, text in (('.fork-fleet-version', version), ('.fork-fleet-floor', floor)):
+        if not text:
+            continue   # no floor: the first template, or one with no good version
+        fd = os.open(at(name), NEW, 0o644)
+        with os.fdopen(fd, 'w') as out:
+            out.write(text + '\n')
+            os.fchmod(out.fileno(), 0o644)
+except (tarfile.TarError, OSError, EOFError, zlib.error) as e:
+    sys.exit(f'did not unpack: {e}')
+EOF
+
+# The release's name for this machine. The launcher itself runs on Linux (systemd, nft), WSL2 included; another OS
+# needs its own sandbox first (the per-OS walls layer).
+runner_platform() {
+  local os arch
+  os=$(uname -s) arch=$(uname -m)
+  [[ $os == Linux ]] || die "refresh: no runner template for $os here (the launcher runs on Linux only)"
+  case $arch in
+    x86_64) printf 'linux-x64\n' ;;
+    aarch64 | arm64) printf 'linux-arm64\n' ;;
+    armv7l) printf 'linux-arm\n' ;;
+    *) die "refresh: actions/runner has no release for $arch" ;;
+  esac
+}
+
+# The newest runner into TEMPLATE, or nothing when it has it already. Only forward, by at most one major version (a
+# bigger jump is refused: no real release does that, a compromised one might); a template NEWER than the newest
+# release is rolled back to it (a release GitHub withdrew must not stay, nor make every later release "older"), but
+# never below its floor: the version it replaced (.fork-fleet-floor, written when it came; without one, one major
+# version down, as forward), and never below RUNNER_MIN. So one withdrawn release is undone, and an old release
+# marked "latest" by mistake is refused. TEMPLATE sits alone in a folder of its own, the only one the sandboxed service
+# may write (no file the dispatcher runs as root is there). The new one is unpacked in a temp folder beside
+# TEMPLATE (one filesystem, so the swap is a rename), checked, flushed to disk, then swapped in under the launch lock:
+# no start copies a half-swapped template, and running jobs keep their copies (hard links of the old files). A cut
+# download, a bad checksum or any other failure leaves the old template as it was; the temp folder goes on exit, and a
+# leftover of a run that was killed goes with the next one. Two refreshes run one after the other (a lock on TEMPLATE's
+# folder). It writes nothing else: RUN_DIR's launch lock is only opened read-only.
+refresh() {
+  local base parent platform meta out newest sum have='' floor='' lowest tmp url f bad
+  base=${TEMPLATE##*/} parent=${TEMPLATE%/*}
+  [[ $TEMPLATE =~ ^/[A-Za-z0-9._/-]+$ && $base =~ ^[A-Za-z0-9._-]+$ && $base != . && $base != .. && -n $parent ]] ||
+    die "$conf: TEMPLATE is not a plain absolute path in a folder: $TEMPLATE"
+  [[ $RUNNER_RELEASE =~ ^https://[A-Za-z0-9.:/_-]+$ && $RUNNER_DOWNLOAD =~ ^https://[A-Za-z0-9.:/_-]+$ ]] ||
+    die "$conf: RUNNER_RELEASE and RUNNER_DOWNLOAD are https URLs"
+  [[ -z $RUNNER_MIN || $RUNNER_MIN =~ $VERSION ]] || die "$conf: RUNNER_MIN is not a version: $RUNNER_MIN"
+  platform=$(runner_platform)
+  # The template's own folder: made on the first run by hand (the service cannot: it may write only this folder).
+  if [[ ! -e $parent && ! -L $parent ]]; then
+    f=${parent%/*}
+    owned_safe "${f:-/}"
+    mkdir -m 0755 -- "$parent" 2>/dev/null ||
+      die "refresh: there is no $parent, the template's folder: run refresh once by hand (.github/fork-fleet.md," \
+        "host step 7)"
+  fi
+  owned_safe "$parent"
+  for f in "$parent"/* "$parent"/.*; do
+    [[ ${f##*/} == @(.|..|"$base"|".$base.refresh."*) ]] || [[ ! -e $f && ! -L $f ]] ||
+      die "refresh: $parent holds ${f##*/}, not only the template: the template must have a folder of its own (the" \
+        "only one the refresh service may write). Move it once: .github/fork-fleet.md, host step 7"
+  done
+  # Two refreshes: one after the other, by a lock on the template's folder itself (opened read-only: refresh writes
+  # nothing outside that folder; the sandboxed service can write nothing else).
+  exec {rlock}<"$parent"
+  flock -w 1800 "$rlock" || die "refresh: another refresh still holds $parent after 30 minutes"
+  # RUN_DIR: only read here (the service cannot write it). Made when missing only by a refresh by hand (as setup does).
+  if [[ ! -e $RUN_DIR && ! -L $RUN_DIR ]]; then
+    mkdir -m 0700 -- "$RUN_DIR" 2>/dev/null ||
+      die "refresh: there is no $RUN_DIR yet and this refresh may not make it: the dispatcher's next prune or start" \
+        "makes it; the template stays as it is"
+  fi
+  owned_safe "$RUN_DIR"
+  launch_lock_open 'the template stays as it is' # before any download: a refresh that could not swap fetches nothing
+  for tmp in "$parent/.$base.refresh."*; do
+    if [[ -e $tmp || -L $tmp ]]; then rm -rf --one-file-system -- "$tmp"; fi
+  done
+  if [[ -e $TEMPLATE || -L $TEMPLATE ]]; then
+    owned_safe "$TEMPLATE"
+    [[ -d $TEMPLATE ]] || die "$TEMPLATE is not a directory"
+    if [[ -f $TEMPLATE/.fork-fleet-version && ! -L $TEMPLATE/.fork-fleet-version ]]; then
+      have=$(<"$TEMPLATE/.fork-fleet-version")
+      [[ $have =~ $VERSION ]] || have=''
+    fi
+    if [[ -n $have && -f $TEMPLATE/.fork-fleet-floor && ! -L $TEMPLATE/.fork-fleet-floor ]]; then
+      floor=$(<"$TEMPLATE/.fork-fleet-floor")
+      [[ $floor =~ $VERSION ]] && ! older "$have" "$floor" || floor=''
+    fi
+  fi
+  meta=$(curl -q -fsSL --proto =https --proto-redir =https --max-time 120 --max-filesize 10485760 \
+    -H 'Accept: application/vnd.github+json' -- "$RUNNER_RELEASE") ||
+    die "refresh: could not read the newest release ($RUNNER_RELEASE): the template stays as it is"
+  out=$(python3 -I -c "$RELEASE_PY" "$platform" <<<"$meta") || die "refresh: the template stays as it is"
+  read -r newest sum <<<"$out"
+  [[ $newest =~ $VERSION && $sum =~ ^[0-9a-f]{64}$ ]] || die "refresh: an unexpected release record: $out"
+  if [[ $have == "$newest" ]]; then
+    echo "refresh: the template is actions/runner $have, the newest release is $newest: nothing to do"
+    return 0
+  elif [[ -n $RUNNER_MIN ]] && older "$newest" "$RUNNER_MIN"; then
+    die "refresh: the newest release $newest is older than RUNNER_MIN $RUNNER_MIN: not taken, the template stays as" \
+      "it is"
+  elif [[ -n $have ]] && older "$newest" "$have"; then
+    lowest=${floor:-$((10#${have%%.*} > 0 ? 10#${have%%.*} - 1 : 0)).0.0} # no floor file: one major version down
+    if older "$newest" "$lowest"; then
+      die "refresh: the template is actions/runner $have, the newest release $newest is older than $lowest, the" \
+        "oldest it may go back to by itself: not taken, the template stays as it is (to take it: .github/fork-fleet.md," \
+        "host step 7)"
+    fi
+    echo "refresh: the template is actions/runner $have, newer than the newest release $newest (a release GitHub" \
+      "withdrew?): rolling it back to $newest" >&2
+    floor=$newest # no second step back below it
+  elif [[ -n $have ]] && ((10#${newest%%.*} > 10#${have%%.*} + 1)); then
+    die "refresh: the newest release $newest is more than one major version ahead of the template's $have: not" \
+      "taken by itself, the template stays as it is (to take it: .github/fork-fleet.md, host step 7)"
+  fi
+
+  [[ -n $have ]] && ! older "$have" "$newest" || floor=$have # forward: the floor is the version replaced (if any)
+  tmp=$(mktemp -d -- "$parent/.$base.refresh.XXXXXX")
+  # Expanded now (the trap runs after this function's locals are gone). TERM and the like end the script through it.
+  # shellcheck disable=SC2064
+  trap "rm -rf --one-file-system -- $(printf '%q' "$tmp")" EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  url=$RUNNER_DOWNLOAD/v$newest/actions-runner-$platform-$newest.tar.gz
+  curl -q -fsSL --proto =https --proto-redir =https --max-time 1800 --max-filesize 1073741824 \
+    -o "$tmp/runner.tar.gz" -- "$url" ||
+    die "refresh: the download of $url failed: the template stays as it is"
+  printf '%s  %s\n' "$sum" "$tmp/runner.tar.gz" | sha256sum --check --strict --status - ||
+    die "refresh: $url does not match the release's sha256 $sum: refused, the template stays as it is"
+  mkdir -m 0755 -- "$tmp/new"
+  python3 -I -c "$UNPACK_PY" "$tmp/runner.tar.gz" "$tmp/new" "$newest" "$floor" ||
+    die "refresh: $url did not unpack: the template stays as it is"
+  rm -f -- "$tmp/runner.tar.gz"
+  for f in run.sh bin/Runner.Listener; do
+    [[ -f $tmp/new/$f && ! -L $tmp/new/$f && -x $tmp/new/$f ]] ||
+      die "refresh: $url has no run.sh or bin/Runner.Listener: the template stays as it is"
+  done
+  for f in .env .path .runner .credentials .credentials_rsaparams; do
+    [[ ! -e $tmp/new/$f && ! -L $tmp/new/$f ]] || die "refresh: $url has a $f: the template stays as it is"
+  done
+  bad=$(unsafe_file "$tmp/new")
+  [[ -z $bad ]] ||
+    die "refresh: $url has ${bad#"$tmp/new/"}, a file a template must not have: the template stays as it is"
+  sync -f -- "$tmp/new" # the files are on disk before their name is: a power cut leaves the old or the new one
+
+  flock -w 100 "$lock" || die "refresh: another launcher holds $RUN_DIR/launch.lock: the template stays as it is"
+  if [[ -e $TEMPLATE || -L $TEMPLATE ]]; then
+    owned_safe "$TEMPLATE"
+    python3 -I -c "$EXCHANGE_PY" "$tmp/new" "$TEMPLATE" ||
+      die "refresh: could not swap $TEMPLATE for the new one (a filesystem without RENAME_EXCHANGE?): the template" \
+        "stays as it is"
+  else
+    mv -T -- "$tmp/new" "$TEMPLATE"
+  fi
+  flock -u "$lock"
+  sync -f -- "$parent" # after the unlock: a whole-filesystem flush need not hold up start
+  echo "refresh: the template is actions/runner $newest (was ${have:-none})"
 }
 
 # The runner users: each a user of its own, in no group but its own, not lingering, with a network of its own.
@@ -557,7 +982,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv own blocked seen from
+  local name=$1 dir env_file line key value user resolv bad own blocked seen from
   local -a props
   local -A got=()
   name_ok "$name"
@@ -578,10 +1003,11 @@ start() {
   owned_safe "$TEMPLATE"
   [[ -x $TEMPLATE/run.sh ]] || die "$TEMPLATE has no run.sh"
   for f in .env .path .runner .credentials .credentials_rsaparams; do
-    [[ ! -e $TEMPLATE/$f ]] || die "$TEMPLATE/$f exists: the template must be an unconfigured runner (.github/fork-fleet.md)"
+    [[ ! -e $TEMPLATE/$f && ! -L $TEMPLATE/$f ]] || die "$TEMPLATE/$f exists: the template must be an unconfigured runner (.github/fork-fleet.md)"
   done
-  [[ -z $(find "$TEMPLATE" \( ! -uid "$EUID" -o \( ! -type l -perm /022 \) \) -print -quit) ]] ||
-    die "$TEMPLATE has a file that is not this user's or that others may write"
+  bad=$(unsafe_file "$TEMPLATE")
+  [[ -z $bad ]] || die "$TEMPLATE has a file that is not this user's or that others may write, a special file or a" \
+    "setuid, setgid or sticky one: $bad"
   owned_safe "$HOOK"
   template_version >/dev/null
   check_users
@@ -595,6 +1021,8 @@ start() {
   dir=$WORK_ROOT/$name
   env_file=$RUN_DIR/$name.env
   [[ ! -e $dir ]] || die "$dir exists: a runner of that name ran already (prune removes it once its unit is gone)"
+  [[ ! -e $env_file && ! -L $env_file ]] ||
+    die "$env_file exists: refused (prune removes a plain leftover once no unit of that name is loaded)"
   user=$(free_user)
   reset_user "$user"
   merge_own "$own"
@@ -609,12 +1037,16 @@ start() {
   mkdir -m 0700 -- "$dir/home" "$dir/tmp"
   chown -- "$user:" "$dir" "$dir/home" "$dir/tmp"
   chmod 0700 -- "$dir"
-  {
-    printf 'ACTIONS_RUNNER_INPUT_JITCONFIG=%s\n' "${got[ACTIONS_RUNNER_INPUT_JITCONFIG]}"
-    printf 'FORK_FLEET_RUN=%s\nFORK_FLEET_ATTEMPT=%s\n' "${got[FORK_FLEET_RUN]}" "${got[FORK_FLEET_ATTEMPT]}"
-    printf 'HOME=%s\nTMPDIR=%s\n' "$dir/home" "$dir/tmp"
-    printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HOOK"
-  } >"$env_file"
+  # noclobber: a new file (O_EXCL), never one, or a link, someone put there (root would write through it).
+  (
+    set -o noclobber
+    {
+      printf 'ACTIONS_RUNNER_INPUT_JITCONFIG=%s\n' "${got[ACTIONS_RUNNER_INPUT_JITCONFIG]}"
+      printf 'FORK_FLEET_RUN=%s\nFORK_FLEET_ATTEMPT=%s\n' "${got[FORK_FLEET_RUN]}" "${got[FORK_FLEET_ATTEMPT]}"
+      printf 'HOME=%s\nTMPDIR=%s\n' "$dir/home" "$dir/tmp"
+      printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HOOK"
+    } >"$env_file"
+  ) || die "start: could not make $env_file, a new file: refused"
   # Type=exec: systemd-run returns once run.sh started, so the environment file has been read and can go.
   # ProtectSystem=strict: the job writes its copy and its own memory file systems, nothing else.
   "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" --working-directory "$dir" \
@@ -876,6 +1308,7 @@ case "${1-}:$#" in
     "$SYSTEMCTL" stop -- "fork-fleet-$2.service"
     ;;
   prune:1) prune ;;
+  refresh:1) refresh ;;
   refresh-net:1) refresh_net ;;
   paths:1) paths ;;
   check-net:*)
@@ -883,5 +1316,5 @@ case "${1-}:$#" in
     shift
     check_net "$@"
     ;;
-  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh-net | paths | check-net URL HOST:PORT..." ;;
+  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh | refresh-net | paths | check-net URL HOST:PORT..." ;;
 esac
