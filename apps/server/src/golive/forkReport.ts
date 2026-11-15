@@ -5,7 +5,7 @@ import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
-import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import { DEFAULT_SERVER_SETTINGS, FORK_SERVER_SETTING_KEYS } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
@@ -14,7 +14,11 @@ import packageJson from "../../package.json" with { type: "json" };
 import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
 import { migrationManifest, skippedV2Migrations } from "../persistence/Migrations.ts";
 import { reconciledV2PreviewHistory } from "../persistence/reconcileV2PreviewMigration.ts";
-import { decodeSettingsFileText, settingsFileLegacyKeysUnreadable } from "../serverSettings.ts";
+import {
+  decodeSettingsFileText,
+  parseSettingsFileText,
+  settingsFileLegacyKeysUnreadable,
+} from "../serverSettings.ts";
 
 /**
  * Fork (go-live kit): what a T3 home holds, read without writing a byte. It never migrates, never
@@ -85,20 +89,17 @@ export interface ForkReport {
   readonly ok: boolean;
 }
 
-/** Fork keys in `settings.json`, including the retired names a load still renames. */
-const FORK_SETTINGS_KEYS = [
-  "automaticUpdates",
-  "automaticUpdatesQuietCommand",
-  "autoUpdateServer",
-  "autoUpdateQuietCommand",
-  "usagePacing",
-  "usagePacingGate",
-  "usagePacingLowerEffort",
-  "waitFor",
-  "waitChecks",
-  "agentSlots",
-  "headlessUsageRefreshInterval",
-] as const;
+/** Retired fork key names a load still renames, each after the name it became. */
+const RETIRED_FORK_SETTINGS_KEYS: Readonly<Record<string, string>> = {
+  automaticUpdates: "autoUpdateServer",
+  automaticUpdatesQuietCommand: "autoUpdateQuietCommand",
+};
+
+/** Fork keys in `settings.json` (forkSettings.ts's list), with the retired names. */
+const FORK_SETTINGS_KEYS = FORK_SERVER_SETTING_KEYS.flatMap((key) => {
+  const retired = RETIRED_FORK_SETTINGS_KEYS[key];
+  return retired === undefined ? [key] : [key, retired];
+});
 
 type Problem = ForkReport["problems"][number];
 
@@ -154,10 +155,25 @@ function readDatabase(databasePath: string, problems: Array<Problem>): ForkRepor
     unknownMigrations: [],
     counts: null,
   } as const;
-  if (!isFile(databasePath)) return { ...empty, state: "missing" };
-  if (NodeFS.statSync(databasePath).size === 0) return { ...empty, state: "empty" };
+  if (NodeFS.lstatSync(databasePath, { throwIfNoEntry: false }) === undefined) {
+    return { ...empty, state: "missing" };
+  }
+  // SQLite keeps -wal, -shm and -journal beside the file a link resolves to, so every check and the
+  // open use the real path. A link that leads nowhere is not "no database": the data is elsewhere.
+  let realPath: string;
+  try {
+    realPath = NodeFS.realpathSync(databasePath);
+  } catch (cause) {
+    problems.push({
+      code: "database-unreadable",
+      message: `statev2.sqlite is a link that does not lead to a file (${errorText(cause)}); a start would create a new, empty database where it points.`,
+    });
+    return { ...empty, state: "unreadable" };
+  }
+  if (!isFile(realPath)) return { ...empty, state: "missing" };
+  if (NodeFS.statSync(realPath).size === 0) return { ...empty, state: "empty" };
 
-  const opened = openWithoutWriting(databasePath);
+  const opened = openWithoutWriting(realPath);
   if (!("db" in opened)) {
     problems.push(opened);
     return { ...empty, state: "unreadable" };
@@ -253,35 +269,56 @@ function readSettings(
   settingsPath: string,
   problems: Array<Problem>,
 ): { settings: ForkReport["settings"]; fork: ForkReport["fork"] } {
-  const raw = isFile(settingsPath) ? NodeFS.readFileSync(settingsPath, "utf8") : undefined;
-  const state = raw === undefined ? "missing" : raw.trim() === "" ? "empty" : "present";
-  // A load treats a missing or empty file as all defaults.
-  const decoded = decodeSettingsFileText(state === "present" ? raw! : "{}");
+  // As the load: a missing file (or a link to nothing) means every default, without a warning; a
+  // file that is there, even empty, goes through the load's own decode.
+  let raw: string | undefined;
+  let readError: string | null = null;
+  try {
+    if (NodeFS.statSync(settingsPath, { throwIfNoEntry: false }) !== undefined) {
+      raw = NodeFS.readFileSync(settingsPath, "utf8");
+    }
+  } catch (cause) {
+    readError = errorText(cause);
+  }
+  const state =
+    raw === undefined && readError === null
+      ? "missing"
+      : raw !== undefined && raw.trim() === ""
+        ? "empty"
+        : "present";
+  const decoded = raw === undefined ? undefined : decodeSettingsFileText(raw);
   let parseWarning: string | null = null;
-  if (Exit.isFailure(decoded)) {
+  if (readError !== null) {
+    parseWarning = `settings.json could not be read: ${readError}`;
+  } else if (decoded !== undefined && Exit.isFailure(decoded)) {
     parseWarning = Cause.pretty(decoded.cause);
-  } else if (state === "present" && settingsFileLegacyKeysUnreadable(raw!)) {
+  } else if (raw !== undefined && settingsFileLegacyKeysUnreadable(raw)) {
     parseWarning = "The legacy provider or source control keys do not decode.";
   }
   if (parseWarning !== null) {
     problems.push({
       code: "settings-unreadable",
-      message: `A load would ignore settings.json and use defaults: ${parseWarning}`,
+      message:
+        readError === null
+          ? `A load would ignore settings.json and use defaults: ${parseWarning}`
+          : parseWarning,
     });
   }
   // The load uses every default when the file does not decode; so does the report.
   const settings =
-    Exit.isSuccess(decoded) && parseWarning === null ? decoded.value : DEFAULT_SERVER_SETTINGS;
+    decoded !== undefined && Exit.isSuccess(decoded) && parseWarning === null
+      ? decoded.value
+      : DEFAULT_SERVER_SETTINGS;
 
-  let parsed: unknown;
-  try {
-    parsed = state === "present" ? JSON.parse(raw!) : {};
-  } catch {
-    parsed = {};
-  }
+  // The keys come from the load's lenient parse, so comments and trailing commas hide none.
+  const parsed = raw === undefined ? undefined : parseSettingsFileText(raw);
   const keysInFile =
-    typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-      ? FORK_SETTINGS_KEYS.filter((key) => Object.hasOwn(parsed as object, key))
+    parsed !== undefined &&
+    Exit.isSuccess(parsed) &&
+    typeof parsed.value === "object" &&
+    parsed.value !== null &&
+    !Array.isArray(parsed.value)
+      ? FORK_SETTINGS_KEYS.filter((key) => Object.hasOwn(parsed.value as object, key))
       : [];
 
   const features = {
@@ -322,10 +359,10 @@ function readSettings(
   };
 }
 
-/** The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`). */
 /** The report as the command prints it: indented JSON. */
 export const formatForkReport = (report: ForkReport): string => JSON.stringify(report, null, 2);
 
+/** The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`). */
 export function readForkReport(baseDir: string, version: string = packageJson.version): ForkReport {
   const home = NodePath.resolve(baseDir);
   const stateDir = NodePath.join(home, "userdata");

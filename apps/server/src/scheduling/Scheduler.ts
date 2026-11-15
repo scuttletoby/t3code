@@ -7,6 +7,7 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
 import { forkParked } from "../serverActivation.ts";
+import { WorkAdmission } from "../workAdmission.ts";
 
 export class Scheduler extends Context.Service<
   Scheduler,
@@ -19,6 +20,18 @@ export class Scheduler extends Context.Service<
 >()("t3/scheduling/Scheduler") {}
 
 const make = Effect.gen(function* () {
+  const admission = yield* WorkAdmission;
+  // Startup checks this before a held boot serves, and an update before it holds the gate.
+  yield* admission.register("scheduler");
+  // Fork: `serve --hold-work` runs no source (scheduled tasks, webhooks, waits, usage-limit
+  // recovery, usage refresh): their due work stays due for the next start without the flag.
+  if (admission.heldFromBoot) {
+    return Scheduler.of({
+      register: Effect.fn("Scheduler.registerHeld")(function* (name) {
+        yield* Effect.logInfo("Scheduler source held (--hold-work)", { source: name });
+      }),
+    });
+  }
   const sources = yield* Ref.make(new Map<symbol, Effect.Effect<void>>());
   const register: Scheduler["Service"]["register"] = Effect.fn("Scheduler.register")(function* <
     E,

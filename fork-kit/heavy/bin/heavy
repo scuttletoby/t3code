@@ -4,6 +4,10 @@
   heavy <command> [args...]       run <command> in its own scope in the slice, wait for it, stop the scope
   HEAVY_KEEP=1 heavy <command>    the same, but processes the command leaves running are kept (a daemon)
   heavy --self-check              check the config, the slice and the installed files; exit 1 on a problem
+  heavy sweep [--dry-run|--json]  stop or report what commands left behind outside heavy (lib/heavy_sweep.py)
+  heavy docker-label [--value]    the owner label for a container a test starts, so the sweep can remove it
+                                  (--owner-pid PID: the long-lived test process that uses it; README)
+  heavy -- <command> [args...]    run a command that is named sweep or docker-label
 
 The command runs with the same folder, environment, stdin, stdout, stderr and open files, and heavy exits with
 its exit code (or dies of the same signal). When the command ends, every process it left in its scope is stopped
@@ -572,9 +576,33 @@ def self_check():
     return 0 if not problems else 1
 
 
+def sweep_module():
+    """lib/heavy_sweep.py of this kit, loaded only for the sweep verbs (plain heavy never needs it)."""
+    import importlib.machinery, importlib.util
+    kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    path = os.path.join(kit, 'lib', 'heavy_sweep.py')
+    loader = importlib.machinery.SourceFileLoader('heavy_sweep', path)
+    spec = importlib.util.spec_from_loader('heavy_sweep', loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
 def main(argv):
     if argv[:1] == ['--self-check']:
         return self_check()
+    if argv[:1] in (['sweep'], ['docker-label']):
+        try:
+            mod = sweep_module()
+        except (OSError, ImportError, SyntaxError) as e:
+            say(f'{argv[0]}: cannot load the sweep ({e})')
+            return 1
+        return (mod.sweep_main if argv[0] == 'sweep' else mod.label_main)(argv[1:])
+    if argv[:1] == ['--']:
+        argv = argv[1:]
+        if not argv:
+            print('usage: heavy <command> [args...]', file=sys.stderr)
+            return 2
     if not argv or argv[:1] in (['-h'], ['--help']):
         print(__doc__.split('\n\n')[1] if argv else 'usage: heavy <command> [args...]',
               file=sys.stdout if argv else sys.stderr)
