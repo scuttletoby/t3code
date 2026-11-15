@@ -33,6 +33,7 @@
 fork-ci/actions/ci-demand/ci_demand.test.py
 fork-ci/actions/docs-scope/docs-scope.test.py
 fork-ci/actions/fleet-route/fleet_route.test.py
+fork-ci/actions/fleet-watch/fleet_watch.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/head-check/head_check.test.py
 fork-ci/actions/head-check/head_gate.test.py

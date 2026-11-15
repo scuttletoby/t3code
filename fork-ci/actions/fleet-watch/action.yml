@@ -1,0 +1,60 @@
+name: fleet watch
+description: >-
+  Re-runs, once, the failed jobs of a run whose job on a dispatcher pool (a machine that comes and goes) was cut off:
+  its runner stopped or lost its network, was killed for memory, its gate refused the job, or the job waited too long
+  and never started. The re-run's jobs take fleet-route's fallback (an always-on pool or GitHub-hosted). Also cancels a
+  run whose job waits too long for a dispatcher pool (sweep), and tells a red-run report whether a re-run is coming
+  (pending). Only runs of the config's trusted workflows, repository and actors; GitHub's record of each run is the
+  only state. Needs a token with actions write (the job's GITHUB_TOKEN: a re-run it starts is never re-run again).
+inputs:
+  config:
+    description: The project's fleet config (fleet-route README, "Config"), a path in the checkout of the default branch.
+    required: true
+  verb:
+    description: watch (a run completed), sweep (on a schedule) or pending (is this red attempt about to be re-run?).
+    required: true
+  run-id:
+    description: watch and pending - the run's id (github.event.workflow_run.id).
+    required: false
+    default: ""
+  attempt:
+    description: pending - the red attempt (github.event.workflow_run.run_attempt).
+    required: false
+    default: ""
+  vars:
+    description: The repository variables as a JSON object, ${{ toJSON(vars) }} (the setting decides how long a job may wait).
+    required: false
+    default: "{}"
+  token:
+    description: A token with actions write on this repository. Keep the default; a person's token would make its re-runs trusted.
+    required: false
+    default: ${{ github.token }}
+outputs:
+  rerun:
+    description: watch - true when it re-ran the run's failed jobs.
+    value: ${{ steps.watch.outputs.rerun }}
+  pending:
+    description: >-
+      pending - true only when this red attempt will be re-run (or a newer attempt runs); false or empty (the step
+      failed) means report the red. Test it with == 'true'.
+    value: ${{ steps.watch.outputs.pending }}
+runs:
+  using: composite
+  steps:
+    - id: watch
+      name: Fleet watch
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        CONFIG: ${{ inputs.config }}
+        VERB: ${{ inputs.verb }}
+        RUN_ID: ${{ inputs.run-id }}
+        ATTEMPT: ${{ inputs.attempt }}
+        FLEET_VARS: ${{ inputs.vars }}
+      run: |
+        case "$VERB" in
+          watch|sweep|pending) ;;
+          *) echo "::error::fleet watch: verb must be watch, sweep or pending"; exit 2 ;;
+        esac
+        exec python3 -I "$GITHUB_ACTION_PATH/fleet_watch.py" --config="$CONFIG" "$VERB" --run-id="$RUN_ID" \
+          --attempt="$ATTEMPT"
