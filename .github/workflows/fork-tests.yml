@@ -246,6 +246,8 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.changes.outputs.sha }}
+          # Two commits: on a pull request, the merge commit and its base (the seam check).
+          fetch-depth: 2
           sparse-checkout: |
             /.github/
             /docs/fork/
@@ -316,6 +318,13 @@ jobs:
 
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
+
+      # Fork lines in upstream files stay the seam lines pinned in .github/fork-seams.json (a fork
+      # setting goes in forkSettings.ts, not upstream's settings.ts). A pull request's run checks out
+      # its merge commit, whose first parent is the base: the lines the pull request adds.
+      - name: Fork lines in upstream files
+        if: ${{ github.event_name == 'pull_request' }}
+        run: node .github/scripts/fork-seam-check.cjs HEAD^1 HEAD
 
   # Every commit a pull request or a push to main adds, history included: a
   # secret committed and then deleted is still public. Release runs test a
