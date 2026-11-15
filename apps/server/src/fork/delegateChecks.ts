@@ -80,6 +80,11 @@ export interface BeforeCreateThreadInput {
   readonly target: DelegateTarget;
 }
 
+/** The target the thread is created on: a later check (model policy, placement) may change it. */
+export interface BeforeCreateThreadResult {
+  readonly target: DelegateTarget;
+}
+
 export interface DelegateChecks {
   /** `delegate_task`, before the child workspace is planned. May move the task and add a note. */
   readonly beforeWorkspace: (
@@ -92,7 +97,7 @@ export interface DelegateChecks {
   /** `create_threads`, per thread before its dispatch. */
   readonly beforeCreateThread: (
     input: BeforeCreateThreadInput,
-  ) => Effect.Effect<void, OrchestratorMcpFailure>;
+  ) => Effect.Effect<BeforeCreateThreadResult, OrchestratorMcpFailure>;
 }
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
@@ -238,7 +243,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         ? Effect.succeed(NO_HOLD)
         : acquireSlot(slotGate.value, input),
     // No fork check on created threads yet; model policy (M3) and placement (P1) add theirs here.
-    beforeCreateThread: () => Effect.void,
+    beforeCreateThread: (input) => Effect.succeed({ target: input.target }),
   };
   return checks;
 });

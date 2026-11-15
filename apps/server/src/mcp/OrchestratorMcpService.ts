@@ -2993,7 +2993,7 @@ const make = Effect.gen(function* () {
                     .getThreadShell(threadId)
                     .pipe(Effect.mapError(threadManagementFailure))
                 : null;
-              const target = yield* resolveTargetRechecking({
+              const resolvedTarget = yield* resolveTargetRechecking({
                 parent,
                 target:
                   committedThread === null
@@ -3005,6 +3005,13 @@ const make = Effect.gen(function* () {
                 providers,
                 skipProjectEnablementFilter: isRetryOfAcceptedCreation,
               });
+              // Fork: the seat of the fork's delegation checks for created threads (may change the target).
+              const { target } = yield* delegateChecks.beforeCreateThread({
+                isRetry: isRetryOfAcceptedCreation,
+                callerThreadId: scope.thread.threadId,
+                parent,
+                target: resolvedTarget,
+              });
               const runtimeMode = yield* resolveRuntimeMode(
                 parent.thread.runtimeMode,
                 request.runtimeMode,
@@ -3015,13 +3022,6 @@ const make = Effect.gen(function* () {
                 request.interactionMode,
               );
               yield* assertTargetEnabledForProject(parent, commandId, target);
-              // Fork: the seat of the fork's delegation checks for created threads.
-              yield* delegateChecks.beforeCreateThread({
-                isRetry: isRetryOfAcceptedCreation,
-                callerThreadId: scope.thread.threadId,
-                parent,
-                target,
-              });
               const title = threadTitle({
                 parentTitle: parent.thread.title,
                 prompt: request.prompt,

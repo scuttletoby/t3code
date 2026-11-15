@@ -135,11 +135,17 @@ describe("fork delegation checks: runs again", () => {
     }).pipe(Effect.scoped, Effect.provide(untouched)),
   );
 
-  it.effect("create_threads' seat checks nothing yet, retry or not", () =>
+  it.effect("create_threads' seat checks nothing yet and keeps the target, retry or not", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
       for (const isRetry of [false, true]) {
-        yield* checks.beforeCreateThread({ isRetry, callerThreadId, parent, target });
+        const result = yield* checks.beforeCreateThread({
+          isRetry,
+          callerThreadId,
+          parent,
+          target,
+        });
+        assert.deepStrictEqual(result, { target });
       }
     }).pipe(Effect.provide(untouched)),
   );
