@@ -363,8 +363,8 @@ done
 #    /opt/fork-fleet/template/runner-template (the launcher's default TEMPLATE): the refresh service may write only
 #    that folder. /opt and /var/lib must be on one filesystem: each copy hard-links the template (the launcher checks it).
 
-# 3. The fleet files, from one pinned main commit. All six are fetched first and installed only when each came;
-#    SOURCE is written last, so it never names a commit whose files are not all in place.
+# 3. The fleet files, from one pinned main commit. Every file in the list is fetched first and installed only when
+#    each came; SOURCE is written last, so it never names a commit whose files are not all in place.
 (
   set -euo pipefail
   sha=FULL_MAIN_SHA
@@ -443,8 +443,10 @@ mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
 #    failure leaves the old template. The same version: nothing (one API call). Safe to run by hand at any time (a
 #    second refresh waits for the first). The timer runs it every hour at a random minute in the first 10, and after
 #    boot when a run was missed; a failed run is tried again the next hour. The service is sandboxed: it writes only
-#    the template's own folder /opt/fork-fleet/template and /run/fork-fleet (with TEMPLATE or RUN_DIR elsewhere, add a
-#    drop-in: the unit file says how), reaches the network by IP only, and has 1 GiB of memory, one CPU and 64 tasks.
+#    the template's own folder /opt/fork-fleet/template (with TEMPLATE elsewhere, add a drop-in: the unit file says
+#    how); /run/fork-fleet, the root launcher's, is read-only to it (it opens the launch lock the dispatcher's first
+#    prune made: right after a boot, before that, it says so and the next hour's run goes on). It reaches the network
+#    by IP only, and has 1 GiB of memory, one CPU and 64 tasks.
 #    refresh refuses a template whose folder holds anything else (such as the launcher: root runs it).
 #    The tarball is treated as hostile even after its sha256 passed (a compromised release would pass it): refresh
 #    refuses absolute names, "..", links that lead outside, device files, FIFOs, sockets and sparse files, a tarball
@@ -460,8 +462,10 @@ mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
 #    Re-run the two install lines after step 3 brings new unit files.
 #    A host set up before the template had its own folder (TEMPLATE=/opt/fork-fleet/runner-template in launch.conf):
 #    refresh refuses it ("not only the template") until it is moved, once; start and ready keep working meanwhile.
-#    Under the launch lock, so no runner copies it half-way (a start in that second fails once and is started again):
-#      install -d -m 755 /opt/fork-fleet/template && flock /run/fork-fleet/launch.lock sh -c 'mv -T /opt/fork-fleet/runner-template /opt/fork-fleet/template/runner-template && sed -i /^TEMPLATE=/d /etc/fork-fleet/launch.conf'
+#    Under the launch lock, so no runner copies it half-way (a start in that second fails once and is started again).
+#    Safe to run again, also after it stopped half-way (the move only while the old one is there), and it removes the
+#    temp folders a refresh killed under the old layout left beside the launcher:
+#      install -d -m 755 /opt/fork-fleet/template && install -d -m 700 /run/fork-fleet && flock /run/fork-fleet/launch.lock sh -c '{ [ ! -e /opt/fork-fleet/runner-template ] || mv -T /opt/fork-fleet/runner-template /opt/fork-fleet/template/runner-template; } && sed -i /^TEMPLATE=/d /etc/fork-fleet/launch.conf && rm -rf --one-file-system /opt/fork-fleet/.runner-template.refresh.*'
 /opt/fork-fleet/fork-fleet-launch.sh refresh                   # the first template (and its folder), or the newest one now
 /opt/fork-fleet/template/runner-template/bin/installdependencies.sh   # once, and again if a release needs new libraries:
                                                                # refresh installs no system packages

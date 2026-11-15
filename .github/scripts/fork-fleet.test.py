@@ -1665,6 +1665,37 @@ class Launcher(unittest.TestCase):
         self.assertNotEqual(got.returncode, 0)
         self.assertEqual([n for n in os.listdir(self.path('run')) if n.endswith('.env')], [])
 
+    def test_root_never_writes_through_a_link_planted_in_run_dir(self):
+        """Root opens RUN_DIR's files without following a link: launch.lock only read-only (flock needs no more), a
+        job's .env only as a new file. A link planted there (by whatever could once write RUN_DIR) is refused, and the
+        file it points to stays as it was (a plain `>` would truncate the job hook or launch.conf, as root)."""
+        run = self.path('run')
+        os.makedirs(run, 0o700)
+        os.chmod(run, 0o700)
+        with open(self.hook) as f:
+            hook = f.read()
+        for planted, verbs in (('launch.lock', (('prune',), ('start', self.NAME))),
+                               (f'{self.NAME}.env', (('start', self.NAME),))):
+            for target in (self.hook, self.path('made-by-root')):   # a file, and a dangling link
+                for verb in verbs:
+                    with self.subTest(planted=planted, target=target, verb=verb[0]):
+                        os.symlink(target, f'{run}/{planted}')
+                        try:
+                            got = self.launch(*verb, stdin=self.INPUT if verb[0] == 'start' else '')
+                        finally:
+                            os.remove(f'{run}/{planted}')
+                        self.assertNotEqual(got.returncode, 0)
+                        self.assertIn(f'{run}/{planted}', got.stderr)
+                        self.assertIsNone(self.rec_text('systemd-run'))
+                        with open(self.hook) as f:
+                            self.assertEqual(f.read(), hook)
+                        self.assertFalse(os.path.lexists(self.path('made-by-root')))
+        os.remove(f'{run}/launch.lock')   # made by the .env cases' start (a plain file)
+        os.mkfifo(f'{run}/launch.lock')   # not a plain file: refused before it is opened (a FIFO would hang)
+        got = self.launch('prune')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('not a plain file', got.stderr)
+
     def test_active(self):
         self.write('rec/units', 'fork-fleet-fleet-vm-t3code-11.service loaded active running x\n'
                                 'fork-fleet-bogus.service loaded active running x\n'

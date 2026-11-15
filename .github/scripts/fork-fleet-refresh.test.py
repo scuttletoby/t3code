@@ -470,6 +470,56 @@ class Refresh(unittest.TestCase):
         with open(mark) as f:
             self.assertEqual(f.read().split('\n'), ['exchange held', 'sync free', ''])
 
+    def run_dir_read_only(self, lock=True):
+        """RUN_DIR as the sandboxed service sees it: read-only (here: no write bit), with or without the launch lock
+        the dispatcher's prune made."""
+        run = self.path('run')
+        os.makedirs(run, 0o700)
+        if lock:
+            self.write('run/launch.lock', '')
+        os.chmod(run, 0o500)
+        self.addCleanup(lambda: os.path.isdir(run) and os.chmod(run, 0o700))
+        return run
+
+    def test_refresh_writes_nothing_in_run_dir(self):
+        """The service cannot write RUN_DIR (the root launcher's lock and the jobs' environment files are there):
+        refresh takes its own lock on the template's folder and only opens the launch lock."""
+        self.old_template()
+        run = self.run_dir_read_only()
+        got = self.launch('refresh')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(self.version(), f'{NEW}\n')
+        self.assertEqual(os.listdir(run), ['launch.lock'])
+
+    def test_refresh_without_a_launch_lock_it_may_not_make_waits_for_the_dispatcher(self):
+        """Right after a boot, before the dispatcher's first prune: refused before any download, template kept."""
+        ino = self.old_template()
+        self.run_dir_read_only(lock=False)
+        self.assert_kept(self.launch('refresh'), "the dispatcher's next prune or start makes it", ino)
+        self.assertEqual(self.server.asked, [])
+        os.chmod(self.path('run'), 0o700)
+        os.rmdir(self.path('run'))
+        os.chmod(self.path('opt'), 0o555)   # no RUN_DIR at all, and none can be made
+        self.addCleanup(os.chmod, self.path('opt'), 0o755)
+        self.conf(RUN_DIR=self.path('opt/run'))
+        self.assert_kept(self.launch('refresh'), "the dispatcher's next prune or start makes it", ino)
+
+    def test_a_link_planted_at_the_launch_lock_is_refused(self):
+        """Root's refresh by hand never writes through a link a taken-over service could once plant in RUN_DIR."""
+        ino = self.old_template()
+        os.makedirs(self.path('run'), 0o700)
+        target = self.write('hook.sh', '#!/bin/sh\nexec gate\n', 0o755)
+        for to in (target, self.path('made-by-root')):
+            with self.subTest(to=to):
+                os.symlink(to, self.path('run/launch.lock'))
+                try:
+                    self.assert_kept(self.launch('refresh'), 'is a symlink or not a plain file', ino)
+                finally:
+                    os.remove(self.path('run/launch.lock'))
+                with open(target) as f:
+                    self.assertEqual(f.read(), '#!/bin/sh\nexec gate\n')
+                self.assertFalse(os.path.lexists(self.path('made-by-root')))
+
     def test_a_curlrc_cannot_turn_off_the_certificate_check(self):
         """curl -q: a root ~/.curlrc with `insecure` (or a proxy) is not read."""
         ino = self.old_template()
@@ -690,6 +740,10 @@ class Refresh(unittest.TestCase):
                           'longer than 4096'),
             'long link target': (hostile([(member('./bin/l', sym, link='a/' * 2500), None)], fmt=tarfile.PAX_FORMAT),
                                  'longer than 4096'),
+            # Each pax header under 64 KiB, but 4000 of them: ~240 MB of names, unless each is checked as it is read
+            # (a refresh by hand has no MemoryMax).
+            'many long names': (hostile([(member(f'./{i:05d}' + 'a' * 60000), b'') for i in range(4000)],
+                                        fmt=tarfile.PAX_FORMAT), 'longer than 4096'),
         }
         limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (192 << 20, 192 << 20))
         for name, (data, word) in cases.items():
@@ -810,9 +864,10 @@ class Refresh(unittest.TestCase):
 
     def test_a_real_run_in_the_services_sandbox(self):
         """The service's sandbox (as a transient user unit) lets a real refresh through. Only the places differ: the
-        test's folder in place of /opt/fork-fleet and /run/fork-fleet, and so ProtectHome and PrivateTmp (they would
+        test's template folder in place of /opt/fork-fleet/template, and so ProtectHome and PrivateTmp (they would
         hide it), and the capability bound (a user manager cannot set it). Skipped where the user manager applies no
-        sandbox (no user namespaces): there the root proof in the runbook (host step 7) covers it."""
+        sandbox (no user namespaces): there the root proof in the runbook (host step 7) covers it. RUN_DIR is read-only
+        in it, as on the host."""
         if not shutil.which('systemd-run'):
             self.skipTest('no systemd-run')
         probe = subprocess.run(['systemd-run', '--user', '--wait', '--pipe', '--quiet', '--collect',
@@ -821,10 +876,13 @@ class Refresh(unittest.TestCase):
         if 'Read-only file system' not in probe.stderr:
             self.skipTest('this user manager applies no sandbox (no user namespaces, or no user manager)')
         self.old_template()
-        skip = {'Type', 'ExecStart', 'ReadWritePaths', 'RuntimeDirectory', 'RuntimeDirectoryMode',
-                'RuntimeDirectoryPreserve', 'ProtectHome', 'PrivateTmp', 'CapabilityBoundingSet', 'TimeoutStartSec'}
+        os.makedirs(self.path('run'), 0o700)
+        self.write('run/launch.lock', '')   # made by the dispatcher's prune; the service may only read RUN_DIR
+        skip = {'Type', 'ExecStart', 'ReadWritePaths', 'ProtectHome', 'PrivateTmp', 'CapabilityBoundingSet',
+                'TimeoutStartSec'}
         props = [f'{k}={v}' for k, v in unit('fork-fleet-refresh.service')['Service'].items() if k not in skip]
-        cmd = ['systemd-run', '--user', '--wait', '--pipe', '--quiet', '--collect', '-p', f'ReadWritePaths={self.d}']
+        cmd = ['systemd-run', '--user', '--wait', '--pipe', '--quiet', '--collect', '-p',
+               f'ReadWritePaths={self.path("opt")}']
         for prop in props:
             cmd += ['-p', prop]
         for k, v in self.env().items():
@@ -845,11 +903,10 @@ def unit(name):
     return p
 
 
-# The service's sandbox: it may write the template's own folder and its locks only, make no device, setuid or setgid
+# The service's sandbox: it may write the template's own folder only (not RUN_DIR, the root launcher's), make no device, setuid or setgid
 # file, reach the network by IP only (no unix socket: systemd and the bus are out of reach) and use 1 GiB of memory, one
 # CPU and 64 tasks at most (a compromised release unpacked by a bug in refresh still cannot reach the host).
-SANDBOX = {'ProtectSystem': 'strict', 'ReadWritePaths': '-/opt/fork-fleet/template', 'RuntimeDirectory': 'fork-fleet',
-           'RuntimeDirectoryMode': '0700', 'RuntimeDirectoryPreserve': 'yes', 'ProtectHome': 'yes',
+SANDBOX = {'ProtectSystem': 'strict', 'ReadWritePaths': '-/opt/fork-fleet/template', 'ProtectHome': 'yes',
            'PrivateTmp': 'yes', 'PrivateDevices': 'yes', 'NoNewPrivileges': 'yes', 'RestrictSUIDSGID': 'yes',
            'RestrictAddressFamilies': 'AF_INET AF_INET6', 'CapabilityBoundingSet': 'CAP_DAC_OVERRIDE',
            'MemoryMax': '1G', 'MemorySwapMax': '0', 'CPUQuota': '100%', 'TasksMax': '64'}
@@ -899,8 +956,14 @@ class Timer(unittest.TestCase):
     def test_the_service_is_sandboxed(self):
         service = unit('fork-fleet-refresh.service')['Service']
         self.assertEqual({k: service.get(k) for k in SANDBOX}, SANDBOX)
-        # RUN_DIR is the dispatcher's lock folder too: the unit must never remove it when it stops.
-        self.assertEqual(service['RuntimeDirectoryPreserve'], 'yes')
+
+    def test_the_service_cannot_write_run_dir(self):
+        """/run/fork-fleet holds the root launcher's lock and the jobs' environment files (root opens them outside any
+        sandbox): no RuntimeDirectory= (it would make the folder writable) and no other write path under /run."""
+        service = unit('fork-fleet-refresh.service')['Service']
+        self.assertFalse([k for k in service if k.startswith('RuntimeDirectory')])
+        for key in ('ReadWritePaths', 'BindPaths', 'StateDirectory', 'LogsDirectory', 'CacheDirectory'):
+            self.assertFalse([p for p in service.get(key, '').split() if p.lstrip('-+').startswith('/run')], key)
 
     def test_the_service_writes_the_templates_own_folder_only(self):
         """The writable folder is the default template's own folder, and none of the files root runs (the launcher,
@@ -916,6 +979,50 @@ class Timer(unittest.TestCase):
         with open(os.path.join(os.path.dirname(HERE), 'fork-fleet.md')) as f:
             runbook = f.read()
         self.assertIn(f'mv -T /opt/fork-fleet/runner-template {default_template()}', runbook)   # the move, once
+
+    def test_the_runbooks_move_is_safe_to_run_again(self):
+        """Host step 7's one-time move, run as written (its places pointed at a temp folder): it finishes when run
+        again after it stopped half-way (template moved, launch.conf not yet changed), does nothing harmful a third
+        time, and removes the temp folders a refresh killed under the old layout left beside the launcher."""
+        if not shutil.which('flock'):
+            self.skipTest('no flock')
+        with open(os.path.join(os.path.dirname(HERE), 'fork-fleet.md')) as f:
+            line = next(x.strip()[2:].strip() for x in f if 'mv -T /opt/fork-fleet/runner-template' in x)
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        line = line.replace('/opt/', f'{d}/opt/').replace('/run/', f'{d}/run/').replace('/etc/', f'{d}/etc/')
+        os.makedirs(f'{d}/opt/fork-fleet/runner-template')
+        os.makedirs(f'{d}/opt/fork-fleet/.runner-template.refresh.AbC123/new')
+        os.makedirs(f'{d}/etc/fork-fleet')
+        conf = f'{d}/etc/fork-fleet/launch.conf'
+
+        def write_conf():
+            with open(conf, 'w') as f:
+                f.write('RUNNER_USERS=a\nTEMPLATE=/opt/fork-fleet/runner-template\n')
+
+        def run():
+            return subprocess.run(['bash', '-c', line], capture_output=True, text=True, timeout=60)
+
+        write_conf()
+        os.chmod(conf, 0o400)   # sed fails: it stops half-way, after the move
+        os.chmod(f'{d}/etc/fork-fleet', 0o500)
+        self.assertNotEqual(run().returncode, 0)
+        os.chmod(f'{d}/etc/fork-fleet', 0o700)
+        os.chmod(conf, 0o600)
+        self.assertTrue(os.path.isdir(f'{d}/opt/fork-fleet/template/runner-template'))
+        for _ in range(2):   # again: it finishes; and once more: still fine
+            got = run()
+            self.assertEqual(got.returncode, 0, got.stderr)
+            with open(conf) as f:
+                self.assertEqual(f.read(), 'RUNNER_USERS=a\n')
+            self.assertEqual(sorted(os.listdir(f'{d}/opt/fork-fleet')), ['template'])
+            self.assertEqual(os.listdir(f'{d}/opt/fork-fleet/template'), ['runner-template'])
+
+    def test_the_runbook_names_no_file_count(self):
+        """Host step 3's file list grows with each fleet part: a count in the text beside it goes stale."""
+        with open(os.path.join(os.path.dirname(HERE), 'fork-fleet.md')) as f:
+            runbook = f.read()
+        self.assertNotRegex(runbook, r'All (two|three|four|five|six|seven|eight|nine|ten|\d+) are fetched')
 
     def test_systemd_rates_the_sandbox_ok(self):
         """systemd-analyze security, offline (reads the file only): exposure 4.0 or less, "OK"."""

@@ -102,11 +102,27 @@ setup() {
   launch_lock
 }
 
-# The launch lock alone (RUN_DIR made and checked already): refresh takes it without touching WORK_ROOT, which its
-# sandboxed service cannot write.
+# The launch lock alone (RUN_DIR made and checked already).
 launch_lock() {
-  exec {lock}>"$RUN_DIR/launch.lock"
+  launch_lock_open
   flock -w 100 "$lock" || die "another launcher holds $RUN_DIR/launch.lock"
+}
+
+# Opens RUN_DIR/launch.lock read-only (flock needs no more) as $lock, never through a link: root runs this outside any
+# sandbox, and a plain `>` would truncate whatever a link planted there points to (the job hook, launch.conf). Made
+# empty when missing (noclobber: O_EXCL, which a dangling link fails too); a link or anything but a plain file is
+# refused. The sandboxed refresh service cannot write RUN_DIR: it only opens the file the dispatcher's first prune or
+# start made (or a refresh by hand).
+launch_lock_open() {
+  local path=$RUN_DIR/launch.lock outcome=${1:-nothing changed}
+  if [[ ! -e $path && ! -L $path ]]; then
+    (set -o noclobber && : >"$path") 2>/dev/null || [[ -e $path || -L $path ]] ||
+      die "there is no $path yet and this launcher may not make it (the refresh service only reads $RUN_DIR): the" \
+        "dispatcher's next prune or start makes it; $outcome"
+  fi
+  [[ -f $path && ! -L $path ]] ||
+    die "$path is a symlink or not a plain file: refused (only root writes $RUN_DIR: find out who made it); $outcome"
+  exec {lock}<"$path"
 }
 
 # The first file under $1 that a template must not have: one not this user's, one others may write, a special file
@@ -256,6 +272,9 @@ try:
     tar = tarfile.open(src, 'r:gz', tarinfo=Capped)
     members = []
     for m in tar:
+        # Each name as it is read: many long names would fill memory before a check after the loop.
+        if len(m.name) > MAX_NAME or len(m.linkname) > MAX_NAME:
+            no(f'a name or link target longer than {MAX_NAME}: {m.name[:100]!r}')
         members.append(m)
         if len(members) > MAX_ENTRIES:
             no(f'more than {MAX_ENTRIES} entries')
@@ -264,8 +283,6 @@ except (tarfile.TarError, OSError, EOFError, zlib.error) as e:
 
 kinds, links, order, plan, total = {}, {}, {}, [], 0
 for i, m in enumerate(members):
-    if len(m.name) > MAX_NAME or len(m.linkname) > MAX_NAME:
-        no(f'a name or link target longer than {MAX_NAME}: {m.name[:100]!r}')
     p = parts(m.name)
     if m.isdir():
         kind = 'dir'
@@ -410,7 +427,8 @@ runner_platform() {
 # TEMPLATE (one filesystem, so the swap is a rename), checked, flushed to disk, then swapped in under the launch lock:
 # no start copies a half-swapped template, and running jobs keep their copies (hard links of the old files). A cut
 # download, a bad checksum or any other failure leaves the old template as it was; the temp folder goes on exit, and a
-# leftover of a run that was killed goes with the next one. Two refreshes run one after the other (refresh.lock).
+# leftover of a run that was killed goes with the next one. Two refreshes run one after the other (a lock on TEMPLATE's
+# folder). It writes nothing else: RUN_DIR's launch lock is only opened read-only.
 refresh() {
   local base parent platform meta out newest sum have='' floor='' lowest tmp url f bad
   base=${TEMPLATE##*/} parent=${TEMPLATE%/*}
@@ -434,11 +452,18 @@ refresh() {
       die "refresh: $parent holds ${f##*/}, not only the template: the template must have a folder of its own (the" \
         "only one the refresh service may write). Move it once: .github/fork-fleet.md, host step 7"
   done
-  mkdir -p -- "$RUN_DIR"
+  # Two refreshes: one after the other, by a lock on the template's folder itself (opened read-only: refresh writes
+  # nothing outside that folder; the sandboxed service can write nothing else).
+  exec {rlock}<"$parent"
+  flock -w 1800 "$rlock" || die "refresh: another refresh still holds $parent after 30 minutes"
+  # RUN_DIR: only read here (the service cannot write it). Made when missing only by a refresh by hand (as setup does).
+  if [[ ! -e $RUN_DIR && ! -L $RUN_DIR ]]; then
+    mkdir -m 0700 -- "$RUN_DIR" 2>/dev/null ||
+      die "refresh: there is no $RUN_DIR yet and this refresh may not make it: the dispatcher's next prune or start" \
+        "makes it; the template stays as it is"
+  fi
   owned_safe "$RUN_DIR"
-  chmod 0700 -- "$RUN_DIR"
-  exec {rlock}>"$RUN_DIR/refresh.lock"
-  flock -w 1800 "$rlock" || die "refresh: another refresh still holds $RUN_DIR/refresh.lock after 30 minutes"
+  launch_lock_open 'the template stays as it is' # before any download: a refresh that could not swap fetches nothing
   for tmp in "$parent/.$base.refresh."*; do
     if [[ -e $tmp || -L $tmp ]]; then rm -rf --one-file-system -- "$tmp"; fi
   done
@@ -511,7 +536,7 @@ refresh() {
     die "refresh: $url has ${bad#"$tmp/new/"}, a file a template must not have: the template stays as it is"
   sync -f -- "$tmp/new" # the files are on disk before their name is: a power cut leaves the old or the new one
 
-  launch_lock
+  flock -w 100 "$lock" || die "refresh: another launcher holds $RUN_DIR/launch.lock: the template stays as it is"
   if [[ -e $TEMPLATE || -L $TEMPLATE ]]; then
     owned_safe "$TEMPLATE"
     python3 -I -c "$EXCHANGE_PY" "$tmp/new" "$TEMPLATE" ||
@@ -733,6 +758,8 @@ start() {
   dir=$WORK_ROOT/$name
   env_file=$RUN_DIR/$name.env
   [[ ! -e $dir ]] || die "$dir exists: a runner of that name ran already (prune removes it once its unit is gone)"
+  [[ ! -e $env_file && ! -L $env_file ]] ||
+    die "$env_file exists: refused (prune removes a plain leftover once no unit of that name is loaded)"
   user=$(free_user)
   reset_user "$user"
   net_up "$user"
@@ -746,12 +773,16 @@ start() {
   mkdir -m 0700 -- "$dir/home" "$dir/tmp"
   chown -- "$user:" "$dir" "$dir/home" "$dir/tmp"
   chmod 0700 -- "$dir"
-  {
-    printf 'ACTIONS_RUNNER_INPUT_JITCONFIG=%s\n' "${got[ACTIONS_RUNNER_INPUT_JITCONFIG]}"
-    printf 'FORK_FLEET_RUN=%s\nFORK_FLEET_ATTEMPT=%s\n' "${got[FORK_FLEET_RUN]}" "${got[FORK_FLEET_ATTEMPT]}"
-    printf 'HOME=%s\nTMPDIR=%s\n' "$dir/home" "$dir/tmp"
-    printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HOOK"
-  } >"$env_file"
+  # noclobber: a new file (O_EXCL), never one, or a link, someone put there (root would write through it).
+  (
+    set -o noclobber
+    {
+      printf 'ACTIONS_RUNNER_INPUT_JITCONFIG=%s\n' "${got[ACTIONS_RUNNER_INPUT_JITCONFIG]}"
+      printf 'FORK_FLEET_RUN=%s\nFORK_FLEET_ATTEMPT=%s\n' "${got[FORK_FLEET_RUN]}" "${got[FORK_FLEET_ATTEMPT]}"
+      printf 'HOME=%s\nTMPDIR=%s\n' "$dir/home" "$dir/tmp"
+      printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=%s\n' "$HOOK"
+    } >"$env_file"
+  ) || die "start: could not make $env_file, a new file: refused"
   # Type=exec: systemd-run returns once run.sh started, so the environment file has been read and can go.
   # ProtectSystem=strict: the job writes its copy and its own memory file systems, nothing else.
   "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" --working-directory "$dir" \
