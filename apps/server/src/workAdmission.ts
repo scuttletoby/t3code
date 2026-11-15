@@ -12,11 +12,21 @@ import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
-/** The parts of the server that must use one shared gate before an update may hold it. */
-export const WORK_ADMISSION_CONSUMERS = ["outbox", "thread-launch", "recovery"] as const;
+/** The parts of the server that must use one shared gate before an update may hold it, or before
+ * `serve --hold-work` may serve. The scheduler runs every timed source (scheduled tasks, waits,
+ * usage-limit recovery, webhooks, usage refresh). */
+export const WORK_ADMISSION_CONSUMERS = [
+  "outbox",
+  "thread-launch",
+  "recovery",
+  "scheduler",
+] as const;
 export type WorkAdmissionConsumer = (typeof WORK_ADMISSION_CONSUMERS)[number];
 
 export const UPDATE_HOLD_MARKER_FILE = "work-held-for-update.json";
+/** Fork: `serve --hold-work` holds the gate from boot to exit; nothing in the process opens it. */
+export const HOLD_WORK_BOOT_MESSAGE =
+  "Work is held (--hold-work): no agent turn, launch, scheduled task, wait, usage-limit resume, project pull or linked-environment follow-up starts until this server restarts without the flag. Provider status checks still run. The server is not broken.";
 /** An older marker is left over from a hold that ended without clearing it, not this restart. */
 export const UPDATE_HOLD_MAX_AGE_MS = 2 * 60 * 60_000;
 
@@ -119,6 +129,8 @@ export interface HeldPreparation {
 export interface WorkAdmissionGate {
   /** False for the default pass-through: nothing is held, so callers must not rely on `hold`. */
   readonly enforced: boolean;
+  /** `serve --hold-work`: held from boot until the process exits; `release` keeps it held. */
+  readonly heldFromBoot: boolean;
   /** Runs `effect` once the gate is open, counting it as in flight while it runs. */
   readonly admit: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   /** Closes the gate. New work waits; returns how many admitted units are still running. */
@@ -179,10 +191,11 @@ const markerSince = (hold: UpdateHold, nowMs: number) => {
 };
 
 export const makeWorkAdmissionGate = Effect.fn("workAdmission.makeWorkAdmissionGate")(function* (
-  options: { readonly marker?: UpdateHoldStore } = {},
+  options: { readonly marker?: UpdateHoldStore; readonly heldFromBoot?: boolean } = {},
 ) {
   const marker = options.marker ?? noMarker;
-  const state = yield* Ref.make<GateState>({ held: false, inFlight: 0 });
+  const heldFromBoot = options.heldFromBoot === true;
+  const state = yield* Ref.make<GateState>({ held: heldFromBoot, inFlight: 0 });
   const registered = yield* Ref.make(new Set<WorkAdmissionConsumer>());
   // The fresh marker as this process last read or wrote it.
   const freshMarker = yield* Ref.make<UpdateHold | undefined>(undefined);
@@ -203,7 +216,7 @@ export const makeWorkAdmissionGate = Effect.fn("workAdmission.makeWorkAdmissionG
   const resumer = yield* Ref.make<
     ((preparation: HeldPreparation) => Effect.Effect<void>) | undefined
   >(undefined);
-  const open = yield* Latch.make(true);
+  const open = yield* Latch.make(!heldFromBoot);
   const admit = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -227,6 +240,7 @@ export const makeWorkAdmissionGate = Effect.fn("workAdmission.makeWorkAdmissionG
     );
   const gate: WorkAdmissionGate = {
     enforced: true,
+    heldFromBoot,
     admit,
     hold: Effect.gen(function* () {
       const inFlight = yield* Ref.modify(state, (current): [number, GateState] => [
@@ -237,11 +251,13 @@ export const makeWorkAdmissionGate = Effect.fn("workAdmission.makeWorkAdmissionG
       return inFlight;
     }),
     // The marker goes first: work released here must not be restarted by a later startup.
-    release: marker.clear.pipe(
-      Effect.andThen(Ref.update(state, (current) => ({ ...current, held: false }))),
-      Effect.andThen(open.open),
-      Effect.asVoid,
-    ),
+    release: heldFromBoot
+      ? Effect.logWarning("Work stays held: this server was started with --hold-work.")
+      : marker.clear.pipe(
+          Effect.andThen(Ref.update(state, (current) => ({ ...current, held: false }))),
+          Effect.andThen(open.open),
+          Effect.asVoid,
+        ),
     inFlight: Ref.get(state).pipe(Effect.map((current) => current.inFlight)),
     isHeld: Ref.get(state).pipe(Effect.map((current) => current.held)),
     register: (consumer) => Ref.update(registered, (current) => new Set([...current, consumer])),
@@ -287,7 +303,10 @@ export const makeWorkAdmissionGate = Effect.fn("workAdmission.makeWorkAdmissionG
     ),
     heldWorkSettled: Ref.get(settled),
     setHeldWorkStarter: (start) => Ref.set(heldWorkStarter, start),
-    startHeldWork: Ref.get(heldWorkStarter).pipe(Effect.flatMap((start) => start ?? Effect.void)),
+    // Held from boot: the marker stays for the next start without the flag, which starts it.
+    startHeldWork: heldFromBoot
+      ? Effect.void
+      : Ref.get(heldWorkStarter).pipe(Effect.flatMap((start) => start ?? Effect.void)),
     setPreparationResumer: (resume) => Ref.set(resumer, resume),
     resumePreparation: (preparation) =>
       Ref.get(resumer).pipe(
@@ -306,6 +325,7 @@ export const makeWorkAdmissionGate = Effect.fn("workAdmission.makeWorkAdmissionG
 
 const passThrough: WorkAdmissionGate = {
   enforced: false,
+  heldFromBoot: false,
   admit: (effect) => effect,
   hold: Effect.succeed(0),
   release: Effect.void,
