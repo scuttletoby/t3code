@@ -2,7 +2,7 @@
 """Tests of fork-fleet-desk-seed.py (a desk pool's warm caches) and the `seeds` check of fork-fleet.json: the host's
 offer in-process, the desktop's run end to end through a fake ssh that runs the host's side, and the forced command's
 divert in fork-fleet-desk.py. Temp folders only; no root, no ssh, no network. Run: python3 -I -B <this>. Linux only."""
-import fcntl, hashlib, importlib.util, io, json, os, shutil, stat, subprocess, sys, tarfile, tempfile, threading
+import contextlib, fcntl, hashlib, importlib.util, io, json, os, shutil, stat, subprocess, sys, tarfile, tempfile, threading
 import time, unittest
 from unittest import mock
 
@@ -44,13 +44,19 @@ except FileNotFoundError:
 if mode == 'down':
     print('ssh: connect to host h port 22: No route to host', file=sys.stderr)
     sys.exit(255)
+if words[0] == 'seeds' and mode == 'oldhost':   # a host on an older kit: a serve session, not a list
+    print('fork-fleet-desk: serving')
+    sys.exit(0)
+if words[0] == 'seeds' and mode == 'exit1':     # a host stopped half-way through its install
+    print('fork-fleet-desk: no config', file=sys.stderr)
+    sys.exit(1)
 kw = dict(config={t!r} + '/fork-fleet.json', files={t!r} + '/files')
 if words[0] == 'seeds' and mode == 'biglist':
     os.write(1, b' ' * (2 << 20))
 if mode == 'noisy':
     for _ in range(64):
         os.write(2, b'x' * (1 << 16) + b'\\n')
-if words[0] == 'seed' and mode in ('cut', 'trailer', 'odd'):
+if words[0] == 'seed' and mode in ('cut', 'trailer', 'odd', 'made1'):
     with open({t!r} + '/sent', 'w+b') as out:
         err = io.StringIO()
         code = seed.offer({pool!r}, ' '.join(words), {t!r} + '/run', out=out.fileno(), err=err, **kw)
@@ -62,6 +68,8 @@ if words[0] == 'seed' and mode in ('cut', 'trailer', 'odd'):
     os.write(1, data)
     if mode == 'odd':   # a MADE that str.isdigit() takes but int() does not
         print(err.getvalue().rsplit(' ', 1)[0] + ' \u00b2', file=sys.stderr)
+    elif mode == 'made1':   # bytes and sha256 right, MADE not the list's
+        print(err.getvalue().rsplit(' ', 1)[0] + ' 1', file=sys.stderr)
     else:
         print(err.getvalue().rsplit(' ', 2)[0] + ' ' + '0' * 64 + ' 1', file=sys.stderr)   # a wrong sha256
     sys.exit(code)
@@ -72,7 +80,7 @@ sys.exit(seed.offer({pool!r}, ' '.join(words), {t!r} + '/run', **kw))
 class Base(unittest.TestCase):
     def setUp(self):
         self.t = os.path.realpath(tempfile.mkdtemp(prefix='seed-test-'))
-        self.addCleanup(shutil.rmtree, self.t, True)
+        self.addCleanup(seed.remove, self.t)   # a tree of any depth
         for d in ('files', f'files/{POOL}', 'run', 'src'):
             os.mkdir(os.path.join(self.t, d), 0o755)
         self.config(SEEDS)
@@ -422,7 +430,8 @@ class Desktop(Base):
                 st = os.lstat(os.path.join(d, n))
                 if not stat.S_ISLNK(st.st_mode):   # a link's own mode is always 0777 and means nothing
                     self.assertFalse(st.st_mode & 0o022, os.path.join(d, n))
-        label = json.load(open(os.path.join(seed.current(self.root, 'm2')[0], 'label.json')))
+        with open(os.path.join(seed.current(self.root, 'm2')[0], 'label.json')) as f:
+            label = json.load(f)
         self.assertEqual(label['bytes'], os.path.getsize(self.tar('m2')))
         self.assertEqual(self.run_seed(), 0)   # the same seed on the host: nothing fetched
         self.assertEqual(self.fetches(), ['seed m2'])
@@ -514,6 +523,7 @@ class Desktop(Base):
     def test_a_0600_file_is_readable_by_jobs(self):
         self.make('m2', {'cache/entry': b'x', 'cache/tool': b'#!/bin/sh\n'}, mode=0o600)
         self.run_seed()
+        self.assertEqual(self.files('m2'), {'cache/entry': b'x', 'cache/tool': b'#!/bin/sh\n'}, self.said)
         top = os.path.realpath(os.path.join(self.root, 'm2'))
         for d, dirs, names in os.walk(top):
             for n in dirs + names:
@@ -571,6 +581,157 @@ class Desktop(Base):
                 self.torn(evil, 'Error')
                 for d, dirs, names in os.walk(self.t):
                     self.assertNotIn('escaped', dirs + names, d)
+
+    def deep_tar(self, name, depth, count=1, size=0):
+        """FILES/POOL/NAME.tar of COUNT members d{i}/x/x/.../f, DEPTH folders deep, newer than any made before."""
+        tmp = os.path.join(self.t, 'files', POOL, f'.{name}.tmp')
+        with tarfile.open(tmp, 'w', format=tarfile.GNU_FORMAT) as tar:
+            for i in range(count):
+                info = tarfile.TarInfo(f'd{i}/' + 'x/' * depth + 'f')
+                info.size = size
+                tar.addfile(info, io.BytesIO(b'z' * size))
+        os.utime(tmp, (time.time() + 5,) * 2)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, self.tar(name))
+
+    def deep_folder(self, top, depth):
+        """TOP/x/x/.../f, DEPTH folders deep, made folder by folder (a path that long is past PATH_MAX)."""
+        os.makedirs(top)
+        fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for _ in range(depth):
+                os.mkdir('x', dir_fd=fd)
+                child = os.open('x', os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            os.close(os.open('f', os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd))
+        finally:
+            os.close(fd)
+
+    def test_a_deep_path_does_not_stop_the_run(self):
+        self.make('npm', {'a': b'n'})
+        self.deep_tar('m2', 1500)
+        self.assertEqual(self.run_seed(), 0)
+        self.assertEqual(self.files('npm'), {'a': b'n'})
+        self.assertIsNone(self.files('m2'))
+        self.assertTrue(any('m2' in s and 'folders deep' in s for s in self.said), self.said)
+        self.assertEqual(os.listdir(os.path.join(self.root, '.new')), ['.lock'])
+
+    def test_any_failure_of_one_seed_never_stops_the_run_and_old_versions_are_still_pruned(self):
+        os.makedirs(os.path.join(self.root, '.v', 'm2.1', 'data'))   # a version no link names, long replaced
+        os.utime(os.path.join(self.root, '.v', 'm2.1'), (1, 1))
+        self.make('npm', {'a': b'n'})
+        self.deep_tar('m2', 1500)
+        real = seed.fetch
+
+        def broken(agent_, conf, item, root, now):
+            if item['name'] == 'm2':
+                raise RuntimeError('anything at all')
+            return real(agent_, conf, item, root, now)
+        with mock.patch.object(seed, 'fetch', broken):
+            self.assertEqual(self.run_seed(), 0)
+        self.assertEqual(self.files('npm'), {'a': b'n'})
+        self.assertTrue(any('m2' in s and 'RuntimeError' in s for s in self.said), self.said)
+        self.assertFalse(os.path.exists(os.path.join(self.root, '.v', 'm2.1')))
+        # a path deeper than Python's recursion allows, past the depth check: said, cleaned up, the run goes on
+        shutil.rmtree(self.root)
+        with mock.patch.object(seed, 'DEPTH', 10 ** 6), mock.patch.object(seed, 'NAME_MOST', 10 ** 6), \
+                mock.patch.object(seed, 'ENTRY', 0):
+            self.assertEqual(self.run_seed(), 0)
+        self.assertTrue(any('m2' in s and 'RecursionError' in s for s in self.said), self.said)
+        self.assertEqual(self.files('npm'), {'a': b'n'})
+        self.assertIsNone(self.files('m2'))
+        self.assertEqual(os.listdir(os.path.join(self.root, '.new')), ['.lock'])
+
+    def test_a_tree_deeper_than_recursion_left_by_an_older_run_is_removed(self):
+        self.make('m2', {'a': b'one'})
+        self.run_seed()
+        self.deep_folder(os.path.join(self.root, '.new', 'm2.5'), 1500)          # a torn unpack of an older release
+        self.deep_folder(os.path.join(self.root, '.v', 'm2.6', 'data'), 1500)    # a version it left, long replaced
+        os.utime(os.path.join(self.root, '.v', 'm2.6'), (1, 1))
+        self.assertEqual(self.run_seed(), 0)
+        self.assertEqual(os.listdir(os.path.join(self.root, '.new')), ['.lock'])
+        self.assertEqual(os.listdir(os.path.join(self.root, '.v')),
+                         [os.path.basename(seed.current(self.root, 'm2')[0])])
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+
+    def test_folders_count_against_max_mb(self):
+        self.deep_tar('m2', 900, count=150)
+        self.run_seed()
+        self.assertLess(sum(len(d) for _, d, _ in os.walk(self.root)), 100000)
+        self.assertIsNone(self.files('m2'))
+        cases = [('1220 folders', 'max_mb', lambda: self.deep_tar('m2', 60, count=20)),
+                 ('600 empty files', 'max_mb', lambda: self.make('m2', {f'f{i}': b'' for i in range(600)},
+                                                                 mtime=time.time() + 5)),
+                 ('a long name', 'over 1024 bytes', lambda: self.make('m2', {'/'.join(['y' * 120] * 10): b'x'},
+                                                                      mtime=time.time() + 5))]
+        for case, why, setup in cases:
+            with self.subTest(case):
+                shutil.rmtree(self.root, True)
+                self.torn(setup, why)
+
+    def test_the_trailers_bytes_and_made_must_be_the_lists(self):
+        self.torn(lambda: (self.make('m2', {'a': b'two'}, mtime=time.time() + 5), self.mode('made1')),
+                  'does not match the list')
+        t0 = time.time() + 7 * 3600
+        for h in range(5):   # each hour tries again; a copy dated 1 is never swapped in, so none piles up in .v
+            self.run_seed(now=lambda: t0 + h * 3600)
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+        self.assertEqual(len(os.listdir(os.path.join(self.root, '.v'))), 1)
+        os.unlink(os.path.join(self.t, 'mode'))
+        shutil.rmtree(self.root)
+        real = seed.listing
+
+        def lying(*a):
+            out = real(*a)
+            out['m2'] = {**out['m2'], 'bytes': out['m2']['bytes'] + 512}
+            return out
+        lie = mock.patch.object(seed, 'listing', lying)
+        self.addCleanup(lie.stop)
+        self.torn(lambda: (self.make('m2', {'a': b'two'}, mtime=time.time() + 5), lie.start()),
+                  'does not match the list')
+
+    def test_a_broken_or_pool_less_own_config_still_drops_a_too_old_seed(self):
+        for why in ('broken', 'pool-less'):
+            with self.subTest(why):
+                shutil.rmtree(self.root, True)
+                self.own(SEEDS)
+                self.make('m2', {'a': b'one'})
+                self.run_seed()
+                with open(os.path.join(self.t, 'own.json'), 'w') as f:
+                    if why == 'broken':
+                        f.write('{')
+                    else:
+                        cfg = json.loads(json.dumps(CONFIG))
+                        cfg['pools'][0]['name'] = 'not-this-pool'
+                        json.dump(cfg, f)
+                fetched = len(self.fetches())
+                with self.assertRaisesRegex(agent.Bad, 'no seeds fetched'):
+                    self.run_seed(now=lambda: time.time() + 999 * 3600)
+                self.assertEqual(self.files('m2'), {'a': b'one'})   # under its label's max_age_hours: kept
+                with self.assertRaises(agent.Bad):
+                    self.run_seed(now=lambda: time.time() + 1001 * 3600)
+                self.assertIsNone(self.files('m2'))
+                self.assertTrue(any('older than 1000 h' in s for s in self.said), self.said)
+                self.assertEqual(len(self.fetches()), fetched)
+
+    def test_an_older_or_half_installed_host_means_no_seeds(self):
+        for mode in ('oldhost', 'exit1'):
+            with self.subTest(mode):
+                shutil.rmtree(self.root, True)
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(self.t, 'mode'))
+                self.make('m2', {'a': b'one'})
+                self.run_seed()
+                fetched = len(self.fetches())
+                self.mode(mode)
+                self.make('m2', {'a': b'two'}, mtime=time.time() + 5)
+                self.assertEqual(self.run_seed(now=lambda: time.time() + 999 * 3600), 0)
+                self.assertEqual(self.files('m2'), {'a': b'one'})
+                self.assertTrue(any('stays until its age drops it' in s for s in self.said), self.said)
+                self.assertEqual(self.run_seed(now=lambda: time.time() + 1001 * 3600), 0)
+                self.assertIsNone(self.files('m2'))
+                self.assertEqual(len(self.fetches()), fetched)
 
     def test_dropped_when_no_longer_listed_or_too_old_or_from_the_future(self):
         self.make('m2', {'a': b'one'})

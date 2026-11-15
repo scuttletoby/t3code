@@ -47,6 +47,8 @@ if name == 'ssh-keygen':
     open(key + '.pub', 'w').write('ssh-ed25519 AAAAfake desk-x\n')
 if name == 'systemctl' and args[0] in ('is-active', 'is-enabled'):
     sys.exit(1 if args[-1] in lines('down') else 0)
+if name == 'systemctl' and args[:3] == ['show', '-p', 'Result']:   # a unit's last result: the file `result`
+    print((lines('result') or ['success'])[0])
 if name == 'systemctl' and args[0] == 'list-units':   # runner units: the file `units`; `stuck` ones never stop
     print(''.join(f'{u} loaded active running runner\n' for u in lines('units')), end='')
 if name == 'systemctl' and args[0] == 'stop':
@@ -515,6 +517,7 @@ class Desk(unittest.TestCase):
         self.write(os.path.join(self.fakes, 'wall-fails'), '')
         self.write(os.path.join(self.fakes, 'agent-bad'), '')
         self.write(os.path.join(self.fakes, 'down'), 'fork-fleet-desk-agent.service\n')
+        self.write(os.path.join(self.fakes, 'result'), 'exit-code\n')   # the seed service failed its last run
         self.write(self.path('/opt/fork-fleet/hook.sh'), '#!/bin/bash\nevil\n', 0o755)
         self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '0\n')
         os.unlink(os.path.join(self.fakes, 'users'))
@@ -523,10 +526,10 @@ class Desk(unittest.TestCase):
         for line in ('FAIL  kit  /opt/fork-fleet/hook.sh: differs', 'FAIL  vsock  closed: open',
                      'FAIL  agent-settings  bad settings', 'FAIL  unit  fork-fleet-desk-agent.service',
                      'PASS  unit  t3code-fleet-refresh.timer', 'PASS  unit  t3code-fleet-seed.timer',
-                     'FAIL  template', 'FAIL  runner-user  fork-runner-1',
-                     'FAIL  ip-forward'):
+                     'FAIL  unit  t3code-fleet-seed.service last run: exit-code', 'FAIL  template',
+                     'FAIL  runner-user  fork-runner-1', 'FAIL  ip-forward'):
             self.assertIn(line, out)
-        self.assertTrue(out.endswith('8 FAIL\n'), out)
+        self.assertTrue(out.endswith('9 FAIL\n'), out)
 
     def test_check_fails_on_a_drop_in_and_on_settings_the_machine_file_no_longer_gives(self):
         self.assertEqual(self.install()[0], 0)

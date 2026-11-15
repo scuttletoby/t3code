@@ -721,10 +721,20 @@ The desktop's side is the same script's `run`, hourly from
 names its own installed fleet config lists for its pool, and holds them to
 its own `every_hours` and `max_age_hours` and the smaller of its own and the
 host's `max_mb`: a host cannot make a desktop take more. Each new seed is
-unpacked with Python's tar data filter (members' sizes and count limited
-too), checked against the trailer, checked again for links that lead out of
+unpacked with Python's tar data filter and a limit on what it would make on
+disk (each member's size plus 4 KiB for it and for each folder it makes, all
+within `max_mb`; at most 200,000 members and folders; no member more than 64
+folders deep or with a name over 1 KiB), checked against the trailer (its size
+and date must be the list's too), checked again for links that lead out of
 it, made readable by every job (a cache's 0600 files too), and swapped in by a
-rename; ssh's stderr and the list are read with a limit. Jobs see
+rename; ssh's stderr and the list are read with a limit. A seed that fails in
+any way is named in the log and the run goes on with the next; old copies
+are pruned in every run. A host that gives no list (down, an older kit, a
+half-done install) means no new seeds: each one here stays until its age
+drops it. A desktop whose own fleet config is broken or lacks its pool fetches
+nothing and exits 2 (`desk-install check` shows the seed service's last
+result), but still drops each seed past the `max_age_hours` it was fetched
+with. Jobs see
 `/var/lib/fork-fleet/seeds/NAME` read-only (the launcher's `ALLOW_PATHS`;
 the unpacking and old copies beside it, `.new` and `.v`, are visible too and
 hold the same data), copy what they need from it when it is there, and run

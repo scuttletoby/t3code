@@ -507,6 +507,9 @@ def check():
         on = run('systemctl', 'is-active', '--quiet', unit, check=False).returncode == 0
         row(on and run('systemctl', 'is-enabled', '--quiet', unit, check=False).returncode == 0, 'unit',
             f'{unit} enabled and active')
+    last = run('systemctl', 'show', '-p', 'Result', '--value', SEED, check=False).stdout.strip() or 'unknown'
+    row(last == 'success', 'unit', f'{SEED} last run: {last}' + ('' if last == 'success' else
+                                                                  f' (journalctl -u {SEED} says why)'))
     row(os.path.exists(p(OPT + '/template/runner-template/.fork-fleet-version')), 'template',
         'the runner template is there (the refresh timer makes it)')
     try:

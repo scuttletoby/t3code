@@ -51,7 +51,8 @@ the refresh timer; `check` says FAIL for `template` until it is there.
 
 `check` only reads: the installed files against their manifest, each unit against the release's (header plus
 `/opt/fork-fleet/units/UNIT`), a restart a stopped install still owes, systemd drop-ins that change the kit's units,
-every wall of this OS (`fork-fleet-walls.py describe`), the agent's settings, the units, the template, the settings
+every wall of this OS (`fork-fleet-walls.py describe`), the agent's settings, the units (and the seed service's
+last result), the template, the settings
 files against the machine file, the runner users (and names a user the kit made that a smaller `slots` no longer
 uses) and IPv4 forwarding.
 

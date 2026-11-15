@@ -17,7 +17,9 @@ own beside the agent's:
                      the desktop, as root, hourly (t3code-fleet-seed.timer), with the agent's settings (FILE, default
                      its CONF). Only names its own installed fleet config lists for its POOL, held to its own
                      every_hours and max_age_hours and the smaller of its own and the host's max_mb. Each new seed is
-                     unpacked with tarfile's data filter into a folder of its own, checked against the trailer, walked
+                     unpacked with tarfile's data filter into a folder of its own (what it would make on disk held
+                     to max_mb, ENTRY bytes counted for each member and folder; no member over DEPTH folders deep or
+                     a name over NAME_MOST bytes), checked against the trailer (bytes and MADE the list's too), walked
                      (a link out of it is refused; all made readable), flushed, and swapped in by rename: SEEDS/NAME is a link to
                      .v/NAME.STAMP/data, root's (folders 0755, files no one else may write), unpacked in .new
                      (one folder: a rename never crosses a mount of the unit's sandbox). Jobs see SEEDS read-only
@@ -27,13 +29,20 @@ own beside the agent's:
 Each run (one at a time: a lock) meets this state:
   the same seed on the host (bytes and MADE)   nothing is fetched
   a new one under every_hours after the last   nothing yet
-  a torn copy (the stream cut or past FETCH_WAIT, a trailer that does not match, more than max_mb, a tar member
-  that would leave its folder or is a device)  the copy is removed, the old seed stays, the next hour tries again
+  a torn copy (the stream cut or past FETCH_WAIT, a trailer that does not match it or the list, more than max_mb,
+  a tar member that would leave its folder, is a device, too deep or too long, or any other error)
+                                               the copy is removed, the old seed stays, the next hour tries again;
+                                               the other seeds go on, old versions are still pruned
   no seed (never fetched, the host down)       jobs run cold
+  no list (the host down, an older kit that answers with a session or not JSON, exit 1 of a half-done install)
+                                               nothing fetched; each seed stays until its age drops it
+  its own fleet config broken or without POOL  nothing fetched, exit 2; a seed older than its label's maxAgeHours
+                                               (its own max_age_hours when it was fetched) is still dropped
   older than max_age_hours, made over SKEW in the future (the clocks disagree), or no longer in the pool's list
                                                the link is removed: jobs run cold
   a label that is missing or unreadable        the link is removed and the seed fetched again in the same run
-  a run that stopped half-way                  SEEDS/.new is emptied by the next run; a link is the old one or the new
+  a run that stopped half-way                  SEEDS/.new is emptied by the next run (folder by folder, a tree of
+                                               any depth); a link is the old one or the new
   a replaced version                           kept KEEP_OLD after it was replaced, for a job still reading it (a job
                                                runs at most the launcher's MAX_SECONDS, 1 h by default), then removed
 
@@ -45,7 +54,7 @@ desktop takes less than WRITE bytes in STALL seconds or the whole file not by it
 MIN_RATE bytes a second): the pool's lock is then let go.
 Standard library only.
 """
-import argparse, fcntl, hashlib, importlib.util, json, math, os, re, shutil, signal, stat, subprocess, sys
+import argparse, fcntl, hashlib, importlib.util, json, math, os, re, signal, stat, subprocess, sys
 import tarfile, threading, time
 
 sys.dont_write_bytecode = True
@@ -69,6 +78,7 @@ LIST_MOST, ERR_KEEP, MEMBERS = 1 << 20, 4096, 200_000   # the list's bytes, ssh'
 KEEP_OLD, SKEW = 24 * 3600, 3600       # SKEW: how far the host's clock may be ahead of the desktop's
 PIECE, WRITE, STALL, AHEAD = 1 << 20, 64 << 10, 120, 300   # AHEAD: seconds a file's date may be ahead of now
 GRACE, MIN_RATE = 600, 256 << 10   # a stream's deadline: GRACE seconds plus one second per MIN_RATE bytes
+DEPTH, NAME_MOST, ENTRY = 64, 1024, 4096   # a member's most folders deep and name bytes; the disk an entry costs
 ITEM = {'everyHours': 'every_hours', 'maxAgeHours': 'max_age_hours', 'maxMb': 'max_mb'}
 
 
@@ -243,6 +253,12 @@ class Tail(threading.Thread):
         while chunk := os.read(self.f.fileno(), 65536):
             self.data = (self.data + chunk)[-ERR_KEEP:]
 
+    def close(self):
+        """The pipe closed once its reader is done (a child that keeps it open past 5 s keeps it, and the thread)."""
+        self.join(5)
+        if not self.is_alive():
+            self.f.close()
+
     def text(self):
         self.join(5)
         return ' '.join(self.data.decode('utf-8', 'replace').split())[-300:] or 'nothing on stderr'
@@ -259,8 +275,8 @@ def listing(agent, conf):
     timer = threading.Timer(LIST_WAIT, lambda: (late.set(), p.kill()))
     timer.start()
     out = b''
+    err = Tail(p.stderr)
     try:
-        err = Tail(p.stderr)
         while len(out) <= LIST_MOST and (chunk := os.read(p.stdout.fileno(), 65536)):
             out += chunk
     finally:
@@ -268,6 +284,7 @@ def listing(agent, conf):
         p.kill()
         code = p.wait()
         p.stdout.close()
+        err.close()
     if late.is_set():
         raise Torn(f'no list in {LIST_WAIT} s')
     if len(out) > LIST_MOST:
@@ -297,15 +314,31 @@ def whole(x):
 
 
 def guarded(most):
-    """tarfile's data filter, and a limit on what the tar says it holds: members' sizes together at most MOST
-    bytes (a sparse member is small in the stream, not on disk) and at most MEMBERS members (each is kept in memory)."""
-    seen = [0, 0]
+    """tarfile's data filter, and a limit on what the tar would make on disk: each member's size (a sparse member is
+    small in the stream, not on disk) plus ENTRY bytes for it and for each folder it makes, together at most MOST
+    bytes (a stream of empty files or deep paths is small but would fill the disk with entries); at most MEMBERS
+    members and MEMBERS folders (each is kept in memory); no member more than DEPTH folders deep (unpacking and
+    removing a tree goes folder by folder) or with a name or link target over NAME_MOST bytes."""
+    seen, folders = [0, 0], {}   # folders: {(its parent's number, its name): its number}, a name kept once
 
     def check(member, path):
+        parts = [x for x in member.name.split('/') if x not in ('', '.')]
+        if len(parts) > DEPTH:
+            raise Torn(f'{"/".join(parts[:3])}/... is more than {DEPTH} folders deep')
+        for text in (member.name, member.linkname or ''):
+            if len(text.encode('utf-8', 'surrogateescape')) > NAME_MOST:
+                raise Torn(f'a member\'s name or link target is over {NAME_MOST} bytes: {text[:80]!r}...')
+        new = up = 0
+        for i, part in enumerate(parts if member.isdir() else parts[:-1], 1):   # the folders it makes
+            if (up, part) not in folders:
+                folders[up, part] = len(folders) + 1
+                new += i < len(parts)                      # a folder member pays ENTRY once, as a member
+            up = folders[up, part]
         seen[0] += 1
-        seen[1] += member.size
-        if seen[0] > MEMBERS or seen[1] > most:
-            raise Torn(f'the tar holds more than {MEMBERS} members or {most >> 20} MB (max_mb)')
+        seen[1] += member.size + ENTRY * (1 + new)
+        if seen[0] > MEMBERS or len(folders) > MEMBERS or seen[1] > most:
+            raise Torn(f'the tar holds more than {MEMBERS} members or folders, or more than {most >> 20} MB '
+                       f'(max_mb; {ENTRY} bytes counted for each member and folder)')
         return tarfile.data_filter(member, path)
     return check
 
@@ -341,8 +374,8 @@ def fetch(agent, conf, item, root, now):
                          stderr=subprocess.PIPE, env=agent.ENV, start_new_session=True)
     timer = threading.Timer(FETCH_WAIT, p.kill)
     timer.start()
+    err = Tail(p.stderr)
     try:
-        err = Tail(p.stderr)
         got = Summed(p.stdout, most)
         with tarfile.open(fileobj=got, mode='r|') as t:
             t.extractall(os.path.join(new, 'data'), filter=guarded(most))
@@ -354,11 +387,14 @@ def fetch(agent, conf, item, root, now):
         p.kill()
         p.wait()
         p.stdout.close()
-    err.join(5)
+        err.close()
     last = (err.data.decode('utf-8', 'replace').strip().splitlines() or [''])[-1].split()
     if code or len(last) != 5 or last[:4] != ['seed', name, str(got.size), got.sha.hexdigest()] or \
             not re.fullmatch(r'[0-9]{1,20}', last[4]):
         raise Torn(f'exit {code}, {got.size} bytes, the trailer does not match: {err.text()}')
+    if (got.size, int(last[4])) != (item['bytes'], item['made']):   # MADE decides the age drop and every_hours
+        raise Torn(f'the trailer does not match the list ({got.size} bytes made {last[4]}, the list said '
+                   f'{item["bytes"]} made {item["made"]}): the host made a new one since')
     settle(os.path.join(new, 'data'))
     label = {'v': 1, 'name': name, 'bytes': got.size, 'sha256': got.sha.hexdigest(), 'made': int(last[4]),
              'fetched': int(now()), 'maxAgeHours': item['maxAgeHours']}
@@ -397,14 +433,41 @@ def current(root, name):
 
 
 def remove(path):
+    """PATH, and when it is a folder all it holds, folder by folder without recursion: a tree of any depth (one an
+    older release unpacked, before DEPTH) never stops a run with RecursionError. Links are removed, never followed."""
     try:
         st = os.lstat(path)
     except FileNotFoundError:
         return
-    if stat.S_ISDIR(st.st_mode):
-        shutil.rmtree(path)
-    else:
+    if not stat.S_ISDIR(st.st_mode):
         os.unlink(path)
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    below, fd = [], os.open(path, flags)
+    try:
+        while True:
+            sub = None
+            with os.scandir(fd) as entries:
+                for e in entries:
+                    if e.is_dir(follow_symlinks=False):
+                        sub = e.name
+                        break
+                    os.unlink(e.name, dir_fd=fd)
+            if sub is not None:                   # down into it; back up once it is empty
+                child = os.open(sub, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child
+                below.append(sub)
+            elif below:
+                up = os.open('..', flags, dir_fd=fd)
+                os.close(fd)
+                fd = up
+                os.rmdir(below.pop(), dir_fd=fd)
+            else:
+                break
+    finally:
+        os.close(fd)
+    os.rmdir(path)
 
 
 def drop(root, name, version, now):
@@ -420,15 +483,22 @@ def own_seeds(conf, config):
         return pool_seeds(conf['POOL'], config)
     except Refused as e:
         raise Torn(f'its own {e}') from None
+    except Exception as e:   # a config the fleet's own loader trips on
+        raise Torn(f'its own fleet config: {e.__class__.__name__}: {e}') from None
 
 
 def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
+    """One run (the module's docstring). A seed that fails in any way, a deep tree included, is said and the run
+    goes on with the next; old versions are pruned in every run. When it may fetch nothing (no data filter, its own
+    fleet config broken or without its pool) it still drops each seed past its age, by its label's max_age_hours,
+    and then says why (agent.Bad: exit 2, the unit's last result shows it)."""
+    cannot, own = None, None
     if not hasattr(tarfile, 'data_filter'):   # releases with known filter bypasses pass this: settle() checks again
-        raise agent.Bad('this Python has no tarfile data filter (3.12, or 3.8.17 and later): no seeds')
+        cannot = 'this Python has no tarfile data filter (3.12, or 3.8.17 and later)'
     try:
         own = own_seeds(conf, config)
     except Torn as e:
-        raise agent.Bad(f'{e}: no seeds') from None
+        cannot = cannot or str(e)
     os.umask(0o022)
     for d in (root, root + '/.new', root + '/.v'):   # root: made by the unit (StateDirectory) or here
         os.makedirs(d, 0o755, exist_ok=True)
@@ -438,66 +508,99 @@ def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
         except OSError:
             say('another seed run is running')
             return 1
-        for e in os.listdir(root + '/.new'):   # a run that stopped half-way
-            if e != '.lock':
-                remove(os.path.join(root + '/.new', e))
-        for e in os.listdir(root):   # a link made but not yet swapped in
-            if e.startswith('.') and e.endswith('.link'):
-                remove(os.path.join(root, e))
         try:
-            host = listing(agent, conf)
-            items = {n: {**host[n], 'everyHours': s['every_hours'], 'maxAgeHours': s['max_age_hours'],
-                         'maxMb': min(host[n]['maxMb'], s['max_mb'])} for n, s in own.items() if n in host}
-        except Torn as e:
-            items = None
-            say(f'seeds: {e}: each seed stays until its age drops it')
-        for name in sorted(n for n in os.listdir(root) if NAME.fullmatch(n)):
-            version, label = current(root, name)
-            if label is None:
-                why = 'its label is missing or cannot be read (fetched again now)'
-            elif name not in own:
-                why = 'no longer one of the pool\'s seeds'
-            else:
-                age = now() - label['made']
-                hours = own[name]['max_age_hours']
-                why = (f'older than {hours} h (max_age_hours)' if age > hours * 3600
-                       else 'made in the future (the clocks disagree)' if age < -SKEW else None)
-            if why:
-                drop(root, name, version, now)
-                say(f'seed {name}: dropped, {why}; jobs run cold until a new one comes')
-        for name, item in sorted((items or {}).items()):
-            label = current(root, name)[1]
-            if 'made' not in item:
-                say(f'seed {name}: the host offers none ({item.get("why", "no reason")}): '
-                    f'{"the one here stays" if label else "jobs run cold"}')
-                continue
-            if label and (label['bytes'], label['made']) == (item['bytes'], item['made']):
-                continue
-            if label and 0 <= now() - label['fetched'] < item['everyHours'] * 3600:
-                continue
-            if not -SKEW <= now() - item['made'] <= item['maxAgeHours'] * 3600:
-                say(f'seed {name}: the host\'s is too old or made in the future (the clocks disagree): not fetched')
-                continue
+            clean(root, say)
+            for e in os.listdir(root):   # a link made but not yet swapped in
+                if e.startswith('.') and e.endswith('.link'):
+                    each(say, f'seed link {e}', remove, os.path.join(root, e))
+            for name in sorted(n for n in os.listdir(root) if NAME.fullmatch(n)):
+                each(say, f'seed {name}', age_out, root, name, own, now, say)
+            if cannot:
+                raise agent.Bad(f'{cannot}: no seeds fetched (each seed here stays until its age drops it)')
             try:
-                got = fetch(agent, conf, item, root, now)
-                say(f'seed {name}: {got["bytes"] >> 20} MB, sha256 checked, swapped in')
-            except (Torn, OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as e:
-                for e2 in os.listdir(root + '/.new'):
-                    if e2 != '.lock':
-                        remove(os.path.join(root + '/.new', e2))
-                say(f'seed {name}: keeps {"the old one" if label else "none"}: {e.__class__.__name__}: '
-                    f'{str(e)[:300]}; tried again next hour')
-        prune(root, now)
+                host = listing(agent, conf)
+                items = {n: {**host[n], 'everyHours': s['every_hours'], 'maxAgeHours': s['max_age_hours'],
+                             'maxMb': min(host[n]['maxMb'], s['max_mb'])} for n, s in own.items() if n in host}
+            except Torn as e:   # the host down, or a host on an older kit (no list, or not one this reads)
+                items = {}
+                say(f'seeds: {e}: each seed stays until its age drops it')
+            for name, item in sorted(items.items()):
+                if not each(say, f'seed {name}', take, agent, conf, item, root, now, say):
+                    clean(root, say)
+        finally:
+            prune(root, now, say)
     return 0
 
 
-def prune(root, now):
-    """Versions no link names, KEEP_OLD after they were replaced or dropped."""
-    linked = {current(root, n)[0] for n in os.listdir(root) if NAME.fullmatch(n)}
-    for e in os.listdir(root + '/.v'):
-        path = os.path.join(root, '.v', e)
+def each(say, what, step, *args):
+    """step(*args); any Exception is said, not raised: one seed never stops the others. False when it failed."""
+    try:
+        return step(*args) is not False
+    except Exception as e:
+        say(f'{what}: {e.__class__.__name__}: {str(e)[:300]}; tried again next hour')
+        return False
+
+
+def clean(root, say):
+    """SEEDS/.new emptied but for the lock: a run (or a fetch) that stopped half-way."""
+    for e in os.listdir(root + '/.new'):
+        if e != '.lock':
+            each(say, f'seeds: removing .new/{e}', remove, os.path.join(root + '/.new', e))
+
+
+def age_out(root, name, own, now, say):
+    version, label = current(root, name)
+    if label is None:
+        why = 'its label is missing or cannot be read (fetched again now)'
+    elif own is not None and name not in own:
+        why = 'no longer one of the pool\'s seeds'
+    else:
+        age = now() - label['made']
+        hours = own[name]['max_age_hours'] if own is not None else label['maxAgeHours']   # own config broken
+        why = (f'older than {hours} h (max_age_hours)' if age > hours * 3600
+               else 'made in the future (the clocks disagree)' if age < -SKEW else None)
+    if why:
+        drop(root, name, version, now)
+        say(f'seed {name}: dropped, {why}; jobs run cold until a new one comes')
+
+
+def take(agent, conf, item, root, now, say):
+    """The listed seed `item`, fetched when it is new and due. False when its fetch failed (the old one stays)."""
+    name = item['name']
+    label = current(root, name)[1]
+    if 'made' not in item:
+        say(f'seed {name}: the host offers none ({item.get("why", "no reason")}): '
+            f'{"the one here stays" if label else "jobs run cold"}')
+        return
+    if label and (label['bytes'], label['made']) == (item['bytes'], item['made']):
+        return
+    if label and 0 <= now() - label['fetched'] < item['everyHours'] * 3600:
+        return
+    if not -SKEW <= now() - item['made'] <= item['maxAgeHours'] * 3600:
+        say(f'seed {name}: the host\'s is too old or made in the future (the clocks disagree): not fetched')
+        return
+    try:
+        got = fetch(agent, conf, item, root, now)
+    except Exception as e:   # any: a torn stream, a full disk, a tar this Python cannot unpack
+        say(f'seed {name}: keeps {"the old one" if label else "none"}: {e.__class__.__name__}: {str(e)[:300]}; '
+            f'tried again next hour')
+        return False
+    say(f'seed {name}: {got["bytes"] >> 20} MB, sha256 checked, swapped in')
+
+
+def prune(root, now, say=print):
+    """Versions no link names, KEEP_OLD after they were replaced or dropped; one that cannot go is said."""
+    def old(path):
         if path not in linked and now() - os.lstat(path).st_mtime > KEEP_OLD:
             remove(path)
+    try:
+        linked = {current(root, n)[0] for n in os.listdir(root) if NAME.fullmatch(n)}
+        names = os.listdir(root + '/.v')
+    except OSError as e:
+        say(f'seeds: no prune: {e}')
+        return
+    for e in names:
+        each(say, f'seeds: old version {e}', old, os.path.join(root, '.v', e))
 
 
 def main(argv=None):
