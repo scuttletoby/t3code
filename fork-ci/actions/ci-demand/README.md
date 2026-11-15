@@ -1,0 +1,61 @@
+# ci-demand
+
+Not a composite action: a read-only command that says how much CI a repository ran, per UTC day. Use it to record
+a baseline before a CI change and to measure again after it.
+
+```sh
+python3 -I ci_demand.py --repo OWNER/REPO --days 7 --cache "$XDG_CACHE_HOME/ci-demand"
+python3 -I ci_demand.py --config .github/fleet.json --since 2026-11-01 --until 2026-11-07 --cache DIR --json
+```
+
+It needs `gh`, logged in with read access to the repository's Actions. Outside a workflow, run it pinned like any
+fork-ci file: `pinned.py --config <pin config> run ci-demand ci_demand.py <args>` ([pinned](../pinned/README.md)).
+
+## What it prints
+
+For each day (a run belongs to the UTC day it was created), then a `total` row:
+
+| Number                   | How it is counted                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| CI hours                 | the sum of `completed_at - started_at` of every job of every attempt; a cancelled job counts the time it ran |
+| runs per workflow        | runs by workflow file (`ci.yml`), not by run name                                                            |
+| cancelled / failed share | of the day's completed runs (skipped runs included); failed = `failure`, `timed_out`, `startup_failure`      |
+| queue wait               | job `created_at -> started_at`: n, p50, p90 (nearest rank), max, per runner label set (`self-hosted,build`)  |
+| never reached a runner   | jobs with no runner: cancelled while queued (not in the wait numbers), or still queued now                   |
+| runs without jobs        | runs whose jobs were not read because the run stopped early (see below)                                      |
+
+Skipped jobs count nowhere; skipped runs count as runs but cost no request. `--json` prints the same numbers as one
+object (`days.<day>`, `days.total`).
+
+## Inputs
+
+| Input               | Meaning                                                                                             |
+| ------------------- | --------------------------------------------------------------------------------------------------- |
+| `--repo OWNER/REPO` | the repository; or                                                                                  |
+| `--config FILE`     | a JSON file of the project with `{"ciDemand": {"repo": "OWNER/REPO"}}` (other keys are ignored)     |
+| `--days N`          | the N full UTC days before today; or `--since DAY --until DAY` (both included)                      |
+| `--cache DIR`       | required: the caller's folder for saved pages (made 0700)                                           |
+| `--max-requests N`  | stop after N requests (default 2000)                                                                |
+| `--reserve N`       | stop once the rate limit has fewer than N requests left (default 1000), so other tools keep working |
+
+## What it guarantees
+
+- **Read-only.** Every request is `gh api -X GET --include <endpoint>`: no field, body or method that could write.
+- **Rate limit.** One runs-list query per day (a day over the API's 1000-run cap is split in halves), then one jobs
+  page per run that was not skipped. It stops at `--max-requests` or `--reserve`. A 403/429 waits `Retry-After`,
+  the reset time (when it is at most 2 minutes away) or 60 s for a secondary limit; a longer wait stops the run.
+  Server errors and network trouble are retried three times with back-off.
+- **Stops half-way, runs again.** A stop prints what it has, says `INCOMPLETE` (and whether the run list was
+  finished) and exits 3. Run the same command again later: every page it saved is read from `--cache`, so no page is
+  asked for twice.
+- **Cache.** A jobs page is saved when the run and all its jobs are completed, keyed by run id and attempt (a re-run
+  is a new attempt, so a new page). A runs-list page is saved when every run in it is completed and the day ended over
+  an hour ago, and is reused for 12 hours (a later re-run changes it). Writes are a `.part-` file then a rename; a
+  broken file, or one saved for another page, is fetched again; `.part-` files older than an hour are removed. A cache
+  folder another user owns is refused.
+- Exit codes: 0 complete, 2 bad arguments or an API error (404, no access, network down after retries), 3 incomplete.
+
+## General vs project
+
+General: the command, its counting rules and its cache. Project: only the repository (an argument, or `ciDemand.repo`
+in the project's own config file) and where the caller keeps the cache.
