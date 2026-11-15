@@ -1755,10 +1755,10 @@ class Launcher(unittest.TestCase):
         # says so: the tests cannot chown).
         self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in */open/own) echo 4242; exit 0;; '
                    'esac\nexec /usr/bin/stat "$@"\n', 0o755)
-        self.refused(f'{self.path("open/own")} is uid 4242\'s, in {self.path("open")}, which is sticky but others may '
-                     'write')
+        # #226 item 6: every folder on the way is checked for its owner now, sticky one above it or not.
+        self.refused(f'{self.path("open/own")}, a folder of uid 4242')
         os.chmod(self.path('open'), 0o1775)   # its group, the same
-        self.refused(f'{self.path("open/own")} is uid 4242\'s')
+        self.refused(f'{self.path("open/own")}, a folder of uid 4242')
         os.chmod(self.path('open'), 0o1777)
         os.remove(self.path('bin/stat'))
         self.start(self.NAME)
@@ -1825,6 +1825,22 @@ class Launcher(unittest.TestCase):
             with self.subTest(mode=oct(mode)):
                 os.chmod(self.path('grp'), mode)
                 self.start(name)
+
+    def test_every_folder_above_a_bound_path_is_roots_or_this_users_and_slash_too(self):
+        """#226 item 6: a folder above the real path that another user owns, closed (0755) or not, is that user's to
+        rename entries in: they could move the hook's folder away and put a link in its place between the check and
+        the bind. Only root's folders (or, in these tests, this user's) pass, and `/` is one of them."""
+        os.makedirs(self.path('own/sub'))
+        for d in ('own', 'own/sub'):
+            os.chmod(self.path(d), 0o755)
+        self.conf(HOOK=self.write('own/sub/hook.sh', '#!/bin/sh\n', 0o755))
+        for folder, pattern in ((self.path('own'), '*/own'), ('/', '/')):
+            with self.subTest(folder):
+                self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in '
+                           f'{pattern}) echo 4242; exit 0;; esac\nexec /usr/bin/stat "$@"\n', 0o755)
+                self.refused(f', a folder of uid 4242: its owner could swap a link into it')
+        os.remove(self.path('bin/stat'))
+        self.start(self.NAME)
 
     def walls_root(self, conf, files=(), links=(), dirs=()):
         """A fake machine for `paths` (FORK_FLEET_WALLS_ROOT): its launch.conf, files, folders and links (relative,

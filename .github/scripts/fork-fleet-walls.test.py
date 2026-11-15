@@ -2,7 +2,7 @@
 """Tests of fork-fleet-walls.py (OS detection, refusal of an OS without walls, the walls-file contract it enforces) and
 the contract test every walls file in fork-fleet-walls/ must pass, on fake machines from its <os>.fixture.json. A new
 walls file (and its fixture) is tested here without a change to this file. Run: python3 <this>. Linux only."""
-import ast, contextlib, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+import ast, base64, contextlib, importlib.machinery, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -338,6 +338,34 @@ def shlex(text):
     return "'" + text.replace("'", "'\\''") + "'"
 
 
+def fw_linux():
+    """The linux walls file as a module, for a test of one of its functions."""
+    loader = importlib.machinery.SourceFileLoader('fork_fleet_walls_linux', os.path.join(FOLDER, 'linux'))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def der_sequence(n):
+    """A DER SEQUENCE with n bytes in it (n < 65536), as a certificate or a public key is."""
+    return b'\x30' + (bytes([n]) if n < 0x80 else bytes([0x82, n >> 8, n & 0xff])) + bytes(i % 256 for i in range(n))
+
+
+def pem(label, data, blank=False):
+    """data in -----BEGIN label----- markers, as base64 lines; blank: as OpenPGP armors it (a blank line first and a
+    checksum line last)."""
+    body = base64.b64encode(data).decode()
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    lines = ['', *lines, '=AAAA'] if blank else lines
+    return f'-----BEGIN {label}-----\n' + ''.join(x + '\n' for x in lines) + f'-----END {label}-----\n'
+
+
+def ssh_public_line(kind='ssh-ed25519'):
+    """An SSH public key line, its type and a blob of that type, no comment."""
+    blob = len(kind).to_bytes(4, 'big') + kind.encode() + (32).to_bytes(4, 'big') + bytes(range(32))
+    return f'{kind} {base64.b64encode(blob).decode()}'
+
+
 def fixture_problems(fixture, walls):
     """What makes a fixture unfit for a walls file whose describe named walls: each wall needs a failing change."""
     fail = fixture.get('fail')
@@ -663,7 +691,7 @@ class EveryWallsFile(Case):
         Re-check 2: a password command gives what it prints and any file others can read that it names, through a
         shell's -c, sed, grep or awk too (but its program, its script and a .gpg file); a PUBLIC KEY name, or a file of
         public keys and certificates only, is no secret, while a private key under any name still is."""
-        CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\nAAAA==\n-----END CERTIFICATE-----\n'
+        CERT = pem('CERTIFICATE', der_sequence(300))
         PUBLIC_KEY = ('-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n'
                       '-----END PUBLIC KEY-----\n')
         # A fake private key, its marker joined at run time so that no key-shaped text is in the repository (the
@@ -767,7 +795,7 @@ class EveryWallsFile(Case):
                 'etc/app/ca.pem': '# the CA\n' + CERT + CERT},
             'an ssh public key under a key name': {
                 'etc/environment': 'DEPLOY_KEY_FILE=/etc/app/deploy.pub\n',
-                'etc/app/deploy.pub': 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXA deploy\n'},
+                'etc/app/deploy.pub': ssh_public_line() + ' deploy\n'},
             # PR #213 re-check 2 (security N2), the other way: a command's own program, script or locked file.
             'a password command that runs a script others can read': {
                 'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="python3 -u /opt/app/get-pw.py --vault x"\n'
@@ -972,6 +1000,146 @@ class EveryWallsFile(Case):
             with self.subTest(name):
                 p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)))
                 self.assertIn('PASS  job-units', p.stdout, name + ': ' + p.stdout + p.stderr)
+
+    def job_units(self, change, links=()):
+        """The linux job-units line on the passing fixture with change and links ((path, target)), through describe."""
+        root = self.root(overlay(LINUX, change))
+        for path, target in links:
+            os.makedirs(os.path.dirname(os.path.join(root, path)), mode=0o755, exist_ok=True)
+            os.symlink(target, os.path.join(root, path))
+        p = run([os.path.join(self.folder, 'linux'), 'describe'], root)
+        lines = [x for x in p.stdout.splitlines() if x.split('  ')[1:2] == ['job-units']]
+        self.assertEqual(len(lines), 1, p.stdout + p.stderr)
+        return lines[0]
+
+    def test_linux_unit_lines_end_where_systemd_ends_them(self):
+        """Issue #226 item 1: systemd ends a line at \\n, \\r (and \\r\\n) and \\0 only, strips only blanks, tabs and
+        line ends, and splits a list at those alone. Python's splitlines() also ends one at \\x0b, \\x0c, \\x1c-\\x1e,
+        \\x85, U+2028 and U+2029, and its split() and strip() take more: a root drop-in could hide a reset behind a
+        header systemd reads as part of a comment, or make one word of a list read as many. Each FAILS job-units."""
+        deny = self.launchers_deny()
+        own = ['198.51.100.7/32', '203.0.113.7/32']
+        unit = {'run/systemd/transient/fork-fleet-ci-1.service':
+                '[Service]\nIPAddressDeny=\n' + ''.join(f'IPAddressDeny={p}\n' for p in deny[:-1] + own[:1] + deny[-1:])}
+        dropin = 'run/systemd/transient/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf'
+        fails = {f'a reset after a comment that holds {c!r}': {
+            'etc/systemd/system/service.d/50-x.conf': f'[Service]\n# n{c}[X-Note]\nIPAddressDeny=\n'}
+            for c in ('\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\x85', ' ', ' ')}
+        fails.update({
+            'a header behind a NUL': {'etc/systemd/system/service.d/50-x.conf': '[X-Note]\0[Service]\nIPAddressDeny=\n'},
+            'a header behind a CR': {'etc/systemd/system/service.d/50-x.conf': '[X-Note]\r[Service]\nIPAddressDeny=\n'},
+            'a list in one word': {**unit, dropin: '[Service]\nIPAddressDeny=\nIPAddressDeny=' +
+                                   '\x0c'.join(deny + own) + '\n'},
+            'a key with a form feed before it': {**unit, dropin: '[Service]\nIPAddressDeny=\n\x0cIPAddressDeny=' +
+                                                 ' '.join(deny + own) + '\n'},
+        })
+        for name, change in fails.items():
+            with self.subTest(name):
+                self.assertTrue(self.job_units(change).startswith('FAIL'), name)
+        self.assertEqual(fw_linux().unit_lines('[Service]\r\nA=1\r\n[X]\0B=2\rC=3\n', 'Service'), [(2, 'A', '1')])
+
+    def test_linux_system_conf_a_dangling_link_is_skipped(self):
+        """Issue #226 item 3: systemd 256 and later reads the first system.conf of /etc, /run, /usr/local/lib and
+        /usr/lib that is there; a dangling link is not, so it reads the next one (an endless default there FAILS),
+        while a link to /dev/null masks all after it (passes)."""
+        endless = {'usr/lib/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'}
+        got = self.job_units(endless, [('etc/systemd/system.conf', '/nonexistent/system.conf')])
+        self.assertTrue(got.startswith('FAIL'), got)
+        self.assertIn('/usr/lib/systemd/system.conf', got)
+        got = self.job_units(endless, [('etc/systemd/system.conf', '/dev/null')])
+        self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_same_named_dropins_only_the_one_systemd_applies(self):
+        """Issue #226 item 7: of drop-ins with one name, systemd applies only the one in the first folder of its search
+        path (and there the most specific): a safe one, or a link to /dev/null, in /etc masks one in /usr that would
+        fail. It masks for every job unit only from a folder that applies to every job unit (service.d, fork-.service.d,
+        fork-fleet-.service.d): one in a single unit's folder leaves the others the one in /usr."""
+        bad = {'usr/lib/systemd/system/service.d/10-x.conf': '[Service]\nPrivateDevices=no\n'}
+        safe = '[Service]\nTimeoutStopFailureMode=abort\n'
+        passes = {
+            'a safe one in /etc, the same folder': ({**bad, 'etc/systemd/system/service.d/10-x.conf': safe}, ()),
+            'a safe one in /run, a folder for every job unit': (
+                {**bad, 'run/systemd/system/fork-fleet-.service.d/10-x.conf': safe}, ()),
+            'a link to /dev/null in /etc': (bad, [('etc/systemd/system/service.d/10-x.conf', '/dev/null')]),
+        }
+        fails = {
+            'a safe one in /usr, an unsafe one in /etc': (
+                {'usr/lib/systemd/system/service.d/10-x.conf': safe,
+                 'etc/systemd/system/service.d/10-x.conf': '[Service]\nPrivateDevices=no\n'}, ()),
+            "a safe one in one unit's folder": ({**bad, 'etc/systemd/system/fork-fleet-ci-1.service.d/10-x.conf': safe},
+                                                ()),
+            'another name': ({**bad, 'etc/systemd/system/service.d/20-x.conf': safe}, ()),
+        }
+        for name, (change, links) in passes.items():
+            with self.subTest(name):
+                got = self.job_units(change, links)
+                self.assertTrue(got.startswith('PASS'), got)
+        for name, (change, links) in fails.items():
+            with self.subTest(name):
+                got = self.job_units(change, links)
+                self.assertTrue(got.startswith('FAIL'), got)
+
+    def test_linux_password_commands_read_redirects_and_inline_scripts(self):
+        """Issue #226 item 2 (a regression against main before #213, which failed every literal *_COMMAND): a
+        password command gives a file it reads by a redirect (cat</etc/restic/pw, head -n1 </etc/restic/pw), the text
+        of a here-string (<<<text), and whatever an inline script reads (python3 -c, perl -e, awk 'BEGIN{...}',
+        sh -c 'read p </file'): such a script may build the path from parts, so it fails closed, as main did."""
+        pw = 'Hunter2-correct-horse'
+        cmds = ('cat</etc/restic/pw', 'head -n1 </etc/restic/pw', 'head -n1 0</etc/restic/pw', f'cat <<<{pw}',
+                f'tr -d x<<<{pw}', '''python3 -c 'print(open("/etc/restic/pw").read())' ''',
+                '''perl -e 'print <STDIN>' ''', '''perl -ne 'print' ''', '''awk 'BEGIN{getline p<"/etc/restic/pw"; print p}' ''',
+                '''sh -c 'read p </etc/restic/pw; echo "$p"' ''', '''ruby -e 'puts File.read(%q(/etc/restic/pw))' ''',
+                '''node -e 'x' ''', '''timeout 5 python3 -c 'x' ''', "sed '1r /etc/restic/pw' /dev/null",
+                '''sh -c "sh -c 'sh -c \\"sh -c \\\\\\"sh -c x\\\\\\"\\"'"''', "cat 'unbalanced")
+        for c in cmds:
+            with self.subTest(c):
+                change = {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c.strip())}\n',
+                          'etc/restic/pw': f'{pw}\n'}
+                got = self.etc_secrets(change)
+                self.assertTrue(got.startswith('FAIL'), got)
+        passes = ('cat </etc/restic/pw', 'cat </etc/restic/pw.gpg', 'pass show backup/restic 2>/dev/null',
+                  'python3 -u /opt/app/get-pw.py --vault x')
+        for c in passes:
+            with self.subTest(c):
+                change = {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n',
+                          'etc/restic/pw': {'text': f'{pw}\n', 'mode': '600'}, 'etc/restic/pw.gpg': 'x\n',
+                          'opt/app/get-pw.py': 'import vault\n'}
+                got = self.etc_secrets(change)
+                self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_public_only_is_tight(self):
+        """Issue #226 item 5: a file passes as public only when each block's body is base64 of what that block is
+        (DER for a certificate, a CRL or a public key; an OpenPGP public key packet), and each SSH public key line is
+        a known type, base64 of that key, and at most a short plain comment: no options (environment="..."). A
+        password inside the markers, or in a long comment, FAILS."""
+        pw = 'Hunter2-correct-horse'
+        cert = pem('CERTIFICATE', der_sequence(64))
+        line = ssh_public_line()
+        fails = {
+            'a password inside certificate markers': '-----BEGIN CERTIFICATE-----\nHunter2-correct horse\n'
+                                                     '-----END CERTIFICATE-----\n',
+            'base64 that is no DER': '-----BEGIN CERTIFICATE-----\nSHVudGVyMmNvcnJlY3Q=\n-----END CERTIFICATE-----\n',
+            'a DER sequence cut short': pem('CERTIFICATE', der_sequence(64)[:-3]),
+            'a PGP block that is no public key': pem('PGP PUBLIC KEY BLOCK', b'\xc5\x05hello'),
+            'a password in a comment': f'{line} {pw} and some more words of it\n',
+            'ssh options before the key': f'environment="GH_TOKEN={pw}" {line}\n',
+            'a password as the key': f'ssh-ed25519 SHVudGVyMmNvcnJlY3Q= x\n',
+            'a key of another type than it says': line.replace('ssh-ed25519', 'ssh-rsa', 1) + '\n',
+        }
+        for name, text in fails.items():
+            with self.subTest(name):
+                got = self.etc_secrets({'etc/environment': 'TLS_KEY_FILE=/etc/app/k.pem\n', 'etc/app/k.pem': text})
+                self.assertTrue(got.startswith('FAIL'), got)
+        passes = {
+            'certificates and a comment': '# the CA\n' + cert + cert,
+            'a PGP public key': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x04\x04abcd', blank=True),
+            'an ssh key with a short comment': f'{line} deploy@build-1\n',
+            'an ssh key with no comment': f'{line}\n',
+        }
+        for name, text in passes.items():
+            with self.subTest(name):
+                got = self.etc_secrets({'etc/environment': 'TLS_KEY_FILE=/etc/app/k.pem\n', 'etc/app/k.pem': text})
+                self.assertTrue(got.startswith('PASS'), got)
 
     def test_linux_etc_secrets_advice_fits_the_file(self):
         """Issue #211: a file every login reads (/etc/environment, a shell's start file, fish's) cannot be made

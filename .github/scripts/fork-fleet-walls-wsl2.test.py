@@ -251,14 +251,22 @@ SYSTEMD_RUN_WORDS = 7   # the setting, its default, `tools` (2), and the three j
 TOOLS = ("  tools:1) printf 'SYSTEMD_RUN %s\\nSYSTEMCTL %s\\n' \"$(shown \"$SYSTEMD_RUN\")\" "
          "\"$(shown \"$SYSTEMCTL\")\" ;;\n")
 B_ANCHOR = '  b=$real\n  resolv_bind=$b:$resolv\n'
+# Its traps, as launcher_tripwires reads them (quotes and backslashes out): each cleans up or exits, on EXIT or a signal.
+TRAPS = ('trap rm -rf --one-file-system -- $(printf %q $tmp) EXIT', 'trap exit 129 HUP', 'trap exit 130 INT',
+         'trap exit 143 TERM', 'trap rm -f -- $(printf %q $env_file) EXIT')
+# Ways bash runs code later, at a time of its own, or loads it (none in the launcher): mapfile's and readarray's -C
+# callback, a builtin from a file (enable -f), extdebug (shopt), a prompt, PS4 under set -x, BASH_ENV in a child bash.
+LATER = re.compile(r'(?<![\w$.-])(mapfile|readarray|enable|shopt)(?![\w-])|(?<![\w$])(PROMPT_COMMAND|PS[0-4]|BASH_ENV)(?!\w)')
 
 
 def launcher_tripwires(text):
     """Cheap checks on the launcher's text that the pin test runs, so that a launcher change that also moves the pin
     cannot bring back one of round 1's edits unseen: a plain systemd-run or another "$SYSTEMD_RUN", eval, source or a
-    name reference (also spelt with quotes or backslashes), a command word built from expansions or quotes, a # that bash reads inside quotes, a function defined twice, view_ro set outside job_view, b set
-    again before the resolv bind, `tools` or the SYSTEMD_RUN default changed. Not a parser: what trips needs the
-    security lens, and then this check changed with it. [what tripped]"""
+    name reference (also spelt with quotes or backslashes), a command word built from expansions or quotes, a # that
+    bash reads inside quotes, a trap other than the launcher's own (TRAPS: a RETURN or DEBUG one runs code when a
+    function returns or before each command) or another way bash runs code later (LATER), a function defined twice,
+    view_ro set outside job_view, b set again before the resolv bind, `tools` or the SYSTEMD_RUN default changed. Not
+    a parser: what trips needs the security lens, and then this check changed with it. [what tripped]"""
     out = []
     bash, spans = bash_comments(text)
     walls = {m.start(2) for m in re.finditer(r'(^|[ \t])(#[^\n]*)', text, re.M)
@@ -282,6 +290,12 @@ def launcher_tripwires(text):
                          r'(?<![\w-])(?:local|declare|typeset|readonly)\s+(?:-\w+\s+)*-\w*n|\$\{!', flat, re.M):
         out.append(f'line {flat.count(chr(10), 0, m.start()) + 1}: {m.group(0).strip()!r} '
                    '(eval, source or a name reference)')
+    traps = sorted(m.group(0).strip() for m in re.finditer(r'(?<![\w$.-])trap(?![\w-]).*', flat))
+    if traps != sorted(TRAPS):
+        out.append(f'traps {[t for t in traps if t not in TRAPS][:2]} (not the launcher\'s own, TRAPS: a trap runs '
+                   'code later)')
+    out += [f'line {flat.count(chr(10), 0, m.start()) + 1}: {m.group(0)!r} (a way bash runs code later)'
+            for m in LATER.finditer(flat)]
     # A command bash only knows when it runs (${e}al, $cmd, "ev"al, $'\x65val'): only the two settings' tools and
     # must's "$@" may be one.
     tests = re.sub(r'\[\[[ \t].*?[ \t]\]\]|(?<!\$)\(\(.*?\)\)', lambda m: re.sub(r'[^\n]', ' ', m.group(0)), code)
@@ -540,6 +554,20 @@ class Launcher(Case):
             'exec ${e}al': real.replace(RUN, '  local e=ev; exec ${e}al' + pro + RUN),
             '$(echo eval) after &&': real.replace(RUN, '  true && $(echo eval)' + pro + RUN),
             'e\\(newline)${x}': real.replace(RUN, '  local x=val; e\\\n${x}' + pro + RUN),
+        })
+        # Issue #226 item 4: code bash runs later, at a time of its own (a trap when a function returns or before each
+        # command, mapfile's callback, a prompt, PS4 under set -x, BASH_ENV in a child bash, a loaded builtin).
+        edits.update({
+            'a RETURN trap': real.replace(RUN, "  trap 'props+=(-p PrivateDevices=no)' RETURN\n" + RUN),
+            "a DEBUG trap, tr''ap": real.replace(RUN, "  tr''ap 'props+=(-p PrivateDevices=no)' DEBUG\n" + RUN),
+            'a cleanup trap that does more': real.replace("trap 'exit 130' INT", "trap 'props=(); exit 130' INT"),
+            'mapfile -C': real.replace(RUN, "  mapfile -C 'props+=(-p PrivateDevices=no)' -c 1 x <<<a\n" + RUN),
+            'readarray -C': real.replace(RUN, "  readarray -C 'props+=(-p PrivateDevices=no)' -c 1 x <<<a\n" + RUN),
+            'PROMPT_COMMAND': real.replace(RUN, "  PROMPT_COMMAND='props+=(-p PrivateDevices=no)'\n" + RUN),
+            'PS4 and set -x': real.replace(RUN, "  PS4='$(echo x)'; set -x\n" + RUN),
+            'BASH_ENV': real.replace(RUN, '  export BASH_ENV=/etc/fork-fleet/more.sh\n' + RUN),
+            'enable -f': real.replace(RUN, '  enable -f /etc/fork-fleet/more.so more\n' + RUN),
+            'shopt -s extdebug': real.replace(RUN, '  shopt -s extdebug\n' + RUN),
         })
         for name, text in edits.items():
             with self.subTest(name):
