@@ -1,0 +1,11 @@
+# heavy kit: written by heavy-install. Do not edit: run the installer again.
+[Unit]
+Description=heavy leftover sweep every 5 minutes (fork-kit/heavy)
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target
