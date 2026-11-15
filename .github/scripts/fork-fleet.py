@@ -176,12 +176,40 @@ def check_config(cfg):
             out.append(f'job {j.get("job")!r}: memory_mb must be a positive number')
         if j.get('shards') is not None and not (positive(j['shards']) and j['shards'] < 1000):
             out.append(f'job {j.get("job")!r}: shards must be 1 to 999')
+        out += avoid_problems(pools, j)
     if out:
         return out
     keys = [k for k, _ in job_keys(cfg)]
     if len(set(keys)) != len(keys):
         out.append('a job key twice')
     return out
+
+
+def avoid_problems(pools, job):
+    """A job's `avoid` ({pool name: [kinds]}): the pools this job is never sent to for those kinds of run. Only a
+    dispatcher pool that does not wait may be avoided: the pool that waits and the static pools are where a job goes
+    when nothing else takes it (fleet mode, "hosted": false, re-runs), so avoiding one could leave it nowhere."""
+    if 'avoid' not in job:
+        return []
+    who, got = f'job {job.get("job")!r}: avoid', job['avoid']
+    if not (isinstance(got, dict) and got):
+        return [f'{who} must be an object {{"<pool name>": ["push", ...]}}']
+    out, named = [], {p.get('name'): p for p in pools}
+    for name, kinds in got.items():
+        pool = named.get(name)
+        if pool is None:
+            out.append(f'{who} names pool {name!r}, which the config does not have')
+        elif pool.get('static') or pool.get('waits') is not False:
+            out.append(f'{who} names pool {name!r}: only a dispatcher pool that does not wait may be avoided (the '
+                       'static pools and the pool that waits are where a job goes when nothing else takes it)')
+        if not (isinstance(kinds, list) and kinds and all(k in KINDS for k in kinds)):
+            out.append(f'{who}[{name!r}] must list some of {list(KINDS)}')
+    return out
+
+
+def avoids(job, pool, kind):
+    """Is this job never sent to this pool for this kind of run (its config `avoid`)?"""
+    return kind in ((job.get('avoid') or {}).get(pool['name']) or ())
 
 
 def dispatcher_or_retired(cfg, label):
@@ -590,7 +618,7 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
         if pool.get('static'):
             return list(pool['runs_on'])
         return [pool['label'], f'{pool["label"]}-{key}-{nonce}' + (f'-a{int(attempt)}' if attempt else '')]
-    todo, t = list(wanted), now()
+    todo, t, entry = list(wanted), now(), dict(job_keys(cfg))
     for pool in cfg['pools']:
         if kind not in takes_of(pool):
             say(f'pool {pool["name"]}: does not take {kind} runs')
@@ -607,10 +635,14 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
                     if why.startswith('its dispatcher says') else '::error::fork-fleet: ')
             say(f'{seen}pool {pool["name"]}: no free slot counted: {why}'
                 + (' (is its dispatcher running, with a valid token? .github/fork-fleet.md)' if 'error' in seen else ''))
+        kept = [key for key in todo if avoids(entry[key], pool, kind)]
+        if kept and free:
+            say(f'pool {pool["name"]}: not for {", ".join(kept)} in {kind} runs (the job\'s avoid)')
         for _ in range(min(free, pool.get('per_run', free))):
-            if not todo:
+            key = next((k for k in todo if k not in kept), None)
+            if key is None:
                 break
-            key = todo.pop(0)
+            todo.remove(key)
             out[key] = labels(pool, key)
             say(f'{key}: pool {pool["name"]} ' + ('(always there)' if pool.get('static') else
                                                   '(its dispatcher reports a free slot)'))

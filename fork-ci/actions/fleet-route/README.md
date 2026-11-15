@@ -190,7 +190,7 @@ for pull requests ready for review.
 | `trusted`              | yes                    | `workflows` (paths), `actors` (logins) and `push_branches`: who may use the fleet                                                        |
 | `upstream_sync`        | no                     | `{"tag_prefix": "..."}`: a push commit tagged `<prefix><sha>` stays GitHub-hosted (the fork's upstream sync); not with `"hosted": false` |
 | `pools`                | yes                    | tried in order; see below                                                                                                                |
-| `jobs`                 | yes                    | routed jobs, heaviest first: `job` (id), `memory_mb`, optional `shards` (1-999) and `gates`                                              |
+| `jobs`                 | yes                    | routed jobs, heaviest first: `job` (id), `memory_mb`, optional `shards` (1-999), `gates` and `avoid` (below)                             |
 | `retired_labels`       | no                     | old pool labels (keep a label here for a week after changing it): never `hosted` or a static pool's label                                |
 | `stuck_seconds`        | yes                    | auto: how long a fleet job may wait before the watch cancels its run (the sweep re-runs it)                                              |
 | `fleet_stuck_seconds`  | yes                    | the same in fleet mode (cancelled with an error, not re-run)                                                                             |
@@ -211,6 +211,12 @@ A pool:
 | `launch`  | dispatcher | the command the dispatcher starts and stops runners with (`.github/fork-fleet.md`)                                    |
 | `static`  | static     | `true`: runners registered by hand and always there; no dispatcher, no heartbeat                                      |
 | `runs_on` | static     | its runners' labels, at least one not generic (`self-hosted`, `linux`, `x64`, ...); no dispatcher or retired label    |
+
+A job's `avoid` keeps it off a pool for some kinds of run: `{"job": "plugins", "memory_mb": 6000, "avoid": {"desktop":
+["push"]}}` never sends `plugins` of a push to `desktop` (say the jars a deploy ships are built on the always-on pool
+only), while drafts may still use it. The pool's slots then go to the next job in `jobs` order. Only a dispatcher pool
+that does not wait may be avoided: the pool that waits and the static pools are where a job goes when nothing else takes
+it. The pool must be in the config and the kinds from `push`, `draft` and `ready`.
 
 A config that breaks any rule above fails the step with the list of problems and puts out nothing.
 
