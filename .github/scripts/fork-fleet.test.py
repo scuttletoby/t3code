@@ -1761,15 +1761,15 @@ class Launcher(unittest.TestCase):
         root = self.walls_root(conf, files=(('/etc/fork-fleet/job-paths', '# list\n/usr\n/lib/x\n/bin\n'),
                                             ('/opt/ff/hook.sh', ''), ('/opt/ff/fork-fleet.py', ''),
                                             ('/run/r/resolv.conf', '')),
-                               dirs=('/usr/lib/x', '/srv/share', '/c/Users', '/home/u', '/data/s/x'),
+                               dirs=('/usr/lib/x', '/data/w', '/c/Users', '/home/u', '/data/s/x'),
                                links=(('/lib', 'usr/lib'), ('/bin', 'usr/bin'), ('/hl', 'opt/ff'), ('/rl', 'run/r'),
-                                      ('/var/lib/ff', '../../srv/share'), ('/opt/win', '../c'),
+                                      ('/var/lib/ff', '../../data/w'), ('/opt/win', '../c'),
                                       ('/opt/h', '../home'), ('/usr/share/s', '../../data/s'), ('/opt/abs', '/')))
         got = self.paths(root)
         self.assertEqual(got.returncode, 0, got.stderr)
         self.assertEqual(got.stdout.splitlines(), [
             '/usr /usr', '/lib/x /usr/lib/x', '/hl/hook.sh /opt/ff/hook.sh', '/hl/fork-fleet.py /opt/ff/fork-fleet.py',
-            '/srv/share/runners /srv/share/runners', '/etc/resolv.conf /run/r/resolv.conf'])
+            '/data/w/runners /data/w/runners', '/etc/resolv.conf /run/r/resolv.conf'])
         for allow, word in (('/opt/win/Users', '/opt/win/Users leads to /c/Users, which no line'),
                             ('/opt/h/u', '/opt/h/u (that is /home/u): a job never sees it'),
                             ('/usr/share/s/x', '/usr/share/s/x leads to /data/s/x, which no line'),
@@ -1782,6 +1782,46 @@ class Launcher(unittest.TestCase):
                 self.assertNotEqual(got.returncode, 0)
                 self.assertIn(word, got.stderr)
                 self.assertEqual(got.stdout, '')
+
+    def test_paths_refuses_a_bound_path_that_holds_data(self):
+        """Fix round 3 (#191 re-check, correctness): the hook, its two files, WORK_ROOT and resolv.conf are bound into
+        every job like the list's lines: one under /home, /root, /mnt, /media or /srv is refused, as written and once
+        a link in a folder above is resolved. (Not /run, /tmp and the other own-or-none roots: systemd-resolved keeps
+        resolv.conf in /run.)"""
+        files = (('/home/o/kit/hook.sh', ''), ('/home/o/kit/fork-fleet.json', '{}'), ('/mnt/share/r/resolv.conf', ''),
+                 ('/opt/ok/hook.sh', ''), ('/home/o/x.py', ''))
+        dirs = ('/usr', '/srv/s')
+        for name, conf, links, word in (
+                ('hook to /home', 'HOOK=/opt/ff/hook.sh\n', (('/opt/ff', '../home/o/kit'),), '(that is /home/o/kit/hook.sh)'),
+                ('resolv.conf to /mnt', 'RESOLV_CONF=/etc/ff/resolv.conf\n', (('/etc/ff', '../mnt/share/r'),),
+                 '(that is /mnt/share/r/resolv.conf)'),
+                ('WORK_ROOT to /srv', 'WORK_ROOT=/var/lib/ff/runners\n', (('/var/lib/ff', '../../srv/s'),),
+                 '(that is /srv/s/runners)'),
+                ('the file beside the hook to /home', 'HOOK=/opt/ok/hook.sh\n',
+                 (('/opt/ok/fork-fleet.py', '../../home/o/x.py'),), '(that is /home/o/x.py)'),
+                ('WORK_ROOT in /srv as written', 'WORK_ROOT=/srv/s/runners\n', (), '/srv/s/runners: a job never sees')):
+            with self.subTest(name):
+                if os.path.isdir(self.path('machine')):
+                    shutil.rmtree(self.path('machine'))
+                got = self.paths(self.walls_root(conf, files=files, links=links, dirs=dirs))
+                self.assertNotEqual(got.returncode, 0, 'bound from a folder that holds data: ' + got.stdout)
+                self.assertIn(word, got.stderr)
+                self.assertIn('it holds data', got.stderr)
+                self.assertEqual(got.stdout, '')
+
+    def test_start_refuses_a_work_root_that_holds_data_and_an_open_file_beside_the_hook(self):
+        """Fix round 3 (#191 re-check nits): start, not only `paths`: WORK_ROOT under /srv is refused before anything
+        is made; the two files beside the hook (every job sees them) must be writable by their owner only, as the hook
+        is."""
+        self.conf(WORK_ROOT='/srv/fork-fleet/runners')
+        self.refused('it holds data')
+        self.conf()
+        for f in ('fork-fleet.py', 'fork-fleet.json'):
+            with self.subTest(f):
+                self.write(f, '', 0o666)
+                self.refused(f'{f} must be writable by its owner only')
+                os.chmod(self.path(f), 0o644)
+        self.start(self.NAME)
 
     def test_paths_reads_the_conf_the_launcher_would(self):
         """Fix round 2 (#194 minor 2): one lookup of launch.conf, FORK_FLEET_LAUNCH_CONF's or the default; none at
@@ -2172,6 +2212,43 @@ class Launcher(unittest.TestCase):
         self.assertEqual(self.rec_text('nft-args'), 'list table inet fork_fleet\n')
         self.assertEqual(self.rec_text('set-property'), want * 2)
 
+    def test_a_lookups_answer_never_reaches_the_terminal_raw(self):
+        """Fix round 3 (#191 re-check S1): a lookup service's answer, curl's words and a caller's argument reach the
+        terminal of whoever runs check-net, refresh-net or the walls proof by hand: printable ASCII only (an OSC 52
+        clipboard write, a hidden OSC 8 link, a bidi mark become ?), at most 2000 bytes."""
+        evil = '\x1b]52;c;aWQ+L3RtcC94Cg==\x07\u202e1.2.3.4'   # clipboard write, then a bidi override
+        self.write('rec/own-a', evil + '\n', 0o644)
+        self.write('rec/own-b', '203.0.113.9\n', 0o644)
+        got = self.launch('refresh-net')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn('answered no IPv4 address', got.stderr)
+        for c in ('\x1b', '\x07', '\u202e'):
+            self.assertNotIn(c, got.stderr, f'{c!r} from the lookup reached stderr raw: {got.stderr!r}')
+        self.write('rec/own-a', 'x' * 9000 + '\n', 0o644)
+        got = self.launch('refresh-net')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertTrue(all(len(line) <= 2000 + len('fork-fleet-launch: ') for line in got.stderr.splitlines()))
+        got = self.launch('check-net', 'https://example.com/\x1b]8;;x\x07', '127.0.0.1:1')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('not a plain http(s) URL', got.stderr)
+        self.assertNotIn('\x1b', got.stderr)
+        got = self.launch('nope\x1b[2J')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertNotIn('\x1b', got.stderr)
+
+    def test_every_lookups_address_stays_blocked_with_more_than_four_lookups(self):
+        """Fix round 3 (#191 re-check nit): the last-4 limit never drops an address a lookup gives now: with five
+        lookups that each see another address, all five are blocked."""
+        urls = [f'https://own-{x}.test/' for x in 'abcde']
+        self.conf(OWN_ADDRESS_URLS=','.join(urls))
+        for i, x in enumerate('abcde'):
+            self.write(f'rec/own-{x}', f'203.0.113.{10 + i}\n', 0o644)
+        self.start(self.NAME)
+        deny = next(a for a in self.rec_text('systemd-run').splitlines() if a.startswith('IPAddressDeny='))
+        for i in range(5):
+            self.assertIn(f' 203.0.113.{10 + i} ', deny)
+            self.assertIn(f'ip daddr 203.0.113.{10 + i} counter reject', self.rec_text('nft'))
+
     def test_a_runner_user_in_another_group_is_refused(self):
         """A runner user also in, say, docker (root on the host) or adm (the logs) is never handed a job."""
         gid = pwd.getpwnam('daemon').pw_gid
@@ -2539,7 +2616,8 @@ class WallsProof(unittest.TestCase):
         for name in ('ip', 'iptables', 'systemctl', 'nft', 'pkill', 'userdel', 'sysctl', 'kill'):
             body = f'echo "{name} $*" >>"$T/rec"\n'
             if name == 'iptables':
-                body += 'if [[ " $* " == *" -C "* ]]; then grep -qxF -- "${*: -1}" "$T/present"; exit; fi\n'
+                body += ('if [[ " $* " == *" -C "* ]]; then [[ ! -e $T/c-exit ]] || exit "$(<"$T/c-exit")"; '
+                         'grep -qxF -- "${*: -1}" "$T/present"; exit; fi\n')
             if name in ('ip', 'nft'):
                 body += '[[ " $* " != *" show "* && " $* " != *" list "* ]] || exit 1\n'
             with open(os.path.join(bin_, name), 'w') as f:
@@ -2564,6 +2642,103 @@ class WallsProof(unittest.TestCase):
             self.assertIn('ip netns del fork-fleet-u1', calls)
             deleted = [c for c in calls if ' -D DOCKER-USER ' in c]
             self.assertEqual(deleted, [f'iptables -w 60 -D DOCKER-USER {r}' for r in rules] if present else [])
+        # Fix round 3 (#198 re-check nit): a check that gives no answer (exit 4, the xtables lock) is neither "there"
+        # nor "absent": a failed step, named, exit 1, and the rule is not deleted blind.
+        with open(os.path.join(tmp, 'c-exit'), 'w') as f:
+            f.write('4\n')
+        open(rec, 'w').close()
+        got = subprocess.run(['bash', '-c', code + '\nmade=() docker=("$R1") failed=() tmp="" listener="" forward=0\n'
+                              'cleanup\necho done'],
+                             env={'PATH': bin_ + ':/usr/bin:/bin', 'T': tmp, 'R1': rules[0]},
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual((got.returncode, got.stdout), (1, ''))
+        self.assertIn(f'iptables -C DOCKER-USER {rules[0]} (exit 4: no answer; the rule may be left)', got.stderr)
+        with open(rec) as f:
+            self.assertNotIn(' -D DOCKER-USER ', f.read())
+
+    def fakes(self, scripts):
+        """A folder of fake commands (name: bash body), first on PATH; $T is the test's temp folder."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.makedirs(os.path.join(tmp, 'bin'))
+        for name, body in scripts.items():
+            with open(os.path.join(tmp, 'bin', name), 'w') as f:
+                f.write('#!/bin/bash\n' + body)
+            os.chmod(os.path.join(tmp, 'bin', name), 0o755)
+        return tmp, {'PATH': os.path.join(tmp, 'bin') + ':/usr/bin:/bin', 'T': tmp}
+
+    def test_it_owns_only_the_docker_rules_that_are_missing_and_stops_when_a_check_gives_no_answer(self):
+        """Fix round 3 (#198 re-check nits): of Docker's two DOCKER-USER rules, the proof owns (cleanup deletes) only
+        the ones missing when it starts; a rule there already is someone else's. A check that gives no answer (exit 4)
+        stops the proof before it changes anything, not "missing"."""
+        src = self.src()
+        code = src[src.index('docker=() made=()'):src.index('step() {')]
+        tmp, env = self.fakes({'iptables': 'case " $* " in *" -S "*) exit 0 ;; esac\n'
+                                           '[[ ! -e $T/c-exit ]] || exit "$(<"$T/c-exit")"\n'
+                                           'grep -qxF -- "${*:5}" "$T/present"\n'})
+        rules = ['-o ffh-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT', '-i ffh-+ -j ACCEPT']
+        run = lambda: subprocess.run(['bash', '-c', 'set -euo pipefail\ndie() { echo "DIE $*" >&2; exit 1; }\n' + code +
+                                      '\nprintf "%s\\n" "${docker[@]}"'], env=env, capture_output=True, text=True,
+                                     timeout=30)
+        for present, owned in (([], rules), ([rules[0]], [rules[1]]), (rules, [])):
+            with self.subTest(present=present):
+                with open(os.path.join(tmp, 'present'), 'w') as f:
+                    f.write(''.join(r + '\n' for r in present))
+                got = run()
+                self.assertEqual(got.returncode, 0, got.stderr)
+                self.assertEqual([x for x in got.stdout.splitlines() if x], owned)
+        with open(os.path.join(tmp, 'c-exit'), 'w') as f:
+            f.write('4\n')
+        got = run()
+        self.assertEqual((got.returncode, got.stdout), (1, ''))
+        self.assertIn('DIE iptables -C DOCKER-USER', got.stderr)
+        self.assertIn('gave no answer (exit 4)', got.stderr)
+
+    def test_each_block_alone_counts_only_when_its_target_answers_from_the_host(self):
+        """Fix round 3 (#198 re-check nit): a listener that died makes every connection fail, so a "refused" from the
+        namespace or the unit would prove nothing: each block-alone check first connects from this host, and when
+        that fails it is a FAIL (not tried), never an ok."""
+        src = self.src()
+        tmp, env = self.fakes({
+            # python3 on this host answers $T/host; in the runner's namespace (ip netns exec) and in the unit
+            # (systemd-run), $T/inside.
+            'python3': 'cat -- "$T/host"\n',
+            'ip': '[[ $1 == netns && $2 == exec ]] || exit 2\ncat -- "$T/inside"\n',
+            'systemd-run': 'cat -- "$T/inside"\n'})
+        os.makedirs(os.path.join(tmp, 'netns'))
+        open(os.path.join(tmp, 'netns', 'fork-fleet-u1'), 'w').close()
+        code = src[src.index('# Each of the two network blocks'):].replace('/run/netns/', tmp + '/netns/')
+        for name, host, inside, want_rc, want in (
+                ('both blocks hold', 'open', 'ConnectionRefusedError', 0,
+                 ['ok    the nft table alone refuses', 'ok    IPAddressDeny alone refuses', 'PASSED']),
+                ('the listener died', 'ConnectionRefusedError', 'ConnectionRefusedError', 1,
+                 ['FAIL  the nft table alone: not tried (192.0.2.7:4321 does not answer from this host either',
+                  'FAIL  IPAddressDeny alone: not tried (127.0.0.1:4321 does not answer', 'FAILED (exit 1)']),
+                ('neither block holds', 'open', 'open', 1,
+                 ['FAIL  the nft table alone lets', 'FAIL  IPAddressDeny does not apply here', 'FAILED (exit 1)'])):
+            with self.subTest(name):
+                for f, text in (('host', host), ('inside', inside)):
+                    with open(os.path.join(tmp, f), 'w') as fh:
+                        fh.write(text + '\n')
+                got = subprocess.run(['bash', '-c', 'set -euo pipefail\nusers=(u1) own=192.0.2.7 port=4321 '
+                                      'cg=cgroup2fs rc=0\n' + code], env=env, capture_output=True, text=True,
+                                     timeout=30)
+                self.assertEqual(got.returncode, want_rc, got.stdout + got.stderr)
+                for line in want:
+                    self.assertIn(line, got.stdout)
+                if want_rc:
+                    self.assertNotIn('ok    ', got.stdout)
+
+    def test_its_messages_reach_the_terminal_as_printable_text(self):
+        """Fix round 3 (#191 re-check S1, the proof too): die names other processes' command lines (a pool's part):
+        printable ASCII only, at most 2000 bytes."""
+        src = self.src()
+        got = subprocess.run(['bash', '-c', src[src.index('die() {'):src.index('((EUID == 0))')] + 'die "$X"'],
+                             env={'PATH': '/usr/bin:/bin', 'X': 'process 7 fork-fleet.py \x1b]52;c;eA==\x07\u202e' + 'y' * 3000},
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn('fork-fleet-walls-proof: process 7 fork-fleet.py ?]52;c;eA==??', got.stderr)
+        self.assertLessEqual(len(got.stderr), 2000 + len('fork-fleet-walls-proof: \n'))
 
     def test_it_prints_the_cgroup_version_and_tries_each_block_alone(self):
         src = self.src()

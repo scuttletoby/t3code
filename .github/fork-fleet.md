@@ -464,6 +464,8 @@ chmod 600 /etc/fork-fleet/launch.conf
 ( umask 077; read -rsp 'token: ' t; printf '%s\n' "$t" > /etc/fork-fleet/token ); echo
 # RUNNER_USERS: one user per slot of the pool (step 1). WORK_ROOT (/var/lib/fork-fleet/runners): the launcher makes
 # it 0711. Every directory above it must let the runner users through (o+x), or no runner can reach its copy.
+# WORK_ROOT, HOOK and RESOLV_CONF are bound into every job: never under /home, /root, /mnt, /media or /srv (refused,
+# also through a symlink).
 # NET_BASE (10.204) and RESOLV_CONF (/etc/fork-fleet/resolv.conf): add a line only to change one (step 1b).
 # OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is
 # looked up before every start and every dispatcher pass; every address any of them gives is blocked, and no answer

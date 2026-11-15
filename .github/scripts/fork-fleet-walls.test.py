@@ -436,6 +436,29 @@ class EveryWallsFile(Case):
         self.assertRegex(line, fw.LINE)
         self.assertIn('cg\\x1b[2J\\u202eb\\u200e\\u200f\\u061c', line)
 
+    def test_linux_etc_secrets_reads_mount_units_and_the_login_environment(self):
+        """Fix round 3 (#194 re-check S2): a share mounted by a systemd unit keeps its password in Options= (0644 as
+        installed, so every job reads it), and /etc/environment and /etc/profile.d set every login's variables: a
+        credential in either FAILS, as the same line in /etc/fstab does (the control)."""
+        opts = 'username=me,password=hunter2,uid=1000'
+        unit = f'[Mount]\nWhat=//nas/share\nWhere=/srv/nas\nType=cifs\nOptions={opts}\n'
+        for name, change in (('fstab (control)', {'etc/fstab': f'//nas/share /srv/nas cifs {opts} 0 0\n'}),
+                             ('mount unit', {'etc/systemd/system/srv-nas.mount': unit}),
+                             ('automount drop-in', {'etc/systemd/system/srv-nas.automount.d/x.conf':
+                                                    '[Mount]\nOptions=credentials=/etc/nas.txt\n',
+                                                    'etc/nas.txt': 'username=me\npassword=hunter2\n'}),
+                             ('environment', {'etc/environment': 'GITHUB_TOKEN="ghp_x"\n'}),
+                             ('profile.d', {'etc/profile.d/x.sh': 'export AWS_SECRET_ACCESS_KEY=abc\n'})):
+            with self.subTest(name):
+                root = self.root(overlay(LINUX, change))
+                self.assertIn('etc-secrets', self.walls('linux', 'describe', root)[1])
+        for name, change in (('a mount unit only root reads', {'etc/systemd/system/srv-nas.mount':
+                                                               {'text': unit, 'mode': '600'}}),
+                             ('a variable named, not set', {'etc/profile.d/x.sh': 'export GH_TOKEN=$(cat ~/.t)\n'})):
+            with self.subTest(name):
+                root = self.root(overlay(LINUX, change))
+                self.assertNotIn('etc-secrets', self.walls('linux', 'describe', root)[1])
+
     def test_linux_cgroup_bpf_from_the_kernel_config(self):   # the config in /boot decides before /proc/kallsyms
         for config, want in (('CONFIG_CGROUP_BPF=y\n', []), ('# CONFIG_CGROUP_BPF is not set\n', ['cgroup-bpf'])):
             with self.subTest(config):

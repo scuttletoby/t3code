@@ -14,9 +14,20 @@ LOCAL_FS = {'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'f2fs', 'jfs', 'reiserfs', '
             'tmpfs', 'ramfs', 'rootfs', 'squashfs', 'erofs'}
 PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 # Files in /etc that hold a password for a share: by name (smbcredentials, *.cred, ...), and the mount tables, whose
-# lines may name one (password=, pass=) or point at a file that does (credentials=, cred=).
+# lines may name one (password=, pass=) or point at a file that does (credentials=, cred=): fstab, autofs maps and
+# systemd's mount and automount units with their drop-ins (Options=; the usual way to mount a share on a systemd host).
 SECRET_NAME = re.compile(r'(.*\.creds?|.*credentials?|\.?smbcred.*)', re.I)
-MOUNT_TABLES = ('/etc/fstab', '/etc/auto.*')
+MOUNT_TABLES = ('/etc/fstab', '/etc/auto.*', '/etc/systemd/system/*.mount', '/etc/systemd/system/*.automount',
+                '/etc/systemd/system/*.mount.d/*.conf', '/etc/systemd/system/*.automount.d/*.conf')
+MOUNT_PASSWORD = re.compile(r'(^|[\s,=])(password|pass)=')
+MOUNT_CRED = re.compile(r'(?:^|[\s,=])(?:credentials|cred)=([^\s,]+)')
+# The files every login shell reads, and so every job may (/etc is in its view): a variable whose name says it holds
+# a secret, with a value of its own (not one read from another variable or a command). NAME=, export NAME= and csh's
+# setenv NAME; a name with TOKEN, SECRET, PASSW (PASSWORD, PASSWD), PASSPHRASE or CREDENTIAL in it, or one that is
+# KEY or PASS or ends in _KEY, _PASS or APIKEY.
+ENV_FILES = ('/etc/environment', '/etc/profile.d/*')
+ENV_SET = re.compile(r'^\s*(?:(?:export\s+)?([A-Za-z_]\w*)=|setenv\s+([A-Za-z_]\w*)\s+)["\']?([^\s"\'$`].*)?$')
+SECRET_VAR = re.compile(r'.*(TOKEN|SECRET|PASSW|PASSPHRASE|CREDENTIAL).*|(.*_)?(KEY|PASS)|.*APIKEY', re.I)
 WSL_MARKS = ('/run/WSL', '/proc/sys/fs/binfmt_misc/WSLInterop*', '/usr/lib/wsl', '/mnt/wsl')   # as fork-fleet-walls.py
 WSL_CMDLINE = 'WSL_ROOT_INIT'
 
@@ -175,10 +186,18 @@ def others_read(path, last=0o004):
     return True
 
 
+def readable(patterns):
+    """The files (no folders) these globs find under ROOT that others can read, sorted, each once."""
+    return sorted({p[len(ROOT):] for t in patterns for p in glob.glob(glob.escape(ROOT) + t)
+                   if os.path.isfile(p) and others_read(p[len(ROOT):])})
+
+
 def etc_secrets_wall():
     """Jobs see this host's /etc (the launcher's list has it): no password for a share may be in it that they can
-    read. A credentials file (smbcredentials, *.cred, ...) readable by others, a mount table line with password= or
-    pass=, or one whose credentials= file others can read. A file only its owner reads is fine."""
+    read. A credentials file (smbcredentials, *.cred, ...) readable by others; a line of a mount table (MOUNT_TABLES:
+    fstab, autofs maps, systemd mount and automount units and their drop-ins) with password= or pass=, or with a
+    credentials= or cred= file others can read; a secret's variable (SECRET_VAR) set in /etc/environment or
+    /etc/profile.d. A file only its owner reads is fine."""
     found = []
     for top in ('/etc',):
         for folder, dirs, files in os.walk(ROOT + top):
@@ -187,19 +206,23 @@ def etc_secrets_wall():
                 path = os.path.join(folder, name)[len(ROOT):]
                 if SECRET_NAME.fullmatch(name) and others_read(path):
                     found.append(f'{path} (others can read it)')
-    for table in sorted({p[len(ROOT):] for t in MOUNT_TABLES for p in glob.glob(glob.escape(ROOT) + t)}):
-        if not others_read(table):
-            continue
+    for table in readable(MOUNT_TABLES):
         for n, line in enumerate((read(table) or '').splitlines(), 1):
-            if line.lstrip().startswith('#'):
+            if line.lstrip().startswith(('#', ';')):
                 continue
-            if re.search(r'(^|[\s,])(password|pass)=', line):
+            if MOUNT_PASSWORD.search(line):
                 found.append(f'{table} line {n} (a password)')
-            for cred in re.findall(r'(?:^|[\s,])(?:credentials|cred)=([^\s,]+)', line):
+            for cred in MOUNT_CRED.findall(line):
                 if cred.startswith('/') and others_read(cred):
                     found.append(f'{table} line {n} ({cred}, which others can read)')
+    for env in readable(ENV_FILES):
+        for n, line in enumerate((read(env) or '').splitlines(), 1):
+            m = ENV_SET.match(line)
+            name = m and (m.group(1) or m.group(2))
+            if name and m.group(3) and SECRET_VAR.fullmatch(name):
+                found.append(f'{env} line {n} ({name})')
     if found:
-        return (f'jobs can read a password for a share: {", ".join(found[:3])}; make the file readable by its owner '
+        return (f'jobs can read a secret in /etc: {", ".join(found[:3])}; make the file readable by its owner '
                 'alone (0600)')
     return None
 
@@ -215,7 +238,8 @@ WALLS = [
     ('container', 'not in a container', container_wall),
     ('mounts', 'jobs see only the launcher\'s allow list of system paths, on this host\'s own disks; no other '
                'mount', mounts_wall),
-    ('etc-secrets', 'no password for a share in /etc that jobs can read', etc_secrets_wall),
+    ('etc-secrets', 'no password for a share, nor a secret in the login environment, in /etc that jobs can read',
+     etc_secrets_wall),
 ]
 
 

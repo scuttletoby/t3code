@@ -19,7 +19,19 @@
       "text": "username=u\npassword=p\n",
       "mode": "600"
     },
-    "etc/xrdp/xrdp.ini": "[Xorg]\npassword=ask\n"
+    "etc/xrdp/xrdp.ini": "[Xorg]\npassword=ask\n",
+    "etc/systemd/system/srv-media.mount": "[Unit]\nDescription=media share\n\n[Mount]\nWhat=//nas.example/media\nWhere=/srv/media\nType=cifs\nOptions=credentials=/etc/nas.cred,uid=1000\n",
+    "etc/systemd/system/srv-old.mount": {
+      "text": "[Mount]\nWhat=//nas.example/old\nWhere=/srv/old\nType=cifs\nOptions=username=u,password=owner-only\n",
+      "mode": "600"
+    },
+    "etc/systemd/system/srv-media.automount.d/override.conf": "[Automount]\n# Options=password=old\nTimeoutIdleSec=60\n",
+    "etc/environment": "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n",
+    "etc/profile.d/tools.sh": "export EDITOR=vi\nexport GPG_TTY=$(tty)\nexport GH_TOKEN=$(cat ~/.gh-token)\n[ -n \"$SSH_AUTH_SOCK\" ] && export SSH_KEY_HINT=\n",
+    "etc/profile.d/owner.sh": {
+      "text": "export DEPLOY_TOKEN=only-root-reads-this\n",
+      "mode": "600"
+    }
   },
   "fail": {
     "os": [
@@ -173,6 +185,28 @@
       {
         "etc/fstab": "//nas.example/s /srv/s cifs credentials=/etc/nas.secret 0 0\n",
         "etc/nas.secret": "password=p\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.mount": "[Mount]\nWhat=//nas.example/share\nWhere=/srv/nas\nType=cifs\nOptions=username=me,password=hunter2,uid=1000\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.mount": "[Mount]\nWhat=//nas.example/share\nWhere=/srv/nas\nType=cifs\nOptions=pass=hunter2\n"
+      },
+      {
+        "etc/systemd/system/srv-media.mount.d/creds.conf": "[Mount]\nOptions=credentials=/etc/nas.secret\n",
+        "etc/nas.secret": "password=p\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.automount.d/x.conf": "[Automount]\nOptions=username=u,password=hunter2\n"
+      },
+      {
+        "etc/environment": "PATH=\"/usr/bin:/bin\"\nGITHUB_TOKEN=ghp_example\n"
+      },
+      {
+        "etc/profile.d/tools.sh": "export EDITOR=vi\nexport OPENAI_API_KEY='sk-example'\n"
+      },
+      {
+        "etc/profile.d/nas.csh": "setenv NAS_PASSWORD hunter2\n"
       }
     ]
   }
