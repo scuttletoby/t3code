@@ -1,0 +1,161 @@
+{
+  "about": "fork-fleet-walls.test.py: `pass` is a fake WSL2 distro on which every wall of `wsl2` holds (paths under FORK_FLEET_WALLS_ROOT; a string is a file's text, a path ending in / a folder, {\"text\", \"mode\"} a program; opt/fork-fleet/fork-fleet-launch.sh a launcher with the job units' walls); `fail` names each wall with the changes that make it fail (null removes a path).",
+  "pass": {
+    "proc/sys/kernel/ostype": "Linux\n",
+    "proc/sys/kernel/osrelease": "6.6.87.2-microsoft-standard-WSL2\n",
+    "proc/1/comm": "systemd\n",
+    "proc/sys/kernel/seccomp/actions_avail": "kill_process kill_thread trap errno user_notif trace log allow\n",
+    "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 8:48 / / rw,relatime - ext4 /dev/sdd rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n",
+    "proc/sys/fs/binfmt_misc/status": "enabled\n",
+    "run/WSL/": "",
+    "usr/lib/wsl/": "",
+    "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=false\n[interop]\nenabled=false\nappendWindowsPath=false\n",
+    "etc/binfmt.d/WSLInterop.conf": "",
+    "usr/bin/wslinfo": {
+      "text": "#!/bin/sh\n[ \"$1\" = --networking-mode ] || exit 2\necho nat\nexit 0\n",
+      "mode": "755"
+    },
+    "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
+  },
+  "fail": {
+    "os": [
+      {
+        "proc/sys/kernel/osrelease": "6.8.0-47-generic\n",
+        "run/WSL/": null,
+        "usr/lib/wsl/": null,
+        "proc/1/comm": "init\n"
+      },
+      {
+        "proc/sys/kernel/osrelease": "4.4.0-19041-Microsoft\n"
+      },
+      {
+        "proc/sys/kernel/ostype": null
+      }
+    ],
+    "kernel": [
+      {
+        "proc/sys/kernel/osrelease": "5.4.72-microsoft-standard-WSL2\n"
+      }
+    ],
+    "systemd": [
+      {
+        "proc/1/comm": "init\n"
+      },
+      {
+        "proc/1/comm": null
+      }
+    ],
+    "cgroup2": [
+      {
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 8:48 / / rw,relatime - ext4 /dev/sdd rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - tmpfs tmpfs rw\n"
+      }
+    ],
+    "seccomp": [
+      {
+        "proc/sys/kernel/seccomp/actions_avail": null
+      }
+    ],
+    "container": [
+      {
+        ".dockerenv": ""
+      }
+    ],
+    "mounts": [
+      {
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 8:48 / / rw,relatime - ext4 /dev/sdd rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n60 29 0:60 / /mnt/c rw,noatime - 9p drvfs rw\n"
+      }
+    ],
+    "interop": [
+      {
+        "proc/sys/fs/binfmt_misc/WSLInterop": "enabled\n"
+      },
+      {
+        "proc/sys/fs/binfmt_misc/WSLInterop-late": "enabled\n"
+      },
+      {
+        "proc/sys/fs/binfmt_misc/status": null
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=false\n[interop]\nenabled=true\nappendWindowsPath=false\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=false\n[interop]\nappendWindowsPath=false\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=false\n[interop]\nenabled=false\nappendWindowsPath=false\nenabled=false\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=false\n[interop]\nenabled=false # off\nappendWindowsPath=false\n"
+      },
+      {
+        "etc/wsl.conf": null
+      },
+      {
+        "etc/binfmt.d/WSLInterop.conf": null
+      },
+      {
+        "etc/binfmt.d/WSLInterop.conf": ":WSLInterop:M::MZ::/init:PF\n"
+      }
+    ],
+    "windows-path": [
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=false\n[interop]\nenabled=false\nappendWindowsPath=true\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=false\n[interop]\nenabled=false\nappendwindowspath=false\n"
+      },
+      {
+        "etc/wsl.conf": null
+      }
+    ],
+    "networking": [
+      {
+        "usr/bin/wslinfo": {
+          "text": "#!/bin/sh\n[ \"$1\" = --networking-mode ] || exit 2\necho mirrored\nexit 0\n",
+          "mode": "755"
+        }
+      },
+      {
+        "usr/bin/wslinfo": {
+          "text": "#!/bin/sh\n[ \"$1\" = --networking-mode ] || exit 2\necho nat\nexit 1\n",
+          "mode": "755"
+        }
+      },
+      {
+        "usr/bin/wslinfo": null
+      }
+    ],
+    "vsock": [
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": null
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\nprops=(-p RestrictAddressFamilies=~AF_VSOCK)\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    -p \"RestrictAddressFamilies=AF_UNIX AF_INET AF_VSOCK\"\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p RestrictAddressFamilies=\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    # -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p SystemCallArchitectures=native\n  )\n}\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=@system-service\"\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n  )\n}\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    -p \"TemporaryFileSystem=/run /tmp:size=1G,mode=1777\" -p NoNewPrivileges=yes\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n    -p SystemCallArchitectures=\n  )\n}\n"
+      }
+    ]
+  }
+}
