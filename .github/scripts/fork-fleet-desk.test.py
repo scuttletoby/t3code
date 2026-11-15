@@ -476,12 +476,22 @@ class Wire(unittest.TestCase):
     def test_verbs_are_the_launchers(self):
         case = self.LAUNCH[self.LAUNCH.index('case "${1-}:$#" in'):]
         verbs = dict(re.findall(r'^  ([a-z-]+):([0-9]+|\*)\)', case, re.M))
-        self.assertEqual(set(verbs), set(wire.VERBS))
+        self.assertEqual(set(verbs), set(wire.VERBS) | wire.LOCAL_ONLY)
+        self.assertFalse(set(wire.VERBS) & wire.LOCAL_ONLY)
         for verb, n in verbs.items():
+            if verb in wire.LOCAL_ONLY:
+                continue
             fixed, rest, _ = wire.VERBS[verb]
             self.assertEqual(n == '*', rest is not None, verb)
             if n != '*':
                 self.assertEqual(int(n) - 1, len(fixed), verb)
+
+    def test_local_only_verbs_never_cross_the_link(self):
+        for verb in wire.LOCAL_ONLY:
+            for with_id in (False, True):
+                frame = {'verb': verb, 'args': []} | ({'id': 1} if with_id else {})
+                with self.assertRaises(wire.WireError, msg=verb):
+                    wire.check_request(frame, with_id=with_id)
 
     def test_patterns_are_the_launchers_and_the_dispatchers(self):
         self.assertEqual(wire.NAME.pattern, self.shell_var('NAME'))
@@ -495,7 +505,7 @@ class Wire(unittest.TestCase):
         limit = int(re.search(r'timeout=([0-9]+)', inspect.getsource(ff.Host._do)).group(1))
         src = ''.join(inspect.getsource(f) for f in vars(ff.Host).values() if inspect.isfunction(f))
         verbs = set(re.findall(r"self\._(?:must|do)\('([a-z-]+)'", src))
-        self.assertEqual(verbs, {'start', 'ready', 'active', 'fits', 'stop', 'prune'})
+        self.assertEqual(verbs, {'start', 'ready', 'active', 'fits', 'stop', 'prune', 'refresh-net'})
         for verb in wire.VERBS:
             self.assertLess(wire.limit(verb), wire.serve_seconds(verb), verb)
             self.assertLess(wire.serve_seconds(verb), wire.seconds(verb), verb)
