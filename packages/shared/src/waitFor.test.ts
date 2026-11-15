@@ -483,37 +483,66 @@ describe("judgePrChecks (T12)", () => {
   });
 
   it("orders outcomes failed, then needs_action, then passed", () => {
-    const seen = { headSha: "1a2b3c4d5e6f", finishedAt: T0 };
     const now = T0 + 200 * SECOND;
-    const failed = judgePr({
-      checks: [
-        check("build", "failure"),
-        check("lint", "cancelled"),
-        check("deploy", "action-required"),
-      ],
-      seen,
-      now,
-    });
+    const settle = (checks: ReadonlyArray<PullRequestCheck>) =>
+      judgePr({ checks, seen: judgePr({ checks, now: T0 }).seen, now });
+    const failed = settle([
+      check("build", "failure"),
+      check("lint", "cancelled"),
+      check("deploy", "action-required"),
+    ]);
     expect(failed).toMatchObject({
       type: "met",
       outcome: "failed",
       detail: "Head 1a2b3c4. 2 of 3 failed: build, lint.",
     });
-    const action = judgePr({
-      checks: [check("build", "success"), check("deploy", "action-required")],
-      seen,
-      now,
-    });
+    const action = settle([check("build", "success"), check("deploy", "action-required")]);
     expect(action).toMatchObject({ type: "met", outcome: "needs_action" });
-    const many = judgePr({
-      checks: ["a", "b", "c", "d", "e", "f"].map((name) => check(name, "failure")),
-      seen,
-      now,
-    });
+    const many = settle(["a", "b", "c", "d", "e", "f"].map((name) => check(name, "failure")));
     expect(many).toMatchObject({
       detail: "Head 1a2b3c4. 6 of 6 failed: a, b, c, d, e, ….",
       outcome: "failed",
     });
+  });
+
+  it("settles a head only on two reads of the same finished checks (head and checks of different ages)", () => {
+    // One read pairs the new head with the old head's finished checks (an older checks cache);
+    // the next lists only the new head's fast check. Neither is two reads of one head's checks.
+    const oldRun = { ...check("ci", "success"), url: "https://host/run/1" };
+    const first = judgePr({ checks: [oldRun], now: T0 });
+    expect(first).toMatchObject({ type: "notYet", seen: { finishedAt: T0 } });
+    const fast = judgePr({
+      checks: [check("title-lint", "success")],
+      seen: first.seen,
+      now: T0 + 120 * SECOND,
+    });
+    expect(fast).toMatchObject({
+      type: "notYet",
+      seen: { finishedAt: T0 + 120 * SECOND },
+    });
+    // The same check name from a new run is a different list too.
+    const rerun = judgePr({
+      checks: [{ ...oldRun, url: "https://host/run/2" }],
+      seen: first.seen,
+      now: T0 + 240 * SECOND,
+    });
+    expect(rerun.type).toBe("notYet");
+    // The same list in another order is the same list.
+    const both = [check("a", "success"), check("b", "failure")];
+    const again = judgePr({
+      checks: [...both].reverse(),
+      seen: judgePr({ checks: both, now: T0 }).seen,
+      now: T0 + 120 * SECOND,
+    });
+    expect(again).toMatchObject({ type: "met", outcome: "failed" });
+    // A seen record without a checks list (from before this rule) starts again, never meets.
+    expect(
+      judgePr({
+        checks: both,
+        seen: { headSha: "1a2b3c4d5e6f", finishedAt: T0 },
+        now: T0 + HOUR,
+      }).type,
+    ).toBe("notYet");
   });
 
   it("treats unreadable checks as an error, not as no checks", () => {

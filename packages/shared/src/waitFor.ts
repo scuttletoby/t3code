@@ -359,12 +359,20 @@ function checkStatusClass(
 
 /**
  * The newest head seen with every check finished (or with no checks at all, `noChecks`), and when
- * it was first seen so.
+ * it was first seen so. `checks` is that read's list (`prChecksKey`): the head and the checks can
+ * come from reads of different ages and checks name no commit, so a changed list starts again.
  */
 export interface PrSeen {
   readonly headSha: string | null;
   readonly finishedAt: number;
   readonly noChecks?: true;
+  readonly checks?: string;
+}
+
+/** The finished checks of one read, in a stable order: names, results and links (one per run). */
+function prChecksKey(checks: ReadonlyArray<PullRequestCheck>): string {
+  const each = checks.map((check) => JSON.stringify([check.name, check.status, check.url ?? null]));
+  return JSON.stringify(each.sort());
 }
 
 export type PrJudgement = Judgement & { readonly seen: PrSeen | null };
@@ -379,9 +387,10 @@ function names(checks: ReadonlyArray<PullRequestCheck>): string {
 }
 
 /**
- * Met only when one head reads all finished (or no checks, after `noChecksGraceSeconds` from when
- * it was first seen with none) at two reads at least `prSweepSeconds` apart: a fresh push lists
- * few or no checks until its workflows are queued. A missing `headSha` cannot tell heads apart.
+ * Met only when one head reads the same finished checks (or none, after `noChecksGraceSeconds`)
+ * at two reads at least `prSweepSeconds` apart: a fresh push lists few or no checks until its
+ * workflows are queued, and one read can pair a new head with the old head's checks. A missing
+ * `headSha` cannot tell heads apart.
  */
 export function judgePrChecks(input: {
   readonly detail: { readonly state: PullRequestState; readonly headSha?: string | undefined };
@@ -434,11 +443,17 @@ export function judgePrChecks(input: {
       seen: null,
     };
   }
-  if (seen === null || seen.headSha !== headSha || seen.noChecks === true) {
+  const checksKey = prChecksKey(checks);
+  if (
+    seen === null ||
+    seen.headSha !== headSha ||
+    seen.noChecks === true ||
+    seen.checks !== checksKey
+  ) {
     return {
       type: "notYet",
       detail: `${head} All checks finished once.`,
-      seen: { headSha, finishedAt: now },
+      seen: { headSha, finishedAt: now, checks: checksKey },
     };
   }
   if (now - seen.finishedAt < settings.prSweepSeconds * MS_PER_SECOND) {
