@@ -900,6 +900,7 @@ describe("SlotGate", () => {
               assert.deepStrictEqual(types(yield* grant({ key: "w1", threadId: holder })), [
                 "granted",
               ]);
+              yield* gate.keep(["w1"]);
               assert.deepStrictEqual([...used].sort(), ["stored-0", "stored-1"]);
               assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 2 });
               assert.strictEqual((yield* acquireAs(other)).type, "allow");
@@ -907,6 +908,92 @@ describe("SlotGate", () => {
               assert.strictEqual((yield* acquireAs(holder)).type, "allow");
               assert.deepStrictEqual(used.slice(2), ["w1"]);
               assert.strictEqual((yield* acquireAs(caller)).type, "refuse");
+            }),
+          );
+        }),
+    );
+
+    // The old hold goes only once the new grant is written (`keep`).
+    it.effect(
+      "a re-ask that is not kept (cancelled, or its write failed) leaves the slot the thread held",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          const used: Array<string> = [];
+          let inStore: ReadonlyArray<SlotReservation> = [
+            { key: "stored", threadId: holder, untilMs: 50_000 },
+          ];
+          const attach = (gate: SlotGate.SlotGate["Service"]) =>
+            gate.attachReservations({
+              read: Effect.sync(() => inStore),
+              used: (key) =>
+                Effect.sync(() => {
+                  used.push(key);
+                  inStore = inStore.filter((entry) => entry.key !== key);
+                }),
+            });
+          yield* run(
+            world,
+            waitsOn({ maxPerMachine: 1, reserveSeconds: 60 }),
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              yield* attach(gate);
+              assert.deepStrictEqual(types(yield* grant({ key: "w1", threadId: holder })), [
+                "granted",
+              ]);
+              // Granted but not written yet: the stored hold is still there (a stop here keeps it).
+              assert.deepStrictEqual(used, []);
+              assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 1 });
+              assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+              // The re-ask was cancelled (or its write failed): its grant is dropped.
+              yield* gate.drop(["w1"]);
+              assert.deepStrictEqual(used, []);
+              assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 1 });
+              assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+
+              // Asked again and written this time: the stored hold is replaced, still one slot.
+              assert.deepStrictEqual(types(yield* grant({ key: "w2", threadId: holder })), [
+                "granted",
+              ]);
+              yield* gate.keep(["w2"]);
+              yield* gate.keep(["w2"]);
+              assert.deepStrictEqual(used, ["stored"]);
+              assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 1 });
+              assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+              // A late drop of a kept grant (or of one never made) changes nothing.
+              yield* gate.drop(["w1"]);
+              assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+
+              // Not kept, then its agent starts: the old and the new hold are both used up.
+              yield* TestClock.adjust("10 seconds");
+              assert.deepStrictEqual(types(yield* grant({ key: "w3", threadId: holder })), [
+                "granted",
+              ]);
+              assert.strictEqual((yield* acquireAs(holder)).type, "allow");
+              yield* gate.drop(["w3"]);
+              assert.deepStrictEqual(used.slice(1).sort(), ["w2", "w3"]);
+              // Only the started agent counts now (its start grace), no held slot.
+              assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 1 });
+            }),
+          );
+          // A memory-only hold: dropped re-ask, the hold stays until its own end.
+          yield* run(
+            world,
+            waitsOn({ maxPerMachine: 1, reserveSeconds: 60 }),
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              assert.deepStrictEqual(types(yield* grant({ key: "m1", threadId: holder })), [
+                "granted",
+              ]);
+              yield* gate.keep(["m1"]);
+              yield* TestClock.adjust("30 seconds");
+              assert.deepStrictEqual(types(yield* grant({ key: "m2", threadId: holder })), [
+                "granted",
+              ]);
+              yield* gate.drop(["m2"]);
+              assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+              yield* TestClock.adjust("30 seconds");
+              assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 0, max: 1 });
             }),
           );
         }),
