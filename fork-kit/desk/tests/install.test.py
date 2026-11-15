@@ -260,6 +260,32 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.install()[0], 0)
         self.assertIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
 
+    def test_a_change_written_by_a_killed_run_still_restarts_the_agent(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'host': 'new-host.example'}})
+        self.assertIn('stopped after', str(self.install(stop_after='settings')[0]))
+        code, out, _ = self.run_main('check')   # desk.conf is new, the running agent still has the old one
+        self.assertEqual(code, 1)
+        self.assertIn('did not restart it', out)
+        self.clear_calls()
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
+        self.assertNotIn('restartPending', self.read('/etc/fork-fleet/desk-kit.json'))
+        self.clear_calls()
+        self.assertEqual(self.install()[0], 0)   # and once restarted, not again
+        self.assertNotIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
+
+    def test_a_refused_agent_check_keeps_the_restart_for_the_next_run(self):
+        self.assertEqual(self.install()[0], 0)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'port': 2222}})
+        self.write(os.path.join(self.fakes, 'agent-bad'), '')
+        self.assertEqual(self.install()[0], 1)
+        os.unlink(os.path.join(self.fakes, 'agent-bad'))
+        self.clear_calls()
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
+
     def test_stopped_at_any_step_the_next_run_ends_it(self):
         self.assertEqual(self.install()[0], 0)
         want = self.tree()
@@ -312,6 +338,33 @@ class Desk(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('one or the other', err)
 
+    def test_the_fleet_config_choice_outlives_a_run_killed_after_the_swap(self):
+        project = os.path.join(self.tmp, 'project.json')
+        self.write(project, json.dumps({'pools': [{'name': 'desktop'}], 'project': True}))
+        newer = self.release('release3', {'.github/fork-fleet.json': json.dumps({'pools': [{'name': 'desktop'}],
+                                                                                 'release3': True})})
+        swap = self.m.swap
+
+        def killed(*args):
+            swap(*args)
+            raise SystemExit('killed right after the swap')
+        for first, then, want, other in ((['--fleet-config', project], ['--release-fleet-config'], '"release3"',
+                                          '"project"'),
+                                         ([], ['--fleet-config', project], '"project"', '"release3"')):
+            with self.subTest(then[0]):
+                shutil.rmtree(self.root)
+                self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '1\n')
+                self.assertEqual(self.install(*first)[0], 0)
+                self.m.swap = killed
+                try:
+                    self.assertIn('killed', str(self.install(*then, sha=SHA2)[0]))
+                finally:
+                    self.m.swap = swap
+                code, _, err = self.install(sha=SHA1, source=newer)   # a plain later install keeps the last choice
+                self.assertEqual(code, 0, err)
+                self.assertIn(want, self.read('/opt/fork-fleet/fork-fleet.json'))
+                self.assertNotIn(other, self.read('/opt/fork-fleet/fork-fleet.json'))
+
     def test_refusals_change_nothing(self):
         cases = {
             'not a release sha': (lambda: None, ['--sha', 'abc'], '--sha must be'),
@@ -340,6 +393,11 @@ class Desk(unittest.TestCase):
                 '/run/systemd/system/t3code-fleet-.timer.d/x.conf'), '[Timer]\n'), [], 'changes t3code-fleet'),
             'a record of another shape': (lambda: self.write(self.path('/etc/fork-fleet/desk-kit.json'),
                                                              '{"version": 1}'), [], 'not an install record'),
+            'a fleet config others may write': (lambda: (os.makedirs(os.path.join(self.tmp, 'open'), exist_ok=True),
+                                                         os.chmod(os.path.join(self.tmp, 'open'), 0o777),
+                                                         self.write(os.path.join(self.tmp, 'open', 'f.json'), '{}')),
+                                                ['--fleet-config', os.path.join(self.tmp, 'open', 'f.json')],
+                                                'can be written by other users'),
         }
         for name, (setup, args, msg) in cases.items():
             with self.subTest(name):
@@ -456,6 +514,23 @@ class Desk(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('override.conf: a drop-in the kit did not write changes fork-fleet-desk-agent.service', out)
 
+    def test_check_fails_when_a_unit_is_not_the_release_unit(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        new = self.release('release2', {'.github/scripts/fork-fleet-desk-agent.service': '# v2\n[Service]\n'})
+        self.assertIn('stopped after', str(self.install(sha=SHA2, source=new, stop_after='settings')[0]))
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        self.assertIn('fork-fleet-desk-agent.service: not the unit of release', out)
+        self.assertEqual(self.install(sha=SHA2, source=new)[0], 0)
+        self.assertEqual(self.run_main('check')[0], 0)
+
+    def test_check_names_a_runner_user_left_by_fewer_slots(self):
+        self.assertEqual(self.install()[0], 0)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'slots': 1}})
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('PASS  runner-user  fork-runner-2 is no longer a slot', self.run_main('check')[1])
+
     def test_check_before_install_fails_without_writing(self):
         code, out, _ = self.run_main('check')
         self.assertEqual(code, 1)
@@ -506,6 +581,15 @@ class Desk(unittest.TestCase):
 
     def test_uninstall_removes_the_deny_files_it_made(self):
         self.write(self.path('/etc/cron.deny'), 'someone\n')   # there before: kept, without the kit's lines
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.read('/etc/at.deny'), 'fork-runner-1\nfork-runner-2\n')
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertFalse(os.path.lexists(self.path('/etc/at.deny')))   # with none, only root may use at again
+        self.assertEqual(self.read('/etc/cron.deny'), 'someone\n')
+
+    def test_uninstall_removes_the_deny_lines_it_added_for_users_that_were_there(self):
+        self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\nfork-runner-2\n')   # both made by hand
+        self.write(self.path('/etc/cron.deny'), 'someone\n')
         self.assertEqual(self.install()[0], 0)
         self.assertEqual(self.read('/etc/at.deny'), 'fork-runner-1\nfork-runner-2\n')
         self.assertEqual(self.run_main('uninstall')[0], 0)
@@ -612,9 +696,10 @@ class Release(unittest.TestCase):
         env = {'PATH': '/usr/bin:/bin'}
         for args, msg in ((['--repo', 'x'], '--repo must be'), (['--repo', 'a/b', '--sha', 'x'], '--sha must be'),
                           (['--nope'], 'unknown option'),
-                          # flags after --fleet-config are checked too: a later --sha cannot slip past
-                          (['--repo', 'a/b', '--fleet-config', boot, '--sha', 'x'], '--sha must be'),
-                          (['--fleet-config', boot, '--repo', 'x'], '--repo must be'),
+                          # flags after --fleet-config are checked too: a later --sha cannot replace a good one
+                          (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config', boot, '--sha', 'x'], '--sha must be'),
+                          (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config', boot, '--repo', 'x'],
+                           '--repo must be'),
                           (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config', '/nonexistent/f.json'],
                            'no such file'),
                           (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config'], 'needs a value')):
