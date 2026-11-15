@@ -47,11 +47,26 @@ if name == 'ssh-keygen':
     open(key + '.pub', 'w').write('ssh-ed25519 AAAAfake desk-x\n')
 if name == 'systemctl' and args[0] in ('is-active', 'is-enabled'):
     sys.exit(1 if args[-1] in lines('down') else 0)
+if name == 'systemctl' and args[0] == 'list-units':   # runner units: the file `units`; `stuck` ones never stop
+    print(''.join(f'{u} loaded active running runner\n' for u in lines('units')), end='')
+if name == 'systemctl' and args[0] == 'stop':
+    put('units', [u for u in lines('units') if u not in args[1:] or u in lines('stuck')])
+if name == 'ip' and args[:2] == ['netns', 'list']:
+    print(''.join(f'{n} (id: 0)\n' for n in lines('netns')), end='')
+if name == 'ip' and args[:2] == ['netns', 'delete']:
+    put('netns', [n for n in lines('netns') if n != args[2]])
+    put('links', [n for n in lines('links') if n != 'ffh-' + args[2].rsplit('-', 1)[-1]])
+if name == 'ip' and args[:2] == ['-o', 'link']:
+    print(''.join(f'{i}: {n}@if2: <BROADCAST> mtu 1500\n' for i, n in enumerate(lines('links'), 5)), end='')
+if name == 'ip' and args[:2] == ['link', 'delete']:
+    put('links', [n for n in lines('links') if n != args[2]])
 '''
 
 STUBS = {
     '.github/scripts/fork-fleet-launch.sh': '#!/bin/bash\necho "launch $*" >> {log}\n'
-                                            '[ "$1" = active ] && cat {here}/active 2>/dev/null\nexit 0\n',
+                                            '[ "$1" = active ] && cat {here}/active 2>/dev/null\n'
+                                            'if [ "$1" = stop ]; then grep -vx "$2" {here}/active > {here}/a.new;'
+                                            ' mv {here}/a.new {here}/active; fi\nexit 0\n',
     '.github/scripts/fork-fleet-walls.py': '#!/usr/bin/python3 -I\nimport sys, os\n'
                                            'v = sys.argv[1]\nif v == "os":\n'
                                            '    print("linux"); sys.exit(int(open("{here}/os-exit").read()))\n'
@@ -213,8 +228,9 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.read('/etc/cron.deny'), 'fork-runner-1\nfork-runner-2\n')
         self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['createdUsers'],
                          ['fork-runner-1', 'fork-runner-2'])
-        order = [c for c in calls if c.startswith(('systemctl', 'launch'))]
-        self.assertEqual(order, ['systemctl stop fork-fleet-desk-agent.service', 'systemctl daemon-reload',
+        order = [c for c in calls if c.startswith(('systemctl', 'launch')) and not c.startswith('systemctl show')]
+        self.assertEqual(order, ['systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service '
+                                 'fork-fleet-desk-agent.service', 'systemctl daemon-reload',
                                  'systemctl enable --now t3code-fleet-refresh.timer', 'launch prune',
                                  'systemctl start --no-block t3code-fleet-refresh.service',
                                  'systemctl enable fork-fleet-desk-agent.service',
@@ -234,8 +250,17 @@ class Desk(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.tree(), before)
         calls = self.calls()
-        self.assertFalse([c for c in calls if c.startswith(('useradd', 'ssh-keygen', 'systemctl stop'))], calls)
+        self.assertFalse([c for c in calls if c.startswith(('useradd', 'ssh-keygen', 'systemctl stop',
+                                                            'systemctl restart'))], calls)
+        self.assertIn('systemctl start fork-fleet-desk-agent.service', calls)   # a no-op for a running agent
         self.assertNotIn('systemctl start --no-block t3code-fleet-refresh.service', calls)   # the template is there
+
+    def test_a_changed_setting_restarts_the_agent(self):
+        self.assertEqual(self.install()[0], 0)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'reserveMb': 2048}})
+        self.clear_calls()
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
 
     def test_stopped_at_any_step_the_next_run_ends_it(self):
         self.assertEqual(self.install()[0], 0)
@@ -268,8 +293,8 @@ class Desk(unittest.TestCase):
         self.assertIn('# new', self.read('/opt/fork-fleet/hook.sh'))
         self.assertEqual(os.stat(self.path('/opt/fork-fleet/fork-fleet-launch.sh')).st_ino, launcher)  # unchanged
         calls = self.calls()
-        self.assertLess(calls.index('systemctl stop fork-fleet-desk-agent.service'),
-                        calls.index('systemctl restart fork-fleet-desk-agent.service'))
+        stop = 'systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service fork-fleet-desk-agent.service'
+        self.assertLess(calls.index(stop), calls.index('systemctl restart fork-fleet-desk-agent.service'))
         self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['sha'], SHA2)
 
     def test_project_fleet_config_is_used_and_kept(self):
@@ -281,6 +306,13 @@ class Desk(unittest.TestCase):
         code, _, err = self.install(sha=SHA2)   # no --fleet-config: the project's stays
         self.assertEqual(code, 0, err)
         self.assertIn('"project": true', self.read('/opt/fork-fleet/fork-fleet.json'))
+        code, _, err = self.install('--release-fleet-config', sha=SHA2)   # and back to the release's own
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('"project": true', self.read('/opt/fork-fleet/fork-fleet.json'))
+        self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['fleetConfig'], 'release')
+        code, _, err = self.install('--release-fleet-config', '--fleet-config', project)
+        self.assertEqual(code, 1)
+        self.assertIn('one or the other', err)
 
     def test_refusals_change_nothing(self):
         cases = {
@@ -303,6 +335,13 @@ class Desk(unittest.TestCase):
             'a foreign unit': (lambda: self.write(self.path('/etc/systemd/system/fork-fleet-desk-agent.service'), 'x'),
                                [], 'this kit did not make'),
             'no such fleet config': (lambda: None, ['--fleet-config', '/nonexistent/x.json'], 'no such file'),
+            'a drop-in for the agent': (lambda: self.write(self.path(
+                '/etc/systemd/system/fork-fleet-desk-agent.service.d/override.conf'), '[Service]\nExecStart=\n'), [],
+                'override.conf changes fork-fleet-desk-agent.service'),
+            'a dash-prefix drop-in': (lambda: self.write(self.path(
+                '/run/systemd/system/t3code-fleet-.timer.d/x.conf'), '[Timer]\n'), [], 'changes t3code-fleet'),
+            'a record of another shape': (lambda: self.write(self.path('/etc/fork-fleet/desk-kit.json'),
+                                                             '{"version": 1}'), [], 'not an install record'),
         }
         for name, (setup, args, msg) in cases.items():
             with self.subTest(name):
@@ -320,7 +359,8 @@ class Desk(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn(msg, err)
                 self.assertEqual(self.tree(), before)
-                self.assertFalse([c for c in self.calls() if not c.startswith('id ')], self.calls())
+                self.assertFalse([c for c in self.calls() if not c.startswith(('id ', 'systemctl show'))],
+                                 self.calls())
 
     def test_bad_release_is_not_installed(self):
         self.assertEqual(self.install()[0], 0)
@@ -329,7 +369,9 @@ class Desk(unittest.TestCase):
                 ('no pool', {'.github/fork-fleet.json': json.dumps({'pools': [{'name': 'vm'}]})}, "no pool 'desktop'"),
                 ('gate does not load', {'.github/scripts/fork-fleet.py': 'raise SystemExit("bad config")\n'},
                  'the gate does not load'),
-                ('launcher syntax', {'.github/scripts/fork-fleet-launch.sh': '#!/bin/bash\nif then\n'}, 'bash -n')):
+                ('launcher syntax', {'.github/scripts/fork-fleet-launch.sh': '#!/bin/bash\nif then\n'}, 'bash -n'),
+                ('pools not a list', {'.github/fork-fleet.json': json.dumps({'pools': {'desktop': {}}})},
+                 'not a list of pools')):
             with self.subTest(name):
                 bad = self.release('bad-' + name.replace(' ', '-'), extra)
                 code, _, err = self.install(sha=SHA2, source=bad)
@@ -420,6 +462,21 @@ class Desk(unittest.TestCase):
             self.assertIn(line, out)
         self.assertTrue(out.endswith('8 FAIL\n'), out)
 
+    def test_check_fails_on_a_drop_in_and_on_settings_the_machine_file_no_longer_gives(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.assertEqual(self.run_main('check')[0], 0)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'slots': 1}})
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  settings  /etc/fork-fleet/launch.conf differs from the machine file', out)
+        self.machine(MACHINE)
+        self.write(self.path('/etc/systemd/system/fork-fleet-desk-agent.service.d/override.conf'),
+                   '[Service]\nExecStart=\nExecStart=/bin/sh -c evil\n')
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        self.assertIn('override.conf: a drop-in the kit did not write changes fork-fleet-desk-agent.service', out)
+
     def test_check_before_install_fails_without_writing(self):
         code, out, _ = self.run_main('check')
         self.assertEqual(code, 1)
@@ -454,6 +511,76 @@ class Desk(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('nothing here was installed by this kit', out)
 
+    def test_uninstall_keeps_what_the_kit_did_not_make(self):
+        self.assertEqual(self.install()[0], 0)
+        for path in ('/etc/fork-fleet/token', '/opt/fork-fleet/notes.txt', '/var/lib/fork-fleet/other/x'):
+            self.write(self.path(path), 'not the kit\'s\n')
+        self.write(self.path('/var/lib/fork-fleet/runners/desktop-1/x'), '')
+        code, out, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        left = {k for k in self.tree() if k.startswith(('/etc/fork-fleet', '/opt/fork-fleet', '/var/lib/fork-fleet'))}
+        self.assertEqual(left, {'/etc/fork-fleet', '/etc/fork-fleet/token', '/opt/fork-fleet',
+                                '/opt/fork-fleet/notes.txt', '/var/lib/fork-fleet', '/var/lib/fork-fleet/other',
+                                '/var/lib/fork-fleet/other/x'})
+        self.assertIn('left /etc/fork-fleet/token: the kit did not make it', out)
+
+    def test_uninstall_removes_the_deny_files_it_made(self):
+        self.write(self.path('/etc/cron.deny'), 'someone\n')   # there before: kept, without the kit's lines
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.read('/etc/at.deny'), 'fork-runner-1\nfork-runner-2\n')
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertFalse(os.path.lexists(self.path('/etc/at.deny')))   # with none, only root may use at again
+        self.assertEqual(self.read('/etc/cron.deny'), 'someone\n')
+
+    def test_uninstall_keeps_the_table_while_a_runner_still_runs(self):
+        self.assertEqual(self.install()[0], 0)
+        self.write(os.path.join(self.fakes, 'units'), 'fork-fleet-desktop-1.service\nfork-fleet-desktop-2.service\n')
+        self.write(os.path.join(self.fakes, 'stuck'), 'fork-fleet-desktop-2.service\n')
+        self.clear_calls()
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1)
+        self.assertIn('fork-fleet-desktop-2.service is still running', err)
+        calls = self.calls()
+        self.assertIn('systemctl stop fork-fleet-desktop-1.service', calls)   # what the launcher did not stop
+        self.assertFalse([c for c in calls if c.startswith(('nft', 'userdel', 'ip netns delete'))], calls)
+        self.assertTrue(os.path.exists(self.path('/etc/fork-fleet/desk-kit.json')))
+        os.unlink(os.path.join(self.fakes, 'stuck'))
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertIn('nft delete table inet fork_fleet', self.calls())
+
+    def test_uninstall_removes_every_runner_namespace(self):
+        self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n')   # made by hand, not by the kit
+        self.assertEqual(self.install()[0], 0)
+        self.write(os.path.join(self.fakes, 'netns'), 'fork-fleet-fork-runner-1\nfork-fleet-fork-runner-2\nother\n')
+        self.write(os.path.join(self.fakes, 'links'), 'ffh-1001\neth0\nffh-1009\n')
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertEqual(slurp(os.path.join(self.fakes, 'netns')).split(), ['other'])
+        self.assertEqual(slurp(os.path.join(self.fakes, 'links')).split(), ['eth0'])
+
+    def test_uninstall_removes_its_record_last(self):
+        self.assertEqual(self.install()[0], 0)
+        gone, unlink = [], os.unlink
+
+        def record(path, *a, **kw):
+            gone.append(os.path.basename(path))
+            return unlink(path, *a, **kw)
+        os.unlink = record
+        try:
+            self.assertEqual(self.run_main('uninstall')[0], 0)
+        finally:
+            os.unlink = unlink
+        self.assertEqual(gone[-1], 'desk-kit.json', gone)
+
+    def test_uninstall_refuses_a_record_of_another_shape(self):
+        self.assertEqual(self.install()[0], 0)
+        for bad in ('[]', '{"version": 1, "createdUsers": "fork-runner-1", "fleetConfig": "release"}',
+                    '{"version": 1, "createdUsers": ["root;x"], "fleetConfig": "release"}'):
+            with self.subTest(bad):
+                self.write(self.path('/etc/fork-fleet/desk-kit.json'), bad, 0o600)
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1)
+                self.assertIn('not an install record', err)
+
     def test_uninstall_stopped_half_way_runs_again(self):
         self.assertEqual(self.install()[0], 0)
         self.write(os.path.join(self.fakes, 'fail'), 'userdel\n')
@@ -486,7 +613,13 @@ class Release(unittest.TestCase):
         self.assertEqual(subprocess.run(['sh', '-n', boot]).returncode, 0)
         env = {'PATH': '/usr/bin:/bin'}
         for args, msg in ((['--repo', 'x'], '--repo must be'), (['--repo', 'a/b', '--sha', 'x'], '--sha must be'),
-                          (['--nope'], 'unknown option')):
+                          (['--nope'], 'unknown option'),
+                          # flags after --fleet-config are checked too: a later --sha cannot slip past
+                          (['--repo', 'a/b', '--fleet-config', boot, '--sha', 'x'], '--sha must be'),
+                          (['--fleet-config', boot, '--repo', 'x'], '--repo must be'),
+                          (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config', '/nonexistent/f.json'],
+                           'no such file'),
+                          (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config'], 'needs a value')):
             r = subprocess.run(['sh', boot, *args], capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 1)
             self.assertIn(msg, r.stderr)

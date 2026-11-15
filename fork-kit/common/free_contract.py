@@ -28,6 +28,10 @@ def parse_at(at):
     return when if when.tzinfo is not None else None
 
 
+def no_constant(name):
+    raise ValueError(f'{name} is not JSON')
+
+
 def judge(code, out, now, need_mb=None):
     """(verdict, reason, facts) for one answer: verdict 'free', 'busy' or 'unavailable' (only 'free' is free).
 
@@ -42,8 +46,8 @@ def judge(code, out, now, need_mb=None):
     if code not in (FREE, BUSY):
         return no(f'exit {code}')
     try:
-        facts = json.loads(out.decode('utf-8'))
-    except ValueError:   # UnicodeDecodeError is one
+        facts = json.loads(out.decode('utf-8'), parse_constant=no_constant)
+    except ValueError:   # UnicodeDecodeError is one, and so is NaN or Infinity (not JSON, and NaN < size is False)
         return no('stdout is not JSON')
     if not isinstance(facts, dict):
         return no('stdout is not a JSON object')
@@ -72,7 +76,9 @@ def judge(code, out, now, need_mb=None):
 
 def unsafe(command, uid=None):
     """Why COMMAND must not run, or None: an absolute plain path to an executable file that it and every folder
-    above it belong to root or to this user and that no one else may change (a sticky folder like /tmp is fine)."""
+    above it belong to root or to this user and that no one else may change (a sticky folder like /tmp is fine).
+    A link is judged by the file it leads to, and ask() runs that file, never the link (it could be repointed).
+    Plain mode bits only: an ACL that lets others write is not seen."""
     uid = os.geteuid() if uid is None else uid
     if not os.path.isabs(command) or os.path.normpath(command) != command:
         return f'{command!r} is not an absolute plain path'
@@ -93,26 +99,47 @@ def unsafe(command, uid=None):
         return f'{path}: {e.strerror}'
 
 
+def holders(pipe):
+    """The other processes that hold the pipe PIPE (a file object) open: a script's child that left its process
+    group (setsid) and kept stdout. Only processes this user may look at are seen (all of them for root)."""
+    name, found = f'pipe:[{os.fstat(pipe.fileno()).st_ino}]', []
+    for pid in filter(str.isdigit, os.listdir('/proc')):
+        if int(pid) == os.getpid():
+            continue
+        try:
+            if any(os.readlink(f'/proc/{pid}/fd/{fd}') == name for fd in os.listdir(f'/proc/{pid}/fd')):
+                found.append(int(pid))
+        except OSError:   # gone, or not ours to look at
+            pass
+    return found
+
+
 def ask(command, need_mb=None, timeout=LIMIT_SECONDS):
-    """Runs the free script (no arguments, stdin empty, a plain environment, its whole process group ended after it)
-    and judges its answer: (verdict, reason, facts)."""
+    """Runs the free script (no arguments, stdin empty, a plain environment) and judges its answer: (verdict,
+    reason, facts). After it, its whole process group is ended, and so is any other process that still holds its
+    stdout (a child that left the group with setsid). A child that leaves the group and closes stdout is not seen:
+    FREE.md asks scripts to leave nothing running."""
     why = unsafe(command)
     if why:
         return 'unavailable', why, None
+    path = os.path.realpath(command)   # what unsafe() judged; the link itself may be repointed after the check
     try:
-        p = subprocess.Popen([command], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        p = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              env=ENV, cwd='/', start_new_session=True)
     except OSError as e:
-        return 'unavailable', f'cannot run {command}: {e.strerror}', None
-    out, code, deadline = b'', None, time.monotonic() + timeout
+        return 'unavailable', f'cannot run {path}: {e.strerror}', None
+    out, code, closed, deadline = b'', None, False, time.monotonic() + timeout
+    poll = select.poll()   # not select(): a long-lived consumer may hold descriptors above 1024
+    poll.register(p.stdout, select.POLLIN)
     with p:
         try:
             while len(out) <= MAX_BYTES:
                 left = deadline - time.monotonic()
-                if left <= 0 or not select.select([p.stdout], [], [], left)[0]:
+                if left <= 0 or not poll.poll(left * 1000):
                     break
                 chunk = os.read(p.stdout.fileno(), 65536)
                 if not chunk:
+                    closed = True
                     try:
                         code = p.wait(max(0.0, deadline - time.monotonic()))
                     except subprocess.TimeoutExpired:
@@ -124,6 +151,12 @@ def ask(command, need_mb=None, timeout=LIMIT_SECONDS):
                 os.killpg(p.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+            if not closed:   # someone still holds stdout open
+                for pid in holders(p.stdout):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
     return judge(code, out, datetime.datetime.now(datetime.timezone.utc), need_mb)
 
 

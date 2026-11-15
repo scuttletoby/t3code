@@ -53,6 +53,20 @@
       "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\"}",
       "verdict": "free"
     },
+    {
+      "name": "NaN is not JSON",
+      "exit": 0,
+      "needMb": 100,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"memory\": {\"freeMb\": NaN}}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "Infinity is not JSON",
+      "exit": 0,
+      "needMb": 100,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"memory\": {\"freeMb\": -Infinity}}",
+      "verdict": "unavailable"
+    },
     { "name": "no answer in time", "exit": null, "stdout": "", "verdict": "unavailable" },
     {
       "name": "another exit code",
