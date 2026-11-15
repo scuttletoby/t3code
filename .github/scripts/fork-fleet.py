@@ -55,6 +55,7 @@ LABEL = re.compile(r'[a-z0-9][a-z0-9-]{0,62}')
 VARIABLE = re.compile(r'(?!GITHUB_)[A-Z][A-Z0-9_]{0,99}')
 JOB_ID = re.compile(r'[a-z0-9_]{1,40}')
 POOL = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
+SEED_MAX_MB = 16384   # a seed's largest max_mb: 16 GiB
 KINDS = ('push', 'draft', 'ready')   # a pool's `takes`: pushes, draft pull requests, pull requests ready for review
 # Events whose code and workflow are this repository's own (a pull request event: only when head and base are too).
 OWN_EVENTS = ('push', 'workflow_dispatch', 'schedule')
@@ -143,9 +144,9 @@ def check_config(cfg):
         if not (isinstance(seeds, list) and all(
                 isinstance(x, dict) and isinstance(x.get('name'), str) and POOL.fullmatch(x['name'])
                 and all(positive(x.get(k)) for k in ('every_hours', 'max_age_hours', 'max_mb'))
-                and x['max_age_hours'] >= x['every_hours'] for x in seeds)):
+                and x['max_age_hours'] >= x['every_hours'] and x['max_mb'] <= SEED_MAX_MB for x in seeds)):
             out.append(f'{who}: seeds must list {{"name" (a-z, 0-9, _, -), "every_hours", "max_age_hours" (at least '
-                       'every_hours), "max_mb"}, each a positive whole number')
+                       f'every_hours), "max_mb" (at most {SEED_MAX_MB})}}, each a positive whole number')
         elif len({x['name'] for x in seeds}) != len(seeds):
             out.append(f'{who}: two seeds with one name')
         if not positive(p.get('slots')):

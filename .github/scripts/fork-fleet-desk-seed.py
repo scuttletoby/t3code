@@ -40,11 +40,13 @@ Each run (one at a time: a lock) meets this state:
 The forced command sends every command that starts with `seed` here. The host side exits 2 for any other command,
 3 while another stream for the pool runs, 4 when the file may not be sent (missing, a link, in a folder or a file
 others may write, above max_mb, older than max_age_hours or dated in the future, or changed while it was sent: made
-in place, not by rename), 1 when the desktop stops reading for STALL seconds (the pool's lock is then let go).
+in place, not by rename; a file replaced by rename while it is sent is fine, the old one is sent whole), 1 when the
+desktop takes less than WRITE bytes in STALL seconds or the whole file not by its deadline (GRACE seconds plus
+MIN_RATE bytes a second): the pool's lock is then let go.
 Standard library only.
 """
-import argparse, fcntl, hashlib, importlib.util, json, os, re, shutil, signal, stat, subprocess, sys, tarfile
-import threading, time
+import argparse, fcntl, hashlib, importlib.util, json, math, os, re, shutil, signal, stat, subprocess, sys
+import tarfile, threading, time
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -65,7 +67,8 @@ LINK = re.compile(r'\.v/((?P<name>[a-z0-9][a-z0-9_-]{0,39})\.[0-9]{1,20})/data')
 LIST_WAIT, FETCH_WAIT = 30, 30 * 60   # seconds for the list, and for one seed's whole stream
 LIST_MOST, ERR_KEEP, MEMBERS = 1 << 20, 4096, 200_000   # the list's bytes, ssh's stderr kept, a seed's tar members
 KEEP_OLD, SKEW = 24 * 3600, 3600       # SKEW: how far the host's clock may be ahead of the desktop's
-PIECE, STALL, AHEAD = 1 << 20, 120, 300   # AHEAD: seconds a file's date may be ahead of now (a clock set back)
+PIECE, WRITE, STALL, AHEAD = 1 << 20, 64 << 10, 120, 300   # AHEAD: seconds a file's date may be ahead of now
+GRACE, MIN_RATE = 600, 256 << 10   # a stream's deadline: GRACE seconds plus one second per MIN_RATE bytes
 ITEM = {'everyHours': 'every_hours', 'maxAgeHours': 'max_age_hours', 'maxMb': 'max_mb'}
 
 
@@ -152,7 +155,9 @@ def offer(pool, command, lock_dir, out=1, err=sys.stderr, config=CONFIG, files=F
                 os.close(fd)
         finally:
             os.close(lock)
-        same = ('st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_ino')
+        # A rename over NAME.tar unlinks the open file (st_nlink 0), which changes its ctime but not its bytes:
+        # only a file still in place must keep its ctime (a rewrite with the old mtime put back).
+        same = ('st_size', 'st_mtime_ns') + (('st_ctime_ns',) if after.st_nlink else ())
         if sent != st.st_size or any(getattr(after, k) != getattr(st, k) for k in same):
             raise Refused(f'{name}: it changed while it was sent (made in place, not by rename?)', 4)
         print(f'seed {name} {sent} {sha} {int(st.st_mtime)}', file=err, flush=True)
@@ -172,9 +177,11 @@ def stalled(*_):
 
 def send(fd, out, size, stall=None):
     """Sends at most SIZE bytes of FD (the size that was checked: a file that grows is cut there, and then fails the
-    changed-file check) to OUT; Refused (1) when OUT takes nothing for STALL seconds."""
+    changed-file check) to OUT; Refused (1) when OUT takes less than WRITE bytes in STALL seconds, or not all of it
+    within GRACE seconds plus SIZE / MIN_RATE."""
     stall = STALL if stall is None else stall
     sha, sent = hashlib.sha256(), 0
+    deadline = time.monotonic() + GRACE + size / MIN_RATE
     old = signal.signal(signal.SIGALRM, stalled)
     try:
         while sent < size and (data := os.read(fd, min(PIECE, size - sent))):
@@ -182,10 +189,16 @@ def send(fd, out, size, stall=None):
             sent += len(data)
             view = memoryview(data)
             while view:
-                signal.alarm(stall)   # each write that moves anything starts the wait again
-                view = view[os.write(out, view):]
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise Stalled
+                signal.alarm(max(1, min(stall, math.ceil(left))))   # each piece that moves starts the wait again
+                view = view[os.write(out, view[:WRITE]):]
     except Stalled:
-        raise Refused(f'the desktop took nothing for {stall} seconds: stopped', 1) from None
+        if time.monotonic() >= deadline:
+            raise Refused(f'the desktop did not take {size} bytes within {GRACE + size / MIN_RATE:.0f} seconds '
+                          f'(at least {MIN_RATE >> 10} KiB a second): stopped', 1) from None
+        raise Refused(f'the desktop took less than {WRITE >> 10} KiB in {stall} seconds: stopped', 1) from None
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old)

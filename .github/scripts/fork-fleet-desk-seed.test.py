@@ -2,7 +2,8 @@
 """Tests of fork-fleet-desk-seed.py (a desk pool's warm caches) and the `seeds` check of fork-fleet.json: the host's
 offer in-process, the desktop's run end to end through a fake ssh that runs the host's side, and the forced command's
 divert in fork-fleet-desk.py. Temp folders only; no root, no ssh, no network. Run: python3 -I -B <this>. Linux only."""
-import fcntl, hashlib, importlib.util, io, json, os, shutil, stat, subprocess, sys, tarfile, tempfile, time, unittest
+import fcntl, hashlib, importlib.util, io, json, os, shutil, stat, subprocess, sys, tarfile, tempfile, threading
+import time, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -121,9 +122,11 @@ class Config(unittest.TestCase):
             return [p for p in ff.check_config(cfg) if 'seed' in p]
         self.assertEqual(problems(SEEDS), [])
         self.assertEqual(problems([]), [])
+        self.assertEqual(problems([{**SEEDS[0], 'max_mb': ff.SEED_MAX_MB}]), [])
         good = SEEDS[0]
         for bad in ({}, [{**good, 'name': 'M2'}], [{**good, 'name': '../x'}], [{**good, 'every_hours': 0}],
                     [{**good, 'max_mb': True}], [{**good, 'max_age_hours': 5}], [{**good, 'max_mb': '2'}],
+                    [{**good, 'max_mb': ff.SEED_MAX_MB + 1}],
                     [{k: v for k, v in good.items() if k != 'max_mb'}], ['m2'], [good, good]):
             with self.subTest(bad):
                 self.assertEqual(len(problems(bad)), 1, bad)
@@ -162,15 +165,16 @@ class Host(Base):
     def test_a_file_that_may_not_be_sent_is_exit_4(self):
         top, files = os.path.join(self.t, 'files'), os.path.join(self.t, 'files', POOL)
         now = time.time()
-        cases = {'missing': lambda: None,
-                 'a link': lambda: os.symlink(os.path.join(self.t, 'src', 'x.tar'), f'{files}/m2.tar'),
-                 'group-writable': lambda: (self.make('m2', {'a': b'x'}), os.chmod(f'{files}/m2.tar', 0o664)),
-                 'too big': lambda: self.make('m2', {'a': os.urandom(3 << 20)}),
-                 'too old': lambda: self.make('m2', {'a': b'x'}, mtime=now - 1001 * 3600),
+        cases = {'not made yet': lambda: None,
+                 'Too many levels of symbolic links': lambda: os.symlink(os.path.join(self.t, 'src', 'x.tar'),
+                                                                         f'{files}/m2.tar'),
+                 'others may write it': lambda: (self.make('m2', {'a': b'x'}), os.chmod(f'{files}/m2.tar', 0o664)),
+                 'above max_mb': lambda: self.make('m2', {'a': os.urandom(3 << 20)}),
+                 'older than max_age_hours': lambda: self.make('m2', {'a': b'x'}, mtime=now - 1001 * 3600),
                  'dated in the future': lambda: self.make('m2', {'a': b'x'}, mtime=now + 10 * 365 * 86400),
-                 'the files folder others write': lambda: (self.make('m2', {'a': b'x'}), os.chmod(top, 0o777)),
-                 'a folder': lambda: os.mkdir(f'{files}/m2.tar'),
-                 'folder others write': lambda: (self.make('m2', {'a': b'x'}), os.chmod(files, 0o777))}
+                 f'{top} must be a folder': lambda: (self.make('m2', {'a': b'x'}), os.chmod(top, 0o777)),
+                 'not a plain file': lambda: os.mkdir(f'{files}/m2.tar'),
+                 f'{files} must be a folder': lambda: (self.make('m2', {'a': b'x'}), os.chmod(files, 0o777))}
         with open(os.path.join(self.t, 'src', 'x.tar'), 'wb') as f:
             f.write(b'x')
         os.chmod(os.path.join(self.t, 'src', 'x.tar'), 0o644)   # only the link itself may be the reason
@@ -179,6 +183,7 @@ class Host(Base):
                 make()
                 code, out, err = self.offer('seed m2')
                 self.assertEqual((code, out), (4, b''), err)
+                self.assertIn(name, err)   # refused for this reason, read where the pool's files are
                 os.chmod(files, 0o755)
                 os.chmod(top, 0o755)
                 p = f'{files}/m2.tar'
@@ -207,6 +212,25 @@ class Host(Base):
         self.assertEqual(code, 4)
         self.assertIn('changed while it was sent', err)
         self.assertEqual(len(out), os.stat(path).st_size - 512)   # cut at the size that was checked
+
+    def test_a_rename_while_sent_is_fine(self):
+        old, send = self.make('m2', {'a': b'x' * 3000}), seed.send
+
+        def renaming(fd, out, size):
+            self.make('m2', {'a': b'y' * 3000})   # the documented refresh: a temp file, then a rename
+            return send(fd, out, size)
+        with mock.patch.object(seed, 'send', renaming):
+            code, out, err = self.offer('seed m2')
+        self.assertEqual((code, out), (0, old), err)
+        self.assertTrue(err.startswith(f'seed m2 {len(old)} {hashlib.sha256(old).hexdigest()} '), err)
+
+    def test_a_lock_of_another_user_is_refused(self):
+        self.make('m2', {'a': b'x'})
+        open(os.path.join(self.t, 'run', f'{POOL}.seed.lock'), 'a').close()
+        with mock.patch.object(seed.os, 'geteuid', return_value=os.geteuid() + 4242):
+            code, out, err = self.offer('seed m2')
+        self.assertEqual((code, out), (1, b''), err)
+        self.assertIn(f'belongs to uid {os.geteuid()}', err)
 
     def test_a_same_size_rewrite_with_its_old_date_put_back_is_exit_4(self):
         self.make('m2', {'a': b'x' * 3000})
@@ -237,9 +261,47 @@ class Host(Base):
             os.close(r)
             os.close(w)
         self.assertEqual(code, 1)
-        self.assertIn('took nothing for 1 seconds', err.getvalue())
+        self.assertIn('took less than 64 KiB in 1 seconds', err.getvalue())
         self.make('m2', {'a': b'x'})   # small enough for the pipe: offer() below has no reader until it returns
         self.assertEqual(self.offer('seed m2')[0], 0)   # the pool's lock was let go
+
+    def test_a_slow_desktop_meets_the_deadline(self):
+        self.make('m2', {'a': os.urandom(1 << 20)})
+        r, w = os.pipe()   # nobody reads r; the stall wait alone (100 s) would hold the lock much longer
+        err = io.StringIO()
+        try:
+            with mock.patch.multiple(seed, STALL=100, GRACE=1, MIN_RATE=1 << 40):
+                t = time.monotonic()
+                code = seed.offer(POOL, 'seed m2', os.path.join(self.t, 'run'), out=w, err=err,
+                                  config=os.path.join(self.t, 'fork-fleet.json'), files=os.path.join(self.t, 'files'))
+            self.assertLess(time.monotonic() - t, 30)
+        finally:
+            os.close(r)
+            os.close(w)
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertIn('within 1 seconds', err.getvalue())
+
+    def test_a_desktop_reading_slowly_but_steadily_is_not_dropped(self):
+        data = self.make('m2', {'a': os.urandom(300 << 10)})
+        r, w = os.pipe()
+        got = bytearray()
+
+        def reader():
+            with os.fdopen(r, 'rb', buffering=0) as f:
+                while chunk := f.read(16 << 10):   # 16 KiB, then a pause: under a stall wait per 64 KiB piece
+                    got.extend(chunk)
+                    time.sleep(0.3)
+        th = threading.Thread(target=reader)
+        th.start()
+        err = io.StringIO()
+        try:
+            with mock.patch.object(seed, 'STALL', 2):
+                code = seed.offer(POOL, 'seed m2', os.path.join(self.t, 'run'), out=w, err=err,
+                                  config=os.path.join(self.t, 'fork-fleet.json'), files=os.path.join(self.t, 'files'))
+        finally:
+            os.close(w)
+            th.join(60)
+        self.assertEqual((code, bytes(got)), (0, data), err.getvalue())
 
     def test_pools_never_share_a_seed_file(self):
         cfg = json.loads(json.dumps(CONFIG))

@@ -74,26 +74,71 @@ def judge(code, out, now, need_mb=None):
     return 'free', '', facts
 
 
-def unsafe(command, uid=None):
-    """Why COMMAND must not run, or None: an absolute plain path to an executable file that it and every folder
-    above it belong to root or to this user and that no one else may change (a sticky folder like /tmp is fine).
-    A link is judged by the file it leads to; ask() resolves the link once and both judges and runs that file.
-    Plain mode bits only: an ACL that lets others write is not seen."""
+def kept(path, st, uid):
+    """Why the folder PATH (its stat ST) may not be trusted to hold what we run, or None."""
+    if st.st_uid not in (0, uid):
+        return f'{path} belongs to uid {st.st_uid}'
+    if st.st_mode & 0o022 and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
+        return f'{path} may be changed by others'
+    return None
+
+
+def resolve(command, uid=None):
+    """(the file COMMAND leads to, None), or (None, why not). Follows the path one part at a time, as the kernel
+    does, so the folders of the path as written are judged, not only those of the file it leads to: every folder
+    on the way belongs to root or to this user and no one else may change it (a sticky folder like /tmp is fine),
+    and every link on the way belongs to root or to this user. The kernel's fs.protected_symlinks would refuse
+    another user's link in a sticky folder; resolving here must not quietly follow one."""
     uid = os.geteuid() if uid is None else uid
     if not os.path.isabs(command) or os.path.normpath(command) != command:
-        return f'{command!r} is not an absolute plain path'
-    path = os.path.realpath(command)
+        return None, f'{command!r} is not an absolute plain path'
+    parts, path, links = command.split('/')[1:], '/', 0
+    try:
+        while parts:
+            name = parts.pop(0)
+            if name in ('', '.'):
+                continue
+            if name == '..':
+                path = os.path.dirname(path)
+                continue
+            why = kept(path, os.stat(path), uid)
+            if why:
+                return None, why
+            here = os.path.join(path, name)
+            st = os.lstat(here)
+            if not stat.S_ISLNK(st.st_mode):
+                path = here
+                continue
+            if st.st_uid not in (0, uid):
+                return None, f'{here} is a link of uid {st.st_uid}'
+            links += 1
+            if links > 40:
+                return None, f'{command}: too many levels of links'
+            target = os.readlink(here)
+            parts = target.split('/') + parts
+            if target.startswith('/'):
+                path = '/'
+    except OSError as e:
+        return None, f'{os.path.join(path, name)}: {e.strerror}'
+    return path, None
+
+
+def unsafe(command, uid=None):
+    """Why COMMAND must not run, or None: an absolute plain path that resolve() accepts, to an executable file
+    that it and every folder above it belong to root or to this user and that no one else may change (a sticky
+    folder like /tmp is fine). ask() resolves a link once and both judges and runs the file it leads to.
+    Plain mode bits only: an ACL that lets others write is not seen."""
+    uid = os.geteuid() if uid is None else uid
+    path, why = resolve(command, uid)
+    if why:
+        return why
     try:
         if not stat.S_ISREG(os.stat(path).st_mode) or not os.access(path, os.X_OK):
             return f'{path} is not an executable file'
         while True:
-            st = os.stat(path)
-            if st.st_uid not in (0, uid):
-                return f'{path} belongs to uid {st.st_uid}'
-            if st.st_mode & 0o022 and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
-                return f'{path} may be changed by others'
-            if path == '/':
-                return None
+            why = kept(path, os.stat(path), uid)
+            if why or path == '/':
+                return why
             path = os.path.dirname(path)
     except OSError as e:
         return f'{path}: {e.strerror}'
@@ -119,9 +164,8 @@ def ask(command, need_mb=None, timeout=LIMIT_SECONDS):
     reason, facts). After it, its whole process group is ended, and so is any other process that still holds its
     stdout (a child that left the group with setsid). A child that leaves the group and closes stdout is not seen:
     FREE.md asks scripts to leave nothing running."""
-    plain = os.path.isabs(command) and os.path.normpath(command) == command
-    path = os.path.realpath(command) if plain else command   # resolved once: a link repointed later changes nothing
-    why = unsafe(path)
+    path, why = resolve(command)   # resolved once: a link repointed later changes nothing
+    why = why or unsafe(path)
     if why:
         return 'unavailable', why, None
     try:
@@ -132,32 +176,41 @@ def ask(command, need_mb=None, timeout=LIMIT_SECONDS):
     out, code, closed, deadline = b'', None, False, time.monotonic() + timeout
     poll = select.poll()   # not select(): a long-lived consumer may hold descriptors above 1024
     poll.register(p.stdout, select.POLLIN)
-    with p:
+    try:
+        while len(out) <= MAX_BYTES:
+            left = deadline - time.monotonic()
+            if left <= 0 or not poll.poll(left * 1000):
+                break
+            chunk = os.read(p.stdout.fileno(), 65536)
+            if not chunk:
+                closed = True
+                try:
+                    code = p.wait(max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+            out += chunk
+    finally:
         try:
-            while len(out) <= MAX_BYTES:
-                left = deadline - time.monotonic()
-                if left <= 0 or not poll.poll(left * 1000):
-                    break
-                chunk = os.read(p.stdout.fileno(), 65536)
-                if not chunk:
-                    closed = True
-                    try:
-                        code = p.wait(max(0.0, deadline - time.monotonic()))
-                    except subprocess.TimeoutExpired:
-                        pass
-                    break
-                out += chunk
-        finally:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:   # a group we may not signal (a set-uid script): end at least the script
             try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+                p.kill()
+            except OSError:
                 pass
-            if not closed:   # someone still holds stdout open
-                for pid in holders(p.stdout):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+        if not closed:   # someone still holds stdout open
+            for pid in holders(p.stdout):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        p.stdout.close()
+        try:   # never a wait without a limit: a script we could not end is left to finish on its own
+            p.wait(1)
+        except subprocess.TimeoutExpired:
+            pass
     return judge(code, out, datetime.datetime.now(datetime.timezone.utc), need_mb)
 
 
