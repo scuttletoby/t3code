@@ -46,6 +46,26 @@ the refresh timer; `check` says FAIL for `template` until it is there.
 `check` only reads: the installed files against their manifest, every wall of this OS (`fork-fleet-walls.py
 describe`), the agent's settings, the units, the template, the runner users and IPv4 forwarding.
 
+## Windows (WSL2)
+
+[windows/start-desk.ps1](windows/start-desk.ps1) does the Windows side and then this kit inside one WSL2 distro.
+Save the machine file on Windows, then in a normal (not administrator) Windows PowerShell window:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File start-desk.ps1 -Repo OWNER/REPO -Sha RELEASE_SHA -MachineFile machine.json
+```
+
+It prints the PC's facts and asks before it changes anything. Then: the distro (`-Distro`, default `fork-desk`,
+Ubuntu 24.04); `.wslconfig`'s `[wsl2]` memory cap (`-MemoryGB`, default three quarters of the RAM and at least 6 GB
+left to Windows), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (a dated copy of the old file
+is kept, other keys stay); the distro's own settings the WSL2 walls ask for (`/etc/wsl.conf`: systemd on, no
+Windows drives, programs or PATH; its own `/etc/resolv.conf`; WSL's binfmt handler masked); one `wsl --shutdown`
+only when one of these changed (every WSL distro and Docker Desktop stop); the packages the fleet needs; the
+machine file and `-FleetConfig`, if given; this kit's bootstrap; a logon task that keeps the distro running while
+the owner is logged in. Last, `desk-install check` and the Windows side's own PASS/FAIL lines. Safe to run again.
+`-Uninstall` runs `desk-install uninstall` in the distro and removes the logon task; the distro and `.wslconfig`
+stay (`wsl --unregister DISTRO` removes the distro).
+
 ## Runs again, stops half-way, old or empty state
 
 - **Again:** files, settings and units that did not change are not rewritten, and the agent is not stopped.
