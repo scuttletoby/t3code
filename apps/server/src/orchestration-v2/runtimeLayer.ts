@@ -60,6 +60,7 @@ import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as SlotGate from "../slots/SlotGate.ts";
 
 export const layerEventInfrastructure = Layer.mergeAll(
   OrchestrationEventStore.layer,
@@ -411,6 +412,9 @@ export const layerProduction = Layer.mergeAll(
   ),
   // Fork (waits): off by default; the sweep reads and writes nothing until it is switched on.
   WaitWorker.layer.pipe(
+    // The server's slot gate: the very layer server.ts gives /mcp (layers memoize by reference),
+    // so slot waits and delegate_task share one gate. Its needs are provided below and by server.ts.
+    Layer.provide(SlotGate.layer),
     Layer.provide(
       Layer.mergeAll(
         layerThreadManagementProvided,
