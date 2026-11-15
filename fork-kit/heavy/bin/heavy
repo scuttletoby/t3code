@@ -1,0 +1,434 @@
+#!/usr/bin/python3 -IB
+"""heavy: run a command in a capped systemd user slice, and stop whatever it leaves behind.
+
+  heavy <command> [args...]       run <command> in its own scope in the slice, wait for it, stop the scope
+  HEAVY_KEEP=1 heavy <command>    the same, but processes the command leaves running are kept (a daemon)
+  heavy --self-check              check the config, the slice and the installed files; exit 1 on a problem
+
+The command runs with the same folder, environment, stdin, stdout, stderr and open files, and heavy exits with
+its exit code (or dies of the same signal). When the command ends, every process it left in its scope is stopped
+(TERM, then KILL after the grace time) and heavy prints one line on stderr:
+
+  heavy: stopped N leftover processes (<names>)
+
+Nothing is printed when nothing was left. When heavy itself gets INT, TERM, HUP or QUIT, the command gets the
+signal too (from heavy when someone sent it to heavy alone; a terminal's Ctrl-C reaches both); after the grace
+time, or at a second signal, the whole scope is stopped.
+
+heavy never runs a command uncapped: it refuses (exit 1) when the systemd user manager cannot be reached, or the
+slice has no unit or no memory limit. Inside another heavy command it runs the command in the outer scope, which
+the outer heavy cleans up (HEAVY_KEEP=1 still gets a scope of its own).
+
+Settings: /etc/heavy/config.json ({"slice": "heavy.slice", "grace_seconds": 5}), or the file HEAVY_CONFIG names;
+HEAVY_SLICE and HEAVY_GRACE override single values. Standard library only; Linux with systemd and cgroup v2.
+"""
+import hashlib, json, os, re, secrets, signal, subprocess, sys, time
+
+CONFIG = '/etc/heavy/config.json'
+INSTALLED = '/etc/heavy/installed.tsv'
+DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 5}
+SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
+CGROUP_ROOTS = ('/sys/fs/cgroup', '/sys/fs/cgroup/unified')
+WATCH = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)   # stop the scope after the grace time
+FORWARD = (signal.SIGUSR1, signal.SIGUSR2)                               # only passed on to the command
+# Signals heavy dies of again itself (the caller sees the same signal). Signals that dump core are reported as
+# exit 128+N instead, so heavy never leaves a core file of its own.
+RERAISE = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGKILL, signal.SIGPIPE, signal.SIGUSR1,
+           signal.SIGUSR2, signal.SIGALRM}
+PR_SET_PDEATHSIG = 1
+MAX_NAMES = 5
+
+
+class Refused(Exception):
+    pass
+
+
+def say(msg):
+    try:
+        sys.stderr.write(f'heavy: {msg}\n')
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+
+def tool(name):
+    for folder in ('/usr/bin', '/bin'):
+        path = os.path.join(folder, name)
+        if os.access(path, os.X_OK):
+            return path
+    raise Refused(f'{name} not found in /usr/bin or /bin (heavy needs systemd)')
+
+
+def load_config():
+    path = os.environ.get('HEAVY_CONFIG') or CONFIG
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as e:
+        raise Refused(f'cannot read {path}: {e}')
+    if not isinstance(data, dict):
+        raise Refused(f'{path} must hold a JSON object')
+    for key in ('slice', 'grace_seconds'):
+        if key in data:
+            cfg[key] = data[key]
+    if os.environ.get('HEAVY_SLICE'):
+        cfg['slice'] = os.environ['HEAVY_SLICE']
+    if os.environ.get('HEAVY_GRACE'):
+        cfg['grace_seconds'] = os.environ['HEAVY_GRACE']
+    if not isinstance(cfg['slice'], str) or not SLICE_RE.match(cfg['slice']):
+        raise Refused(f'bad slice name {cfg["slice"]!r} (it must end in .slice)')
+    try:
+        grace = float(cfg['grace_seconds'])
+    except (TypeError, ValueError):
+        grace = -1
+    if not 0 < grace <= 600:
+        raise Refused(f'bad grace_seconds {cfg["grace_seconds"]!r} (a number of seconds, more than 0, at most 600)')
+    cfg['grace_seconds'] = grace
+    return cfg
+
+
+def show(systemctl, unit, props):
+    r = subprocess.run([systemctl, '--user', 'show', unit, '-p', ','.join(props)], stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        err = (r.stderr.strip() or f'exit {r.returncode}').splitlines()[-1]
+        raise Refused(f'cannot reach the systemd user manager ({err})')
+    out = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition('=')
+        out[k] = v
+    return out
+
+
+def check_slice(systemctl, name):
+    """The slice's cgroup path ('' while it is not active). Refuses anything that would run the command uncapped."""
+    p = show(systemctl, name, ['LoadState', 'ActiveState', 'ControlGroup', 'MemoryMax', 'MemoryHigh',
+                               'FragmentPath', 'DropInPaths'])
+    # systemd makes up any missing slice on the fly (loaded, no file, no limits): that is "no unit" too
+    if p.get('LoadState') != 'loaded' or not (p.get('FragmentPath') or p.get('DropInPaths')):
+        raise Refused(f'{name} has no unit file: the command would run uncapped. '
+                      f'Add one with a memory limit (fork-kit/heavy/README.md)')
+    if p.get('MemoryMax', 'infinity') == 'infinity' and p.get('MemoryHigh', 'infinity') == 'infinity':
+        raise Refused(f'{name} has no MemoryMax or MemoryHigh: the command would run uncapped')
+    return p.get('ControlGroup', '') if p.get('ActiveState') == 'active' else ''
+
+
+def own_cgroup():
+    try:
+        with open('/proc/self/cgroup', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('0::'):
+                    return line[3:].strip()
+    except OSError:
+        pass
+    return ''
+
+
+def in_heavy_scope(slice_cg):
+    """True inside a scope a heavy made in this slice (not a service or another tool's scope in the slice)."""
+    own = own_cgroup()
+    if not slice_cg or not own:
+        return False
+    parent, _, leaf = own.rpartition('/')
+    return parent == slice_cg and leaf.startswith('heavy-') and leaf.endswith('.scope')
+
+
+def unit_name(cmd):
+    label = re.sub(r'[^A-Za-z0-9_.]', '_', os.path.basename(cmd))[:32].strip('.') or 'cmd'
+    return f'heavy-{label}-{secrets.token_hex(4)}.scope'
+
+
+def cgroup_pids(cg):
+    """Every pid in the cgroup and below it, or None when the cgroup cannot be read."""
+    if not cg:
+        return None
+    for root in CGROUP_ROOTS:
+        top = root + cg
+        if not os.path.isfile(os.path.join(top, 'cgroup.procs')):
+            continue
+        pids = []
+        for folder, _dirs, files in os.walk(top):
+            if 'cgroup.procs' in files:
+                try:
+                    with open(os.path.join(folder, 'cgroup.procs'), encoding='ascii') as f:
+                        pids += [int(x) for x in f.read().split()]
+                except (OSError, ValueError):
+                    pass
+        return pids
+    return None
+
+
+def comm(pid):
+    try:
+        with open(f'/proc/{pid}/comm', encoding='utf-8', errors='replace') as f:
+            return f.read().strip() or '?'
+    except OSError:
+        return '?'
+
+
+def describe(pids):
+    names = []
+    for pid in pids:
+        n = comm(pid)
+        if n not in names:
+            names.append(n)
+    shown = ', '.join(names[:MAX_NAMES]) + (', ...' if len(names) > MAX_NAMES else '')
+    noun = 'process' if len(pids) == 1 else 'processes'
+    return f'{len(pids)} leftover {noun} ({shown})'
+
+
+def scope_state(systemctl, unit):
+    """(cgroup path, pids) of the scope; ('', []) once it is gone."""
+    for attempt in range(3):
+        try:
+            p = show(systemctl, unit, ['ActiveState', 'ControlGroup'])
+        except (Refused, subprocess.SubprocessError, OSError):
+            return '', None
+        if p.get('ActiveState') not in ('active', 'activating', 'deactivating') or not p.get('ControlGroup'):
+            return '', []
+        pids = cgroup_pids(p['ControlGroup'])
+        if pids is not None or attempt == 2:
+            return p['ControlGroup'], pids
+        time.sleep(0.1)     # systemd removes an empty scope's cgroup a moment before it marks the scope inactive
+
+
+def stop_scope(systemctl, unit, cg, grace):
+    """Stop the scope (systemd sends TERM, then KILL after TimeoutStopSec = the grace time). If systemd cannot do
+    it, kill what is left by hand. Returns the pids still alive afterwards (empty when all are gone)."""
+    try:
+        subprocess.run([systemctl, '--user', 'stop', unit], stdin=subprocess.DEVNULL, capture_output=True,
+                       timeout=grace * 2 + 30)
+    except (subprocess.SubprocessError, OSError):
+        pass
+    left = cgroup_pids(cg) or []
+    if left:
+        for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 5)):
+            for pid in left:
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                left = cgroup_pids(cg) or []
+                if not left:
+                    break
+                time.sleep(0.05)
+            if not left:
+                break
+    return left
+
+
+def child_setup(restore_ignored, mask):
+    try:   # loaded before the fork: the child only calls it
+        import ctypes
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (ImportError, OSError, AttributeError):
+        prctl = None
+
+    def setup():
+        for sig in restore_ignored:
+            signal.signal(sig, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        if prctl is not None:   # heavy killed with -9: the command dies too, as when heavy and it were one process
+            prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+    return setup
+
+
+def finish(status, got):
+    """Leave with the command's result: the same exit code, or die of the same signal."""
+    code = os.waitstatus_to_exitcode(status)
+    if code >= 0:
+        return code
+    sig = -code
+    if got is not None and status_signal_was_ours(sig, got):
+        sig = got
+    if sig in RERAISE:
+        try:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, [sig])
+            signal.signal(sig, signal.SIG_DFL)
+            sys.stdout.flush()
+            os.kill(os.getpid(), sig)
+            time.sleep(1)
+        except (OSError, ValueError):
+            pass
+    return 128 + sig
+
+
+def status_signal_was_ours(sig, got):
+    """The command died of the TERM/KILL the scope stop sent after heavy got `got`: report `got` instead."""
+    return sig in (signal.SIGTERM, signal.SIGKILL) and got != sig
+
+
+def run(argv, cfg):
+    systemctl = tool('systemctl')
+    systemd_run = tool('systemd-run')
+    keep = os.environ.get('HEAVY_KEEP') == '1'
+    slice_cg = check_slice(systemctl, cfg['slice'])
+    if not keep and in_heavy_scope(slice_cg):
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as e:
+            say(f'{argv[0]}: {e.strerror}')
+            return 127 if isinstance(e, FileNotFoundError) else 126
+    grace = cfg['grace_seconds']
+    unit = unit_name(argv[0])
+
+    ignored = [s for s in WATCH + FORWARD if signal.getsignal(s) == signal.SIG_IGN]
+    watch = [s for s in WATCH if s not in ignored]
+    forward = [s for s in FORWARD if s not in ignored]
+    chld_ignored = signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watch + forward + [signal.SIGCHLD])
+    restore = ignored + ([signal.SIGCHLD] if chld_ignored else [])
+    cmd = [systemd_run, '--user', '--scope', '--quiet', '--collect', f'--slice={cfg["slice"]}', f'--unit={unit}',
+           '-p', f'TimeoutStopSec={grace:g}s', '--', *argv]
+    try:
+        child = subprocess.Popen(cmd, close_fds=False, preexec_fn=child_setup(restore, old_mask))
+    except OSError as e:
+        say(f'cannot start systemd-run: {e}')
+        return 1
+
+    # The first INT/TERM/HUP/QUIT reaches the command (heavy passes it on when it was sent to heavy alone); heavy
+    # gives the command the grace time to end, then stops the whole scope. A second one stops the scope at once.
+    got, status, deadline = None, None, None
+    while status is None:
+        pid, st = os.waitpid(child.pid, os.WNOHANG)
+        if pid:
+            status = st
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        wanted = watch + forward + [signal.SIGCHLD]
+        info = (signal.sigwaitinfo(wanted) if deadline is None
+                else signal.sigtimedwait(wanted, max(0.0, deadline - time.monotonic())))
+        if info is None or info.si_signo == signal.SIGCHLD:
+            continue
+        sender_is_process = info.si_code <= 0      # kill(), sigqueue(), tkill(); a terminal's signal is SI_KERNEL
+        if info.si_signo in forward:
+            if sender_is_process:
+                try:
+                    os.kill(child.pid, info.si_signo)
+                except OSError:
+                    pass
+            continue
+        if got is not None:                         # a second signal: stop now
+            got = info.si_signo
+            break
+        got = info.si_signo
+        if sender_is_process:
+            try:
+                os.kill(child.pid, got)
+            except OSError:
+                pass
+        deadline = time.monotonic() + grace
+
+    if status is None:                              # a signal to heavy, and the command is still running
+        cg, pids = scope_state(systemctl, unit)
+        text = describe(pids) if pids else ''       # names now: the processes are gone after the stop
+        left = stop_scope(systemctl, unit, cg, grace) if cg else []
+        try:
+            os.kill(child.pid, signal.SIGKILL)      # whatever happened to the scope, never leave the command behind
+        except OSError:
+            pass
+        _, status = os.waitpid(child.pid, 0)
+        name = signal.Signals(got).name
+        if text:
+            say(f'{name}: stopped {text}')
+        if left:
+            say(f'{name}: {len(left)} processes are still running in {unit}: {", ".join(map(str, left[:10]))}')
+        return finish(status, got)
+
+    why = f'{signal.Signals(got).name}: ' if got is not None else ''   # the command ended after a signal to heavy
+
+    cg, pids = scope_state(systemctl, unit)
+    if pids is None and cg:                          # the scope is still there, but its cgroup cannot be read
+        if keep and got is None:
+            say(f'kept {unit} (HEAVY_KEEP=1; its processes cannot be read); stop it with: systemctl --user stop {unit}')
+        else:
+            left = stop_scope(systemctl, unit, cg, grace)
+            say(f'{why}stopped {unit} (its processes cannot be read)' + (f'; {len(left)} still running' if left else ''))
+    elif pids:
+        if keep and got is None:
+            say(f'kept {describe(pids)} in {unit} (HEAVY_KEEP=1); stop them with: systemctl --user stop {unit}')
+        else:
+            text = describe(pids)
+            left = stop_scope(systemctl, unit, cg, grace)
+            say(f'{why}stopped {text}')
+            if left:
+                say(f'{len(left)} processes are still running in {unit}: {", ".join(map(str, left[:10]))}')
+    return finish(status, got)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 16), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def self_check():
+    problems = []
+    try:
+        cfg = load_config()
+        print(f'config: slice {cfg["slice"]}, grace {cfg["grace_seconds"]:g}s')
+        check_slice(tool('systemctl'), cfg['slice'])
+        print(f'slice {cfg["slice"]}: loaded, has a memory limit')
+    except (Refused, subprocess.SubprocessError, OSError) as e:
+        problems.append(str(e))
+    try:
+        with open(INSTALLED, encoding='utf-8') as f:
+            rows = [line.rstrip('\n').split('\t') for line in f if line.strip() and not line.startswith('#')]
+    except FileNotFoundError:
+        rows = None
+        print(f'{INSTALLED}: not there (not installed by the kit); files not checked')
+    except OSError as e:
+        rows = None
+        problems.append(f'cannot read {INSTALLED}: {e}')
+    for row in rows or []:
+        if len(row) != 3:
+            problems.append(f'{INSTALLED}: bad row {row!r}')
+            continue
+        path, kind, want = row
+        try:
+            if kind == 'link':
+                ok = os.readlink(path) == want
+            elif kind == 'file':
+                ok = sha256_file(path) == want
+            else:
+                ok = False
+        except OSError:
+            ok = False
+        if not ok:
+            problems.append(f'{path}: differs from what was installed ({kind})')
+    if rows is not None:
+        print(f'installed files: {len(rows)} checked')
+    for p in problems:
+        print(f'PROBLEM: {p}')
+    print('self-check: ' + ('OK' if not problems else f'{len(problems)} problems'))
+    return 0 if not problems else 1
+
+
+def main(argv):
+    if argv[:1] == ['--self-check']:
+        return self_check()
+    if not argv or argv[:1] in (['-h'], ['--help']):
+        print(__doc__.split('\n\n')[1] if argv else 'usage: heavy <command> [args...]',
+              file=sys.stdout if argv else sys.stderr)
+        return 0 if argv else 2
+    try:
+        return run(argv, load_config())
+    except Refused as e:
+        say(f'{e}; not running {argv[0]}')
+        return 1
+    except subprocess.TimeoutExpired:
+        say(f'the systemd user manager did not answer; not running {argv[0]}')
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
