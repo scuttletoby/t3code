@@ -719,11 +719,12 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  // The file before this write, parsed; only read when policy defaults need it.
+  // The file before this write, parsed; only read when policy defaults need it. Fork: renamed as on
+  // load, so a choice saved under an old name is kept like one under the new name.
   const readStoredSettings = Effect.gen(function* () {
     if (!(yield* readConfigExists)) return undefined;
     const parsed = decodeSettingsFileJsonExit(yield* readRawConfig);
-    return Exit.isSuccess(parsed) ? parsed.value : undefined;
+    return Exit.isSuccess(parsed) ? renameRetiredAutoUpdateKeys(parsed.value) : undefined;
   });
 
   const writeSettingsAtomically = Effect.fnUntraced(
