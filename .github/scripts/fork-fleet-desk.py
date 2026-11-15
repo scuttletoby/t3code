@@ -35,7 +35,7 @@ _spec.loader.exec_module(wire)
 DIR = '/run/fork-fleet-desk'
 USER = 'fleet-desk'          # the desk-link user's default name: the same as fork-fleet-desk-key.py's USER
 INSTALLED = '/opt/fork-fleet/fork-fleet-desk.py'
-FORCED = f'python3 -I {INSTALLED} serve'   # + POOL: the forced command, pinned by fork-fleet-desk-key.py's SERVE
+FORCED = f'/usr/bin/python3 -I {INSTALLED} serve'   # + POOL: the forced command, the same as fork-fleet-desk-key.py's SERVE
 TMPFILES = f'd {DIR} 0710 {USER} {USER} -'  # the runbook's tmpfiles.d line (default user and socket group)
 HELLO = 30        # seconds the agent has for its hello
 PING, DEAD = 15, 45
