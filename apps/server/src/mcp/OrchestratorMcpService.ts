@@ -140,9 +140,7 @@ import { assertTargetWithinLimits, isLiveCallerShell, threadNotFound } from "./t
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
-import * as UsagePacer from "../usage/UsagePacer.ts";
-import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
-import * as SlotGate from "../slots/SlotGate.ts";
+import * as DelegateChecks from "../fork/delegateChecks.ts";
 
 // Return recoverable handles before common MCP client timeouts expire.
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
@@ -1326,11 +1324,6 @@ const make = Effect.gen(function* () {
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const remoteDelegation = yield* RemoteDelegation.RemoteDelegation;
-  // Fork: read if the server runs one. Optional, so no test of this service has to provide it;
-  // server.ts refuses to compile without it.
-  const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
-  // Fork: the agent slot gate, the same way; server.ts asks for it beside /mcp.
-  const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -1810,120 +1803,8 @@ const make = Effect.gen(function* () {
     };
   });
 
-  /**
-   * Fork: the agent slot gate, or `null` (no slot held) on a server without it. The slot is taken
-   * uninterruptibly and released when the call's scope closes, on every exit (failure, defect, a
-   * cancelled call); `releaseSlot` ends it sooner, once the dispatch is done.
-   */
-  const acquireSlot = (callerThreadId: ThreadId, targetInstanceId: ModelSelection["instanceId"]) =>
-    Option.isNone(slotGate)
-      ? Effect.succeed(null)
-      : Effect.acquireRelease(
-          slotGate.value
-            .acquire({ callerThreadId, targetInstanceId })
-            .pipe(
-              Effect.flatMap((outcome) =>
-                outcome.type === "refuse"
-                  ? Effect.fail(failure("slots_full", outcome.message))
-                  : Effect.succeed(outcome.token),
-              ),
-            ),
-          (token) => slotGate.value.release(token),
-        );
-  const releaseSlot = (token: SlotGate.SlotToken | null) =>
-    Option.isNone(slotGate) ? Effect.void : slotGate.value.release(token);
-  const startedSlot = (token: SlotGate.SlotToken | null, childThreadId: ThreadId) =>
-    Option.isNone(slotGate) ? Effect.void : slotGate.value.started(token, childThreadId);
-
-  /**
-   * Fork: the usage pacing gate (`usagePacingGate` setting, off by default) on a task an agent
-   * delegates. A setting or a pace that cannot be read lets the task through as asked.
-   */
-  const paceTarget = Effect.fn("OrchestratorMcpService.paceTarget")(function* (input: {
-    readonly parent: Pick<OrchestrationV2ThreadProjection, "thread">;
-    readonly requested: OrchestratorMcpTarget | undefined;
-    readonly runtimeMode: OrchestratorMcpDelegateTaskInput["runtimeMode"];
-    readonly providers: ReadonlyArray<ServerProvider>;
-    readonly target: ResolvedTarget;
-  }): Effect.fn.Return<
-    { readonly target: ResolvedTarget; readonly note?: string },
-    OrchestratorMcpFailure
-  > {
-    const settings = yield* serverSettings.getSettings.pipe(Effect.option);
-    if (Option.isNone(settings) || settings.value.usagePacingGate === "off") {
-      return { target: input.target };
-    }
-    const { instanceId, model, options } = input.target.modelSelection;
-    const provider = input.providers.find((candidate) => candidate.instanceId === instanceId);
-    const parentMode = input.parent.thread.runtimeMode;
-    const modeOn = (target: ResolvedTarget) =>
-      resolveRuntimeMode(parentMode, input.runtimeMode, target).pipe(Effect.option);
-    const outcome = yield* UsagePacingGate.decide({
-      mode: settings.value.usagePacingGate,
-      lowerEffort: settings.value.usagePacingLowerEffort,
-      nowMs: yield* Clock.currentTimeMillis,
-      instanceId,
-      pinned: input.requested?.providerInstanceId !== undefined,
-      providers: input.providers,
-      descriptors:
-        provider === undefined
-          ? undefined
-          : advertisedModel(provider, model)?.capabilities?.optionDescriptors,
-      options,
-      paceOf: (id) =>
-        Option.match(usagePacer, {
-          onNone: () => Effect.undefined,
-          onSome: (pacer) => pacer.paceOf(id).pipe(Effect.orElseSucceed(() => undefined)),
-        }),
-      // The same model, options and runtime mode on an instance this project may use, or nothing.
-      targetOn: Effect.fnUntraced(function* (candidate) {
-        const enabled = yield* threadManagement.isProviderInstanceEnabledForProject({
-          projectId: input.parent.thread.projectId,
-          instanceId: candidate,
-        });
-        if (!enabled) return undefined;
-        const resolved = yield* resolveTarget({
-          parent: input.parent,
-          target: {
-            providerInstanceId: candidate,
-            model,
-            ...(options === undefined ? {} : { options }),
-          },
-          providers: input.providers,
-        }).pipe(Effect.option);
-        if (Option.isNone(resolved)) return undefined;
-        const modes = yield* Effect.all([modeOn(input.target), modeOn(resolved.value)]);
-        return Option.isSome(modes[1]) && Option.getOrNull(modes[0]) === modes[1].value
-          ? resolved.value
-          : undefined;
-      }),
-    });
-    switch (outcome.action) {
-      case "hold":
-        return yield* failure("usage_pacing_hold", outcome.message);
-      case "switch":
-        return { target: outcome.target, note: outcome.note };
-      case "lowerEffort":
-        return {
-          target: {
-            ...input.target,
-            modelSelection: {
-              ...input.target.modelSelection,
-              options: [
-                ...(options ?? []).filter((option) => option.id !== outcome.step.optionId),
-                { id: outcome.step.optionId, value: outcome.step.to },
-              ],
-            },
-          },
-          note: outcome.note,
-        };
-      case "pass":
-        return {
-          target: input.target,
-          ...(outcome.note === undefined ? {} : { note: outcome.note }),
-        };
-    }
-  });
+  // Fork: the fork's delegation checks (usage pacing, agent slots), called at their seats.
+  const delegateChecks = yield* DelegateChecks.make({ resolveTarget });
 
   const requestKey = (clientRequestId: string | undefined): Effect.Effect<string> =>
     clientRequestId === undefined ? random.uuidV4() : Effect.succeed(clientRequestId);
@@ -3000,28 +2881,24 @@ const make = Effect.gen(function* () {
         cwd: yield* parentWorkspaceCwd(parent),
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
-      // Fork: a request that is invalid anyway fails now, not after a usage hold of hours. The pacer moves a task only
-      // to an account with the same runtime mode, so the check on the requested target holds for the paced one too.
-      yield* resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode, requestedTarget);
+      const runtimeMode = yield* resolveRuntimeMode(
+        parent.thread.runtimeMode,
+        input.runtimeMode,
+        requestedTarget,
+      );
       const interactionMode = yield* resolveInteractionMode(
         parent.thread.interactionMode,
         input.interactionMode,
       );
-      // Fork: a retry of an accepted delegation starts no work, so it is not paced again.
-      const { target, note: usagePacingNote } = isRetryOfAcceptedDelegation
-        ? { target: requestedTarget, note: undefined }
-        : yield* paceTarget({
-            parent,
-            requested: input.target,
-            runtimeMode: input.runtimeMode,
-            providers,
-            target: requestedTarget,
-          });
-      const runtimeMode = yield* resolveRuntimeMode(
-        parent.thread.runtimeMode,
-        input.runtimeMode,
-        target,
-      );
+      // Fork: seat 1 of the fork's delegation checks (fork/delegateChecks.ts), before the workspace.
+      const { target, note: usagePacingNote } = yield* delegateChecks.beforeWorkspace({
+        isRetry: isRetryOfAcceptedDelegation,
+        parent,
+        requested: input.target,
+        runtimeMode: input.runtimeMode,
+        providers,
+        target: requestedTarget,
+      });
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
@@ -3053,12 +2930,13 @@ const make = Effect.gen(function* () {
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
       const parentNodeId = parentRun.rootNodeId;
-      // Fork: the agent slot gate (`agentSlots`, off by default) on the final target, last before
-      // the dispatch. It holds the slot until the dispatch and the child's run preparation end; the
-      // call's scope releases it on any other exit. A retry starts no new agent.
-      const slotToken = isRetryOfAcceptedDelegation
-        ? null
-        : yield* acquireSlot(scope.thread.threadId, target.modelSelection.instanceId);
+      // Fork: seat 2 of the fork's delegation checks, last before the dispatch. Its hold lasts
+      // until the dispatch and the child's run preparation end, or the call's scope closes.
+      const forkHold = yield* delegateChecks.afterWorkspace({
+        isRetry: isRetryOfAcceptedDelegation,
+        callerThreadId: scope.thread.threadId,
+        target,
+      });
       // The command commits the child's preparing run, which only this call
       // prepares, so a caller that goes away must not stop it in between.
       return yield* Effect.uninterruptibleMask((restore) =>
@@ -3109,7 +2987,7 @@ const make = Effect.gen(function* () {
           }
           const taskId = taskEvent.event.payload.id;
           const childThreadId = taskEvent.event.payload.childThreadId;
-          if (childThreadId !== null) yield* startedSlot(slotToken, childThreadId);
+          if (childThreadId !== null) yield* forkHold.started(childThreadId);
           const childRunEvent = result.storedEvents.find(
             (stored) =>
               stored.event.type === "run.created" && stored.event.threadId === childThreadId,
@@ -3126,14 +3004,14 @@ const make = Effect.gen(function* () {
             });
           }
           // Fork: the dispatch is done; a named child keeps counting until its run shows.
-          yield* releaseSlot(slotToken);
+          yield* forkHold.release;
           const task = yield* input.mode === "wait"
             ? awaitTask(scope, taskId, key, input.timeoutMs, restore)
             : restore(readTask(scope, taskId, false, true));
           return usagePacingNote === undefined ? task : { ...task, usagePacingNote };
         }),
       );
-    }, Effect.scoped), // Fork: the agent slot gate's finalizer (a call that stops half-way).
+    }, Effect.scoped), // Fork: closes the hold of a call that stops half-way (fork/delegateChecks.ts).
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");
       return yield* readTask(scope, taskId, false, true);
@@ -3393,7 +3271,7 @@ const make = Effect.gen(function* () {
                     .getThreadShell(threadId)
                     .pipe(Effect.mapError(threadManagementFailure))
                 : null;
-              const target = yield* resolveTargetRechecking({
+              const resolvedTarget = yield* resolveTargetRechecking({
                 parent,
                 target:
                   committedThread === null
@@ -3405,6 +3283,13 @@ const make = Effect.gen(function* () {
                 providers,
                 cwd,
                 skipProjectEnablementFilter: isRetryOfAcceptedCreation,
+              });
+              // Fork: the seat of the fork's delegation checks for created threads (may change the target).
+              const { target } = yield* delegateChecks.beforeCreateThread({
+                isRetry: isRetryOfAcceptedCreation,
+                callerThreadId: scope.thread.threadId,
+                parent,
+                target: resolvedTarget,
               });
               const runtimeMode = yield* resolveRuntimeMode(
                 parent.thread.runtimeMode,
