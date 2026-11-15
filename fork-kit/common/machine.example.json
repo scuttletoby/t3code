@@ -27,7 +27,7 @@
     "freeFloorMb": 2048
   },
   "desk": {
-    "pool": "desktop",
+    "pool": "pc",
     "host": "fleet-host.example",
     "hostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "slots": 2,
