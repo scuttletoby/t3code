@@ -6,7 +6,8 @@ owner steps, the design and the failure table: .github/fork-fleet.md.
 
   python3 -I fork-fleet.py route     the last step of fork-tests.yml's `changes` job (GitHub-hosted). Writes to
                                      $GITHUB_OUTPUT: runners=<JSON {job key: runs-on}>, mode, attempt, watch,
-                                     fallback=<JSON runs-on for a job of another attempt (a re-run of failed jobs)>.
+                                     fallback=<JSON runs-on for a job of another attempt (a re-run of failed jobs)>,
+                                     rerun=<JSON where a trusted person's re-run may go instead; {} for none>.
                                      A job key is the job id, or <id>-<shard> for a sharded job.
   python3 -I fork-fleet.py watch     fork-tests.yml's `fleet_watch` job (GitHub-hosted, actions: write): a fleet job of
                                      its run that waits too long for a runner cancels the run with an error.
@@ -134,6 +135,9 @@ def check_config(cfg):
     if not (isinstance(retired, list) and all(isinstance(x, str) and LABEL.fullmatch(x) and x not in GENERIC
                                               for x in retired)):
         out.append(f'retired_labels must be a list of labels, none of {sorted(GENERIC)}')
+    if 'reruns' in cfg and cfg['reruns'] not in [p.get('name') for p in launched]:
+        out.append(f'reruns is {cfg["reruns"]!r}: it must name a dispatcher pool (where a person\'s re-run of failed '
+                   'jobs may go)')
     for field, among in (('name', pools), ('label', launched), ('beacon', launched)):
         got = [p.get(field) for p in among]
         if len(set(map(str, got))) != len(got):
@@ -574,14 +578,15 @@ def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt
     return route_all(cfg, env, event, mode_value, gates, now, nonce, attempt)[:2]
 
 
-def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt=None):
+def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt=None, rerun=None):
     """(mode, {key: runs-on}, fallback). Raises for a broken setting or CONFIG, and with "hosted": false for a run that
     may hold another repository's code or that no static pool may take (red: nothing can run it). It calls no API (a
     push: one anonymous git ls-remote, made_by_the_sync). With `attempt`, a run label ends with -a<attempt> already.
     Every runs-on is the hosted label, a static pool's runs_on, or a dispatcher pool's label plus this run's own label:
     never a label that nothing serves. `fallback` is the runs-on for a job of another attempt (a re-run of failed jobs
     does not re-run route, and a run label serves one attempt only): the always-on pool for a trusted run, else where
-    this run's jobs went; never a dispatcher pool's label."""
+    this run's jobs went; never a dispatcher pool's label. A dict passed as `rerun` gets the `rerun` output
+    (rerun_labels): where a trusted person's re-run may go instead."""
     mode = mode_in(cfg, mode_value)
     hosted = hosted_of(cfg)
     keys = [key for key, _ in job_keys(cfg)]
@@ -626,6 +631,8 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
             return list(pool['runs_on'])
         return [pool['label'], f'{pool["label"]}-{key}-{nonce}' + (f'-a{int(attempt)}' if attempt else '')]
     todo, t, entry = list(wanted), now(), dict(job_keys(cfg))
+    if rerun is not None:
+        rerun.update(rerun_labels(cfg, env, kind, wanted, nonce, t))
     for pool in cfg['pools']:
         if kind not in takes_of(pool):
             say(f'pool {pool["name"]}: does not take {kind} runs')
@@ -663,6 +670,26 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
     return mode, out, fallback
 
 
+def rerun_labels(cfg, env, kind, keys, nonce, t):
+    """The `rerun` output, {"actors": [...], "pool": <label>, "labels": {key: <run label without -a<attempt>>}}, or {}.
+    A re-run of failed jobs does not re-run route, so its jobs take `fallback` (never a dispatcher pool). With the
+    config's `reruns` pool, a job that pool takes (its `takes`, the job's `avoid`) may instead ask for the pool's
+    label and its run label plus -a<the re-run's attempt> (the job's runs-on adds it), when a trusted actor started
+    the re-run: the dispatcher makes a runner only for a trusted attempt, and the gate checks the attempt. A re-run
+    that fleet-watch started is the bot's: `fallback`. Only when the pool's heartbeat was fresh now: a full pool is
+    waited for (the sweep bounds the wait), a dispatcher that is down, closed or never ran is not."""
+    pool = next((p for p in dispatched(cfg) if p['name'] == cfg.get('reruns')), None)
+    if pool is None or kind not in takes_of(pool):
+        return {}
+    _, why = beacon_free(cfg, pool, env, t)
+    if why:
+        say(f're-runs of failed jobs take the fallback, not pool {pool["name"]}: {why}')
+        return {}
+    entry = dict(job_keys(cfg))
+    labels = {key: f'{pool["label"]}-{key}-{nonce}' for key in keys if not avoids(entry[key], pool, kind)}
+    return {'actors': list(cfg['trusted']['actors']), 'pool': pool['label'], 'labels': labels} if labels else {}
+
+
 def with_vars(cfg, env):
     """env, with the setting and each dispatcher pool's heartbeat also read from $FLEET_VARS, the repository variables
     as one JSON object (the fleet-route action's `vars` input, toJSON(vars)). A variable set in env itself wins."""
@@ -696,10 +723,13 @@ def cmd_route(cfg, env, with_attempt=False):
     except ValueError:
         say('::warning::fork-fleet: the changes outputs cannot be read: every routed job counts as running')
     attempt = env.get('GITHUB_RUN_ATTEMPT') or '1'
-    mode, out, fallback = route_all(cfg, env, event, env.get('FLEET_MODE'), gates, attempt=with_attempt and int(attempt))
+    rerun = {}
+    mode, out, fallback = route_all(cfg, env, event, env.get('FLEET_MODE'), gates,
+                                    attempt=with_attempt and int(attempt), rerun=rerun)
     fleet = sum(1 for v in out.values() if not isinstance(v, str))
     lines = [f'runners={json.dumps(out, separators=(",", ":"))}', f'mode={mode}', f'attempt={attempt}',
-             f'watch={"true" if fleet else "false"}', f'fallback={json.dumps(fallback, separators=(",", ":"))}']
+             f'watch={"true" if fleet else "false"}', f'fallback={json.dumps(fallback, separators=(",", ":"))}',
+             f'rerun={json.dumps(rerun, separators=(",", ":"))}']
     with open(env['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
         f.write(''.join(f'{line}\n' for line in lines))
     where = {}
