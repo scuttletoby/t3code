@@ -574,10 +574,10 @@ class Install(unittest.TestCase):
         tool = os.path.join(HERE, 'fork-fleet-desk-key.py')
         if not os.path.exists(tool):
             self.skipTest('fork-fleet-desk-key.py (row D4) is not here yet')
-        src = open(tool, encoding='utf-8').read()
-        self.assertIn(f"DESK = '{desk.INSTALLED}'", src)
-        self.assertIn("SERVE = f'python3 -I {DESK} serve'", src)
-        self.assertIn(f"USER = '{desk.USER}'", src)
+        spec = importlib.util.spec_from_file_location('fork_fleet_desk_key', tool)
+        dk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dk)                   # its own constants, not its text
+        self.assertEqual((dk.SERVE, dk.DESK, dk.USER), (desk.FORCED, desk.INSTALLED, desk.USER))
 
 
 if __name__ == '__main__':
