@@ -26,7 +26,9 @@ The facts of this machine go in the `desk` section of `/etc/fork-kit/machine.jso
 `pool` must be a pool in the fleet config; `host` and `hostKey` are the always-on host and its ssh host key
 (on that host: `cat /etc/ssh/ssh_host_ed25519_key.pub`, without the comment). Optional: `port` (22), `user` (`fleet-desk`), `slots` (1, at most 8; one
 runner user each), `reserveMb` (memory the launcher keeps free for the owner), `netBase` (`10.N`, the runners' network,
-default `10.204`: pick another when this machine's network already uses it).
+default `10.204`: pick another when this machine's network already uses it), `freeCommand` (a free/v1 script,
+[FREE.md](../common/FREE.md): `fits` then also needs it to answer free; the kit installs an example as
+`/opt/fork-fleet/free-memory`; default none, the memory rule alone).
 
 ## Install, check, uninstall
 

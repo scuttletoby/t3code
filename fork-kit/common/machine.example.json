@@ -31,6 +31,7 @@
     "host": "fleet-host.example",
     "hostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "slots": 2,
-    "reserveMb": 4096
+    "reserveMb": 4096,
+    "freeCommand": "/opt/fork-fleet/free-memory"
   }
 }

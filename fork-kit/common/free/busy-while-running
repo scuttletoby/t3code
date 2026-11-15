@@ -1,0 +1,16 @@
+#!/bin/sh
+# A free/v1 script (FREE.md): busy while one of the programs in NAMES runs, say a game or a video editor, so the
+# machine is left to its person. Copy it, put your programs' process names (as `ps -e -o comm=` shows them) in
+# NAMES, make the copy root's and not writable by others, and name the copy as the free command.
+# It sees the processes of this system only: in WSL, Windows programs are not visible (interop is off, on purpose).
+NAMES='example-game example-editor'
+
+at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+running=$(ps -e -o comm=) || { echo '{"v": 1, "free": false, "reason": "ps failed", "at": "'"$at"'"}'; exit 1; }
+for name in $NAMES; do
+  if printf '%s\n' "$running" | grep -qxF -- "$name"; then
+    echo '{"v": 1, "free": false, "reason": "'"$name"' is running", "at": "'"$at"'"}'
+    exit 75
+  fi
+done
+echo '{"v": 1, "free": true, "at": "'"$at"'"}'
