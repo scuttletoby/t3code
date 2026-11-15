@@ -127,6 +127,71 @@ class Ask(unittest.TestCase):
         os.symlink(s, os.path.join(self.d, 'link'))
         self.assertEqual(fc.ask(os.path.join(self.d, 'link'))[0], 'free')
 
+    def test_a_link_another_user_owns_in_a_sticky_folder_is_not_followed(self):
+        # what fs.protected_symlinks refuses; resolving in Python must not quietly follow it to a root program
+        real, geteuid = os.geteuid(), os.geteuid
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o1777)
+            link = os.path.join(d, 'free')
+            os.symlink(os.path.realpath(shutil.which('true')), link)
+            os.geteuid = lambda: real + 4242
+            try:
+                verdict, reason, _ = fc.ask(link)
+            finally:
+                os.geteuid = geteuid
+        self.assertEqual(verdict, 'unavailable')
+        self.assertNotEqual(reason, 'stdout is not JSON')   # true ran: the link was followed
+        self.assertIn(f'uid {real}', reason)
+
+    def test_the_folders_of_the_path_as_written_are_judged_too(self):
+        body = f': > {self.d}/ran\necho \'{{"v": 1, "free": true, "at": "{now_text()}"}}\'\n'
+        good = self.script(body)
+        open_ = os.path.join(self.d, 'open')
+        os.mkdir(open_)
+        os.symlink(good, os.path.join(open_, 'free'))
+        os.chmod(open_, 0o777)   # others may swap the link for one to any program they like
+        verdict, reason, _ = fc.ask(os.path.join(open_, 'free'))
+        self.assertEqual((verdict, reason), ('unavailable', f'{open_} may be changed by others'))
+        self.assertFalse(os.path.exists(f'{self.d}/ran'))
+        os.chmod(open_, 0o755)
+        self.assertEqual(fc.ask(os.path.join(open_, 'free'))[0], 'free')
+
+    def test_relative_links_chains_and_loops(self):
+        good = self.script(f'echo \'{{"v": 1, "free": true, "at": "{now_text()}"}}\'\n')
+        os.mkdir(os.path.join(self.d, 'sub'), 0o755)
+        os.chmod(os.path.join(self.d, 'sub'), 0o755)   # whatever the umask
+        os.symlink('../free', os.path.join(self.d, 'sub', 'one'))
+        os.symlink('one', os.path.join(self.d, 'sub', 'two'))
+        os.symlink(os.path.join(self.d, 'sub'), os.path.join(self.d, 'dir'))
+        self.assertEqual(fc.resolve(os.path.join(self.d, 'dir', 'two')), (good, None))
+        self.assertEqual(fc.ask(os.path.join(self.d, 'dir', 'two'))[0], 'free')
+        os.symlink('b', os.path.join(self.d, 'a'))
+        os.symlink('a', os.path.join(self.d, 'b'))
+        verdict, reason, _ = fc.ask(os.path.join(self.d, 'a'))
+        self.assertEqual(verdict, 'unavailable')
+        self.assertIn('too many levels of links', reason)
+
+    def test_a_script_it_may_not_end_is_not_waited_for_without_a_limit(self):
+        s = self.script(f'echo $$ > {self.d}/pid\necho \'{{"v": 1, "free": true, "at": "{now_text()}"}}\'\n'
+                        'exec sleep 30 >&-\n')
+        def refused(*_):
+            raise PermissionError(1, 'Operation not permitted')
+        killpg, kill = os.killpg, os.kill
+        os.killpg = os.kill = refused   # a set-uid script: its group is not ours to signal
+        t = time.monotonic()
+        try:
+            verdict = fc.ask(s, timeout=1)[0]
+        finally:
+            os.killpg, os.kill = killpg, kill
+            with open(f'{self.d}/pid') as f:
+                pid = int(f.read())
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+        self.assertLess(time.monotonic() - t, 10)
+        self.assertEqual(verdict, 'unavailable')
+
     def test_a_link_repointed_after_the_check_does_not_change_what_runs(self):
         good = self.script(f': > {self.d}/good-ran\necho \'{{"v": 1, "free": true, "at": "{now_text()}"}}\'\n',
                            name='good')

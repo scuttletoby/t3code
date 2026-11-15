@@ -11,8 +11,12 @@ One small contract for every tool that asks whether a machine may take more work
   and so is any process that still holds its stdout. It leaves nothing running: a child that leaves the group
   (`setsid`) and closes stdout is not seen and not ended.
 - It and every folder above it belong to root (or to the user the consumer runs as) and no one else can change
-  them (a sticky folder such as `/tmp` is fine). Otherwise it is not run. A link is judged and run by the file it
-  leads to. Only the mode bits are read: an ACL that lets others write is not seen, so do not set one.
+  them (a sticky folder such as `/tmp` is fine). Otherwise it is not run. The path is followed one part at a
+  time: the folders of the path as written are judged too, and every link on the way must belong to root or to
+  that user (another user's link in `/tmp` is refused, as the kernel's `fs.protected_symlinks` would). The script
+  is judged and run by the file the path leads to, resolved once. Only the mode bits are read: an ACL that lets
+  others write is not seen, so do not set one. A script that could not be ended (a group the consumer may not
+  signal) is waited for at most one more second, then left to finish on its own.
 - **The exit code is the verdict:** `0` free, `75` busy. Anything else, a timeout, output that is not one JSON
   object (`NaN` and `Infinity` are not JSON), a higher `v`, a `free` that disagrees with the exit code, or facts
   more than 60 seconds from now = **not available**. Busy and not available both count as **not free**.
