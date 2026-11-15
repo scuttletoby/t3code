@@ -25,7 +25,7 @@ For each day (a run belongs to the UTC day it was created), then a `total` row:
 | runs without jobs        | runs whose jobs were not read because the run stopped early (see below)                                      |
 
 Skipped jobs count nowhere; skipped runs count as runs but cost no request. `--json` prints the same numbers as one
-object (`days.<day>`, `days.total`).
+object (`days.<day>`, `days.total`), plus `incomplete`, `run_list_complete` and `cache_write_failed` (see below).
 
 Two choices to keep in mind when comparing before and after:
 
@@ -39,7 +39,7 @@ Two choices to keep in mind when comparing before and after:
 | Input               | Meaning                                                                                                |
 | ------------------- | ------------------------------------------------------------------------------------------------------ |
 | `--repo OWNER/REPO` | the repository; or                                                                                     |
-| `--config FILE`     | a JSON file of the project with `{"ciDemand": {"repo": "OWNER/REPO"}}` (other keys are ignored)        |
+| `--config FILE`     | a UTF-8 JSON file of the project with `{"ciDemand": {"repo": "OWNER/REPO"}}` (other keys are ignored)  |
 | `--days N`          | the N full UTC days before today; or `--since DAY --until DAY` (both included)                         |
 | `--cache DIR`       | required: the caller's folder for saved pages (made 0700 where the OS has modes)                       |
 | `--max-requests N`  | stop after N requests (default 2000)                                                                   |
@@ -56,16 +56,22 @@ Two choices to keep in mind when comparing before and after:
   Server errors and network trouble are retried three times with back-off.
 - **Stops half-way, runs again.** A stop prints what it has, says `INCOMPLETE` (and whether the run list was
   finished) and exits 3. Run the same command again later: every page it saved is read from `--cache`, so no page is
-  asked for twice.
+  asked for twice. If the cache could not be written (a read-only folder, a full disk), the result says so (in the
+  first line, and `cache_write_failed` in `--json`) and a stop does not say to run again: nothing was saved, so it
+  would ask for the same pages again. Fix the cache folder first.
 - **Cache.** A jobs page is saved when the run and all its jobs are completed, keyed by run id and attempt (a re-run
   is a new attempt, so a new page). A runs-list page is saved when every run in it is completed and the day ended over
   an hour ago, and is reused for 12 hours (a later re-run changes it). Writes are a `.part-` file then a rename, so a
   run killed mid-write leaves no half page under a name that is read. A file that is broken (bad JSON, a bad date, a
   body that is not an object), saved for another page or in another cache format (an older or newer version of this
   tool) is fetched again, never a crash. A write that fails (a full disk) is reported once and the run goes on
-  without saving. `.part-` files older than an hour are removed.
+  without saving (see above). `.part-` files older than an hour are removed.
 - **Any OS.** It needs Python 3 and `gh`. Where the OS has user ids (Linux, macOS), a cache folder another user owns
-  is refused and the folder is made 0700, also when it existed before; on Windows these checks are skipped.
+  is refused and the folder is made 0700, also when it existed before; on Windows these checks are skipped. So on
+  Linux or macOS the cache folder must allow private permissions: one on a filesystem where chmod has no effect (FAT
+  or exFAT, WSL's `/mnt/c`, some network mounts) is refused (exit 2). Pick a folder on a normal disk, such as
+  `$XDG_CACHE_HOME/ci-demand` or `~/.cache/ci-demand`. `gh` output and the config file are read as UTF-8 (a BOM is
+  fine) whatever the locale.
 - Exit codes: 0 complete, 2 bad arguments or an API error (404, no access, network down after retries), 3 incomplete.
 
 ## General vs project
