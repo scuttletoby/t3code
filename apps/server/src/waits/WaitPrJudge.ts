@@ -4,6 +4,7 @@
  * settle rule's "seen" head is kept in memory only: after a restart it takes two fresh reads.
  */
 import type { PullRequestRef } from "@t3tools/contracts";
+import { WaitPrSpec } from "@t3tools/contracts/waitFor";
 import { type Judgement, judgePrChecks, type PrSeen } from "@t3tools/shared/waitFor";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as Effect from "effect/Effect";
@@ -92,6 +93,8 @@ function failedRead(
   return transient(clip(`Pull request ${name} could not be read: ${error.detail}`));
 }
 
+const isPrSpec = Schema.is(WaitPrSpec);
+
 export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
   const settingsService = yield* ServerSettingsService;
   const projects = yield* ProjectService.ProjectService;
@@ -151,11 +154,15 @@ export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
       number: target.success.number,
       allowStale: false,
     };
-    if (spec.host === undefined && context.pin !== undefined) {
-      yield* context.pin({
-        kind: "pr",
-        spec: { ...spec, repository: target.success.repository, host: target.success.host },
-      });
+    const pinnedSpec = {
+      ...spec,
+      repository: target.success.repository,
+      host: target.success.host,
+    };
+    // Pinned only when it fits the stored format: a remote name too long to store stays
+    // unpinned (read as before) instead of making the stored wait unreadable after a restart.
+    if (spec.host === undefined && context.pin !== undefined && isPrSpec(pinnedSpec)) {
+      yield* context.pin({ kind: "pr", spec: pinnedSpec });
     }
     const name = `${ref.repository}#${ref.number}`;
     const result = yield* Effect.result(read(ref, spec.until === "checks"));

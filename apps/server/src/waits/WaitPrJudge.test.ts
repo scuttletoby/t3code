@@ -806,4 +806,36 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
       assert.deepStrictEqual(cancelled?.spec, { number: 7, until: "merged" });
     }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
   });
+  // A remote name longer than the stored format allows (a project in deeply nested groups):
+  // the wait is not pinned, and it survives a restart as it did before pins existed.
+  it.effect(
+    "a wait whose remote repository is too long to store is not pinned and survives a restart",
+    () => {
+      const host = fakeHost();
+      const long = `acme/${"group-".repeat(40)}widgets`;
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        host.projects.set(PROJECT, shell(PROJECT, long));
+        host.prs.set(`${long.toLowerCase()}#7`, { state: "open", headSha: HEAD_A });
+        const filePath = yield* storePath;
+        const before = yield* makeService(filePath, yield* makePrJudge());
+        assert.strictEqual(
+          (yield* register(before, prWait({ number: 7, until: "merged" }))).state,
+          "waiting",
+        );
+        assert.deepStrictEqual((yield* storedWaits(filePath))[0]?.spec, {
+          number: 7,
+          until: "merged",
+        });
+
+        const restarted = yield* makeService(filePath, yield* makePrJudge());
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* restarted.judgeDue(), { judged: 1, ended: 0 });
+        assert.strictEqual(
+          (yield* storedWaits(filePath)).filter((wait) => wait.state === "waiting").length,
+          1,
+        );
+      }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
 });
