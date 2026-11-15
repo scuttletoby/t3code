@@ -74,7 +74,8 @@ When upstream's server updater (upstream PRs 17585 and 17586) reaches a nightly,
 the `automaticUpdates` line in `settings.ts`. That stop is wanted. Three fork pull requests follow, in
 this order, so that "half-way" always means "no automatic update":
 
-1. **Remove** the fork's update scheduler and its work gate, and add a start-up step that deletes a
+1. **Remove** the fork's update scheduler and its work gate (keep the gate itself while
+   `serve --hold-work`, below, uses it), and add a start-up step that deletes a
    leftover held-work marker and logs what it held. First check on upstream's merged code that a
    scheduled run or a message that arrives during the restart is neither lost nor started twice; if
    it is, keep the gate and record it as a known fork difference. After this step alone the fork has
@@ -94,3 +95,35 @@ on stays on, one without the key stays off.
 
 The old-name rename (`apps/server/src/cloud/autoUpdateSettings.ts`) stays after the sync, since old
 settings files may still exist; it moves with the add-ons.
+
+## Trying a build on a copy: `serve --hold-work`
+
+`t3 serve --hold-work --base-dir <copy>` starts a server on a copy of a T3 home with the work gate
+(`apps/server/src/workAdmission.ts`) held from boot until exit. Use it to look at a new build's
+threads, settings and migrations before it replaces a running T3. It is refused for the background
+service.
+
+Held (nothing of it starts until the server restarts without the flag):
+
+- agent turns, steers and rollbacks (outbox effects stay pending, unclaimed);
+- thread launches and worktree preparation;
+- every scheduler source: scheduled tasks, webhook coalescing, waits, usage-limit recovery and
+  usage refresh;
+- work an automatic update held (its marker stays);
+- automatic project pull;
+- following and stopping delegated tasks in linked environments (owed stops stay owed);
+- the startup analytics heartbeat.
+
+Still runs:
+
+- startup recovery on the copy's database, exactly as on any boot: runs that were mid-turn end as
+  interrupted, process-bound starts are cancelled, a user's unsent message goes back to the queue,
+  and continuations are written (they stay pending);
+- provider status checks, which start the provider CLIs (`claude`, `codex app-server`) without a
+  turn. Run the copy with an empty `HOME` and a bare `PATH` if they must not start;
+- the UI, WebSocket and HTTP API, and timers that only change thread state (pull request watch and
+  sync, auto-settle);
+- anything a user asks for directly, such as a commit message or a pull request guide.
+
+Startup refuses to serve when the gate is not held or a part that starts work (outbox, thread launch,
+recovery, scheduler) does not use it. The check runs before activation, so nothing parked has run.

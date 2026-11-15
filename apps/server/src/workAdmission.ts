@@ -12,14 +12,21 @@ import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
-/** The parts of the server that must use one shared gate before an update may hold it. */
-export const WORK_ADMISSION_CONSUMERS = ["outbox", "thread-launch", "recovery"] as const;
+/** The parts of the server that must use one shared gate before an update may hold it, or before
+ * `serve --hold-work` may serve. The scheduler runs every timed source (scheduled tasks, waits,
+ * usage-limit recovery, webhooks, usage refresh). */
+export const WORK_ADMISSION_CONSUMERS = [
+  "outbox",
+  "thread-launch",
+  "recovery",
+  "scheduler",
+] as const;
 export type WorkAdmissionConsumer = (typeof WORK_ADMISSION_CONSUMERS)[number];
 
 export const UPDATE_HOLD_MARKER_FILE = "work-held-for-update.json";
 /** Fork: `serve --hold-work` holds the gate from boot to exit; nothing in the process opens it. */
 export const HOLD_WORK_BOOT_MESSAGE =
-  "Work is held (--hold-work): no agent turn, scheduled task, wait, usage-limit resume or launch starts until this server restarts without the flag. The server is not broken.";
+  "Work is held (--hold-work): no agent turn, launch, scheduled task, wait, usage-limit resume, project pull or linked-environment follow-up starts until this server restarts without the flag. Provider status checks still run. The server is not broken.";
 /** An older marker is left over from a hold that ended without clearing it, not this restart. */
 export const UPDATE_HOLD_MAX_AGE_MS = 2 * 60 * 60_000;
 

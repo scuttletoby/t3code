@@ -87,7 +87,7 @@ export const startCommand = Command.make("start", { ...sharedServerCommandFlags 
 // Fork (go-live kit): a server that starts no agent work, to try a build on a copy of a T3 home.
 const holdWorkFlag = Flag.Boolean("hold-work").pipe(
   Flag.withDescription(
-    "Start no agent work: no turn, scheduled task, wait, usage-limit resume or launch. For trying a build on a copy of a T3 home. Refused for the background service.",
+    "Start no agent work, for trying a build on a copy of a T3 home: no turn, launch, scheduled task, wait, usage-limit resume, project pull, linked-environment follow-up or startup analytics ping. Startup recovery and provider status checks (which start the provider CLIs, no turn) still run. Refused for the background service.",
   ),
   Flag.withDefault(false),
 );
