@@ -12,7 +12,8 @@ after the job. A job that names a fleet label by itself finds no runner.
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `.github/fork-fleet.json`                  | Every fact about the repository and its fleet: the setting's name, the trust rule (workflows, actors, branches), the pools (label, slots, heartbeat variable, launch command, which pool `fleet` mode queues on), the jobs (shards, change gates, memory), and the time limits. |
 | `.github/scripts/fork-fleet.py`            | `route`, `watch`, `sweep`, `dispatch` and `gate`. Standard library only. It holds no repository facts.                                                                                                                                                                          |
-| `.github/scripts/fork-fleet-launch.sh`     | Runs on a fleet host, as root, for `dispatch`: `start`, `ready`, `active`, `fits`, `stop`, `prune` and `refresh-net` of one-job runners.                                                                                                                                        |
+| `.github/scripts/fork-fleet-launch.sh`     | Runs on a fleet host, as root, for `dispatch`: `start`, `ready`, `active`, `fits`, `stop`, `prune` and `refresh-net` of one-job runners. Its `refresh` keeps the runner template new (host step 7).                                                                             |
+| `.github/scripts/fork-fleet-refresh.*`     | The hourly timer and the sandboxed service of `refresh` (installed as `t3code-fleet-refresh`, host step 7). `fork-fleet-refresh.test.py` tests both, with a fake release server.                                                                                                |
 | `.github/scripts/fork-fleet-job-paths.txt` | The one mount rule: the host's system paths every fleet job sees (read-only). The launcher's `job_fs` reads it; the per-OS walls ask the launcher (`paths`).                                                                                                                    |
 | `.github/scripts/fork-fleet-hook.sh`       | Each fleet runner's job-started hook. It runs `gate` from the installed copy.                                                                                                                                                                                                   |
 | `.github/scripts/fork-fleet.test.py`       | The tests, and checks that the workflows match the config. Run by the `workflows` job.                                                                                                                                                                                          |
@@ -301,12 +302,14 @@ does leave the marker, and that turns the test red.
   GitHub's newest `actions/runner` release would update itself in its copy
   before the job. The fleet does not rely on that. The dispatcher reads the
   newest release once an hour, and the launcher's `ready` compares it with the
-  template's `.fork-fleet-version` (written in host step 2). When the template
+  template's `.fork-fleet-version` (written by `refresh`, host step 7). When the template
   is older, or has no version file, no runner starts on that pool. The
   heartbeat then reports `free: 0` with a `why` that says to refresh the
-  template, so `auto` goes GitHub-hosted. Running jobs and cleanup go on. Fix:
-  host step 2 with the new release. If the release cannot be read, the last
-  version read is kept; before the first read, nothing starts.
+  template, so `auto` goes GitHub-hosted. Running jobs and cleanup go on. The
+  refresh timer (host step 7) fixes this within about an hour; to fix it at once, run
+  `fork-fleet-launch.sh refresh`. If the release cannot be read, the last
+  version read is kept; before the first read, nothing starts. With no template
+  at all, `ready` says so and no runner starts.
 - **Per-pool locks.** Each dispatcher takes `dispatch-<pool>.lock` in
   `--lock-dir` (default `/run/fork-fleet`) for each pool it serves. Two
   dispatchers can serve different pools, never the same one.
@@ -393,37 +396,11 @@ done
   ! ip -4 route | grep -q '^10\.204\.' || echo "10.204 is in use here: pick another NET_BASE in step 4"
 )
 
-# 2. The runner template: an unconfigured actions/runner release, owned by root, checked by sha256.
-#    Take the newest version and its linux-x64 sha256 from https://github.com/actions/runner/releases
-#    Run this again for each new release: the fleet starts no runner while the template is older than the newest one.
-#    /opt and /var/lib must be on one filesystem: each copy hard-links the template (the launcher checks it).
-#    The new template is checked (sha256, unconfigured, its version file) before anything is replaced; the old one
-#    stays in place until then, and a failure stops here with the dispatcher still running the old one.
-(
-  set -euo pipefail
-  ver=X.Y.Z; sum=SHA256_FROM_THE_RELEASE_PAGE
-  [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $sum =~ ^[0-9a-f]{64}$ ]] || { echo "set ver and sum first"; exit 1; }
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-  new=/opt/fork-fleet/runner-template.new live=/opt/fork-fleet/runner-template old=/opt/fork-fleet/runner-template.old
-  curl -fsSLo "$tmp/runner.tgz" "https://github.com/actions/runner/releases/download/v$ver/actions-runner-linux-x64-$ver.tar.gz"
-  echo "$sum  $tmp/runner.tgz" | sha256sum -c --strict -
-  install -d -m 755 /opt/fork-fleet
-  rm -rf "$new" && install -d -m 755 "$new"
-  tar -xzf "$tmp/runner.tgz" -C "$new" --no-same-owner
-  printf '%s\n' "$ver" > "$new/.fork-fleet-version"
-  chmod -R go-w "$new"
-  "$new/bin/installdependencies.sh"              # the runner's own libraries
-  [ -x "$new/run.sh" ] && [ -x "$new/bin/Runner.Listener" ] && [ "$(cat "$new/.fork-fleet-version")" = "$ver" ]
-  for f in .env .path .runner .credentials .credentials_rsaparams; do [ ! -e "$new/$f" ]; done   # never config.sh here
-  # Swap with no runner starting: stop the dispatcher (running jobs keep their own copies), swap, start it again.
-  systemctl stop t3code-fleet-dispatcher 2>/dev/null || true
-  rm -rf "$old"
-  [ ! -e "$live" ] || mv -T "$live" "$old"
-  mv -T "$new" "$live"
-  rm -rf "$old"
-  systemctl start t3code-fleet-dispatcher 2>/dev/null || true   # on a first install, step 5 starts it
-  echo "template: actions/runner $(cat "$live/.fork-fleet-version")"
-)
+# 2. The runner template: an unconfigured actions/runner release, owned by root. The launcher's `refresh` makes it,
+#    checked by sha256, and keeps it new (step 7, right after step 4: it needs the launcher and its settings). Until
+#    then the pool stays closed ("there is no runner template"). It lives alone in a folder of its own,
+#    /opt/fork-fleet/template/runner-template (the launcher's default TEMPLATE): the refresh service may write only
+#    that folder. /opt and /var/lib must be on one filesystem: each copy hard-links the template (the launcher checks it).
 
 # 3. The fleet files, from one pinned main commit. All of them are fetched first and installed only when each came;
 #    SOURCE is written last, so it never names a commit whose files are not all in place.
@@ -436,6 +413,8 @@ done
   files="fork-fleet.json:fork-fleet.json:644 scripts/fork-fleet.py:fork-fleet.py:644
          scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755
          scripts/fork-fleet-desk.py:fork-fleet-desk.py:644 scripts/fork-fleet-desk-wire.py:fork-fleet-desk-wire.py:644
+         scripts/fork-fleet-refresh.service:fork-fleet-refresh.service:644
+         scripts/fork-fleet-refresh.timer:fork-fleet-refresh.timer:644
          scripts/fork-fleet-job-paths.txt:fork-fleet-job-paths.txt:644"
   for f in $files; do
     IFS=: read -r src dst mode <<<"$f"
@@ -459,14 +438,15 @@ python3 -I /opt/fork-fleet/fork-fleet.py --config /opt/fork-fleet/fork-fleet.jso
 
 # 4. The launcher's settings and the dispatcher's token (root only).
 install -d -m 700 /etc/fork-fleet
-printf 'RUNNER_USERS=fork-runner-1,fork-runner-2\nTEMPLATE=/opt/fork-fleet/runner-template\n' > /etc/fork-fleet/launch.conf
+printf 'RUNNER_USERS=fork-runner-1,fork-runner-2\n' > /etc/fork-fleet/launch.conf
 chmod 600 /etc/fork-fleet/launch.conf
 ( umask 077; read -rsp 'token: ' t; printf '%s\n' "$t" > /etc/fork-fleet/token ); echo
 # RUNNER_USERS: one user per slot of the pool (step 1). WORK_ROOT (/var/lib/fork-fleet/runners): the launcher makes
 # it 0711. Every directory above it must let the runner users through (o+x), or no runner can reach its copy.
 # WORK_ROOT, HOOK and RESOLV_CONF are bound into every job: never under /home, /root, /mnt, /media or /srv (refused,
 # also through a symlink).
-# NET_BASE (10.204) and RESOLV_CONF (/etc/fork-fleet/resolv.conf): add a line only to change one (step 1b).
+# NET_BASE (10.204), RESOLV_CONF (/etc/fork-fleet/resolv.conf), TEMPLATE (/opt/fork-fleet/template/runner-template)
+# and RUNNER_MIN (none: the oldest runner version refresh may install): add a line only to change one (step 1b).
 # OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is
 # looked up before every start and every dispatcher pass; every address any of them gives is blocked, and no answer
 # at all starts nothing. Add a line only to use other https lookups.
@@ -508,6 +488,44 @@ mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
     if (h == "0.0.0.0" || h == "*") { k = split(addrs, a, " "); for (i = 1; i <= k; i++) print a[i] ":" p } else print h ":" p
   }' | sort -u)
 /opt/fork-fleet/fork-fleet-launch.sh check-net https://github.com "${targets[@]}"; echo "exit $?"
+
+# 7. The runner template and its hourly refresh. `refresh` reads the newest actions/runner release, downloads its
+#    tarball, checks the release's sha256 before unpacking, unpacks it beside the template and swaps the two in one
+#    rename under the launch lock: running jobs keep their copies, and a cut download, a bad checksum or any other
+#    failure leaves the old template. The same version: nothing (one API call). Safe to run by hand at any time (a
+#    second refresh waits for the first). The timer runs it every hour at a random minute in the first 10, and after
+#    boot when a run was missed; a failed run is tried again the next hour. The service is sandboxed: it writes only
+#    the template's own folder /opt/fork-fleet/template (with TEMPLATE elsewhere, add a drop-in: the unit file says
+#    how); /run/fork-fleet, the root launcher's, is read-only to it (it opens the launch lock the dispatcher's first
+#    prune made: right after a boot, before that, it says so and the next hour's run goes on). It reaches the network
+#    by IP only, and has 1 GiB of memory, one CPU and 64 tasks.
+#    refresh refuses a template whose folder holds anything else (such as the launcher: root runs it).
+#    The tarball is treated as hostile even after its sha256 passed (a compromised release would pass it): refresh
+#    refuses absolute names, "..", links that lead outside, device files, FIFOs, sockets and sparse files, a tarball
+#    over 4 GiB or 100000 entries, headers over 64 KiB, names over 4096 and links that take too long to follow; it
+#    strips setuid, setgid and group/other write. `start` refuses such files in a template too.
+#    Versions: only forward, and by at most one major version at a time (a bigger jump is refused: no real release
+#    does that). A template NEWER than the newest release (one GitHub withdrew) is rolled back to it by the next run,
+#    but never below the version it replaced (.fork-fleet-floor; without one, one major version down) nor below
+#    RUNNER_MIN (step 4). After a rollback the dispatcher may still hold the withdrawn version for up to an hour (it
+#    reads the newest release hourly): the pool stays closed until its next read.
+#    Roll back further or jump by hand (the pool is closed in between; running jobs keep their copies):
+#      rm -rf --one-file-system /opt/fork-fleet/template/runner-template && /opt/fork-fleet/fork-fleet-launch.sh refresh
+#    Re-run the two install lines after step 3 brings new unit files.
+#    A host set up before the template had its own folder (TEMPLATE=/opt/fork-fleet/runner-template in launch.conf):
+#    refresh refuses it ("not only the template") until it is moved, once; start and ready keep working meanwhile.
+#    Under the launch lock, so no runner copies it half-way (a start in that second fails once and is started again).
+#    Safe to run again, also after it stopped half-way (the move only while the old one is there), and it removes the
+#    temp folders a refresh killed under the old layout left beside the launcher:
+#      install -d -m 755 /opt/fork-fleet/template && install -d -m 700 /run/fork-fleet && flock /run/fork-fleet/launch.lock sh -c '{ [ ! -e /opt/fork-fleet/runner-template ] || mv -T /opt/fork-fleet/runner-template /opt/fork-fleet/template/runner-template; } && sed -i /^TEMPLATE=/d /etc/fork-fleet/launch.conf && rm -rf --one-file-system /opt/fork-fleet/.runner-template.refresh.*'
+/opt/fork-fleet/fork-fleet-launch.sh refresh                   # the first template (and its folder), or the newest one now
+/opt/fork-fleet/template/runner-template/bin/installdependencies.sh   # once, and again if a release needs new libraries:
+                                                               # refresh installs no system packages
+install -o root -g root -m 644 /opt/fork-fleet/fork-fleet-refresh.service /etc/systemd/system/t3code-fleet-refresh.service
+install -o root -g root -m 644 /opt/fork-fleet/fork-fleet-refresh.timer /etc/systemd/system/t3code-fleet-refresh.timer
+systemctl daemon-reload && systemctl enable --now t3code-fleet-refresh.timer
+systemctl list-timers t3code-fleet-refresh.timer               # its next run
+journalctl -u t3code-fleet-refresh -n 20                       # what each refresh did
 ```
 
 Do not name the dispatcher's unit `fork-fleet-*`: that prefix is for runner
@@ -576,6 +594,35 @@ old `/run/fork-fleet-desk` first (`serve` refuses a lock file or directory left
 by root, with a message that says so). A desk agent of an older wire version
 gets exit 76 and a line that says to upgrade it.
 
+**The desktop's side** (`fork-fleet-desk-agent.py`, as root on the desktop; on
+WSL2 inside the distro, which runs systemd). Install it and
+`fork-fleet-desk-wire.py` from the same pinned commit as step 3, beside the
+launcher and the walls (`fork-fleet-walls.py`) in `/opt/fork-fleet`; the
+launcher and its setup are as on a vm-pool host. Then, once per desktop:
+
+```sh
+install -d -m 755 /etc/fork-fleet
+ssh-keygen -t ed25519 -N '' -C desk-POOL -f /etc/fork-fleet/desk-key   # desk-key.pub goes to the always-on host
+# The always-on host's own key, from that host (`cat /etc/ssh/ssh_host_ed25519_key.pub`), as one line;
+# with another PORT the name is [HOST]:PORT. Nothing else is ever trusted.
+echo 'HOST ssh-ed25519 AAAA...' > /etc/fork-fleet/desk-known_hosts
+printf 'POOL=POOL\nHOST=HOST\n' > /etc/fork-fleet/desk.conf && chmod 600 /etc/fork-fleet/desk.conf
+python3 -I /opt/fork-fleet/fork-fleet-desk-agent.py check
+install -m 644 fork-fleet-desk-agent.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now fork-fleet-desk-agent
+```
+
+The agent checks each verb again against the wire rules (anything else ends
+the session), runs `start` only after `fork-fleet-walls.py check` passes, gives
+the launcher and the walls only `PATH` and `LC_ALL` (they read their own
+settings files), kills a verb at its limit (answer 75) and every running verb
+when the session ends, and dials again with backoff and jitter (at once after
+a sleep, also on WSL2, where only the wall clock jumps). One agent per desktop
+(a lock in `/run/fork-fleet-desk-agent`); the other settings and their
+defaults are in the script's header. `check-net` (step 6) never comes over the
+link, so the always-on host cannot use it to probe the desktop's own network:
+run it by hand on the desktop.
+
 **What jobs need on the host.** The jobs run without sudo, so the host must
 already have:
 
@@ -631,7 +678,7 @@ Set it up on the workspace machine next to the real install, with its own paths:
   `["/usr/bin/env", "FORK_FLEET_LAUNCH_CONF=/etc/fork-fleet-proof/launch.conf", "/opt/fork-fleet-proof/fork-fleet-launch.sh"]`,
   and one job `{"job": "lint", "memory_mb": 1024}`.
 - In `/etc/fork-fleet-proof/launch.conf`, set `RUNNER_USERS=fork-runner-1,fork-runner-2`,
-  `TEMPLATE=/opt/fork-fleet/runner-template`,
+  `TEMPLATE=/opt/fork-fleet/template/runner-template`,
   `WORK_ROOT=/var/lib/fork-fleet-proof/runners`, `RUN_DIR=/run/fork-fleet-proof`
   and `HOOK=/opt/fork-fleet-proof/hook.sh`.
 - Store a token for the proof repository at `/etc/fork-fleet-proof/token`, with
@@ -756,14 +803,18 @@ dispatcher keeps only pacing in memory, so a restart starts over cleanly.
 | Dispatcher  | The PC or VM has no memory                                                                                                    | No start, and the heartbeat shows 0 free slots. `auto`: new runs go GitHub-hosted.                                                                                                                                                                                                                        |
 | Dispatcher  | GitHub fails during a pass                                                                                                    | A warning. The pass stops, and the next one, 20 s later, starts over.                                                                                                                                                                                                                                     |
 | Dispatcher  | One pool's host fails (launcher error, cannot be run)                                                                         | That pool is left alone for the rest of the pass: no cleanup, no start, heartbeat `free: 0` with the reason. Other pools go on.                                                                                                                                                                           |
-| Dispatcher  | The runner template is older than the newest release, or has no `.fork-fleet-version`                                         | No runner starts on that pool; cleanup goes on. Heartbeat `free: 0` with a `why` that says to refresh the template (host step 2). `auto`: GitHub-hosted.                                                                                                                                                  |
+| Dispatcher  | The runner template is older than the newest release, or has no `.fork-fleet-version`                                         | No runner starts on that pool; cleanup goes on. Heartbeat `free: 0` with a `why` that says to refresh the template (host step 7: the timer does it within about an hour). `auto`: GitHub-hosted.                                                                                                          |
 | Dispatcher  | Token file missing, readable by anyone but root, or empty                                                                     | It refuses to start. `systemctl status` shows why.                                                                                                                                                                                                                                                        |
 | Dispatcher  | Down for a while                                                                                                              | Heartbeats go stale after 180 s. `auto`: GitHub-hosted. `fleet`: jobs queue, and the watch reports after 2 hours.                                                                                                                                                                                         |
 | Gate        | Run, attempt or trust rule does not match                                                                                     | `Runner.Worker` is killed before the first step: the job fails and no `always()` step runs.                                                                                                                                                                                                               |
 | Gate        | Broken installed config                                                                                                       | It refuses every job, failing closed. The dispatcher stops too. Re-install from `main`.                                                                                                                                                                                                                   |
 | Gate        | Installed script that does not even start (a syntax error)                                                                    | The dispatcher fails on start too, so no runner starts. Restart the dispatcher after each re-install, so it never runs an older copy than the hook.                                                                                                                                                       |
 | Gate        | No `FORK_FLEET_RUN` (a runner not made by the dispatcher)                                                                     | Refused.                                                                                                                                                                                                                                                                                                  |
-| Launcher    | Template configured (`.env` and the like), a symlink, or writable by others                                                   | It refuses to start a runner, and the dispatcher logs the reason.                                                                                                                                                                                                                                         |
+| Launcher    | Template configured (`.env` and the like, even a symlink to nothing), a symlink, or writable by others                        | It refuses to start a runner, and the dispatcher logs the reason.                                                                                                                                                                                                                                         |
+| Refresh     | The template's folder holds anything else (a host set up before it had a folder of its own)                                   | Refused before any download; `start` and `ready` keep working. Host step 7 gives the one-time move.                                                                                                                                                                                                       |
+| Refresh     | The newest release is below the template's floor (`.fork-fleet-floor`, or one major version down) or `RUNNER_MIN`             | Refused; the template stays. Host step 7 says how to take it by hand.                                                                                                                                                                                                                                     |
+| Refresh     | A hostile tarball: fanned-out symlinks, a huge long-name or pax header, a sparse file, a name over 4096                       | Refused quickly, before the header is read into memory. The service also has `MemoryMax=1G`, `CPUQuota=100%`, `TasksMax=64`.                                                                                                                                                                              |
+| Dispatcher  | Template rolled back (a withdrawn release)                                                                                    | The dispatcher may still hold the withdrawn version for up to an hour: no runner starts on that pool until its next hourly read. Heals by itself.                                                                                                                                                         |
 | Launcher    | `launch.conf` or the hook writable by anyone but root                                                                         | It refuses.                                                                                                                                                                                                                                                                                               |
 | Launcher    | Bad input (an extra line, a key twice, a malformed value)                                                                     | It refuses before touching anything.                                                                                                                                                                                                                                                                      |
 | Launcher    | A name that ran already                                                                                                       | It refuses. `prune` removes the old copy once its unit is gone.                                                                                                                                                                                                                                           |
