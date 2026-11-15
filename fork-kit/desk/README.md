@@ -55,15 +55,19 @@ Save the machine file on Windows, then in a normal (not administrator) Windows P
 powershell -ExecutionPolicy Bypass -File start-desk.ps1 -Repo OWNER/REPO -Sha RELEASE_SHA -MachineFile machine.json
 ```
 
-It prints the PC's facts and asks before it changes anything. Then: the distro (`-Distro`, default `fork-desk`,
-Ubuntu 24.04); `.wslconfig`'s `[wsl2]` memory cap (`-MemoryGB`, default three quarters of the RAM and at least 6 GB
-left to Windows), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (a dated copy of the old file
-is kept, other keys stay); the distro's own settings the WSL2 walls ask for (`/etc/wsl.conf`: systemd on, no
-Windows drives, programs or PATH; its own `/etc/resolv.conf`; WSL's binfmt handler masked); one `wsl --shutdown`
-only when one of these changed (every WSL distro and Docker Desktop stop); the packages the fleet needs; the
+It prints the PC's facts and asks before it changes anything. A distro of that name that the script did not make
+is named in the question (its whole `/etc/wsl.conf` is replaced) and must be confirmed by typing its name. Then: the
+distro (`-Distro`, default `fork-desk`, Ubuntu 24.04); `.wslconfig`'s `[wsl2]` memory cap (`-MemoryGB`, default
+three quarters of the RAM, at most the RAM less 6 GB, never under 4 GB; one that leaves Windows under 2 GB is
+refused), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (read and written as UTF-8 without a
+BOM; a dated copy of the old file is kept, other keys and sections stay); the distro's own settings the WSL2 walls
+ask for (`/etc/wsl.conf`: systemd on, no Windows drives, programs or PATH; its own `/etc/resolv.conf`; WSL's binfmt
+handler masked); one `wsl --shutdown` when one of these changed or the running WSL does not have them yet (PID 1 not
+systemd, interop live, `wsl.conf` or `.wslconfig` newer than the running one, more memory than the cap, not NAT),
+so a run stopped before its shutdown restarts next time (every WSL distro and Docker Desktop stop); the packages the fleet needs; the
 machine file and `-FleetConfig`, if given; this kit's bootstrap; a logon task that keeps the distro running while
-the owner is logged in. Last, `desk-install check` and the Windows side's own PASS/FAIL lines. Safe to run again.
-`-Uninstall` runs `desk-install uninstall` in the distro and removes the logon task; the distro and `.wslconfig`
+the owner is logged in. Last, `desk-install check` and the Windows side's own PASS/FAIL lines (the `[wsl2]` keys);
+any FAIL or error exits 1. Safe to run again. `-Uninstall` (needs no `-Repo` or `-Sha`) runs `desk-install uninstall` in the distro and removes the logon task; the distro and `.wslconfig`
 stay (`wsl --unregister DISTRO` removes the distro).
 
 ## Runs again, stops half-way, old or empty state
