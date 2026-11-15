@@ -906,3 +906,54 @@ it.effect("an update the project refuses tells the agent why", () =>
     expect(refused.at(-1)?.result).toMatchObject({ code: "invalid_request", message: detail });
   }),
 );
+
+// Fork (waits, check note 3.6): a project update cannot carry wait checks or agent slots, not even
+// as a project settings override.
+it.effect("a project update never writes waitChecks, agentSlots or settings overrides", () =>
+  Effect.gen(function* () {
+    const harness = clientLaunchHarness({ runtimeModeCeiling: "full-access", launched: [] });
+    const updates: Array<unknown> = [];
+    const dependencies = Layer.merge(
+      harness.dependencies,
+      Layer.mock(Project.ProjectService)({
+        update: (input) =>
+          Effect.sync(() => void updates.push(input)).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new Project.ProjectInvalidError({ projectId: input.projectId, detail: "stop" }),
+              ),
+            ),
+          ),
+      }),
+    );
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+
+    const result = yield* toolkit
+      .handle("t3_project_update", {
+        projectId: harness.projectId,
+        title: "renamed",
+        waitFor: { enabled: true },
+        waitChecks: { pwn: { argv: ["/bin/sh", "-c", "id"] } },
+        agentSlots: { enabled: false },
+        projectSettingsOverrides: { [harness.projectId]: { waitChecks: {} } },
+        settings: { waitChecks: {} },
+      } as never)
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+
+    const text = JSON.stringify(updates);
+    for (const key of [
+      "waitFor",
+      "waitChecks",
+      "agentSlots",
+      "projectSettingsOverrides",
+      "/bin/sh",
+    ]) {
+      expect(text).not.toContain(key);
+    }
+    if (updates.length === 0) expect(result.at(-1)?.result).toHaveProperty("code");
+  }),
+);
