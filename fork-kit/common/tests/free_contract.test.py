@@ -127,6 +127,45 @@ class Ask(unittest.TestCase):
         os.symlink(s, os.path.join(self.d, 'link'))
         self.assertEqual(fc.ask(os.path.join(self.d, 'link'))[0], 'free')
 
+    def test_a_link_repointed_after_the_check_does_not_change_what_runs(self):
+        good = self.script(f': > {self.d}/good-ran\necho \'{{"v": 1, "free": true, "at": "{now_text()}"}}\'\n',
+                           name='good')
+        bad = self.script(f': > {self.d}/bad-ran\necho \'{{"v": 1, "free": true, "at": "{now_text()}"}}\'\n',
+                          name='bad')
+        link = os.path.join(self.d, 'link')
+        os.symlink(good, link)
+        checked = fc.unsafe
+
+        def check_then_repoint(command, uid=None):
+            why = checked(command, uid)
+            os.unlink(link)
+            os.symlink(bad, link)   # what another user could do in a folder they may change
+            return why
+        fc.unsafe = check_then_repoint
+        try:
+            self.assertEqual(fc.ask(link)[0], 'free')
+        finally:
+            fc.unsafe = checked
+        self.assertEqual((os.path.exists(f'{self.d}/good-ran'), os.path.exists(f'{self.d}/bad-ran')), (True, False))
+
+    def test_a_child_that_left_the_group_and_holds_stdout_is_ended(self):
+        s = self.script(f'setsid sh -c \'echo $$ > {self.d}/child; exec sleep 30\' &\n'
+                        f'echo \'{{"v": 1, "free": true, "at": "{now_text()}"}}\'\n')
+        self.assertEqual(fc.ask(s, timeout=1)[0], 'unavailable')
+        with open(f'{self.d}/child') as f:
+            child = int(f.read())
+        for _ in range(50):
+            try:
+                with open(f'/proc/{child}/stat') as f:
+                    if f.read().rsplit(')', 1)[1].split()[0] == 'Z':
+                        break
+            except (FileNotFoundError, ProcessLookupError):
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(child, 9)
+            self.fail('the child that left the group with setsid still runs')
+
     def test_the_command_line(self):
         def cli(*args):
             return subprocess.run([sys.executable, '-I', '-B', READER, *args], capture_output=True, text=True,
@@ -173,6 +212,19 @@ class Examples(unittest.TestCase):
         p = subprocess.Popen(['sleep', '30'])
         try:
             self.assertEqual(fc.ask(copy)[:2], ('busy', 'sleep is running'))
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_busy_while_running_knows_names_longer_than_15_characters(self):
+        with open(os.path.join(COMMON, 'free', 'busy-while-running')) as f:
+            text = f.read()
+        copy = self.copy('busy', text.replace("NAMES='example-game example-editor'", "NAMES='sleeps-a-long-while'"))
+        d = os.path.dirname(copy)
+        shutil.copy(shutil.which('sleep'), os.path.join(d, 'sleeps-a-long-while'))
+        p = subprocess.Popen([os.path.join(d, 'sleeps-a-long-while'), '30'])
+        try:
+            self.assertEqual(fc.ask(copy)[:2], ('busy', 'sleeps-a-long-while is running'))
         finally:
             p.kill()
             p.wait()
