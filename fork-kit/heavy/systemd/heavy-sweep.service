@@ -1,0 +1,12 @@
+# heavy kit: written by heavy-install. Do not edit: run the installer again.
+[Unit]
+Description=heavy leftover sweep (fork-kit/heavy)
+# runs the sweep of the release in use; a release without one (a rollback) skips it
+ConditionPathExists=/usr/local/libexec/heavy/current/lib/heavy_sweep.py
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/heavy/current/lib/heavy_sweep.py sweep
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=10min

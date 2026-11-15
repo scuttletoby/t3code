@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "heavy": {
+    "sweep": {
+      "stop": false,
+      "minAgeSeconds": 600,
+      "longLivedSeconds": 7200,
+      "busyCpuPercent": 20,
+      "report": "~/.local/state/heavy-sweep",
+      "knownUnits": ["example-app.service", "dbus.service"],
+      "knownContainers": ["example-dev-db"],
+      "testPatterns": [
+        "(^|[ /])pytest( |$)",
+        "\\.test\\.(py|sh|cjs)( |$)",
+        "GradleWorkerMain( |$)",
+        "testcontainers"
+      ],
+      "ignorePatterns": ["^(tmux|screen|SCREEN)( |:|$)", "^-", "^ssh-agent"]
+    }
+  }
+}
