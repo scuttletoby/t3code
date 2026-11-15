@@ -16,8 +16,13 @@ import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/cli";
 
 import { cli } from "../binCli.ts";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ServerConfig from "../config.ts";
 import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
 import { migrationManifest } from "../persistence/Migrations.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as ServerSettingsModule from "../serverSettings.ts";
 import { FORK_REPORT_VERSION, formatForkReport, readForkReport } from "./forkReport.ts";
 
 const homes: Array<string> = [];
@@ -65,15 +70,17 @@ function makeHome(
   return home;
 }
 
-/** Every path under `dir` with its bytes' hash, size and mtime. */
+/** Every path under `dir` with its bytes' hash, size and mtime (a link: its target, not followed). */
 function snapshot(dir: string): Record<string, string> {
   const out: Record<string, string> = {};
   const walk = (current: string) => {
     for (const entry of NodeFS.readdirSync(current, { withFileTypes: true })) {
       const full = NodePath.join(current, entry.name);
-      const stat = NodeFS.statSync(full);
+      const stat = NodeFS.lstatSync(full);
       const rel = NodePath.relative(dir, full);
-      if (entry.isDirectory()) {
+      if (entry.isSymbolicLink()) {
+        out[rel] = `-> ${NodeFS.readlinkSync(full)} ${stat.mtimeMs}`;
+      } else if (entry.isDirectory()) {
         out[`${rel}/`] = String(stat.mtimeMs);
         walk(full);
       } else {
@@ -104,6 +111,38 @@ function leaveCrashedWal(home: string) {
     childScript(dbPathOf(home), "process.exit(0);"),
   ]);
   expect(NodeFS.statSync(`${dbPathOf(home)}-wal`).size).toBeGreaterThan(0);
+}
+
+/** A running server: it holds the ownership lock and has two threads in its WAL, never checkpointed. */
+async function startWriter(home: string) {
+  const lockPath = NodePath.join(home, "userdata", "server-owner.sqlite");
+  const child = NodeChildProcess.spawn(
+    process.execPath,
+    [
+      "-e",
+      childScript(
+        dbPathOf(home),
+        `const lock = new DatabaseSync(${JSON.stringify(lockPath)});
+         lock.exec("BEGIN EXCLUSIVE");
+         process.stdout.write("ready\\n");
+         setInterval(() => {}, 1000);`,
+      ),
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  children.push(child);
+  await new Promise<void>((resolve, reject) => {
+    child.stdout!.on("data", (data) => String(data).includes("ready") && resolve());
+    child.on("exit", (code) => reject(new Error(`writer exited early (${code})`)));
+  });
+}
+
+/** A home whose statev2.sqlite is only a link (`target` is what the link says). */
+function homeWithDatabaseLink(target: string) {
+  const home = tempDir();
+  NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+  NodeFS.symlinkSync(target, dbPathOf(home));
+  return home;
 }
 
 const runCli = (args: ReadonlyArray<string>) =>
@@ -198,26 +237,7 @@ describe("__fork-report writes nothing", () => {
 
   it("reads beside a running writer that holds the ownership lock, writing nothing", async () => {
     const home = makeHome();
-    const lockPath = NodePath.join(home, "userdata", "server-owner.sqlite");
-    const child = NodeChildProcess.spawn(
-      process.execPath,
-      [
-        "-e",
-        childScript(
-          dbPathOf(home),
-          `const lock = new DatabaseSync(${JSON.stringify(lockPath)});
-           lock.exec("BEGIN EXCLUSIVE");
-           process.stdout.write("ready\\n");
-           setInterval(() => {}, 1000);`,
-        ),
-      ],
-      { stdio: ["ignore", "pipe", "inherit"] },
-    );
-    children.push(child);
-    await new Promise<void>((resolve, reject) => {
-      child.stdout!.on("data", (data) => String(data).includes("ready") && resolve());
-      child.on("exit", (code) => reject(new Error(`writer exited early (${code})`)));
-    });
+    await startWriter(home);
     const before = snapshot(home);
 
     const report = readForkReport(home);
@@ -295,7 +315,6 @@ describe("__fork-report on old, newer and empty state", () => {
   it("reads an empty home as no database and every fork feature off", () => {
     const home = tempDir();
     NodeFS.mkdirSync(NodePath.join(home, "userdata"));
-    NodeFS.writeFileSync(settingsPathOf(home), "");
     NodeFS.writeFileSync(dbPathOf(home), "");
     const before = snapshot(home);
 
@@ -303,7 +322,8 @@ describe("__fork-report on old, newer and empty state", () => {
 
     expect(snapshot(home)).toEqual(before);
     expect(report.database.state).toBe("empty");
-    expect(report.settings.state).toBe("empty");
+    expect(report.settings.state).toBe("missing");
+    expect(report.settings.parseWarning).toBeNull();
     expect(report.fork.features).toEqual({
       agentSlots: "off",
       waitFor: "off",
@@ -311,6 +331,72 @@ describe("__fork-report on old, newer and empty state", () => {
       automaticUpdates: "off",
     });
     expect(report.ok).toBe(true);
+  });
+});
+
+describe("__fork-report through a linked statev2.sqlite", () => {
+  // SQLite keeps -wal and -shm beside the file a link resolves to, not beside the link.
+  it("reads the crashed WAL beside the real file of an absolute link, writing nothing", () => {
+    const real = makeHome();
+    leaveCrashedWal(real);
+    const home = homeWithDatabaseLink(dbPathOf(real));
+    const before = [snapshot(real), snapshot(home)];
+
+    const report = readForkReport(home);
+
+    expect([snapshot(real), snapshot(home)]).toEqual(before);
+    expect(report.database.path).toBe(dbPathOf(home));
+    expect(report.database.openMode).toBe("readonly-shm");
+    expect(report.database.counts?.threads).toBe(4);
+    expect(report.ok).toBe(true);
+  });
+
+  it("follows a relative link to another link before looking for the WAL", () => {
+    const real = makeHome();
+    leaveCrashedWal(real);
+    const home = homeWithDatabaseLink(NodePath.join("..", "hop.sqlite"));
+    NodeFS.symlinkSync(dbPathOf(real), NodePath.join(home, "hop.sqlite"));
+    const before = [snapshot(real), snapshot(home)];
+
+    const report = readForkReport(home);
+
+    expect([snapshot(real), snapshot(home)]).toEqual(before);
+    expect(report.database.openMode).toBe("readonly-shm");
+    expect(report.database.counts?.threads).toBe(4);
+    expect(report.ok).toBe(true);
+  });
+
+  it("reads beside a running writer through a link, writing nothing", async () => {
+    const real = makeHome();
+    await startWriter(real);
+    const home = homeWithDatabaseLink(dbPathOf(real));
+    const before = [snapshot(real), snapshot(home)];
+
+    const report = readForkReport(home);
+
+    expect([snapshot(real), snapshot(home)]).toEqual(before);
+    expect(report.database.openMode).toBe("readonly-shm");
+    expect(report.database.counts?.threads).toBe(4);
+    expect(report.ok).toBe(true);
+  });
+
+  it("reports a link that leads nowhere as an error, not as no database, and creates nothing", () => {
+    const elsewhere = tempDir();
+    const dangling = homeWithDatabaseLink(NodePath.join(elsewhere, "gone.sqlite"));
+    const looping = homeWithDatabaseLink(NodePath.join("..", "loop.sqlite"));
+    NodeFS.symlinkSync(dbPathOf(looping), NodePath.join(looping, "loop.sqlite"));
+
+    for (const home of [dangling, looping]) {
+      const before = [snapshot(elsewhere), snapshot(home)];
+
+      const report = readForkReport(home);
+
+      expect([snapshot(elsewhere), snapshot(home)]).toEqual(before);
+      expect(report.database.state).toBe("unreadable");
+      expect(report.problems.map((problem) => problem.code)).toEqual(["database-unreadable"]);
+      expect(report.problems[0]!.message).toContain("link");
+      expect(report.ok).toBe(false);
+    }
   });
 });
 
@@ -349,7 +435,115 @@ describe("__fork-report settings", () => {
     expect(report.fork.featuresOn).toEqual([]);
     expect(report.settings.providerInstances).toEqual([]);
   });
+
+  it("warns on an empty, blank or cut-off file, which a load also ignores", () => {
+    for (const text of ["", "  \n", '{ "agentSlots": { "enabled": true ']) {
+      const report = readForkReport(makeHome({ settings: text }));
+
+      expect(report.settings.parseWarning).not.toBeNull();
+      expect(report.problems.map((problem) => problem.code)).toEqual(["settings-unreadable"]);
+      expect(report.fork.featuresOn).toEqual([]);
+      expect(report.ok).toBe(false);
+    }
+  });
+
+  it("lists the fork keys of a file with comments and a trailing comma, as a load reads it", () => {
+    const report = readForkReport(
+      makeHome({ settings: `{\n  // note\n  "agentSlots": { "enabled": true },\n}\n` }),
+    );
+
+    expect(report.settings.parseWarning).toBeNull();
+    expect(report.fork.keysInFile).toEqual(["agentSlots"]);
+    expect(report.fork.featuresOn).toEqual(["agentSlots"]);
+  });
+
+  it("reports a settings.json it cannot read instead of failing", () => {
+    const home = makeHome();
+    NodeFS.rmSync(settingsPathOf(home));
+    NodeFS.mkdirSync(settingsPathOf(home));
+
+    const report = readForkReport(home);
+
+    expect(report.settings.parseWarning).toContain("could not be read");
+    expect(report.problems.map((problem) => problem.code)).toEqual(["settings-unreadable"]);
+    expect(report.ok).toBe(false);
+  });
 });
+
+// The report must warn exactly when the server's own load ignores settings.json. A load that ignores
+// the file turns `continueThreadsAfterServerUpdate` (default on) off; no case below sets that key.
+it.layer(Layer.mergeAll(NodeServices.layer, NodeCryptoLayer.layer))(
+  "__fork-report settings warning matches the server's load",
+  (it) => {
+    const loadedSettings = (home: string) =>
+      Effect.gen(function* () {
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        return yield* service.getSettings;
+      }).pipe(
+        Effect.provide(
+          ServerSettingsModule.layer.pipe(
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ManagedPolicy.layerTest()),
+            Layer.provideMerge(Layer.fresh(SqlitePersistence.layerMemory)),
+            Layer.provideMerge(Layer.fresh(ServerConfig.layerTest(process.cwd(), home))),
+          ),
+        ),
+      );
+
+    /** Each case lays out userdata/settings.json in a fresh home (`home` already has userdata). */
+    const cases: ReadonlyArray<readonly [string, (home: string) => void]> = [
+      ["no file", () => {}],
+      ["an empty file", (home) => NodeFS.writeFileSync(settingsPathOf(home), "")],
+      ["a blank file", (home) => NodeFS.writeFileSync(settingsPathOf(home), " \n\t\n")],
+      ["a cut-off file", (home) => NodeFS.writeFileSync(settingsPathOf(home), '{ "waitFor": {')],
+      [
+        "a wrong value",
+        (home) => NodeFS.writeFileSync(settingsPathOf(home), '{ "agentSlots": { "enabled": 1 } }'),
+      ],
+      [
+        "comments and a trailing comma",
+        (home) =>
+          NodeFS.writeFileSync(settingsPathOf(home), '{ // c\n "waitFor": { "enabled": true },\n}'),
+      ],
+      [
+        "a link to an empty file",
+        (home) => {
+          const target = NodePath.join(tempDir(), "settings.json");
+          NodeFS.writeFileSync(target, "");
+          NodeFS.symlinkSync(target, settingsPathOf(home));
+        },
+      ],
+      [
+        "a link to a valid file",
+        (home) => {
+          const target = NodePath.join(tempDir(), "settings.json");
+          NodeFS.writeFileSync(target, '{ "waitFor": { "enabled": true } }');
+          NodeFS.symlinkSync(target, settingsPathOf(home));
+        },
+      ],
+      [
+        "a link to nothing",
+        (home) => NodeFS.symlinkSync(NodePath.join(tempDir(), "gone.json"), settingsPathOf(home)),
+      ],
+    ];
+
+    it.effect.each(cases)("with %s", ([, layOut]) =>
+      Effect.gen(function* () {
+        const home = tempDir();
+        NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+        layOut(home);
+
+        const report = readForkReport(home);
+        const loaded = yield* loadedSettings(home);
+
+        const loadIgnoredFile = !loaded.continueThreadsAfterServerUpdate;
+        expect(report.settings.parseWarning !== null).toBe(loadIgnoredFile);
+        expect(report.fork.features.waitFor).toBe(loaded.waitFor.enabled ? "on" : "off");
+        expect(report.fork.features.agentSlots).toBe(loaded.agentSlots.enabled ? "on" : "off");
+      }),
+    );
+  },
+);
 
 // Contract: the go-live kit reads these keys. Changing one means bumping FORK_REPORT_VERSION and
 // changing the kit in the same pull request.
