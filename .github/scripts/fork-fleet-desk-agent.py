@@ -15,7 +15,7 @@ environment (PATH and LC_ALL only: the launcher and the walls read their own set
 limit (fork-fleet-desk-wire.py, "Time") is killed with its process group and answered 75 (UNKNOWN); when the session
 ends, every running verb is killed. The launcher's own 75 is answered 1. At most MAX_VERBS run at once; at most OUT_MAX
 frames wait to be sent (an always-on host that stops reading ends the session). Verbs the machine runs only itself
-(wire.LOCAL_ONLY: check-net, refresh) never come over the link. Time counts a sleep (Clock): CLOCK_BOOTTIME, plus
+(wire.LOCAL_ONLY: check-net, refresh, paths) never come over the link. Time counts a sleep (Clock): CLOCK_BOOTTIME, plus
 any forward step of the wall clock against it (on WSL2 Windows' sleep pauses the distro, so BOOTTIME may not move and
 only the wall clock is stepped on resume): a desktop that wakes finds its link and its verbs past their time at once.
 
