@@ -6,14 +6,19 @@ never beside a changing run.
 
 The journal is <stateDir>/journal.jsonl, append-only, one JSON object per line, each written and fsynced before
 the step it names starts. Each line carries the sha256 of the line before it, so an edited or lost line is found.
-A run is: begin, then per step "started" and "done" (with its facts, such as hashes), then end. A run with no end
-whose lock is free stopped half-way (killed, or the machine went down): every later run reads and reports it, and
-a changing run refuses to start until the command that owns that state settles it (close_unfinished()).
-A torn last line (killed while writing) is reported and ignored; damage anywhere else refuses.
+A run is: begin, then per step "started" and "done" (with its facts, such as hashes), then end.
+
+A run needs settling when it has no end (killed, or the machine went down) or when it ended with an error after
+its first step started (an error can leave the same half-applied state as a kill). Every later run reports it,
+and a changing run refuses to start until the owner puts the home right and runs `t3-golive settle` (settle()).
+A run that failed before its first step changed nothing and needs no settling.
+A torn last line (killed while writing) is reported and ignored. Damage anywhere else refuses until settle moves
+the journal aside; a journal written by a newer kit refuses with "update the kit".
 """
 import contextlib, datetime, errno, fcntl, hashlib, json, os
 
 JOURNAL_VERSION = 1
+SETTLE_HINT = ('look at the T3 home and put it right, then run `t3-golive settle --reason "<what you did>"`')
 
 
 class Busy(Exception):
@@ -21,15 +26,19 @@ class Busy(Exception):
 
 
 class Unfinished(Exception):
-    """The last run stopped half-way; .run holds what the journal says about it."""
+    """The last run needs settling; .run holds what the journal says about it."""
 
     def __init__(self, run):
         self.run = run
-        super().__init__(describe(run))
+        super().__init__(f'{describe(run)}; {SETTLE_HINT}')
 
 
 class Damaged(Exception):
     """The journal cannot be trusted (a line other than the last is broken, or the hash chain is cut)."""
+
+
+class Newer(Damaged):
+    """A line of the journal was written by a newer kit; this kit must not read or move it."""
 
 
 def _now():
@@ -44,6 +53,14 @@ def _ensure_dir(state_dir):
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
 
 
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 @contextlib.contextmanager
 def lock(state_dir, command, exclusive):
     """Hold the kit's lock for a command; Busy when a changing run (or, for one, any command) holds it."""
@@ -56,7 +73,7 @@ def lock(state_dir, command, exclusive):
         except OSError as e:
             if e.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
                 raise
-            raise Busy(_holder_text(fd)) from None
+            raise Busy(_holder_text(fd, exclusive)) from None
         if exclusive:
             os.ftruncate(fd, 0)
             os.pwrite(fd, json.dumps({'pid': os.getpid(), 'command': command, 'at': _now()}).encode(), 0)
@@ -69,18 +86,28 @@ def lock(state_dir, command, exclusive):
         os.close(fd)  # releases the flock
 
 
-def _holder_text(fd):
+def _holder_text(fd, wanted_exclusive):
     try:
         holder = json.loads(os.pread(fd, 4096, 0) or b'null')
-        return (f'another golive run is active: {holder["command"]} (pid {holder["pid"]}, since {holder["at"]})'
-                if isinstance(holder, dict) else 'a golive check is running; try again when it ends')
-    except (ValueError, KeyError, TypeError):
-        return 'another golive command holds the lock'
+    except ValueError:
+        holder = None
+    if isinstance(holder, dict) and {'command', 'pid', 'at'} <= set(holder):
+        return f'another golive run is active: {holder["command"]} (pid {holder["pid"]}, since {holder["at"]})'
+    # An empty lock file: a shared holder (a check), or a changing run in the instant before it wrote its name.
+    if wanted_exclusive:
+        return 'a golive check is running (or a run is just starting); try again when it ends'
+    return 'a golive run is just starting; try again in a moment'
+
+
+def _damaged(path, what):
+    return (f'{path} {what}; the journal cannot be trusted. Read it to see where the last run got to, put the T3 '
+            'home right, then run `t3-golive settle --reason "<what you did>"`: it moves this journal aside '
+            '(journal.jsonl.damaged-<time>) and the next run starts a new one')
 
 
 def read(state_dir):
-    """All runs in the journal, oldest first: [{id, command, pid, began, steps: [...], end, torn}], and a note
-    when the last line is torn. Raises Damaged."""
+    """All runs in the journal, oldest first: [{id, command, pid, began, steps: [...], end, settled}], and a note
+    when the last line is torn. Raises Newer (a newer kit wrote it) or Damaged."""
     _, path = _paths(state_dir)
     try:
         with open(path, 'rb') as f:
@@ -93,16 +120,19 @@ def read(state_dir):
     for n, raw in enumerate(lines, 1):
         try:
             rec = json.loads(raw)
-            ok = isinstance(rec, dict) and rec.get('prev') == prev and rec.get('v') == JOURNAL_VERSION
         except ValueError:
-            ok = False
-        if not ok:
-            raise Damaged(f'{path} line {n} is broken or out of order; the journal cannot be trusted')
+            rec = None
+        v = rec.get('v') if isinstance(rec, dict) else None
+        if type(v) is int and v > JOURNAL_VERSION:
+            raise Newer(f'{path} line {n} was written by a newer go-live kit (journal version {v}, this kit reads '
+                        f'{JOURNAL_VERSION}): update the kit')
+        if not (isinstance(rec, dict) and rec.get('prev') == prev and v == JOURNAL_VERSION):
+            raise Damaged(_damaged(path, f'line {n} is broken or out of order'))
         prev = hashlib.sha256(raw).hexdigest()
         event, rid = rec.get('event'), rec.get('run')
         if event == 'begin':
             run = {'id': rid, 'command': rec.get('command'), 'pid': rec.get('pid'), 'began': rec.get('at'),
-                   'steps': [], 'end': None}
+                   'steps': [], 'end': None, 'settled': None}
             runs.append(run)
             by_id[rid] = run
         elif rid in by_id:
@@ -112,23 +142,38 @@ def read(state_dir):
                                      'data': rec.get('data')})
             elif event == 'end':
                 run['end'] = {'result': rec.get('result'), 'detail': rec.get('detail'), 'at': rec.get('at')}
+            elif event == 'settle':
+                run['settled'] = {'detail': rec.get('detail'), 'at': rec.get('at')}
         else:
-            raise Damaged(f'{path} line {n} names a run that never began')
+            raise Damaged(_damaged(path, f'line {n} names a run that never began'))
     if tail:
         note = f'{path} ends with a torn line (a run was killed while writing); it was ignored'
     return runs, note
 
 
+def needs_settling(run):
+    """True when the run stopped half-way, or ended with an error after its first step started, and the owner
+    has not settled it."""
+    if run['settled'] is not None:
+        return False
+    if run['end'] is None:
+        return True
+    return run['end']['result'] != 'ok' and bool(run['steps'])
+
+
 def unfinished(state_dir):
-    """The last run if it has no end, else None. Only meaningful while the caller holds the lock."""
+    """The last run if it needs settling, else None. Only meaningful while the caller holds the lock."""
     runs, _ = read(state_dir)
-    return runs[-1] if runs and runs[-1]['end'] is None else None
+    return runs[-1] if runs and needs_settling(runs[-1]) else None
 
 
 def describe(run):
     last = run['steps'][-1] if run['steps'] else None
     where = f'step "{last["step"]}" {last["phase"]} at {last["at"]}' if last else 'before its first step'
-    return f'the last run ({run["command"]}, pid {run["pid"]}, began {run["began"]}) stopped half-way: {where}'
+    head = f'the last run ({run["command"]}, pid {run["pid"]}, began {run["began"]})'
+    if run['end'] is None:
+        return f'{head} stopped half-way: {where}'
+    return f'{head} ended {run["end"]["result"]} after {where}: {run["end"]["detail"]}'
 
 
 class Run:
@@ -136,8 +181,14 @@ class Run:
 
     def __init__(self, state_dir, command):
         self.state_dir, self.command = state_dir, command
-        self.id = f'{_now()}-{os.getpid()}'
+        self.id = f'{_now()}-{os.getpid()}-{os.urandom(4).hex()}'
         self._path = _paths(state_dir)[1]
+        self._holds_lock = False
+
+    @property
+    def holds_lock(self):
+        """True only inside journal.run(): this run holds the kit's lock exclusively (see check.run_check)."""
+        return self._holds_lock
 
     def _append(self, event, **fields):
         _, note = read(self.state_dir)  # Damaged stops the run before it writes
@@ -161,11 +212,7 @@ class Run:
         finally:
             os.close(fd)
         if new:
-            dfd = os.open(self.state_dir, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            _fsync_dir(self.state_dir)
 
     @contextlib.contextmanager
     def step(self, name, **facts):
@@ -178,29 +225,51 @@ class Run:
 
 @contextlib.contextmanager
 def run(state_dir, command):
-    """Begin a changing run: take the lock (Busy), refuse an unfinished one (Unfinished), journal begin and end.
-    An exception ends the run "failed" and goes on; a kill leaves it unfinished for the next run to report."""
+    """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished), journal begin
+    and end. An exception ends the run "failed" and goes on (after a started step it then needs settling); a kill
+    leaves it with no end for the next run to report."""
     with lock(state_dir, command, exclusive=True):
         last = unfinished(state_dir)
         if last is not None:
             raise Unfinished(last)
         r = Run(state_dir, command)
         r._append('begin', command=command, pid=os.getpid())
+        r._holds_lock = True
         try:
-            yield r
-        except BaseException as e:
-            r._append('end', result='failed', detail=f'{type(e).__name__}: {e}'[:500])
+            try:
+                yield r
+            except BaseException as e:
+                r._append('end', result='failed', detail=f'{type(e).__name__}: {e}'[:500])
+                raise
+            r._append('end', result='ok', detail=None)
+        finally:
+            r._holds_lock = False
+
+
+def settle(state_dir, reason):
+    """The owner says the home is right again (`t3-golive settle`). Holds the lock exclusively (Busy).
+    Returns ('settled', run) after journalling the reason against the run that needed settling, ('moved', path)
+    after moving a damaged journal aside, or (None, None) when nothing needed settling. A journal from a newer
+    kit raises Newer and is left alone. Running it again changes nothing."""
+    reason = (reason or '').strip()
+    if not reason:
+        raise ValueError('settle needs a reason: what was done to put the T3 home right')
+    with lock(state_dir, 'settle', exclusive=True):
+        _, path = _paths(state_dir)
+        try:
+            last = unfinished(state_dir)
+        except Newer:
             raise
-        r._append('end', result='ok', detail=None)
-
-
-def close_unfinished(state_dir, reason):
-    """Mark the unfinished run as settled (by the command that put things right). Holds the lock."""
-    with lock(state_dir, 'close-unfinished', exclusive=True):
-        last = unfinished(state_dir)
+        except Damaged:
+            aside = f'{path}.damaged-{datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
+            if os.path.lexists(aside):
+                aside = f'{aside}-{os.getpid()}'
+            os.rename(path, aside)
+            _fsync_dir(state_dir)
+            return 'moved', aside
         if last is None:
-            return None
+            return None, None
         r = Run(state_dir, last['command'])
         r.id = last['id']
-        r._append('end', result='stopped-half-way', detail=reason[:500])
-        return last
+        r._append('settle', detail=reason[:500])
+        return 'settled', last

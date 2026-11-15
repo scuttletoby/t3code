@@ -1,6 +1,6 @@
 """The kit's lock and journal, the systemd adapter (with stub commands) and the version order.
 No root, no systemd, no T3.  python3 -I -B fork-kit/golive/tests/journal.test.py"""
-import json, os, subprocess, sys, unittest
+import fcntl, json, os, subprocess, sys, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golive_fixture as fx  # noqa: E402
@@ -57,6 +57,17 @@ class Lock(Base):
         self.assertIn('a golive check is running', str(e.exception))
         self.assertFalse(os.path.exists(os.path.join(self.state, 'journal.jsonl')))
 
+    def test_an_empty_lock_held_alone_is_a_run_starting(self):
+        # The instant between a changing run taking the lock and writing its name: a check must not call it a check.
+        os.makedirs(self.state)
+        fd = os.open(os.path.join(self.state, 'lock'), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with self.assertRaises(journal.Busy) as e:
+            with journal.lock(self.state, 'check', exclusive=False):
+                pass
+        self.assertIn('a golive run is just starting', str(e.exception))
+
     def test_the_lock_dies_with_its_holder(self):
         p = self.hold(kill=True)
         p.wait()
@@ -93,8 +104,33 @@ class Journal(Base):
         self.assertEqual(run['end']['result'], 'failed')
         self.assertIn('disk full', run['end']['detail'])
         self.assertEqual([s['phase'] for s in run['steps']], ['started'])  # never "done"
+        # An error after a step started can leave the home half-applied, like a kill: the next run is refused
+        # until the owner settles it, and the refusal says how.
+        with self.assertRaises(journal.Unfinished) as e:
+            with journal.run(self.state, 'copy'):
+                self.fail('ran over a failed run')
+        self.assertIn('ended failed after step "cold-copy" started', str(e.exception))
+        self.assertIn('t3-golive settle --reason', str(e.exception))
+        what, run = journal.settle(self.state, 'database copy checked by hand')
+        self.assertEqual(what, 'settled')
+        self.assertEqual(journal.read(self.state)[0][-1]['settled']['detail'], 'database copy checked by hand')
         with journal.run(self.state, 'copy'):
-            pass  # a failed run does not block the next one
+            pass
+
+    def test_a_run_that_failed_before_its_first_step_does_not_block(self):
+        with self.assertRaises(ValueError):
+            with journal.run(self.state, 'copy'):
+                raise ValueError('refused before changing anything')
+        self.assertIsNone(journal.unfinished(self.state))
+        with journal.run(self.state, 'copy'):
+            pass
+
+    def test_run_ids_are_unique_within_a_second(self):
+        for _ in range(3):
+            with journal.run(self.state, 'copy'):
+                pass
+        ids = [r['id'] for r in journal.read(self.state)[0]]
+        self.assertEqual(len(set(ids)), 3)
 
     def test_a_run_killed_half_way_blocks_the_next_until_it_is_settled(self):
         p = self.hold(kill=True)
@@ -106,13 +142,24 @@ class Journal(Base):
             with journal.run(self.state, 'copy'):
                 self.fail('ran over an unfinished run')
         self.assertIn('step "switch" started', str(e.exception))
-        settled = journal.close_unfinished(self.state, 'service restarted on the old build by hand')
-        self.assertEqual(settled['id'], last['id'])
+        self.assertIn('t3-golive settle --reason', str(e.exception))
+        with self.assertRaises(ValueError):
+            journal.settle(self.state, '  ')  # the owner says what was done
+        what, settled = journal.settle(self.state, 'service restarted on the old build by hand')
+        self.assertEqual((what, settled['id']), ('settled', last['id']))
         self.assertIsNone(journal.unfinished(self.state))
-        self.assertEqual(journal.read(self.state)[0][-1]['end']['result'], 'stopped-half-way')
-        self.assertIsNone(journal.close_unfinished(self.state, 'again'))  # running it again changes nothing
+        run = journal.read(self.state)[0][-1]
+        self.assertEqual((run['end'], run['settled']['detail']), (None, 'service restarted on the old build by hand'))
+        before = self.journal_lines()
+        self.assertEqual(journal.settle(self.state, 'again'), (None, None))  # running it again changes nothing
+        self.assertEqual(self.journal_lines(), before)
         with journal.run(self.state, 'copy'):
             pass
+
+    def test_settle_waits_for_a_running_command(self):
+        self.hold(kill=False)
+        with self.assertRaises(journal.Busy):
+            journal.settle(self.state, 'x')
 
     def test_a_torn_last_line_is_reported_ignored_and_cut_by_the_next_run(self):
         with journal.run(self.state, 'copy'):
@@ -149,9 +196,43 @@ class Journal(Base):
                     f.write(b'\n'.join(new) + (b'' if new[-1] == b'' else b'\n'))
                 with self.assertRaises(journal.Damaged):
                     journal.read(self.state)
-                with self.assertRaises(journal.Damaged):
+                with self.assertRaises(journal.Damaged) as e:
                     with journal.run(self.state, 'copy'):
                         self.fail('ran on a damaged journal')
+                self.assertNotIsInstance(e.exception, journal.Newer)
+                self.assertIn(os.path.join(self.state, 'journal.jsonl'), str(e.exception))
+                self.assertIn('t3-golive settle', str(e.exception))
+
+    def test_settle_moves_a_damaged_journal_aside(self):
+        with journal.run(self.state, 'copy'):
+            pass
+        path = os.path.join(self.state, 'journal.jsonl')
+        with open(path, 'ab') as f:
+            f.write(b'garbage\n{"v": 1}\n')
+        what, aside = journal.settle(self.state, 'read it, home is fine')
+        self.assertEqual(what, 'moved')
+        self.assertTrue(aside.startswith(path + '.damaged-'))
+        self.assertIn(b'garbage', open(aside, 'rb').read())
+        self.assertEqual(journal.read(self.state), ([], None))
+        with journal.run(self.state, 'copy'):
+            pass
+
+    def test_a_journal_from_a_newer_kit_says_update_the_kit_and_is_left_alone(self):
+        with journal.run(self.state, 'copy'):
+            pass
+        path = os.path.join(self.state, 'journal.jsonl')
+        with open(path, 'ab') as f:
+            f.write(json.dumps({'v': 2, 'prev': 'anything', 'event': 'begin'}).encode() + b'\n')
+        before = self.journal_lines()
+        for attempt in (lambda: journal.read(self.state), lambda: journal.settle(self.state, 'x')):
+            with self.assertRaises(journal.Newer) as e:
+                attempt()
+            self.assertIn('update the kit', str(e.exception))
+            self.assertNotIn('cannot be trusted', str(e.exception))
+        with self.assertRaises(journal.Newer):
+            with journal.run(self.state, 'copy'):
+                self.fail('ran on a newer journal')
+        self.assertEqual(self.journal_lines(), before)
 
     def test_an_empty_or_missing_journal_is_a_fresh_start(self):
         self.assertEqual(journal.read(self.state), ([], None))

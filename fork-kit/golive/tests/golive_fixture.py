@@ -10,8 +10,7 @@ KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
 sys.path[:0] = [os.path.join(KIT, 'lib'), COMMON]
 
-import machine_file  # noqa: E402
-from golive import live, osadapter  # noqa: E402
+from golive import config, live, osadapter  # noqa: E402
 
 LIVE, TARGET = '0.1.9', '0.1.10-nightly.20261114.4682.fork.1'
 
@@ -73,7 +72,7 @@ class Machine:
         self.backups = self.path('backups')
         self.bin = self.path('bin')
         self.server = None
-        self._saved = (machine_file.PATH, machine_file.ROOT_UID, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
+        self._saved = (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
                        os.environ.get('PATH'))
         for d in (self.bin, self.backups, self.path('etc')):
             os.makedirs(d)
@@ -81,7 +80,7 @@ class Machine:
         for name, text in (('systemctl', STUB_SYSTEMCTL), ('systemd-run', STUB_SYSTEMD_RUN)):
             self.write(f'bin/{name}', text.format(python=sys.executable, root=self.root), mode=0o755)
         os.environ['PATH'] = self.bin
-        machine_file.PATH, machine_file.ROOT_UID = self.path('etc/machine.json'), os.getuid()
+        config.MACHINE_FILE, config.MACHINE_OWNER = self.path('etc/machine.json'), os.getuid()
         osadapter.SYSTEMCTL = os.path.join(self.bin, 'systemctl')
         osadapter.SYSTEMD_RUN = os.path.join(self.bin, 'systemd-run')
 
@@ -100,7 +99,7 @@ class Machine:
         if self.server is not None:
             kill(self.server)
             self.server = None
-        (machine_file.PATH, machine_file.ROOT_UID, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN, path) = self._saved
+        (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN, path) = self._saved
         os.environ['PATH'] = path or ''
         shutil.rmtree(self.root, ignore_errors=True)
 

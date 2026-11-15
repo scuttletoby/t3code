@@ -68,15 +68,14 @@ def markers(home):
 
 
 def _proc(pid):
-    """(exe real path, parent pid) of a live process, or None."""
+    """(exe path, parent pid) of a live process, or None. A binary deleted or replaced on disk keeps its
+    " (deleted)" suffix, so it never matches a runtime path."""
     try:
         exe = os.readlink(f'/proc/{pid}/exe')
         with open(f'/proc/{pid}/stat', encoding='utf-8', errors='replace') as f:
             stat = f.read()
     except OSError:
         return None
-    if exe.endswith(' (deleted)'):
-        exe = exe[:-len(' (deleted)')]
     return exe, int(stat[stat.rindex(')') + 2:].split()[1])
 
 
@@ -102,6 +101,8 @@ def live_server(home, service_main_pid):
     exe, ppid = proc
     versions = os.path.realpath(os.path.join(home, 'runtime', 'versions'))
     m = re.fullmatch(re.escape(versions) + r'/([^/]+)/t3', exe)
+    if exe.endswith(' (deleted)'):
+        raise NotLive(f'pid {pid} runs {exe}: its binary was deleted or replaced on disk')
     if m is None:
         raise NotLive(f'pid {pid} runs {exe}, not a runtime of this home')
     if service_main_pid is None or ppid != service_main_pid:
@@ -111,6 +112,20 @@ def live_server(home, service_main_pid):
     if rt.get('serverVersion') not in (None, version):
         raise NotLive(f'{path} says version {rt.get("serverVersion")} but the process runs {version}')
     return {'pid': pid, 'version': version, 'binary': exe, 'port': rt.get('port')}
+
+
+def traces(home):
+    """Files that say T3 ran in `home` as a service: its service state, its server runtime file, markers."""
+    found = [p for p in (os.path.join(home, 'runtime', 'service-state.json'),
+                         os.path.join(home, 'userdata', 'server-runtime.json')) if os.path.lexists(p)]
+    return found + markers(home)
+
+
+def database_aside(home):
+    """Other files named like the database (a copy moved aside, for example), not its WAL or index."""
+    userdata = os.path.join(home, 'userdata')
+    return sorted(p for p in glob.glob(os.path.join(glob.escape(userdata), DATABASE + '?*'))
+                  if not p.endswith(('-wal', '-shm', '-journal')))
 
 
 def database_bytes(home):
@@ -182,9 +197,17 @@ def staged_runtime(stage_dir, version):
                     raise NotLive(f'{local} differs from the file in {archive}')
     except (tarfile.TarError, EOFError) as e:
         raise NotLive(f'{archive_path} cannot be read as an archive: {e}') from None
-    extra = sorted(os.path.relpath(os.path.join(d, n), runtime) for d, _, names in os.walk(runtime)
-                   for n in names) if os.path.isdir(runtime) else []
-    extra = [e for e in extra if e not in seen]
+    extra, links = [], []
+    for d, dirs, names in (os.walk(runtime) if os.path.isdir(runtime) else ()):
+        for n in dirs + names:
+            rel = os.path.relpath(os.path.join(d, n), runtime)
+            if os.path.islink(os.path.join(d, n)):
+                links.append(rel)  # os.walk does not go into a linked folder, and a linked file is not the archive's
+            elif n in names and rel not in seen:
+                extra.append(rel)
+    if links:
+        raise NotLive(f'{runtime} holds links, which the archive does not: {", ".join(sorted(links)[:5])}')
+    extra.sort()
     if extra:
         raise NotLive(f'{runtime} holds files that are not in {archive}: {", ".join(extra[:5])}')
     binary = os.path.join(runtime, 't3')

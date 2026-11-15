@@ -2,8 +2,9 @@
 defines one of them changes or moves, so the kit is updated in the same PR instead of breaking on a live machine.
 It reads source files only.  python3 -I -B fork-kit/golive/tests/contract.test.py
 
-The report command comes from the fork PR "read-only report command" (apps/server/src/golive/forkReport.ts); until
-that PR is on main, the report part fails on purpose: the kit cannot run without it.
+Names the kit would fail open on are pinned too: if upstream renamed the pending update status, check would pass
+with an update in flight, so the exact name is pinned here. The report command is the fork's own
+(apps/server/src/golive/forkReport.ts and apps/server/src/cli/forkReport.ts).
 """
 import os, re, sys, unittest
 
@@ -32,6 +33,14 @@ UPSTREAM = [
      'stop marker'),
     ('apps/server/src/cloud/serviceProtocol.ts', 'export const SERVICE_RESTART_PENDING_FILE = ".restart-pending";',
      'restart marker'),
+    ('apps/server/src/cloud/serviceProtocol.ts', 'readonly status: "pending";',
+     'live.service_state: an update in flight is status "pending" (fails open if renamed)'),
+    ('apps/server/src/cloud/serviceProtocol.ts', 'update?.status === "pending"', 'pending status in use'),
+    ('apps/server/src/serverRuntimeState.ts', 'version: Schema.Literal(1),', 'server-runtime.json record version 1'),
+    ('apps/server/src/serverRuntimeState.ts', '  pid: Schema.Int,', 'server-runtime.json pid'),
+    ('apps/server/src/serverRuntimeState.ts', '  port: Schema.Int,', 'server-runtime.json port'),
+    ('apps/server/src/serverRuntimeState.ts', '  serverVersion: Schema.optional(Schema.String),',
+     'server-runtime.json serverVersion'),
     ('apps/server/src/cloud/serviceProtocol.ts', 'protocol === 3 || protocol === SERVICE_LAUNCHER_PROTOCOL',
      'service state protocols 3 and 4'),
     ('apps/server/src/cloud/serviceProtocol.ts',
@@ -58,10 +67,31 @@ UPSTREAM = [
 
 REPORT_FILE = 'apps/server/src/golive/forkReport.ts'
 REPORT_CLI = 'apps/server/src/cli/forkReport.ts'
-# Every key path check.py and live.py read from the report.
-REPORT_KEYS = ['readonly reportVersion: number;', 'readonly version:', 'readonly pendingMigrations:',
-               'readonly counts:', 'readonly threads:', 'readonly projects:', 'readonly featuresOn:',
-               'readonly problems:', 'readonly ok: boolean;']
+# Every key path check.py and live.py read from the report, with where it sits.
+REPORT_PATHS = ['reportVersion', 'version', 'ok', 'problems', 'problems.code', 'problems.message',
+                'database.pendingMigrations', 'database.counts', 'database.counts.threads',
+                'database.counts.projects', 'fork.featuresOn']
+
+
+def interface_paths(text, name):
+    """The key paths of `export interface <name> { ... }` (nested objects and arrays of objects), e.g.
+    'database.counts.threads'. Enough TypeScript for the report's interface, nothing more."""
+    body = text[text.index(f'export interface {name} {{'):]
+    paths, stack = set(), []
+    for line in body.splitlines()[1:]:
+        keys = re.findall(r'\breadonly (\w+)\??:', line)
+        if keys:
+            paths.add('.'.join(stack + [keys[0]]))
+            for inner in keys[1:]:  # an object on one line: { readonly a: x; readonly b: y }
+                paths.add('.'.join(stack + [keys[0], inner]))
+        opened = line.count('{') - line.count('}')
+        if opened > 0:
+            stack.append(keys[0] if keys else '?')
+        elif opened < 0:
+            if not stack:
+                break  # the interface's own closing brace
+            stack.pop()
+    return paths
 
 
 class Upstream(unittest.TestCase):
@@ -84,10 +114,20 @@ class Report(unittest.TestCase):
                         f'{REPORT_FILE} is missing: the kit needs the fork PR "read-only report command" on main')
         text = source(REPORT_FILE)
         self.assertIn(f'export const FORK_REPORT_VERSION = {live.REPORT_VERSION};', text)
-        for key in REPORT_KEYS:
+        paths = interface_paths(text, 'ForkReport')
+        for key in REPORT_PATHS:
             with self.subTest(key):
-                self.assertIn(key, text)
-        self.assertIn('Command.make("__fork-report"', source(REPORT_CLI))
+                self.assertIn(key, paths, f'{REPORT_FILE}: ForkReport.{key} moved or is gone')
+        cli = source(REPORT_CLI)
+        self.assertIn('Command.make("__fork-report"', cli)
+        self.assertIn('Flag.String("base-dir")', cli)  # live.fork_report passes --base-dir <home>
+
+    def test_the_interface_reader_sees_nesting(self):
+        paths = interface_paths('export interface X {\n  readonly a: {\n    readonly b: number;\n  };\n'
+                                '  readonly c: ReadonlyArray<{\n    readonly d: string;\n  }>;\n'
+                                '  readonly e: { readonly f: string; readonly g: boolean };\n}\nconst z = { y: 1 };\n',
+                                'X')
+        self.assertEqual(paths, {'a', 'a.b', 'c', 'c.d', 'e', 'e.f', 'e.g'})
 
 
 if __name__ == '__main__':
