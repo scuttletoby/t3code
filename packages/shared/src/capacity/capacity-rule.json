@@ -7,9 +7,9 @@
     "noSwapOrNoCapsPercent": 150
   },
   "readingBounds": {
-    "minTotalMb": 256,
-    "maxTotalMb": 4194304,
-    "maxCpuCores": 4096
+    "minTotalMb": 1024,
+    "maxTotalMb": 1048575,
+    "maxCpuCores": 1024
   },
   "kinds": {
     "agent-light": { "group": "agent", "startMb": 384, "startCentiCores": 10 },

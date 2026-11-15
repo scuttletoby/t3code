@@ -41,7 +41,12 @@ export function runCapacityVector(
   file: CapacityVectorsFile,
   vector: CapacityVector,
 ): Record<string, unknown> {
-  const base = typeof vector.facts === "string" ? file.factSets[vector.facts] : vector.facts;
+  const base =
+    typeof vector.facts === "string"
+      ? vector.facts.startsWith("//") || !Object.hasOwn(file.factSets, vector.facts)
+        ? undefined
+        : file.factSets[vector.facts]
+      : vector.facts;
   if (base === undefined)
     throw new Error(`${vector.name}: unknown fact set ${String(vector.facts)}`);
   if ((vector.ask === undefined) === (vector.fill === undefined)) {

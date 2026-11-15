@@ -47,6 +47,7 @@ function checkAlternative(
     case "number>=0":
       return isFiniteNumber(value) && value >= 0;
     case "uint":
+      // Whole, 0 to 2^53-1; never a boolean (README "The format language": agreement rules).
       return Number.isSafeInteger(value) && (value as number) >= 0;
     default:
       errors.push(`${path}: the format has an unknown type "${alternative}"`);
@@ -110,13 +111,13 @@ function checkSpec(
 }
 
 /**
- * Problems with `value` as the format's type `typeName` (`"rule"` or `"vectors"`); empty when it is
- * well formed. Strict: an unknown or missing key is a problem, so a file from a newer or older
- * build is refused by name, never half-read.
+ * Problems with `value` as `spec` (a spec of the format language, e.g. `"uint"` or `"@rule"`); empty
+ * when it fits. `path` names the value in the messages.
  */
-export function capacityFormatErrors(
+export function capacitySpecErrors(
   value: unknown,
-  typeName: "rule" | "vectors",
+  spec: unknown,
+  path = "value",
   format: unknown = formatJson,
 ): ReadonlyArray<string> {
   if (
@@ -128,6 +129,19 @@ export function capacityFormatErrors(
   }
   const types = format.types as Record<string, FormatSpec>;
   const errors: Array<string> = [];
-  checkSpec(value, `@${typeName}`, types, typeName, errors);
+  checkSpec(value, spec as FormatSpec, types, path, errors);
   return errors;
+}
+
+/**
+ * Problems with `value` as the format's type `typeName` (`"rule"` or `"vectors"`); empty when it is
+ * well formed. Strict: an unknown or missing key is a problem, so a file from a newer or older
+ * build is refused by name, never half-read.
+ */
+export function capacityFormatErrors(
+  value: unknown,
+  typeName: "rule" | "vectors",
+  format: unknown = formatJson,
+): ReadonlyArray<string> {
+  return capacitySpecErrors(value, `@${typeName}`, typeName, format);
 }

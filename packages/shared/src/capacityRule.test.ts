@@ -3,7 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import formatJson from "./capacity/capacity-format.json" with { type: "json" };
 import ruleJson from "./capacity/capacity-rule.json" with { type: "json" };
 import vectorsJson from "./capacity/capacity-vectors.json" with { type: "json" };
-import { capacityFormatErrors } from "./capacityFormat.ts";
+import { capacityFormatErrors, capacitySpecErrors } from "./capacityFormat.ts";
 import {
   CAPACITY_RULE,
   capacityDecision,
@@ -81,6 +81,47 @@ describe("capacity files", () => {
     ]);
   });
 
+  it("holds every evaluator to the same number rules (the format file's cases)", () => {
+    const cases = (formatJson as { cases?: ReadonlyArray<Record<string, unknown>> }).cases ?? [];
+    expect(cases.length).toBeGreaterThan(0);
+    for (const entry of cases) {
+      expect(Object.keys(entry).toSorted()).toEqual(["json", "ok", "spec", "why"]);
+      // A parser that refuses the text (NaN, Infinity) refuses the value.
+      let ok = false;
+      try {
+        const value: unknown = JSON.parse(entry.json as string);
+        ok = capacitySpecErrors(value, entry.spec).length === 0;
+      } catch {
+        ok = false;
+      }
+      expect(ok, `${String(entry.spec)} ${String(entry.json)}: ${String(entry.why)}`).toBe(
+        entry.ok,
+      );
+    }
+  });
+
+  it("never treats a note in kinds as a kind, and refuses a kind that costs nothing", () => {
+    const noted = clone(ruleJson) as Record<string, any>;
+    noted.kinds["//agent-light"] = "a note about light agents";
+    const parsed = parseCapacityRule(noted);
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+    expect(Object.keys(parsed.rule.kinds)).not.toContain("//agent-light");
+    const decision = capacityDecision(parsed.rule, {
+      facts: vectorsFile.factSets["host-12gb-idle"]!,
+      ask: { kind: "//agent-light" },
+    });
+    expect({ kind: decision.kind, costMb: decision.costMb }).toEqual({
+      kind: "agent-writer",
+      costMb: 768,
+    });
+    const free = clone(ruleJson) as Record<string, any>;
+    free.kinds["agent-light"].startMb = 0;
+    expect(parseCapacityRule(free)).toEqual({
+      ok: false,
+      errors: ["rule.kinds.agent-light.startMb: must be at least 1"],
+    });
+  });
+
   it("refuses a format file it does not know", () => {
     expect(capacityFormatErrors(ruleJson, "rule", { format: "capacity-format/2" })).toEqual([
       "format file: not capacity-format/1",
@@ -99,6 +140,7 @@ describe("capacity vectors", () => {
     for (const name of [
       "incident: 18 build agents and a test server at once",
       "incident: two CI runs and an agent build on 12 cores",
+      "incident: two CI runs and an agent build, builds that learned 6 cores",
       "incident: CI runs and a build on 4 cores",
       "incident fan-out of 24 light agents",
       "incident: a capped box stalls while the machine has free memory",
@@ -107,10 +149,18 @@ describe("capacity vectors", () => {
       "total grows to 18 GB: builds stop at 4 by cores",
       "total shrinks to 10 GB",
       "machine smaller than the floor: writers",
+      "2 GB box read in kB",
+      "4 GB box read in kB",
+      "machine stall with a calm box is still severe",
+      "box PSI elevated, machine calm",
     ]) {
       expect(names, name).toContain(name);
     }
     expect(names.size).toBe(vectorsFile.vectors.length);
+  });
+
+  it("shows its working in every vector", () => {
+    for (const vector of vectorsFile.vectors) expect(vector.why.trim(), vector.name).not.toBe("");
   });
 
   it.each(vectorsFile.vectors.map((vector) => [vector.name, vector] as const))(
@@ -146,6 +196,15 @@ describe("capacity rule", () => {
           `${name} ${kind}`,
         ).toBeGreaterThanOrEqual(severeLine(after.marginMb!));
       }
+    }
+  });
+
+  it("reads any machine of 1 GB or more given in kB as unreadable", () => {
+    for (const totalMb of [1024, 2048, 3900, 4096, 16_384, 1_048_575]) {
+      const kb = { ...facts({}), totalMb: totalMb * 1024, availableMb: totalMb * 800, cpuCores: 2 };
+      expect(
+        capacityDecision(CAPACITY_RULE, { facts: kb, ask: { kind: "agent-light" } }).reason,
+      ).toBe("unreadable");
     }
   });
 

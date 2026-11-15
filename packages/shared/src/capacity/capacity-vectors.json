@@ -313,7 +313,7 @@
     },
     {
       "name": "incident: two CI runs and an agent build on 12 cores",
-      "why": "All three builds ask one rule: 7.5 cores of the 10.8 allowed, 6144 of 9391 MB.",
+      "why": "With start costs all three builds fit: 3 x 250 = 750 of the 1080 job centi-cores, 6144 of 9391 MB. The start cost alone does not refuse this incident (the measured build cost is 1.6-2.5 cores). The protection: all three now ask one rule (before, two ran outside any door); a build that uses more CPU learns it (next vector refuses it); jobs keep a low CPU weight (outside the rule).",
       "facts": "host-12gb-idle",
       "fill": [
         {
@@ -324,6 +324,27 @@
       "expect": {
         "admitted": [3],
         "stoppedBy": [null]
+      }
+    },
+    {
+      "name": "incident: two CI runs and an agent build, builds that learned 6 cores",
+      "why": "The protection against the load-90 incident: builds that learned 6 cores (600 centi-cores, inside 400% of 250). The first uses 600 of the 1080 job centi-cores; the second would make 1200 > 1080, so it and the third wait for cores. The job floor (1) is already met.",
+      "facts": "host-12gb-idle",
+      "learned": {
+        "job-build": {
+          "mb": 2048,
+          "centiCores": 600
+        }
+      },
+      "fill": [
+        {
+          "kind": "job-build",
+          "count": 3
+        }
+      ],
+      "expect": {
+        "admitted": [1],
+        "stoppedBy": ["cores"]
       }
     },
     {
@@ -346,10 +367,14 @@
     },
     {
       "name": "incident: a capped box stalls while the machine has free memory",
-      "why": "Memory stall high (full avg10 15%) is severe: no new piece at all, floors included.",
+      "why": "The build box stalls at its cap (box PSI full 15%) while the machine reads PSI 0 and has 9391 MB free. The level takes the worst of machine and box: severe, so nothing more goes into that box, floors included.",
       "facts": "host-12gb-idle",
       "patch": {
         "psi": {
+          "someAvg10Pct": 0,
+          "fullAvg10Pct": 0
+        },
+        "boxPsi": {
           "someAvg10Pct": 30,
           "fullAvg10Pct": 15
         }
@@ -363,6 +388,91 @@
       "expect": {
         "admitted": [0],
         "stoppedBy": ["severe"]
+      }
+    },
+    {
+      "name": "machine stall with a calm box is still severe",
+      "why": "Machine PSI full 15%, the box reads 0: the worst of the two is severe, nothing new.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "psi": {
+          "someAvg10Pct": 30,
+          "fullAvg10Pct": 15
+        },
+        "boxPsi": {
+          "someAvg10Pct": 0,
+          "fullAvg10Pct": 0
+        }
+      },
+      "fill": [
+        {
+          "kind": "job-build",
+          "count": 2
+        }
+      ],
+      "expect": {
+        "admitted": [0],
+        "stoppedBy": ["severe"]
+      }
+    },
+    {
+      "name": "box PSI elevated, machine calm",
+      "why": "Box PSI some 12% (limit 10%) with a calm machine: elevated. The job floor admits one build (10600-2048=8552 stays above the severe line 604.5); the second is refused as elevated.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "boxPsi": {
+          "someAvg10Pct": 12,
+          "fullAvg10Pct": 0
+        }
+      },
+      "fill": [
+        {
+          "kind": "job-build",
+          "count": 2
+        }
+      ],
+      "expect": {
+        "admitted": [1],
+        "stoppedBy": ["elevated"]
+      }
+    },
+    {
+      "name": "box PSI unreadable is elevated",
+      "why": "A box PSI that could not be read is never ok: elevated, and the 8 live agents are above the floor.",
+      "facts": "measured-host-now",
+      "patch": {
+        "boxPsi": "unreadable"
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": false,
+        "reason": "elevated",
+        "level": "elevated"
+      }
+    },
+    {
+      "name": "a box that is not calm keeps elevated",
+      "why": "Machine calm, box PSI some 7% (under the elevated 10%, above the calm 5%): the 60 s wait does not start.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "boxPsi": {
+          "someAvg10Pct": 7,
+          "fullAvg10Pct": 0
+        }
+      },
+      "previous": {
+        "level": "elevated",
+        "calmSinceMs": 0
+      },
+      "nowMs": 70000,
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "level": "elevated",
+        "calmSinceMs": null
       }
     },
     {
@@ -748,7 +858,7 @@
     },
     {
       "name": "total in KB",
-      "why": "12 GB given in KB as MB is above the 4 TiB bound.",
+      "why": "12 GB given in kB as MB (12372992) is above the 1048575 MB bound: unreadable.",
       "facts": "measured-host-now",
       "patch": {
         "totalMb": 12372992
@@ -766,7 +876,7 @@
     },
     {
       "name": "total in GB",
-      "why": "12 given as MB is below the 256 MB bound.",
+      "why": "12 given as MB is below the 1024 MB bound: unreadable.",
       "facts": "measured-host-now",
       "patch": {
         "totalMb": 12
@@ -780,6 +890,180 @@
         "level": "elevated",
         "freeMb": null,
         "marginMb": null
+      }
+    },
+    {
+      "name": "2 GB box read in kB",
+      "why": "/proc/meminfo is in kB: a 2 GB box read as MB says 2097152, above the 1048575 MB bound. Unreadable: nothing admitted (read right, the same box admits 1 writer).",
+      "facts": "small-2gb",
+      "patch": {
+        "totalMb": 2097152,
+        "availableMb": 1638400
+      },
+      "fill": [
+        {
+          "kind": "agent-writer",
+          "count": 10
+        },
+        {
+          "kind": "job-build",
+          "count": 4
+        }
+      ],
+      "expect": {
+        "admitted": [0, 0],
+        "stoppedBy": ["unreadable", "unreadable"]
+      }
+    },
+    {
+      "name": "4 GB box read in kB",
+      "why": "4096 MB in kB is 4194304, above the 1048575 MB bound: unreadable.",
+      "facts": "small-2gb",
+      "patch": {
+        "totalMb": 4194304,
+        "availableMb": 3194880,
+        "cpuCores": 4
+      },
+      "fill": [
+        {
+          "kind": "agent-writer",
+          "count": 10
+        },
+        {
+          "kind": "job-build",
+          "count": 4
+        }
+      ],
+      "expect": {
+        "admitted": [0, 0],
+        "stoppedBy": ["unreadable", "unreadable"]
+      }
+    },
+    {
+      "name": "1 GB read in kB, or 1 TiB of RAM: unreadable",
+      "why": "1048576 is above the 1048575 MB bound. It is a 1 GB machine read in kB, or a machine with 1 TiB of RAM: the rule cannot tell them apart, so it takes the safe side (unreadable). Such a big machine raises maxTotalMb in its rule file.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "totalMb": 1048576,
+        "availableMb": 900000
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": false,
+        "reason": "unreadable",
+        "level": "elevated",
+        "freeMb": null,
+        "marginMb": null
+      }
+    },
+    {
+      "name": "largest readable machine",
+      "why": "1048575 MB is inside the bound. Margin ceil(1048575 x 10 / 100) = 104858; free 1000000-104858 = 895142.",
+      "facts": {
+        "totalMb": 1048575,
+        "availableMb": 1000000,
+        "cpuCores": 256,
+        "pieceCaps": true,
+        "swap": {
+          "totalMb": 8192,
+          "freeMb": 8192
+        },
+        "psi": {
+          "someAvg10Pct": 0,
+          "fullAvg10Pct": 0
+        },
+        "pieces": [],
+        "reservations": []
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": true,
+        "reason": "fits",
+        "marginMb": 104858,
+        "freeMb": 895142
+      }
+    },
+    {
+      "name": "machine under 1 GB is unreadable",
+      "why": "1000 MB total is below the 1024 MB bound (also what a 1 TB machine read in GB looks like); the minimum margin alone is 1024 MB, so nothing could run.",
+      "facts": "small-2gb",
+      "patch": {
+        "totalMb": 1000,
+        "availableMb": 800
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": false,
+        "reason": "unreadable",
+        "level": "elevated",
+        "freeMb": null,
+        "marginMb": null
+      }
+    },
+    {
+      "name": "cores in centi-cores",
+      "why": "12 cores given as 1200 (hundredths) is above the 1024-core bound: unreadable.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "cpuCores": 1200
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": false,
+        "reason": "unreadable",
+        "level": "elevated",
+        "freeMb": null,
+        "marginMb": null
+      }
+    },
+    {
+      "name": "swap in kB is unreadable",
+      "why": "4 GB of swap given in kB (4194304) is above the 1048575 MB bound: swap unreadable, so elevated and the wider margin ceil(120830 x 150 / 10000) = 1813. Nothing runs, so the floor admits (10600-384 = 10216 >= 906.5).",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "swap": {
+          "totalMb": 4194304,
+          "freeMb": 4194304
+        }
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": true,
+        "reason": "floor",
+        "level": "elevated",
+        "marginMb": 1813
+      }
+    },
+    {
+      "name": "reservation in bytes holds at most the largest machine",
+      "why": "1 GB held, given in bytes (1073741824), counts as 1048575 MB (the bound), so sums stay exact in every language. free 10600-1209-1048575 = -1039184: only the floor admits.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "reservations": [
+          {
+            "mb": 1073741824,
+            "useMb": 0
+          }
+        ]
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": true,
+        "reason": "floor",
+        "reservedMb": 1048575,
+        "freeMb": -1039184
       }
     },
     {
@@ -802,7 +1086,7 @@
     },
     {
       "name": "available negative",
-      "why": "",
+      "why": "Available below 0 is impossible: unreadable, never free.",
       "facts": "measured-host-now",
       "patch": {
         "availableMb": -5
@@ -820,7 +1104,7 @@
     },
     {
       "name": "total missing",
-      "why": "",
+      "why": "No total means nothing is known: unreadable, never \"no limit\".",
       "facts": "measured-host-now",
       "patch": {
         "totalMb": null
@@ -838,7 +1122,7 @@
     },
     {
       "name": "total not a number",
-      "why": "",
+      "why": "A string is not a number, even when it reads like one: unreadable.",
       "facts": "measured-host-now",
       "patch": {
         "totalMb": "12083"
@@ -856,7 +1140,7 @@
     },
     {
       "name": "cores zero",
-      "why": "",
+      "why": "0 cores is impossible: unreadable.",
       "facts": "measured-host-now",
       "patch": {
         "cpuCores": 0
@@ -1000,7 +1284,7 @@
     },
     {
       "name": "negative or missing demand owes in full",
-      "why": "",
+      "why": "Demand -1 and no demand both count as 0: each writer owes 768, owed 1536, free 10600-1209-1536=7855.",
       "facts": "host-12gb-idle",
       "patch": {
         "pieces": [
@@ -1050,7 +1334,7 @@
     },
     {
       "name": "fractional available rounds down",
-      "why": "",
+      "why": "7977.9 counts as 7977: free 7977-1209-906-1715=4147, as with 7977.",
       "facts": "measured-host-now",
       "patch": {
         "availableMb": 7977.9
@@ -1155,7 +1439,7 @@
     },
     {
       "name": "no per-piece caps widens the margin",
-      "why": "",
+      "why": "Margin 1209 x1.5 = 1812.45, rounded up to 1813; free 7977-1813-906-1715=3543.",
       "facts": "measured-host-now",
       "patch": {
         "pieceCaps": false
@@ -1170,7 +1454,7 @@
     },
     {
       "name": "zero swap is no swap",
-      "why": "",
+      "why": "Swap total 0 is no swap: wider margin 1813, and no swap-free limit, so the level stays ok.",
       "facts": "measured-host-now",
       "patch": {
         "swap": {
@@ -1334,7 +1618,7 @@
     },
     {
       "name": "PSI unreadable is elevated",
-      "why": "",
+      "why": "A PSI file that could not be read is never \"ok\": elevated, and 8 agents are above the floor.",
       "facts": "measured-host-now",
       "patch": {
         "psi": "unreadable"
@@ -1349,7 +1633,7 @@
     },
     {
       "name": "PSI out of range is unreadable",
-      "why": "",
+      "why": "PSI is a percentage 0-100; -1 is broken, so elevated.",
       "facts": "measured-host-now",
       "patch": {
         "psi": {
@@ -1366,7 +1650,7 @@
     },
     {
       "name": "swap unreadable is elevated and widens the margin",
-      "why": "",
+      "why": "Unreadable swap counts as no swap for the margin (1813) and as elevated for the level.",
       "facts": "measured-host-now",
       "patch": {
         "swap": "unreadable"
@@ -1381,7 +1665,7 @@
     },
     {
       "name": "swap free above total is unreadable",
-      "why": "",
+      "why": "200 MB free of 100 MB swap is impossible: elevated.",
       "facts": "measured-host-now",
       "patch": {
         "swap": {
@@ -1413,7 +1697,7 @@
     },
     {
       "name": "no PSI: OS level garbage is unreadable",
-      "why": "",
+      "why": "An OS level that is not ok, elevated or severe is broken: elevated.",
       "facts": "laptop-8gb-basic",
       "patch": {
         "osLevel": "warn"
@@ -1445,7 +1729,7 @@
     },
     {
       "name": "elevated to ok waits: 59.999 s",
-      "why": "",
+      "why": "Calm since 1000000 ms, now 1059999: 59.999 s is under the 60 s wait, so still elevated and the calm start is kept.",
       "facts": "measured-host-now",
       "previous": {
         "level": "elevated",
@@ -1462,7 +1746,7 @@
     },
     {
       "name": "elevated to ok after 60 s",
-      "why": "",
+      "why": "Calm since 1000000 ms, now 1060000: 60 s of calm readings, so ok again and the calm start is cleared.",
       "facts": "measured-host-now",
       "previous": {
         "level": "elevated",
@@ -1503,7 +1787,7 @@
     },
     {
       "name": "severe steps down after 120 s",
-      "why": "",
+      "why": "No severe reading since 1000000 ms, now 1120000: 120 s, so one step down to elevated (not to ok).",
       "facts": "measured-host-now",
       "previous": {
         "level": "severe",
@@ -1520,7 +1804,7 @@
     },
     {
       "name": "severe waits 119.999 s",
-      "why": "",
+      "why": "119.999 s is under the 120 s wait: still severe.",
       "facts": "measured-host-now",
       "previous": {
         "level": "severe",
@@ -1537,7 +1821,7 @@
     },
     {
       "name": "severe stays while severe",
-      "why": "",
+      "why": "500 MB available is under half the margin (604.5): severe again, so the wait starts over (calmSinceMs null).",
       "facts": "measured-host-now",
       "patch": {
         "availableMb": 500
@@ -1557,7 +1841,7 @@
     },
     {
       "name": "up at once",
-      "why": "",
+      "why": "PSI full 2% is the elevated limit: up from ok on the first such read, no wait.",
       "facts": "measured-host-now",
       "patch": {
         "psi": {
@@ -1579,7 +1863,7 @@
     },
     {
       "name": "clock went back restarts the wait",
-      "why": "",
+      "why": "Now (1000000) is before the calm start (2000000): the clock went back, so the wait restarts from now.",
       "facts": "measured-host-now",
       "previous": {
         "level": "elevated",
@@ -1596,7 +1880,7 @@
     },
     {
       "name": "no clock never steps down",
-      "why": "",
+      "why": "Without nowMs the rule cannot know how long it was calm: it stays elevated.",
       "facts": "measured-host-now",
       "previous": {
         "level": "elevated",
@@ -1669,7 +1953,7 @@
     },
     {
       "name": "one type-check at a time",
-      "why": "",
+      "why": "A type-check is already running and the kind allows 1 at once: refused by the kind limit.",
       "facts": "measured-host-now",
       "patch": {
         "pieces": [
@@ -1753,7 +2037,7 @@
     },
     {
       "name": "learned cost is clamped down to half",
-      "why": "",
+      "why": "A learned 10 MB writer counts as at least 50% of 768 = 384 MB.",
       "facts": "measured-host-now",
       "learned": {
         "agent-writer": {
@@ -1769,7 +2053,7 @@
     },
     {
       "name": "broken learned cost is the start cost",
-      "why": "",
+      "why": "A negative learned cost is broken: the 768 MB start cost.",
       "facts": "measured-host-now",
       "learned": {
         "agent-writer": {
@@ -1781,6 +2065,199 @@
       },
       "expect": {
         "costMb": 768
+      }
+    },
+    {
+      "name": "agreement: cores true is unreadable",
+      "why": "A boolean is not a number (Python's bool is an int: a lax evaluator reads true as 1 core).",
+      "facts": "measured-host-now",
+      "patch": {
+        "cpuCores": true
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": false,
+        "reason": "unreadable",
+        "level": "elevated",
+        "freeMb": null,
+        "marginMb": null
+      }
+    },
+    {
+      "name": "agreement: total true is unreadable",
+      "why": "A boolean total is not a number: unreadable.",
+      "facts": "measured-host-now",
+      "patch": {
+        "totalMb": true
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": false,
+        "reason": "unreadable",
+        "level": "elevated",
+        "freeMb": null,
+        "marginMb": null
+      }
+    },
+    {
+      "name": "agreement: demand true owes in full",
+      "why": "A boolean demand is broken, so 0: the light agent owes 384 (a lax evaluator says 383). free 10600-1209-384 = 9007.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "pieces": [
+          {
+            "kind": "agent-light",
+            "demandMb": true
+          }
+        ]
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "owedMb": 384,
+        "freeMb": 9007
+      }
+    },
+    {
+      "name": "agreement: reservation use true holds it all",
+      "why": "A boolean use is broken, so 0 used: 1000 reserved (a lax evaluator says 999).",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "reservations": [
+          {
+            "mb": 1000,
+            "useMb": true
+          }
+        ]
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "reservedMb": 1000,
+        "freeMb": 8391
+      }
+    },
+    {
+      "name": "agreement: reservation size true holds nothing",
+      "why": "A boolean size is broken: it holds 0 (a lax evaluator holds 1).",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "reservations": [
+          {
+            "mb": true,
+            "useMb": 0
+          }
+        ]
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "reservedMb": 0,
+        "freeMb": 9391
+      }
+    },
+    {
+      "name": "agreement: swap free true is unreadable",
+      "why": "Boolean swap free: swap unreadable, so elevated and the wider margin 1813; nothing runs, so the floor admits.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "swap": {
+          "totalMb": 4096,
+          "freeMb": true
+        }
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": true,
+        "reason": "floor",
+        "level": "elevated",
+        "marginMb": 1813
+      }
+    },
+    {
+      "name": "agreement: PSI true is unreadable",
+      "why": "A boolean PSI value is broken: elevated; nothing runs, so the floor admits.",
+      "facts": "host-12gb-idle",
+      "patch": {
+        "psi": {
+          "someAvg10Pct": true,
+          "fullAvg10Pct": 0
+        }
+      },
+      "ask": {
+        "kind": "agent-light"
+      },
+      "expect": {
+        "admit": true,
+        "reason": "floor",
+        "level": "elevated"
+      }
+    },
+    {
+      "name": "agreement: declared size true falls back",
+      "why": "A boolean declared size is broken: the 4096 MB fallback plus 512.",
+      "facts": "host-12gb-idle",
+      "ask": {
+        "kind": "job-server",
+        "declaredMb": true
+      },
+      "expect": {
+        "costMb": 4608
+      }
+    },
+    {
+      "name": "agreement: learned cost true is the start cost",
+      "why": "A boolean learned cost is broken: the 768 MB start cost (a lax evaluator clamps 1 up to 384).",
+      "facts": "host-12gb-idle",
+      "learned": {
+        "agent-writer": {
+          "mb": true
+        }
+      },
+      "ask": {
+        "kind": "agent-writer"
+      },
+      "expect": {
+        "costMb": 768
+      }
+    },
+    {
+      "name": "agreement: whole numbers written with a fraction",
+      "why": "12083.0 is 12083 and count 2.0 is 2 in every evaluator (a JSON parser may give a float): margin 1209, both light agents admitted.",
+      "facts": {
+        "totalMb": 12083.0,
+        "availableMb": 10600.0,
+        "cpuCores": 12.0,
+        "pieceCaps": true,
+        "swap": {
+          "totalMb": 4096.0,
+          "freeMb": 4096.0
+        },
+        "psi": {
+          "someAvg10Pct": 0.0,
+          "fullAvg10Pct": 0.0
+        },
+        "pieces": [],
+        "reservations": []
+      },
+      "fill": [
+        {
+          "kind": "agent-light",
+          "count": 2.0
+        }
+      ],
+      "expect": {
+        "admitted": [2],
+        "stoppedBy": [null]
       }
     },
     {
