@@ -812,6 +812,23 @@ export function limitErrorWakes(input: {
   return { changes, heldThreads: held.size, joined };
 }
 
+/**
+ * A stored held slot ends at most `reserveSeconds` after its delivery (`endedAt`) and after `nowMs`,
+ * the time the store is read: a clock that was ahead or a hand-edited or damaged file never holds
+ * a slot longer, and the record can be pruned after it. Ended or unreadable: no hold at all.
+ */
+export function boundHeldSlot(wait: WaitRecord, nowMs: number, reserveSeconds: number): WaitRecord {
+  if (wait.reservedUntil === undefined) return wait;
+  const endedMs = wait.endedAt === undefined ? Number.NaN : Date.parse(wait.endedAt);
+  const limitMs =
+    Math.min(nowMs, Number.isFinite(endedMs) ? endedMs : nowMs) + reserveSeconds * MS_PER_SECOND;
+  const untilMs = Date.parse(wait.reservedUntil);
+  if (untilMs <= limitMs) return wait;
+  return limitMs > nowMs
+    ? update(wait, { reservedUntil: iso(limitMs) })
+    : update(wait, {}, ["reservedUntil"]);
+}
+
 /** Ended waits leave the file after `keepEndedHours`, a slot wait not before its reservation. */
 export function shouldPruneWait(
   wait: WaitRecord,

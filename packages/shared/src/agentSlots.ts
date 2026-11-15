@@ -148,6 +148,27 @@ export function liveReservations(
   return [...byKey.values()].sort((a, b) => a.untilMs - b.untilMs || (a.key < b.key ? -1 : 1));
 }
 
+/**
+ * The held slots that count: at most one per thread (the latest end wins, then the last key), in
+ * the order given. A thread that asks again moves its slot; it never holds two.
+ */
+export function onePerThread(
+  reservations: ReadonlyArray<SlotReservation>,
+): ReadonlyArray<SlotReservation> {
+  const byThread = new Map<string, SlotReservation>();
+  for (const reservation of reservations) {
+    const seen = byThread.get(reservation.threadId);
+    if (
+      seen === undefined ||
+      seen.untilMs < reservation.untilMs ||
+      (seen.untilMs === reservation.untilMs && seen.key < reservation.key)
+    ) {
+      byThread.set(reservation.threadId, reservation);
+    }
+  }
+  return reservations.filter((reservation) => byThread.get(reservation.threadId) === reservation);
+}
+
 export type SlotRule = "machine" | "account" | "memory";
 
 export type SlotDecision =

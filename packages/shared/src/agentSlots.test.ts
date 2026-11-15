@@ -8,6 +8,7 @@ import {
   limitsCount,
   liveReservations,
   liveStarting,
+  onePerThread,
   runningAgents,
   slotDecision,
   slotRefusalText,
@@ -264,6 +265,24 @@ describe("slot reservations (4.6)", () => {
       ["w_a", 400],
     ]);
     expect(liveReservations([], 0)).toEqual([]);
+  });
+
+  it("count at most one per thread: the latest end, then the last key", () => {
+    const of = (key: string, threadId: string, untilMs: number): SlotReservation => ({
+      key,
+      threadId,
+      untilMs,
+    });
+    expect(
+      onePerThread([
+        of("w_a", "t1", 200),
+        of("w_b", "t2", 300),
+        of("w_c", "t1", 400),
+        of("w_d", "t1", 400),
+        of("w_e", "t3", 100),
+      ]).map((reservation) => reservation.key),
+    ).toEqual(["w_b", "w_d", "w_e"]);
+    expect(onePerThread([])).toEqual([]);
   });
 
   it("count on the machine, and on an account only when they name it", () => {

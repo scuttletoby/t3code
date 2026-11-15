@@ -10,6 +10,7 @@ import {
   limitsCount,
   liveReservations,
   liveStarting,
+  onePerThread,
   runningAgents,
   slotDecision,
   slotRefusalText,
@@ -59,8 +60,13 @@ export interface SlotRequest {
 export type SlotGrant =
   /** Slots are off or have no limit: nothing to wait for, nothing held. */
   | { readonly type: "off" }
-  /** Free: held for the thread until `untilMs` (memory only). */
+  /**
+   * Free: held for the thread until `untilMs` (memory only). A thread holds at most one slot: a
+   * slot it already held moves to this request (its end renewed), it is never added to.
+   */
   | { readonly type: "granted"; readonly untilMs: number }
+  /** An earlier request of the same thread was granted in this call: asked again next time. */
+  | { readonly type: "sameThread" }
   | { readonly type: "full"; readonly decision: Extract<SlotDecision, { readonly type: "refuse" }> }
   /** The running agents cannot be counted now: never "free". */
   | { readonly type: "unread"; readonly message: string };
@@ -169,8 +175,9 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Every live held slot: granted in memory and kept in the wait store, one per wait. None while
-   * waits are off (nothing of the store is read then). A store that cannot be read holds none.
+   * Every live held slot: granted in memory and kept in the wait store, one per wait (counted one
+   * per thread, `onePerThread`). None while waits are off (nothing of the store is read then). A
+   * store that cannot be read holds none.
    */
   const liveHeld = Effect.fn("SlotGate.liveHeld")(function* (waitsOn: boolean, nowMs: number) {
     for (const [key, untilMs] of usedKeys) if (untilMs <= nowMs) usedKeys.delete(key);
@@ -191,6 +198,33 @@ const make = Effect.gen(function* () {
   const readSettings = serverSettings.getSettings.pipe(Effect.option);
 
   /**
+   * Every slot held for `threadId` stops counting (memory ones go; stored ones are skipped until
+   * their end). Returns their keys, for the store to clear. Under the semaphore.
+   */
+  const useUp = Effect.fnUntraced(function* (
+    reservations: ReadonlyArray<SlotReservation>,
+    threadId: string,
+  ) {
+    const own = reservations.filter((reservation) => reservation.threadId === threadId);
+    if (own.length === 0) return [];
+    for (const reservation of own) usedKeys.set(reservation.key, reservation.untilMs);
+    yield* Ref.update(held, (current) => current.filter((entry) => entry.threadId !== threadId));
+    return own.map((reservation) => reservation.key);
+  });
+
+  /** Clears used or replaced held slots in the store, outside the semaphore (see `acquire`). */
+  const clearStored = (keys: ReadonlyArray<string>) =>
+    stored === null || keys.length === 0
+      ? Effect.void
+      : Effect.forEach(keys, stored.used, { discard: true }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("agent slots: a used slot could not be cleared in the wait store", {
+              cause,
+            }),
+          ),
+        );
+
+  /**
    * The decision, under the semaphore, and the caller's held slot it used up (if any). The
    * caller's own held slots never count against it; they are not a pass past a limit either.
    */
@@ -204,7 +238,10 @@ const make = Effect.gen(function* () {
         ? null
         : effectiveSlotLimits(settings.value.agentSlots);
       if (Option.isNone(settings) || limits === null) {
-        return { outcome: { type: "allow", token: null } satisfies SlotAcquire, used: null };
+        return {
+          outcome: { type: "allow", token: null } satisfies SlotAcquire,
+          used: [] as ReadonlyArray<string>,
+        };
       }
       const waitsOn = settings.value.waitFor.enabled;
       const nowMs = yield* Clock.currentTimeMillis;
@@ -217,8 +254,8 @@ const make = Effect.gen(function* () {
         limits: running === undefined ? { ...limits, machine: null, account: () => null } : limits,
         running: running ?? [],
         starting: kept,
-        reservations: reservations.filter(
-          (reservation) => reservation.threadId !== input.callerThreadId,
+        reservations: onePerThread(
+          reservations.filter((reservation) => reservation.threadId !== input.callerThreadId),
         ),
         targetInstanceId: input.targetInstanceId,
         freeMemoryBytes: yield* freeMemoryBytes(limits),
@@ -229,7 +266,7 @@ const make = Effect.gen(function* () {
             type: "refuse",
             message: slotRefusalText(decision, waitsOn),
           } satisfies SlotAcquire,
-          used: null,
+          used: [] as ReadonlyArray<string>,
         };
       }
       const token = yield* Ref.getAndUpdate(nextToken, (value) => value + 1);
@@ -237,13 +274,9 @@ const make = Effect.gen(function* () {
         ...current,
         { token, instanceId: input.targetInstanceId, atMs: nowMs },
       ]);
-      // The agent it held a slot for starts now: the slot ending first is used up.
-      const own = reservations.find((reservation) => reservation.threadId === input.callerThreadId);
-      if (own !== undefined) {
-        usedKeys.set(own.key, own.untilMs);
-        yield* Ref.update(held, (current) => current.filter((entry) => entry.key !== own.key));
-      }
-      return { outcome: { type: "allow", token } satisfies SlotAcquire, used: own?.key ?? null };
+      // The agent it held a slot for starts now: its held slot is used up, with every older copy.
+      const used = yield* useUp(reservations, input.callerThreadId);
+      return { outcome: { type: "allow", token } satisfies SlotAcquire, used };
     },
     // One at a time: the next caller sees the entry the last one added.
     semaphore.withPermits(1),
@@ -256,28 +289,20 @@ const make = Effect.gen(function* () {
     const { outcome, used } = yield* decide(input);
     // Cleared in the store after the decision, outside the semaphore; a failed write only means
     // the stored copy ends by itself (it no longer counts here either way).
-    if (used !== null && stored !== null) {
-      yield* stored.used(used).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("agent slots: a used slot could not be cleared in the wait store", {
-            cause,
-          }),
-        ),
-      );
-    }
+    yield* clearStored(used);
     return outcome;
   });
 
-  const grant = Effect.fn("SlotGate.grant")(
+  const grantLocked = Effect.fn("SlotGate.grantLocked")(
     function* (requests: ReadonlyArray<SlotRequest>) {
       const settings = yield* readSettings;
       const limits = Option.isNone(settings)
         ? null
         : effectiveSlotLimits(settings.value.agentSlots);
       if (Option.isNone(settings) || limits === null) {
-        return requests.map((): SlotGrant => ({ type: "off" }));
+        return { grants: requests.map((): SlotGrant => ({ type: "off" })), replaced: [] };
       }
-      if (requests.length === 0) return [];
+      if (requests.length === 0) return { grants: [], replaced: [] };
       const nowMs = yield* Clock.currentTimeMillis;
       /** A wait without an account waits for the machine limit and the memory floor only. */
       const limitsFor = (request: SlotRequest): SlotLimits =>
@@ -290,10 +315,16 @@ const make = Effect.gen(function* () {
       const kept = yield* keepStarting(read?.visible, nowMs, limits);
       const memoryBytes = yield* freeMemoryBytes(limits);
       const reserveMs = settings.value.agentSlots.reserveSeconds * 1000;
-      // Slots held for the requesting thread count too: it never holds two for one free slot.
-      const reservations = [...(yield* liveHeld(settings.value.waitFor.enabled, nowMs))];
+      let reservations = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
       const grants: Array<SlotGrant> = [];
+      const replaced: Array<string> = [];
+      const grantedThreads = new Set<string>();
       for (const request of requests) {
+        // One wake per thread in a call: its other slot waits ask again next time.
+        if (grantedThreads.has(request.threadId)) {
+          grants.push({ type: "sameThread" });
+          continue;
+        }
         const own = limitsFor(request);
         if (read === undefined && limitsCount(own, request.account ?? "")) {
           grants.push({ type: "unread", message: "The running agents cannot be counted now." });
@@ -303,11 +334,15 @@ const make = Effect.gen(function* () {
           limits: own,
           running: (read?.running ?? []).filter((agent) => agent.threadId !== request.threadId),
           starting: kept,
-          reservations,
+          // Its own held slot is not counted: a grant moves it here, so the thread keeps one.
+          reservations: onePerThread(
+            reservations.filter((reservation) => reservation.threadId !== request.threadId),
+          ),
           targetInstanceId: request.account ?? "",
           freeMemoryBytes: memoryBytes,
         });
         if (decision.type === "refuse") {
+          // Refused: a slot it already holds stays as it is.
           grants.push({ type: "full", decision });
           continue;
         }
@@ -318,18 +353,30 @@ const make = Effect.gen(function* () {
           ...(request.account === undefined ? {} : { account: request.account }),
           untilMs,
         };
-        // A slot held for 0 s is not held at all; the wait is still woken.
-        if (reserveMs > 0) {
-          reservations.push(reservation);
-          yield* Ref.update(held, (current) => [...current, reservation]);
-        }
+        // The slot it held before (memory or store) is replaced by this one.
+        replaced.push(...(yield* useUp(reservations, request.threadId)));
+        // Counted for the rest of this call even when held 0 s: one free slot, one wake (R17).
+        reservations = [
+          ...reservations.filter((entry) => entry.threadId !== request.threadId),
+          reservation,
+        ];
+        // A slot held for 0 s is not held after this call; the wait is still woken.
+        if (reserveMs > 0) yield* Ref.update(held, (current) => [...current, reservation]);
+        grantedThreads.add(request.threadId);
         grants.push({ type: "granted", untilMs });
       }
-      return grants;
+      return { grants, replaced };
     },
     // Under the same semaphore as `acquire`: a delegation never takes a slot being granted.
     semaphore.withPermits(1),
   );
+
+  const grant = Effect.fn("SlotGate.grant")(function* (requests: ReadonlyArray<SlotRequest>) {
+    const { grants, replaced } = yield* grantLocked(requests);
+    // A replaced slot in the store is cleared like a used one, outside the semaphore.
+    yield* clearStored(replaced);
+    return grants;
+  });
 
   const usage = Effect.gen(function* () {
     const settings = yield* readSettings;
@@ -343,7 +390,7 @@ const make = Effect.gen(function* () {
       limits === null
         ? []
         : liveStarting(yield* Ref.get(entries), read.visible, nowMs, limits.startGraceMs);
-    const reservations = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
+    const reservations = onePerThread(yield* liveHeld(settings.value.waitFor.enabled, nowMs));
     const accountMax = (id: string) => {
       const max = agentSlots.maxPerAccount[id as ProviderInstanceId];
       return max === undefined || max <= 0 ? null : max;

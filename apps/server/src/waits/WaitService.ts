@@ -28,6 +28,7 @@ import {
 } from "@t3tools/shared/agentSlots";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
+  boundHeldSlot,
   capEndedWaits,
   deliveryCommandId,
   type DeliveryGroup,
@@ -252,17 +253,27 @@ const slotJudgement = (
       };
     case "full":
       return { type: "notYet", detail: `No free slot yet: ${slotRefusalReason(grant.decision)}.` };
+    case "sameThread":
+      return { type: "notYet", detail: "This thread's other slot wait was just given a slot." };
     case "unread":
       return { type: "failed", message: grant.message, permanent: false };
   }
 };
 
-/** The slot a delivered slot wait still holds, from its `reservedUntil`. */
-const storedReservation = (wait: WaitRecord, now: number): ReadonlyArray<SlotReservation> => {
+/**
+ * The slot a delivered slot wait still holds, from its `reservedUntil`: never longer than
+ * `reserveSeconds` (as set now) after its delivery, so a lowered setting shortens it too.
+ */
+const storedReservation = (
+  wait: WaitRecord,
+  now: number,
+  reserveSeconds: number,
+): ReadonlyArray<SlotReservation> => {
   if (wait.kind !== "slot" || wait.state !== "delivered" || wait.reservedUntil === undefined) {
     return [];
   }
-  const untilMs = Date.parse(wait.reservedUntil);
+  const endedMs = wait.endedAt === undefined ? Number.NaN : Date.parse(wait.endedAt);
+  const untilMs = Math.min(Date.parse(wait.reservedUntil), endedMs + reserveSeconds * 1000);
   if (!(untilMs > now)) return [];
   const account = wait.spec.account;
   return [
@@ -418,6 +429,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   const runProject = new Map<string, ProjectId>();
   /** Ids that registrations in progress will store their waits under. */
   const reserved = new Set<string>();
+  /**
+   * Granted slot waits whose thread started its agent before the wake was delivered (memory only;
+   * after a restart such a slot counts until it ends, the safe side).
+   */
+  const usedBeforeDelivery = new Set<string>();
   /** Checks that have not returned, per place; late once past their own `lateAt`. */
   const running = new Map<JudgePool, Set<RunningJudge>>();
   /** Places whose checks are all stuck, already logged; cleared when one of them returns. */
@@ -572,7 +588,13 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       case "Loaded":
         break;
     }
-    current = { waits: load.waits, notices: load.notices };
+    // Held slots are bounded as they are read (a clock that was ahead, a hand-edited file).
+    const settings = yield* readSettingsOrNull;
+    const reserveSeconds = settings?.agentSlots.reserveSeconds ?? 0;
+    current = {
+      waits: load.waits.map((wait) => boundHeldSlot(wait, nowMs, reserveSeconds)),
+      notices: load.notices,
+    };
     lastProblem = null;
     return { ok: true, contents: current } satisfies Loaded;
   });
@@ -642,8 +664,12 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     Effect.gen(function* () {
       const loaded = yield* ensureLoaded(true);
       if (!loaded.ok) return [];
+      const settings = yield* readSettingsOrNull;
+      if (settings === null) return [];
       const now = yield* Clock.currentTimeMillis;
-      return loaded.contents.waits.flatMap((wait) => storedReservation(wait, now));
+      return loaded.contents.waits.flatMap((wait) =>
+        storedReservation(wait, now, settings.agentSlots.reserveSeconds),
+      );
     }),
   );
 
@@ -657,6 +683,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         if (!loaded.ok) return;
         const wait = loaded.contents.waits.find((candidate) => candidate.id === key);
         if (wait === undefined) return;
+        // Granted but not delivered yet: its slot is not held when the delivery is written.
+        if (wait.kind === "slot" && (wait.state === "waiting" || wait.state === "delivering")) {
+          usedBeforeDelivery.add(key);
+          return;
+        }
         const now = yield* Clock.currentTimeMillis;
         const transition = nextWaitState(wait, { type: "slotUsed" }, now, stateSettings(settings));
         if (transition === null) return;
@@ -1694,7 +1725,10 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             settings,
           ));
         const kept = written ? changes : new Map<string, WaitTransition>();
-        yield* input.slots!.drop([...granted.keys()].filter((id) => !kept.has(id)));
+        const notKept = [...granted.keys()].filter((id) => !kept.has(id));
+        yield* input.slots!.drop(notKept);
+        // A cancelled wait is never delivered; one not written is granted again from the start.
+        for (const id of notKept) usedBeforeDelivery.delete(id);
         for (const [id, transition] of kept) {
           nextCheckAt.delete(id);
           yield* logTransition(transition);
@@ -1967,9 +2001,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           if (result === undefined || wait.state !== "delivering") return wait;
           const group = planned.find((candidate) => candidate.waits.some((w) => w.id === wait.id));
           if (group === undefined || wait.messageId !== group.messageId) return wait;
+          const events = eventsFor(result, wait, now, settings);
+          // Its slot was used before this delivery: the delivered wait holds none.
           return applyEvents(
             wait,
-            eventsFor(result, wait, now, settings),
+            usedBeforeDelivery.has(wait.id) ? [...events, { type: "slotUsed" }] : events,
             now,
             settings,
             transitions,
@@ -1985,6 +2021,22 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           // Not written: the next sweep finds the message in the thread, or replays its receipt.
           if (!written) return { sent: 0, ended: 0 };
           yield* Effect.forEach(transitions, logTransition, { discard: true });
+          // A granted slot wait handed over to the parent, or ended without a receiver: the slot
+          // held for its thread is freed at once (the parent cannot use it).
+          const noReceiver = transitions.flatMap(({ record }) =>
+            record.kind === "slot" &&
+            (record.handedOverBecause !== undefined ||
+              ["thread_gone", "thread_stopped", "dropped"].includes(record.state))
+              ? [record.id]
+              : [],
+          );
+          if (input.slots !== undefined) yield* input.slots.drop(noReceiver);
+          for (const id of usedBeforeDelivery) {
+            const wait = waits.find((candidate) => candidate.id === id);
+            if (wait === undefined || (wait.state !== "waiting" && wait.state !== "delivering")) {
+              usedBeforeDelivery.delete(id);
+            }
+          }
         }
         for (const [group, result] of results) {
           const at = nextTry(group, result, waits, now, settings);
@@ -2176,7 +2228,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       (wait) => wait.kind === "slot" && wait.state === "waiting",
     );
     for (const wait of current.waits) {
-      if (slotsWaiting) for (const held of storedReservation(wait, now)) at(held.untilMs);
+      if (slotsWaiting) {
+        for (const held of storedReservation(wait, now, settings.agentSlots.reserveSeconds)) {
+          at(held.untilMs);
+        }
+      }
       if (wait.state === "waiting") at(nextCheckAt.get(wait.id) ?? now);
       else if (wait.state !== "delivering" && wait.endedAt !== undefined) {
         at(
