@@ -5,7 +5,7 @@ import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
-import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import { DEFAULT_SERVER_SETTINGS, FORK_SERVER_SETTING_KEYS } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
@@ -85,20 +85,17 @@ export interface ForkReport {
   readonly ok: boolean;
 }
 
-/** Fork keys in `settings.json`, including the retired names a load still renames. */
-const FORK_SETTINGS_KEYS = [
-  "automaticUpdates",
-  "automaticUpdatesQuietCommand",
-  "autoUpdateServer",
-  "autoUpdateQuietCommand",
-  "usagePacing",
-  "usagePacingGate",
-  "usagePacingLowerEffort",
-  "waitFor",
-  "waitChecks",
-  "agentSlots",
-  "headlessUsageRefreshInterval",
-] as const;
+/** Retired fork key names a load still renames, each after the name it became. */
+const RETIRED_FORK_SETTINGS_KEYS: Readonly<Record<string, string>> = {
+  automaticUpdates: "autoUpdateServer",
+  automaticUpdatesQuietCommand: "autoUpdateQuietCommand",
+};
+
+/** Fork keys in `settings.json` (forkSettings.ts's list), with the retired names. */
+const FORK_SETTINGS_KEYS = FORK_SERVER_SETTING_KEYS.flatMap((key) => {
+  const retired = RETIRED_FORK_SETTINGS_KEYS[key];
+  return retired === undefined ? [key] : [key, retired];
+});
 
 type Problem = ForkReport["problems"][number];
 

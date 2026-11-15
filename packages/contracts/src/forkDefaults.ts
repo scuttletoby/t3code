@@ -1,7 +1,7 @@
 // Fork: every setting this fork adds, with its default, the reason and where it was decided. A
 // machine whose file never names one must behave as upstream's T3 Code: nothing changes unasked.
-// forkDefaults.test.ts fails while a setting marked `Fork:` in settings.ts has no row here, or a
-// row's default is not the code's. See docs/fork/updates.md.
+// forkDefaults.test.ts fails while a fork setting in forkSettings.ts (or the inline
+// `automaticUpdates`) has no row here, or a row's default is not the code's. See docs/fork/updates.md.
 
 import * as Schema from "effect/Schema";
 
