@@ -62,7 +62,7 @@ export type SlotGrant =
   | { readonly type: "off" }
   /**
    * Free: held for the thread until `untilMs` (memory only). A thread holds at most one slot: a
-   * slot it already held moves to this request (its end renewed), it is never added to.
+   * slot it already held moves to this request once the grant is kept (`keep`), never added to.
    */
   | { readonly type: "granted"; readonly untilMs: number }
   /** An earlier request of the same thread was granted in this call: asked again next time. */
@@ -110,7 +110,15 @@ export class SlotGate extends Context.Service<
     readonly grant: (
       requests: ReadonlyArray<SlotRequest>,
     ) => Effect.Effect<ReadonlyArray<SlotGrant>>;
-    /** Grants that were not kept (the wait was cancelled, or its write failed) hold nothing. */
+    /**
+     * Grants that were written: a slot their thread held before is used up now (memory, and
+     * cleared in the store). Until then a re-ask only hides it, so a stop half-way keeps it.
+     */
+    readonly keep: (keys: ReadonlyArray<string>) => Effect.Effect<void>;
+    /**
+     * Grants that were not kept (the wait was cancelled, or its write failed) hold nothing; a slot
+     * the thread held before counts again.
+     */
     readonly drop: (keys: ReadonlyArray<string>) => Effect.Effect<void>;
     /** For `wait_list`: null while slots are off, or when the running agents cannot be read. */
     readonly usage: Effect.Effect<SlotUsage | null>;
@@ -131,6 +139,13 @@ const make = Effect.gen(function* () {
   const held = yield* Ref.make<ReadonlyArray<SlotReservation>>([]);
   /** Keys used up, until their end: the store's copy stops counting even if clearing it failed. */
   const usedKeys = new Map<string, number>();
+  /**
+   * A re-ask's grant not kept yet, by its key: the thread's earlier holds, hidden (they do not
+   * count) but not used up, so a grant that is dropped gives them back.
+   */
+  const replacing = new Map<string, ReadonlyArray<SlotReservation>>();
+  const hiddenKeys = () =>
+    new Set([...replacing.values()].flatMap((olds) => olds.map((old) => old.key)));
   let stored: StoredReservations | null = null;
 
   /**
@@ -181,11 +196,16 @@ const make = Effect.gen(function* () {
    */
   const liveHeld = Effect.fn("SlotGate.liveHeld")(function* (waitsOn: boolean, nowMs: number) {
     for (const [key, untilMs] of usedKeys) if (untilMs <= nowMs) usedKeys.delete(key);
+    // A grant never kept nor dropped (a cut-off call) hides the old holds only until they end.
+    for (const [key, olds] of replacing) {
+      if (olds.every((old) => old.untilMs <= nowMs)) replacing.delete(key);
+    }
     const memory = yield* Ref.updateAndGet(held, (current) => liveReservations(current, nowMs));
     if (!waitsOn) return [];
     const fromStore = stored === null ? [] : yield* stored.read;
+    const hidden = hiddenKeys();
     return liveReservations([...memory, ...fromStore], nowMs).filter(
-      (reservation) => !usedKeys.has(reservation.key),
+      (reservation) => !usedKeys.has(reservation.key) && !hidden.has(reservation.key),
     );
   });
 
@@ -197,20 +217,37 @@ const make = Effect.gen(function* () {
   /** Settings that cannot be read count as off, as for the usage pacing gate. */
   const readSettings = serverSettings.getSettings.pipe(Effect.option);
 
-  /**
-   * Every slot held for `threadId` stops counting (memory ones go; stored ones are skipped until
-   * their end). Returns their keys, for the store to clear. Under the semaphore.
-   */
-  const useUp = Effect.fnUntraced(function* (
+  /** Used up: they stop counting (memory ones go; stored ones are skipped until their end). */
+  const useUpAll = Effect.fn("SlotGate.useUpAll")(function* (
     reservations: ReadonlyArray<SlotReservation>,
-    threadId: string,
   ) {
-    const own = reservations.filter((reservation) => reservation.threadId === threadId);
-    if (own.length === 0) return [];
-    for (const reservation of own) usedKeys.set(reservation.key, reservation.untilMs);
-    yield* Ref.update(held, (current) => current.filter((entry) => entry.threadId !== threadId));
-    return own.map((reservation) => reservation.key);
+    if (reservations.length === 0) return [];
+    for (const reservation of reservations) usedKeys.set(reservation.key, reservation.untilMs);
+    const keys = new Set(reservations.map((reservation) => reservation.key));
+    yield* Ref.update(held, (current) => current.filter((entry) => !keys.has(entry.key)));
+    return [...keys];
   });
+
+  /** The holds of `threadId` that a re-ask not kept yet hides; their entries go. */
+  const takeHidden = (threadId: string) => {
+    const taken: Array<SlotReservation> = [];
+    for (const [key, olds] of replacing) {
+      if (!olds.some((old) => old.threadId === threadId)) continue;
+      taken.push(...olds);
+      replacing.delete(key);
+    }
+    return taken;
+  };
+
+  /**
+   * Every slot held for `threadId` (hidden ones too) is used up. Returns their keys, for the store
+   * to clear. Under the semaphore.
+   */
+  const useUp = (reservations: ReadonlyArray<SlotReservation>, threadId: string) =>
+    useUpAll([
+      ...reservations.filter((reservation) => reservation.threadId === threadId),
+      ...takeHidden(threadId),
+    ]);
 
   /** Clears used or replaced held slots in the store, outside the semaphore (see `acquire`). */
   const clearStored = (keys: ReadonlyArray<string>) =>
@@ -293,16 +330,16 @@ const make = Effect.gen(function* () {
     return outcome;
   });
 
-  const grantLocked = Effect.fn("SlotGate.grantLocked")(
+  const grant = Effect.fn("SlotGate.grant")(
     function* (requests: ReadonlyArray<SlotRequest>) {
       const settings = yield* readSettings;
       const limits = Option.isNone(settings)
         ? null
         : effectiveSlotLimits(settings.value.agentSlots);
       if (Option.isNone(settings) || limits === null) {
-        return { grants: requests.map((): SlotGrant => ({ type: "off" })), replaced: [] };
+        return requests.map((): SlotGrant => ({ type: "off" }));
       }
-      if (requests.length === 0) return { grants: [], replaced: [] };
+      if (requests.length === 0) return [];
       const nowMs = yield* Clock.currentTimeMillis;
       /** A wait without an account waits for the machine limit and the memory floor only. */
       const limitsFor = (request: SlotRequest): SlotLimits =>
@@ -317,7 +354,6 @@ const make = Effect.gen(function* () {
       const reserveMs = settings.value.agentSlots.reserveSeconds * 1000;
       let reservations = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
       const grants: Array<SlotGrant> = [];
-      const replaced: Array<string> = [];
       const grantedThreads = new Set<string>();
       for (const request of requests) {
         // One wake per thread in a call: its other slot waits ask again next time.
@@ -363,8 +399,13 @@ const make = Effect.gen(function* () {
           ...(request.account === undefined ? {} : { account: request.account }),
           untilMs,
         };
-        // The slot it held before (memory or store) is replaced by this one.
-        replaced.push(...(yield* useUp(reservations, request.threadId)));
+        // The slot it held before (memory or store) is replaced by this one once it is kept; until
+        // then it is hidden, so a cancelled or unwritten re-ask gives it back.
+        const olds = [
+          ...reservations.filter((entry) => entry.threadId === request.threadId),
+          ...takeHidden(request.threadId),
+        ];
+        if (olds.length > 0) replacing.set(request.key, olds);
         // Counted for the rest of this call even when held 0 s: one free slot, one wake (R17).
         reservations = [
           ...reservations.filter((entry) => entry.threadId !== request.threadId),
@@ -375,18 +416,22 @@ const make = Effect.gen(function* () {
         grantedThreads.add(request.threadId);
         grants.push({ type: "granted", untilMs });
       }
-      return { grants, replaced };
+      return grants;
     },
     // Under the same semaphore as `acquire`: a delegation never takes a slot being granted.
     semaphore.withPermits(1),
   );
 
-  const grant = Effect.fn("SlotGate.grant")(function* (requests: ReadonlyArray<SlotRequest>) {
-    const { grants, replaced } = yield* grantLocked(requests);
-    // A replaced slot in the store is cleared like a used one, outside the semaphore.
-    yield* clearStored(replaced);
-    return grants;
-  });
+  const keepLocked = Effect.fn("SlotGate.keepLocked")(function* (keys: ReadonlyArray<string>) {
+    const replaced: Array<string> = [];
+    for (const key of keys) {
+      const olds = replacing.get(key);
+      if (olds === undefined) continue;
+      replacing.delete(key);
+      replaced.push(...(yield* useUpAll(olds)));
+    }
+    return replaced;
+  }, semaphore.withPermits(1));
 
   const usage = Effect.gen(function* () {
     const settings = yield* readSettings;
@@ -440,8 +485,13 @@ const make = Effect.gen(function* () {
         stored = source;
       }),
     ),
+    // A replaced slot in the store is cleared like a used one, outside the semaphore.
+    keep: Effect.fn("SlotGate.keep")(function* (keys: ReadonlyArray<string>) {
+      yield* clearStored(yield* keepLocked(keys));
+    }),
     drop: Effect.fn("SlotGate.drop")(function* (keys: ReadonlyArray<string>) {
       if (keys.length === 0) return;
+      for (const key of keys) replacing.delete(key);
       yield* Ref.update(held, (current) => current.filter((entry) => !keys.includes(entry.key)));
     }),
     started: Effect.fn("SlotGate.started")((token: SlotToken | null, childThreadId: ThreadId) =>
