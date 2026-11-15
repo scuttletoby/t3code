@@ -87,10 +87,20 @@ export const WAIT_FOR_NUMBER_FIELDS: ReadonlyArray<NumberFieldSpec<NumberKey<Wai
   {
     key: "errorGraceSeconds",
     title: "Give up after errors",
-    description: "A wait whose source fails this long without one good read ends with an error.",
+    description:
+      "A wait whose source fails this long without one good read ends with an error. When its thread is woken anyway, a wait failing for half this long ends in the same message.",
     unit: "seconds",
     min: 0,
     step: 60,
+  },
+  {
+    key: "maxErrorWakesPerSweep",
+    title: "Error wakes per sweep",
+    description:
+      "When a source fails for many threads at once, at most this many threads are woken per sweep; the rest follow.",
+    unit: "threads",
+    min: 1,
+    step: 1,
   },
   {
     key: "keepEndedHours",
