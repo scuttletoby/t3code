@@ -859,7 +859,15 @@ const layerMakeRoutes = Layer.mergeAll(
   Layer.effectDiscard(SlotGate.SlotGate.pipe(Effect.asVoid)),
   // Follows delegated tasks running in linked environments, including after a restart.
   Layer.effectDiscard(
-    RemoteDelegation.RemoteDelegation.pipe(Effect.flatMap((remote) => remote.start())),
+    Effect.gen(function* () {
+      const remote = yield* RemoteDelegation.RemoteDelegation;
+      // Fork: a held server (`serve --hold-work`) neither follows nor stops tasks in linked
+      // environments. What it owes them stays owed for the next start without the flag.
+      if ((yield* WorkAdmission.WorkAdmission).heldFromBoot) {
+        return yield* Effect.logInfo("Remote delegated task follower held (--hold-work)");
+      }
+      yield* remote.start();
+    }),
   ),
   // Off unless automaticUpdates is on; shares the Update button's ServerSelfUpdate below.
   ServerAutoUpdate.layer,
@@ -915,8 +923,12 @@ const layerMakeServer = Layer.unwrap(
       WorkAdmission.WorkAdmission,
       yield* WorkAdmission.makeWorkAdmissionGate({
         marker: yield* WorkAdmission.makeFileUpdateHoldStore(config.baseDir),
+        heldFromBoot: config.holdWork === true,
       }),
     );
+    if (config.holdWork === true) {
+      yield* Effect.logWarning(WorkAdmission.HOLD_WORK_BOOT_MESSAGE);
+    }
     const runtimeStateParked = yield* Deferred.make<void>();
     const tailscaleParked = yield* Deferred.make<void>();
     const cloudLinkParked = yield* Deferred.make<void>();

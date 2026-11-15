@@ -404,6 +404,9 @@ export function decodeSettingsFileText(
     : decodePersistedServerSettingsExit(withDefaults(renameRetiredAutoUpdateKeys(parsed.value)));
 }
 
+/** The load's lenient parse of a settings file's text (comments, trailing commas), before decoding. */
+export const parseSettingsFileText = (raw: string) => decodeSettingsFileJsonExit(raw);
+
 /** True when the load would also refuse the file's legacy provider or source control keys. */
 export const settingsFileLegacyKeysUnreadable = (raw: string): boolean =>
   Exit.isFailure(decodeLegacyProviderSettingsJsonExit(raw));

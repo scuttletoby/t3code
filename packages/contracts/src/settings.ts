@@ -24,14 +24,8 @@ import {
 } from "./baseSchemas.ts";
 import { UsageLimitSourceId } from "./usageLimitSourceId.ts";
 import { UsageModelFilter } from "./usage.ts";
-import {
-  AgentSlotsSettings,
-  AgentSlotsSettingsPatch,
-  WaitChecks,
-  WaitChecksFromSettingsFile,
-  WaitForSettings,
-  WaitForSettingsPatch,
-} from "./waitFor.ts";
+import * as ForkSettings from "./forkSettings.ts";
+export * from "./forkSettings.ts";
 import { SecretProviderId, SecretProviderSlug } from "./secretReference.ts";
 import { SettingsSecretValue } from "./settingsSecretValue.ts";
 import { EnvironmentMachineKind, ThreadEnvMode, WorktreeSubmodules } from "./environment.ts";
@@ -411,6 +405,7 @@ export const VoiceTranscriptionDestination = Schema.Union([
 export type VoiceTranscriptionDestination = typeof VoiceTranscriptionDestination.Type;
 
 export const ClientSettingsSchema = Schema.Struct({
+  ...ForkSettings.ForkClientSettingsFields,
   notificationMode: NotificationMode.pipe(
     Schema.withDecodingDefault(Effect.succeed("off" as const)),
   ),
@@ -949,54 +944,6 @@ export const UsageLimitSourceConfig = Schema.Struct({
 });
 export type UsageLimitSourceConfig = typeof UsageLimitSourceConfig.Type;
 
-const UsagePacingReservePercent = Schema.Number.check(
-  Schema.isBetween({ minimum: 0, maximum: 100 }),
-);
-
-/** Fork: how agents pace one provider instance's usage limits. The defaults change nothing. */
-export const UsagePacingInstanceSettings = Schema.Struct({
-  /** Points of each window kept free for the owner, released over the window's last 12 hours. */
-  reservePercent: UsagePacingReservePercent.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
-  /** Spend this instance first: no even pace, only the reserve holds agents back. */
-  burnFirst: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
-  /**
-   * The owner says this instance has no usage limits (an API key, pay per use). The only source
-   * of "no limits": no reading ever means it, since upstream's `unsupported` means "cannot read".
-   */
-  noLimits: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
-});
-export type UsagePacingInstanceSettings = typeof UsagePacingInstanceSettings.Type;
-
-export const DEFAULT_USAGE_PACING_INSTANCE_SETTINGS: UsagePacingInstanceSettings = {
-  reservePercent: 0,
-  burnFirst: false,
-  noLimits: false,
-};
-
-/** Fork: a patch of one instance's pacing; a field left out keeps its stored value. */
-export const UsagePacingInstanceSettingsPatch = Schema.Struct({
-  reservePercent: Schema.optionalKey(UsagePacingReservePercent),
-  burnFirst: Schema.optionalKey(Schema.Boolean),
-  noLimits: Schema.optionalKey(Schema.Boolean),
-});
-export type UsagePacingInstanceSettingsPatch = typeof UsagePacingInstanceSettingsPatch.Type;
-
-/**
- * Fork: what the usage pacing gate does when an agent delegates a task. `off` (the default) changes
- * nothing and reads no pace. `advise` never changes or refuses a task, it only adds a note.
- * `enforce` moves a task off an account that is ahead of pace, lowers its effort or holds it.
- */
-export const UsagePacingGateMode = Schema.Literals(["off", "advise", "enforce"]);
-export type UsagePacingGateMode = typeof UsagePacingGateMode.Type;
-
-/**
- * Fork: what each effort level turns into while an account is ahead of its even pace and no other
- * account has room, by level id (`{ "high": "medium", "medium": "medium" }`). A level that is not
- * listed waits instead. Empty (the default) never lowers an effort.
- */
-export const UsagePacingLowerEffort = Schema.Record(TrimmedNonEmptyString, TrimmedNonEmptyString);
-export type UsagePacingLowerEffort = typeof UsagePacingLowerEffort.Type;
-
 export const TextGeneratorKind = Schema.Literals(["openaiCompatible", "anthropic"]);
 export type TextGeneratorKind = typeof TextGeneratorKind.Type;
 
@@ -1146,8 +1093,6 @@ export interface BranchNamingOptions {
 
 export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.seconds(30);
 export const DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL = Duration.minutes(5);
-/** Fork: how often usage limits refresh while no client watches; 0 turns it off. */
-const DEFAULT_HEADLESS_USAGE_REFRESH_INTERVAL = Duration.minutes(10);
 
 export const BackgroundActivityProfile = Schema.Literals([
   "balanced",
@@ -1227,6 +1172,7 @@ export const WorktreeCleanup = Schema.NullOr(
 export type WorktreeCleanup = typeof WorktreeCleanup.Type;
 
 export const PROJECT_SCOPED_SERVER_SETTING_KEYS = [
+  ...ForkSettings.FORK_PROJECT_SCOPED_KEYS,
   "worktreeCleanup",
   "defaultModelSelection",
   "defaultRuntimeMode",
@@ -1254,8 +1200,6 @@ export const PROJECT_SCOPED_SERVER_SETTING_KEYS = [
   "continueThreadsAfterServerUpdate",
   "responseStreamingMode",
   "speechProjectCustomWords",
-  // Fork: a project lists every check it uses; its map replaces the server's.
-  "waitChecks",
 ] as const;
 export type ProjectScopedServerSettingKey = (typeof PROJECT_SCOPED_SERVER_SETTING_KEYS)[number];
 
@@ -1267,6 +1211,7 @@ export type ProjectProviderInstanceOverride = typeof ProjectProviderInstanceOver
 /** Absent keys inherit; null is a value for nullable settings.
  * providerInstances overrides fields per instance; other keys replace the whole setting. */
 export const ProjectSettingsOverrides = Schema.Struct({
+  ...ForkSettings.ForkProjectOverrideFields,
   worktreeCleanup: Schema.optionalKey(WorktreeCleanup),
   defaultModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   defaultRuntimeMode: Schema.optionalKey(RuntimeMode),
@@ -1294,8 +1239,6 @@ export const ProjectSettingsOverrides = Schema.Struct({
   continueThreadsAfterServerUpdate: Schema.optionalKey(Schema.Boolean),
   responseStreamingMode: Schema.optionalKey(ResponseStreamingMode),
   speechProjectCustomWords: Schema.optionalKey(SpeechCustomWords),
-  // Fork: bad entries are dropped on read; the settings patch refuses them.
-  waitChecks: Schema.optionalKey(WaitChecksFromSettingsFile),
   providerInstances: Schema.optionalKey(
     Schema.Record(ProviderInstanceId, ProjectProviderInstanceOverride),
   ),
@@ -1419,6 +1362,7 @@ export const CloudSpeechCredentials = Schema.Struct({
 });
 
 export const ServerSettings = Schema.Struct({
+  ...ForkSettings.ForkServerSettingsFields,
   // Null means unmigrated; empty is authoritative and must not resurrect cleared preferences.
   favorites: Schema.NullOr(ModelFavorites).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   providerModelPreferences: Schema.NullOr(ProviderModelPreferences).pipe(
@@ -1455,8 +1399,6 @@ export const ServerSettings = Schema.Struct({
   requireConnectDeviceApproval: Schema.Boolean.pipe(
     Schema.withDecodingDefault(Effect.succeed(false)),
   ),
-  /** Fork: optional executable asked before an automatic update; a non-zero exit means "not now". */
-  automaticUpdatesQuietCommand: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
 
   enableAgentBrowserAccess: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   cloudSpeechCredentials: CloudSpeechCredentials.pipe(
@@ -1493,26 +1435,6 @@ export const ServerSettings = Schema.Struct({
   ),
   fallbackModelSelection: Schema.NullOr(ModelSelection).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
-  ),
-  /** Fork: usage pacing per provider instance; an instance without an entry has no reserve. */
-  usagePacing: Schema.Record(ProviderInstanceId, UsagePacingInstanceSettings).pipe(
-    Schema.withDecodingDefault(Effect.succeed({})),
-  ),
-  /** Fork: the usage pacing gate on agent-delegated tasks; `off` keeps upstream's behaviour. */
-  usagePacingGate: UsagePacingGateMode.pipe(Schema.withDecodingDefault(Effect.succeed("off"))),
-  /** Fork: effort levels the gate may lower to; empty never lowers one. */
-  usagePacingLowerEffort: UsagePacingLowerEffort.pipe(
-    Schema.withDecodingDefault(Effect.succeed({})),
-  ),
-  /** Fork: waits (`wait_for`); off by default. */
-  waitFor: WaitForSettings.pipe(
-    Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(WaitForSettings)({}))),
-  ),
-  /** Fork: named check commands for waits; only settings can add one. */
-  waitChecks: WaitChecksFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
-  /** Fork: agent slot limits on `delegate_task`; off by default. */
-  agentSlots: AgentSlotsSettings.pipe(
-    Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(AgentSlotsSettings)({}))),
   ),
   defaultRuntimeMode: RuntimeMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE)),
@@ -1581,12 +1503,6 @@ export const ServerSettings = Schema.Struct({
   providerHealthRefreshInterval: Schema.DurationFromMillis.pipe(
     Schema.withDecodingDefault(
       Effect.succeed(Duration.toMillis(DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL)),
-    ),
-  ),
-  /** Fork: never more often than `providerHealthRefreshInterval`; 0 turns it off. */
-  headlessUsageRefreshInterval: Schema.DurationFromMillis.pipe(
-    Schema.withDecodingDefault(
-      Effect.succeed(Duration.toMillis(DEFAULT_HEADLESS_USAGE_REFRESH_INTERVAL)),
     ),
   ),
   backgroundActivityProfile: BackgroundActivityProfile.pipe(
@@ -1887,6 +1803,7 @@ const ModelSelectionPatch = Schema.Struct({
 });
 
 export const ServerSettingsPatch = Schema.Struct({
+  ...ForkSettings.ForkServerSettingsPatchFields,
   setModelFavorites: Schema.optionalKey(
     Schema.Array(Schema.Struct({ ...ModelFavorite.fields, favorite: Schema.Boolean })),
   ),
@@ -1943,7 +1860,6 @@ export const ServerSettingsPatch = Schema.Struct({
   continueThreadsAfterServerUpdate: Schema.optionalKey(Schema.Boolean),
   keepAwakeWhileAgentsWork: Schema.optionalKey(Schema.Boolean),
   requireConnectDeviceApproval: Schema.optionalKey(Schema.Boolean),
-  automaticUpdatesQuietCommand: Schema.optionalKey(TrimmedString),
   enableAgentBrowserAccess: Schema.optionalKey(Schema.Boolean),
   cloudSpeechCredentials: Schema.optionalKey(
     Schema.Struct({
@@ -1971,17 +1887,6 @@ export const ServerSettingsPatch = Schema.Struct({
   defaultModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   defaultRuntimeMode: Schema.optionalKey(RuntimeMode),
   fallbackModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
-  // Fork: merged per instance and per field; null removes an entry.
-  usagePacing: Schema.optionalKey(
-    Schema.Record(ProviderInstanceId, Schema.NullOr(UsagePacingInstanceSettingsPatch)),
-  ),
-  usagePacingGate: Schema.optionalKey(UsagePacingGateMode),
-  // Fork: replaced whole, so a level left out of the patch is removed.
-  usagePacingLowerEffort: Schema.optionalKey(UsagePacingLowerEffort),
-  // Fork: merged per field; `agentSlots.maxPerAccount` and `waitChecks` are replaced whole.
-  waitFor: Schema.optionalKey(WaitForSettingsPatch),
-  waitChecks: Schema.optionalKey(WaitChecks),
-  agentSlots: Schema.optionalKey(AgentSlotsSettingsPatch),
   /** Replaces each project's override set; null removes it. Omitted providerInstances retains its stored value. */
   projectSettingsOverrides: Schema.optionalKey(
     Schema.Record(
@@ -1990,9 +1895,8 @@ export const ServerSettingsPatch = Schema.Struct({
         keepUnknownOverrideKeys(
           Schema.Struct({
             ...ProjectSettingsOverrides.fields,
+            ...ForkSettings.ForkProjectOverridePatchFields,
             sourceControlWritingStyle: Schema.optionalKey(SourceControlWritingStyleSettings),
-            // Fork: a save refuses a bad check (reading the file drops it with a warning).
-            waitChecks: Schema.optionalKey(WaitChecks),
           }),
         ),
       ),
@@ -2028,7 +1932,6 @@ export const ServerSettingsPatch = Schema.Struct({
   ),
   automaticGitFetchInterval: Schema.optionalKey(Schema.DurationFromMillis),
   providerHealthRefreshInterval: Schema.optionalKey(Schema.DurationFromMillis),
-  headlessUsageRefreshInterval: Schema.optionalKey(Schema.DurationFromMillis),
   backgroundActivityProfile: Schema.optionalKey(BackgroundActivityProfile),
   defaultTheme: Schema.optionalKey(DefaultThemePreference),
   defaultThemeSetAt: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),

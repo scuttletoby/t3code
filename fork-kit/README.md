@@ -16,4 +16,8 @@ Every kit follows the same pattern:
 | Kit                          | What                                                                                                    |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------- |
 | [gh-apps](gh-apps/README.md) | GitHub App tokens for agents through `gh-as`, without giving agents the keys (Linux)                    |
+| [golive](golive/README.md)   | Move a T3 boot service to a new build with a cold copy first; core and `check` so far (Linux)           |
 | [heavy](heavy/README.md)     | `heavy <command>`: run builds and tests in a capped slice, stop what they leave behind (Linux, systemd) |
+
+[common](common/README.md) is code the kits share, copied into each kit's version folder: the loader of the one
+private machine file (`/etc/fork-kit/machine.json`) where the facts of one machine live.
