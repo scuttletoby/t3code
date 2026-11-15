@@ -50,7 +50,11 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { getServerOwners } from "./telemetry/Identify.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
-import { WorkAdmission } from "./workAdmission.ts";
+import {
+  WORK_ADMISSION_CONSUMERS,
+  WorkAdmission,
+  type WorkAdmissionGate,
+} from "./workAdmission.ts";
 import { formatHeadlessServeOutput, issueHeadlessServeAccessInfo } from "./startupAccess.ts";
 
 export class ServerRuntimeStartupError extends Schema.TaggedError<ServerRuntimeStartupError>()(
@@ -418,6 +422,30 @@ export const startEffectWorkerWithRelay = Effect.fn(
   );
 });
 
+/** Fork (`serve --hold-work`, `config.holdWork`): refuses to serve when the gate is not held from
+ * boot or a consumer did not register with it (`missingConsumers`). Either means work could start
+ * despite the flag. */
+export const checkHoldWork = Effect.fn("serverRuntimeStartup.checkHoldWork")(function* (
+  admission: WorkAdmissionGate,
+) {
+  const held = admission.heldFromBoot && (yield* admission.isHeld);
+  const missing = yield* admission.missingConsumers;
+  const problems = [
+    ...(held ? [] : ["the shared work gate is not held"]),
+    ...(missing.length === 0 ? [] : [`not using the shared gate: ${missing.join(", ")}`]),
+  ];
+  if (problems.length > 0) {
+    return yield* Effect.die(
+      new Error(
+        `--hold-work cannot hold this server, so it does not start: ${problems.join("; ")}`,
+      ),
+    );
+  }
+  yield* Effect.logInfo("Work is held: every consumer uses the held gate (--hold-work)", {
+    consumers: WORK_ADMISSION_CONSUMERS,
+  });
+});
+
 const runOrderedV2StartupPhases = Effect.fn("serverRuntimeStartup.runOrderedV2StartupPhases")(
   function* <
     Import,
@@ -559,11 +587,16 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       ),
       startEffectWorker: runStartupPhase(
         "orchestration-v2.effect-worker.start",
-        startEffectWorkerWithRelay({
-          runWorker: EffectWorker.runDaemon,
-          startRelay: agentAwarenessRelay.start(),
-          workerFiberRef: effectWorkerFiber,
-        }),
+        // Prepared here, before activation: the outbox registers with the gate it admits through.
+        EffectWorker.prepareDaemon.pipe(
+          Effect.flatMap((runWorker) =>
+            startEffectWorkerWithRelay({
+              runWorker,
+              startRelay: agentAwarenessRelay.start(),
+              workerFiberRef: effectWorkerFiber,
+            }),
+          ),
+        ),
       ),
       autoBootstrap: (serverConfig.autoBootstrapProjectFromCwd
         ? runStartupPhase(
@@ -576,11 +609,21 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       ).pipe(Effect.map((targets): AutoBootstrapWelcomeTargets => targets)),
     });
     yield* Effect.logInfo("V2 orchestration recovery completed", recovery);
+    if (serverConfig.holdWork === true) {
+      // Fork (`serve --hold-work`): serve only if every consumer registered with this gate and it
+      // is held. Failing here aborts activation, so no parked work (sources, outbox) ever runs.
+      yield* runStartupPhase("hold-work.check", checkHoldWork(admission));
+    }
     // Runs after activation: the status check fetches every enabled project's
     // remote, and awaiting it here held command readiness for that long.
+    // A held server pulls nothing: its projects may point at real checkouts.
     yield* runStartupPhase(
       "projects.auto-pull",
       Effect.gen(function* () {
+        if (admission.heldFromBoot) {
+          yield* Effect.logInfo("Automatic project pull held (--hold-work)");
+          return;
+        }
         const projects = yield* (yield* ProjectStore.ProjectStoreV2).listShells();
         const settings = yield* serverSettings.getSettings;
         yield* autoPullProjects(projects, settings);
@@ -619,7 +662,12 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
     yield* forkParked(
       Effect.gen(function* () {
         yield* Effect.logDebug("startup phase: recording startup heartbeat");
-        yield* recordStartupHeartbeat.pipe(
+        // A held server (`serve --hold-work`) is a trial on a copy: it sends no startup ping.
+        yield* (
+          admission.heldFromBoot
+            ? Effect.logInfo("Startup analytics heartbeat held (--hold-work)")
+            : recordStartupHeartbeat
+        ).pipe(
           Effect.withSpan("server.startup.heartbeat.record", {
             attributes: { "startup.phase": "heartbeat.record" },
           }),
