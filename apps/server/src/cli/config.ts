@@ -271,6 +271,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     readonly forceAutoBootstrapProjectFromCwd?: boolean;
     readonly rejectRunningServer?: boolean;
     readonly prepareDirectories?: boolean;
+    readonly holdWork?: boolean;
     readonly selectAutomaticPort?: (
       preferred: number,
       host: string | undefined,
@@ -542,6 +543,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logWebSocketEvents,
     tailscaleServeEnabled,
     tailscaleServePort,
+    ...(options?.holdWork === true ? { holdWork: true } : {}),
   };
 
   return config;
