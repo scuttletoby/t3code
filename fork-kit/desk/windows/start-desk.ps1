@@ -9,7 +9,7 @@
 # task that keeps the distro running; then `desk-install check` and this side's checks.
 param(
   [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')][string]$Repo,   # both required, except with -Uninstall
-  [ValidatePattern('^[0-9a-f]{40}$')][string]$Sha,
+  [ValidateScript({ $_ -cmatch '^[0-9a-f]{40}$' })][string]$Sha,   # -cmatch: ValidatePattern ignores case
   [string]$MachineFile, [string]$FleetConfig,
   [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')][string]$Distro = 'fork-desk',
   [ValidateRange(0, 4096)][int]$MemoryGB = 0, [ValidateRange(0, 4096)][int]$SwapGB = 4,
@@ -20,6 +20,11 @@ $env:WSL_UTF8 = '1'                      # wsl.exe's own lines in UTF-8, not UTF
 $OutputEncoding = [Text.UTF8Encoding]::new($false)   # what is piped into wsl.exe: UTF-8, not ASCII
 $Task = "fork-desk-$Distro"
 $WslConfig = Join-Path $env:USERPROFILE '.wslconfig'
+# Marks on the Windows side, for a run that stops: `made` (this script is installing the distro: a later run asks no
+# takeover question), `restart` (.wslconfig changed and its `wsl --shutdown` is still owed: VM uptime skips sleep)
+$Marks = Join-Path $env:LOCALAPPDATA 'fork-desk'
+$Made = Join-Path $Marks "$Distro.made"; $Owed = Join-Path $Marks "$Distro.restart"
+function Mark([string]$path) { New-Item -ItemType Directory -Force -Path $Marks | Out-Null; Set-Content -LiteralPath $path 'start-desk.ps1' }
 
 function Head([string]$t) { Write-Host "==== $t" -ForegroundColor Cyan }
 function Run([string]$what, [scriptblock]$cmd) {
@@ -86,6 +91,10 @@ mem=$(sed -n 's/^MemTotal: *\([0-9]*\) kB$/\1/p' "$ROOT/proc/meminfo" 2>/dev/nul
 [ -z "${WANT_KB:-}" ] || [ -z "$mem" ] || [ "$mem" -le "$WANT_KB" ] || echo "restart: WSL has $mem kB, above the cap"
 mode=$(wslinfo --networking-mode 2>/dev/null || true)
 [ -z "$mode" ] || [ "$mode" = nat ] || echo "restart: the networking mode is $mode, not nat"
+# automount=false: no Windows drive mounted under /mnt
+if awk '$2 ~ /^\/mnt\/[a-z]$/ { found = 1 } END { exit !found }' "$ROOT/proc/mounts" 2>/dev/null; then
+  echo 'restart: Windows drives are mounted under /mnt'
+fi
 '@
 # .wslconfig, read and written as UTF-8 without a BOM: Windows PowerShell 5.1's Get-Content reads a file without a
 # BOM as ANSI and Set-Content with the ASCII encoding turns every other letter into '?' (a kernel= path with an accent in it
@@ -103,7 +112,7 @@ function Wsl2Keys([string[]]$lines) {   # the keys of the [wsl2] section only
   }
   $keys
 }
-function Merge-WslConfig([string]$path, $want) {   # True when it changed the file (a dated copy of the old one kept)
+function Merge-WslConfig([string]$path, $want, [scriptblock]$before = {}) {   # True when it changed the file (a dated copy of the old one kept; $before runs first)
   $lines = Read-WslConfig $path
   $out = [Collections.Generic.List[string]]::new(); $sec = ''; $done = @{}
   function AddMissing { foreach ($k in $want.Keys) { if (-not $done[$k]) { $out.Add("$k=$($want[$k])"); $done[$k] = 1 } } }
@@ -116,10 +125,18 @@ function Merge-WslConfig([string]$path, $want) {   # True when it changed the fi
   if ($sec -eq 'wsl2') { AddMissing }
   if ($done.Count -lt $want.Count) { $out.Add('[wsl2]'); AddMissing }
   if (($out -join "`n") -eq ($lines -join "`n")) { return $false }
+  & $before
   if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path "$path.bak-$(Get-Date -Format yyyyMMdd-HHmmss)" }
   [IO.File]::WriteAllLines("$path.new", [string[]]$out, [Text.UTF8Encoding]::new($false))
   Move-Item -LiteralPath "$path.new" $path -Force
   $true
+}
+function WslVersion([string[]]$lines, [string]$name) {   # the WSL version of one distro in `wsl -l -v`; 0: not there
+  foreach ($l in $lines) {
+    $f = @(($l.Trim([char]0, ' ', '*', "`t") -replace [char]0, '') -split '\s+')
+    if ($f.Count -ge 3 -and $f[0] -eq $name -and $f[-1] -match '^[0-9]+$') { return [int]$f[-1] }
+  }
+  0
 }
 # --- end wslconfig ---
 $Packages = 'set -eu; export DEBIAN_FRONTEND=noninteractive; need=; for p in python3 nftables iproute2 curl ca-certificates openssh-client tar; do dpkg -s $p >/dev/null 2>&1 || need="$need $p"; done; [ -z "$need" ] || { apt-get update -q && apt-get install -y -q $need; }'
@@ -128,26 +145,41 @@ try {
   Head 'This PC'
   $os = Get-CimInstance Win32_OperatingSystem; $cs = Get-CimInstance Win32_ComputerSystem
   $ram = [math]::Floor($cs.TotalPhysicalMemory / 1GB)
-  if ($MemoryGB -eq 0) { $MemoryGB = [math]::Max(4, [math]::Min([math]::Floor($ram * 3 / 4), $ram - 6)) }
-  if (-not $Uninstall -and $MemoryGB -gt $ram - 2) { throw "-MemoryGB $MemoryGB leaves Windows less than 2 GB of this PC's $ram GB" }
+  $asked = $MemoryGB -ne 0
+  if (-not $asked) { $MemoryGB = [math]::Max(4, [math]::Min([math]::Floor($ram * 3 / 4), $ram - 6)) }
+  if (-not $Uninstall -and $MemoryGB -gt $ram - 2) {
+    if ($asked) { throw "-MemoryGB $MemoryGB leaves Windows less than 2 GB of this PC's $ram GB" }
+    throw "this PC has $ram GB of RAM: a desk needs at least 4 GB for WSL and 2 GB for Windows"
+  }
   "Windows $($os.Version) build $($os.BuildNumber); $($cs.NumberOfLogicalProcessors) threads; RAM $ram GB"
   'WSL:'; wsl.exe --version
-  $have = @(wsl.exe -l -q | ForEach-Object { $_.Trim([char]0, ' ') }) -contains $Distro
-  "distro ${Distro}: $(if ($have) { 'there' } else { 'not yet' })"
+  $version = WslVersion @(wsl.exe -l -v) $Distro   # read without starting any distro
+  $have = $version -ne 0
+  "distro ${Distro}: $(if ($have) { "there (WSL $version)" } else { 'not yet' })"
   if (Test-Path $WslConfig) { ".wslconfig now:"; Read-WslConfig $WslConfig | ForEach-Object { "  $_" } }
-  # A distro of that name that this script did not make: its /etc/wsl.conf is replaced below
-  $ours = $false
-  if ($have) { wsl.exe -d $Distro -u root --cd / -- test -e /etc/fork-kit/desk-distro; $ours = $LASTEXITCODE -eq 0 }
 
   if ($Uninstall) {
     if ((Read-Host "Remove the desk kit from $Distro and the logon task $Task? Type yes") -ne 'yes') { 'Stopped: nothing changed.'; return }
     if ($have) { InDistro 'desk-install uninstall' '[ ! -x /opt/fork-fleet/desk-install ] || /opt/fork-fleet/desk-install uninstall' }
+    Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue   # its `sleep infinity` too
     Unregister-ScheduledTask -TaskName $Task -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Owed, $Made -ErrorAction SilentlyContinue
+    $bak = @(Get-ChildItem -Path "$WslConfig.bak-*" -ErrorAction SilentlyContinue | Sort-Object Name)
     "Done. The distro and .wslconfig are kept; to remove the distro too: wsl --unregister $Distro"
+    if ($bak) { ".wslconfig as it was before the first run: $($bak[0].FullName) (copy it back over .wslconfig to undo)" }
     return
   }
   if (-not $MachineFile) { throw '-MachineFile is required: the machine file with the desk section (README)' }
   if (-not $Repo -or -not $Sha) { throw '-Repo and -Sha are required (the fork and its release commit)' }
+  # every input before the question, so a typo is found before anything changes
+  if (-not (Test-Path -LiteralPath $MachineFile -PathType Leaf)) { throw "-MachineFile ${MachineFile}: no such file" }
+  if ($FleetConfig -and -not (Test-Path -LiteralPath $FleetConfig -PathType Leaf)) { throw "-FleetConfig ${FleetConfig}: no such file" }
+  # WSL1 runs no systemd: every run would restart WSL and check would never pass
+  if ($have -and $version -ne 2) { throw "the distro $Distro is WSL $version; the desk needs WSL 2: wsl --set-version $Distro 2 (or pick another -Distro), then this again" }
+  # A distro of that name that this script did not make: its /etc/wsl.conf is replaced below. (This starts it; it
+  # changes nothing in it.) A run stopped while installing it left the Windows-side mark.
+  $ours = Test-Path -LiteralPath $Made
+  if ($have -and -not $ours) { wsl.exe -d $Distro -u root --cd / -- test -e /etc/fork-kit/desk-distro; $ours = $LASTEXITCODE -eq 0 }
 
   Write-Host ''
   Write-Host "Next: the distro $Distro; .wslconfig [wsl2] memory=${MemoryGB}GB swap=${SwapGB}GB networkingMode=nat" -ForegroundColor Yellow
@@ -163,29 +195,38 @@ try {
 
   Head 'the distro'
   if (-not $have) {
-    wsl.exe --install -d Ubuntu-24.04 --name $Distro --no-launch
+    Mark $Made   # before the install: a run stopped inside it asks no takeover question next time
+    wsl.exe --install -d Ubuntu-24.04 --name $Distro --no-launch --version 2
     if ($LASTEXITCODE -ne 0) { throw "wsl --install failed (exit $LASTEXITCODE): run wsl --update (or restart Windows after WSL's own install), then this again" }
+    $version = WslVersion @(wsl.exe -l -v) $Distro
+    if ($version -ne 2) { throw "the new distro $Distro is WSL $version, not 2: wsl --unregister $Distro, then wsl --set-default-version 2 and this again" }
   }
-  Run 'the first start of the distro' { wsl.exe -d $Distro -u root --cd / -- true }
+  wsl.exe -d $Distro -u root --cd / -- true
+  if ($LASTEXITCODE -ne 0) {
+    throw "the first start of the distro failed (exit $LASTEXITCODE). If a run was stopped while installing it: wsl --unregister $Distro (removes it and all in it), then this again"
+  }
 
   Head '.wslconfig'
   $want = [ordered]@{ memory = "${MemoryGB}GB"; swap = "${SwapGB}GB"; networkingMode = 'nat'; dnsTunneling = 'true'; guiApplications = 'false' }
-  $restart = Merge-WslConfig $WslConfig $want
+  $restart = Merge-WslConfig $WslConfig $want { Mark $Owed }   # the mark first: a run stopped after the write still restarts
   if ($restart) { 'changed: .wslconfig' }
 
   Head "the distro's own settings"
   $changed = InDistro "the distro's settings" $Prepare
   $changed
+  Remove-Item -LiteralPath $Made -ErrorAction SilentlyContinue   # the distro's own mark is there now
   # The live state decides, not only what this run changed: a run stopped before its shutdown restarts next time
   $live = @(InDistro 'the running settings' ("WANT_KB=$([long]$MemoryGB * 1048576)`n" + $Live))
   $up = [double]((wsl.exe -d $Distro -u root --cd / -- cat /proc/uptime) -split ' ')[0]
   if ((Test-Path $WslConfig) -and ((Get-Date) - (Get-Item -LiteralPath $WslConfig).LastWriteTime).TotalSeconds -lt $up) {
     $live += 'restart: .wslconfig is newer than the running WSL'
   }
+  if (Test-Path -LiteralPath $Owed) { $live += 'restart: .wslconfig changed and its wsl --shutdown is still owed' }
   $live
   if ($restart -or $changed -or $live) {
     Head 'wsl --shutdown (the new settings apply at the next start)'
     Run 'wsl --shutdown' { wsl.exe --shutdown }
+    Remove-Item -LiteralPath $Owed -ErrorAction SilentlyContinue
   }
   InDistro 'the packages the fleet needs' $Packages
 
