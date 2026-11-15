@@ -1,3 +1,14 @@
+> **This is a fork of [T3 Code](https://github.com/pingdotgg/t3code).** It follows upstream's releases daily. With no fork
+> settings it behaves like upstream, except that it updates from this fork's releases. What it adds:
+>
+> - **Usage pacing and agent slots:** agents keep a reserve of each subscription limit free for you, and a machine never
+>   runs more agents than it has room for.
+> - **Waits:** an agent sleeps until a pull request, file, system unit or check changes, and is woken then, instead of polling.
+> - **Self-update:** a server running as a boot service can update itself once no thread is working.
+> - **Fleet CI:** one-job runners on your own machines and desktops, each behind walls, a merge queue and shared CI actions.
+>
+> Every change, one line each: [FORK_CHANGES.md](FORK_CHANGES.md). Settings and how to install: [docs/fork/README.md](docs/fork/README.md).
+
 <p align="center">
   <a href="https://t3.codes">
     <img src="./assets/prod/t3-black-web-icon-192x192.png" width="80" height="80" alt="T3 Code logo" />
