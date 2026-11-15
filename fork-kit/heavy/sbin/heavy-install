@@ -1,0 +1,421 @@
+#!/usr/bin/python3 -IB
+"""heavy-install: install, uninstall or check the heavy kit, as root (fork-kit/heavy/README.md).
+
+  heavy-install install --source KIT_FOLDER --sha RELEASE_SHA [--slice NAME] [--grace SECONDS]
+                        [--memory-high SIZE] [--memory-max SIZE] [--swap-max SIZE] [--cpu-weight N]
+  heavy-install uninstall
+  heavy-install self-check
+
+install copies bin/heavy, sbin/heavy-install and README.md of one release into
+/usr/local/libexec/heavy/versions/<sha>/ (with MANIFEST.sha256), checks the copy, switches the link `current` to it,
+writes /etc/heavy/config.json and links /usr/local/bin/heavy and /usr/local/sbin/heavy-install to it. An old
+/usr/local/bin/heavy that is a plain file (a copy from before this kit) is kept in /usr/local/libexec/heavy/replaced/
+and put back by uninstall. With a --memory-*, --swap-max or --cpu-weight option it also writes the slice unit
+/etc/systemd/user/<slice> (every user's manager reads it after `systemctl --user daemon-reload`; a user's own
+~/.config/systemd/user/<slice> wins over it). Safe to run again, and to stop at any step.
+"""
+import argparse, contextlib, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
+
+PREFIX = ''          # tests only: every fixed path below is read under this folder
+ROOT_UID = 0         # tests only: who must run the installer and own the installed files
+
+ETC = '/etc/heavy'
+CONFIG = ETC + '/config.json'
+INSTALLED = ETC + '/installed.tsv'
+LIBEXEC = '/usr/local/libexec/heavy'
+VERSIONS = LIBEXEC + '/versions'
+CURRENT = LIBEXEC + '/current'
+REPLACED = LIBEXEC + '/replaced'
+WRAPPER = '/usr/local/bin/heavy'
+INSTALLER = '/usr/local/sbin/heavy-install'
+UNIT_DIR = '/etc/systemd/user'
+LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install'}
+
+SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md')
+EXECUTABLE = {'bin/heavy', 'sbin/heavy-install'}
+DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 30}
+SHA_RE = re.compile(r'^[0-9a-f]{40}\Z')
+SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
+SIZE_RE = re.compile(r'^(?:[0-9]+[KMGT]?|[0-9]{1,3}%|infinity)\Z')
+LIMITS = {'memory_high': 'MemoryHigh', 'memory_max': 'MemoryMax', 'swap_max': 'MemorySwapMax',
+          'cpu_weight': 'CPUWeight'}
+STEPS = ('check', 'folders', 'copy', 'self-test', 'config', 'slice-unit', 'switch', 'links', 'record')
+
+
+class Refused(Exception):
+    pass
+
+
+def p(path):
+    return PREFIX + path
+
+
+def say(msg):
+    print(f'heavy-install: {msg}', flush=True)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 16), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def ensure_dir(path, mode=0o755):
+    real = p(path)
+    if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)):
+        raise Refused(f'{path} exists and is not a folder: remove it by hand and run again')
+    os.makedirs(real, mode=0o755, exist_ok=True)
+    os.chmod(real, mode)
+
+
+def write_file(path, text, mode=0o644):
+    """Atomic: a temporary file in the same folder, then renamed over the old one. Unchanged text is not rewritten."""
+    real = p(path)
+    with contextlib.suppress(OSError):
+        with open(real, encoding='utf-8') as f:
+            if f.read() == text and stat.S_IMODE(os.stat(real).st_mode) == mode:
+                return False
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix='.' + os.path.basename(real) + '.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, real)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return True
+
+
+def switch_link(path, target):
+    """Point path at target in one step (a new link renamed over the old one)."""
+    real = p(path)
+    if os.path.islink(real) and os.readlink(real) == target:
+        return
+    os.makedirs(os.path.dirname(real), mode=0o755, exist_ok=True)
+    tmp = f'{real}.new-link'
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp)
+    os.symlink(target, tmp)
+    os.replace(tmp, real)
+
+
+def ours(path, target):
+    real = p(path)
+    return os.path.islink(real) and os.readlink(real) == target
+
+
+def read_manifest(folder):
+    out = {}
+    with open(os.path.join(folder, 'MANIFEST.sha256'), encoding='utf-8') as f:
+        for line in f:
+            digest, _, rel = line.rstrip('\n').partition('  ')
+            out[rel] = digest
+    return out
+
+
+def tree_problems(folder):
+    """What differs between a version folder and its manifest, or is not root-owned, or others may write."""
+    try:
+        want = read_manifest(folder)
+    except OSError as e:
+        return [f'{folder}: no readable MANIFEST.sha256 ({e.strerror})']
+    problems, seen = [], set()
+    for dirpath, dirnames, filenames in os.walk(folder):
+        for name in dirnames + filenames + ([] if dirpath != folder else ['.']):
+            path = os.path.normpath(os.path.join(dirpath, name))
+            st = os.lstat(path)
+            if st.st_uid != ROOT_UID or st.st_mode & 0o022 or stat.S_ISLNK(st.st_mode):
+                problems.append(f'{path}: not root-owned, writable by others, or a link')
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), folder)
+            if rel == 'MANIFEST.sha256':
+                continue
+            seen.add(rel)
+            if rel not in want:
+                problems.append(f'{rel}: not in the manifest')
+            elif sha256_file(os.path.join(dirpath, name)) != want[rel]:
+                problems.append(f'{rel}: changed since install')
+    problems += [f'{rel}: missing' for rel in sorted(set(want) - seen)]
+    return problems
+
+
+def copy_tool(source, sha):
+    versions = p(VERSIONS)
+    dest = os.path.join(versions, sha)
+    if os.path.lexists(dest):
+        if os.path.isdir(dest) and not os.path.islink(dest) and not tree_problems(dest) \
+                and set(read_manifest(dest)) == set(SOURCE_FILES):
+            return dest
+        say(f'versions/{sha} is incomplete or changed: made again')
+        shutil.rmtree(dest) if not os.path.islink(dest) else os.unlink(dest)
+    for name in os.listdir(versions):   # a run that stopped while copying
+        if name.startswith('.tmp-'):
+            shutil.rmtree(os.path.join(versions, name), ignore_errors=True)
+    tmp = tempfile.mkdtemp(prefix=f'.tmp-{sha[:12]}-', dir=versions)
+    lines = []
+    for rel in sorted(SOURCE_FILES):
+        dst = os.path.join(tmp, rel)
+        os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
+        with open(os.path.join(source, rel), 'rb') as f:
+            data = f.read()
+        with open(dst, 'wb') as f:
+            f.write(data)
+        os.chmod(dst, 0o755 if rel in EXECUTABLE else 0o644)
+        lines.append(f'{hashlib.sha256(data).hexdigest()}  {rel}')
+    with open(os.path.join(tmp, 'MANIFEST.sha256'), 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.chmod(os.path.join(tmp, 'MANIFEST.sha256'), 0o644)
+    for dirpath, dirnames, _ in os.walk(tmp):
+        for name in dirnames:
+            os.chmod(os.path.join(dirpath, name), 0o755)
+    os.chmod(tmp, 0o755)
+    os.rename(tmp, dest)
+    return dest
+
+
+def read_config():
+    try:
+        with open(p(CONFIG), encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise Refused(f'{CONFIG} cannot be read ({e}): fix or remove it and run again')
+    if not isinstance(data, dict):
+        raise Refused(f'{CONFIG} is not a JSON object: fix or remove it and run again')
+    return data
+
+
+def slice_unit_text(name, limits):
+    lines = ['# heavy kit: written by heavy-install. Do not edit: run the installer again.',
+             '[Unit]', 'Description=Capped slice for heavy commands (fork-kit/heavy)', '', '[Slice]']
+    lines += [f'{LIMITS[k]}={v}' for k, v in limits.items()]
+    return '\n'.join(lines) + '\n'
+
+
+def check_options(a):
+    if not SHA_RE.match(a.sha or ''):
+        raise Refused('--sha must be the full 40-character release commit')
+    for rel in SOURCE_FILES:
+        if not os.path.isfile(os.path.join(a.source or '', rel)):
+            raise Refused(f'--source {a.source}: {rel} is missing (point it at the fork-kit/heavy folder)')
+    if a.slice is not None and not SLICE_RE.match(a.slice):
+        raise Refused(f'bad --slice {a.slice!r} (a unit name ending in .slice)')
+    if a.grace is not None:
+        try:
+            g = float(a.grace)
+        except ValueError:
+            g = -1
+        if not 0 < g <= 600:
+            raise Refused(f'bad --grace {a.grace!r} (seconds, more than 0, at most 600)')
+    limits = {}
+    for key in LIMITS:
+        v = getattr(a, key)
+        if v is None:
+            continue
+        ok = (v.isdigit() and 1 <= int(v) <= 10000) if key == 'cpu_weight' else bool(SIZE_RE.match(v))
+        if not ok:
+            raise Refused(f'bad --{key.replace("_", "-")} {v!r}')
+        limits[key] = v
+    if limits and not any(k in limits for k in ('memory_high', 'memory_max')):
+        raise Refused('a slice unit needs --memory-high or --memory-max (heavy refuses a slice without one)')
+    return limits
+
+
+def check_old_state():
+    """Refuse, before writing anything, what the installer must not overwrite."""
+    for path, target in LINKS.items():
+        real = p(path)
+        if not os.path.lexists(real) or ours(path, target):
+            continue
+        if path == WRAPPER and os.path.isfile(real) and not os.path.islink(real):
+            continue   # a plain old copy: kept in REPLACED, put back by uninstall
+        raise Refused(f'{path} exists and is not the kit\'s link (a link elsewhere, or a folder): '
+                      f'remove it by hand and run again')
+    for path in (ETC, LIBEXEC, VERSIONS, REPLACED):
+        real = p(path)
+        if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)):
+            raise Refused(f'{path} exists and is not a folder: remove it by hand and run again')
+    if os.path.lexists(p(CURRENT)) and not os.path.islink(p(CURRENT)):
+        raise Refused(f'{CURRENT} exists and is not a link: remove it by hand and run again')
+
+
+def keep_old_wrapper():
+    """A plain old /usr/local/bin/heavy goes to REPLACED (by its hash, so a second run copies nothing)."""
+    real = p(WRAPPER)
+    if not os.path.isfile(real) or os.path.islink(real):
+        return None
+    ensure_dir(REPLACED)
+    digest = sha256_file(real)
+    dest = p(f'{REPLACED}/heavy.{digest[:16]}')
+    if not os.path.exists(dest):
+        tmp = dest + '.tmp'
+        shutil.copy2(real, tmp)
+        os.replace(tmp, dest)
+        say(f'the old {WRAPPER} (sha256 {digest[:16]}) is kept as {REPLACED}/heavy.{digest[:16]}')
+    return dest
+
+
+def record_rows(sha, unit_path):
+    rows = [(path, 'link', target) for path, target in sorted(LINKS.items())]
+    rows.append((CURRENT, 'link', f'{VERSIONS}/{sha}'))
+    folder = p(f'{VERSIONS}/{sha}')
+    for rel, digest in sorted(read_manifest(folder).items()):
+        rows.append((f'{VERSIONS}/{sha}/{rel}', 'file', digest))
+    rows.append((CONFIG, 'file', sha256_file(p(CONFIG))))
+    if unit_path:
+        rows.append((unit_path, 'file', sha256_file(p(unit_path))))
+    return rows
+
+
+def install(a, stop_after=None):
+    def done(step):
+        if step == stop_after:
+            raise SystemExit(f'stopped after {step} (test)')
+
+    if os.geteuid() != ROOT_UID:
+        raise Refused('run this as root')
+    limits = check_options(a)
+    check_old_state()
+    old = read_config()
+    done('check')
+    for path in (ETC, LIBEXEC, VERSIONS):
+        ensure_dir(path)
+    done('folders')
+    dest = copy_tool(os.path.realpath(a.source), a.sha)
+    done('copy')
+    problems = tree_problems(dest)
+    r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', 'heavy'), '--help'],
+                       capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    if r.returncode != 0 or 'heavy' not in r.stdout:
+        problems.append(f'bin/heavy --help failed: {(r.stderr or r.stdout).strip()[:200]}')
+    if problems:
+        raise Refused('the new copy failed its self-test (the version in use is unchanged):\n  ' + '\n  '.join(problems))
+    done('self-test')
+    cfg = {'version': 1,
+           'slice': a.slice or old.get('slice') or DEFAULTS['slice'],
+           'grace_seconds': float(a.grace) if a.grace is not None else old.get('grace_seconds',
+                                                                                DEFAULTS['grace_seconds'])}
+    unit_path = old.get('slice_unit') if old.get('slice_unit') == f'{UNIT_DIR}/{cfg["slice"]}' else None
+    if limits:
+        unit_path = f'{UNIT_DIR}/{cfg["slice"]}'
+    if unit_path:
+        cfg['slice_unit'] = unit_path
+    write_file(CONFIG, json.dumps(cfg, indent=2, sort_keys=True) + '\n')
+    done('config')
+    if limits:
+        if os.path.lexists(p(unit_path)) and old.get('slice_unit') != unit_path:
+            raise Refused(f'{unit_path} exists and was not written by this kit: remove it, or install without '
+                          f'limit options to use it as it is')
+        os.makedirs(p(UNIT_DIR), mode=0o755, exist_ok=True)
+        if write_file(unit_path, slice_unit_text(cfg['slice'], limits)):
+            say(f'wrote {unit_path}: every user runs `systemctl --user daemon-reload` (or logs in again) to load it')
+    if old.get('slice_unit') and old['slice_unit'] != unit_path:
+        say(f'note: {old["slice_unit"]} (written by an earlier install) is no longer used: remove it by hand')
+    done('slice-unit')
+    switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
+    done('switch')
+    keep_old_wrapper()
+    for path, target in LINKS.items():
+        switch_link(path, target)
+    done('links')
+    rows = record_rows(a.sha, unit_path)
+    write_file(INSTALLED, '# path\tkind\twant (written by heavy-install; read by heavy --self-check)\n'
+               + ''.join('\t'.join(r) + '\n' for r in rows))
+    done('record')
+    say(f'installed release {a.sha}: slice {cfg["slice"]}, grace {cfg["grace_seconds"]:g}s')
+    for path, kind, want in rows:
+        say(f'  {path}  {kind}  {want}')
+    return 0
+
+
+def uninstall():
+    if os.geteuid() != ROOT_UID:
+        raise Refused('run this as root')
+    cfg = {}
+    with contextlib.suppress(Refused):
+        cfg = read_config()
+    for path, target in LINKS.items():
+        if ours(path, target):
+            os.unlink(p(path))
+    backups = []
+    if os.path.isdir(p(REPLACED)):
+        backups = sorted((os.path.join(p(REPLACED), n) for n in os.listdir(p(REPLACED)) if not n.endswith('.tmp')),
+                         key=os.path.getmtime)
+    if backups and not os.path.lexists(p(WRAPPER)):
+        tmp = p(WRAPPER) + '.restore'
+        shutil.copy2(backups[-1], tmp)
+        os.replace(tmp, p(WRAPPER))
+        say(f'put the old {WRAPPER} back')
+    unit = cfg.get('slice_unit')
+    if unit and unit.startswith(UNIT_DIR + '/') and os.path.isfile(p(unit)):
+        with open(p(unit), encoding='utf-8') as f:
+            if f.read().startswith('# heavy kit: written by heavy-install.'):
+                os.unlink(p(unit))
+                say(f'removed {unit} (users run `systemctl --user daemon-reload`)')
+    for path in (LIBEXEC, ETC):
+        shutil.rmtree(p(path), ignore_errors=True)
+    say('uninstalled')
+    return 0
+
+
+def self_check():
+    problems = []
+    try:
+        with open(p(INSTALLED), encoding='utf-8') as f:
+            rows = [line.rstrip('\n').split('\t') for line in f if line.strip() and not line.startswith('#')]
+    except OSError as e:
+        print(f'PROBLEM: cannot read {INSTALLED} ({e.strerror}): not installed?')
+        return 1
+    for row in rows:
+        if len(row) != 3:
+            problems.append(f'bad row {row!r}')
+            continue
+        path, kind, want = row
+        try:
+            ok = (os.readlink(p(path)) == want) if kind == 'link' else (sha256_file(p(path)) == want)
+        except OSError:
+            ok = False
+        if not ok:
+            problems.append(f'{path}: differs from what was installed ({kind})')
+    if os.path.islink(p(CURRENT)):
+        problems += tree_problems(p(os.readlink(p(CURRENT))))
+    for prob in problems:
+        print(f'PROBLEM: {prob}')
+    print(f'self-check: {len(rows)} installed paths, ' + ('OK' if not problems else f'{len(problems)} problems'))
+    return 0 if not problems else 1
+
+
+def main(argv, stop_after=None):
+    ap = argparse.ArgumentParser(prog='heavy-install', description=__doc__.split('\n\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    i = sub.add_parser('install')
+    i.add_argument('--source', required=True)
+    i.add_argument('--sha', required=True)
+    i.add_argument('--slice')
+    i.add_argument('--grace')
+    for key in LIMITS:
+        i.add_argument('--' + key.replace('_', '-'), dest=key)
+    sub.add_parser('uninstall')
+    sub.add_parser('self-check')
+    a = ap.parse_args(argv)
+    os.umask(0o022)
+    try:
+        if a.cmd == 'install':
+            return install(a, stop_after)
+        if a.cmd == 'uninstall':
+            return uninstall()
+        return self_check()
+    except Refused as e:
+        print(f'heavy-install: {e}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
