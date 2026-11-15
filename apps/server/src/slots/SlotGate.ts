@@ -346,7 +346,17 @@ const make = Effect.gen(function* () {
           grants.push({ type: "full", decision });
           continue;
         }
-        const untilMs = nowMs + reserveMs;
+        // Asking again moves its hold but never extends it: a thread that keeps asking without
+        // starting an agent loses the slot at the old end, so an older waiter gets it (R17).
+        const heldUntil = reservations
+          .filter((reservation) => reservation.threadId === request.threadId)
+          .reduce<number | null>(
+            (latest, reservation) =>
+              latest === null ? reservation.untilMs : Math.max(latest, reservation.untilMs),
+            null,
+          );
+        const untilMs =
+          heldUntil === null ? nowMs + reserveMs : Math.min(nowMs + reserveMs, heldUntil);
         const reservation: SlotReservation = {
           key: request.key,
           threadId: request.threadId,

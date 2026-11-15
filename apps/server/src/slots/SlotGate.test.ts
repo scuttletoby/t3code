@@ -818,7 +818,7 @@ describe("SlotGate", () => {
       }),
     );
 
-    it.effect("one held slot per thread: asking again moves and renews it, never adds one", () =>
+    it.effect("one held slot per thread: asking again moves it, never adds or extends one", () =>
       Effect.gen(function* () {
         const world = newWorld();
         yield* run(
@@ -826,19 +826,19 @@ describe("SlotGate", () => {
           waitsOn({ maxPerMachine: 3, reserveSeconds: 60 }),
           Effect.gen(function* () {
             const gate = yield* SlotGate.SlotGate;
-            // Asked three times (three slots free): still one slot held.
-            for (const key of ["w1", "w2", "w3"]) {
+            // Asked three times (three slots free, at 0, 20 and 40 s): still one slot held.
+            for (const [index, key] of ["w1", "w2", "w3"].entries()) {
+              if (index > 0) yield* TestClock.adjust("20 seconds");
               assert.deepStrictEqual(types(yield* grant({ key, threadId: holder })), ["granted"]);
-              yield* TestClock.adjust("20 seconds");
             }
             assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 3 });
             assert.strictEqual((yield* acquireAs(other)).type, "allow");
             assert.strictEqual((yield* acquireAs(other)).type, "allow");
             assert.strictEqual((yield* acquireAs(other)).type, "refuse");
-            // Renewed by the last ask (at 40 s): still held at 90 s, gone after 100 s.
-            yield* TestClock.adjust("30 seconds");
+            // Not renewed by the later asks: held until the first ask's end (60 s), then gone.
+            yield* TestClock.adjust("19 seconds");
             assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 3, max: 3 });
-            yield* TestClock.adjust("15 seconds");
+            yield* TestClock.adjust("1 second");
             assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 2, max: 3 });
           }),
         );
@@ -932,6 +932,33 @@ describe("SlotGate", () => {
               used: 2,
               max: 2,
             });
+          }),
+        );
+      }),
+    );
+    it.effect("asking again moves a held slot but never extends it past the first end", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 1, reserveSeconds: 60 }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(types(yield* grant({ key: "h0", threadId: holder })), [
+              "granted",
+            ]);
+            // An older wait of another thread comes first in every sweep; the holder asks
+            // again every 50 s without starting an agent.
+            const otherGot: Array<string> = [];
+            for (let round = 1; round <= 10; round += 1) {
+              yield* TestClock.adjust("50 seconds");
+              const grants = yield* grant(
+                { key: "o1", threadId: other },
+                { key: `h${round}`, threadId: holder },
+              );
+              otherGot.push(grants[0]!.type);
+            }
+            // The first hold ended at 60 s: the other thread got the slot at the 100 s sweep.
+            assert.deepStrictEqual(otherGot.slice(0, 2), ["full", "granted"]);
           }),
         );
       }),
