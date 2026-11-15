@@ -1,0 +1,248 @@
+#!/usr/bin/python3 -I
+"""Fork only: the walls of a plain Linux desktop (not WSL), for fork-fleet-walls.py (its contract is there). Each wall
+is one systemd or kernel can drop without an error: a runner would then start with less of its sandbox than the
+launcher asked for, or would see more of this host than it allows. Reads files only; changes nothing. Standard
+library only."""
+import glob, gzip, os, re, stat, subprocess, sys
+
+ROOT = os.environ.get('FORK_FLEET_WALLS_ROOT', '')
+KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # the folder of fork-fleet-launch.sh
+LAUNCHER = os.path.join(KIT, 'fork-fleet-launch.sh')
+# The kinds of mount a path jobs see may be on: this host's own disks and memory. Not a share (cifs, nfs, 9p,
+# virtiofs, drvfs, fuse, autofs, ...): its I/O goes out from this host's network, past every network wall.
+LOCAL_FS = {'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'f2fs', 'jfs', 'reiserfs', 'zfs', 'bcachefs', 'nilfs2', 'overlay',
+            'tmpfs', 'ramfs', 'rootfs', 'squashfs', 'erofs'}
+PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
+# Files in /etc that hold a password for a share: by name (smbcredentials, *.cred, ...), and the mount tables, whose
+# lines may name one (password=, pass=) or point at a file that does (credentials=, cred=).
+SECRET_NAME = re.compile(r'(.*\.creds?|.*credentials?|\.?smbcred.*)', re.I)
+MOUNT_TABLES = ('/etc/fstab', '/etc/auto.*')
+WSL_MARKS = ('/run/WSL', '/proc/sys/fs/binfmt_misc/WSLInterop*', '/usr/lib/wsl', '/mnt/wsl')   # as fork-fleet-walls.py
+WSL_CMDLINE = 'WSL_ROOT_INIT'
+
+
+def read(path):
+    try:
+        with open(ROOT + path, encoding='utf-8', errors='replace') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def mounts():
+    """(mount point, fs type) of every mount, from mountinfo (points unescaped: \\040 is a space)."""
+    text = read('/proc/self/mountinfo')
+    if text is None:
+        raise ValueError('cannot read /proc/self/mountinfo')
+    out = []
+    for line in text.splitlines():
+        left, _, right = line.partition(' - ')
+        fields = left.split()
+        if len(fields) < 5 or not right:
+            raise ValueError(f'/proc/self/mountinfo has a line that is not a mount: {line[:80]!r}')
+        out.append((re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), fields[4]), right.split()[0]))
+    return out
+
+
+def os_wall():
+    release = read('/proc/sys/kernel/osrelease')
+    if read('/proc/sys/kernel/ostype') != 'Linux' or release is None:
+        return 'no Linux /proc/sys/kernel/ostype and osrelease'
+    if ('microsoft' in release.lower() or any(glob.glob(glob.escape(ROOT) + m) for m in WSL_MARKS)
+            or WSL_CMDLINE in (read('/proc/cmdline') or '')):
+        return f'this is WSL ({release}): its walls are fork-fleet-walls/wsl2'
+    return None
+
+
+def kernel_wall():
+    m = re.match(r'(\d+)\.(\d+)', read('/proc/sys/kernel/osrelease') or '')
+    if not m:
+        return 'cannot read the kernel version in /proc/sys/kernel/osrelease'
+    if (int(m.group(1)), int(m.group(2))) < (5, 8):
+        return f'kernel {m.group(0)}: before 5.8, systemd drops ProtectProc and jobs see every process'
+    return None
+
+
+def systemd_wall():
+    comm = read('/proc/1/comm')
+    return None if comm == 'systemd' else f'PID 1 is {comm or "unknown"}: the launcher runs jobs as systemd units'
+
+
+def cgroup_wall():
+    kinds = [kind for point, kind in mounts() if point == '/sys/fs/cgroup']
+    if kinds[-1:] != ['cgroup2']:
+        return (f'/sys/fs/cgroup is {kinds[-1] if kinds else "not mounted"}, not cgroup2: without the unified '
+                'hierarchy systemd drops IPAddressDeny, the jobs\' second firewall')
+    return None
+
+
+def cgroup_bpf_wall():
+    """CONFIG_CGROUP_BPF, from the first of these that can be read: the kernel's config in /boot or /proc/config.gz,
+    or its symbols (/proc/kallsyms names are readable even where their addresses are hidden)."""
+    release = read('/proc/sys/kernel/osrelease') or ''
+    configs = [f'/boot/config-{release}'] if re.fullmatch(r'[A-Za-z0-9._+-]+', release) else []
+    for path, opener in [(p, open) for p in configs] + [('/proc/config.gz', gzip.open)]:
+        try:
+            with opener(ROOT + path, 'rt', encoding='utf-8', errors='replace') as f:
+                found = any(line.strip() == 'CONFIG_CGROUP_BPF=y' for line in f)
+        except OSError:
+            continue
+        return None if found else f'{path} has no CONFIG_CGROUP_BPF=y'
+    try:
+        with open(ROOT + '/proc/kallsyms', encoding='utf-8', errors='replace') as f:
+            found = any(line.rstrip('\n').endswith(' __cgroup_bpf_run_filter_skb') for line in f)
+    except OSError:
+        return 'cannot read the kernel config (/boot/config-<release>, /proc/config.gz) nor /proc/kallsyms'
+    return None if found else '/proc/kallsyms has no __cgroup_bpf_run_filter_skb'
+
+
+def namespaces_wall():
+    missing = [n for n in ('ipc', 'mnt', 'net') if not os.path.lexists(f'{ROOT}/proc/self/ns/{n}')]
+    if missing:
+        return (f'no {", ".join(missing)} namespaces (/proc/self/ns): systemd drops PrivateIPC without an error, '
+                'and the jobs\' own network and file view need the others')
+    return None
+
+
+def seccomp_wall():
+    actions = (read('/proc/sys/kernel/seccomp/actions_avail') or '').split()
+    if 'errno' not in actions:
+        return 'no seccomp filters (/proc/sys/kernel/seccomp/actions_avail): systemd drops the jobs\' system-call walls'
+    return None
+
+
+def container_wall():
+    found = [p for p in ('/run/systemd/container', '/.dockerenv', '/run/.containerenv') if os.path.lexists(ROOT + p)]
+    if found:
+        return f'{found[0]} is there: in a container systemd drops some of the jobs\' walls without an error'
+    return None
+
+
+def job_view():
+    """What a job sees of this host's files: `fork-fleet-launch.sh paths`, job_fs's own rule (the one place of it, with
+    the launcher's conf lookup and every link resolved): (where in the job, real host path) for each path it binds.
+    The launcher refuses a path no job may see (/home, /mnt, ..., or one that leads there): the wall then fails."""
+    st = os.lstat(LAUNCHER)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        raise ValueError(f'{LAUNCHER} is a link, or not owned by uid {os.geteuid()} and writable by it alone')
+    env = {'PATH': os.environ.get('PATH', '/usr/sbin:/usr/bin:/sbin:/bin'), 'LC_ALL': 'C'}
+    env.update({k: os.environ[k] for k in ('FORK_FLEET_WALLS_ROOT', 'FORK_FLEET_LAUNCH_CONF') if os.environ.get(k)})
+    p = subprocess.run([LAUNCHER, 'paths'], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       timeout=30, cwd='/')
+    if p.returncode != 0:
+        why = (p.stderr.strip().splitlines() or [f'exit {p.returncode}'])[-1]
+        raise ValueError(f'the launcher refuses what jobs would see: {why}')
+    view = [line.split(' ') for line in p.stdout.splitlines()]
+    if not view or not all(len(v) == 2 and all(PLAIN.fullmatch(x) for x in v) for v in view):
+        raise ValueError(f'the launcher\'s `paths` printed no list of "<in the job> <host path>" lines')
+    return view
+
+
+def on_local_disk(table, p):
+    """The fs type and point of the mount that holds p: the deepest point, and of two on one point the later one (it
+    is on top)."""
+    held = [(point, kind) for point, kind in table if p == point or p.startswith(point.rstrip('/') + '/')]
+    return max(reversed(held), key=lambda m: len(m[0])) if held else ('', 'nothing')
+
+
+def mounts_wall():
+    """Every mount of this host but those that hold a path jobs see stays out of their units (an allow list, each path
+    without its submounts): those few must be this host's own disks. A share, a data disk mounted anywhere (/srv,
+    /data, /net, /mnt) or a mount made later is fine: no job sees it."""
+    table = mounts()
+    shared = []
+    for _, real in job_view():
+        point, kind = on_local_disk(table, real)
+        if kind not in LOCAL_FS:
+            shared.append(f'{real} (on {kind} at {point or "?"})')
+    if shared:
+        return (f'jobs see {", ".join(shared[:3])}: not a disk of this host\'s own; a share\'s I/O goes out past the '
+                'network walls')
+    return None
+
+
+def others_read(path, last=0o004):
+    """Whether a user with no claim on path (a job's runner user) can read it (last=0o001: enter the folder): every
+    folder above it searchable by others, and it readable by others."""
+    try:
+        parts = path.strip('/').split('/')
+        for i in range(len(parts)):
+            mode = os.stat(ROOT + '/' + '/'.join(parts[:i + 1])).st_mode
+            if not mode & (last if i == len(parts) - 1 else 0o001):
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def etc_secrets_wall():
+    """Jobs see this host's /etc (the launcher's list has it): no password for a share may be in it that they can
+    read. A credentials file (smbcredentials, *.cred, ...) readable by others, a mount table line with password= or
+    pass=, or one whose credentials= file others can read. A file only its owner reads is fine."""
+    found = []
+    for top in ('/etc',):
+        for folder, dirs, files in os.walk(ROOT + top):
+            dirs[:] = [d for d in dirs if others_read(os.path.join(folder, d)[len(ROOT):], 0o001)]   # else no entry
+            for name in files:
+                path = os.path.join(folder, name)[len(ROOT):]
+                if SECRET_NAME.fullmatch(name) and others_read(path):
+                    found.append(f'{path} (others can read it)')
+    for table in sorted({p[len(ROOT):] for t in MOUNT_TABLES for p in glob.glob(glob.escape(ROOT) + t)}):
+        if not others_read(table):
+            continue
+        for n, line in enumerate((read(table) or '').splitlines(), 1):
+            if line.lstrip().startswith('#'):
+                continue
+            if re.search(r'(^|[\s,])(password|pass)=', line):
+                found.append(f'{table} line {n} (a password)')
+            for cred in re.findall(r'(?:^|[\s,])(?:credentials|cred)=([^\s,]+)', line):
+                if cred.startswith('/') and others_read(cred):
+                    found.append(f'{table} line {n} ({cred}, which others can read)')
+    if found:
+        return (f'jobs can read a password for a share: {", ".join(found[:3])}; make the file readable by its owner '
+                'alone (0600)')
+    return None
+
+
+WALLS = [
+    ('os', 'a plain Linux kernel, not WSL', os_wall),
+    ('kernel', 'kernel 5.8 or newer (per-mount /proc, so jobs see no other process)', kernel_wall),
+    ('systemd', 'systemd is PID 1', systemd_wall),
+    ('cgroup2', '/sys/fs/cgroup is cgroup2 only', cgroup_wall),
+    ('cgroup-bpf', 'the kernel has cgroup BPF (else systemd drops IPAddressDeny without an error)', cgroup_bpf_wall),
+    ('namespaces', 'the kernel has IPC, mount and network namespaces', namespaces_wall),
+    ('seccomp', 'seccomp filters are available', seccomp_wall),
+    ('container', 'not in a container', container_wall),
+    ('mounts', 'jobs see only the launcher\'s allow list of system paths, on this host\'s own disks; no other '
+               'mount', mounts_wall),
+    ('etc-secrets', 'no password for a share in /etc that jobs can read', etc_secrets_wall),
+]
+
+
+def text(s):
+    """s on one line, every control character (ESC, CR, ...) and line or bidi mark escaped: a mount's name never
+    reaches a terminal raw."""
+    return re.sub('[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]',
+                  lambda m: f'\\x{ord(m[0]):02x}' if ord(m[0]) < 0x100 else f'\\u{ord(m[0]):04x}', s)
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in ('check', 'describe'):
+        print('usage: linux check | describe', file=sys.stderr)
+        return 2
+    failed = False
+    for wall, what, test in WALLS:
+        try:
+            why = test()
+        except Exception as e:   # a wall that cannot be told does not hold
+            why = f'cannot tell ({e.__class__.__name__}: {e})'
+        failed |= why is not None
+        if why is not None:
+            print(f'FAIL  {wall}  ' + text(f'{what}: {why}')[:400])
+        elif argv[0] == 'describe':
+            print(f'PASS  {wall}  {what}')
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
