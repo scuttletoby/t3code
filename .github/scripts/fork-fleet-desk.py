@@ -9,7 +9,8 @@ pool's runners are started through that session.
       The ssh forced command, as the desk-link user, never root (its authorized_keys: `restrict,command="FORCED
       POOL" ssh-ed25519 ...`, written by fork-fleet-desk-key.py). Takes DIR/POOL.lock (one session per pool: a
       second one exits 3 at once), reads the agent's hello, then listens on the socket DIR/POOL.sock and passes each
-      request to the agent and its answer back. Pings the agent every PING s; with no word from it in DEAD s, or on
+      request to the agent and its answer back. Pings the agent whenever it has heard nothing from it, or sent nothing
+      to it, for PING s (the agent drops a link that says nothing for DEAD s); with no word from it in DEAD s, or on
       its end of the session, every request in flight is answered "outcome unknown" and the socket is removed.
   python3 -I fork-fleet-desk.py launch POOL VERB ARGS...
       A pool's `launch` command for `fork-fleet.py dispatch`: ["python3", "-I", ".../fork-fleet-desk.py", "launch",
@@ -200,6 +201,7 @@ class Session:
 
     def send(self, frame):
         self.outbuf += wire.encode(frame)
+        self.sent = self.now()
         self.flush()
 
     def flush(self):
@@ -210,7 +212,7 @@ class Session:
             pass
 
     def loop(self, listener):
-        self.heard = self.now()
+        self.heard = self.sent = self.now()
         while True:
             for key, _ in self.sel.select(min(1.0, self.ping / 4) if not self.outbuf else 0.05):
                 if key.data == 'agent':
@@ -224,7 +226,8 @@ class Session:
             t = self.now()
             if t - self.heard > self.dead:
                 raise Refused(f'no word from the desktop in {self.dead} s')
-            if t - self.heard > self.ping * (self.pings + 1):
+            # also when only the agent talks (answers spaced under PING s): its side counts frames FROM serve
+            if t - self.heard > self.ping * (self.pings + 1) or t - self.sent > self.ping:
                 self.pings += 1
                 self.send({'v': wire.VERSION, 'ping': self.pings})
             for client, (_, deadline) in list(self.waiting.items()):
