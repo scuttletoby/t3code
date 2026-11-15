@@ -139,6 +139,15 @@ def check_config(cfg):
         who = f'pool {p.get("name")!r}'
         if not (isinstance(p.get('name'), str) and POOL.fullmatch(p['name'])):
             out.append(f'{who}: name must be a-z, 0-9, _ and - (it names the dispatcher\'s lock file)')
+        seeds = p.get('seeds', [])   # a desk pool's warm caches: fork-fleet-desk-seed.py
+        if not (isinstance(seeds, list) and all(
+                isinstance(x, dict) and isinstance(x.get('name'), str) and POOL.fullmatch(x['name'])
+                and all(positive(x.get(k)) for k in ('every_hours', 'max_age_hours', 'max_mb'))
+                and x['max_age_hours'] >= x['every_hours'] for x in seeds)):
+            out.append(f'{who}: seeds must list {{"name" (a-z, 0-9, _, -), "every_hours", "max_age_hours" (at least '
+                       'every_hours), "max_mb"}, each a positive whole number')
+        elif len({x['name'] for x in seeds}) != len(seeds):
+            out.append(f'{who}: two seeds with one name')
         if not positive(p.get('slots')):
             out.append(f'{who}: slots must be a positive whole number')
         if not isinstance(p.get('waits'), bool):

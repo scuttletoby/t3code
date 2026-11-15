@@ -448,6 +448,7 @@ done
   files="fork-fleet.json:fork-fleet.json:644 scripts/fork-fleet.py:fork-fleet.py:644
          scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755
          scripts/fork-fleet-desk.py:fork-fleet-desk.py:644 scripts/fork-fleet-desk-wire.py:fork-fleet-desk-wire.py:644
+         scripts/fork-fleet-desk-seed.py:fork-fleet-desk-seed.py:644
          scripts/fork-fleet-refresh.service:fork-fleet-refresh.service:644
          scripts/fork-fleet-refresh.timer:fork-fleet-refresh.timer:644
          scripts/fork-fleet-job-paths.txt:fork-fleet-job-paths.txt:644"
@@ -682,6 +683,31 @@ already have:
 Bun, Node and Rust are installed per job by the setup actions, into the job's
 own home, which goes with its copy. Leave a few tens of GB of disk for
 `/var/lib/fork-fleet/runners`.
+
+#### Seeds (warm caches for a desk pool)
+
+A job's copy starts empty, so each job would download its tools and
+dependencies again. A desk pool may list **seeds** in its fleet config entry,
+ready-made caches the desktop keeps and its jobs start from:
+
+```json
+"seeds": [{"name": "gradle", "every_hours": 6, "max_age_hours": 72, "max_mb": 4096}]
+```
+
+`every_hours` is how often a desktop takes a new one, `max_age_hours` (at
+least `every_hours`) the age, from when it was made, at which it is dropped,
+`max_mb` its largest size. Nothing in the fleet makes a seed: on the always-on
+host the project's own timer or job writes a tar of a cache folder's contents
+to `/var/lib/fork-fleet/seed-files/NAME.tar`, by a temp file and a rename (a
+file changed while it is sent is refused). That folder and its files are
+root's (or the project's), readable by the desk-link user and writable by no
+one else; never put a secret in a seed: every job of the pool reads it.
+
+The desktop asks for them with the desk link's key, in an ssh session of its
+own: the same forced command answers `seeds` with the pool's list and
+`seed NAME` with that one file, only a name of that list, and a trailer with its
+size and SHA-256 (`fork-fleet-desk-seed.py`, which step 3 installs; its header
+has the exit codes).
 
 ## Owner steps on the repository
 

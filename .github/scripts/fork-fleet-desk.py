@@ -17,6 +17,8 @@ pool's runners are started through that session.
       POOL]. Sends one launcher verb (`start` with its stdin) through the live session and prints the desktop's
       stdout and stderr and exits with its exit code. No live session: exit 3 at once, nothing sent. No answer in
       the verb's time (fork-fleet-desk-wire.py, "Time"): exit 75, the verb may or may not have run.
+  The same forced command asked `seeds` or `seed NAME` (SSH_ORIGINAL_COMMAND): a desktop's warm caches, not a
+  session (fork-fleet-desk-seed.py; its lock DIR/POOL.seed.lock).
 DIR is /run/fork-fleet-desk, made at boot by systemd-tmpfiles (runbook): owned by the desk-link user, its group the
 socket group (who may connect: the dispatcher's user, or root), mode 0710 or 0750. The socket is 0660 in that group,
 and serve lets in only root, its own user and members of that group (SO_PEERCRED). Not as root (tests),
@@ -391,9 +393,25 @@ def launch(pool, verb, args, stdin, path, out=sys.stdout, err=sys.stderr, wait=N
     return got['exit']
 
 
+def seed_side(pool, asked, env):
+    """A desktop's seed session (fork-fleet-desk-seed.py): the same key and forced command, another command."""
+    pool_ok(pool)
+    if os.geteuid() == 0:
+        raise Refused('serve never runs as root', 2)
+    path = sock_dir(env)
+    safe_dir(path, (os.geteuid(),), make=True)
+    spec = importlib.util.spec_from_file_location('fork_fleet_desk_seed', os.path.join(HERE, 'fork-fleet-desk-seed.py'))
+    seed = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(seed)
+    return seed.offer(pool, asked, path)
+
+
 def main(argv=None, env=os.environ):
     argv = sys.argv[1:] if argv is None else argv
     try:
+        if len(argv) == 2 and argv[0] == 'serve' and (env.get('SSH_ORIGINAL_COMMAND') == 'seeds' or
+                                                      env.get('SSH_ORIGINAL_COMMAND', '').startswith('seed ')):
+            return seed_side(argv[1], env['SSH_ORIGINAL_COMMAND'], env)
         if len(argv) == 2 and argv[0] == 'serve':
             for sig in (signal.SIGTERM, signal.SIGHUP):
                 signal.signal(sig, lambda *_: sys.exit(1))   # through serve's finally: the socket goes, clients learn
