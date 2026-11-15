@@ -28,7 +28,11 @@
 #                (services this host reaches: its loopback, its LAN address, Tailscale) is closed from inside, this
 #                host's own public address is refused, no AF_VSOCK socket, io_uring ring or 32-bit system call
 #                works inside, only the pseudo devices and no socket are there, the unit sees no mount but the ones
-#                job_fs allows, and none of them receives a mount the host makes later.
+#                job_fs allows, each of them comes from the host path job_fs resolved (no link swapped in between),
+#                and none of them receives a mount the host makes later.
+#   paths        reads only, for the per-OS walls (fork-fleet-walls/<os>, `mounts`): a line `DEST SOURCE` for every
+#                file or folder of this host a job's unit gets (DEST where the unit has it, SOURCE the real path bound
+#                there: job_view, the same rule as start's), WORK_ROOT standing for each job's copy in it.
 #
 # The network: each runner user has a namespace of its own, fork-fleet-USER, so a job has its own loopback and reaches
 # no service on this host's (nor an abstract socket). Its only link, ffh-UID (host side), goes to the public internet:
@@ -48,6 +52,8 @@
 # they see: every public address they give is blocked, at least one must answer), JOB_PATHS (the system paths every
 # job sees: fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only,
 # comma-separated, say a tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN and SYSTEMCTL have defaults below.
+# FORK_FLEET_WALLS_ROOT: the walls' test knob (fork-fleet-walls.py), `paths` only and never as root: a fake machine
+# whose launch.conf and paths it reads.
 set -euo pipefail
 umask 077
 
@@ -66,26 +72,39 @@ owned_safe() {
   (((8#$mode & 8#022) == 0)) || die "$1 must be writable by its owner only"
 }
 
+# The fake machine of the walls' tests, or '' (this one): refused for every verb but `paths`, and when root runs this.
+ROOT=${FORK_FLEET_WALLS_ROOT-}
+if [[ -n $ROOT ]]; then
+  [[ ${1-} == paths && $EUID != 0 ]] || die "FORK_FLEET_WALLS_ROOT is set: it is for the walls' tests only (paths, not as root)"
+  ROOT=$(realpath -e -- "$ROOT") && [[ $ROOT =~ ^/[A-Za-z0-9._/-]+$ ]] || die "FORK_FLEET_WALLS_ROOT is no plain folder"
+fi
 conf=${FORK_FLEET_LAUNCH_CONF:-/etc/fork-fleet/launch.conf}
-owned_safe "$conf"
+# paths on a host not set up yet (no conf at all): what jobs would see with the defaults below.
+conf_file=/dev/null
+[[ ${1-} == paths && ! -e $ROOT$conf && ! -L $ROOT$conf ]] || { owned_safe "$ROOT$conf" && conf_file=$ROOT$conf; }
 RUNNER_USERS='' TEMPLATE='' WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
 SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com ALLOW_PATHS=''
-JOB_PATHS=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fork-fleet-job-paths.txt
+JOB_PATHS=''
 setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|JOB_PATHS|ALLOW_PATHS)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
   printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
-done <"$conf"
-[[ -n $RUNNER_USERS && -n $TEMPLATE ]] || die "$conf: RUNNER_USERS and TEMPLATE are required"
+done <"$conf_file"
+[[ -n $RUNNER_USERS && -n $TEMPLATE || ${1-} == paths ]] || die "$conf: RUNNER_USERS and TEMPLATE are required"
 [[ $RESERVE_MB =~ ^[0-9]{1,7}$ && $MAX_SECONDS =~ ^[1-9][0-9]{0,6}$ ]] || die "$conf: RESERVE_MB and MAX_SECONDS are numbers"
 { [[ $NET_BASE =~ ^10\.(0|[1-9][0-9]{0,2})$ ]] && ((BASH_REMATCH[1] <= 255)); } || die "$conf: NET_BASE is 10.N (N up to 255)"
 own_url='https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?'
 [[ $OWN_ADDRESS_URLS =~ ^$own_url(,$own_url)*$ ]] || die "$conf: OWN_ADDRESS_URLS is a comma-separated list of https URLs"
 PLAIN_PATH='(/[A-Za-z0-9._@+-]+)+'
 [[ $ALLOW_PATHS =~ ^($PLAIN_PATH(,$PLAIN_PATH)*)?$ ]] || die "$conf: ALLOW_PATHS is a comma-separated list of plain paths"
+# An absolute path (a relative one would be read from wherever this runs); on the fake machine, the fake one's.
+[[ $JOB_PATHS =~ ^($PLAIN_PATH)?$ ]] || die "$conf: JOB_PATHS is a plain absolute path"
+if [[ -n $JOB_PATHS ]]; then JOB_PATHS=$ROOT$JOB_PATHS; else
+  JOB_PATHS=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fork-fleet-job-paths.txt
+fi
 
 NAME='^[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}$'
 name_ok() { [[ $1 =~ $NAME ]] || die "not a runner name: $1"; }
@@ -107,6 +126,8 @@ setup() {
   mkdir -p -- "$RUN_DIR"
   owned_safe "$WORK_ROOT"
   owned_safe "$RUN_DIR"
+  # From here on its real path (a link in a folder above it resolved): the copies are made, bound and pruned there.
+  WORK_ROOT=$(real_path "$WORK_ROOT")
   chmod 0711 -- "$WORK_ROOT"
   chmod 0700 -- "$RUN_DIR"
   exec {lock}>"$RUN_DIR/launch.lock"
@@ -352,19 +373,27 @@ docker_rules() {
 
 # refresh-net (each dispatcher pass): the address may change while a job runs (a new lease, a VPN that went down).
 # The table covers every runner's link, so re-applying it covers running jobs; their units get the new addresses too.
+# The same addresses in another order change nothing. A unit whose set-property failed is tried again next pass.
 refresh_net() {
-  local own name blocked old=''
+  local own name blocked old='' retry=$RUN_DIR/deny-retry
   own=$(own_address)
   setup
   [[ ! -f $RUN_DIR/own-address ]] || old=$(<"$RUN_DIR/own-address")
   merge_own "$own"
-  if [[ $blocked == "$old" ]] && nft list table inet fork_fleet >/dev/null 2>&1; then return 0; fi
+  if [[ $(addr_set "$blocked") == "$(addr_set "$old")" && ! -e $retry ]] &&
+    nft list table inet fork_fleet >/dev/null 2>&1; then return 0; fi
+  local failed=''
+  : >"$retry"
   table_up
   for name in $(active); do
-    "$SYSTEMCTL" set-property --runtime -- "fork-fleet-$name.service" "IPAddressDeny=$blocked" ||
-      warn "refresh-net: IPAddressDeny of fork-fleet-$name not changed (the table blocks $blocked)"
+    "$SYSTEMCTL" set-property --runtime -- "fork-fleet-$name.service" "IPAddressDeny=$blocked" || failed+=" $name"
   done
+  if [[ -n $failed ]]; then
+    warn "refresh-net: IPAddressDeny not changed for$failed (the table blocks $blocked); tried again next pass"
+  else rm -f -- "$retry"; fi
 }
+
+addr_set() { tr ' ' '\n' <<<"$1" | sort -u | tr '\n' ' '; }
 
 # The jobs' resolv.conf: this host's resolver listens on its loopback, which a job's namespace does not have.
 resolv_target() {
@@ -377,19 +406,49 @@ resolv_target() {
   printf '%s\n' "$target"
 }
 
-# THE rule of what a job sees of this host's files, in one place (the per-OS walls read the same JOB_PATHS file): an
-# allow list, never a list of what to hide, as a disk or share may be mounted anywhere (/mnt, /media, /srv, /data,
-# /net). The unit's root is an empty directory of its own ($1, root's) holding only: each path of JOB_PATHS and
-# ALLOW_PATHS that exists here, read-only (a symlink here, like /bin -> usr/bin, is the same symlink there); the hook
-# and the two files it runs, read-only; its own copy ($2), read-write; the jobs' resolv.conf; and systemd's own /proc,
-# /sys, a /dev of pseudo devices and memory file systems for /run, /tmp, /var/tmp and /dev/shm. Each path is one mount,
-# not its submounts (norbind: WSL2's driver share under /usr/lib/wsl, a disk under /etc stay out), and no mount the
-# host makes later reaches the unit (MountFlags=private: no mount of the unit receives the host's). Sets props_fs, and
-# seen: the mount points check-net's probe allows (its own /proc, /sys, /dev and memory file systems are allowed there).
-job_fs() {
-  local root=$1 rw=$2 line p hook_dir=${HOOK%/*}
-  local -a paths=() ro=()
-  [[ $HOOK =~ ^$PLAIN_PATH$ && $rw =~ ^($PLAIN_PATH)?$ ]] || die "HOOK ($HOOK) and WORK_ROOT must be plain paths"
+# A path's real path: every symlink in every part of it resolved (on the fake machine: in it), as systemd follows
+# them in a bind's source. What job_view checks and binds, so a link in a folder above a path (/opt/x -> /c, /home,
+# a share) never leads a job past the checks. Dies when it is no plain path, or when a folder above it is one a user
+# but root could swap for a link (others may write it, and it is not sticky): then the bind could come from another
+# place than the one checked. A folder root alone may change cannot change between this check and the bind.
+real_path() {
+  local real d
+  real=$(realpath -m -- "$ROOT$1") || die "$1: cannot resolve it"
+  if [[ -n $ROOT ]]; then
+    [[ $real == "$ROOT"/* ]] || die "$1 leads out of FORK_FLEET_WALLS_ROOT"
+    real=${real#"$ROOT"}
+  fi
+  [[ $real =~ ^$PLAIN_PATH$ ]] || die "$1 leads to ${real:-/}: not a plain path"
+  d=$real
+  while d=${d%/*} && [[ -n $d ]]; do
+    [[ ! -e $ROOT$d ]] || (($(stat -c '0%a' -- "$ROOT$d") & 01002 ^ 02)) ||
+      die "$1 leads to $real, under $d, which others may write: anyone could swap a link into it"
+  done
+  printf '%s\n' "$real"
+}
+
+# A path no job ever sees of this host's: its own of these or none (/proc, /sys, /dev, /run, /tmp, /var/tmp), or one
+# that holds data (/home, /root, /mnt, /media, /srv).
+never() {
+  case $1/ in /proc/* | /sys/* | /dev/* | /run/* | /tmp/* | /var/tmp/* | /home/* | /root/* | /mnt/* | /media/* | /srv/*)
+    die "$2: a job never sees it from this host (its own, none, or data): not a path to allow" ;;
+  esac
+}
+
+# THE rule of what a job sees of this host's files, in one place (the per-OS walls read it through `paths`): an allow
+# list, never a list of what to hide, as a disk or share may be mounted anywhere (/mnt, /media, /srv, /data, /net).
+# The unit's root is an empty directory of its own holding only: each path of JOB_PATHS and ALLOW_PATHS that exists
+# here, read-only (a symlink here, like /bin -> usr/bin, is the same symlink there); the hook and the two files it
+# runs, read-only; the job's copy in WORK_ROOT, read-write; the jobs' resolv.conf; and systemd's own /proc, /sys, a
+# /dev of pseudo devices and memory file systems for /run, /tmp, /var/tmp and /dev/shm. Each is bound from its real
+# path (real_path: never through a link in a folder above it), and the list's are refused when that real path, or
+# the one written, is one no job sees (never). Each path is one mount, not its submounts (norbind: WSL2's driver
+# share under /usr/lib/wsl, a disk under /etc stay out), and no mount the host makes later reaches the unit
+# (MountFlags=private). Sets view_ro (SOURCE:DEST) and view_links (DEST and its link's text).
+job_view() {
+  local line p real hook_dir=${HOOK%/*}
+  local -a paths=() plain=()
+  [[ $HOOK =~ ^$PLAIN_PATH$ && $WORK_ROOT =~ ^$PLAIN_PATH$ ]] || die "HOOK ($HOOK) and WORK_ROOT must be plain paths"
   owned_safe "$JOB_PATHS"
   while IFS= read -r line || [[ -n $line ]]; do
     [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
@@ -397,32 +456,75 @@ job_fs() {
   done <"$JOB_PATHS"
   # shellcheck disable=SC2206 # plain paths only, checked below
   paths+=(${ALLOW_PATHS//,/ })
+  view_ro=() view_links=()
   for p in "${paths[@]}"; do
     [[ $p =~ ^$PLAIN_PATH$ && /$p/ != */./* && /$p/ != */../* ]] || die "$JOB_PATHS or ALLOW_PATHS: not a plain path: $p"
-    case $p/ in /proc/* | /sys/* | /dev/* | /run/* | /tmp/* | /var/tmp/* | /home/* | /root/*)
-      die "$p: a job never sees it from this host (its own or none): not a path to allow" ;;
-    esac
-  done
-  rm -rf --one-file-system -- "$root"
-  mkdir -m 0755 -- "$root"
-  seen='/'
-  for p in "${paths[@]}"; do
-    if [[ -L $p ]]; then
-      mkdir -p -m 0755 -- "$root${p%/*}"
-      ln -s -- "$(readlink -- "$p")" "$root$p"
-    elif [[ -e $p ]]; then
-      ro+=("$p:$p:norbind") seen+=" $p"
+    never "$p" "$p"
+    if [[ -L $ROOT$p ]]; then
+      view_links+=("$p" "$(readlink -- "$ROOT$p")")
+    elif [[ -e $ROOT$p ]]; then
+      real=$(real_path "$p")
+      never "$real" "$p (that is $real)"
+      view_ro+=("$real:$p")
+      [[ $real != "$p" ]] || plain+=("$p")
     fi
   done
+  # A list path that a link above it leads elsewhere must land in one the list has as it is (/lib/x -> /usr/lib/x
+  # is in /usr): /opt/win/Users with /opt/win -> /c leads to /c/Users, which no line allows.
+  for line in "${view_ro[@]}"; do
+    real=${line%%:*}
+    [[ $real != "${line#*:}" ]] || continue
+    for p in "${plain[@]}"; do
+      [[ $real != "$p" && $real != "$p"/* ]] || continue 2
+    done
+    die "${line#*:} leads to $real, which no line of $JOB_PATHS or ALLOW_PATHS allows as it is"
+  done
   for p in "$HOOK" "$hook_dir/fork-fleet.py" "$hook_dir/fork-fleet.json"; do
-    [[ $p == "$HOOK" || -e $p ]] || continue
-    ro+=("$p:$p:norbind") seen+=" $p"
+    [[ $p == "$HOOK" || -e $ROOT$p ]] || continue
+    real=$(real_path "$p")
+    view_ro+=("$real:$p")
+  done
+}
+
+# job_view for a unit: its root ($1, root's), its copy ($2, read-write; already a real path, in WORK_ROOT's), and
+# the jobs' resolv.conf at $3. Sets props_fs and resolv_bind; seen, the mount points check-net's probe allows (its
+# own /proc, /sys, /dev and memory file systems are allowed there); and from, each of them with the device and inode
+# its source has here, which the probe compares with what the unit has there (a link swapped in after job_view shows).
+job_fs() {
+  local root=$1 rw=$2 resolv=$3 i b
+  local -a ro=() view_ro view_links
+  job_view
+  rm -rf --one-file-system -- "$root"
+  mkdir -m 0755 -- "$root"
+  for ((i = 0; i < ${#view_links[@]}; i += 2)); do
+    mkdir -p -m 0755 -- "$root${view_links[i]%/*}"
+    ln -s -- "${view_links[i + 1]}" "$root${view_links[i]}"
+  done
+  seen='/' from=''
+  for b in "${view_ro[@]}"; do
+    ro+=("$b:norbind") seen+=" ${b#*:}" from+=" ${b#*:}=$(stat -L -c '%d:%i' -- "${b%%:*}")"
   done
   props_fs=(-p "RootDirectory=$root" -p MountAPIVFS=yes -p MountFlags=private -p "BindReadOnlyPaths=${ro[*]}")
   if [[ -n $rw ]]; then
     props_fs+=(-p "BindPaths=$rw:$rw:norbind")
-    seen+=" $rw"
+    seen+=" $rw"   # made after this (start), under WORK_ROOT's real path
   fi
+  b=$(real_path "$RESOLV_CONF")
+  resolv_bind=$b:$resolv
+  seen+=" $resolv" from+=" $resolv=$(stat -L -c '%d:%i' -- "$b")"
+  from=${from# }
+}
+
+# paths: job_view, for the walls, with WORK_ROOT (each job's copy is in it) and the jobs' resolv.conf. Reads only.
+paths() {
+  local b
+  local -a view_ro view_links
+  job_view
+  for b in "${view_ro[@]}"; do printf '%s %s\n' "${b#*:}" "${b%%:*}"; done
+  b=$(real_path "$WORK_ROOT")
+  printf '%s %s\n' "$b" "$b"
+  b=$(real_path "$RESOLV_CONF")
+  printf '/etc/resolv.conf %s\n' "$b"
 }
 
 # The sandbox of every runner unit, and of check-net's probes (which prove it): the props array. Its own network
@@ -437,16 +539,15 @@ job_fs() {
 # native arch does not check. So io_uring fails with ENOSYS (libuv, Node and the like then use plain calls) and a
 # system call of another arch ends the process (SIGSYS).
 sandbox() {
-  local user=$1 resolv=$2 own=$3
+  local user=$1 resolv=$2 own=$3 resolv_bind
   local -a props_fs
-  job_fs "$4" "$5"
-  seen+=" $resolv"
+  job_fs "$4" "$5" "$resolv"
   props=(
     -p "NetworkNamespacePath=/run/netns/fork-fleet-$user"
     -p "IPAddressDeny=${PRIVATE4[*]} $own ::/0" -p IPAddressAllow=localhost
     "${props_fs[@]}"
     -p "TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777"
-    -p "BindReadOnlyPaths=$RESOLV_CONF:$resolv"
+    -p "BindReadOnlyPaths=$resolv_bind"
     -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p ProtectProc=invisible -p PrivateIPC=yes
     -p RemoveIPC=yes -p PrivateDevices=yes
     -p RestrictAddressFamilies=~AF_VSOCK
@@ -456,7 +557,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv own blocked seen
+  local name=$1 dir env_file line key value user resolv own blocked seen from
   local -a props
   local -A got=()
   name_ok "$name"
@@ -556,16 +657,18 @@ fi
 exit "$bad"
 EOF
 
-# The walls' probe (python3 -I -c, arguments job or host, then the mount points job_fs allows). job: in the sandbox,
+# The walls' probe (python3 -I -c, arguments job or host, the mount points job_fs allows, then each bound one's
+# POINT=DEVICE:INODE: its source as job_fs checked it, seen from outside). job: in the sandbox,
 # as the runner user; a line per wall, exit 1 when one is open or could not be tried. host: as root, outside, the
 # control: whether this host has what the walls close (where it has not, the refusal inside shows nothing; the walls
 # are still set). Each 32-bit call is made in a child that may not dump core: the filter ends it with SIGSYS; another
 # signal means this kernel has no such calls. i386: getpid (20) through int 0x80; x32: getpid (39 | 0x40000000).
 # Then what the files show: device nodes besides the pseudo ones (a GPU, /dev/dxg); every mount point the unit has
 # (the allowed ones, its own /proc, /sys and /dev, and nothing else); whether any of its mounts receives the host's
-# mounts (mountinfo's master: or shared: tag: a disk mounted after the job started would show up in it); entries in
-# /mnt or /media; and sockets in the places a desktop keeps them (WSLg's X11 and PulseAudio). Mount points are read
-# from mountinfo, never looked at: a share that hangs cannot stop the probe.
+# mounts (mountinfo's master: or shared: tag: a disk mounted after the job started would show up in it); whether each
+# bound point is the very file or folder job_fs checked (a link swapped in before systemd bound it would show);
+# entries in /mnt or /media; and sockets in the places a desktop keeps them (WSLg's X11 and PulseAudio). Other mount
+# points are read from mountinfo, never looked at: a share that hangs cannot stop the probe.
 read -r -d '' WALLS <<'EOF' || true
 import ctypes, errno, mmap, os, re, signal, socket, stat, sys
 libc = ctypes.CDLL(None, use_errno=True)
@@ -641,6 +744,15 @@ def own(point, dev, root):
         root.startswith('/systemd/inaccessible/') or \
         (point != '/' and top == [(dev, top[0][1])] and root.startswith(top[0][1].rstrip('/') + '/'))
 foreign = [f'{p} ({k})' for p, k, _, dev, root in mounts if not own(p, dev, root)]
+def moved(entry):
+    point, _, want = entry.partition('=')
+    try:
+        st = os.stat(point)
+    except OSError:
+        return True
+    return f'{st.st_dev}:{st.st_ino}' != want
+sources = sys.argv[3].split() if len(sys.argv) > 3 else []
+swapped = [x.partition('=')[0] for x in sources if moved(x)]
 receive = [p for p, _, tags, _, _ in mounts if any(t.startswith(('master:', 'shared:')) for t in tags)]
 devs = [p[5:] for p in walk('/dev', lambda m: stat.S_ISCHR(m) or stat.S_ISBLK(m))
         if p[5:] not in ('null', 'zero', 'full', 'random', 'urandom', 'tty', 'ptmx')]
@@ -682,6 +794,9 @@ for k, v in calls.items():
 line(not devs, 'devices: ' + (f'host ones inside: {few(devs)}' if devs else 'only the pseudo ones'))
 line(bool(allowed) and not foreign, 'mounts: ' + (f'not allowed inside: {few(foreign)}' if foreign else
                                                   'only the allowed ones' if allowed else 'no allow list given'))
+line(bool(sources) and not swapped, 'mount sources: ' + (
+    f'not what job_fs checked: {few(swapped)}' if swapped else 'each the host path job_fs checked' if sources else
+    'none given'))
 line(not receive, 'later mounts: ' + (f'the host\'s reach {few(receive)}' if receive else
                                       'no mount inside receives the host\'s'))
 line(not mnt, '/mnt and /media: ' + (f'hold {few(mnt)} inside' if mnt else 'nothing inside'))
@@ -691,7 +806,7 @@ sys.exit(bad)
 EOF
 
 check_net() {
-  local url=$1 target host port user resolv own blocked seen rc=0
+  local url=$1 target host port user resolv own blocked seen from rc=0
   local -a pairs=() props
   shift
   [[ $url =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] || die "check-net: not a plain http(s) URL: $url"
@@ -715,13 +830,13 @@ check_net() {
   merge_own "$own"
   net_up "$user"
   sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/check-net.root" ''
-  /usr/bin/python3 -I -c "$WALLS" host "$seen"
+  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from"
   echo "check-net: as $user, in its namespace fork-fleet-$user"
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-net --uid "$user" "${props[@]}" \
     -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null ||
     rc=$?
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-walls --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" </dev/null || rc=$((rc | 2))
+    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" </dev/null || rc=$((rc | 2))
   ((rc == 0)) || die "check-net: the runners' network or walls are NOT as they must be (see above): do not use this pool"
   echo "check-net: the runners reach $url and none of the $((${#pairs[@]} / 2)) services named nor this host's own" \
     "public address; AF_VSOCK, io_uring and 32-bit system calls are closed; no host device, socket or mount but the" \
@@ -762,10 +877,11 @@ case "${1-}:$#" in
     ;;
   prune:1) prune ;;
   refresh-net:1) refresh_net ;;
+  paths:1) paths ;;
   check-net:*)
     (($# >= 3)) || die "usage: check-net URL HOST:PORT..."
     shift
     check_net "$@"
     ;;
-  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh-net | check-net URL HOST:PORT..." ;;
+  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh-net | paths | check-net URL HOST:PORT..." ;;
 esac

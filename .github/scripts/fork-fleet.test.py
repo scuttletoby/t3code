@@ -1356,6 +1356,13 @@ class Dispatch(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform.startswith('linux') and os.geteuid() != 0, 'Linux, not as root')
+def walls_probe():
+    """check-net's walls' probe, the Python code the launcher runs in the unit (its WALLS)."""
+    with open(LAUNCH) as f:
+        text = f.read()
+    return text.split("read -r -d '' WALLS <<'EOF' || true\n", 1)[1].split('\nEOF\n', 1)[0]
+
+
 class Launcher(unittest.TestCase):
     """fork-fleet-launch.sh with a fake systemd-run, systemctl, chown, pgrep, setpriv, ip, nft, iptables and id (it
     runs here as this user, not root; LauncherAsRoot runs the real ones). The fake systemd-run records each unit it
@@ -1382,7 +1389,8 @@ class Launcher(unittest.TestCase):
                      'case $1 in list-units) cat -- "$REC/units" 2>/dev/null; exit 0 ;; '
                      'show) cat -- "$REC/user-${!#}" 2>/dev/null; exit 0 ;; '
                      'stop) printf "%s\\n" "$*" >> "$REC/stopped" ;; '
-                     'set-property) printf "%s\\n" "$*" >> "$REC/set-property" ;; *) exit 2 ;; esac\n',
+                     'set-property) printf "%s\\n" "$*" >> "$REC/set-property"; [[ ! -e $REC/set-property-fails ]] ;; '
+                     '*) exit 2 ;; esac\n',
         'chown': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/chown"\n',
         # Processes of a runner user: a file $REC/procs-UID; setpriv's kill(-1) ends them unless procs-stay exists.
         'pgrep': '#!/usr/bin/env bash\n[[ $1 == -u ]] || exit 3\nprintf "%s\\n" "$2" >> "$REC/pgrep"\n'
@@ -1498,10 +1506,10 @@ class Launcher(unittest.TestCase):
         and the walls (no AF_VSOCK, io_uring or 32-bit system calls)."""
         props = (f'NetworkNamespacePath=/run/netns/fork-fleet-{user}', f'IPAddressDeny={self.PRIVATE4} {self.OWN} ::/0',
                  'IPAddressAllow=localhost', f'RootDirectory={root}', 'MountAPIVFS=yes', 'MountFlags=private',
-                 'BindReadOnlyPaths=' + ' '.join(f'{p}:{p}:norbind' for p in self.allowed()),
+                 'BindReadOnlyPaths=' + ' '.join(f'{os.path.realpath(p)}:{p}:norbind' for p in self.allowed()),
                  *([f'BindPaths={rw}:{rw}:norbind'] if rw else []),
                  'TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777',
-                 f'BindReadOnlyPaths={self.path("resolv.conf")}:{os.path.realpath("/etc/resolv.conf")}',
+                 f'BindReadOnlyPaths={os.path.realpath(self.path("resolv.conf"))}:{os.path.realpath("/etc/resolv.conf")}',
                  'NoNewPrivileges=yes', 'ProtectSystem=strict', 'ProtectHome=yes', 'ProtectProc=invisible',
                  'PrivateIPC=yes', 'RemoveIPC=yes', 'PrivateDevices=yes', *self.WALL_PROPS)
         return [a for prop in props for a in ('-p', prop)]
@@ -1514,6 +1522,15 @@ class Launcher(unittest.TestCase):
     def seen(self, rw=''):
         """The mount points check-net's probe is told to allow."""
         return ' '.join(['/', *self.allowed(), *([rw] if rw else []), os.path.realpath('/etc/resolv.conf')])
+
+    def sources(self):
+        """Where check-net's probe is told each bound point comes from: POINT=DEVICE:INODE of the real path job_fs
+        checked and bound."""
+        def of(p):
+            st = os.stat(p)
+            return f'{st.st_dev}:{st.st_ino}'
+        return ' '.join([*(f'{p}={of(p)}' for p in self.allowed()),
+                         f'{os.path.realpath("/etc/resolv.conf")}={of(self.path("resolv.conf"))}'])
 
     def test_start(self):
         got = self.launch('start', self.NAME, stdin=self.INPUT)
@@ -1611,7 +1628,8 @@ class Launcher(unittest.TestCase):
         self.assertIn('MountFlags=private', props)
         binds = [x.split(':')[0] for p in props if p.startswith(('BindReadOnlyPaths=', 'BindPaths='))
                  for x in p.split('=', 1)[1].split()]
-        self.assertEqual(sorted(binds), sorted([*self.allowed([extra]), dest, self.path('resolv.conf')]))
+        self.assertEqual(sorted(binds), sorted([*map(os.path.realpath, self.allowed([extra])), dest,
+                                                os.path.realpath(self.path('resolv.conf'))]))
         self.assertIn('TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 '
                       '/var/tmp:size=1G,mode=1777', props)
         links = {os.path.join('/', os.path.relpath(os.path.join(d, x), root)): os.readlink(os.path.join(d, x))
@@ -1627,7 +1645,8 @@ class Launcher(unittest.TestCase):
     def test_a_path_that_may_hold_data_is_never_allowed(self):
         """ALLOW_PATHS and the list itself: a plain absolute path, never one a job has its own of or that holds
         data of this host's; the list is root's only."""
-        for bad in ('/home/x', '/root', '/tmp/x', '/run/x', '/proc', '/a/../b', '/a/./b', 'usr', '/a:b', '/a b'):
+        for bad in ('/home/x', '/root', '/tmp/x', '/run/x', '/proc', '/mnt/x', '/media/x', '/srv/x', '/a/../b',
+                    '/a/./b', 'usr', '/a:b', '/a b'):
             with self.subTest(bad):
                 self.conf(ALLOW_PATHS=bad)
                 got = self.launch('start', self.NAME, stdin=self.INPUT)
@@ -1640,6 +1659,141 @@ class Launcher(unittest.TestCase):
         with open(self.job_paths, 'a') as f:
             f.write('/home\n')
         self.refused('a job never sees it from this host')
+
+    def test_a_link_above_a_path_is_followed_before_any_check(self):
+        """Fix round 2 (#191 security re-check R1, #194 both lenses' major): a symlink in a folder above a path
+        (systemd follows it in a bind's source) never leads a job past the checks. Each path, of the list, ALLOW_PATHS,
+        the hook, resolv.conf and WORK_ROOT, is resolved to its real path first: that is checked and that is bound."""
+        if not os.path.islink('/var/run') or not os.path.isdir('/var/run/lock'):
+            self.skipTest('no /var/run -> /run link here')
+        self.conf(ALLOW_PATHS='/var/run/lock')   # it leads to /run/lock: the host's own /run
+        self.refused('(that is /run/lock): a job never sees it')
+        self.conf()
+        with open(self.job_paths, 'a') as f:
+            f.write('/var/run/lock\n')
+        self.refused('(that is /run/lock): a job never sees it')
+
+    def test_each_bind_comes_from_the_real_path(self):
+        """The hook, resolv.conf and WORK_ROOT reached through a linked folder are bound from where they really are
+        (the source the probe and the per-OS walls check), never through the link."""
+        for d in ('real/hook', 'real/resolv', 'real/work'):
+            os.makedirs(self.path(d))
+        for link, to in (('hl', 'real/hook'), ('rl', 'real/resolv'), ('wl', 'real/work')):
+            os.symlink(self.path(to), self.path(link))
+        hook = self.write('real/hook/hook.sh', '#!/bin/sh\n', 0o755)
+        resolv = self.write('real/resolv/resolv.conf', 'nameserver 1.1.1.1\n', 0o644)
+        self.conf(HOOK=self.path('hl/hook.sh'), RESOLV_CONF=self.path('rl/resolv.conf'),
+                  WORK_ROOT=self.path('wl/runners'))
+        self.start(self.NAME)
+        args = self.rec_text('systemd-run').splitlines()
+        binds = [x for i, a in enumerate(args) if a == '-p' and args[i + 1].startswith(('BindReadOnlyPaths=',
+                 'BindPaths=')) for x in args[i + 1].split('=', 1)[1].split()]
+        self.assertIn(f'{hook}:{self.path("hl/hook.sh")}:norbind', binds)
+        self.assertIn(f'{resolv}:{os.path.realpath("/etc/resolv.conf")}', binds)
+        work = self.path(f'real/work/runners/{self.NAME}')
+        self.assertIn(f'{work}:{work}:norbind', binds)
+        self.assertTrue(os.path.isdir(work))
+        self.assertFalse([b for b in binds if '/hl/' in b.split(':')[0] or '/rl/' in b or '/wl/' in b])
+
+    def test_a_folder_others_may_swap_a_link_into_is_refused(self):
+        """The race: once the path has no link, swapping one in between the check and the bind takes write access to
+        a folder above it. A folder others may write that is not sticky (like /tmp is) lets anyone: refused."""
+        os.mkdir(self.path('open'))
+        os.chmod(self.path('open'), 0o777)
+        hook = self.write('open/hook.sh', '#!/bin/sh\n', 0o755)
+        self.conf(HOOK=hook)
+        self.refused('which others may write')
+        os.chmod(self.path('open'), 0o1777)   # sticky: only the owner may rename or remove what is in it
+        self.start(self.NAME)
+
+    def walls_root(self, conf, files=(), links=(), dirs=()):
+        """A fake machine for `paths` (FORK_FLEET_WALLS_ROOT): its launch.conf, files, folders and links (relative,
+        so they resolve inside it, as on the machine)."""
+        root = self.path('machine')
+        os.makedirs(root + '/etc/fork-fleet')
+        for d in dirs:
+            os.makedirs(root + d, exist_ok=True)
+        for f, text in (*files, ('/etc/fork-fleet/launch.conf', conf)):
+            os.makedirs(os.path.dirname(root + f), exist_ok=True)
+            with open(root + f, 'w') as fh:
+                fh.write(text)
+            os.chmod(root + f, 0o644)
+        for link, to in links:
+            os.makedirs(os.path.dirname(root + link), exist_ok=True)
+            os.symlink(to, root + link)
+        return root
+
+    def paths(self, root, conf='/etc/fork-fleet/launch.conf'):
+        kit = self.path('kit')   # the launcher as installed: its list beside it, writable by its owner only
+        if not os.path.isdir(kit):
+            os.mkdir(kit)
+            for f in (LAUNCH, os.path.join(os.path.dirname(LAUNCH), 'fork-fleet-job-paths.txt')):
+                shutil.copy(f, kit)
+                os.chmod(os.path.join(kit, os.path.basename(f)), 0o644)
+        return subprocess.run(['bash', os.path.join(kit, os.path.basename(LAUNCH)), 'paths'], capture_output=True, text=True, timeout=60,
+                              env={'PATH': '/usr/bin:/bin', 'FORK_FLEET_WALLS_ROOT': root,
+                                   **({'FORK_FLEET_LAUNCH_CONF': conf} if conf else {})})
+
+    def test_paths_is_what_job_fs_binds_with_every_link_resolved(self):
+        """`paths` (read-only; what the per-OS walls check): each bound path and the real path it comes from, of
+        the list, the hook (and its two files), WORK_ROOT and resolv.conf, on a fake machine. A line of the list
+        through a link is bound from the real path; the lenses' cases are refused: a link to a Windows drive (/c),
+        to /home, to a share; a link out of the machine."""
+        conf = ('JOB_PATHS=/etc/fork-fleet/job-paths\nHOOK=/hl/hook.sh\nRESOLV_CONF=/rl/resolv.conf\n'
+                'WORK_ROOT=/var/lib/ff/runners\n')
+        root = self.walls_root(conf, files=(('/etc/fork-fleet/job-paths', '# list\n/usr\n/lib/x\n/bin\n'),
+                                            ('/opt/ff/hook.sh', ''), ('/opt/ff/fork-fleet.py', ''),
+                                            ('/run/r/resolv.conf', '')),
+                               dirs=('/usr/lib/x', '/srv/share', '/c/Users', '/home/u', '/data/s/x'),
+                               links=(('/lib', 'usr/lib'), ('/bin', 'usr/bin'), ('/hl', 'opt/ff'), ('/rl', 'run/r'),
+                                      ('/var/lib/ff', '../../srv/share'), ('/opt/win', '../c'),
+                                      ('/opt/h', '../home'), ('/usr/share/s', '../../data/s'), ('/opt/abs', '/')))
+        got = self.paths(root)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(got.stdout.splitlines(), [
+            '/usr /usr', '/lib/x /usr/lib/x', '/hl/hook.sh /opt/ff/hook.sh', '/hl/fork-fleet.py /opt/ff/fork-fleet.py',
+            '/srv/share/runners /srv/share/runners', '/etc/resolv.conf /run/r/resolv.conf'])
+        for allow, word in (('/opt/win/Users', '/opt/win/Users leads to /c/Users, which no line'),
+                            ('/opt/h/u', '/opt/h/u (that is /home/u): a job never sees it'),
+                            ('/usr/share/s/x', '/usr/share/s/x leads to /data/s/x, which no line'),
+                            ('/opt/abs/usr', 'leads out of FORK_FLEET_WALLS_ROOT'),
+                            ('/mnt/x', 'a job never sees it')):
+            with self.subTest(allow):
+                with open(root + '/etc/fork-fleet/launch.conf', 'w') as f:
+                    f.write(conf + f'ALLOW_PATHS={allow}\n')
+                got = self.paths(root)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn(word, got.stderr)
+                self.assertEqual(got.stdout, '')
+
+    def test_paths_reads_the_conf_the_launcher_would(self):
+        """Fix round 2 (#194 minor 2): one lookup of launch.conf, FORK_FLEET_LAUNCH_CONF's or the default; none at
+        all is the defaults (a host not set up yet). The test knob is for `paths` as a user only."""
+        root = self.walls_root('ALLOW_PATHS=/opt/tools\n', dirs=('/opt/tools', '/opt/other'),
+                               files=(('/etc/other.conf', 'ALLOW_PATHS=/opt/other\n'),))
+        self.assertIn('/opt/tools /opt/tools\n', self.paths(root).stdout)
+        got = self.paths(root, '/etc/other.conf')
+        self.assertIn('/opt/other /opt/other\n', got.stdout)
+        self.assertNotIn('/opt/tools', got.stdout)
+        os.remove(root + '/etc/fork-fleet/launch.conf')
+        got = self.paths(root)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn('/var/lib/fork-fleet/runners /var/lib/fork-fleet/runners\n', got.stdout)
+        self.assertIn('/etc/resolv.conf /etc/fork-fleet/resolv.conf\n', got.stdout)
+        os.chmod(root + '/etc/other.conf', 0o666)
+        self.assertIn('must be writable by its owner only', self.paths(root, '/etc/other.conf').stderr)
+        self.conf()
+        env = {**self.env(), 'FORK_FLEET_WALLS_ROOT': root}
+        for args in (('start', self.NAME), ('check-net', 'https://example.com/', '127.0.0.1:1'), ('prune',)):
+            with self.subTest(args):
+                got = subprocess.run(['bash', LAUNCH, *args], env=env, capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn("FORK_FLEET_WALLS_ROOT is set: it is for the walls' tests only", got.stderr)
+        self.assertIsNone(self.rec_text('systemd-run'))
+        with open(root + '/etc/fork-fleet/launch.conf', 'w') as f:
+            f.write('JOB_PATHS=job-paths\n')
+        os.chmod(root + '/etc/fork-fleet/launch.conf', 0o644)
+        self.assertIn('JOB_PATHS is a plain absolute path', self.paths(root).stderr)
 
     def test_a_configured_template_is_refused(self):
         for f in ('.env', '.path', '.runner', '.credentials', '.credentials_rsaparams'):
@@ -1977,6 +2131,30 @@ class Launcher(unittest.TestCase):
         self.assertEqual(self.rec_text('nft'), table)   # the last block stays
         self.assertIn('refresh-net', self.launch('nope').stderr)
 
+    def test_refresh_net_changes_nothing_for_a_reorder_and_retries_a_failed_unit(self):
+        """Fix round 2 (#191 correctness re-check nits 5 and 6): the same addresses in another order (flapping
+        lookups) re-apply nothing; a unit whose IPAddressDeny could not be changed is tried again next pass."""
+        self.start(self.NAME)
+        for x in 'ab':
+            self.write(f'rec/own-{x}', '203.0.113.77\n', 0o644)
+        self.write('rec/set-property-fails', '', 0o644)
+        got = self.launch('refresh-net')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn(f'IPAddressDeny not changed for {self.NAME}', got.stderr)
+        want = f'set-property --runtime -- fork-fleet-{self.NAME}.service IPAddressDeny=203.0.113.77 {self.OWN}\n'
+        self.assertEqual(self.rec_text('set-property'), want)
+        os.remove(self.path('rec/set-property-fails'))
+        self.assertEqual(self.launch('refresh-net').returncode, 0)   # the same addresses: tried again
+        self.assertEqual(self.rec_text('set-property'), want * 2)
+        self.assertEqual(self.launch('refresh-net').returncode, 0)   # done: nothing more
+        self.assertEqual(self.rec_text('set-property'), want * 2)
+        for x in 'ab':   # the old address first now: the same two, so nothing is applied again
+            self.write(f'rec/own-{x}', f'{self.OWN}\n', 0o644)
+        os.remove(os.path.join(self.rec, 'nft-args'))
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        self.assertEqual(self.rec_text('nft-args'), 'list table inet fork_fleet\n')
+        self.assertEqual(self.rec_text('set-property'), want * 2)
+
     def test_a_runner_user_in_another_group_is_refused(self):
         """A runner user also in, say, docker (root on the host) or adm (the logs) is never handed a job."""
         gid = pwd.getpwnam('daemon').pw_gid
@@ -2064,7 +2242,7 @@ class Launcher(unittest.TestCase):
                                        '--uid', 'nobody', *self.sandbox('nobody', self.path('run/check-net.root')),
                                        '-p', 'RuntimeMaxSec=60'])
         self.assertEqual(args[dash + 1:dash + 4], ['/usr/bin/python3', '-I', '-c'])
-        self.assertEqual(args[dash + 5:], ['job', self.seen()])
+        self.assertEqual(args[dash + 5:], ['job', self.seen(), self.sources()])
         self.assertEqual(self.rec_text('ip').splitlines(), self.ip_calls('nobody', self.NOBODY_NET))
         self.write('rec/probe-exit', '1', 0o644)
         got = self.check_net(f'127.0.0.1:{port}')
@@ -2079,6 +2257,12 @@ class Launcher(unittest.TestCase):
         """The probes themselves, run here outside any namespace or filter: the service this host reaches is
         reachable, its own address is not refused by a wall, io_uring gives a ring, so they fail."""
         port = self.server()
+        if os.path.isdir('/dev/shm'):   # a socket where a desktop keeps them (WSLg's): the probe must name it
+            shm = tempfile.mkdtemp(dir='/dev/shm', prefix='fork-fleet-test-')
+            self.addCleanup(shutil.rmtree, shm, True)
+            sock = socket.socket(socket.AF_UNIX)
+            sock.bind(os.path.join(shm, 's'))
+            sock.close()
         self.write('rec/own-a', '127.0.0.2\n', 0o644)   # the lookup refuses it; only its probe's own check is wanted
         got = self.check_net(f'127.0.0.1:{port}', url=f'http://127.0.0.1:{port}/')
         self.assertIn('not a public address', got.stderr)
@@ -2101,6 +2285,29 @@ class Launcher(unittest.TestCase):
             self.assertIn('FAIL  mounts: not allowed inside:', got.stdout)
         if any(t.startswith(('shared:', 'master:')) for f in info for t in f[6:f.index('-')]):
             self.assertIn("FAIL  later mounts: the host's reach", got.stdout)
+        # Fix round 2 (#191 correctness re-check minor 1): the PC proof's evidence for WSL's drives and WSLg's sockets.
+        if any(os.listdir(d) for d in ('/mnt', '/media') if os.path.isdir(d)):
+            self.assertIn('FAIL  /mnt and /media: hold ', got.stdout)
+        if os.path.isdir('/dev/shm'):
+            self.assertIn('FAIL  sockets: ', got.stdout)   # LauncherAsRoot names them, in a mount namespace
+        # Each bound point is the very file or folder job_fs checked (seen from outside, by device and inode): here
+        # they are, and a point whose source is another one (a link swapped in before the bind) fails.
+        # Here, outside the unit, only resolv.conf is another file (the host's, not the jobs').
+        resolv = os.path.realpath('/etc/resolv.conf')
+        self.assertIn(f'FAIL  mount sources: not what job_fs checked: {resolv}\n', got.stdout)
+        args = self.waited('fork-fleet-check-walls')
+        code, job, seen, sources = args[args.index('--') + 4:]
+        sources = ' '.join(x for x in sources.split() if not x.startswith(resolv + '='))
+
+        def probe(sources):
+            return subprocess.run(['python3', '-I', '-c', code, job, seen, sources], capture_output=True, text=True,
+                                  timeout=60).stdout
+        self.assertIn('ok    mount sources: each the host path job_fs checked\n', probe(sources))
+        usr = os.stat('/usr')
+        swapped = sources.replace(f'/usr={usr.st_dev}:{usr.st_ino}', f'/usr={usr.st_dev}:{usr.st_ino + 1}')
+        self.assertNotEqual(swapped, sources)
+        self.assertIn('FAIL  mount sources: not what job_fs checked: /usr\n', probe(swapped))
+        self.assertIn('FAIL  mount sources: none given\n', probe(''))
 
     def test_the_walls_hold_in_a_real_systemd_unit(self):
         """The walls' probe in a real unit of this user's systemd, with the walls check-net gives it: AF_VSOCK,
@@ -2149,7 +2356,8 @@ def real_walls(test, args, systemd_run, *more, full=False):
         test.assertNotIn('FAIL', got.stdout)
         for want in ('ok    devices: only the pseudo ones', 'ok    mounts: only the allowed ones',
                      "ok    later mounts: no mount inside receives the host's", 'ok    /mnt and /media: nothing inside',
-                     'ok    sockets: none in /tmp, /var/tmp, /run, /dev/shm'):
+                     'ok    sockets: none in /tmp, /var/tmp, /run, /dev/shm',
+                     'ok    mount sources: each the host path job_fs checked'):
             test.assertIn(want, got.stdout)
         tools = [t for t in (['git', '--version'], ['node', '--version'], ['java', '-version'], ['docker', '--version'])
                  if shutil.which(t[0]) and os.path.realpath(shutil.which(t[0])).startswith(('/usr/', '/etc/'))]
@@ -2434,6 +2642,26 @@ class LauncherAsRoot(unittest.TestCase):
             if got.returncode:
                 failed.append(f'round {round_}: {got.stderr.strip()}')
         self.assertEqual(failed, [])
+
+    def test_check_nets_probe_names_drives_and_sockets(self):
+        """Fix round 2 (#191 correctness re-check minor 1): the probe's evidence for WSL's drives (/mnt/c) and WSLg's
+        sockets, in a mount namespace of its own (empty memory file systems on the places it looks): an entry in /mnt
+        and a socket in /run fail by name; without them both lines say ok."""
+        script = ('for d in /tmp /var/tmp /run /dev/shm /mnt /media; do mount -t tmpfs fork-fleet-test "$d" || exit 9; '
+                  'done; [ "$1" = clean ] || { : > /mnt/drive; /usr/bin/python3 -c "import socket; '
+                  'socket.socket(socket.AF_UNIX).bind(\'/run/s\')"; }; exec /usr/bin/python3 -I -c "$0" job / ""')
+
+        def probe(mode):
+            got = subprocess.run(['unshare', '-m', '--propagation', 'private', 'sh', '-c', script, walls_probe(), mode],
+                                 capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(got.returncode, 9, got.stderr)
+            return got.stdout
+        out = probe('dirty')
+        self.assertIn('FAIL  /mnt and /media: hold /mnt/drive inside\n', out)
+        self.assertIn('FAIL  sockets: /run/s inside\n', out)
+        out = probe('clean')
+        self.assertIn('ok    /mnt and /media: nothing inside\n', out)
+        self.assertIn('ok    sockets: none in /tmp, /var/tmp, /run, /dev/shm\n', out)
 
     def test_check_net_proves_a_runners_network(self):
         """check-net with real namespaces and the real nft table (CI installs nftables): from inside a runner's
