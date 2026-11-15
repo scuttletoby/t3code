@@ -4,6 +4,7 @@
  * settle rule's "seen" head is kept in memory only: after a restart it takes two fresh reads.
  */
 import type { PullRequestRef } from "@t3tools/contracts";
+import { WaitPrSpec } from "@t3tools/contracts/waitFor";
 import { type Judgement, judgePrChecks, type PrSeen } from "@t3tools/shared/waitFor";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as Effect from "effect/Effect";
@@ -92,6 +93,8 @@ function failedRead(
   return transient(clip(`Pull request ${name} could not be read: ${error.detail}`));
 }
 
+const isPrSpec = Schema.is(WaitPrSpec);
+
 export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
   const settingsService = yield* ServerSettingsService;
   const projects = yield* ProjectService.ProjectService;
@@ -119,14 +122,29 @@ export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
     // `git remote`), as T3's pull request service does, so "not looked up yet" never reads as
     // "no remote".
     const shell = project.value.value;
-    const identity =
+    let identity =
       shell.repositoryIdentity ?? (yield* enrichment.readRepositoryIdentity(shell.workspaceRoot));
+    // A cached "none" may be a `git remote` lookup that timed out, kept for a minute: a
+    // new wait looks again past that cache before it is refused. A stored wait only retries.
+    if (identity === null && registering) {
+      yield* enrichment.refreshRepositoryIdentity(shell.workspaceRoot);
+      identity = yield* enrichment.readRepositoryIdentity(shell.workspaceRoot);
+    }
     if (identity === null) return remoteProblem(NO_REMOTE, registering);
     const withRemote = { ...shell, repositoryIdentity: identity };
     const repository = spec.repository ?? sourceControlDefinitions.repositorySelector(identity);
     if (repository === null) return remoteProblem(NO_REPOSITORY, registering);
+    // A wait keeps the host and repository of its first read: a later remote change (a
+    // fork's remote flipped to upstream) must not end it from another pull request's number.
     const target = yield* Effect.result(
-      resolveTarget({ repository, number: spec.number }, withRemote),
+      resolveTarget(
+        {
+          repository,
+          number: spec.number,
+          ...(spec.host === undefined ? {} : { host: spec.host }),
+        },
+        withRemote,
+      ),
     );
     if (Result.isFailure(target)) return targetProblem(target.failure, registering);
     const ref: PullRequestRef = {
@@ -136,6 +154,16 @@ export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
       number: target.success.number,
       allowStale: false,
     };
+    const pinnedSpec = {
+      ...spec,
+      repository: target.success.repository,
+      host: target.success.host,
+    };
+    // Pinned only when it fits the stored format: a remote name too long to store stays
+    // unpinned (read as before) instead of making the stored wait unreadable after a restart.
+    if (spec.host === undefined && context.pin !== undefined && isPrSpec(pinnedSpec)) {
+      yield* context.pin({ kind: "pr", spec: pinnedSpec });
+    }
     const name = `${ref.repository}#${ref.number}`;
     const result = yield* Effect.result(read(ref, spec.until === "checks"));
     if (Result.isFailure(result)) return failedRead(result.failure, name, registering);
