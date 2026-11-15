@@ -424,12 +424,14 @@ class EveryWallsFile(Case):
         def a_link(): os.rename(allow, allow + '.real'); os.symlink(allow + '.real', allow)
         def lists_home(): write(allow, '/usr\n/home\n')
         def lists_dots(): write(allow, '/usr/../home\n')
-        for change in (gone, open_list, a_link, lists_home, lists_dots):
+        def none(): pass   # in place: a desktop with shares and data disks mounted outside the list holds
+        for change in (none, gone, open_list, a_link, lists_home, lists_dots):
             with self.subTest(change.__name__):
                 self.folder = os.path.join(os.path.dirname(self.install()), 'fork-fleet-walls')
                 allow = os.path.join(os.path.dirname(self.folder), JOB_PATHS)
                 change()
-                self.assertIn('mounts', self.walls('linux', 'check', self.root(LINUX))[1])
+                fails = self.walls('linux', 'check', self.root(LINUX))[1]
+                (self.assertNotIn if change is none else self.assertIn)('mounts', fails)
 
     def test_linux_mounts_reads_what_the_launcher_reads(self):   # its defaults and the allow list's place
         launcher = slurp(LAUNCHER)
