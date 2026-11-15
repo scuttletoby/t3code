@@ -44,8 +44,16 @@ for u in "${users[@]}"; do [[ ! -e /run/netns/fork-fleet-$u ]] || die "namespace
 
 # Docker's rules this proof owns (cleanup deletes them): only those missing now, which the launcher adds. A rule there
 # already is never deleted; a check that gives no answer (exit 4: the xtables lock) stops the proof before it starts.
+# The first one too: 0 is Docker's chain, 1 (or no iptables at all) no Docker; any other exit is no answer, not
+# "no Docker" (the launcher could then add the rules, and the proof would not own them).
 docker=() made=() failed=() tmp='' listener='' forward=$(</proc/sys/net/ipv4/ip_forward)
-if iptables -w 60 -S DOCKER-USER >/dev/null 2>&1; then
+rc=1
+! command -v iptables >/dev/null 2>&1 || { rc=0; iptables -w 60 -S DOCKER-USER >/dev/null 2>&1 || rc=$?; }
+case $rc in
+  0 | 1) ;;
+  *) die "iptables -S DOCKER-USER gave no answer (exit $rc): run the proof again" ;;
+esac
+if ((rc == 0)); then
   for r in "-o ffh-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "-i ffh-+ -j ACCEPT"; do
     rc=0
     # shellcheck disable=SC2086 # $r is split into iptables' arguments on purpose

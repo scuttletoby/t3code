@@ -61,7 +61,8 @@
 # URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
 # empty for none) have defaults below.
 # HOOK (and the two files beside it), WORK_ROOT and RESOLV_CONF are bound into every job too: never under a folder that
-# holds data (/home, /root, /mnt, /media, /srv), also through a symlink (no_data).
+# holds data (/home, /root, /mnt, /media, /srv), also through a symlink (no_data). A bind mount of a data folder at
+# one of them is not seen (it has no link to resolve): that is the operator's to avoid (.github/fork-fleet.md, step 4).
 # FORK_FLEET_WALLS_ROOT: the walls' test knob (fork-fleet-walls.py), `paths` only and never as root: a fake machine
 # whose launch.conf and paths it reads.
 set -euo pipefail
@@ -74,6 +75,11 @@ shown() {
   local LC_ALL=C s=$1
   s=${s//[^ -~]/?}
   printf '%s' "${s:0:2000}"
+}
+# A probe's lines (check-net's: host file, socket and mount names, a job's view of them) through the same shown().
+shown_lines() {
+  local l
+  while IFS= read -r l || [[ -n $l ]]; do printf '%s\n' "$(shown "$l")"; done
 }
 warn() { printf 'fork-fleet-launch: %s\n' "$(shown "$*")" >&2; }
 die() {
@@ -1022,7 +1028,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv bad own blocked seen from f
+  local name=$1 dir env_file line key value user resolv bad own blocked seen from f real
   local -a props
   local -A got=()
   name_ok "$name"
@@ -1050,6 +1056,10 @@ start() {
     "setuid, setgid or sticky one: $bad"
   owned_safe "$HOOK"
   # The two files the hook runs: every job sees them (job_view), so no runner user may change them for the next one.
+  # Its folder too (where it really is): they are checked here but bound later (job_view binds them if they exist
+  # then), so no one else may make one there in between (a shared folder such as /var/tmp, sticky or not, is refused).
+  real=$(real_path "$HOOK")
+  owned_safe "${real%/*}"
   for f in "${HOOK%/*}/fork-fleet.py" "${HOOK%/*}/fork-fleet.json"; do [[ ! -e $f && ! -L $f ]] || owned_safe "$f"; done
   template_version >/dev/null
   check_users
@@ -1304,13 +1314,15 @@ check_net() {
   merge_own "$own"
   net_up "$user"
   sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/check-net.root" ''
-  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from"
+  # Every probe's words (the names of files any local user may make among them) reach the terminal through shown().
+  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from" 2>&1 | shown_lines
   echo "check-net: as $user, in its namespace fork-fleet-$user"
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-net --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null ||
-    rc=$?
+    -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null 2>&1 |
+    shown_lines || rc=$?
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-walls --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" </dev/null || rc=$((rc | 2))
+    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" </dev/null 2>&1 |
+    shown_lines || rc=$((rc | 2))
   ((rc == 0)) || die "check-net: the runners' network or walls are NOT as they must be (see above): do not use this pool"
   echo "check-net: the runners reach $url and none of the $((${#pairs[@]} / 2)) services named nor this host's own" \
     "public address; AF_VSOCK, io_uring and 32-bit system calls are closed; no host device, socket or mount but the" \

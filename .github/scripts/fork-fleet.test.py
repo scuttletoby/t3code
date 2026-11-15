@@ -43,6 +43,24 @@ GIT_ENV = {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFI
            'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
 
 
+def data_roots():
+    """The folders that hold data, as the launcher's no_data has them (one source): it refuses a bound path there."""
+    with open(LAUNCH) as f:
+        body = f.read().split('\nno_data() {\n', 1)[1].split('\n}\n', 1)[0]
+    roots = re.findall(r'(/[a-z]+)/\*', body.split(')', 1)[0])
+    assert '/home' in roots, body
+    return roots
+
+
+def launcher_tmp():
+    """A temp folder for the launcher's tests, which bind it (WORK_ROOT, HOOK, RESOLV_CONF): never under a folder that
+    holds data, which the launcher refuses, even when TMPDIR is one (a local run with TMPDIR under /home)."""
+    base = os.path.realpath(tempfile.gettempdir())
+    if any(base == r or base.startswith(r + '/') for r in data_roots()):
+        base = next(d for d in ('/tmp', '/var/tmp') if os.path.isdir(d) and os.access(d, os.W_OK | os.X_OK))
+    return tempfile.mkdtemp(dir=base)
+
+
 def fake_ls_remote(argv, **kw):
     """`git ls-remote --exit-code <repo> <ref>` of this repository: SYNCED's tag exists, UNKNOWN's read fails."""
     code = 0 if argv[-1].endswith(SYNCED) else 128 if argv[-1].endswith(UNKNOWN) else 2
@@ -1393,10 +1411,12 @@ class Launcher(unittest.TestCase):
                        'printf "%s\\0" "$@" > "$REC/systemd-run.0"\n'
                        'for a in "$@"; do case $a in EnvironmentFile=*) f=${a#EnvironmentFile=}; '
                        'cp -- "$f" "$REC/env"; stat -c %a -- "$f" > "$REC/env-mode" ;; esac; done\n'
-                       # check-net's probe (--wait): exits $REC/probe-exit when that file exists, else runs here.
+                       # check-net's probe (--wait): prints $REC/probe-out and exits $REC/probe-exit when that file
+                       # exists, else runs here.
                        'if [[ " $* " == *" --wait "* ]]; then a=("$@"); for i in "${!a[@]}"; do '
                        '[[ ${a[i]} != --unit ]] || cp -- "$REC/systemd-run.0" "$REC/${a[i+1]}.0"; done; '
-                       '[[ ! -e $REC/probe-exit ]] || exit "$(cat "$REC/probe-exit")"; '
+                       '[[ ! -e $REC/probe-exit ]] || { cat -- "$REC/probe-out" 2>/dev/null; '
+                       'exit "$(cat "$REC/probe-exit")"; }; '
                        'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"; fi\n'
                        'code=$(cat "$REC/systemd-run-exit" 2>/dev/null || echo 0)\n'
                        'if [[ $code == 0 ]]; then while (($#)); do case $1 in --unit) unit=$2 ;; --uid) user=$2 ;; '
@@ -1456,7 +1476,7 @@ class Launcher(unittest.TestCase):
             if subprocess.run(['id', '-G', user], capture_output=True, text=True).stdout.split() != \
                     [str(pwd.getpwnam(user).pw_gid)]:
                 self.skipTest(f'{user} is in other groups here')
-        self.d = tempfile.mkdtemp()
+        self.d = launcher_tmp()
         self.addCleanup(shutil.rmtree, self.d, True)
         self.rec = self.path('rec')
         os.mkdir(self.rec)
@@ -1697,6 +1717,7 @@ class Launcher(unittest.TestCase):
             os.makedirs(self.path(d))
         for link, to in (('hl', 'real/hook'), ('rl', 'real/resolv'), ('wl', 'real/work')):
             os.symlink(self.path(to), self.path(link))
+        os.chmod(self.path('real/hook'), 0o755)   # the hook's folder: its owner's alone (#208 N1)
         hook = self.write('real/hook/hook.sh', '#!/bin/sh\n', 0o755)
         resolv = self.write('real/resolv/resolv.conf', 'nameserver 1.1.1.1\n', 0o644)
         self.conf(HOOK=self.path('hl/hook.sh'), RESOLV_CONF=self.path('rl/resolv.conf'),
@@ -1721,6 +1742,11 @@ class Launcher(unittest.TestCase):
         self.conf(HOOK=hook)
         self.refused('which others may write')
         os.chmod(self.path('open'), 0o1777)   # sticky: only the owner may rename or remove what is in it
+        # Fix round 4 (#208 N1): but the hook's own folder must be its owner's alone (anyone may add a file beside it
+        # in a sticky one), so the hook goes one folder down; the sticky folder above it passes.
+        self.refused(f'{self.path("open")} must be writable by its owner only')
+        os.mkdir(self.path('open/own'), 0o755)
+        self.conf(HOOK=self.write('open/own/hook.sh', '#!/bin/sh\n', 0o755))
         self.start(self.NAME)
 
     def walls_root(self, conf, files=(), links=(), dirs=()):
@@ -1821,6 +1847,19 @@ class Launcher(unittest.TestCase):
                 self.write(f, '', 0o666)
                 self.refused(f'{f} must be writable by its owner only')
                 os.chmod(self.path(f), 0o644)
+        self.start(self.NAME)
+
+    def test_start_refuses_a_hook_folder_others_may_write(self):
+        """Fix round 4 (#208 security N1): the two files beside the hook are checked by start but bound later (if they
+        exist then), so the hook's folder must be writable by its owner only: in a shared folder (sticky, as /var/tmp
+        is, or not) another user could make fork-fleet.py there in between, and every job would run it."""
+        for mode, why in ((0o1777, f'{self.d} must be writable by its owner only'),
+                          (0o775, f'{self.d} must be writable by its owner only'),
+                          (0o777, f'under {self.d}, which others may write')):   # real_path's rule, first
+            with self.subTest(oct(mode)):
+                os.chmod(self.d, mode)
+                self.refused(why)
+        os.chmod(self.d, 0o755)
         self.start(self.NAME)
 
     def test_paths_reads_the_conf_the_launcher_would(self):
@@ -2267,6 +2306,50 @@ class Launcher(unittest.TestCase):
         got = self.launch('nope\x1b[2J')
         self.assertNotEqual(got.returncode, 0)
         self.assertNotIn('\x1b', got.stderr)
+
+    def test_check_nets_probe_lines_reach_the_terminal_as_printable_text(self):
+        """Fix round 4 (#208 security S1, correctness nit 2): check-net's walls probe names host files any local user
+        may make (a socket in /tmp or /dev/shm, a FUSE mount point) and the job's view of them: every probe line goes
+        through the launcher's own shown() (shown_lines), so ESC, BEL or a bidi mark never reach the terminal raw."""
+        evil = '\x1b]52;c;aWQK\x07\u202ex'
+        port = self.server()
+        # The job's side (both units' output, the fake systemd-run prints it).
+        self.write('rec/probe-exit', '0', 0o644)
+        self.write('rec/probe-out', f'ok    sockets: {evil}.sock inside\n', 0o644)
+        # The host's side: a socket with such a name where the host probe looks (it may not reach it on a host with
+        # a big /tmp: its budget; the probe itself is run below on a folder of its own).
+        if os.path.isdir('/dev/shm') and os.access('/dev/shm', os.W_OK):
+            shm = tempfile.mkdtemp(dir='/dev/shm', prefix='!fork-fleet-test-')
+            self.addCleanup(shutil.rmtree, shm, True)
+            sock = socket.socket(socket.AF_UNIX)
+            self.addCleanup(sock.close)
+            sock.bind(os.path.join(shm, evil + '.sock'))
+        got = self.check_net(f'127.0.0.1:{port}')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn('ok    sockets: ?]52;c;aWQK????x.sock inside\n', got.stdout)
+        self.assertIn('host: sockets: ', got.stdout)
+        for c in ('\x1b', '\x07', '\u202e'):
+            self.assertNotIn(c, got.stdout + got.stderr)
+        # The lens's case: the host probe on a folder holding that socket, through the launcher's shown_lines.
+        with open(LAUNCH) as f:
+            text = f.read()
+        funcs = ''.join(text[text.index(f'\n{name}() {{\n') + 1:].split('\n}\n', 1)[0] + '\n}\n'
+                        for name in ('shown', 'shown_lines'))
+        roots = "('/tmp', '/var/tmp', '/run', '/dev/shm')"
+        self.assertIn(roots, walls_probe())
+        d = launcher_tmp()
+        self.addCleanup(shutil.rmtree, d, True)
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        sock.bind(os.path.join(d, evil + '.sock'))
+        out = subprocess.run(['bash', '-c', funcs + '/usr/bin/python3 -I -c "$W" host "" "" 2>&1 | shown_lines'],
+                             env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C.UTF-8',
+                                  'W': walls_probe().replace(roots, repr((d,)))},
+                             capture_output=True, timeout=120).stdout
+        self.assertIn(b'host: sockets: ', out)
+        self.assertIn(b'?]52;c;aWQK????x.sock', out)
+        for c in (b'\x1b', b'\x07', '\u202e'.encode()):
+            self.assertNotIn(c, out)
 
     def test_every_lookups_address_stays_blocked_with_more_than_four_lookups(self):
         """Fix round 3 (#191 re-check nit): the last-4 limit never drops an address a lookup gives now: with five
@@ -2725,6 +2808,29 @@ class WallsProof(unittest.TestCase):
         self.assertEqual((got.returncode, got.stdout), (1, ''))
         self.assertIn('DIE iptables -C DOCKER-USER', got.stderr)
         self.assertIn('gave no answer (exit 4)', got.stderr)
+        os.remove(os.path.join(tmp, 'c-exit'))
+        # Fix round 4 (#208 correctness nit 3): the first check, whether Docker's chain is there, is held to the same
+        # rule: 0 there, 1 (or no iptables) no Docker, anything else no answer, which stops the proof (else the
+        # launcher could add the rules and the proof would not own them).
+        tmp2, env2 = self.fakes({'iptables': 'case " $* " in *" -S "*) exit "$(<"$T/s-exit")" ;; esac\n'
+                                             'grep -qxF -- "${*:5}" "$T/present"\n'})
+        open(os.path.join(tmp2, 'present'), 'w').close()
+        for s_exit, want_rc, owned in (('0', 0, rules), ('1', 0, []), ('4', 1, []), ('2', 1, [])):
+            with self.subTest(s_exit=s_exit):
+                with open(os.path.join(tmp2, 's-exit'), 'w') as f:
+                    f.write(s_exit + '\n')
+                got = subprocess.run(['bash', '-c', 'set -euo pipefail\ndie() { echo "DIE $*" >&2; exit 1; }\n' + code +
+                                      '\nprintf "%s\\n" "${docker[@]}"'], env=env2, capture_output=True, text=True,
+                                     timeout=30)
+                self.assertEqual(got.returncode, want_rc, got.stderr)
+                self.assertEqual([x for x in got.stdout.splitlines() if x], owned)
+                if want_rc:
+                    self.assertIn(f'DIE iptables -S DOCKER-USER gave no answer (exit {s_exit})', got.stderr)
+        os.remove(os.path.join(tmp2, 'bin', 'iptables'))   # no iptables at all: no Docker
+        got = subprocess.run([shutil.which('bash'), '-c', 'set -euo pipefail\ndie() { echo "DIE $*" >&2; exit 1; }\n' + code +
+                              '\nprintf "%s\\n" "${docker[@]}"'], env={**env2, 'PATH': os.path.join(tmp2, 'bin')},
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual((got.returncode, got.stdout.strip()), (0, ''), got.stderr)
 
     def test_each_block_alone_counts_only_when_its_target_answers_from_the_host(self):
         """Fix round 3 (#198 re-check nit): a listener that died makes every connection fail, so a "refused" from the
@@ -2811,7 +2917,7 @@ class LauncherAsRoot(unittest.TestCase):
             cls.addClassCleanup(subprocess.run, ['pkill', '-KILL', '-u', user], check=False)   # runs before userdel
 
     def setUp(self):
-        self.d = tempfile.mkdtemp()
+        self.d = launcher_tmp()
         self.addCleanup(shutil.rmtree, self.d, True)
         os.chmod(self.d, 0o711)   # the runner users pass through to their copies, as through /var/lib
         self.rec = self.path('rec')

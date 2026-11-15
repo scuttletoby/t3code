@@ -31,6 +31,14 @@
     "etc/profile.d/owner.sh": {
       "text": "export DEPLOY_TOKEN=only-root-reads-this\n",
       "mode": "600"
+    },
+    "etc/environment.d/10-locale.conf": "LANG=en_US.UTF-8\nPATH=${PATH}:/opt/tools/bin\n",
+    "etc/profile": "if [ \"$(id -u)\" -eq 0 ]; then PATH=\"/usr/sbin:/usr/bin\"; fi\nexport PATH\nexport https_proxy=http://proxy.example:3128\n",
+    "etc/bash.bashrc": "[ -z \"$PS1\" ] && return\nPS1='\\u@\\h:\\w\\$ '\nexport GH_TOKEN=\"${GH_TOKEN:-}\"\n",
+    "etc/systemd/system/backup.service": "[Service]\nEnvironment=\"LANG=C.UTF-8\" TZ=UTC\nEnvironmentFile=-/etc/default/backup\nExecStart=/usr/bin/backup\n",
+    "etc/default/backup": {
+      "text": "RESTIC_PASSWORD=only-root-reads-this\n",
+      "mode": "600"
     }
   },
   "fail": {
@@ -207,6 +215,24 @@
       },
       {
         "etc/profile.d/nas.csh": "setenv NAS_PASSWORD hunter2\n"
+      },
+      {
+        "etc/environment.d/50-ci.conf": "GH_PAT=not-a-real-token\n"
+      },
+      {
+        "etc/profile": "export EDITOR=vi DEPLOY_TOKEN=not-a-real-token\n"
+      },
+      {
+        "etc/bash.bashrc": "[ -n \"$DEPLOY_TOKEN\" ] || export DEPLOY_TOKEN=\"${DEPLOY_TOKEN:-not-a-real-token}\"\n"
+      },
+      {
+        "etc/environment": "https_proxy=http://me:hunter2@proxy.example:3128\n"
+      },
+      {
+        "etc/systemd/system/backup.service": "[Service]\nEnvironment=RESTIC_PASSWORD=hunter2\nExecStart=/usr/bin/backup\n"
+      },
+      {
+        "etc/default/backup": "RESTIC_PASSWORD=hunter2\n"
       }
     ]
   }
