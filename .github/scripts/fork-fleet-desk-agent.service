@@ -1,0 +1,24 @@
+# Fork only: the desk agent on a desktop (fork-fleet-desk-agent.py; .github/fork-fleet.md, "The desk link").
+# Install as /etc/systemd/system/fork-fleet-desk-agent.service, root-owned 0644. A system unit, as root: the launcher
+# and the walls it runs need root (namespaces, nft, transient units as the runner users).
+# No Environment= on purpose: the launcher reads /etc/fork-fleet/launch.conf and the walls the real machine, never a
+# variable (FORK_FLEET_LAUNCH_CONF and FORK_FLEET_WALLS_ROOT are test knobs; the agent passes neither to them).
+[Unit]
+Description=Fork fleet desk agent (the desktop's side of the desk link)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 -I /opt/fork-fleet/fork-fleet-desk-agent.py run
+# The agent dials again by itself; this is for a crash. Exit 2 (unusable settings or files): fix them, then start it.
+Restart=always
+RestartSec=30
+RestartPreventExitStatus=2
+# Stopping the unit (or a crash) ends every verb it was running: all of its processes go, children included.
+KillMode=control-group
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
