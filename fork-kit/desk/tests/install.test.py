@@ -492,6 +492,7 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.install()[0], 0)
         self.write(os.path.join(self.fakes, 'active'), 'desktop-1\n')
         self.write(self.path('/var/lib/fork-fleet/runners/x'), '')
+        self.write(os.path.join(self.fakes, 'netns'), 'fork-fleet-fork-runner-1\n')   # the namespaces that are there
         self.clear_calls()
         code, out, err = self.run_main('uninstall')
         self.assertEqual(code, 0, err)
@@ -559,16 +560,34 @@ class Desk(unittest.TestCase):
 
     def test_uninstall_removes_its_record_last(self):
         self.assertEqual(self.install()[0], 0)
-        gone, unlink = [], os.unlink
+        gone, unlink, scandir = [], os.unlink, os.scandir
 
         def record(path, *a, **kw):
             gone.append(os.path.basename(path))
             return unlink(path, *a, **kw)
-        os.unlink = record
+
+        class Sorted:
+            """Folders listed by name, so the record (desk-kit.json sorts before desk.conf and launch.conf) comes
+            first: a whole-folder removal would take it before the rest, whatever order the file system gives."""
+            def __init__(self, *a, **kw):
+                self.it = scandir(*a, **kw)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.it.close()
+
+            def __iter__(self):
+                return iter(sorted(self.it, key=lambda e: e.name))
+
+            def close(self):
+                self.it.close()
+        os.unlink, os.scandir = record, Sorted
         try:
             self.assertEqual(self.run_main('uninstall')[0], 0)
         finally:
-            os.unlink = unlink
+            os.unlink, os.scandir = unlink, scandir
         self.assertEqual(gone[-1], 'desk-kit.json', gone)
 
     def test_uninstall_refuses_a_record_of_another_shape(self):
