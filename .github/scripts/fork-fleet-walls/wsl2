@@ -1,0 +1,346 @@
+#!/usr/bin/python3 -I
+"""Fork only: the walls of a WSL2 distro, for fork-fleet-walls.py (its contract is there). A WSL2 distro is Linux to
+its kernel, so every wall of the linux file next to this one holds here too and is taken from it, not copied (its
+`os` aside): kernel, systemd, cgroup2, cgroup-bpf, namespaces, seccomp, container, mounts (what jobs see, as the
+launcher beside this folder says with `fork-fleet-launch.sh paths`: Windows' drives at /mnt/c or /c, WSL's shares at
+/mnt/wsl and /usr/lib/wsl are outside it, so no job sees them) and etc-secrets. A wall the linux file gains is a wall
+here too. The launcher is one file: the one the linux walls ask (`paths`) is the one whose sandbox() is read here, and
+it must be as safe as they want it. On top, what only WSL2 has:
+- interop: WSL runs Windows programs from the distro (a binfmt_misc handler run by /init), as the Windows user,
+  outside every Linux wall. It must be off now, and stay off: in /etc/wsl.conf, and masked for systemd-binfmt, which
+  registers WSL's handler again at boot. Any handler that runs Windows programs counts, whatever its name;
+- sockets: no socket to Windows in a job unit. WSL's interop server listens on unix sockets in /run/WSL, WSLg's X
+  server in /tmp/.X11-unix; a path socket is not kept apart by a network namespace, so job units must get a /run and
+  a /tmp of their own, and what the launcher shows jobs (`paths`) must hold none of them. And AF_VSOCK (Hyper-V
+  sockets, WSL2's channel to Windows, 9p's way to its drives) is not namespaced: the job units close it, and the two
+  ways around that filter (io_uring, other-arch system calls). Read in the launcher's sandbox(); check-net's probe
+  proves it in a real unit;
+- windows-path: WSL appends Windows' PATH to the distro's, so a tool finds Windows programs first;
+- userns: a job that can make a user namespace gets CAP_SYS_ADMIN and CAP_NET_ADMIN in it, the usual way into a
+  kernel bug, and a kernel bug here is root on the PC. Off for every user (user.max_user_namespaces=0), or for job
+  units (RestrictNamespaces in the launcher's sandbox());
+- resolv: WSL makes /etc/resolv.conf a link to /mnt/wsl/resolv.conf; the launcher binds the jobs' resolv.conf where
+  that link leads, so job units would get a /mnt. A file of the distro's own, and WSL told not to make the link again;
+- networking: mirrored mode puts Windows' localhost and the home network's interfaces into the distro; NAT only.
+WSL's update, a restart or an edited .wslconfig can turn each of them back on, so each is read before every start.
+Reads files and runs wslinfo and the launcher's read-only `paths` only; changes nothing. Standard library only."""
+import configparser, glob, os, re, stat, subprocess, sys, types
+
+sys.dont_write_bytecode = True   # the walls folder holds walls files and fixtures only
+ROOT = os.environ.get('FORK_FLEET_WALLS_ROOT', '')
+ME = os.path.realpath(__file__)
+WSL_CONF = '/etc/wsl.conf'
+BINFMT = '/proc/sys/fs/binfmt_misc'
+MASK = '/etc/binfmt.d/WSLInterop.conf'   # same name as WSL's /usr/lib/binfmt.d file: systemd-binfmt reads this one
+# What runs Windows programs: WSL's /init as a binfmt interpreter, a handler for MZ (PE) files, or for their names.
+WINDOWS_EXT = {'exe', 'com', 'bat', 'cmd', 'ps1', 'msi', 'lnk'}
+# The folders WSL keeps its sockets in, which a job unit must get its own (empty) copy of; no path jobs see (where in
+# the job, or where it comes from) may be in them, in /mnt, or WSL's interop server /init.
+OWN_DIRS = ('/run', '/tmp')
+WSL_ONLY = ('/init', '/run', '/tmp', '/mnt')
+SHUTDOWN = 'then wsl --shutdown from Windows'
+USERNS_OFF = (('/proc/sys/user/max_user_namespaces', '0'), ('/proc/sys/kernel/unprivileged_userns_clone', '0'))
+SYSCTL = '/etc/sysctl.d/90-fork-fleet.conf'
+RESOLV = '/etc/resolv.conf'
+NOT_RESOLV = ('/mnt', '/media', '/srv', '/home', '/root', '/usr/lib/wsl')   # never where the jobs' resolv.conf goes
+LINUX = None   # the linux walls file, as a module (load_linux; main loads it first)
+
+
+def read(path):
+    try:
+        with open(ROOT + path, encoding='utf-8', errors='replace') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def load_linux():
+    """The linux walls file next to this one, as a module. It runs as this one does, so it must be no more open: a
+    plain file of this file's owner that no one else may write unless they may write this one too. Checked on the
+    open file itself, and run from its source (never a cached .pyc beside it), so what is checked is what runs."""
+    path = os.path.join(os.path.dirname(ME), 'linux')
+    mine = os.stat(ME)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0))
+    with os.fdopen(fd, 'rb') as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != mine.st_uid or st.st_mode & 0o022 & ~mine.st_mode:
+            raise ValueError(f'{path} must be a plain file of uid {mine.st_uid}, no more writable than {ME}')
+        source = f.read()
+    module = types.ModuleType('fork_fleet_walls_linux')
+    module.__file__ = path
+    exec(compile(source, path, 'exec', dont_inherit=True), module.__dict__)
+    return module
+
+
+def os_wall():
+    release = read('/proc/sys/kernel/osrelease')
+    if read('/proc/sys/kernel/ostype') != 'Linux' or release is None:
+        return 'no Linux /proc/sys/kernel/ostype and osrelease'
+    if re.search(r'-Microsoft$', release):
+        return f'this is WSL1 ({release}): not supported (wsl --set-version <distro> 2)'
+    if ('microsoft' not in release.lower() and not any(glob.glob(glob.escape(ROOT) + m) for m in LINUX.WSL_MARKS)
+            and LINUX.WSL_CMDLINE not in (read('/proc/cmdline') or '')):
+        return f'not WSL ({release}): its walls are fork-fleet-walls/linux'
+    return None
+
+
+def systemd_wall():
+    why = LINUX.systemd_wall()
+    return why and f'{why} ([boot] systemd=true in {WSL_CONF}, {SHUTDOWN})'
+
+
+def wsl_conf(section, key):
+    """A value of /etc/wsl.conf, as WSL reads it: keys as written; a key given twice cannot be told (ValueError)."""
+    text = read(WSL_CONF)
+    if text is None:
+        raise ValueError(f'cannot read {WSL_CONF}')
+    cp = configparser.ConfigParser(interpolation=None, strict=True, inline_comment_prefixes=None)
+    cp.optionxform = str
+    try:
+        cp.read_string(text, WSL_CONF)
+    except configparser.Error as e:
+        raise ValueError(f'{WSL_CONF} cannot be read as WSL does: {str(e).splitlines()[0]}')
+    return cp.get(section, key, fallback='not set').strip().lower()
+
+
+def windows_handler(name, text):
+    """Why binfmt_misc handler name (its /proc text) runs Windows programs, or None. Enabled or not: root, or WSL
+    itself, can turn one on again."""
+    if name.startswith('WSLInterop'):
+        return name
+    if text is None:
+        return f'{name} (cannot read it)'
+    fields = dict(line.partition(' ')[::2] for line in text.splitlines())
+    interpreter, magic = fields.get('interpreter', '').strip(), fields.get('magic', '').strip().lower()
+    if interpreter == '/init' or interpreter.startswith('/mnt/') or re.search(r'wsl|\.exe$', interpreter, re.I):
+        return f'{name} (run by {interpreter})'
+    if magic.startswith('4d5a'):
+        return f'{name} (MZ files: Windows programs)'
+    if fields.get('extension', '').strip().lower().lstrip('.') in WINDOWS_EXT:
+        return f'{name} (.{fields["extension"].strip().lstrip(".")} files)'
+    return None
+
+
+def interop_wall():
+    bad = []
+    if not os.path.lexists(ROOT + BINFMT + '/status'):
+        bad.append(f'{BINFMT} is not mounted, so whether Windows programs run here cannot be told')
+    handlers = sorted(p for p in glob.glob(glob.escape(ROOT + BINFMT) + '/*')
+                      if os.path.basename(p) not in ('status', 'register'))
+    found = [why for p in handlers if (why := windows_handler(os.path.basename(p), read(p[len(ROOT):])))]
+    if found:
+        bad.append('Windows programs run here: ' + ', '.join(found))
+    value = wsl_conf('interop', 'enabled')
+    if value != 'false':
+        bad.append(f'{WSL_CONF}: [interop] enabled is {value}, not false ({SHUTDOWN})')
+    mask = ROOT + MASK
+    if not (os.path.islink(mask) and os.readlink(mask) == '/dev/null' or
+            not os.path.islink(mask) and os.path.isfile(mask) and os.path.getsize(mask) == 0):
+        bad.append(f'{MASK} is not empty or a link to /dev/null, so systemd-binfmt may register WSL\'s handler at boot '
+                   f'(ln -sf /dev/null {MASK})')
+    return '; '.join(bad) or None
+
+
+def path_wall():
+    value = wsl_conf('interop', 'appendWindowsPath')
+    return None if value == 'false' else f'{WSL_CONF}: [interop] appendWindowsPath is {value}, not false ({SHUTDOWN})'
+
+
+def networking_wall():
+    try:
+        p = subprocess.run([ROOT + '/usr/bin/wslinfo', '--networking-mode'], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=20, cwd='/')
+    except FileNotFoundError:
+        return 'no /usr/bin/wslinfo: this WSL is too old to tell (wsl --update)'
+    mode = p.stdout.decode('utf-8', 'replace').strip().lower() if p.returncode == 0 else ''
+    if mode != 'nat':
+        return (f'networking mode is {mode or f"unknown (wslinfo exit {p.returncode})"}, not nat '
+                f'(networkingMode=nat in .wslconfig, {SHUTDOWN})')
+    return None
+
+
+def sandbox_props(text):
+    """{property: [values, in order]} of the launcher's sandbox(): its `-p NAME=VALUE` words as bash reads them
+    (quotes anywhere in the word), comments left out."""
+    m = re.search(r'^sandbox\(\) \{\n(.*?)^\}', text or '', re.M | re.S)
+    if not m:
+        raise ValueError(f'the launcher has no sandbox() (the job units\' properties)')
+    props = {}
+    for line in m.group(1).splitlines():
+        for word in re.findall(r'(?:^|\s)-p\s+((?:"[^"]*"|\'[^\']*\'|[^\s"\'])+)', re.sub(r'(^|\s)#.*', '', line)):
+            name, _, value = re.sub(r'"([^"]*)"|\'([^\']*)\'', lambda q: q.group(1) or q.group(2) or '', word).partition('=')
+            props.setdefault(name, []).append(value)
+    return props
+
+
+def props_after_reset(values):
+    """The assignments of a property that count, as systemd reads them: an empty one drops all before it."""
+    values = values or []
+    last = max((i for i, v in enumerate(values) if not v.strip()), default=-1)
+    return values[last + 1:]
+
+
+def merged(values):
+    """The words a list property ends up with, as systemd merges it: every assignment adds its words."""
+    return [w for v in props_after_reset(values) for w in v.split()]
+
+
+def launcher_props():
+    """sandbox() of the launcher the linux walls ask what jobs see (LINUX.LAUNCHER, beside this folder: the one the
+    pool runs, also under FORK_FLEET_LAUNCH_CONF), checked as they check it, on the open file itself."""
+    path = LINUX.LAUNCHER
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))   # a FIFO: no wait
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
+            raise ValueError(f'{path} is not a plain file owned by uid {os.geteuid()} and writable by it alone')
+        with os.fdopen(fd, 'rb') as f:
+            fd = None
+            return sandbox_props(f.read().decode('utf-8', 'replace'))
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def vsock_wall():
+    """Part of the sockets wall: the job units close AF_VSOCK, and io_uring and other-arch calls, which pass that."""
+    props = launcher_props()
+    families = [v.split() for v in props.get('RestrictAddressFamilies', [])]
+    filters = [v.split() for v in props.get('SystemCallFilter', [])]
+    arches = merged(props.get('SystemCallArchitectures'))
+    bad = []
+    if not families or any(not f or not f[0].startswith('~') for f in families) or \
+            'AF_VSOCK' not in {w.lstrip('~') for f in families for w in f}:
+        bad.append('AF_VSOCK is not on a RestrictAddressFamilies=~ list of its own')
+    if not filters or any(not f or not f[0].startswith('~') for f in filters) or \
+            'io_uring_setup' not in {w.lstrip('~').split(':')[0] for f in filters for w in f}:
+        bad.append('io_uring_setup is not on a SystemCallFilter=~ list of its own (IORING_OP_SOCKET passes the first)')
+    if not arches or set(arches) != {'native'}:
+        bad.append(f'SystemCallArchitectures is {" ".join(arches) or "not set"}, not native alone (i386 or x32 calls '
+                   'pass the first)')
+    if bad:
+        return f'the launcher\'s job units ({LINUX.LAUNCHER}): ' + '; '.join(bad) + ' (the launcher walls, D1)'
+    return None
+
+
+def sockets_wall():
+    """No socket to Windows in a job unit. Job units get a /run and a /tmp of their own (TemporaryFileSystem), and
+    what the launcher shows them (`paths`, through the linux walls: the same view, asked once more) holds none of
+    those folders, /mnt nor /init, where it lands nor where it comes from: WSL's interop sockets (/run/WSL) and WSLg's
+    X socket (/tmp/.X11-unix) stay out. And AF_VSOCK is closed to them (vsock_wall)."""
+    own = {entry.split(':')[0].rstrip('/') or '/' for entry in merged(launcher_props().get('TemporaryFileSystem'))}
+    bad = [f'its job units see this host\'s {d} (no TemporaryFileSystem={d} in {LINUX.LAUNCHER} sandbox())'
+           for d in OWN_DIRS if d not in own]
+    shown = sorted({real for _, real in LINUX.job_view()   # the host path a job reaches, wherever it sits there
+                    if any(real == d or real.startswith(d + '/') for d in WSL_ONLY)})
+    if shown:
+        bad.append(f'the launcher\'s `paths` lets jobs see {", ".join(shown[:3])} (its launch.conf, ALLOW_PATHS or '
+                   'JOB_PATHS)')
+    if bad:
+        bad[-1] += ' (WSL\'s interop sockets are in /run/WSL)'
+    why = vsock_wall()
+    return '; '.join(bad + [why] if why else bad) or None
+
+
+def userns_wall():
+    """Jobs make no user namespace: the host allows none (a knob of USERNS_OFF), or the launcher's job units refuse
+    them (RestrictNamespaces, as systemd merges it: every assignment since the last empty one says so). AppArmor's
+    restriction does not count: it has known ways around it."""
+    if any(read(path) == off for path, off in USERNS_OFF):
+        return None
+    values = props_after_reset(launcher_props().get('RestrictNamespaces'))
+    words = [v.split() for v in values]
+    if values and (all(v.strip().lower() in ('yes', 'true', 'on', '1') for v in values)
+                   or all(w[0].startswith('~') and 'user' in [w[0][1:]] + w[1:] for w in words)
+                   or all(not w[0].startswith('~') and w[0].lower() not in ('no', 'false', 'off', '0')
+                          and 'user' not in w for w in words)):
+        return None
+    now = read(USERNS_OFF[0][0])
+    return (f'jobs can make user namespaces ({USERNS_OFF[0][0]} is {now or "not readable"}, no RestrictNamespaces '
+            f'that refuses user in {LINUX.LAUNCHER} sandbox()): echo user.max_user_namespaces=0 > {SYSCTL}; sysctl --system')
+
+
+def resolve(path):
+    """Where path leads under ROOT, every link followed (an absolute one from ROOT): a path, or ValueError."""
+    parts, out, hops = path.strip('/').split('/'), '', 0
+    while parts:
+        part = parts.pop(0)
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            out = out.rsplit('/', 1)[0]
+            continue
+        if os.path.islink(ROOT + out + '/' + part):
+            hops += 1
+            if hops > 40:
+                raise ValueError(f'{path} leads round in a loop of links')
+            target = os.readlink(ROOT + out + '/' + part)
+            out = '' if target.startswith('/') else out
+            parts = target.strip('/').split('/') + parts
+        else:
+            out += '/' + part
+    return out or '/'
+
+
+def resolv_wall():
+    bad = []
+    value = wsl_conf('network', 'generateResolvConf')
+    if value != 'false':
+        bad.append(f'{WSL_CONF}: [network] generateResolvConf is {value}, not false, so WSL makes {RESOLV} a link to '
+                   f'/mnt/wsl/resolv.conf at every start ({SHUTDOWN})')
+    target = resolve(RESOLV)
+    if any(target == d or target.startswith(d + '/') for d in NOT_RESOLV):
+        bad.append(f'{RESOLV} leads to {target}, so job units would get that folder (rm {RESOLV}, then write a file '
+                   'with this host\'s nameservers there)')
+    elif not os.path.isfile(ROOT + target):
+        bad.append(f'{RESOLV} leads to {target}, which is not a file')
+    return '; '.join(bad) or None
+
+
+OWN = [
+    ('interop', 'WSL interop is off and stays off: no Windows program runs from here', interop_wall),
+    ('sockets', 'job units reach no socket to Windows: their /run and /tmp are their own, AF_VSOCK is closed',
+     sockets_wall),
+    ('userns', 'jobs cannot make a user namespace (the way into kernel bugs)', userns_wall),
+    ('resolv', f'{RESOLV} is the distro\'s own file, not a link into /mnt that WSL makes', resolv_wall),
+    ('windows-path', 'Windows\' PATH is not appended to the distro\'s', path_wall),
+    ('networking', 'WSL networking mode is nat (not mirrored)', networking_wall),
+]
+
+
+def walls():
+    """Every wall: this file's os, each of the linux file's other walls as it has them, then WSL2's own."""
+    out = [('os', 'a WSL2 kernel (not WSL1, not plain Linux)', os_wall)]
+    for wall, what, test in LINUX.WALLS:
+        if wall != 'os':
+            out.append((wall, what, systemd_wall if wall == 'systemd' else test))
+    return out + OWN
+
+
+def main(argv):
+    global LINUX
+    if len(argv) != 1 or argv[0] not in ('check', 'describe'):
+        print('usage: wsl2 check | describe', file=sys.stderr)
+        return 2
+    try:   # without the linux walls this file cannot even name its walls: a broken install, not a FAIL list
+        LINUX = load_linux()
+        every = walls()
+    except Exception as e:
+        print(f'wsl2: cannot load the linux walls ({e.__class__.__name__}: {e})', file=sys.stderr)
+        return 2
+    failed = False
+    for wall, what, test in every:
+        try:
+            why = test()
+        except Exception as e:   # a wall that cannot be told does not hold
+            why = f'cannot tell ({e.__class__.__name__}: {e})'
+        failed |= why is not None
+        if why is not None:
+            print(f'FAIL  {wall}  ' + LINUX.text(f'{what}: {why}')[:400])
+        elif argv[0] == 'describe':
+            print(f'PASS  {wall}  {what}')
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
