@@ -4,6 +4,7 @@ pages (testdata/) and logs each call: no network.
 Run: python3 fork-ci/actions/ci-demand/ci_demand.test.py
 """
 import contextlib, copy, io, json, os, shutil, sys, tempfile, unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True   # leave no __pycache__ in the action folder
 
@@ -14,6 +15,8 @@ import ci_demand as M   # noqa: E402
 R = 'repos/acme/widgets/actions/runs'
 DAY1 = f'{R}?created=2026-11-01T00:00:00Z..2026-11-01T23:59:59Z&per_page=100&page=1'
 DAY2 = f'{R}?created=2026-11-02T00:00:00Z..2026-11-02T23:59:59Z&per_page=100&page=1'
+DAY4 = f'{R}?created=2026-11-04T00:00:00Z..2026-11-04T23:59:59Z&per_page=100&page=1'   # "today" at NOW
+J101, J201 = (f'{R}/{n}/jobs?filter=all&per_page=100&page=1' for n in (101, 201))
 NOW = 1793793600.0   # 2026-11-04T12:00:00Z
 with open(os.path.join(HERE, 'testdata', 'two-days.json')) as f:
     PAGES = json.load(f)['pages']
@@ -32,7 +35,7 @@ answers = routes.get(ep) or [{"status": 404, "body": {"message": "Not Found"}}]
 a = answers[min(calls, len(answers)) - 1]
 if 'raw' in a:
     sys.stdout.write(a['raw']); sys.stderr.write('connection refused\n'); sys.exit(1)
-h = {"X-Ratelimit-Remaining": "4000", "X-Ratelimit-Reset": "1793797200", **a.get('headers', {})}
+h = {"X-Ratelimit-Limit": "5000", "X-Ratelimit-Remaining": "4000", "X-Ratelimit-Reset": "1793797200", **a.get('headers', {})}
 body = a['body'] if isinstance(a['body'], str) else json.dumps(a['body'])
 sys.stdout.write(f"HTTP/2.0 {a['status']} X\r\n" + ''.join(f"{k}: {v}\r\n" for k, v in h.items()) + "\r\n" + body)
 sys.exit(0 if a['status'] == 200 else 1)
@@ -261,6 +264,105 @@ class State(Case):
         self.numbers()
         self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o700)
 
+    def test_cache_files_damaged_or_in_another_format_are_fetched_again(self):
+        self.assertEqual(self.numbers()[0], 0)
+        damage = {'date not a number': lambda d: d.update(saved='yesterday'), 'no date': lambda d: d.pop('saved'),
+                  'date in the future': lambda d: d.update(saved=NOW + 86400), 'body not an object': lambda d: d.update(body=[]),
+                  'older format (none)': lambda d: d.pop('v'), 'older format': lambda d: d.update(v=M.FORMAT - 1),
+                  'newer format': lambda d: d.update(v=M.FORMAT + 1)}
+        for what, change in damage.items():
+            for name in os.listdir(self.cache):
+                p = os.path.join(self.cache, name)
+                with open(p) as f:
+                    doc = json.load(f)
+                change(doc)
+                with open(p, 'w') as f:
+                    json.dump(doc, f)
+            code, doc = self.numbers()
+            self.assertEqual((code, doc['requests'], doc['cached']), (0, 6, 0), (what, self.err))
+            self.assertEqual(doc['days']['total']['ci_hours'], 3.25, what)
+        self.assertEqual(self.numbers()[1]['requests'], 0)   # the pages fetched again were saved again
+
+    def test_a_write_that_fails_half_way_leaves_no_page_and_goes_on(self):
+        real = json.dump
+
+        def half(obj, f, **kw):   # the disk fills up in the middle of a page
+            f.write(json.dumps(obj)[:40])
+            raise OSError(28, 'No space left on device')
+
+        with mock.patch.object(M.json, 'dump', half):
+            code, doc = self.numbers()
+        self.assertIs(json.dump, real)
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual(doc['days']['total']['ci_hours'], 3.25)
+        self.assertEqual(self.err.count('cache not written'), 1, self.err)
+        self.assertEqual(os.listdir(self.cache), [])   # no half page under its final name, no .part- left
+        self.assertEqual(self.numbers()[1]['requests'], 6)
+
+    def test_a_write_killed_half_way_leaves_only_a_part_file(self):
+        class Killed(BaseException):   # the process dies: nothing in the tool gets to clean up
+            pass
+
+        def half(obj, f, **kw):
+            f.write(json.dumps(obj)[:40])
+            f.flush()
+            raise Killed
+
+        with mock.patch.object(M.json, 'dump', half), self.assertRaises(Killed):
+            self.numbers()
+        left = os.listdir(self.cache)
+        self.assertEqual(len(left), 1)
+        self.assertTrue(left[0].startswith('.part-'), left)   # never under the name a later run reads
+        code, doc = self.numbers()
+        self.assertEqual((code, doc['requests'], doc['days']['total']['ci_hours']), (0, 6, 3.25))
+
+    def test_run_list_of_today_or_the_last_hour_is_not_cached(self):
+        run = {'id': 401, 'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'skipped',
+               'run_attempt': 1, 'created_at': '2026-11-04T01:00:00Z'}
+        self.serve({DAY4: [ok({'total_count': 1, 'workflow_runs': [run]})]})
+        today = ('--since', '2026-11-04', '--until', '2026-11-04')
+        for clock, cached in ((NOW, False), (NOW, False),                       # today, all runs completed
+                              (NOW + 12.5 * 3600, False), (NOW + 12.5 * 3600, False),   # ended 30 min ago
+                              (NOW + 13.5 * 3600, False), (NOW + 13.5 * 3600, True)):   # ended over an hour ago
+            self.clock = clock
+            code, doc = self.numbers(days=today)
+            self.assertEqual((code, doc['cached'] == 1), (0, cached), clock)
+
+    def test_jobs_page_with_an_unfinished_job_is_not_cached(self):
+        p = copy.deepcopy(PAGES)
+        p[J201]['jobs'][0].update(status='in_progress', conclusion=None, completed_at=None)   # the run says completed
+        self.serve({k: [ok(v)] for k, v in p.items()})
+        self.numbers()
+        n = len(self.calls())
+        self.numbers()
+        self.assertEqual([c[-1] for c in self.calls()[n:]], [J201])
+
+    def test_existing_cache_folder_is_made_private(self):
+        os.makedirs(self.cache)
+        os.chmod(self.cache, 0o755)
+        self.assertEqual(self.numbers()[0], 0, self.err)
+        self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o700)
+
+    def test_cache_folder_of_another_user_is_refused(self):
+        os.makedirs(self.cache)
+        other = os.stat(self.cache).st_uid + 1
+        with mock.patch.object(os, 'getuid', lambda: other):
+            code, doc = self.numbers()
+        self.assertEqual((code, doc, self.calls()), (2, None, []))
+        self.assertIn('belongs to another user', self.err)
+
+    def test_os_without_user_ids_runs(self):
+        # Windows: no os.getuid and no owner or mode bits; the tool must not crash before its first request.
+        real = os.getuid
+        del os.getuid
+        try:
+            code, doc = self.numbers()
+            self.assertFalse(hasattr(os, 'getuid'))
+        finally:
+            os.getuid = real
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual(doc['days']['total']['ci_hours'], 3.25)
+
     def test_empty_range_and_new_cache_folder(self):
         self.serve({k: [ok({'total_count': 0, 'workflow_runs': []})] for k in (DAY1, DAY2)})
         code, out = self.run_main()
@@ -314,6 +416,30 @@ class RateLimit(Case):
         self.assertEqual(len(self.calls()), 2)   # the page that said so is used, no request after it
         self.assertEqual(doc['days']['2026-11-02']['runs'], 1)
         self.assertEqual(self.numbers('--reserve', '100')[0], 0)
+
+    def test_reserve_reached_on_a_jobs_page_stops_there(self):
+        self.routes[J101] = [ok(PAGES[J101], **{'X-Ratelimit-Remaining': '900'})]
+        self.serve(self.routes)
+        code, doc = self.numbers()
+        self.assertEqual(code, 3)
+        self.assertIn('900 left, reserve 1000', doc['incomplete'])
+        self.assertEqual([c[-1] for c in self.calls()], [DAY1, DAY2, J101])   # no request after it
+        self.assertEqual(doc['days']['total']['runs_without_jobs'], 4)   # 101 too: its run was not finished
+        n = len(self.calls())
+        self.assertEqual(self.numbers('--reserve', '100')[0], 0)
+        self.assertNotIn(J101, [c[-1] for c in self.calls()[n:]])   # the page that said stop was saved
+
+    def test_default_reserve_follows_the_limit_so_a_workflow_token_works(self):
+        token = {'X-Ratelimit-Limit': '1000', 'X-Ratelimit-Remaining': '990'}   # GITHUB_TOKEN: 1000 an hour
+        self.serve({k: [ok(v, **token)] for k, v in PAGES.items()})
+        self.assertEqual(self.numbers()[0], 0, self.err)
+        shutil.rmtree(self.cache)
+        self.routes = {k: [ok(v, **token)] for k, v in PAGES.items()}
+        self.routes[DAY2] = [ok(PAGES[DAY2], **{**token, 'X-Ratelimit-Remaining': '150'})]
+        self.serve(self.routes)
+        code, doc = self.numbers()
+        self.assertEqual(code, 3)
+        self.assertIn('150 left, reserve 200', doc['incomplete'])
 
     def test_server_error_is_retried_and_a_dead_network_fails(self):
         self.routes[DAY1] = [{'status': 502, 'body': 'bad gateway'}, ok(PAGES[DAY1])]

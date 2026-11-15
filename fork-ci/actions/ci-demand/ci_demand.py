@@ -8,19 +8,26 @@ per runner label set, and the share of completed runs that ended cancelled or fa
   python3 -I ci_demand.py (--repo OWNER/REPO | --config FILE) (--days N | --since DAY --until DAY)
                           --cache DIR [--max-requests N] [--reserve N] [--json]
 
+A re-run's attempts count on the day the run was created (a re-run of a run created before the range is not
+counted), and queue wait includes time a job waits for an environment approval, not only for a runner.
+
 --days N is the N full UTC days before today. --config reads `ciDemand.repo` from a JSON file of the project.
 It only ever sends GET requests (`gh api -X GET`): it never writes to GitHub. Rate limit: it stops before
-X-RateLimit-Remaining falls below --reserve and after --max-requests requests; on 403/429 it waits Retry-After or
+X-RateLimit-Remaining falls below --reserve (default 20% of X-RateLimit-Limit, so a workflow token's 1000
+an hour works too) and after --max-requests requests; on 403/429 it waits Retry-After or
 the reset time when that is short (MAX_WAIT), else it stops. A stop prints what it has, marked INCOMPLETE (exit 3):
 run it again with the same --cache and it goes on from the pages it already saved.
 
 Cache (--cache, a folder the caller owns): a page is saved only when it cannot change any more: a job page when the
 run and all its jobs are completed (keyed by run id and attempt, so a re-run is a new page); a run-list page when
-every run in it is completed, and then reused for LIST_MAX_AGE (a later re-run changes the run). Writes are a
-`.part-` file then a rename in a 0700 folder (one another user owns is refused); an unreadable or foreign file is fetched again; `.part-` files older than an hour go.
+every run in it is completed and its window ended over an hour ago, and then reused for LIST_MAX_AGE (a later re-run
+changes the run). Where the OS has user ids (not Windows), a folder another user owns is refused and the folder is
+made 0700. Writes are a `.part-` file then a rename. A file that is unreadable, half-written, damaged, saved for
+another page or in another FORMAT is fetched again; a failed write only costs the cache; `.part-` files older than
+an hour go.
 Exit: 0 complete, 2 bad arguments or an API error, 3 incomplete (budget).
 """
-import argparse, datetime as dt, hashlib, json, os, re, subprocess, sys, time
+import argparse, contextlib, datetime as dt, hashlib, json, os, re, subprocess, sys, time
 
 MAX_WAIT = 120          # seconds: a longer rate-limit wait stops the run (INCOMPLETE) instead
 LIST_MAX_AGE = 12 * 3600
@@ -28,6 +35,8 @@ PART_AGE = 3600
 PAGE = 100
 SEARCH_CAP = 1000       # the runs list returns at most this many runs for one `created` query
 RETRIES = 3
+FORMAT = 1              # cache file format: a file of another format (older or newer tool) is fetched again
+RESERVE_PCT = 20        # default --reserve: this share of X-RateLimit-Limit (1000 when the limit is not given)
 sleep = time.sleep      # tests replace these two
 now = time.time
 
@@ -65,10 +74,16 @@ class Api:
     def __init__(self, cache, max_requests, reserve, gh='gh'):
         self.cache, self.max_requests, self.reserve, self.gh = cache, max_requests, reserve, gh
         self.requests = self.hits = 0
-        self.stop = None
+        self.stop = self.save_failed = None
         os.makedirs(cache, mode=0o700, exist_ok=True)   # pages of a private repository: kept private
-        if os.stat(cache).st_uid != os.getuid():
-            raise ValueError(f'--cache {cache} belongs to another user')
+        getuid = getattr(os, 'getuid', None)   # None on Windows: no owner or mode bits to check there
+        if getuid is not None:
+            if os.stat(cache).st_uid != getuid():
+                raise ValueError(f'--cache {cache} belongs to another user')
+            if os.stat(cache).st_mode & 0o077:   # made earlier by someone with a wider umask
+                os.chmod(cache, 0o700)
+                if os.stat(cache).st_mode & 0o077:
+                    raise ValueError(f'--cache {cache} cannot be made private (0700)')
         for name in os.listdir(cache):   # a killed write leaves a .part- file; it is never read
             p = os.path.join(cache, name)
             if name.startswith('.part-') and now() - os.path.getmtime(p) > PART_AGE:
@@ -79,22 +94,36 @@ class Api:
 
     def cached(self, key, max_age=None):
         try:
-            with open(self._path(key)) as f:
+            with open(self._path(key), encoding='utf-8') as f:
                 doc = json.load(f)
         except (OSError, ValueError):
             return None
-        if not isinstance(doc, dict) or doc.get('key') != key or 'body' not in doc:
+        if not (isinstance(doc, dict) and doc.get('v') == FORMAT and doc.get('key') == key
+                and isinstance(doc.get('body'), dict)):
             return None
-        if max_age is not None and now() - doc.get('saved', 0) > max_age:
+        saved = doc.get('saved')
+        if isinstance(saved, bool) or not isinstance(saved, (int, float)) or saved > now() + 60:
+            return None   # a damaged date: fetched again
+        if max_age is not None and now() - saved > max_age:
             return None
         self.hits += 1
         return doc['body']
 
     def save(self, key, body):
+        """Atomic: a `.part-` file, then a rename. A failed write is reported once and only costs the cache."""
         part = os.path.join(self.cache, f'.part-{os.getpid()}-{hashlib.sha256(key.encode()).hexdigest()[:12]}')
-        with open(part, 'w') as f:
-            json.dump({'key': key, 'saved': now(), 'body': body}, f)
-        os.replace(part, self._path(key))
+        try:
+            with open(part, 'w', encoding='utf-8') as f:
+                json.dump({'v': FORMAT, 'key': key, 'saved': now(), 'body': body}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(part, self._path(key))
+        except OSError as e:
+            with contextlib.suppress(OSError):
+                os.unlink(part)
+            if not self.save_failed:
+                self.save_failed = str(e)
+                print(f'ci-demand: cache not written ({shown(e)}); going on without it', file=sys.stderr)
 
     def get(self, endpoint):
         """The decoded JSON of one GET; Budget when the cap or reserve would be crossed."""
@@ -102,7 +131,8 @@ class Api:
             if self.requests >= self.max_requests:
                 raise Budget(f'--max-requests {self.max_requests} reached')
             self.requests += 1
-            r = subprocess.run([self.gh, 'api', '-X', 'GET', '--include', endpoint], capture_output=True, text=True)
+            r = subprocess.run([self.gh, 'api', '-X', 'GET', '--include', endpoint], capture_output=True, text=True,
+                               encoding='utf-8', errors='replace')   # not the locale's code page (Windows)
             got = parse_include(r.stdout)
             if got is None:   # network or gh trouble: no HTTP answer
                 if attempt == RETRIES:
@@ -112,8 +142,9 @@ class Api:
             status, h, body = got
             remaining = int(h['x-ratelimit-remaining']) if h.get('x-ratelimit-remaining', '').isdigit() else None
             if status == 200:
-                if remaining is not None and remaining < self.reserve:
-                    self.stop = f'rate limit: {remaining} left, reserve {self.reserve}'
+                reserve = self.reserve_for(h)
+                if remaining is not None and remaining < reserve:
+                    self.stop = f'rate limit: {remaining} left, reserve {reserve}'
                 try:
                     return json.loads(body)
                 except ValueError:
@@ -135,6 +166,13 @@ class Api:
                 continue
             raise ApiError(f'{endpoint}: HTTP {status} {shown(body[:200])}')
         raise ApiError(f'{endpoint}: gave up')   # not reached
+
+    def reserve_for(self, headers):
+        """--reserve, or by default RESERVE_PCT of the answer's limit (a workflow token has only 1000 an hour)."""
+        if self.reserve is not None:
+            return self.reserve
+        limit = headers.get('x-ratelimit-limit', '')
+        return int(limit) * RESERVE_PCT // 100 if limit.isdigit() else 1000
 
     def check(self):
         """Budget once the last answer said the reserve is reached (the answer itself was still used)."""
@@ -329,7 +367,7 @@ def repo_of(args):
         raise ValueError('give --repo or --config, one of them')
     repo = args.repo
     if args.config:
-        with open(args.config) as f:
+        with open(args.config, encoding='utf-8') as f:
             repo = ((json.load(f) or {}).get('ciDemand') or {}).get('repo')
         if not repo:
             raise ValueError(f'{args.config}: no ciDemand.repo')
@@ -347,7 +385,8 @@ def main(argv=None):
     ap.add_argument('--until')
     ap.add_argument('--cache', required=True)
     ap.add_argument('--max-requests', type=int, default=2000)
-    ap.add_argument('--reserve', type=int, default=1000, help='leave this much of the rate limit to others')
+    ap.add_argument('--reserve', type=int, help=f'leave this much of the rate limit to others '
+                    f'(default {RESERVE_PCT}%% of X-RateLimit-Limit)')
     ap.add_argument('--json', action='store_true')
     args = ap.parse_args(argv)
     try:
@@ -391,4 +430,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    for stream in (sys.stdout, sys.stderr):   # a Windows console's code page cannot show every run name
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(errors='replace')
     sys.exit(main())
