@@ -25,8 +25,7 @@
     "usr/bin/wslinfo": {
       "text": "#!/bin/sh\n[ \"$1\" = --networking-mode ] || exit 2\necho nat\nexit 0\n",
       "mode": "755"
-    },
-    "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
+    }
   },
   "fail": {
     "os": [
@@ -106,6 +105,24 @@
         "proc/self/mountinfo": null
       }
     ],
+    "etc-secrets": [
+      {
+        "etc/fstab": "UUID=0 / ext4 defaults 0 1\n//nas.example/share /srv/share cifs username=u,password=hunter2 0 0\n"
+      },
+      {
+        "etc/auto.nas": "share -fstype=cifs,username=u,pass=hunter2 ://nas.example/share\n"
+      },
+      {
+        "etc/nas.cred": "username=u\npassword=p\n"
+      },
+      {
+        "etc/samba/.smbcredentials": "username=u\npassword=p\n"
+      },
+      {
+        "etc/fstab": "//nas.example/s /srv/s cifs credentials=/etc/nas.secret 0 0\n",
+        "etc/nas.secret": "password=p\n"
+      }
+    ],
     "interop": [
       {
         "proc/sys/fs/binfmt_misc/WSLInterop": "enabled\ninterpreter /init\nflags: PF\noffset 0\nmagic 4d5a\n"
@@ -155,28 +172,22 @@
     ],
     "sockets": [
       {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p TemporaryFileSystem=\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p TemporaryFileSystem=\n    -p TemporaryFileSystem=/tmp\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    # -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/init\n"
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/init\n",
+        "init": "ELF (WSL's init)\n"
       },
       {
         "etc/fork-fleet/launch.conf": "WORK_ROOT=/tmp/runners\n"
       },
       {
-        "opt/fork-fleet/fork-fleet-launch.sh": null
+        "etc/fork-fleet/launch.conf": "WORK_ROOT=/run/fork-fleet/runners\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/run/WSL\n",
+        "run/WSL/": ""
+      },
+      {
+        "etc/fork-fleet/launch.conf": "RESOLV_CONF=/mnt/wsl/resolv.conf\n",
+        "mnt/wsl/resolv.conf": "nameserver 1.1.1.1\n"
       }
     ],
     "userns": [
@@ -189,22 +200,6 @@
       {
         "proc/sys/user/max_user_namespaces": "15000\n",
         "proc/sys/kernel/unprivileged_userns_clone": "1\n"
-      },
-      {
-        "proc/sys/user/max_user_namespaces": "15000\n",
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n    -p RestrictNamespaces=~net\n  )\n}\n"
-      },
-      {
-        "proc/sys/user/max_user_namespaces": "15000\n",
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n    -p \"RestrictNamespaces=net user\"\n  )\n}\n"
-      },
-      {
-        "proc/sys/user/max_user_namespaces": "15000\n",
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n    -p RestrictNamespaces=yes\n    -p RestrictNamespaces=\n  )\n}\n"
-      },
-      {
-        "proc/sys/user/max_user_namespaces": "15000\n",
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n    -p RestrictNamespaces=no\n  )\n}\n"
       }
     ],
     "resolv": [
@@ -244,47 +239,6 @@
       },
       {
         "usr/bin/wslinfo": null
-      }
-    ],
-    "vsock": [
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": null
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\nprops=(-p RestrictAddressFamilies=~AF_VSOCK)\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    \n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p \"RestrictAddressFamilies=AF_UNIX AF_INET AF_VSOCK\"\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p RestrictAddressFamilies=\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    # -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    \n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=@system-service\"\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~@mount\"\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    \n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=native\n    -p SystemCallArchitectures=\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p SystemCallArchitectures=x86\n    -p SystemCallArchitectures=native\n  )\n}\n"
-      },
-      {
-        "opt/fork-fleet/fork-fleet-launch.sh": "#!/bin/bash\n# -p RestrictAddressFamilies=~AF_VSOCK in a comment is not a property\nsandbox() {\n  local user=$1 resolv=$2 own=$3\n  local -a props_fs\n  job_fs \"$4\" \"$5\"\n  props=(\n    -p \"NetworkNamespacePath=/run/netns/fork-fleet-$user\"\n    \"${props_fs[@]}\"\n    -p \"TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777\"\n    -p \"BindReadOnlyPaths=$RESOLV_CONF:$resolv\"\n    -p NoNewPrivileges=yes -p ProtectSystem=strict\n    -p RestrictAddressFamilies=~AF_VSOCK\n    -p \"SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS\"\n    -p \"SystemCallArchitectures=native x86\"\n  )\n}\n"
       }
     ]
   }
