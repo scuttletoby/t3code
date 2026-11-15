@@ -21,10 +21,12 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                Environment, the App key is named only by the guard's presence test and the one token
                step, and that token reaches only the start step right after it and the finish step
                (the last). No other fork workflow names the key.
-  secret-scan  fork-secret-scan.yml runs on every pull request on its own, with no concurrency group
-               (workflow or job), so a newer push never cancels the scan of an older head;
-               fork-tests.yml's `secrets` job calls it (the check a ruleset requires), and no other
-               fork workflow runs the scan script.
+  secret-scan  fork-secret-scan.yml runs on every pull request and every push (no branch, tag or
+               path filter) on its own, with no concurrency group (workflow or job), so a newer push
+               never cancels the scan of an older head; fork-tests.yml's `secrets` job calls it (the
+               check a ruleset requires), and no other fork workflow runs the scan script. Its scan
+               step runs the script read from the default branch's tip (CONFIG_BRANCH), never the
+               checkout's copy.
   removed      .github/fork-removed-workflows.txt (the upstream workflows the fork deletes, kept
                deleted by fork-follow.sh) is there, every line is an upstream workflow path, none of
                them is in the tree, and it names the files the owner decided to delete.
@@ -903,6 +905,24 @@ def secret_scan_problems(wfs):
         return [f"{SCAN_FILE} is missing"]
     if "pull_request" not in triggers(scan):
         problems.append(f"{SCAN_FILE}: no pull_request trigger (a run of its own that nothing cancels)")
+    on = scan.get(True, scan.get("on"))
+    if "push" not in triggers(scan):
+        problems.append(f"{SCAN_FILE}: no push trigger (a branch is public from its first push)")
+    elif isinstance(on, dict) and set(on.get("push") or {}) & {
+            "branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore"}:
+        problems.append(f"{SCAN_FILE}: the push trigger is filtered (every push to any branch is scanned)")
+    runs = [(j, step) for j, step in steps(scan) if "fork-secret-scan.sh" in str(step.get("run", ""))]
+    if not runs:
+        problems.append(f"{SCAN_FILE}: no step runs the scan script")
+    for j, step in runs:
+        run = str(step.get("run", ""))
+        fetched = re.search(r'git fetch [^\n]*"\+refs/heads/\$CONFIG_BRANCH:([^"\s]+)"', run)
+        if re.search(r"(?<!:\.github/scripts/)fork-secret-scan\.sh", run):
+            problems.append(f"{SCAN_FILE}/{j}: names the checkout's scan script (run the default branch's copy)")
+        if not fetched or f'git show "{fetched.group(1)}:.github/scripts/fork-secret-scan.sh"' not in run:
+            problems.append(f"{SCAN_FILE}/{j}: does not read the scan script from the default branch's tip")
+        if (step.get("env") or {}).get("CONFIG_BRANCH") != "${{ github.event.repository.default_branch }}":
+            problems.append(f"{SCAN_FILE}/{j}: CONFIG_BRANCH is not the default branch")
     if "concurrency" in scan:
         problems.append(f"{SCAN_FILE}: a workflow concurrency group (a newer push could cancel a scan)")
     problems += [f"{SCAN_FILE}: job {j} has a concurrency group"
@@ -915,7 +935,8 @@ def secret_scan_problems(wfs):
     return problems
 
 
-check("secret-scan: fork-secret-scan.yml runs on pull requests uncancelled, fork-tests.yml calls it",
+check("secret-scan: fork-secret-scan.yml runs on pull requests and pushes uncancelled with the default "
+      "branch's script, fork-tests.yml calls it",
       not secret_scan_problems(real), "; ".join(secret_scan_problems(real)))
 
 
@@ -929,12 +950,30 @@ def scan_mutant(mutate):
 
 
 GROUP = {"group": "scan-${{ github.ref }}", "cancel-in-progress": True}
+
+
+def scan_step(wfs):
+    return next(s for _, s in steps(wfs[SCAN_FILE]) if "scan-from-default-branch" in str(s.get("run", "")))
+
+
 for label, mutate in {
     "a workflow concurrency group": lambda w: w[SCAN_FILE].__setitem__("concurrency", GROUP),
     "a job concurrency group": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__("concurrency", GROUP),
     "a concurrency group that does not cancel": lambda w: w[SCAN_FILE].__setitem__(
         "concurrency", {"group": "scan", "cancel-in-progress": False}),
     "no pull_request trigger": lambda w: w[SCAN_FILE][True].pop("pull_request"),
+    "no push trigger": lambda w: w[SCAN_FILE][True].pop("push"),
+    "a push trigger for main only": lambda w: w[SCAN_FILE][True].__setitem__("push", {"branches": ["main"]}),
+    "a push trigger without tags": lambda w: w[SCAN_FILE][True].__setitem__("push", {"branches": ["**"]}),
+    "the scan step running the checkout's script": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r'bash "[^"]*"\s*$', "bash .github/scripts/fork-secret-scan.sh\n", scan_step(w)["run"])),
+    "the scan step copying the checkout's script": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace(
+            "git show ", "cp ./.github/scripts/fork-secret-scan.sh \"$RUNNER_TEMP/x.sh\"\ngit show ", 1)),
+    "the scan script read from the head": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace('"+refs/heads/$CONFIG_BRANCH:', '"+refs/heads/$HEAD_REF:')),
+    "CONFIG_BRANCH from the pull request": lambda w: scan_step(w)["env"].__setitem__(
+        "CONFIG_BRANCH", "${{ github.head_ref }}"),
     "fork-tests.yml scanning in a step of its own": lambda w: w["fork-tests.yml"]["jobs"].__setitem__(
         "secrets", {"runs-on": "ubuntu-24.04", "steps": [{"run": "bash .github/scripts/fork-secret-scan.sh"}]}),
     "fork-tests.yml calling it without its tests": lambda w: w["fork-tests.yml"]["jobs"]["secrets"].pop("with"),

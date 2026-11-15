@@ -6,15 +6,20 @@
 #   GITLEAKS     gitleaks binary
 #   EVENT_NAME   pull_request or push
 #   HEAD_SHA     pull_request: the PR head
-#   BEFORE       push: the branch tip before the push (all zeros when the branch is new)
+#   BEFORE       push: the branch tip before the push (all zeros when the branch is new);
+#                pull_request: the head before this push of it (synchronize), else empty
+#   OLD_HEADS    pull_request: every tip the PR's branch has had, as far as the workflow could list
+#                them (whitespace-separated commit ids; may be empty)
 #   AFTER        push: the branch tip after the push
+#   PUSH_REF     push: the ref pushed (refs/heads/<name> or refs/tags/<name>); empty is read as the
+#                default branch
 #   UPSTREAM     push: owner/name of the repository this fork follows (the workflow reads this
 #                fork's parent, as fork-follow.yml does); empty when it could not be read
 #   UPSTREAM_URL push: git URL of upstream (default https://github.com/$UPSTREAM.git, as in
 #                fork-follow.sh)
-#   CONFIG_BRANCH  pull_request: the repository's default branch (the branch whose pushes this job
-#                scans); its tip holds the gitleaks settings the scan uses (see "Settings" below)
-#                and is what the range leaves out
+#   CONFIG_BRANCH  the repository's default branch; for a pull request and a push to any other
+#                ref, its tip holds the gitleaks settings the scan uses (see "Settings" below) and
+#                is what the range leaves out
 #   RUNNER_TEMP  folder for the scan's temporary files (else TMPDIR, else /tmp)
 #
 # Ranges:
@@ -25,15 +30,30 @@
 #                  fires `edited`, which does not re-run the scan; this range does not depend on the
 #                  base, so a retarget changes nothing. The default branch's own commits were scanned
 #                  by its push runs. A squash merge never brings the PR's own commits to main, but
-#                  they stay public under refs/pull/N/head, so they are scanned here. Each push
-#                  of the head gets a run that nothing cancels (fork-secret-scan.yml), so a head
-#                  a force push replaced, still served by id, is scanned to the end too.
-#   push           BEFORE..AFTER. After a force push that is every commit the new tip has and the
-#                  old one had not; commits both share were scanned when they were first pushed.
-#   push, no BEFORE  a new branch (BEFORE all zeros) or an old tip that can no longer be fetched:
-#                  only AFTER itself, with a warning. Everything before it is history this fork
-#                  already had (upstream's, or scanned by earlier runs), and there is no older tip
-#                  to tell new commits from old ones.
+#                  they stay public under refs/pull/N/head, so they are scanned here.
+#   pull_request, replaced heads  a force push replaces the head, but GitHub still serves the old
+#                  head's commits by id: a key there is public. The check the ruleset requires
+#                  runs on the newest head only (older runs are cancelled or no longer shown), so
+#                  the range also holds every earlier head (BEFORE and OLD_HEADS) that is neither
+#                  in the new head nor on the default branch: `HEAD_SHA <earlier heads>
+#                  ^<default tip>`. The pull request stays red until the key is rotated and its
+#                  exact, now dead, value is allowed in .gitleaks.toml (a pull request of its own),
+#                  or the work moves to a branch of another name. An earlier head that can no
+#                  longer be fetched gets a warning (GitHub no longer serves it; its push was
+#                  scanned by the push run). Each push of the head also gets a run of its own that
+#                  nothing cancels (fork-secret-scan.yml).
+#   push, other ref  a push to any branch but the default one, or a tag: AFTER ^<default tip>, every
+#                  commit the pushed tip has that the default branch has not (a new branch
+#                  included), with the default branch's settings, as for a pull request. Such a
+#                  branch is unreviewed, so neither its range nor its settings may depend on its
+#                  own earlier pushes.
+#   push           (the default branch) BEFORE..AFTER. After a force push that is every commit the
+#                  new tip has and the old one had not; commits both share were scanned when they
+#                  were first pushed.
+#   push, no BEFORE  (the default branch) an old tip that can no longer be fetched, or a new
+#                  branch: only AFTER itself, with a warning. Everything before it is history this
+#                  fork already had (upstream's, or scanned by earlier runs), and there is no older
+#                  tip to tell new commits from old ones.
 #   push, upstream  every push range leaves out the commits upstream's default branch or one of its
 #                  v* tags holds. A fork-follow rebase force-pushes the series onto a newer upstream
 #                  tag, so BEFORE..AFTER would otherwise hold hundreds of upstream's commits (and
@@ -48,14 +68,14 @@
 # one fails the job (exit 2); merge the branches one at a time instead.
 #
 # Settings: gitleaks reads .gitleaks.toml and .gitleaksignore, which can allow any finding. They
-# never come from the checkout (the pull request's head). For a pull request: the default branch's
-# tip (CONFIG_BRANCH, fetched each run), which the range leaves out. For a push: the tip before the
-# push (BEFORE). A push with no fetchable BEFORE (a new branch, or an old tip that is gone) reads
+# never come from the checkout (the pull request's head). For a pull request and a push to any
+# other ref: the default branch's tip (CONFIG_BRANCH, fetched each run), which the range leaves out.
+# For a push to the default branch: the tip before the push (BEFORE). A push with no fetchable BEFORE (a new branch, or an old tip that is gone) reads
 # AFTER's first parent, a commit of the same push that no scan reads, so there the push can set
 # its own settings: gitleaks' built-in defaults instead would bring back the broad path skip list
 # .gitleaks.toml removes, and a push run takes this script and the workflow from the pushed commit
-# anyway. A root commit uses gitleaks' defaults. In this repository pushes are scanned only on the
-# default branch, which is never new. gitleaks runs in a temporary folder holding only those two
+# anyway. A root commit uses gitleaks' defaults. In this repository that case is the default
+# branch only (other refs read the default branch's settings), which is never new. gitleaks runs in a temporary folder holding only those two
 # files, so it finds no other; `[extend] path` therefore cannot load, and settings gitleaks cannot
 # load fail the job (exit 2) with that reason.
 # A range that changes the settings gets a notice saying when the change applies. The reviewed path
@@ -77,7 +97,8 @@
 # squash result as one more diff.
 #
 # Not covered: a `gitleaks:allow` comment on the line itself (visible in the diff); a pull request
-# that edits this script or the workflow (pull_request runs take both from the pull request); text
+# that edits the workflow (pull_request runs take it from the pull request; the workflow runs this
+# script from the default branch's tip, so an edit of the script alone changes nothing); text
 # in another encoding than UTF-8 or UTF-16 with a byte-order mark (UTF-16 without one, UTF-32);
 # compressed or packed contents (zip, gzip, images' compressed data); a key split across lines.
 #
@@ -124,6 +145,7 @@ fetch() {
   have "$1"
 }
 zero() { [[ -z "$1" || "$1" =~ ^0+$ ]]; }
+short() { printf '%s ' "$@" | sed -E 's/([0-9a-f]{12})[0-9a-f]+/\1/g; s/ $//'; }
 # Upstream's default branch and v* tags (the same tags fork-follow.sh reads), commits only, into
 # refs/scan-upstream/*. Refs from an earlier run go first, so a tag upstream has deleted since is
 # not left out. A failed fetch adds no exclusion at all.
@@ -148,6 +170,7 @@ fetch_config_branch() {
 }
 
 warning=""
+other_ref=""
 case "$EVENT_NAME" in
   pull_request)
     if ! fetch "$HEAD_SHA"; then
@@ -162,11 +185,54 @@ case "$EVENT_NAME" in
     changes=("$settings...$HEAD_SHA")
     # Everything the head has that the default branch has not, whatever the PR's base (see the header).
     range="$settings..$HEAD_SHA"
-    opts="--remerge-diff --text $range"
     what="the pull request's $(git rev-list --count "$range") commit(s) not on $CONFIG_BRANCH, merges included"
+    # Earlier heads a force push replaced (see the header): what they had that neither the head nor
+    # the default branch has is scanned too.
+    tips=()
+    gone=()
+    for old in ${BEFORE:-} ${OLD_HEADS:-}; do
+      zero "$old" && continue
+      if ! [[ "$old" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+        echo "::error::Secret scan: '$old' in BEFORE or OLD_HEADS is not a commit id" >&2
+        exit 2
+      fi
+      [[ " $HEAD_SHA ${tips[*]} ${gone[*]} " != *" $old "* ]] || continue
+      if ! fetch "$old"; then gone+=("$old"); continue; fi
+      if git merge-base --is-ancestor "$old" "$HEAD_SHA" || git merge-base --is-ancestor "$old" "$settings"; then
+        continue
+      fi
+      tips+=("$old")
+    done
+    if [[ ${#tips[@]} -gt 0 ]]; then
+      range="$HEAD_SHA ${tips[*]} ^$settings"
+      # shellcheck disable=SC2086
+      what="$what, and the $(( $(git rev-list --count $range) - $(git rev-list --count "$settings..$HEAD_SHA") )) commit(s) only the ${#tips[@]} earlier head(s) a force push replaced ($(short "${tips[@]}")) had"
+    fi
+    if [[ ${#gone[@]} -gt 0 ]]; then
+      warning="${#gone[@]} earlier head(s) of this pull request cannot be fetched ($(short "${gone[@]}")), so they are not scanned here (each push of them had a push scan of its own)"
+    fi
+    opts="--remerge-diff --text $range"
     ;;
   push)
-    if ! zero "$BEFORE" && fetch "$BEFORE"; then
+    if [[ -n "${PUSH_REF:-}" && "$PUSH_REF" != "refs/heads/${CONFIG_BRANCH:-}" ]]; then
+      # A push to any other branch (or a tag): everything its tip has that the default branch has
+      # not, read with the default branch's settings, as for a pull request (see the header).
+      if ! fetch "$AFTER"; then
+        echo "::error::Secret scan: cannot fetch commit $AFTER" >&2
+        exit 2
+      fi
+      if ! settings="$(fetch_config_branch)"; then
+        echo "::error::Secret scan: cannot fetch the default branch '${CONFIG_BRANCH:-}' (CONFIG_BRANCH), whose gitleaks settings the scan uses" >&2
+        exit 2
+      fi
+      settings_what="the default branch $CONFIG_BRANCH (${settings:0:12})"
+      other_ref=1
+      changes=("$settings...$AFTER")
+      range="$AFTER ^$settings"
+      opts="--remerge-diff --text $range"
+      # shellcheck disable=SC2086
+      what="the $(git rev-list --count $range) commit(s) $PUSH_REF has that $CONFIG_BRANCH has not"
+    elif ! zero "$BEFORE" && fetch "$BEFORE"; then
       settings="$BEFORE"
       settings_what="the tip before the push (${BEFORE:0:12})"
       changes=("$BEFORE" "$AFTER")
@@ -283,7 +349,9 @@ if [[ ${#changes[@]} -gt 0 ]]; then
   changed="$(git diff --no-renames --name-only "${changes[@]}" -- .gitleaks.toml .gitleaksignore 2> /dev/null)" || changed=""
   if [[ -n "$changed" ]]; then
     files="$(tr '\n' ' ' <<< "$changed")"
-    if [[ "$EVENT_NAME" == push ]]; then
+    if [[ -n "$other_ref" ]]; then
+      echo "::notice title=Secret scan::This push changes ${files}but the scan reads them from $settings_what. A change to them takes effect once it is on the default branch (a pull request of its own)."
+    elif [[ "$EVENT_NAME" == push ]]; then
       echo "::notice title=Secret scan::This push changes ${files}but this scan read them from $settings_what. The change applies from the next push."
     elif [[ "$(git diff --no-renames --name-only "${changes[@]}" 2> /dev/null)" == "$changed" ]]; then
       echo "::notice title=Secret scan::This pull request changes only ${files}(the reviewed path for a settings change): this scan read them from $settings_what, and the change applies once it is merged."

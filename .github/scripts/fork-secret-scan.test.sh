@@ -25,7 +25,7 @@ git config --global user.name test
 git config --global user.email test@example.invalid
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
-unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML OLD_HEADS PUSH_REF
 export CONFIG_BRANCH=main
 
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
@@ -264,6 +264,40 @@ BEFORE="0000000000000000000000000000000000000000" AFTER="$leaky" \
   check "push of a new branch: only its newest commit, with a warning" 0 "::warning.*new branch"
 BEFORE="1111111111111111111111111111111111111111" AFTER="$leaky" \
   check "push: an old tip that cannot be fetched warns" 0 "::warning.*cannot be fetched"
+# A push to any branch but the default one, or a tag (see the script's header): every commit its tip
+# has that the default branch has not, whatever the old tip.
+zeros="0000000000000000000000000000000000000000"
+PUSH_REF=refs/heads/leaky BEFORE="$zeros" AFTER="$leaky" \
+  check "push of a new branch: every commit not on the default branch, a key deleted again included" 1 \
+  "refs/heads/leaky has that main has not"
+PUSH_REF=refs/heads/leaky BEFORE="$(git rev-parse leaky~1)" AFTER="$leaky" \
+  check "push to another branch: the whole branch, not only the commits after the old tip" 1
+PUSH_REF=refs/heads/clean BEFORE="$zeros" AFTER="$clean" check "push of a new branch without a key passes" 0
+PUSH_REF=refs/heads/fresh BEFORE="$zeros" AFTER="$base" \
+  check "push of a new branch at the default branch's tip: nothing to scan, passes" 0 "the 0 commit"
+PUSH_REF=refs/tags/v9 BEFORE="$zeros" AFTER="$leaky" check "push of a tag: every commit not on the default branch" 1
+PUSH_REF=refs/heads/main BEFORE="$(git rev-parse leaky~1)" AFTER="$leaky" \
+  check "push to the default branch: only the commits after the old tip, as before" 0 "pushed after"
+PUSH_REF=refs/heads/leaky CONFIG_BRANCH="" BEFORE="$zeros" AFTER="$leaky" \
+  check "push to another branch without CONFIG_BRANCH fails" 2 "cannot fetch the default branch"
+
+# A force push replaced a pull request's head (see the script's header). The check the ruleset
+# requires runs on the newest head only, so it also reads what the earlier heads had: BEFORE (the
+# synchronize event's old head) and OLD_HEADS (every tip of the PR's branch the workflow listed).
+export EVENT_NAME=pull_request AFTER=""
+BEFORE="$leaky" HEAD_SHA="$clean" \
+  check "pull request: a key only the head a force push replaced (BEFORE) had is found" 1 "1 earlier head"
+BEFORE="" OLD_HEADS="$leaky $clean" HEAD_SHA="$clean" \
+  check "pull request: a key only an earlier tip of the PR's branch (OLD_HEADS) had is found" 1 "1 earlier head"
+BEFORE="$leaky" OLD_HEADS="$evil $leaky" HEAD_SHA="$clean" \
+  check "pull request: each earlier head counts once" 1 "2 earlier head"
+BEFORE="$(git rev-parse clean~1)" OLD_HEADS="$base $fork_point $clean" HEAD_SHA="$clean" \
+  check "pull request: earlier heads the head or the default branch holds add nothing" 0 "" "earlier head"
+BEFORE="3333333333333333333333333333333333333333" OLD_HEADS="" HEAD_SHA="$clean" \
+  check "pull request: an earlier head that cannot be fetched warns" 0 "::warning.*cannot be fetched \\(333333333333\\)"
+BEFORE="" OLD_HEADS="--output=x" HEAD_SHA="$clean" check "pull request: an OLD_HEADS word that is not a commit id fails" 2 "not a commit id"
+BEFORE="" OLD_HEADS="" HEAD_SHA="$clean" check "pull request: the newest head alone passes (control)" 0
+export EVENT_NAME=push HEAD_SHA=""
 
 EVENT_NAME=workflow_dispatch check "an unknown event fails" 2
 
@@ -398,6 +432,14 @@ UPSTREAM="" BEFORE="$old_series" AFTER="$rebased" \
   check "force push, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
 BEFORE="$old_series" AFTER="$rebased" \
   check "force push: upstream reachable again, the scan passes again" 0
+# A push to another branch leaves upstream's commits out too: the branch on upstream's stable tag
+# holds that tag's commit with a key, which the default branch has not.
+PUSH_REF=refs/heads/stable BEFORE="0000000000000000000000000000000000000000" AFTER="$stable" \
+  check "push to another branch on an upstream tag: the tag's commits are left out" 0 "upstream up/t3code already has"
+UPSTREAM="" PUSH_REF=refs/heads/stable BEFORE="0000000000000000000000000000000000000000" AFTER="$stable" \
+  check "push to another branch, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
+PUSH_REF=refs/heads/leaky BEFORE="$rebased" AFTER="$rebased_leaky" \
+  check "push to another branch: a key in the fork's own commit is found" 1
 unset UPSTREAM UPSTREAM_URL
 
 # New origins for the cases below: a bare origin that serves blob-less clones, and a work repo.
@@ -444,6 +486,20 @@ BASE_SHA="$settings_base" HEAD_SHA="$(git rev-parse own-ignore)" \
 printf '%s\n' '[extend]' 'useDefault = true' '[allowlist]' "$allow_all" > "$root/env.toml"
 GITLEAKS_CONFIG="$root/env.toml" BASE_SHA="$settings_base" HEAD_SHA="$(git rev-parse own-ignore)" \
   check "pull request: GITLEAKS_CONFIG does not reach gitleaks" 1
+# A push to another branch reads the default branch's settings, never what its own earlier push
+# set: the first push allows every path, the second adds a key.
+git checkout -q -b own-toml-2 "$settings_base"
+printf '%s\n' '[extend]' 'useDefault = true' '[allowlist]' "$allow_all" > .gitleaks.toml
+date=$((date + 60)); git add -A; GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "branch: allow every path"
+own_toml_1=$(git rev-parse HEAD)
+commit k2.txt "aws_access_key_id=$key" "branch: a key, after its own settings"
+git checkout -q main
+git push -q origin own-toml-2
+checkout settings own-toml-2
+EVENT_NAME=push PUSH_REF=refs/heads/own-toml-2 BEFORE="$own_toml_1" AFTER="$(git rev-parse own-toml-2)" \
+  check "push to another branch: settings its own earlier push added do not hide its key" 1 "::notice.*reads them from the default branch main.*once it is on the default branch"
+EVENT_NAME=push PUSH_REF=refs/heads/main BEFORE="$own_toml_1" AFTER="$(git rev-parse own-toml-2)" \
+  check "push to the default branch reads the tip before the push (control)" 0 "settings .* from the tip before the push"
 # The reviewed path: the ignore line lands on the default branch in a change of its own; the same
 # PR's scan, run again, then passes.
 git checkout -q main
@@ -655,13 +711,22 @@ else
 fi
 # Its shape (any gitleaks): no [extend] (useDefault brings back the default path skip list,
 # disabledRules drops rules) and no [allowlist] table (a second global allowlist); every
-# [[allowlists]] entry after the first names its rules and the values it allows (anchored, and
-# none allows a token-shaped value), and one with paths has condition = "AND", so it never skips a
-# whole file. Against the gitleaks binary (the real one only; its default config is built in): the
-# rules, from the first [[rules]] to the end, are its default rules byte for byte, and the first
-# entry is its global allowlist without the path skip list. Each rule is tried on broken copies too.
+# [[allowlists]] entry after the first names its rules and the values it allows, and one with paths
+# has condition = "AND", so it never skips a whole file. Each value regex holds whole values: ^ first
+# and $ last with no | outside a group, no .* or .+, and in the syntax Python and Go share (one
+# Python cannot read is a problem, never "narrow"). Against the gitleaks binary (the real one only;
+# its default config is built in): the rules, from the first [[rules]] to the end, are its default
+# rules byte for byte; the first entry is its global allowlist without the path skip list; and the
+# binary judges every allowlist part (entry 1 with its stop words, each regex of a later entry with
+# its paths dropped) on generated token shapes, each of which its rules alone find: a part that
+# hides one is a problem, as is a targetRules rule none of the shapes trigger. Without the binary,
+# Python's re tries the same shapes. Each rule is tried on broken copies too.
 cat > "$root/toml-check.py" <<'CHECK'
-import re, sys, tomllib
+import collections, hashlib, json, math, os, re, subprocess, sys, tempfile, tomllib
+try:
+    from re import _parser as sre  # Python 3.11+
+except ImportError:  # pragma: no cover
+    import sre_parse as sre
 path, binary_path = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
 raw = open(path, "rb").read()
 try:
@@ -676,9 +741,138 @@ entries = cfg.get("allowlists") or []
 if not entries:
     problems.append("no [[allowlists]] entries (the first is gitleaks' global value allowlist)")
 NARROW = {"description", "targetRules", "condition", "paths", "regexes", "regexTarget"}
-# Token-shaped values (and lines holding them) no entry may allow, put together at run time.
-fake = "Zx8Kq2Lm9" + "Vb4Nc7Rt5Wy3Hd6Jf1Gs0Pa"
-samples = [fake, "1.0.0-" + fake, "AK" + "IA" + "ZR4PLM7VNQWT2XJD", "api_" + "key = '" + fake + "'"]
+
+
+# Token shapes no entry may allow, made at run time from a hash (this file holds none of them):
+# hex (32, 40, 64), letters and digits (16 to 64), base64, URL-safe, a token after a version
+# (1.0.0-<token>), each after 8 secret-like names in 4 ways of writing them; and AWS, GitHub, Slack
+# and Bedrock keys. Each line must be a finding of gitleaks' rules alone (the judge checks that).
+STOP = {w.lower() for part in [*entries[:1], *(a for r in cfg.get("rules") or [] for a in r.get("allowlists") or [])]
+        for w in part.get("stopwords") or []}
+
+
+def rand(seed, n, alphabet):
+    out, block = [], 0
+    while len(out) < n:
+        for b in hashlib.sha256(f"{seed}/{block}".encode()).digest():
+            if b < 256 - 256 % len(alphabet) and len(out) < n:
+                out.append(alphabet[b % len(alphabet)])
+        block += 1
+    return "".join(out)
+
+
+def tok(seed, n, alphabet):
+    # Like a real key: starts with a letter or digit, has both, and is random enough for gitleaks'
+    # entropy limits (3.5 for generic-api-key), and holds none of the rules' stop words (java, ...);
+    # else the next one.
+    for tries in range(1000):
+        v = rand(f"{seed}/{tries}", n, alphabet)
+        entropy = -sum(c / n * math.log2(c / n) for c in collections.Counter(v).values())
+        if (v[0].isalnum() and re.search("[0-9]", v) and re.search("[A-Za-z]", v)
+                and entropy >= min(3.7, math.log2(n) - 0.4) and not any(w in v.lower() for w in STOP)):
+            return v
+    raise SystemExit(f"no token for {seed}")
+
+
+HEX, UP = "0123456789abcdef", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+B62 = "0123456789" + UP + UP.lower()
+SHAPES = {"hex32": (32, HEX), "hex40": (40, HEX), "hex64": (64, HEX), "HEX40": (40, HEX.upper()),
+          "alnum16": (16, B62), "alnum20": (20, B62), "alnum24": (24, B62), "alnum32": (32, B62),
+          "alnum40": (40, B62), "alnum64": (64, B62), "base64-40": (40, B62 + "+/"),
+          "base64-pad": (43, B62 + "+/"), "url32": (32, B62 + "-_"), "version": (24, B62)}
+NAMES = ["api_key", "client_secret", "auth_token", "password", "aws_secret_access_key", "access_token",
+         "secret", "apiKey"]
+FORMATS = ['{n} = "{v}"', "{n}: {v}", "{N}={v}", '"{n}": "{v}",']
+fixture = []  # (line, value, what it is)
+for i, (shape, (n, alphabet)) in enumerate(SHAPES.items()):
+    for j, name in enumerate(NAMES):
+        v = tok(f"{shape}/{name}", n, alphabet)
+        v = {"base64-pad": v + "=", "version": "1.0.0-" + v}.get(shape, v)
+        fixture.append((FORMATS[(i + j) % len(FORMATS)].format(n=name, N=name.upper(), v=v), v, f"{name}, {shape}"))
+for line, v in [("aws_access_key_id = {v}", "AK" + "IA" + tok("aws", 16, UP + "234567")),
+                ("AWS_SESSION_KEY_ID={v}", "AS" + "IA" + tok("asia", 16, UP + "234567")),
+                ("GITHUB_TOKEN={v}", "gh" + "p_" + tok("ghp", 36, B62)),
+                ("token: {v}", "github" + "_pat_" + tok("pat", 82, B62 + "_")),
+                ("SLACK_BOT_TOKEN={v}", "xo" + "xb-" + rand("s1", 10, HEX[:10]) + "-" + rand("s2", 13, HEX[:10])
+                 + "-" + tok("s3", 24, B62)),
+                ("bedrock = {v}", "bedrock-api-key-" + __import__("base64").b64encode(b"bedrock.amazonaws.com").decode()
+                 + tok("bedrock", 40, B62 + "+/"))]:
+    fixture.append((line.format(v=v), v, line.split()[0].split("=")[0] + ", " + v[:4] + "..."))
+
+UNBOUNDED = (sre.MAXREPEAT,)
+
+
+def any_unbounded(items):
+    """A . (any character) with no upper bound (.*, .+, .{n,}) anywhere in the parsed regex."""
+    for op, av in items:
+        if op in (sre.MAX_REPEAT, sre.MIN_REPEAT) + ((sre.POSSESSIVE_REPEAT,) if hasattr(sre, "POSSESSIVE_REPEAT") else ()):
+            lo, hi, sub = av
+            if hi in UNBOUNDED and any(o == sre.ANY for o, _ in sub):
+                return True
+            if any_unbounded(sub):
+                return True
+        elif op == sre.SUBPATTERN:
+            if any_unbounded(av[-1]):
+                return True
+        elif op == sre.BRANCH:
+            if any(any_unbounded(b) for b in av[1]):
+                return True
+        elif op in (sre.ASSERT, sre.ASSERT_NOT):
+            if any_unbounded(av[1]):
+                return True
+    return False
+
+
+def top_level_bar(r):
+    """A | outside every group and character class (Python's parser folds (?:a|b) into its parent, so
+    this reads the text): escapes skip a character, [...] (with a leading ] or ^], and [:name:])
+    holds no syntax, parentheses nest."""
+    depth, i = 0, 0
+    while i < len(r):
+        c = r[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":
+            i += 1
+            if i < len(r) and r[i] == "^":
+                i += 1
+            if i < len(r) and r[i] == "]":
+                i += 1
+            while i < len(r) and r[i] != "]":
+                if r[i] == "\\":
+                    i += 1
+                elif r.startswith("[:", i) and ":]" in r[i + 2:]:
+                    i = r.index(":]", i + 2) + 1
+                i += 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "|" and depth == 0:
+            return True
+        i += 1
+    return False
+
+
+def shape_problem(r):
+    """Why the value regex r is not narrow, or None. It must hold whole values: ^ first and $ last,
+    no | outside a group (^a|b$ is ^a or b$), no .* or .+ (a whole-line or any-value pattern), and
+    in the syntax Python and Go share (one Python cannot read, such as Go's \\pL, cannot be checked)."""
+    try:
+        items = list(sre.parse(r))
+        re.compile(r)
+    except (re.error, OverflowError, RecursionError) as e:
+        return f"cannot be read by Python's re ({e}), so it cannot be checked; write it in the syntax Python and Go share"
+    if top_level_bar(r):
+        return "has a | outside a group, so ^ and $ do not hold every branch (write ^(?:a|b)$)"
+    if not (items and items[0] == (sre.AT, sre.AT_BEGINNING) and items[-1] == (sre.AT, sre.AT_END)):
+        return "is not anchored (^...$)"
+    if any_unbounded(items):
+        return "has .* or .+ (any text of any length): a whole-line or any-value pattern"
+    return None
+
+
 for i, e in enumerate(entries[1:], start=2):
     where = f"[[allowlists]] entry {i} ({e.get('description', 'no description')!r})"
     problems += [f"{where}: key {k!r} is not allowed (only {', '.join(sorted(NARROW))})" for k in sorted(set(e) - NARROW)]
@@ -691,15 +885,85 @@ for i, e in enumerate(entries[1:], start=2):
     if e.get("regexTarget", "secret") not in ("secret", "line"):
         problems.append(f"{where}: regexTarget {e.get('regexTarget')!r}")
     for r in e.get("regexes") or []:
-        if not (r.startswith("^") and r.endswith("$")):
-            problems.append(f"{where}: regex {r!r} is not anchored (^...$)")
+        why = shape_problem(r)
+        if why:
+            problems.append(f"{where}: regex '{r}' {why}")
             continue
-        try:
-            wide = [v for v in samples if re.search(r, v)]
-        except re.error:
-            wide = []
+        # Without the binary: Python's re on the fixture (the binary below is the real judge).
+        on_line = e.get("regexTarget") == "line"
+        wide = [what for line, v, what in fixture if re.search(r, line if on_line else v)]
         if wide:
-            problems.append(f"{where}: regex {r!r} allows a token-shaped value")
+            problems.append(f"{where}: regex '{r}' allows a token-shaped value ({wide[0]})")
+
+
+def toml_value(v):
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    if "'''" not in v and not re.search(r"[\x00-\x08\x0a-\x1f\x7f]", v):
+        return f"'''{v}'''"
+    return json.dumps(v, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def entry_toml(e):
+    return "[[allowlists]]\n" + "".join(f"{k} = {toml_value(v)}\n" for k, v in e.items()) + "\n"
+
+
+def judge(rules):
+    """The real gitleaks judges every value the settings allow: the fixture is scanned with the rules
+    alone, then with the rules and one allowlist part at a time (entry 1 whole, so its stop words
+    too; each regex of a later entry, with its paths and condition dropped, so it applies to every
+    file: wider than the entry, so what it allows there is what the entry could allow in its paths).
+    Any finding the part removes is a token shape it allows."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.mkdir(src)
+        # One file per line: gitleaks gives a line-target allowlist the whole line only when the
+        # line starts its file (or its hunk, in a git scan); after another line it starts with "\n".
+        for n, (line, _, _) in enumerate(fixture, start=1):
+            with open(os.path.join(src, f"{n:03}.txt"), "w") as f:
+                f.write(line + "\n")
+        env = {k: v for k, v in os.environ.items() if k not in ("GITLEAKS_CONFIG", "GITLEAKS_CONFIG_TOML")}
+
+        def scan(parts):
+            conf, report = os.path.join(tmp, "judge.toml"), os.path.join(tmp, "report.json")
+            with open(conf, "w") as f:
+                f.write("".join(entry_toml(p) for p in parts) + rules)
+            run = subprocess.run([os.path.abspath(binary_path), "dir", "--no-banner", "--no-color", "--exit-code", "0",
+                                  "--config", conf, "--report-format", "json", "--report-path", report, src],
+                                 cwd=tmp, env=env, capture_output=True, text=True)
+            if run.returncode != 0:
+                return None, (run.stdout + run.stderr).strip().splitlines()[-1:] or [f"exit {run.returncode}"]
+            return {(int(os.path.basename(x["File"])[:3]), x["RuleID"]) for x in json.load(open(report))}, None
+
+        base, err = scan([])
+        if base is None:
+            return [f"gitleaks cannot scan the judge's fixture with these rules: {err[0]}"]
+        out = [f"the judge's fixture line {n} ({what}) is not a finding of gitleaks' rules,"
+               " so it judges nothing: change its shape" for n, (_, _, what) in enumerate(fixture, start=1)
+               if not any(found == n for found, _ in base)]
+        found_rules = {rule for _, rule in base}
+        parts = [("entry 1 (gitleaks' global allowlist)", [entries[0]])] if entries else []
+        for i, e in enumerate(entries[1:], start=2):
+            where = f"[[allowlists]] entry {i} ({e.get('description', 'no description')!r})"
+            for rule in e.get("targetRules") or []:
+                if rule not in found_rules:
+                    out.append(f"{where}: targetRules {rule!r} has no finding in the judge's fixture, so its"
+                               " values cannot be judged: add a token shape for that rule to the fixture")
+            for r in e.get("regexes") or []:
+                wide = {k: v for k, v in e.items() if k not in ("paths", "condition", "regexes")}
+                wide["regexes"] = [r]
+                parts.append((f"{where}: regex '{r}'", entries[:1] + [wide]))
+        for what, part in parts:
+            got, err = scan(part)
+            if got is None:
+                out.append(f"{what}: gitleaks cannot load it ({err[0]})")
+            elif base - got:
+                n, rule = min(base - got)
+                out.append(f"{what} allows a token-shaped value: gitleaks no longer finds fixture line {n}"
+                           f" ({fixture[n - 1][2]}; {rule}) and {len(base - got) - 1} more")
+        return out
+
+
 if binary_path:
     binary = open(binary_path, "rb").read()
     start = raw.find(b"\n[[rules]]\n")
@@ -719,6 +983,8 @@ if binary_path:
                 differ = sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))
                 problems.append("[[allowlists]] entry 1 is not this gitleaks' global allowlist without its paths"
                                 f" (differs in {', '.join(differ)})")
+        if start >= 0:
+            problems += judge(raw[start + 1:].decode())
 print("\n".join(problems))
 sys.exit(1 if problems else 0)
 CHECK
@@ -757,6 +1023,43 @@ toml_mutant "an unanchored value" "$(narrow_entry "targetRules = [\\\"generic-ap
 toml_mutant "an entry with stopwords" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"^abc\$\\\"]\\nstopwords = [\\\"key\\\"]")"
 toml_mutant "the old pnpm-lock.yaml version shape (any 1.0.0-<token>)" \
   "t.replace(\"(?:-(?:[a-z]{1,10}|[a-z]{0,2}\\\\d{1,14})(?:\\\\.(?:[a-z]{1,10}|[a-z]{0,2}\\\\d{1,14})){0,2})?\$\", \"(?:-[0-9A-Za-z.-]+)?(?:\\\\+[0-9A-Za-z.-]+)?\$\", 1)"
+# Later entries that look narrow, each with what it would hide (the reviewers' cases of #212): the
+# check refuses them. An exact fake value, and an alternation inside a group, still pass.
+toml_entry() { # toml_entry NAME pass|fail ENTRY_LINE... -> the repository's file with one more entry
+  [[ -f "$repo_toml" ]] || return 0
+  local name="$1" want="$2" got=fail verb=fails
+  shift 2
+  [[ "$want" == fail ]] || verb=passes
+  python3 -I -c 'import sys; t = open(sys.argv[1]).read(); e = "\n".join(sys.argv[3:])
+open(sys.argv[2], "w").write(t.replace("\n[[rules]]\n", "\n[[allowlists]]\n" + e + "\n\n[[rules]]\n", 1))' \
+    "$repo_toml" "$root/mutant.toml" "$@"
+  if toml_check "$root/mutant.toml" > "$root/mutant.out"; then got=pass; fi
+  if [[ "$got" == "$want" ]]; then
+    echo "ok   repository settings: an entry with $name $verb the check"
+  else
+    echo "FAIL repository settings: an entry with $name: the check gives $got, expected $want"
+    sed 's/^/    /' "$root/mutant.out"
+    failures=$((failures + 1))
+  fi
+}
+generic='targetRules = ["generic-api-key"]'
+toml_entry "a | outside a group (^abc|<40 hex>\$: any 40-hex value)" fail "$generic" 'condition = "AND"' \
+  "paths = ['''^test/fx\\.txt\$''']" "regexes = ['''^abc|[0-9a-f]{40}\$''']"
+toml_entry "an alternation inside a group that allows 40-hex values" fail "$generic" "regexes = ['''^(?:abc|[0-9a-f]{40})\$''']"
+toml_entry "a 40-character token class (^[A-Za-z0-9/+]{40}\$)" fail "$generic" "regexes = ['''^[A-Za-z0-9/+]{40}\$''']"
+toml_entry "Go-only syntax Python cannot read (\\pL\\pN)" fail "$generic" "regexes = ['''^[\\pL\\pN]{16,}\$''']"
+toml_entry "a whole-line pattern (regexTarget line, ^.*secret.*\$)" fail "$generic" 'regexTarget = "line"' \
+  "regexes = ['''^.*secret.*\$''']"
+toml_entry "a line pattern without .* for lines naming a secret" fail "$generic" 'regexTarget = "line"' \
+  "regexes = ['''^\\S*secret\\S* = \"\\w+\"\$''']"
+toml_entry "an exact fake value in one file (reviewed)" pass 'targetRules = ["aws-access-token"]' 'condition = "AND"' \
+  "paths = ['''^test/fx\\.txt\$''']" "regexes = ['''^${key:0:4}[${key:4:1}]${key:5}\$''']"
+toml_entry "an alternation of exact values inside a group" pass "$generic" "regexes = ['''^(?:abc|def)\$''']"
+if [[ -n "${GITLEAKS_BIN:-}" ]]; then
+  # Only the binary judges by rule: an entry for a rule none of the generated shapes trigger.
+  toml_entry "a rule the judge's token shapes do not trigger" fail 'targetRules = ["stripe-access-token"]' \
+    "regexes = ['''^sk_live_abc\$''']"
+fi
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   toml_mutant "one more global allowlist value" "t.replace('regexes = [', 'regexes = [\n    \'\'\'^x\$\'\'\',', 1)"
   toml_mutant "a global allowlist stopword dropped" "t.replace('stopwords = [\n', 'stopwords = [\n#', 1)"
