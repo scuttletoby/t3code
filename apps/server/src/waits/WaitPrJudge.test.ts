@@ -9,6 +9,7 @@ import {
   PullRequestOperationError,
   type PullRequestRef,
   PullRequestUnavailableError,
+  type RepositoryIdentity,
   SourceControlProviderKind,
   ThreadId,
 } from "@t3tools/contracts";
@@ -21,6 +22,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import { TestClock } from "effect/testing";
 
+import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
@@ -42,24 +44,23 @@ const HEAD_B = "b".repeat(40);
 
 const ON = { waitFor: { enabled: true } } as const;
 
+const identityOf = (repository: string): RepositoryIdentity => ({
+  canonicalKey: `github.com/${repository}`,
+  locator: {
+    source: "git-remote" as const,
+    remoteName: "origin",
+    remoteUrl: `https://github.com/${repository}.git`,
+  },
+  provider: SourceControlProviderKind.make("github"),
+  displayName: repository,
+});
+
+/** `repository` null: the shell shows no remote (none, or not looked up yet). */
 const shell = (id: ProjectId, repository: string | null): OrchestrationProjectShell => ({
   id,
   title: "Project",
-  workspaceRoot: "/work/project",
-  ...(repository === null
-    ? {}
-    : {
-        repositoryIdentity: {
-          canonicalKey: `github.com/${repository}`,
-          locator: {
-            source: "git-remote" as const,
-            remoteName: "origin",
-            remoteUrl: `https://github.com/${repository}.git`,
-          },
-          provider: SourceControlProviderKind.make("github"),
-          displayName: repository,
-        },
-      }),
+  workspaceRoot: `/work/${id}`,
+  ...(repository === null ? {} : { repositoryIdentity: identityOf(repository) }),
   defaultModelSelection: null,
   scripts: [],
   createdAt: "2026-11-01T00:00:00Z",
@@ -94,13 +95,20 @@ const providerError = (reason: PullRequestProviderError["reason"], detail: strin
 /**
  * A pull request host as T3's pull request service answers for it, without its caches: every
  * judge call reads it. `prs` is keyed `owner/repo#N` (lowercase, as targets are resolved).
+ * `remotes` is what the remote lookup finds, by workspace root; a shell in `projects` shows a
+ * remote only once the background lookup has run (`shell(id, null)` before that).
  */
 const fakeHost = () => {
   const prs = new Map<string, PrState>();
   const reads: string[] = [];
+  const lookups: string[] = [];
   const projects = new Map<ProjectId, OrchestrationProjectShell>([
     [PROJECT, shell(PROJECT, "acme/widgets")],
     [BARE_PROJECT, shell(BARE_PROJECT, null)],
+  ]);
+  const remotes = new Map<string, RepositoryIdentity | null>([
+    [`/work/${PROJECT}`, identityOf("acme/widgets")],
+    [`/work/${BARE_PROJECT}`, null],
   ]);
   const find = (ref: PullRequestRef, what: string) =>
     Effect.suspend(() => {
@@ -136,8 +144,12 @@ const fakeHost = () => {
     Layer.mock(ProjectService.ProjectService)({
       getShell: (projectId) => Effect.succeed(Option.fromNullishOr(projects.get(projectId))),
     }),
+    Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({
+      readRepositoryIdentity: (workspaceRoot) =>
+        Effect.sync(() => (lookups.push(workspaceRoot), remotes.get(workspaceRoot) ?? null)),
+    }),
   );
-  return { prs, reads, projects, layer };
+  return { prs, reads, lookups, projects, remotes, layer };
 };
 
 /** Records each message; every thread is there. */
@@ -387,27 +399,173 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
     }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
   });
 
-  it.effect("a project without a remote needs the repository; a gone project ends the wait", () => {
+  it.effect(
+    "a project without a remote refuses a new wait in wait_for's words; a gone project ends the wait",
+    () => {
+      const host = fakeHost();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+        const filePath = yield* storePath;
+        const service = yield* makeService(filePath, yield* makePrJudge());
+
+        // Naming the repository does not help: the host comes from the project's remote. The
+        // refusal never says "pass url" or "pass host" (fields link_pull_request has, wait_for not).
+        for (const input of [
+          prWait({ number: 7 }),
+          prWait({ number: 7, repository: "acme/widgets" }),
+        ]) {
+          const refused = yield* refusal(service, input, BARE_PROJECT);
+          assert.strictEqual(refused.code, "invalid");
+          assert.include(refused.message, "has no remote on a pull request host T3 knows");
+          assert.notMatch(refused.message, /\bpass\b/iu);
+        }
+        assert.deepStrictEqual(host.reads, []);
+        assert.deepStrictEqual(host.lookups, [`/work/${BARE_PROJECT}`, `/work/${BARE_PROJECT}`]);
+
+        yield* register(service, prWait({ number: 7, until: "merged" }));
+        host.projects.delete(PROJECT);
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
+        const [ended] = yield* storedWaits(filePath);
+        assert.strictEqual(ended?.result?.outcome, "check_error");
+        assert.strictEqual(ended?.result?.detail, "The project of this wait is gone.");
+      }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
+
+  it.effect(
+    "after a restart a stored wait waits for its project's remote lookup; it is never ended by it",
+    () => {
+      const host = fakeHost();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+        const filePath = yield* storePath;
+        const before = yield* makeService(filePath, yield* makePrJudge());
+        // One wait names its repository, one takes the project's: both need the project's host.
+        yield* register(before, prWait({ number: 7, until: "merged" }));
+        yield* register(before, prWait({ number: 7, repository: "acme/widgets", until: "merged" }));
+        assert.deepStrictEqual(host.lookups, [], "a shell with its remote needs no lookup");
+
+        // Restart: the project shell shows no remote until its background lookup ends.
+        host.projects.set(PROJECT, shell(PROJECT, null));
+        const after = yield* makeService(filePath, yield* makePrJudge());
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* after.judgeDue(), { judged: 2, ended: 0 });
+        const waiting = yield* storedWaits(filePath);
+        assert.deepStrictEqual(
+          waiting.map((wait) => [wait.state, wait.lastError ?? null]),
+          [
+            ["waiting", null],
+            ["waiting", null],
+          ],
+        );
+        assert.deepStrictEqual(host.lookups, [`/work/${PROJECT}`, `/work/${PROJECT}`]);
+
+        host.prs.set("acme/widgets#7", { state: "merged", headSha: HEAD_A });
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* after.judgeDue(), { judged: 2, ended: 2 });
+        assert.deepStrictEqual(
+          (yield* storedWaits(filePath)).map((wait) => wait.result?.outcome),
+          ["merged", "merged"],
+        );
+      }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
+
+  it.effect("a new wait made before the project's remote is looked up waits for the lookup", () => {
     const host = fakeHost();
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOW);
       host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+      host.projects.set(PROJECT, shell(PROJECT, null));
       const filePath = yield* storePath;
       const service = yield* makeService(filePath, yield* makePrJudge());
+      assert.strictEqual((yield* register(service, prWait({ number: 7 }))).state, "waiting");
+      assert.deepStrictEqual(host.reads.slice(0, 1), [
+        "detail github.com acme/widgets#7 stale:false",
+      ]);
+    }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+  });
 
-      const refused = yield* refusal(service, prWait({ number: 7 }), BARE_PROJECT);
-      assert.strictEqual(refused.code, "invalid");
-      assert.include(refused.message, "Name the pull request's repository");
-      assert.deepStrictEqual(host.reads, []);
+  it.effect(
+    "a stored wait whose project's remote is gone is a failed read: check_error only after the grace",
+    () => {
+      const host = fakeHost();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        host.prs.set("acme/widgets#8", { state: "open", headSha: HEAD_A });
+        const filePath = yield* storePath;
+        const service = yield* makeService(filePath, yield* makePrJudge());
+        yield* register(service, prWait({ number: 8, until: "merged" }));
+        const readsAtRegistration = host.reads.length;
 
-      yield* register(service, prWait({ number: 7, until: "merged" }));
-      host.projects.delete(PROJECT);
+        // The lookup finds no remote now (removed, or `git remote` timed out on a busy host).
+        host.projects.set(PROJECT, shell(PROJECT, null));
+        host.remotes.set(`/work/${PROJECT}`, null);
+        host.prs.set("acme/widgets#8", { state: "merged", headSha: HEAD_A });
+        yield* TestClock.adjust(SWEEP);
+        assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 0 });
+        const [failed] = yield* storedWaits(filePath);
+        assert.strictEqual(failed?.state, "waiting");
+        assert.include(failed?.lastError ?? "", "has no remote on a pull request host T3 knows");
+        assert.include(failed?.lastError ?? "", "looked up again");
+
+        for (let minute = 0; minute < 16; minute += 2) {
+          yield* TestClock.adjust(SWEEP);
+          yield* service.judgeDue();
+        }
+        const [ended] = yield* storedWaits(filePath);
+        assert.strictEqual(ended?.result?.outcome, "check_error");
+        // Never met: the pull request merged meanwhile, but nothing was read without a host.
+        assert.strictEqual(host.reads.length, readsAtRegistration);
+      }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
+
+  it.effect("a head is settled only by two reads of its own checks", () => {
+    // T3 reads the head and the checks from two caches of different ages (60 s and 15 s), so one
+    // read can pair the new head B with the old head's finished checks.
+    const host = fakeHost();
+    let checksOf: ReadonlyArray<PullRequestCheck> = [];
+    const mixed = Layer.mock(PullRequestService.PullRequestService)({
+      detail: (ref) =>
+        Effect.sync(
+          () =>
+            ({
+              repository: ref.repository,
+              number: ref.number,
+              state: "open",
+              headSha: HEAD_B,
+            }) as PullRequestDetail,
+        ),
+      checks: () => Effect.sync(() => ({ state: "open" as const, checks: checksOf })),
+    });
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      checksOf = [check("ci", "pending")];
+      const filePath = yield* storePath;
+      const service = yield* makeService(filePath, yield* makePrJudge());
+      assert.strictEqual((yield* register(service, prWait({ number: 7 }))).state, "waiting");
+      // First sweep: the head is B, the checks are still head A's, finished.
+      checksOf = [check("ci", "success")];
+      yield* TestClock.adjust(SWEEP);
+      assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 0 });
+      // Second sweep: B's own checks, read once: only its fast check is listed so far.
+      checksOf = [check("title-lint", "success")];
+      yield* TestClock.adjust(SWEEP);
+      assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 0 });
+      // B's main check is queued and finishes; two reads of that list settle it.
+      checksOf = [check("title-lint", "success"), check("ci", "failure")];
+      yield* TestClock.adjust(SWEEP);
+      assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 0 });
       yield* TestClock.adjust(SWEEP);
       assert.deepStrictEqual(yield* service.judgeDue(), { judged: 1, ended: 1 });
       const [ended] = yield* storedWaits(filePath);
-      assert.strictEqual(ended?.result?.outcome, "check_error");
-      assert.strictEqual(ended?.result?.detail, "The project of this wait is gone.");
-    }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+      assert.strictEqual(ended?.result?.outcome, "failed");
+      assert.strictEqual(ended?.result?.detail, "Head bbbbbbb. 1 of 2 failed: ci.");
+    }).pipe(Effect.provide(Layer.mergeAll(host.layer, mixed, ServerSettingsService.layerTest(ON))));
   });
 
   it.effect("after a restart the settle rule takes two fresh reads again", () => {

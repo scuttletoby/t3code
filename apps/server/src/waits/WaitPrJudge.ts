@@ -11,9 +11,10 @@ import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
+import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
-import { resolveTarget } from "../pullRequest/pullRequestTarget.ts";
+import { type PullRequestTargetError, resolveTarget } from "../pullRequest/pullRequestTarget.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import type { WaitJudge } from "./WaitJudges.ts";
@@ -28,6 +29,38 @@ const permanent = (message: string): Judgement => ({ type: "failed", message, pe
 const transient = (message: string): Judgement => ({ type: "failed", message, permanent: false });
 const clip = (text: string) =>
   text.length > MESSAGE_MAX ? `${text.slice(0, MESSAGE_MAX - 1)}…` : text;
+
+/**
+ * wait_for's own words for a target it cannot build (link_pull_request's say "pass url", a field
+ * wait_for does not have). Each comes from the project's remote: it refuses a new wait, but for a
+ * stored one it is a failed read, retried and reported after the error grace, since a remote can
+ * be changed back and a remote lookup that timed out reads as none.
+ */
+const NO_REMOTE =
+  "This thread's project has no remote on a pull request host T3 knows, so the host to read is unknown. Wait from a thread whose project's remote is on the pull request's host.";
+const NO_REPOSITORY =
+  "T3 cannot tell this project's repository from its remote. Name the pull request's repository.";
+const NO_URL_SHAPE =
+  "This thread's project is on a host whose pull requests T3 cannot find by repository and number, so a pull request wait cannot read them.";
+
+function remoteProblem(message: string, registering: boolean): Judgement {
+  return registering
+    ? permanent(message)
+    : transient(`${message} The project's remote is looked up again at the next read.`);
+}
+
+function targetProblem(error: PullRequestTargetError, registering: boolean): Judgement {
+  switch (error._tag) {
+    case "PullRequestHostRequiredError":
+      return remoteProblem(NO_REMOTE, registering);
+    case "PullRequestUrlUnavailableError":
+      return remoteProblem(NO_URL_SHAPE, registering);
+    // A wait always has repository and number and never a url, so these cannot happen.
+    case "PullRequestTargetIncompleteError":
+    case "PullRequestUrlInvalidError":
+      return permanent("The pull request wait has no repository and number to read.");
+  }
+}
 
 /**
  * What a failed read means; never met. Not found and a host without pull request reads are
@@ -62,6 +95,7 @@ function failedRead(
 export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
   const settingsService = yield* ServerSettingsService;
   const projects = yield* ProjectService.ProjectService;
+  const enrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
   const pullRequests = yield* PullRequestService.PullRequestService;
   /** The settle rule's memory, by pull request: it is about the head, not about one wait. */
   const seenByPr = new Map<string, { readonly seen: PrSeen; readonly at: number }>();
@@ -80,16 +114,21 @@ export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
     const project = yield* projects.getShell(context.projectId).pipe(Effect.option);
     if (Option.isNone(project)) return transient("The project cannot be read now.");
     if (Option.isNone(project.value)) return permanent("The project of this wait is gone.");
+    // A project shell shows only a remote already looked up: after a server start or a project
+    // update it has none until a background lookup ends. Wait for that lookup (a cached
+    // `git remote`), as T3's pull request service does, so "not looked up yet" never reads as
+    // "no remote".
     const shell = project.value.value;
-    const repository =
-      spec.repository ?? sourceControlDefinitions.repositorySelector(shell.repositoryIdentity);
-    if (repository === null || repository === undefined) {
-      return permanent(
-        "This thread's project has no recognised remote. Name the pull request's repository.",
-      );
-    }
-    const target = yield* Effect.result(resolveTarget({ repository, number: spec.number }, shell));
-    if (Result.isFailure(target)) return permanent(target.failure.message);
+    const identity =
+      shell.repositoryIdentity ?? (yield* enrichment.readRepositoryIdentity(shell.workspaceRoot));
+    if (identity === null) return remoteProblem(NO_REMOTE, registering);
+    const withRemote = { ...shell, repositoryIdentity: identity };
+    const repository = spec.repository ?? sourceControlDefinitions.repositorySelector(identity);
+    if (repository === null) return remoteProblem(NO_REPOSITORY, registering);
+    const target = yield* Effect.result(
+      resolveTarget({ repository, number: spec.number }, withRemote),
+    );
+    if (Result.isFailure(target)) return targetProblem(target.failure, registering);
     const ref: PullRequestRef = {
       projectId: context.projectId,
       host: target.success.host,
