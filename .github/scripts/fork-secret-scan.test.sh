@@ -478,7 +478,7 @@ UPSTREAM="" EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$stable" HEAD_
 # The daily sweep (every branch and tag) leaves upstream's commits out too, and only then.
 git -C "$root/fork.git" update-ref -d refs/heads/leaky
 EVENT_NAME=schedule check "daily sweep: upstream's commits on the fork's branches are left out" 0 \
-  "every branch and tag of origin.*upstream up/t3code already has"
+  "every ref of origin but refs/pull.*upstream up/t3code already has"
 UPSTREAM="" EVENT_NAME=schedule check "daily sweep, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
 unset UPSTREAM UPSTREAM_URL
 
@@ -546,19 +546,30 @@ msgs_pr=$(git rev-parse HEAD)
 git checkout -q -b pr-clean "$msgs_base"
 commit y.txt "y" "a plain message"
 msgs_clean=$(git rev-parse HEAD)
+# PR #214 (r1s-1): the commit object as stored, so its author and committer lines too.
+git checkout -q -b pr-author "$msgs_base"
+GIT_AUTHOR_NAME="aws_access_key_id=$key" commit a.txt "a" "a plain message"
+msgs_author=$(git rev-parse HEAD)
+git checkout -q -b pr-committer "$msgs_base"
+GIT_COMMITTER_EMAIL="$key@example.invalid" commit c.txt "c" "a plain message"
+msgs_committer=$(git rev-parse HEAD)
 git checkout -q main
 GIT_COMMITTER_DATE="@$date" git tag -a v9 -m "release notes: token $key" "$msgs_base"
 GIT_COMMITTER_DATE="@$date" git tag -a v8 -m "release notes" "$msgs_base"
-git push -q origin main pr pr-clean v9 v8
+git push -q origin main pr pr-clean pr-author pr-committer v9 v8
 checkout msgs pr
 EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_pr" \
-  check "pull request: a key in a commit message is found" 1 "message of commit $msgs_pr"
+  check "pull request: a key in a commit message is found" 1 "message, author or committer of commit $msgs_pr"
 EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_clean" \
-  check "pull request: plain commit messages pass (control)" 0 "Scanning the messages.*1 in all"
+  check "pull request: plain commit messages pass (control)" 0 "Scanning the commit objects.*1 in all"
+EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_author" \
+  check "pull request: a key in a commit's author name is found" 1 "author or committer of commit $msgs_author"
+EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_committer" \
+  check "pull request: a key in a commit's committer email is found" 1 "author or committer of commit $msgs_committer"
 EVENT_NAME=push PUSH_REF=refs/tags/v9 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_base" \
-  check "push of an annotated tag: a key in its message is found" 1 "message of tag object"
+  check "push of an annotated tag: a key in its message is found" 1 "author or committer of tag object"
 EVENT_NAME=push PUSH_REF=refs/tags/v8 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_base" \
-  check "push of an annotated tag: a plain message passes (control)" 0 "1 tag\\(s\\)"
+  check "push of an annotated tag: a plain message passes (control)" 0 "1 tag object\\(s\\)"
 EVENT_NAME=push PUSH_REF=refs/tags/v8 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_clean" \
   check "push of a tag that moved since: its message is not read, with a warning" 0 "::warning.*cannot be fetched as pushed"
 
@@ -572,12 +583,21 @@ git checkout -q main
 git push -q origin main side
 clone="$root/sweep-clone"
 git clone -q --filter=blob:none --no-checkout "file://$root/sweep.git" "$clone"
-EVENT_NAME=schedule check "daily sweep: a key on a branch no push run scanned is found" 1 "every branch and tag of origin"
+EVENT_NAME=schedule check "daily sweep: a key on a branch no push run scanned is found" 1 "every ref of origin but refs/pull"
 git push -q origin :side
-EVENT_NAME=schedule check "daily sweep: the branch gone, the same clone passes (control)" 0 "every branch and tag of origin \\(1 distinct"
+EVENT_NAME=schedule check "daily sweep: the branch gone, the same clone passes (control)" 0 "every ref of origin but refs/pull/\\* \\(1 distinct"
+# PR #214 (r1s-1): refs outside branches and tags (notes, anything) are public too: any clone can
+# fetch them, and no push run scans them. Pull request heads are left out (see the script header).
+git push -q origin side:refs/notes/commits
+EVENT_NAME=schedule check "daily sweep: a key held only by refs/notes/commits is found" 1
+git push -q origin :refs/notes/commits side:refs/keep/x
+EVENT_NAME=schedule check "daily sweep: a key held only by refs/keep/x is found" 1
+git push -q origin :refs/keep/x side:refs/pull/1/head
+EVENT_NAME=schedule check "daily sweep: a pull request head is left out, as documented" 0 "\\(1 distinct"
+git push -q origin :refs/pull/1/head
 GIT_COMMITTER_DATE="@$date" git tag -a v2 -m "notes: $key" main
 git push -q origin v2
-EVENT_NAME=workflow_dispatch check "manual sweep: a key in a tag message is found" 1 "message of tag object"
+EVENT_NAME=workflow_dispatch check "manual sweep: a key in a tag message is found" 1 "author or committer of tag object"
 git push -q origin :refs/tags/v2
 git tag tree-tag "main^{tree}"
 git push -q origin tree-tag
@@ -839,22 +859,17 @@ else
 fi
 # Its shape (any gitleaks): no [extend] (useDefault brings back the default path skip list,
 # disabledRules drops rules) and no [allowlist] table (a second global allowlist); every
-# [[allowlists]] entry after the first names its rules and the values it allows, and one with paths
-# has condition = "AND", so it never skips a whole file. Each value regex holds whole values: ^ first
-# and $ last with no | outside a group, no .* or .+, and in the syntax Python and Go share (one
-# Python cannot read is a problem, never "narrow"). Against the gitleaks binary (the real one only;
-# its default config is built in): the rules, from the first [[rules]] to the end, are its default
-# rules byte for byte; the first entry is its global allowlist without the path skip list; and the
-# binary judges every allowlist part (entry 1 with its stop words, each regex of a later entry with
-# its paths dropped) on generated token shapes, each of which its rules alone find: a part that
-# hides one is a problem, as is a targetRules rule none of the shapes trigger. Without the binary,
-# Python's re tries the same shapes. Each rule is tried on broken copies too.
+# [[allowlists]] entry after the first names rules of the file and the values it allows, and one
+# with paths has condition = "AND", so it never skips a whole file. Each value regex of such an
+# entry is an exact value: ^, one fixed string with no regex syntax (escapes \<punctuation> and
+# \xHH only), $; anything else is a problem, whatever it would match (see literal_value for why).
+# Against the gitleaks binary (the real one only; its default config is built in): the rules, from
+# the first [[rules]] to the end, are its default rules byte for byte; the first entry is its global
+# allowlist without the path skip list; and the binary judges that entry (with its stop words) on
+# generated token shapes, each of which its rules alone find: one it hides is a problem. Each rule
+# is tried on broken copies too.
 cat > "$root/toml-check.py" <<'CHECK'
 import collections, hashlib, json, math, os, re, subprocess, sys, tempfile, tomllib
-try:
-    from re import _parser as sre  # Python 3.11+
-except ImportError:  # pragma: no cover
-    import sre_parse as sre
 path, binary_path = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
 raw = open(path, "rb").read()
 try:
@@ -871,7 +886,7 @@ if not entries:
 NARROW = {"description", "targetRules", "condition", "paths", "regexes", "regexTarget"}
 
 
-# Token shapes no entry may allow, made at run time from a hash (this file holds none of them):
+# Token shapes entry 1 may not allow, made at run time from a hash (this file holds none of them):
 # hex (32, 40, 64), letters and digits (16 to 64), base64, URL-safe, a token after a version
 # (1.0.0-<token>), each after 8 secret-like names in 4 ways of writing them; and AWS, GitHub, Slack
 # and Bedrock keys. Each line must be a finding of gitleaks' rules alone (the judge checks that).
@@ -927,228 +942,64 @@ for line, v in [("aws_access_key_id = {v}", "AK" + "IA" + tok("aws", 16, UP + "2
                  + tok("bedrock", 40, B62 + "+/"))]:
     fixture.append((line.format(v=v), v, line.split()[0].split("=")[0] + ", " + v[:4] + "..."))
 
-UNBOUNDED = (sre.MAXREPEAT,)
+# Later entries allow exact values only (PR #214, round 2). Each earlier rule that judged a value
+# regex from its text (bounded repeats, letter-and-digit classes, alternations of fixed text) was
+# got round by a form it misread: (?m) anchors that match inside a multi-line key, POSIX classes
+# Python's re reads differently from gitleaks' Go RE2, nested repeats, an alternation of single
+# characters. This rule reads no regex syntax at all, so there is nothing to misread: ^, then only
+# characters that are not syntax in either engine (printable ASCII) or an escape that stands for
+# one character in both (a backslash before punctuation, or \xHH), then $. Such a regex matches
+# exactly one string, the one the reviewer reads in it. Nothing is guessed about which keys it
+# could match, so no sample of key shapes is needed for these entries.
+SYNTAX = set("\\.+*?()|[]{}^$")
+PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")  # what both engines accept after a backslash
+HEXDIGITS = set("0123456789abcdefABCDEF")
 
 
-def any_unbounded(items):
-    """A . (any character) with no upper bound (.*, .+, .{n,}) anywhere in the parsed regex."""
-    for op, av in items:
-        if op in (sre.MAX_REPEAT, sre.MIN_REPEAT) + ((sre.POSSESSIVE_REPEAT,) if hasattr(sre, "POSSESSIVE_REPEAT") else ()):
-            lo, hi, sub = av
-            if hi in UNBOUNDED and any(o == sre.ANY for o, _ in sub):
-                return True
-            if any_unbounded(sub):
-                return True
-        elif op == sre.SUBPATTERN:
-            if any_unbounded(av[-1]):
-                return True
-        elif op == sre.BRANCH:
-            if any(any_unbounded(b) for b in av[1]):
-                return True
-        elif op in (sre.ASSERT, sre.ASSERT_NOT):
-            if any_unbounded(av[1]):
-                return True
-    return False
-
-
-def top_level_bar(r):
-    """A | outside every group and character class (Python's parser folds (?:a|b) into its parent, so
-    this reads the text): escapes skip a character, [...] (with a leading ] or ^], and [:name:])
-    holds no syntax, parentheses nest."""
-    depth, i = 0, 0
-    while i < len(r):
+def literal_value(r):
+    """(the one string r matches, None) when r is an exact value (see above), else (None, why)."""
+    if not (isinstance(r, str) and r.startswith("^") and r.endswith("$") and len(r) >= 3):
+        return None, "is not ^value$"
+    out, i, end = [], 1, len(r) - 1
+    while i < end:
         c = r[i]
         if c == "\\":
-            i += 2
-            continue
-        if c == "[":
-            i += 1
-            if i < len(r) and r[i] == "^":
-                i += 1
-            if i < len(r) and r[i] == "]":
-                i += 1
-            while i < len(r) and r[i] != "]":
-                if r[i] == "\\":
-                    i += 1
-                elif r.startswith("[:", i) and ":]" in r[i + 2:]:
-                    i = r.index(":]", i + 2) + 1
-                i += 1
-        elif c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-        elif c == "|" and depth == 0:
-            return True
-        i += 1
-    return False
-
-
-def shape_problem(r):
-    """Why the value regex r is not narrow, or None. It must hold whole values: ^ first and $ last,
-    no | outside a group (^a|b$ is ^a or b$), no .* or .+ (a whole-line or any-value pattern), and
-    in the syntax Python and Go share (one Python cannot read, such as Go's \\pL, cannot be checked)."""
-    try:
-        items = list(sre.parse(readable(r)))
-        re.compile(readable(r))
-    except (re.error, OverflowError, RecursionError) as e:
-        return f"cannot be read by Python's re ({e}), so it cannot be checked; write it in the syntax Python and Go share"
-    if top_level_bar(r):
-        return "has a | outside a group, so ^ and $ do not hold every branch (write ^(?:a|b)$)"
-    if not (items and items[0] == (sre.AT, sre.AT_BEGINNING) and items[-1] == (sre.AT, sre.AT_END)):
-        return "is not anchored (^...$)"
-    if any_unbounded(items):
-        return "has .* or .+ (any text of any length): a whole-line or any-value pattern"
-    return None if exact_value(r) else token_problem(r)
-
-
-def readable(r):
-    """r as Python's re reads it: Go (RE2) also takes flags right after ^ (^(?i)value$), which
-    Python 3.11+ refuses; (?i)^value$ means the same."""
-    m = re.match(r"\^(\(\?[a-zA-Z]+\))", r)
-    return m.group(1) + "^" + r[m.end():] if m else r
-
-
-REPEATS = (sre.MAX_REPEAT, sre.MIN_REPEAT) + ((sre.POSSESSIVE_REPEAT,) if hasattr(sre, "POSSESSIVE_REPEAT") else ())
-ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-
-
-def exact_items(items):
-    """Only fixed text: literals (escaped or not, a one-character class), and groups or alternations
-    of fixed text."""
-    for op, av in items:
-        if op == sre.LITERAL:
-            continue
-        if op == sre.IN and len(av) == 1 and av[0][0] == sre.LITERAL:
-            continue
-        if op == sre.SUBPATTERN and exact_items(av[-1]):
-            continue
-        if op == sre.BRANCH and all(exact_items(b) for b in av[1]):
-            continue
-        return False
-    return True
-
-
-def exact_value(r):
-    """An anchored exact value (^value$, (?i)^value$, ^(?i)value$, ^(?:a|b)$): it allows only the
-    fixed strings it spells, so it is a reviewed fake key and needs no judge."""
-    try:
-        items = list(sre.parse(readable(r)))
-    except (re.error, OverflowError, RecursionError):
-        return False
-    return (len(items) >= 2 and items[0] == (sre.AT, sre.AT_BEGINNING) and items[-1] == (sre.AT, sre.AT_END)
-            and exact_items(items[1:-1]))
-
-
-def in_class(op, av, ch):
-    """Whether the one-character item (op, av) matches ch (case as written)."""
-    if op == sre.ANY:
-        return ch != "\n"
-    if op == sre.LITERAL:
-        return ord(ch) == av
-    if op == sre.NOT_LITERAL:
-        return ord(ch) != av
-    if op != sre.IN:
-        return False
-    hit, negate = False, False
-    for o, a in av:
-        if o == sre.NEGATE:
-            negate = True
-        elif o == sre.LITERAL:
-            hit |= ord(ch) == a
-        elif o == sre.RANGE:
-            hit |= a[0] <= ord(ch) <= a[1]
-        elif o == sre.CATEGORY:
-            word = ch.isalnum() or ch == "_"
-            hit |= {sre.CATEGORY_DIGIT: ch.isdigit(), sre.CATEGORY_NOT_DIGIT: not ch.isdigit(),
-                    sre.CATEGORY_SPACE: ch.isspace(), sre.CATEGORY_NOT_SPACE: not ch.isspace(),
-                    sre.CATEGORY_WORD: word, sre.CATEGORY_NOT_WORD: not word}.get(a, False)
-    return hit != negate
-
-
-def token_class(op, av):
-    """(token, mixed): a one-character item that matches two or more letters or digits (a token
-    character, not one fixed character), and one that matches both letters and digits."""
-    if op not in (sre.ANY, sre.NOT_LITERAL, sre.IN):
-        return False, False
-    hits = [c for c in ALNUM if in_class(op, av, c)]
-    return len(hits) >= 2, any(c.isalpha() for c in hits) and any(c.isdigit() for c in hits)
-
-
-def has_token(items):
-    for op, av in items:
-        if token_class(op, av)[0]:
-            return True
-        if op in REPEATS and has_token(av[2]):
-            return True
-        if op == sre.SUBPATTERN and has_token(av[-1]):
-            return True
-        if op == sre.BRANCH and any(has_token(b) for b in av[1]):
-            return True
-        if op in (sre.ASSERT, sre.ASSERT_NOT) and has_token(av[1]):
-            return True
-    return False
-
-
-def token_repeat(items):
-    """A repeat of token characters with no upper bound (\\w+, [a-z0-9]*, .+, x{16,}) or one of 16
-    or more ({16}, {41,63}): why, or None."""
-    for op, av in items:
-        if op in REPEATS:
-            lo, hi, sub = av
-            if has_token(sub) and hi == sre.MAXREPEAT:
-                return "repeats a character class with no upper bound (+, *, {n,})"
-            if has_token(sub) and hi >= 16:
-                return f"repeats a character class up to {hi} times (16 or more)"
-            why = token_repeat(sub)
-        elif op == sre.SUBPATTERN:
-            why = token_repeat(av[-1])
-        elif op == sre.BRANCH:
-            why = next((w for w in map(token_repeat, av[1]) if w), None)
-        elif op in (sre.ASSERT, sre.ASSERT_NOT):
-            why = token_repeat(av[1])
+            n = r[i + 1] if i + 1 < end else ""
+            if n and n in PUNCT:
+                out.append(n)
+                i += 2
+            elif n == "x" and i + 4 <= end and set(r[i + 2:i + 4]) <= HEXDIGITS:
+                out.append(chr(int(r[i + 2:i + 4], 16)))
+                i += 4
+            elif not n:
+                return None, "ends in a backslash, so its $ is a literal $ and the value is not anchored"
+            else:
+                return None, f"has the escape \\{n}, which is not one fixed character (only \\<punctuation> or \\xHH)"
+        elif c in SYNTAX:
+            return None, f"has the regex syntax {c!r} (escape it with a backslash to mean the character)"
+        elif not " " <= c <= "~":
+            return None, f"has the character {c!r}, which is not printable ASCII (write it as \\xHH)"
         else:
-            why = None
-        if why:
-            return why
-    return None
+            out.append(c)
+            i += 1
+    value = "".join(out)
+    # Python's re must agree that r matches exactly this string (a check on this reader).
+    try:
+        if not re.fullmatch(r, value):
+            return None, "does not match its own value in Python's re (a bug in this check)"
+    except re.error as e:
+        return None, f"cannot be read by Python's re ({e})"
+    return value, None
 
 
-def mixed_length(items):
-    """The most characters a match can take from classes that match both letters and digits
-    ([0-9a-f], \\w, .): a UUID shape holds 32."""
-    total = 0
-    for op, av in items:
-        if token_class(op, av)[1]:
-            total += 1
-        elif op in REPEATS:
-            total += av[1] * mixed_length(av[2])
-        elif op == sre.SUBPATTERN:
-            total += mixed_length(av[-1])
-        elif op == sre.BRANCH:
-            total += max(mixed_length(b) for b in av[1])
-    return total
-
-
-def token_problem(r):
-    """Why the value regex r could hold a key whatever the judge's samples say, or None: any regex
-    that is not an exact value is refused when it repeats a character class without a bound or 16
-    or more times, or takes 16 or more characters from classes of both letters and digits."""
-    items = list(sre.parse(readable(r)))
-    why = token_repeat(items)
-    if why:
-        return f"{why}: it could allow a key of that shape (allow the exact fake value instead)"
-    n = mixed_length(items)
-    if n >= 16:
-        return (f"takes up to {n} characters from classes of both letters and digits: it could allow a key"
-                " of that shape (allow the exact fake value instead)")
-    return None
-
-
+rule_ids = {rule.get("id") for rule in cfg.get("rules") or []}
 for i, e in enumerate(entries[1:], start=2):
     where = f"[[allowlists]] entry {i} ({e.get('description', 'no description')!r})"
     problems += [f"{where}: key {k!r} is not allowed (only {', '.join(sorted(NARROW))})" for k in sorted(set(e) - NARROW)]
     if not e.get("targetRules"):
         problems.append(f"{where}: no targetRules (it would apply to every rule)")
+    problems += [f"{where}: targetRules names {rule!r}, which is not a rule of this file"
+                 for rule in e.get("targetRules") or [] if rule not in rule_ids]
     if not e.get("regexes"):
         problems.append(f"{where}: no regexes (it would allow every value)")
     if e.get("paths") and e.get("condition") != "AND":
@@ -1156,17 +1007,10 @@ for i, e in enumerate(entries[1:], start=2):
     if e.get("regexTarget", "secret") not in ("secret", "line"):
         problems.append(f"{where}: regexTarget {e.get('regexTarget')!r}")
     for r in e.get("regexes") or []:
-        why = shape_problem(r)
+        _, why = literal_value(r)
         if why:
-            problems.append(f"{where}: regex '{r}' {why}")
-            continue
-        if exact_value(r):
-            continue  # a reviewed fake key: fixed text only, no judge
-        # Without the binary: Python's re on the fixture (the binary below is the real judge).
-        on_line = e.get("regexTarget") == "line"
-        wide = [what for line, v, what in fixture if re.search(readable(r), line if on_line else v)]
-        if wide:
-            problems.append(f"{where}: regex '{r}' allows a token-shaped value ({wide[0]})")
+            problems.append(f"{where}: regex '{r}' {why}: a later entry allows exact values only (see the"
+                            " header of .gitleaks.toml)")
 
 
 def toml_value(v):
@@ -1182,11 +1026,9 @@ def entry_toml(e):
 
 
 def judge(rules):
-    """The real gitleaks judges every value the settings allow: the fixture is scanned with the rules
-    alone, then with the rules and one allowlist part at a time (entry 1 whole, so its stop words
-    too; each regex of a later entry, with its paths and condition dropped, so it applies to every
-    file: wider than the entry, so what it allows there is what the entry could allow in its paths).
-    Any finding the part removes is a token shape it allows."""
+    """The real gitleaks judges gitleaks' global allowlist (entry 1, the only part that is not exact
+    values): the fixture is scanned with the rules alone, then with the rules and entry 1 (its stop
+    words too). Any finding entry 1 removes is a token shape it allows."""
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "src")
         os.mkdir(src)
@@ -1214,19 +1056,7 @@ def judge(rules):
         out = [f"the judge's fixture line {n} ({what}) is not a finding of gitleaks' rules,"
                " so it judges nothing: change its shape" for n, (_, _, what) in enumerate(fixture, start=1)
                if not any(found == n for found, _ in base)]
-        found_rules = {rule for _, rule in base}
         parts = [("entry 1 (gitleaks' global allowlist)", [entries[0]])] if entries else []
-        for i, e in enumerate(entries[1:], start=2):
-            where = f"[[allowlists]] entry {i} ({e.get('description', 'no description')!r})"
-            judged = [r for r in e.get("regexes") or [] if not exact_value(r)]
-            for rule in (e.get("targetRules") or []) if judged else []:
-                if rule not in found_rules:
-                    out.append(f"{where}: targetRules {rule!r} has no finding in the judge's fixture, so its"
-                               " values cannot be judged: add a token shape for that rule to the fixture")
-            for r in judged:
-                wide = {k: v for k, v in e.items() if k not in ("paths", "condition", "regexes")}
-                wide["regexes"] = [r]
-                parts.append((f"{where}: regex '{r}'", entries[:1] + [wide]))
         for what, part in parts:
             got, err = scan(part)
             if got is None:
@@ -1295,10 +1125,13 @@ toml_mutant "an entry without regexes" "$(narrow_entry "targetRules = [\\\"gener
 toml_mutant "an entry that allows any value (^.*\$)" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"^.*\$\\\"]")"
 toml_mutant "an unanchored value" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"abc\\\"]")"
 toml_mutant "an entry with stopwords" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"^abc\$\\\"]\\nstopwords = [\\\"key\\\"]")"
-toml_mutant "the old pnpm-lock.yaml version shape (any 1.0.0-<token>)" \
-  "t.replace(\"(?:-(?:[a-z]{1,10}|[a-z]{0,2}\\\\d{1,14})(?:\\\\.(?:[a-z]{1,10}|[a-z]{0,2}\\\\d{1,14})){0,2})?\$\", \"(?:-[0-9A-Za-z.-]+)?(?:\\\\+[0-9A-Za-z.-]+)?\$\", 1)"
-# Later entries that look narrow, each with what it would hide (the reviewers' cases of #212): the
-# check refuses them. An exact fake value, and an alternation inside a group, still pass.
+toml_mutant "the pnpm-lock.yaml value widened back to a shape (any 14 digits)" \
+  "t.replace(\"^0\\\\.0\\\\.4-canary\\\\.v20260819050620\$\", \"^0\\\\.0\\\\.4-canary\\\\.v\\\\d{14}\$\", 1)"
+toml_mutant "a #91 value widened to any 16 hex characters" \
+  "t.replace(\"'''^0123456789abcdef\$'''\", \"'''^[0-9a-f]{16}\$'''\", 1)"
+# Later entries: each regex must be an exact value (^, one fixed string, $; see the header of
+# .gitleaks.toml). Every other form is refused, whatever it would match: a rule that read regex text
+# to judge "narrow" was got round each round (#212, #214) by a form it misread.
 toml_entry() { # toml_entry NAME pass|fail ENTRY_LINE... -> the repository's file with one more entry
   [[ -f "$repo_toml" ]] || return 0
   local name="$1" want="$2" got=fail verb=fails
@@ -1326,28 +1159,73 @@ toml_entry "a whole-line pattern (regexTarget line, ^.*secret.*\$)" fail "$gener
   "regexes = ['''^.*secret.*\$''']"
 toml_entry "a line pattern without .* for lines naming a secret" fail "$generic" 'regexTarget = "line"' \
   "regexes = ['''^\\S*secret\\S* = \"\\w+\"\$''']"
-toml_entry "an exact fake value in one file (reviewed)" pass 'targetRules = ["aws-access-token"]' 'condition = "AND"' \
-  "paths = ['''^test/fx\\.txt\$''']" "regexes = ['''^${key:0:4}[${key:4:1}]${key:5}\$''']"
-toml_entry "an alternation of exact values inside a group" pass "$generic" "regexes = ['''^(?:abc|def)\$''']"
-# PR #214 (s2, c1, c4): a regex that is not an exact value is refused when it repeats a token
-# character class without a bound or 16 or more times, or takes 16 or more characters from classes
-# of both letters and digits, whatever the judge's samples say. Exact values need no samples.
 toml_entry "a UUID shape (32 hex characters in five groups)" fail "$generic" \
   "regexes = ['''^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$''']"
 toml_entry "a 36-character class ({36})" fail "$generic" "regexes = ['''^[a-z0-9-]{36}\$''']"
-toml_entry "a 41 to 63 character class ({41,63})" fail "$generic" "regexes = ['''^[a-zA-Z0-9]{41,63}\$''']"
 toml_entry "an open-ended word class (\\w+)" fail "$generic" "regexes = ['''^key_\\w+\$''']"
-toml_entry "an open-ended short class ({8,})" fail "$generic" "regexes = ['''^tok[a-z0-9]{8,}\$''']"
+# Forms that are close to an exact value, and still refused.
+toml_entry "an alternation of exact values inside a group" fail "$generic" "regexes = ['''^(?:abc|def)\$''']"
+toml_entry "a flag after ^ (^(?i)value\$)" fail "$generic" "regexes = ['''^(?i)abc123def456\$''']"
+toml_entry "a flag first ((?i)^value\$)" fail "$generic" "regexes = ['''(?i)^abc123def456\$''']"
+toml_entry "an unescaped dot (any character)" fail "$generic" "regexes = ['''^abc.def\$''']"
+toml_entry "an escaped last \$ (no end anchor: ^abc\\\$)" fail "$generic" "regexes = ['''^abc\\\$''']"
+toml_entry "a \\d escape (a class, not one character)" fail "$generic" "regexes = ['''^abc\\d\$''']"
+toml_entry "a \\n escape (only \\<punctuation> and \\xHH)" fail "$generic" "regexes = ['''^abc\\ndef\$''']"
+toml_entry "a broken \\x escape (\\xZ1)" fail "$generic" "regexes = ['''^abc\\xZ1\$''']"
+toml_entry "a character that is not printable ASCII" fail "$generic" "regexes = ['''^abc$(printf '\303\251')def\$''']"
+toml_entry "an empty value (^\$)" fail "$generic" "regexes = ['''^\$''']"
+toml_entry "targetRules naming a rule the file does not have" fail 'targetRules = ["no-such-rule"]' \
+  "regexes = ['''^abc\$''']"
+toml_entry "an exact value with regexTarget match" fail "$generic" 'regexTarget = "match"' "regexes = ['''^abc\$''']"
+# Exact values pass: written plainly, with \<punctuation> escapes, or one character as \xHH.
+toml_entry "an exact fake value in one file (reviewed)" pass 'targetRules = ["aws-access-token"]' 'condition = "AND"' \
+  "paths = ['''^test/fx\\.txt\$''']" "regexes = ['''^${key:0:4}\\x$(printf %02X "'${key:4:1}")${key:5}\$''']"
 ant="sk\\-ant\\-api03\\-$(printf 'q%.0s' {1..20})Fake" # an escaped fake, built at run time
 toml_entry "an exact escaped fake Anthropic-shaped value" pass "$generic" "regexes = ['''^$ant\$''']"
 toml_entry "an exact fake JWT" pass "$generic" "regexes = ['''^eyJhbGciOiJub25lIn0\\.eyJzdWIiOiJ0ZXN0In0\\.\$''']"
-toml_entry "an exact value with flags after ^ (^(?i)value\$)" pass "$generic" "regexes = ['''^(?i)abc123def456\$''']"
-toml_entry "an exact value with flags first ((?i)^value\$)" pass "$generic" "regexes = ['''(?i)^abc123def456\$''']"
-if [[ -n "${GITLEAKS_BIN:-}" ]]; then
-  # Only the binary judges by rule: an entry for a rule none of the generated shapes trigger.
-  toml_entry "a rule the judge's token shapes do not trigger" fail 'targetRules = ["stripe-access-token"]' \
-    "regexes = ['''^sk_live_[a-z]{3}\$''']"
-fi
+toml_entry "an exact value with an escaped backslash last (^abc\\\\\\\\\$)" pass "$generic" "regexes = ['''^abc\\\\\$''']"
+# The reviewers' bypasses of #214 round 1: each entry hides a key in the real gitleaks (proved
+# first, when GITLEAKS_BIN is set), and the check refuses it. The keys are built at run time.
+rnd() { python3 -I -c 'import hashlib,sys; a=sys.argv[2]; out=""; i=0
+while len(out) < int(sys.argv[3]):
+    out += "".join(a[b % len(a)] for b in hashlib.sha256(f"{sys.argv[1]}/{i}".encode()).digest()); i += 1
+print(out[:int(sys.argv[3])])' "$@"; }
+toml_hides() { # toml_hides NAME RULE REGEX FILE_CONTENT
+  if [[ -n "${GITLEAKS_BIN:-}" && -f "$repo_toml" ]]; then
+    python3 -I -c 'import sys; t = open(sys.argv[1]).read()
+e = "[[allowlists]]\ntargetRules = [\"" + sys.argv[3] + "\"]\nregexes = [\x27\x27\x27" + sys.argv[4] + "\x27\x27\x27]\n"
+open(sys.argv[2], "w").write(t.replace("\n[[rules]]\n", "\n" + e + "\n[[rules]]\n", 1))' "$repo_toml" "$root/hide.toml" "$2" "$3"
+    rm -rf "${root:?}/hide-src"; mkdir "$root/hide-src"; printf '%s\n' "$4" > "$root/hide-src/f.txt"
+    local n=() c
+    for c in "$repo_toml" "$root/hide.toml"; do
+      "$gitleaks" dir --no-banner --exit-code 0 --config "$c" --report-format json --report-path "$root/hide.json" "$root/hide-src" 2> /dev/null
+      n+=("$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$root/hide.json")")
+    done
+    if [[ "${n[0]}" -gt 0 && "${n[1]}" -eq 0 ]]; then
+      echo "ok   repository settings: an entry with $1 hides a key in gitleaks (${n[0]} findings -> 0)"
+    else
+      echo "FAIL repository settings: an entry with $1 does not hide its key (${n[0]} -> ${n[1]}): the case proves nothing"
+      failures=$((failures + 1))
+    fi
+  fi
+  toml_entry "$1" fail "targetRules = [\"$2\"]" "regexes = ['''$3''']"
+}
+B62=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
+k36="$(rnd r1-36 "$B62" 36)"
+h="$(rnd r1-uuid 0123456789abcdef 32)"; uuid="${h:0:8}-${h:8:4}-4${h:13:3}-a${h:17:3}-${h:20:12}"
+h40="$(rnd r1-hex 0123456789abcdef 40)"
+b64="$(rnd r1-pem "$B62+/" 256)"
+pem="$(printf -- '-----BEGIN PRIV''ATE KEY-----\n%s\n%s\n%s\n%s\n-----END PRIV''ATE KEY-----' \
+  "${b64:0:64}" "${b64:64:64}" "${b64:128:64}" "${b64:192:64}")"
+xd='[[:xdigit:]]'
+alt="(?:$(printf '%s|' 0 1 2 3 4 5 6 7 8 9 a b c d e f)zz)"
+toml_hides "(?m) around an exact-looking value (every private key)" private-key '(?m)^-----BEGIN PRIVATE KEY-----$' "$pem"
+toml_hides "a POSIX class ([[:alnum:]]{36}, which Python misreads)" generic-api-key '^[[:alnum:]]{36}$' "api_key = \"$k36\""
+toml_hides "nested repeats of an alternation (36 letters or digits)" generic-api-key \
+  '^(?:(?:[A-Za-z]|[0-9]{1}){6}){6}$' "api_key = \"$k36\""
+toml_hides "a POSIX-class UUID shape" generic-api-key "^$xd{8}-$xd{4}-$xd{4}-$xd{4}-$xd{12}\$" "client_secret = \"$uuid\""
+toml_hides "40 groups of fixed alternatives (any 40-hex value)" generic-api-key \
+  "^$(for _ in $(seq 40); do printf '%s' "$alt"; done)\$" "auth_token = \"$h40\""
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   toml_mutant "one more global allowlist value" "t.replace('regexes = [', 'regexes = [\n    \'\'\'^x\$\'\'\',', 1)"
   toml_mutant "a global allowlist stopword dropped" "t.replace('stopwords = [\n', 'stopwords = [\n#', 1)"
@@ -1519,7 +1397,7 @@ EVENT_NAME=push BEFORE="$pinned_main" AFTER="$squashed_pinned" \
 # merge. A different key on that line, or another key beside it, is still found. Real gitleaks only
 # (the stand-in reads no [[allowlists]]).
 if [[ -n "${GITLEAKS_BIN:-}" && -f "$repo_toml" ]]; then
-  key_toml="^${key:0:4}[${key:4:1}]${key:5}\$"
+  key_toml="^${key:0:4}\\x$(printf %02X "'${key:4:1}")${key:5}\$"
   new_origin values
   cp "$repo_toml" .gitleaks.toml
   commit app.txt "app" "main 1, with the repository's .gitleaks.toml"

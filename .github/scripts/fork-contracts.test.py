@@ -32,7 +32,11 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                pull request's own tests run in a job of their own. The earlier-heads lookup keeps its
                exact form (a failure fails the job; both tips of each activity entry; nothing empties
                the list). The jobs' if: conditions are evaluated as GitHub does for each kind of run.
-               A daily schedule (and workflow_dispatch) runs the sweep.
+               The job that runs the scan's tests runs exactly that script against the installed
+               gitleaks, and neither it, its steps nor fork-tests.yml's `secrets` call may fail
+               quietly. fork-secret-sweep.yml runs the sweep (daily and by hand) by calling the
+               scan workflow, read-only; only its alert job, after the sweep whatever its result,
+               may write issues, and it hands the sweep's result to fork-run-alert.sh.
   removed      .github/fork-removed-workflows.txt (the upstream workflows the fork deletes, kept
                deleted by fork-follow.sh) is there, every line is an upstream workflow path, none of
                them is in the tree, and it names the files the owner decided to delete.
@@ -902,6 +906,12 @@ for label, mutate in gate_mutants.items():
 # --- secret-scan -------------------------------------------------------------------------------
 SCAN_FILE = "fork-secret-scan.yml"
 SCAN_CALL = "./.github/workflows/" + SCAN_FILE
+SWEEP_FILE = "fork-secret-sweep.yml"
+# The default branch: from the event, or for a schedule (whose payload may have no repository, and which
+# runs on the default branch) the ref's name.
+CONFIG_BRANCH_EXPR = ("${{ github.event.repository.default_branch || "
+                      "(github.event_name == 'schedule' && github.ref_name) || '' }}")
+TESTS_RUN = "bash .github/scripts/fork-secret-scan.test.sh"
 
 
 # A step that runs code from the workspace (the checkout): a relative path, a script file, an
@@ -1115,6 +1125,92 @@ def scan_if_problems(scan):
     return problems
 
 
+def tests_job_problems(scan):
+    """The job that runs the scan's tests: exactly that script against the installed gitleaks, and
+    nothing in it may fail quietly (c3 of PR #214 round 1: continue-on-error on the job would keep
+    fork-ci-result green with the tests red)."""
+    problems = []
+    for j, job in (scan.get("jobs") or {}).items():
+        job_steps = job.get("steps") or []
+        runs = [s for s in job_steps if "fork-secret-scan.test.sh" in str(s.get("run", ""))]
+        if not runs:
+            continue
+        if "continue-on-error" in job:
+            problems.append(f"{SCAN_FILE}/{j}: continue-on-error (failed scan tests would pass)")
+        for i, step in enumerate(job_steps):
+            if "continue-on-error" in step:
+                problems.append(f"{SCAN_FILE}/{j} step {i + 1}: continue-on-error (a failed step would pass)")
+        for step in runs:
+            if str(step.get("run", "")).strip() != TESTS_RUN or "if" in step:
+                problems.append(f"{SCAN_FILE}/{j}: the tests step is not exactly `{TESTS_RUN}`")
+            if (step.get("env") or {}).get("GITLEAKS_BIN") != "${{ runner.temp }}/gitleaks":
+                problems.append(f"{SCAN_FILE}/{j}: the tests do not run against the installed gitleaks (GITLEAKS_BIN)")
+    return problems
+
+
+ALERT_RUN = re.compile(r'bash \.github/scripts/fork-run-alert\.sh --title "[^"]+" --result "\$RESULT"(?: --message "[^"]*")?')
+
+
+def sweep_problems(wfs):
+    """fork-secret-sweep.yml: the daily and manual sweep, a call of the scan workflow that only
+    reads, and one alert job after it, whatever its result, that hands that result to
+    fork-run-alert.sh (r1s-3 of PR #214: a red schedule run alerts no one)."""
+    sweep = wfs.get(SWEEP_FILE)
+    if sweep is None:
+        return [f"{SWEEP_FILE} is missing (the daily sweep)"]
+    problems = []
+    events = triggers(sweep)
+    for event in ("schedule", "workflow_dispatch"):
+        if event not in events:
+            problems.append(f"{SWEEP_FILE}: no {event} trigger (the sweep of every ref)")
+    if events - {"schedule", "workflow_dispatch"}:
+        problems.append(f"{SWEEP_FILE}: triggers other than schedule and workflow_dispatch "
+                        f"({', '.join(sorted(events - {'schedule', 'workflow_dispatch'}))})")
+    if sweep.get("permissions") != {"contents": "read"}:
+        problems.append(f"{SWEEP_FILE}: workflow permissions are not exactly contents: read")
+    jobs = sweep.get("jobs") or {}
+    callers = [j for j, job in jobs.items() if job.get("uses") == SCAN_CALL]
+    if len(callers) != 1:
+        problems.append(f"{SWEEP_FILE}: not exactly one job calls {SCAN_CALL}")
+        return problems
+    caller = callers[0]
+    if not set(jobs[caller]) <= {"name", "uses"}:
+        problems.append(f"{SWEEP_FILE}/{caller}: more than name and uses (an if, inputs or permissions)")
+    alerts = [j for j, job in jobs.items() if any("fork-run-alert.sh" in str(s.get("run", "")) for s in job.get("steps") or [])]
+    if len(alerts) != 1:
+        problems.append(f"{SWEEP_FILE}: not exactly one job runs fork-run-alert.sh")
+    for j, job in jobs.items():
+        if j == caller:
+            continue
+        perms = job.get("permissions")
+        if j not in alerts:
+            problems.append(f"{SWEEP_FILE}/{j}: a job other than the sweep and its alert")
+            continue
+        needs = job.get("needs")
+        if (needs if isinstance(needs, list) else [needs]) != [caller]:
+            problems.append(f"{SWEEP_FILE}/{j}: does not need exactly the sweep job")
+        if not expression(job.get("if", "")).startswith("always() && "):
+            problems.append(f"{SWEEP_FILE}/{j}: does not run whatever the sweep's result (if: always() && ...)")
+        if "continue-on-error" in job or any("continue-on-error" in s for s in job.get("steps") or []):
+            problems.append(f"{SWEEP_FILE}/{j}: continue-on-error (a failed alert would pass)")
+        if perms != {"contents": "read", "issues": "write"}:
+            problems.append(f"{SWEEP_FILE}/{j}: permissions are not exactly contents: read, issues: write")
+        for step in job.get("steps") or []:
+            run = " ".join(str(step.get("run", "")).split())
+            if "fork-run-alert.sh" not in run:
+                continue
+            if not ALERT_RUN.fullmatch(run) or "if" in step:
+                problems.append(f"{SWEEP_FILE}/{j}: the alert step is not one fork-run-alert.sh call with --result \"$RESULT\"")
+            if (step.get("env") or {}).get("RESULT") != f"${{{{ needs.{caller}.result }}}}":
+                problems.append(f"{SWEEP_FILE}/{j}: RESULT is not the sweep job's result")
+    # The scan itself never writes issues: only the sweep's alert job does.
+    problems += [f"{SCAN_FILE}/{j}: may write issues" for j, job in ((wfs.get(SCAN_FILE) or {}).get("jobs") or {}).items()
+                 if "issues" in str(job.get("permissions", ""))]
+    if "issues" in str((wfs.get(SCAN_FILE) or {}).get("permissions", "")):
+        problems.append(f"{SCAN_FILE}: may write issues")
+    return problems
+
+
 def secret_scan_problems(wfs):
     problems = []
     scan = wfs.get(SCAN_FILE)
@@ -1138,26 +1234,28 @@ def secret_scan_problems(wfs):
             problems.append(f"{SCAN_FILE}/{j}: names the checkout's scan script (run the default branch's copy)")
         if not fetched or f'git show "{fetched.group(1)}:.github/scripts/fork-secret-scan.sh"' not in run:
             problems.append(f"{SCAN_FILE}/{j}: does not read the scan script from the default branch's tip")
-        if (step.get("env") or {}).get("CONFIG_BRANCH") != "${{ github.event.repository.default_branch }}":
+        if (step.get("env") or {}).get("CONFIG_BRANCH") != CONFIG_BRANCH_EXPR:
             problems.append(f"{SCAN_FILE}/{j}: CONFIG_BRANCH is not the default branch")
     if "concurrency" in scan:
         problems.append(f"{SCAN_FILE}: a workflow concurrency group (a newer push could cancel a scan)")
     problems += [f"{SCAN_FILE}: job {j} has a concurrency group"
                  for j, job in (scan.get("jobs") or {}).items() if "concurrency" in job]
-    for event in ("schedule", "workflow_dispatch"):
-        if event not in triggers(scan):
-            problems.append(f"{SCAN_FILE}: no {event} trigger (the daily sweep of every branch and tag)")
-    problems += scan_job_problems(scan) + lookup_problems(scan) + scan_if_problems(scan)
+    problems += scan_job_problems(scan) + lookup_problems(scan) + scan_if_problems(scan) + tests_job_problems(scan)
     caller = ((wfs.get("fork-tests.yml") or {}).get("jobs") or {}).get("secrets") or {}
     if caller.get("uses") != SCAN_CALL or (caller.get("with") or {}).get("test") is not True:
         problems.append(f"fork-tests.yml: job secrets does not call {SCAN_CALL} with test: true")
+    if not set(caller) <= {"name", "if", "uses", "with"}:
+        problems.append(f"fork-tests.yml: job secrets has more than name, if, uses and with "
+                        f"({', '.join(sorted(set(caller) - {'name', 'if', 'uses', 'with'}))}): a failed scan could pass")
+    problems += sweep_problems(wfs)
     problems += [f"{n}/{j}: runs the scan script outside {SCAN_FILE}" for n, wf in wfs.items() if n != SCAN_FILE
                  for j, step in steps(wf) if "fork-secret-scan.sh" in str(step.get("run", ""))]
     return problems
 
 
-check("secret-scan: fork-secret-scan.yml runs on pull requests, pushes and daily, uncancelled, with the "
-      "default branch's script in a job that runs no checkout code, fork-tests.yml calls it",
+check("secret-scan: fork-secret-scan.yml runs on pull requests and pushes, uncancelled, with the default "
+      "branch's script in a job that runs no checkout code; fork-tests.yml calls it with its tests, which "
+      "cannot fail quietly; fork-secret-sweep.yml calls it daily and alerts by issue",
       not secret_scan_problems(real), "; ".join(secret_scan_problems(real)))
 
 
@@ -1241,12 +1339,44 @@ for label, mutate in {
             "(!(github.event_name == 'push'", "(github.event_name != 'schedule' && !(github.event_name == 'push'")),
     "the tests job on every pull request": lambda w: w[SCAN_FILE]["jobs"]["tests"].__setitem__(
         "if", w[SCAN_FILE]["jobs"]["tests"]["if"].replace("(inputs.test)", "(true)")),
-    # The daily sweep (the gaps no push run covers).
-    "no schedule": lambda w: w[SCAN_FILE][True].pop("schedule"),
-    "no workflow_dispatch": lambda w: w[SCAN_FILE][True].pop("workflow_dispatch"),
+    # c3 of round 1: the tests job, its steps and the call cannot fail quietly or test nothing.
+    "a tests job that may fail quietly": lambda w: w[SCAN_FILE]["jobs"]["tests"].__setitem__("continue-on-error", True),
+    "a tests step that may fail quietly": lambda w: w[SCAN_FILE]["jobs"]["tests"]["steps"][-1].__setitem__(
+        "continue-on-error", True),
+    "a gitleaks install that may fail quietly in the tests job": lambda w: w[SCAN_FILE]["jobs"]["tests"]["steps"][
+        1].__setitem__("continue-on-error", "${{ true }}"),
+    "a tests step that tests nothing (exit 0)": lambda w: w[SCAN_FILE]["jobs"]["tests"]["steps"][-1].__setitem__(
+        "run", "exit 0"),
+    "a tests step that ignores its failure": lambda w: w[SCAN_FILE]["jobs"]["tests"]["steps"][-1].__setitem__(
+        "run", TESTS_RUN + " || true"),
+    "the tests without the real gitleaks": lambda w: w[SCAN_FILE]["jobs"]["tests"]["steps"][-1].pop("env"),
+    "fork-tests.yml's scan call that may fail quietly": lambda w: w["fork-tests.yml"]["jobs"]["secrets"].__setitem__(
+        "continue-on-error", True),
+    # The daily sweep (the gaps no push run covers) and its alert.
+    "no fork-secret-sweep.yml": lambda w: w.pop(SWEEP_FILE),
+    "a sweep without its schedule": lambda w: w[SWEEP_FILE][True].pop("schedule"),
+    "a sweep without workflow_dispatch": lambda w: w[SWEEP_FILE][True].pop("workflow_dispatch"),
+    "a sweep that does not call the scan": lambda w: w[SWEEP_FILE]["jobs"]["sweep"].__setitem__(
+        "uses", "./.github/workflows/fork-tests.yml"),
+    "a sweep job skipped (if: false)": lambda w: w[SWEEP_FILE]["jobs"]["sweep"].__setitem__("if", "${{ false }}"),
+    "a sweep with issues: write for every job": lambda w: w[SWEEP_FILE].__setitem__(
+        "permissions", {"contents": "read", "issues": "write"}),
+    "no alert job": lambda w: w[SWEEP_FILE]["jobs"].pop("alert"),
+    "an alert only when the sweep passed": lambda w: w[SWEEP_FILE]["jobs"]["alert"].__setitem__(
+        "if", "${{ github.event_name == 'schedule' }}"),
+    "an alert not after the sweep": lambda w: w[SWEEP_FILE]["jobs"]["alert"].pop("needs"),
+    "an alert that may fail quietly": lambda w: w[SWEEP_FILE]["jobs"]["alert"].__setitem__("continue-on-error", True),
+    "an alert without issues: write": lambda w: w[SWEEP_FILE]["jobs"]["alert"].__setitem__(
+        "permissions", {"contents": "read"}),
+    "an alert always told success": lambda w: w[SWEEP_FILE]["jobs"]["alert"]["steps"][-1]["env"].__setitem__(
+        "RESULT", "success"),
+    "an alert whose failure is ignored": lambda w: w[SWEEP_FILE]["jobs"]["alert"]["steps"][-1].__setitem__(
+        "run", w[SWEEP_FILE]["jobs"]["alert"]["steps"][-1]["run"] + " || true"),
+    "the scan workflow with issues: write": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
+        "permissions", {"contents": "read", "issues": "write"}),
 }.items():
-    check(f"secret-scan: {SCAN_FILE} with {label} fails" if "fork-tests" not in label
-          else f"secret-scan: {label} fails", scan_mutant(mutate))
+    check(f"secret-scan: {SCAN_FILE} with {label} fails" if "fork-tests" not in label and "sweep" not in label
+          and "alert" not in label else f"secret-scan: {label} fails", scan_mutant(mutate))
 
 check("secret-scan: the expression evaluator reads GitHub's rules (&& and || give an operand, == ignores case)",
       gh_eval("'a' && 'B' == 'b'", {}) and not gh_eval("'' || null", {}) and gh_eval("!x.y", {})

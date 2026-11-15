@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Fork only: the scan job of fork-secret-scan.yml. Picks the commits a pull request or a push adds
-# (or, in the daily sweep, every branch and tag holds) and runs gitleaks over their changes and
-# their messages. Tests: fork-secret-scan.test.sh.
+# (or, in the daily sweep, every ref of origin holds but pull request heads) and runs gitleaks over
+# their changes and their commit objects (message, author, committer). Tests:
+# fork-secret-scan.test.sh.
 #
 # Environment:
 #   GITLEAKS     gitleaks binary
-#   EVENT_NAME   pull_request, push, or schedule / workflow_dispatch (the sweep)
+#   EVENT_NAME   pull_request, push, or schedule / workflow_dispatch (the sweep, fork-secret-sweep.yml)
 #   HEAD_SHA     pull_request: the PR head
 #   BEFORE       push: the branch tip before the push (all zeros when the branch is new);
 #                pull_request: the head before this push of it (synchronize), else empty
@@ -67,16 +68,22 @@
 #                  Upstream is fetched read-only, commits only, into refs/scan-upstream/*, which
 #                  each run empties first. Fail closed: when UPSTREAM is empty or the fetch fails,
 #                  nothing is left out (the full range, with a warning).
-#   schedule, workflow_dispatch  the sweep: every branch and tag of origin (fetched into
+#   schedule, workflow_dispatch  the sweep: every ref origin lists but refs/pull/* (branches, tags,
+#                  notes such as refs/notes/commits, any other refs/<name>/*; fetched into
 #                  refs/scan-sweep/*, which each run empties first), minus what upstream has, with
 #                  the default branch's settings. It catches what no push run read: GitHub starts
 #                  no push run for a push with [skip ci] in its message, for a push of more than 3
-#                  tags at once, or for a push made with a workflow's GITHUB_TOKEN, and branches
-#                  older than this scan were never read. A finding is old by then: rotate it.
+#                  tags at once, for a push made with a workflow's GITHUB_TOKEN, or for a ref that
+#                  is not a branch or tag (notes), and branches older than this scan were never
+#                  read. A finding is old by then: rotate it. A failed sweep opens (or comments on)
+#                  an issue (fork-secret-sweep.yml), as a schedule run alerts no one otherwise.
 #
-# Messages: the commit messages of the range, and on a tag push the pushed tag's message (each
-# annotated tag in the chain; the sweep reads every tag's, but those of tag objects upstream also
-# has), go through `gitleaks stdin` with the same settings. A finding names the commit or tag.
+# Commit objects: each commit of the range as git stores it (`git cat-file`: its message, author
+# and committer names and emails, signature and other headers), and on a tag push the pushed tag's
+# object (each annotated tag in the chain, with its message and tagger; the sweep reads every
+# ref's, but those of tag objects upstream also has), go through `gitleaks stdin` with the same
+# settings. A finding names the commit or tag. (Not `git log --format=%B`: that is the message
+# alone, and a key in an author or committer field would pass.)
 # Merge commits are diffed with --remerge-diff: only what the merge itself changed beyond an
 # automatic merge of its parents (a conflict resolution, or a file added in the merge). Without it
 # git log shows merges with no diff at all, so gitleaks would never read them. --remerge-diff knows
@@ -112,9 +119,11 @@
 # commit id change), and a value entry does not depend on either, so the PR scan does not scan the
 # squash result as one more diff.
 #
-# Not covered: a `gitleaks:allow` comment on the line itself (visible in the diff); branch and tag
-# names; the pull request's title, body and comments (GitHub data, not git); commits only an
-# outside pull request (refs/pull/N/head) holds, as the sweep reads branches and tags; a pull request
+# Not covered (the job summary lists these too): a `gitleaks:allow` comment on the line itself
+# (visible in the diff); ref names (branch, tag and note names); the pull request's title, body and
+# comments (GitHub data, not git); commits only an outside pull request (refs/pull/N/head) holds, as
+# the sweep leaves refs/pull/* out; a ref that names a tree or blob rather than a commit (the sweep
+# warns, and reads only its tag messages); a pull request
 # that edits the workflow (pull_request runs take it from the pull request; the workflow runs this
 # script from the default branch's tip, so an edit of the script alone changes nothing); text
 # in another encoding than UTF-8 or UTF-16 with a byte-order mark (UTF-16 without one, UTF-32);
@@ -331,7 +340,7 @@ case "$EVENT_NAME" in
     fi
     # Leave out upstream's commits (see the header).
     without_upstream
-    # A tag push: the tag's own message too (see "Messages" in the header). The tag is fetched as
+    # A tag push: the tag's own message too (see "Commit objects" in the header). The tag is fetched as
     # pushed; when it is gone already (deleted, or moved by a later push), that push's run reads it.
     if [[ "${PUSH_REF:-}" == refs/tags/* ]]; then
       if git check-ref-format "$PUSH_REF" &&
@@ -344,8 +353,8 @@ case "$EVENT_NAME" in
     fi
     ;;
   schedule | workflow_dispatch)
-    # The daily sweep (see "sweep" in the header): every branch and tag of origin, with the default
-    # branch's settings, minus what upstream has.
+    # The daily sweep (see "sweep" in the header): every ref of origin but refs/pull/*, with the
+    # default branch's settings, minus what upstream has.
     if ! settings="$(fetch_config_branch)"; then
       echo "::error::Secret scan: cannot fetch the default branch '${CONFIG_BRANCH:-}' (CONFIG_BRANCH), whose gitleaks settings the scan uses" >&2
       exit 2
@@ -354,8 +363,8 @@ case "$EVENT_NAME" in
     changes=()
     if ! git for-each-ref --format='delete %(refname)' refs/scan-sweep/ | git update-ref --stdin ||
       ! timeout 900 git fetch --quiet --no-tags --filter=blob:none origin \
-        "+refs/heads/*:refs/scan-sweep/heads/*" "+refs/tags/*:refs/scan-sweep/tags/*" >&2; then
-      echo "::error::Secret scan: cannot fetch the branches and tags of origin. Re-run the job." >&2
+        "+refs/*:refs/scan-sweep/*" "^refs/pull/*" >&2; then
+      echo "::error::Secret scan: cannot fetch the refs of origin. Re-run the job." >&2
       exit 2
     fi
     tips=()
@@ -366,18 +375,18 @@ case "$EVENT_NAME" in
       else
         odd+=("${ref#refs/scan-sweep/}")
       fi
-      if [[ "$ref" == refs/scan-sweep/tags/* ]]; then mapfile -t -O "${#tag_objects[@]}" tag_objects < <(tag_chain "$ref"); fi
+      mapfile -t -O "${#tag_objects[@]}" tag_objects < <(tag_chain "$ref")
     done < <(git for-each-ref --format='%(refname)' refs/scan-sweep/)
     if [[ ${#tips[@]} -eq 0 ]]; then
-      echo "::error::Secret scan: origin has no branch or tag to scan" >&2
+      echo "::error::Secret scan: origin has no ref naming a commit to scan" >&2
       exit 2
     fi
     if [[ ${#odd[@]} -gt 0 ]]; then
-      warning="${#odd[@]} tag(s) name no commit (${odd[*]:0:5}), so only their messages are scanned"
+      warning="${#odd[@]} ref(s) name no commit (${odd[*]:0:5}), so their contents are not scanned, only their tag messages"
     fi
     mapfile -t tips < <(printf '%s\n' "${tips[@]}" | sort -u)
     range="${tips[*]}"
-    what="every branch and tag of origin (${#tips[@]} distinct tip(s))"
+    what="every ref of origin but refs/pull/* (${#tips[@]} distinct tip(s))"
     without_upstream
     # shellcheck disable=SC2086
     what="$what: $(git rev-list --count $range) commit(s)"
@@ -605,12 +614,12 @@ if [[ $status -ne 0 ]] && ! grep -aqE 'leaks found: [1-9][0-9]*' <<< "$plain"; t
   exit 2
 fi
 
-# Messages (see the header): the range's commit messages and the tag messages, each under a line
-# naming it, through gitleaks stdin with the same settings. A tag object upstream also has is
-# upstream's, as its commits are.
+# Commit objects (see the header): each of the range's commits and tag objects as stored (message,
+# author, committer, tagger), each under a line naming it, through gitleaks stdin with the same
+# settings. A tag object upstream also has is upstream's, as its commits are.
 messages="$work/messages"
 # shellcheck disable=SC2086
-if ! git log --format='--- fork-secret-scan: commit %H%n%B' $range > "$messages"; then cannot_read; fi
+if ! git cat-file --batch='--- fork-secret-scan: commit %(objectname)' < "$work/commits" > "$messages"; then cannot_read; fi
 if [[ ${#tag_objects[@]} -gt 0 ]]; then
   upstream_tags=" "
   if [[ -n "$upstream_used" ]]; then
@@ -626,7 +635,7 @@ if [[ ${#tag_objects[@]} -gt 0 ]]; then
   done
 fi
 message_count="$(grep -c '^--- fork-secret-scan: ' "$messages" || true)"
-echo "Scanning the messages of the range's commits and of ${tags_read:-0} tag(s): $message_count in all"
+echo "Scanning the commit objects of the range (message, author, committer) and ${tags_read:-0} tag object(s): $message_count in all"
 set +e
 (cd "$config" && env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML \
   "$gitleaks" stdin --no-banner --no-color --redact --verbose "${config_args[@]}" \
@@ -640,23 +649,25 @@ mleaks=""
 if grep -aqE 'leaks found: [1-9][0-9]*' <<< "$mplain"; then mleaks=1; fi
 if [[ $mstatus -eq 0 && -n "$merrors" ]] || [[ $mstatus -ne 0 && -z "$mleaks" ]]; then
   echo "::error::Secret scan: gitleaks stopped or logged an error while reading the messages (exit $mstatus), so they were not all checked: ${merrors:-see the log above}" >&2
-  summary "Failed: gitleaks could not read the messages of $what (see the job log), so they were not checked."
+  summary "Failed: gitleaks could not read the commit and tag objects of $what (see the job log), so they were not checked."
   exit 2
 fi
 if [[ $mstatus -ne 0 ]]; then
   # Which messages: the line each finding starts on, under the nearest naming line above it.
   sed -nE 's/^[[:space:]]*"StartLine": ([0-9]+),?$/\1/p' "$work/messages.json" | sort -nu > "$work/message-lines"
   while read -r name; do
-    echo "::error title=Secret scan::A possible secret in the message of $name (value redacted). Rotate any real secret: it is already public."
+    echo "::error title=Secret scan::A possible secret in the message, author or committer of $name (value redacted). Rotate any real secret: it is already public."
   done < <(awk 'NR == FNR { want[$1] = 1; next }
       /^--- fork-secret-scan: / { name = substr($0, 23) }
       (FNR in want) && !(name in said) { said[name] = 1; print name }' "$work/message-lines" "$messages")
 fi
 
 if [[ $status -eq 0 && $mstatus -eq 0 ]]; then
-  summary "No secrets found in $what ($scanned commit(s) with changes scanned; $message_count commit and tag message(s))."
+  summary "No secrets found in $what ($scanned commit(s) with changes scanned; $message_count commit and tag object(s): messages, authors, committers)."
 else
   summary "gitleaks found possible secrets in $what (values redacted; see the job log). Rotate any real secret: it is already public."
 fi
+summary "" "Not covered: ref names; pull request titles, bodies and comments; commits only an outside pull request's head (refs/pull/*) holds; refs that name a tree or blob; a \`gitleaks:allow\` line; text in other encodings; packed or compressed contents; a key split across lines (see the header of fork-secret-scan.sh)."
+
 if [[ $status -ne 0 ]]; then exit "$status"; fi
 exit "$mstatus"

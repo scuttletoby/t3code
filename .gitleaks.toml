@@ -18,25 +18,35 @@
 # this file, so gitleaks cannot load the other one and the job fails.)
 #
 # The fork's skip list: no path is skipped. Each entry after the first names its rules
-# (targetRules) and the values it allows (regexes, anchored); one with paths also has
+# (targetRules) and the exact values it allows (regexes); one with paths also has
 # condition = "AND", so it never skips a whole file. Each says why.
+#
+# Exact values only: each regex of a later entry is ^, one fixed string, then $. The string holds
+# no regex syntax at all (no class, repeat, group, alternation, flag or \d-style escape); a
+# character that is syntax (. + * ? ( ) | [ ] { } ^ $ \) is escaped with a backslash, and any
+# character can be written as \xHH (two hex digits). The scan's tests refuse anything else. Why so
+# strict: such a regex matches exactly the one string a reviewer reads in it. Earlier rules judged
+# value regexes from their text (bounded repeats, letter-and-digit classes) and were got round
+# each time by a form they misread: (?m) anchors that match inside a multi-line key, POSIX classes
+# Python reads differently from gitleaks' Go, nested repeats, an alternation of single characters.
+# A rule that accepts no regex syntax has nothing to misread. A value that changes (a version, a
+# generated id) gets one exact entry per value seen.
 #
 # A reviewed fake key in a test (the way to allow one): an entry with the rule, the file and the
 # exact value, as the #91 entry below. It matches that value in every commit, whatever its line
 # number or commit id, so it survives a squash merge, a line added above it and a fork-follow
 # rebase, and it never hides another key on the same line. Write the value so this file does not
-# match its own rules (the entries here are scanned too). A `gitleaks:allow` comment on the line
-# itself works as well where the file allows a comment. Not .gitleaksignore: see its header.
-# An exact value (fixed text between ^ and $, escaped where needed; flags such as (?i) go first or
-# right after ^) needs nothing more. Any other value regex is refused by the scan's tests if it
-# repeats a letter-or-digit class without a bound or 16 or more times, or spans 16 or more
-# characters of classes holding both letters and digits (a UUID shape): allow the exact fake.
+# match its own rules (the entries here are scanned too): one character as \xHH does it. A
+# `gitleaks:allow` comment on the line itself works as well where the file allows a comment. Not
+# .gitleaksignore: see its header. A false finding in a commit or tag message needs an entry
+# without paths (paths do not apply to messages).
 #
-# Measured over main's full history (11,292 commits) with these settings and `git log --text`:
-# 7 findings the default settings skipped, all the pnpm-lock.yaml version strings of the first
-# entry, and the one line of this file in the second. A fork-follow rebase re-scans every fork
-# commit (new ids): over main's 79 fork-only commits these settings find nothing; without the #91
-# entry they find its 3 values.
+# Measured on main (11,341 commits, 83 of them fork-only) with these settings and gitleaks 8.30.1:
+# the fork-only commits have no finding, in their changes (`git log --text`) or in their commit
+# objects; without the #91 entry they have its 3 values. Every finding left in the full history is
+# in upstream's commits (the scan leaves those out), none in pnpm-lock.yaml or this file, and the
+# commit objects of all 11,341 commits (ids, signatures, authors) have none. A fork-follow rebase
+# re-scans every fork commit (new ids), so these entries hold by value, never by commit.
 
 title = "gitleaks config"
 minVersion = "v8.25.0"
@@ -67,29 +77,32 @@ stopwords = [
 ]
 
 # pnpm-lock.yaml names packages with "key" in them (@clerk/electron-passkeys...), and
-# generic-api-key reads the version after the name as a key. Only that rule, only in pnpm-lock.yaml,
-# and only a found value shaped like a version: 1.2.3, optionally -pre.release with at most three
-# parts, each a lowercase word (canary) or a number with at most two letters before it (v2026...,
-# rc1). A token after `1.0.0-` (mixed case, or letters and digits mixed) is still found. The one
-# such value in main's history: 0.0.4-canary.v20260819050620. Integrity hashes (sha512-...) gave
-# no finding over main's history, so they need no entry.
+# generic-api-key reads a long pre-release version after the name as a key. Only that rule, only in
+# pnpm-lock.yaml, and only the exact versions seen: the one in main's history is
+# 0.0.4-canary.v20260819050620 (upstream's commits, which the scan leaves out unless upstream cannot
+# be fetched). A short version (1.2.3) is no finding. A new such version is a finding: add it here.
+# Integrity hashes (sha512-...) gave no finding over main's history, so they need no entry.
 [[allowlists]]
 description = "pnpm-lock.yaml: package versions after a name with 'key' in it"
 targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''(?:^|/)pnpm-lock\.yaml$''']
-regexes = ['''^\d{1,8}\.\d{1,8}\.\d{1,8}(?:-(?:[a-z]{1,10}|[a-z]{0,2}\d{1,14})(?:\.(?:[a-z]{1,10}|[a-z]{0,2}\d{1,14})){0,2})?$''']
+regexes = ['''^0\.0\.4-canary\.v20260819050620$''']
 
 # This file's own rule for short-lived Amazon Bedrock keys is a fixed prefix that matches itself.
 # Only that rule, only this file, and only the exact rule line (any other text on the line, a key
-# included, is still found). [Y] keeps the prefix itself out of this line.
+# included, is still found). gitleaks gives the line with a newline before it unless the line starts
+# its hunk, hence two values. \x59 (Y) keeps the prefix, and \x27 (') the quotes, out of this line.
 [[allowlists]]
 description = "this file: the Bedrock rule's own pattern line"
 targetRules = ["aws-amazon-bedrock-api-key-short-lived"]
 condition = "AND"
 paths = ['''^\.gitleaks\.toml$''']
 regexTarget = "line"
-regexes = ['''^\s*regex = '{3}bedrock-api-key-[Y]mVkcm9jay5hbWF6b25hd3MuY29t'{3}\s*$''']
+regexes = [
+    '''^regex = \x27\x27\x27bedrock-api-key-\x59mVkcm9jay5hbWF6b25hd3MuY29t\x27\x27\x27$''',
+    '''^\x0aregex = \x27\x27\x27bedrock-api-key-\x59mVkcm9jay5hbWF6b25hd3MuY29t\x27\x27\x27$''',
+]
 
 # Fake values in the fork's wait tests (#91): fixed 16-character strings that generic-api-key reads
 # as keys. Only that rule, only those two files, only these exact values; any other value there is
@@ -100,7 +113,7 @@ description = "fork wait tests: fixed fake values (#91)"
 targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''^apps/server/src/waits/Wait(?:Delivery|Service)\.test\.ts$''']
-regexes = ['''^[01f]123456789abcdef$''']
+regexes = ['''^0123456789abcdef$''', '''^1123456789abcdef$''', '''^f123456789abcdef$''']
 
 [[rules]]
 id = "1password-secret-key"
