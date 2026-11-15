@@ -1,7 +1,14 @@
-# Fork only: the fleet host's daily runner template refresh (fork-fleet-launch.sh refresh). Install as
+# Fork only: the fleet host's runner template refresh (fork-fleet-launch.sh refresh). Install as
 # /etc/systemd/system/t3code-fleet-refresh.service with its timer (.github/fork-fleet.md, host step 7); not as
 # fork-fleet-*, the runner units' prefix. Safe to start by hand: a second refresh waits for the first (refresh.lock),
 # then finds the template new already.
+#
+# Root, sandboxed. Root because the template must be root's (each job hard-links it, and start refuses one anyone
+# else owns or may write). The sandbox lets it write only the template's folder (/opt/fork-fleet, where the new
+# template is unpacked and swapped in) and its locks (/run/fork-fleet), reach the network only by IP and local
+# sockets, make no device, setuid or setgid file, and keep one capability: CAP_DAC_OVERRIDE, so a leftover folder
+# without owner write can still be removed. With TEMPLATE or RUN_DIR elsewhere (launch.conf), add a drop-in:
+# [Service] ReadWritePaths=<the template's folder> <RUN_DIR>.
 [Unit]
 Description=t3code fork fleet: refresh the runner template
 Wants=network-online.target
@@ -10,6 +17,30 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/opt/fork-fleet/fork-fleet-launch.sh refresh
-TimeoutStartSec=1h
+TimeoutStartSec=50min
 Nice=10
 IOSchedulingClass=idle
+UMask=0077
+ProtectSystem=strict
+ReadWritePaths=/opt/fork-fleet
+# The launcher's RUN_DIR (the dispatcher's locks live there too): made if missing, never removed.
+RuntimeDirectory=fork-fleet
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native

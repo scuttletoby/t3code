@@ -599,7 +599,7 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
             continue
         free, why = (pool['slots'], None) if pool.get('static') else beacon_free(cfg, pool, env, t)
         if why:
-            # A pool its dispatcher closed (a new actions/runner release: the owner refreshes the template) or reports
+            # A pool its dispatcher closed (a new actions/runner release, until refresh renews the template) or reports
             # down: a notice. A heartbeat gone stale or garbled (the dispatcher is down, its token expired or was
             # revoked): an error on the run page, or the jobs would go elsewhere unseen for days. A pool with no
             # heartbeat at all was never set up: a log line.

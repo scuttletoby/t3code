@@ -13,7 +13,7 @@ after the job. A job that names a fleet label by itself finds no runner.
 | `.github/fork-fleet.json`              | Every fact about the repository and its fleet: the setting's name, the trust rule (workflows, actors, branches), the pools (label, slots, heartbeat variable, launch command, which pool `fleet` mode queues on), the jobs (shards, change gates, memory), and the time limits. |
 | `.github/scripts/fork-fleet.py`        | `route`, `watch`, `sweep`, `dispatch` and `gate`. Standard library only. It holds no repository facts.                                                                                                                                                                          |
 | `.github/scripts/fork-fleet-launch.sh` | Runs on a fleet host, as root, for `dispatch`: `start`, `ready`, `active`, `fits`, `stop` and `prune` of one-job runners. Its `refresh` keeps the runner template new (host step 7).                                                                                            |
-| `.github/scripts/fork-fleet-refresh.*` | The daily timer and service of `refresh` (installed as `t3code-fleet-refresh`, host step 7). `fork-fleet-refresh.test.py` tests both, with a fake release server.                                                                                                               |
+| `.github/scripts/fork-fleet-refresh.*` | The hourly timer and the sandboxed service of `refresh` (installed as `t3code-fleet-refresh`, host step 7). `fork-fleet-refresh.test.py` tests both, with a fake release server.                                                                                                |
 | `.github/scripts/fork-fleet-hook.sh`   | Each fleet runner's job-started hook. It runs `gate` from the installed copy.                                                                                                                                                                                                   |
 | `.github/scripts/fork-fleet.test.py`   | The tests, and checks that the workflows match the config. Run by the `workflows` job.                                                                                                                                                                                          |
 | `.github/workflows/fork-tests.yml`     | The `Route` step of `changes` feeds each Linux job's `runs-on`. The `fleet_watch` job bounds the wait for a fleet runner.                                                                                                                                                       |
@@ -263,11 +263,11 @@ does leave the marker, and that turns the test red.
   GitHub's newest `actions/runner` release would update itself in its copy
   before the job. The fleet does not rely on that. The dispatcher reads the
   newest release once an hour, and the launcher's `ready` compares it with the
-  template's `.fork-fleet-version` (written in host step 2). When the template
+  template's `.fork-fleet-version` (written by `refresh`, host step 7). When the template
   is older, or has no version file, no runner starts on that pool. The
   heartbeat then reports `free: 0` with a `why` that says to refresh the
   template, so `auto` goes GitHub-hosted. Running jobs and cleanup go on. The
-  refresh timer (host step 7) fixes this within a day; to fix it at once, run
+  refresh timer (host step 7) fixes this within about an hour; to fix it at once, run
   `fork-fleet-launch.sh refresh`. If the release cannot be read, the last
   version read is kept; before the first read, nothing starts. With no template
   at all, `ready` says so and no runner starts.
@@ -432,11 +432,20 @@ mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
   }' | sort -u)
 /opt/fork-fleet/fork-fleet-launch.sh check-net https://github.com "${targets[@]}"; echo "exit $?"
 
-# 7. The runner template and its daily refresh. `refresh` reads the newest actions/runner release, downloads its
+# 7. The runner template and its hourly refresh. `refresh` reads the newest actions/runner release, downloads its
 #    tarball, checks the release's sha256 before unpacking, unpacks it beside the template and swaps the two in one
 #    rename under the launch lock: running jobs keep their copies, and a cut download, a bad checksum or any other
-#    failure leaves the old template. The same version: nothing. Safe to run by hand at any time (a second refresh
-#    waits for the first). The timer runs it once a day at a random time, and after boot when a day was missed.
+#    failure leaves the old template. The same version: nothing (one API call). Safe to run by hand at any time (a
+#    second refresh waits for the first). The timer runs it every hour at a random minute in the first 10, and after
+#    boot when a run was missed; a failed run is tried again the next hour. The service is sandboxed: it writes only
+#    /opt/fork-fleet and /run/fork-fleet (with TEMPLATE or RUN_DIR elsewhere, add a drop-in: the unit file says how).
+#    The tarball is treated as hostile even after its sha256 passed (a compromised release would pass it): refresh
+#    refuses absolute names, "..", links that lead outside, device files, FIFOs and sockets, and a tarball over 4 GiB
+#    or 100000 entries; it strips setuid, setgid and group/other write. `start` refuses such files in a template too.
+#    Versions: only forward, and by at most one major version at a time (a bigger jump is refused: no real release
+#    does that). A template NEWER than the newest release (one GitHub withdrew) is rolled back to it by the next run.
+#    Roll back or jump by hand (the pool is closed in between; running jobs keep their copies):
+#      rm -rf --one-file-system /opt/fork-fleet/runner-template && /opt/fork-fleet/fork-fleet-launch.sh refresh
 #    Re-run the two install lines after step 3 brings new unit files.
 /opt/fork-fleet/fork-fleet-launch.sh refresh                   # the first template, or the newest one now
 /opt/fork-fleet/runner-template/bin/installdependencies.sh     # once, and again if a release needs new libraries:
@@ -637,7 +646,7 @@ dispatcher keeps only pacing in memory, so a restart starts over cleanly.
 | Dispatcher  | The PC or VM has no memory                                                                                                    | No start, and the heartbeat shows 0 free slots. `auto`: new runs go GitHub-hosted.                                                                                                                                                                                                                        |
 | Dispatcher  | GitHub fails during a pass                                                                                                    | A warning. The pass stops, and the next one, 20 s later, starts over.                                                                                                                                                                                                                                     |
 | Dispatcher  | One pool's host fails (launcher error, cannot be run)                                                                         | That pool is left alone for the rest of the pass: no cleanup, no start, heartbeat `free: 0` with the reason. Other pools go on.                                                                                                                                                                           |
-| Dispatcher  | The runner template is older than the newest release, or has no `.fork-fleet-version`                                         | No runner starts on that pool; cleanup goes on. Heartbeat `free: 0` with a `why` that says to refresh the template (host step 2). `auto`: GitHub-hosted.                                                                                                                                                  |
+| Dispatcher  | The runner template is older than the newest release, or has no `.fork-fleet-version`                                         | No runner starts on that pool; cleanup goes on. Heartbeat `free: 0` with a `why` that says to refresh the template (host step 7: the timer does it within about an hour). `auto`: GitHub-hosted.                                                                                                          |
 | Dispatcher  | Token file missing, readable by anyone but root, or empty                                                                     | It refuses to start. `systemctl status` shows why.                                                                                                                                                                                                                                                        |
 | Dispatcher  | Down for a while                                                                                                              | Heartbeats go stale after 180 s. `auto`: GitHub-hosted. `fleet`: jobs queue, and the watch reports after 2 hours.                                                                                                                                                                                         |
 | Gate        | Run, attempt or trust rule does not match                                                                                     | `Runner.Worker` is killed before the first step: the job fails and no `always()` step runs.                                                                                                                                                                                                               |

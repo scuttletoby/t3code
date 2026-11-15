@@ -1627,7 +1627,8 @@ class Launcher(unittest.TestCase):
                 self.assertEqual(got.returncode == 0, ok, got.stderr)
                 if not ok:
                     self.assertIn(f'actions/runner {NEWEST_RUNNER}, older than the newest release {newest}', got.stderr)
-                    self.assertIn('refreshes the template (.github/fork-fleet.md, host step 2)', got.stderr)
+                    self.assertIn('`fork-fleet-launch.sh refresh` refreshes the template', got.stderr)
+                    self.assertIn('host step 7', got.stderr)
         self.assertIn('not a version', self.launch('ready', 'v2.330.0;id').stderr)
         self.write('template/.fork-fleet-version', 'latest\n', 0o644)
         self.assertIn('not a version', self.launch('ready', NEWEST_RUNNER).stderr)
