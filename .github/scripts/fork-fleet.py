@@ -599,7 +599,7 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
             continue
         free, why = (pool['slots'], None) if pool.get('static') else beacon_free(cfg, pool, env, t)
         if why:
-            # A pool its dispatcher closed (a new actions/runner release: the owner refreshes the template) or reports
+            # A pool its dispatcher closed (a new actions/runner release, until refresh renews the template) or reports
             # down: a notice. A heartbeat gone stale or garbled (the dispatcher is down, its token expired or was
             # revoked): an error on the run page, or the jobs would go elsewhere unseen for days. A pool with no
             # heartbeat at all was never set up: a log line.
@@ -855,6 +855,10 @@ class Host:
         """HostError (with the launcher's reason) unless the pool's runner template is not older than `newest`."""
         self._must('ready', newest)
 
+    def refresh_net(self):
+        """HostError unless the host looked its own public address up again and blocks it for running jobs too."""
+        self._must('refresh-net')
+
     def start(self, name, env_text):
         self._must('start', name, stdin=env_text)
 
@@ -908,7 +912,7 @@ def new_state():
     """Kept between passes only to pace heartbeats, idle checks, retries, messages and the newest runner release.
     GitHub (runs, jobs, runner registrations) and the host (units) hold everything else, so a restarted dispatcher
     picks up where one stopped."""
-    return {'beacon': {}, 'idle': {}, 'tries': {}, 'said': set(), 'newest': None}
+    return {'beacon': {}, 'idle': {}, 'tries': {}, 'said': set(), 'newest': None, 'down': {}}
 
 
 RELEASE_EVERY = 3600   # seconds between reads of the newest actions/runner release
@@ -933,6 +937,24 @@ def newest_runner(gh, state, now):
     return state['newest'][0]
 
 
+DOWN_EVERY = 600   # seconds between "still left alone" lines of a pool that stays down for the same reason
+
+
+def say_down(state, pool, why, t):
+    """A pool's host failed: said at once; while it keeps failing for the same reason (a desktop asleep all night),
+    again only every DOWN_EVERY s, with the count of passes."""
+    downs = state.setdefault('down', {})
+    last = downs.get(pool)
+    if last and last['why'] == why:
+        last['passes'] += 1
+        if t - last['said'] >= DOWN_EVERY:
+            last['said'] = t
+            say(f'::warning::fork-fleet: {why}; pool {pool} is still left alone ({last["passes"]} passes in a row)')
+        return
+    downs[pool] = {'why': why, 'passes': 1, 'said': t}
+    say(f'::warning::fork-fleet: {why}; pool {pool} is left alone for this pass, the other pools go on')
+
+
 def once(state, key, msg):
     if key not in state['said']:
         state['said'].add(key)
@@ -952,7 +974,7 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
             return getattr(hosts[p['name']], verb)(*args)
         except HostError as e:
             down[p['name']] = str(e)
-            say(f'::warning::fork-fleet: {e}; pool {p["name"]} is left alone for this pass, the other pools go on')
+            say_down(state, p['name'], str(e), now())
             return None
 
     runs = {}
@@ -962,7 +984,7 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
     queued = [(run, j) for run in runs.values() for j in gh.pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
               if j.get('status') == 'queued' and not j.get('runner_name')]
     queued_ids = {j['id'] for _, j in queued}
-    state['said'] = {k for k in state['said'] if k[0] in queued_ids or k[0] == 'ready'}
+    state['said'] = {k for k in state['said'] if k[0] in queued_ids or k[0] in ('ready', 'net')}
     state['tries'] = {k: v for k, v in state['tries'].items() if k in queued_ids}
     newest = newest_runner(gh, state, now())
     units = {}
@@ -976,6 +998,15 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
         except HostError as e:
             closed[p['name']] = str(e)
             once(state, ('ready', p['name'], str(e)), f'::warning::fork-fleet: {e}')
+        # This host's own public address, again every pass: it may change while a job runs. The launcher re-applies
+        # the block for the running jobs too; when no lookup answers, the last block stays and no runner starts.
+        try:
+            hosts[p['name']].refresh_net()
+            state['said'] = {k for k in state['said'] if k[:2] != ('net', p['name'])}
+        except HostError as e:
+            closed[p['name']] = str(e)
+            once(state, ('net', p['name'], str(e)), f'::warning::fork-fleet: {e}; no runner starts on pool '
+                                                    f'{p["name"]} until it answers (the last block stays)')
     ours = {}
     for r in gh.pages('actions/runners', 'runners'):
         for p in pools:
@@ -1092,6 +1123,10 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
             continue
         set_variable(gh, p['beacon'], json.dumps(beat, separators=(',', ':')))
         state['beacon'][p['name']] = ((free, why), t)
+    for p in pools:
+        gone = p['name'] not in down and state.setdefault('down', {}).pop(p['name'], None)
+        if gone and gone['passes'] > 1:
+            say(f'fork-fleet: pool {p["name"]} answers again, after {gone["passes"]} passes left alone')
     return 0
 
 
