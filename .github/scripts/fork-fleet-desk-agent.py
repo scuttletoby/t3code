@@ -15,9 +15,10 @@ environment (PATH and LC_ALL only: the launcher and the walls read their own set
 limit (fork-fleet-desk-wire.py, "Time") is killed with its process group and answered 75 (UNKNOWN); when the session
 ends, every running verb is killed. The launcher's own 75 is answered 1. At most MAX_VERBS run at once; at most OUT_MAX
 frames wait to be sent (an always-on host that stops reading ends the session). Verbs the machine runs only itself
-(wire.LOCAL_ONLY: check-net, refresh, paths) never come over the link. Time counts a sleep (Clock): CLOCK_BOOTTIME, plus
-any forward step of the wall clock against it (on WSL2 Windows' sleep pauses the distro, so BOOTTIME may not move and
-only the wall clock is stepped on resume): a desktop that wakes finds its link and its verbs past their time at once.
+(wire.LOCAL_ONLY: check-net, refresh, paths, tools) never come over the link. Time counts a sleep (Clock):
+CLOCK_BOOTTIME, plus any forward step of the wall clock against it (on WSL2 Windows' sleep pauses the distro, so
+BOOTTIME may not move and only the wall clock is stepped on resume): a desktop that wakes finds its link and its verbs
+past their time at once.
 
 The link drops (sleep, network, the always-on host restarts): the agent dials again after FIRST s, then BASE s
 doubling to MAX s, each with jitter; a wake from sleep dials at once. A wrong wire version (ssh exit 76, or a frame of
@@ -29,7 +30,10 @@ Settings: FILE (default CONF), KEY=value lines, owned by this user and writable 
   PORT 22, USER fleet-desk (the desk-link user: fork-fleet-desk.py's USER)
   KEY            /etc/fork-fleet/desk-key: the private ed25519 key, this user's only (no group or other bits)
   KNOWN_HOSTS    /etc/fork-fleet/desk-known_hosts: the always-on host's key line; nothing else is ever trusted
-  LAUNCH, WALLS  /opt/fork-fleet/fork-fleet-launch.sh and /opt/fork-fleet/fork-fleet-walls.py (run as python3 -I)
+  WALLS          /opt/fork-fleet/fork-fleet-walls.py (run as python3 -I). The launcher it runs is KIT_LAUNCHER in the
+                 same folder (the folder's real path): the one those walls read and ask what jobs see, so the walls
+                 that pass a `start` are the walls of the launcher that runs it. One kit, never two
+  LAUNCH         optional, only for old settings files: it must lead to that same launcher, or nothing runs (exit 2)
   RUN_DIR        /run/fork-fleet-desk-agent (its lock: one agent per desktop), SSH /usr/bin/ssh
 Standard library only. Linux (and WSL2) now; another OS is refused by the walls.
 """
@@ -43,13 +47,14 @@ _spec.loader.exec_module(wire)
 
 CONF = '/etc/fork-fleet/desk.conf'
 DEFAULTS = {'PORT': '22', 'USER': 'fleet-desk', 'KEY': '/etc/fork-fleet/desk-key',
-            'KNOWN_HOSTS': '/etc/fork-fleet/desk-known_hosts', 'LAUNCH': '/opt/fork-fleet/fork-fleet-launch.sh',
-            'WALLS': '/opt/fork-fleet/fork-fleet-walls.py', 'RUN_DIR': '/run/fork-fleet-desk-agent',
+            'KNOWN_HOSTS': '/etc/fork-fleet/desk-known_hosts', 'WALLS': '/opt/fork-fleet/fork-fleet-walls.py',
+            'RUN_DIR': '/run/fork-fleet-desk-agent',
             'SSH': '/usr/bin/ssh'}
 PATH_KEYS = ('KEY', 'KNOWN_HOSTS', 'LAUNCH', 'WALLS', 'RUN_DIR', 'SSH')
 SHAPES = {'POOL': wire.POOL, 'HOST': re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]{0,252}'),
           'PORT': re.compile(r'[1-9][0-9]{0,4}'), 'USER': re.compile(r'[a-z_][a-z0-9_-]{0,31}'),
           **{k: re.compile(r'/[A-Za-z0-9._/-]{1,255}') for k in PATH_KEYS}}
+KIT_LAUNCHER = 'fork-fleet-launch.sh'   # beside WALLS: the launcher fork-fleet-walls.py reads (its LAUNCHER)
 PYTHON = '/usr/bin/python3'
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C.UTF-8'}   # all a verb, the walls and ssh get
 FIRST, BASE, MAX = (2, 10), 30, 900   # seconds: after a link that was up; then doubling from BASE to MAX
@@ -132,7 +137,23 @@ def load(path):
         raise Bad(f'{path}: PORT is 1 to 65535')
     owned_safe(conf['KEY'], 'file', private=True)
     owned_safe(conf['KNOWN_HOSTS'], 'file')
+    # The kit is fixed here, once: WALLS in its real path, and the launcher beside it. A link above WALLS (a `current`
+    # an upgrade repoints) would otherwise lead each walls run to the new kit while the agent starts the old launcher.
+    # After an upgrade the agent runs the kit it started with, whole, until it is restarted.
+    conf['WALLS'] = os.path.realpath(conf['WALLS'])
+    conf['LAUNCH'] = kit_launcher(path, conf)
     return conf
+
+
+def kit_launcher(path, conf):
+    """The launcher the agent runs: the one beside WALLS (in its folder's real path, as fork-fleet-walls.py finds
+    its own), the one those walls read. A LAUNCH setting (old settings files) must lead to it: a launcher elsewhere,
+    say an old copy, would run behind walls that never read it."""
+    launch = os.path.join(os.path.dirname(conf['WALLS']), KIT_LAUNCHER)   # WALLS: its real path (load)
+    if 'LAUNCH' in conf and os.path.realpath(conf['LAUNCH']) != launch:
+        raise Bad(f'{path}: LAUNCH={conf["LAUNCH"]} is not {launch}, the launcher beside WALLS that its walls read: '
+                  'the walls and the launcher are one kit; drop the LAUNCH line')
+    return launch
 
 
 def ssh_argv(conf):
