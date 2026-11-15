@@ -704,6 +704,7 @@ class Route(unittest.TestCase):
         self.assertEqual(runners['lint'][0], POOLS[WAITING]['label'])
         lines, _ = self.outputs(**{POOLS[FIRST]['beacon']: beacon(1, at=int(ff.time.time()))})
         self.assertEqual(lines['watch'], 'true')
+        self.assertEqual(lines['rerun'], '{}')   # the fork's config has no reruns: always the line, {} for none
 
     def test_cmd_route_with_unreadable_outputs_counts_every_job(self):
         lines, log = self.outputs(FLEET_MODE='fleet', GATES='{')
@@ -3687,6 +3688,76 @@ class AnyRepository(unittest.TestCase):
         problems = ff.check_config(bad)
         self.assertTrue(any("unknown key 'avoids'" in p for p in problems), problems)
         self.assertEqual(ff.check_config(copy.deepcopy(GEN)), [])
+
+    def rerun(self, cfg, pc=None, e=None, event=PUSH, attempt=None, mode='', gates=None, own=True):
+        """(rerun output, log) of route_all for this run."""
+        e = dict(e or env())
+        if pc is not None:
+            e['PROJ_BEACON_PC'] = pc
+        got = {}
+        _, log = quiet(ff.route_all, cfg, e, private(event) if own else event, mode, gates, now=lambda: T0,
+                       nonce=NONCE, attempt=attempt, rerun=got)
+        return got, log
+
+    def test_a_trusted_persons_rerun_may_use_the_reruns_pool_for_its_own_attempt(self):
+        """Issue 224 item 4: a re-run of failed jobs does not re-run route; with `reruns`, route says ahead which run
+        label each job may ask for on that pool, and the job adds -a<its attempt>. The dispatcher (unchanged) accepts
+        exactly that pair for that attempt only."""
+        cfg = {**copy.deepcopy(GEN), 'reruns': 'pc'}
+        self.assertEqual(ff.check_config(cfg), [])
+        for attempt in (None, 1, 2, 3):   # a full re-run re-runs route too: the rerun labels never carry an attempt
+            with self.subTest(attempt=attempt):
+                got, _ = self.rerun(cfg, pc=beacon(2), attempt=attempt)
+                self.assertEqual(got, {'actors': list(GEN['trusted']['actors']), 'pool': 'proj-pc',
+                                       'labels': {k: GEN_PC[1].format(k) for k in ('plugins', 'engine', 'docs')}})
+        for attempt in (2, 3):   # what the README's runs-on asks for on attempt N
+            with self.subTest(attempt=attempt):
+                ask = [got['pool'], got['labels']['engine'] + f'-a{attempt}']
+                self.assertEqual(ff.fleet_job(cfg, ask)[1:], ('engine', attempt))
+        self.assertIsNone(ff.fleet_job(cfg, [got['pool'], got['labels']['engine']]))   # never without an attempt
+        got, _ = self.rerun(GEN, pc=beacon(2))   # no reruns: re-runs take fallback
+        self.assertEqual(got, {})
+
+    def test_a_full_pool_still_takes_reruns_a_missing_or_stale_heartbeat_does_not(self):
+        cfg = {**copy.deepcopy(GEN), 'reruns': 'pc'}
+        got, _ = self.rerun(cfg, pc=beacon(0))   # full now: the re-run waits for a slot (the sweep bounds the wait)
+        self.assertEqual(got['pool'], 'proj-pc')
+        cases = {'no heartbeat': None, 'a stale heartbeat': beacon(2, at=T0 - 3600), 'a garbled heartbeat': '{'}
+        for name, pc in cases.items():
+            with self.subTest(name):
+                got, log = self.rerun(cfg, pc=pc)
+                self.assertEqual(got, {})
+                self.assertIn('re-runs of failed jobs take the fallback, not pool pc', log)
+
+    def test_reruns_only_for_trusted_runs_kinds_the_pool_takes_and_jobs_that_do_not_avoid_it(self):
+        cfg = {**copy.deepcopy(GEN_HOSTED), 'reruns': 'pc'}
+        cases = {
+            'a pull request from another repository': dict(e=env(**PR_ENV), event=pr(head='someone/fork')),
+            'an untrusted actor': dict(e=env(GITHUB_ACTOR='someone', GITHUB_TRIGGERING_ACTOR='someone')),
+            'github mode': dict(mode='github'),
+            'a ready pull request (pc does not take ready)': dict(e=env(**PR_ENV), event=draft(False)),
+        }
+        for name, kw in cases.items():
+            with self.subTest(name):
+                got, _ = self.rerun(cfg, pc=beacon(2), **kw)
+                self.assertEqual(got, {})
+        got, _ = self.rerun(cfg, pc=beacon(2), gates={'docs': 'false'})   # a job this change skips gets none
+        self.assertEqual(sorted(got['labels']), ['engine', 'plugins'])
+        cfg['jobs'][0]['avoid'] = {'pc': ['push']}
+        got, _ = self.rerun(cfg, pc=beacon(2))
+        self.assertEqual(sorted(got['labels']), ['docs', 'engine'])
+        got, _ = self.rerun(cfg, pc=beacon(2), e=env(**PR_ENV), event=draft(True))   # avoid says push only
+        self.assertIn('plugins', got['labels'])
+        for job in cfg['jobs']:
+            job['avoid'] = {'pc': ['push']}
+        got, _ = self.rerun(cfg, pc=beacon(2))
+        self.assertEqual(got, {})
+
+    def test_reruns_must_name_a_dispatcher_pool(self):
+        for name in ('build', 'desk', '', None):
+            with self.subTest(name=name):
+                problems = ff.check_config({**GEN, 'reruns': name})
+                self.assertTrue(any('reruns' in p for p in problems), problems)
 
     def test_pool_by_draft_state(self):
         _, out, _ = self.route(pc=beacon(2), e=env(**PR_ENV), event=draft(True))
