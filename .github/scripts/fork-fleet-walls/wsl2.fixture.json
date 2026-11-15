@@ -1,0 +1,245 @@
+{
+  "about": "fork-fleet-walls.test.py: `pass` is a fake WSL2 distro on which every wall of `wsl2` holds (paths under FORK_FLEET_WALLS_ROOT; a string is a file's text, a path ending in / a folder, {\"text\", \"mode\"} a file with that mode; opt/fork-fleet/fork-fleet-launch.sh a launcher with the job units' walls). Windows' drive is mounted at /mnt/c and /c, WSL's shares and sockets at /mnt/wsl, /mnt/wslg, /usr/lib/wsl/drivers and /tmp/.X11-unix: all outside the launcher's allow list, so they hold. `fail` names each wall with the changes that make it fail (null removes a path).",
+  "pass": {
+    "proc/sys/kernel/ostype": "Linux\n",
+    "proc/sys/kernel/osrelease": "6.6.87.2-microsoft-standard-WSL2\n",
+    "proc/cmdline": "initrd=\\initrd.img WSL_ROOT_INIT=1 panic=-1 nr_cpus=8\n",
+    "proc/1/comm": "systemd\n",
+    "proc/sys/kernel/seccomp/actions_avail": "kill_process kill_thread trap errno user_notif trace log allow\n",
+    "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 8:48 / / rw,relatime - ext4 /dev/sdd rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:40 / /usr/lib/wsl/drivers ro,nosuid - 9p drivers rw\n41 29 0:41 / /mnt/wsl rw - tmpfs none rw\n42 29 0:42 / /mnt/wslg rw - tmpfs none rw\n43 29 0:43 / /mnt/c rw,noatime - 9p drvfs rw\n44 29 0:44 / /c rw,noatime - 9p drvfs rw\n45 29 0:45 /.X11-unix /tmp/.X11-unix ro - tmpfs none rw\n46 29 0:46 / /run rw,nosuid - tmpfs tmpfs rw\n",
+    "proc/self/ns/ipc": "",
+    "proc/self/ns/mnt": "",
+    "proc/self/ns/net": "",
+    "proc/kallsyms": "0000000000000000 T __cgroup_bpf_run_filter_skb\n",
+    "proc/sys/fs/binfmt_misc/status": "enabled\n",
+    "proc/sys/fs/binfmt_misc/python3.12": "enabled\ninterpreter /usr/bin/python3.12\nflags: \noffset 0\nmagic cb0d0d0a\n",
+    "run/WSL/": "",
+    "usr/lib/wsl/": "",
+    "mnt/c/": "",
+    "c/": "",
+    "etc/": "",
+    "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nenabled=false\nappendWindowsPath=false\n[network]\ngenerateResolvConf=false\n",
+    "etc/binfmt.d/WSLInterop.conf": "",
+    "proc/sys/user/max_user_namespaces": "0\n",
+    "etc/resolv.conf": "nameserver 1.1.1.1\nnameserver 9.9.9.9\n",
+    "usr/bin/wslinfo": {
+      "text": "#!/bin/sh\n[ \"$1\" = --networking-mode ] || exit 2\necho nat\nexit 0\n",
+      "mode": "755"
+    }
+  },
+  "fail": {
+    "os": [
+      {
+        "proc/sys/kernel/osrelease": "6.8.0-47-generic\n",
+        "run/WSL/": null,
+        "usr/lib/wsl/": null,
+        "proc/cmdline": "BOOT_IMAGE=/vmlinuz root=UUID=0 ro\n",
+        "proc/1/comm": "init\n"
+      },
+      {
+        "proc/sys/kernel/osrelease": "4.4.0-19041-Microsoft\n"
+      },
+      {
+        "proc/sys/kernel/ostype": null
+      }
+    ],
+    "kernel": [
+      {
+        "proc/sys/kernel/osrelease": "5.4.72-microsoft-standard-WSL2\n"
+      }
+    ],
+    "systemd": [
+      {
+        "proc/1/comm": "init\n"
+      },
+      {
+        "proc/1/comm": null
+      }
+    ],
+    "cgroup2": [
+      {
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 8:48 / / rw,relatime - ext4 /dev/sdd rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - tmpfs tmpfs rw\n40 29 0:40 / /usr/lib/wsl/drivers ro,nosuid - 9p drivers rw\n41 29 0:41 / /mnt/wsl rw - tmpfs none rw\n42 29 0:42 / /mnt/wslg rw - tmpfs none rw\n43 29 0:43 / /mnt/c rw,noatime - 9p drvfs rw\n44 29 0:44 / /c rw,noatime - 9p drvfs rw\n45 29 0:45 /.X11-unix /tmp/.X11-unix ro - tmpfs none rw\n46 29 0:46 / /run rw,nosuid - tmpfs tmpfs rw\n"
+      }
+    ],
+    "cgroup-bpf": [
+      {
+        "proc/kallsyms": null
+      }
+    ],
+    "namespaces": [
+      {
+        "proc/self/ns/net": null
+      }
+    ],
+    "seccomp": [
+      {
+        "proc/sys/kernel/seccomp/actions_avail": null
+      }
+    ],
+    "container": [
+      {
+        ".dockerenv": ""
+      },
+      {
+        "run/systemd/container": "wsl\n"
+      }
+    ],
+    "mounts": [
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/c\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "JOB_PATHS=/etc/fork-fleet/job-paths.txt\n",
+        "etc/fork-fleet/job-paths.txt": {
+          "text": "/usr\n/etc\n/c\n",
+          "mode": "644"
+        }
+      },
+      {
+        "etc/fork-fleet/launch.conf": "WORK_ROOT=/c/runners\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/mnt/c\n"
+      },
+      {
+        "proc/self/mountinfo": null
+      }
+    ],
+    "etc-secrets": [
+      {
+        "etc/fstab": "UUID=0 / ext4 defaults 0 1\n//nas.example/share /srv/share cifs username=u,password=hunter2 0 0\n"
+      },
+      {
+        "etc/auto.nas": "share -fstype=cifs,username=u,pass=hunter2 ://nas.example/share\n"
+      },
+      {
+        "etc/nas.cred": "username=u\npassword=p\n"
+      },
+      {
+        "etc/samba/.smbcredentials": "username=u\npassword=p\n"
+      },
+      {
+        "etc/fstab": "//nas.example/s /srv/s cifs credentials=/etc/nas.secret 0 0\n",
+        "etc/nas.secret": "password=p\n"
+      }
+    ],
+    "interop": [
+      {
+        "proc/sys/fs/binfmt_misc/WSLInterop": "enabled\ninterpreter /init\nflags: PF\noffset 0\nmagic 4d5a\n"
+      },
+      {
+        "proc/sys/fs/binfmt_misc/WSLInterop-late": "enabled\n"
+      },
+      {
+        "proc/sys/fs/binfmt_misc/windows": "enabled\ninterpreter /init\nflags: PF\noffset 0\nmagic 4d5a\n"
+      },
+      {
+        "proc/sys/fs/binfmt_misc/run-it": "enabled\ninterpreter /init\nflags: F\noffset 0\nmagic 2321\n"
+      },
+      {
+        "proc/sys/fs/binfmt_misc/pe": "disabled\ninterpreter /usr/local/bin/run-pe\nflags: \noffset 0\nmagic 4d5a\n"
+      },
+      {
+        "proc/sys/fs/binfmt_misc/exe": "enabled\ninterpreter /usr/local/bin/run-it\nflags: \nextension .exe\n"
+      },
+      {
+        "proc/sys/fs/binfmt_misc/odd/": ""
+      },
+      {
+        "proc/sys/fs/binfmt_misc/status": null
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nenabled=true\nappendWindowsPath=false\n[network]\ngenerateResolvConf=false\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nappendWindowsPath=false\n[network]\ngenerateResolvConf=false\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nenabled=false\nappendWindowsPath=false\nenabled=false\n[network]\ngenerateResolvConf=false\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nenabled=false # off\nappendWindowsPath=false\n[network]\ngenerateResolvConf=false\n"
+      },
+      {
+        "etc/wsl.conf": null
+      },
+      {
+        "etc/binfmt.d/WSLInterop.conf": null
+      },
+      {
+        "etc/binfmt.d/WSLInterop.conf": ":WSLInterop:M::MZ::/init:PF\n"
+      }
+    ],
+    "sockets": [
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/init\n",
+        "init": "ELF (WSL's init)\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "WORK_ROOT=/tmp/runners\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "WORK_ROOT=/run/fork-fleet/runners\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/run/WSL\n",
+        "run/WSL/": ""
+      },
+      {
+        "etc/fork-fleet/launch.conf": "RESOLV_CONF=/mnt/wsl/resolv.conf\n",
+        "mnt/wsl/resolv.conf": "nameserver 1.1.1.1\n"
+      }
+    ],
+    "userns": [
+      {
+        "proc/sys/user/max_user_namespaces": "15000\n"
+      },
+      {
+        "proc/sys/user/max_user_namespaces": null
+      },
+      {
+        "proc/sys/user/max_user_namespaces": "15000\n",
+        "proc/sys/kernel/unprivileged_userns_clone": "1\n"
+      }
+    ],
+    "resolv": [
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nenabled=false\nappendWindowsPath=false\n[network]\ngenerateResolvConf=true\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nenabled=false\nappendWindowsPath=false\n"
+      },
+      {
+        "etc/resolv.conf": null
+      }
+    ],
+    "windows-path": [
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nenabled=false\nappendWindowsPath=true\n[network]\ngenerateResolvConf=false\n"
+      },
+      {
+        "etc/wsl.conf": "[boot]\nsystemd=true\n[automount]\nenabled=true\n[interop]\nenabled=false\nappendwindowspath=false\n[network]\ngenerateResolvConf=false\n"
+      },
+      {
+        "etc/wsl.conf": null
+      }
+    ],
+    "networking": [
+      {
+        "usr/bin/wslinfo": {
+          "text": "#!/bin/sh\n[ \"$1\" = --networking-mode ] || exit 2\necho mirrored\nexit 0\n",
+          "mode": "755"
+        }
+      },
+      {
+        "usr/bin/wslinfo": {
+          "text": "#!/bin/sh\n[ \"$1\" = --networking-mode ] || exit 2\necho nat\nexit 1\n",
+          "mode": "755"
+        }
+      },
+      {
+        "usr/bin/wslinfo": null
+      }
+    ]
+  }
+}
