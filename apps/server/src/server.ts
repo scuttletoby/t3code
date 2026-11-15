@@ -915,8 +915,12 @@ const layerMakeServer = Layer.unwrap(
       WorkAdmission.WorkAdmission,
       yield* WorkAdmission.makeWorkAdmissionGate({
         marker: yield* WorkAdmission.makeFileUpdateHoldStore(config.baseDir),
+        heldFromBoot: config.holdWork === true,
       }),
     );
+    if (config.holdWork === true) {
+      yield* Effect.logWarning(WorkAdmission.HOLD_WORK_BOOT_MESSAGE);
+    }
     const runtimeStateParked = yield* Deferred.make<void>();
     const tailscaleParked = yield* Deferred.make<void>();
     const cloudLinkParked = yield* Deferred.make<void>();

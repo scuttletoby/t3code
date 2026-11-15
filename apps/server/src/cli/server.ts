@@ -3,10 +3,13 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { Command, GlobalFlag } from "effect/cli";
+import { Command, Flag, GlobalFlag } from "effect/cli";
 import * as CliError from "effect/cli/CliError";
 
-import { awaitServiceLauncherStop } from "../cloud/serviceLauncherClient.ts";
+import {
+  awaitServiceLauncherStop,
+  resolveServiceLauncherMode,
+} from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import { awaitLauncherLoss } from "../launcherWatch.ts";
 import * as DatabaseMaintenance from "../persistence/DatabaseMaintenance.ts";
@@ -22,8 +25,10 @@ const runServerCommand = Effect.fn("server.runServerCommand")(function* (
     readonly startupPresentation?: ServerConfig.StartupPresentation;
     readonly forceAutoBootstrapProjectFromCwd?: boolean;
     readonly rejectRunningServer?: boolean;
+    readonly holdWork?: boolean;
   },
 ) {
+  if (options?.holdWork === true) yield* refuseHoldWorkForBootService;
   // Before config resolution, which claims a port and creates directories.
   const { runServer } = yield* Effect.promise(() => import("../server.ts"));
   const logLevel = yield* GlobalFlag.LogLevel;
@@ -79,20 +84,50 @@ export const startCommand = Command.make("start", { ...sharedServerCommandFlags 
   Command.withHandler((flags) => runServerCommand(flags, { rejectRunningServer: true })),
 );
 
+// Fork (go-live kit): a server that starts no agent work, to try a build on a copy of a T3 home.
+const holdWorkFlag = Flag.Boolean("hold-work").pipe(
+  Flag.withDescription(
+    "Start no agent work: no turn, scheduled task, wait, usage-limit resume or launch. For trying a build on a copy of a T3 home. Refused for the background service.",
+  ),
+  Flag.withDefault(false),
+);
+
+/** The background service must never run held: its threads would silently stop working. A
+ * launcher context that cannot be read refuses too. */
+export const refuseHoldWorkForBootService = resolveServiceLauncherMode().pipe(
+  Effect.map(({ managed }) => managed),
+  Effect.orElseSucceed(() => true),
+  Effect.flatMap((managed) =>
+    managed
+      ? Effect.fail(
+          new CliError.UserError({
+            cause: "hold-work",
+            userMessage:
+              "--hold-work is refused for the background service. Run `t3 serve --hold-work --base-dir <copy>` by hand on a copy of a T3 home.",
+          }),
+        )
+      : Effect.void,
+  ),
+);
+
 // Serve never bootstraps a project, so it does not offer the flag that asks for one.
 const { autoBootstrapProjectFromCwd: _, ...serveCommandFlags } = sharedServerCommandFlags;
 
-export const serveCommand = Command.make("serve", serveCommandFlags).pipe(
+export const serveCommand = Command.make("serve", {
+  ...serveCommandFlags,
+  holdWork: holdWorkFlag,
+}).pipe(
   Command.withShortDescription("Run T3 Code in this terminal, with no browser."),
   Command.withDescription(
     "Run T3 Code in this terminal without opening a browser, and print pairing details. The background service runs this. To set up access from your other devices, run `t3 up`.",
   ),
-  Command.withHandler((flags) =>
+  Command.withHandler(({ holdWork, ...flags }) =>
     runServerCommand(
       { ...flags, autoBootstrapProjectFromCwd: Option.none() },
       {
         startupPresentation: "headless",
         forceAutoBootstrapProjectFromCwd: false,
+        ...(holdWork ? { holdWork: true } : {}),
       },
     ),
   ),
