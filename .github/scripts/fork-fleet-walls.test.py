@@ -659,7 +659,17 @@ class EveryWallsFile(Case):
         of #211 lost db_pass, api_key and DJANGO_SECRETKEY) FAILS; a name whose secret word is followed by one that
         says the value is about it (DB_PASSWORD_FILE, TOKEN_TTL, PASSWORD_MIN_LENGTH, RESTIC_PASSWORD_COMMAND), a
         value that is systemd's %d path or a number, and fish's set -q and set -e (which set nothing) pass: the
-        pattern systemd documents for credentials, which this wall's own advice points to, must not fail it."""
+        pattern systemd documents for credentials, which this wall's own advice points to, must not fail it.
+        Re-check 2: a password command gives what it prints and any file others can read that it names, through a
+        shell's -c, sed, grep or awk too (but its program, its script and a .gpg file); a PUBLIC KEY name, or a file of
+        public keys and certificates only, is no secret, while a private key under any name still is."""
+        CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\nAAAA==\n-----END CERTIFICATE-----\n'
+        PUBLIC_KEY = ('-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n'
+                      '-----END PUBLIC KEY-----\n')
+        # A fake private key, its marker joined at run time so that no key-shaped text is in the repository (the
+        # secret scan reads every commit).
+        private = '-----{} PRIVATE KEY-----'
+        PRIVATE_KEY = f'{private.format("BEGIN")}\nMC4CAQAw\n{private.format("END")}\n'
         pw = 'Hunter2-correct-horse'   # no known token's shape: found by its name only
         fails = {
             'lower case _pass': {'etc/profile.d/x.sh': f'db_pass={pw}\n'},
@@ -691,6 +701,22 @@ class EveryWallsFile(Case):
             'a password file others can read, by a specifier': {
                 'etc/systemd/system/app@.service': '[Service]\nEnvironment=DB_PASSWORD_FILE=/etc/app/%i.pw\n',
                 'etc/app/main.pw': f'{pw}\n'},
+            # PR #213 re-check 2 (security N2): a command gives what it prints and what it reads, however it is run.
+            **{f'a password command: {c}': {
+                'etc/systemd/system/backup.service': f'[Service]\nEnvironment="RESTIC_PASSWORD_COMMAND={c}"\n',
+                'etc/restic/pw': f'{pw}\n'} for c in (
+                f"sh -c 'echo {pw}'", f"bash -c 'printf %s {pw}'", f"env -i sh -ec 'exec echo {pw}'",
+                'sed -n 1p /etc/restic/pw', 'grep -m1 . /etc/restic/pw', 'awk NR==1 /etc/restic/pw',
+                "sh -c 'tr -d x < /etc/restic/pw | head -1'", 'restic-pw --password-file=/etc/restic/pw', 'python3 -I -c pass /etc/restic/pw')},
+            # PR #213 re-check 2 (correctness N1), the guard: only a PUBLIC key, or a file of public keys only, clears.
+            'a private key file others can read': {
+                'etc/systemd/system/app.service': '[Service]\nEnvironment=JWT_PRIVATE_KEY_FILE=/etc/app/jwt.pem\n',
+                'etc/app/jwt.pem': PRIVATE_KEY},
+            'a certificate with its private key after it': {
+                'etc/systemd/system/app.service': '[Service]\nEnvironment=TLS_KEY_FILE=/etc/app/both.pem\n',
+                'etc/app/both.pem': CERT + PRIVATE_KEY},
+            'a public word that is not right before KEY': {
+                'etc/environment': 'PUBLIC_API_KEY=Hunter2-correct-horse\nSECRET_PUBLIC_KEY=Hunter2-correct-horse\n'},
         }
         for name, change in fails.items():
             with self.subTest(name):
@@ -730,6 +756,26 @@ class EveryWallsFile(Case):
                                       'export GIT_PASSWORD_HELPER="secret-tool lookup app x"\n'},
             'an id file, not a key': {'etc/environment': 'AWS_ACCESS_KEY_ID_FILE=/etc/aws/id\n',
                                       'etc/aws/id': 'AKIDX\n'},
+            # PR #213 re-check 2 (correctness N1): a public key is meant to be read.
+            **{f'a public key: {line}': {'etc/systemd/system/app.service': f'[Service]\n{line}\n',
+                                         'etc/app/jwt-public.pem': PUBLIC_KEY} for line in (
+                'Environment=JWT_PUBLIC_KEY_FILE=/etc/app/jwt-public.pem',
+                'Environment=OIDC_PUBLIC_KEY_PATH=/etc/app/jwt-public.pem',
+                'Environment=SIGNING_PUBLIC_KEY=/etc/app/jwt-public.pem', 'Environment=SSH_PUB_KEY=x1')},
+            'a certificate under a key name': {
+                'etc/systemd/system/app.service': '[Service]\nEnvironment=TLS_KEY_FILE=/etc/app/ca.pem\n',
+                'etc/app/ca.pem': '# the CA\n' + CERT + CERT},
+            'an ssh public key under a key name': {
+                'etc/environment': 'DEPLOY_KEY_FILE=/etc/app/deploy.pub\n',
+                'etc/app/deploy.pub': 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXA deploy\n'},
+            # PR #213 re-check 2 (security N2), the other way: a command's own program, script or locked file.
+            'a password command that runs a script others can read': {
+                'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="python3 -u /opt/app/get-pw.py --vault x"\n'
+                                      'export GIT_PASSWORD_HELPER="/opt/app/get-pw.py"\n',
+                'opt/app/get-pw.py': 'import vault\n'},
+            'a password command that decrypts with a key jobs have not': {
+                'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="gpg -qd /etc/restic/pw.gpg"\n',
+                'etc/restic/pw.gpg': 'x\n'},
         }
         for name, change in passes.items():
             with self.subTest(name):
@@ -831,7 +877,13 @@ class EveryWallsFile(Case):
         the launcher denies; a reset to a shorter list FAILS. A slice the job units sit in (system.slice, -.slice,
         every slice: slice.d) that allows more than localhost reopens the home network (allow beats deny, and a unit
         takes its slices' rules): FAILS. A stop timeout of infinity (or 0, or longer than STOP_MAX) lets a job that
-        ignores SIGTERM run on past its limit: FAILS, in a drop-in or in systemd's own config."""
+        ignores SIGTERM run on past its limit: FAILS, in a drop-in or in systemd's own config.
+        PR #213 re-check 2 (security N1, N3; correctness N2): systemd takes a list only in the section it belongs to
+        ([Service], [Slice]) and drops it anywhere else, so a reset whose list sits in [X-Note] FAILS, and a reset that
+        sits there passes. A reset passes only in set-property's own file for a running unit, and there only with all
+        of that unit's own list (the host's own address too): one in /etc, in a prefix folder, for a unit that is not
+        there, or one that drops the own address FAILS. systemd's main system.conf is the first of /etc, /run,
+        /usr/local/lib and /usr/lib: an endless default in the one it reads FAILS."""
         header = ('# This is a drop-in unit file extension, created via "systemctl set-property"\n'
                   '# or an equivalent operation. Do not edit.\n')
         dropin = 'run/systemd/transient/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf'
@@ -840,6 +892,12 @@ class EveryWallsFile(Case):
             return header + '[Service]\nIPAddressDeny=\n' + ''.join(f'IPAddressDeny={p}\n' for p in prefixes) + '\n'
         deny = self.launchers_deny()
         own = ['198.51.100.7/32', '203.0.113.7/32']
+        unit = {'run/systemd/transient/fork-fleet-ci-1.service':   # as systemd-run writes it, the own address in it
+                '# This is a transient unit file, created programmatically via the systemd API. Do not edit.\n'
+                '[Unit]\nDescription=CI job\n[Service]\nIPAddressDeny=\n' +
+                ''.join(f'IPAddressDeny={p}\n' for p in deny[:-1] + own[:1] + deny[-1:]) + 'IPAddressAllow=localhost\n'}
+        listed = ''.join(f'IPAddressDeny={p}\n' for p in deny)
+        full = '[Service]\nIPAddressDeny=\n' + listed
         fails = {
             'a reset to only the own address': {dropin: as_systemd_writes(['203.0.113.7/32'])},
             'a reset that drops one range': {dropin: as_systemd_writes([d for d in deny if d != '100.64.0.0/10'])},
@@ -865,13 +923,35 @@ class EveryWallsFile(Case):
                                                        '[Manager]\nDefaultTimeoutStopSec=infinity\n'},
             "systemd's default, in system.conf, only root reads": {
                 'etc/systemd/system.conf': {'text': '[Manager]\nDefaultTimeoutStopSec=2h\n', 'mode': '600'}},
+            # re-check 2: lists by section
+            'a reset whose list sits in [X-Note]': {'etc/systemd/system/service.d/50-deny.conf':
+                                                    '[Service]\nIPAddressDeny=\n[X-Note]\n' + listed},
+            'a reset whose list sits in [Unit]': {**unit, dropin: '[Service]\nIPAddressDeny=\n[Unit]\n' + listed},
+            'a reset whose list sits in [Install]': {**unit, dropin: '[Service]\nIPAddressDeny=\n[Install]\n' +
+                                                     listed},
+            'a slice allow whose reset sits in [X-Note]': {'etc/systemd/system/system.slice.d/10-lan.conf':
+                                                           '[Slice]\nIPAddressAllow=any\n[X-Note]\nIPAddressAllow=\n'},
+            # re-check 2: where a reset may be
+            'a reset in /etc that drops the own address': {**unit, 'etc/systemd/system/service.d/10-deny.conf': full},
+            "set-property's file, the own address dropped": {**unit, dropin: as_systemd_writes(deny)},
+            'a reset in a prefix folder': {**unit, 'run/systemd/transient/fork-fleet-ci-.service.d/'
+                                                   '50-IPAddressDeny.conf': as_systemd_writes(deny + own)},
+            'a reset for a unit that is not there': {dropin: as_systemd_writes(deny + own)},
+            # re-check 2: the main system.conf systemd reads
+            **{f'an endless default in {p}': {p: '[Manager]\nDefaultTimeoutStopSec=infinity\n'}
+               for p in ('run/systemd/system.conf', 'usr/local/lib/systemd/system.conf', 'usr/lib/systemd/system.conf')},
         }
         passes = {
-            "refresh-net's set-property, as systemd writes it": {dropin: as_systemd_writes(deny + own)},
-            'a reset, then the list in another order': {dropin: as_systemd_writes(own + list(reversed(deny)))},
-            'a reset, then the list in words': {dropin: as_systemd_writes(
+            "refresh-net's set-property, as systemd writes it": {**unit, dropin: as_systemd_writes(deny + own)},
+            'a reset, then the list in another order': {**unit, dropin: as_systemd_writes(own + list(reversed(deny)))},
+            'a reset, then the list in words': {**unit, dropin: as_systemd_writes(
                 [d for d in deny if not d.startswith(('127.', '169.254.', '224.'))] +
-                ['localhost', 'link-local', 'multicast'])},
+                ['localhost', 'link-local', 'multicast'] + own)},
+            'a reset where systemd drops it': {'etc/systemd/system/service.d/x.conf': '[X-Note]\nIPAddressDeny=\n'},
+            'a slice allow where systemd drops it': {'etc/systemd/system/system.slice.d/x.conf':
+                                                     '[Slice]\nIPAccounting=yes\n[X-Note]\nIPAddressAllow=any\n'},
+            "/etc's system.conf before /usr's": {'etc/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=90s\n',
+                                                 'usr/lib/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'},
             'a stock slice drop-in': {'usr/lib/systemd/system/system.slice.d/10-oomd.conf':
                                       '[Slice]\nManagedOOMMemoryPressure=kill\nIPAccounting=yes\n'},
             'a slice that allows only localhost': {'etc/systemd/system/system.slice.d/x.conf':

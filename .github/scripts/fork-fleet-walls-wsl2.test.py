@@ -158,6 +158,94 @@ def bash_comments(text):
     return out, spans
 
 
+ASSIGN = re.compile(r'[A-Za-z_]\w*(?:\[[^]]*\])?\+?=')
+BASH_OPENS = (('$((', '))'), ('$(', ')'), ('${', '}'), ('`', '`'), ('"', '"'), ("'", "'"))
+LEADS = {'!', 'then', 'do', 'else', 'if', 'elif', 'while', 'until', 'time', '{', '}', 'exec', 'command', 'builtin',
+         'coproc'}   # a word after one of these is a command too
+
+
+def bash_words(code):
+    """bash's words in code as [(offset, word, operator after it: newline ; & | ( ) or '')], with quotes, $( ), ${ },
+    $(( )), backquotes and an array's ( ) kept whole, and a word going on after a backslash-newline. A tripwire's reading, not a
+    parser."""
+    out, i, n, start, nest = [], 0, len(code), None, []
+
+    def opened(at):
+        for o, c in BASH_OPENS if not nest or nest[-1] != '"' else BASH_OPENS[:4]:
+            if code.startswith(o, at):
+                nest.append(c)
+                return len(o)
+        return 1
+
+    def close(at, op):
+        nonlocal start
+        if start is not None:
+            out.append((start, code[start:at], op))
+        start = None
+    while i < n:
+        c = code[i]
+        if nest:
+            if nest[-1] == "'":
+                nest.pop() if c == "'" else None
+                i += 1
+            elif c == '\\':
+                i += 2
+            elif code.startswith(nest[-1], i):
+                i += len(nest.pop())
+            else:
+                i += opened(i)
+        elif c == '\\' and code[i + 1:i + 2] == '\n':   # bash drops it: e\(newline)${x} is one word
+            i += 2
+        elif c in ' \t':
+            close(i, '')
+            i += 1
+        elif c == '(' and start is not None and ASSIGN.fullmatch(code[start:i]):
+            nest.append(')')   # name=( ... ): the array is one word
+            i += 1
+        elif c in '\n;&|()':
+            close(i, c)
+            if c in '()':
+                out.append((i, '', c))
+            i += 1
+        else:
+            start = i if start is None else start
+            i += 2 if c == '\\' else opened(i)
+    close(n, '')
+    return out
+
+
+def command_words(code):
+    """(offset, word) for each word bash runs as a command in code (its [[ ]] and (( )) blanked): the first word of a
+    simple command after its assignments and redirections, and the word after exec, command and the like; case
+    patterns skipped."""
+    out, first, case, prev = [], True, [], ''
+    for at, word, op in bash_words(code):
+        if case and case[-1] != 'body':
+            if word == 'esac':
+                case.pop()
+            elif case[-1] == 'head' and word == 'in':
+                case[-1] = 'pattern'
+            elif case[-1] == 'pattern' and op == ')':
+                case[-1], first = 'body', True
+            prev = op
+            continue
+        if word and first:
+            if word == 'case':
+                case.append('head')
+                first = False
+            elif word == 'esac' and case:
+                case.pop()
+            elif not re.fullmatch(ASSIGN.pattern + r'.*|\{?\w*\}?\d*[<>].*', word, re.S):
+                out.append((at, word))
+                first = word in LEADS
+        if op:
+            if op == ';' and prev == ';' and case and case[-1] == 'body':
+                case[-1] = 'pattern'
+            first = True
+        prev = op
+    return out
+
+
 # What the real launcher has, which a change must keep or read with the security lens (launcher_tripwires).
 SYSTEMD_RUN_WORDS = 7   # the setting, its default, `tools` (2), and the three job units (start, check_net's two)
 TOOLS = ("  tools:1) printf 'SYSTEMD_RUN %s\\nSYSTEMCTL %s\\n' \"$(shown \"$SYSTEMD_RUN\")\" "
@@ -168,7 +256,7 @@ B_ANCHOR = '  b=$real\n  resolv_bind=$b:$resolv\n'
 def launcher_tripwires(text):
     """Cheap checks on the launcher's text that the pin test runs, so that a launcher change that also moves the pin
     cannot bring back one of round 1's edits unseen: a plain systemd-run or another "$SYSTEMD_RUN", eval, source or a
-    name reference, a # that bash reads inside quotes, a function defined twice, view_ro set outside job_view, b set
+    name reference (also spelt with quotes or backslashes), a command word built from expansions or quotes, a # that bash reads inside quotes, a function defined twice, view_ro set outside job_view, b set
     again before the resolv bind, `tools` or the SYSTEMD_RUN default changed. Not a parser: what trips needs the
     security lens, and then this check changed with it. [what tripped]"""
     out = []
@@ -187,9 +275,19 @@ def launcher_tripwires(text):
 
     def line(i):
         return code.count('\n', 0, i) + 1
+    # Quotes, backslashes and backslash-newlines taken out first, as bash does before it runs a word: ev''al, e"va"l,
+    # ev\al and ev\(newline)al are all eval (line numbers then count the joined lines).
+    flat = re.sub(r'[\'"\\]', '', code.replace('\\\n', ''))
     for m in re.finditer(r'(?<![\w$.-])(eval|source)(?![\w-])|(?:^|[;&|({]|\bthen|\bdo|\belse)[ \t]*\.[ \t]+\S|'
-                         r'(?<![\w-])(?:local|declare|typeset|readonly)\s+(?:-\w+\s+)*-\w*n|\$\{!', code, re.M):
-        out.append(f'line {line(m.start())}: {m.group(0).strip()!r} (eval, source or a name reference)')
+                         r'(?<![\w-])(?:local|declare|typeset|readonly)\s+(?:-\w+\s+)*-\w*n|\$\{!', flat, re.M):
+        out.append(f'line {flat.count(chr(10), 0, m.start()) + 1}: {m.group(0).strip()!r} '
+                   '(eval, source or a name reference)')
+    # A command bash only knows when it runs (${e}al, $cmd, "ev"al, $'\x65val'): only the two settings' tools and
+    # must's "$@" may be one.
+    tests = re.sub(r'\[\[[ \t].*?[ \t]\]\]|(?<!\$)\(\(.*?\)\)', lambda m: re.sub(r'[^\n]', ' ', m.group(0)), code)
+    out += [f'line {line(at)}: {word!r} run as a command (a word built from expansions or quotes)'
+            for at, word in command_words(tests)
+            if re.search(r'[$`\'"\\\\]', word) and word not in ('"$SYSTEMD_RUN"', '"$SYSTEMCTL"', '"$@"')]
     if code.count('printf -v') != 1:
         out.append('printf -v other than once (the settings\' loop)')
     names = re.findall(r'(?:^|[\s;&|(){}])(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\s*\)', code, re.M)
@@ -393,7 +491,8 @@ class Launcher(Case):
 
     def test_a_pinned_edit_trips_a_check(self):
         """PR #213 re-check RS N4: each of round 1's launcher edits (and their cousins: source, a name reference,
-        printf -v, `tools` or the SYSTEMD_RUN default changed) trips launcher_tripwires, which the pin test runs, so
+        printf -v, `tools` or the SYSTEMD_RUN default changed; re-check 2 RS 4: eval spelt with quotes, backslashes or
+        expansions) trips launcher_tripwires, which the pin test runs, so
         that moving the pin to such a launcher fails CI; the real launcher and a comment trip nothing."""
         real = slurp(LAUNCHER)
         bad = '-p BindReadOnlyPaths=/run/WSL:/run/WSL -p PrivateDevices=no -- "$dir/run.sh"'
@@ -426,12 +525,31 @@ class Launcher(Case):
             '`tools` shows a fixed program': real.replace(TOOLS, "  tools:1) printf 'SYSTEMD_RUN systemd-run\\n"
                                                                  "SYSTEMCTL systemctl\\n' ;;\n"),
         }
+        # Re-check 2 RS 4: eval reworded the ways bash still reads as eval, or as a command it only knows when it runs.
+        pro = " 'pro''ps+=(-p PrivateDevices=no)'\n"
+        edits.update({
+            "ev''al": real.replace(RUN, "  ev''al" + pro + RUN),
+            'e"va"l': real.replace(RUN, '  e"va"l' + pro + RUN),
+            'ev\\al': real.replace(RUN, '  ev\\al' + pro + RUN),
+            'ev\\(newline)al': real.replace(RUN, '  ev\\\nal' + pro + RUN),
+            "so''urce": real.replace(RUN, "  so''urce /etc/fork-fleet/more.sh\n" + RUN),
+            '${e}al': real.replace(RUN, '  local e=ev; ${e}al' + pro + RUN),
+            '"$e"al after if': real.replace(RUN, '  local e=ev; if true; then "$e"al' + pro.rstrip() + '; fi\n' + RUN),
+            "$'\\x65val'": real.replace(RUN, "  $'\\x65val'" + pro + RUN),
+            'a command in a variable': real.replace(RUN, '  local c=eval; $c' + pro + RUN),
+            'exec ${e}al': real.replace(RUN, '  local e=ev; exec ${e}al' + pro + RUN),
+            '$(echo eval) after &&': real.replace(RUN, '  true && $(echo eval)' + pro + RUN),
+            'e\\(newline)${x}': real.replace(RUN, '  local x=val; e\\\n${x}' + pro + RUN),
+        })
         for name, text in edits.items():
             with self.subTest(name):
                 self.assertNotEqual(text, real)
                 self.assertNotEqual(launcher_tripwires(text), [], name)
         self.assertEqual(launcher_tripwires(real + '# a comment\n'), [])
         self.assertEqual(launcher_tripwires(real.replace(RUN, '  : "a#b" ${x#y}  # a comment\n' + RUN)), [])
+        quiet = ('  x=$(printf %s "$y") z+=("$x") w[$((1 + 1))]=$z {fd}<"$x" true\n'
+                 '  case $x in "$y" | \'\') "$SYSTEMCTL" is-active -- "$x" ;; *) [[ $x == "$y" ]] ;; esac\n')
+        self.assertEqual(launcher_tripwires(real.replace(RUN, quiet + RUN)), [])   # expansions not run as commands
 
     def test_any_other_launcher_cannot_be_told(self):
         """No reading of bash follows every way a changed launcher could start a job unit with more (a plain

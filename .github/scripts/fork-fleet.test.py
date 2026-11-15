@@ -1750,7 +1750,28 @@ class Launcher(unittest.TestCase):
         self.refused(f'{self.path("open")} must be writable by its owner only')
         os.mkdir(self.path('open/own'), 0o755)
         self.conf(HOOK=self.write('open/own/hook.sh', '#!/bin/sh\n', 0o755))
+        # PR #213 re-check 2 (security N5): in a sticky folder others may write, the folder below it must be root's
+        # (here: this user's): another user who made it may rename it away and put a link in its place (a stat that
+        # says so: the tests cannot chown).
+        self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in */open/own) echo 4242; exit 0;; '
+                   'esac\nexec /usr/bin/stat "$@"\n', 0o755)
+        self.refused(f'{self.path("open/own")} is uid 4242\'s, in {self.path("open")}, which is sticky but others may '
+                     'write')
+        os.chmod(self.path('open'), 0o1775)   # its group, the same
+        self.refused(f'{self.path("open/own")} is uid 4242\'s')
+        os.chmod(self.path('open'), 0o1777)
+        os.remove(self.path('bin/stat'))
         self.start(self.NAME)
+
+    def test_the_folder_rule_says_the_fix(self):
+        """PR #213 re-check 2 (correctness observation): the refusal names the folder and the fix."""
+        os.makedirs(self.path('grp/own'))
+        os.chmod(self.path('grp/own'), 0o755)
+        os.chmod(self.path('grp'), 0o775)
+        self.conf(HOOK=self.write('grp/own/hook.sh', '#!/bin/sh\n', 0o755))
+        g = self.path('grp')
+        self.refused(f'which others may write (its group or all): they could swap a link into it (chmod go-w {g}, '
+                     f'or make it sticky: chmod +t {g})')
 
     def test_a_path_through_a_link_another_user_may_repoint_is_refused(self):
         """#211: a link on the way to a bound path (the hook's among them) is root's (or, in these tests, the user's

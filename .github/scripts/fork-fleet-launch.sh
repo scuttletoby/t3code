@@ -864,12 +864,21 @@ resolv_target() {
 # THE rule of a folder on the way to a bound path (a link's, and each one above the real path): only its owner may
 # write it, or it is sticky (then only an entry's owner may rename or remove it). A folder its group or all may write
 # lets each of them rename a link or a plain folder in it away and put their own link in its place, between the check
-# and the bind, so the bind comes from wherever they like. Dies otherwise; $2: how the path goes through it.
+# and the bind, so the bind comes from wherever they like. In a sticky one that others may write (/var/tmp), any of
+# them may have made the entry the path goes through ($3, when it is there): as its owner they may still rename it
+# away, so it must be root's or this user's, as a link must. Dies otherwise; $2: how the path goes through it.
 closed_folder() {
-  local mode
+  local mode uid
   mode=$(stat -c '0%a' -- "$ROOT${1:-/}") || die "$2: cannot read the folder ${1:-/}"
   ((mode & 01000 || !(mode & 022))) ||
-    die "$2, which others may write (its group or all): they could swap a link into it"
+    die "$2, which others may write (its group or all): they could swap a link into it" \
+      "(chmod go-w ${1:-/}, or make it sticky: chmod +t ${1:-/})"
+  if ((mode & 022)) && [[ -n ${3:-} && -e $ROOT$3 ]]; then
+    uid=$(stat -c %u -- "$ROOT$3") || die "$2: cannot read $3"
+    [[ $uid == 0 || $uid == "$EUID" ]] ||
+      die "$2: $3 is uid $uid's, in ${1:-/}, which is sticky but others may write: that user could rename it away" \
+        "and put a link in its place (only root's, or this user's; or move it out of ${1:-/})"
+  fi
 }
 
 # Every symlink on the way from $1 to its real path (on the fake machine: in it) is root's (or this user's, who runs
@@ -908,7 +917,7 @@ links_owned() {
 # a share) never leads a job past the checks. Dies when it is no plain path, or when a folder above it is not closed
 # (closed_folder, the same rule as a link's folder): then the bind could come from another place than the one checked.
 real_path() {
-  local real d
+  local real d below
   links_owned "$1"
   real=$(realpath -m -- "$ROOT$1") || die "$1: cannot resolve it"
   if [[ -n $ROOT ]]; then
@@ -917,8 +926,8 @@ real_path() {
   fi
   [[ $real =~ ^$PLAIN_PATH$ ]] || die "$1 leads to ${real:-/}: not a plain path"
   d=$real
-  while d=${d%/*} && [[ -n $d ]]; do
-    [[ ! -e $ROOT$d ]] || closed_folder "$d" "$1 leads to $real, under $d"
+  while below=$d && d=${d%/*} && [[ -n $d ]]; do
+    [[ ! -e $ROOT$d ]] || closed_folder "$d" "$1 leads to $real, under $d" "$below"
   done
   printf '%s\n' "$real"
 }

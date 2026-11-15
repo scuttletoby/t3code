@@ -64,6 +64,22 @@ ABOUT = {'FILE', 'FILES', 'PATH', 'DIR', 'DIRECTORY', 'COMMAND', 'CMD', 'HELPER'
          'POLICY', 'URL', 'URI', 'ENDPOINT', 'HOST', 'PORT', 'ENABLED', 'DISABLED', 'REQUIRED'}
 FILE_WORDS = {'FILE', 'FILES', 'PATH'}
 COMMAND_WORDS = {'COMMAND', 'CMD', 'HELPER'}
+# A KEY that a PUBLIC (or PUB) comes right before is a public key (JWT_PUBLIC_KEY_FILE): no secret word. A file that
+# plainly holds only public keys and certificates (PUBLIC_BLOCK, SSH_PUBLIC; comments) is no secret either, whatever
+# names it; one with anything else in it (a private key after a certificate) still is.
+PUBLIC_WORDS = {'PUBLIC', 'PUB'}
+PUBLIC_BLOCK = re.compile(r'-----BEGIN (CERTIFICATE|TRUSTED CERTIFICATE|X509 CRL|PUBLIC KEY|RSA PUBLIC KEY|'
+                          r'PGP PUBLIC KEY BLOCK)-----\n[A-Za-z0-9+/=:,\-\s]*?-----END \1-----')
+SSH_PUBLIC = re.compile(r'(?:\S+\s+)?(?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp\d+|sk-[a-z0-9-]+@openssh\.com)\s+'
+                        r'[A-Za-z0-9+/]+={0,2}(?:\s.*)?')
+PUBLIC_MAX = 1 << 20   # a file larger than this is not read as public
+# A *_COMMAND's value, read as a command (command_secret): what a shell runs (SHELLS -c ...) is read again; the words
+# of WRAPPERS before a program are not it; a file an INTERPRETERS runs is its program, not its input; a file of LOCKED
+# needs a key to be read.
+SHELLS = re.compile(r'(?:ba|da|z|k|mk|a)?sh')
+WRAPPERS = {'env', 'exec', 'command', 'nice', 'nohup'}
+INTERPRETERS = re.compile(r'(?:python|perl|ruby|node|php|lua|tclsh|(?:ba|da|z|k|mk|a)?sh)[\d.]*')
+LOCKED = ('.gpg', '.age')
 TOKEN_SHAPE = re.compile(r'(?<![A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|'
                          r'glpat-[A-Za-z0-9_-]{20,}|xox[abeprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|'
                          r'AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{40,}|'
@@ -120,11 +136,20 @@ DROPIN_SAFE = {'Description', 'Documentation', 'TimeoutSec', 'TimeoutStartSec', 
                'TimeoutStartFailureMode', 'TimeoutStopFailureMode'}
 STOP_TIMEOUTS = ('TimeoutSec', 'TimeoutStopSec', 'TimeoutAbortSec')
 STOP_MAX = 300   # seconds
-# The same from systemd's own config: its defaults for every unit, the job units among them (they set none).
-MANAGER_CONFS = ('/etc/systemd/system.conf', '/etc/systemd/system.conf.d/*.conf', '/run/systemd/system.conf.d/*.conf',
+# The same from systemd's own config: its defaults for every unit, the job units among them (they set none). The main
+# file is the first of MANAGER_MAIN there is (systemd 256 and later; before, /etc's only: reading the others too can
+# only report more), and every drop-in of MANAGER_CONFS is read.
+MANAGER_MAIN = ('/etc/systemd/system.conf', '/run/systemd/system.conf', '/usr/local/lib/systemd/system.conf',
+                '/usr/lib/systemd/system.conf', '/lib/systemd/system.conf')
+MANAGER_CONFS = ('/etc/systemd/system.conf.d/*.conf', '/run/systemd/system.conf.d/*.conf',
                  '/usr/local/lib/systemd/system.conf.d/*.conf', '/usr/lib/systemd/system.conf.d/*.conf',
                  '/lib/systemd/system.conf.d/*.conf')
 MANAGER_STOP_TIMEOUTS = ('DefaultTimeoutStopSec', 'DefaultTimeoutAbortSec')
+# The one file a reset of the job units' IPAddressDeny= may be in: the one systemd's set-property writes for a
+# transient unit (bus_cgroup_set_property: an empty IPAddressDeny=, then the old list merged with the new), for one
+# fork-fleet-<name>.service (not a prefix folder, fork-fleet-x-.service.d, which applies to many), as the launcher's
+# refresh-net makes it. Group 1: the unit; its own file beside the folder holds the list systemd merged with.
+SET_PROPERTY = re.compile(r'/run/systemd/transient/(fork-fleet-[^/@]*[^/@-]\.service)\.d/50-IPAddressDeny\.conf')
 # What the launcher's job units refuse (its PRIVATE4, as sandbox() gives it to IPAddressDeny=, and ::/0); a test
 # keeps it the launcher's.
 JOB_DENY = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
@@ -349,45 +374,63 @@ def endless(lines, keys):
     return [f'{k}={v}' for _, k, v in lines if k in keys and v and seconds(v) > STOP_MAX]
 
 
-def file_lines(path):
+def file_lines(path, section=None):
     """unit_lines of a file under ROOT; one that cannot be read raises (cannot tell)."""
     with open(ROOT + path, encoding='utf-8', errors='replace') as f:
-        return unit_lines(f.read())
+        return unit_lines(f.read(), section)
+
+
+def reset_left(path, deny):
+    """What a drop-in's IPAddressDeny= lines (deny, its [Service] ones) that start with or hold a reset no longer
+    refuse: the reason, or None. systemd writes a reset only in SET_PROPERTY's file, and there the list after it is
+    the unit's own list merged with refresh-net's; so it must still hold all of the unit's own list (the host's own
+    address too, which JOB_DENY has not), and JOB_DENY. A reset anywhere else, or for a unit that is not here (its
+    own file gone: a later unit of that name would take it): a FAIL."""
+    m = SET_PROPERTY.fullmatch(path)
+    if not m:
+        return 'IPAddressDeny= (an empty one: systemd writes that only in set-property\'s own file)'
+    try:
+        own = after_reset([v for _, k, v in file_lines(f'/run/systemd/transient/{m.group(1)}', 'Service')
+                           if k == 'IPAddressDeny'])
+    except FileNotFoundError:
+        return f'IPAddressDeny= (an empty one, for {m.group(1)}, which is not running)'
+    left = within(networks(list(JOB_DENY) + own), networks(after_reset(deny)))
+    return f'IPAddressDeny= (an empty one, then a list without {left[0]})' if left else None
 
 
 def job_units_wall():
     """The launcher starts each job's unit with systemd-run and its properties (the walls): nothing may change them
     on the way. A drop-in that applies to the job units (DROPIN_DIRS, DROPIN_FOLDERS: /etc, /run and /usr, for every
     service or for fork-fleet-*) and sets anything but DROPIN_SAFE (PrivateDevices=no, a BindPaths=, an empty
-    SystemCallFilter=, ...), an endless stop timeout, or an IPAddressDeny= that no longer refuses JOB_DENY, turns a
-    wall off where the launcher cannot see it; so does a slice above them (SLICE_UNITS, SLICE_FOLDERS) that allows
-    more than localhost, or sets another firewall of its own (SLICE_OPENS), and systemd's default stop timeout
-    (MANAGER_CONFS) when endless. A SYSTEMD_RUN or SYSTEMCTL (the launcher's `tools`, as its settings set them) that
+    SystemCallFilter=, ...), an endless stop timeout, or a reset of IPAddressDeny= (reset_left), turns a wall off
+    where the launcher cannot see it; so does a slice above them (SLICE_UNITS, SLICE_FOLDERS) that allows more than
+    localhost, or sets another firewall of its own (SLICE_OPENS), and systemd's default stop timeout (MANAGER_MAIN,
+    MANAGER_CONFS) when endless. A list counts only in the section systemd reads it in ([Service], [Slice]). A SYSTEMD_RUN or SYSTEMCTL (the launcher's `tools`, as its settings set them) that
     is not systemd's own (LAUNCH_TOOLS) starts the units with a program that may drop any property. A file that
     cannot be read, or a value that cannot be read (an address, a time span): cannot tell."""
     bad = []
     for path in dropins():
         lines = file_lines(path)
         keys = sorted({k for _, k, v in lines if k not in DROPIN_SAFE and k != 'IPAddressDeny'})
-        deny = [v for _, k, v in lines if k == 'IPAddressDeny']
-        if any(not v for v in deny):   # a reset: what follows it in this file must refuse all the launcher refuses
-            left = within(networks(JOB_DENY), networks(after_reset(deny)))
-            if left:
-                keys.append(f'IPAddressDeny= (an empty one, then a list without {left[0]})')
+        deny = [v for _, k, v in file_lines(path, 'Service') if k == 'IPAddressDeny']   # systemd drops the others
+        left = reset_left(path, deny) if any(not v for v in deny) else None   # without a reset, a list only adds
+        if left:
+            keys.append(left)
         keys += endless(lines, STOP_TIMEOUTS)
         if keys:
             bad.append(f'{path} sets {", ".join(keys[:4])} for the job units')
     for path in dropins(SLICE_FOLDERS, SLICE_UNITS):
         lines = file_lines(path)
         keys = sorted({k for _, k, _ in lines if SLICE_OPENS.fullmatch(k) and k != 'IPAddressAllow'})
-        allow = within(networks(after_reset([v for _, k, v in lines if k == 'IPAddressAllow'])),
+        allow = within(networks(after_reset([v for _, k, v in file_lines(path, 'Slice') if k == 'IPAddressAllow'])),
                        networks(['localhost']))
         if allow:
             keys.append(f'IPAddressAllow={allow[0]}')
         if keys:
             bad.append(f'{path} sets {", ".join(keys[:4])} for the slice the job units sit in')
-    for path in sorted({p[len(ROOT):] for t in MANAGER_CONFS for p in glob.glob(glob.escape(ROOT) + t)
-                        if os.path.isfile(p)}):
+    main = [p for p in MANAGER_MAIN if os.path.lexists(ROOT + p)][:1]   # a link to /dev/null too: systemd's choice
+    for path in [p for p in main if os.path.isfile(ROOT + p)] + sorted(
+            {p[len(ROOT):] for t in MANAGER_CONFS for p in glob.glob(glob.escape(ROOT) + t) if os.path.isfile(p)}):
         keys = endless(file_lines(path), MANAGER_STOP_TIMEOUTS)
         if keys:
             bad.append(f'{path} sets {", ".join(keys[:2])} for every unit, the job units among them')
@@ -426,7 +469,8 @@ def secret_kind(name):
     file that holds one, 'command' a command that gives one (only FILE_WORDS, or only COMMAND_WORDS, after the secret
     word); 'about' something about one (any other ABOUT word after it: AWS_ACCESS_KEY_ID_FILE holds an id)."""
     words = [w.upper() for w in name.split('_') if w]
-    last = max((i for i, w in enumerate(words) if SECRET_WORD.fullmatch(w)), default=None)
+    last = max((i for i, w in enumerate(words) if SECRET_WORD.fullmatch(w)
+                and not (w in ('KEY', 'KEYS') and i and words[i - 1] in PUBLIC_WORDS)), default=None)
     if last is None:
         return ''
     about = {w for w in words[last + 1:] if w in ABOUT}
@@ -457,7 +501,7 @@ def secret_value(value, unit=False):
     if unit and A_SPECIFIER.fullmatch(value):
         return False
     if A_PATH.fullmatch(value) and os.path.exists(ROOT + value):
-        return bool(files_in(value))
+        return bool(exposed(value))
     return True
 
 
@@ -466,8 +510,8 @@ def file_exposed(value, unit=False):
     specifiers read as unit_paths reads them (%d, the unit's own credentials, is none of this host's files)."""
     value = unquote(value)
     if unit and '%' in value:
-        return not value.startswith('%d/') and any(files_in(p) for p in unit_paths(value))
-    return bool(A_PATH.fullmatch(value) and files_in(value))
+        return not value.startswith('%d/') and any(exposed(p) for p in unit_paths(value))
+    return bool(A_PATH.fullmatch(value) and exposed(value))
 
 
 def literal(word):
@@ -476,14 +520,30 @@ def literal(word):
             and re.sub(r'%[-#0 +]*\d*(?:\.\d+)?[A-Za-z%]|\\.', '', word).strip() != '')
 
 
-def command_secret(value, unit=False):
-    """Whether a *_COMMAND value holds a secret as text: an echo or printf of literal text, a cat of a file others can
-    read, a secret's NAME=value, or a secret's --option=value (--password hunter2)."""
+def command_secret(value, unit=False, depth=0):
+    """Whether a *_COMMAND value gives a secret to whoever runs it, as a job could: it holds the secret as text, or
+    reads it from a file others can read. Each simple command of it (split at ; & | and brackets) is read: a secret's
+    NAME=value or --option=value (--password hunter2); an echo or printf of literal text; any file others can read
+    that it names (an argument, or an option's value: sed -n 1p /etc/pw, --password-file=/etc/pw) but its program
+    (INTERPRETERS' script too) and a LOCKED file; and what a shell runs (sh -c '...'), read again."""
     value = unquote(value)
     try:
-        words = shlex.split(value)
+        lex = shlex.shlex(value, posix=True, punctuation_chars=';&|()')
+        lex.whitespace_split = True
+        words = list(lex)
     except ValueError:
         words = value.split()
+    commands = [[]]
+    for w in words:
+        if w and not w.strip(';&|()'):
+            commands.append([])
+        else:
+            commands[-1].append(w)
+    return any(simple_secret(c, unit, depth) for c in commands if c)
+
+
+def simple_secret(words, unit, depth):
+    """command_secret of one simple command: [word]."""
     for i, word in enumerate(words):
         name, eq, v = word.partition('=')
         if eq and re.fullmatch(r'[A-Za-z_]\w*', name) and secret_assignment(name, v, unit):
@@ -493,13 +553,27 @@ def command_secret(value, unit=False):
             if secret_kind(name.replace('-', '_')) == 'value' and secret_value(
                     v if eq else (words[i + 1] if i + 1 < len(words) else ''), unit):
                 return True
-    words = [w for w in words if not re.fullmatch(r'[A-Za-z_]\w*=.*', w)]
-    while words and os.path.basename(words[0]) in ('env', 'exec', 'command'):
+    while words and (re.fullmatch(r'[A-Za-z_]\w*=.*', words[0]) or os.path.basename(words[0]) in WRAPPERS):
         words = words[1:]
-    prog = os.path.basename(words[0]) if words else ''
-    if prog in ('echo', 'printf') and any(literal(w) for w in words[1:]):
+        while words and words[0].startswith('-'):   # the wrapper's options (env -i, nice -n 5: the 5 is no program)
+            words = words[1 + (words[0] in ('-n', '-u', '-a')):]
+    if not words:
+        return False
+    prog, args = os.path.basename(words[0]), words[1:]
+    if SHELLS.fullmatch(prog):
+        script = next((args[i + 1] for i, w in enumerate(args[:-1]) if re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', w)), None)
+        if script is not None:
+            return depth < 4 and command_secret(script, unit, depth + 1)
+    if prog in ('echo', 'printf') and any(literal(w) for w in args):
         return True
-    return prog in ('cat', 'head', 'tail') and any(A_PATH.fullmatch(w) and files_in(w) for w in words[1:])
+    if INTERPRETERS.fullmatch(prog):   # its script is its program: the words before it and it are not its input
+        first = next((i for i, w in enumerate(args) if not w.startswith('-')), len(args))
+        args = args[first + 1:]
+    for w in args:
+        for path in {w, w.partition('=')[2]}:
+            if A_PATH.fullmatch(path) and not path.endswith(LOCKED) and exposed(path):
+                return True
+    return False
 
 
 def secret_assignment(name, value, unit=False):
@@ -557,15 +631,25 @@ def env_secrets(path, seen):
     return [(where, path) for where in out]
 
 
-def unit_lines(text):
+def unit_lines(text, section=None):
     """(line number, key, value) of each assignment in a systemd unit, drop-in or config file, as systemd reads it
-    (systemd.syntax(7)): a comment line (# or ;) and a section line skipped; a line ending in a backslash continued on
-    the next, the backslash a blank, a comment line inside it skipped; blanks around the key and the `=` dropped."""
-    out, buf, start = [], None, 0
+    (systemd.syntax(7)): a comment line (# or ;) skipped; a line ending in a backslash continued on the next, the
+    backslash a blank, a comment line inside it skipped; blanks around the key and the `=` dropped. section (Service,
+    Slice, Manager): only the lines in that [section], as systemd takes a setting only in the section it belongs to; it
+    drops one in any other section (an X- one, [Unit], [Install]) or before the first, and so does this."""
+    out, buf, start, at = [], None, 0, None
+
+    def keep(buf):
+        key, eq, value = buf.partition('=')
+        if eq and (section is None or at == section):
+            out.append((start, key.strip(), value.strip()))
     for n, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if buf is None:
-            if not line or line[0] in '#;[':
+            if line[:1] == '[':
+                at = line[1:-1] if line.endswith(']') else None   # a broken header: systemd takes nothing after it
+                continue
+            if not line or line[0] in '#;':
                 continue
             buf, start = '', n
         elif line[:1] in ('#', ';'):
@@ -573,15 +657,10 @@ def unit_lines(text):
         if line.endswith('\\'):
             buf += line[:-1] + ' '
             continue
-        buf += line
-        key, eq, value = buf.partition('=')
-        if eq:
-            out.append((start, key.strip(), value.strip()))
+        keep(buf + line)
         buf = None
     if buf:
-        key, eq, value = buf.partition('=')
-        if eq:
-            out.append((start, key.strip(), value.strip()))
+        keep(buf)
     return out
 
 
@@ -595,6 +674,26 @@ def files_in(path):
         except OSError:
             return []
     return [path] if os.path.isfile(full) and others_read(path) else []
+
+
+def public_only(path):
+    """Whether a file under ROOT plainly holds only public keys and certificates (PUBLIC_BLOCK, SSH_PUBLIC; blank and
+    # lines between them): nothing secret in it, whoever reads it."""
+    try:
+        if os.path.getsize(ROOT + path) > PUBLIC_MAX:
+            return False
+        with open(ROOT + path, encoding='utf-8', errors='replace') as f:
+            text = f.read().replace('\r\n', '\n')
+    except OSError:
+        return False
+    rest = [line.strip() for line in PUBLIC_BLOCK.sub('', text).splitlines()]
+    rest = [line for line in rest if line and not line.startswith('#')]
+    return bool(PUBLIC_BLOCK.search(text) or rest) and all(SSH_PUBLIC.fullmatch(line) for line in rest)
+
+
+def exposed(path):
+    """files_in(path) that may hold a secret: those not public_only."""
+    return [f for f in files_in(path) if not public_only(f)]
 
 
 def unit_paths(value):
