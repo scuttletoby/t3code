@@ -3390,8 +3390,18 @@ class Wiring(unittest.TestCase):
             if name in routed:
                 continue
             with self.subTest(name):
-                self.assertIsInstance(spec['runs-on'], str)
-                self.assertTrue(spec['runs-on'] == HOSTED or spec['runs-on'].startswith('macos-'), spec['runs-on'])
+                if 'uses' in spec:   # a call of a workflow in this repository (the secret scan): its jobs must stay off the fleet too
+                    self.assertTrue(spec['uses'].startswith('./.github/workflows/'), spec['uses'])
+                    import yaml
+                    with open(os.path.join(ROOT, spec['uses'][2:])) as f:
+                        called = yaml.safe_load(f)['jobs']
+                    self.assertTrue(called, spec['uses'])
+                    specs = [(name + '/' + n, s) for n, s in called.items()]
+                else:
+                    specs = [(name, spec)]
+                for where, s in specs:
+                    self.assertIsInstance(s.get('runs-on'), str, where)
+                    self.assertTrue(s['runs-on'] == HOSTED or s['runs-on'].startswith('macos-'), (where, s['runs-on']))
         self.assertEqual(self.sweep['jobs']['sweep']['runs-on'], HOSTED)
 
     def test_the_upstream_sync_runs_on_github_hosted_runners_only(self):

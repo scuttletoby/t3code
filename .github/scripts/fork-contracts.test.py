@@ -21,6 +21,10 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                Environment, the App key is named only by the guard's presence test and the one token
                step, and that token reaches only the start step right after it and the finish step
                (the last). No other fork workflow names the key.
+  secret-scan  fork-secret-scan.yml runs on every pull request on its own, with no concurrency group
+               (workflow or job), so a newer push never cancels the scan of an older head;
+               fork-tests.yml's `secrets` job calls it (the check a ruleset requires), and no other
+               fork workflow runs the scan script.
   removed      .github/fork-removed-workflows.txt (the upstream workflows the fork deletes, kept
                deleted by fork-follow.sh) is there, every line is an upstream workflow path, none of
                them is in the tree, and it names the files the owner decided to delete.
@@ -886,6 +890,57 @@ gate_mutants = {
 }
 for label, mutate in gate_mutants.items():
     check(f"head-gate: {label} fails", gate_mutant(mutate))
+
+# --- secret-scan -------------------------------------------------------------------------------
+SCAN_FILE = "fork-secret-scan.yml"
+SCAN_CALL = "./.github/workflows/" + SCAN_FILE
+
+
+def secret_scan_problems(wfs):
+    problems = []
+    scan = wfs.get(SCAN_FILE)
+    if scan is None:
+        return [f"{SCAN_FILE} is missing"]
+    if "pull_request" not in triggers(scan):
+        problems.append(f"{SCAN_FILE}: no pull_request trigger (a run of its own that nothing cancels)")
+    if "concurrency" in scan:
+        problems.append(f"{SCAN_FILE}: a workflow concurrency group (a newer push could cancel a scan)")
+    problems += [f"{SCAN_FILE}: job {j} has a concurrency group"
+                 for j, job in (scan.get("jobs") or {}).items() if "concurrency" in job]
+    caller = ((wfs.get("fork-tests.yml") or {}).get("jobs") or {}).get("secrets") or {}
+    if caller.get("uses") != SCAN_CALL or (caller.get("with") or {}).get("test") is not True:
+        problems.append(f"fork-tests.yml: job secrets does not call {SCAN_CALL} with test: true")
+    problems += [f"{n}/{j}: runs the scan script outside {SCAN_FILE}" for n, wf in wfs.items() if n != SCAN_FILE
+                 for j, step in steps(wf) if "fork-secret-scan.sh" in str(step.get("run", ""))]
+    return problems
+
+
+check("secret-scan: fork-secret-scan.yml runs on pull requests uncancelled, fork-tests.yml calls it",
+      not secret_scan_problems(real), "; ".join(secret_scan_problems(real)))
+
+
+def scan_mutant(mutate):
+    wfs = copy.deepcopy(real)
+    try:
+        mutate(wfs)
+    except (KeyError, TypeError):  # nothing to break: the check above has already failed
+        return False
+    return bool(secret_scan_problems(wfs))
+
+
+GROUP = {"group": "scan-${{ github.ref }}", "cancel-in-progress": True}
+for label, mutate in {
+    "a workflow concurrency group": lambda w: w[SCAN_FILE].__setitem__("concurrency", GROUP),
+    "a job concurrency group": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__("concurrency", GROUP),
+    "a concurrency group that does not cancel": lambda w: w[SCAN_FILE].__setitem__(
+        "concurrency", {"group": "scan", "cancel-in-progress": False}),
+    "no pull_request trigger": lambda w: w[SCAN_FILE][True].pop("pull_request"),
+    "fork-tests.yml scanning in a step of its own": lambda w: w["fork-tests.yml"]["jobs"].__setitem__(
+        "secrets", {"runs-on": "ubuntu-24.04", "steps": [{"run": "bash .github/scripts/fork-secret-scan.sh"}]}),
+    "fork-tests.yml calling it without its tests": lambda w: w["fork-tests.yml"]["jobs"]["secrets"].pop("with"),
+}.items():
+    check(f"secret-scan: {SCAN_FILE} with {label} fails" if "fork-tests" not in label
+          else f"secret-scan: {label} fails", scan_mutant(mutate))
 
 # --- removed -----------------------------------------------------------------------------------
 removed_path = root / ".github/fork-removed-workflows.txt"
