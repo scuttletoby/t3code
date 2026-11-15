@@ -57,8 +57,8 @@ Two choices to keep in mind when comparing before and after:
 - **Stops half-way, runs again.** A stop prints what it has, says `INCOMPLETE` (and whether the run list was
   finished) and exits 3. Run the same command again later: every page it saved is read from `--cache`, so no page is
   asked for twice. If the cache could not be written (a read-only folder, a full disk), the result says so (in the
-  first line, and `cache_write_failed` in `--json`) and a stop does not say to run again: nothing was saved, so it
-  would ask for the same pages again. Fix the cache folder first.
+  first line, and `cache_write_failed` in `--json`) and a stop does not say to run again: the pages that failed were not saved, so it
+  would ask for them again. Fix the cache folder first.
 - **Cache.** A jobs page is saved when the run and all its jobs are completed, keyed by run id and attempt (a re-run
   is a new attempt, so a new page). A runs-list page is saved when every run in it is completed and the day ended over
   an hour ago, and is reused for 12 hours (a later re-run changes it). Writes are a `.part-` file then a rename, so a
@@ -70,8 +70,8 @@ Two choices to keep in mind when comparing before and after:
   is refused and the folder is made 0700, also when it existed before; on Windows these checks are skipped. So on
   Linux or macOS the cache folder must allow private permissions: one on a filesystem where chmod has no effect (FAT
   or exFAT, WSL's `/mnt/c`, some network mounts) is refused (exit 2). Pick a folder on a normal disk, such as
-  `$XDG_CACHE_HOME/ci-demand` or `~/.cache/ci-demand`. `gh` output and the config file are read as UTF-8 (a BOM is
-  fine) whatever the locale.
+  `$XDG_CACHE_HOME/ci-demand` or `~/.cache/ci-demand`. `gh` output and the config file are read as UTF-8 whatever the
+  locale (a BOM is fine in the config file).
 - Exit codes: 0 complete, 2 bad arguments or an API error (404, no access, network down after retries), 3 incomplete.
 
 ## General vs project

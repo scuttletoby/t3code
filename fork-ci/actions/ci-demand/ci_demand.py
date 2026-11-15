@@ -17,7 +17,8 @@ X-RateLimit-Remaining falls below --reserve (default 20% of X-RateLimit-Limit, s
 an hour works too) and after --max-requests requests; on 403/429 it waits Retry-After or
 the reset time when that is short (MAX_WAIT), else it stops. A stop prints what it has, marked INCOMPLETE (exit 3):
 run it again with the same --cache and it goes on from the pages it already saved. A cache that could not be
-written is in the result (`cache_write_failed`), and then a stop does not say to run again: nothing was saved.
+written is in the result (`cache_write_failed`), and then a stop does not say to run again: the pages
+that failed were not saved.
 
 Cache (--cache, a folder the caller owns): a page is saved only when it cannot change any more: a job page when the
 run and all its jobs are completed (keyed by run id and attempt, so a re-run is a new page); a run-list page when
@@ -103,9 +104,13 @@ class Api:
                 and isinstance(doc.get('body'), dict)):
             return None
         saved = doc.get('saved')
-        if isinstance(saved, bool) or not isinstance(saved, (int, float)) or not math.isfinite(saved) \
-                or saved > now() + 60:
-            return None   # a damaged date (json.load reads NaN and Infinity): fetched again
+        try:   # float(): json.load reads NaN, Infinity and any-size integers; a huge one raises OverflowError
+            date_ok = not isinstance(saved, bool) and isinstance(saved, (int, float)) and math.isfinite(float(saved)) \
+                and 0 <= saved <= now() + 60
+        except OverflowError:
+            date_ok = False
+        if not date_ok:
+            return None   # a damaged date (NaN, infinite, huge, before 1970 or in the future): fetched again
         if max_age is not None and now() - saved > max_age:
             return None
         self.hits += 1

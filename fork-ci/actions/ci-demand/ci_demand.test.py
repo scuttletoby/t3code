@@ -275,6 +275,9 @@ class State(Case):
                   'date in the future': lambda d: d.update(saved=NOW + 86400), 'body not an object': lambda d: d.update(body=[]),
                   'date NaN': lambda d: d.update(saved=float('nan')),   # json.load reads NaN, never stale
                   'date -Infinity': lambda d: d.update(saved=float('-inf')),
+                  'date a huge integer': lambda d: d.update(saved=10 ** 400),   # float() of it overflows
+                  'date a huge negative integer': lambda d: d.update(saved=-10 ** 400),
+                  'date before 1970': lambda d: d.update(saved=-1),
                   'older format (none)': lambda d: d.pop('v'), 'older format': lambda d: d.update(v=M.FORMAT - 1),
                   'newer format': lambda d: d.update(v=M.FORMAT + 1)}
         for what, change in damage.items():
