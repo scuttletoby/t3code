@@ -1,0 +1,52 @@
+{
+  "format": "capacity-rule/1",
+  "//": "Every number of the capacity rule. Read by the TypeScript evaluator (packages/shared/src/capacityRule.ts) and, later, the kit's Python one; both must pass capacity-vectors.json. Format: README.md beside this file. Memory in MB (1 MB = 1048576 bytes), CPU in hundredths of a core.",
+  "margin": {
+    "minMb": 1024,
+    "totalPercent": 10,
+    "noSwapOrNoCapsPercent": 150
+  },
+  "readingBounds": {
+    "minTotalMb": 1024,
+    "maxTotalMb": 1048575,
+    "maxCpuCores": 1024
+  },
+  "kinds": {
+    "agent-light": { "group": "agent", "startMb": 384, "startCentiCores": 10 },
+    "agent-writer": { "group": "agent", "startMb": 768, "startCentiCores": 30 },
+    "job-build": { "group": "job", "startMb": 2048, "startCentiCores": 250 },
+    "job-test": { "group": "job", "startMb": 768, "startCentiCores": 170 },
+    "job-typecheck": { "group": "job", "startMb": 3072, "startCentiCores": 30, "maxAtOnce": 1 },
+    "job-server": {
+      "group": "job",
+      "startMb": 512,
+      "startCentiCores": 100,
+      "plusDeclared": true,
+      "declaredFallbackMb": 4096
+    },
+    "job-default": { "group": "job", "startMb": 3072, "startCentiCores": 250 }
+  },
+  "unknownKinds": { "jobPrefix": "job-", "job": "job-default", "other": "agent-writer" },
+  "learnedBounds": { "minPercent": 50, "maxPercent": 400 },
+  "jobCoresPercent": 90,
+  "writers": { "kind": "agent-writer", "buildKind": "job-build", "perBuildThatFits": 2, "min": 2 },
+  "floors": { "agent": 2, "job": 1 },
+  "ceilings": { "agent": 10, "job": 4 },
+  "pressure": {
+    "elevated": {
+      "psiSomeAvg10Pct": 10,
+      "psiFullAvg10Pct": 2,
+      "availableBelowMarginPercent": 100,
+      "swapFreeBelowPercent": 15
+    },
+    "severe": { "psiFullAvg10Pct": 10, "availableBelowMarginPercent": 50 },
+    "calm": {
+      "psiSomeAvg10Pct": 5,
+      "psiFullAvg10Pct": 1,
+      "availableAtLeastMarginPercent": 150,
+      "swapFreeAtLeastPercent": 30
+    },
+    "elevatedClearSeconds": 60,
+    "severeClearSeconds": 120
+  }
+}
