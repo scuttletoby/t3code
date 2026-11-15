@@ -3,7 +3,7 @@
  * Fork (waits): the judges, one per kind, that read a condition once. A judge never fails: an error
  * is a `failed` judgement, and the wait service decides what it means. Here: the `file` judge (in
  * the server and in a short-lived process), the `check` judge (a command from settings) and the
- * `unit` judge (one `systemctl show`). The `pr` judge comes with its own PR.
+ * `unit` judge (one `systemctl show`). The `pr` judge is in `WaitPrJudge.ts`.
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";

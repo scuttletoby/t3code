@@ -1,0 +1,125 @@
+/**
+ * Fork (waits): the `pr` judge. It reads through T3's own pull request service (host tools, logins
+ * and caches of link_pull_request and watch_pull_request) and judges with `judgePrChecks`. The
+ * settle rule's "seen" head is kept in memory only: after a restart it takes two fresh reads.
+ */
+import type { PullRequestRef } from "@t3tools/contracts";
+import { type Judgement, judgePrChecks, type PrSeen } from "@t3tools/shared/waitFor";
+import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
+
+import * as ProjectService from "../project/ProjectService.ts";
+import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import { resolveTarget } from "../pullRequest/pullRequestTarget.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
+import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
+import type { WaitJudge } from "./WaitJudges.ts";
+
+/** A pull request's seen head is forgotten when no wait has read it for this long. */
+const FORGET_SEEN_MS = 24 * 60 * 60_000;
+const MESSAGE_MAX = 300;
+
+const isProviderError = Schema.is(PullRequestProviderError);
+
+const permanent = (message: string): Judgement => ({ type: "failed", message, permanent: true });
+const transient = (message: string): Judgement => ({ type: "failed", message, permanent: false });
+const clip = (text: string) =>
+  text.length > MESSAGE_MAX ? `${text.slice(0, MESSAGE_MAX - 1)}…` : text;
+
+/**
+ * What a failed read means; never met. Not found and a host without pull request reads are
+ * permanent. A missing tool or login refuses a new wait, but for a stored one it is a failed read
+ * like a rate limit or a host that is down: retried, and reported after the error grace.
+ */
+function failedRead(
+  error: PullRequestService.PullRequestError,
+  name: string,
+  registering: boolean,
+): Judgement {
+  if (error._tag === "PullRequestUnavailableError") {
+    return error.reason === "provider-unsupported" || registering
+      ? permanent(error.message)
+      : transient(error.message);
+  }
+  const provider = isProviderError(error.cause) ? error.cause : undefined;
+  if (error.reason === "not-found" || provider?.reason === "not-found") {
+    return permanent(
+      `Pull request ${name} was not found: it may be deleted, its repository renamed or moved, or not readable with this host's login. Wait again with its current repository.`,
+    );
+  }
+  if (provider?.reason === "rate-limited") {
+    return transient(`The host is limiting reads of ${name} (rate limit); it is read again later.`);
+  }
+  if (registering && (provider?.reason === "forbidden" || provider?.reason === "unauthenticated")) {
+    return permanent(clip(`Pull request ${name} cannot be read: ${error.detail}`));
+  }
+  return transient(clip(`Pull request ${name} could not be read: ${error.detail}`));
+}
+
+export const makePrJudge = Effect.fn("WaitPrJudge.make")(function* () {
+  const settingsService = yield* ServerSettingsService;
+  const projects = yield* ProjectService.ProjectService;
+  const pullRequests = yield* PullRequestService.PullRequestService;
+  /** The settle rule's memory, by pull request: it is about the head, not about one wait. */
+  const seenByPr = new Map<string, { readonly seen: PrSeen; readonly at: number }>();
+
+  const read = Effect.fn("WaitPrJudge.read")(function* (ref: PullRequestRef, withChecks: boolean) {
+    const detail = yield* pullRequests.detail(ref);
+    const checks = withChecks && detail.state === "open" ? yield* pullRequests.checks(ref) : null;
+    return { detail, checks };
+  });
+
+  const judge: WaitJudge<"pr"> = Effect.fn("WaitPrJudge.pr")(function* ({ spec }, context) {
+    const registering = context.waitId === null;
+    const settings = yield* settingsService.getSettings.pipe(Effect.option);
+    if (Option.isNone(settings)) return transient("The settings cannot be read.");
+    // The project the wait was registered in gives the host, the login and the default repository.
+    const project = yield* projects.getShell(context.projectId).pipe(Effect.option);
+    if (Option.isNone(project)) return transient("The project cannot be read now.");
+    if (Option.isNone(project.value)) return permanent("The project of this wait is gone.");
+    const shell = project.value.value;
+    const repository =
+      spec.repository ?? sourceControlDefinitions.repositorySelector(shell.repositoryIdentity);
+    if (repository === null || repository === undefined) {
+      return permanent(
+        "This thread's project has no recognised remote. Name the pull request's repository.",
+      );
+    }
+    const target = yield* Effect.result(resolveTarget({ repository, number: spec.number }, shell));
+    if (Result.isFailure(target)) return permanent(target.failure.message);
+    const ref: PullRequestRef = {
+      projectId: context.projectId,
+      host: target.success.host,
+      repository: target.success.repository,
+      number: target.success.number,
+      allowStale: false,
+    };
+    const name = `${ref.repository}#${ref.number}`;
+    const result = yield* Effect.result(read(ref, spec.until === "checks"));
+    if (Result.isFailure(result)) return failedRead(result.failure, name, registering);
+
+    const key = `${ref.projectId} ${ref.host} ${ref.repository}#${ref.number}`;
+    for (const [held, entry] of seenByPr) {
+      if (context.now - entry.at >= FORGET_SEEN_MS) seenByPr.delete(held);
+    }
+    const { detail, checks } = result.success;
+    const { seen, ...judgement } = judgePrChecks({
+      detail,
+      checks,
+      until: spec.until,
+      seen: seenByPr.get(key)?.seen ?? null,
+      now: context.now,
+      settings: settings.value.waitFor,
+    });
+    // Only a checks read says anything about the head's checks; a `merged` wait leaves it be.
+    if (spec.until === "checks") {
+      if (seen === null) seenByPr.delete(key);
+      else seenByPr.set(key, { seen, at: context.now });
+    }
+    return judgement;
+  });
+  return judge;
+});
