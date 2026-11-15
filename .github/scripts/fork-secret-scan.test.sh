@@ -25,7 +25,8 @@ git config --global user.name test
 git config --global user.email test@example.invalid
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
-unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
+export CONFIG_BRANCH=main
 
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   gitleaks="$(realpath "$GITLEAKS_BIN")"
@@ -34,12 +35,34 @@ else
   export TMPDIR="$root"
   cat > "$gitleaks" <<'FAKE'
 #!/usr/bin/env bash
-# Stand-in: `gitleaks git ... --log-opts=OPTS .` fails when the diffs of `git log -p -U0 OPTS` add a
-# key id, and logs how many commits it scanned. Like gitleaks 8.30.1, a git error (a file content
-# fetch that fails) stops it with "0 commits scanned" and exit 0.
+# Stand-in: `gitleaks git ... --log-opts=OPTS SOURCE` fails when the diffs of `git log -p -U0 OPTS`
+# add a key id, and logs how many commits it scanned. Like gitleaks 8.30.1, a git error (a file
+# content fetch that fails) stops it with "0 commits scanned" and exit 0. Settings, found as gitleaks
+# finds them: a config (--config, GITLEAKS_CONFIG, GITLEAKS_CONFIG_TOML, SOURCE/.gitleaks.toml) with
+# an [allowlist] allows every key; a .gitleaksignore (--gitleaks-ignore-path, default ".", and
+# SOURCE) line `<commit>:...` ignores the keys of that commit.
 set -uo pipefail
-opts=""
-for arg in "$@"; do [[ "$arg" == --log-opts=* ]] && opts="${arg#--log-opts=}"; done
+opts="" config="" ignore_path="." source="."
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --log-opts=*) opts="${1#--log-opts=}" ;;
+    --config) config="$2"; shift ;;
+    --gitleaks-ignore-path) ignore_path="$2"; shift ;;
+    -*) ;;
+    *) [[ "$1" == git ]] || source="$1" ;;
+  esac
+  shift
+done
+settings=""
+if [[ -n "$config" ]]; then settings="$(cat "$config")"
+elif [[ -n "${GITLEAKS_CONFIG:-}" ]]; then settings="$(cat "$GITLEAKS_CONFIG")"
+elif [[ -n "${GITLEAKS_CONFIG_TOML:-}" ]]; then settings="$GITLEAKS_CONFIG_TOML"
+elif [[ -f "$source/.gitleaks.toml" ]]; then settings="$(cat "$source/.gitleaks.toml")"
+fi
+ignored=" "
+for file in "$ignore_path" "$ignore_path/.gitleaksignore" "$source/.gitleaksignore"; do
+  if [[ -f "$file" ]]; then ignored+="$(grep -oE '^[0-9a-f]{40,64}' "$file" | tr '\n' ' ')"; fi
+done
 # Into a file first: `grep -q` stops reading early, and pipefail would read git's SIGPIPE as no match.
 # shellcheck disable=SC2086
 if ! git log -p -U0 $opts > "$TMPDIR/fake-gitleaks.log" 2> "$TMPDIR/fake-gitleaks.err"; then
@@ -57,7 +80,13 @@ fi
 scanned="$(awk '/^commit / { c = $2 } /^diff --git / { d = 0 } /^deleted file mode / { d = 1 }
   /^@@ / && !d && !(c in s) { s[c] = 1; n++ } END { print n + 0 }' "$TMPDIR/fake-gitleaks.log")"
 echo "INF $scanned commits scanned."
-if grep -qE '^\+.*(AKIA)[A-Z2-7]{16}' "$TMPDIR/fake-gitleaks.log"; then echo "leaks found: 1"; exit 1; fi
+if [[ "$settings" != *"[allowlist]"* ]]; then
+  # The commits whose diffs add a key, minus the ignored ones.
+  for sha in $(grep -E '^commit |^\+.*(AKIA)[A-Z2-7]{16}' "$TMPDIR/fake-gitleaks.log" |
+    awk '/^commit / { c = $2; next } { print c }' | sort -u); do
+    if [[ "$ignored" != *" $sha "* ]]; then echo "leaks found: 1"; exit 1; fi
+  done
+fi
 echo "no leaks found"
 FAKE
   chmod +x "$gitleaks"
@@ -238,13 +267,20 @@ BASE_SHA="$base" HEAD_SHA="$leaky" \
 gitleaks="$real_gitleaks"
 
 # The file contents cannot be fetched part-way: a fresh blob-less clone (no contents yet) whose
-# origin is gone afterwards. gitleaks would log "0 commits scanned" and exit 0.
+# origin then holds every branch and commit but no file contents (a blob-less copy whose own source
+# is gone). gitleaks would log "0 commits scanned" and exit 0.
 clone="$root/clone-offline"
 git clone -q --filter=blob:none --no-checkout --single-branch --branch leaky "file://$root/origin.git" "$clone"
-mv "$root/origin.git" "$root/origin-gone.git"
+git clone -q --bare --filter=blob:none "file://$root/origin.git" "$root/origin-commits.git"
+git -C "$root/origin-commits.git" config remote.origin.url "$root/no-such-origin.git"
+git -C "$root/origin-commits.git" config uploadpack.allowFilter true
+git -C "$root/origin-commits.git" config uploadpack.allowAnySHA1InWant true
+mv "$root/origin.git" "$root/origin-full.git"
+mv "$root/origin-commits.git" "$root/origin.git"
 BASE_SHA="$base" HEAD_SHA="$leaky" \
   check "pull request: contents that cannot be fetched after the clone fail" 2 "cannot read the commits"
-mv "$root/origin-gone.git" "$root/origin.git"
+mv "$root/origin.git" "$root/origin-commits.git"
+mv "$root/origin-full.git" "$root/origin.git"
 
 # git writes a stray line to stderr while gitleaks reads the log (in gitleaks 8.30.1 that is
 # `ERR error="stderr is not empty"`, possibly with diffs dropped, and still exit 0): the scan fails.
@@ -337,6 +373,207 @@ UPSTREAM="" BEFORE="$old_series" AFTER="$rebased" \
 BEFORE="$old_series" AFTER="$rebased" \
   check "force push: upstream reachable again, the scan passes again" 0
 unset UPSTREAM UPSTREAM_URL
+
+# New origins for the cases below: a bare origin that serves blob-less clones, and a work repo.
+new_origin() { # new_origin NAME [OBJECT_FORMAT]
+  git init -q --bare --object-format="${2:-sha1}" "$root/$1.git"
+  git -C "$root/$1.git" config uploadpack.allowFilter true
+  git -C "$root/$1.git" config uploadpack.allowAnySHA1InWant true
+  git init -q --object-format="${2:-sha1}" "$root/$1"
+  cd "$root/$1"
+  git remote add origin "$root/$1.git"
+}
+# A clone with a work tree (as the workflow's checkout has): its files are the PR head's.
+checkout() { # checkout ORIGIN BRANCH
+  clone="$root/$1-$2-checkout"
+  git clone -q --filter=blob:none --single-branch --branch "$2" "file://$root/$1.git" "$clone"
+}
+allow_all="paths = ['''.*''']"
+export EVENT_NAME=pull_request BEFORE="" AFTER=""
+
+# gitleaks settings come from the default branch, never from the PR (see the script's header).
+new_origin settings
+commit app.txt "app" "main 1"
+settings_base=$(git rev-parse HEAD)
+git checkout -q -b own-toml
+printf '%s\n' '[extend]' 'useDefault = true' '[allowlist]' "$allow_all" > .gitleaks.toml
+commit k.txt "aws_access_key_id=$key" "PR: a key and a .gitleaks.toml that allows every path"
+git checkout -q -b own-ignore "$settings_base"
+commit k.txt "aws_access_key_id=$key" "PR: a key"
+own_key=$(git rev-parse HEAD)
+commit .gitleaksignore "$own_key:k.txt:aws-access-token:1" "PR: ignore its own key"
+git checkout -q -b fixture "$settings_base"
+mkdir -p fixtures
+commit fixtures/k.txt "aws_access_key_id=$key" "PR: a key in a fixture the default branch allows"
+git checkout -q main
+git push -q origin main own-toml own-ignore fixture
+checkout settings own-toml
+BASE_SHA="$settings_base" HEAD_SHA="$(git rev-parse own-toml)" \
+  check "pull request: a .gitleaks.toml the PR adds does not hide its key" 1 "settings .* from the default branch main"
+checkout settings own-ignore
+BASE_SHA="$settings_base" HEAD_SHA="$(git rev-parse own-ignore)" \
+  check "pull request: a .gitleaksignore the PR adds does not hide its key, with a notice" 1 "::notice.*changes \.gitleaksignore"
+# Settings environment variables do not reach gitleaks either.
+printf '%s\n' '[extend]' 'useDefault = true' '[allowlist]' "$allow_all" > "$root/env.toml"
+GITLEAKS_CONFIG="$root/env.toml" BASE_SHA="$settings_base" HEAD_SHA="$(git rev-parse own-ignore)" \
+  check "pull request: GITLEAKS_CONFIG does not reach gitleaks" 1
+# The reviewed path: the ignore line lands on the default branch in a change of its own; the same
+# PR's scan, run again, then passes.
+git checkout -q main
+commit .gitleaksignore "$own_key:k.txt:aws-access-token:1" "main: ignore the PR's fixture key (reviewed)"
+printf '%s\n' '[extend]' 'useDefault = true' '[allowlist]' "paths = ['''fixtures/.*''']" > .gitleaks.toml
+date=$((date + 60)); git add -A; GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "main: allow fixtures/"
+git push -q origin main
+BASE_SHA="$settings_base" HEAD_SHA="$own_key" \
+  check "pull request: an ignore line on the default branch applies on a re-run" 0
+checkout settings fixture
+BASE_SHA="$settings_base" HEAD_SHA="$(git rev-parse fixture)" \
+  check "pull request: the default branch's .gitleaks.toml applies" 0
+CONFIG_BRANCH="" BASE_SHA="$settings_base" HEAD_SHA="$own_key" \
+  check "pull request: no CONFIG_BRANCH fails" 2 "cannot fetch the default branch"
+CONFIG_BRANCH="no-such-branch" BASE_SHA="$settings_base" HEAD_SHA="$own_key" \
+  check "pull request: a CONFIG_BRANCH that cannot be fetched fails" 2 "cannot fetch the default branch"
+# A push reads the settings of the tip before the push: a push that adds an ignore line for its own
+# key still fails.
+clone="$root/settings-own-ignore-checkout"
+EVENT_NAME=push BEFORE="$settings_base" AFTER="$(git rev-parse own-ignore)" CONFIG_BRANCH="" \
+  check "push: a .gitleaksignore the push adds does not hide its key" 1 "settings .* from the tip before the push"
+
+# Attributes: a .gitattributes in the PR marks the key file -diff (the checkout's work tree holds it).
+new_origin attrs
+commit app.txt "app" "main 1"
+attrs_base=$(git rev-parse HEAD)
+git checkout -q -b diffoff
+commit .gitattributes "*.cfg -diff" "PR: *.cfg -diff"
+commit k.cfg "aws_access_key_id=$key" "PR: a key in a -diff file"
+git checkout -q -b count "$attrs_base"
+commit .gitattributes "*.cfg -diff" "PR: *.cfg -diff"
+commit k.cfg "no key" "PR: a -diff file"
+git push -q origin main diffoff count
+checkout attrs diffoff
+BASE_SHA="$attrs_base" HEAD_SHA="$(git rev-parse diffoff)" \
+  check "pull request: a key in a file the PR's .gitattributes marks -diff is found" 1
+# The count reads no attributes either: gitleaks that silently skips the newest commit (the -diff
+# file's) scans 1 of 2 commits, which fails.
+real_gitleaks="$gitleaks"
+gitleaks="$root/skip-newest-gitleaks"
+cat > "$gitleaks" <<SKIP
+#!/usr/bin/env bash
+args=()
+for arg in "\$@"; do
+  if [[ "\$arg" == --log-opts=* ]]; then arg="--log-opts=--skip=1 \${arg#--log-opts=}"; fi
+  args+=("\$arg")
+done
+"$real_gitleaks" "\${args[@]}"
+SKIP
+chmod +x "$gitleaks"
+checkout attrs count
+BASE_SHA="$attrs_base" HEAD_SHA="$(git rev-parse count)" \
+  check "pull request: the count is not lowered by the PR's .gitattributes" 2 "scanned 1 commit"
+gitleaks="$real_gitleaks"
+
+# An octopus merge (3 parents) shows no diff even with --remerge-diff: the scan fails, with or
+# without a key in it.
+new_origin octopus
+commit app.txt "app" "main 1"
+octopus_base=$(git rev-parse HEAD)
+git checkout -q -b o1; commit o1.txt "one" "o1"
+git checkout -q -b o2 "$octopus_base"; commit o2.txt "two" "o2"
+for name in octo octo-key; do
+  git checkout -q -b "$name" "$octopus_base"; commit "$name.txt" "pr" "$name"
+  git merge -q --no-ff --no-commit o1 o2 > /dev/null 2>&1
+  if [[ "$name" == octo-key ]]; then printf 'aws_access_key_id=%s\n' "$key" > octo.txt; git add octo.txt; fi
+  date=$((date + 60)); GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "Octopus merge into $name"
+done
+git push -q origin main o1 o2 octo octo-key
+clone="$root/octopus-clone"
+git clone -q --filter=blob:none --no-checkout --single-branch --branch main "file://$root/octopus.git" "$clone"
+BASE_SHA="$octopus_base" HEAD_SHA="$(git rev-parse octo-key)" \
+  check "pull request: a key only an octopus merge adds fails the scan" 2 "octopus merge"
+BASE_SHA="$octopus_base" HEAD_SHA="$(git rev-parse octo)" \
+  check "pull request: an octopus merge without a key fails the scan" 2 "octopus merge"
+EVENT_NAME=push BEFORE="0000000000000000000000000000000000000000" AFTER="$(git rev-parse octo)" \
+  check "push of a new branch whose tip is an octopus merge fails" 2 "octopus merge"
+BASE_SHA="$octopus_base" HEAD_SHA="$octopus_base" check "pull request: an empty range passes" 0 "gitleaks scanned 0 commit"
+
+# Criss-cross merges: two merge bases, and three (merge-ort builds virtual bases from temporary
+# objects), 60 conflicts resolved by hand in each merge, a fresh blob-less clone.
+new_origin cross
+cross_files() { local n; for n in $(seq 1 60); do printf '%s %s\n' "$1" "$n" > "f$n.txt"; done; }
+cross_commit() { date=$((date + 60)); git add -A; GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "$1"; }
+cross_merge() { # cross_merge COMMIT CONTENT [KEY]
+  git merge -q --no-ff --no-commit "$1" > /dev/null 2>&1 || true
+  cross_files "$2"
+  if [[ -n "${3:-}" ]]; then printf 'aws_access_key_id=%s\n' "$3" >> f7.txt; fi
+  cross_commit "merge $1"
+}
+cross_files start; cross_commit base; cross_base=$(git rev-parse HEAD)
+git checkout -q -b A; cross_files A1; cross_commit A1
+git checkout -q -b B "$cross_base"; cross_files B1; cross_commit B1
+git checkout -q A; cross_merge B rA
+git checkout -q B; cross_merge A~1 rB
+for branch in A B; do git checkout -q "$branch"; cross_files "${branch}2"; cross_commit "${branch}2"; done
+git checkout -q -b cross2 A; cross_merge B final
+git checkout -q -b cross2-key A; cross_merge B final "$key"
+# Three bases: X merges B and C, Y merges B's and X's first commits, then X merges Y.
+git checkout -q -b C "$cross_base"; cross_files C1; cross_commit C1
+git checkout -q -b X "$cross_base"; cross_files X1; cross_commit X1
+cross_merge B rXB; cross_merge C rXC
+git checkout -q -b Y C; cross_merge "$(git rev-parse B~2)" rYB; cross_merge "$(git rev-parse X~2)" rYX
+git checkout -q -b cross3 X; cross_merge Y final
+git checkout -q -b cross3-key X; cross_merge Y final "$key"
+cross2_bases=$(git merge-base --all cross2^1 cross2^2 | wc -l)
+cross3_bases=$(git merge-base --all cross3^1 cross3^2 | wc -l)
+git push -q origin main A B C X Y cross2 cross2-key cross3 cross3-key
+cross_clone() {
+  clone="$root/cross-clone-$1"
+  git clone -q --filter=blob:none --no-checkout --single-branch --branch main "file://$root/cross.git" "$clone"
+}
+cross_clone 2
+BASE_SHA="$cross_base" HEAD_SHA="$(git rev-parse cross2)" \
+  check "pull request: a criss-cross merge ($cross2_bases merge bases) with conflicts passes" 0
+BASE_SHA="$cross_base" HEAD_SHA="$(git rev-parse cross2)" check "pull request: the same criss-cross scan again passes" 0
+cross_clone 2-key
+BASE_SHA="$cross_base" HEAD_SHA="$(git rev-parse cross2-key)" \
+  check "pull request: a key in a criss-cross merge's resolution is found" 1
+cross_clone 3
+BASE_SHA="$cross_base" HEAD_SHA="$(git rev-parse cross3)" \
+  check "pull request: a merge with $cross3_bases merge bases and conflicts passes" 0
+cross_clone 3-key
+BASE_SHA="$cross_base" HEAD_SHA="$(git rev-parse cross3-key)" \
+  check "pull request: a key in a $cross3_bases-base merge's resolution is found" 1
+
+# A SHA-256 repository: the view gitleaks reads has the checkout's object format.
+new_origin sha256 sha256
+commit app.txt "app" "main 1"
+sha256_base=$(git rev-parse HEAD)
+git checkout -q -b clean; commit notes.txt "notes" "PR: no key"
+git checkout -q -b leaky; commit k.txt "aws_access_key_id=$key" "PR: a key"
+git push -q origin main clean leaky
+clone="$root/sha256-clone"
+git clone -q --filter=blob:none --no-checkout --single-branch --branch main "file://$root/sha256.git" "$clone"
+BASE_SHA="$sha256_base" HEAD_SHA="$(git rev-parse clean)" check "SHA-256 repository: a clean pull request passes" 0
+BASE_SHA="$sha256_base" HEAD_SHA="$(git rev-parse leaky)" check "SHA-256 repository: a key is found" 1
+
+# Temporary files go to RUNNER_TEMP when it is set, and are gone afterwards.
+mkdir "$root/runner-temp"
+real_gitleaks="$gitleaks"
+gitleaks="$root/where-gitleaks"
+cat > "$gitleaks" <<WHERE
+#!/usr/bin/env bash
+ls "$root/runner-temp" > "$root/runner-temp-seen"
+"$real_gitleaks" "\$@"
+WHERE
+chmod +x "$gitleaks"
+RUNNER_TEMP="$root/runner-temp" BASE_SHA="$sha256_base" HEAD_SHA="$(git rev-parse clean)" \
+  check "RUNNER_TEMP set: the scan passes" 0
+if grep -q '^fork-secret-scan\.' "$root/runner-temp-seen" 2> /dev/null && [[ -z "$(ls -A "$root/runner-temp")" ]]; then
+  echo "ok   RUNNER_TEMP set: temporary files there while gitleaks runs, none left after"
+else
+  echo "FAIL RUNNER_TEMP set: while gitleaks ran: $(cat "$root/runner-temp-seen" 2> /dev/null); after: $(ls -A "$root/runner-temp")"
+  failures=$((failures + 1))
+fi
+gitleaks="$real_gitleaks"
 
 if [[ "$failures" -ne 0 ]]; then
   echo "$failures check(s) failed"
