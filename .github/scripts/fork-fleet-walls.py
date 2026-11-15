@@ -30,17 +30,22 @@ The walls-file contract (fork-fleet-walls.test.py checks it for every file in th
 - one wall is `os`: proof that this machine is that OS, so a file run on the wrong OS fails;
 - it reads every path, and runs every program, under $FORK_FLEET_WALLS_ROOT (default: empty, the real /), so the
   tests can hand it a fake machine; an empty root fails closed (exit 1). It changes nothing and uses no network;
-- it gets only PATH, LC_ALL and FORK_FLEET_WALLS_ROOT, no stdin, and TIMEOUT seconds.
+- it gets only PATH, LC_ALL, FORK_FLEET_WALLS_ROOT and FORK_FLEET_LAUNCH_CONF (the launcher's conf, when the caller
+  set it: what jobs see is the launcher's to say, `fork-fleet-launch.sh paths`, with that conf), no stdin, and TIMEOUT
+  seconds.
 FORK_FLEET_WALLS_ROOT is a test knob: refused (exit 2) when root runs this, as in real use, and otherwise unless it is
-a folder of this user that it alone can write (fake_root). A caller needs no clean environment for it.
+a folder of this user that it alone can write (fake_root). A caller needs no clean environment for it. The launcher
+beside this file must be as safe as a walls file (it runs as root), and FORK_FLEET_LAUNCH_CONF a plain absolute path.
 Standard library only."""
 import glob, json, os, platform, re, stat, subprocess, sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 WALLS = os.path.join(HERE, 'fork-fleet-walls')
+LAUNCHER = os.path.join(HERE, 'fork-fleet-launch.sh')
+PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 OS_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
 # What a terminal must never get raw from a walls file: control characters (ESC, CR, ...), line and bidi marks.
-CONTROL = '\x00-\x1f\x7f-\x9f  ‪-‮⁦-⁩'
+CONTROL = '\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069'
 LINE = re.compile(rf'(PASS|FAIL)  ([a-z0-9][a-z0-9-]{{0,47}})  ([^\s{CONTROL}][^{CONTROL}]{{0,400}})')
 TIMEOUT = 60
 PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
@@ -132,6 +137,7 @@ def walls_file(name):
     safe(path, 'file')
     fixture = path + '.fixture.json'
     safe(fixture, 'data')
+    safe(LAUNCHER, 'file')
     try:
         with open(fixture, encoding='utf-8') as f:
             walls = json.load(f)['fail']
@@ -148,6 +154,11 @@ def run_walls(path, verb, root, want):
     env = {'PATH': PATH, 'LC_ALL': 'C'}
     if root:
         env['FORK_FLEET_WALLS_ROOT'] = root
+    conf = os.environ.get('FORK_FLEET_LAUNCH_CONF', '')
+    if conf:
+        if not PLAIN.fullmatch(conf) or re.search(r'/\.\.?(/|$)', conf):
+            raise Broken(f'FORK_FLEET_LAUNCH_CONF is not a plain absolute path: {clean(conf)[:200]!r}')
+        env['FORK_FLEET_LAUNCH_CONF'] = conf
     name = os.path.basename(path)
     try:
         p = subprocess.run([path, 'describe'], env=env, stdin=subprocess.DEVNULL, capture_output=True,

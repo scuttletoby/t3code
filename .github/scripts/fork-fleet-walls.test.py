@@ -42,8 +42,7 @@ def build(root, files):
         text = value['text'] if isinstance(value, dict) else value
         with open(full, 'w', encoding='utf-8') as f:
             f.write(text)
-        if isinstance(value, dict):
-            os.chmod(full, int(value['mode'], 8))
+        os.chmod(full, int(value['mode'], 8) if isinstance(value, dict) else 0o644)   # as installed, whatever the umask
     return root
 
 
@@ -86,6 +85,8 @@ class Case(unittest.TestCase):
         os.chmod(os.path.join(bin_dir, 'fork-fleet-walls.py'), 0o755)
         shutil.copy(os.path.join(HERE, JOB_PATHS), bin_dir)
         os.chmod(os.path.join(bin_dir, JOB_PATHS), 0o644)
+        shutil.copy(LAUNCHER, bin_dir)   # the walls ask it what jobs see (`paths`)
+        os.chmod(os.path.join(bin_dir, 'fork-fleet-launch.sh'), 0o755)
         os.chmod(bin_dir, 0o755)
         if walls is None:
             walls = {n: slurp(os.path.join(FOLDER, n)) for n in OSES}
@@ -241,13 +242,15 @@ class Contract(Case):
             ('describe', ok + 'FAIL  kernel  a \x1b[2J b\n', 1, 2, ''),   # control characters: never raw
             ('describe', ok + 'FAIL  kernel  a \r b\n', 1, 2, ''),
             ('describe', ok + 'FAIL  kernel  a \u202e b\n', 1, 2, ''),
+            ('describe', ok + 'FAIL  kernel  a \u200f b\n', 1, 2, ''),
+            ('describe', ok + 'FAIL  kernel  a \u061c b\n', 1, 2, ''),
         ]
         for verb, out, code, want, stdout in cases:
             with self.subTest(verb=verb, out=out, code=code):
                 p = self.answer(verb, out, code)
                 self.assertEqual(p.returncode, want, p.stderr)
                 self.assertEqual(p.stdout, stdout)
-                self.assertNotRegex(p.stderr, '[\x1b\r\u202e]')
+                self.assertNotRegex(p.stderr, '[\x1b\r\u202e\u200f\u061c]')
 
     def test_its_stderr_reaches_the_terminal_escaped(self):
         p = self.answer('check', 'PASS  os  x\nPASS  kernel  y\n', 0, err='a\x1b]0;title\x07 b\rc\n2nd line')
@@ -284,6 +287,23 @@ class Contract(Case):
         keys = {line.split('=')[0] for line in slurp(f'{root}/env.out').splitlines()} - {'PWD', 'SHLVL', '_'}
         self.assertEqual(keys, {'PATH', 'LC_ALL', 'FORK_FLEET_WALLS_ROOT'})
         self.assertEqual(slurp(f'{root}/stdin.out'), '')
+        # the launcher's conf, when the caller set it, reaches the walls file (it hands it to the launcher's `paths`)
+        p = run([script, 'check'], root, FORK_FLEET_LAUNCH_CONF='/etc/fork-fleet-proof/launch.conf', GH_TOKEN='x')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('FORK_FLEET_LAUNCH_CONF=/etc/fork-fleet-proof/launch.conf\n', slurp(f'{root}/env.out'))
+        self.assertNotIn('GH_TOKEN', slurp(f'{root}/env.out'))
+        for bad in ('etc/launch.conf', '/etc/../root/launch.conf', '/etc/a b', '/etc/x\n'):
+            with self.subTest(bad):
+                p = run([script, 'check'], root, FORK_FLEET_LAUNCH_CONF=bad)
+                self.assertEqual((p.returncode, p.stdout), (2, ''), p.stderr)
+                self.assertIn('FORK_FLEET_LAUNCH_CONF is not a plain absolute path', p.stderr)
+
+    def test_the_os_wall_must_be_in_the_list(self):
+        """A walls file and fixture that agree, and both without `os` (no proof this is that OS): refused."""
+        script = self.install({'linux': '#!/bin/sh\necho "PASS  kernel  x"\n'}, {'linux': ['kernel']})
+        p = run([script, 'check'], self.root(LINUX))
+        self.assertEqual((p.returncode, p.stdout), (2, ''), p.stderr)
+        self.assertIn('does not name the walls', p.stderr)
 
     def test_unsafe_walls_files_are_refused(self):
         def group_writable(f, d): os.chmod(f, 0o775)
@@ -296,8 +316,12 @@ class Contract(Case):
         def fixture_not_json(f, d): write(f + '.fixture.json', '{"fail": {"os": [')
         def fixture_no_os(f, d): write(f + '.fixture.json', '{"fail": {"kernel": [{}]}}')
         def fixture_bad_name(f, d): write(f + '.fixture.json', '{"fail": {"os": [{}], "a  b": [{}]}}')
+        launcher = lambda d: os.path.join(os.path.dirname(d), 'fork-fleet-launch.sh')
+        def no_launcher(f, d): os.remove(launcher(d))
+        def open_launcher(f, d): os.chmod(launcher(d), 0o775)
+        def launcher_link(f, d): os.rename(launcher(d), launcher(d) + '.x'); os.symlink(launcher(d) + '.x', launcher(d))
         for change in (group_writable, not_executable, a_link, open_folder, open_fixture, fixture_link, no_fixture,
-                       fixture_not_json, fixture_no_os, fixture_bad_name):
+                       fixture_not_json, fixture_no_os, fixture_bad_name, no_launcher, open_launcher, launcher_link):
             with self.subTest(change.__name__):
                 script = self.install({'linux': '#!/bin/sh\necho "PASS  os  x"\n'})
                 folder = os.path.join(os.path.dirname(script), 'fork-fleet-walls')
@@ -403,13 +427,14 @@ class EveryWallsFile(Case):
         self.assertEqual(slurp(SCRIPT).splitlines()[0], '#!/usr/bin/python3 -I')
 
     def test_linux_escapes_what_it_prints(self):   # a mount's fs type with ESC in it, as the cgroup2 wall prints it
-        mountinfo = '29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - cg\x1b[2J\u202eb x rw\n'
+        mountinfo = ('29 1 252:0 / / rw - ext4 /dev/vda1 rw\n'
+                     '35 24 0:29 / /sys/fs/cgroup rw - cg\x1b[2J\u202eb\u200e\u200f\u061c x rw\n')
         root = self.root(overlay(LINUX, {'proc/self/mountinfo': mountinfo}))
         p = run([os.path.join(self.folder, 'linux'), 'describe'], root)
         self.assertEqual(p.returncode, 1, p.stderr)
         line = next(x for x in p.stdout.splitlines() if x.startswith('FAIL  cgroup2'))
         self.assertRegex(line, fw.LINE)
-        self.assertIn('cg\\x1b[2J\\u202eb', line)
+        self.assertIn('cg\\x1b[2J\\u202eb\\u200e\\u200f\\u061c', line)
 
     def test_linux_cgroup_bpf_from_the_kernel_config(self):   # the config in /boot decides before /proc/kallsyms
         for config, want in (('CONFIG_CGROUP_BPF=y\n', []), ('# CONFIG_CGROUP_BPF is not set\n', ['cgroup-bpf'])):
@@ -433,15 +458,52 @@ class EveryWallsFile(Case):
                 fails = self.walls('linux', 'check', self.root(LINUX))[1]
                 (self.assertNotIn if change is none else self.assertIn)('mounts', fails)
 
-    def test_linux_mounts_reads_what_the_launcher_reads(self):   # its defaults and the allow list's place
-        launcher = slurp(LAUNCHER)
-        self.assertIn('conf=${FORK_FLEET_LAUNCH_CONF:-/etc/fork-fleet/launch.conf}', launcher)
-        self.assertIn('/fork-fleet-job-paths.txt', launcher)
+    def test_linux_mounts_asks_the_launcher_and_its_conf(self):
+        """One rule and one conf lookup (fix round 2): the walls hold what jobs see to `fork-fleet-launch.sh paths`,
+        which reads FORK_FLEET_LAUNCH_CONF when set, as `start` does. Through the dispatcher too."""
         linux = slurp(os.path.join(FOLDER, 'linux'))
-        for key, default in re.findall(r"'([A-Z_]+)': '(/[^']+)'", linux):
-            with self.subTest(key):
-                self.assertRegex(launcher, rf'(^|\s){key}={re.escape(default)}(\s|$)')
-        self.assertTrue(os.path.isfile(os.path.join(HERE, JOB_PATHS)))
+        self.assertIn("[LAUNCHER, 'paths']", linux)
+        self.assertNotIn('launch.conf', linux)   # no second copy of the conf lookup
+        other = {'etc/fork-fleet-proof/launch.conf': 'ALLOW_PATHS=/c\n', 'c/': ''}
+        root = self.root(overlay(LINUX, other))
+        self.assertNotIn('mounts', self.walls('linux', 'check', root)[1])   # the default conf: no /c
+        p = run([os.path.join(self.folder, 'linux'), 'check'], root,
+                FORK_FLEET_LAUNCH_CONF='/etc/fork-fleet-proof/launch.conf')
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertRegex(p.stdout, r'FAIL  mounts  .*/c \(on 9p at /c\)')
+        script = os.path.join(os.path.dirname(self.folder), 'fork-fleet-walls.py')
+        p = run([script, 'check'], root, FORK_FLEET_LAUNCH_CONF='/etc/fork-fleet-proof/launch.conf')
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn('FAIL  mounts', p.stdout)
+
+    def test_linux_mounts_follows_a_link_in_a_folder_above(self):
+        """The lenses' major: a path under a linked folder lands on the link's target. The launcher resolves it, so a
+        Windows drive, a home folder or a share behind a link fails `mounts` (the launcher refuses it, or binds the
+        share's real path), and a link a system path has itself (/var/run -> /run style) stays fine."""
+        c_on_9p = LINUX['proc/self/mountinfo']
+        cases = {
+            'a link to the Windows drive': {'opt/win': '../c', 'c/Users/': '',
+                                            'etc/fork-fleet/launch.conf': 'ALLOW_PATHS=/opt/win/Users\n'},
+            'a link to /home': {'opt/h': '../home', 'home/someone/': '',
+                                'etc/fork-fleet/launch.conf': 'ALLOW_PATHS=/opt/h/someone\n'},
+            'the work folder under a link to a share': {'var/lib/fork-fleet': '../../data', 'data/runners/': '',
+                                                        'etc/fork-fleet/launch.conf': ''},
+            'the hook under a link to a share': {'opt/fork-fleet': '../data/kit', 'data/kit/hook.sh': ''},
+            'resolv.conf under a link to the drive': {'etc/fork-fleet/resolv.conf': None, 'c/r/': '',
+                                                      'etc/fork-fleet/launch.conf': 'RESOLV_CONF=/etc/ff/resolv.conf\n',
+                                                      'etc/ff': '../c/r'},
+        }
+        for name, change in cases.items():
+            with self.subTest(name):
+                links = {k: v for k, v in change.items() if v and not k.endswith('/') and v.startswith('..')}
+                root = self.root(overlay(LINUX, {k: v for k, v in change.items() if k not in links}))
+                for path, target in links.items():
+                    os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+                    os.symlink(target, os.path.join(root, path))
+                self.assertIn('mounts', self.walls('linux', 'check', root)[1], c_on_9p)
+                if name == 'a link to /home':   # refused outright: a refusal is never read as "nothing to bind"
+                    p = run([os.path.join(self.folder, 'linux'), 'check'], root)
+                    self.assertRegex(p.stdout, r'FAIL  mounts  .*the launcher refuses what jobs would see: .*home')
 
     def test_this_machine_gets_an_answer(self):
         for name in OSES:   # on the real machine: exit 0 or 1 in the contract, never a crash
