@@ -6,7 +6,12 @@
     "proc/1/comm": "systemd\n",
     "proc/sys/kernel/seccomp/actions_avail": "kill_process kill_thread trap errno user_notif trace log allow\n",
     "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n",
-    "run/": ""
+    "run/": "",
+    "proc/self/ns/ipc": "",
+    "proc/self/ns/mnt": "",
+    "proc/self/ns/net": "",
+    "proc/kallsyms": "0000000000000000 T __cgroup_bpf_run_filter_sk\n0000000000000000 T __cgroup_bpf_run_filter_skb\n",
+    "proc/cmdline": "BOOT_IMAGE=/vmlinuz-6.8.0-47-generic root=UUID=0 ro quiet\n"
   },
   "fail": {
     "os": [
@@ -14,6 +19,7 @@
       {"run/WSL/": ""},
       {"usr/lib/wsl/": ""},
       {"proc/sys/fs/binfmt_misc/WSLInterop-late": "enabled\n"},
+      {"proc/cmdline": "initrd=\\initrd.img WSL_ROOT_INIT=1 panic=-1 nr_cpus=8\n"},
       {"proc/sys/kernel/ostype": null}
     ],
     "kernel": [
@@ -28,6 +34,15 @@
       {"proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n36 35 0:30 / /sys/fs/cgroup/unified rw - cgroup2 cgroup2 rw\n"},
       {"proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n"},
       {"proc/self/mountinfo": "not a mount line\n"}
+    ],
+    "cgroup-bpf": [
+      {"proc/kallsyms": "0000000000000000 T __cgroup_bpf_run_filter_sk\n"},
+      {"proc/kallsyms": null},
+      {"boot/config-6.8.0-47-generic": "CONFIG_CGROUPS=y\n# CONFIG_CGROUP_BPF is not set\n"}
+    ],
+    "namespaces": [
+      {"proc/self/ns/ipc": null},
+      {"proc/self/ns/": null}
     ],
     "seccomp": [
       {"proc/sys/kernel/seccomp/actions_avail": null},

@@ -2,7 +2,8 @@
 """Tests of fork-fleet-walls.py (OS detection, refusal of an OS without walls, the walls-file contract it enforces) and
 the contract test every walls file in fork-fleet-walls/ must pass, on fake machines from its <os>.fixture.json. A new
 walls file (and its fixture) is tested here without a change to this file. Run: python3 <this>. Linux only."""
-import importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+import contextlib, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +18,11 @@ OSES = sorted(n for n in os.listdir(FOLDER) if fw.OS_NAME.fullmatch(n))
 def slurp(path):
     with open(path, encoding='utf-8') as f:
         return f.read()
+
+
+def write(path, text):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
 
 
 LINUX = json.loads(slurp(os.path.join(FOLDER, 'linux.fixture.json')))['pass']
@@ -63,10 +69,14 @@ class Case(unittest.TestCase):
 
     def root(self, files):
         self.n += 1
-        return build(os.path.join(self.tmp, f'root{self.n}'), files)
+        root = os.path.join(self.tmp, f'root{self.n}')
+        os.makedirs(root, mode=0o755)
+        os.chmod(root, 0o755)   # whatever the umask: fake_root takes only a folder this user alone can write
+        return build(root, files)
 
-    def install(self, walls=None):
-        """A copy of fork-fleet-walls.py with a walls folder of its own: {os: walls file text}; None: the real ones."""
+    def install(self, walls=None, lists=None):
+        """A copy of fork-fleet-walls.py with a walls folder of its own: {os: walls file text} (None: the real ones,
+        with their fixtures), each with a fixture whose `fail` names the walls in lists[os] (default: os only)."""
         bin_dir = os.path.join(self.tmp, f'bin{self.n}')
         self.n += 1
         os.makedirs(os.path.join(bin_dir, 'fork-fleet-walls'))
@@ -74,11 +84,17 @@ class Case(unittest.TestCase):
         os.chmod(os.path.join(bin_dir, 'fork-fleet-walls.py'), 0o755)
         if walls is None:
             walls = {n: slurp(os.path.join(FOLDER, n)) for n in OSES}
+            fixtures = {n: slurp(os.path.join(FOLDER, n + '.fixture.json')) for n in OSES}
+        else:
+            fixtures = {n: json.dumps({'fail': {w: [{}] for w in (lists or {}).get(n, ['os'])}}) for n in walls}
         for name, text in walls.items():
             path = os.path.join(bin_dir, 'fork-fleet-walls', name)
             with open(path, 'w') as f:
                 f.write(text)
             os.chmod(path, 0o755)
+            with open(path + '.fixture.json', 'w') as f:
+                f.write(fixtures[name])
+            os.chmod(path + '.fixture.json', 0o644)
         os.chmod(os.path.join(bin_dir, 'fork-fleet-walls'), 0o755)
         return os.path.join(bin_dir, 'fork-fleet-walls.py')
 
@@ -92,6 +108,7 @@ class Detect(Case):
             (overlay(LINUX, {'proc/sys/fs/binfmt_misc/WSLInterop-late': 'enabled\n'}), 'wsl2'),
             (overlay(LINUX, {'usr/lib/wsl/': ''}), 'wsl2'),   # interop off: WSL's shared folders
             (overlay(LINUX, {'mnt/wsl/': ''}), 'wsl2'),
+            (overlay(LINUX, {'proc/cmdline': 'initrd=\\initrd.img WSL_ROOT_INIT=1 panic=-1\n'}), 'wsl2'),
             (WSL1, 'wsl1'),
             ({'proc/sys/kernel/ostype': 'FreeBSD\n'}, 'freebsd'),
             ({'proc/sys/kernel/ostype': '../../etc\n'}, 'etc'),   # never a path
@@ -104,7 +121,8 @@ class Detect(Case):
 
     def test_linux_walls_know_every_wsl_mark(self):   # else a WSL2 that detect calls linux could pass them
         text = slurp(os.path.join(FOLDER, 'linux'))
-        self.assertIn(repr(fw.WSL_MARKS), text)
+        self.assertIn(f'WSL_MARKS = {fw.WSL_MARKS!r}', text)
+        self.assertIn(f'WSL_CMDLINE = {fw.WSL_CMDLINE!r}', text)
 
     def test_this_machine(self):
         self.assertRegex(fw.detect(''), fw.OS_NAME)
@@ -135,44 +153,126 @@ class Refuse(Case):
             p = run([self.install(), *args], self.root(LINUX))
             self.assertEqual((p.returncode, p.stdout), (2, ''))
 
+    def test_native_windows_is_not_supported_yet(self):   # no os.geteuid there: exit 3, not a crash
+        euid = os.geteuid
+        with mock.patch.object(fw, 'detect', return_value='windows'), \
+                mock.patch.dict(os.environ, {'FORK_FLEET_WALLS_ROOT': ''}):
+            del os.geteuid
+            try:
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(fw.main(['check']), 3)
+                self.assertIn('this OS (windows) is not supported yet', err.getvalue())
+                self.assertIsNone(fw.walls_file('linux'))
+            finally:
+                os.geteuid = euid
+
+    def test_no_walls_is_exit_3_even_in_an_open_folder(self):   # a checkout with umask 002
+        script = self.install({'linux': '#!/bin/sh\nexit 0\n'})
+        os.chmod(os.path.dirname(script) + '/fork-fleet-walls', 0o775)
+        p = run([script, 'check'], self.root(WSL1))
+        self.assertEqual(p.returncode, 3, p.stderr)
+
+
+class FakeRoot(Case):
+    """FORK_FLEET_WALLS_ROOT is a test knob: never for root, and only a folder of this user that it alone can write."""
+    def test_refused_for_root(self):
+        root = self.root(LINUX)
+        with mock.patch.dict(os.environ, {'FORK_FLEET_WALLS_ROOT': root}), mock.patch.object(os, 'geteuid',
+                                                                                             return_value=0):
+            with self.assertRaisesRegex(fw.Broken, 'for the tests only, never for root'):
+                fw.fake_root()
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(fw.main(['check']), 2)
+            self.assertIn('never for root', err.getvalue())
+
+    def test_refused_unless_this_users_own_folder(self):
+        def open_root(r): os.chmod(r, 0o777)
+        def group_root(r): os.chmod(r, 0o775)
+        def link_root(r): os.rename(r, r + '.real'); os.symlink(r + '.real', r)
+        def file_root(r): shutil.rmtree(r); open(r, 'w').close()
+        for change in (open_root, group_root, link_root, file_root):
+            with self.subTest(change.__name__):
+                root = self.root(LINUX)
+                change(root)
+                p = run([self.install(), 'check'], root)
+                self.assertEqual((p.returncode, p.stdout), (2, ''), p.stderr)
+        p = run([self.install(), 'check'], 'relative/root')
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('not an absolute path', p.stderr)
+
+    def test_said_on_stderr(self):
+        root = self.root(LINUX)
+        p = run([self.install(), 'os'], root)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn(f"the walls of the fake machine {root!r}, not of this one", p.stderr)
+
 
 class Contract(Case):
     """What fork-fleet-walls.py makes of a walls file's answer (a fake `linux` that prints OUT and exits CODE)."""
-    def answer(self, verb, out, code):
-        script = self.install({'linux': f'#!/bin/sh\nprintf %s {shlex(out)}\nexit {code}\n'})
+    def answer(self, verb, out, code, err=''):
+        """A fake `linux` (walls os and kernel) that prints OUT to `describe` (and nothing to `check`)."""
+        script = self.install({'linux': f'#!/bin/sh\nprintf %s {shlex(err)} >&2\n[ "$1" = describe ] && '
+                                        f'printf %s {shlex(out)}\nexit {code}\n'}, {'linux': ['os', 'kernel']})
         return run([script, verb], self.root(LINUX))
 
     def test_answers(self):
-        fail = 'FAIL  mounts  nothing mounted: mounted: /mnt\n'
+        fail = 'FAIL  kernel  kernel 5.8 or newer: kernel 5.4\n'
         ok = 'PASS  os  a plain Linux kernel\n'
-        cases = [   # verb, stdout, exit of the walls file -> exit of fork-fleet-walls.py
-            ('check', '', 0, 0), ('check', fail, 1, 1), ('describe', ok, 0, 0), ('describe', ok + fail, 1, 1),
-            ('check', fail, 0, 2),            # a failing wall with exit 0 is not a pass
-            ('check', '', 1, 2),              # exit 1 that names no wall
-            ('check', fail, 3, 2),            # any other exit: a crash is not a FAIL list
-            ('check', ok, 0, 2),              # check prints only the walls that fail
-            ('check', 'FAIL mounts x\n', 1, 2), ('check', 'FAIL  Mounts  x\n', 1, 2), ('check', 'all good\n', 0, 2),
-            ('check', fail + fail, 1, 2),     # a wall named twice
-            ('describe', 'PASS  kernel  ok\n', 0, 2),   # no `os` wall
-            ('describe', ok + ok, 0, 2),
+        good = ok + 'PASS  kernel  kernel 5.8 or newer\n'
+        cases = [   # verb, stdout of describe, exit of the walls file -> exit of fork-fleet-walls.py, its stdout
+            ('check', good, 0, 0, ''), ('describe', good, 0, 0, good),
+            ('check', ok + fail, 1, 1, fail), ('describe', ok + fail, 1, 1, ok + fail),
+            ('check', '', 0, 2, ''),             # it ran no wall (a cut-off or empty file): not a pass
+            ('check', ok, 0, 2, ''),             # a wall of its list was not reported (stopped early, older file)
+            ('check', fail, 1, 2, ''),           # no `os` wall
+            ('check', good + 'PASS  extra  x\n', 0, 2, ''),   # a wall its list does not name
+            ('check', ok + fail, 0, 2, ''),      # a failing wall with exit 0 is not a pass
+            ('check', good, 1, 2, ''),           # exit 1 that names no wall
+            ('check', ok + fail, 3, 2, ''),      # any other exit: a crash is not a FAIL list
+            ('check', 'FAIL kernel x\n', 1, 2, ''), ('check', 'FAIL  Kernel  x\n', 1, 2, ''),
+            ('check', 'all good\n', 0, 2, ''),
+            ('check', ok + fail + fail, 1, 2, ''),   # a wall named twice
+            ('describe', good + ok, 0, 2, ''),
+            ('describe', ok + 'FAIL  kernel  a \x1b[2J b\n', 1, 2, ''),   # control characters: never raw
+            ('describe', ok + 'FAIL  kernel  a \r b\n', 1, 2, ''),
+            ('describe', ok + 'FAIL  kernel  a \u202e b\n', 1, 2, ''),
         ]
-        for verb, out, code, want in cases:
+        for verb, out, code, want, stdout in cases:
             with self.subTest(verb=verb, out=out, code=code):
                 p = self.answer(verb, out, code)
                 self.assertEqual(p.returncode, want, p.stderr)
-                self.assertEqual(p.stdout, out if want in (0, 1) else '')
+                self.assertEqual(p.stdout, stdout)
+                self.assertNotRegex(p.stderr, '[\x1b\r\u202e]')
+
+    def test_its_stderr_reaches_the_terminal_escaped(self):
+        p = self.answer('check', 'PASS  os  x\nPASS  kernel  y\n', 0, err='a\x1b]0;title\x07 b\rc\n2nd line')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('a?]0;title? b?c\n2nd line', p.stderr)
+
+    def test_a_cut_off_or_older_walls_file_is_refused(self):
+        text = slurp(os.path.join(FOLDER, 'linux'))
+        cut = text[:text.index("if __name__ == '__main__':")]   # an in-place copy that stopped at a line
+        older = text.replace("    ('kernel', ", "    # ('kernel', ")   # a file older than its list
+        bad = overlay(LINUX, {'proc/1/comm': 'init\n', '.dockerenv': ''})
+        for name, walls in (('cut', cut), ('older', older), ('shebang only', '#!/usr/bin/python3 -I\n')):
+            with self.subTest(name):
+                script = self.install({'linux': walls}, {'linux': list(json.loads(
+                    slurp(os.path.join(FOLDER, 'linux.fixture.json')))['fail'])})
+                for verb in ('check', 'describe'):
+                    p = run([script, verb], self.root(bad))
+                    self.assertEqual((p.returncode, p.stdout), (2, ''), p.stderr)
 
     def test_timeout(self):
         script = self.install({'linux': '#!/bin/sh\nexec sleep 30\n'})
         old, fw.TIMEOUT = fw.TIMEOUT, 1
         self.addCleanup(setattr, fw, 'TIMEOUT', old)
         with self.assertRaisesRegex(fw.Broken, 'took more than 1 s'):
-            fw.run_walls(os.path.join(os.path.dirname(script), 'fork-fleet-walls', 'linux'), 'check')
+            fw.run_walls(os.path.join(os.path.dirname(script), 'fork-fleet-walls', 'linux'), 'check', '', {'os'})
 
     def test_it_gets_no_stdin_and_a_clean_environment(self):
         root = self.root(LINUX)
         script = self.install({'linux': '#!/bin/bash\nenv > "$FORK_FLEET_WALLS_ROOT/env.out"\ncat > '
-                                        '"$FORK_FLEET_WALLS_ROOT/stdin.out"\nexit 0\n'})
+                                        '"$FORK_FLEET_WALLS_ROOT/stdin.out"\necho "PASS  os  x"\n'})
         p = subprocess.run([script, 'check'], input='secret', capture_output=True, text=True,
                            env={'PATH': fw.PATH, 'FORK_FLEET_WALLS_ROOT': root, 'GH_TOKEN': 'x', 'PYTHONPATH': '/x'})
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -185,10 +285,16 @@ class Contract(Case):
         def not_executable(f, d): os.chmod(f, 0o644)
         def a_link(f, d): os.rename(f, f + '.real'); os.symlink(f + '.real', f)
         def open_folder(f, d): os.chmod(d, 0o777)
-        def no_folder(f, d): shutil.rmtree(d)
-        for change in (group_writable, not_executable, a_link, open_folder, no_folder):
+        def open_fixture(f, d): os.chmod(f + '.fixture.json', 0o664)
+        def fixture_link(f, d): os.rename(f + '.fixture.json', f + '.x'); os.symlink(f + '.x', f + '.fixture.json')
+        def no_fixture(f, d): os.remove(f + '.fixture.json')
+        def fixture_not_json(f, d): write(f + '.fixture.json', '{"fail": {"os": [')
+        def fixture_no_os(f, d): write(f + '.fixture.json', '{"fail": {"kernel": [{}]}}')
+        def fixture_bad_name(f, d): write(f + '.fixture.json', '{"fail": {"os": [{}], "a  b": [{}]}}')
+        for change in (group_writable, not_executable, a_link, open_folder, open_fixture, fixture_link, no_fixture,
+                       fixture_not_json, fixture_no_os, fixture_bad_name):
             with self.subTest(change.__name__):
-                script = self.install({'linux': '#!/bin/sh\nexit 0\n'})
+                script = self.install({'linux': '#!/bin/sh\necho "PASS  os  x"\n'})
                 folder = os.path.join(os.path.dirname(script), 'fork-fleet-walls')
                 change(os.path.join(folder, 'linux'), folder)
                 p = run([script, 'check'], self.root(LINUX))
@@ -198,6 +304,16 @@ class Contract(Case):
 
 def shlex(text):
     return "'" + text.replace("'", "'\\''") + "'"
+
+
+def fixture_problems(fixture, walls):
+    """What makes a fixture unfit for a walls file whose describe named walls: each wall needs a failing change."""
+    fail = fixture.get('fail')
+    if not isinstance(fail, dict) or sorted(fail) != sorted(walls):
+        return [f'its `fail` names {sorted(fail or [])}, not the walls {sorted(walls)}']
+    return [f'wall {wall} has no failing change' for wall, changes in fail.items()
+            if not (changes if isinstance(changes, list) else [changes])
+            or not all(isinstance(c, dict) and c for c in (changes if isinstance(changes, list) else [changes]))]
 
 
 class EveryWallsFile(Case):
@@ -251,7 +367,7 @@ class EveryWallsFile(Case):
                 self.assertEqual(fw.detect(good), name, f'{name}: its passing fixture is detected as another OS')
                 p = run([self.install(), 'check'], good)   # and through fork-fleet-walls.py
                 self.assertEqual((p.returncode, p.stdout), (0, ''), p.stderr)
-                self.assertEqual(sorted(fixture['fail']), sorted(ids), f'{name}: each wall needs a failing change')
+                self.assertEqual(fixture_problems(fixture, ids), [], name)
                 for wall, changes in fixture['fail'].items():
                     for change in changes if isinstance(changes, list) else [changes]:
                         with self.subTest(name=name, wall=wall, change=change):
@@ -259,6 +375,37 @@ class EveryWallsFile(Case):
                             self.assertIn(wall, self.both(name, root)[1])
                             p = run([self.install(), 'check'], root)
                             self.assertIn(p.returncode, (1, 3), p.stderr)   # 3: the change made it another OS
+
+    def test_a_wall_without_a_failing_change_fails_the_contract(self):
+        ids = ['os', 'mounts']
+        self.assertEqual(fixture_problems({'fail': {'os': [{'a': 'b'}], 'mounts': [{'c': None}]}}, ids), [])
+        for fail in ({'os': [{'a': 'b'}], 'mounts': []}, {'os': [{'a': 'b'}], 'mounts': [{}]},
+                     {'os': [{'a': 'b'}], 'mounts': {}}, {'os': [{'a': 'b'}]}, {'os': [{'a': 'b'}], 'mounts': [1]}):
+            with self.subTest(fail=fail):
+                self.assertNotEqual(fixture_problems({'fail': fail}, ids), [])
+
+    def test_python_walls_files_run_isolated(self):   # -I: nothing beside the file, nor PYTHON*, is imported
+        for name in OSES:
+            with self.subTest(name):
+                first = slurp(os.path.join(FOLDER, name)).splitlines()[0]
+                if 'python' in first:
+                    self.assertEqual(first, '#!/usr/bin/python3 -I')
+        self.assertEqual(slurp(SCRIPT).splitlines()[0], '#!/usr/bin/python3 -I')
+
+    def test_linux_escapes_what_it_prints(self):   # a mount's fs type with ESC in it, as the cgroup2 wall prints it
+        mountinfo = '29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - cg\x1b[2J\u202eb x rw\n'
+        root = self.root(overlay(LINUX, {'proc/self/mountinfo': mountinfo}))
+        p = run([os.path.join(FOLDER, 'linux'), 'describe'], root)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        line = next(x for x in p.stdout.splitlines() if x.startswith('FAIL  cgroup2'))
+        self.assertRegex(line, fw.LINE)
+        self.assertIn('cg\\x1b[2J\\u202eb', line)
+
+    def test_linux_cgroup_bpf_from_the_kernel_config(self):   # the config in /boot decides before /proc/kallsyms
+        for config, want in (('CONFIG_CGROUP_BPF=y\n', []), ('# CONFIG_CGROUP_BPF is not set\n', ['cgroup-bpf'])):
+            with self.subTest(config):
+                root = self.root(overlay(LINUX, {'proc/kallsyms': None, 'boot/config-6.8.0-47-generic': config}))
+                self.assertEqual(EveryWallsFile.walls(self, 'linux', 'check', root)[1], want)
 
     def test_this_machine_gets_an_answer(self):
         for name in OSES:   # on the real machine: exit 0 or 1 in the contract, never a crash

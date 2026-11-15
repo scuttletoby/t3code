@@ -1,10 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Fork only: the walls of a plain Linux desktop (not WSL), for fork-fleet-walls.py (its contract is there). Each wall
 is one systemd or kernel can drop without an error: a runner would then start with less of its sandbox than the
 launcher asked for. Reads files only; changes nothing. Standard library only."""
-import glob, os, re, sys
+import glob, gzip, os, re, sys
 
 ROOT = os.environ.get('FORK_FLEET_WALLS_ROOT', '')
+WSL_MARKS = ('/run/WSL', '/proc/sys/fs/binfmt_misc/WSLInterop*', '/usr/lib/wsl', '/mnt/wsl')   # as fork-fleet-walls.py
+WSL_CMDLINE = 'WSL_ROOT_INIT'
 
 
 def read(path):
@@ -34,8 +36,8 @@ def os_wall():
     release = read('/proc/sys/kernel/osrelease')
     if read('/proc/sys/kernel/ostype') != 'Linux' or release is None:
         return 'no Linux /proc/sys/kernel/ostype and osrelease'
-    marks = ('/run/WSL', '/proc/sys/fs/binfmt_misc/WSLInterop*', '/usr/lib/wsl', '/mnt/wsl')   # as WSL_MARKS
-    if 'microsoft' in release.lower() or any(glob.glob(glob.escape(ROOT) + m) for m in marks):
+    if ('microsoft' in release.lower() or any(glob.glob(glob.escape(ROOT) + m) for m in WSL_MARKS)
+            or WSL_CMDLINE in (read('/proc/cmdline') or '')):
         return f'this is WSL ({release}): its walls are fork-fleet-walls/wsl2'
     return None
 
@@ -59,6 +61,34 @@ def cgroup_wall():
     if kinds[-1:] != ['cgroup2']:
         return (f'/sys/fs/cgroup is {kinds[-1] if kinds else "not mounted"}, not cgroup2: without the unified '
                 'hierarchy systemd drops IPAddressDeny, the jobs\' second firewall')
+    return None
+
+
+def cgroup_bpf_wall():
+    """CONFIG_CGROUP_BPF, from the first of these that can be read: the kernel's config in /boot or /proc/config.gz,
+    or its symbols (/proc/kallsyms names are readable even where their addresses are hidden)."""
+    release = read('/proc/sys/kernel/osrelease') or ''
+    configs = [f'/boot/config-{release}'] if re.fullmatch(r'[A-Za-z0-9._+-]+', release) else []
+    for path, opener in [(p, open) for p in configs] + [('/proc/config.gz', gzip.open)]:
+        try:
+            with opener(ROOT + path, 'rt', encoding='utf-8', errors='replace') as f:
+                found = any(line.strip() == 'CONFIG_CGROUP_BPF=y' for line in f)
+        except OSError:
+            continue
+        return None if found else f'{path} has no CONFIG_CGROUP_BPF=y'
+    try:
+        with open(ROOT + '/proc/kallsyms', encoding='utf-8', errors='replace') as f:
+            found = any(line.rstrip('\n').endswith(' __cgroup_bpf_run_filter_skb') for line in f)
+    except OSError:
+        return 'cannot read the kernel config (/boot/config-<release>, /proc/config.gz) nor /proc/kallsyms'
+    return None if found else '/proc/kallsyms has no __cgroup_bpf_run_filter_skb'
+
+
+def namespaces_wall():
+    missing = [n for n in ('ipc', 'mnt', 'net') if not os.path.lexists(f'{ROOT}/proc/self/ns/{n}')]
+    if missing:
+        return (f'no {", ".join(missing)} namespaces (/proc/self/ns): systemd drops PrivateIPC without an error, '
+                'and the jobs\' own network and file view need the others')
     return None
 
 
@@ -89,10 +119,19 @@ WALLS = [
     ('kernel', 'kernel 5.8 or newer (per-mount /proc, so jobs see no other process)', kernel_wall),
     ('systemd', 'systemd is PID 1', systemd_wall),
     ('cgroup2', '/sys/fs/cgroup is cgroup2 only', cgroup_wall),
+    ('cgroup-bpf', 'the kernel has cgroup BPF (else systemd drops IPAddressDeny without an error)', cgroup_bpf_wall),
+    ('namespaces', 'the kernel has IPC, mount and network namespaces', namespaces_wall),
     ('seccomp', 'seccomp filters are available', seccomp_wall),
     ('container', 'not in a container', container_wall),
     ('mounts', 'nothing mounted under /mnt or /media', mounts_wall),
 ]
+
+
+def text(s):
+    """s on one line, every control character (ESC, CR, ...) and line or bidi mark escaped: a mount's name never
+    reaches a terminal raw."""
+    return re.sub('[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]',
+                  lambda m: f'\\x{ord(m[0]):02x}' if ord(m[0]) < 0x100 else f'\\u{ord(m[0]):04x}', s)
 
 
 def main(argv):
@@ -107,7 +146,7 @@ def main(argv):
             why = f'cannot tell ({e.__class__.__name__}: {e})'
         failed |= why is not None
         if why is not None:
-            print(f'FAIL  {wall}  ' + f'{what}: {why}'.replace('\n', ' ')[:400])
+            print(f'FAIL  {wall}  ' + text(f'{what}: {why}')[:400])
         elif argv[0] == 'describe':
             print(f'PASS  {wall}  {what}')
     return 1 if failed else 0
