@@ -464,6 +464,27 @@ that runs `fork-fleet-launch.sh` on the PC over ssh. Run the dispatcher with
 `--pool vm` until then. Without its dispatcher, `pc` has no heartbeat, and
 `route` never counts it. Whether and how the PC joins is an owner decision.
 
+### The desk link (a desktop pool)
+
+A desktop accepts no connection and holds no GitHub token. Its desk agent dials
+out to the always-on host over ssh, with a key that may only run `serve` for
+its own pool, and the pool's dispatcher on the always-on host sends the
+launcher's verbs through that one session (`fork-fleet-desk.py`, its wire
+format `fork-fleet-desk-wire.py`):
+
+```
+# root's authorized_keys on the always-on host (sshd: PermitRootLogin forced-commands-only), one line per pool:
+restrict,command="python3 -I /opt/fork-fleet/fork-fleet-desk.py serve POOL" ssh-ed25519 AAAA... desk-POOL
+# the pool's launch command in the project's fleet config:
+"launch": ["python3", "-I", "/opt/fork-fleet/fork-fleet-desk.py", "launch", "POOL"]
+```
+
+`serve` keeps one session per pool (a lock), listens on a root-only socket in
+`/run/fork-fleet-desk`, and pings the agent; `launch` fails at once (exit 3)
+when no session is live, so a sleeping desktop's pool is down for the pass and
+`route` sends its jobs elsewhere. A verb with no answer in its time exits 75:
+it may or may not have run, and the next pass's `active` tells.
+
 **What jobs need on the host.** The jobs run without sudo, so the host must
 already have:
 
