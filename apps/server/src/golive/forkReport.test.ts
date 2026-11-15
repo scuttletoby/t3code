@@ -414,8 +414,8 @@ describe("__fork-report settings", () => {
 
     expect(report.fork.featuresOn).toEqual(["agentSlots", "usagePacingGate", "automaticUpdates"]);
     expect(report.fork.keysInFile).toEqual([
-      "automaticUpdatesQuietCommand",
       "autoUpdateServer",
+      "automaticUpdatesQuietCommand",
       "usagePacingGate",
       "agentSlots",
     ]);

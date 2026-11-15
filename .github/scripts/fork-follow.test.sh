@@ -157,7 +157,8 @@ new_fork() {
     git remote set-url origin https://github.com/me/t3code.git
     git checkout -q -B main "$1"
     mkdir -p .github/scripts .github/workflows
-    cp "$here/fork-schema-check.cjs" .github/scripts/
+    cp "$here/fork-schema-check.cjs" "$here/fork-seam-check.cjs" .github/scripts/
+    echo '{"files":{}}' > .github/fork-seams.json
     printf 'jobs:\n  desktop:\n    uses: ./.github/workflows/release-desktop.yml\n' > .github/workflows/fork-release.yml
     echo "on: workflow_dispatch" > .github/workflows/fork-follow.yml
     echo "# upstream workflow files the fork deletes" > .github/fork-removed-workflows.txt
@@ -398,6 +399,22 @@ printf '#!/bin/sh\necho "Fork changes must not change the database schema (no do
   bash "$dir/fork-follow.sh") > "$root/out" 2>&1
 check "plan: a schema check refusal is reported as a schema change" \
   eval 'has "The series changes the database schema" "$root/report.md" && has "a.sql" "$root/report.md"'
+
+# Fork lines in upstream files beyond the pinned seams (.github/fork-seams.json) stop the plan.
+seams() { # seams ALLOWED_LINE ADDED_TEXT: the fork's commit adds ADDED_TEXT to upstream's u2.txt
+  (cd "$root/work" && printf '{"files":{"u2.txt":{"why":"test","added":["%s"]}}}' "$1" > .github/fork-seams.json \
+    && printf '%s\n' "$2" >> u2.txt && git add -A && git commit -q --amend --no-edit && git push -q --force origin main) > /dev/null 2>&1
+}
+new_upstream
+new_fork v0.1.10
+seams "fork seam" "fork seam"
+plan
+check "plan: a fork line listed as a seam passes" action_is release
+new_fork v0.1.10
+seams "fork seam" "inline fork line"
+plan
+check "plan: a fork line beyond the seams stops the plan, naming it" \
+  eval 'has "The series adds fork lines to upstream files beyond the seams" "$root/report.md" && has "inline fork line" "$root/report.md" && [[ -z "$(out action)" ]]'
 
 # Round 5: upstream workflow files the fork deletes (.github/fork-removed-workflows.txt) stay
 # deleted on every follow, and a new upstream workflow that someone outside the fork can start
