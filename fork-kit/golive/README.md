@@ -4,13 +4,13 @@
 fork build), with a cold copy of the data first and a way back. It is built in steps; this folder has the
 **core** so far:
 
-| Part             | File                      | What it does                                                 |
-| ---------------- | ------------------------- | ------------------------------------------------------------ |
-| config           | `lib/golive/config.py`    | reads the `golive` section of the machine file               |
-| lock and journal | `lib/golive/journal.py`   | one run at a time; each step journalled "started" and "done" |
-| live T3          | `lib/golive/live.py`      | finds the running server from its own files and process      |
-| `check`, `settle` | `lib/golive/check.py`   | read only: may this home move to the target build now?       |
-| OS adapter       | `lib/golive/osadapter.py` | systemd user units only; other systems refuse until written  |
+| Part              | File                      | What it does                                                 |
+| ----------------- | ------------------------- | ------------------------------------------------------------ |
+| config            | `lib/golive/config.py`    | reads the `golive` section of the machine file               |
+| lock and journal  | `lib/golive/journal.py`   | one run at a time; each step journalled "started" and "done" |
+| live T3           | `lib/golive/live.py`      | finds the running server from its own files and process      |
+| `check`, `settle` | `lib/golive/check.py`     | read only: may this home move to the target build now?       |
+| OS adapter        | `lib/golive/osadapter.py` | systemd user units only; other systems refuse until written  |
 
 Later parts (copy, rehearse, switch, back) come in their own PRs. Install from `ci-release` comes with them.
 
