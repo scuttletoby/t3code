@@ -17,10 +17,14 @@ export const make = () => {
       hint = null;
     }),
     version: Effect.sync(() => version),
+    // A wall clock set back (now before the check) is not idle: the hint's times are stale.
     isIdle: (nowMs: number) =>
       Effect.sync(
         () =>
-          hint !== null && hint.dueAtMs > nowMs && nowMs - hint.checkedAtMs < DUE_HINT_MAX_AGE_MS,
+          hint !== null &&
+          hint.dueAtMs > nowMs &&
+          nowMs >= hint.checkedAtMs &&
+          nowMs - hint.checkedAtMs < DUE_HINT_MAX_AGE_MS,
       ),
     record: (readVersion: number, dueAtMs: number, nowMs: number) =>
       Effect.sync(() => {
