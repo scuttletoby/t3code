@@ -63,8 +63,9 @@ cleanup() {
     step userdel -- "$u"
   done
   ! nft list table inet fork_fleet >/dev/null 2>&1 || step nft delete table inet fork_fleet
+  # Only the rules the launcher added (a run that stopped before it did leaves none): no false failed step.
   # shellcheck disable=SC2086
-  for r in "${docker[@]}"; do step iptables -w 60 -D DOCKER-USER $r; done
+  for r in "${docker[@]}"; do ! iptables -w 60 -C DOCKER-USER $r 2>/dev/null || step iptables -w 60 -D DOCKER-USER $r; done
   [[ -z $tmp ]] || step rm -rf --one-file-system -- "${tmp:?}"
   step sysctl -qw "net.ipv4.ip_forward=$forward"
   if ((${#failed[@]})); then

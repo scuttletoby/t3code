@@ -2504,6 +2504,50 @@ class WallsProof(unittest.TestCase):
                              capture_output=True, text=True, timeout=30)
         self.assertEqual((got.returncode, got.stdout), (0, 'false one false two\n'))
 
+    def test_cleanup_deletes_the_launchers_namespace_and_only_the_docker_rules_that_are_there(self):
+        """Fix round 2 (#198 nits): cleanup deletes the namespace the launcher made for that user (its name and path),
+        and a DOCKER-USER rule the launcher never added (a run that stopped early) is not a failed step (no exit 1)."""
+        src = self.src()
+        with open(os.path.join(HERE, 'fork-fleet-launch.sh')) as f:
+            launch = f.read()
+        self.assertIn('ns=fork-fleet-$user ', launch)
+        self.assertIn('NetworkNamespacePath=/run/netns/fork-fleet-$user', launch)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bin_, rec = os.path.join(tmp, 'bin'), os.path.join(tmp, 'rec')
+        os.makedirs(bin_)
+        os.makedirs(os.path.join(tmp, 'netns'))
+        open(os.path.join(tmp, 'netns', 'fork-fleet-u1'), 'w').close()
+        # Fakes: each records its arguments; iptables -C finds only the rules listed in $T/present.
+        for name in ('ip', 'iptables', 'systemctl', 'nft', 'pkill', 'userdel', 'sysctl', 'kill'):
+            body = f'echo "{name} $*" >>"$T/rec"\n'
+            if name == 'iptables':
+                body += 'if [[ " $* " == *" -C "* ]]; then grep -qxF -- "${*: -1}" "$T/present"; exit; fi\n'
+            if name in ('ip', 'nft'):
+                body += '[[ " $* " != *" show "* && " $* " != *" list "* ]] || exit 1\n'
+            with open(os.path.join(bin_, name), 'w') as f:
+                f.write('#!/bin/bash\n' + body + 'exit 0\n')
+            os.chmod(os.path.join(bin_, name), 0o755)
+        with open(os.path.join(bin_, 'id'), 'w') as f:
+            f.write('#!/bin/bash\necho 4242\n')
+        os.chmod(os.path.join(bin_, 'id'), 0o755)
+        code = src[src.index('step() {'):src.index('trap cleanup EXIT')].replace('/run/netns/', tmp + '/netns/')
+        rules = ['-o ffh-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT', '-i ffh-+ -j ACCEPT']
+        for present in ([], ['ACCEPT']):
+            with open(os.path.join(tmp, 'present'), 'w') as f:
+                f.write('\n'.join(present) + '\n')
+            open(rec, 'w').close()
+            got = subprocess.run(['bash', '-c', code + '\nmade=(u1) docker=("$R1" "$R2") failed=() tmp="" listener="" '
+                                  'forward=0\ncleanup\necho done'],
+                                 env={'PATH': bin_ + ':/usr/bin:/bin', 'T': tmp, 'R1': rules[0], 'R2': rules[1]},
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual((got.returncode, got.stdout, got.stderr), (0, 'done\n', ''))
+            with open(rec) as f:
+                calls = f.read().splitlines()
+            self.assertIn('ip netns del fork-fleet-u1', calls)
+            deleted = [c for c in calls if ' -D DOCKER-USER ' in c]
+            self.assertEqual(deleted, [f'iptables -w 60 -D DOCKER-USER {r}' for r in rules] if present else [])
+
     def test_it_prints_the_cgroup_version_and_tries_each_block_alone(self):
         src = self.src()
         self.assertIn('stat -fc %T /sys/fs/cgroup', src)
