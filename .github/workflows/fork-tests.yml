@@ -298,6 +298,22 @@ jobs:
       - name: gh-apps kit as root
         run: sudo env GH_APPS_ROOT_TESTS=1 GITHUB_ACTIONS="$GITHUB_ACTIONS" python3 -I -B fork-kit/gh-apps/tests/root.test.py
 
+      # The heavy kit's wrapper with a real systemd user manager (fork-kit/heavy/README.md):
+      # linger starts the runner user's manager, and the slice gets a unit with a memory
+      # limit (heavy refuses a slice without one). HEAVY_REAL_TESTS=1: no manager fails
+      # the step instead of skipping it; so does a slice without the limit (the show line).
+      - name: heavy kit with a real systemd user manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export XDG_RUNTIME_DIR
+          mkdir -p ~/.config/systemd/user
+          printf '[Slice]\nMemoryMax=2G\n' > ~/.config/systemd/user/heavy.slice
+          systemctl --user daemon-reload
+          systemctl --user show heavy.slice -p LoadState,FragmentPath,MemoryMax
+          HEAVY_REAL_TESTS=1 python3 -I -B fork-kit/heavy/tests/heavy.test.py
+
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
 
