@@ -36,7 +36,12 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
-import { makeWorkAdmissionGate, WorkAdmission } from "./workAdmission.ts";
+import {
+  makeWorkAdmissionGate,
+  memoryUpdateHoldStore,
+  WORK_ADMISSION_CONSUMERS,
+  WorkAdmission,
+} from "./workAdmission.ts";
 
 it.effect.each([
   { name: "committed", trial: "committed" },
@@ -182,4 +187,34 @@ it.effect.each([
       );
     }),
   ),
+);
+
+// Fork (`serve --hold-work`): the boot check refuses to serve unless the gate is held from boot and
+// every consumer registered with it. holdWork.boot.test.ts runs it through the real CLI.
+it.effect("a held boot serves only on a held gate that every consumer uses", () =>
+  Effect.gen(function* () {
+    const marker = yield* memoryUpdateHoldStore;
+    const refusal = (exit: Exit.Exit<unknown, unknown>) =>
+      Exit.isFailure(exit) ? String(exit.cause) : "served";
+    const held = yield* makeWorkAdmissionGate({ marker, heldFromBoot: true });
+    for (const consumer of WORK_ADMISSION_CONSUMERS.filter((name) => name !== "scheduler")) {
+      yield* held.register(consumer);
+    }
+    assert.include(
+      refusal(yield* Effect.exit(ServerRuntimeStartup.checkHoldWork(held))),
+      "not using the shared gate: scheduler",
+    );
+    yield* held.register("scheduler");
+    assert.strictEqual(
+      refusal(yield* Effect.exit(ServerRuntimeStartup.checkHoldWork(held))),
+      "served",
+    );
+
+    const open = yield* makeWorkAdmissionGate({ marker, heldFromBoot: false });
+    for (const consumer of WORK_ADMISSION_CONSUMERS) yield* open.register(consumer);
+    assert.include(
+      refusal(yield* Effect.exit(ServerRuntimeStartup.checkHoldWork(open))),
+      "the shared work gate is not held",
+    );
+  }),
 );
