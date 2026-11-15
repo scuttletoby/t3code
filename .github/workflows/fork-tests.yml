@@ -58,6 +58,7 @@ permissions:
   contents: read
 
 # A new push to a pull request cancels its older run. Main and release runs finish.
+# The secret scan does not depend on this: fork-secret-scan.yml also runs on its own for each push.
 # The event name keeps a release's workflow_call apart from its caller's group.
 concurrency:
   group: fork-tests-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.ref || github.sha }}
@@ -244,6 +245,7 @@ jobs:
       # docs/fork/: the fork's pages whose commands and links a test runs (fork-gate-trust-docs.test.py).
       # apps/, packages/: only the T3 source files the go-live kit's contract test pins
       # (fork-kit/golive/tests/contract.test.py); keep the two lists in step.
+      # .gitleaks.toml: fork-secret-scan.test.sh checks the repository's gitleaks rules.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -256,6 +258,7 @@ jobs:
             /fork-ci/
             /fork-kit/
             /scripts/
+            /.gitleaks.toml
             /apps/server/src/cli/forkReport.ts
             /apps/server/src/cloud/bootService.ts
             /apps/server/src/cloud/serviceProtocol.ts
@@ -339,65 +342,15 @@ jobs:
   # Every commit a pull request or a push to main adds, history included: a
   # secret committed and then deleted is still public. Release runs test a
   # commit that already passed this on its way to main, so they skip it.
-  # The ranges, and why: .github/scripts/fork-secret-scan.sh.
+  # The job, the ranges and why: fork-secret-scan.yml, which a pull request
+  # also runs on its own, so a newer push cancelling this run cannot leave a
+  # head unscanned.
   secrets:
     name: Secret scan
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (inputs.ref == '') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      # Full history without file contents. The scan script fetches the contents
-      # of only the scanned commits (a failed fetch fails the job), then runs
-      # gitleaks offline.
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
-          filter: blob:none
-
-      - name: Install gitleaks
-        env:
-          VERSION: 8.30.1
-          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
-        run: |
-          archive="gitleaks_${VERSION}_linux_x64.tar.gz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${archive}"
-          echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
-
-      # The range rules against this gitleaks: a key added and deleted again
-      # before a merge of main, a key only a merge commit adds, push ranges,
-      # settings the pull request cannot change, octopus merges.
-      - name: Test the scan ranges
-        env:
-          GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
-        run: bash .github/scripts/fork-secret-scan.test.sh
-
-      - name: Scan the added commits
-        env:
-          GITLEAKS: ${{ runner.temp }}/gitleaks
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.sha }}
-          # A pull request's gitleaks settings come from this branch's tip, never from the PR.
-          CONFIG_BRANCH: ${{ github.event.repository.default_branch }}
-          PARENT_TOKEN: ${{ github.token }}
-        # A push leaves out the commits upstream (this fork's parent, as in fork-follow.yml)
-        # already has. Parent not readable: UPSTREAM stays empty and the full range is scanned.
-        # The token reaches only the parent lookup, never the scan script or gitleaks.
-        run: |
-          set -euo pipefail
-          UPSTREAM=""
-          if [[ "$EVENT_NAME" == push ]]; then
-            UPSTREAM="$(GH_TOKEN="$PARENT_TOKEN" gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty' || true)"
-          fi
-          unset PARENT_TOKEN
-          export UPSTREAM
-          bash .github/scripts/fork-secret-scan.sh
+    uses: ./.github/workflows/fork-secret-scan.yml
+    with:
+      test: true
 
   lint:
     name: Lint
