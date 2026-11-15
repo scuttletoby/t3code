@@ -192,17 +192,29 @@ Two more things limit what a job can do:
   `systemd-run` and `systemctl` it runs) instead of keeping a list of their
   own. A systemd drop-in that changes the job units (`service.d`,
   `fork-.service.d` or `fork-fleet-*.service.d` in any unit folder,
-  `system.control` and the generators' among them) fails them (`job-units`),
-  and so does a launcher setting that runs another program than systemd's
-  own. On WSL2 they also read every property the launcher gives a job's unit
+  `system.control` and the generators' among them) fails them (`job-units`).
+  So does an empty `IPAddressDeny=` (systemd's reset) unless the list after
+  the last one still denies every range the launcher denies (as the drop-in
+  systemd writes for refresh-net's `set-property` does); a slice the job units
+  sit in (`system.slice`, `-.slice`, every slice's `slice.d`) that allows more
+  than localhost (a unit takes its slices' rules, and allow beats deny); a stop
+  timeout that is endless or longer than 5 minutes (a job that ignores SIGTERM
+  would run on past its limit), in a drop-in or as systemd's own default; and
+  a launcher setting that runs another program than systemd's own. On WSL2 they also read every property the launcher gives a job's unit
   (each way `systemd-run` takes one), of the launcher they ship with only:
   its sha256 is pinned in the `wsl2` walls file, and any other launcher
   cannot be told and fails (no reading of bash can follow every way a changed
-  one could hand a unit more). A bind that `paths` did not make, or
+  one could hand a unit more). A launcher change moves the pin in the same
+  pull request: it needs the security lens, and the pin test also runs cheap
+  tripwires on the launcher's text (a second `systemd-run`, `eval`, `source`,
+  a `#` inside quotes, a function defined twice, binds made outside
+  `job_view`), so that none of the edits the scan cannot follow comes back
+  with a moved pin unseen. A bind that `paths` did not make, or
   `PrivateDevices=` that is not yes, fails them, and a property they cannot
-  read fails them too. A symlink on the way to a bound path must be root's,
-  in a folder of root's that only root may write (or a sticky one): another
-  user, or any member of the folder's group, could repoint it.
+  read fails them too. One rule for every folder on the way to a bound path:
+  only its owner may write it, or it is sticky; a symlink there must also be
+  root's, in a folder of root's. Otherwise another user, or any member of the
+  folder's group, could repoint the link, or swap a folder for one.
   Before a new kind of host joins a pool (a Windows PC's WSL2 first),
   `sudo bash .github/scripts/fork-fleet-walls-proof.sh` runs step 6 there with
   throwaway users, then each network block alone, prints the cgroup version,
@@ -460,14 +472,15 @@ chmod 600 /etc/fork-fleet/launch.conf
 # also through a symlink). A bind mount is not seen (it has no link to resolve): never bind-mount a data folder at
 # one of them, or at a folder above one (prune also deletes runner copies in WORK_ROOT). The hook's folder must be
 # root's and writable by root alone (start refuses a shared one such as /var/tmp), and every symlink on the way to
-# these paths root's, in a folder of root's that only root may write (or a sticky one; not group-writable).
+# these paths root's, in a folder of root's; every folder on the way only its owner may write (or sticky; not
+# group-writable), a plain folder as much as a link's.
 # NET_BASE (10.204), RESOLV_CONF (/etc/fork-fleet/resolv.conf), TEMPLATE (/opt/fork-fleet/template/runner-template)
 # and RUNNER_MIN (none: the oldest runner version refresh may install): add a line only to change one (step 1b).
 # OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is
 # looked up before every start and every dispatcher pass; every address any of them gives is blocked, and no answer
 # at all starts nothing. Add a line only to use other https lookups.
 # ALLOW_PATHS (empty): more paths jobs see read-only, comma-separated (a tool cache); never one that holds data
-# (/home, /root, /mnt, /media, /srv are refused, also through a symlink), never under a folder others may write.
+# (/home, /root, /mnt, /media, /srv are refused, also through a symlink), never under a folder others (its group or all) may write.
 # JOB_PATHS (fork-fleet-job-paths.txt beside the launcher): the system paths every job sees; leave it.
 
 # 5. The dispatcher, for the vm pool only.

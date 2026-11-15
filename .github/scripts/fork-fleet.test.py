@@ -1476,6 +1476,9 @@ class Launcher(unittest.TestCase):
             if subprocess.run(['id', '-G', user], capture_output=True, text=True).stdout.split() != \
                     [str(pwd.getpwnam(user).pw_gid)]:
                 self.skipTest(f'{user} is in other groups here')
+        # Folders as an install makes them, whatever this machine's umask: the launcher refuses a bound path under a
+        # folder its group may write (closed_folder), and a test's own folders must not trip it.
+        self.addCleanup(os.umask, os.umask(0o022))
         self.d = launcher_tmp()
         self.addCleanup(shutil.rmtree, self.d, True)
         self.rec = self.path('rec')
@@ -1875,6 +1878,24 @@ class Launcher(unittest.TestCase):
         self.assertNotEqual(got.returncode, 0)
         self.assertIn('/opt/shared/hl, in /opt/shared, which others may write', got.stderr)
 
+    def test_paths_refuses_a_plain_folder_in_a_folder_its_group_may_write(self):
+        """PR #213 re-check RS N5: a plain folder on the way to a bound path, in a folder its group may write, is
+        refused as a link there is (closed_folder, one rule): a member could rename the folder away and put a link in
+        its place between the check and the bind. Sticky, or only its owner may write: passes."""
+        root = self.walls_root('HOOK=/opt/shared/ff/hook.sh\n', files=(('/opt/shared/ff/hook.sh', ''),))
+        self.assertEqual(self.paths(root).returncode, 0)
+        for mode in (0o775, 0o2775, 0o770, 0o757):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(root + '/opt/shared', mode)
+                got = self.paths(root)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn('/opt/shared/ff/hook.sh leads to /opt/shared/ff/hook.sh, under /opt/shared, which others '
+                              'may write (its group or all)', got.stderr)
+        for mode in (0o1775, 0o755):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(root + '/opt/shared', mode)
+                self.assertEqual(self.paths(root).returncode, 0, self.paths(root).stderr)
+
     def test_paths_refuses_a_bound_path_that_holds_data(self):
         """Fix round 3 (#191 re-check, correctness): the hook, its two files, WORK_ROOT and resolv.conf are bound into
         every job like the list's lines: one under /home, /root, /mnt, /media or /srv is refused, as written and once
@@ -1920,7 +1941,7 @@ class Launcher(unittest.TestCase):
         exist then), so the hook's folder must be writable by its owner only: in a shared folder (sticky, as /var/tmp
         is, or not) another user could make fork-fleet.py there in between, and every job would run it."""
         for mode, why in ((0o1777, f'{self.d} must be writable by its owner only'),
-                          (0o775, f'{self.d} must be writable by its owner only'),
+                          (0o775, f'under {self.d}, which others may write'),   # its group: the same rule
                           (0o777, f'under {self.d}, which others may write')):   # real_path's rule, first
             with self.subTest(oct(mode)):
                 os.chmod(self.d, mode)

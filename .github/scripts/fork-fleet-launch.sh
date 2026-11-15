@@ -861,13 +861,23 @@ resolv_target() {
   printf '%s\n' "$target"
 }
 
+# THE rule of a folder on the way to a bound path (a link's, and each one above the real path): only its owner may
+# write it, or it is sticky (then only an entry's owner may rename or remove it). A folder its group or all may write
+# lets each of them rename a link or a plain folder in it away and put their own link in its place, between the check
+# and the bind, so the bind comes from wherever they like. Dies otherwise; $2: how the path goes through it.
+closed_folder() {
+  local mode
+  mode=$(stat -c '0%a' -- "$ROOT${1:-/}") || die "$2: cannot read the folder ${1:-/}"
+  ((mode & 01000 || !(mode & 022))) ||
+    die "$2, which others may write (its group or all): they could swap a link into it"
+}
+
 # Every symlink on the way from $1 to its real path (on the fake machine: in it) is root's (or this user's, who runs
 # the launcher: root, but for the walls' tests), in a folder no other user may swap it in: one a user can repoint
 # leads a bind between the check and the job wherever that user likes, past every check. Dies otherwise. That
-# folder is root's too (its owner may remove any link in it, sticky or not) and only its owner may write it, or it is
-# sticky (then only a link's owner, root, may remove it): a folder its group may write lets every member swap it.
+# folder is root's too (its owner may remove any link in it, sticky or not), and closed (closed_folder).
 links_owned() {
-  local rest=${1#/} cur='' part target uid mode hops=0
+  local rest=${1#/} cur='' part target uid hops=0
   while [[ -n $rest ]]; do
     part=${rest%%/*}
     if [[ $rest == */* ]]; then rest=${rest#*/}; else rest=''; fi
@@ -883,9 +893,7 @@ links_owned() {
       uid=$(stat -c %u -- "$ROOT${cur:-/}") || die "$1: cannot read the folder ${cur:-/}"
       [[ $uid == 0 || $uid == "$EUID" ]] ||
         die "$1 goes through $cur/$part, in ${cur:-/}, a folder of uid $uid: only in root's, or that user could swap it"
-      mode=$(stat -c '0%a' -- "$ROOT${cur:-/}") || die "$1: cannot read the folder ${cur:-/}"
-      ((mode & 01000 || !(mode & 022))) ||
-        die "$1 goes through $cur/$part, in ${cur:-/}, which others may write (its group or all): they could swap that link"
+      closed_folder "$cur" "$1 goes through $cur/$part, in ${cur:-/}"
       target=$(readlink -- "$ROOT$cur/$part") || die "$1: cannot read the link $cur/$part"
       [[ $target != /* ]] || cur=''
       rest=${target#/}${rest:+/$rest}
@@ -897,10 +905,8 @@ links_owned() {
 
 # A path's real path: every symlink in every part of it resolved (on the fake machine: in it), as systemd follows
 # them in a bind's source. What job_view checks and binds, so a link in a folder above a path (/opt/x -> /c, /home,
-# a share) never leads a job past the checks. Dies when it is no plain path, or when a folder above it is one a user
-# but root could swap for a link (others may write it, and it is not sticky): then the bind could come from another
-# place than the one checked. A folder only its owner or its group may write passes: the runner users own nothing
-# outside their copies and are in no group but their own (check_users), so they cannot swap a link into it.
+# a share) never leads a job past the checks. Dies when it is no plain path, or when a folder above it is not closed
+# (closed_folder, the same rule as a link's folder): then the bind could come from another place than the one checked.
 real_path() {
   local real d
   links_owned "$1"
@@ -912,8 +918,7 @@ real_path() {
   [[ $real =~ ^$PLAIN_PATH$ ]] || die "$1 leads to ${real:-/}: not a plain path"
   d=$real
   while d=${d%/*} && [[ -n $d ]]; do
-    [[ ! -e $ROOT$d ]] || (($(stat -c '0%a' -- "$ROOT$d") & 01002 ^ 02)) ||
-      die "$1 leads to $real, under $d, which others may write: anyone could swap a link into it"
+    [[ ! -e $ROOT$d ]] || closed_folder "$d" "$1 leads to $real, under $d"
   done
   printf '%s\n' "$real"
 }

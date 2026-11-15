@@ -113,7 +113,106 @@ class Case(unittest.TestCase):
             with open(full, 'w', encoding='utf-8') as f:
                 f.write(value['text'] if isinstance(value, dict) else value)
             os.chmod(full, int(value['mode'], 8) if isinstance(value, dict) else 0o644)   # as installed, any umask
+        for folder, _, _ in os.walk(root):   # folders too: the launcher refuses a path under a group-writable one
+            os.chmod(folder, 0o755)
         return root
+
+
+def bash_comments(text):
+    """Where bash starts a comment in text (a # at a word's start, outside quotes), and the spans of its heredocs'
+    lines (none of them a comment): a tripwire's reading of bash's quotes, not a parser. ({offsets}, [(start, end)])"""
+    out, spans, i, n, quote, pending = set(), [], 0, len(text), '', []
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == '\\' and quote != "'":
+                i += 1
+            elif c == quote[-1]:
+                quote = ''
+        elif c == '\\':
+            i += 1
+        elif c == '$' and text[i + 1:i + 2] == "'":
+            quote, i = "$'", i + 1
+        elif c in '"\'':
+            quote = c
+        elif c == '#' and (i == 0 or text[i - 1] in ' \t\n'):
+            out.add(i)
+            i = text.find('\n', i)
+            i = n if i < 0 else i
+            continue
+        elif text.startswith('<<', i) and not text.startswith('<<<', i):
+            m = re.match(r'<<(-?)\s*([\'"]?)([A-Za-z_]\w*)\2', text[i:])
+            if m:
+                pending.append((m.group(1), m.group(3)))
+                i += m.end()
+                continue
+        elif c == '\n' and pending:
+            start = i + 1
+            for dash, word in pending:
+                m = re.compile(rf'^{"[ \t]*" if dash else ""}{word}$', re.M).search(text, i + 1)
+                i = m.end() if m else n
+            spans.append((start, i))
+            pending = []
+            continue
+        i += 1
+    return out, spans
+
+
+# What the real launcher has, which a change must keep or read with the security lens (launcher_tripwires).
+SYSTEMD_RUN_WORDS = 7   # the setting, its default, `tools` (2), and the three job units (start, check_net's two)
+TOOLS = ("  tools:1) printf 'SYSTEMD_RUN %s\\nSYSTEMCTL %s\\n' \"$(shown \"$SYSTEMD_RUN\")\" "
+         "\"$(shown \"$SYSTEMCTL\")\" ;;\n")
+B_ANCHOR = '  b=$real\n  resolv_bind=$b:$resolv\n'
+
+
+def launcher_tripwires(text):
+    """Cheap checks on the launcher's text that the pin test runs, so that a launcher change that also moves the pin
+    cannot bring back one of round 1's edits unseen: a plain systemd-run or another "$SYSTEMD_RUN", eval, source or a
+    name reference, a # that bash reads inside quotes, a function defined twice, view_ro set outside job_view, b set
+    again before the resolv bind, `tools` or the SYSTEMD_RUN default changed. Not a parser: what trips needs the
+    security lens, and then this check changed with it. [what tripped]"""
+    out = []
+    bash, spans = bash_comments(text)
+    walls = {m.start(2) for m in re.finditer(r'(^|[ \t])(#[^\n]*)', text, re.M)
+             if not any(a <= m.start(2) < b for a, b in spans)}
+    out += [f'line {text.count(chr(10), 0, i) + 1}: a # that bash and the walls read differently (quotes before it)'
+            for i in sorted(bash ^ walls)[:3]]
+    code = list(text)
+    for i in bash:   # bash's comments and heredoc lines blanked, the same length
+        end = text.find('\n', i) % (len(text) + 1)
+        code[i:end] = ' ' * (end - i)
+    for a, b in spans:
+        code[a:b] = re.sub(r'[^\n]', ' ', text[a:b])
+    code = ''.join(code)
+
+    def line(i):
+        return code.count('\n', 0, i) + 1
+    for m in re.finditer(r'(?<![\w$.-])(eval|source)(?![\w-])|(?:^|[;&|({]|\bthen|\bdo|\belse)[ \t]*\.[ \t]+\S|'
+                         r'(?<![\w-])(?:local|declare|typeset|readonly)\s+(?:-\w+\s+)*-\w*n|\$\{!', code, re.M):
+        out.append(f'line {line(m.start())}: {m.group(0).strip()!r} (eval, source or a name reference)')
+    if code.count('printf -v') != 1:
+        out.append('printf -v other than once (the settings\' loop)')
+    names = re.findall(r'(?:^|[\s;&|(){}])(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\s*\)', code, re.M)
+    out += [f'{name}() defined {names.count(name)} times' for name in sorted(set(names)) if names.count(name) > 1]
+    if code.count('SYSTEMD_RUN') != SYSTEMD_RUN_WORDS or code.count('systemd-run') != 1:
+        out.append(f'SYSTEMD_RUN named {code.count("SYSTEMD_RUN")} times (not {SYSTEMD_RUN_WORDS}), systemd-run '
+                   f'{code.count("systemd-run")} (not 1, its default): a job unit started another way')
+    for want in (' SYSTEMD_RUN=systemd-run\n', '\nSYSTEMCTL=systemctl ', TOOLS):
+        if code.count(want) != 1:
+            out.append(f'{want.strip()!r} not once')
+    try:
+        view, fs = wsl2.function(code, 'job_view'), wsl2.function(code, 'job_fs')
+    except ValueError as e:
+        return out + [str(e)]
+    for m in re.finditer(r'(?<![\w$-])view_ro(?![\w-])', code):
+        declared = re.fullmatch(r'\s*local\s+-a\s+[\w =()]*', code[code.rfind('\n', 0, m.start()) + 1:m.start()])
+        read = code[m.start() - 2:m.start()] == '${'
+        if not view[0] <= m.start() < view[1] and (re.match(r'\+?=', code[m.end():]) or not (declared or read)):
+            out.append(f'line {line(m.start())}: view_ro set outside job_view')
+    body = code[fs[0]:fs[1]]
+    if body.count(B_ANCHOR) != 1 or len(re.findall(r'(?<![\w$-])b\+?=', body)) != 1:
+        out.append('job_fs sets b other than once, right before the resolv bind')
+    return out
 
 
 def walls_with(test, root, launcher_text=None):
@@ -282,9 +381,57 @@ class Launcher(Case):
                         wall()
 
     def test_the_pin_is_the_launchers(self):   # change the launcher, read it again, then change the pin
+        """The walls read the pinned launcher only; a launcher change moves the pin in the same PR. That change needs
+        the security lens (the walls' scan does not follow every way bash could start a unit with more), and the
+        tripwires below must still pass on it, so that none of round 1's edits comes back with a moved pin unseen."""
+        self.assertEqual(launcher_tripwires(slurp(LAUNCHER)), [], 'fork-fleet-launch.sh trips a check of the walls\' '
+                         'pin (launcher_tripwires): read the change with the security lens before you change either')
         self.assertEqual(wsl2.LAUNCHER_SHA256, sha(slurp(LAUNCHER)), 'fork-fleet-launch.sh changed: read its job '
-                         'units again (unit_props) and set LAUNCHER_SHA256 in fork-fleet-walls/wsl2 to its sha256')
+                         'units again (unit_props) with the security lens, and set LAUNCHER_SHA256 in '
+                         'fork-fleet-walls/wsl2 to its sha256')
         self.assertEqual(len(PIN.findall(slurp(os.path.join(FOLDER, 'wsl2')))), 1)
+
+    def test_a_pinned_edit_trips_a_check(self):
+        """PR #213 re-check RS N4: each of round 1's launcher edits (and their cousins: source, a name reference,
+        printf -v, `tools` or the SYSTEMD_RUN default changed) trips launcher_tripwires, which the pin test runs, so
+        that moving the pin to such a launcher fails CI; the real launcher and a comment trip nothing."""
+        real = slurp(LAUNCHER)
+        bad = '-p BindReadOnlyPaths=/run/WSL:/run/WSL -p PrivateDevices=no -- "$dir/run.sh"'
+        at = '\nstart() {\n'
+        self.assertEqual((real.count(RUN), real.count(at), real.count(B_ANCHOR), real.count(TOOLS)), (1, 1, 1, 1))
+        self.assertEqual(real.count('  job_view\n  rm -rf'), 1)
+        edits = {
+            'a plain systemd-run': real.replace(RUN, f'  systemd-run --quiet --uid "$user" {bad}\n' + RUN),
+            'a helper with "$SYSTEMD_RUN"': real.replace(at, f'\nside_unit() {{\n  "$SYSTEMD_RUN" --quiet {bad}\n}}\n'
+                                                         + at).replace(RUN, '  side_unit\n' + RUN),
+            'a run through a variable': real.replace(RUN, f'  local r=$SYSTEMD_RUN\n  "$r" --quiet {bad}\n' + RUN),
+            'eval': real.replace(RUN, "  eval 'pro''ps+=(-p PrivateDevices=no)'\n" + RUN),
+            'source': real.replace(RUN, '  source /etc/fork-fleet/more.sh\n' + RUN),
+            '. a file': real.replace(RUN, '  . /etc/fork-fleet/more.sh\n' + RUN),
+            'a name reference': real.replace(RUN, '  local -n p=props\n  p+=(-p PrivateDevices=no)\n' + RUN),
+            'an indirect read': real.replace(RUN, '  x=props; : "${!x}"\n' + RUN),
+            'printf -v': real.replace(RUN, "  printf -v 'props[99]' %s -pPrivateDevices=no\n" + RUN),
+            'a quoted #': real.replace(RUN, '  : " #"; props+=(-p PrivateDevices=no)\n' + RUN),
+            "a quoted #, ' quotes": real.replace(RUN, "  : ' #'; props+=(-p PrivateDevices=no)\n" + RUN),
+            'sandbox() again after a quoted #':
+                real.replace(at, '\n: " #"; sandbox() { props=(-p PrivateDevices=no); }\n' + at),
+            'sandbox() again': real.replace(at, '\nsandbox() { props=(-p PrivateDevices=no); }\n' + at),
+            'view_ro grown in job_fs': real.replace('  job_view\n  rm -rf',
+                                                    '  job_view\n  view_ro+=(/run/WSL)\n  rm -rf'),
+            'view_ro set where it is declared':
+                real.replace('  local -a ro=() view_ro view_links', '  local -a ro=() view_ro=(/run/WSL) view_links'),
+            'b set twice': real.replace(B_ANCHOR, '  b=$real\n  b=/run/WSL/1_interop\n  resolv_bind=$b:$resolv\n'),
+            'b set after the anchor': real.replace(B_ANCHOR, B_ANCHOR + '  b=/run/WSL/1_interop\n'),
+            'another SYSTEMD_RUN default': real.replace(' SYSTEMD_RUN=systemd-run\n', ' SYSTEMD_RUN=/opt/x/run\n'),
+            '`tools` shows a fixed program': real.replace(TOOLS, "  tools:1) printf 'SYSTEMD_RUN systemd-run\\n"
+                                                                 "SYSTEMCTL systemctl\\n' ;;\n"),
+        }
+        for name, text in edits.items():
+            with self.subTest(name):
+                self.assertNotEqual(text, real)
+                self.assertNotEqual(launcher_tripwires(text), [], name)
+        self.assertEqual(launcher_tripwires(real + '# a comment\n'), [])
+        self.assertEqual(launcher_tripwires(real.replace(RUN, '  : "a#b" ${x#y}  # a comment\n' + RUN)), [])
 
     def test_any_other_launcher_cannot_be_told(self):
         """No reading of bash follows every way a changed launcher could start a job unit with more (a plain

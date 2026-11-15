@@ -41,7 +41,11 @@
       "mode": "600"
     },
     "etc/zsh/zshrc": "if [[ \"$TERM\" != emacs ]]\nthen\n    typeset -A key\n    key=(\n        Home       \"${terminfo[khome]}\"\n    )\nfi\n",
-    "etc/environment.d/20-tools.conf": "TOKENIZERS_PARALLELISM=false\nGOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n"
+    "etc/environment.d/20-tools.conf": "TOKENIZERS_PARALLELISM=false\nGOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n",
+    "opt/gcp/key.json": {
+      "text": "{}\n",
+      "mode": "600"
+    }
   },
   "fail": {
     "os": [
@@ -194,6 +198,15 @@
       },
       {
         "etc/fork-fleet/launch.conf": "SYSTEMD_RUN=/usr/local/sbin/run-with-gpu\n"
+      },
+      {
+        "run/systemd/transient/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf": "# This is a drop-in unit file extension, created via \"systemctl set-property\"\n# or an equivalent operation. Do not edit.\n[Service]\nIPAddressDeny=\nIPAddressDeny=203.0.113.7/32\n"
+      },
+      {
+        "etc/systemd/system/system.slice.d/10-lan.conf": "[Slice]\nIPAddressAllow=any\n"
+      },
+      {
+        "etc/systemd/system/service.d/10-slow.conf": "[Service]\nTimeoutStopSec=infinity\n"
       }
     ],
     "etc-secrets": [

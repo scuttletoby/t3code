@@ -2,7 +2,7 @@
 """Tests of fork-fleet-walls.py (OS detection, refusal of an OS without walls, the walls-file contract it enforces) and
 the contract test every walls file in fork-fleet-walls/ must pass, on fake machines from its <os>.fixture.json. A new
 walls file (and its fixture) is tested here without a change to this file. Run: python3 <this>. Linux only."""
-import contextlib, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+import ast, contextlib, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -620,8 +620,10 @@ class EveryWallsFile(Case):
         passes = {
             'stock /etc/zsh/zshrc': {'etc/zsh/zshrc': zshrc},
             'TOKENIZERS_PARALLELISM': {'etc/environment': 'TOKENIZERS_PARALLELISM=false\n'},
-            'a credentials path': {'etc/environment': 'GOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n'},
-            'a key file path': {'etc/profile.d/ssh.sh': 'export SSH_KEY=~/.ssh/id_ed25519 GPG_KEY=/etc/x.gpg\n'},
+            'a credentials path': {'etc/environment': 'GOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n',
+                                   'opt/gcp/key.json': {'text': '{}\n', 'mode': '600'}},
+            'a key file path': {'etc/profile.d/ssh.sh': 'export SSH_KEY=~/.ssh/id_ed25519 GPG_KEY=/etc/x.gpg\n',
+                                'etc/x.gpg': {'text': 'x\n', 'mode': '600'}},
             'an id, not a key': {'etc/profile.d/aws.sh': 'export AWS_ACCESS_KEY_ID_FILE=/etc/x AWS_KEY_ID=AKIDX\n'},
             'a yes/no': {'etc/environment': 'GIT_TERMINAL_PROMPT_PASSWORD=false\nNO_TOKEN=1\n'},
             'lower case key, an array': {'etc/zsh/zshrc': 'typeset -A key\nkey=(Home x)\n'},
@@ -638,7 +640,17 @@ class EveryWallsFile(Case):
         for name, change in {'a key, upper case': {'etc/profile.d/x.sh': 'export OPENAI_API_KEY=sk1\n'},
                              'TOKENS, a word': {'etc/profile.d/x.sh': 'export HF_TOKENS=x1\n'},
                              'a password in a word': {'etc/environment': 'DBPASSWORD=hunter2\n'},
-                             'a lower case token': {'etc/profile.d/x.sh': 'github_token=x1\n'}}.items():
+                             'a lower case token': {'etc/profile.d/x.sh': 'github_token=x1\n'},
+                             # PR #213 re-check RS N1: a path is no secret only when it is there and others cannot
+                             # read it; one others can read holds the secret, and one that is not there may be a
+                             # password that starts with /.
+                             'a credentials path others can read': {
+                                 'etc/environment': 'GOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n',
+                                 'opt/gcp/key.json': '{}\n'},
+                             'a key file path others can read': {'etc/profile.d/ssh.sh': 'export GPG_KEY=/etc/x.gpg\n',
+                                                                 'etc/x.gpg': 'x\n'},
+                             'a key path that is not there': {'etc/profile.d/ssh.sh': 'export GPG_KEY=/etc/x.gpg\n'},
+                             }.items():
             with self.subTest(name):
                 self.assertTrue(self.etc_secrets(change).startswith('FAIL'), name)
 
@@ -657,6 +669,28 @@ class EveryWallsFile(Case):
             'secret word not last': {'etc/environment': f'SECRET_KEY_BASE={pw}\n'},
             'a long number': {'etc/environment': 'DB_PASSWORD=12345678\n'},
             'fish set after a query': {'etc/fish/conf.d/x.fish': f'set -q GH_TOKEN; or set -gx GH_TOKEN {pw}\n'},
+            # PR #213 re-check RS N1: a shape clears a name only when the value truly is that kind.
+            'a six-digit PIN': {'etc/environment': 'VNC_PASSWORD=482913\n'},
+            'a password shaped like a path': {'etc/profile.d/app.sh': 'export DB_PASSWORD=/Xk9q2/Zp3m7\n'},
+            'a password shaped like a specifier, in a login file': {
+                'etc/profile.d/app.sh': 'export DB_PASSWORD=%Q/zP3m7Xk9\n'},
+            'a password shaped like a specifier systemd has not': {
+                'etc/systemd/system/app.service': '[Service]\nEnvironment=DB_PASSWORD=%Q/zP3m7Xk9\n'},
+            'a literal password in a password command': {
+                'etc/systemd/system/backup.service': f'[Service]\nEnvironment="RESTIC_PASSWORD_COMMAND=echo {pw}"\n'},
+            'a password option in a password command': {
+                'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND="tool --password={pw}"\n'},
+            'a password variable in a token helper': {
+                'etc/profile.d/x.sh': f'export VAULT_TOKEN_HELPER="env VAULT_TOKEN={pw} vault"\n'},
+            'a cat of a file others can read, in a password command': {
+                'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="cat /etc/restic/pw"\n',
+                'etc/restic/pw': f'{pw}\n'},
+            'a password file others can read': {
+                'etc/systemd/system/app.service': '[Service]\nEnvironment=DB_PASSWORD_FILE=/etc/app/db-password\n',
+                'etc/app/db-password': f'{pw}\n'},
+            'a password file others can read, by a specifier': {
+                'etc/systemd/system/app@.service': '[Service]\nEnvironment=DB_PASSWORD_FILE=/etc/app/%i.pw\n',
+                'etc/app/main.pw': f'{pw}\n'},
         }
         for name, change in fails.items():
             with self.subTest(name):
@@ -680,6 +714,22 @@ class EveryWallsFile(Case):
                                       'set --erase GITHUB_TOKEN\nset -nS api_key x\n'},
             'csh setenv, a comment': {'etc/csh.cshrc': 'setenv GH_TOKEN # set by the login\n'},
             'words that only hold KEY or PASS': {'etc/environment': 'HOTKEY=x1\nBYPASS=x1\nKEYMAP=x1\n'},
+            # PR #213 re-check RS N1, the other way: each shape that is truly its kind still passes.
+            'a password file only root reads': {
+                'etc/systemd/system/app.service': '[Service]\nEnvironment=DB_PASSWORD_FILE=/etc/app/db-password\n',
+                'etc/app/db-password': {'text': 'hunter2\n', 'mode': '600'}},
+            'a password file that is not here': {'etc/environment': 'DB_PASSWORD_FILE=/run/secrets/db\n'},
+            'a password path only root reads': {'etc/environment': 'DB_PASSWORD=/etc/app/db-password\n',
+                                                'etc/app/db-password': {'text': 'hunter2\n', 'mode': '600'}},
+            'a path in a home folder': {'etc/profile.d/x.sh': 'export GH_TOKEN=~/.config/gh/token\n'},
+            'a password command that reads a file only root reads': {
+                'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="cat /etc/restic/pw"\n',
+                'etc/restic/pw': {'text': 'hunter2\n', 'mode': '600'}},
+            'a password command that asks a tool': {
+                'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="pass show backup/restic"\n'
+                                      'export GIT_PASSWORD_HELPER="secret-tool lookup app x"\n'},
+            'an id file, not a key': {'etc/environment': 'AWS_ACCESS_KEY_ID_FILE=/etc/aws/id\n',
+                                      'etc/aws/id': 'AKIDX\n'},
         }
         for name, change in passes.items():
             with self.subTest(name):
@@ -746,7 +796,7 @@ class EveryWallsFile(Case):
         passes = {
             "a distro's timeout drop-in": {'usr/lib/systemd/system/service.d/10-timeout-abort.conf':
                                            '[Service]\nTimeoutStopFailureMode=abort\n'},
-            "the launcher's own IPAddressDeny": {
+            "an IPAddressDeny that adds to the list": {
                 'run/systemd/system.control/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf': safe},
             "another service's drop-in": {'etc/systemd/system/ssh.service.d/x.conf': '[Service]\nPrivateDevices=no\n',
                                           'etc/systemd/system/forkd.service.d/x.conf': '[Service]\nUser=x\n'},
@@ -761,6 +811,87 @@ class EveryWallsFile(Case):
         for name, change in passes.items():
             with self.subTest(name):
                 self.assertNotIn('job-units', self.walls('linux', 'describe', self.root(overlay(LINUX, change)))[1])
+
+    def launchers_deny(self):
+        """The launcher's job unit IPAddressDeny ranges: PRIVATE4 and ::/0 (sandbox())."""
+        text = slurp(LAUNCHER)
+        m = re.search(r'^PRIVATE4=\(([^)]*)\)', text, re.M)
+        self.assertIn('-p "IPAddressDeny=${PRIVATE4[*]} $own ::/0"', text)
+        return m.group(1).split() + ['::/0']
+
+    def test_linux_job_units_deny_list_is_the_launchers(self):
+        """The ranges job-units wants after a reset (JOB_DENY) are the ones the launcher's sandbox() denies."""
+        m = re.search(r'^JOB_DENY = (\(.*?\))$', slurp(os.path.join(FOLDER, 'linux')), re.M | re.S)
+        self.assertEqual(sorted(ast.literal_eval(m.group(1))), sorted(self.launchers_deny()))
+
+    def test_linux_job_units_reads_resets_slices_and_stop_timeouts(self):
+        """PR #213 re-checks (correctness N1; security N2, N3). systemd's own set-property drop-in (refresh-net's, in
+        /run/systemd/transient for a transient unit) starts with an empty IPAddressDeny= and then lists the merged
+        ranges: only what follows the last empty line counts, and it passes while that list still holds every range
+        the launcher denies; a reset to a shorter list FAILS. A slice the job units sit in (system.slice, -.slice,
+        every slice: slice.d) that allows more than localhost reopens the home network (allow beats deny, and a unit
+        takes its slices' rules): FAILS. A stop timeout of infinity (or 0, or longer than STOP_MAX) lets a job that
+        ignores SIGTERM run on past its limit: FAILS, in a drop-in or in systemd's own config."""
+        header = ('# This is a drop-in unit file extension, created via "systemctl set-property"\n'
+                  '# or an equivalent operation. Do not edit.\n')
+        dropin = 'run/systemd/transient/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf'
+
+        def as_systemd_writes(prefixes):
+            return header + '[Service]\nIPAddressDeny=\n' + ''.join(f'IPAddressDeny={p}\n' for p in prefixes) + '\n'
+        deny = self.launchers_deny()
+        own = ['198.51.100.7/32', '203.0.113.7/32']
+        fails = {
+            'a reset to only the own address': {dropin: as_systemd_writes(['203.0.113.7/32'])},
+            'a reset that drops one range': {dropin: as_systemd_writes([d for d in deny if d != '100.64.0.0/10'])},
+            'a reset that drops IPv6': {dropin: as_systemd_writes([d for d in deny if d != '::/0'])},
+            'a full list, then a reset to less': {dropin: as_systemd_writes(deny) +
+                                                  'IPAddressDeny=\nIPAddressDeny=10.0.0.0/8\n'},
+            'a reset alone': {dropin: header + '[Service]\nIPAddressDeny=\n'},
+            'system.slice allows any': {'etc/systemd/system/system.slice.d/10-lan.conf':
+                                        '[Slice]\nIPAddressAllow=any\n'},
+            '-.slice allows the home network': {'etc/systemd/system/-.slice.d/10-lan.conf':
+                                                '[Slice]\nIPAddressAllow=192.168.0.0/16\n'},
+            'every slice allows any, from /usr': {'usr/lib/systemd/system/slice.d/10-lan.conf':
+                                                  '[Slice]\nIPAddressAllow=any\n'},
+            'system.slice itself allows any': {'etc/systemd/system/system.slice':
+                                               '[Slice]\nIPAddressAllow=link-local\n'},
+            'a slice that sets a BPF program': {'run/systemd/system/system.slice.d/x.conf':
+                                                '[Slice]\nIPIngressFilterPath=/sys/fs/bpf/x\n'},
+            'an endless stop timeout': {'etc/systemd/system/service.d/10-slow.conf':
+                                        '[Service]\nTimeoutStopSec=infinity\n'},
+            'a stop timeout of 0': {'run/systemd/system/fork-fleet-.service.d/x.conf': '[Service]\nTimeoutSec=0\n'},
+            'a stop timeout of a day': {'etc/systemd/system/service.d/x.conf': '[Service]\nTimeoutAbortSec=1d\n'},
+            "systemd's default stop timeout endless": {'etc/systemd/system.conf.d/x.conf':
+                                                       '[Manager]\nDefaultTimeoutStopSec=infinity\n'},
+            "systemd's default, in system.conf, only root reads": {
+                'etc/systemd/system.conf': {'text': '[Manager]\nDefaultTimeoutStopSec=2h\n', 'mode': '600'}},
+        }
+        passes = {
+            "refresh-net's set-property, as systemd writes it": {dropin: as_systemd_writes(deny + own)},
+            'a reset, then the list in another order': {dropin: as_systemd_writes(own + list(reversed(deny)))},
+            'a reset, then the list in words': {dropin: as_systemd_writes(
+                [d for d in deny if not d.startswith(('127.', '169.254.', '224.'))] +
+                ['localhost', 'link-local', 'multicast'])},
+            'a stock slice drop-in': {'usr/lib/systemd/system/system.slice.d/10-oomd.conf':
+                                      '[Slice]\nManagedOOMMemoryPressure=kill\nIPAccounting=yes\n'},
+            'a slice that allows only localhost': {'etc/systemd/system/system.slice.d/x.conf':
+                                                   '[Slice]\nIPAddressAllow=localhost\n'},
+            'a slice allow that is reset': {'etc/systemd/system/system.slice.d/x.conf':
+                                            '[Slice]\nIPAddressAllow=any\nIPAddressAllow=\n'},
+            "another slice's drop-in": {'etc/systemd/system/user.slice.d/x.conf': '[Slice]\nIPAddressAllow=any\n'},
+            'a finite stop timeout': {'usr/lib/systemd/system/service.d/10-timeout.conf':
+                                      '[Service]\nTimeoutStopSec=90s\nTimeoutAbortSec=3min\n'},
+            "systemd's stock system.conf": {'etc/systemd/system.conf':
+                                            '[Manager]\n#DefaultTimeoutStopSec=90s\nDefaultTimeoutStopSec=10s\n'},
+        }
+        for name, change in fails.items():
+            with self.subTest(name):
+                p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)))
+                self.assertIn('FAIL  job-units', p.stdout, name + ': ' + p.stdout + p.stderr)
+        for name, change in passes.items():
+            with self.subTest(name):
+                p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)))
+                self.assertIn('PASS  job-units', p.stdout, name + ': ' + p.stdout + p.stderr)
 
     def test_linux_etc_secrets_advice_fits_the_file(self):
         """Issue #211: a file every login reads (/etc/environment, a shell's start file, fish's) cannot be made
