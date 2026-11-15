@@ -443,6 +443,10 @@ chmod 600 /etc/fork-fleet/launch.conf
 ( umask 077; read -rsp 'token: ' t; printf '%s\n' "$t" > /etc/fork-fleet/token ); echo
 # RUNNER_USERS: one user per slot of the pool (step 1). WORK_ROOT (/var/lib/fork-fleet/runners): the launcher makes
 # it 0711. Every directory above it must let the runner users through (o+x), or no runner can reach its copy.
+# WORK_ROOT, HOOK and RESOLV_CONF are bound into every job: never under /home, /root, /mnt, /media or /srv (refused,
+# also through a symlink). A bind mount is not seen (it has no link to resolve): never bind-mount a data folder at
+# one of them, or at a folder above one (prune also deletes runner copies in WORK_ROOT). The hook's folder must be
+# root's and writable by root alone (start refuses a shared one such as /var/tmp).
 # NET_BASE (10.204), RESOLV_CONF (/etc/fork-fleet/resolv.conf), TEMPLATE (/opt/fork-fleet/template/runner-template)
 # and RUNNER_MIN (none: the oldest runner version refresh may install): add a line only to change one (step 1b).
 # OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is

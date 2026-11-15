@@ -60,12 +60,28 @@
 # tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an https
 # URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
 # empty for none) have defaults below.
+# HOOK (and the two files beside it), WORK_ROOT and RESOLV_CONF are bound into every job too: never under a folder that
+# holds data (/home, /root, /mnt, /media, /srv), also through a symlink (no_data). A bind mount of a data folder at
+# one of them is not seen (it has no link to resolve): that is the operator's to avoid (.github/fork-fleet.md, step 4).
 # FORK_FLEET_WALLS_ROOT: the walls' test knob (fork-fleet-walls.py), `paths` only and never as root: a fake machine
 # whose launch.conf and paths it reads.
 set -euo pipefail
 umask 077
 
-warn() { printf 'fork-fleet-launch: %s\n' "$*" >&2; }
+# Every message goes out through here, and text from outside is in some of them (a lookup service's answer, curl's
+# or iptables' words, a caller's argument): printable ASCII only, so ESC, BEL, a bidi mark or any other byte reaches a
+# terminal as ?, never raw (an OSC 52 clipboard write, a hidden OSC 8 link), and at most 2000 bytes.
+shown() {
+  local LC_ALL=C s=$1
+  s=${s//[^ -~]/?}
+  printf '%s' "${s:0:2000}"
+}
+# A probe's lines (check-net's: host file, socket and mount names, a job's view of them) through the same shown().
+shown_lines() {
+  local l
+  while IFS= read -r l || [[ -n $l ]]; do printf '%s\n' "$(shown "$l")"; done
+}
+warn() { printf 'fork-fleet-launch: %s\n' "$(shown "$*")" >&2; }
 die() {
   warn "$@"
   exit 1
@@ -131,12 +147,16 @@ active() {
 # dispatchers, one per pool, may drive one host). WORK_ROOT: each runner user passes through it to its own copy
 # (0711: it cannot list the others). RUN_DIR: root only.
 setup() {
+  local real
+  # Never under a root that holds data (no_data), as written or as resolved: checked before anything is made there.
+  bound_real "$WORK_ROOT"
   (umask 022 && mkdir -p -- "$WORK_ROOT")
   mkdir -p -- "$RUN_DIR"
   owned_safe "$WORK_ROOT"
   owned_safe "$RUN_DIR"
   # From here on its real path (a link in a folder above it resolved): the copies are made, bound and pruned there.
-  WORK_ROOT=$(real_path "$WORK_ROOT")
+  bound_real "$WORK_ROOT"
+  WORK_ROOT=$real
   chmod 0711 -- "$WORK_ROOT"
   chmod 0700 -- "$RUN_DIR"
   launch_lock
@@ -699,18 +719,23 @@ own_address() {
 }
 
 # What the table and the units block (sets blocked): the addresses own_address found now ($1), then those blocked
-# before (RUN_DIR/own-address), at most 4, newest first: a lookup that is down this time (each WAN link seen by
-# another one) or an address that just changed opens nothing that was blocked. Under the launch lock.
+# before (RUN_DIR/own-address), newest first, at most 4 or one per lookup URL if there are more: a lookup that is down
+# this time (each WAN link seen by another one) or an address that just changed opens nothing that was blocked, and
+# every address found now is always in (more URLs than 4 never push one out). The edge left: a lookup that lies with
+# a new public address on every pass while the honest ones are down pushes the real one out after that many passes;
+# the honest lookup's next answer blocks it again. Under the launch lock.
 merge_own() {
-  local a old=''
+  local a old='' urls cap=4
   local -a all
+  read -ra urls <<<"${OWN_ADDRESS_URLS//,/ }"
+  ((${#urls[@]} <= cap)) || cap=${#urls[@]}
   blocked=$1
   [[ ! -f $RUN_DIR/own-address ]] || old=$(<"$RUN_DIR/own-address")
   for a in $old; do
     if [[ $a =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ && " $blocked " != *" $a "* ]]; then blocked+=" $a"; fi
   done
   read -ra all <<<"$blocked"
-  blocked=${all[*]:0:4}
+  blocked=${all[*]:0:cap}
 }
 
 ip4_int() {
@@ -835,7 +860,8 @@ resolv_target() {
 # them in a bind's source. What job_view checks and binds, so a link in a folder above a path (/opt/x -> /c, /home,
 # a share) never leads a job past the checks. Dies when it is no plain path, or when a folder above it is one a user
 # but root could swap for a link (others may write it, and it is not sticky): then the bind could come from another
-# place than the one checked. A folder root alone may change cannot change between this check and the bind.
+# place than the one checked. A folder only its owner or its group may write passes: the runner users own nothing
+# outside their copies and are in no group but their own (check_users), so they cannot swap a link into it.
 real_path() {
   local real d
   real=$(realpath -m -- "$ROOT$1") || die "$1: cannot resolve it"
@@ -853,11 +879,29 @@ real_path() {
 }
 
 # A path no job ever sees of this host's: its own of these or none (/proc, /sys, /dev, /run, /tmp, /var/tmp), or one
-# that holds data (/home, /root, /mnt, /media, /srv).
+# that holds data (no_data). The rule of the list's and ALLOW_PATHS' lines.
 never() {
-  case $1/ in /proc/* | /sys/* | /dev/* | /run/* | /tmp/* | /var/tmp/* | /home/* | /root/* | /mnt/* | /media/* | /srv/*)
+  case $1/ in /proc/* | /sys/* | /dev/* | /run/* | /tmp/* | /var/tmp/*)
     die "$2: a job never sees it from this host (its own, none, or data): not a path to allow" ;;
   esac
+  no_data "$1" "$2"
+}
+
+# A path that holds data (/home, /root, /mnt, /media, /srv): no job sees one, by any name. The rule of every other
+# path a job's unit gets (bound_real); the own-or-none roots are never's alone, as these may be there (the jobs'
+# resolv.conf may be a file in /run, like systemd-resolved's, and the walls proof keeps its files in /var/tmp).
+no_data() {
+  case $1/ in /home/* | /root/* | /mnt/* | /media/* | /srv/*)
+    die "$2: a job never sees it from this host (it holds data): not a path to allow" ;;
+  esac
+}
+
+# The real path of a file or folder a job's unit gets besides the list's (the hook and the two files beside it,
+# WORK_ROOT, the jobs' resolv.conf), in real: refused when it holds data (no_data), as written or once resolved.
+bound_real() {
+  no_data "$1" "$1"
+  real=$(real_path "$1")
+  no_data "$real" "$1 (that is $real)"
 }
 
 # THE rule of what a job sees of this host's files, in one place (the per-OS walls read it through `paths`): an allow
@@ -906,7 +950,7 @@ job_view() {
   done
   for p in "$HOOK" "$hook_dir/fork-fleet.py" "$hook_dir/fork-fleet.json"; do
     [[ $p == "$HOOK" || -e $ROOT$p ]] || continue
-    real=$(real_path "$p")
+    bound_real "$p"
     view_ro+=("$real:$p")
   done
 }
@@ -916,7 +960,7 @@ job_view() {
 # own /proc, /sys, /dev and memory file systems are allowed there); and from, each of them with the device and inode
 # its source has here, which the probe compares with what the unit has there (a link swapped in after job_view shows).
 job_fs() {
-  local root=$1 rw=$2 resolv=$3 i b
+  local root=$1 rw=$2 resolv=$3 i b real
   local -a ro=() view_ro view_links
   job_view
   rm -rf --one-file-system -- "$root"
@@ -934,7 +978,8 @@ job_fs() {
     props_fs+=(-p "BindPaths=$rw:$rw:norbind")
     seen+=" $rw"   # made after this (start), under WORK_ROOT's real path
   fi
-  b=$(real_path "$RESOLV_CONF")
+  bound_real "$RESOLV_CONF"
+  b=$real
   resolv_bind=$b:$resolv
   seen+=" $resolv" from+=" $resolv=$(stat -L -c '%d:%i' -- "$b")"
   from=${from# }
@@ -942,14 +987,15 @@ job_fs() {
 
 # paths: job_view, for the walls, with WORK_ROOT (each job's copy is in it) and the jobs' resolv.conf. Reads only.
 paths() {
-  local b
+  local b real out=''
   local -a view_ro view_links
   job_view
-  for b in "${view_ro[@]}"; do printf '%s %s\n' "${b#*:}" "${b%%:*}"; done
-  b=$(real_path "$WORK_ROOT")
-  printf '%s %s\n' "$b" "$b"
-  b=$(real_path "$RESOLV_CONF")
-  printf '/etc/resolv.conf %s\n' "$b"
+  for b in "${view_ro[@]}"; do out+="${b#*:} ${b%%:*}"$'\n'; done
+  bound_real "$WORK_ROOT"
+  out+="$real $real"$'\n'
+  bound_real "$RESOLV_CONF"
+  # All or nothing: a refused path prints no line at all, so no reader takes the lines before it for the whole list.
+  printf '%s/etc/resolv.conf %s\n' "$out" "$real"
 }
 
 # The sandbox of every runner unit, and of check-net's probes (which prove it): the props array. Its own network
@@ -982,7 +1028,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv bad own blocked seen from
+  local name=$1 dir env_file line key value user resolv bad own blocked seen from f real
   local -a props
   local -A got=()
   name_ok "$name"
@@ -1009,6 +1055,12 @@ start() {
   [[ -z $bad ]] || die "$TEMPLATE has a file that is not this user's or that others may write, a special file or a" \
     "setuid, setgid or sticky one: $bad"
   owned_safe "$HOOK"
+  # The two files the hook runs: every job sees them (job_view), so no runner user may change them for the next one.
+  # Its folder too (where it really is): they are checked here but bound later (job_view binds them if they exist
+  # then), so no one else may make one there in between (a shared folder such as /var/tmp, sticky or not, is refused).
+  real=$(real_path "$HOOK")
+  owned_safe "${real%/*}"
+  for f in "${HOOK%/*}/fork-fleet.py" "${HOOK%/*}/fork-fleet.json"; do [[ ! -e $f && ! -L $f ]] || owned_safe "$f"; done
   template_version >/dev/null
   check_users
   resolv=$(resolv_target)
@@ -1262,13 +1314,15 @@ check_net() {
   merge_own "$own"
   net_up "$user"
   sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/check-net.root" ''
-  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from"
+  # Every probe's words (the names of files any local user may make among them) reach the terminal through shown().
+  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from" 2>&1 | shown_lines
   echo "check-net: as $user, in its namespace fork-fleet-$user"
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-net --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null ||
-    rc=$?
+    -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null 2>&1 |
+    shown_lines || rc=$?
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-walls --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" </dev/null || rc=$((rc | 2))
+    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" </dev/null 2>&1 |
+    shown_lines || rc=$((rc | 2))
   ((rc == 0)) || die "check-net: the runners' network or walls are NOT as they must be (see above): do not use this pool"
   echo "check-net: the runners reach $url and none of the $((${#pairs[@]} / 2)) services named nor this host's own" \
     "public address; AF_VSOCK, io_uring and 32-bit system calls are closed; no host device, socket or mount but the" \
