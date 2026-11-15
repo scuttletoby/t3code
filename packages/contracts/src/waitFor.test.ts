@@ -84,11 +84,29 @@ describe("WaitCheck", () => {
     expect(decodeCheck({ argv: ["/usr/bin/true"] })).toEqual({
       argv: ["/usr/bin/true"],
       maxArgs: 0,
-      argPattern: "^[A-Za-z0-9._:/@=+-]{1,200}$",
+      argPattern: "^[A-Za-z0-9._:/][A-Za-z0-9._:/@=+-]{0,199}$",
       intervalSeconds: 30,
       timeoutSeconds: 20,
       description: "",
     });
+  });
+
+  it("the default argument pattern refuses a leading -, =, @ or + and takes names, refs and paths", () => {
+    const pattern = new RegExp(`^(?:${decodeCheck({ argv: ["x"] }).argPattern})$`, "u");
+    for (const bad of ["-x", "=x", "@file", "+cmd", "", "a b", "a".repeat(201)]) {
+      expect(pattern.test(bad), bad).toBe(false);
+    }
+    for (const good of [
+      "main",
+      "v1.2.3",
+      "feature/x-y",
+      "a=b",
+      "user@host",
+      "c++",
+      "x".repeat(200),
+    ]) {
+      expect(pattern.test(good), good).toBe(true);
+    }
   });
 
   it("refuses an empty argv, a pattern that does not compile and out-of-range numbers", () => {
