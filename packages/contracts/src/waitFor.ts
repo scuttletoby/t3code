@@ -244,6 +244,7 @@ export const WaitUnitScope = Schema.Literals(["system", "user"]);
 
 const PrNumber = PositiveInt;
 const PrRepository = TrimmedNonEmptyString.check(Schema.isMaxLength(200));
+const PrHost = TrimmedNonEmptyString.check(Schema.isMaxLength(255));
 const FilePath = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(1000));
 const UnitName = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200));
 const CheckArg = Schema.String.check(Schema.isMaxLength(1000));
@@ -253,6 +254,12 @@ const SlotAccount = ProviderInstanceId;
 export const WaitPrSpec = Schema.Struct({
   number: PrNumber,
   repository: Schema.optionalKey(PrRepository),
+  /**
+   * Stored only, never asked for: the pull request's host, written with its repository at the
+   * wait's first read, so a later change of the project's remote never moves the wait to another
+   * pull request. A wait without it (stored before it existed) gets both at its next read.
+   */
+  host: Schema.optionalKey(PrHost),
   until: WaitPrUntil,
 });
 export const WaitFileSpec = Schema.Struct({ path: FilePath, until: WaitFileUntil });

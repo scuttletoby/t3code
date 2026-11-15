@@ -38,6 +38,11 @@ export interface WaitJudgeContext {
    * same project's check. Without it the check judge works it out itself.
    */
   readonly place?: CheckPlace | undefined;
+  /**
+   * Fixes the wait's target to what this read resolved (a `pr` wait's repository and host), so
+   * later reads keep to it. Kept only while the wait is still waiting with the target judged.
+   */
+  readonly pin?: ((target: WaitTarget) => Effect.Effect<void>) | undefined;
 }
 
 export type WaitJudge<K extends WaitKind = WaitKind> = (
