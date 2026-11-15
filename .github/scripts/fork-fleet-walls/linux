@@ -121,8 +121,8 @@ def container_wall():
 def job_view():
     """What a job sees of this host's files, as fork-fleet-launch.sh's job_fs builds it (the one place of that rule):
     the allow list JOB_PATHS (default: fork-fleet-job-paths.txt beside the launcher) and ALLOW_PATHS of launch.conf,
-    each without what is mounted under it, and the job's WORK_ROOT, HOOK and RESOLV_CONF. Returns (the allow list's
-    path, its paths and ALLOW_PATHS, the other three)."""
+    each without what is mounted under it, and the job's WORK_ROOT, HOOK (and the two files it runs, beside it) and
+    RESOLV_CONF. Returns (the allow list's path, its paths and ALLOW_PATHS, the others)."""
     conf = {}
     if os.path.lexists(ROOT + LAUNCH_CONF):
         text = read(LAUNCH_CONF)
@@ -143,7 +143,9 @@ def job_view():
         raise ValueError(f'the jobs\' allow list {where} is a link, or not owned by uid {os.geteuid()} and writable '
                          'by it alone')
     listed += [p for p in conf.get('ALLOW_PATHS', '').split(',') if p]
-    return where, listed, [conf.get(k, v) for k, v in SEEN.items()]
+    seen = [conf.get(k, v) for k, v in SEEN.items()]
+    hook_dir = os.path.dirname(conf.get('HOOK', SEEN['HOOK']))   # and the two files the hook runs, beside it
+    return where, listed, seen + [hook_dir + '/fork-fleet.py', hook_dir + '/fork-fleet.json']
 
 
 def mounts_wall():
