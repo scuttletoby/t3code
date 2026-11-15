@@ -390,6 +390,24 @@ const LegacyProviderSettingsJson = fromLenientJson(
 );
 const decodeLegacyProviderSettingsJsonExit = Schema.decodeUnknownExit(LegacyProviderSettingsJson);
 
+/**
+ * The load's decode of a settings file's text: parse, rename retired keys, fill policy defaults,
+ * decode. Pure, so the fork's read-only report (`__fork-report`) decodes exactly as a load does.
+ */
+export function decodeSettingsFileText(
+  raw: string,
+  withDefaults: (persisted: unknown) => unknown = (persisted) => persisted,
+) {
+  const parsed = decodeSettingsFileJsonExit(raw);
+  return Exit.isFailure(parsed)
+    ? parsed
+    : decodePersistedServerSettingsExit(withDefaults(renameRetiredAutoUpdateKeys(parsed.value)));
+}
+
+/** True when the load would also refuse the file's legacy provider or source control keys. */
+export const settingsFileLegacyKeysUnreadable = (raw: string): boolean =>
+  Exit.isFailure(decodeLegacyProviderSettingsJsonExit(raw));
+
 const LEGACY_BITBUCKET_SECRET_NAMES: Readonly<Record<string, string>> = {
   accessToken: "bitbucket-access-token",
   apiToken: "bitbucket-api-token",
@@ -793,12 +811,7 @@ const make = Effect.gen(function* () {
 
     if (yield* readConfigExists) {
       const raw = yield* readRawConfig;
-      const parsed = decodeSettingsFileJsonExit(raw);
-      const decoded = Exit.isFailure(parsed)
-        ? parsed
-        : decodePersistedServerSettingsExit(
-            managed.withDefaults(renameRetiredAutoUpdateKeys(parsed.value)),
-          );
+      const decoded = decodeSettingsFileText(raw, managed.withDefaults);
       const legacySettings = decodeLegacyProviderSettingsJsonExit(raw);
       if (legacySettings._tag === "Success") {
         legacyProviders = legacySettings.value.providers;
