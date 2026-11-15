@@ -2,7 +2,9 @@
 """Tests of fork-fleet-desk.py (the desk link's always-on side) and of fork-fleet-desk-wire.py, its wire format, with
 the contract between the wire and fork-fleet-launch.sh and fork-fleet.py. A fake desk agent on pipes, real Unix sockets
 in a temp directory; no root, no ssh, no network. Run: python3 <this>. Linux only."""
-import importlib.util, inspect, io, os, re, signal, subprocess, sys, tempfile, threading, time, unittest
+import importlib.util, inspect, io, json, os, pwd, re, signal, socket, subprocess, sys, tempfile, threading, time, types
+import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -92,7 +94,7 @@ class Link(unittest.TestCase):
         self.assertEqual(self.launch('active'), (0, 'fleet-desk-1\n', ''))
         self.assertEqual(self.launch('start', 'fleet-desk-5', stdin=START_IN)[0], 0)
         self.assertEqual(self.launch('fits', '4096'), (1, '', 'not enough memory?[2J\n'))   # escapes made harmless
-        self.assertEqual(oct(os.stat(self.sock).st_mode & 0o777), '0o600')
+        self.assertEqual(oct(os.stat(self.sock).st_mode & 0o777), '0o660')
         self.assertEqual(oct(os.stat(self.dir).st_mode & 0o777), '0o700')
         agent.hang_up()
         t.join(5)
@@ -104,7 +106,6 @@ class Link(unittest.TestCase):
         self.assertEqual(self.launch('active')[0], wire.NO_SESSION)        # no directory at all (after a boot)
         os.mkdir(self.dir, 0o700)
         self.assertEqual(self.launch('active')[0], wire.NO_SESSION)        # no socket
-        import socket
         with socket.socket(socket.AF_UNIX) as s:                          # a socket left by a killed session
             s.bind(self.sock)
         code, _, err = self.launch('active')
@@ -240,6 +241,230 @@ class Link(unittest.TestCase):
         self.assertFalse(os.path.exists(self.sock))
         self.assertEqual(self.launch('active')[0], wire.NO_SESSION)
 
+    # -- reviewer tests (PR #192, correctness lens): each fails when its guard is removed
+    def test_peer_of_another_uid_is_dropped_without_a_second_user(self):
+        # SO_PEERCRED faked: the peer looks like uid 4242, in no group of the socket. No second user, no root needed.
+        agent = Agent(lambda f: wire.answer(0))
+        t, _, _ = self.serve(agent)
+        real = desk.struct
+        fake = types.SimpleNamespace(unpack=lambda fmt, b: (real.unpack(fmt, b)[0], 4242, 4242))
+        with mock.patch.object(desk, 'struct', fake):
+            code = self.launch('active', wait=2)[0]
+        self.assertNotEqual(code, 0)
+        self.assertEqual([f for f in agent.got if 'id' in f], [])          # nothing reached the agent
+        self.assertEqual(self.launch('active')[0], 0)                      # own uid still served
+        agent.hang_up(); t.join(5)
+
+    def test_stale_socket_of_a_killed_serve_is_replaced(self):
+        os.mkdir(self.dir, 0o700)
+        with socket.socket(socket.AF_UNIX) as s:                          # left by a SIGKILLed serve
+            s.bind(self.sock)
+        agent = Agent(lambda f: wire.answer(0, 'x\n'))
+        t, result, log = self.serve(agent)
+        time.sleep(0.2)
+        self.assertTrue(t.is_alive(), log.getvalue())
+        self.assertEqual(self.launch('active')[:2], (0, 'x\n'))
+        agent.hang_up(); t.join(5)
+
+    def test_serve_rechecks_a_raw_request(self):
+        agent = Agent(lambda f: wire.answer(0))
+        t, _, _ = self.serve(agent)
+        for raw in (b'{"v":1,"verb":"rm","args":["-rf"]}\n',
+                    b'{"v":1,"verb":"start","args":["x-1"],"stdin":"EVIL=1\\n"}\n',
+                    b'{"v":1,"verb":"active","args":[]}\n{"v":1,"verb":"prune","args":[]}\n'):
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(self.sock); s.sendall(raw); s.settimeout(3)
+                got = wire.decode(s.recv(65536).split(b'\n')[0])
+            self.assertEqual(got['exit'], 2, raw)
+        self.assertEqual([f for f in agent.got if 'id' in f], [])
+        agent.hang_up(); t.join(5)
+
+    def test_serve_own_deadline_answers_unknown(self):
+        agent = Agent(lambda f: None)
+        t, _, _ = self.serve(agent)
+        with mock.patch.object(desk.wire, 'serve_seconds', lambda verb: 0.3):
+            code, _, err = self.launch('active', wait=5)
+        self.assertEqual(code, wire.UNKNOWN)
+        self.assertIn('no answer in time', err)
+        agent.hang_up(); t.join(5)
+
+    def test_answer_to_an_id_never_sent_ends_the_session(self):
+        agent = Agent(lambda f: wire.answer(0))
+        t, result, log = self.serve(agent)
+        os.write(agent.to_serve_w, wire.encode({**wire.answer(0), 'id': 99}))
+        t.join(5)
+        self.assertEqual(result.get('code'), 1)
+        self.assertIn('never sent', log.getvalue())
+
+    def test_launch_refuses_a_socket_of_another_owner(self):
+        os.mkdir(self.dir, 0o700)
+        with socket.socket(socket.AF_UNIX) as s:
+            s.bind(self.sock)
+        real = os.lstat
+        def fake(p, *a, **k):
+            st = real(p, *a, **k)
+            return types.SimpleNamespace(st_mode=st.st_mode, st_uid=4242) if p == self.sock else st
+        with mock.patch.object(desk.os, 'lstat', fake):
+            code, _, err = self.launch('active')
+        self.assertEqual(code, 1, err)
+
+    def test_silent_client_is_dropped(self):
+        agent = Agent(lambda f: wire.answer(0))
+        t, _, _ = self.serve(agent)
+        with mock.patch.object(desk, 'CLIENT', 0.3):
+            s = socket.socket(socket.AF_UNIX); s.connect(self.sock); s.settimeout(5)
+            self.assertEqual(s.recv(10), b'')                              # closed after CLIENT s, not held
+            s.close()
+        agent.hang_up(); t.join(5)
+
+    # -- fix round 1 (PR #192)
+    def test_serve_never_runs_as_root(self):
+        with mock.patch.object(desk.os, 'geteuid', lambda: 0):
+            with self.assertRaises(desk.Refused) as e:
+                desk.serve(POOL, self.dir, *os.pipe(), log=io.StringIO())
+        self.assertIn('never runs as root', str(e.exception))
+        self.assertFalse(os.path.exists(self.dir))                         # refused before it touched anything
+
+    def test_root_launch_takes_the_desk_users_directory(self):
+        # The dispatcher (root) reaches a directory owned by the desk-link user ($FORK_FLEET_DESK_USER, default
+        # fleet-desk), and no other user's.
+        os.mkdir(self.dir, 0o710)
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        with mock.patch.object(desk.os, 'geteuid', lambda: 0):
+            for env, want in (({'FORK_FLEET_DESK_USER': me}, wire.NO_SESSION),
+                              ({'FORK_FLEET_DESK_USER': 'no-such-x'}, 1)):
+                try:
+                    code = desk.launch(POOL, 'active', [], None, self.dir, io.StringIO(), io.StringIO(), env=env)
+                except desk.Refused as e:
+                    code = e.code
+                self.assertEqual(code, want, env)
+
+    def test_socket_is_0660_in_the_directory_group_and_the_group_is_let_in(self):
+        mine = [g for g in os.getgroups() if g != os.getegid()]
+        gid = mine[0] if mine else os.getegid()                          # another group of this user, when it has one
+        os.mkdir(self.dir, 0o710)
+        os.chown(self.dir, -1, gid)
+        agent = Agent(lambda f: wire.answer(0, 'ok\n'))
+        born, chown = [], os.chown                                       # its mode as bound, before chown/chmod
+        def seen(p, u, g):
+            born.append(os.stat(p).st_mode & 0o777)
+            chown(p, u, g)
+        with mock.patch.object(desk.os, 'chown', seen):
+            t, _, log = self.serve(agent)
+            for _ in range(200):
+                if born or not t.is_alive():
+                    break
+                time.sleep(0.01)
+        self.assertEqual(born, [0o600], log.getvalue())                  # owner only until the group is set
+        st = os.stat(self.sock)
+        self.assertEqual((oct(st.st_mode & 0o777), st.st_gid), ('0o660', gid), log.getvalue())
+        real = desk.struct                                               # the dispatcher's user: another uid, the group
+        fake = types.SimpleNamespace(unpack=lambda fmt, b: (real.unpack(fmt, b)[0], 4242, gid))
+        with mock.patch.object(desk, 'struct', fake):
+            self.assertEqual(self.launch('active')[:2], (0, 'ok\n'))
+        agent.hang_up(); t.join(5)
+
+    @unittest.skipIf(os.geteuid() == 0, 'root opens any file')
+    def test_a_lock_or_directory_left_by_an_older_root_serve_is_refused_clearly(self):
+        os.mkdir(self.dir, 0o700)
+        os.close(os.open(os.path.join(self.dir, f'{POOL}.lock'), os.O_CREAT | os.O_WRONLY, 0o000))
+        with self.assertRaises(desk.Refused) as e:
+            desk.serve(POOL, self.dir, *os.pipe(), log=io.StringIO())
+        self.assertIn('older serve that ran as root', str(e.exception))
+        shut = os.path.join(self.tmp.name, 'shut')                       # a /run it cannot write: tmpfiles' job
+        os.mkdir(shut, 0o500)
+        with self.assertRaises(desk.Refused) as e:
+            desk.serve(POOL, os.path.join(shut, 'run'), *os.pipe(), log=io.StringIO())
+        self.assertIn('systemd-tmpfiles', str(e.exception))
+        os.chmod(shut, 0o700)
+
+    def test_wrong_wire_version_says_which_side_to_upgrade(self):
+        for v, side in ((0, 'upgrade the desktop agent'), (2, "upgrade this host's fork-fleet files")):
+            r, w = os.pipe()
+            out_r, out_w = os.pipe()
+            os.write(w, f'{{"v":{v},"hello":"{POOL}"}}\n'.encode())
+            log = io.StringIO()
+            self.assertEqual(desk.serve(POOL, self.dir, r, out_w, log=log), wire.WRONG_VERSION)
+            self.assertIn(side, log.getvalue())
+            for fd in (r, w, out_r, out_w):
+                os.close(fd)
+
+    def test_a_launchers_own_exit_3_is_not_no_session(self):
+        agent = Agent(lambda f: wire.answer(3, '', 'three\n'))
+        t, _, _ = self.serve(agent)
+        code, _, err = self.launch('stop', 'fleet-desk-5')
+        self.assertEqual(code, 1)
+        self.assertIn("the desktop's launcher exited 3", err)
+        agent.hang_up(); t.join(5)
+
+    def test_launch_takes_its_budget_all_told(self):
+        # A stuck serve: connect and send each take nearly CLIENT s, the answer never comes. launch still ends within
+        # its budget, not CLIENT + CLIENT + budget (start's worst case was 120 s, the dispatcher's own limit).
+        os.mkdir(self.dir, 0o700)
+        with socket.socket(socket.AF_UNIX) as s:
+            s.bind(self.sock)
+
+        class Stuck:
+            def __init__(self, *a):
+                self.t = None
+            def settimeout(self, t):
+                self.t = t
+            def connect(self, _):
+                time.sleep(max(0, self.t - 0.05))
+            def sendall(self, _):
+                time.sleep(max(0, self.t - 0.05))
+            def recv(self, _):
+                time.sleep(self.t)
+                raise socket.timeout()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+        began = time.monotonic()
+        with mock.patch.object(desk, 'CLIENT', 1), mock.patch.object(desk.socket, 'socket', Stuck):
+            code = self.launch('active', wait=1.5)[0]
+        self.assertEqual(code, wire.UNKNOWN)
+        self.assertLess(time.monotonic() - began, 1.5 + 0.4)
+
+    def test_an_accept_error_costs_one_client_not_the_session(self):
+        agent = Agent(lambda f: wire.answer(0, 'ok\n'))
+        t, result, log = self.serve(agent)
+        real, failed = socket.socket.accept, []
+
+        def accept(sock):
+            if not failed:
+                failed.append(1)
+                raise OSError(24, 'Too many open files')
+            return real(sock)
+        with mock.patch.object(socket.socket, 'accept', accept):
+            first = self.launch('active', wait=3)[0]
+        self.assertEqual(failed, [1])
+        self.assertEqual(first, 0)                                          # it waited in the backlog, then was taken
+        self.assertTrue(t.is_alive(), log.getvalue())                      # the session goes on
+        self.assertEqual(self.launch('active')[:2], (0, 'ok\n'))
+        self.assertIn('Too many open files', log.getvalue())
+        agent.hang_up(); t.join(5)
+
+    def test_odd_names_and_bytes_never_crash_launch(self):
+        env = {'PATH': os.environ['PATH'], 'FORK_FLEET_DESK_DIR': self.dir}
+        for argv, stdin in (([b'launch', b'\xff\n', b'active'], b''), ([b'launch', b'desk', b'stop', b'\xff-1'], b''),
+                            ([b'launch', b'desk', b'\xc3\xa9'], b''),
+                            ([b'launch', b'desk', b'start', b'x-1'], b'\xff\n'),
+                            ([b'launch', b'de"sk', b'fits', b'1\x00'.replace(b'\x00', b'\x01')], b'')):
+            got = subprocess.run([sys.executable, '-I', DESK.encode(), *argv], env=env, input=stdin,
+                                 capture_output=True, timeout=30)
+            self.assertEqual(got.returncode, 2, (argv, got.stderr))
+            self.assertNotIn(b'Traceback', got.stderr)
+        strict = [io.TextIOWrapper(io.BytesIO(b), encoding='utf-8', errors='strict') for b in (b'\xff\n', b'', b'')]
+        with mock.patch.multiple(desk.sys, stdin=strict[0], stdout=strict[1], stderr=strict[2]):   # a UTF-8 locale
+            self.assertEqual(desk.main(['launch', POOL, 'start', 'x-1'], env), 2)
+        agent = Agent(lambda f: wire.answer(0, 'café \ud800\n'))          # odd text back: shown, not a crash
+        t, _, _ = self.serve(agent)
+        got = subprocess.run([sys.executable, '-I', DESK, 'launch', POOL, 'active'], env=env, capture_output=True,
+                             timeout=30)
+        self.assertEqual((got.returncode, got.stdout.decode()), (0, 'café ?\n'), got.stderr)
+        agent.hang_up(); t.join(5)
+
 
 class Wire(unittest.TestCase):
     """The wire's rules, and its contract with fork-fleet-launch.sh and fork-fleet.py (one source each)."""
@@ -265,8 +490,16 @@ class Wire(unittest.TestCase):
         self.assertIn(f'$url =~ ^{wire.URL.pattern}$ ]]', self.LAUNCH)
 
     def test_every_dispatcher_verb_answers_before_the_dispatcher_gives_up(self):
+        # The agent kills a verb at its limit, serve answers 75 after that, launch ends after that, and all of it
+        # before Host._do's timeout. The verbs are read from Host itself, so a new one is checked too.
         limit = int(re.search(r'timeout=([0-9]+)', inspect.getsource(ff.Host._do)).group(1))
-        for verb in ('start', 'ready', 'active', 'fits', 'stop', 'prune'):
+        src = ''.join(inspect.getsource(f) for f in vars(ff.Host).values() if inspect.isfunction(f))
+        verbs = set(re.findall(r"self\._(?:must|do)\('([a-z-]+)'", src))
+        self.assertEqual(verbs, {'start', 'ready', 'active', 'fits', 'stop', 'prune'})
+        for verb in wire.VERBS:
+            self.assertLess(wire.limit(verb), wire.serve_seconds(verb), verb)
+            self.assertLess(wire.serve_seconds(verb), wire.seconds(verb), verb)
+        for verb in verbs:
             self.assertLess(wire.seconds(verb), limit, verb)
 
     def test_the_dispatchers_start_input_passes(self):
@@ -275,6 +508,37 @@ class Wire(unittest.TestCase):
         for bad in (text + 'X=1\n', text.replace('FORK_FLEET_RUN=123\n', ''), text + text, text.replace('123', '0')):
             with self.assertRaises(wire.WireError):
                 wire.check_start_input(bad)
+
+    def test_deep_json_is_a_wire_error(self):
+        line = b'[' * 100000 + b']' * 100000                             # under MAX_FRAME, too deep for json
+        self.assertLess(len(line), wire.MAX_FRAME)
+        with self.assertRaises(wire.WireError):
+            wire.decode(line)
+        with self.assertRaises(wire.WireError):
+            wire.Reader().feed(line + b'\n')
+
+    def test_answer_text_is_clean_of_lone_surrogates(self):
+        got = wire.check_answer(json.loads('{"v":1,"exit":0,"stdout":"a\\ud800b","stderr":""}'), with_id=False)
+        self.assertEqual(got['stdout'], 'a?b')
+        got['stdout'].encode('utf-8')
+
+    def test_text_is_sized_in_bytes(self):
+        frame = wire.answer(0, '\u00e9' * wire.MAX_TEXT, 'x' * (wire.MAX_TEXT + 5))   # 6 bytes each on the wire
+        self.assertLessEqual(len(wire.encode(frame)), wire.MAX_FRAME)
+        for key in ('stdout', 'stderr'):
+            self.assertLessEqual(wire.text_size(frame[key]), wire.MAX_TEXT)
+            self.assertTrue(frame[key].endswith(wire.CUT))
+        self.assertEqual(wire.fit('short \u00e9'), 'short \u00e9')
+        over = {'v': 1, 'exit': 0, 'stdout': '\u00e9' * (wire.MAX_TEXT // 6 + 1), 'stderr': ''}   # few characters
+        with self.assertRaises(wire.WireError):
+            wire.check_answer(over, with_id=False)
+
+    def test_start_input_ends_in_a_newline(self):
+        with self.assertRaisesRegex(wire.WireError, 'newline'):
+            wire.check_start_input(START_IN[:-1])
+        with self.assertRaisesRegex(wire.WireError, 'newline'):
+            wire.check_start_input(START_IN[:-1] + 'x')
+        wire.check_start_input(START_IN)
 
     def test_frames(self):
         r = wire.Reader()
@@ -292,6 +556,28 @@ class Wire(unittest.TestCase):
                 wire.check_answer(bad, with_id=True)
         with self.assertRaises(wire.WireError):
             wire.check_request({'v': 1, 'verb': 'active', 'args': [], 'stdin': 'x'}, with_id=False)
+
+
+class Install(unittest.TestCase):
+    """The runbook and the key tool (fork-fleet-desk-key.py, row D4) name this program the same way."""
+    DOC = open(os.path.join(HERE, '..', 'fork-fleet.md'), encoding='utf-8').read()
+
+    def test_the_runbook_installs_and_names_the_desk_link(self):
+        self.assertIn(f'command="{desk.FORCED} POOL"', self.DOC)
+        self.assertEqual(desk.FORCED.split()[2], desk.INSTALLED)
+        self.assertIn(f"echo '{desk.TMPFILES}'", self.DOC)
+        for f in ('fork-fleet-desk.py', 'fork-fleet-desk-wire.py'):
+            self.assertIn(f'scripts/{f}:{f}:644', self.DOC)
+        self.assertIn(f'--shell /bin/sh {desk.USER}', self.DOC)            # nologin would close the link
+
+    def test_the_key_tool_writes_this_forced_command(self):
+        tool = os.path.join(HERE, 'fork-fleet-desk-key.py')
+        if not os.path.exists(tool):
+            self.skipTest('fork-fleet-desk-key.py (row D4) is not here yet')
+        src = open(tool, encoding='utf-8').read()
+        self.assertIn(f"DESK = '{desk.INSTALLED}'", src)
+        self.assertIn("SERVE = f'python3 -I {DESK} serve'", src)
+        self.assertIn(f"USER = '{desk.USER}'", src)
 
 
 if __name__ == '__main__':
