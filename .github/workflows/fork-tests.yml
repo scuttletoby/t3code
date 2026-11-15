@@ -369,7 +369,9 @@ jobs:
 
       # The range rules against this gitleaks: a key added and deleted again
       # before a merge of main, a key only a merge commit adds, push ranges,
-      # settings the pull request cannot change, octopus merges.
+      # settings the pull request cannot change, octopus merges; and the
+      # repository's .gitleaks.toml (no path skipped, rules as gitleaks' own),
+      # binary and UTF-16 contents, settings that fail to load.
       - name: Test the scan ranges
         env:
           GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
@@ -379,11 +381,12 @@ jobs:
         env:
           GITLEAKS: ${{ runner.temp }}/gitleaks
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
-          # A pull request's gitleaks settings come from this branch's tip, never from the PR.
+          # A pull request's gitleaks settings come from this branch's tip, never from the PR, and
+          # the PR range is everything its head has that this branch has not, whatever the PR's
+          # base (so a PR against a side branch, or one retargeted later, is still fully read).
           CONFIG_BRANCH: ${{ github.event.repository.default_branch }}
           PARENT_TOKEN: ${{ github.token }}
         # A push leaves out the commits upstream (this fork's parent, as in fork-follow.yml)

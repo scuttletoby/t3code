@@ -39,8 +39,10 @@ else
 # add a key id, and logs how many commits it scanned. Like gitleaks 8.30.1, a git error (a file
 # content fetch that fails) stops it with "0 commits scanned" and exit 0. Settings, found as gitleaks
 # finds them: a config (--config, GITLEAKS_CONFIG, GITLEAKS_CONFIG_TOML, SOURCE/.gitleaks.toml) with
-# an [allowlist] allows every key; a .gitleaksignore (--gitleaks-ignore-path, default ".", and
-# SOURCE) line `<commit>:...` ignores the keys of that commit.
+# an [allowlist] allows every key, and one with `[extend]` and a `path =` line fails to load (FTL,
+# exit 1) unless the file is there; a .gitleaksignore (--gitleaks-ignore-path, default ".", and
+# SOURCE) line `<commit>:...` ignores the keys of that commit, a line `file:aws-access-token:line`
+# the key on that line of that file in any commit.
 set -uo pipefail
 opts="" config="" ignore_path="." source="."
 while [[ $# -gt 0 ]]; do
@@ -59,9 +61,14 @@ elif [[ -n "${GITLEAKS_CONFIG:-}" ]]; then settings="$(cat "$GITLEAKS_CONFIG")"
 elif [[ -n "${GITLEAKS_CONFIG_TOML:-}" ]]; then settings="$GITLEAKS_CONFIG_TOML"
 elif [[ -f "$source/.gitleaks.toml" ]]; then settings="$(cat "$source/.gitleaks.toml")"
 fi
+extend_path="$(sed -nE "s/^[[:space:]]*path[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'].*/\1/p" <<< "$settings" | head -n 1)"
+if [[ "$settings" == *"[extend]"* && -n "$extend_path" && ! -f "$extend_path" ]]; then
+  echo "FTL Failed to load config error=\"failed to load extended config, err: open $extend_path: no such file or directory\""
+  exit 1
+fi
 ignored=" "
 for file in "$ignore_path" "$ignore_path/.gitleaksignore" "$source/.gitleaksignore"; do
-  if [[ -f "$file" ]]; then ignored+="$(grep -oE '^[0-9a-f]{40,64}' "$file" | tr '\n' ' ')"; fi
+  if [[ -f "$file" ]]; then ignored+="$(grep -vE '^[[:space:]]*(#|$)' "$file" | tr '\n' ' ')"; fi
 done
 # Into a file first: `grep -q` stops reading early, and pipefail would read git's SIGPIPE as no match.
 # shellcheck disable=SC2086
@@ -81,11 +88,17 @@ scanned="$(awk '/^commit / { c = $2 } /^diff --git / { d = 0 } /^deleted file mo
   /^@@ / && !d && !(c in s) { s[c] = 1; n++ } END { print n + 0 }' "$TMPDIR/fake-gitleaks.log")"
 echo "INF $scanned commits scanned."
 if [[ "$settings" != *"[allowlist]"* ]]; then
-  # The commits whose diffs add a key, minus the ignored ones.
-  for sha in $(grep -E '^commit |^\+.*(AKIA)[A-Z2-7]{16}' "$TMPDIR/fake-gitleaks.log" |
-    awk '/^commit / { c = $2; next } { print c }' | sort -u); do
-    if [[ "$ignored" != *" $sha "* ]]; then echo "leaks found: 1"; exit 1; fi
-  done
+  # Each added line with a key: "commit file:aws-access-token:line", minus the ignored ones.
+  while read -r sha fingerprint; do
+    if [[ "$ignored" != *" $sha:$fingerprint "* && "$ignored" != *" $fingerprint "* ]]; then
+      echo "leaks found: 1"; exit 1
+    fi
+  done < <(LC_ALL=C awk '
+    /^commit / { c = $2; next }
+    /^\+\+\+ / { f = substr($0, 7); next }
+    /^@@ / { split($3, a, ","); l = substr(a[1], 2) + 0; next }
+    /^\+/ { if ($0 ~ /AKIA[A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7][A-Z2-7]/) print c, f ":aws-access-token:" l; l++ }' \
+    "$TMPDIR/fake-gitleaks.log")
 fi
 echo "no leaks found"
 FAKE
@@ -101,6 +114,13 @@ commit() { # commit FILE CONTENT MESSAGE (each commit one minute newer)
   git add -A
   GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "$3"
 }
+commit_bytes() { # commit_bytes FILE MESSAGE < CONTENT
+  date=$((date + 60))
+  mkdir -p "$(dirname "$1")"
+  cat > "$1"
+  git add -A
+  GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "$2"
+}
 remove() {
   date=$((date + 60))
   git rm -q "$1"
@@ -112,8 +132,8 @@ merge() {
 }
 
 failures=0
-check() { # check NAME EXPECTED_STATUS [GREP_PATTERN] -- runs the scan in $clone with the env given
-  local name="$1" expected="$2" pattern="${3:-}" out status
+check() { # check NAME EXPECTED_STATUS [GREP_PATTERN [ABSENT_PATTERN]] -- runs the scan in $clone with the env given
+  local name="$1" expected="$2" pattern="${3:-}" absent="${4:-}" out status
   set +e
   out="$(cd "$clone" && GITLEAKS="$gitleaks" GITHUB_STEP_SUMMARY="$root/summary" "$script" 2>&1)"
   status=$?
@@ -124,6 +144,10 @@ check() { # check NAME EXPECTED_STATUS [GREP_PATTERN] -- runs the scan in $clone
     failures=$((failures + 1))
   elif [[ -n "$pattern" ]] && ! grep -qE "$pattern" <<< "$out"; then
     echo "FAIL $name: output lacks /$pattern/"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    failures=$((failures + 1))
+  elif [[ -n "$absent" ]] && grep -qE "$absent" <<< "$out"; then
+    echo "FAIL $name: output has /$absent/"
     printf '%s\n' "$out" | sed 's/^/    /'
     failures=$((failures + 1))
   else
@@ -183,7 +207,7 @@ COMMITS=$(git rev-list --count "$base..$leaky")
 export COMMITS
 HEAD_SHA="$leaky" check "pull request: a key added then deleted before a merge of main is found" 1
 HEAD_SHA="$clean" check "pull request: main's own old key is not the PR's" 0
-HEAD_SHA="$leaky" check "pull request: the range is base..head" 1 "\\.\\.$leaky"
+HEAD_SHA="$leaky" check "pull request: the range is <default branch tip>..head" 1 "$base\\.\\.$leaky"
 HEAD_SHA="$evil" check "pull request: a key added only in a merge commit is found" 1
 
 # Two merges of a moving branch, each with 60 conflicts resolved by hand. --remerge-diff writes each
@@ -243,8 +267,9 @@ BEFORE="1111111111111111111111111111111111111111" AFTER="$leaky" \
 EVENT_NAME=workflow_dispatch check "an unknown event fails" 2
 
 export EVENT_NAME=pull_request BEFORE="" AFTER=""
+# The range does not depend on the PR's base (see the script's header).
 BASE_SHA="1111111111111111111111111111111111111111" HEAD_SHA="$leaky" \
-  check "pull request: a base commit that cannot be fetched fails" 2 "cannot fetch commit 1111"
+  check "pull request: the PR's base is not read (one that cannot be fetched changes nothing)" 1 "not on main"
 BASE_SHA="$base" HEAD_SHA="2222222222222222222222222222222222222222" \
   check "pull request: a head commit that cannot be fetched fails" 2 "cannot fetch commit 2222"
 
@@ -386,6 +411,7 @@ new_origin() { # new_origin NAME [OBJECT_FORMAT]
 # A clone with a work tree (as the workflow's checkout has): its files are the PR head's.
 checkout() { # checkout ORIGIN BRANCH
   clone="$root/$1-$2-checkout"
+  rm -rf "${clone:?}"
   git clone -q --filter=blob:none --single-branch --branch "$2" "file://$root/$1.git" "$clone"
 }
 allow_all="paths = ['''.*''']"
@@ -555,7 +581,222 @@ git clone -q --filter=blob:none --no-checkout --single-branch --branch main "fil
 BASE_SHA="$sha256_base" HEAD_SHA="$(git rev-parse clean)" check "SHA-256 repository: a clean pull request passes" 0
 BASE_SHA="$sha256_base" HEAD_SHA="$(git rev-parse leaky)" check "SHA-256 repository: a key is found" 1
 
-# Temporary files go to RUNNER_TEMP when it is set, and are gone afterwards.
+# A pull request against a side branch that already holds a key (pushed there without a scan:
+# pushes are scanned only on the default branch): the key is not on main, so it is the PR's. The
+# range does not use the PR's base, so retargeting the PR changes nothing either.
+new_origin side
+commit app.txt "app" "main 1"
+git checkout -q -b side
+commit k.txt "aws_access_key_id=$key" "side branch: a key, never on main"
+side=$(git rev-parse HEAD)
+git checkout -q -b on-side
+commit notes.txt "notes" "PR against the side branch: no key of its own"
+git push -q origin main side on-side
+checkout side on-side
+BASE_SHA="$side" HEAD_SHA="$(git rev-parse on-side)" \
+  check "pull request against a side branch that holds a key: the key is found" 1 "not on main"
+
+# The repository's .gitleaks.toml on the default branch (gitleaks' default rules, its path skip list
+# removed; see its header). FORK_SECRET_SCAN_TOML picks another file ("" for none).
+repo_toml="${FORK_SECRET_SCAN_TOML-$here/../../.gitleaks.toml}"
+new_origin repo
+if [[ -n "$repo_toml" && -f "$repo_toml" ]]; then cp "$repo_toml" .gitleaks.toml; fi
+commit app.txt "app" "main 1, with the repository's .gitleaks.toml"
+repo_base=$(git rev-parse HEAD)
+repo_branches=()
+repo_pr() { # repo_pr BRANCH FILE CONTENT
+  git checkout -q -b "$1" "$repo_base"
+  mkdir -p "$(dirname "$2")"
+  commit "$2" "$3" "PR: $2"
+  repo_branches+=("$1")
+}
+# Paths gitleaks' built-in list skips: the scan reads them.
+repo_pr key-toml .gitleaks.toml "aws_access_key_id=$key"
+repo_pr key-toml-example docs/gitleaks.toml.example "aws_access_key_id=$key"
+repo_pr key-lock pnpm-lock.yaml "aws_access_key_id=$key"
+repo_pr key-svg icons/logo.svg "<svg><!-- aws_access_key_id=$key --></svg>"
+repo_pr key-node-modules node_modules/x/config.js "const aws_access_key_id = '$key'"
+repo_pr key-png img/x.png "aws_access_key_id=$key"
+# A package version after a name with "key" in it, as pnpm writes them: no finding. (The name is
+# put together at run time, so this file's own line is not a finding of generic-api-key.)
+repo_pr lock-version pnpm-lock.yaml "$(printf "importers:\n  '@example/desktop-pass%s': 0.0.4-canary.v20260819050620\n" keys)"
+# The file itself (deleted and added again, so the PR's diff holds all of it) passes its own rules.
+git checkout -q -b own-file "$repo_base"
+if [[ -f .gitleaks.toml ]]; then
+  git rm -q .gitleaks.toml; date=$((date + 60)); GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "PR: drop .gitleaks.toml"
+  git checkout -q "$repo_base" -- .gitleaks.toml; date=$((date + 60)); GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "PR: add it again"
+fi
+repo_branches+=(own-file)
+git checkout -q main
+git push -q origin main "${repo_branches[@]}"
+clone="$root/repo-clone"
+git clone -q --filter=blob:none --no-checkout --single-branch --branch main "file://$root/repo.git" "$clone"
+for branch in key-toml key-toml-example key-lock key-svg key-node-modules key-png; do
+  BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse "$branch")" \
+    check "repository settings: a key in $(git diff --name-only "$repo_base" "$branch") is found" 1
+done
+BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse lock-version)" \
+  check "repository settings: a pnpm-lock.yaml package version is not a finding" 0
+if [[ -n "$repo_toml" && -f "$repo_toml" ]]; then
+  BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse own-file)" \
+    check "repository settings: .gitleaks.toml passes its own rules" 0
+else
+  echo "FAIL repository settings: no .gitleaks.toml (${repo_toml:-none given})"
+  failures=$((failures + 1))
+fi
+# Its rules are the gitleaks binary's own (the default config is built into it): everything from the
+# first [[rules]] to the end, byte for byte. Only with the real gitleaks.
+if [[ -n "${GITLEAKS_BIN:-}" ]]; then
+  if [[ -f "$repo_toml" ]] && python3 -c '
+import sys
+toml = open(sys.argv[1], "rb").read()
+binary = open(sys.argv[2], "rb").read()
+rules = toml[toml.index(b"\n[[rules]]\n"):]
+sys.exit(0 if rules in binary else 1)' "$repo_toml" "$gitleaks"; then
+    echo "ok   repository settings: the rules are this gitleaks' default rules, unchanged"
+  else
+    echo "FAIL repository settings: the rules in $repo_toml are not this gitleaks' default rules (update them from its config/gitleaks.toml)"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Settings gitleaks cannot load: `[extend] path` names a file the settings folder does not hold.
+new_origin extend
+printf '%s\n' '[extend]' 'path = "base.toml"' > .gitleaks.toml
+printf '%s\n' '[extend]' 'useDefault = true' > base.toml
+commit app.txt "app" "main 1: settings that extend base.toml"
+extend_base=$(git rev-parse HEAD)
+git checkout -q -b clean; commit notes.txt "notes" "PR: no key"
+git push -q origin main clean
+checkout extend clean
+BASE_SHA="$extend_base" HEAD_SHA="$(git rev-parse clean)" \
+  check "settings that cannot load fail the job (2), not \"found possible secrets\"" 2 "gitleaks stopped without a result.*extend"
+
+# Contents git takes for binary, and UTF-16 text.
+new_origin contents
+commit app.txt "app" "main 1"
+commit_bytes existing.env "main 2" < <(printf '\377\376'; printf 'notes=none\n' | iconv -f UTF-8 -t UTF-16LE)
+contents_base=$(git rev-parse HEAD)
+contents_branches=()
+contents_pr() { # contents_pr BRANCH FILE < CONTENT
+  git checkout -q -b "$1" "$contents_base"
+  commit_bytes "$2" "PR: $2"
+  contents_branches+=("$1")
+}
+contents_pr nul data.cfg < <(printf 'bin\000ary\naws_access_key_id=%s\n' "$key")
+contents_pr utf16le win.env < <(printf '\377\376'; printf 'aws_access_key_id=%s\n' "$key" | iconv -f UTF-8 -t UTF-16LE)
+contents_pr utf16be mac.env < <(printf '\376\377'; printf 'aws_access_key_id=%s\n' "$key" | iconv -f UTF-8 -t UTF-16BE)
+contents_pr bom-ascii odd.env < <(printf '\377\376\naws_access_key_id=%s\n' "$key")
+contents_pr utf16-clean notes.env < <(printf '\377\376'; printf 'notes=none\n' | iconv -f UTF-8 -t UTF-16LE)
+contents_pr utf16-existing existing.env < <(printf '\377\376'; printf 'notes=none\naws_access_key_id=%s\n' "$key" | iconv -f UTF-8 -t UTF-16LE)
+contents_pr utf16-space "win notes.env" < <(printf '\377\376'; printf 'aws_access_key_id=%s\n' "$key" | iconv -f UTF-8 -t UTF-16LE)
+git checkout -q main
+git push -q origin main "${contents_branches[@]}"
+clone="$root/contents-clone"
+git clone -q --filter=blob:none --no-checkout --single-branch --branch main "file://$root/contents.git" "$clone"
+BASE_SHA="$contents_base" HEAD_SHA="$(git rev-parse nul)" \
+  check "a key after a NUL byte (a file git takes for binary) is found, no file decoded" 1 "" "UTF-16 byte-order mark"
+BASE_SHA="$contents_base" HEAD_SHA="$(git rev-parse utf16le)" \
+  check "a key in UTF-16 LE text (byte-order mark) is found" 1 "1 file\\(s\\) start with a UTF-16 byte-order mark"
+BASE_SHA="$contents_base" HEAD_SHA="$(git rev-parse utf16be)" check "a key in UTF-16 BE text (byte-order mark) is found" 1
+BASE_SHA="$contents_base" HEAD_SHA="$(git rev-parse bom-ascii)" \
+  check "a key in plain text after the UTF-16 mark's two bytes is found (read as stored too)" 1
+BASE_SHA="$contents_base" HEAD_SHA="$(git rev-parse utf16-clean)" \
+  check "UTF-16 text without a key passes, every commit read" 0 "gitleaks scanned 1 commit"
+BASE_SHA="$contents_base" HEAD_SHA="$(git rev-parse utf16-existing)" \
+  check "a key added to a UTF-16 file the default branch already has is found" 1
+BASE_SHA="$contents_base" HEAD_SHA="$(git rev-parse utf16-space)" \
+  check "a key in a UTF-16 file with a space in its name is found (every file filtered)" 1
+
+# The reviewed path for a fake key in a test fixture: an ignore line (file:rule:line) lands on the
+# default branch in a change of its own; the PR's re-run passes; the PR is squash-merged (a new
+# commit id); the default branch's push scan of that merge passes too.
+new_origin squash
+commit app.txt "app" "main 1"
+squash_base=$(git rev-parse HEAD)
+git checkout -q -b fixture-pr
+mkdir -p test
+commit test/fx.txt "aws_access_key_id=$key" "PR: a fake key in a test fixture"
+fixture_pr=$(git rev-parse HEAD)
+git checkout -q -b pinned-pr "$squash_base"
+mkdir -p test
+commit test/fx2.txt "aws_access_key_id=$key" "PR: another fake key in a test fixture"
+pinned_pr=$(git rev-parse HEAD)
+git checkout -q main
+git push -q origin main fixture-pr pinned-pr
+checkout squash fixture-pr
+BASE_SHA="$squash_base" HEAD_SHA="$fixture_pr" check "squash path: the fixture key is found before the ignore line" 1
+git checkout -q main
+commit .gitleaksignore "test/fx.txt:aws-access-token:1" "main: ignore the fixture key (reviewed, a change of its own)"
+ignore_main=$(git rev-parse HEAD)
+git push -q origin main
+BASE_SHA="$squash_base" HEAD_SHA="$fixture_pr" \
+  check "squash path: the PR's re-run passes with the file:rule:line line on the default branch" 0 "" "pinned to a commit"
+git merge -q --squash fixture-pr
+date=$((date + 60)); GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "PR: a fake key in a test fixture (squashed)"
+squashed=$(git rev-parse HEAD)
+git push -q origin main
+checkout squash main
+EVENT_NAME=push BEFORE="$ignore_main" AFTER="$squashed" \
+  check "squash path: the default branch's push scan of the squash merge passes" 0 "from the tip before the push"
+# A line pinned to the PR's commit: it applies to that commit, with a warning saying why it will
+# not survive the squash merge, and the push scan of the merge then fails.
+commit .gitleaksignore "$(printf '%s\n' "test/fx.txt:aws-access-token:1" "$pinned_pr:test/fx2.txt:aws-access-token:1")" \
+  "main: ignore the second fixture key, pinned to its commit"
+pinned_main=$(git rev-parse HEAD)
+git push -q origin main
+checkout squash pinned-pr
+BASE_SHA="$squash_base" HEAD_SHA="$pinned_pr" \
+  check "squash path: a commit-pinned ignore line warns why" 0 "::warning.*pinned to a commit.*file:rule:line"
+cd "$root/squash"
+git merge -q --squash pinned-pr
+date=$((date + 60)); GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "PR: another fake key (squashed)"
+squashed_pinned=$(git rev-parse HEAD)
+git push -q origin main
+checkout squash main
+EVENT_NAME=push BEFORE="$pinned_main" AFTER="$squashed_pinned" \
+  check "squash path: after the squash merge the commit-pinned line no longer matches" 1 "pinned to a commit"
+
+# A push reads, and uses, the settings of the tip before the push.
+new_origin pushset
+commit .gitleaksignore "k.txt:aws-access-token:1" "main: ignore the key on k.txt line 1 (reviewed)"
+pushset_before=$(git rev-parse HEAD)
+commit k.txt "aws_access_key_id=$key" "main: the key that ignore line allows"
+pushset_after=$(git rev-parse HEAD)
+commit .gitleaksignore "$(printf '%s\n' "k.txt:aws-access-token:1" "other.txt:aws-access-token:1")" "main: another ignore line"
+pushset_change=$(git rev-parse HEAD)
+git push -q origin main
+checkout pushset main
+EVENT_NAME=push BEFORE="$pushset_before" AFTER="$pushset_after" \
+  check "push: an ignore line on the tip before the push applies" 0 "settings .* from the tip before the push"
+# A new branch (or an old tip that cannot be fetched): AFTER's first parent, as the header says.
+EVENT_NAME=push BEFORE="0000000000000000000000000000000000000000" AFTER="$pushset_after" \
+  check "push of a new branch: the settings of the pushed commit's first parent apply" 0 "settings .* from the pushed commit's first parent \\(${pushset_before:0:12}\\)"
+EVENT_NAME=push BEFORE="$pushset_after" AFTER="$pushset_change" \
+  check "push: a settings change gets a notice that it applies from the next push" 0 "::notice.*applies from the next push" "re-run"
+# A pull request that changes only the settings: the reviewed path, no advice to re-run it.
+git checkout -q -b settings-only "$pushset_after"
+commit .gitleaksignore "$(printf '%s\n' "k.txt:aws-access-token:1" "third.txt:aws-access-token:1")" "PR: an ignore line, nothing else"
+git checkout -q -b settings-and-code "$pushset_after"
+commit .gitleaksignore "$(printf '%s\n' "k.txt:aws-access-token:1" "code.txt:aws-access-token:1")" "PR: an ignore line"
+commit code.txt "code" "PR: and code"
+git checkout -q main
+git reset -q --hard "$pushset_after"
+git push -q -f origin main settings-only settings-and-code
+checkout pushset settings-only
+BASE_SHA="$pushset_after" HEAD_SHA="$(git -C "$root/pushset" rev-parse settings-only)" \
+  check "pull request changing only the settings: a notice, no re-run advice" 0 "::notice.*changes only \\.gitleaksignore" "re-run"
+checkout pushset settings-and-code
+BASE_SHA="$pushset_after" HEAD_SHA="$(git -C "$root/pushset" rev-parse settings-and-code)" \
+  check "pull request changing the settings and code: land the settings first" 0 "::notice.*land it in a pull request of its own first"
+
+# Temporary files go to RUNNER_TEMP when it is set, and are gone afterwards. A clone of its own.
+new_origin runner-temp-origin
+commit app.txt "app" "main 1"
+rt_base=$(git rev-parse HEAD)
+git checkout -q -b clean; commit notes.txt "notes" "PR: no key"
+git push -q origin main clean
+checkout runner-temp-origin clean
 mkdir "$root/runner-temp"
 real_gitleaks="$gitleaks"
 gitleaks="$root/where-gitleaks"
@@ -565,7 +806,7 @@ ls "$root/runner-temp" > "$root/runner-temp-seen"
 "$real_gitleaks" "\$@"
 WHERE
 chmod +x "$gitleaks"
-RUNNER_TEMP="$root/runner-temp" BASE_SHA="$sha256_base" HEAD_SHA="$(git rev-parse clean)" \
+RUNNER_TEMP="$root/runner-temp" BASE_SHA="$rt_base" HEAD_SHA="$(git rev-parse clean)" \
   check "RUNNER_TEMP set: the scan passes" 0
 if grep -q '^fork-secret-scan\.' "$root/runner-temp-seen" 2> /dev/null && [[ -z "$(ls -A "$root/runner-temp")" ]]; then
   echo "ok   RUNNER_TEMP set: temporary files there while gitleaks runs, none left after"

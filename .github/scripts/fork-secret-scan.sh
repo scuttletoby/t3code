@@ -5,7 +5,6 @@
 # Environment:
 #   GITLEAKS     gitleaks binary
 #   EVENT_NAME   pull_request or push
-#   BASE_SHA     pull_request: the base branch commit the PR is compared with
 #   HEAD_SHA     pull_request: the PR head
 #   BEFORE       push: the branch tip before the push (all zeros when the branch is new)
 #   AFTER        push: the branch tip after the push
@@ -13,14 +12,20 @@
 #                fork's parent, as fork-follow.yml does); empty when it could not be read
 #   UPSTREAM_URL push: git URL of upstream (default https://github.com/$UPSTREAM.git, as in
 #                fork-follow.sh)
-#   CONFIG_BRANCH  pull_request: the repository's default branch; its tip holds the gitleaks
-#                settings the scan uses (see "Settings" below)
+#   CONFIG_BRANCH  pull_request: the repository's default branch (the branch whose pushes this job
+#                scans); its tip holds the gitleaks settings the scan uses (see "Settings" below)
+#                and is what the range leaves out
 #   RUNNER_TEMP  folder for the scan's temporary files (else TMPDIR, else /tmp)
 #
 # Ranges:
-#   pull_request   BASE_SHA..HEAD_SHA: every commit the PR adds, merges of the base branch
-#                  included, whatever their dates. A squash merge never brings the PR's own commits
-#                  to main, but they stay public under refs/pull/N/head, so they are scanned here.
+#   pull_request   <default branch tip>..HEAD_SHA: every commit the PR head has that the default
+#                  branch has not, merges included, whatever their dates and whatever the PR's base.
+#                  Not BASE..HEAD: a PR against a side branch (whose pushes no scan reads) would
+#                  leave that branch's commits out, and retargeting the PR to the default branch
+#                  fires `edited`, which does not re-run the scan; this range does not depend on the
+#                  base, so a retarget changes nothing. The default branch's own commits were scanned
+#                  by its push runs. A squash merge never brings the PR's own commits to main, but
+#                  they stay public under refs/pull/N/head, so they are scanned here.
 #   push           BEFORE..AFTER. After a force push that is every commit the new tip has and the
 #                  old one had not; commits both share were scanned when they were first pushed.
 #   push, no BEFORE  a new branch (BEFORE all zeros) or an old tip that can no longer be fetched:
@@ -41,20 +46,39 @@
 # one fails the job (exit 2); merge the branches one at a time instead.
 #
 # Settings: gitleaks reads .gitleaks.toml and .gitleaksignore, which can allow any finding. They
-# come from a commit the range cannot change, never from the scanned commits or the checkout (the
-# pull request's head): for a pull request the default branch's tip (CONFIG_BRANCH, fetched each
-# run), for a push the tip before the push (BEFORE; for a new branch AFTER's first parent; none for
-# a root commit: gitleaks' defaults). gitleaks runs in a temporary folder holding only those two
-# files, so it finds no other. A range that changes them gets a notice: the change takes effect
-# once it is on the default branch. The reviewed path is a pull request of its own that changes
-# only these files (its own scan uses the old settings, and it adds no key); once it is merged,
-# re-run the scan of the pull request that needs it. Not covered: a `gitleaks:allow` comment on
-# the line itself (visible in the diff), and a pull request that edits this script or the workflow
-# (pull_request runs take both from the pull request).
+# never come from the checkout (the pull request's head). For a pull request: the default branch's
+# tip (CONFIG_BRANCH, fetched each run), which the range leaves out. For a push: the tip before the
+# push (BEFORE). A push with no fetchable BEFORE (a new branch, or an old tip that is gone) reads
+# AFTER's first parent, a commit of the same push that no scan reads, so there the push can set
+# its own settings: gitleaks' built-in defaults instead would bring back the broad path skip list
+# .gitleaks.toml removes, and a push run takes this script and the workflow from the pushed commit
+# anyway. A root commit uses gitleaks' defaults. In this repository pushes are scanned only on the
+# default branch, which is never new. gitleaks runs in a temporary folder holding only those two
+# files, so it finds no other; `[extend] path` therefore cannot load, and settings gitleaks cannot
+# load fail the job (exit 2) with that reason.
+# A range that changes the settings gets a notice saying when the change applies. The reviewed path
+# for a change is a pull request of its own that changes only these files (its own scan uses the
+# old settings, and it adds no key); once it is merged, re-run the scan of the pull request that
+# needs it. An ignore line takes the form file:rule:line (no commit), which matches that line in
+# every commit, so it survives a squash merge: the merged commit has a new id, and a commit-pinned
+# line (commit:file:rule:line) would stop matching, so main's push scan would fail. Pinned lines
+# get a warning. Prefer a `gitleaks:allow` comment on the line itself where the file allows one.
+#
+# Not covered: a `gitleaks:allow` comment on the line itself (visible in the diff); a pull request
+# that edits this script or the workflow (pull_request runs take both from the pull request); text
+# in another encoding than UTF-8 or UTF-16 with a byte-order mark (UTF-16 without one, UTF-32);
+# compressed or packed contents (zip, gzip, images' compressed data); a key split across lines.
+#
+# Contents: git log runs with --text, so a file git takes for binary (a NUL byte in it) still shows
+# its lines. A path whose contents in the range start with a UTF-16 byte-order mark goes through a
+# textconv filter that prints it as stored and decoded to UTF-8 as well (a key in a UTF-16 .env as
+# some Windows editors save it). The filter only adds lines, so a file that merely starts with those
+# two bytes is still read as stored. Line numbers in the decoded part follow the stored lines.
 #
 # Attributes: a .gitattributes in the range could mark a file `-diff` or binary, so git log shows
-# "Binary files differ" instead of its lines. Both git logs below read attributes from the empty
-# tree (GIT_ATTR_SOURCE), never from the checkout or a commit; real binary contents stay binary.
+# "Binary files differ" instead of its lines. Both git logs below read attributes from a tree the
+# script writes (GIT_ATTR_SOURCE: only the filter's lines, `/<path> diff=fork-secret-scan-text`),
+# never from the checkout or a commit.
 #
 # Offline, and counted: the checkout is a blob-less clone, so file contents are fetched on demand.
 # gitleaks 8.30.1 stops reading at the first git error (a blob fetch that fails: network, GitHub
@@ -112,21 +136,20 @@ fetch_config_branch() {
 warning=""
 case "$EVENT_NAME" in
   pull_request)
-    for sha in "$BASE_SHA" "$HEAD_SHA"; do
-      if ! fetch "$sha"; then
-        echo "::error::Secret scan: cannot fetch commit $sha" >&2
-        exit 2
-      fi
-    done
+    if ! fetch "$HEAD_SHA"; then
+      echo "::error::Secret scan: cannot fetch commit $HEAD_SHA" >&2
+      exit 2
+    fi
     if ! settings="$(fetch_config_branch)"; then
       echo "::error::Secret scan: cannot fetch the default branch '${CONFIG_BRANCH:-}' (CONFIG_BRANCH), whose gitleaks settings the scan uses" >&2
       exit 2
     fi
     settings_what="the default branch $CONFIG_BRANCH (${settings:0:12})"
-    changes=("$BASE_SHA...$HEAD_SHA")
-    range="$BASE_SHA..$HEAD_SHA"
-    opts="--remerge-diff $range"
-    what="the pull request's $(git rev-list --count "$range") commit(s) after base ${BASE_SHA:0:12}, merges included"
+    changes=("$settings...$HEAD_SHA")
+    # Everything the head has that the default branch has not, whatever the PR's base (see the header).
+    range="$settings..$HEAD_SHA"
+    opts="--remerge-diff --text $range"
+    what="the pull request's $(git rev-list --count "$range") commit(s) not on $CONFIG_BRANCH, merges included"
     ;;
   push)
     if ! zero "$BEFORE" && fetch "$BEFORE"; then
@@ -134,7 +157,7 @@ case "$EVENT_NAME" in
       settings_what="the tip before the push (${BEFORE:0:12})"
       changes=("$BEFORE" "$AFTER")
       range="$BEFORE..$AFTER"
-      opts="--remerge-diff $range"
+      opts="--remerge-diff --text $range"
       if git merge-base --is-ancestor "$BEFORE" "$AFTER"; then
         what="the $(git rev-list --count "$range") commit(s) pushed after ${BEFORE:0:12}"
       else
@@ -150,7 +173,7 @@ case "$EVENT_NAME" in
         changes=()
       fi
       range="--max-count=1 $AFTER"
-      opts="--remerge-diff $range"
+      opts="--remerge-diff --text $range"
       if zero "$BEFORE"; then
         warning="a new branch has no earlier tip, so only its newest commit ${AFTER:0:12} is scanned"
       else
@@ -162,7 +185,7 @@ case "$EVENT_NAME" in
     if fetch_upstream; then
       full="$range"
       range="$range --not --glob=refs/scan-upstream"
-      opts="--remerge-diff $range"
+      opts="--remerge-diff --text $range"
       # shellcheck disable=SC2086
       what="$what, minus the $(( $(git rev-list --count $full) - $(git rev-list --count $range) )) commit(s) upstream $UPSTREAM already has"
     else
@@ -219,23 +242,33 @@ for name in .gitleaks.toml .gitleaksignore; do
   git cat-file blob "$oid" > "$config/$name" || cannot_read
 done
 echo "gitleaks settings (.gitleaks.toml, .gitleaksignore) from $settings_what"
+# Ignore lines pinned to a commit stop matching after a squash merge (see the header).
+if [[ -f "$config/.gitleaksignore" ]]; then
+  pinned="$(grep -cE '^[[:space:]]*[0-9a-f]{40}([0-9a-f]{24})?:' "$config/.gitleaksignore" || true)"
+  if [[ "$pinned" -gt 0 ]]; then
+    echo "::warning title=Secret scan::.gitleaksignore on $settings_what has $pinned line(s) pinned to a commit (commit:file:rule:line). Such a line stops matching once a squash merge gives the commit a new id, so the default branch's push scan fails on the same finding. Write it as file:rule:line instead."
+  fi
+fi
 # Only a message: when the diff fails (no merge base, say), there is none.
 if [[ ${#changes[@]} -gt 0 ]]; then
   changed="$(git diff --no-renames --name-only "${changes[@]}" -- .gitleaks.toml .gitleaksignore 2> /dev/null)" || changed=""
   if [[ -n "$changed" ]]; then
-    echo "::notice title=Secret scan::This range changes $(tr '\n' ' ' <<< "$changed")but the scan reads them from $settings_what. A change to them takes effect once it is on the default branch: land it in a pull request of its own first, then re-run this scan."
+    files="$(tr '\n' ' ' <<< "$changed")"
+    if [[ "$EVENT_NAME" == push ]]; then
+      echo "::notice title=Secret scan::This push changes ${files}but this scan read them from $settings_what. The change applies from the next push."
+    elif [[ "$(git diff --no-renames --name-only "${changes[@]}" 2> /dev/null)" == "$changed" ]]; then
+      echo "::notice title=Secret scan::This pull request changes only ${files}(the reviewed path for a settings change): this scan read them from $settings_what, and the change applies once it is merged."
+    else
+      echo "::notice title=Secret scan::This pull request changes ${files}but the scan reads them from $settings_what. A change to them takes effect once it is on the default branch: land it in a pull request of its own first, then re-run this scan."
+    fi
   fi
 fi
-
-# Attributes from the empty tree for both git logs (see the header).
-GIT_ATTR_SOURCE="$(git hash-object -t tree /dev/null)"
-export GIT_ATTR_SOURCE
 
 # The contents every diff in the range compares (each commit against each parent, merges included),
 # in one batch before git log runs, so that git log's own batches hold either temporary objects or
 # real contents (the merge base's side of an automatic merge), never both (see the header).
-if ! git diff-tree --stdin -m -r --no-commit-id --raw --no-abbrev < "$work/commits" |
-    awk '$1 != ":160000" && $3 !~ /^0+$/ { print $3 } $2 != "160000" && $4 !~ /^0+$/ { print $4 }' |
+if ! git -c core.quotepath=false diff-tree --stdin -m -r --no-commit-id --raw --no-abbrev < "$work/commits" > "$work/raw" ||
+  ! awk '$1 != ":160000" && $3 !~ /^0+$/ { print $3 } $2 != "160000" && $4 !~ /^0+$/ { print $4 }' "$work/raw" |
     sort -u > "$work/wanted" ||
   ! git cat-file --batch-check='%(objectname)' --batch-all-objects 2> /dev/null | sort -u > "$work/have" ||
   ! comm -23 "$work/wanted" "$work/have" > "$work/missing" ||
@@ -243,6 +276,54 @@ if ! git diff-tree --stdin -m -r --no-commit-id --raw --no-abbrev < "$work/commi
     --no-write-fetch-head --recurse-submodules=no --filter=blob:none origin --stdin < "$work/missing"; }; then
   cannot_read
 fi
+
+# Attributes and the text filter for both git logs (see the header). The filter applies to the paths
+# whose contents in the range start with a UTF-16 byte-order mark: one read of the contents fetched
+# above finds them; a path with a character a .gitattributes pattern could misread puts every file
+# under the filter instead (it only adds lines). Each run of the filter costs a process or two, too
+# slow for every file of a wide range. git runs it through sh, set in the environment (GIT_CONFIG_*,
+# added to any already set).
+# shellcheck disable=SC2016
+if ! git cat-file --batch < "$work/wanted" | perl -e '
+    binmode STDIN;
+    while (defined(my $head = <STDIN>)) {
+      my ($oid, $type, $size) = split " ", $head;
+      die "fork-secret-scan: no content: $head" unless defined $size;
+      read(STDIN, my $data, $size) == $size or die "fork-secret-scan: short read of $oid\n";
+      read(STDIN, my $newline, 1);
+      print "$oid\n" if $data =~ /\A(?:\xff\xfe|\xfe\xff)/;
+    }' > "$work/utf16" ||
+  ! awk -F '\t' 'NR == FNR { utf16[$1] = 1; next }
+      { split($1, side, " "); if ((side[3] in utf16) || (side[4] in utf16)) print $2 }' \
+      "$work/utf16" "$work/raw" | sort -u > "$work/utf16-paths" ||
+  ! awk '/^[A-Za-z0-9._\/+@,=-]+$/ { print "/" $0 " diff=fork-secret-scan-text"; next }
+      { every = 1 } END { if (every) print "* diff=fork-secret-scan-text" }' "$work/utf16-paths" > "$work/gitattributes" ||
+  ! attributes="$(git hash-object -w "$work/gitattributes")" ||
+  ! GIT_ATTR_SOURCE="$(printf '100644 blob %s\t.gitattributes\n' "$attributes" | git mktree)"; then
+  cannot_read
+fi
+export GIT_ATTR_SOURCE
+if [[ -s "$work/utf16-paths" ]]; then
+  echo "$(wc -l < "$work/utf16-paths") file(s) start with a UTF-16 byte-order mark: read as stored and decoded"
+fi
+cat > "$work/textconv" <<'FILTER'
+# $1: a temporary file holding one side of a diff. Print it as stored; when it starts with a
+# UTF-16 byte-order mark, print it decoded to UTF-8 after it. A failure (no iconv) fails git log.
+case "$(od -An -N2 -tx1 -- "$1")" in
+  *"ff fe"*) encoding=UTF-16LE ;;
+  *"fe ff"*) encoding=UTF-16BE ;;
+  *) exec cat -- "$1" ;;
+esac
+cat -- "$1" || exit 1
+echo
+# iconv -c leaves out what is not valid UTF-16 and then exits 1.
+tail -c +3 -- "$1" | iconv -c -f "$encoding" -t UTF-8
+[ $? -le 1 ]
+FILTER
+n="${GIT_CONFIG_COUNT:-0}"
+export "GIT_CONFIG_KEY_$n=diff.fork-secret-scan-text.textconv"
+export "GIT_CONFIG_VALUE_$n=sh $(printf '%q' "$work/textconv")"
+export GIT_CONFIG_COUNT=$((n + 1))
 
 # gitleaks runs `git log -p -U0 <log-opts>`. The same command here fetches what it still lacks;
 # counts the commits gitleaks will scan (see the header); and fails the job (pipefail) when a fetch
@@ -286,14 +367,16 @@ set +e
 status=$?
 set -e
 cat "$log"
-scanned="$(sed -E 's/\x1b\[[0-9;]*m//g' "$log" | sed -nE 's/.* ([0-9]+) commits scanned.*/\1/p' | tail -n 1)"
+# The log without colours, read below.
+plain="$(tr -d '\000' < "$log" | sed -E 's/\x1b\[[0-9;]*m//g')"
+scanned="$(sed -nE 's/.* ([0-9]+) commits scanned.*/\1/p' <<< "$plain" | tail -n 1)"
 echo "gitleaks scanned ${scanned:-no} commit(s); $expected commit(s) in range have changes it reads"
 summary "### Secret scan" ""
 if [[ -n "$warning" ]]; then summary "Warning: $warning." ""; fi
 # gitleaks 8.30.1 logs git's stderr as ERR (and `ERR error="stderr is not empty"`), stops reading
 # diffs once git exits, and still exits 0; the count above misses that when the dropped files all
 # belong to a commit it already counted. Any ERR line with exit 0 fails the job.
-errors="$(sed -E 's/\x1b\[[0-9;]*m//g' "$log" | grep -E '^([^[:space:]]+[[:space:]]+)?ERR[[:space:]]' || true)"
+errors="$(grep -aE '^([^[:space:]]+[[:space:]]+)?ERR[[:space:]]' <<< "$plain" || true)"
 if [[ $status -eq 0 && -n "$errors" ]]; then
   echo "::error::Secret scan: gitleaks logged an error and still passed, so it may not have read every change: $(head -n 1 <<< "$errors")" >&2
   summary "Failed: gitleaks logged an error while scanning $what (see the job log), so the scan may be incomplete."
@@ -302,6 +385,14 @@ fi
 if [[ $status -eq 0 && ( -z "$scanned" || "$scanned" -lt "$expected" ) ]]; then
   echo "::error::Secret scan: gitleaks scanned ${scanned:-no} commit(s), but $expected commit(s) in range have changes (a git error stopped it?)" >&2
   summary "Failed: gitleaks scanned ${scanned:-no} of the $expected commit(s) with changes in $what, so the rest were not checked."
+  exit 2
+fi
+# gitleaks exits 1 both for findings ("leaks found: N") and for a fatal error, such as settings it
+# cannot load ("FTL Failed to load config"; `[extend] path` cannot load here, see the header).
+if [[ $status -ne 0 ]] && ! grep -aqE 'leaks found: [1-9][0-9]*' <<< "$plain"; then
+  reason="$(grep -a -m 1 -E '(FTL|ERR)[[:space:]]' <<< "$plain" || true)"
+  echo "::error::Secret scan: gitleaks stopped without a result (exit $status), so nothing was checked. Settings it cannot load (from $settings_what; \`[extend] path\` is not supported) cause this: ${reason:-see the log above}" >&2
+  summary "Failed: gitleaks stopped without a result while scanning $what (settings from $settings_what could not be loaded?), so nothing was checked."
   exit 2
 fi
 if [[ $status -eq 0 ]]; then

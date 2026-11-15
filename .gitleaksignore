@@ -1,12 +1,12 @@
-# Fork: findings gitleaks may skip, one fingerprint (commit:file:rule:line) each, with the reason.
-# Fake 16-character test values in the wait store tests, in commits of fork PR #90 before they were marked
-# `gitleaks:allow` (the secret scan reads every commit a PR adds).
-47cd255f192206f56bdd0cd56de7c1509ae35eeb:apps/server/src/waits/WaitStore.test.ts:generic-api-key:18
-47cd255f192206f56bdd0cd56de7c1509ae35eeb:apps/server/src/waits/WaitService.test.ts:generic-api-key:66
-c739cbb3dc50fb8883024f21095c727e4ee2afa1:apps/server/src/waits/WaitService.test.ts:generic-api-key:1178
-# Same fake 16-character test values in fork PR #91 (wait delivery and service tests).
-597bb9fa10e1789d4b00311c4856b185f8f38b1b:apps/server/src/waits/WaitDelivery.test.ts:generic-api-key:329
-c28991334481fca3bc6b96b62b1b764bb45a8848:apps/server/src/waits/WaitService.test.ts:generic-api-key:1946
-c28991334481fca3bc6b96b62b1b764bb45a8848:apps/server/src/waits/WaitService.test.ts:generic-api-key:2014
-# The fake wait key in the `serve --hold-work` boot test, in a commit of fork PR #175 before it was marked.
-e8dce462d34fdc6f7f00d4b1eedb147bdf26acfb:apps/server/src/holdWork.boot.test.ts:generic-api-key:385
+# Fork: findings the secret scan (.github/scripts/fork-secret-scan.sh) may skip, one per line, each
+# with a comment saying what it is and why it is safe.
+#
+# Form: file:rule:line (no commit), for example
+#   apps/server/src/example.test.ts:generic-api-key:12
+# Such a line matches that finding in every commit, so it still matches after a squash merge gives
+# the commit a new id. A line pinned to a commit (commit:file:rule:line) stops matching then, and the
+# default branch's push scan fails on the same finding; the scan warns about such lines.
+# Prefer a `gitleaks:allow` comment on the line itself where the file allows one.
+#
+# The scan reads this file from the default branch (a pull request) or the tip before the push, so a
+# change here applies once it is merged: land it in a pull request of its own first.
