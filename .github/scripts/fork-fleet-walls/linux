@@ -3,7 +3,7 @@
 is one systemd or kernel can drop without an error: a runner would then start with less of its sandbox than the
 launcher asked for, or would see more of this host than it allows. Reads files only; changes nothing. Standard
 library only."""
-import glob, gzip, os, re, stat, subprocess, sys
+import glob, gzip, os, re, shlex, stat, subprocess, sys
 
 ROOT = os.environ.get('FORK_FLEET_WALLS_ROOT', '')
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # the folder of fork-fleet-launch.sh
@@ -14,9 +14,41 @@ LOCAL_FS = {'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'f2fs', 'jfs', 'reiserfs', '
             'tmpfs', 'ramfs', 'rootfs', 'squashfs', 'erofs'}
 PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 # Files in /etc that hold a password for a share: by name (smbcredentials, *.cred, ...), and the mount tables, whose
-# lines may name one (password=, pass=) or point at a file that does (credentials=, cred=).
+# lines may name one (password=, pass=) or point at a file that does (credentials=, cred=): fstab, autofs maps and
+# systemd's mount and automount units with their drop-ins (Options=; the usual way to mount a share on a systemd host).
 SECRET_NAME = re.compile(r'(.*\.creds?|.*credentials?|\.?smbcred.*)', re.I)
-MOUNT_TABLES = ('/etc/fstab', '/etc/auto.*')
+MOUNT_TABLES = ('/etc/fstab', '/etc/auto.*', '/etc/systemd/system/*.mount', '/etc/systemd/system/*.automount',
+                '/etc/systemd/system/*.mount.d/*.conf', '/etc/systemd/system/*.automount.d/*.conf')
+MOUNT_PASSWORD = re.compile(r'(^|[\s,=])(password|pass)=')
+MOUNT_CRED = re.compile(r'(?:^|[\s,=])(?:credentials|cred)=([^\s,]+)')
+# The files that set every login's or session's variables, and so every job may read (/etc is in its view): bash's,
+# zsh's and csh's start files, pam_env's and systemd's environment.d. Each line is read for (1) a value shaped like a
+# known token (TOKEN_SHAPE: GitHub, GitLab, Slack, AWS, Google, npm, PyPI, Anthropic, OpenAI, a private key block),
+# commented out or not; (2) a password in a URL (scheme://user:password@, as an https_proxy line has it); (3) every
+# NAME=value on it (after export, declare -x, typeset -x, readonly, export -n, a guard `[ ... ] ||` or `&&`; csh's
+# setenv NAME value; pam_env's NAME DEFAULT=value; ${NAME:=value}) whose name says it holds a secret (SECRET_VAR:
+# TOKEN, SECRET, PASSW, PASSPHRASE or CREDENTIAL in it; KEY, PASS or PAT alone or after a _; or ending in APIKEY) and
+# whose value is literal: not empty, not a command ($(...) or `...`), not another variable ($X, ${X}); a default in
+# ${X:-value} is its value. Not covered (no shell is run, no full parser): a value built from parts (A=gh; B=${A}p_x),
+# read from a file at login, an alias or a function that sets one, or a secret with another name and no known shape.
+ENV_FILES = ('/etc/environment', '/etc/environment.d/*.conf', '/etc/security/pam_env.conf', '/etc/profile',
+             '/etc/profile.d/*', '/etc/bash.bashrc', '/etc/bashrc', '/etc/bash.bash_logout', '/etc/zshenv',
+             '/etc/zprofile', '/etc/zshrc', '/etc/zlogin', '/etc/zsh/*', '/etc/csh.cshrc', '/etc/csh.login',
+             '/etc/csh.logout')
+SECRET_VAR = re.compile(r'.*(TOKEN|SECRET|PASSW|PASSPHRASE|CREDENTIAL).*|(.*_)?(KEY|PASS|PAT)|.*APIKEY', re.I)
+TOKEN_SHAPE = re.compile(r'(?<![A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|'
+                         r'glpat-[A-Za-z0-9_-]{20,}|xox[abeprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|'
+                         r'AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{40,}|'
+                         r'sk-(?:ant|proj)-[A-Za-z0-9_-]{20,})|-----BEGIN [A-Z ]*PRIVATE KEY-----')
+URL_PASSWORD = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@\'"]*:(?![$`])[^/\s@\'"]+@')
+# Where a NAME= or setenv starts: the line's start or after a blank, ; & | ( { or ! (a guard, a subshell, a group).
+_AT = r'(?:^|(?<=[\s;&|({!]))'
+_VALUE = r'((?:"[^"]*"|\'[^\']*\'|[^\s;&|"\'])*)'
+ASSIGN = re.compile(_AT + r'([A-Za-z_]\w*)=' + _VALUE)
+SETENV = re.compile(_AT + r'setenv\s+([A-Za-z_]\w*)\s+' + _VALUE)
+PAM_ENV = re.compile(r'^\s*([A-Za-z_]\w*)\s+(?:DEFAULT|OVERRIDE)=' + _VALUE)
+DEFAULT = re.compile(r'\$\{[A-Za-z_]\w*:?[-=](.*)\}')
+SET_DEFAULT = re.compile(r'\$\{([A-Za-z_]\w*):?=([^}]*)\}')   # ${NAME:=value} sets NAME
 WSL_MARKS = ('/run/WSL', '/proc/sys/fs/binfmt_misc/WSLInterop*', '/usr/lib/wsl', '/mnt/wsl')   # as fork-fleet-walls.py
 WSL_CMDLINE = 'WSL_ROOT_INIT'
 
@@ -175,10 +207,89 @@ def others_read(path, last=0o004):
     return True
 
 
+def readable(patterns):
+    """The files (no folders) these globs find under ROOT that others can read, sorted, each once."""
+    return sorted({p[len(ROOT):] for t in patterns for p in glob.glob(glob.escape(ROOT) + t)
+                   if os.path.isfile(p) and others_read(p[len(ROOT):])})
+
+
+def literal(value):
+    """Whether a shell value is a secret of its own: not empty, not a command, not another variable (a default in
+    ${X:-value} is its value)."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+        value = value[1:-1]
+    m = DEFAULT.fullmatch(value)
+    if m:
+        return literal(m.group(1))
+    return bool(value) and not value.startswith(('$', '`'))
+
+
+def shaped(path, n, line):
+    """A known token's shape anywhere on the line (a comment too: the file still holds it), or a URL's password."""
+    out = []
+    if TOKEN_SHAPE.search(line):
+        out.append(f'{path} line {n} (a token)')
+    if not line.lstrip().startswith(('#', ';')) and URL_PASSWORD.search(line):
+        out.append(f'{path} line {n} (a password in a URL)')
+    return out
+
+
+def env_secrets(path, seen):
+    """What a login or session environment file (ENV_FILES, or a unit's EnvironmentFile=) holds that is a secret."""
+    if path in seen:
+        return []
+    seen.add(path)
+    out = []
+    for n, line in enumerate((read(path) or '').splitlines(), 1):
+        out += shaped(path, n, line)
+        if line.lstrip().startswith('#'):
+            continue
+        sets = [m.groups() for r in (ASSIGN, SETENV, PAM_ENV, SET_DEFAULT) for m in r.finditer(line)]
+        names = sorted({name for name, value in sets if SECRET_VAR.fullmatch(name) and literal(value)})
+        out += [f'{path} line {n} ({name})' for name in names]
+    return out
+
+
+def unit_secrets(path, seen):
+    """A systemd unit's or drop-in's Environment= (DefaultEnvironment= in system.conf) with a secret's name and a
+    value, or an EnvironmentFile= others can read that holds one; and any line shaped like a token."""
+    out = []
+    for n, line in enumerate((read(path) or '').splitlines(), 1):
+        out += shaped(path, n, line)
+        key, _, value = line.strip().partition('=')
+        if key in ('Environment', 'DefaultEnvironment'):
+            try:
+                items = shlex.split(value)
+            except ValueError:
+                items = value.split()
+            names = sorted({k for k, eq, v in (x.partition('=') for x in items) if eq and v and SECRET_VAR.fullmatch(k)})
+            out += [f'{path} line {n} ({name})' for name in names]
+        elif key == 'EnvironmentFile':
+            env = value.strip().lstrip('-')
+            if env.startswith('/') and os.path.isfile(ROOT + env) and others_read(env):
+                out += env_secrets(env, seen)
+    return out
+
+
+def readable_under(top):
+    """Every file under top (and its folders) that others can read, sorted."""
+    out = []
+    for folder, dirs, files in os.walk(ROOT + top):
+        dirs[:] = [d for d in dirs if others_read(os.path.join(folder, d)[len(ROOT):], 0o001)]
+        out += [p[len(ROOT):] for p in (os.path.join(folder, f) for f in files)
+                if os.path.isfile(p) and others_read(p[len(ROOT):])]
+    return sorted(out)
+
+
 def etc_secrets_wall():
     """Jobs see this host's /etc (the launcher's list has it): no password for a share may be in it that they can
-    read. A credentials file (smbcredentials, *.cred, ...) readable by others, a mount table line with password= or
-    pass=, or one whose credentials= file others can read. A file only its owner reads is fine."""
+    read. A credentials file (smbcredentials, *.cred, ...) readable by others; a line of a mount table (MOUNT_TABLES:
+    fstab, autofs maps, systemd mount and automount units and their drop-ins) with password= or pass=, or with a
+    credentials= or cred= file others can read; a secret in a login or session environment file (ENV_FILES: by
+    name and value, by a token's shape, or a URL's password) or in a systemd unit's Environment= or EnvironmentFile=
+    under /etc/systemd. A file only its owner reads is fine. Not covered: see ENV_FILES' comment; a secret in some
+    other file in /etc that has none of these names or shapes; a unit's secret on its command line (ExecStart=)."""
     found = []
     for top in ('/etc',):
         for folder, dirs, files in os.walk(ROOT + top):
@@ -187,19 +298,22 @@ def etc_secrets_wall():
                 path = os.path.join(folder, name)[len(ROOT):]
                 if SECRET_NAME.fullmatch(name) and others_read(path):
                     found.append(f'{path} (others can read it)')
-    for table in sorted({p[len(ROOT):] for t in MOUNT_TABLES for p in glob.glob(glob.escape(ROOT) + t)}):
-        if not others_read(table):
-            continue
+    for table in readable(MOUNT_TABLES):
         for n, line in enumerate((read(table) or '').splitlines(), 1):
-            if line.lstrip().startswith('#'):
+            if line.lstrip().startswith(('#', ';')):
                 continue
-            if re.search(r'(^|[\s,])(password|pass)=', line):
+            if MOUNT_PASSWORD.search(line):
                 found.append(f'{table} line {n} (a password)')
-            for cred in re.findall(r'(?:^|[\s,])(?:credentials|cred)=([^\s,]+)', line):
+            for cred in MOUNT_CRED.findall(line):
                 if cred.startswith('/') and others_read(cred):
                     found.append(f'{table} line {n} ({cred}, which others can read)')
+    seen = set()
+    for env in readable(ENV_FILES):
+        found += env_secrets(env, seen)
+    for unit in readable_under('/etc/systemd'):
+        found += unit_secrets(unit, seen)
     if found:
-        return (f'jobs can read a password for a share: {", ".join(found[:3])}; make the file readable by its owner '
+        return (f'jobs can read a secret in /etc: {", ".join(found[:3])}; make the file readable by its owner '
                 'alone (0600)')
     return None
 
@@ -215,7 +329,8 @@ WALLS = [
     ('container', 'not in a container', container_wall),
     ('mounts', 'jobs see only the launcher\'s allow list of system paths, on this host\'s own disks; no other '
                'mount', mounts_wall),
-    ('etc-secrets', 'no password for a share in /etc that jobs can read', etc_secrets_wall),
+    ('etc-secrets', 'no password for a share, nor a secret in the login environment, in /etc that jobs can read',
+     etc_secrets_wall),
 ]
 
 

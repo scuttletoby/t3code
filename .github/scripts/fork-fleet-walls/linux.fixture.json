@@ -19,7 +19,27 @@
       "text": "username=u\npassword=p\n",
       "mode": "600"
     },
-    "etc/xrdp/xrdp.ini": "[Xorg]\npassword=ask\n"
+    "etc/xrdp/xrdp.ini": "[Xorg]\npassword=ask\n",
+    "etc/systemd/system/srv-media.mount": "[Unit]\nDescription=media share\n\n[Mount]\nWhat=//nas.example/media\nWhere=/srv/media\nType=cifs\nOptions=credentials=/etc/nas.cred,uid=1000\n",
+    "etc/systemd/system/srv-old.mount": {
+      "text": "[Mount]\nWhat=//nas.example/old\nWhere=/srv/old\nType=cifs\nOptions=username=u,password=owner-only\n",
+      "mode": "600"
+    },
+    "etc/systemd/system/srv-media.automount.d/override.conf": "[Automount]\n# Options=password=old\nTimeoutIdleSec=60\n",
+    "etc/environment": "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n",
+    "etc/profile.d/tools.sh": "export EDITOR=vi\nexport GPG_TTY=$(tty)\nexport GH_TOKEN=$(cat ~/.gh-token)\n[ -n \"$SSH_AUTH_SOCK\" ] && export SSH_KEY_HINT=\n",
+    "etc/profile.d/owner.sh": {
+      "text": "export DEPLOY_TOKEN=only-root-reads-this\n",
+      "mode": "600"
+    },
+    "etc/environment.d/10-locale.conf": "LANG=en_US.UTF-8\nPATH=${PATH}:/opt/tools/bin\n",
+    "etc/profile": "if [ \"$(id -u)\" -eq 0 ]; then PATH=\"/usr/sbin:/usr/bin\"; fi\nexport PATH\nexport https_proxy=http://proxy.example:3128\n",
+    "etc/bash.bashrc": "[ -z \"$PS1\" ] && return\nPS1='\\u@\\h:\\w\\$ '\nexport GH_TOKEN=\"${GH_TOKEN:-}\"\n",
+    "etc/systemd/system/backup.service": "[Service]\nEnvironment=\"LANG=C.UTF-8\" TZ=UTC\nEnvironmentFile=-/etc/default/backup\nExecStart=/usr/bin/backup\n",
+    "etc/default/backup": {
+      "text": "RESTIC_PASSWORD=only-root-reads-this\n",
+      "mode": "600"
+    }
   },
   "fail": {
     "os": [
@@ -173,6 +193,46 @@
       {
         "etc/fstab": "//nas.example/s /srv/s cifs credentials=/etc/nas.secret 0 0\n",
         "etc/nas.secret": "password=p\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.mount": "[Mount]\nWhat=//nas.example/share\nWhere=/srv/nas\nType=cifs\nOptions=username=me,password=hunter2,uid=1000\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.mount": "[Mount]\nWhat=//nas.example/share\nWhere=/srv/nas\nType=cifs\nOptions=pass=hunter2\n"
+      },
+      {
+        "etc/systemd/system/srv-media.mount.d/creds.conf": "[Mount]\nOptions=credentials=/etc/nas.secret\n",
+        "etc/nas.secret": "password=p\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.automount.d/x.conf": "[Automount]\nOptions=username=u,password=hunter2\n"
+      },
+      {
+        "etc/environment": "PATH=\"/usr/bin:/bin\"\nGITHUB_TOKEN=ghp_example\n"
+      },
+      {
+        "etc/profile.d/tools.sh": "export EDITOR=vi\nexport OPENAI_API_KEY='sk-example'\n"
+      },
+      {
+        "etc/profile.d/nas.csh": "setenv NAS_PASSWORD hunter2\n"
+      },
+      {
+        "etc/environment.d/50-ci.conf": "GH_PAT=not-a-real-token\n"
+      },
+      {
+        "etc/profile": "export EDITOR=vi DEPLOY_TOKEN=not-a-real-token\n"
+      },
+      {
+        "etc/bash.bashrc": "[ -n \"$DEPLOY_TOKEN\" ] || export DEPLOY_TOKEN=\"${DEPLOY_TOKEN:-not-a-real-token}\"\n"
+      },
+      {
+        "etc/environment": "https_proxy=http://me:hunter2@proxy.example:3128\n"
+      },
+      {
+        "etc/systemd/system/backup.service": "[Service]\nEnvironment=RESTIC_PASSWORD=hunter2\nExecStart=/usr/bin/backup\n"
+      },
+      {
+        "etc/default/backup": "RESTIC_PASSWORD=hunter2\n"
       }
     ]
   }
