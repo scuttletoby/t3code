@@ -642,8 +642,9 @@ beside the walls (one kit: the one those walls read), so `desk.conf` needs no
 `LAUNCH` line; an old one that names another launcher makes the agent refuse
 to run (exit 2) until the line is gone. The agent fixes the kit when it starts,
 in its real path: a link above it that an upgrade repoints changes nothing
-until the agent restarts, so restart it after an upgrade. Then, once per
-desktop:
+until the agent restarts, so restart it after an upgrade. The desk kit
+([fork-kit/desk](../fork-kit/desk/README.md)) does all of this, with a PASS/FAIL
+check and an uninstall; by hand, once per desktop:
 
 ```sh
 install -d -m 755 /etc/fork-fleet
