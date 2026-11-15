@@ -224,14 +224,20 @@ function WaitCheckDialog({
   readonly onOpenChange: (open: boolean) => void;
   readonly previousName: string | null;
   readonly initialDraft: WaitCheckDraft;
-  readonly onSave: (name: string, check: WaitCheck) => string | null;
+  /**
+   * Returns an error to show, or null once the write is sent. The caller closes the dialog when
+   * the write is saved and calls `onFailed` when it is not, so the typed draft stays.
+   */
+  readonly onSave: (name: string, check: WaitCheck, onFailed: () => void) => string | null;
 }) {
   const baseId = useId();
   const [draft, setDraft] = useState(initialDraft);
   const [errors, setErrors] = useState<Partial<Record<WaitCheckDraftField, string>>>({});
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const save = () => {
+    if (saving) return;
     const parsed = parseWaitCheckDraft(draft);
     if (!parsed.ok) {
       setErrors(parsed.errors);
@@ -239,12 +245,16 @@ function WaitCheckDialog({
       return;
     }
     setErrors({});
-    const error = onSave(parsed.name, parsed.check);
+    setSaveError(null);
+    setSaving(true);
+    const error = onSave(parsed.name, parsed.check, () => {
+      setSaving(false);
+      setSaveError("The check was not saved. Your draft is kept, so you can try again.");
+    });
     if (error !== null) {
+      setSaving(false);
       setSaveError(error);
-      return;
     }
-    onOpenChange(false);
   };
 
   const field = (key: WaitCheckDraftField, multiline = false) => {
@@ -323,7 +333,9 @@ function WaitCheckDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button onClick={save}>Save check</Button>
+          <Button disabled={saving} onClick={save}>
+            {saving ? "Saving…" : "Save check"}
+          </Button>
         </DialogFooter>
       </DialogPopup>
     </Dialog>
@@ -347,13 +359,20 @@ function WaitChecksSection({ updateSettings }: { readonly updateSettings: Update
     setEditing({ previousName, draft, revision });
     setRevision(revision + 1);
   };
-  const save = (previousName: string | null) => (name: string, check: WaitCheck) => {
-    const result = withWaitCheck(checks, previousName, name, check);
-    if (!result.ok) return result.error;
-    // The server replaces the whole map, so the other checks are sent as they are.
-    updateSettings({ waitChecks: result.checks } satisfies ServerSettingsPatch);
-    return null;
-  };
+  const save =
+    (previousName: string | null, dialogRevision: number) =>
+    (name: string, check: WaitCheck, onFailed: () => void) => {
+      const result = withWaitCheck(checks, previousName, name, check);
+      if (!result.ok) return result.error;
+      // The server replaces the whole map, so the other checks are sent as they are.
+      updateSettings({ waitChecks: result.checks } satisfies ServerSettingsPatch, {
+        onFailed,
+        // Close only the dialog that sent this write, not one opened since.
+        onSaved: () =>
+          setEditing((current) => (current?.revision === dialogRevision ? null : current)),
+      });
+      return null;
+    };
 
   return (
     <SettingsSection id="wait-checks-section" title="Wait checks">
@@ -387,6 +406,9 @@ function WaitChecksSection({ updateSettings }: { readonly updateSettings: Update
             <SettingsRow
               key={name}
               id={`wait-check-${name}`}
+              // Not serverScoped (the section row carries the scope chip), but an administrator's
+              // lock on waitChecks makes Edit and Remove inert like "Add check".
+              settingKeys={["waitChecks"]}
               title={<span className="font-mono">{name}</span>}
               description={
                 <>
@@ -436,7 +458,7 @@ function WaitChecksSection({ updateSettings }: { readonly updateSettings: Update
           }}
           previousName={editing.previousName}
           initialDraft={editing.draft}
-          onSave={save(editing.previousName)}
+          onSave={save(editing.previousName, editing.revision)}
         />
       ) : null}
     </SettingsSection>
@@ -445,11 +467,17 @@ function WaitChecksSection({ updateSettings }: { readonly updateSettings: Update
 
 function AgentSlotsSection({ updateSettings }: { readonly updateSettings: UpdateSettings }) {
   const slots = useScopedSettings((settings) => settings.agentSlots);
-  const { targets, environment } = useSettingsScope();
+  const { targets, environment, connectedEnvironments } = useSettingsScope();
   const providersByEnvironment = useEnvironmentProviders();
-  const providers =
-    (environment ? providersByEnvironment.get(environment.environmentId) : undefined) ??
-    EMPTY_SERVER_PROVIDERS;
+  // Every selected environment's accounts, the primary's first, so each can be limited here.
+  const providers = [
+    ...(environment ? [environment] : []),
+    ...connectedEnvironments.filter(
+      (candidate) => candidate.environmentId !== environment?.environmentId,
+    ),
+  ].flatMap(
+    (candidate) => providersByEnvironment.get(candidate.environmentId) ?? EMPTY_SERVER_PROVIDERS,
+  );
   const enabledMixed = targetsDiffer(targets, (settings) => settings.agentSlots.enabled);
   const accountsMixed = targetsDiffer(targets, (settings) => settings.agentSlots.maxPerAccount);
   const patch = (value: AgentSlotsSettingsPatch) => ({ agentSlots: value });

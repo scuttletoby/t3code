@@ -15,7 +15,9 @@ import {
 } from "@t3tools/contracts";
 import type { WaitForInput, WaitRecord } from "@t3tools/contracts/waitFor";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -32,6 +34,7 @@ import type { WaitDelivery } from "./WaitDelivery.ts";
 import type { WaitJudge } from "./WaitJudges.ts";
 import { makePrJudge } from "./WaitPrJudge.ts";
 import * as WaitService from "./WaitService.ts";
+import { memoryFileSystem } from "./WaitService.testkit.ts";
 import { WAIT_STORE_FILE } from "./WaitStore.ts";
 
 const NOW = Date.parse("2026-11-15T12:00:00.000Z");
@@ -768,6 +771,87 @@ it.layer(NodeServices.layer)("WaitPrJudge", (it) => {
         assert.deepStrictEqual(yield* restarted.judgeDue(), { judged: 2, ended: 0 });
         assert.isFalse(host.reads.some((read) => read.includes("upstream/")));
       }).pipe(Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))));
+    },
+  );
+
+  it.effect(
+    "a pin made while the new wait is being written is saved with it, so a changed remote is never read (#118)",
+    () => {
+      const host = fakeHost();
+      return Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        host.prs.set("acme/widgets#7", { state: "open", headSha: HEAD_A });
+        // In memory, so every write answers at once while the test clock moves.
+        const filePath = `/waits/${WAIT_STORE_FILE}`;
+        const memoryFs = yield* FileSystem.FileSystem;
+        const writing = yield* Deferred.make<void>();
+        const pinned = yield* Deferred.make<void>();
+        let armed = true;
+        // The wait's first write ends in a rename onto the store; it is held there until the pin.
+        const fs: FileSystem.FileSystem = {
+          ...memoryFs,
+          rename: (from, to) =>
+            armed && to === filePath
+              ? Effect.gen(function* () {
+                  armed = false;
+                  yield* Deferred.succeed(writing, undefined);
+                  yield* Deferred.await(pinned);
+                  return yield* memoryFs.rename(from, to);
+                })
+              : memoryFs.rename(from, to),
+        };
+        const letFibersRun = Effect.gen(function* () {
+          for (let turn = 0; turn < 20; turn += 1) yield* Effect.yieldNow;
+        });
+        const prJudge = yield* makePrJudge();
+        // At registration the read answers only after the 3 s limit, while the wait is written.
+        const lateRead: WaitJudge<"pr"> = (target, context) =>
+          context.waitId !== null
+            ? prJudge(target, context)
+            : Deferred.await(writing).pipe(
+                Effect.andThen(
+                  prJudge(target, {
+                    ...context,
+                    pin: (next) =>
+                      context.pin!(next).pipe(Effect.andThen(Deferred.succeed(pinned, undefined))),
+                  }),
+                ),
+              );
+        const service = yield* makeService(filePath, lateRead).pipe(
+          Effect.provideService(FileSystem.FileSystem, fs),
+        );
+        const registering = yield* Effect.forkChild(
+          register(service, prWait({ number: 7, until: "merged" })),
+        );
+        // One second at a time, so each forked step has set its timer before the clock moves.
+        for (let second = 0; second < 5; second += 1) {
+          yield* letFibersRun;
+          yield* TestClock.adjust(1_000);
+        }
+        assert.strictEqual((yield* Fiber.join(registering)).state, "waiting");
+        const pinnedSpec = {
+          number: 7,
+          repository: "acme/widgets",
+          host: "github.com",
+          until: "merged" as const,
+        };
+        assert.deepStrictEqual((yield* storedWaits(filePath))[0]?.spec, pinnedSpec);
+
+        // The project's remote flips before the next check: the wait still reads acme/widgets.
+        host.projects.set(PROJECT, shell(PROJECT, "upstream/widgets"));
+        host.remotes.set(`/work/${PROJECT}`, identityOf("upstream/widgets"));
+        host.prs.set("upstream/widgets#7", { state: "merged", headSha: HEAD_B });
+        for (let pass = 0; pass < 2; pass += 1) {
+          yield* TestClock.adjust(SWEEP);
+          yield* service.judgeDue();
+        }
+        assert.isFalse(host.reads.some((read) => read.includes("upstream/")));
+        assert.deepStrictEqual((yield* storedWaits(filePath))[0]?.spec, pinnedSpec);
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "waiting");
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),
+        Effect.provide(Layer.merge(host.layer, ServerSettingsService.layerTest(ON))),
+      );
     },
   );
 
