@@ -13,7 +13,9 @@ WireError, never a cut on the receiving side.
   serve -> agent, answer    {"v":1, "hello": POOL}
   serve -> agent            {"v":1, "id": N, "verb": V, "args": [...], "stdin": S}   one launcher call ("stdin": start only)
   agent -> serve            {"v":1, "id": N, "exit": E, "stdout": O, "stderr": R}   its result; any order, once per id
-  serve -> agent            {"v":1, "ping": N}       the agent answers {"v":1, "pong": N} at once, also while verbs run
+  serve -> agent            {"v":1, "ping": N}       the agent answers {"v":1, "pong": N} at once, also while verbs run.
+                            serve sends one whenever it has sent nothing for PING (15) s, however much the agent
+                            sends: the agent ends the session after 45 s with no frame from serve.
   launch -> serve (socket)  a request without "id"; serve answers with an answer without "id".
 Anything else ends the session (or drops that one socket client). A hello of another VERSION ends it with serve's
 exit WRONG_VERSION (ssh passes it to the agent) and a line on ssh's stderr that says which side to upgrade.
@@ -38,8 +40,6 @@ POOL = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')                       # fork-flee
 NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}')             # fork-fleet-launch.sh's NAME
 RUNNER_VERSION = re.compile(r'[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}')    # fork-fleet-launch.sh's VERSION
 MB = re.compile(r'[0-9]{1,7}')
-URL = re.compile(r'https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?')
-HOST_PORT = re.compile(r'[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}')
 START_LINE = re.compile(r'(ACTIONS_RUNNER_INPUT_JITCONFIG=[A-Za-z0-9+/=]{1,65536}|FORK_FLEET_(RUN|ATTEMPT)=[1-9][0-9]{0,19})')
 # The launcher's verbs: (argument patterns, then a pattern every further argument matches or None, the verb's limit
 # in seconds: the agent kills it then). fork-fleet.py's Host waits 120 s for its launch command: see "Time" above.
@@ -50,12 +50,13 @@ VERBS = {
     'fits': ((MB,), None, 30),
     'stop': ((NAME,), None, 100),
     'prune': ((), None, 100),
-    'check-net': ((URL, HOST_PORT), HOST_PORT, 300),
     'refresh-net': ((), None, 100),   # each dispatcher pass: the address lookups (10 s each) and the units' new deny lists
 }
 # The launcher's verbs that only its own machine runs (a root timer, the walls check or a person at the machine), never
 # the link: `serve` and the agent refuse them like an unknown verb, and the contract test counts them as the launcher's.
-LOCAL_ONLY = frozenset({'refresh', 'paths'})
+# check-net connects, as root and from the machine's own network, to each HOST:PORT it is given and says which one it
+# cannot reach: through the link that would let the always-on host map the desktop's home network.
+LOCAL_ONLY = frozenset({'refresh', 'check-net', 'paths'})
 MARGIN = 10                   # seconds `launch` waits beyond a verb's limit, all told
 SERVE_MARGIN = 5              # seconds `serve` waits beyond it before it answers UNKNOWN itself
 UNKNOWN = 75                  # launch's exit when the verb may or may not have run (EX_TEMPFAIL)
@@ -168,7 +169,8 @@ def check_request(frame, with_id):
     if with_id:
         _count(frame['id'])
     verb, args = frame['verb'], frame['args']
-    if verb not in VERBS or not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+    if not isinstance(verb, str) or verb not in VERBS or not isinstance(args, list) or \
+            not all(isinstance(a, str) for a in args):   # str first: a list or an object is no key, and no crash
         raise WireError(f'not a launcher verb: {str(verb)[:40]!r}')
     fixed, rest, _ = VERBS[verb]
     if len(args) < len(fixed) or (rest is None and len(args) > len(fixed)):
