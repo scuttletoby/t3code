@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Fork only: the walls of a plain Linux desktop (not WSL), for fork-fleet-walls.py (its contract is there). Each wall
+is one systemd or kernel can drop without an error: a runner would then start with less of its sandbox than the
+launcher asked for. Reads files only; changes nothing. Standard library only."""
+import glob, os, re, sys
+
+ROOT = os.environ.get('FORK_FLEET_WALLS_ROOT', '')
+
+
+def read(path):
+    try:
+        with open(ROOT + path, encoding='utf-8', errors='replace') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def mounts():
+    """(mount point, fs type) of every mount, from mountinfo (points unescaped: \\040 is a space)."""
+    text = read('/proc/self/mountinfo')
+    if text is None:
+        raise ValueError('cannot read /proc/self/mountinfo')
+    out = []
+    for line in text.splitlines():
+        left, _, right = line.partition(' - ')
+        fields = left.split()
+        if len(fields) < 5 or not right:
+            raise ValueError(f'/proc/self/mountinfo has a line that is not a mount: {line[:80]!r}')
+        out.append((re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), fields[4]), right.split()[0]))
+    return out
+
+
+def os_wall():
+    release = read('/proc/sys/kernel/osrelease')
+    if read('/proc/sys/kernel/ostype') != 'Linux' or release is None:
+        return 'no Linux /proc/sys/kernel/ostype and osrelease'
+    marks = ('/run/WSL', '/proc/sys/fs/binfmt_misc/WSLInterop*', '/usr/lib/wsl', '/mnt/wsl')   # as WSL_MARKS
+    if 'microsoft' in release.lower() or any(glob.glob(glob.escape(ROOT) + m) for m in marks):
+        return f'this is WSL ({release}): its walls are fork-fleet-walls/wsl2'
+    return None
+
+
+def kernel_wall():
+    m = re.match(r'(\d+)\.(\d+)', read('/proc/sys/kernel/osrelease') or '')
+    if not m:
+        return 'cannot read the kernel version in /proc/sys/kernel/osrelease'
+    if (int(m.group(1)), int(m.group(2))) < (5, 8):
+        return f'kernel {m.group(0)}: before 5.8, systemd drops ProtectProc and jobs see every process'
+    return None
+
+
+def systemd_wall():
+    comm = read('/proc/1/comm')
+    return None if comm == 'systemd' else f'PID 1 is {comm or "unknown"}: the launcher runs jobs as systemd units'
+
+
+def cgroup_wall():
+    kinds = [kind for point, kind in mounts() if point == '/sys/fs/cgroup']
+    if kinds[-1:] != ['cgroup2']:
+        return (f'/sys/fs/cgroup is {kinds[-1] if kinds else "not mounted"}, not cgroup2: without the unified '
+                'hierarchy systemd drops IPAddressDeny, the jobs\' second firewall')
+    return None
+
+
+def seccomp_wall():
+    actions = (read('/proc/sys/kernel/seccomp/actions_avail') or '').split()
+    if 'errno' not in actions:
+        return 'no seccomp filters (/proc/sys/kernel/seccomp/actions_avail): systemd drops the jobs\' system-call walls'
+    return None
+
+
+def container_wall():
+    found = [p for p in ('/run/systemd/container', '/.dockerenv', '/run/.containerenv') if os.path.lexists(ROOT + p)]
+    if found:
+        return f'{found[0]} is there: in a container systemd drops some of the jobs\' walls without an error'
+    return None
+
+
+def mounts_wall():
+    found = [p for p, _ in mounts() if re.match(r'/(mnt|media)(/|$)', p)]
+    if found:
+        return (f'mounted: {", ".join(found[:3])}: a job could read what a mounted disk lets everyone read; unmount '
+                'it while runners run')
+    return None
+
+
+WALLS = [
+    ('os', 'a plain Linux kernel, not WSL', os_wall),
+    ('kernel', 'kernel 5.8 or newer (per-mount /proc, so jobs see no other process)', kernel_wall),
+    ('systemd', 'systemd is PID 1', systemd_wall),
+    ('cgroup2', '/sys/fs/cgroup is cgroup2 only', cgroup_wall),
+    ('seccomp', 'seccomp filters are available', seccomp_wall),
+    ('container', 'not in a container', container_wall),
+    ('mounts', 'nothing mounted under /mnt or /media', mounts_wall),
+]
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in ('check', 'describe'):
+        print('usage: linux check | describe', file=sys.stderr)
+        return 2
+    failed = False
+    for wall, what, test in WALLS:
+        try:
+            why = test()
+        except Exception as e:   # a wall that cannot be told does not hold
+            why = f'cannot tell ({e.__class__.__name__}: {e})'
+        failed |= why is not None
+        if why is not None:
+            print(f'FAIL  {wall}  ' + f'{what}: {why}'.replace('\n', ' ')[:400])
+        elif argv[0] == 'describe':
+            print(f'PASS  {wall}  {what}')
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

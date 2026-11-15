@@ -1,0 +1,46 @@
+{
+  "about": "fork-fleet-walls.test.py: `pass` is a fake machine on which every wall of `linux` holds (paths under FORK_FLEET_WALLS_ROOT; a string is a file's text, a path ending in / a folder, {\"text\", \"mode\"} a program); `fail` names each wall with the changes that make it fail (null removes a path).",
+  "pass": {
+    "proc/sys/kernel/ostype": "Linux\n",
+    "proc/sys/kernel/osrelease": "6.8.0-47-generic\n",
+    "proc/1/comm": "systemd\n",
+    "proc/sys/kernel/seccomp/actions_avail": "kill_process kill_thread trap errno user_notif trace log allow\n",
+    "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n",
+    "run/": ""
+  },
+  "fail": {
+    "os": [
+      {"proc/sys/kernel/osrelease": "6.6.36.3-microsoft-standard-WSL2\n"},
+      {"run/WSL/": ""},
+      {"usr/lib/wsl/": ""},
+      {"proc/sys/fs/binfmt_misc/WSLInterop-late": "enabled\n"},
+      {"proc/sys/kernel/ostype": null}
+    ],
+    "kernel": [
+      {"proc/sys/kernel/osrelease": "5.4.0-200-generic\n"},
+      {"proc/sys/kernel/osrelease": "generic\n"}
+    ],
+    "systemd": [
+      {"proc/1/comm": "init\n"},
+      {"proc/1/comm": null}
+    ],
+    "cgroup2": [
+      {"proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n36 35 0:30 / /sys/fs/cgroup/unified rw - cgroup2 cgroup2 rw\n"},
+      {"proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n"},
+      {"proc/self/mountinfo": "not a mount line\n"}
+    ],
+    "seccomp": [
+      {"proc/sys/kernel/seccomp/actions_avail": null},
+      {"proc/sys/kernel/seccomp/actions_avail": "kill_process allow\n"}
+    ],
+    "container": [
+      {"run/systemd/container": "lxc\n"},
+      {".dockerenv": ""},
+      {"run/.containerenv": ""}
+    ],
+    "mounts": [
+      {"proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n50 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n"},
+      {"proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n51 29 8:33 / /mnt rw - ext4 /dev/sdc1 rw\n"}
+    ]
+  }
+}
