@@ -235,12 +235,11 @@ const logTransition = (transition: WaitTransition) =>
 type JudgePool = WaitKind | "fileChild";
 
 /**
- * Places whose checks run in a process: stopping one kills its process group, so its place is free
- * at once. The others run in the server (a file check's `stat` holds one of Node's few I/O threads
- * until the kernel answers, and nothing can stop it), so a stopped one answers its waiter at once
- * but keeps its place until it really returns: stuck ones never pass `MAX_RUNNING_JUDGES_PER_KIND`.
+ * Places whose stopped checks free their place at once (their process group is killed). Others
+ * keep it until the check returns, so stuck ones never pass `MAX_RUNNING_JUDGES_PER_KIND`: a `stat`
+ * in the server cannot be stopped, and a file check process on a dead mount may not die.
  */
-const STOPPABLE_POOLS: ReadonlySet<JudgePool> = new Set<JudgePool>(["check", "unit", "fileChild"]);
+const STOPPABLE_POOLS: ReadonlySet<JudgePool> = new Set<JudgePool>(["check", "unit"]);
 
 /** Who a check runs for, and (check waits) which check in which project. */
 interface JudgeRun {
@@ -843,7 +842,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   /**
    * Stops the running checks of these waits (of all, for null): each answers `judgement` at once.
    * A check process has its group killed, and its slot is free once it is gone; a check in the
-   * server cannot be stopped, so it keeps its slot until it returns (see `STOPPABLE_POOLS`).
+   * server, or a file check process, keeps its slot until it returns (see `STOPPABLE_POOLS`).
    */
   const stopRuns = (waitIds: ReadonlySet<string> | null, judgement: Judgement) =>
     Effect.forEach(
@@ -908,8 +907,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           );
           return { type: "started", started: { fiber, entry } } as const;
         }
-        // In the server: stopped, it answers at once, but the slot is freed only when the check
-        // itself returns (or the service stops), since its thread is held until then.
+        // In the server or a file check process: stopped, it answers at once, but the slot is
+        // freed only when the check itself returns (or the service stops).
         const own = yield* Effect.forkIn(
           Effect.interruptible(checked).pipe(Effect.ensuring(release)),
           runScope,
