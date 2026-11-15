@@ -190,9 +190,35 @@ export interface SlotDecisionInput {
   readonly starting: ReadonlyArray<StartingEntry>;
   /** Live reservations that count (`liveReservations`), without the caller's own. */
   readonly reservations?: ReadonlyArray<SlotReservation>;
+  /**
+   * Live held slots that count against their account only, never the machine: a thread's earlier
+   * hold while its re-ask is not kept yet (its new hold counts on the machine). Each thread counts
+   * once per account, and not where one of its `reservations` already holds that account.
+   */
+  readonly accountOnly?: ReadonlyArray<SlotReservation>;
   readonly targetInstanceId: string;
   /** `null` when the memory floor is off. */
   readonly freeMemoryBytes: number | null;
+}
+
+/** Threads whose `accountOnly` holds are on `account` and not already counted there. */
+export function accountOnlyThreads(
+  counted: ReadonlyArray<SlotReservation>,
+  accountOnly: ReadonlyArray<SlotReservation>,
+  account: string,
+): number {
+  const already = new Set(
+    counted.flatMap((reservation) =>
+      reservation.account === account ? [reservation.threadId] : [],
+    ),
+  );
+  return new Set(
+    accountOnly.flatMap((reservation) =>
+      reservation.account === account && !already.has(reservation.threadId)
+        ? [reservation.threadId]
+        : [],
+    ),
+  ).size;
 }
 
 /** Machine limit first, then the target's account, then the memory floor. */
@@ -215,7 +241,8 @@ export function slotDecision(input: SlotDecisionInput): SlotDecision {
     const accountUsed =
       running.filter((agent) => agent.instanceId === targetInstanceId).length +
       starting.filter((entry) => entry.instanceId === targetInstanceId).length +
-      reservations.filter((reservation) => reservation.account === targetInstanceId).length;
+      reservations.filter((reservation) => reservation.account === targetInstanceId).length +
+      accountOnlyThreads(reservations, input.accountOnly ?? [], targetInstanceId);
     if (accountUsed >= accountMax) return refuse("account", accountUsed, accountMax);
   }
   if (
