@@ -13,6 +13,7 @@ Every kit follows the same pattern:
 - safe to run again, and safe to stop at any step;
 - an uninstall that leaves nothing.
 
-| Kit                          | What                                                                                 |
-| ---------------------------- | ------------------------------------------------------------------------------------ |
-| [gh-apps](gh-apps/README.md) | GitHub App tokens for agents through `gh-as`, without giving agents the keys (Linux) |
+| Kit                          | What                                                                                                    |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------- |
+| [gh-apps](gh-apps/README.md) | GitHub App tokens for agents through `gh-as`, without giving agents the keys (Linux)                    |
+| [heavy](heavy/README.md)     | `heavy <command>`: run builds and tests in a capped slice, stop what they leave behind (Linux, systemd) |
