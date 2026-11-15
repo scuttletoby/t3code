@@ -14,7 +14,7 @@ import {
 } from "@t3tools/contracts";
 import type { AgentSlotsSettings } from "@t3tools/contracts/waitFor";
 import type { DeepPartial } from "@t3tools/shared/Struct";
-import { DISPATCH_SAFETY_MS } from "@t3tools/shared/agentSlots";
+import { DISPATCH_SAFETY_MS, type SlotReservation } from "@t3tools/shared/agentSlots";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -487,4 +487,481 @@ describe("SlotGate", () => {
       assert.strictEqual((yield* run(world, settings, acquire())).type, "allow");
     }),
   );
+
+  describe("slots held for slot waits (4.6)", () => {
+    const holder = ThreadId.make("thread:slot-holder");
+    const other = ThreadId.make("thread:slot-other");
+    const waitsOn = (patch: Partial<AgentSlotsSettings>) => ({
+      ...on(patch),
+      waitFor: { enabled: true },
+    });
+    const acquireAs = (callerThreadId: ThreadId, targetInstanceId = MAIN) =>
+      SlotGate.SlotGate.pipe(
+        Effect.flatMap((gate) => gate.acquire({ callerThreadId, targetInstanceId })),
+      );
+    const grant = (...requests: ReadonlyArray<SlotGate.SlotRequest>) =>
+      SlotGate.SlotGate.pipe(Effect.flatMap((gate) => gate.grant(requests)));
+    const types = (grants: ReadonlyArray<SlotGate.SlotGrant>) => grants.map((g) => g.type);
+
+    it.effect("off, or no limit: every request is 'off', nothing read, nothing held", () =>
+      Effect.gen(function* () {
+        for (const settings of [{}, { waitFor: { enabled: true } }, waitsOn({})]) {
+          const world = newWorld();
+          world.threads = [{ id: "a", instanceId: MAIN }];
+          const grants = yield* run(
+            world,
+            settings,
+            grant({ key: "w1", threadId: holder }, { key: "w2", threadId: other }),
+          );
+          assert.deepStrictEqual(types(grants), ["off", "off"]);
+          assert.strictEqual(world.snapshotReads, 0);
+          assert.strictEqual(world.memoryReads, 0);
+        }
+      }),
+    );
+
+    it.effect(
+      "two waits for one free slot: the first is held, the second is not; no double start",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          world.threads = [{ id: "a", instanceId: MAIN }];
+          yield* run(
+            world,
+            waitsOn({ maxPerMachine: 2, reserveSeconds: 60 }),
+            Effect.gen(function* () {
+              const grants = yield* grant(
+                { key: "w1", threadId: holder },
+                { key: "w2", threadId: other },
+              );
+              assert.deepStrictEqual(grants, [{ type: "granted", untilMs: 60_000 }, grants[1]!]);
+              assert.strictEqual(grants[1]!.type, "full");
+              // The slot is held: the other thread is refused, and told to wait for a slot.
+              const refused = yield* acquireAs(other);
+              assert.strictEqual(refused.type, "refuse");
+              if (refused.type === "refuse") assert.include(refused.message, "wait_for");
+              // The holder starts its agent; its held slot is used up, not counted twice.
+              assert.strictEqual((yield* acquireAs(holder)).type, "allow");
+              assert.strictEqual((yield* acquireAs(holder)).type, "refuse");
+              assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+            }),
+          );
+        }),
+    );
+
+    it.effect("a held slot ends after reserveSeconds, and a dropped grant holds nothing", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 1, reserveSeconds: 30 }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(types(yield* grant({ key: "w1", threadId: holder })), [
+              "granted",
+            ]);
+            assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+            yield* TestClock.adjust("30 seconds");
+            assert.deepStrictEqual(types(yield* grant({ key: "w2", threadId: holder })), [
+              "granted",
+            ]);
+            const gate = yield* SlotGate.SlotGate;
+            yield* gate.drop(["w2"]);
+            yield* gate.drop([]);
+            assert.strictEqual((yield* acquireAs(other)).type, "allow");
+          }),
+        );
+      }),
+    );
+
+    it.effect("reserveSeconds 0: the wait is woken but no slot is held", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 1, reserveSeconds: 0 }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(yield* grant({ key: "w1", threadId: holder }), [
+              { type: "granted", untilMs: 0 },
+            ]);
+            assert.strictEqual((yield* acquireAs(other)).type, "allow");
+          }),
+        );
+      }),
+    );
+
+    it.effect("held slots count only while waits are on (turned off while held)", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 1 }),
+          Effect.gen(function* () {
+            yield* grant({ key: "w1", threadId: holder });
+            assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+            const settings = yield* ServerSettings.ServerSettingsService;
+            yield* settings.updateSettings({ waitFor: { enabled: false } });
+            const allowed = yield* acquireAs(other);
+            assert.strictEqual(allowed.type, "allow");
+            if (allowed.type === "allow") {
+              const gate = yield* SlotGate.SlotGate;
+              yield* gate.release(allowed.token);
+            }
+            // Slots turned off: everything is allowed and slot waits are 'off'.
+            yield* settings.updateSettings({ waitFor: { enabled: true } });
+            yield* settings.updateSettings({ agentSlots: { enabled: false } });
+            assert.strictEqual((yield* acquireAs(other)).type, "allow");
+            assert.deepStrictEqual(types(yield* grant({ key: "w2", threadId: other })), ["off"]);
+          }),
+        );
+      }),
+    );
+
+    it.effect("the limit raised while held: the next grant sees the new limit", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [{ id: "a", instanceId: MAIN }];
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 1 }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(types(yield* grant({ key: "w1", threadId: holder })), ["full"]);
+            const settings = yield* ServerSettings.ServerSettingsService;
+            yield* settings.updateSettings({ agentSlots: { maxPerMachine: 3 } });
+            assert.deepStrictEqual(
+              types(
+                yield* grant(
+                  { key: "w1", threadId: holder },
+                  { key: "w2", threadId: other },
+                  { key: "w3", threadId: caller },
+                ),
+              ),
+              ["granted", "granted", "full"],
+            );
+          }),
+        );
+      }),
+    );
+
+    it.effect("an account wait counts its account; a wait with no account only the machine", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [{ id: "a", instanceId: SECOND }];
+        yield* run(
+          world,
+          waitsOn({ maxPerAccount: { [SECOND]: 1 } }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(
+              types(
+                yield* grant(
+                  { key: "w1", threadId: holder, account: SECOND },
+                  { key: "w2", threadId: other, account: MAIN },
+                ),
+              ),
+              ["full", "granted"],
+            );
+            // No account and no machine limit: nothing to count, so nothing is read for it.
+            const reads = world.snapshotReads;
+            assert.deepStrictEqual(types(yield* grant({ key: "w3", threadId: caller })), [
+              "granted",
+            ]);
+            assert.strictEqual(world.snapshotReads, reads);
+          }),
+        );
+      }),
+    );
+
+    it.effect("running agents that cannot be counted: 'unread', never granted, nothing held", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotFails = true;
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 5 }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(types(yield* grant({ key: "w1", threadId: holder })), [
+              "unread",
+            ]);
+            assert.isNull(yield* (yield* SlotGate.SlotGate).usage);
+            world.snapshotFails = false;
+            world.snapshotDies = true;
+            assert.deepStrictEqual(types(yield* grant({ key: "w1", threadId: holder })), [
+              "unread",
+            ]);
+          }),
+        );
+      }),
+    );
+
+    it.effect("slots held in the wait store: read only while waits are on; used up once", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        let reads = 0;
+        const used: Array<string> = [];
+        let inStore: ReadonlyArray<SlotReservation> = [
+          { key: "stored", threadId: holder, untilMs: 90_000 },
+        ];
+        yield* run(
+          world,
+          on({ maxPerMachine: 1 }),
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* gate.attachReservations({
+              read: Effect.sync(() => {
+                reads += 1;
+                return inStore;
+              }),
+              used: (key) =>
+                Effect.sync(() => {
+                  used.push(key);
+                  inStore = inStore.filter((entry) => entry.key !== key);
+                }),
+            });
+            // Waits off: the store is never read and its slot does not count.
+            assert.strictEqual((yield* acquireAs(other)).type, "allow");
+            assert.strictEqual(reads, 0);
+            assert.deepStrictEqual(used, []);
+          }),
+        );
+        // Restart with waits on (stored slots outlive the gate's memory).
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 1 }),
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* gate.attachReservations({
+              read: Effect.sync(() => {
+                reads += 1;
+                return inStore;
+              }),
+              used: (key) =>
+                Effect.sync(() => {
+                  used.push(key);
+                  inStore = inStore.filter((entry) => entry.key !== key);
+                }),
+            });
+            assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+            assert.isAbove(reads, 0);
+            const usage = yield* gate.usage;
+            assert.deepStrictEqual(usage?.machine, { used: 1, max: 1 });
+            assert.strictEqual((yield* acquireAs(holder)).type, "allow");
+            assert.deepStrictEqual(used, ["stored"]);
+          }),
+        );
+      }),
+    );
+
+    it.effect(
+      "a used slot whose store write fails no longer counts; the acquire still allows",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          yield* run(
+            world,
+            waitsOn({ maxPerMachine: 2 }),
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              yield* gate.attachReservations({
+                read: Effect.succeed([{ key: "stored", threadId: holder, untilMs: 90_000 }]),
+                used: () => Effect.die(new Error("disk full")),
+              });
+              assert.strictEqual((yield* acquireAs(holder)).type, "allow");
+              // One starting agent, the store's copy (not cleared) not counted again: one slot free.
+              assert.strictEqual((yield* acquireAs(other)).type, "allow");
+              assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+            }),
+          );
+        }),
+    );
+
+    it.effect("usage: null while slots are off; counts running, starting and held", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [{ id: "a", instanceId: SECOND }];
+        assert.isNull(
+          yield* run(world, {}, SlotGate.SlotGate.pipe(Effect.flatMap((gate) => gate.usage))),
+        );
+        assert.strictEqual(world.snapshotReads, 0);
+        const usage = yield* run(
+          world,
+          waitsOn({ maxPerMachine: 4, maxPerAccount: { [MAIN]: 2 } }),
+          Effect.gen(function* () {
+            yield* grant({ key: "w1", threadId: holder, account: MAIN });
+            yield* acquireAs(other, MAIN);
+            return yield* (yield* SlotGate.SlotGate).usage;
+          }),
+        );
+        assert.deepStrictEqual(usage, {
+          machine: { used: 3, max: 4 },
+          accounts: [
+            { id: SECOND, used: 1, max: null },
+            { id: MAIN, used: 2, max: 2 },
+          ].sort((a, b) => (a.id < b.id ? -1 : 1)),
+          freeMemoryMb: 16_000,
+        });
+      }),
+    );
+
+    // R17: "as many wakes as free slots". reserveSeconds 0 is a valid setting.
+    it.effect("reserveSeconds 0: one free slot wakes one wait, not every wait", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        const grants = yield* run(
+          world,
+          waitsOn({ maxPerMachine: 1, reserveSeconds: 0 }),
+          grant(
+            { key: "w1", threadId: holder },
+            { key: "w2", threadId: other },
+            { key: "w3", threadId: caller },
+          ),
+        );
+        assert.deepStrictEqual(types(grants), ["granted", "full", "full"]);
+      }),
+    );
+
+    it.effect("one held slot per thread: asking again moves it, never adds or extends one", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 3, reserveSeconds: 60 }),
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            // Asked three times (three slots free, at 0, 20 and 40 s): still one slot held.
+            for (const [index, key] of ["w1", "w2", "w3"].entries()) {
+              if (index > 0) yield* TestClock.adjust("20 seconds");
+              assert.deepStrictEqual(types(yield* grant({ key, threadId: holder })), ["granted"]);
+            }
+            assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 3 });
+            assert.strictEqual((yield* acquireAs(other)).type, "allow");
+            assert.strictEqual((yield* acquireAs(other)).type, "allow");
+            assert.strictEqual((yield* acquireAs(other)).type, "refuse");
+            // Not renewed by the later asks: held until the first ask's end (60 s), then gone.
+            yield* TestClock.adjust("19 seconds");
+            assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 3, max: 3 });
+            yield* TestClock.adjust("1 second");
+            assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 2, max: 3 });
+          }),
+        );
+      }),
+    );
+
+    it.effect("two slot waits of one thread in one sweep: one wake, the other asks next time", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 3 }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(
+              types(
+                yield* grant(
+                  { key: "w1", threadId: holder, account: MAIN },
+                  { key: "w2", threadId: holder, account: SECOND },
+                  { key: "w3", threadId: other },
+                ),
+              ),
+              ["granted", "sameThread", "granted"],
+            );
+            assert.deepStrictEqual((yield* (yield* SlotGate.SlotGate).usage)?.machine, {
+              used: 2,
+              max: 3,
+            });
+          }),
+        );
+      }),
+    );
+
+    it.effect(
+      "two stored held slots of one thread (a restart): counted once, both replaced by a new ask",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          const used: Array<string> = [];
+          let inStore: ReadonlyArray<SlotReservation> = [
+            { key: "stored-1", threadId: holder, untilMs: 50_000 },
+            // A restart lost the gate's note that this older copy was replaced.
+            { key: "stored-0", threadId: holder, untilMs: 40_000 },
+          ];
+          yield* run(
+            world,
+            waitsOn({ maxPerMachine: 2, reserveSeconds: 60 }),
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              yield* gate.attachReservations({
+                read: Effect.sync(() => inStore),
+                used: (key) =>
+                  Effect.sync(() => {
+                    used.push(key);
+                    inStore = inStore.filter((entry) => entry.key !== key);
+                  }),
+              });
+              assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 2 });
+              // Asked again: granted, and both stored copies are cleared (replaced).
+              assert.deepStrictEqual(types(yield* grant({ key: "w1", threadId: holder })), [
+                "granted",
+              ]);
+              assert.deepStrictEqual([...used].sort(), ["stored-0", "stored-1"]);
+              assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 2 });
+              assert.strictEqual((yield* acquireAs(other)).type, "allow");
+              // Its agent starts: the one held slot is used up and the store asked to clear it.
+              assert.strictEqual((yield* acquireAs(holder)).type, "allow");
+              assert.deepStrictEqual(used.slice(2), ["w1"]);
+              assert.strictEqual((yield* acquireAs(caller)).type, "refuse");
+            }),
+          );
+        }),
+    );
+
+    it.effect("a thread already holding a slot that is refused keeps the slot it holds", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 2, maxPerAccount: { [SECOND]: 1 } }),
+          Effect.gen(function* () {
+            yield* grant({ key: "w1", threadId: other, account: SECOND });
+            assert.deepStrictEqual(types(yield* grant({ key: "w2", threadId: holder })), [
+              "granted",
+            ]);
+            // The account is full: refused, and its held machine slot stays.
+            assert.deepStrictEqual(
+              types(yield* grant({ key: "w3", threadId: holder, account: SECOND })),
+              ["full"],
+            );
+            assert.deepStrictEqual((yield* (yield* SlotGate.SlotGate).usage)?.machine, {
+              used: 2,
+              max: 2,
+            });
+          }),
+        );
+      }),
+    );
+    it.effect("asking again moves a held slot but never extends it past the first end", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* run(
+          world,
+          waitsOn({ maxPerMachine: 1, reserveSeconds: 60 }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(types(yield* grant({ key: "h0", threadId: holder })), [
+              "granted",
+            ]);
+            // An older wait of another thread comes first in every sweep; the holder asks
+            // again every 50 s without starting an agent.
+            const otherGot: Array<string> = [];
+            for (let round = 1; round <= 10; round += 1) {
+              yield* TestClock.adjust("50 seconds");
+              const grants = yield* grant(
+                { key: "o1", threadId: other },
+                { key: `h${round}`, threadId: holder },
+              );
+              otherGot.push(grants[0]!.type);
+            }
+            // The first hold ended at 60 s: the other thread got the slot at the 100 s sweep.
+            assert.deepStrictEqual(otherGot.slice(0, 2), ["full", "granted"]);
+          }),
+        );
+      }),
+    );
+  });
 });

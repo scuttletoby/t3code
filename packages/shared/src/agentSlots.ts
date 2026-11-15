@@ -56,12 +56,12 @@ export interface RunningAgent {
 }
 
 /**
- * Threads with an active run, less the caller and less threads blocked in a thread wait (a
- * parent inside `t3_thread_wait` holds no model turn of its own while it waits).
+ * Threads with an active run, less the caller (`null`: nobody) and less threads blocked in a
+ * thread wait (a parent inside `t3_thread_wait` holds no model turn of its own while it waits).
  */
 export function runningAgents(
   threads: ReadonlyArray<SlotThread>,
-  callerThreadId: string,
+  callerThreadId: string | null,
 ): ReadonlyArray<RunningAgent> {
   const seen = new Set<string>();
   const running: Array<RunningAgent> = [];
@@ -120,6 +120,55 @@ export function liveStarting(
   });
 }
 
+/**
+ * A slot held for a thread whose slot wait was met (gate memory, or a delivered wait's
+ * `reservedUntil`; `key` is the wait id, so one wait counts once). Counts as a running agent on the
+ * machine and its `account`; the thread's next allowed delegation uses it up.
+ */
+export interface SlotReservation {
+  readonly key: string;
+  readonly threadId: string;
+  readonly account?: string;
+  readonly untilMs: number;
+}
+
+/** Reservations still live at `nowMs`, one per key (the latest end wins), oldest end first. */
+export function liveReservations(
+  reservations: ReadonlyArray<SlotReservation>,
+  nowMs: number,
+): ReadonlyArray<SlotReservation> {
+  const byKey = new Map<string, SlotReservation>();
+  for (const reservation of reservations) {
+    if (reservation.untilMs <= nowMs) continue;
+    const seen = byKey.get(reservation.key);
+    if (seen === undefined || seen.untilMs < reservation.untilMs) {
+      byKey.set(reservation.key, reservation);
+    }
+  }
+  return [...byKey.values()].sort((a, b) => a.untilMs - b.untilMs || (a.key < b.key ? -1 : 1));
+}
+
+/**
+ * The held slots that count: at most one per thread (the latest end wins, then the last key), in
+ * the order given. A thread that asks again moves its slot; it never holds two.
+ */
+export function onePerThread(
+  reservations: ReadonlyArray<SlotReservation>,
+): ReadonlyArray<SlotReservation> {
+  const byThread = new Map<string, SlotReservation>();
+  for (const reservation of reservations) {
+    const seen = byThread.get(reservation.threadId);
+    if (
+      seen === undefined ||
+      seen.untilMs < reservation.untilMs ||
+      (seen.untilMs === reservation.untilMs && seen.key < reservation.key)
+    ) {
+      byThread.set(reservation.threadId, reservation);
+    }
+  }
+  return reservations.filter((reservation) => byThread.get(reservation.threadId) === reservation);
+}
+
 export type SlotRule = "machine" | "account" | "memory";
 
 export type SlotDecision =
@@ -139,6 +188,8 @@ export interface SlotDecisionInput {
   readonly running: ReadonlyArray<RunningAgent>;
   /** Live entries only (`liveStarting`). */
   readonly starting: ReadonlyArray<StartingEntry>;
+  /** Live reservations that count (`liveReservations`), without the caller's own. */
+  readonly reservations?: ReadonlyArray<SlotReservation>;
   readonly targetInstanceId: string;
   /** `null` when the memory floor is off. */
   readonly freeMemoryBytes: number | null;
@@ -147,6 +198,7 @@ export interface SlotDecisionInput {
 /** Machine limit first, then the target's account, then the memory floor. */
 export function slotDecision(input: SlotDecisionInput): SlotDecision {
   const { limits, running, starting, targetInstanceId } = input;
+  const reservations = input.reservations ?? [];
   const refuse = (rule: SlotRule, used: number, max: number): SlotDecision => ({
     type: "refuse",
     rule,
@@ -154,7 +206,7 @@ export function slotDecision(input: SlotDecisionInput): SlotDecision {
     max,
     instanceId: targetInstanceId,
   });
-  const machineUsed = running.length + starting.length;
+  const machineUsed = running.length + starting.length + reservations.length;
   if (limits.machine !== null && machineUsed >= limits.machine) {
     return refuse("machine", machineUsed, limits.machine);
   }
@@ -162,7 +214,8 @@ export function slotDecision(input: SlotDecisionInput): SlotDecision {
   if (accountMax !== null) {
     const accountUsed =
       running.filter((agent) => agent.instanceId === targetInstanceId).length +
-      starting.filter((entry) => entry.instanceId === targetInstanceId).length;
+      starting.filter((entry) => entry.instanceId === targetInstanceId).length +
+      reservations.filter((reservation) => reservation.account === targetInstanceId).length;
     if (accountUsed >= accountMax) return refuse("account", accountUsed, accountMax);
   }
   if (
@@ -179,6 +232,18 @@ export function slotDecision(input: SlotDecisionInput): SlotDecision {
   return { type: "allow" };
 }
 
+/** Why a slot is not free, without a full stop (held slots count as running agents). */
+export function slotRefusalReason(
+  decision: Extract<SlotDecision, { readonly type: "refuse" }>,
+): string {
+  const agents = (count: number) => (count === 1 ? "1 agent is" : `${count} agents are`);
+  return decision.rule === "machine"
+    ? `${agents(decision.used)} running on this machine, and the limit is ${decision.max}`
+    : decision.rule === "account"
+      ? `${agents(decision.used)} running on account ${decision.instanceId}, and the limit is ${decision.max}`
+      : `only ${decision.used} MB of memory is free, and a new agent needs at least ${decision.max} MB`;
+}
+
 /**
  * The `slots_full` message. `waitsEnabled`: a slot wait can be registered (the `slot` kind of
  * `wait_for`), so the text names the call; else it says to try again later.
@@ -187,13 +252,7 @@ export function slotRefusalText(
   decision: Extract<SlotDecision, { readonly type: "refuse" }>,
   waitsEnabled: boolean,
 ): string {
-  const agents = (count: number) => (count === 1 ? "1 agent is" : `${count} agents are`);
-  const reason =
-    decision.rule === "machine"
-      ? `${agents(decision.used)} running on this machine, and the limit is ${decision.max}`
-      : decision.rule === "account"
-        ? `${agents(decision.used)} running on account ${decision.instanceId}, and the limit is ${decision.max}`
-        : `only ${decision.used} MB of memory is free, and a new agent needs at least ${decision.max} MB`;
+  const reason = slotRefusalReason(decision);
   const slot =
     decision.rule === "account" ? `{"account":${JSON.stringify(decision.instanceId)}}` : "{}";
   const next = waitsEnabled
