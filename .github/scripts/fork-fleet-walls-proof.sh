@@ -13,8 +13,11 @@
 # port of 445, 135 and 53 (on WSL2's NAT network that gateway is Windows). Exit 0 only when check-net passes, each of
 # the two network blocks applies by itself, and every cleanup step worked.
 set -euo pipefail
+# Text from outside (another process's command line, a file's name) reaches the terminal as printable ASCII only.
 die() {
-  printf 'fork-fleet-walls-proof: %s\n' "$*" >&2
+  local LC_ALL=C s="$*"
+  s=${s//[^ -~]/?}
+  printf 'fork-fleet-walls-proof: %s\n' "${s:0:2000}" >&2
   exit 1
 }
 ((EUID == 0)) || die "run it as root (sudo): it makes throwaway users, a network namespace and the nft table"
@@ -39,11 +42,27 @@ while read -r pid cmd; do pool+=("process $pid $cmd"); done < <(pgrep -af 'fork-
   "half-way: undo them by hand first): ${pool[*]}"
 for u in "${users[@]}"; do [[ ! -e /run/netns/fork-fleet-$u ]] || die "namespace fork-fleet-$u exists"; done
 
+# Docker's rules this proof owns (cleanup deletes them): only those missing now, which the launcher adds. A rule there
+# already is never deleted; a check that gives no answer (exit 4: the xtables lock) stops the proof before it starts.
+# The first one too: 0 is Docker's chain, 1 (or no iptables at all) no Docker; any other exit is no answer, not
+# "no Docker" (the launcher could then add the rules, and the proof would not own them).
 docker=() made=() failed=() tmp='' listener='' forward=$(</proc/sys/net/ipv4/ip_forward)
-if iptables -w 60 -S DOCKER-USER >/dev/null 2>&1; then
+rc=1
+! command -v iptables >/dev/null 2>&1 || { rc=0; iptables -w 60 -S DOCKER-USER >/dev/null 2>&1 || rc=$?; }
+case $rc in
+  0 | 1) ;;
+  *) die "iptables -S DOCKER-USER gave no answer (exit $rc): run the proof again" ;;
+esac
+if ((rc == 0)); then
   for r in "-o ffh-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "-i ffh-+ -j ACCEPT"; do
+    rc=0
     # shellcheck disable=SC2086 # $r is split into iptables' arguments on purpose
-    iptables -w 60 -C DOCKER-USER $r 2>/dev/null || docker+=("$r")
+    iptables -w 60 -C DOCKER-USER $r 2>/dev/null || rc=$?
+    case $rc in
+      0) ;;
+      1) docker+=("$r") ;;
+      *) die "iptables -C DOCKER-USER $r gave no answer (exit $rc): run the proof again" ;;
+    esac
   done
 fi
 
@@ -51,7 +70,7 @@ fi
 step() { "$@" || failed+=("$*"); }
 kill_all() { pkill -KILL -u "$1" || (($? == 1)); }
 cleanup() {
-  local u uid r unit
+  local u uid r unit rc
   set +e
   [[ -z $listener ]] || step kill "$listener"
   while read -r unit _; do step systemctl stop -- "$unit"; done < <(systemctl list-units --no-legend --plain 'fork-fleet-*')
@@ -63,9 +82,18 @@ cleanup() {
     step userdel -- "$u"
   done
   ! nft list table inet fork_fleet >/dev/null 2>&1 || step nft delete table inet fork_fleet
-  # Only the rules the launcher added (a run that stopped before it did leaves none): no false failed step.
+  # Only the rules the launcher added (a run that stopped before it did leaves none): no false failed step. A check
+  # that gives no answer (not 0, there; not 1, absent) is a failed step: the rule may be left.
   # shellcheck disable=SC2086
-  for r in "${docker[@]}"; do ! iptables -w 60 -C DOCKER-USER $r 2>/dev/null || step iptables -w 60 -D DOCKER-USER $r; done
+  for r in "${docker[@]}"; do
+    rc=0
+    iptables -w 60 -C DOCKER-USER $r 2>/dev/null || rc=$?
+    case $rc in
+      0) step iptables -w 60 -D DOCKER-USER $r ;;
+      1) ;;
+      *) failed+=("iptables -C DOCKER-USER $r (exit $rc: no answer; the rule may be left)") ;;
+    esac
+  done
   [[ -z $tmp ]] || step rm -rf --one-file-system -- "${tmp:?}"
   step sysctl -qw "net.ipv4.ip_forward=$forward"
   if ((${#failed[@]})); then
@@ -125,23 +153,30 @@ rc=0
 FORK_FLEET_LAUNCH_CONF=$tmp/launch.conf bash "$launch" check-net https://github.com "${targets[@]}" || rc=$?
 
 # Each of the two network blocks by itself (check-net proves the two together): the nft table, from the runner's
-# namespace without a unit; the unit's IPAddressDeny, in a unit outside the namespace.
+# namespace without a unit; the unit's IPAddressDeny, in a unit outside the namespace. Each counts only when its
+# target answers from this host just before (as check-net's do): a listener that died would make both look blocked.
 connect='import socket, sys
 try:
     socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3).close(); print("open")
 except OSError as e:
     print(type(e).__name__)'
 first=${own%%$'\n'*}
-if [[ -n $first && -e /run/netns/fork-fleet-${users[0]} ]]; then
+if [[ -z $first || ! -e /run/netns/fork-fleet-${users[0]} ]]; then
+  echo "FAIL  the nft table alone: not tried (no address of this host's, or no namespace)"; rc=1
+elif here=$(python3 -I -c "$connect" "$first" "$port" 2>&1 || true); [[ $here != open ]]; then
+  echo "FAIL  the nft table alone: not tried ($first:$port does not answer from this host either: $here)"; rc=1
+else
   got=$(ip netns exec "fork-fleet-${users[0]}" python3 -I -c "$connect" "$first" "$port")
   [[ $got != open ]] && echo "ok    the nft table alone refuses this host's $first:$port from a runner's namespace ($got)" ||
     { echo "FAIL  the nft table alone lets a runner's namespace reach $first:$port"; rc=1; }
-else
-  echo "FAIL  the nft table alone: not tried (no address of this host's, or no namespace)"; rc=1
 fi
-got=$(systemd-run --quiet --wait --pipe --collect -p IPAddressDeny=any -- /usr/bin/python3 -I -c "$connect" \
-  127.0.0.1 "$port")
-[[ $got != open ]] && echo "ok    IPAddressDeny alone refuses 127.0.0.1:$port in a unit ($got)" ||
-  { echo "FAIL  IPAddressDeny does not apply here (cgroup $cg): a unit reaches 127.0.0.1:$port"; rc=1; }
+if here=$(python3 -I -c "$connect" 127.0.0.1 "$port" 2>&1 || true); [[ $here != open ]]; then
+  echo "FAIL  IPAddressDeny alone: not tried (127.0.0.1:$port does not answer from this host either: $here)"; rc=1
+else
+  got=$(systemd-run --quiet --wait --pipe --collect -p IPAddressDeny=any -- /usr/bin/python3 -I -c "$connect" \
+    127.0.0.1 "$port")
+  [[ $got != open ]] && echo "ok    IPAddressDeny alone refuses 127.0.0.1:$port in a unit ($got)" ||
+    { echo "FAIL  IPAddressDeny does not apply here (cgroup $cg): a unit reaches 127.0.0.1:$port"; rc=1; }
+fi
 ((rc == 0)) && echo "fork-fleet-walls-proof: PASSED" || echo "fork-fleet-walls-proof: FAILED (exit $rc)"
 exit "$rc"
