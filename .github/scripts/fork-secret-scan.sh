@@ -43,6 +43,19 @@
 # gitleaks counts a commit when a file it neither deletes nor turns binary has a hunk: a pure
 # rename, a mode change, an empty new file or a merge with nothing beyond the automatic merge has
 # none, so the count can be below `git rev-list --count`.
+#
+# Merges in a blob-less checkout: --remerge-diff writes each automatic merge (a file with conflict
+# markers, say) to a temporary object folder, and git's batch fetch before each diff checks objects
+# with a stale cache of that folder (git 2.43 to 2.56 at least): when a lookup earlier in the same
+# git log (another merge, typically) shared the temporary object's first byte, git takes it for a
+# missing file content and asks the remote for it ("not our ref"). Alone in a batch that is harmless:
+# git then reads the object from the folder. In a batch with a real missing content, git stops with
+# "could not fetch <that content>"; under GIT_NO_LAZY_FETCH it logs "lazy fetching disabled", which
+# fails the scan below. So the script fetches, in one batch first, the contents every diff in the
+# range compares (each commit against each parent), and gitleaks reads a view that is not a partial
+# clone: a temporary bare repository that borrows this checkout's objects (objects/info/alternates)
+# and the refs a range names, with no promisor remote, so git never fetches there and a content
+# still missing is a fatal git error, which fails the scan.
 set -euo pipefail
 
 have() { git cat-file -e "$1^{commit}" 2>/dev/null; }
@@ -122,24 +135,60 @@ esac
 echo "Scanning $what ($range)"
 if [[ -n "$warning" ]]; then echo "::warning title=Secret scan::$warning"; fi
 
-# gitleaks runs `git log -p -U0 <log-opts>`. The same command here fetches what it reads; counts the
-# commits gitleaks will scan (see the header); and fails the job (pipefail) when a fetch fails.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+log="$work/gitleaks.log"
+
+# The contents every diff in the range compares (each commit against each parent, merges included),
+# in one batch before git log runs, so that git log's own batches hold either temporary objects or
+# real contents (the merge base's side of an automatic merge), never both (see the header).
 # shellcheck disable=SC2086
-if ! expected="$(git log -p -U0 $opts | awk '
-  /^commit / { sha = $2; next }
-  /^diff --git / { deleted = 0; next }
-  /^deleted file mode / { deleted = 1; next }
-  /^@@ / { if (!deleted && sha != "" && !(sha in seen)) { seen[sha] = 1; n++ } }
-  END { print n + 0 }')"; then
+if ! git rev-list $range > "$work/commits" ||
+  ! git diff-tree --stdin -m -r --no-commit-id --raw --no-abbrev < "$work/commits" |
+    awk '$1 != ":160000" && $3 !~ /^0+$/ { print $3 } $2 != "160000" && $4 !~ /^0+$/ { print $4 }' |
+    sort -u > "$work/wanted" ||
+  ! git cat-file --batch-check='%(objectname)' --batch-all-objects 2> /dev/null | sort -u > "$work/have" ||
+  ! comm -23 "$work/wanted" "$work/have" > "$work/missing" ||
+  { [[ -s "$work/missing" ]] && ! timeout 600 git -c fetch.negotiationAlgorithm=noop fetch --quiet --no-tags \
+    --no-write-fetch-head --recurse-submodules=no --filter=blob:none origin --stdin < "$work/missing"; }; then
   echo "::error::Secret scan: cannot read the commits to scan (a file content fetch failed?)" >&2
   summary "### Secret scan" "" "Failed: the contents of $what could not be read, so nothing was scanned."
   exit 2
 fi
 
-log="$(mktemp)"
-trap 'rm -f "$log"' EXIT
+# gitleaks runs `git log -p -U0 <log-opts>`. The same command here fetches what it still lacks;
+# counts the commits gitleaks will scan (see the header); and fails the job (pipefail) when a fetch
+# fails.
+# shellcheck disable=SC2086
+if ! expected="$(git log -p -U0 $opts 2> "$work/fetch.err" | awk '
+  /^commit / { sha = $2; next }
+  /^diff --git / { deleted = 0; next }
+  /^deleted file mode / { deleted = 1; next }
+  /^@@ / { if (!deleted && sha != "" && !(sha in seen)) { seen[sha] = 1; n++ } }
+  END { print n + 0 }')"; then
+  cat "$work/fetch.err" >&2
+  echo "::error::Secret scan: cannot read the commits to scan (a file content fetch failed?)" >&2
+  summary "### Secret scan" "" "Failed: the contents of $what could not be read, so nothing was scanned."
+  exit 2
+fi
+# git exited 0, so every content it read was there. A batch that asked for a temporary
+# --remerge-diff object fails with "not our ref" (see the header): shown, not judged; the offline
+# scan below is the check.
+if [[ -s "$work/fetch.err" ]]; then
+  echo "git's messages while reading the contents (\"not our ref\" for a temporary merge object is expected; see the script header):"
+  sed 's/^/    /' "$work/fetch.err"
+fi
+
+# The view gitleaks reads (see the header): this checkout's objects, the refs a range may name
+# (refs/scan-upstream), and origin's URL for gitleaks' finding links, but no promisor remote.
+view="$work/view.git"
+git init -q --bare "$view"
+printf '%s\n' "$(git rev-parse --path-format=absolute --git-common-dir)/objects" > "$view/objects/info/alternates"
+git for-each-ref --format='create %(refname) %(objectname)' refs/scan-upstream/ | git --git-dir="$view" update-ref --stdin
+if url="$(git config --get remote.origin.url)"; then git --git-dir="$view" config remote.origin.url "$url"; fi
+
 set +e
-GIT_NO_LAZY_FETCH=1 "$GITLEAKS" git --no-banner --no-color --redact --verbose --log-opts="$opts" . > "$log" 2>&1
+GIT_DIR="$view" GIT_NO_LAZY_FETCH=1 "$GITLEAKS" git --no-banner --no-color --redact --verbose --log-opts="$opts" . > "$log" 2>&1
 status=$?
 set -e
 cat "$log"
