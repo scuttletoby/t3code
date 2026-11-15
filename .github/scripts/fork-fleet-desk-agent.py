@@ -75,7 +75,9 @@ class Clock:
     more than SLEPT s past the furthest it has been ahead so far. On a Linux sleep both move together (nothing added);
     on WSL2 Windows' sleep pauses the distro and only the wall clock is stepped on resume. A wall clock set back and
     later put right adds nothing (the correction only returns to where it was); one set forward by hand (or a first
-    time sync that steps it) counts as a sleep: the link is dialled again and running verbs are answered 75."""
+    time sync that steps it) counts as a sleep: the link is dialled again and running verbs are answered 75. The cost:
+    after a set-back that is never put right, a WSL2 sleep shorter than the set-back is not seen here for the rest of
+    the session; the dead link (DEAD, 45 s) still ends it."""
 
     def __init__(self):
         self.lock, self.added, self.top = threading.Lock(), 0.0, None

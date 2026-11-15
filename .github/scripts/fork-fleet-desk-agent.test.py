@@ -494,7 +494,7 @@ class Desk(unittest.TestCase):
         self.assertNotIn('Environment', s)
         self.assertNotIn('User', s)
         self.assertNotIn('EnvironmentFile', s)
-        self.assertEqual(s['MemoryMax'], '512M')
+        self.assertEqual((s['MemoryMax'], s['MemorySwapMax']), ('512M', '0'))
         self.assertEqual(A.DEFAULTS['LAUNCH'], '/opt/fork-fleet/fork-fleet-launch.sh')
 
 
