@@ -18,7 +18,7 @@ watches; it changes nothing on the machine, and `0` turns it off.
 ### What guards it
 
 - [`forkDefaults.test.ts`](../../packages/contracts/src/forkDefaults.test.ts) finds each fork setting
-  in `packages/contracts/src/settings.ts` by the `Fork:` comment on its line, and fails when one has
+  in `packages/contracts/src/settings.ts` by the `Fork:` comment on the line above it, and fails when one has
   no row in `forkDefaults.ts`, a row has no setting, or a default differs from its row. A rebase that
   takes upstream's `true` turns it red, and fork-follow publishes nothing on a red test.
 - [`serverSettings.forkDefaults.test.ts`](../../apps/server/src/serverSettings.forkDefaults.test.ts)
@@ -42,7 +42,7 @@ A key without the `Fork:` comment is invisible to the test. The sync steps below
 
 | State on the machine                                                          | Result                                                                                                                                                                                                                                                                                                             |
 | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| No settings file, `{}`, or a file that cannot be parsed                       | Every fork setting at its default: updates off.                                                                                                                                                                                                                                                                    |
+| No settings file, `{}`, or a file that cannot be parsed                       | Every fork setting at its default: updates off, also when an admin policy defaults them on (only a locked policy value turns them on).                                                                                                                                                                             |
 | A file that cannot be read at all                                             | No settings are served; the update loop skips every tick.                                                                                                                                                                                                                                                          |
 | A machine that ran an upstream build in between                               | Upstream writes only values that differ from its defaults, and its updater defaults on, so the key is not in the file: back on the fork, updates are off. An upstream "off" is written as `false` and stays off.                                                                                                   |
 | A file saved before the rename (`autoUpdateServer`, `autoUpdateQuietCommand`) | Read under the new names; the next save writes only the new names.                                                                                                                                                                                                                                                 |
@@ -65,7 +65,7 @@ change it stops and opens one issue. Then:
    `git diff <upstream tag> HEAD -- packages/contracts/src/settings.ts` must show a `Fork:` comment
    above every key the fork adds.
 3. Run the pin tests before pushing:
-   `vp test run packages/contracts/src/forkDefaults.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts`.
+   `vp test run packages/contracts/src/forkDefaults.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
 4. Push with `--force-with-lease` and start fork-follow once, as its report says.
 
 ### The sync that brings upstream's updater

@@ -810,8 +810,13 @@ const make = Effect.gen(function* () {
       }
       if (decoded._tag === "Failure" || legacySettings._tag === "Failure") {
         const failure = decoded._tag === "Failure" ? decoded : legacySettings;
-        // The file may hold an opt-out we can no longer read; never resume threads on a guess.
-        settings = { ...managed.defaults, continueThreadsAfterServerUpdate: false };
+        // The file may hold an opt-out we can no longer read; never resume threads or update on a
+        // guess, even when an admin policy defaults them on (a locked policy value still applies).
+        settings = {
+          ...managed.defaults,
+          continueThreadsAfterServerUpdate: false,
+          automaticUpdates: false,
+        };
         if (failure._tag === "Failure") {
           parseFailure = Option.some(Cause.squash(failure.cause));
           yield* Effect.logWarning("failed to parse settings.json, using defaults", {

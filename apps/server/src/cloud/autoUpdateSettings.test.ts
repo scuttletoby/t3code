@@ -165,6 +165,42 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))(
       }).pipe(Effect.provide(layerServerSettings(POLICY_DEFAULTS_UPDATES_ON))),
     );
 
+    it.effect(
+      "a cut-off file that said off stays off under a policy that defaults updates on",
+      () =>
+        Effect.gen(function* () {
+          const settings = yield* loadSettingsFile(
+            '{ "automaticUpdates": false, "waitFor": { "enab',
+          );
+          assert.isFalse(settings.automaticUpdates);
+        }).pipe(Effect.provide(layerServerSettings(POLICY_DEFAULTS_UPDATES_ON))),
+    );
+
+    it.effect(
+      "a wrong value elsewhere keeps updates off under a policy that defaults them on",
+      () =>
+        Effect.gen(function* () {
+          const settings = yield* loadSettingsFile(
+            JSON.stringify({ automaticUpdates: false, usagePacingGate: "maybe" }),
+          );
+          assert.isFalse(settings.automaticUpdates);
+        }).pipe(Effect.provide(layerServerSettings(POLICY_DEFAULTS_UPDATES_ON))),
+    );
+
+    it.effect("a locked policy still turns updates on when the file cannot be decoded", () =>
+      Effect.gen(function* () {
+        const settings = yield* loadSettingsFile('{ "automaticUpdates": false, "waitFor": { "enab');
+        assert.isTrue(settings.automaticUpdates);
+      }).pipe(
+        Effect.provide(
+          layerServerSettings({
+            ...POLICY_DEFAULTS_UPDATES_ON,
+            settings: { automaticUpdates: { value: true, locked: true } },
+          }),
+        ),
+      ),
+    );
+
     it.effect("stays off with no settings file", () =>
       Effect.gen(function* () {
         const settings = yield* loadSettingsFile(undefined);
