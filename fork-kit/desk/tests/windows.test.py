@@ -3,7 +3,7 @@ and the rules a script for Windows PowerShell 5.1 must keep. With pwsh on PATH, 
 
   python3 -I -B fork-kit/desk/tests/windows.test.py
 """
-import importlib.machinery, importlib.util, os, re, shutil, subprocess, tempfile, unittest
+import importlib.machinery, importlib.util, os, re, shutil, subprocess, tempfile, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(KIT))
@@ -26,9 +26,14 @@ def text():
         return f.read()
 
 
-def prepare():
-    m = re.search(r"\$Prepare = @'\r?\n(.*?)\r?\n'@", text().decode('ascii'), re.S)
+def prepare(name='Prepare'):
+    m = re.search(r"\$" + name + r" = @'\r?\n(.*?)\r?\n'@", text().decode('ascii'), re.S)
     return m.group(1)
+
+
+def wslconfig_part():
+    src = text().decode('ascii')
+    return src[src.index('# --- wslconfig ---'):src.index('# --- end wslconfig ---')]
 
 
 def walls(root):
@@ -91,6 +96,37 @@ class Prepare(unittest.TestCase):
         self.assertFalse([n for n in os.listdir(self.root + '/etc') if '.bak-' in n])
         self.assertIsNone(walls(self.root).interop_wall())
 
+    def live(self, env=None):
+        r = subprocess.run(['bash', '-s'], input=prepare('Live') + '\n# end\r\n', text=True, capture_output=True,
+                           env={'PATH': '/usr/bin:/bin', 'ROOT': self.root, **(env or {})})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_the_restart_decision_reads_the_live_state(self):
+        # a run stopped after it wrote wsl.conf, before its `wsl --shutdown`: the next run changes nothing, but the
+        # running distro still has the old settings, so it restarts
+        os.makedirs(self.root + '/proc/1')
+        put(self.root + '/proc/1/comm', 'systemd\n')
+        put(self.root + '/proc/meminfo', 'MemTotal:        8000000 kB\n')
+        self.run_prepare()
+        past = time.time() - 3600
+        os.utime(self.root + '/proc/1', (past, past))
+        self.assertIn('restart: /etc/wsl.conf is newer than the running distro', self.live())
+        os.utime(self.root + '/etc/wsl.conf', (past - 60, past - 60))
+        self.assertEqual(self.live({'WANT_KB': '8388608'}), '')
+        put(self.root + '/proc/sys/fs/binfmt_misc/WSLInterop', 'enabled\n')
+        put(self.root + '/proc/1/comm', 'init\n')
+        out = self.live({'WANT_KB': '4194304'})
+        for why in ('PID 1 is not systemd', 'WSL interop is live (WSLInterop)', 'above the cap'):
+            self.assertIn(why, out)
+        os.unlink(self.root + '/proc/sys/fs/binfmt_misc/WSLInterop')
+        put(self.root + '/proc/1/comm', 'systemd\n')
+        fake = os.path.join(self.root, 'bin')
+        os.makedirs(fake)
+        put(fake + '/wslinfo', '#!/bin/sh\necho mirrored\n')
+        os.chmod(fake + '/wslinfo', 0o755)
+        self.assertIn('the networking mode is mirrored, not nat', self.live({'PATH': fake + ':/usr/bin:/bin'}))
+
     def test_a_resolv_conf_of_its_own_is_kept(self):
         put(self.root + '/etc/resolv.conf', 'nameserver 192.0.2.1\n')
         self.run_prepare()
@@ -117,9 +153,54 @@ class Script(unittest.TestCase):
     def test_it_asks_before_it_changes_anything(self):
         src = text().decode('ascii')
         body = src[src.index('try {'):]
-        first_change = min(body.index(x) for x in ('wsl.exe --install', 'Set-Content', 'Unregister-ScheduledTask',
-                                                   'InDistro', 'Register-ScheduledTask', 'wsl.exe --shutdown'))
+        first_change = min(body.index(x) for x in ('wsl.exe --install', 'Merge-WslConfig $WslConfig',
+                                                   'Unregister-ScheduledTask', 'InDistro', 'Register-ScheduledTask',
+                                                   'wsl.exe --shutdown'))
         self.assertIn("Read-Host", body[:first_change])
+
+    def test_a_distro_it_did_not_make_is_named_and_must_be_typed(self):
+        src = text().decode('ascii')
+        body = src[src.index('try {'):]
+        ask = body.index("if ($have -and -not $ours)")
+        self.assertLess(ask, body.index('wsl.exe --install'))
+        self.assertIn("-cne $Distro", body[ask:ask + 800])
+        self.assertIn('/etc/wsl.conf is REPLACED', body[ask:ask + 800])
+        self.assertIn('/etc/fork-kit/desk-distro', prepare())   # the mark of a distro it made or took over
+
+    def test_wslconfig_is_utf8_without_a_bom_never_ascii(self):
+        src = text().decode('ascii')
+        self.assertNotRegex(src, r'(?i)-Encoding\s+ascii')
+        self.assertNotRegex(src, r'(?i)(Get|Set)-Content[^\n]*\$WslConfig')
+        self.assertIn('[Text.UTF8Encoding]::new($false)', wslconfig_part())
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_wslconfig_merge_keeps_every_other_letter_and_key(self):
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, '.wslconfig')
+        old = '[wsl2]\nkernel=D:\\kernels\\Jos\u00e9\\bzImage\nmemory=2GB\n[experimental]\nsparseVhd=true\nmemory=9GB\n'
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(old)
+        script = os.path.join(d, 'merge.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = "6GB"; swap = "4GB" }\n'
+                    '"changed=$(Merge-WslConfig $args[0] $want)"\n"again=$(Merge-WslConfig $args[0] $want)"\n'
+                    '$k = Wsl2Keys (Read-WslConfig $args[0]); "memory=$($k[\'memory\'])"\n')
+        r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path], capture_output=True,
+                           text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('changed=True', r.stdout)
+        self.assertIn('again=False', r.stdout)
+        self.assertIn('memory=6GB', r.stdout)   # the [wsl2] one, not [experimental]'s
+        with open(path, 'rb') as f:
+            raw = f.read()
+        self.assertFalse(raw.startswith(b'\xef\xbb\xbf'))
+        new = raw.decode('utf-8').replace('\r\n', '\n')
+        self.assertIn('kernel=D:\\kernels\\Jos\u00e9\\bzImage\n', new)
+        self.assertIn('[wsl2]\nkernel=D:\\kernels\\Jos\u00e9\\bzImage\nmemory=6GB\nswap=4GB\n[experimental]', new)
+        self.assertIn('sparseVhd=true\nmemory=9GB', new)
+        backups = [n for n in os.listdir(d) if n.startswith('.wslconfig.bak-')]
+        self.assertEqual(len(backups), 1)
 
     def test_text_piped_into_the_distro_ends_in_a_comment(self):
         src = text().decode('ascii')
