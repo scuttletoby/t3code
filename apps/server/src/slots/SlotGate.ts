@@ -6,6 +6,7 @@
  */
 import type { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import {
+  accountOnlyThreads,
   effectiveSlotLimits,
   limitsCount,
   liveReservations,
@@ -462,6 +463,8 @@ const make = Effect.gen(function* () {
         ? []
         : liveStarting(yield* Ref.get(entries), read.visible, nowMs, limits.startGraceMs);
     const reservations = onePerThread(yield* liveHeld(settings.value.waitFor.enabled, nowMs));
+    // Holds hidden by a re-ask not kept yet: on their own account only, as `decide` counts them.
+    const hidden = hiddenHeld(settings.value.waitFor.enabled, nowMs, "");
     const accountMax = (id: string) => {
       const max = agentSlots.maxPerAccount[id as ProviderInstanceId];
       return max === undefined || max <= 0 ? null : max;
@@ -470,7 +473,7 @@ const make = Effect.gen(function* () {
       ...Object.keys(agentSlots.maxPerAccount).filter((id) => accountMax(id) !== null),
       ...read.running.map((agent) => agent.instanceId),
       ...starting.map((entry) => entry.instanceId),
-      ...reservations.flatMap((reservation) =>
+      ...[...reservations, ...hidden].flatMap((reservation) =>
         reservation.account === undefined ? [] : [reservation.account],
       ),
     ]);
@@ -485,7 +488,8 @@ const make = Effect.gen(function* () {
         used:
           read.running.filter((agent) => agent.instanceId === id).length +
           starting.filter((entry) => entry.instanceId === id).length +
-          reservations.filter((reservation) => reservation.account === id).length,
+          reservations.filter((reservation) => reservation.account === id).length +
+          accountOnlyThreads(reservations, hidden, id),
         max: accountMax(id),
       })),
       freeMemoryMb: Math.floor(memory.availableMemoryBytes / (1024 * 1024)),

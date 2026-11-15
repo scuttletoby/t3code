@@ -1028,6 +1028,11 @@ describe("SlotGate", () => {
                 ),
                 ["granted", "full"],
               );
+              // The settings screen shows the hidden hold on SECOND too (1 of 1, not 0 of 1).
+              assert.deepStrictEqual(
+                (yield* gate.usage)?.accounts.find((account) => account.id === SECOND),
+                { id: SECOND, used: 1, max: 1 },
+              );
               assert.strictEqual((yield* acquireAs(other, SECOND)).type, "refuse");
               // Not twice against the machine: the holder counts once (its new hold), so a
               // third thread still gets the second machine slot.

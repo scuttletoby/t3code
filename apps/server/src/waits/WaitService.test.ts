@@ -2737,26 +2737,259 @@ it.layer(NodeServices.layer)("WaitService: monotonic clock and early messages (#
     ),
   );
 
+  /** Every stored time (`at`, or a key ending in At, Until or Since) is an ISO wall time near NOW. */
+  const assertWallTimesOnly = (value: unknown, where = "store"): void => {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => assertWallTimesOnly(item, `${where}[${index}]`));
+      return;
+    }
+    if (value === null || typeof value !== "object") return;
+    for (const [key, field] of Object.entries(value)) {
+      if (/^at$|(At|Until|Since)$/.test(key)) {
+        assert.strictEqual(typeof field, "string", `${where}.${key} is not an ISO wall time`);
+        const ms = Date.parse(field as string);
+        assert.isTrue(
+          Math.abs(ms - NOW) < 6 * HOUR,
+          `${where}.${key} = ${String(field)} is not a wall time near now`,
+        );
+      } else assertWallTimesOnly(field, `${where}.${key}`);
+    }
+  };
+
   it.effect(
-    "after a restart (a new monotonic clock, far behind the old one) every wait is judged at once and stuck checks still turn late",
+    "after a restart on the store the old run left (a new monotonic clock, a day behind): stuck checks still turn late and every stored time is a wall time",
     () =>
       Effect.gen(function* () {
         const { clock, shift } = yield* shiftedClock;
         yield* Effect.gen(function* () {
           yield* TestClock.setTime(NOW);
-          const before = yield* deadMount;
+          // The monotonic clock counts from the machine's boot, far from the wall clock.
+          shift.monotonic = -7 * 24 * HOUR;
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.writeFileString(watched("ready"), "");
+          yield* seed(filePath, [
+            fileRecord(1, watched("dead/a")),
+            fileRecord(2, watched("dead/b")),
+            fileRecord(3, watched("ready")),
+            fileRecord(4, watched("later")),
+          ]);
+          const exists = (path: string) =>
+            fs.exists(path).pipe(
+              Effect.orDie,
+              Effect.map((found): Judgement =>
+                found
+                  ? { type: "met", outcome: "exists", detail: "It exists." }
+                  : { type: "notYet" },
+              ),
+            );
+          // A new service on whatever store is there now (never seeded again): a restart.
+          const start = Effect.gen(function* () {
+            const childChecks: string[] = [];
+            const service = yield* makeService({
+              filePath,
+              judges: {
+                file: (target) =>
+                  target.spec.path.includes("/dead/")
+                    ? (Effect.never as Effect.Effect<Judgement>)
+                    : exists(target.spec.path),
+              },
+              fileChildJudge: (target) =>
+                Effect.sync(() => childChecks.push(target.spec.path)).pipe(
+                  Effect.andThen(exists(target.spec.path)),
+                ),
+            });
+            return { service, childChecks };
+          });
+          const stateOf = (n: number) =>
+            Effect.map(
+              storedWaits(filePath),
+              (waits) => waits.find((w) => w.id === idOf(n))?.state,
+            );
+
+          const before = yield* start;
+          // a and b hang; once they are late, ready and later are judged in their own processes.
           assert.isTrue(yield* pass(before.service));
-          // The server restarts: its monotonic clock starts again, a day behind; nothing of the
-          // old run's timing is in the store.
-          shift.monotonic = -24 * HOUR;
           yield* TestClock.adjust(5_000);
-          const after = yield* deadMount;
+          assert.isTrue(yield* pass(before.service));
+          assert.deepStrictEqual(before.childChecks, [watched("ready"), watched("later")]);
+          assert.strictEqual(yield* stateOf(3), "delivering");
+          assert.strictEqual(yield* stateOf(4), "waiting");
+          const leftBehind = JSON.parse(yield* fs.readFileString(filePath));
+          assertWallTimesOnly(leftBehind);
+
+          // The server restarts on that store: its monotonic clock starts again, a day behind.
+          // Any monotonic time kept from the old run (a stuck check's lateAt) would now lie a day
+          // ahead, so a and b would never turn late and later would never be judged.
+          yield* fs.writeFileString(watched("later"), "");
+          shift.monotonic = -8 * 24 * HOUR;
+          yield* TestClock.adjust(MINUTE);
+          const after = yield* start;
           assert.isTrue(yield* pass(after.service));
-          assert.strictEqual(yield* after.ready, "waiting");
+          assert.strictEqual(yield* stateOf(4), "waiting");
           yield* TestClock.adjust(5_000);
           assert.isTrue(yield* pass(after.service));
-          assert.deepStrictEqual(after.childChecks, [watched("ready")]);
-          assert.strictEqual(yield* after.ready, "delivering");
+          assert.deepStrictEqual(after.childChecks, [watched("later")]);
+          assert.strictEqual(yield* stateOf(4), "delivering");
+          assertWallTimesOnly(JSON.parse(yield* fs.readFileString(filePath)));
+        }).pipe(Effect.provideService(Clock.Clock, clock));
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),
+        Effect.provide(ServerSettingsService.layerTest(ON)),
+      ),
+  );
+
+  /** For the early-send tests: a met at once, b met after 3 s (both file), c a 55 s pr check. */
+  const earlyWaits = [
+    record({
+      id: idOf(1),
+      key: "1".padStart(16, "0"),
+      spec: { path: watched("a"), until: "exists" },
+    }),
+    record({
+      id: idOf(2),
+      key: "2".padStart(16, "0"),
+      threadId: OTHER_THREAD,
+      spec: { path: watched("b"), until: "exists" },
+    }),
+    record({
+      id: idOf(3),
+      key: "3".padStart(16, "0"),
+      kind: "pr",
+      spec: { number: 1, until: "checks" },
+    }),
+  ];
+  const metJudgement: Judgement = { type: "met", outcome: "exists", detail: "It exists." };
+  const earlyJudges: WaitJudges = {
+    file: (target) =>
+      target.spec.path.endsWith("/b")
+        ? Effect.sleep(3_000).pipe(Effect.as(metJudgement))
+        : Effect.succeed(metJudgement),
+    pr: () => Effect.sleep(55_000).pipe(Effect.as<Judgement>({ type: "notYet" })),
+  };
+
+  it.effect("two waits ending at different times in one pass: each is sent at once, and once", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      yield* seed(filePath, earlyWaits);
+      const tries: Array<[ThreadId, number]> = [];
+      const service = yield* makeService({
+        filePath,
+        judges: earlyJudges,
+        delivery: {
+          receiver: () => Effect.succeed({ type: "ok" }),
+          deliver: (message) =>
+            Effect.map(Clock.currentTimeMillis, (now): WaitDeliveryResult => {
+              tries.push([message.threadId, Math.floor((now - NOW) / 1_000)]);
+              return { type: "delivered" };
+            }),
+        },
+      });
+      const sweep = yield* Effect.forkChild(service.runDue());
+      yield* letFibersRun;
+      yield* stepSeconds(12);
+      assert.strictEqual(sweep.pollUnsafe(), undefined, "the pr check still runs");
+      // Each within a second of its own answer, while the 55 s pr check still runs.
+      assert.deepStrictEqual(tries, [
+        [THREAD, 0],
+        [OTHER_THREAD, 3],
+      ]);
+      yield* stepSeconds(70);
+      assert.isDefined(sweep.pollUnsafe());
+      assert.strictEqual(tries.length, 2, "nothing sent twice");
+      assert.deepStrictEqual(
+        (yield* storedWaits(filePath)).map((wait) => wait.state),
+        ["delivered", "delivered", "waiting"],
+      );
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),
+      Effect.provide(ServerSettingsService.layerTest(ON)),
+    ),
+  );
+
+  it.effect(
+    "stops half-way: a restart while an early send hangs sends the same message id, once",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        yield* seed(filePath, [earlyWaits[0], earlyWaits[2]]);
+        const ids: string[] = [];
+        const first = yield* makeService({
+          filePath,
+          judges: earlyJudges,
+          delivery: {
+            receiver: () => Effect.succeed({ type: "ok" }),
+            deliver: (message) =>
+              Effect.sync(() => void ids.push(message.messageId)).pipe(
+                Effect.andThen(Effect.never),
+              ),
+          },
+        });
+        const sweep = yield* Effect.forkChild(first.runDue());
+        yield* stepSeconds(5);
+        assert.strictEqual(ids.length, 1, "the early send started");
+        const mid = yield* storedWaits(filePath);
+        assert.strictEqual(mid[0]?.state, "delivering");
+        assert.strictEqual(mid[0]?.messageId, ids[0], "the id is written before the send");
+        // The server stops half-way through the pass.
+        yield* Fiber.interrupt(sweep);
+        const sent: string[] = [];
+        const second = yield* makeService({
+          filePath,
+          judges: earlyJudges,
+          delivery: {
+            receiver: () => Effect.succeed({ type: "ok" }),
+            deliver: (message) =>
+              Effect.sync((): WaitDeliveryResult => {
+                sent.push(message.messageId);
+                return { type: "delivered" };
+              }),
+          },
+        });
+        const again = yield* Effect.forkChild(second.runDue());
+        yield* stepSeconds(70);
+        assert.isDefined(again.pollUnsafe());
+        assert.deepStrictEqual(sent, [ids[0]]);
+        assert.strictEqual((yield* storedWaits(filePath))[0]?.state, "delivered");
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),
+        Effect.provide(ServerSettingsService.layerTest(ON)),
+      ),
+  );
+
+  it.effect(
+    "a wake message that got 'try again later' is tried again after its delay even when the wall clock was set back an hour",
+    () =>
+      Effect.gen(function* () {
+        const { clock, shift } = yield* shiftedClock;
+        yield* Effect.gen(function* () {
+          yield* TestClock.setTime(NOW);
+          yield* seed(filePath, [delivering({ deadlineAt: "2026-11-14T15:00:00.000Z" })]);
+          let busy = true;
+          let sent = 0;
+          const service = yield* makeService({
+            filePath,
+            delivery: {
+              receiver: () => Effect.succeed({ type: "ok" }),
+              deliver: () =>
+                Effect.sync((): WaitDeliveryResult => {
+                  if (busy) return { type: "retry", detail: "busy" };
+                  sent += 1;
+                  return { type: "delivered" };
+                }),
+            },
+          });
+          assert.strictEqual((yield* service.deliverDue()).sent, 0);
+          busy = false;
+          // A time sync sets the wall clock back an hour; real time moves on two minutes, far
+          // past the retry delay (10 s).
+          shift.wall = -HOUR;
+          yield* TestClock.adjust(2 * MINUTE);
+          yield* service.deliverDue();
+          assert.strictEqual(
+            sent,
+            1,
+            "the retried message is held until the wall clock catches up",
+          );
         }).pipe(Effect.provideService(Clock.Clock, clock));
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),

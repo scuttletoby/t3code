@@ -452,7 +452,10 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     judgesChanged = yield* Deferred.make<void>();
     yield* Deferred.succeed(previous, undefined);
   });
-  /** When a message is tried again, by message id; empty after a restart, so all go at once. */
+  /**
+   * When a message is tried again, by message id, on the monotonic clock (a wall clock set back
+   * never holds a retry); empty after a restart, so all go at once.
+   */
   const retryAt = new Map<string, number>();
   /** Tries of a message's current command id that recorded nothing, for its back-off. */
   const failures = new Map<string, number>();
@@ -460,6 +463,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   const receiversToCheck = new Set<ThreadId>();
   /** The first sweep looks at every thread with a `waiting` wait (events missed while down). */
   let checkAllReceivers = true;
+  /** When held notices are looked at again, on the monotonic clock; 0 when none are held. */
   let noticesRetryAt = 0;
   /** Sends that have not returned, by message id, each with its own token. */
   const sending = new Map<string, object>();
@@ -1962,6 +1966,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
 
     // 2. Hand over the waits of gone receivers, pick the due messages, write their ids.
     const startedAt = yield* Clock.currentTimeMillis;
+    const monoStartedAt = yield* monotonicMillis;
     const planned = yield* lock.withPermits(1)(
       Effect.gen(function* () {
         const loaded = yield* ensureLoaded(true);
@@ -1980,7 +1985,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
               );
         });
         const due = deliveryGroups(waits).filter(
-          (group) => (retryAt.get(group.messageId) ?? 0) <= startedAt,
+          (group) => (retryAt.get(group.messageId) ?? 0) <= monoStartedAt,
         );
         const fresh = new Map<string, DeliveryGroup>();
         for (const group of due) {
@@ -2057,6 +2062,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         const loaded = yield* ensureLoaded(true);
         if (!loaded.ok) return { sent: 0, ended: 0 };
         const now = yield* Clock.currentTimeMillis;
+        const monoNow = yield* monotonicMillis;
         const answers = new Map<string, WaitDeliveryResult>();
         for (const [group, result] of results) {
           for (const wait of group.waits) answers.set(wait.id, result);
@@ -2117,7 +2123,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         for (const [group, result] of results) {
           const at = nextTry(group, result, waits, now, settings);
           if (at === null) forgetMessage(group.messageId);
-          else retryAt.set(group.messageId, at);
+          // Kept as the time left, on the monotonic clock.
+          else retryAt.set(group.messageId, monoNow + Math.max(0, at - now));
         }
         const sent = results.filter(([, result]) => result.type === "delivered").length;
         const ended = transitions.filter((transition) =>
@@ -2261,7 +2268,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           break;
       }
     }
-    noticesRetryAt = held ? (yield* Clock.currentTimeMillis) + PROBLEM_RECHECK_MS : 0;
+    noticesRetryAt = held ? (yield* monotonicMillis) + PROBLEM_RECHECK_MS : 0;
     if (done.size > 0 || replaced.size > 0) {
       yield* lock.withPermits(1)(
         Effect.gen(function* () {
@@ -2290,14 +2297,18 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     return Option.getOrElse(result, () => 0);
   });
 
-  /** When the next sweep has work, from what is in memory; Infinity when nothing is open. */
-  const nextDueAt = (settings: ServerSettings, now: number) => {
+  /**
+   * When the next sweep has work, on the wall clock, from what is in memory; Infinity when nothing
+   * is open. Monotonic times (`monoNow`) are turned into the time left from `now`.
+   */
+  const nextDueAt = (settings: ServerSettings, now: number, monoNow: number) => {
     if (current === null) return now + PROBLEM_RECHECK_MS;
     let next = Infinity;
     const at = (ms: number) => {
       next = Math.min(next, ms);
     };
-    if (current.notices.length > 0) at(Math.max(noticesRetryAt, now));
+    const fromMono = (ms: number) => now + Math.max(0, ms - monoNow);
+    if (current.notices.length > 0) at(fromMono(noticesRetryAt));
     if (receiversToCheck.size > 0) at(now);
     // A held slot that ends may go to a slot wait still waiting.
     const slotsWaiting = current.waits.some(
@@ -2319,7 +2330,10 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         );
       }
     }
-    for (const group of deliveryGroups(current.waits)) at(retryAt.get(group.messageId) ?? now);
+    for (const group of deliveryGroups(current.waits)) {
+      const retry = retryAt.get(group.messageId);
+      at(retry === undefined ? now : fromMono(retry));
+    }
     return Math.max(next, now);
   };
 
@@ -2420,8 +2434,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         if ((yield* phase("notices", noticesSweep, 0)) === null) return stopped;
         const latest = (yield* readSettingsOrNull) ?? settings;
         const now = yield* Clock.currentTimeMillis;
+        const monoNow = yield* monotonicMillis;
         return yield* lock
-          .withPermits(1)(Effect.sync(() => ({ nextDueAt: nextDueAt(latest, now) })))
+          .withPermits(1)(Effect.sync(() => ({ nextDueAt: nextDueAt(latest, now, monoNow) })))
           .pipe(
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),

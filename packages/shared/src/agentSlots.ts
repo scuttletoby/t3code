@@ -202,7 +202,7 @@ export interface SlotDecisionInput {
 }
 
 /** Threads whose `accountOnly` holds are on `account` and not already counted there. */
-function accountOnlyThreads(
+export function accountOnlyThreads(
   counted: ReadonlyArray<SlotReservation>,
   accountOnly: ReadonlyArray<SlotReservation>,
   account: string,
