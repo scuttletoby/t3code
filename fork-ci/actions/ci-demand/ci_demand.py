@@ -16,18 +16,20 @@ It only ever sends GET requests (`gh api -X GET`): it never writes to GitHub. Ra
 X-RateLimit-Remaining falls below --reserve (default 20% of X-RateLimit-Limit, so a workflow token's 1000
 an hour works too) and after --max-requests requests; on 403/429 it waits Retry-After or
 the reset time when that is short (MAX_WAIT), else it stops. A stop prints what it has, marked INCOMPLETE (exit 3):
-run it again with the same --cache and it goes on from the pages it already saved.
+run it again with the same --cache and it goes on from the pages it already saved. A cache that could not be
+written is in the result (`cache_write_failed`), and then a stop does not say to run again: the pages
+that failed were not saved.
 
 Cache (--cache, a folder the caller owns): a page is saved only when it cannot change any more: a job page when the
 run and all its jobs are completed (keyed by run id and attempt, so a re-run is a new page); a run-list page when
 every run in it is completed and its window ended over an hour ago, and then reused for LIST_MAX_AGE (a later re-run
 changes the run). Where the OS has user ids (not Windows), a folder another user owns is refused and the folder is
-made 0700. Writes are a `.part-` file then a rename. A file that is unreadable, half-written, damaged, saved for
+made 0700 (a filesystem where chmod has no effect is refused). Writes are a `.part-` file then a rename. A file that is unreadable, half-written, damaged, saved for
 another page or in another FORMAT is fetched again; a failed write only costs the cache; `.part-` files older than
 an hour go.
 Exit: 0 complete, 2 bad arguments or an API error, 3 incomplete (budget).
 """
-import argparse, contextlib, datetime as dt, hashlib, json, os, re, subprocess, sys, time
+import argparse, contextlib, datetime as dt, hashlib, json, math, os, re, subprocess, sys, time
 
 MAX_WAIT = 120          # seconds: a longer rate-limit wait stops the run (INCOMPLETE) instead
 LIST_MAX_AGE = 12 * 3600
@@ -102,8 +104,13 @@ class Api:
                 and isinstance(doc.get('body'), dict)):
             return None
         saved = doc.get('saved')
-        if isinstance(saved, bool) or not isinstance(saved, (int, float)) or saved > now() + 60:
-            return None   # a damaged date: fetched again
+        try:   # float(): json.load reads NaN, Infinity and any-size integers; a huge one raises OverflowError
+            date_ok = not isinstance(saved, bool) and isinstance(saved, (int, float)) and math.isfinite(float(saved)) \
+                and 0 <= saved <= now() + 60
+        except OverflowError:
+            date_ok = False
+        if not date_ok:
+            return None   # a damaged date (NaN, infinite, huge, before 1970 or in the future): fetched again
         if max_age is not None and now() - saved > max_age:
             return None
         self.hits += 1
@@ -367,7 +374,7 @@ def repo_of(args):
         raise ValueError('give --repo or --config, one of them')
     repo = args.repo
     if args.config:
-        with open(args.config, encoding='utf-8') as f:
+        with open(args.config, encoding='utf-8-sig') as f:   # utf-8-sig: a BOM (some Windows editors) is fine
             repo = ((json.load(f) or {}).get('ciDemand') or {}).get('repo')
         if not repo:
             raise ValueError(f'{args.config}: no ciDemand.repo')
@@ -417,12 +424,17 @@ def main(argv=None):
         return 2
     out = report(summarize(runs, jobs))
     missing = sum(r['runs_without_jobs'] for k, r in out.items() if k != 'total')
-    head = (f'{repo} {since}..{until} (UTC days, by run creation): {api.requests} requests, {api.hits} cached pages'
-            + (f'; INCOMPLETE: {stopped}, ' + ('' if listed else 'run list not finished, ')
-               + f'{missing} runs without jobs; run again with the same --cache' if stopped else ''))
+    head = f'{repo} {since}..{until} (UTC days, by run creation): {api.requests} requests, {api.hits} cached pages'
+    if stopped:
+        head += (f'; INCOMPLETE: {stopped}, ' + ('' if listed else 'run list not finished, ') + f'{missing} runs without jobs'
+                 + ('' if api.save_failed else '; run again with the same --cache'))
+    if api.save_failed:   # nothing new was saved: a run again would fetch the same pages, never further
+        head += f'; cache not written ({shown(api.save_failed)})' + (
+            ', so a run again asks for the same pages: fix --cache first' if stopped else '')
     if args.json:
         print(json.dumps({'repo': repo, 'since': str(since), 'until': str(until), 'requests': api.requests,
-                          'cached': api.hits, 'incomplete': stopped, 'run_list_complete': listed, 'days': out}, indent=1))
+                          'cached': api.hits, 'incomplete': stopped, 'run_list_complete': listed,
+                          'cache_write_failed': api.save_failed, 'days': out}, indent=1))
     else:
         print(head)
         print(text(out))
