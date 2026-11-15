@@ -3,7 +3,7 @@ with GET-only `gh api` calls. Every case runs the real command against a fake `g
 pages (testdata/) and logs each call: no network.
 Run: python3 fork-ci/actions/ci-demand/ci_demand.test.py
 """
-import contextlib, copy, io, json, os, shutil, sys, tempfile, unittest
+import contextlib, copy, io, json, os, shutil, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True   # leave no __pycache__ in the action folder
@@ -22,7 +22,8 @@ with open(os.path.join(HERE, 'testdata', 'two-days.json')) as f:
     PAGES = json.load(f)['pages']
 
 # The fake gh: answers from $FAKE_GH_ROUTES ({endpoint: [answer, ...]}, the n-th call gets the n-th answer, the
-# last one repeats), logs argv to $FAKE_GH_LOG. An answer is {"status", "headers", "body"} or {"raw": stdout}.
+# last one repeats), logs argv to $FAKE_GH_LOG. An answer is {"status", "headers", "body"} or {"raw": stdout}; a
+# header set to null is left out. Like the real gh, it writes the body as UTF-8 bytes whatever the locale.
 FAKE_GH = r'''
 import json, os, sys
 log = os.environ['FAKE_GH_LOG']
@@ -36,8 +37,9 @@ a = answers[min(calls, len(answers)) - 1]
 if 'raw' in a:
     sys.stdout.write(a['raw']); sys.stderr.write('connection refused\n'); sys.exit(1)
 h = {"X-Ratelimit-Limit": "5000", "X-Ratelimit-Remaining": "4000", "X-Ratelimit-Reset": "1793797200", **a.get('headers', {})}
-body = a['body'] if isinstance(a['body'], str) else json.dumps(a['body'])
-sys.stdout.write(f"HTTP/2.0 {a['status']} X\r\n" + ''.join(f"{k}: {v}\r\n" for k, v in h.items()) + "\r\n" + body)
+body = a['body'] if isinstance(a['body'], str) else json.dumps(a['body'], ensure_ascii=False)
+head = f"HTTP/2.0 {a['status']} X\r\n" + ''.join(f"{k}: {v}\r\n" for k, v in h.items() if v is not None)
+sys.stdout.buffer.write((head + "\r\n" + body).encode('utf-8'))
 sys.exit(0 if a['status'] == 200 else 1)
 '''
 
@@ -114,6 +116,7 @@ class Numbers(Case):
         self.assertEqual(tot['queue_wait_s']['self-hosted,build']['max'], 1200.0)
         self.assertEqual(d1['never_started_jobs'], 1)
         self.assertIsNone(doc['incomplete'])
+        self.assertIsNone(doc['cache_write_failed'])
 
     def test_text_output(self):
         code, out = self.run_main()
@@ -259,6 +262,8 @@ class State(Case):
         code, out = self.run_main('--max-requests', '1')
         self.assertEqual(code, 3)
         self.assertIn('INCOMPLETE: --max-requests 1 reached, run list not finished', out)
+        self.assertIn('run again with the same --cache', out)   # the page it got was saved
+        self.assertNotIn('cache not written', out)
 
     def test_cache_folder_is_private(self):
         self.numbers()
@@ -268,6 +273,11 @@ class State(Case):
         self.assertEqual(self.numbers()[0], 0)
         damage = {'date not a number': lambda d: d.update(saved='yesterday'), 'no date': lambda d: d.pop('saved'),
                   'date in the future': lambda d: d.update(saved=NOW + 86400), 'body not an object': lambda d: d.update(body=[]),
+                  'date NaN': lambda d: d.update(saved=float('nan')),   # json.load reads NaN, never stale
+                  'date -Infinity': lambda d: d.update(saved=float('-inf')),
+                  'date a huge integer': lambda d: d.update(saved=10 ** 400),   # float() of it overflows
+                  'date a huge negative integer': lambda d: d.update(saved=-10 ** 400),
+                  'date before 1970': lambda d: d.update(saved=-1),
                   'older format (none)': lambda d: d.pop('v'), 'older format': lambda d: d.update(v=M.FORMAT - 1),
                   'newer format': lambda d: d.update(v=M.FORMAT + 1)}
         for what, change in damage.items():
@@ -298,6 +308,29 @@ class State(Case):
         self.assertEqual(self.err.count('cache not written'), 1, self.err)
         self.assertEqual(os.listdir(self.cache), [])   # no half page under its final name, no .part- left
         self.assertEqual(self.numbers()[1]['requests'], 6)
+
+    def test_a_cache_that_cannot_be_written_shows_in_the_result(self):
+        # A read-only folder or a full disk: nothing is saved, so "run again with the same --cache" would fetch the
+        # same pages again (and a range over --max-requests would never finish). The result says so, --json too.
+        def read_only(src, dst):
+            raise OSError(30, 'Read-only file system')
+
+        with mock.patch.object(M.os, 'replace', read_only):
+            code, doc = self.numbers()
+            self.assertEqual(code, 0, self.err)
+            self.assertIn('Read-only file system', doc['cache_write_failed'])
+            self.assertIsNone(doc['incomplete'])
+            code, doc = self.numbers('--max-requests', '4')
+            self.assertEqual(code, 3)
+            self.assertIn('Read-only file system', doc['cache_write_failed'])
+            code, out = self.run_main('--max-requests', '4')
+        self.assertEqual(code, 3)
+        head = out.splitlines()[0]
+        self.assertIn('INCOMPLETE: --max-requests 4 reached', head)
+        self.assertIn('cache not written (', head)
+        self.assertNotIn('run again with the same --cache', head)
+        self.assertIn('fix --cache first', head)
+        self.assertEqual(os.listdir(self.cache), [])
 
     def test_a_write_killed_half_way_leaves_only_a_part_file(self):
         class Killed(BaseException):   # the process dies: nothing in the tool gets to clean up
@@ -343,6 +376,15 @@ class State(Case):
         self.assertEqual(self.numbers()[0], 0, self.err)
         self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o700)
 
+    def test_cache_folder_that_cannot_be_made_private_is_refused(self):
+        # FAT, WSL /mnt/c, some network mounts: chmod "works" but the mode stays open to others.
+        os.makedirs(self.cache)
+        os.chmod(self.cache, 0o755)
+        with mock.patch.object(M.os, 'chmod', lambda path, mode: None):
+            code, doc = self.numbers()
+        self.assertEqual((code, doc, self.calls()), (2, None, []))
+        self.assertIn('cannot be made private (0700)', self.err)
+
     def test_cache_folder_of_another_user_is_refused(self):
         os.makedirs(self.cache)
         other = os.stat(self.cache).st_uid + 1
@@ -381,6 +423,13 @@ class RateLimit(Case):
         code, doc = self.numbers()
         self.assertEqual((code, self.slept), (0, [7]))
         self.assertEqual(doc['days']['total']['ci_hours'], 3.25)
+
+    def test_reserve_without_a_limit_header_is_1000(self):
+        self.routes[DAY2] = [ok(PAGES[DAY2], **{'X-Ratelimit-Limit': None, 'X-Ratelimit-Remaining': '900'})]
+        self.serve(self.routes)
+        code, doc = self.numbers()
+        self.assertEqual(code, 3, self.err)
+        self.assertIn('900 left, reserve 1000', doc['incomplete'])
 
     def test_secondary_limit_without_retry_after_waits_a_minute(self):
         self.routes[DAY1] = [{'status': 403, 'body': {'message': 'You have exceeded a secondary rate limit'}},
@@ -471,6 +520,35 @@ class Arguments(Case):
             json.dump({'repo': 'acme/widgets'}, f)   # a top-level repo is some other tool's
         self.assertEqual(self.numbers(repo=('--config', cfg))[0], 2)
         self.assertIn('no ciDemand.repo', self.err)
+
+    def test_config_with_a_utf8_bom_is_read(self):
+        cfg = os.path.join(self.d, 'project.json')   # some Windows editors save UTF-8 with a byte-order mark
+        with open(cfg, 'w', encoding='utf-8-sig') as f:
+            json.dump({'ciDemand': {'repo': 'acme/widgets'}}, f)
+        code, doc = self.numbers(repo=('--config', cfg))
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual(doc['repo'], 'acme/widgets')
+
+    def test_a_locale_that_is_not_utf8_reads_names_and_config_as_utf8(self):
+        # The script itself, in the C locale with UTF-8 mode off (ASCII): gh output and the config file are UTF-8
+        # whatever the locale (a Windows code page, an old server), so non-ASCII names survive and nothing is refused.
+        env = {**os.environ, 'LC_ALL': 'C', 'PYTHONCOERCECLOCALE': '0', 'PYTHONUTF8': '0'}
+        probe = subprocess.run([sys.executable, '-I', '-X', 'utf8=0', '-c', 'import locale; print(locale.getencoding())'],
+                               env=env, capture_output=True, text=True, check=True).stdout.strip()
+        if probe.lower().replace('-', '') in ('utf8', 'utf8mb4'):
+            self.skipTest(f'the C locale is UTF-8 here ({probe})')
+        p = copy.deepcopy(PAGES)
+        p[DAY2]['workflow_runs'][0]['path'] = '.github/workflows/bäck-énd.yml'
+        self.serve({k: [ok(v)] for k, v in p.items()})
+        cfg = os.path.join(self.d, 'project.json')
+        with open(cfg, 'w', encoding='utf-8') as f:
+            json.dump({'owner': 'Zoë Ångström', 'ciDemand': {'repo': 'acme/widgets'}}, f, ensure_ascii=False)
+        r = subprocess.run([sys.executable, '-I', '-B', '-X', 'utf8=0', os.path.join(HERE, 'ci_demand.py'),
+                            '--config', cfg, '--since', '2026-11-01', '--until', '2026-11-02', '--cache', self.cache,
+                            '--json'], env=env, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode('utf-8', 'replace'))
+        doc = json.loads(r.stdout)
+        self.assertEqual(doc['days']['2026-11-02']['workflows'], {'bäck-énd.yml': 1})
 
     def test_days_means_full_utc_days_before_today(self):
         self.routes[DAY1.replace('11-01T', '11-03T')] = [ok({'total_count': 0, 'workflow_runs': []})]
