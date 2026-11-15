@@ -233,4 +233,43 @@ describe("WorkAdmission", () => {
       expect(yield* fs.exists(file)).toBe(false);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+  // Fork (go-live kit): `serve --hold-work`.
+  it.effect(
+    "holds from boot: admits nothing, and release, hold and the starter cannot open it",
+    () =>
+      Effect.gen(function* () {
+        const marker = yield* memoryUpdateHoldStore;
+        const hold = { heldAt: "2026-01-01T00:00:00.000Z", targetVersion: "9.9.9" };
+        yield* marker.set(hold);
+        const gate = yield* makeWorkAdmissionGate({ marker, heldFromBoot: true });
+        expect(gate.heldFromBoot).toBe(true);
+        expect(yield* gate.isHeld).toBe(true);
+        const ran = yield* Ref.make(false);
+        const waiting = yield* Effect.forkChild(gate.admit(Ref.set(ran, true)));
+        const started = yield* Ref.make(false);
+        yield* gate.setHeldWorkStarter(Ref.set(started, true));
+        yield* gate.release;
+        yield* gate.startHeldWork;
+        expect(yield* gate.hold).toBe(0);
+        yield* gate.release;
+        yield* settle;
+        expect(yield* Ref.get(ran)).toBe(false);
+        expect(yield* Ref.get(started)).toBe(false);
+        expect(yield* gate.isHeld).toBe(true);
+        expect(yield* gate.inFlight).toBe(0);
+        // The update marker stays for the next start without the flag.
+        expect(yield* marker.current).toEqual(hold);
+        yield* Fiber.interrupt(waiting);
+      }),
+  );
+
+  it.effect("is open from boot without the flag, as before", () =>
+    Effect.gen(function* () {
+      const gate = yield* makeWorkAdmissionGate();
+      expect(gate.heldFromBoot).toBe(false);
+      expect(yield* gate.isHeld).toBe(false);
+      expect(yield* gate.admit(Effect.succeed(1))).toBe(1);
+      expect((yield* WorkAdmission).heldFromBoot).toBe(false);
+    }),
+  );
 });

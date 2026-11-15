@@ -489,3 +489,25 @@ describe("server ownership", () => {
     );
   });
 });
+
+// Fork (go-live kit): a held server says so in its status, so nobody takes it for a broken one.
+it.effect("records workHeld only for a server started with --hold-work", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-hold-work-state-" });
+    const statePath = path.join(root, "server-runtime.json");
+    const held = yield* ServerRuntimeState.makePersistedServerRuntimeState({
+      config: { host: undefined, devUrl: undefined, holdWork: true },
+      port: 3773,
+    });
+    yield* ServerRuntimeState.persistServerRuntimeState({ path: statePath, state: held });
+    const read = yield* ServerRuntimeState.readPersistedServerRuntimeState(statePath);
+    assert.equal(Option.getOrUndefined(read)?.workHeld, true);
+    const normal = yield* ServerRuntimeState.makePersistedServerRuntimeState({
+      config: { host: undefined, devUrl: undefined },
+      port: 3773,
+    });
+    assert.isFalse("workHeld" in normal);
+  }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);

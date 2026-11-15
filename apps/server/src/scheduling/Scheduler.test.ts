@@ -2,11 +2,13 @@ import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerActivation from "../serverActivation.ts";
+import { makeWorkAdmissionGate, WorkAdmission } from "../workAdmission.ts";
 import * as Scheduler from "./Scheduler.ts";
 
 it.effect("keeps other sources running after a source defects", () =>
@@ -107,4 +109,27 @@ it.effect("holds due work and the clock until startup recovery activates the ser
     );
     assert.isAtLeast(yield* Ref.get(runs), 1);
   }),
+);
+
+// Fork (go-live kit): `serve --hold-work` runs no scheduler source.
+it.effect("runs no source when work is held from boot", () =>
+  Effect.gen(function* () {
+    const scheduler = yield* Scheduler.Scheduler;
+    const runs = yield* Ref.make(0);
+    yield* scheduler.register(
+      "held",
+      Ref.update(runs, (n) => n + 1),
+    );
+    for (let tick = 0; tick < 3; tick += 1) {
+      yield* TestClock.adjust("5 seconds");
+      for (let i = 0; i < 20; i += 1) yield* Effect.yieldNow;
+    }
+    assert.equal(yield* Ref.get(runs), 0);
+  }).pipe(
+    Effect.provide(
+      Scheduler.layer.pipe(
+        Layer.provide(Layer.effect(WorkAdmission, makeWorkAdmissionGate({ heldFromBoot: true }))),
+      ),
+    ),
+  ),
 );
