@@ -6,7 +6,7 @@ log in only to run the desk link's `serve` for its own pool (row D2, `fork-fleet
 fleet runbook is `.github/fork-fleet.md`.
 
 ```
-desk-key = sudo -u fleet-desk -H /usr/bin/python3 -I /opt/fork-fleet/fork-fleet-desk-key.py [--config FILE] [--user NAME]
+desk-key = sudo -u fleet-desk -H /usr/bin/python3 -I /opt/fork-fleet/fork-fleet-desk-key.py --config /opt/fork-fleet/fork-fleet.json [--user NAME]
 
 desk-key add POOL < desktop-key.pub   # add POOL's line (one ssh-ed25519 public key on stdin)
 desk-key status [POOL]                # POOL's line, or every desk pool's and every retired pool's
@@ -74,7 +74,7 @@ and its PASS/FAIL check proves them:
    added to it. The check runs `sshd -T -C user=...,host=...,addr=...` and checks that
    `authorizedkeysfile` is `.ssh/authorized_keys` and that those values hold.
 3. **The /run folder.** `/run/fork-fleet-desk` is made by tmpfiles, owned by the desk-link user,
-   mode 0700, and the desk link's `launch` accepts that owner.
+   mode 0710 with the socket group, and the desk link's `launch` accepts that owner.
 4. **Root-owned install files.** `/opt/fork-fleet`, `fork-fleet-desk.py` and this tool are owned
    by root and not writable by the desk-link user; `/usr/bin/python3` exists (the forced command
    names it by its full path).
