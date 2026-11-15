@@ -61,7 +61,7 @@ jobs:
     runs-on: >-
       ${{ needs.route.result == 'success'
           && (needs.route.outputs.attempt == github.run_attempt && fromJSON(needs.route.outputs.runners).plugins
-              || contains(fromJSON(needs.route.outputs.rerun).actors, github.triggering_actor)
+              || needs.route.outputs.rerun && contains(fromJSON(needs.route.outputs.rerun).actors, github.triggering_actor)
                  && fromJSON(needs.route.outputs.rerun).labels.plugins
                  && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.route.outputs.rerun).pool,
                                     fromJSON(needs.route.outputs.rerun).labels.plugins, github.run_attempt))
@@ -236,6 +236,13 @@ job's `avoid`): only when the pool's heartbeat is fresh and its dispatcher open 
 for a slot like any other, and the fork's sweep cancels a run that waits too long). `per_run` does not apply to
 re-runs. The job's `runs-on` adds `-a${{ github.run_attempt }}`; the dispatcher's own checks (a trusted actor started
 this attempt, the label's attempt is the run's) and the job-started hook stay as they are.
+
+Because `route` decides at the first attempt, two things are fixed for that run's re-runs: a later change of mode or
+of `reruns` does not stop them going to the pool, and the heartbeat is the one seen then. A trusted re-run long after
+(say a day later, with the desktop switched off or the pool removed) asks for a label no dispatcher serves and waits
+until GitHub drops it (24 hours) or someone cancels it; the fork's sweep only looks at runs created in the last 24
+hours. Cancel it and start a new run (not a re-run) to route it again. `needs.route.outputs.rerun &&` keeps the
+expression working for a workflow that does not map the `rerun` output (its re-runs take `fallback`).
 
 A config that breaks any rule above fails the step with the list of problems and puts out nothing.
 

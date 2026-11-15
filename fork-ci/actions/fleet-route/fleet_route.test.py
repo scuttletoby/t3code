@@ -343,6 +343,9 @@ class Action(unittest.TestCase):
         _, stale, _ = self.run_step(self.own())   # no heartbeat: re-runs take fallback whoever starts them
         self.assertEqual(stale['rerun'], '{}')
         self.assertEqual(runs_on('2', person, stale), json.loads(stale['fallback']))
+        unmapped = {k: v for k, v in outputs.items() if k != 'rerun'}   # a workflow that does not map `rerun`
+        self.assertEqual(runs_on('2', person, unmapped), json.loads(outputs['fallback']))
+        self.assertEqual(runs_on('1', person, unmapped), json.loads(outputs['runners'])['plugins'])
 
     def test_a_missing_or_broken_config_or_setting_fails_and_puts_out_nothing(self):
         broken = os.path.join(self.d, 'broken.json')
