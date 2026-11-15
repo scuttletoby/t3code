@@ -190,6 +190,11 @@ Two more things limit what a job can do:
   that each bound path is the one the launcher checked. The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`) instead of keeping a list of
   their own.
+  Before a new kind of host joins a pool (a Windows PC's WSL2 first),
+  `sudo bash .github/scripts/fork-fleet-walls-proof.sh` runs step 6 there with
+  throwaway users, then each network block alone, prints the cgroup version,
+  and undoes all it made. It refuses a host with any part of a pool, running or
+  not.
 
 Fleet jobs read no secrets (a test checks this). The fleet's GitHub token lives
 only on the fleet host, readable by root.

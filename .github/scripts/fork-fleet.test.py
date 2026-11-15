@@ -2510,6 +2510,102 @@ exec nsenter --net="$ns" -- setpriv --reuid="$(id -u -- "$user")" --regid="$(id 
 """
 
 
+class WallsProof(unittest.TestCase):
+    """fork-fleet-walls-proof.sh proves the walls on a new kind of host, as root, with throwaway users. Here: it
+    parses, refuses without root and changes nothing, and has the parts fix round 1 asked for (LauncherAsRoot runs it
+    as root, where it must refuse: that class's users are a pool's)."""
+    PROOF = os.path.join(HERE, 'fork-fleet-walls-proof.sh')
+
+    def src(self):
+        with open(self.PROOF) as f:
+            return f.read()
+
+    def test_it_parses_and_needs_root(self):
+        self.assertEqual(subprocess.run(['bash', '-n', self.PROOF]).returncode, 0)
+        if os.geteuid() != 0:
+            got = subprocess.run(['bash', self.PROOF], capture_output=True, text=True, timeout=30)
+            self.assertEqual((got.returncode, got.stdout), (1, ''))
+            self.assertIn('run it as root', got.stderr)
+        self.assertIn('"$launch" check-net https://github.com', self.src())
+
+    def test_it_looks_for_every_part_of_a_pool_running_or_not(self):
+        src = self.src()
+        for part in ('/etc/fork-fleet*', '/opt/fork-fleet*', '/var/lib/fork-fleet*', '/run/fork-fleet*',
+                     "list-unit-files --no-legend --plain \\\n  'fork-fleet*' 't3code-fleet*'",
+                     "list-units --all --no-legend --plain 'fork-fleet*' 't3code-fleet*'",
+                     "grep -E '^fork-(fleet|runner)-'", 'nft list table inet fork_fleet',
+                     "ip netns list | grep -E '^fork-fleet-'", '^ffh-', "pgrep -af 'fork-fleet(\\.py|-launch\\.sh)'",
+                     '/run/netns/fork-fleet-$u'):
+            self.assertIn(part, src)
+        self.assertLess(src.index('die "this host has a pool'), src.index('useradd --system'))
+
+    def test_every_cleanup_step_runs_and_a_failed_one_is_named(self):
+        src = self.src()
+        cleanup = src[src.index('cleanup() {'):src.index('trap cleanup EXIT')]
+        self.assertIn('set +e', cleanup)
+        for undo in ('kill "$listener"', 'systemctl stop', 'ip netns del', 'ip link del', 'kill_all', 'userdel',
+                     'nft delete table inet fork_fleet', 'iptables -w 60 -D DOCKER-USER', 'rm -rf', 'sysctl -qw'):
+            self.assertRegex(cleanup, r'step [^\n]*' + re.escape(undo), undo)
+        self.assertIn('cleanup steps that failed', cleanup)
+        # step() runs the next step whatever this one gave, and names the failed one
+        got = subprocess.run(['bash', '-c', src[src.index('step() {'):src.index('kill_all()')] +
+                              'set -e; failed=(); step false one; step true; step false two; echo "${failed[*]}"'],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual((got.returncode, got.stdout), (0, 'false one false two\n'))
+
+    def test_cleanup_deletes_the_launchers_namespace_and_only_the_docker_rules_that_are_there(self):
+        """Fix round 2 (#198 nits): cleanup deletes the namespace the launcher made for that user (its name and path),
+        and a DOCKER-USER rule the launcher never added (a run that stopped early) is not a failed step (no exit 1)."""
+        src = self.src()
+        with open(os.path.join(HERE, 'fork-fleet-launch.sh')) as f:
+            launch = f.read()
+        self.assertIn('ns=fork-fleet-$user ', launch)
+        self.assertIn('NetworkNamespacePath=/run/netns/fork-fleet-$user', launch)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bin_, rec = os.path.join(tmp, 'bin'), os.path.join(tmp, 'rec')
+        os.makedirs(bin_)
+        os.makedirs(os.path.join(tmp, 'netns'))
+        open(os.path.join(tmp, 'netns', 'fork-fleet-u1'), 'w').close()
+        # Fakes: each records its arguments; iptables -C finds only the rules listed in $T/present.
+        for name in ('ip', 'iptables', 'systemctl', 'nft', 'pkill', 'userdel', 'sysctl', 'kill'):
+            body = f'echo "{name} $*" >>"$T/rec"\n'
+            if name == 'iptables':
+                body += 'if [[ " $* " == *" -C "* ]]; then grep -qxF -- "${*: -1}" "$T/present"; exit; fi\n'
+            if name in ('ip', 'nft'):
+                body += '[[ " $* " != *" show "* && " $* " != *" list "* ]] || exit 1\n'
+            with open(os.path.join(bin_, name), 'w') as f:
+                f.write('#!/bin/bash\n' + body + 'exit 0\n')
+            os.chmod(os.path.join(bin_, name), 0o755)
+        with open(os.path.join(bin_, 'id'), 'w') as f:
+            f.write('#!/bin/bash\necho 4242\n')
+        os.chmod(os.path.join(bin_, 'id'), 0o755)
+        code = src[src.index('step() {'):src.index('trap cleanup EXIT')].replace('/run/netns/', tmp + '/netns/')
+        rules = ['-o ffh-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT', '-i ffh-+ -j ACCEPT']
+        for present in ([], ['ACCEPT']):
+            with open(os.path.join(tmp, 'present'), 'w') as f:
+                f.write('\n'.join(present) + '\n')
+            open(rec, 'w').close()
+            got = subprocess.run(['bash', '-c', code + '\nmade=(u1) docker=("$R1" "$R2") failed=() tmp="" listener="" '
+                                  'forward=0\ncleanup\necho done'],
+                                 env={'PATH': bin_ + ':/usr/bin:/bin', 'T': tmp, 'R1': rules[0], 'R2': rules[1]},
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual((got.returncode, got.stdout, got.stderr), (0, 'done\n', ''))
+            with open(rec) as f:
+                calls = f.read().splitlines()
+            self.assertIn('ip netns del fork-fleet-u1', calls)
+            deleted = [c for c in calls if ' -D DOCKER-USER ' in c]
+            self.assertEqual(deleted, [f'iptables -w 60 -D DOCKER-USER {r}' for r in rules] if present else [])
+
+    def test_it_prints_the_cgroup_version_and_tries_each_block_alone(self):
+        src = self.src()
+        self.assertIn('stat -fc %T /sys/fs/cgroup', src)
+        self.assertIn('ip netns exec "fork-fleet-${users[0]}"', src)
+        self.assertIn('-p IPAddressDeny=any', src)
+        for key in ('JOB_PATHS=$tmp/job-paths.txt', 'HOOK=$tmp/hook.sh'):
+            self.assertIn(key, src)
+
+
 @unittest.skipUnless(sys.platform.startswith('linux') and os.geteuid() == 0 and
                      os.environ.get('FORK_FLEET_ROOT_TESTS') == '1',
                      'as root with FORK_FLEET_ROOT_TESTS=1 only: it creates and deletes users (CI: the workflow lint '
@@ -2796,6 +2892,16 @@ class LauncherAsRoot(unittest.TestCase):
         self.assertIn('ok    http://203.0.113.2/ answers (HTTP 200)', got.stdout)
         self.assertIn("ok    this host's own public address 203.0.113.3 is refused (No route to host)", got.stdout)
         self.assertIn(f'check-net: as {self.USERS[0]}, in its namespace fork-fleet-{self.USERS[0]}', got.stdout)
+
+    def test_the_walls_proof_refuses_a_host_with_a_pools_users(self):
+        """As root, with this class's runner users (a pool's part, as an idle pool's after a reboot): it refuses
+        before it makes anything, and names them."""
+        users = {p.pw_name for p in pwd.getpwall()}
+        got = subprocess.run(['bash', WallsProof.PROOF], capture_output=True, text=True, timeout=60)
+        self.assertEqual((got.returncode, got.stdout), (1, ''), got.stderr)
+        for user in self.USERS:
+            self.assertIn(f'user {user}', got.stderr)
+        self.assertEqual({p.pw_name for p in pwd.getpwall()}, users)
 
     def test_the_walls_hold_in_a_real_systemd_unit(self):
         """As Launcher's, in a unit of the system's systemd as a real runner user (CI: the hosted runner's), and with
