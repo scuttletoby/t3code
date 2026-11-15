@@ -38,6 +38,8 @@
 #   paths        reads only, for the per-OS walls (fork-fleet-walls/<os>, `mounts`): a line `DEST SOURCE` for every
 #                file or folder of this host a job's unit gets (DEST where the unit has it, SOURCE the real path bound
 #                there: job_view, the same rule as start's), WORK_ROOT standing for each job's copy in it.
+#   tools        reads only, for the per-OS walls (`job-units`): the programs the job units are started and asked
+#                with, `SYSTEMD_RUN <program>` and `SYSTEMCTL <program>`, as launch.conf sets them.
 #
 # The network: each runner user has a namespace of its own, fork-fleet-USER, so a job has its own loopback and reaches
 # no service on this host's (nor an abstract socket). Its only link, ffh-UID (host side), goes to the public internet:
@@ -63,8 +65,8 @@
 # HOOK (and the two files beside it), WORK_ROOT and RESOLV_CONF are bound into every job too: never under a folder that
 # holds data (/home, /root, /mnt, /media, /srv), also through a symlink (no_data). A bind mount of a data folder at
 # one of them is not seen (it has no link to resolve): that is the operator's to avoid (.github/fork-fleet.md, step 4).
-# FORK_FLEET_WALLS_ROOT: the walls' test knob (fork-fleet-walls.py), `paths` only and never as root: a fake machine
-# whose launch.conf and paths it reads.
+# FORK_FLEET_WALLS_ROOT: the walls' test knob (fork-fleet-walls.py), `paths` and `tools` only and never as root: a
+# fake machine whose launch.conf and paths it reads.
 set -euo pipefail
 umask 077
 
@@ -96,16 +98,19 @@ owned_safe() {
   (((8#$mode & 8#022) == 0)) || die "$1 must be writable by its owner only"
 }
 
-# The fake machine of the walls' tests, or '' (this one): refused for every verb but `paths`, and when root runs this.
+# The fake machine of the walls' tests, or '' (this one): refused for every verb but `paths` and `tools`, and when
+# root runs this.
 ROOT=${FORK_FLEET_WALLS_ROOT-}
+readonly_verb=0
+[[ ${1-}:$# != paths:1 && ${1-}:$# != tools:1 ]] || readonly_verb=1
 if [[ -n $ROOT ]]; then
-  [[ ${1-} == paths && $EUID != 0 ]] || die "FORK_FLEET_WALLS_ROOT is set: it is for the walls' tests only (paths, not as root)"
+  ((readonly_verb && EUID != 0)) || die "FORK_FLEET_WALLS_ROOT is set: it is for the walls' tests only (paths and tools, not as root)"
   ROOT=$(realpath -e -- "$ROOT") && [[ $ROOT =~ ^/[A-Za-z0-9._/-]+$ ]] || die "FORK_FLEET_WALLS_ROOT is no plain folder"
 fi
 conf=${FORK_FLEET_LAUNCH_CONF:-/etc/fork-fleet/launch.conf}
-# paths on a host not set up yet (no conf at all): what jobs would see with the defaults below.
+# paths and tools on a host not set up yet (no conf at all): what jobs would get with the defaults below.
 conf_file=/dev/null
-[[ ${1-} == paths && ! -e $ROOT$conf && ! -L $ROOT$conf ]] || { owned_safe "$ROOT$conf" && conf_file=$ROOT$conf; }
+((readonly_verb)) && [[ ! -e $ROOT$conf && ! -L $ROOT$conf ]] || { owned_safe "$ROOT$conf" && conf_file=$ROOT$conf; }
 RUNNER_USERS='' TEMPLATE=/opt/fork-fleet/template/runner-template WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
@@ -118,7 +123,7 @@ while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
   printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
 done <"$conf_file"
-[[ -n $RUNNER_USERS && -n $TEMPLATE || ${1-} == paths ]] || die "$conf: RUNNER_USERS and TEMPLATE are required"
+[[ -n $RUNNER_USERS && -n $TEMPLATE ]] || ((readonly_verb)) || die "$conf: RUNNER_USERS and TEMPLATE are required"
 [[ $RESERVE_MB =~ ^[0-9]{1,7}$ && $MAX_SECONDS =~ ^[1-9][0-9]{0,6}$ ]] || die "$conf: RESERVE_MB and MAX_SECONDS are numbers"
 { [[ $NET_BASE =~ ^10\.(0|[1-9][0-9]{0,2})$ ]] && ((BASH_REMATCH[1] <= 255)); } || die "$conf: NET_BASE is 10.N (N up to 255)"
 own_url='https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?'
@@ -856,14 +861,64 @@ resolv_target() {
   printf '%s\n' "$target"
 }
 
+# THE rule of a folder on the way to a bound path (a link's, and each one above the real path): only its owner may
+# write it, or it is sticky (then only an entry's owner may rename or remove it). A folder its group or all may write
+# lets each of them rename a link or a plain folder in it away and put their own link in its place, between the check
+# and the bind, so the bind comes from wherever they like. In a sticky one that others may write (/var/tmp), any of
+# them may have made the entry the path goes through ($3, when it is there): as its owner they may still rename it
+# away, so it must be root's or this user's, as a link must. Dies otherwise; $2: how the path goes through it.
+closed_folder() {
+  local mode uid
+  mode=$(stat -c '0%a' -- "$ROOT${1:-/}") || die "$2: cannot read the folder ${1:-/}"
+  ((mode & 01000 || !(mode & 022))) ||
+    die "$2, which others may write (its group or all): they could swap a link into it" \
+      "(chmod go-w ${1:-/}, or make it sticky: chmod +t ${1:-/})"
+  if ((mode & 022)) && [[ -n ${3:-} && -e $ROOT$3 ]]; then
+    uid=$(stat -c %u -- "$ROOT$3") || die "$2: cannot read $3"
+    [[ $uid == 0 || $uid == "$EUID" ]] ||
+      die "$2: $3 is uid $uid's, in ${1:-/}, which is sticky but others may write: that user could rename it away" \
+        "and put a link in its place (only root's, or this user's; or move it out of ${1:-/})"
+  fi
+}
+
+# Every symlink on the way from $1 to its real path (on the fake machine: in it) is root's (or this user's, who runs
+# the launcher: root, but for the walls' tests), in a folder no other user may swap it in: one a user can repoint
+# leads a bind between the check and the job wherever that user likes, past every check. Dies otherwise. That
+# folder is root's too (its owner may remove any link in it, sticky or not), and closed (closed_folder).
+links_owned() {
+  local rest=${1#/} cur='' part target uid hops=0
+  while [[ -n $rest ]]; do
+    part=${rest%%/*}
+    if [[ $rest == */* ]]; then rest=${rest#*/}; else rest=''; fi
+    case $part in
+      '' | .) continue ;;
+      ..) cur=${cur%/*}; continue ;;
+    esac
+    if [[ -L $ROOT$cur/$part ]]; then
+      ((++hops <= 40)) || die "$1: too many links on the way (a loop?)"
+      uid=$(stat -c %u -- "$ROOT$cur/$part") || die "$1: cannot read the link $cur/$part"
+      [[ $uid == 0 || $uid == "$EUID" ]] ||
+        die "$1 goes through $cur/$part, a link of uid $uid: only root's links, or that user could repoint it"
+      uid=$(stat -c %u -- "$ROOT${cur:-/}") || die "$1: cannot read the folder ${cur:-/}"
+      [[ $uid == 0 || $uid == "$EUID" ]] ||
+        die "$1 goes through $cur/$part, in ${cur:-/}, a folder of uid $uid: only in root's, or that user could swap it"
+      closed_folder "$cur" "$1 goes through $cur/$part, in ${cur:-/}"
+      target=$(readlink -- "$ROOT$cur/$part") || die "$1: cannot read the link $cur/$part"
+      [[ $target != /* ]] || cur=''
+      rest=${target#/}${rest:+/$rest}
+    else
+      cur+=/$part
+    fi
+  done
+}
+
 # A path's real path: every symlink in every part of it resolved (on the fake machine: in it), as systemd follows
 # them in a bind's source. What job_view checks and binds, so a link in a folder above a path (/opt/x -> /c, /home,
-# a share) never leads a job past the checks. Dies when it is no plain path, or when a folder above it is one a user
-# but root could swap for a link (others may write it, and it is not sticky): then the bind could come from another
-# place than the one checked. A folder only its owner or its group may write passes: the runner users own nothing
-# outside their copies and are in no group but their own (check_users), so they cannot swap a link into it.
+# a share) never leads a job past the checks. Dies when it is no plain path, or when a folder above it is not closed
+# (closed_folder, the same rule as a link's folder): then the bind could come from another place than the one checked.
 real_path() {
-  local real d
+  local real d below
+  links_owned "$1"
   real=$(realpath -m -- "$ROOT$1") || die "$1: cannot resolve it"
   if [[ -n $ROOT ]]; then
     [[ $real == "$ROOT"/* ]] || die "$1 leads out of FORK_FLEET_WALLS_ROOT"
@@ -871,9 +926,8 @@ real_path() {
   fi
   [[ $real =~ ^$PLAIN_PATH$ ]] || die "$1 leads to ${real:-/}: not a plain path"
   d=$real
-  while d=${d%/*} && [[ -n $d ]]; do
-    [[ ! -e $ROOT$d ]] || (($(stat -c '0%a' -- "$ROOT$d") & 01002 ^ 02)) ||
-      die "$1 leads to $real, under $d, which others may write: anyone could swap a link into it"
+  while below=$d && d=${d%/*} && [[ -n $d ]]; do
+    [[ ! -e $ROOT$d ]] || closed_folder "$d" "$1 leads to $real, under $d" "$below"
   done
   printf '%s\n' "$real"
 }
@@ -1365,10 +1419,11 @@ case "${1-}:$#" in
   refresh:1) refresh ;;
   refresh-net:1) refresh_net ;;
   paths:1) paths ;;
+  tools:1) printf 'SYSTEMD_RUN %s\nSYSTEMCTL %s\n' "$(shown "$SYSTEMD_RUN")" "$(shown "$SYSTEMCTL")" ;;
   check-net:*)
     (($# >= 3)) || die "usage: check-net URL HOST:PORT..."
     shift
     check_net "$@"
     ;;
-  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh | refresh-net | paths | check-net URL HOST:PORT..." ;;
+  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh | refresh-net | paths | tools | check-net URL HOST:PORT..." ;;
 esac

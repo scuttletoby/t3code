@@ -39,6 +39,12 @@
     "etc/default/backup": {
       "text": "RESTIC_PASSWORD=only-root-reads-this\n",
       "mode": "600"
+    },
+    "etc/zsh/zshrc": "if [[ \"$TERM\" != emacs ]]\nthen\n    typeset -A key\n    key=(\n        Home       \"${terminfo[khome]}\"\n    )\nfi\n",
+    "etc/environment.d/20-tools.conf": "TOKENIZERS_PARALLELISM=false\nGOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n",
+    "opt/gcp/key.json": {
+      "text": "{}\n",
+      "mode": "600"
     }
   },
   "fail": {
@@ -177,6 +183,32 @@
         "mnt/tools/": ""
       }
     ],
+    "job-units": [
+      {
+        "etc/systemd/system/service.d/10-x.conf": "[Service]\nPrivateDevices=no\n"
+      },
+      {
+        "run/systemd/system/fork-fleet-.service.d/10-gpu.conf": "[Service]\nBindReadOnlyPaths=/run/WSL:/run/WSL\n"
+      },
+      {
+        "usr/lib/systemd/system/fork-.service.d/x.conf": "[Service]\nSystemCallFilter=\n"
+      },
+      {
+        "etc/systemd/system/fork-fleet-ci-1.service.d/x.conf": "[Service]\nIPAddressDeny=\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "SYSTEMD_RUN=/usr/local/sbin/run-with-gpu\n"
+      },
+      {
+        "run/systemd/transient/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf": "# This is a drop-in unit file extension, created via \"systemctl set-property\"\n# or an equivalent operation. Do not edit.\n[Service]\nIPAddressDeny=\nIPAddressDeny=203.0.113.7/32\n"
+      },
+      {
+        "etc/systemd/system/system.slice.d/10-lan.conf": "[Slice]\nIPAddressAllow=any\n"
+      },
+      {
+        "etc/systemd/system/service.d/10-slow.conf": "[Service]\nTimeoutStopSec=infinity\n"
+      }
+    ],
     "etc-secrets": [
       {
         "etc/fstab": "UUID=0 / ext4 defaults 0 1\n//nas.example/share /srv/share cifs username=u,password=hunter2 0 0\n"
@@ -233,6 +265,19 @@
       },
       {
         "etc/default/backup": "RESTIC_PASSWORD=hunter2\n"
+      },
+      {
+        "etc/systemd/system/nightly.service": "[Service]\nEnvironment = A=1 \\\n  RESTIC_PASSWORD=hunter2\n"
+      },
+      {
+        "etc/systemd/system/nightly.service": "[Service]\nSetCredential=restic.password:hunter2\n"
+      },
+      {
+        "usr/lib/systemd/system/telegraf.service": "[Service]\nEnvironmentFile=-/etc/default/telegraf\n",
+        "etc/default/telegraf": "INFLUX_TOKEN=hunter2hunter2\n"
+      },
+      {
+        "etc/fish/conf.d/gh.fish": "set -gx GH_TOKEN abc123secretvalue\n"
       }
     ]
   }
