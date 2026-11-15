@@ -626,6 +626,8 @@ const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
       Layer.provide(RuntimeLayer.layerProjectService),
     ),
   ),
+  // Fork (waits): the `pr` judge reads through the same pull request service and its caches.
+  Layer.provide(layerPullRequestService.pipe(Layer.provide(RuntimeLayer.layerProjectService))),
 );
 
 const layerOrchestrationApplication = Layer.merge(

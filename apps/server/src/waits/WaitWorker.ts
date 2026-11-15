@@ -28,6 +28,7 @@ import {
   makeUnitJudge,
   type WaitJudgeContext,
 } from "./WaitJudges.ts";
+import { makePrJudge } from "./WaitPrJudge.ts";
 import * as WaitService from "./WaitService.ts";
 import { WAIT_STORE_FILE } from "./WaitStore.ts";
 
@@ -84,6 +85,7 @@ export const layer = Layer.effect(
       judges: {
         check: yield* makeCheckJudge({ placeOf: checkPlaceOf }),
         unit: yield* makeUnitJudge(),
+        pr: yield* makePrJudge(),
       },
       onChange: due.invalidate,
       // Each run is timed by the project its thread is in now.
