@@ -1749,6 +1749,30 @@ class Launcher(unittest.TestCase):
         self.conf(HOOK=self.write('open/own/hook.sh', '#!/bin/sh\n', 0o755))
         self.start(self.NAME)
 
+    def test_a_path_through_a_link_another_user_may_repoint_is_refused(self):
+        """#211: a link on the way to a bound path (the hook's among them) is root's (or, in these tests, the user's
+        who runs the launcher), in a folder no other user may write: a link another user owns, or may swap, could
+        be repointed between start's check and the job. Each link on the way is checked, not only the real path."""
+        os.makedirs(self.path('real/hook'), 0o755)
+        os.chmod(self.path('real/hook'), 0o755)
+        self.write('real/hook/hook.sh', '#!/bin/sh\n', 0o755)
+        os.mkdir(self.path('pub'))
+        os.chmod(self.path('pub'), 0o777)   # not sticky: anyone may swap a link in it
+        os.symlink(self.path('real/hook'), self.path('pub/hl'))
+        self.conf(HOOK=self.path('pub/hl/hook.sh'))
+        self.refused(f'goes through {self.path("pub/hl")}, in {self.path("pub")}, which others may write')
+        os.symlink(self.path('pub/hl'), self.path('l2'))   # a link to a link: each one on the way is checked
+        self.conf(HOOK=self.path('l2/hook.sh'))
+        self.refused(f'goes through {self.path("pub/hl")}, in {self.path("pub")}')
+        os.chmod(self.path('pub'), 0o755)
+        # A link another user owns (a stat that says so: the tests cannot chown): that user could repoint it.
+        self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in */pub/hl) echo 4242; exit 0;; esac\n'
+                   'exec /usr/bin/stat "$@"\n', 0o755)
+        self.refused(f'goes through {self.path("pub/hl")}, a link of uid 4242')
+        os.remove(self.path('bin/stat'))
+        os.chmod(self.path('pub'), 0o1777)   # sticky: only a link's owner may swap it, and that is this user (root)
+        self.start(self.NAME)
+
     def walls_root(self, conf, files=(), links=(), dirs=()):
         """A fake machine for `paths` (FORK_FLEET_WALLS_ROOT): its launch.conf, files, folders and links (relative,
         so they resolve inside it, as on the machine)."""

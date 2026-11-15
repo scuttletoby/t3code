@@ -189,7 +189,11 @@ Two more things limit what a job can do:
   root on the host). Step 6 proves each of these from inside a runner, and
   that each bound path is the one the launcher checked. The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`) instead of keeping a list of
-  their own.
+  their own, and on WSL2 read every property the launcher gives a job's unit
+  (each way `systemd-run` takes one): a bind that `paths` did not make, or
+  `PrivateDevices=` that is not yes, fails them, and a property they cannot
+  read fails them too. A symlink on the way to a bound path must be root's,
+  in a folder no other user may write: another user could repoint it.
   Before a new kind of host joins a pool (a Windows PC's WSL2 first),
   `sudo bash .github/scripts/fork-fleet-walls-proof.sh` runs step 6 there with
   throwaway users, then each network block alone, prints the cgroup version,
@@ -446,7 +450,8 @@ chmod 600 /etc/fork-fleet/launch.conf
 # WORK_ROOT, HOOK and RESOLV_CONF are bound into every job: never under /home, /root, /mnt, /media or /srv (refused,
 # also through a symlink). A bind mount is not seen (it has no link to resolve): never bind-mount a data folder at
 # one of them, or at a folder above one (prune also deletes runner copies in WORK_ROOT). The hook's folder must be
-# root's and writable by root alone (start refuses a shared one such as /var/tmp).
+# root's and writable by root alone (start refuses a shared one such as /var/tmp), and every symlink on the way to
+# these paths root's, in a folder only its owner may write (or a sticky one).
 # NET_BASE (10.204), RESOLV_CONF (/etc/fork-fleet/resolv.conf), TEMPLATE (/opt/fork-fleet/template/runner-template)
 # and RUNNER_MIN (none: the oldest runner version refresh may install): add a line only to change one (step 1b).
 # OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is
@@ -600,7 +605,10 @@ gets exit 76 and a line that says to upgrade it.
 WSL2 inside the distro, which runs systemd). Install it and
 `fork-fleet-desk-wire.py` from the same pinned commit as step 3, beside the
 launcher and the walls (`fork-fleet-walls.py`) in `/opt/fork-fleet`; the
-launcher and its setup are as on a vm-pool host. Then, once per desktop:
+launcher and its setup are as on a vm-pool host. The agent runs the launcher
+beside the walls (one kit: the one those walls read), so `desk.conf` needs no
+`LAUNCH` line; an old one that names another launcher makes the agent refuse
+to run (exit 2) until the line is gone. Then, once per desktop:
 
 ```sh
 install -d -m 755 /etc/fork-fleet

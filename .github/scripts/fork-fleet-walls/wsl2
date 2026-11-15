@@ -4,21 +4,23 @@ its kernel, so every wall of the linux file next to this one holds here too and 
 `os` aside): kernel, systemd, cgroup2, cgroup-bpf, namespaces, seccomp, container, mounts (what jobs see, as the
 launcher beside this folder says with `fork-fleet-launch.sh paths`: Windows' drives at /mnt/c or /c, WSL's shares at
 /mnt/wsl and /usr/lib/wsl are outside it, so no job sees them) and etc-secrets. A wall the linux file gains is a wall
-here too. The launcher is one file: the one the linux walls ask (`paths`) is the one whose sandbox() is read here, and
-it must be as safe as they want it. On top, what only WSL2 has:
+here too. The launcher is one file: the one the linux walls ask (`paths`) is the one whose job units' properties are
+read here (unit_props: sandbox(), job_fs() and start()'s systemd-run, every form of -p, or cannot tell), and it must be
+as safe as they want it. On top, what only WSL2 has:
 - interop: WSL runs Windows programs from the distro (a binfmt_misc handler run by /init), as the Windows user,
   outside every Linux wall. It must be off now, and stay off: in /etc/wsl.conf, and masked for systemd-binfmt, which
   registers WSL's handler again at boot. Any handler that runs Windows programs counts, whatever its name;
 - sockets: no socket to Windows in a job unit. WSL's interop server listens on unix sockets in /run/WSL, WSLg's X
   server in /tmp/.X11-unix; a path socket is not kept apart by a network namespace, so job units must get a /run and
-  a /tmp of their own, and what the launcher shows jobs (`paths`) must hold none of them. And AF_VSOCK (Hyper-V
-  sockets, WSL2's channel to Windows, 9p's way to its drives) is not namespaced: the job units close it, and the two
-  ways around that filter (io_uring, other-arch system calls). Read in the launcher's sandbox(); check-net's probe
-  proves it in a real unit;
+  a /tmp of their own, what the launcher shows jobs (`paths`) must hold none of them, and nothing else of the host
+  is bound in, nor its devices (PrivateDevices=yes: /dev/dxg is WSL2's channel to Windows' GPU driver). And AF_VSOCK
+  (Hyper-V sockets, WSL2's channel to Windows, 9p's way to its drives) is not namespaced: the job units close it,
+  and the two ways around that filter (io_uring, other-arch system calls). Read in the launcher's job units' properties;
+  check-net's probe proves it in a real unit;
 - windows-path: WSL appends Windows' PATH to the distro's, so a tool finds Windows programs first;
 - userns: a job that can make a user namespace gets CAP_SYS_ADMIN and CAP_NET_ADMIN in it, the usual way into a
   kernel bug, and a kernel bug here is root on the PC. Off for every user (user.max_user_namespaces=0), or for job
-  units (RestrictNamespaces in the launcher's sandbox());
+  units (RestrictNamespaces in the launcher's job units' properties);
 - resolv: WSL makes /etc/resolv.conf a link to /mnt/wsl/resolv.conf; the launcher binds the jobs' resolv.conf where
   that link leads, so job units would get a /mnt. A file of the distro's own, and WSL told not to make the link again;
 - networking: mirrored mode puts Windows' localhost and the home network's interfaces into the distro; NAT only.
@@ -43,6 +45,29 @@ USERNS_OFF = (('/proc/sys/user/max_user_namespaces', '0'), ('/proc/sys/kernel/un
 SYSCTL = '/etc/sysctl.d/90-fork-fleet.conf'
 RESOLV = '/etc/resolv.conf'
 NOT_RESOLV = ('/mnt', '/media', '/srv', '/home', '/root', '/usr/lib/wsl')   # never where the jobs' resolv.conf goes
+# systemd-run's options in start() that set no property: flags, and options with a value (--unit X, --unit=X). Any
+# other option (--scope, --setenv, -E, --pty, an abbreviation) cannot be told.
+RUN_FLAGS = ('--quiet', '--collect')
+RUN_OPTIONS = ('--unit', '--uid', '--working-directory')
+# The properties the launcher gives job units, each known to give a job nothing of the host's beyond what `paths`
+# shows (binds only from BINDS, EnvironmentFile= only its own file, RootDirectory= only the unit's own root), and any
+# property that only takes away (RESTRICTS). Any other one (DeviceAllow=, LoadCredential=, MountImages=,
+# SupplementaryGroups=, ...) cannot be told: the walls must learn it first.
+RUN_PROPS = {'Type', 'KillMode', 'EnvironmentFile', 'ReadWritePaths', 'RuntimeMaxSec', 'NetworkNamespacePath',
+             'IPAddressDeny', 'IPAddressAllow', 'RootDirectory', 'MountAPIVFS', 'MountFlags', 'BindReadOnlyPaths',
+             'BindPaths', 'TemporaryFileSystem', 'NoNewPrivileges', 'RemoveIPC', 'PrivateDevices', 'PrivateIPC',
+             'PrivateTmp', 'PrivateNetwork', 'PrivateUsers', 'PrivateMounts', 'SystemCallFilter',
+             'SystemCallArchitectures', 'SystemCallErrorNumber', 'LockPersonality', 'CapabilityBoundingSet', 'UMask'}
+RESTRICTS = re.compile(r'(Protect|Restrict|Memory|CPU|Tasks|IO|Limit)[A-Za-z]*')
+READ_LITERAL = {'TemporaryFileSystem', 'RestrictAddressFamilies', 'SystemCallFilter', 'SystemCallArchitectures',
+                'RestrictNamespaces', 'PrivateDevices'}   # read by the walls: must be written out, no $
+# The only binds a job unit may get, as the launcher writes them (job_fs): what `paths` shows (view_ro), the job's
+# own copy, and the jobs' resolv.conf. Any other one (BindReadOnlyPaths=/run/WSL:/run/WSL, a WSLg socket) fails.
+BINDS = {('BindReadOnlyPaths', '${ro[*]}'), ('BindPaths', '$rw:$rw:norbind'), ('BindReadOnlyPaths', '$resolv_bind')}
+ONLY = {'RootDirectory': '$root', 'EnvironmentFile': '$env_file', 'ReadWritePaths': '$dir'}
+# And how job_fs() makes them, the only assignments of those names in the launcher: ro from view_ro alone.
+BIND_SOURCES = {'ro': ['ro=()', 'ro+=("$b:norbind")'], 'rw': ['rw=$2'], 'resolv_bind': ['resolv_bind=$b:$resolv']}
+TRUE = ('yes', 'true', 'on', '1')
 LINUX = None   # the linux walls file, as a module (load_linux; main loads it first)
 
 
@@ -159,18 +184,215 @@ def networking_wall():
     return None
 
 
-def sandbox_props(text):
-    """{property: [values, in order]} of the launcher's sandbox(): its `-p NAME=VALUE` words as bash reads them
-    (quotes anywhere in the word), comments left out."""
-    m = re.search(r'^sandbox\(\) \{\n(.*?)^\}', text or '', re.M | re.S)
+def _close(text, i, closer):
+    """The index after the closer of a construct whose body starts at text[i] (`)` of $( or (, `}` of ${, `"`, `'`
+    or a backquote), quotes and nested constructs inside it skipped as bash skips them."""
+    while i < len(text):
+        c = text[i]
+        if c == closer:
+            return i + 1
+        if c == '\\' and closer != "'":
+            i += 2
+        elif closer == "'":
+            i += 1
+        elif c == "'" and closer != '"':
+            i = _close(text, i + 1, "'")
+        elif c == '"' and closer != '"':
+            i = _close(text, i + 1, '"')
+        elif c == '`':
+            i = _close(text, i + 1, '`')
+        elif text.startswith('$(', i):
+            i = _close(text, i + 2, ')')
+        elif text.startswith('${', i):
+            i = _close(text, i + 2, '}')
+        elif c == '(' and closer == ')':
+            i = _close(text, i + 1, ')')
+        else:
+            i += 1
+    raise ValueError('the launcher has a quote or bracket that is never closed')
+
+
+def _word(text, i):
+    """The shell word at text[i]: (its text with quotes taken off and expansions as written, whether bash would
+    expand some of it unquoted (a $ or backquote out of double quotes, a glob), the index after it)."""
+    out, bare = '', False
+    while i < len(text) and text[i] not in ' \t\n;&|<>()':
+        c = text[i]
+        if text.startswith('\\\n', i):
+            i += 2
+        elif c == '\\':
+            out, i = out + text[i + 1:i + 2], i + 2
+        elif c == "'":
+            j = _close(text, i + 1, "'")
+            out, i = out + text[i + 1:j - 1], j
+        elif c == '"':
+            j = _close(text, i + 1, '"')
+            out += re.sub(r'\\([$`"\\])', r'\1', text[i + 1:j - 1].replace('\\\n', ''))
+            i = j
+        elif c in '$`':
+            bare = True
+            if text.startswith('$(', i) or text.startswith('${', i):
+                j = _close(text, i + 2, ')' if text[i + 1] == '(' else '}')
+            elif c == '`':
+                j = _close(text, i + 1, '`')
+            else:
+                j = re.match(r'\$(\w+|.)?', text[i:]).end() + i
+            out, i = out + text[i:j], j
+        else:
+            bare |= c in '*?['
+            out, i = out + c, i + 1
+    return out, bare, i
+
+
+def shell_words(text, i, array):
+    """The words from text[i]: of an array's ( ... ) (array: up to its `)`), or of one command (up to the end of its
+    line, a ; & or |). Comments and line continuations left out. ([(word, bare)], the index after them)."""
+    words = []
+    while True:
+        while i < len(text) and (text[i] in ' \t' or text.startswith('\\\n', i)):
+            i += 2 if text[i] == '\\' else 1
+        if i >= len(text):
+            if array:
+                raise ValueError('the launcher has an array that is never closed')
+            return words, i
+        c = text[i]
+        if c == '#':
+            i = text.find('\n', i)
+            i = len(text) if i < 0 else i
+        elif c == '\n' and array:
+            i += 1
+        elif c == ')' and array or c in '\n;&|' and not array:
+            return words, i + 1
+        elif c in ';&|<>()':
+            raise ValueError(f'the launcher has {c!r} where the walls read its job units\' properties')
+        else:
+            word, bare, i = _word(text, i)
+            words.append((word, bare))
+
+
+def uncommented(text):
+    """text with each comment blanked out, the same length (an index in it is one in text)."""
+    return re.sub(r'(^|[ \t])(#[^\n]*)', lambda m: m.group(1) + ' ' * len(m.group(2)), text, flags=re.M)
+
+
+def bind_sources(code):
+    """The launcher makes ro, rw and resolv_bind (BINDS's values) only as BIND_SOURCES says: from view_ro (what
+    `paths` shows), the job's own copy ($2) and the jobs' resolv.conf. Any other assignment cannot be told."""
+    found = {name: [] for name in BIND_SOURCES}
+    for m in re.finditer(r'(?<![\w$-])(ro|rw|resolv_bind)(?![\w-])', code):
+        if code[m.start() - 2:m.start()] == '${':
+            continue   # read
+        line = code[code.rfind('\n', 0, m.start()) + 1:code.find('\n', m.start())]
+        word = re.match(r'(\w+)(\+?=(\([^()]*\)|[^\s;&|()]*))?', code[m.start():]).group(0)
+        if re.match(r'\s*local\s', line) and word == m.group(1):
+            continue   # declared
+        found[m.group(1)].append(word)
+    for name, words in found.items():
+        if sorted(words) != sorted(BIND_SOURCES[name]):
+            raise ValueError(f'the launcher makes {name} (a bind of the job units) by {", ".join(words) or "nothing"},'
+                             f' not by {", ".join(BIND_SOURCES[name])} alone: what it binds cannot be told')
+
+
+def function(text, name):
+    """The span in text of the body of the launcher's function name, defined once (bash runs the last one)."""
+    m = re.search(rf'^{name}\(\) \{{\n(.*?)^\}}', text, re.M | re.S)
     if not m:
-        raise ValueError(f'the launcher has no sandbox() (the job units\' properties)')
-    props = {}
-    for line in m.group(1).splitlines():
-        for word in re.findall(r'(?:^|\s)-p\s+((?:"[^"]*"|\'[^\']*\'|[^\s"\'])+)', re.sub(r'(^|\s)#.*', '', line)):
-            name, _, value = re.sub(r'"([^"]*)"|\'([^\']*)\'', lambda q: q.group(1) or q.group(2) or '', word).partition('=')
-            props.setdefault(name, []).append(value)
-    return props
+        raise ValueError(f'the launcher has no {name}() (the job units\' properties)')
+    if len(re.findall(rf'(^|[\s;&|(){{}}])(function\s+)?{name}\s*(\(\s*\)|\{{)', uncommented(text))) != 1:
+        raise ValueError(f'the launcher defines {name}() more than once, or in another way')
+    return m.start(1), m.end(1)
+
+
+def property_words(words, where):
+    """The NAME=VALUE of each property in words, as systemd-run reads its options: -p X, -pX, --property X and
+    --property=X. Any other word, an abbreviated option (--prop=X) among them, cannot be told: ValueError."""
+    out, it = [], iter(words)
+    for word, bare in it:
+        if bare:
+            raise ValueError(f'{where}: bash expands {word!r} (unquoted): its properties cannot be told')
+        if word in ('-p', '--property'):
+            word, bare = next(it, ('', None))
+            if bare is None:
+                raise ValueError(f'{where}: {word!r} with no property after it')
+            if bare:
+                raise ValueError(f'{where}: bash expands {word!r} (unquoted): its properties cannot be told')
+            out.append(word)
+        elif word.startswith('--property='):
+            out.append(word[len('--property='):])
+        elif word.startswith('-p'):
+            out.append(word[2:])
+        else:
+            raise ValueError(f'{where}: {word!r} is no property word the walls can read (-p X, -pX, --property X, '
+                             '--property=X)')
+    return out
+
+
+def unit_props(text):
+    """{property: [values, in order]} of the job units the launcher starts, as systemd-run gets them: start()'s one
+    "$SYSTEMD_RUN" command, with sandbox()'s props array where it says "${props[@]}", and job_fs()'s props_fs where
+    that says "${props_fs[@]}". Each property in each form systemd-run takes (property_words); values as written
+    (quotes off, expansions as in the text). What cannot be told is a ValueError: props or props_fs set or changed
+    anywhere else or in another way, another word or option in them, or a property RUN_PROPS does not know."""
+    text = text or ''
+    sandbox, job_fs, start = (function(text, n) for n in ('sandbox', 'job_fs', 'start'))
+    code = uncommented(text)   # where the arrays are used
+    sets = {'props': [], 'props_fs': []}
+    for m in re.finditer(r'(?<![\w$])(props|props_fs)(?!\w)', code):
+        name, at, after = m.group(1), m.start(), code[m.end():]
+        line = code[code.rfind('\n', 0, at) + 1:at]
+        if code[at - 3:at] == '"${' and after.startswith('[@]}"'):
+            continue   # "${props[@]}": read where it is
+        if re.fullmatch(r'\s*local\s+-a(\s+\w+(=\(\))?)*\s+', line) and after[:1] in (' ', '\t', '\n'):
+            continue   # a declaration
+        if after.startswith(('=(', '+=(')):
+            span = sandbox if name == 'props' else job_fs
+            if span[0] <= at < span[1] and (name == 'props_fs' or after.startswith('=(')):
+                sets[name].append(text.index('(', m.end()) + 1)
+                continue
+        raise ValueError(f'the launcher sets or uses {name} on line {code.count(chr(10), 0, at) + 1} in a way the '
+                         'walls cannot read')
+    if len(sets['props']) != 1 or not sets['props_fs'] or not code[job_fs[0]:job_fs[1]].count('props_fs=('):
+        raise ValueError('the launcher\'s sandbox() must set props once, and job_fs() set props_fs')
+    fs = [w for at in sets['props_fs'] for w in shell_words(text, at, True)[0]]
+    props = shell_words(text, sets['props'][0], True)[0]
+    if props.count(('${props_fs[@]}', False)) != 1:
+        raise ValueError('the launcher\'s props must hold "${props_fs[@]}" (what jobs see) once')
+    i = props.index(('${props_fs[@]}', False))
+    props = props[:i] + fs + props[i + 1:]
+    runs = [m.start() for m in re.finditer(r'"\$SYSTEMD_RUN"', code[start[0]:start[1]])]
+    if len(runs) != 1:
+        raise ValueError('the launcher\'s start() must run "$SYSTEMD_RUN" once')
+    words = shell_words(text, start[0] + runs[0], False)[0][1:]
+    if ('--', False) not in words:
+        raise ValueError('the launcher\'s start() runs systemd-run with no -- before the command')
+    words = words[:words.index(('--', False))]
+    if words.count(('${props[@]}', False)) != 1:
+        raise ValueError('the launcher\'s start() must hand systemd-run "${props[@]}" once')
+    unit, rest = [], iter(words)
+    for word, bare in rest:
+        if (word, bare) == ('${props[@]}', False):
+            unit += props
+        elif word in RUN_FLAGS:
+            continue
+        elif word in RUN_OPTIONS:
+            next(rest, None)
+        elif word.split('=', 1)[0] in RUN_OPTIONS and '=' in word:
+            continue
+        else:
+            unit.append((word, bare))
+    bind_sources(code)
+    out = {}
+    for prop in property_words(unit, 'the launcher\'s job units'):
+        name, eq, value = prop.partition('=')
+        if not eq or not re.fullmatch(r'[A-Z][A-Za-z]*', name):
+            raise ValueError(f'the launcher\'s job units: {prop!r} is not NAME=VALUE')
+        if name not in RUN_PROPS and not RESTRICTS.fullmatch(name):
+            raise ValueError(f'the launcher\'s job units get {name}=, which the walls do not know (RUN_PROPS): '
+                             'add it there once it is known to open nothing')
+        if name in READ_LITERAL and re.search(r'[$`]', value):
+            raise ValueError(f'the launcher\'s job units: {name}={value} is not written out, so it cannot be told')
+        out.setdefault(name, []).append(value)
+    return out
 
 
 def props_after_reset(values):
@@ -186,8 +408,9 @@ def merged(values):
 
 
 def launcher_props():
-    """sandbox() of the launcher the linux walls ask what jobs see (LINUX.LAUNCHER, beside this folder: the one the
-    pool runs, also under FORK_FLEET_LAUNCH_CONF), checked as they check it, on the open file itself."""
+    """The job units' properties (unit_props) of the launcher the linux walls ask what jobs see (LINUX.LAUNCHER,
+    beside this folder: the one the pool runs, also under FORK_FLEET_LAUNCH_CONF), checked as they check it, on the
+    open file itself."""
     path = LINUX.LAUNCHER
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))   # a FIFO: no wait
     try:
@@ -196,7 +419,7 @@ def launcher_props():
             raise ValueError(f'{path} is not a plain file owned by uid {os.geteuid()} and writable by it alone')
         with os.fdopen(fd, 'rb') as f:
             fd = None
-            return sandbox_props(f.read().decode('utf-8', 'replace'))
+            return unit_props(f.read().decode('utf-8', 'replace'))
     finally:
         if fd is not None:
             os.close(fd)
@@ -223,13 +446,34 @@ def vsock_wall():
     return None
 
 
+def binds_wall():
+    """Part of the sockets wall: a job unit gets the host's files only through what `paths` shows. Its binds are the
+    launcher's own (BINDS: what `paths` shows, the job's copy, the jobs' resolv.conf), its root and environment file
+    its own (ONLY), and no device of the host: PrivateDevices= true, as systemd merges it (the last one wins), so
+    /dev/dxg (WSL's GPU channel to Windows) and the like stay out. [reasons, empty if none]"""
+    props, bad = launcher_props(), []
+    extra = sorted({f'{name}={value}' for name in ('BindPaths', 'BindReadOnlyPaths')
+                    for value in props.get(name, []) if (name, value) not in BINDS}
+                   | {f'{name}={value}' for name, only in ONLY.items() for value in props.get(name, [])
+                      if value != only})
+    if extra:
+        bad.append(f'its job units get {", ".join(extra[:3])} beside what `paths` shows ({LINUX.LAUNCHER})')
+    devices = props.get('PrivateDevices', [])
+    if not devices or devices[-1].strip().lower() not in TRUE:   # a boolean: the last one wins, an empty one resets
+        now = (devices[-1].strip() or 'reset') if devices else 'not set'
+        bad.append(f'its job units see this host\'s /dev (PrivateDevices is {now} in {LINUX.LAUNCHER}, not yes: '
+                   '/dev/dxg reaches Windows\' GPU driver)')
+    return bad
+
+
 def sockets_wall():
     """No socket to Windows in a job unit. Job units get a /run and a /tmp of their own (TemporaryFileSystem), and
     what the launcher shows them (`paths`, through the linux walls: the same view, asked once more) holds none of
-    those folders, /mnt nor /init, where it lands nor where it comes from: WSL's interop sockets (/run/WSL) and WSLg's
-    X socket (/tmp/.X11-unix) stay out. And AF_VSOCK is closed to them (vsock_wall)."""
+    those folders, /mnt nor /init, where it comes from: WSL's interop sockets (/run/WSL) and WSLg's X socket
+    (/tmp/.X11-unix) stay out. Nothing else of the host is bound in, nor its devices (binds_wall). And AF_VSOCK is
+    closed to them (vsock_wall)."""
     own = {entry.split(':')[0].rstrip('/') or '/' for entry in merged(launcher_props().get('TemporaryFileSystem'))}
-    bad = [f'its job units see this host\'s {d} (no TemporaryFileSystem={d} in {LINUX.LAUNCHER} sandbox())'
+    bad = [f'its job units see this host\'s {d} (no TemporaryFileSystem={d} for them in {LINUX.LAUNCHER})'
            for d in OWN_DIRS if d not in own]
     shown = sorted({real for _, real in LINUX.job_view()   # the host path a job reaches, wherever it sits there
                     if any(real == d or real.startswith(d + '/') for d in WSL_ONLY)})
@@ -238,6 +482,7 @@ def sockets_wall():
                    'JOB_PATHS)')
     if bad:
         bad[-1] += ' (WSL\'s interop sockets are in /run/WSL)'
+    bad += binds_wall()
     why = vsock_wall()
     return '; '.join(bad + [why] if why else bad) or None
 
@@ -257,7 +502,8 @@ def userns_wall():
         return None
     now = read(USERNS_OFF[0][0])
     return (f'jobs can make user namespaces ({USERNS_OFF[0][0]} is {now or "not readable"}, no RestrictNamespaces '
-            f'that refuses user in {LINUX.LAUNCHER} sandbox()): echo user.max_user_namespaces=0 > {SYSCTL}; sysctl --system')
+            f'that refuses user for the job units of {LINUX.LAUNCHER}): echo user.max_user_namespaces=0 > {SYSCTL}; '
+            'sysctl --system')
 
 
 def resolve(path):
@@ -299,7 +545,8 @@ def resolv_wall():
 
 OWN = [
     ('interop', 'WSL interop is off and stays off: no Windows program runs from here', interop_wall),
-    ('sockets', 'job units reach no socket to Windows: their /run and /tmp are their own, AF_VSOCK is closed',
+    ('sockets', 'job units reach no socket to Windows: their /run and /tmp are their own, no other bind nor device, '
+     'AF_VSOCK is closed',
      sockets_wall),
     ('userns', 'jobs cannot make a user namespace (the way into kernel bugs)', userns_wall),
     ('resolv', f'{RESOLV} is the distro\'s own file, not a link into /mnt that WSL makes', resolv_wall),

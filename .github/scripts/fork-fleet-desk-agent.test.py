@@ -80,8 +80,8 @@ class Desk(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.run_dir = os.path.join(self.tmp, 'serve-run')
         self.plan({})
-        self.file('launch', LAUNCHER, 0o755)
-        self.file('walls', LAUNCHER, 0o755)
+        self.file('fork-fleet-launch.sh', LAUNCHER, 0o755)   # a kit: the walls and their launcher in one folder
+        self.file('fork-fleet-walls.py', LAUNCHER, 0o755)
         self.file('key', 'not a real key\n', 0o600)
         self.file('known_hosts', 'host ssh-ed25519 AAAA\n')
         self.file('fake-serve', FAKE_SERVE, 0o755)
@@ -103,7 +103,8 @@ class Desk(unittest.TestCase):
         return path
 
     def fresh(self):
-        for name, mode in (('key', 0o600), ('known_hosts', 0o644), ('launch', 0o755), ('walls', 0o755)):
+        for name, mode in (('key', 0o600), ('known_hosts', 0o644), ('fork-fleet-launch.sh', 0o755),
+                           ('fork-fleet-walls.py', 0o755)):
             os.chmod(os.path.join(self.tmp, name), mode)
         return self.settings()
 
@@ -113,7 +114,7 @@ class Desk(unittest.TestCase):
     def settings(self, extra='', ssh='ssh'):
         t = self.tmp
         return self.file('desk.conf', f'POOL={POOL}\nHOST=fleet-host.example\nKEY={t}/key\nKNOWN_HOSTS={t}/known_hosts\n'
-                         f'LAUNCH={t}/launch\nWALLS={t}/walls\nRUN_DIR={t}/agent-run\nSSH={t}/{ssh}\n{extra}', 0o600)
+                         f'WALLS={t}/fork-fleet-walls.py\nRUN_DIR={t}/agent-run\nSSH={t}/{ssh}\n{extra}', 0o600)
 
     def calls(self):
         try:
@@ -157,7 +158,8 @@ class Desk(unittest.TestCase):
             self.assertEqual(self.launch('start', 'desk-7', stdin=START_IN)[0], 0)
         calls = self.calls()
         self.assertEqual([c['argv'] for c in calls], [['active'], ['check'], ['start', 'desk-7']])
-        self.assertEqual(calls[1]['who'], 'walls')
+        self.assertEqual([c['who'] for c in calls],
+                         ['fork-fleet-launch.sh', 'fork-fleet-walls.py', 'fork-fleet-launch.sh'])
         self.assertEqual(calls[2]['stdin'], START_IN)
         for c in calls:   # the launcher and the walls read their own settings files: no variable reaches them
             self.assertEqual({k: v for k, v in c['env'].items() if k not in ('PWD', 'SHLVL', '_')}, A.ENV)
@@ -217,8 +219,36 @@ class Desk(unittest.TestCase):
         self.assertIn('launcher itself exited 75', err)
         self.assertEqual(self.launch('active')[0], 1)   # D2's launch turns a launcher's 3 into 1
 
+    def test_the_launcher_is_the_one_beside_the_walls(self):
+        """One kit: the agent runs the launcher in the walls' folder (its real path), the one those walls read. A LAUNCH
+        setting elsewhere (an old launcher the walls never read) is refused, `check` and `run` alike (exit 2)."""
+        t = self.tmp
+        self.assertEqual(A.load(self.settings())['LAUNCH'], os.path.join(os.path.realpath(t), 'fork-fleet-launch.sh'))
+        for launch in (f'{t}/fork-fleet-launch.sh', f'{t}/./fork-fleet-launch.sh'):   # the kit's own: still fine
+            with self.subTest(launch=launch):
+                self.assertEqual(A.main(['--config', self.settings(f'LAUNCH={launch}\n'), 'check']), 0)
+        os.mkdir(os.path.join(t, 'old'), 0o755)
+        self.file('old/fork-fleet-launch.sh', LAUNCHER, 0o755)
+        os.symlink(f'{t}/old/fork-fleet-launch.sh', f'{t}/old-link.sh')
+        for launch in (f'{t}/old/fork-fleet-launch.sh', f'{t}/old-link.sh', '/opt/fork-fleet/fork-fleet-launch.sh'):
+            with self.subTest(launch=launch):
+                conf = self.settings(f'LAUNCH={launch}\n')
+                err = io.StringIO()
+                with mock.patch('sys.stderr', err):
+                    self.assertEqual(A.main(['--config', conf, 'check']), 2)
+                    self.assertEqual(A.main(['--config', conf, 'run']), 2)
+                self.assertIn('one kit', err.getvalue())
+        kit = os.path.join(t, 'kit2')   # WALLS elsewhere: its own launcher runs, not the default one
+        os.mkdir(kit, 0o755)
+        for name in ('fork-fleet-launch.sh', 'fork-fleet-walls.py'):
+            self.file(f'kit2/{name}', LAUNCHER, 0o755)
+        with open(self.settings()) as f:
+            text = f.read().replace(f'{t}/fork-fleet-walls.py', f'{kit}/fork-fleet-walls.py')
+        conf = self.file('desk.conf', text, 0o600)
+        self.assertEqual(A.load(conf)['LAUNCH'], os.path.join(os.path.realpath(kit), 'fork-fleet-launch.sh'))
+
     def test_an_unsafe_launcher_is_not_run(self):
-        os.chmod(os.path.join(self.tmp, 'launch'), 0o777)
+        os.chmod(os.path.join(self.tmp, 'fork-fleet-launch.sh'), 0o777)
         self.linked()
         code, _, err = self.launch('active')
         self.assertEqual(code, 1)
@@ -481,7 +511,7 @@ class Desk(unittest.TestCase):
         self.assertEqual(A.DEFAULTS['USER'], key.USER)
         # the key's forced command is what runs; the agent asks for the same, and the agent's python is serve's
         self.assertEqual(A.ssh_argv(A.load(self.settings()))[-2:], f'{key.SERVE} {POOL}'.split()[-2:])
-        self.assertTrue(key.SERVE.startswith(f'{A.PYTHON} -I {os.path.dirname(A.DEFAULTS["LAUNCH"])}/'))
+        self.assertTrue(key.SERVE.startswith(f'{A.PYTHON} -I {os.path.dirname(A.DEFAULTS["WALLS"])}/'))
 
     def test_the_unit_runs_the_installed_agent_and_ends_its_verbs_with_it(self):
         unit = configparser.ConfigParser(strict=False, interpolation=None)
@@ -495,7 +525,7 @@ class Desk(unittest.TestCase):
         self.assertNotIn('User', s)
         self.assertNotIn('EnvironmentFile', s)
         self.assertEqual((s['MemoryMax'], s['MemorySwapMax']), ('512M', '0'))
-        self.assertEqual(A.DEFAULTS['LAUNCH'], '/opt/fork-fleet/fork-fleet-launch.sh')
+        self.assertEqual(A.DEFAULTS['WALLS'], '/opt/fork-fleet/fork-fleet-walls.py')
 
 
 if __name__ == '__main__':

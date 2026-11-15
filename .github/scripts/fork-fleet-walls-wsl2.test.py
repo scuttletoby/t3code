@@ -4,7 +4,7 @@ wsl2.fixture.json): that its reading of the launcher's sandbox() fits the real l
 sandbox() that opens a wall (a fixture changes the fake machine only, and the launcher is the kit's, beside the walls
 folder), that it takes every linux wall from the linux file, and that it runs the linux file only from a source no
 more open than itself. Run: python3 <this>. Linux only."""
-import importlib.util, json, os, shutil, signal, subprocess, sys, tempfile, unittest
+import importlib.util, json, os, re, shutil, signal, subprocess, sys, tempfile, unittest
 from importlib._bootstrap_external import _code_to_timestamp_pyc
 
 sys.dont_write_bytecode = True
@@ -57,6 +57,11 @@ class Case(unittest.TestCase):
         with open(os.path.join(kit, 'fork-fleet-launch.sh'), 'w', encoding='utf-8') as f:
             f.write(slurp(LAUNCHER) if launcher_text is None else launcher_text)
         os.chmod(os.path.join(kit, 'fork-fleet-launch.sh'), 0o755)
+        shutil.copy(os.path.join(HERE, 'fork-fleet-walls.py'), kit)   # the dispatcher, which runs wsl2 for real
+        os.chmod(os.path.join(kit, 'fork-fleet-walls.py'), 0o755)
+        for name in ('linux.fixture.json', 'wsl2.fixture.json'):
+            shutil.copy(os.path.join(FOLDER, name), folder)
+            os.chmod(os.path.join(folder, name), 0o644)
         for name, mode in (('linux', linux_mode), ('wsl2', wsl2_mode)):
             shutil.copy(os.path.join(FOLDER, name), folder)
             if name == 'linux' and linux_text is not None:
@@ -67,6 +72,12 @@ class Case(unittest.TestCase):
 
     def run_wsl2(self, path, root, verb='describe'):
         return subprocess.run([path, verb], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+                              env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'FORK_FLEET_WALLS_ROOT': root})
+
+    def run_dispatcher(self, path, root, verb='check'):
+        """The kit's fork-fleet-walls.py (as the pool runs it) for the kit whose wsl2 is path."""
+        walls = os.path.join(os.path.dirname(os.path.dirname(path)), 'fork-fleet-walls.py')
+        return subprocess.run([walls, verb], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
                               env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'FORK_FLEET_WALLS_ROOT': root})
 
     def fake(self, changes=None):
@@ -106,6 +117,11 @@ def walls_with(test, root, launcher_text=None):
 ARCH = '    -p SystemCallArchitectures=native\n'
 TMPFS = '    -p "TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777"\n'
 FAMILIES = '    -p RestrictAddressFamilies=~AF_VSOCK\n'
+DEVICES = '    -p RemoveIPC=yes -p PrivateDevices=yes\n'
+RESOLV_BIND = '    -p "BindReadOnlyPaths=$resolv_bind"\n'
+FS_RO = '-p "BindReadOnlyPaths=${ro[*]}")'
+START = ' "${props[@]}" -p "ReadWritePaths=$dir" \\\n'
+RUN = '  "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name"'
 FILTER = '    -p "SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS"\n'
 # Changes to the real launcher's sandbox() (old line -> new text) that open a wall, with what its FAIL line says. They
 # were fixture cases while the walls read a launcher on the fake machine; the kit's launcher is not on it.
@@ -126,11 +142,57 @@ OPENS = [
     ('sockets', ARCH, ARCH + '    -p SystemCallArchitectures=\n', 'SystemCallArchitectures is not set'),
     ('sockets', ARCH, ARCH + '    -p SystemCallArchitectures=x86\n', 'SystemCallArchitectures is native x86'),
     ('sockets', ARCH, '    -p "SystemCallArchitectures=native x86"\n', 'SystemCallArchitectures is native x86'),
-    ('sockets', 'sandbox() {\n', 'sandbox_x() {\n', 'cannot tell (ValueError: the launcher has no sandbox()'),
+    # PrivateDevices: /dev/dxg is WSL2's channel to Windows' GPU driver. A boolean: the last one wins, empty resets.
+    ('sockets', DEVICES, '    -p RemoveIPC=yes -p PrivateDevices=no\n', 'PrivateDevices is no in'),
+    ('sockets', DEVICES, '    -p RemoveIPC=yes\n', 'PrivateDevices is not set'),
+    ('sockets', ARCH, ARCH + '    -p PrivateDevices=\n', 'PrivateDevices is reset'),
+    ('sockets', ARCH, ARCH + '    -p PrivateDevices=false\n', 'PrivateDevices is false'),
+    # Every form of a property systemd-run takes, in sandbox() and in start()'s own options around "${props[@]}".
+    ('sockets', ARCH, ARCH + '    --property=SystemCallArchitectures=x86\n', 'SystemCallArchitectures is native x86'),
+    ('sockets', ARCH, ARCH + '    -pSystemCallArchitectures=x86\n', 'SystemCallArchitectures is native x86'),
+    ('sockets', ARCH, ARCH + '    --property SystemCallArchitectures=x86\n', 'SystemCallArchitectures is native x86'),
+    ('sockets', ARCH, ARCH + "    -p 'SystemCallArchitectures=x86'\n", 'SystemCallArchitectures is native x86'),
+    ('sockets', START, START.replace(' -p "Read', ' -p SystemCallArchitectures=x86 -p "Read'),
+     'SystemCallArchitectures is native x86'),
+    ('sockets', START, START.replace(' -p "Read', ' -p PrivateDevices=no -p "Read'), 'PrivateDevices is no'),
+    ('sockets', START, START.replace(' -p "Read', ' --property=RestrictAddressFamilies= -p "Read'), 'AF_VSOCK is not on'),
+    # A bind not made from what `paths` shows: WSL's interop sockets, WSLg's X socket and share, a drive.
+    ('sockets', RESOLV_BIND, RESOLV_BIND + '    -p BindReadOnlyPaths=/run/WSL:/run/WSL\n',
+     'BindReadOnlyPaths=/run/WSL:/run/WSL beside what `paths` shows'),
+    ('sockets', RESOLV_BIND, RESOLV_BIND + '    -p BindPaths=/tmp/.X11-unix\n', 'BindPaths=/tmp/.X11-unix beside'),
+    ('sockets', RESOLV_BIND, RESOLV_BIND + '    -p BindReadOnlyPaths=/mnt/wslg:/mnt/wslg\n',
+     'BindReadOnlyPaths=/mnt/wslg:/mnt/wslg beside'),
+    ('sockets', RESOLV_BIND, '    -p "BindReadOnlyPaths=$resolv_bind /mnt/wsl:/mnt/wsl"\n',
+     'BindReadOnlyPaths=$resolv_bind /mnt/wsl:/mnt/wsl beside'),
+    ('sockets', FS_RO, FS_RO.replace(')', ' -p BindPaths=/mnt/c:/c)'), 'BindPaths=/mnt/c:/c beside'),
+    ('sockets', RESOLV_BIND, RESOLV_BIND + '    -p RootDirectory=/\n', 'RootDirectory=/ beside'),
+    ('sockets', RESOLV_BIND, RESOLV_BIND + '    -p EnvironmentFile=/etc/environment\n', 'EnvironmentFile=/etc/environment'),
+    ('sockets', START, START.replace(' -p "Read', ' -p ReadWritePaths=/mnt/c -p "Read'), 'ReadWritePaths=/mnt/c beside'),
     ('userns', ARCH, ARCH + '    -p RestrictNamespaces=~net\n', 'jobs can make user namespaces'),
     ('userns', ARCH, ARCH + '    -p "RestrictNamespaces=net user"\n', 'jobs can make user namespaces'),
     ('userns', ARCH, ARCH + '    -p RestrictNamespaces=yes\n    -p RestrictNamespaces=\n', 'jobs can make user namespaces'),
     ('userns', ARCH, ARCH + '    -p RestrictNamespaces=no\n', 'jobs can make user namespaces'),
+]
+# Changes after which the walls cannot read what the job units get: a FAIL too, "cannot tell" and why.
+UNREADABLE = [
+    ('sockets', 'sandbox() {\n', 'sandbox_x() {\n', 'cannot tell (ValueError: the launcher has no sandbox()'),
+    ('sockets', ARCH, ARCH + '    --prop=SystemCallArchitectures=x86\n', 'cannot tell (ValueError: the launcher\'s job '
+     'units: \'--prop=SystemCallArchitectures=x86\' is no property word'),
+    ('sockets', ARCH, ARCH + '    -p DeviceAllow=/dev/dxg\n', 'which the walls do not know'),
+    ('sockets', ARCH, ARCH + '    -p LoadCredential=x:/etc/shadow\n', 'which the walls do not know'),
+    ('sockets', ARCH, ARCH + '    $more\n', 'cannot tell (ValueError: the launcher\'s job units: bash expands'),
+    ('sockets', ARCH, ARCH + '    -p "$more"\n', 'is not NAME=VALUE'),
+    ('sockets', ARCH, ARCH + '    -p "SystemCallArchitectures=$arch"\n', 'is not written out'),
+    ('sockets', START, START.replace(' "${props[@]}"', ''), 'must hand systemd-run "${props[@]}" once'),
+    ('sockets', START, START.replace(' "${props[@]}"', ' "${props[@]:1}"'), 'sets or uses props on line'),
+    ('sockets', RUN, RUN.replace('--quiet', '--quiet --scope'), "'--scope' is no property word"),
+    ('sockets', RUN, '  props+=(-p PrivateDevices=no)\n' + RUN, 'sets or uses props on line'),
+    ('sockets', RUN, '  "$SYSTEMD_RUN" --quiet --collect --uid "$user" -p PrivateDevices=no true\n' + RUN,
+     'must run "$SYSTEMD_RUN" once'),
+    ('sockets', '    "${props_fs[@]}"\n', '    \n', 'must hold "${props_fs[@]}" (what jobs see) once'),
+    ('sockets', 'ro+=("$b:norbind")', 'ro+=("$b:norbind" /run/WSL:/run/WSL)', 'the launcher makes ro'),
+    ('sockets', 'resolv_bind=$b:$resolv', 'resolv_bind=/run/WSL:$resolv', 'the launcher makes resolv_bind'),
+    ('sockets', '\nstart() {\n', '\nsandbox() {\n  props=()\n}\n\nstart() {\n', 'defines sandbox() more than once'),
 ]
 
 
@@ -148,7 +210,7 @@ class Launcher(Case):
         directly and as the only FAIL; the real launcher passes them all."""
         real = slurp(LAUNCHER)
         on = {'proc/sys/user/max_user_namespaces': '15000\n'}   # userns: off on the host, so the units must refuse it
-        for wall, old, new, why in OPENS:
+        for wall, old, new, why in OPENS + UNREADABLE:
             with self.subTest(wall=wall, new=new):
                 self.assertEqual(real.count(old), 1, f'the launcher no longer has {old!r}: update this test')
                 p = self.run_wsl2(self.copy(launcher_text=real.replace(old, new)),
@@ -156,11 +218,17 @@ class Launcher(Case):
                 self.assertEqual(p.returncode, 1, p.stderr)
                 self.assertEqual([line.split()[1] for line in p.stdout.splitlines()], [wall], p.stdout)
                 self.assertIn(why, p.stdout)
-                if 'cannot tell' not in why:
-                    self.assertNotIn('cannot tell', p.stdout)
-        p = self.run_wsl2(self.copy(), self.fake(on), 'check')
-        self.assertEqual(p.returncode, 1, p.stderr)   # the real launcher: only the host's own userns setting fails
-        self.assertEqual([line.split()[1] for line in p.stdout.splitlines()], ['userns'], p.stdout)
+                self.assertEqual('cannot tell (ValueError: ' in p.stdout, (wall, old, new, why) in UNREADABLE)
+                p = self.run_dispatcher(self.copy(launcher_text=real.replace(old, new)),
+                                        self.fake(on if wall == 'userns' else {}))   # as the pool runs it
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertEqual([line.split()[1] for line in p.stdout.splitlines()], [wall], p.stdout)
+                self.assertIn(why, p.stdout)
+        for run in (self.run_wsl2, self.run_dispatcher):
+            p = run(self.copy(), self.fake(on), 'check')
+            self.assertEqual(p.returncode, 1, p.stderr)   # the real launcher: only the host's own userns setting fails
+            self.assertEqual([line.split()[1] for line in p.stdout.splitlines()], ['userns'], p.stdout)
+            self.assertEqual(run(self.copy(), self.fake(), 'check').returncode, 0)
 
     def test_the_launcher_it_reads_is_the_kits_and_safe(self):
         """sandbox() comes from the launcher beside the walls folder, the one `paths` runs: no other copy on the
@@ -195,11 +263,40 @@ class Launcher(Case):
                         wall()
 
     def test_words(self):
-        props = wsl2.sandbox_props('sandbox() {\n  props=(\n    -p A=1 -p "B=x y"  # -p C=2\n'
-                                   '    # -p D=3\n    -p A=\n  )\n}\n-p E=4\n')
-        self.assertEqual(props, {'A': ['1', ''], 'B': ['x y']})
-        with self.assertRaisesRegex(ValueError, 'no sandbox'):
-            wsl2.sandbox_props('props=(-p A=1)\n')
+        """unit_props reads the job units' properties as bash and systemd-run get them, or cannot tell."""
+        mini = ('job_fs() {\n  local rw=$2\n  local -a ro=()\n  ro+=("$b:norbind")\n'
+                '  props_fs=(-p "BindReadOnlyPaths=${ro[*]}")\n  resolv_bind=$b:$resolv\n}\n'
+                'sandbox() {\n  local resolv_bind\n  local -a props_fs\n  props=(\n'
+                '    -p UMask=0077 -p "IPAddressDeny=x y"  # -p MountFlags=shared\n    # -p Type=simple\n'
+                '    "${props_fs[@]}"\n    -pMountFlags=private --property=RuntimeMaxSec=6 --property \'LockPersonality=yes\' \\\n'
+                '    -p UMask= -p Restrict\\Realtime=yes\n  )\n}\n'
+                'start() {\n  local -a props\n  "$SYSTEMD_RUN" --quiet --unit u --uid "$user" --unit=v -p Type=exec \\\n'
+                '    "${props[@]}" -p KillMode=control-group -- run -p Type=simple\n}\n-p UMask=0\n')
+        self.assertEqual(wsl2.unit_props(mini), {
+            'Type': ['exec'], 'UMask': ['0077', ''], 'IPAddressDeny': ['x y'], 'BindReadOnlyPaths': ['${ro[*]}'],
+            'MountFlags': ['private'], 'RuntimeMaxSec': ['6'], 'LockPersonality': ['yes'], 'RestrictRealtime': ['yes'],
+            'KillMode': ['control-group']})
+        for old, new, why in (
+                ('sandbox() {', 'sandbox_x() {', 'no sandbox'),
+                ('-p UMask=0077', '--prop=UMask=0077', 'is no property word'),
+                ('-p UMask=0077', '-p DeviceAllow=/dev/dxg', 'do not know'),
+                ('-p UMask=0077', '-p UMask=0077 $x', 'bash expands'),
+                ('-p UMask=0077', '-p UMask=00*', 'bash expands'),
+                ('-p UMask=0077', '-p UMask=0077 -p ${x}', 'bash expands'),
+                ('-p UMask=0077', '-p "$x"', 'not NAME=VALUE'),
+                ('-p UMask=0077', '-p "PrivateDevices=$x"', 'not written out'),
+                ('    "${props_fs[@]}"\n', '', 'props_fs[@]'),
+                ('"${props[@]}"', '"${props[*]}"', 'sets or uses props'),
+                (' -- run', ' run', 'no --'),
+                ('  local -a props\n', '  local -a props\n  props+=(-p PrivateDevices=no)\n', 'sets or uses props'),
+                ('ro+=("$b:norbind")', 'ro+=(/run/WSL)', 'makes ro'),
+                ('  local rw=$2\n', '  local rw=$2\n  read -r rw\n', 'makes rw'),
+                ('-p UMask=0077', '-p UMask=0077 )', ''),   # read up to the ), the rest as code: not as it was
+                ('start() {', 'function sandbox { :; }\nstart() {', 'more than once')):
+            with self.subTest(new=new):
+                self.assertEqual(mini.count(old), 1)
+                with self.assertRaisesRegex(ValueError, re.escape(why)):
+                    wsl2.unit_props(mini.replace(old, new))
 
     def test_lists_merge_as_systemd_merges_them(self):   # an empty assignment drops all before it
         for values, want in ((['x86', 'native'], ['x86', 'native']), (['x86', '', 'native'], ['native']),

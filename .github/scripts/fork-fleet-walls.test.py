@@ -520,6 +520,147 @@ class EveryWallsFile(Case):
                 root = self.root(overlay(LINUX, change))
                 self.assertNotIn('etc-secrets', self.walls('linux', 'describe', root)[1])
 
+    def etc_secrets(self, change):
+        """The linux etc-secrets line on the passing fixture with change, through describe."""
+        p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)))
+        lines = [x for x in p.stdout.splitlines() if x.split('  ')[1:2] == ['etc-secrets']]
+        self.assertEqual(len(lines), 1, p.stdout + p.stderr)
+        return lines[0]
+
+    def test_linux_etc_secrets_reads_systemd_unit_syntax(self):
+        """Issue #211 (re-checks of #208, RS1 and the correctness lens): systemd reads a unit as an ini file, not one
+        `Key=value` per line: blanks around the key's `=`, a value continued on the next line by a trailing backslash
+        (a comment line inside it skipped), a literal SetCredential=, a LoadCredential= file others can read, and the
+        EnvironmentFile= of a packaged unit (/usr/lib/systemd/system, enabled or started by a timer) that is in
+        /etc/default. Each FAILS; the same forms with no secret pass."""
+        u = '[Service]\nExecStart=/usr/bin/true\n'
+        fails = {
+            'Environment = (blanks)': {'etc/systemd/system/nightly.service':
+                                       u + 'Environment = RESTIC_PASSWORD=hunter2\n'},
+            'EnvironmentFile = (blanks)': {'etc/systemd/system/backup.service':
+                                           u + 'EnvironmentFile = /etc/backup.env\n',
+                                           'etc/backup.env': 'RESTIC_PASSWORD=hunter2\n'},
+            'continued line': {'etc/systemd/system/nightly.service':
+                               u + 'Environment=A=1 \\\n  RESTIC_PASSWORD=hunter2\n'},
+            'continued, a comment inside': {'etc/systemd/system/nightly.service':
+                                            u + 'Environment=A=1 \\\n# a note\n  RESTIC_PASSWORD=hunter2\n'},
+            'SetCredential=': {'etc/systemd/system/nightly.service': u + 'SetCredential=restic.password:hunter2\n'},
+            'LoadCredential= file others read': {'etc/systemd/system/nightly.service':
+                                                 u + 'LoadCredential=restic.password:/etc/restic.pw\n',
+                                                 'etc/restic.pw': 'hunter2\n'},
+            'ManagerEnvironment=': {'etc/systemd/system.conf.d/x.conf': '[Manager]\nManagerEnvironment=GH_TOKEN=x1\n'},
+            'vendor unit, timer, /etc/default': {
+                'etc/default/nightly': 'RESTIC_PASSWORD=hunter2\n',
+                'usr/lib/systemd/system/nightly.timer': '[Timer]\nOnCalendar=daily\n',
+                'usr/lib/systemd/system/nightly.service': u + 'EnvironmentFile=/etc/default/nightly\n'},
+            'vendor unit, -/etc/default': {
+                'usr/lib/systemd/system/telegraf.service': u + 'EnvironmentFile=-/etc/default/telegraf\n',
+                'etc/default/telegraf': 'INFLUX_TOKEN=hunter2hunter2\n'},
+            'vendor unit, literal': {'usr/lib/systemd/system/x.service': u + 'Environment=GH_TOKEN=x1\n'},
+        }
+        for name, change in fails.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('FAIL'), name)
+        passes = {
+            'blanks, other names': {'etc/systemd/system/x.service': u + 'Environment = LANG=C TZ=UTC\n'},
+            'continued, other names': {'etc/systemd/system/x.service': u + 'Environment=LANG=C \\\n  TZ=UTC\n'},
+            'a continued comment is a comment': {'etc/systemd/system/x.service':
+                                                 u + '# Environment=A=1 \\\nEnvironment=TZ=UTC\n'},
+            'LoadCredential= file only root reads': {'etc/systemd/system/x.service':
+                                                     u + 'LoadCredential=pw:/etc/restic.pw\n',
+                                                     'etc/restic.pw': {'text': 'hunter2\n', 'mode': '600'}},
+            'SetCredentialEncrypted=': {'etc/systemd/system/x.service': u + 'SetCredentialEncrypted=pw: \\\n  k6iUCUh0\n'},
+            'EnvironmentFile= a specifier': {'etc/systemd/system/x@.service': u + 'EnvironmentFile=/etc/x/%i.env\n'},
+            'vendor unit, /etc/default only root reads': {
+                'usr/lib/systemd/system/telegraf.service': u + 'EnvironmentFile=-/etc/default/telegraf\n',
+                'etc/default/telegraf': {'text': 'INFLUX_TOKEN=hunter2hunter2\n', 'mode': '600'}},
+        }
+        for name, change in passes.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('PASS'), name)
+
+    def test_linux_etc_secrets_reads_fish_ansi_c_and_token_shapes_anywhere(self):
+        """Issue #211: fish's config (`set -gx NAME value`), bash's $'...' quoting, and a known token's shape in any
+        file of /etc others can read (/etc/default, fish's conf.d, a tool's own config), not only in the files listed
+        by name. Each FAILS."""
+        tok = 'ghp_' + 'FAKE' * 9
+        fails = {
+            'fish set -gx': {'etc/fish/conf.d/gh.fish': 'set -gx GH_TOKEN abc123secretvalue\n'},
+            'fish config.fish': {'etc/fish/config.fish': 'set --export --global RESTIC_PASSWORD hunter2\n'},
+            'fish, a token shape': {'etc/fish/conf.d/gh.fish': f'set -gx GH_TOKEN {tok}\n'},
+            "$'...'": {'etc/profile.d/gh.sh': "export RESTIC_PASSWORD=$'hunter2'\n"},
+            '$"..."': {'etc/profile.d/gh.sh': 'export RESTIC_PASSWORD=$"hunter2"\n'},
+            'a token shape in /etc/default': {'etc/default/ci': f'GH_TOKEN={tok}\n'},
+            'a name in /etc/default': {'etc/default/ci': 'GH_TOKEN=x1\n'},
+            'a token shape in a tool config': {'etc/sometool/config.yaml': f'auth:\n  token: "{tok}"\n'},
+        }
+        for name, change in fails.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('FAIL'), name)
+        passes = {
+            'fish, from a command': {'etc/fish/conf.d/gh.fish': 'set -gx GH_TOKEN (cat ~/.t)\n'},
+            'fish, from a variable': {'etc/fish/conf.d/gh.fish': 'set -gx GH_TOKEN $OTHER\n'},
+            'fish, other names': {'etc/fish/config.fish': 'set -gx EDITOR vi\nset -U fish_greeting ""\n'},
+            'a token shape only root reads': {'etc/sometool/config.yaml': {'text': f'token: {tok}\n', 'mode': '600'}},
+        }
+        for name, change in passes.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('PASS'), name)
+
+    def test_linux_etc_secrets_names_are_words_not_substrings(self):
+        """Issue #211 (re-checks of #208, RS2 and the correctness lens): a secret's name is a word of it that says so
+        (GH_TOKEN, RESTIC_PASSWORD, OPENAI_API_KEY), not a substring (TOKENIZERS_PARALLELISM), and a value that is a
+        file's path, an array or a yes/no holds no secret. Ubuntu's stock /etc/zsh/zshrc (zsh-common, on every host
+        with zsh), /etc/environment and /etc/default files pass."""
+        zshrc = ('if [[ "$TERM" != emacs ]]\nthen\n\n    typeset -A key\n    key=(\n'
+                 '        BackSpace  "${terminfo[kbs]}"\n        Home       "${terminfo[khome]}"\n    )\nfi\n')
+        passes = {
+            'stock /etc/zsh/zshrc': {'etc/zsh/zshrc': zshrc},
+            'TOKENIZERS_PARALLELISM': {'etc/environment': 'TOKENIZERS_PARALLELISM=false\n'},
+            'a credentials path': {'etc/environment': 'GOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n'},
+            'a key file path': {'etc/profile.d/ssh.sh': 'export SSH_KEY=~/.ssh/id_ed25519 GPG_KEY=/etc/x.gpg\n'},
+            'an id, not a key': {'etc/profile.d/aws.sh': 'export AWS_ACCESS_KEY_ID_FILE=/etc/x AWS_KEY_ID=AKIDX\n'},
+            'a yes/no': {'etc/environment': 'GIT_TERMINAL_PROMPT_PASSWORD=false\nNO_TOKEN=1\n'},
+            'lower case key, an array': {'etc/zsh/zshrc': 'typeset -A key\nkey=(Home x)\n'},
+            'stock /etc/environment': {'etc/environment':
+                                       'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:'
+                                       '/usr/local/games:/snap/bin"\n'},
+            'stock /etc/default': {'etc/default/keyboard': 'XKBMODEL="pc105"\nXKBLAYOUT="us"\nBACKSPACE="guess"\n',
+                                   'etc/default/locale': 'LANG=C.UTF-8\n',
+                                   'etc/default/grub': 'GRUB_DEFAULT=0\nGRUB_CMDLINE_LINUX=""\n'},
+        }
+        for name, change in passes.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('PASS'), name)
+        for name, change in {'a key, upper case': {'etc/profile.d/x.sh': 'export OPENAI_API_KEY=sk1\n'},
+                             'TOKENS, a word': {'etc/profile.d/x.sh': 'export HF_TOKENS=x1\n'},
+                             'a password in a word': {'etc/environment': 'DBPASSWORD=hunter2\n'},
+                             'a lower case token': {'etc/profile.d/x.sh': 'github_token=x1\n'}}.items():
+            with self.subTest(name):
+                self.assertTrue(self.etc_secrets(change).startswith('FAIL'), name)
+
+    def test_linux_etc_secrets_advice_fits_the_file(self):
+        """Issue #211: a file every login reads (/etc/environment, a shell's start file, fish's) cannot be made
+        private: the advice is to move the secret out of it, never to chmod it 0600. A file only a service or
+        mount reads may be made root's alone."""
+        for name, change in (('environment', {'etc/environment': 'GH_TOKEN=x1\n'}),
+                             ('bashrc', {'etc/bash.bashrc': 'export GH_TOKEN=x1\n'}),
+                             ('zshrc', {'etc/zsh/zshrc': 'export GH_TOKEN=x1\n'}),
+                             ('fish', {'etc/fish/conf.d/x.fish': 'set -gx GH_TOKEN x1\n'}),
+                             ('profile.d', {'etc/profile.d/x.sh': 'export GH_TOKEN=x1\n'})):
+            with self.subTest(name):
+                got = self.etc_secrets(change)
+                self.assertTrue(got.startswith('FAIL'), got)
+                self.assertIn('move it out', got)
+                self.assertNotRegex(got, r'0600|chmod')
+        for name, change in (('a credentials file', {'etc/nas.cred': 'password=p\n'}),
+                             ('an EnvironmentFile', {'etc/systemd/system/b.service':
+                                                     '[Service]\nEnvironmentFile=/etc/b.env\n',
+                                                     'etc/b.env': 'RESTIC_PASSWORD=hunter2\n'})):
+            with self.subTest(name):
+                got = self.etc_secrets(change)
+                self.assertRegex(got, r'^FAIL .*0600')
+
     def test_linux_cgroup_bpf_from_the_kernel_config(self):   # the config in /boot decides before /proc/kallsyms
         for config, want in (('CONFIG_CGROUP_BPF=y\n', []), ('# CONFIG_CGROUP_BPF is not set\n', ['cgroup-bpf'])):
             with self.subTest(config):

@@ -856,6 +856,34 @@ resolv_target() {
   printf '%s\n' "$target"
 }
 
+# Every symlink on the way from $1 to its real path (on the fake machine: in it) is root's (or this user's, who runs
+# the launcher: root, but for the walls' tests), in a folder no other user may swap it in: one a user can repoint
+# leads a bind between the check and the job wherever that user likes, past every check. Dies otherwise.
+links_owned() {
+  local rest=${1#/} cur='' part target uid hops=0
+  while [[ -n $rest ]]; do
+    part=${rest%%/*}
+    if [[ $rest == */* ]]; then rest=${rest#*/}; else rest=''; fi
+    case $part in
+      '' | .) continue ;;
+      ..) cur=${cur%/*}; continue ;;
+    esac
+    if [[ -L $ROOT$cur/$part ]]; then
+      ((++hops <= 40)) || die "$1: too many links on the way (a loop?)"
+      uid=$(stat -c %u -- "$ROOT$cur/$part") || die "$1: cannot read the link $cur/$part"
+      [[ $uid == 0 || $uid == "$EUID" ]] ||
+        die "$1 goes through $cur/$part, a link of uid $uid: only root's links, or that user could repoint it"
+      (($(stat -c '0%a' -- "$ROOT${cur:-/}") & 01002 ^ 02)) ||
+        die "$1 goes through $cur/$part, in ${cur:-/}, which others may write: anyone could swap that link"
+      target=$(readlink -- "$ROOT$cur/$part") || die "$1: cannot read the link $cur/$part"
+      [[ $target != /* ]] || cur=''
+      rest=${target#/}${rest:+/$rest}
+    else
+      cur+=/$part
+    fi
+  done
+}
+
 # A path's real path: every symlink in every part of it resolved (on the fake machine: in it), as systemd follows
 # them in a bind's source. What job_view checks and binds, so a link in a folder above a path (/opt/x -> /c, /home,
 # a share) never leads a job past the checks. Dies when it is no plain path, or when a folder above it is one a user
@@ -864,6 +892,7 @@ resolv_target() {
 # outside their copies and are in no group but their own (check_users), so they cannot swap a link into it.
 real_path() {
   local real d
+  links_owned "$1"
   real=$(realpath -m -- "$ROOT$1") || die "$1: cannot resolve it"
   if [[ -n $ROOT ]]; then
     [[ $real == "$ROOT"/* ]] || die "$1 leads out of FORK_FLEET_WALLS_ROOT"

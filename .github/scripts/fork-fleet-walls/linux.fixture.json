@@ -39,7 +39,9 @@
     "etc/default/backup": {
       "text": "RESTIC_PASSWORD=only-root-reads-this\n",
       "mode": "600"
-    }
+    },
+    "etc/zsh/zshrc": "if [[ \"$TERM\" != emacs ]]\nthen\n    typeset -A key\n    key=(\n        Home       \"${terminfo[khome]}\"\n    )\nfi\n",
+    "etc/environment.d/20-tools.conf": "TOKENIZERS_PARALLELISM=false\nGOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n"
   },
   "fail": {
     "os": [
@@ -233,6 +235,19 @@
       },
       {
         "etc/default/backup": "RESTIC_PASSWORD=hunter2\n"
+      },
+      {
+        "etc/systemd/system/nightly.service": "[Service]\nEnvironment = A=1 \\\n  RESTIC_PASSWORD=hunter2\n"
+      },
+      {
+        "etc/systemd/system/nightly.service": "[Service]\nSetCredential=restic.password:hunter2\n"
+      },
+      {
+        "usr/lib/systemd/system/telegraf.service": "[Service]\nEnvironmentFile=-/etc/default/telegraf\n",
+        "etc/default/telegraf": "INFLUX_TOKEN=hunter2hunter2\n"
+      },
+      {
+        "etc/fish/conf.d/gh.fish": "set -gx GH_TOKEN abc123secretvalue\n"
       }
     ]
   }
