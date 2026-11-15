@@ -24,6 +24,7 @@ import {
   deliveryRetryDelayMs,
   judgeExit,
   judgePrChecks,
+  limitErrorWakes,
   joinedWakeMessage,
   messageText,
   nextWaitState,
@@ -1164,5 +1165,130 @@ describe("wait settings (T20)", () => {
         resolveProjectSettings(settings, ProjectId.make("project-b")).settings.waitChecks,
       ),
     ).toEqual(["a", "b"]);
+  });
+});
+
+describe("limitErrorWakes (check note 3.5: one outage, few wakes)", () => {
+  const failure: Judgement = { type: "failed", message: "connection refused", permanent: false };
+  const GRACE = stateSettings.errorGraceSeconds * SECOND;
+  /** One failing wait per thread, failing since `T0 - ageMs`. */
+  const failingWait = (n: number, ageMs = GRACE, fields: Record<string, unknown> = {}) =>
+    makeWait({
+      id: `w_${"abcdefghij".slice(0, 9)}${"abcdefghijklmnopqrstuvwxyz"[n]}`,
+      threadId: `thread-${n}`,
+      key: n.toString(16).padStart(16, "0"),
+      errorSince: iso(T0 - ageMs),
+      lastError: "connection refused",
+      ...fields,
+    });
+  /** What one pass with `failure` for every wait gives before the outage rules. */
+  const pass = (waits: ReadonlyArray<WaitRecord>, judgement: Judgement = failure) => {
+    const changes = new Map<string, { record: WaitRecord }>();
+    const judgements = new Map<string, Judgement>();
+    for (const wait of waits) {
+      judgements.set(wait.id, judgement);
+      const next = nextWaitState(wait, judged(judgement), T0, stateSettings);
+      if (next !== null) changes.set(wait.id, next);
+    }
+    return { changes, judgements };
+  };
+  const limit = (
+    waits: ReadonlyArray<WaitRecord>,
+    maxThreads: number,
+    extra?: ReturnType<typeof pass>,
+  ) => {
+    const { changes, judgements } = extra ?? pass(waits);
+    return limitErrorWakes({
+      waits,
+      changes,
+      judgements,
+      now: T0,
+      settings: stateSettings,
+      maxThreads,
+    });
+  };
+  const errorWakes = (changes: ReadonlyMap<string, { record: WaitRecord }>) =>
+    [...changes.values()]
+      .filter((change) => change.record.result?.outcome === "check_error")
+      .map((change) => change.record.threadId);
+
+  it("wakes at most maxThreads threads, those failing longest first; the rest stay waiting", () => {
+    const waits = [0, 1, 2, 3, 4].map((n) => failingWait(n, GRACE + n * SECOND));
+    const result = limit(waits, 3);
+    expect(errorWakes(result.changes)).toEqual([
+      thread("thread-2"),
+      thread("thread-3"),
+      thread("thread-4"),
+    ]);
+    expect(result.heldThreads).toBe(2);
+    // The held ones keep their error run and change nothing on disk.
+    expect(result.changes.has(waits[0]!.id)).toBe(false);
+    expect(result.changes.has(waits[1]!.id)).toBe(false);
+    // The next pass wakes them.
+    const next = limit(waits.slice(0, 2), 3);
+    expect(errorWakes(next.changes)).toEqual([thread("thread-0"), thread("thread-1")]);
+    expect(next.heldThreads).toBe(0);
+  });
+
+  it("a held wait's error is noted, also a permanent one, and it never ends quietly", () => {
+    const waits = [0, 1].map((n) => failingWait(n, GRACE, { lastError: "old" }));
+    const permanent: Judgement = { type: "failed", message: "Check gone.", permanent: true };
+    const result = limit(waits, 1, pass(waits, permanent));
+    const held = result.changes.get(waits[1]!.id)!.record;
+    expect(held).toMatchObject({
+      state: "waiting",
+      lastError: "Check gone.",
+      errorSince: waits[1]!.errorSince,
+    });
+    expect(errorWakes(result.changes)).toEqual([thread("thread-0")]);
+  });
+
+  it("a thread woken anyway does not count, and its error wakes go with it", () => {
+    const waits = [
+      failingWait(0),
+      failingWait(1),
+      // thread-2 has a message not sent yet: it is woken anyway.
+      failingWait(2),
+      delivering({ id: "w_zzzzzzzzzz", threadId: "thread-2", key: "ffffffffffffffff" }),
+    ];
+    const result = limit(waits, 1, pass(waits.slice(0, 3)));
+    expect(errorWakes(result.changes).sort()).toEqual([thread("thread-0"), thread("thread-2")]);
+    expect(result.heldThreads).toBe(1);
+  });
+
+  it("joins a woken thread's other waits that failed for half the grace; younger errors wait", () => {
+    const own = (n: number, ageMs: number) =>
+      failingWait(0, ageMs, {
+        id: `w_jjjjjjjjj${"abcdefghijklmnopqrstuvwxyz"[n]}`,
+        key: n.toString(16).padStart(16, "1"),
+      });
+    const ending = failingWait(0, GRACE);
+    const half = own(1, GRACE / 2);
+    const young = own(2, GRACE / 2 - SECOND);
+    const healthy = makeWait({ id: "w_kkkkkkkkkk", threadId: "thread-0", key: "2222222222222222" });
+    const waits = [ending, half, young, healthy];
+    const result = limit(waits, 3, pass([ending]));
+    expect(result.joined).toBe(1);
+    expect(result.changes.get(half.id)?.record).toMatchObject({
+      state: "delivering",
+      result: {
+        outcome: "check_error",
+        detail: "No good answer for 8 min. Last: connection refused.",
+      },
+    });
+    expect(result.changes.has(young.id)).toBe(false);
+    expect(result.changes.has(healthy.id)).toBe(false);
+  });
+
+  it("a held thread's waits are not joined, and a pass with no error wakes changes nothing", () => {
+    const waits = [
+      failingWait(0),
+      failingWait(1),
+      failingWait(1, GRACE / 2, { id: "w_mmmmmmmmmm", key: "3333333333333333" }),
+    ];
+    const result = limit(waits, 1, pass(waits.slice(0, 2)));
+    expect(result.changes.has("w_mmmmmmmmmm")).toBe(false);
+    const quiet = limit([makeWait()], 3, { changes: new Map(), judgements: new Map() });
+    expect(quiet).toEqual({ changes: new Map(), heldThreads: 0, joined: 0 });
   });
 });
