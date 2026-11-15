@@ -17,10 +17,26 @@ watches; it changes nothing on the machine, and `0` turns it off.
 
 ### What guards it
 
-- [`forkDefaults.test.ts`](../../packages/contracts/src/forkDefaults.test.ts) finds each fork setting
-  in `packages/contracts/src/settings.ts` by the `Fork:` comment on the line above it, and fails when one has
-  no row in `forkDefaults.ts`, a row has no setting, or a default differs from its row. A rebase that
-  takes upstream's `true` turns it red, and fork-follow publishes nothing on a red test.
+- Every fork setting lives in
+  [`packages/contracts/src/forkSettings.ts`](../../packages/contracts/src/forkSettings.ts), the fork's
+  own file; upstream's `settings.ts` takes its fields with one spread per struct. Only
+  `automaticUpdates` stays inline in `settings.ts`, where upstream's pending setting of the same name
+  will be. A patch's fork fields are applied by
+  [`packages/shared/src/forkSettingsPatch.ts`](../../packages/shared/src/forkSettingsPatch.ts), each by
+  its rule in `FORK_PATCH_RULES`.
+- [`forkDefaults.test.ts`](../../packages/contracts/src/forkDefaults.test.ts) reads the fork's keys
+  from `forkSettings.ts` (no comments, no hand-kept list), and fails when one has no row in
+  `forkDefaults.ts`, a row has no setting, or a default differs from its row. A rebase that takes
+  upstream's `true` turns it red, and fork-follow publishes nothing on a red test.
+- [`forkSettings.test.ts`](../../packages/contracts/src/forkSettings.test.ts) checks that each fork
+  field reaches upstream's structs unchanged (an upstream key of the same name would hide it), that
+  every fork setting has a patch field and a patch rule, and pins the count of fork lines in
+  `settings.ts`; `forkSettingsPatch.test.ts` pins them in `packages/shared/src/serverSettings.ts`.
+- The seam check ([`fork-seam-check.cjs`](../../.github/scripts/fork-seam-check.cjs)) refuses any
+  line the fork adds to an upstream file beyond the seam lines pinned in
+  [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment. It runs on
+  every pull request (Fork tests, "Workflow lint and upstream drift") and in fork-follow before and
+  after each rebase, against the upstream commit the series sits on.
 - [`serverSettings.forkDefaults.test.ts`](../../apps/server/src/serverSettings.forkDefaults.test.ts)
   loads the settings the way a server does and checks every fork setting is at its row's default
   with no file, `{}`, a file an upstream build wrote, a file cut off half-way and a file with a bad
@@ -29,14 +45,20 @@ watches; it changes nothing on the machine, and `0` turns it off.
 
 ### Adding a fork setting
 
-1. Put a comment that contains `Fork:` on the line above the key in `ServerSettings`,
-   `ProjectSettingsOverrides` or `ClientSettingsSchema`.
+1. In `forkSettings.ts`, add the field with its default to `ForkServerSettingsFields`, its patch
+   field to `ForkServerSettingsPatchFields` and its rule to `FORK_PATCH_RULES` (`replace`,
+   `merge-fields`, or `{ mergeEntries: <defaults> }` for a map whose `null` entry removes it). A
+   setting a project may override also goes in `FORK_PROJECT_SCOPED_KEYS`,
+   `ForkProjectOverrideFields` and `ForkProjectOverridePatchFields`; a client setting in
+   `ForkClientSettingsFields`. Upstream's files stay as they are.
 2. Add a row to `forkDefaults.ts`: default as the settings file writes it, `off`, a reason in plain
    words, and the fork pull request or issue that decided it.
 3. The default is off (upstream's behaviour) unless the owner decided otherwise; `off: false` needs
    that decision as `decidedIn`.
+4. An agent tool may not write it: `FORK_AGENT_WRITABLE_KEYS` stays empty unless a pull request gives
+   the reason.
 
-A key without the `Fork:` comment is invisible to the test. The sync steps below check for that.
+A key written straight into `settings.ts` is refused by the seam check, whatever its comment says.
 
 ### State: runs again, stops half-way, old or empty state
 
@@ -57,15 +79,16 @@ its settings say; that is the hard "never update this machine" switch.
 
 fork-follow (`.github/workflows/fork-follow.yml`) rebases the fork onto upstream's newest nightly
 once a day, tests, and publishes only when the tests are green. On a conflict, a red test or a schema
-change it stops and opens one issue. Then:
+change, or a fork line beyond the seams, it stops and opens one issue. Then:
 
 1. Rebase by hand as the workflow's report says. Never take upstream's side of a fork setting's
-   default: keep the fork's value and its `Fork:` comment.
-2. Check that no fork setting lost its marker:
-   `git diff <upstream tag> HEAD -- packages/contracts/src/settings.ts` must show a `Fork:` comment
-   above every key the fork adds.
+   default: keep the fork's value (and the `Fork:` comment of the inline `automaticUpdates`).
+2. Check that the fork's lines in upstream files are only the seams:
+   `node .github/scripts/fork-seam-check.cjs <upstream tag> HEAD`. A refused line moves into the
+   fork's own file (a setting into `forkSettings.ts`); a changed seam line is fixed in
+   `.github/fork-seams.json`.
 3. Run the pin tests before pushing:
-   `vp test run packages/contracts/src/forkDefaults.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
+   `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
 4. Push with `--force-with-lease` and start fork-follow once, as its report says.
 
 ### The sync that brings upstream's updater

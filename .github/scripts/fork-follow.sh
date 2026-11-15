@@ -171,6 +171,21 @@ schema_check() { # schema_check BASE WHAT: fails with the check's output, a refu
 }
 schema_check "$base" "The series"
 
+# Fork lines in upstream files (.github/fork-seams.json): only the pinned seams, so every fork
+# setting stays in the fork's own files. Exit 1 is a refusal; anything else is a crash.
+seam_refusal="Fork changes to upstream files must stay within the seam lines"
+seam_check() { # seam_check BASE WHAT
+  local status=0
+  node .github/scripts/fork-seam-check.cjs "$1" HEAD > "$logs/seam-check.log" 2>&1 || status=$?
+  ((status != 0)) || return 0
+  if ((status == 1)) && grep -qF "$seam_refusal" "$logs/seam-check.log"; then
+    fail "$2 adds fork lines to upstream files beyond the seams:" '```' "$(cat "$logs/seam-check.log")" '```'
+  fi
+  fail "The seam check crashed (exit $status), so it did not say whether the series stays within the seams:" \
+    '```' "$(tail -n 20 "$logs/seam-check.log")" '```' "The series was left as it is."
+}
+seam_check "$base" "The series"
+
 # The upstream workflow files the fork deletes, from the series head. Fail closed: without a
 # readable list the plan cannot keep them deleted, so it stops instead of shipping them.
 removed_file=.github/fork-removed-workflows.txt
@@ -425,6 +440,7 @@ if [[ -n "$kept" ]]; then
     -m "Upstream $target_tag has them again: $(paste -sd ' ' <<< "$kept")"
 fi
 schema_check "$target" "After rebasing onto $target_tag, the series"
+seam_check "$target" "After rebasing onto $target_tag, the series"
 candidate="$(git rev-parse HEAD)"
 refuse_upstream_fork_named "$target" "$target_tag" "$candidate"
 refuse_outside_workflows "$base" "$target" "$target_tag" "$candidate"
