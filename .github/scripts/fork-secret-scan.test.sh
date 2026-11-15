@@ -157,6 +157,50 @@ HEAD_SHA="$clean" check "pull request: main's own old key is not the PR's" 0
 HEAD_SHA="$leaky" check "pull request: the range is base..head" 1 "\\.\\.$leaky"
 HEAD_SHA="$evil" check "pull request: a key added only in a merge commit is found" 1
 
+# Two merges of a moving branch, each with 60 conflicts resolved by hand. --remerge-diff writes each
+# automatic merge (conflict markers) to a temporary object folder; git's diff prefetch checks those
+# objects with a stale cache of that folder and, in a blob-less clone, asks the remote for them
+# ("not our ref"; with GIT_NO_LAZY_FETCH "lazy fetching disabled", which gitleaks logs as ERR).
+# With 60 objects per merge some share a first byte across the two merges, which is what it takes.
+# KEY_IN set: the second merge's resolution of c/f30.txt adds a key.
+conflict_branch() { # conflict_branch NAME [KEY]
+  local name="$1" key_in="${2:-}" n round
+  git checkout -q -b "$name-side" "$fork_point"
+  git checkout -q -b "$name" "$fork_point"
+  mkdir -p c
+  for n in $(seq 1 60); do printf 'start %s\n' "$n" > "c/f$n.txt"; done
+  date=$((date + 60)); git add -A; GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "$name: 60 files"
+  git branch -f "$name-side" HEAD
+  for round in 1 2; do
+    git checkout -q "$name-side"
+    for n in $(seq 1 60); do printf 'side %s %s\n' "$round" "$n" > "c/f$n.txt"; done
+    date=$((date + 60)); git add -A; GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "side $round"
+    git checkout -q "$name"
+    for n in $(seq 1 60); do printf 'pr %s %s\n' "$round" "$n" > "c/f$n.txt"; done
+    date=$((date + 60)); git add -A; GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "PR $round"
+    git merge -q --no-ff --no-commit "$name-side" > /dev/null 2>&1 || true
+    for n in $(seq 1 60); do printf 'resolved %s %s\n' "$round" "$n" > "c/f$n.txt"; done
+    if [[ "$round" == 2 && -n "$key_in" ]]; then printf 'aws_access_key_id=%s\n' "$key_in" >> c/f30.txt; fi
+    date=$((date + 60)); git add -A
+    GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "Merge $name-side into $name (conflicts resolved)"
+  done
+  commit "$name-tail.txt" "tail" "$name: after the merges"
+  git push -q origin "$name"
+}
+cd "$root/work"
+conflict_branch conflicts
+conflict_branch conflicts-key "$key"
+conflicts=$(git rev-parse conflicts)
+conflicts_key=$(git rev-parse conflicts-key)
+git checkout -q main
+# A fresh blob-less clone: nothing of these branches fetched yet, as in the workflow's checkout.
+clone="$root/clone-merges"
+git clone -q --filter=blob:none --no-checkout --single-branch --branch leaky "file://$root/origin.git" "$clone"
+HEAD_SHA="$conflicts" check "pull request: two merges with conflicts resolved by hand pass" 0 "gitleaks scanned 8 commit"
+HEAD_SHA="$conflicts" check "pull request: the same scan again (contents fetched) passes" 0
+HEAD_SHA="$conflicts_key" check "pull request: a key in a conflict resolution is found" 1
+clone="$root/clone"
+
 export EVENT_NAME=push BASE_SHA="" HEAD_SHA=""
 BEFORE="$fork_point" AFTER="$leaky" check "push: the pushed commits are scanned" 1 "pushed after"
 BEFORE="$(git rev-parse leaky~1)" AFTER="$leaky" check "push: only commits after the old tip" 0
