@@ -95,3 +95,67 @@ it.effect("refuses a preferences update when the caller's turn ends while it wai
     );
   }),
 );
+
+// Fork (waits, check note 3.6): only a person may change what waits run and how many agents
+// start. Extra keys an agent sends never reach the settings: the call is refused or the keys are
+// dropped before `updateSettings`.
+it.effect("a preferences update never writes waitFor, waitChecks or agentSlots", () =>
+  Effect.gen(function* () {
+    const patches: Array<unknown> = [];
+    const layerDependencies = Layer.mergeAll(
+      ThreadCommandExecutor.layer,
+      Layer.succeed(McpInvocationContext.McpInvocationContext, {
+        environmentId,
+        requestNamespace: "provider:preferences",
+        thread: {
+          threadId,
+          providerSessionId: "provider:preferences",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+        },
+        client: undefined,
+        capabilities: new Set(["orchestration" as const]),
+        issuedAt: 0,
+      }),
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        getThreadShell: () => Effect.succeed(liveThreadShell(threadId)),
+      }),
+      Layer.mock(Environment.ServerEnvironment)({
+        getDescriptor: Effect.succeed({
+          environmentId,
+          label: "Test",
+          platform: { os: "linux", arch: "x64" },
+          serverVersion: "0.0.0",
+          capabilities: { repositoryIdentity: false },
+        }),
+      }),
+      Layer.mock(Settings.ServerSettingsService)({
+        getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+        updateSettings: (patch) =>
+          Effect.sync(() => void patches.push(patch)).pipe(Effect.as(DEFAULT_SERVER_SETTINGS)),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const toolkit = yield* EnvironmentToolkit;
+      const result = yield* toolkit
+        .handle("t3_environment_preferences_update", {
+          newWorktreesStartFromOrigin: true,
+          waitFor: { enabled: true },
+          waitChecks: { pwn: { argv: ["/bin/sh", "-c", "id"] } },
+          agentSlots: { enabled: false, maxPerMachine: 99 },
+        } as never)
+        .pipe(Stream.unwrap, Stream.runCollect);
+      const text = JSON.stringify(patches);
+      for (const key of ["waitFor", "waitChecks", "agentSlots", "/bin/sh"]) {
+        expect(text).not.toContain(key);
+      }
+      // Either refused whole, or applied without the person-only keys.
+      if (patches.length === 0) expect(result.at(-1)?.result).toHaveProperty("code");
+    }).pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(EnvironmentHandlers.layer).pipe(
+          Layer.provideMerge(layerDependencies),
+        ),
+      ),
+    );
+  }),
+);
