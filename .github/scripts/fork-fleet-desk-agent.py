@@ -13,8 +13,11 @@ Each request is checked again here (wire.check_request: only the launcher's verb
 environment (PATH and LC_ALL only: the launcher and the walls read their own settings files, never a variable). A
 `start` runs only after `WALLS check` exits 0 (any other exit: no runner, answer 1). A verb still running at its
 limit (fork-fleet-desk-wire.py, "Time") is killed with its process group and answered 75 (UNKNOWN); when the session
-ends, every running verb is killed. The launcher's own 75 is answered 1. At most MAX_VERBS run at once. Time is
-CLOCK_BOOTTIME, which counts a sleep: a desktop that wakes finds its link and its verbs past their time at once.
+ends, every running verb is killed. The launcher's own 75 is answered 1. At most MAX_VERBS run at once; at most OUT_MAX
+frames wait to be sent (an always-on host that stops reading ends the session). Verbs the machine runs only itself
+(wire.LOCAL_ONLY: check-net, refresh) never come over the link. Time counts a sleep (Clock): CLOCK_BOOTTIME, plus
+any forward step of the wall clock against it (on WSL2 Windows' sleep pauses the distro, so BOOTTIME may not move and
+only the wall clock is stepped on resume): a desktop that wakes finds its link and its verbs past their time at once.
 
 The link drops (sleep, network, the always-on host restarts): the agent dials again after FIRST s, then BASE s
 doubling to MAX s, each with jitter; a wake from sleep dials at once. A wrong wire version (ssh exit 76, or a frame of
@@ -53,7 +56,9 @@ FIRST, BASE, MAX = (2, 10), 30, 900   # seconds: after a link that was up; then 
 CONNECT, DEAD = 15, 45   # ssh's connect time; no frame in DEAD s (serve pings every 15 s): the link is gone
 TERM_BEFORE, KILL_BEFORE = 3, 1   # seconds before a verb's limit: SIGTERM to its process group, then SIGKILL
 MAX_VERBS = 8
-SLEPT = 10   # BOOTTIME ran this many seconds ahead of MONOTONIC: the desktop slept
+OUT_MAX = 64   # frames waiting to be sent (at most MAX_FRAME bytes each): more, and the session ends
+SLEPT = 10   # BOOTTIME ran this many seconds ahead of MONOTONIC, or the wall clock ahead of BOOTTIME: the desktop slept
+SSH_EXIT = 2   # seconds ssh has to exit on its own after its stdout ends (it passes on serve's exit code, e.g. 76)
 
 
 def boottime():
@@ -62,6 +67,25 @@ def boottime():
 
 def slept_for():
     return boottime() - time.monotonic()
+
+
+class Clock:
+    """Seconds that count a sleep and never go back: BOOTTIME, plus each forward step of the wall clock against it of
+    more than SLEPT s between two reads. On a Linux sleep both move together (nothing added); on WSL2 Windows' sleep
+    pauses the distro and only the wall clock is stepped on resume. A wall clock set forward by hand (or a first time
+    sync that steps it) counts as a sleep too: the link is dialled again and running verbs are answered 75."""
+
+    def __init__(self):
+        self.lock, self.added, self.skew = threading.Lock(), 0.0, None
+
+    def __call__(self):
+        with self.lock:
+            now = boottime()
+            skew = time.time() - now
+            if self.skew is not None and skew - self.skew > SLEPT:
+                self.added += skew - self.skew
+            self.skew = skew
+            return now + self.added
 
 
 class Bad(Exception):
@@ -132,9 +156,10 @@ class Verb:
 class Session:
     """One ssh session: hello, then requests, pings and answers until it ends. run() -> (linked, exit code)."""
 
-    def __init__(self, conf, log, stopping):
-        self.conf, self.log, self.stopping = conf, log, stopping
-        self.out, self.verbs, self.lock = queue.Queue(), {}, threading.Lock()
+    def __init__(self, conf, log, stopping, clock=None):
+        self.conf, self.log, self.stopping, self.clock = conf, log, stopping, clock or Clock()
+        self.out, self.verbs, self.lock = queue.Queue(OUT_MAX), {}, threading.Lock()
+        self.jammed, self.closed = False, threading.Event()
 
     def say(self, msg):
         print(f'fork-fleet-desk-agent {self.conf["POOL"]}: {msg}', file=self.log, flush=True)
@@ -147,18 +172,24 @@ class Session:
             t.start()
         linked, code = False, None
         try:
-            self.out.put(wire.encode({'v': wire.VERSION, 'hello': self.conf['POOL']}))
+            self.send({'v': wire.VERSION, 'hello': self.conf['POOL']})
             reader, fd = wire.Reader(), self.proc.stdout.fileno()
-            heard = boottime()
+            heard = self.clock()
             while not self.stopping.is_set():
                 if select.select([fd], [], [], 0.5)[0]:
                     data = os.read(fd, 65536)
-                    if not data:
+                    if not data:   # ssh's stdout ends a moment before ssh exits with serve's code: wait for it
+                        try:
+                            self.proc.wait(SSH_EXIT)
+                        except subprocess.TimeoutExpired:
+                            pass
                         break
-                    heard = boottime()
+                    heard = self.clock()
                     for frame in reader.feed(data):
                         linked = self.frame(frame, linked)
-                now = boottime()
+                if self.jammed:
+                    raise Ended(f'the always-on host reads nothing: {OUT_MAX} frames wait to be sent')
+                now = self.clock()
                 if now - heard > (DEAD if linked else CONNECT + DEAD):
                     raise Ended(f'no word from the always-on host in {round(now - heard)} s (asleep, or the link '
                                 'is down)')
@@ -183,17 +214,17 @@ class Session:
             self.say('linked')
             return True
         if 'ping' in frame:
-            self.out.put(wire.encode({'v': wire.VERSION, 'pong': wire.check_ping(frame, 'ping')}))
+            self.send({'v': wire.VERSION, 'pong': wire.check_ping(frame, 'ping')})
             return True
         frame = wire.check_request(frame, with_id=True)
         with self.lock:
             if frame['id'] in self.verbs:
                 raise wire.WireError(f'request {frame["id"]} is running already')
             if len(self.verbs) >= MAX_VERBS:
-                self.out.put(wire.encode(wire.answer(1, stderr=f'fork-fleet-desk-agent: {MAX_VERBS} verbs run '
-                                                     'already: not run\n', ident=frame['id'])))
+                self.send(wire.answer(1, stderr=f'fork-fleet-desk-agent: {MAX_VERBS} verbs run already: not run\n',
+                                      ident=frame['id']))
                 return True
-            v = self.verbs[frame['id']] = Verb(frame['id'], frame, boottime())
+            v = self.verbs[frame['id']] = Verb(frame['id'], frame, self.clock())
         threading.Thread(target=self.do, args=(v,), daemon=True).start()
         return True
 
@@ -237,7 +268,14 @@ class Session:
             v.answered = True
         with self.lock:
             self.verbs.pop(v.ident, None)
-        self.out.put(wire.encode(wire.answer(code, out, err, ident=v.ident)))
+        self.send(wire.answer(code, out, err, ident=v.ident))
+
+    def send(self, frame):
+        """Queued for the writer; a full queue (the always-on host reads nothing) ends the session (run's loop)."""
+        try:
+            self.out.put_nowait(wire.encode(frame))
+        except queue.Full:
+            self.jammed = True
 
     def kill(self, v, sig):
         with v.lock:
@@ -274,7 +312,7 @@ class Session:
                 time.sleep(0.05)
         if verbs:
             self.say(f'session ended: killed {", ".join(v.verb for v in verbs)}')
-        self.out.put(None)
+        self.closed.set()
         if self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -290,7 +328,14 @@ class Session:
                     pass
 
     def write(self):
-        while (data := self.out.get()) is not None:
+        """Sends what is queued until the session is closed and nothing is left (or ssh is gone)."""
+        while True:
+            try:
+                data = self.out.get(timeout=0.2)
+            except queue.Empty:
+                if self.closed.is_set():
+                    break
+                continue
             try:
                 self.proc.stdin.write(data)
                 self.proc.stdin.flush()
@@ -308,11 +353,12 @@ class Session:
 
 
 def wait(seconds, stopping, now=boottime, gap=slept_for):
-    """Waits `seconds` of BOOTTIME; returns early on a stop, or True when the desktop slept meanwhile."""
-    until, slept = now() + seconds, gap()
+    """Waits `seconds` of BOOTTIME; returns early on a stop, or True when the desktop slept meanwhile: BOOTTIME ran
+    ahead of MONOTONIC, or the wall clock ahead of BOOTTIME (WSL2, see Clock), by more than SLEPT s."""
+    until, slept, skew = now() + seconds, gap(), time.time() - now()
     while not stopping.is_set() and now() < until:
         stopping.wait(min(5.0, max(0.0, until - now())))
-        if gap() - slept > SLEPT:
+        if gap() - slept > SLEPT or time.time() - now() - skew > SLEPT:
             return True
     return False
 

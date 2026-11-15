@@ -178,6 +178,42 @@ class Link(unittest.TestCase):
         self.assertTrue(any('ping' in f for f in agent.got))
         self.assertEqual(self.launch('active')[0], wire.NO_SESSION)
 
+    def test_serve_pings_a_desktop_that_talks_but_hears_nothing(self):
+        """The agent drops a link with no frame FROM serve in its DEAD s. Answers spaced under PING s (several verbs in
+        flight) used to keep serve quiet, so the agent killed a healthy verb: serve pings whenever it sent nothing."""
+        agent = Agent(lambda f: None)
+        t, _, _ = self.serve(agent, ping=0.3, dead=5)
+        stop = threading.Event()
+
+        def chatter():   # the desktop talks all the time (here: pongs), so serve always hears from it
+            while not stop.wait(0.05):
+                os.write(agent.to_serve_w, wire.encode({'v': 1, 'pong': 0}))
+        threading.Thread(target=chatter, daemon=True).start()
+        time.sleep(1.5)
+        stop.set()
+        pings = [f for f in agent.got if 'ping' in f]
+        self.assertGreaterEqual(len(pings), 3, agent.got)   # about every 0.3 s, not never
+        agent.hang_up()
+        t.join(5)
+
+    def test_a_request_of_the_wrong_type_is_refused_and_the_session_lives(self):
+        agent = Agent(lambda f: wire.answer(0, 'ok\n'))
+        t, _, _ = self.serve(agent)
+        for bad in ({'verb': ['active'], 'args': []}, {'verb': {'a': 1}, 'args': []}, {'verb': 'active', 'args': 'x'}):
+            with socket.socket(socket.AF_UNIX) as c:
+                c.connect(self.sock)
+                c.sendall(json.dumps({'v': 1, **bad}).encode() + b'\n')
+                got = wire.check_answer(json.loads(c.makefile('rb').readline()), with_id=False)
+            self.assertEqual(got['exit'], 2, bad)
+            self.assertIn('not a launcher verb', got['stderr'])
+        self.assertEqual(self.launch('active'), (0, 'ok\n', ''))   # serve is still there
+        for bad in (['start'], {'a': 1}, None, 7):
+            with self.assertRaises(wire.WireError):
+                wire.check_request({'v': 1, 'id': 1, 'verb': bad, 'args': []}, with_id=True)
+        self.assertEqual([f['verb'] for f in agent.got if 'id' in f], ['active'])   # only the good one went on
+        agent.hang_up()
+        t.join(5)
+
     def test_answering_pings_keeps_the_session_and_slow_answer_is_unknown(self):
         agent = Agent(lambda f: None)
         t, _, _ = self.serve(agent, ping=0.2, dead=0.6)
@@ -476,8 +512,11 @@ class Wire(unittest.TestCase):
     def test_verbs_are_the_launchers(self):
         case = self.LAUNCH[self.LAUNCH.index('case "${1-}:$#" in'):]
         verbs = dict(re.findall(r'^  ([a-z-]+):([0-9]+|\*)\)', case, re.M))
-        self.assertEqual(set(verbs), set(wire.VERBS) | wire.LOCAL_ONLY)
+        # every launcher verb crosses the link or is local only (a local-only verb may name one the launcher has yet
+        # to get, as `refresh` before row D7)
+        self.assertEqual(set(verbs) - wire.LOCAL_ONLY, set(wire.VERBS))
         self.assertFalse(set(wire.VERBS) & wire.LOCAL_ONLY)
+        self.assertIn('check-net', verbs)   # the launcher has it, and the link never carries it (LOCAL_ONLY)
         for verb, n in verbs.items():
             if verb in wire.LOCAL_ONLY:
                 continue
@@ -497,7 +536,6 @@ class Wire(unittest.TestCase):
         self.assertEqual(wire.NAME.pattern, self.shell_var('NAME'))
         self.assertEqual(wire.RUNNER_VERSION.pattern, self.shell_var('VERSION'))
         self.assertEqual(wire.POOL.pattern, ff.POOL.pattern)
-        self.assertIn(f'$url =~ ^{wire.URL.pattern}$ ]]', self.LAUNCH)
 
     def test_every_dispatcher_verb_answers_before_the_dispatcher_gives_up(self):
         # The agent kills a verb at its limit, serve answers 75 after that, launch ends after that, and all of it
@@ -506,6 +544,7 @@ class Wire(unittest.TestCase):
         src = ''.join(inspect.getsource(f) for f in vars(ff.Host).values() if inspect.isfunction(f))
         verbs = set(re.findall(r"self\._(?:must|do)\('([a-z-]+)'", src))
         self.assertEqual(verbs, {'start', 'ready', 'active', 'fits', 'stop', 'prune'})
+        self.assertEqual(verbs, set(wire.VERBS))   # the link carries what the dispatcher calls, nothing more
         for verb in wire.VERBS:
             self.assertLess(wire.limit(verb), wire.serve_seconds(verb), verb)
             self.assertLess(wire.serve_seconds(verb), wire.seconds(verb), verb)

@@ -547,8 +547,11 @@ the session), runs `start` only after `fork-fleet-walls.py check` passes, gives
 the launcher and the walls only `PATH` and `LC_ALL` (they read their own
 settings files), kills a verb at its limit (answer 75) and every running verb
 when the session ends, and dials again with backoff and jitter (at once after
-a sleep). One agent per desktop (a lock in `/run/fork-fleet-desk-agent`); the
-other settings and their defaults are in the script's header.
+a sleep, also on WSL2, where only the wall clock jumps). One agent per desktop
+(a lock in `/run/fork-fleet-desk-agent`); the other settings and their
+defaults are in the script's header. `check-net` (step 6) never comes over the
+link, so the always-on host cannot use it to probe the desktop's own network:
+run it by hand on the desktop.
 
 **What jobs need on the host.** The jobs run without sudo, so the host must
 already have:

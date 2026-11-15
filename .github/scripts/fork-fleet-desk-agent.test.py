@@ -51,6 +51,7 @@ hello = sys.stdin.buffer.readline()
 os.write(1, hello)
 for line in plan['lines']:
     os.write(1, line.encode() + b'\n')
+time.sleep(plan.get('deaf', 0))   # reads nothing meanwhile
 with open(os.path.join(d, 'got.jsonl'), 'ab') as f:
     while data := os.read(0, 65536):
         f.write(data); f.flush()
@@ -257,6 +258,40 @@ class Desk(unittest.TestCase):
             self.assertIn('session ends', log)
         self.assertEqual(self.calls(), [])
 
+    def test_the_link_never_carries_a_verb_the_machine_runs_only_itself(self):
+        # check-net connects as root, from the desktop's own network, to each HOST:PORT it is given and names the
+        # first it cannot reach: through the link, a map of the desktop's home network for the always-on host.
+        for verb, args in (('check-net', ['http://example.com', '192.168.1.1:445', '192.168.1.20:8006']),
+                           ('refresh', [])):
+            (linked, _), log = self.scripted({'lines': [json.dumps({'v': 1, 'id': 1, 'verb': verb, 'args': args})]})
+            self.assertTrue(linked)
+            self.assertIn('not a launcher verb', log)
+        self.assertEqual(self.calls(), [])
+        self.assertLessEqual({'check-net', 'refresh'}, wire.LOCAL_ONLY)
+
+    def test_a_request_of_the_wrong_type_ends_the_session_without_a_crash(self):
+        for line in ('{"v":1,"id":1,"verb":["start"],"args":[]}', '{"v":1,"id":1,"verb":{"a":1},"args":[]}',
+                     '{"v":1,"id":1,"verb":null,"args":[]}', '{"v":1,"id":1,"verb":"active","args":[["x"]]}'):
+            result, log = self.scripted({'lines': [line]})
+            self.assertIsNotNone(result, f'Session.run raised for {line}:\n{log}')
+            self.assertIn('session ends', log)
+        self.assertEqual(self.calls(), [])
+
+    def test_an_always_on_host_that_reads_nothing_ends_the_session(self):
+        # pings it never reads the pongs of: ssh's pipe fills, then at most OUT_MAX frames wait in the agent
+        pings = [json.dumps({'v': 1, 'ping': n}) for n in range(1, 8001)]
+        with mock.patch.object(A, 'OUT_MAX', 4):
+            result, log = self.scripted({'lines': pings, 'deaf': 60})
+        self.assertIsNotNone(result, log)
+        self.assertIn('reads nothing: 4 frames wait', log)
+
+    def test_serves_exit_76_survives_the_race_with_sshs_own_exit(self):
+        # real ssh closes its stdout on the channel's end a moment before it exits with the remote exit code
+        self.file('slow-ssh', '#!/bin/sh\necho "upgrade the desktop agent" >&2\nexec 1>&-\nsleep 0.3\nexit 76\n',
+                  0o755)
+        session = A.Session(A.load(self.settings(ssh='slow-ssh')), io.StringIO(), threading.Event())
+        self.assertEqual(session.run(), (False, wire.WRONG_VERSION))
+
     def test_a_wrong_wire_version_says_which_side_to_upgrade(self):
         for got, side in ((2, "this desktop's desk agent"), (0, "the always-on host's fork-fleet files")):
             (_, code), log = self.scripted({'lines': [json.dumps({'v': got, 'ping': 1})]})
@@ -286,6 +321,39 @@ class Desk(unittest.TestCase):
         self.assertTrue(linked)
         self.assertLess(time.monotonic() - began, 5)
         self.assertIn('asleep, or the link is down', log)
+
+    def test_a_wall_clock_jump_alone_is_a_sleep(self):
+        # WSL2: Windows' sleep pauses the distro; BOOTTIME may not move, only the wall clock is stepped on resume
+        real, jumped = time.time, []
+        threading.Timer(1.0, lambda: jumped.append(1)).start()
+        with mock.patch.object(A.time, 'time', lambda: real() + (3600 if jumped else 0)):
+            began = time.monotonic()
+            (linked, _), log = self.scripted({'lines': []})
+        self.assertTrue(linked)
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertIn('asleep, or the link is down', log)
+
+    def test_the_clock_counts_a_sleep_once_and_never_goes_back(self):
+        boot, wall = [100.0], [5000.0]
+        with mock.patch.object(A, 'boottime', lambda: boot[0]), mock.patch.object(A.time, 'time', lambda: wall[0]):
+            clock = A.Clock()
+            self.assertEqual(clock(), 100)
+            boot[0] += 600; wall[0] += 600       # a Linux sleep: BOOTTIME and the wall clock move together
+            self.assertEqual(clock(), 700)
+            wall[0] += 3600                       # WSL2: only the wall clock moves
+            self.assertEqual(clock(), 4300)
+            wall[0] -= 50                         # the wall clock set back: the clock does not go back
+            self.assertEqual(clock(), 4300)
+            boot[0] += 1; wall[0] += 1 + 5        # a small step (time sync): not a sleep
+            self.assertEqual(clock(), 4301)
+
+    def test_time_is_clock_boottime(self):
+        # the sleep tests patch boottime(); this one fails if it reads a clock that stops in a sleep
+        clocks = {time.CLOCK_BOOTTIME: 5000.0, time.CLOCK_MONOTONIC: 10.0}
+        with mock.patch.object(A.time, 'clock_gettime', lambda c: clocks.get(c, -1.0)), \
+                mock.patch.object(A.time, 'monotonic', lambda: 10.0):
+            self.assertEqual(A.boottime(), 5000.0)
+            self.assertEqual(A.slept_for(), 4990.0)
 
     # ------------------------------------------------------------ the loop, the settings, the unit
 
@@ -318,6 +386,16 @@ class Desk(unittest.TestCase):
         with mock.patch.object(stopping, 'wait', lambda s: t.__setitem__(0, t[0] + s)):
             self.assertTrue(A.wait(600, stopping, now=lambda: t[0], gap=lambda: next(gap)))
         self.assertLess(t[0], 600)
+
+    def test_wait_returns_early_when_only_the_wall_clock_jumped(self):
+        mono, wall, stopping = [1000.0], [5000.0], threading.Event()
+
+        def tick(seconds):
+            mono[0] += seconds
+            wall[0] += seconds + (3600 if mono[0] > 1010 else 0)   # resumed: time sync steps the wall clock only
+        with mock.patch.object(stopping, 'wait', tick), mock.patch.object(A.time, 'time', lambda: wall[0]):
+            self.assertTrue(A.wait(600, stopping, now=lambda: mono[0], gap=lambda: 0.0))
+        self.assertLess(mono[0], 1100)
 
     def test_one_agent_per_desktop(self):
         conf = A.load(self.settings())
