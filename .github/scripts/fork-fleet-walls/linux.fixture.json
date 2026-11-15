@@ -5,13 +5,15 @@
     "proc/sys/kernel/osrelease": "6.8.0-47-generic\n",
     "proc/1/comm": "systemd\n",
     "proc/sys/kernel/seccomp/actions_avail": "kill_process kill_thread trap errno user_notif trace log allow\n",
-    "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n",
+    "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n",
     "run/": "",
     "proc/self/ns/ipc": "",
     "proc/self/ns/mnt": "",
     "proc/self/ns/net": "",
     "proc/kallsyms": "0000000000000000 T __cgroup_bpf_run_filter_sk\n0000000000000000 T __cgroup_bpf_run_filter_skb\n",
-    "proc/cmdline": "BOOT_IMAGE=/vmlinuz-6.8.0-47-generic root=UUID=0 ro quiet\n"
+    "proc/cmdline": "BOOT_IMAGE=/vmlinuz-6.8.0-47-generic root=UUID=0 ro quiet\n",
+    "usr/": "",
+    "etc/": ""
   },
   "fail": {
     "os": [
@@ -54,8 +56,13 @@
       {"run/.containerenv": ""}
     ],
     "mounts": [
-      {"proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n50 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n"},
-      {"proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n51 29 8:33 / /mnt rw - ext4 /dev/sdc1 rw\n"}
+      {"proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n60 29 0:60 / /usr rw - nfs4 nas.example:/usr rw\n"},
+      {"proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw - cifs //nas.example/root rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n"},
+      {"etc/fork-fleet/launch.conf": "ALLOW_PATHS=/srv/share\n"},
+      {"etc/fork-fleet/launch.conf": "ALLOW_PATHS=/opt/tools\n", "opt/tools/": "", "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n61 29 0:61 / /opt/tools rw - 9p tools rw\n"},
+      {"etc/fork-fleet/launch.conf": "WORK_ROOT=/data/runners\n"},
+      {"etc/fork-fleet/launch.conf": "JOB_PATHS=/etc/fork-fleet/job-paths.txt\n"},
+      {"proc/self/mountinfo": null}
     ]
   }
 }

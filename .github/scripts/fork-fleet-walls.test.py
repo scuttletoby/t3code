@@ -9,6 +9,8 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, 'fork-fleet-walls.py')
 FOLDER = os.path.join(HERE, 'fork-fleet-walls')
+LAUNCHER = os.path.join(HERE, 'fork-fleet-launch.sh')
+JOB_PATHS = 'fork-fleet-job-paths.txt'   # the launcher's allow list of what jobs see, which the walls read too
 _spec = importlib.util.spec_from_file_location('fork_fleet_walls', SCRIPT)
 fw = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fw)
@@ -82,6 +84,9 @@ class Case(unittest.TestCase):
         os.makedirs(os.path.join(bin_dir, 'fork-fleet-walls'))
         shutil.copy(SCRIPT, bin_dir)
         os.chmod(os.path.join(bin_dir, 'fork-fleet-walls.py'), 0o755)
+        shutil.copy(os.path.join(HERE, JOB_PATHS), bin_dir)
+        os.chmod(os.path.join(bin_dir, JOB_PATHS), 0o644)
+        os.chmod(bin_dir, 0o755)
         if walls is None:
             walls = {n: slurp(os.path.join(FOLDER, n)) for n in OSES}
             fixtures = {n: slurp(os.path.join(FOLDER, n + '.fixture.json')) for n in OSES}
@@ -317,9 +322,14 @@ def fixture_problems(fixture, walls):
 
 
 class EveryWallsFile(Case):
-    """The contract every walls file must pass (fork-fleet-walls.py's docstring), run on each file in the folder."""
+    """The contract every walls file must pass (fork-fleet-walls.py's docstring), run on each file in the folder (an
+    installed copy, beside the launcher's allow list, with the modes an install gives)."""
+    def setUp(self):
+        super().setUp()
+        self.folder = os.path.join(os.path.dirname(self.install()), 'fork-fleet-walls')
+
     def walls(self, name, verb, root):
-        p = run([os.path.join(FOLDER, name), verb], root)
+        p = run([os.path.join(self.folder, name), verb], root)
         self.assertIn(p.returncode, (0, 1), f'{name} {verb}: exit {p.returncode}: {p.stderr}')
         marks = [fw.LINE.fullmatch(line) for line in p.stdout.splitlines()]
         self.assertTrue(all(marks), f'{name} {verb}: lines not in the contract: {p.stdout!r}')
@@ -357,7 +367,7 @@ class EveryWallsFile(Case):
             with self.subTest(name):
                 fixture = json.loads(slurp(os.path.join(FOLDER, f'{name}.fixture.json')))
                 for args in ([], ['start'], ['check', 'describe']):   # usage: exit 2, nothing on stdout
-                    p = run([os.path.join(FOLDER, name), *args], self.root({}))
+                    p = run([os.path.join(self.folder, name), *args], self.root({}))
                     self.assertEqual((p.returncode, p.stdout), (2, ''), f'{name} {args}')
                 ids, fails = self.both(name, self.root({}))   # an empty machine fails closed, `os` among them
                 self.assertIn('os', fails)
@@ -395,7 +405,7 @@ class EveryWallsFile(Case):
     def test_linux_escapes_what_it_prints(self):   # a mount's fs type with ESC in it, as the cgroup2 wall prints it
         mountinfo = '29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - cg\x1b[2J\u202eb x rw\n'
         root = self.root(overlay(LINUX, {'proc/self/mountinfo': mountinfo}))
-        p = run([os.path.join(FOLDER, 'linux'), 'describe'], root)
+        p = run([os.path.join(self.folder, 'linux'), 'describe'], root)
         self.assertEqual(p.returncode, 1, p.stderr)
         line = next(x for x in p.stdout.splitlines() if x.startswith('FAIL  cgroup2'))
         self.assertRegex(line, fw.LINE)
@@ -406,6 +416,30 @@ class EveryWallsFile(Case):
             with self.subTest(config):
                 root = self.root(overlay(LINUX, {'proc/kallsyms': None, 'boot/config-6.8.0-47-generic': config}))
                 self.assertEqual(EveryWallsFile.walls(self, 'linux', 'check', root)[1], want)
+
+    def test_linux_mounts_needs_the_launchers_rule_in_place(self):   # its allow list, safe as owned_safe wants it
+        allow = os.path.join(os.path.dirname(self.folder), JOB_PATHS)
+        def gone(): os.remove(allow)
+        def open_list(): os.chmod(allow, 0o664)
+        def a_link(): os.rename(allow, allow + '.real'); os.symlink(allow + '.real', allow)
+        def lists_home(): write(allow, '/usr\n/home\n')
+        def lists_dots(): write(allow, '/usr/../home\n')
+        for change in (gone, open_list, a_link, lists_home, lists_dots):
+            with self.subTest(change.__name__):
+                self.folder = os.path.join(os.path.dirname(self.install()), 'fork-fleet-walls')
+                allow = os.path.join(os.path.dirname(self.folder), JOB_PATHS)
+                change()
+                self.assertIn('mounts', self.walls('linux', 'check', self.root(LINUX))[1])
+
+    def test_linux_mounts_reads_what_the_launcher_reads(self):   # its defaults and the allow list's place
+        launcher = slurp(LAUNCHER)
+        self.assertIn('conf=${FORK_FLEET_LAUNCH_CONF:-/etc/fork-fleet/launch.conf}', launcher)
+        self.assertIn('/fork-fleet-job-paths.txt', launcher)
+        linux = slurp(os.path.join(FOLDER, 'linux'))
+        for key, default in re.findall(r"'([A-Z_]+)': '(/[^']+)'", linux):
+            with self.subTest(key):
+                self.assertRegex(launcher, rf'(^|\s){key}={re.escape(default)}(\s|$)')
+        self.assertTrue(os.path.isfile(os.path.join(HERE, JOB_PATHS)))
 
     def test_this_machine_gets_an_answer(self):
         for name in OSES:   # on the real machine: exit 0 or 1 in the contract, never a crash
