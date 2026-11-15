@@ -10,12 +10,12 @@
       "knownUnits": ["example-app.service", "dbus.service"],
       "knownContainers": ["example-dev-db"],
       "testPatterns": [
-        "(^|/)pytest( |$)",
+        "(^|[ /])pytest( |$)",
         "\\.test\\.(py|sh|cjs)( |$)",
-        "gradle.*Test",
+        "GradleWorkerMain( |$)",
         "testcontainers"
       ],
-      "ignorePatterns": ["^tmux ", "^ssh-agent"]
+      "ignorePatterns": ["^(tmux|screen|SCREEN)( |:|$)", "^-", "^ssh-agent"]
     }
   }
 }
