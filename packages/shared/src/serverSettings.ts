@@ -3,7 +3,6 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_TEXT_GENERATION_MODEL,
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
-  DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   defaultInstanceIdForDriver,
   globalIdleCompaction,
   type IdleCompactionMode,
@@ -29,6 +28,7 @@ import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import { deepMerge } from "./Struct.ts";
+import { applyForkSettingsPatch, splitForkSettingsPatch } from "./forkSettingsPatch.ts";
 import { fromLenientJson } from "./schemaJson.ts";
 import { createModelSelection, readCustomModelEntries } from "./model.ts";
 import {
@@ -251,22 +251,6 @@ function mergeSettingsEntries<Value>(
   return Object.fromEntries(next);
 }
 
-/** Fork: per instance and per field; a field left out keeps its stored value (or default). */
-function mergeUsagePacing(
-  current: ServerSettings["usagePacing"],
-  patch: NonNullable<ServerSettingsPatch["usagePacing"]>,
-): ServerSettings["usagePacing"] {
-  const next = new Map(Object.entries(current));
-  for (const [id, entry] of Object.entries(patch)) {
-    if (entry === null) {
-      next.delete(id);
-    } else {
-      next.set(id, { ...DEFAULT_USAGE_PACING_INSTANCE_SETTINGS, ...next.get(id), ...entry });
-    }
-  }
-  return Object.fromEntries(next);
-}
-
 // Secret persistence keys tokens by trimmed, lowercased host, so merge on the same key.
 const byHost = (tokens: unknown) =>
   Object.fromEntries(
@@ -405,6 +389,7 @@ export function applyServerSettingsPatch(
   rawPatch: ServerSettingsPatch,
 ): ServerSettings {
   const patch = translateLegacyProjectOverridePatch(current, rawPatch);
+  const [forkPatch, upstreamPatch] = splitForkSettingsPatch(patch); // Fork: forkSettingsPatch.ts
   const selectionPatch = patch.textGenerationModelSelection;
   const {
     migrateModelPreferences,
@@ -414,19 +399,11 @@ export function applyServerSettingsPatch(
     providerModelPreferences,
     automaticGitFetchInterval,
     providerHealthRefreshInterval,
-    // Fork: a Duration is replaced whole; deepMerge would turn it into a plain object.
-    headlessUsageRefreshInterval,
     backgroundActivityProfile,
     backgroundActivity,
     worktreeCleanup: worktreeCleanupPatch,
     // Merged per entry below; its `null` removals must not reach deepMerge.
     usageLimitSources: usageLimitSourcesPatch,
-    usagePacing: usagePacingPatch,
-    // Fork: replaced whole; deepMerge would keep levels the client meant to clear.
-    usagePacingLowerEffort,
-    // Fork: replaced whole; deepMerge would keep checks and account limits the client removed.
-    waitChecks,
-    agentSlots: agentSlotsPatch,
     textGenerators: textGeneratorsPatch,
     secretProviders: secretProvidersPatch,
     sourceControlHosts: sourceControlHostsPatch,
@@ -438,7 +415,7 @@ export function applyServerSettingsPatch(
     projectAutoPullOverrides: _legacyAutoPull,
     projectScriptOverrides: _legacyScripts,
     ...patchForMerge
-  } = patch;
+  } = upstreamPatch;
   const currentBackgroundActivity = normalizeServerBackgroundActivitySettings(current);
   const backgroundActivityPatch =
     backgroundActivityProfile !== undefined
@@ -645,9 +622,6 @@ export function applyServerSettingsPatch(
           ),
         }
       : {}),
-    ...(usagePacingPatch !== undefined
-      ? { usagePacing: mergeUsagePacing(current.usagePacing, usagePacingPatch) }
-      : {}),
     ...(textGeneratorsPatch !== undefined
       ? { textGenerators: mergeSettingsEntries(current.textGenerators, textGeneratorsPatch) }
       : {}),
@@ -678,12 +652,7 @@ export function applyServerSettingsPatch(
       : {}),
     ...(automaticGitFetchInterval !== undefined ? { automaticGitFetchInterval } : {}),
     ...(providerHealthRefreshInterval !== undefined ? { providerHealthRefreshInterval } : {}),
-    ...(headlessUsageRefreshInterval !== undefined ? { headlessUsageRefreshInterval } : {}),
-    ...(usagePacingLowerEffort !== undefined ? { usagePacingLowerEffort } : {}),
-    ...(waitChecks !== undefined ? { waitChecks } : {}),
-    ...(agentSlotsPatch !== undefined
-      ? { agentSlots: { ...current.agentSlots, ...agentSlotsPatch } }
-      : {}),
+    ...applyForkSettingsPatch(current, forkPatch),
   };
   const normalizedBackgroundActivity = normalizeBackgroundActivitySettings(
     nextWithReplacementsBase.backgroundActivity,
