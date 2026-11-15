@@ -367,7 +367,7 @@ class DeskKey(unittest.TestCase):
         with open(doc, encoding='utf-8') as f:
             text = f.read()
         for code in (OK, PROBLEM, REFUSED, MISSING, ERROR):
-            self.assertRegex(text, rf'\n\| {code} \|')
+            self.assertRegex(text, rf'\n\| {code} +\|')
         self.assertEqual((OK, PROBLEM, REFUSED, MISSING, ERROR), (dk.OK, dk.PROBLEM, dk.REFUSED, dk.MISSING, dk.ERROR))
         self.assertEqual(self.run_tool('add', 'desk', stdin=b'junk\n')[0], REFUSED)
         self.assertEqual(self.run_tool('status', 'desk')[0], MISSING)
@@ -460,8 +460,14 @@ class DeskKey(unittest.TestCase):
             self.assertEqual(d2, [], f'the desk link (row D2) is here, but {os.path.basename(dk.DESK)} is not: '
                                      'point DESK and SERVE at its program')
             self.skipTest('the desk link (row D2) is not here yet')
-        with open(desk, encoding='utf-8') as f:
-            self.assertIn(f'{dk.DESK} serve POOL', ' '.join(f.read().split()), 'its usage names another path')
+        spec = importlib.util.spec_from_file_location('fork_fleet_desk', desk)
+        d2 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(d2)                   # its own constants, not its comments
+        for name in ('FORCED', 'INSTALLED', 'USER'):
+            self.assertTrue(hasattr(d2, name), f'the desk link (row D2) no longer defines {name}')
+        self.assertEqual((dk.SERVE, dk.DESK, dk.USER), (d2.FORCED, d2.INSTALLED, d2.USER),
+                         'the key tool and the desk link (row D2) name a different forced command, program or user')
+        self.assertIn(f'command="{d2.FORCED} desk" ', dk.line_for('desk', K1))
         argv = shlex.split(dk.line_for('desk', K1).split('"')[1])
         self.assertEqual(argv[:4], [dk.PYTHON, '-I', dk.DESK, 'serve'])
         run = os.path.join(self.tmp, 'run')

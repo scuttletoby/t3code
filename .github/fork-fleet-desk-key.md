@@ -26,13 +26,13 @@ contains a desk line) is shown by `status` and `remove` and never changed: edit 
 
 ## Exit codes
 
-| Code | Meaning |
-|---|---|
-| 0 | done; `status`: every line is the exact line this version writes |
-| 1 | `status` or `remove` found a problem: a wrong line (run `remove`, then `add`), a line of a retired pool (run `remove POOL`), or a line naming a pool that the tool cannot read (edit it by hand) |
-| 2 | refused, nothing changed: bad input, unknown pool, wrong user, unsafe file, bad config, bad usage |
-| 3 | `status`: a desk pool has no line (and nothing else is wrong) |
-| 4 | error: an unexpected failure (for example a full disk); the file is the old one or the new one, never half |
+| Code | Meaning                                                                                                                                                                                          |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0    | done; `status`: every line is the exact line this version writes                                                                                                                                 |
+| 1    | `status` or `remove` found a problem: a wrong line (run `remove`, then `add`), a line of a retired pool (run `remove POOL`), or a line naming a pool that the tool cannot read (edit it by hand) |
+| 2    | refused, nothing changed: bad input, unknown pool, wrong user, unsafe file, bad config, bad usage                                                                                                |
+| 3    | `status`: a desk pool has no line (and nothing else is wrong)                                                                                                                                    |
+| 4    | error: an unexpected failure (for example a full disk); the file is the old one or the new one, never half                                                                                       |
 
 ## The desk-link user
 
