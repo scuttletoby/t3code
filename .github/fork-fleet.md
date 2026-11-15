@@ -373,6 +373,7 @@ done
   base=https://raw.githubusercontent.com/scuttletoby/t3code/$sha/.github
   files="fork-fleet.json:fork-fleet.json:644 scripts/fork-fleet.py:fork-fleet.py:644
          scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755
+         scripts/fork-fleet-desk.py:fork-fleet-desk.py:644 scripts/fork-fleet-desk-wire.py:fork-fleet-desk-wire.py:644
          scripts/fork-fleet-refresh.service:fork-fleet-refresh.service:644
          scripts/fork-fleet-refresh.timer:fork-fleet-refresh.timer:644"
   for f in $files; do
@@ -383,6 +384,8 @@ done
   out=$(python3 -I "$tmp/fork-fleet.py" --config "$tmp/fork-fleet.json" gate </dev/null 2>&1 || true)
   grep -q 'no Runner.Worker above this hook' <<<"$out" || { printf '%s\n' "$out"; exit 1; }
   bash -n "$tmp/hook.sh" && bash -n "$tmp/fork-fleet-launch.sh"
+  out=$(python3 -I "$tmp/fork-fleet-desk.py" 2>&1 || true)   # the desk link loads its wire format
+  grep -q 'usage: serve POOL' <<<"$out" || { printf '%s\n' "$out"; exit 1; }
   install -d -m 755 /opt/fork-fleet
   for f in $files; do
     IFS=: read -r src dst mode <<<"$f"
@@ -477,6 +480,63 @@ leaves running jobs alone.
 that runs `fork-fleet-launch.sh` on the PC over ssh. Run the dispatcher with
 `--pool vm` until then. Without its dispatcher, `pc` has no heartbeat, and
 `route` never counts it. Whether and how the PC joins is an owner decision.
+
+### The desk link (a desktop pool)
+
+A desktop accepts no connection and holds no GitHub token. Its desk agent dials
+out to the always-on host over ssh, as a dedicated unprivileged user (default
+`fleet-desk`, never root), with a key that may only run `serve` for its own
+pool. The pool's dispatcher on the always-on host sends the launcher's verbs
+through that one session (`fork-fleet-desk.py`, its wire format
+`fork-fleet-desk-wire.py`). Once per always-on host, as root (step 3 installs
+both files):
+
+```sh
+# The desk-link user: a real shell (sshd runs the forced command through it, so nologin would close the link) and no
+# password ('*': none, but not locked; a locked '!' account can be refused by sshd). Its key lines limit it.
+useradd --system --create-home --home-dir /var/lib/fleet-desk --shell /bin/sh fleet-desk
+usermod -p '*' fleet-desk
+# The socket directory, at every boot: owned by that user, its group is the socket group (who may connect).
+echo 'd /run/fork-fleet-desk 0710 fleet-desk fleet-desk -' > /etc/tmpfiles.d/fork-fleet-desk.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/fork-fleet-desk.conf
+# Per desk pool: the desktop's public key, as the desk-link user, with the key tool fork-fleet-desk-key.py
+# (row D4 of the desktop-pool design; install it beside the others).
+sudo -u fleet-desk -H python3 -I /opt/fork-fleet/fork-fleet-desk-key.py add POOL < desk-POOL.pub
+```
+
+The line it writes (and the only kind of line that user's key file holds) is
+`restrict,command="python3 -I /opt/fork-fleet/fork-fleet-desk.py serve POOL" ssh-ed25519 AAAA... fork-fleet-desk:POOL`
+in `~fleet-desk/.ssh/authorized_keys`. The pool's launch command in the
+project's fleet config is
+`"launch": ["python3", "-I", "/opt/fork-fleet/fork-fleet-desk.py", "launch", "POOL"]`.
+Another user name: use it in all three places above, and give the dispatcher
+`Environment=FORK_FLEET_DESK_USER=NAME`. Another socket group: the group in the
+tmpfiles line; the desk-link user must be in it, and so must the dispatcher's
+user when that is not root.
+
+`serve` keeps one session per pool (a lock), listens on a 0660 socket in
+`/run/fork-fleet-desk` (it lets in only root, its own user and the socket
+group), and pings the agent; `launch` fails at once (exit 3) when no session is
+live, so a sleeping desktop's pool is down for the pass and `route` sends its
+jobs elsewhere. The dispatcher says so once, then every 10 minutes with a count,
+and once more when the desktop answers again. A verb with no answer in its time
+exits 75: it may or may not have run, and the next pass's `active` tells.
+
+**One dispatcher per desk pool.** Run each desk pool's dispatcher as its own
+unit (a copy of step 5's unit named `t3code-fleet-dispatcher-POOL`, with
+`dispatch --pool POOL`), never in the vm pool's unit: one dispatcher serves its
+pools one after another, and a desktop that answers each verb just inside its
+time could hold a pass for minutes, so the vm pool would wait behind the least
+trusted machine. A second dispatcher for a pool that one already serves refuses
+to start (the lock `/run/fork-fleet/dispatch-POOL.lock`) and its unit keeps
+failing every 30 s: stop it.
+
+**From an older desk link** (serve as root, the key in root's
+authorized_keys): remove that key line and `PermitRootLogin
+forced-commands-only`, do the steps above, and restart the host or remove the
+old `/run/fork-fleet-desk` first (`serve` refuses a lock file or directory left
+by root, with a message that says so). A desk agent of an older wire version
+gets exit 76 and a line that says to upgrade it.
 
 **What jobs need on the host.** The jobs run without sudo, so the host must
 already have:
