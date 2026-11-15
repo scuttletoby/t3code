@@ -8,6 +8,7 @@
 .github/scripts/fork-ci-tests.test.cjs
 .github/scripts/fork-contracts.test.py
 .github/scripts/fork-fleet-desk-key.test.py
+.github/scripts/fork-fleet-desk.test.py
 .github/scripts/fork-fleet.test.py
 .github/scripts/fork-gate-trust-docs.test.py
 .github/scripts/fork-head-gate-workflow.test.py
@@ -37,6 +38,9 @@ fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 fork-kit/common/tests/machine_file.test.py
+fork-kit/golive/tests/check.test.py
+fork-kit/golive/tests/contract.test.py
+fork-kit/golive/tests/journal.test.py
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py
 fork-kit/gh-apps/tests/policy.test.py
