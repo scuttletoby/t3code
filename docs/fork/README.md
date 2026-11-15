@@ -48,7 +48,7 @@ that does nothing while the switch is off.
 
 A server installed as a boot service (`t3 service install`) updates itself to the newest fork release
 once no thread is working. Off: it updates only when someone runs `t3 update` or presses **Update**.
-Upstream has a setting of the same name that defaults on; the fork keeps `false` through every sync.
+Upstream has a setting of this name pending (not on its `main` yet); the fork keeps `false` through every sync.
 
 Switch on in `settings.json`: `"automaticUpdates": true`. There is no Settings row for it yet. An
 admin policy with updates `"off"` still wins. Details: [updates.md](updates.md).
@@ -102,7 +102,7 @@ woken with the result. `wait_list` and `wait_cancel` list and end them. While of
 judged nor delivered; listing and cancelling still work. Other fields set deadlines, limits per
 thread and how often each kind is checked.
 
-Switch on: **Settings → Waits**, "Let agents wait for events", or in `settings.json`:
+Switch on: **Settings → Threads**, section Waits (shown while a server is connected), "Let agents wait for events", or in `settings.json`:
 `"waitFor": { "enabled": true }`.
 
 ### `server.waitChecks`
@@ -112,7 +112,7 @@ fixed arguments, no shell; exit 0 means the event happened. It runs unsandboxed 
 with the server's environment, so use fixed programs that run no files from the repository (no test
 runners or build scripts). Only the person can add one; agents cannot.
 
-Add one: **Settings → Wait checks → Add check**, or in `settings.json`:
+Add one: **Settings → Threads**, section Wait checks, **Add check**, or in `settings.json`:
 
 ```json
 { "waitChecks": { "build-done": { "argv": ["test", "-f", "/tmp/build.done"] } } }
@@ -127,7 +127,7 @@ above `maxPerAccount` per provider account, or below `minFreeMemoryMb` of free m
 started in other ways are counted but never refused. With `waitFor` on, an agent can wait for a slot
 instead of retrying.
 
-Switch on: **Settings → Agent slots**, "Limit running agents", or in `settings.json`:
+Switch on: **Settings → Threads**, section Agent slots, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is
 refused.
 
@@ -179,8 +179,8 @@ cd t3code && vp i && vp run build:desktop
 node apps/server/dist/bin.mjs
 ```
 
-A server run this way is not updated by `t3 update` or a boot service; update it with `git pull` and
-a rebuild.
+A build made this way does not know it is the fork: its `t3 update` and `t3 service install` would
+fetch upstream's releases. Do not use them on it; update it with `git pull` and a rebuild.
 
 **A machine that already runs T3 as a boot service.** Do not switch it by hand. The go-live kit
 ([fork-kit/golive](../../fork-kit/golive/README.md)) is for this: today it has only its read-only
