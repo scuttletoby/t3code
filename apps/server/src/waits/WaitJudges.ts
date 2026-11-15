@@ -13,10 +13,12 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { judgeExit, type Judgement, messageText, validateWaitSpec } from "@t3tools/shared/waitFor";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import type * as PlatformError from "effect/PlatformError";
+import * as Semaphore from "effect/Semaphore";
 import type { ServerSettings } from "@t3tools/contracts";
 
 import * as ProcessRunner from "../processRunner.ts";
@@ -337,6 +339,8 @@ const timeoutOptions = (seconds: number) => ["-k", "2", `${seconds}`];
 /** The exit code the `timeout` test run asks for, so a usage error (exit 1) cannot pass it. */
 const TIMEOUT_TEST_EXIT = 42;
 const TIMEOUT_TEST_LIMIT_MS = 5_000;
+/** How long after a test run that hung `timeout` is tested again; checks run without it meanwhile. */
+const TIMEOUT_TEST_RETRY_MS = 10 * 60_000;
 
 /** The command line a check runs as: under `timeout` when there is one (Linux), else as it is. */
 export function checkCommandLine(
@@ -353,28 +357,45 @@ export function checkCommandLine(
   };
 }
 
+/** How a `timeout` program answered its test run; `hung` when the test run itself did not end. */
+type TimeoutProgramTest = "works" | "refused" | "hung";
+
 /**
  * Whether `program` runs a command with the options `checkCommandLine` gives and passes its exit
  * code back. An older BusyBox `timeout` refuses `-k` with exit 1, which a check would read as "not
- * yet" for ever, so such a program is not used.
+ * yet" for ever, so such a program is not used. A test run that is killed at its own limit (a very
+ * busy host) says nothing either way.
  */
-export const timeoutProgramWorks = (program: string): Effect.Effect<boolean> =>
-  Effect.callback<boolean>((resume) => {
+export const testTimeoutProgram = (
+  program: string,
+  limitMs: number = TIMEOUT_TEST_LIMIT_MS,
+): Effect.Effect<TimeoutProgramTest> =>
+  Effect.callback<TimeoutProgramTest>((resume) => {
     let child: NodeChildProcess.ChildProcess;
     try {
       child = NodeChildProcess.execFile(
         program,
         [...timeoutOptions(10), "/bin/sh", "-c", `exit ${TIMEOUT_TEST_EXIT}`],
-        { timeout: TIMEOUT_TEST_LIMIT_MS, killSignal: "SIGKILL", windowsHide: true },
-        (error) =>
+        { timeout: limitMs, killSignal: "SIGKILL", windowsHide: true },
+        (error) => {
+          const failure = error as {
+            readonly code?: unknown;
+            readonly killed?: unknown;
+            readonly signal?: unknown;
+          } | null;
           resume(
             Effect.succeed(
-              (error as { readonly code?: unknown } | null)?.code === TIMEOUT_TEST_EXIT,
+              failure?.code === TIMEOUT_TEST_EXIT
+                ? "works"
+                : failure?.killed === true && failure.signal === "SIGKILL"
+                  ? "hung"
+                  : "refused",
             ),
-          ),
+          );
+        },
       );
     } catch {
-      resume(Effect.succeed(false));
+      resume(Effect.succeed("refused"));
       return;
     }
     return Effect.sync(() => {
@@ -382,39 +403,71 @@ export const timeoutProgramWorks = (program: string): Effect.Effect<boolean> =>
     });
   });
 
-/** The first of `programs` that exists and works as `timeoutProgramWorks` tests it; else null. */
-export const findTimeoutProgram = Effect.fnUntraced(function* (programs: ReadonlyArray<string>) {
+/**
+ * The first of `programs` that exists and works as `testTimeoutProgram` tests it, else null.
+ * `known` is false when a program before the answer hung in its test, so a later look may differ.
+ */
+export const findTimeoutProgram = Effect.fnUntraced(function* (
+  programs: ReadonlyArray<string>,
+  timing: { readonly limitMs?: number; readonly retryMs?: number } = {},
+) {
+  const limitMs = timing.limitMs ?? TIMEOUT_TEST_LIMIT_MS;
+  const retryMs = timing.retryMs ?? TIMEOUT_TEST_RETRY_MS;
+  let known = true;
   for (const program of programs) {
     if (!NodeFS.existsSync(program)) continue;
-    if (yield* timeoutProgramWorks(program)) return program;
+    const test = yield* testTimeoutProgram(program, limitMs);
+    if (test === "works") return { program, known };
+    if (test === "hung") {
+      known = false;
+      yield* Effect.logWarning(
+        `waits: ${program} did not answer its test run in ${Duration.format(Duration.millis(limitMs))}, so checks run without it for now; it is tested again in ${Duration.format(Duration.millis(retryMs))}.`,
+      );
+      continue;
+    }
     yield* Effect.logWarning(
       `waits: ${program} does not take "${timeoutOptions(1).slice(0, 2).join(" ")}", so checks run without it; a check left behind by a server crash runs until it ends by itself.`,
     );
   }
-  return null;
+  return { program: null, known };
 });
 
 /**
  * Runs a named check from settings without a shell, in the project's main workspace root, with a
  * timeout and an output cap. The check is looked up again on every run in the thread's current
  * project; a removed or narrowed check is a permanent error. A wait brings no command, cwd or env.
- * For tests: `timeoutProgram` (used as is), `timeoutPrograms` (looked for and tested on Linux).
+ * Test options: `timeoutProgram`, `timeoutPrograms` (tested on Linux) and `timeoutTest` timing.
  */
 export const makeCheckJudge = Effect.fn("WaitJudges.makeCheckJudge")(function* (input: {
   readonly placeOf: (context: WaitJudgeContext) => Effect.Effect<CheckPlace>;
   readonly timeoutProgram?: string | null;
   readonly timeoutPrograms?: ReadonlyArray<string>;
+  readonly timeoutTest?: { readonly limitMs?: number; readonly retryMs?: number };
 }) {
+  const timing = input.timeoutTest ?? {};
   const settingsService = yield* ServerSettingsService;
   const runner = yield* ProcessRunner.ProcessRunner;
   const platform = yield* HostProcess.Platform;
-  // Looked for and tested at the first check, once.
-  const timeoutProgram = yield* Effect.cached(
+  // Looked for and tested at the first check, and kept once the answer is known. A test run that
+  // hung says nothing, so it is tested again at a later check; until then checks run without it.
+  let found: { readonly program: string | null } | null =
     input.timeoutProgram !== undefined
-      ? Effect.succeed(input.timeoutProgram)
+      ? { program: input.timeoutProgram }
       : platform !== "linux"
-        ? Effect.succeed(null)
-        : findTimeoutProgram(input.timeoutPrograms ?? TIMEOUT_PROGRAMS),
+        ? { program: null }
+        : null;
+  let testAgainAt = 0;
+  const finding = yield* Semaphore.make(1);
+  const timeoutProgram = finding.withPermits(1)(
+    Effect.gen(function* () {
+      if (found !== null) return found.program;
+      const now = yield* Clock.currentTimeMillis;
+      if (now < testAgainAt) return null;
+      const result = yield* findTimeoutProgram(input.timeoutPrograms ?? TIMEOUT_PROGRAMS, timing);
+      if (result.known || result.program !== null) found = { program: result.program };
+      else testAgainAt = now + (timing.retryMs ?? TIMEOUT_TEST_RETRY_MS);
+      return result.program;
+    }),
   );
   const judge: WaitJudge<"check"> = Effect.fn("WaitJudges.check")(function* ({ spec }, context) {
     const settings = yield* settingsService.getSettings.pipe(Effect.option);
