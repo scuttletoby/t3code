@@ -26,7 +26,13 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                never cancels the scan of an older head; fork-tests.yml's `secrets` job calls it (the
                check a ruleset requires), and no other fork workflow runs the scan script. Its scan
                step runs the script read from the default branch's tip (CONFIG_BRANCH), never the
-               checkout's copy.
+               checkout's copy. In the job that scans, no step runs the checkout's code (only the
+               pinned checkout action and steps that run no workspace file or interpreter), nothing
+               may fail quietly (continue-on-error) and no other job's output comes in (needs): the
+               pull request's own tests run in a job of their own. The earlier-heads lookup keeps its
+               exact form (a failure fails the job; both tips of each activity entry; nothing empties
+               the list). The jobs' if: conditions are evaluated as GitHub does for each kind of run.
+               A daily schedule (and workflow_dispatch) runs the sweep.
   removed      .github/fork-removed-workflows.txt (the upstream workflows the fork deletes, kept
                deleted by fork-follow.sh) is there, every line is an upstream workflow path, none of
                them is in the tree, and it names the files the owner decided to delete.
@@ -898,6 +904,217 @@ SCAN_FILE = "fork-secret-scan.yml"
 SCAN_CALL = "./.github/workflows/" + SCAN_FILE
 
 
+# A step that runs code from the workspace (the checkout): a relative path, a script file, an
+# interpreter or a package manager, or the workspace itself.
+INTERPRETER = (r"(?<![\w.$/-])(?:bash|sh|zsh|source|eval|exec|python3?|node|npm|npx|pnpm|bun|yarn|make|perl|ruby)\b"
+               r"|GITHUB_WORKSPACE|github\.workspace")
+CHECKOUT_CODE = re.compile(
+    r"""(?:^|[\s;&|(<>'"=])(?:\.\.?/|\.github/|[\w.-]+/|[\w-]+\.(?:sh|py|js|mjs|cjs|ts|pl|rb)\b)|""" + INTERPRETER)
+SCAN_STEP_CODE = re.compile(r"(?:^|[\s;&|(])\.\.?/|" + INTERPRETER)
+CHECKOUT_ACTION = re.compile(r"actions/checkout@[0-9a-f]{40}")
+SCAN_RUN_LINE = 'bash "$RUNNER_TEMP/scan-from-default-branch.sh"'
+
+
+def scan_job_problems(scan):
+    """The job that scans runs nothing from the checkout, before or after the scan (s1 of PR #214: a
+    pull request's test script, run on the same runner first, could swap gitleaks or write
+    GITHUB_ENV / GITHUB_PATH, and main's scan would then pass a key)."""
+    problems = []
+    for j, job in (scan.get("jobs") or {}).items():
+        job_steps = job.get("steps") or []
+        if not any("scan-from-default-branch" in str(s.get("run", "")) for s in job_steps):
+            continue
+        if "needs" in job:
+            problems.append(f"{SCAN_FILE}/{j}: needs another job (its outputs could reach the scan)")
+        if job.get("continue-on-error"):
+            problems.append(f"{SCAN_FILE}/{j}: continue-on-error (a failed scan would pass)")
+        for i, step in enumerate(job_steps):
+            label = f"{SCAN_FILE}/{j} step {i + 1} ({step.get('name', step.get('uses', 'run'))})"
+            if step.get("continue-on-error"):
+                problems.append(f"{label}: continue-on-error (a failed step would pass)")
+            if "uses" in step:
+                if not CHECKOUT_ACTION.fullmatch(str(step["uses"])):
+                    problems.append(f"{label}: an action other than the pinned checkout runs in the scan job")
+                continue
+            run = str(step.get("run", ""))
+            if "scan-from-default-branch" in run:
+                # The scan step: git, gh and the one line that runs the default branch's script.
+                run = run.replace(SCAN_RUN_LINE, "")
+                run = re.sub(r'git show "[^"\s]*:\.github/scripts/fork-secret-scan\.sh"', "git show", run)
+                found = SCAN_STEP_CODE.search(run)
+            else:
+                found = CHECKOUT_CODE.search(run)
+            if found:
+                problems.append(f"{label}: may run the checkout's code ({found.group(0).strip()!r}); the pull "
+                                "request's own tests belong in a job of their own")
+    return problems
+
+
+# The earlier-heads lookup of the scan step, exactly: a failed lookup fails the job, both tips of
+# each activity entry are read, and nothing else touches OLD_HEADS (PR #214, c2).
+LOOKUP = re.compile(
+    r'OLD_HEADS=""\n(?:.*\n)*?\s*if \[\[ "\$EVENT_NAME" == pull_request \]\]; then\n'
+    r'\s*if ! OLD_HEADS="\$\(GH_TOKEN="\$LOOKUP_TOKEN" gh api --paginate -X GET "repos/\$GITHUB_REPOSITORY/activity" \\\n'
+    r"""\s*-f "ref=refs/heads/\$HEAD_REF" -f per_page=100 --jq '\.\[\] \| \.before, \.after'\)"; then\n"""
+    r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n(?:.*\n)*?\s*export UPSTREAM OLD_HEADS\n')
+
+
+def lookup_problems(scan):
+    problems = []
+    for j, job in (scan.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            run = str(step.get("run", ""))
+            if "scan-from-default-branch" not in run:
+                continue
+            if not LOOKUP.search(run):
+                problems.append(f"{SCAN_FILE}/{j}: the earlier-heads lookup is not in its exact form (fails the job "
+                                "on a failed lookup, reads .before and .after, exports OLD_HEADS)")
+            if len(re.findall(r"\bOLD_HEADS\b", run)) != 3:
+                problems.append(f"{SCAN_FILE}/{j}: OLD_HEADS is set or used outside the lookup")
+            env = step.get("env") or {}
+            if env.get("HEAD_REF") != "${{ github.event.pull_request.head.ref }}":
+                problems.append(f"{SCAN_FILE}/{j}: HEAD_REF is not the pull request's branch")
+            if env.get("LOOKUP_TOKEN") != "${{ github.token }}":
+                problems.append(f"{SCAN_FILE}/{j}: LOOKUP_TOKEN is not the job's token")
+    return problems
+
+
+def gh_eval(text, ctx):
+    """A GitHub Actions expression, as GitHub evaluates it, for the few forms fork workflows use:
+    literals, contexts (a missing property is null), !, ==, != (strings ignore case), &&, || (each
+    gives one of its operands), parentheses, format() and startsWith(). Anything else raises ValueError."""
+    tokens = re.findall(r"'(?:[^']|'')*'|[A-Za-z_][\w.-]*|\d+|==|!=|&&|\|\||[!(),]|\S", text)
+    pos = 0
+
+    def truthy(v):
+        return v not in (None, False, 0, "")
+
+    def peek():
+        return tokens[pos] if pos < len(tokens) else None
+
+    def take(expected=None):
+        nonlocal pos
+        if pos >= len(tokens) or (expected and tokens[pos] != expected):
+            raise ValueError(f"expected {expected or 'more'} in {text!r}")
+        pos += 1
+        return tokens[pos - 1]
+
+    def primary():
+        tok = take()
+        if tok == "(":
+            v = disjunction()
+            take(")")
+            return v
+        if tok == "!":
+            return not truthy(primary())
+        if tok.startswith("'"):
+            return tok[1:-1].replace("''", "'")
+        if tok.isdigit():
+            return int(tok)
+        if tok in ("true", "false", "null"):
+            return {"true": True, "false": False, "null": None}[tok]
+        if not re.fullmatch(r"[A-Za-z_][\w.-]*", tok):
+            raise ValueError(f"cannot read {tok!r} in {text!r}")
+        if peek() == "(":
+            take("(")
+            args = []
+            while peek() != ")":
+                args.append(disjunction())
+                if peek() == ",":
+                    take(",")
+            take(")")
+            if tok == "format":
+                return re.sub(r"\{(\d+)\}", lambda m: str(args[int(m.group(1)) + 1]), str(args[0]))
+            if tok == "startsWith":
+                return str(args[0]).lower().startswith(str(args[1]).lower())
+            raise ValueError(f"function {tok} is not known here")
+        value = ctx
+        for part in tok.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        return value
+
+    def comparison():
+        left = primary()
+        while peek() in ("==", "!="):
+            op = take()
+            right = primary()
+            a, b = (x.lower() if isinstance(x, str) else x for x in (left, right))
+            left = (a == b) if op == "==" else (a != b)
+        return left
+
+    def conjunction():
+        left = comparison()
+        while peek() == "&&":
+            take()
+            right = comparison()
+            left = right if truthy(left) else left
+        return left
+
+    def disjunction():
+        left = conjunction()
+        while peek() == "||":
+            take()
+            right = conjunction()
+            left = left if truthy(left) else right
+        return left
+
+    value = disjunction()
+    if pos != len(tokens):
+        raise ValueError(f"cannot read the end of {text!r}")
+    return truthy(value)
+
+
+def run_context(event_name, ref="refs/heads/main", test=None, deleted=False, pr_repo=None):
+    event = {"repository": {"default_branch": "main"}, "deleted": deleted}
+    if pr_repo:
+        event["pull_request"] = {"head": {"repo": {"full_name": pr_repo}}}
+    return {"github": {"event_name": event_name, "ref": ref, "repository": "owner/repo", "event": event},
+            "inputs": {"test": test} if test is not None else {}}
+
+
+# Which kinds of run each job of the scan workflow runs for: (context, scan job, tests job). The
+# scan: every push but the default branch's own and a deletion (fork-tests.yml calls it with `test`
+# for the default branch), every pull request of this repository, the call with `test`, the sweep.
+# Its tests: only the call with `test`.
+SCAN_RUNS = {
+    "a push to a branch": (run_context("push", "refs/heads/feature"), True, False),
+    "a push of a tag": (run_context("push", "refs/tags/v1"), True, False),
+    "a push to the default branch (fork-tests.yml scans it)": (run_context("push"), False, False),
+    "a branch deletion": (run_context("push", "refs/heads/feature", deleted=True), False, False),
+    "fork-tests.yml's call on a push to the default branch": (run_context("push", test=True), True, True),
+    "a pull request from this repository": (run_context("pull_request", pr_repo="owner/repo"), True, False),
+    "fork-tests.yml's call on a pull request": (
+        run_context("pull_request", pr_repo="owner/repo", test=True), True, True),
+    "a pull request from another fork": (run_context("pull_request", pr_repo="other/repo"), False, False),
+    "the daily schedule": (run_context("schedule"), True, False),
+    "a manual sweep (workflow_dispatch)": (run_context("workflow_dispatch", "refs/heads/feature"), True, False),
+}
+
+
+def scan_if_problems(scan):
+    problems = []
+    jobs = scan.get("jobs") or {}
+    scan_job = next((j for j, job in jobs.items()
+                     if any("scan-from-default-branch" in str(s.get("run", "")) for s in job.get("steps") or [])), None)
+    test_job = next((j for j, job in jobs.items()
+                     if any("fork-secret-scan.test.sh" in str(s.get("run", "")) for s in job.get("steps") or [])), None)
+    if test_job is None:
+        problems.append(f"{SCAN_FILE}: no job runs the scan's tests")
+    for j, index in ((scan_job, 1), (test_job, 2)):
+        if j is None:
+            continue
+        for label, values in SCAN_RUNS.items():
+            ctx, want = values[0], values[index]
+            try:
+                got = gh_eval(expression(jobs[j].get("if", "true")), ctx)
+            except ValueError as e:
+                problems.append(f"{SCAN_FILE}/{j}: if: cannot be evaluated ({e})")
+                break
+            if got != want:
+                problems.append(f"{SCAN_FILE}/{j}: {'runs' if got else 'does not run'} on {label}")
+    return problems
+
+
 def secret_scan_problems(wfs):
     problems = []
     scan = wfs.get(SCAN_FILE)
@@ -927,6 +1144,10 @@ def secret_scan_problems(wfs):
         problems.append(f"{SCAN_FILE}: a workflow concurrency group (a newer push could cancel a scan)")
     problems += [f"{SCAN_FILE}: job {j} has a concurrency group"
                  for j, job in (scan.get("jobs") or {}).items() if "concurrency" in job]
+    for event in ("schedule", "workflow_dispatch"):
+        if event not in triggers(scan):
+            problems.append(f"{SCAN_FILE}: no {event} trigger (the daily sweep of every branch and tag)")
+    problems += scan_job_problems(scan) + lookup_problems(scan) + scan_if_problems(scan)
     caller = ((wfs.get("fork-tests.yml") or {}).get("jobs") or {}).get("secrets") or {}
     if caller.get("uses") != SCAN_CALL or (caller.get("with") or {}).get("test") is not True:
         problems.append(f"fork-tests.yml: job secrets does not call {SCAN_CALL} with test: true")
@@ -935,8 +1156,8 @@ def secret_scan_problems(wfs):
     return problems
 
 
-check("secret-scan: fork-secret-scan.yml runs on pull requests and pushes uncancelled with the default "
-      "branch's script, fork-tests.yml calls it",
+check("secret-scan: fork-secret-scan.yml runs on pull requests, pushes and daily, uncancelled, with the "
+      "default branch's script in a job that runs no checkout code, fork-tests.yml calls it",
       not secret_scan_problems(real), "; ".join(secret_scan_problems(real)))
 
 
@@ -977,9 +1198,60 @@ for label, mutate in {
     "fork-tests.yml scanning in a step of its own": lambda w: w["fork-tests.yml"]["jobs"].__setitem__(
         "secrets", {"runs-on": "ubuntu-24.04", "steps": [{"run": "bash .github/scripts/fork-secret-scan.sh"}]}),
     "fork-tests.yml calling it without its tests": lambda w: w["fork-tests.yml"]["jobs"]["secrets"].pop("with"),
+    # s1: nothing from the checkout in the job that scans.
+    "the tests back in the scan job, before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        -1, w[SCAN_FILE]["jobs"]["tests"]["steps"][-1]),
+    "the tests in the scan job, after the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].append(
+        w[SCAN_FILE]["jobs"]["tests"]["steps"][-1]),
+    "a local action before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        -1, {"uses": "./.github/actions/setup"}),
+    "a package install before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        -1, {"run": "pnpm install --frozen-lockfile"}),
+    "a checkout file run by path before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        -1, {"run": "scripts/prepare"}),
+    "an unpinned action before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        -1, {"uses": "actions/setup-node@v4"}),
+    "the scan step running a checkout file too": lambda w: scan_step(w).__setitem__(
+        "run", "./tools/x\n" + scan_step(w)["run"]),
+    "a scan step that may fail quietly": lambda w: scan_step(w).__setitem__("continue-on-error", True),
+    "a scan job that may fail quietly": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__("continue-on-error", True),
+    "the scan job needing the tests job": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__("needs", "tests"),
+    "no tests job": lambda w: w[SCAN_FILE]["jobs"].pop("tests"),
+    # c2: the earlier-heads lookup.
+    "a failed earlier-heads lookup ignored (|| true)": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("--jq '.[] | .before, .after')\"; then",
+                                           "--jq '.[] | .before, .after' || true)\"; then")),
+    "the earlier heads emptied before the export": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("export UPSTREAM OLD_HEADS", 'OLD_HEADS=""\nexport UPSTREAM OLD_HEADS')),
+    "the lookup reading the wrong field": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace(".[] | .before, .after", ".[] | .sha")),
+    "the lookup's failure not failing the job": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r"exit 2\n", "true\n", scan_step(w)["run"], count=1)),
+    "the lookup for another branch": lambda w: scan_step(w)["env"].__setitem__("HEAD_REF", "${{ github.base_ref }}"),
+    # c2: the jobs' if: as GitHub evaluates it.
+    "every push skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
+        "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace("(github.event.deleted ||", "(true || github.event.deleted ||")),
+    "tag pushes skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
+        "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace(
+            "github.event.deleted ||", "github.event.deleted || startsWith(github.ref, 'refs/tags/') ||")),
+    "the default branch's call skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
+        "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace("!inputs.test && ", "")),
+    "the sweep skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
+        "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace(
+            "(!(github.event_name == 'push'", "(github.event_name != 'schedule' && !(github.event_name == 'push'")),
+    "the tests job on every pull request": lambda w: w[SCAN_FILE]["jobs"]["tests"].__setitem__(
+        "if", w[SCAN_FILE]["jobs"]["tests"]["if"].replace("(inputs.test)", "(true)")),
+    # The daily sweep (the gaps no push run covers).
+    "no schedule": lambda w: w[SCAN_FILE][True].pop("schedule"),
+    "no workflow_dispatch": lambda w: w[SCAN_FILE][True].pop("workflow_dispatch"),
 }.items():
     check(f"secret-scan: {SCAN_FILE} with {label} fails" if "fork-tests" not in label
           else f"secret-scan: {label} fails", scan_mutant(mutate))
+
+check("secret-scan: the expression evaluator reads GitHub's rules (&& and || give an operand, == ignores case)",
+      gh_eval("'a' && 'B' == 'b'", {}) and not gh_eval("'' || null", {}) and gh_eval("!x.y", {})
+      and gh_eval("format('refs/heads/{0}', a.b) == 'REFS/heads/main'", {"a": {"b": "main"}})
+      and not gh_eval("(true || false) && !true", {}))
 
 # --- removed -----------------------------------------------------------------------------------
 removed_path = root / ".github/fork-removed-workflows.txt"

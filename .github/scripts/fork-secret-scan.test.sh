@@ -42,16 +42,20 @@ else
 # a line starting [allowlist] allows every key, and one with `[extend]` and a `path =` line fails to load (FTL,
 # exit 1) unless the file is there; a .gitleaksignore (--gitleaks-ignore-path, default ".", and
 # SOURCE) line `<commit>:...` ignores the keys of that commit, a line `file:aws-access-token:line`
-# the key on that line of that file in any commit.
+# the key on that line of that file in any commit. `gitleaks stdin`: the same settings, a key id
+# on a line of the input fails, with each line in the --report-path JSON as "StartLine".
 set -uo pipefail
-opts="" config="" ignore_path="." source="."
+opts="" config="" ignore_path="." source="." mode=git report=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --log-opts=*) opts="${1#--log-opts=}" ;;
     --config) config="$2"; shift ;;
     --gitleaks-ignore-path) ignore_path="$2"; shift ;;
+    --report-path) report="$2"; shift ;;
+    --report-format) shift ;;
     -*) ;;
-    *) [[ "$1" == git ]] || source="$1" ;;
+    git | stdin) mode="$1" ;;
+    *) source="$1" ;;
   esac
   shift
 done
@@ -70,6 +74,20 @@ ignored=" "
 for file in "$ignore_path" "$ignore_path/.gitleaksignore" "$source/.gitleaksignore"; do
   if [[ -f "$file" ]]; then ignored+="$(grep -vE '^[[:space:]]*(#|$)' "$file" | tr '\n' ' ')"; fi
 done
+if [[ "$mode" == stdin ]]; then
+  lines=""
+  if ! grep -qE '^[[:space:]]*\[allowlist\]' <<< "$settings"; then
+    lines="$(grep -nE 'AKIA[A-Z2-7]{16}' | cut -d: -f1)"
+  else
+    cat > /dev/null
+  fi
+  if [[ -n "$report" ]]; then
+    { echo "["; sed 's/.*/ {\n  "StartLine": &,\n  "RuleID": "aws-access-token"\n },/' <<< "$lines"; echo "]"; } > "$report"
+  fi
+  if [[ -n "$lines" ]]; then echo "leaks found: $(wc -l <<< "$lines")"; exit 1; fi
+  echo "no leaks found"
+  exit 0
+fi
 # Into a file first: `grep -q` stops reading early, and pipefail would read git's SIGPIPE as no match.
 # shellcheck disable=SC2086
 if ! git log -p -U0 $opts > "$TMPDIR/fake-gitleaks.log" 2> "$TMPDIR/fake-gitleaks.err"; then
@@ -299,7 +317,7 @@ BEFORE="" OLD_HEADS="--output=x" HEAD_SHA="$clean" check "pull request: an OLD_H
 BEFORE="" OLD_HEADS="" HEAD_SHA="$clean" check "pull request: the newest head alone passes (control)" 0
 export EVENT_NAME=push HEAD_SHA=""
 
-EVENT_NAME=workflow_dispatch check "an unknown event fails" 2
+EVENT_NAME=issues check "an unknown event fails" 2
 
 export EVENT_NAME=pull_request BEFORE="" AFTER=""
 # The range does not depend on the PR's base (see the script's header).
@@ -440,6 +458,28 @@ UPSTREAM="" PUSH_REF=refs/heads/stable BEFORE="000000000000000000000000000000000
   check "push to another branch, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
 PUSH_REF=refs/heads/leaky BEFORE="$rebased" AFTER="$rebased_leaky" \
   check "push to another branch: a key in the fork's own commit is found" 1
+# PR #214 (c3): a pull request's earlier head from before a fork-follow rebase, on an upstream tag
+# off upstream's default branch, holds that tag's commit with a key. It is upstream's: left out as
+# the push scans leave it out, so an honest rebase clears the PR. Without upstream, the full range.
+cd "$root/up"
+git checkout -q -b pr-new "$rebased"
+commit pr.txt "pr" "PR 1, rebased"
+pr_new=$(git rev-parse HEAD)
+git push -q "$root/fork.git" "$pr_new:refs/heads/pr"
+cd "$root"
+EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$stable" HEAD_SHA="$pr_new" \
+  check "pull request: an earlier head on an upstream tag (before a rebase): upstream's commits are left out" 0 \
+  "upstream up/t3code already has"
+EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$rebased_leaky" HEAD_SHA="$pr_new" \
+  check "pull request: an earlier head's own key is still found with upstream left out" 1
+UPSTREAM="" EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$stable" HEAD_SHA="$pr_new" \
+  check "pull request: an earlier head on an upstream tag, upstream unknown: the full range, with a warning" 1 \
+  "::warning.*not known"
+# The daily sweep (every branch and tag) leaves upstream's commits out too, and only then.
+git -C "$root/fork.git" update-ref -d refs/heads/leaky
+EVENT_NAME=schedule check "daily sweep: upstream's commits on the fork's branches are left out" 0 \
+  "every branch and tag of origin.*upstream up/t3code already has"
+UPSTREAM="" EVENT_NAME=schedule check "daily sweep, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
 unset UPSTREAM UPSTREAM_URL
 
 # New origins for the cases below: a bare origin that serves blob-less clones, and a work repo.
@@ -458,6 +498,94 @@ checkout() { # checkout ORIGIN BRANCH
   git clone -q --filter=blob:none --single-branch --branch "$2" "file://$root/$1.git" "$clone"
 }
 allow_all="paths = ['''.*''']"
+
+# PR #214 (s3): an earlier head origin still serves but whose fetch fails for another reason (a
+# network or server error) is tried again, and fails the job when every try fails; only origin
+# saying it no longer has the commit ("not our ref") is a warning (above).
+new_origin flaky
+commit app.txt "app" "main 1"
+git checkout -q -b pr
+commit leak.txt "aws_access_key_id=$key" "old head: a key"
+flaky_old=$(git rev-parse HEAD)
+git push -q origin main pr
+git reset -q --hard main
+commit c.txt "clean" "new head"
+flaky_new=$(git rev-parse HEAD)
+git push -q -f origin pr
+# origin's upload-pack, failing as a 502 would on the calls listed in flaky-fail: the scan's first
+# call fetches the default branch; the later ones are the earlier head's.
+cat > "$root/flaky-upload-pack" <<FLAKY
+#!/usr/bin/env bash
+n=\$(( \$(cat "$root/flaky-count" 2>/dev/null || echo 0) + 1 )); echo \$n > "$root/flaky-count"
+if grep -qx "\$n" "$root/flaky-fail"; then echo "fatal: unable to access origin: The requested URL returned error: 502" >&2; exit 128; fi
+exec git upload-pack "\$@"
+FLAKY
+chmod +x "$root/flaky-upload-pack"
+flaky() { # flaky NAME EXPECTED PATTERN FAILING_CALLS...
+  local name="$1" expected="$2" pattern="$3"
+  shift 3
+  checkout flaky pr
+  git -C "$clone" config remote.origin.uploadpack "$root/flaky-upload-pack"
+  printf '%s\n' "$@" > "$root/flaky-fail"
+  rm -f "$root/flaky-count"
+  FETCH_RETRY_DELAY=0 EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$flaky_old" HEAD_SHA="$flaky_new" \
+    check "$name" "$expected" "$pattern"
+}
+flaky "pull request: an earlier head fetched at once: its key is found (control)" 1 ""
+flaky "pull request: an earlier head whose first fetches fail (502): tried again, its key is found" 1 "" 2 3
+flaky "pull request: an earlier head whose fetch fails every time (502): fails, asks for a re-run" 2 \
+  "cannot fetch the earlier head.*Re-run the job" $(seq 2 40)
+
+# PR #214 (s4): commit and tag messages are scanned too, with the same settings.
+new_origin msgs
+commit app.txt "app" "main 1"
+msgs_base=$(git rev-parse HEAD)
+git checkout -q -b pr
+commit x.txt "x" "debug: aws_access_key_id=$key"
+msgs_pr=$(git rev-parse HEAD)
+git checkout -q -b pr-clean "$msgs_base"
+commit y.txt "y" "a plain message"
+msgs_clean=$(git rev-parse HEAD)
+git checkout -q main
+GIT_COMMITTER_DATE="@$date" git tag -a v9 -m "release notes: token $key" "$msgs_base"
+GIT_COMMITTER_DATE="@$date" git tag -a v8 -m "release notes" "$msgs_base"
+git push -q origin main pr pr-clean v9 v8
+checkout msgs pr
+EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_pr" \
+  check "pull request: a key in a commit message is found" 1 "message of commit $msgs_pr"
+EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_clean" \
+  check "pull request: plain commit messages pass (control)" 0 "Scanning the messages.*1 in all"
+EVENT_NAME=push PUSH_REF=refs/tags/v9 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_base" \
+  check "push of an annotated tag: a key in its message is found" 1 "message of tag object"
+EVENT_NAME=push PUSH_REF=refs/tags/v8 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_base" \
+  check "push of an annotated tag: a plain message passes (control)" 0 "1 tag\\(s\\)"
+EVENT_NAME=push PUSH_REF=refs/tags/v8 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_clean" \
+  check "push of a tag that moved since: its message is not read, with a warning" 0 "::warning.*cannot be fetched as pushed"
+
+# The daily sweep (schedule, or by hand): every branch and tag of origin, for what no push run
+# scanned ([skip ci], more than three tags at once, pushes by the workflow token, older branches).
+new_origin sweep
+commit app.txt "app" "main 1"
+git checkout -q -b side
+commit k.txt "aws_access_key_id=$key" "side: a key"
+git checkout -q main
+git push -q origin main side
+clone="$root/sweep-clone"
+git clone -q --filter=blob:none --no-checkout "file://$root/sweep.git" "$clone"
+EVENT_NAME=schedule check "daily sweep: a key on a branch no push run scanned is found" 1 "every branch and tag of origin"
+git push -q origin :side
+EVENT_NAME=schedule check "daily sweep: the branch gone, the same clone passes (control)" 0 "every branch and tag of origin \\(1 distinct"
+GIT_COMMITTER_DATE="@$date" git tag -a v2 -m "notes: $key" main
+git push -q origin v2
+EVENT_NAME=workflow_dispatch check "manual sweep: a key in a tag message is found" 1 "message of tag object"
+git push -q origin :refs/tags/v2
+git tag tree-tag "main^{tree}"
+git push -q origin tree-tag
+EVENT_NAME=schedule check "daily sweep: a tag that names no commit warns" 0 "::warning.*name no commit \\(tags/tree-tag\\)"
+rm -rf "${root:?}/sweep.git"
+EVENT_NAME=schedule check "daily sweep: origin cannot be read: fails" 2
+cd "$root"
+
 export EVENT_NAME=pull_request BEFORE="" AFTER=""
 
 # gitleaks settings come from the default branch, never from the PR (see the script's header).
@@ -860,8 +988,8 @@ def shape_problem(r):
     no | outside a group (^a|b$ is ^a or b$), no .* or .+ (a whole-line or any-value pattern), and
     in the syntax Python and Go share (one Python cannot read, such as Go's \\pL, cannot be checked)."""
     try:
-        items = list(sre.parse(r))
-        re.compile(r)
+        items = list(sre.parse(readable(r)))
+        re.compile(readable(r))
     except (re.error, OverflowError, RecursionError) as e:
         return f"cannot be read by Python's re ({e}), so it cannot be checked; write it in the syntax Python and Go share"
     if top_level_bar(r):
@@ -870,6 +998,149 @@ def shape_problem(r):
         return "is not anchored (^...$)"
     if any_unbounded(items):
         return "has .* or .+ (any text of any length): a whole-line or any-value pattern"
+    return None if exact_value(r) else token_problem(r)
+
+
+def readable(r):
+    """r as Python's re reads it: Go (RE2) also takes flags right after ^ (^(?i)value$), which
+    Python 3.11+ refuses; (?i)^value$ means the same."""
+    m = re.match(r"\^(\(\?[a-zA-Z]+\))", r)
+    return m.group(1) + "^" + r[m.end():] if m else r
+
+
+REPEATS = (sre.MAX_REPEAT, sre.MIN_REPEAT) + ((sre.POSSESSIVE_REPEAT,) if hasattr(sre, "POSSESSIVE_REPEAT") else ())
+ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def exact_items(items):
+    """Only fixed text: literals (escaped or not, a one-character class), and groups or alternations
+    of fixed text."""
+    for op, av in items:
+        if op == sre.LITERAL:
+            continue
+        if op == sre.IN and len(av) == 1 and av[0][0] == sre.LITERAL:
+            continue
+        if op == sre.SUBPATTERN and exact_items(av[-1]):
+            continue
+        if op == sre.BRANCH and all(exact_items(b) for b in av[1]):
+            continue
+        return False
+    return True
+
+
+def exact_value(r):
+    """An anchored exact value (^value$, (?i)^value$, ^(?i)value$, ^(?:a|b)$): it allows only the
+    fixed strings it spells, so it is a reviewed fake key and needs no judge."""
+    try:
+        items = list(sre.parse(readable(r)))
+    except (re.error, OverflowError, RecursionError):
+        return False
+    return (len(items) >= 2 and items[0] == (sre.AT, sre.AT_BEGINNING) and items[-1] == (sre.AT, sre.AT_END)
+            and exact_items(items[1:-1]))
+
+
+def in_class(op, av, ch):
+    """Whether the one-character item (op, av) matches ch (case as written)."""
+    if op == sre.ANY:
+        return ch != "\n"
+    if op == sre.LITERAL:
+        return ord(ch) == av
+    if op == sre.NOT_LITERAL:
+        return ord(ch) != av
+    if op != sre.IN:
+        return False
+    hit, negate = False, False
+    for o, a in av:
+        if o == sre.NEGATE:
+            negate = True
+        elif o == sre.LITERAL:
+            hit |= ord(ch) == a
+        elif o == sre.RANGE:
+            hit |= a[0] <= ord(ch) <= a[1]
+        elif o == sre.CATEGORY:
+            word = ch.isalnum() or ch == "_"
+            hit |= {sre.CATEGORY_DIGIT: ch.isdigit(), sre.CATEGORY_NOT_DIGIT: not ch.isdigit(),
+                    sre.CATEGORY_SPACE: ch.isspace(), sre.CATEGORY_NOT_SPACE: not ch.isspace(),
+                    sre.CATEGORY_WORD: word, sre.CATEGORY_NOT_WORD: not word}.get(a, False)
+    return hit != negate
+
+
+def token_class(op, av):
+    """(token, mixed): a one-character item that matches two or more letters or digits (a token
+    character, not one fixed character), and one that matches both letters and digits."""
+    if op not in (sre.ANY, sre.NOT_LITERAL, sre.IN):
+        return False, False
+    hits = [c for c in ALNUM if in_class(op, av, c)]
+    return len(hits) >= 2, any(c.isalpha() for c in hits) and any(c.isdigit() for c in hits)
+
+
+def has_token(items):
+    for op, av in items:
+        if token_class(op, av)[0]:
+            return True
+        if op in REPEATS and has_token(av[2]):
+            return True
+        if op == sre.SUBPATTERN and has_token(av[-1]):
+            return True
+        if op == sre.BRANCH and any(has_token(b) for b in av[1]):
+            return True
+        if op in (sre.ASSERT, sre.ASSERT_NOT) and has_token(av[1]):
+            return True
+    return False
+
+
+def token_repeat(items):
+    """A repeat of token characters with no upper bound (\\w+, [a-z0-9]*, .+, x{16,}) or one of 16
+    or more ({16}, {41,63}): why, or None."""
+    for op, av in items:
+        if op in REPEATS:
+            lo, hi, sub = av
+            if has_token(sub) and hi == sre.MAXREPEAT:
+                return "repeats a character class with no upper bound (+, *, {n,})"
+            if has_token(sub) and hi >= 16:
+                return f"repeats a character class up to {hi} times (16 or more)"
+            why = token_repeat(sub)
+        elif op == sre.SUBPATTERN:
+            why = token_repeat(av[-1])
+        elif op == sre.BRANCH:
+            why = next((w for w in map(token_repeat, av[1]) if w), None)
+        elif op in (sre.ASSERT, sre.ASSERT_NOT):
+            why = token_repeat(av[1])
+        else:
+            why = None
+        if why:
+            return why
+    return None
+
+
+def mixed_length(items):
+    """The most characters a match can take from classes that match both letters and digits
+    ([0-9a-f], \\w, .): a UUID shape holds 32."""
+    total = 0
+    for op, av in items:
+        if token_class(op, av)[1]:
+            total += 1
+        elif op in REPEATS:
+            total += av[1] * mixed_length(av[2])
+        elif op == sre.SUBPATTERN:
+            total += mixed_length(av[-1])
+        elif op == sre.BRANCH:
+            total += max(mixed_length(b) for b in av[1])
+    return total
+
+
+def token_problem(r):
+    """Why the value regex r could hold a key whatever the judge's samples say, or None: any regex
+    that is not an exact value is refused when it repeats a character class without a bound or 16
+    or more times, or takes 16 or more characters from classes of both letters and digits."""
+    items = list(sre.parse(readable(r)))
+    why = token_repeat(items)
+    if why:
+        return f"{why}: it could allow a key of that shape (allow the exact fake value instead)"
+    n = mixed_length(items)
+    if n >= 16:
+        return (f"takes up to {n} characters from classes of both letters and digits: it could allow a key"
+                " of that shape (allow the exact fake value instead)")
     return None
 
 
@@ -889,9 +1160,11 @@ for i, e in enumerate(entries[1:], start=2):
         if why:
             problems.append(f"{where}: regex '{r}' {why}")
             continue
+        if exact_value(r):
+            continue  # a reviewed fake key: fixed text only, no judge
         # Without the binary: Python's re on the fixture (the binary below is the real judge).
         on_line = e.get("regexTarget") == "line"
-        wide = [what for line, v, what in fixture if re.search(r, line if on_line else v)]
+        wide = [what for line, v, what in fixture if re.search(readable(r), line if on_line else v)]
         if wide:
             problems.append(f"{where}: regex '{r}' allows a token-shaped value ({wide[0]})")
 
@@ -945,11 +1218,12 @@ def judge(rules):
         parts = [("entry 1 (gitleaks' global allowlist)", [entries[0]])] if entries else []
         for i, e in enumerate(entries[1:], start=2):
             where = f"[[allowlists]] entry {i} ({e.get('description', 'no description')!r})"
-            for rule in e.get("targetRules") or []:
+            judged = [r for r in e.get("regexes") or [] if not exact_value(r)]
+            for rule in (e.get("targetRules") or []) if judged else []:
                 if rule not in found_rules:
                     out.append(f"{where}: targetRules {rule!r} has no finding in the judge's fixture, so its"
                                " values cannot be judged: add a token shape for that rule to the fixture")
-            for r in e.get("regexes") or []:
+            for r in judged:
                 wide = {k: v for k, v in e.items() if k not in ("paths", "condition", "regexes")}
                 wide["regexes"] = [r]
                 parts.append((f"{where}: regex '{r}'", entries[:1] + [wide]))
@@ -1055,10 +1329,24 @@ toml_entry "a line pattern without .* for lines naming a secret" fail "$generic"
 toml_entry "an exact fake value in one file (reviewed)" pass 'targetRules = ["aws-access-token"]' 'condition = "AND"' \
   "paths = ['''^test/fx\\.txt\$''']" "regexes = ['''^${key:0:4}[${key:4:1}]${key:5}\$''']"
 toml_entry "an alternation of exact values inside a group" pass "$generic" "regexes = ['''^(?:abc|def)\$''']"
+# PR #214 (s2, c1, c4): a regex that is not an exact value is refused when it repeats a token
+# character class without a bound or 16 or more times, or takes 16 or more characters from classes
+# of both letters and digits, whatever the judge's samples say. Exact values need no samples.
+toml_entry "a UUID shape (32 hex characters in five groups)" fail "$generic" \
+  "regexes = ['''^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$''']"
+toml_entry "a 36-character class ({36})" fail "$generic" "regexes = ['''^[a-z0-9-]{36}\$''']"
+toml_entry "a 41 to 63 character class ({41,63})" fail "$generic" "regexes = ['''^[a-zA-Z0-9]{41,63}\$''']"
+toml_entry "an open-ended word class (\\w+)" fail "$generic" "regexes = ['''^key_\\w+\$''']"
+toml_entry "an open-ended short class ({8,})" fail "$generic" "regexes = ['''^tok[a-z0-9]{8,}\$''']"
+ant="sk\\-ant\\-api03\\-$(printf 'q%.0s' {1..20})Fake" # an escaped fake, built at run time
+toml_entry "an exact escaped fake Anthropic-shaped value" pass "$generic" "regexes = ['''^$ant\$''']"
+toml_entry "an exact fake JWT" pass "$generic" "regexes = ['''^eyJhbGciOiJub25lIn0\\.eyJzdWIiOiJ0ZXN0In0\\.\$''']"
+toml_entry "an exact value with flags after ^ (^(?i)value\$)" pass "$generic" "regexes = ['''^(?i)abc123def456\$''']"
+toml_entry "an exact value with flags first ((?i)^value\$)" pass "$generic" "regexes = ['''(?i)^abc123def456\$''']"
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   # Only the binary judges by rule: an entry for a rule none of the generated shapes trigger.
   toml_entry "a rule the judge's token shapes do not trigger" fail 'targetRules = ["stripe-access-token"]' \
-    "regexes = ['''^sk_live_abc\$''']"
+    "regexes = ['''^sk_live_[a-z]{3}\$''']"
 fi
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   toml_mutant "one more global allowlist value" "t.replace('regexes = [', 'regexes = [\n    \'\'\'^x\$\'\'\',', 1)"

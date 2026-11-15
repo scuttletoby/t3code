@@ -27,6 +27,10 @@
 # rebase, and it never hides another key on the same line. Write the value so this file does not
 # match its own rules (the entries here are scanned too). A `gitleaks:allow` comment on the line
 # itself works as well where the file allows a comment. Not .gitleaksignore: see its header.
+# An exact value (fixed text between ^ and $, escaped where needed; flags such as (?i) go first or
+# right after ^) needs nothing more. Any other value regex is refused by the scan's tests if it
+# repeats a letter-or-digit class without a bound or 16 or more times, or spans 16 or more
+# characters of classes holding both letters and digits (a UUID shape): allow the exact fake.
 #
 # Measured over main's full history (11,292 commits) with these settings and `git log --text`:
 # 7 findings the default settings skipped, all the pnpm-lock.yaml version strings of the first
