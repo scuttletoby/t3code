@@ -3639,6 +3639,55 @@ class AnyRepository(unittest.TestCase):
                                'engine': ['self-hosted', 'proj-build'], 'docs': ['self-hosted', 'proj-build']})
         self.assertNotIn('::error::', log)
 
+    def test_a_job_that_avoids_a_pool_for_pushes_goes_to_the_next_one(self):
+        """Issue 224 item 3: a project builds what its deploy ships on its always-on pool only (push runs), while its
+        other heavy job may use the desktop. per_run then goes to the heaviest job that does not avoid the pool."""
+        cfg = copy.deepcopy(GEN)
+        cfg['jobs'][0]['avoid'] = {'pc': ['push']}
+        self.assertEqual(ff.check_config(cfg), [])
+        _, out, log = self.route(cfg, pc=beacon(2))
+        self.assertEqual(out, {'plugins': BUILD, 'engine': [GEN_PC[0], GEN_PC[1].format('engine')], 'docs': BUILD})
+        self.assertIn('pool pc: not for plugins in push runs', log)
+        _, out, _ = self.route(cfg, pc=beacon(2), e=env(**PR_ENV), event=draft(True))   # a draft: avoid says push only
+        self.assertEqual(out['plugins'], [GEN_PC[0], GEN_PC[1].format('plugins')])
+        for mode in ff.MODES:   # fleet mode queues it on the pool that waits, never on the avoided one
+            with self.subTest(mode=mode):
+                _, out, _ = self.route(cfg, mode=mode, pc=beacon(0))
+                self.assertEqual(out['plugins'], BUILD)
+        cfg['jobs'][1]['avoid'] = {'pc': ['push', 'draft']}
+        cfg['jobs'][2]['avoid'] = {'pc': ['push']}
+        _, out, log = self.route(cfg, pc=beacon(2))   # every job avoids it: the pool takes none, the slot stays free
+        self.assertEqual(set(map(tuple, out.values())), {tuple(BUILD)})
+
+    def test_a_broken_avoid_is_refused(self):
+        cases = {
+            'not an object': ([], 'avoid must be an object'),
+            'empty': ({}, 'avoid must be an object'),
+            'an unknown pool': ({'desk': ['push']}, "pool 'desk', which the config does not have"),
+            'a static pool': ({'build': ['push']}, 'only a dispatcher pool that does not wait'),
+            'the pool that waits': ({'ready': ['ready']}, 'only a dispatcher pool that does not wait'),
+            'an unknown kind': ({'pc': ['merged']}, "avoid['pc'] must list some of"),
+            'no kinds': ({'pc': []}, "avoid['pc'] must list some of"),
+            'kinds as a string': ({'pc': 'push'}, "avoid['pc'] must list some of"),
+        }
+        for name, (avoid, words) in cases.items():
+            with self.subTest(name):
+                bad = copy.deepcopy(GEN)
+                bad['jobs'][0]['avoid'] = avoid
+                problems = ff.check_config(bad)
+                self.assertTrue(any(words in p for p in problems), problems)
+        waiting = copy.deepcopy(CFG)   # the fork's own config: its pool that waits is a dispatcher pool
+        waiting['jobs'][0]['avoid'] = {WAITING: ['push']}
+        self.assertTrue(any('does not wait' in p for p in ff.check_config(waiting)), ff.check_config(waiting))
+
+    def test_an_unknown_job_key_is_refused(self):
+        # A misspelled `avoid` would otherwise be ignored and the job sent to the pool it meant to avoid.
+        bad = copy.deepcopy(GEN)
+        bad['jobs'][0]['avoids'] = {'pc': ['push']}
+        problems = ff.check_config(bad)
+        self.assertTrue(any("unknown key 'avoids'" in p for p in problems), problems)
+        self.assertEqual(ff.check_config(copy.deepcopy(GEN)), [])
+
     def test_pool_by_draft_state(self):
         _, out, _ = self.route(pc=beacon(2), e=env(**PR_ENV), event=draft(True))
         self.assertEqual(out['plugins'][0], 'proj-pc')
