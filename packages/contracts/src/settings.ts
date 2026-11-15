@@ -1500,6 +1500,7 @@ export const ServerSettings = Schema.Struct({
   ),
   /** Fork: the usage pacing gate on agent-delegated tasks; `off` keeps upstream's behaviour. */
   usagePacingGate: UsagePacingGateMode.pipe(Schema.withDecodingDefault(Effect.succeed("off"))),
+  /** Fork: effort levels the gate may lower to; empty never lowers one. */
   usagePacingLowerEffort: UsagePacingLowerEffort.pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
