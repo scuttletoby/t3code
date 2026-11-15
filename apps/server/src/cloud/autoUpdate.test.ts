@@ -3,6 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   ServerSelfUpdateError,
   type ServerSelfUpdateProgressStage,
+  ServerSettingsError,
   type ServerSelfUpdateResult,
   type TerminalMetadataStreamEvent,
 } from "@t3tools/contracts";
@@ -344,6 +345,8 @@ const makeWorld = Effect.fn("test.makeWorld")(function* (
     readonly launcher?: "accepts" | "rejects" | "answer-lost" | "answer-lost-then-pending";
     /** Fails the update before any stage, like the Update button's update already running. */
     readonly refuseBeforeStart?: boolean;
+    /** Every read of the settings fails, like a settings file the server cannot read. */
+    readonly settingsUnreadable?: boolean;
   } = {},
 ) {
   const marker = options.marker ?? (yield* memoryUpdateHoldStore);
@@ -420,6 +423,16 @@ const makeWorld = Effect.fn("test.makeWorld")(function* (
         automaticUpdates,
         automaticUpdatesQuietCommand: "/usr/local/bin/quiet",
       })),
+      Effect.andThen((preferences) =>
+        options.settingsUnreadable
+          ? Effect.fail(
+              new ServerSettingsError({
+                settingsPath: "/test/settings.json",
+                operation: "read-file",
+              }),
+            )
+          : Effect.succeed(preferences),
+      ),
     ),
     newestRelease: Ref.get(release),
     launcherRecord: Ref.get(record),
@@ -642,6 +655,24 @@ describe("auto-update loop", () => {
       expect(yield* partly.calls).toEqual([]);
       // The same steps do update a background service with an enforcing gate.
       expect(yield* service.calls).toContain(`update ${TARGET}`);
+    }),
+  );
+
+  it.effect("does nothing while the settings cannot be read", () =>
+    Effect.gen(function* () {
+      // Fork: an unreadable settings file never counts as "on" (forkDefaults.ts pins the switch off).
+      const unreadable = yield* makeWorld({ settingsUnreadable: true });
+      const readable = yield* makeWorld();
+      const before = yield* unreadable.state;
+      for (const world of [unreadable, readable]) {
+        yield* world.at(DUE);
+        yield* world.at(DUE + 1);
+      }
+      expect(yield* unreadable.state).toEqual(before);
+      expect(yield* unreadable.calls).toEqual([]);
+      expect(yield* unreadable.gate.isHeld).toBe(false);
+      // The same steps do update when the settings can be read.
+      expect(yield* readable.calls).toContain(`update ${TARGET}`);
     }),
   );
 
