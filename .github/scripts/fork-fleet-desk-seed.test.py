@@ -193,15 +193,19 @@ class Host(Base):
             os.close(w)
         self.assertEqual(code, 1)
         self.assertIn('took nothing for 1 seconds', err.getvalue())
+        self.make('m2', {'a': b'x'})   # small enough for the pipe: offer() below has no reader until it returns
         self.assertEqual(self.offer('seed m2')[0], 0)   # the pool's lock was let go
 
     def test_pools_never_share_a_seed_file(self):
         cfg = json.loads(json.dumps(CONFIG))
         cfg['pools'][0]['seeds'] = SEEDS
-        cfg['pools'].append({**cfg['pools'][0], 'name': 'other-pool'})
+        cfg['pools'].append({**cfg['pools'][0], 'name': 'other-pool', 'label': 'fleet-other-t3code',
+                             'beacon': 'FLEET_BEACON_OTHER'})
+        self.assertEqual(ff.check_config(cfg), [])
         with open(os.path.join(self.t, 'fork-fleet.json'), 'w', encoding='utf-8') as f:
             json.dump(cfg, f)
         self.make('m2', {'a': b'x'})
+        shutil.copy(self.tar('m2'), os.path.join(self.t, 'files', 'm2.tar'))   # one file for all pools, as before
         os.mkdir(os.path.join(self.t, 'files', 'other-pool'), 0o755)
         r, w = os.pipe()
         err = io.StringIO()
