@@ -44,8 +44,17 @@ export const WaitForSettings = Schema.Struct({
   prSweepSeconds: positiveIntDefault(120),
   /** A head with no checks at all is reported as `no_checks` after this long. */
   noChecksGraceSeconds: nonNegativeIntDefault(900),
-  /** A wait whose source fails this long without one good read ends as `check_error`. */
+  /**
+   * A wait whose source fails this long without one good read ends as `check_error`. When its thread is
+   * woken anyway, a wait failing for half this long ends in the same message (one wake, all bad news).
+   */
   errorGraceSeconds: nonNegativeIntDefault(900),
+  /**
+   * When a source fails for many threads at once, at most this many threads are woken with
+   * `check_error` per sweep; the rest follow in later sweeps. One thread's failing waits are
+   * joined into one message.
+   */
+  maxErrorWakesPerSweep: positiveIntDefault(3),
   /**
    * Ended waits stay listed this long, then are removed; sooner beyond the caps on `maxPerThread`.
    * The store file is never written above 8 MiB.
@@ -60,7 +69,12 @@ export const WaitForSettings = Schema.Struct({
 export type WaitForSettings = typeof WaitForSettings.Type;
 
 const WAIT_CHECK_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/u;
-const DEFAULT_WAIT_CHECK_ARG_PATTERN = "^[A-Za-z0-9._:/@=+-]{1,200}$";
+/**
+ * Names, paths, refs and versions. The first character is a letter, digit, `.`, `_`, `:` or `/`:
+ * never `-` (an option), `=`, `@` or `+`, which some programs read as an option, an
+ * assignment, a response file or a command. Checks saved with the older default keep it.
+ */
+const DEFAULT_WAIT_CHECK_ARG_PATTERN = "^[A-Za-z0-9._:/][A-Za-z0-9._:/@=+-]{0,199}$";
 
 export const WaitCheckName = Schema.String.check(Schema.isPattern(WAIT_CHECK_NAME_PATTERN));
 export type WaitCheckName = typeof WaitCheckName.Type;
@@ -75,7 +89,9 @@ const compiles = (pattern: string): boolean => {
 
 /**
  * One check command. It runs as an argument list without a shell: exit 0 = met, 1 = not yet,
- * anything else = error. Only settings can add or change one.
+ * anything else = error. Only settings can add or change one. It runs unsandboxed, in the project
+ * folder, with the server's environment (its tokens too): use fixed programs that do not run
+ * files from the repository (no test runners, no build or package scripts) and print no secrets.
  */
 export const WaitCheck = Schema.Struct({
   /** Program and fixed arguments. */
@@ -84,13 +100,21 @@ export const WaitCheck = Schema.Struct({
   maxArgs: NonNegativeInt.check(Schema.isLessThanOrEqualTo(20)).pipe(
     Schema.withDecodingDefault(Effect.succeed(0)),
   ),
-  /** Every added argument must match all of it; one starting with `-` is always refused. */
+  /**
+   * Every added argument must match all of it; one starting with `-` is always refused. The
+   * server tests it with a time limit (2 s), so a slow pattern refuses the argument instead of
+   * holding the server.
+   */
   argPattern: Schema.String.check(
     Schema.makeFilter(compiles, { expected: "a valid regular expression" }),
   ).pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_WAIT_CHECK_ARG_PATTERN))),
   intervalSeconds: Schema.Int.check(Schema.isGreaterThanOrEqualTo(5)).pipe(
     Schema.withDecodingDefault(Effect.succeed(30)),
   ),
+  /**
+   * One run is stopped after this long. After a server crash, only Linux (`timeout`, when it takes
+   * `-k`) still ends the run, a few seconds later; on macOS and Windows it runs until it ends.
+   */
   timeoutSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 600 })).pipe(
     Schema.withDecodingDefault(Effect.succeed(20)),
   ),
@@ -194,6 +218,7 @@ export const WaitForSettingsPatch = Schema.Struct({
   prSweepSeconds: PositiveIntPatch,
   noChecksGraceSeconds: NonNegativeIntPatch,
   errorGraceSeconds: NonNegativeIntPatch,
+  maxErrorWakesPerSweep: PositiveIntPatch,
   keepEndedHours: NonNegativeIntPatch,
   stoppedHandOverHours: PositiveIntPatch,
 } satisfies Record<keyof WaitForSettings, unknown>);
