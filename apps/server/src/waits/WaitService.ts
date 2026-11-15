@@ -14,12 +14,18 @@ import {
   type WaitKind,
   type WaitListResult,
   type WaitRecord,
+  type WaitSlotSpec,
   type WaitStoreNotice,
   type WaitTarget,
   WaitToolFailure,
   type WaitToolFailureCode,
 } from "@t3tools/contracts/waitFor";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import {
+  effectiveSlotLimits,
+  slotRefusalReason,
+  type SlotReservation,
+} from "@t3tools/shared/agentSlots";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   capEndedWaits,
@@ -56,6 +62,7 @@ import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
 import { ServerSettingsService } from "../serverSettings.ts";
+import type { SlotGate, SlotGrant } from "../slots/SlotGate.ts";
 import type { WaitDelivery, WaitDeliveryResult } from "./WaitDelivery.ts";
 import {
   type CheckLookup,
@@ -213,8 +220,60 @@ const stateSettings = (settings: ServerSettings): WaitStateSettings => ({
   errorGraceSeconds: settings.waitFor.errorGraceSeconds,
   keepEndedHours: settings.waitFor.keepEndedHours,
   stoppedHandOverHours: settings.waitFor.stoppedHandOverHours,
-  reserveSeconds: settings.agentSlots.reserveSeconds,
+  // Slots off or without a limit: a woken slot wait holds nothing.
+  reserveSeconds:
+    effectiveSlotLimits(settings.agentSlots) === null ? 0 : settings.agentSlots.reserveSeconds,
 });
+
+/** A slot wait's answer when the gate gave or refused a slot (`atRegister`: the call's own answer). */
+const slotJudgement = (
+  grant: SlotGrant,
+  settings: ServerSettings,
+  atRegister: boolean,
+): Judgement => {
+  const seconds = settings.agentSlots.reserveSeconds;
+  switch (grant.type) {
+    case "off":
+      return {
+        type: "met",
+        outcome: "free",
+        detail: "Agent slots are off, so delegate_task is not held back.",
+      };
+    case "granted":
+      return {
+        type: "met",
+        outcome: "free",
+        detail:
+          seconds === 0
+            ? "Call delegate_task now."
+            : atRegister
+              ? `A slot is free and held for this thread for ${seconds} s: call delegate_task now.`
+              : `Call delegate_task within ${seconds} s; the slot is held for this thread.`,
+      };
+    case "full":
+      return { type: "notYet", detail: `No free slot yet: ${slotRefusalReason(grant.decision)}.` };
+    case "unread":
+      return { type: "failed", message: grant.message, permanent: false };
+  }
+};
+
+/** The slot a delivered slot wait still holds, from its `reservedUntil`. */
+const storedReservation = (wait: WaitRecord, now: number): ReadonlyArray<SlotReservation> => {
+  if (wait.kind !== "slot" || wait.state !== "delivered" || wait.reservedUntil === undefined) {
+    return [];
+  }
+  const untilMs = Date.parse(wait.reservedUntil);
+  if (!(untilMs > now)) return [];
+  const account = wait.spec.account;
+  return [
+    {
+      key: wait.id,
+      threadId: wait.threadId,
+      untilMs,
+      ...(account === undefined ? {} : { account }),
+    },
+  ];
+};
 
 const waitingResult = (wait: WaitRecord, deduped: boolean): WaitForResult => ({
   state: "waiting",
@@ -327,6 +386,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
    * the check judge works it out itself, and runs are timed by the stored project.
    */
   readonly checkPlaceOf?: (context: WaitJudgeContext) => Effect.Effect<CheckPlace>;
+  /**
+   * The server's slot gate: it grants slot waits their slots, and counts the slots delivered slot
+   * waits hold. Without it, slot waits are refused as not supported.
+   */
+  readonly slots?: SlotGate["Service"];
 }) {
   const onChange = input.onChange ?? Effect.void;
   const settingsService = yield* ServerSettingsService;
@@ -551,6 +615,58 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       Effect.mapError((error) => failure("store_unavailable", error.message)),
     );
 
+  /**
+   * A slot wait's answer at registration: the gate grants a free slot and holds it at once (under
+   * the wait's id, which is never stored when it is met). Behind older slot waits it waits for the
+   * sweep, which grants oldest first; with slots off it is met at once.
+   */
+  const slotAtRegister = Effect.fn("WaitService.slotAtRegister")(function* (
+    gate: SlotGate["Service"],
+    waitId: string,
+    threadId: ThreadId,
+    spec: typeof WaitSlotSpec.Type,
+    queued: boolean,
+  ) {
+    const settings = yield* readSettings;
+    if (queued && effectiveSlotLimits(settings.agentSlots) !== null) {
+      return { type: "notYet", detail: "Older slot waits go first." } satisfies Judgement;
+    }
+    const [grant] = yield* gate.grant([{ key: waitId, threadId, account: spec.account }]);
+    return grant === undefined
+      ? ({ type: "notYet" } satisfies Judgement)
+      : slotJudgement(grant, settings, true);
+  });
+
+  /** The slots delivered slot waits still hold, for the gate (it reads them only while waits are on). */
+  const heldInStore = lock.withPermits(1)(
+    Effect.gen(function* () {
+      const loaded = yield* ensureLoaded(true);
+      if (!loaded.ok) return [];
+      const now = yield* Clock.currentTimeMillis;
+      return loaded.contents.waits.flatMap((wait) => storedReservation(wait, now));
+    }),
+  );
+
+  /** The gate let a holder start its agent: its wait's `reservedUntil` is cleared (row 15). */
+  const useStoredSlot = (key: string) =>
+    lock.withPermits(1)(
+      Effect.gen(function* () {
+        const settings = yield* readSettingsOrNull;
+        if (settings === null || !settings.waitFor.enabled) return;
+        const loaded = yield* ensureLoaded(true);
+        if (!loaded.ok) return;
+        const wait = loaded.contents.waits.find((candidate) => candidate.id === key);
+        if (wait === undefined) return;
+        const now = yield* Clock.currentTimeMillis;
+        const transition = nextWaitState(wait, { type: "slotUsed" }, now, stateSettings(settings));
+        if (transition === null) return;
+        const waits = loaded.contents.waits.map((candidate) =>
+          candidate.id === key ? transition.record : candidate,
+        );
+        yield* commitWaits(loaded.contents, waits, "the used slot ends by itself.", settings);
+      }),
+    );
+
   /** `wait_for`: an open wait for the same condition, a met answer, or a new stored wait. */
   const register = Effect.fn("WaitService.register")(function* (request: {
     readonly threadId: ThreadId;
@@ -576,7 +692,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     if (!valid.ok) return yield* failure(valid.code, valid.message);
     const target = valid.target;
     const judge = judgeOf(target.kind);
-    if (judge === undefined) {
+    const slotGate = target.kind === "slot" ? input.slots : undefined;
+    if (judge === undefined && slotGate === undefined) {
       return yield* failure("not_supported", `This server cannot wait for "${target.kind}" yet.`);
     }
     if (target.kind === "check") {
@@ -628,7 +745,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         if (Option.isSome(found)) return { type: "existing", wait: found.value } as const;
         const id = newWaitId(new Set([...contents.waits.map((wait) => wait.id), ...reserved]));
         reserved.add(id);
-        return { type: "new", id } as const;
+        // Older slot waits go first: a new one waits behind them for the sweep (R17).
+        const queued = contents.waits.some(
+          (wait) => wait.kind === "slot" && wait.state === "waiting",
+        );
+        return { type: "new", id, queued } as const;
       }),
     );
     if (first.type === "existing") return waitingResult(first.wait, true);
@@ -641,20 +762,31 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       // Waits for a free place within its limit; with none, the next sweep judges it first.
       const until = now + REGISTER_JUDGE_LIMIT_MS;
       const context: WaitJudgeContext = { waitId: null, now, threadId, projectId };
-      started = yield* startJudgeWhenFree(
-        target.kind,
-        {
-          waitId,
-          threadId,
-          target: waitTargetText(target),
-          ...(target.kind === "check" ? { check: { spec: target.spec, projectId } } : {}),
-        },
-        until,
-        () => judge(target, context),
-        childJudgeOf(target, context),
-        judgeLimitMs(target, projectId, settings),
-      );
-      const answer = started === null ? Option.none() : yield* awaitJudge(started, until);
+      // A slot wait asks the gate instead, which holds a slot it grants at once.
+      started =
+        slotGate !== undefined
+          ? null
+          : yield* startJudgeWhenFree(
+              target.kind,
+              {
+                waitId,
+                threadId,
+                target: waitTargetText(target),
+                ...(target.kind === "check" ? { check: { spec: target.spec, projectId } } : {}),
+              },
+              until,
+              () => judge!(target, context),
+              childJudgeOf(target, context),
+              judgeLimitMs(target, projectId, settings),
+            );
+      const answer =
+        slotGate !== undefined && target.kind === "slot"
+          ? Option.some(
+              yield* slotAtRegister(slotGate, waitId, threadId, target.spec, first.queued),
+            )
+          : started === null
+            ? Option.none()
+            : yield* awaitJudge(started, until);
       const judgement: Judgement = Option.getOrElse(answer, (): Judgement => ({ type: "notYet" }));
       // A wait that could only ever end in this error is refused, and nothing is stored.
       if (judgement.type === "failed" && judgement.permanent) {
@@ -730,7 +862,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     readonly projectId: ProjectId;
     readonly scope?: "thread" | "project" | undefined;
     readonly includeEnded?: boolean | undefined;
-  }) {
+  }): Effect.fn.Return<WaitListResult, WaitToolFailure> {
     const settings = yield* readSettings;
     const checks = Object.entries(
       resolveProjectSettings(settings, request.projectId).settings.waitChecks,
@@ -738,12 +870,17 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([name, check]) => ({ name, description: check.description, maxArgs: check.maxArgs }));
     const loaded = yield* lock.withPermits(1)(ensureLoaded(settings.waitFor.enabled));
+    // Outside the lock (the gate reads the store's held slots under it); only while slots are on.
+    const usage =
+      input.slots === undefined || !settings.agentSlots.enabled ? null : yield* input.slots.usage;
+    const slots = usage === null ? {} : { slots: usage };
     if (!loaded.ok) {
       return {
         enabled: settings.waitFor.enabled,
         storeError: loaded.reason,
         waits: [],
         checks,
+        ...slots,
       } satisfies WaitListResult;
     }
     const waits = loaded.contents.waits
@@ -765,7 +902,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         ...(wait.lastError === undefined ? {} : { lastError: wait.lastError }),
         ...(wait.via === undefined ? {} : { via: wait.via }),
       }));
-    return { enabled: settings.waitFor.enabled, waits, checks } satisfies WaitListResult;
+    return { enabled: settings.waitFor.enabled, waits, checks, ...slots } satisfies WaitListResult;
   });
 
   /**
@@ -1375,7 +1512,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         for (const wait of loaded.contents.waits) {
           if (wait.state !== "waiting") continue;
           waiting.add(wait.id);
-          if (isDue(wait, startedAt, settings)) due.push(wait);
+          // Slot waits are granted by their own step, oldest first.
+          if (wait.kind !== "slot" && isDue(wait, startedAt, settings)) due.push(wait);
         }
         for (const id of nextCheckAt.keys()) if (!waiting.has(id)) nextCheckAt.delete(id);
         yield* stopEndedRuns;
@@ -1464,6 +1602,106 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     ended += yield* applyJudgements(later, settings);
     return { judged, ended };
   });
+
+  /**
+   * Sweep step 3 (4.6): every `waiting` slot wait asks the gate for a slot, oldest first, so a
+   * sweep wakes as many as there are free slots, each slot held for its thread. A full machine is
+   * "not yet" (the deadline still ends it); counts that cannot be read are an error, never "free".
+   * Reads nothing of the projection when no slot wait is waiting. Returns the waits it ended.
+   */
+  const grantSweep = Effect.fnUntraced(function* (settings: ServerSettings) {
+    const gate = input.slots;
+    if (gate === undefined) return 0;
+    const waiting = yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const loaded = yield* ensureLoaded(true);
+        if (!loaded.ok) return [];
+        return loaded.contents.waits
+          .flatMap((wait) => (wait.kind === "slot" && wait.state === "waiting" ? [wait] : []))
+          .sort((a, b) =>
+            a.createdAt !== b.createdAt
+              ? a.createdAt < b.createdAt
+                ? -1
+                : 1
+              : a.id < b.id
+                ? -1
+                : 1,
+          );
+      }),
+    );
+    if (waiting.length === 0) return 0;
+    // Outside the lock: the gate reads the store's held slots under it.
+    const grants = yield* gate.grant(
+      waiting.map((wait) => ({
+        key: wait.id,
+        threadId: wait.threadId,
+        account: wait.spec.account,
+      })),
+    );
+    const answers = waiting.map((wait, index) => {
+      const grant = grants[index];
+      return [
+        wait.id,
+        grant === undefined
+          ? ({ type: "notYet" } satisfies Judgement)
+          : slotJudgement(grant, settings, false),
+      ] as const;
+    });
+    const freed = answers.flatMap(([id, judgement]) =>
+      judgement.type === "met" ? [[id, judgement.detail] as const] : [],
+    );
+    // Switched off meanwhile: nothing is written, and nothing stays held.
+    if (!(yield* stillOn)) {
+      yield* gate.drop(freed.map(([id]) => id));
+      return 0;
+    }
+    const granted = yield* applyGrants(new Map(freed), settings);
+    return (
+      granted +
+      (yield* applyJudgements(
+        answers.filter(([, judgement]) => judgement.type !== "met"),
+        settings,
+      ))
+    );
+  });
+
+  /** Writes the slots granted; a grant not kept (cancelled meanwhile, or not written) holds nothing. */
+  const applyGrants = (granted: ReadonlyMap<string, string>, settings: ServerSettings) =>
+    lock.withPermits(1)(
+      Effect.gen(function* () {
+        if (granted.size === 0) return 0;
+        const loaded = yield* ensureLoaded(true);
+        const now = yield* Clock.currentTimeMillis;
+        const changes = new Map<string, WaitTransition>();
+        for (const wait of loaded.ok ? loaded.contents.waits : []) {
+          const detail = granted.get(wait.id);
+          if (detail === undefined) continue;
+          const transition = nextWaitState(
+            wait,
+            { type: "slotGranted", detail },
+            now,
+            stateSettings(settings),
+          );
+          if (transition !== null) changes.set(wait.id, transition);
+        }
+        const written =
+          loaded.ok &&
+          changes.size > 0 &&
+          (yield* commitWaits(
+            loaded.contents,
+            loaded.contents.waits.map((wait) => changes.get(wait.id)?.record ?? wait),
+            "the slots are granted again next time.",
+            settings,
+          ));
+        const kept = written ? changes : new Map<string, WaitTransition>();
+        yield* input.slots!.drop([...granted.keys()].filter((id) => !kept.has(id)));
+        for (const [id, transition] of kept) {
+          nextCheckAt.delete(id);
+          yield* logTransition(transition);
+        }
+        return kept.size;
+      }),
+    );
 
   /**
    * Judges every `waiting` wait that is due, at most `JUDGE_CONCURRENCY` at a time (and
@@ -1933,7 +2171,12 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     };
     if (current.notices.length > 0) at(Math.max(noticesRetryAt, now));
     if (receiversToCheck.size > 0) at(now);
+    // A held slot that ends may go to a slot wait still waiting.
+    const slotsWaiting = current.waits.some(
+      (wait) => wait.kind === "slot" && wait.state === "waiting",
+    );
     for (const wait of current.waits) {
+      if (slotsWaiting) for (const held of storedReservation(wait, now)) at(held.untilMs);
       if (wait.state === "waiting") at(nextCheckAt.get(wait.id) ?? now);
       else if (wait.state !== "delivering" && wait.endedAt !== undefined) {
         at(
@@ -1995,7 +2238,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         if ((yield* phase("deliver", deliverSweep, none)) === null) return stopped;
         const judged = yield* phase("judge", judgeSweep, { judged: 0, ended: 0 });
         if (judged === null) return stopped;
-        if (judged.ended > 0 && (yield* phase("deliver", deliverSweep, none)) === null) {
+        const granted = yield* phase("grant", grantSweep, 0);
+        if (granted === null) return stopped;
+        if (judged.ended + granted > 0 && (yield* phase("deliver", deliverSweep, none)) === null) {
           return stopped;
         }
         if ((yield* phase("prune", pruneSweep, 0)) === null) return stopped;
@@ -2033,6 +2278,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       // Before the store was read, the first sweep looks at every receiver anyway.
       if (current !== null) receiversToCheck.add(threadId);
     });
+
+  // The gate counts the slots the store holds (only while waits are on) and clears a used one.
+  if (input.slots !== undefined) {
+    yield* input.slots.attachReservations({ read: heldInStore, used: useStoredSlot });
+  }
 
   return {
     register,

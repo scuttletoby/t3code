@@ -469,6 +469,8 @@ export type WaitEvent =
   | { readonly type: "judged"; readonly judgement: Judgement }
   /** The sweep gave a `waiting` slot wait a free slot. */
   | { readonly type: "slotGranted"; readonly detail: string }
+  /** The slot gate let the wait's thread start an agent: its reservation is used up. */
+  | { readonly type: "slotUsed" }
   | { readonly type: "cancel" }
   /**
    * Written before the first send to the current receiver. `replaces` names an id the wait has
@@ -654,6 +656,10 @@ export function nextWaitState(
       return wait.state === "waiting" && wait.kind === "slot"
         ? { record: freeze(wait, "free", event.detail, now) }
         : null;
+    case "slotUsed":
+      return wait.state === "delivered" && wait.reservedUntil !== undefined
+        ? { record: update(wait, {}, ["reservedUntil"]) }
+        : null;
     case "cancel":
       return wait.state === "waiting"
         ? { record: update(wait, { state: "cancelled", endedAt: iso(now) }) }
@@ -666,8 +672,12 @@ export function nextWaitState(
         : null;
     case "delivered": {
       if (wait.state !== "delivering") return null;
+      // Only a granted slot is held; a slot wait that timed out or was handed over holds none.
       const reservation =
-        wait.kind === "slot"
+        wait.kind === "slot" &&
+        wait.result?.outcome === "free" &&
+        wait.handedOverBecause === undefined &&
+        settings.reserveSeconds > 0
           ? { reservedUntil: iso(now + settings.reserveSeconds * MS_PER_SECOND) }
           : {};
       return {

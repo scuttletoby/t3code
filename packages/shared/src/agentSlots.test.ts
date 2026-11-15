@@ -6,12 +6,14 @@ import {
   DISPATCH_SAFETY_MS,
   effectiveSlotLimits,
   limitsCount,
+  liveReservations,
   liveStarting,
   runningAgents,
   slotDecision,
   slotRefusalText,
   type SlotDecision,
   type SlotLimits,
+  type SlotReservation,
   type SlotThread,
   type StartingEntry,
   visibleRunThreadIds,
@@ -240,6 +242,56 @@ describe("slotDecision (T13)", () => {
       "account",
     );
     expect(refused(slotDecision({ ...base, limits: noMachine, running: [] })).rule).toBe("memory");
+  });
+});
+
+describe("slot reservations (4.6)", () => {
+  const held = (key: string, untilMs: number, account?: string): SlotReservation => ({
+    key,
+    threadId: `holder-${key}`,
+    untilMs,
+    ...(account === undefined ? {} : { account }),
+  });
+
+  it("keeps live ones, one per key with the latest end, oldest end first", () => {
+    expect(
+      liveReservations(
+        [held("w_b", 300), held("w_a", 200), held("w_a", 400), held("w_old", 100)],
+        100,
+      ).map((reservation) => [reservation.key, reservation.untilMs]),
+    ).toEqual([
+      ["w_b", 300],
+      ["w_a", 400],
+    ]);
+    expect(liveReservations([], 0)).toEqual([]);
+  });
+
+  it("count on the machine, and on an account only when they name it", () => {
+    const base = {
+      limits: limitsOf({ maxPerMachine: 3, maxPerAccount: { [MAIN]: 1 } }),
+      running: [{ threadId: "t", instanceId: SECOND }],
+      starting: [],
+      freeMemoryBytes: null,
+    };
+    // One running and two held: the machine is full.
+    expect(
+      refused(
+        slotDecision({
+          ...base,
+          reservations: [held("w_1", 1), held("w_2", 1)],
+          targetInstanceId: SECOND,
+        }),
+      ),
+    ).toMatchObject({ rule: "machine", used: 3 });
+    // A slot held without an account does not count on MAIN's own limit; one held on MAIN does.
+    expect(
+      slotDecision({ ...base, reservations: [held("w_1", 1)], targetInstanceId: MAIN }),
+    ).toEqual({ type: "allow" });
+    expect(
+      refused(
+        slotDecision({ ...base, reservations: [held("w_1", 1, MAIN)], targetInstanceId: MAIN }),
+      ),
+    ).toMatchObject({ rule: "account", used: 1, max: 1 });
   });
 });
 
