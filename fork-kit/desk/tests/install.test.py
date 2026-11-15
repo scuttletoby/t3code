@@ -298,7 +298,8 @@ class Desk(unittest.TestCase):
         self.assertIn('# new', self.read('/opt/fork-fleet/hook.sh'))
         self.assertEqual(os.stat(self.path('/opt/fork-fleet/fork-fleet-launch.sh')).st_ino, launcher)  # unchanged
         calls = self.calls()
-        stop = 'systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service fork-fleet-desk-agent.service'
+        stop = ('systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service t3code-fleet-seed.timer '
+                't3code-fleet-seed.service fork-fleet-desk-agent.service')
         self.assertLess(calls.index(stop), calls.index('systemctl restart fork-fleet-desk-agent.service'))
         self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['sha'], SHA2)
 

@@ -48,7 +48,7 @@ if words[0] == 'seeds' and mode == 'biglist':
     os.write(1, b' ' * (2 << 20))
 if mode == 'noisy':
     for _ in range(64):
-        os.write(2, b'x' * (1 << 16) + b'\n')
+        os.write(2, b'x' * (1 << 16) + b'\\n')
 if words[0] == 'seed' and mode in ('cut', 'trailer', 'odd'):
     with open({t!r} + '/sent', 'w+b') as out:
         err = io.StringIO()
