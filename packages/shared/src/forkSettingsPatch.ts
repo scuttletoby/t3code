@@ -41,6 +41,20 @@ function applyRule(rule: ForkPatchRule, stored: unknown, patch: unknown): unknow
     return next;
   }
   const next = new Map(Object.entries(isRecord(stored) ? stored : {}));
+  if ("replaceEntries" in rule) {
+    for (const [id, entry] of Object.entries(patch as Record<string, unknown>)) {
+      if (entry === undefined) continue;
+      // Delete first, so a changed entry moves to the end: the newest.
+      next.delete(id);
+      if (entry !== null) next.set(id, entry);
+    }
+    const { keepNewest } = rule.replaceEntries;
+    const ids = [...next.keys()];
+    if (keepNewest !== undefined && ids.length > keepNewest) {
+      for (const id of ids.slice(0, ids.length - keepNewest)) next.delete(id);
+    }
+    return Object.fromEntries(next);
+  }
   for (const [id, entry] of Object.entries(patch as Record<string, unknown>)) {
     if (entry === null) {
       next.delete(id);

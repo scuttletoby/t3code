@@ -8,6 +8,17 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { TrimmedString } from "./baseSchemas.ts";
+import {
+  MCP_PROFILE_ALL,
+  MCP_SUBAGENT_INHERIT,
+  MCP_THREAD_PROFILES_KEEP_NEWEST,
+  McpProfileName,
+  McpProfileRef,
+  McpProfilesFromSettingsFile,
+  McpProfilesPatch,
+  McpThreadProfiles,
+  McpThreadProfilesPatch,
+} from "./mcpProfile.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
@@ -25,6 +36,7 @@ import {
   WaitForSettingsPatch,
 } from "./waitFor.ts";
 
+export * from "./mcpProfile.ts";
 export * from "./usagePacing.ts";
 
 /** How often usage limits refresh while no client watches; 0 turns it off. */
@@ -60,6 +72,16 @@ export const ForkServerSettingsFields = {
       Effect.succeed(Duration.toMillis(DEFAULT_HEADLESS_USAGE_REFRESH_INTERVAL)),
     ),
   ),
+  /** Named MCP profiles besides the built-in `all` and `t3-only`; each checked when used. */
+  mcpProfiles: McpProfilesFromSettingsFile,
+  /** The MCP profile a thread gets; `all` (or empty) is today's behaviour. */
+  mcpProfile: McpProfileRef.pipe(Schema.withDecodingDefault(Effect.succeed(MCP_PROFILE_ALL))),
+  /** The MCP profile of a delegated child thread; `inherit` (or empty) follows `mcpProfile`. */
+  mcpSubagentProfile: McpProfileRef.pipe(
+    Schema.withDecodingDefault(Effect.succeed(MCP_SUBAGENT_INHERIT)),
+  ),
+  /** The owner's MCP profile pick per thread; it wins over the defaults above. */
+  mcpThreadProfiles: McpThreadProfiles,
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -78,17 +100,23 @@ export const ForkServerSettingsPatchFields = {
   waitChecks: Schema.optionalKey(WaitChecks),
   agentSlots: Schema.optionalKey(AgentSlotsSettingsPatch),
   headlessUsageRefreshInterval: Schema.optionalKey(Schema.DurationFromMillis),
+  /** Strict: a save refuses a bad profile or a built-in name (reading the file keeps it as is). */
+  mcpProfiles: Schema.optionalKey(McpProfilesPatch),
+  mcpProfile: Schema.optionalKey(McpProfileName),
+  mcpSubagentProfile: Schema.optionalKey(McpProfileName),
+  mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
- * How a patch field changes the stored value: `replace` whole; `merge-fields` replaces only the
- * named fields; `{ mergeEntries }` per entry: `null` removes it, else the fields merge into the
- * stored entry, and a new entry starts from `mergeEntries` (its defaults).
+ * How a patch field changes the stored value: `replace` whole; `merge-fields` only the named fields.
+ * Per entry (`null` removes it): `mergeEntries` merges fields, a new entry starting from its
+ * defaults; `replaceEntries` replaces the entry whole, makes it newest and keeps `keepNewest`.
  */
 export type ForkPatchRule =
   | "replace"
   | "merge-fields"
-  | { readonly mergeEntries: Readonly<Record<string, unknown>> };
+  | { readonly mergeEntries: Readonly<Record<string, unknown>> }
+  | { readonly replaceEntries: { readonly keepNewest?: number } };
 
 /** One rule per fork patch field. */
 export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatchRule } = {
@@ -103,6 +131,12 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   // `maxPerAccount` is one field, so a patch that names it replaces the whole map.
   agentSlots: "merge-fields",
   headlessUsageRefreshInterval: "replace",
+  // One profile per entry, so two people editing different profiles keep both.
+  mcpProfiles: { replaceEntries: {} },
+  mcpProfile: "replace",
+  mcpSubagentProfile: "replace",
+  // One pick per thread, so two picks at once keep both; old picks go beyond the cap.
+  mcpThreadProfiles: { replaceEntries: { keepNewest: MCP_THREAD_PROFILES_KEEP_NEWEST } },
 };
 
 /** The client settings' fork fields (stored in the browser); none yet. */
@@ -112,18 +146,26 @@ export const ForkClientSettingsFields = {};
 export const FORK_PROJECT_SCOPED_KEYS = [
   // A project lists every check it uses; its map replaces the server's.
   "waitChecks",
+  "mcpProfile",
+  "mcpSubagentProfile",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
 /** A project's overrides of fork settings, as the settings file holds them. */
 export const ForkProjectOverrideFields = {
   /** Bad entries are dropped on read; the settings patch refuses them. */
   waitChecks: Schema.optionalKey(WaitChecksFromSettingsFile),
+  /** Absent or empty: the server's `mcpProfile`. */
+  mcpProfile: Schema.optionalKey(McpProfileRef),
+  /** Absent or empty: the server's `mcpSubagentProfile`. */
+  mcpSubagentProfile: Schema.optionalKey(McpProfileRef),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
 /** A project's overrides of fork settings in a patch (each project's set is replaced whole). */
 export const ForkProjectOverridePatchFields = {
   /** A save refuses a bad check. */
   waitChecks: Schema.optionalKey(WaitChecks),
+  mcpProfile: Schema.optionalKey(McpProfileName),
+  mcpSubagentProfile: Schema.optionalKey(McpProfileName),
 } satisfies Record<keyof typeof ForkProjectOverrideFields, unknown>;
 
 /**
@@ -143,3 +185,16 @@ export const FORK_SERVER_SETTING_KEYS: ReadonlyArray<string> = [
   ...FORK_INLINE_SERVER_KEYS,
   ...Object.keys(ForkServerSettingsFields),
 ];
+
+/**
+ * Every fork setting only a person may change: each server, project and client fork key but those
+ * in {@link FORK_AGENT_WRITABLE_KEYS}. No T3 tool's input may name one (the server's
+ * personOnlySettings test). Derived, so a new fork setting is covered without a row.
+ */
+export const FORK_PERSON_ONLY_KEYS: ReadonlyArray<string> = [
+  ...new Set([
+    ...FORK_SERVER_SETTING_KEYS,
+    ...Object.keys(ForkProjectOverrideFields),
+    ...Object.keys(ForkClientSettingsFields),
+  ]),
+].filter((key) => !(FORK_AGENT_WRITABLE_KEYS as ReadonlyArray<string>).includes(key));

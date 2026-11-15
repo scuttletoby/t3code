@@ -2,8 +2,10 @@
 
 import {
   DEFAULT_SERVER_SETTINGS,
+  MCP_THREAD_PROFILES_KEEP_NEWEST,
   ProviderInstanceId,
   type ServerSettings,
+  ThreadId,
 } from "@t3tools/contracts";
 import { WaitCheck } from "@t3tools/contracts/waitFor";
 import * as Duration from "effect/Duration";
@@ -95,6 +97,77 @@ describe("fork settings patch", () => {
     expect(next.waitFor).toEqual({ ...current.waitFor, prSweepSeconds: 60 });
     expect(Duration.toMillis(next.headlessUsageRefreshInterval)).toBe(300_000);
     expect(next.waitChecks).toBe(current.waitChecks);
+  });
+
+  describe("replaces entries (MCP profiles and thread picks)", () => {
+    const t = (id: string) => ThreadId.make(id);
+    const withPicks: ServerSettings = {
+      ...current,
+      mcpProfiles: { lean: { servers: [], t3Tools: ["threads"], future: true } },
+      mcpThreadProfiles: { a: "lean", b: "lean", c: "all" },
+    };
+
+    it("keeps both of two picks saved at once", () => {
+      const first = {
+        ...withPicks,
+        ...applyForkSettingsPatch(withPicks, { mcpThreadProfiles: { [t("d")]: "lean" } }),
+      };
+      // The second client's patch names only its own thread, so the first pick stays.
+      const second = applyForkSettingsPatch(first, { mcpThreadProfiles: { [t("e")]: "all" } });
+      expect(second.mcpThreadProfiles).toEqual({
+        a: "lean",
+        b: "lean",
+        c: "all",
+        d: "lean",
+        e: "all",
+      });
+    });
+
+    it("removes a pick on null and moves a changed pick to the newest", () => {
+      const next = applyForkSettingsPatch(withPicks, {
+        mcpThreadProfiles: { [t("a")]: "all", [t("b")]: null },
+      });
+      expect(Object.entries(next.mcpThreadProfiles ?? {})).toEqual([
+        ["c", "all"],
+        ["a", "all"],
+      ]);
+    });
+
+    it(`keeps the ${MCP_THREAD_PROFILES_KEEP_NEWEST} newest picks`, () => {
+      const many = Object.fromEntries(
+        Array.from({ length: MCP_THREAD_PROFILES_KEEP_NEWEST }, (_, index) => [
+          `old-${index}`,
+          "lean",
+        ]),
+      );
+      const full: ServerSettings = { ...current, mcpThreadProfiles: many };
+      const next = applyForkSettingsPatch(full, {
+        mcpThreadProfiles: { [t("old-0")]: "all", [t("new")]: "lean" },
+      }).mcpThreadProfiles!;
+      expect(Object.keys(next)).toHaveLength(MCP_THREAD_PROFILES_KEEP_NEWEST);
+      // `old-0` was picked again, so `old-1` is now the oldest and goes.
+      expect(Object.keys(next).slice(0, 1)).toEqual(["old-2"]);
+      expect(Object.keys(next).slice(-2)).toEqual(["old-0", "new"]);
+      expect(next).not.toHaveProperty("old-1");
+    });
+
+    it("replaces a profile whole, so a save repairs one this build cannot read", () => {
+      const next = applyForkSettingsPatch(withPicks, {
+        mcpProfiles: { lean: { servers: ["docs"], t3Tools: "all" }, review: null },
+      });
+      expect(next.mcpProfiles).toEqual({ lean: { servers: ["docs"], t3Tools: "all" } });
+    });
+
+    it("goes through applyServerSettingsPatch", () => {
+      const next = applyServerSettingsPatch(withPicks, {
+        mcpProfile: "lean",
+        mcpSubagentProfile: "t3-only",
+        mcpThreadProfiles: { [t("c")]: null },
+      });
+      expect([next.mcpProfile, next.mcpSubagentProfile]).toEqual(["lean", "t3-only"]);
+      expect(next.mcpThreadProfiles).toEqual({ a: "lean", b: "lean" });
+      expect(next.mcpProfiles).toBe(withPicks.mcpProfiles);
+    });
   });
 
   it("pins the fork's lines in serverSettings.ts", () => {
