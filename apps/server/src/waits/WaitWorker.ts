@@ -21,6 +21,7 @@ import * as DueHint from "../scheduling/DueHint.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { forkParked } from "../serverActivation.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import * as SlotGate from "../slots/SlotGate.ts";
 import * as WaitDelivery from "./WaitDelivery.ts";
 import {
   type CheckPlace,
@@ -90,6 +91,8 @@ export const layer = Layer.effect(
       onChange: due.invalidate,
       // Each run is timed by the project its thread is in now.
       checkPlaceOf,
+      // The server's one gate (layers memoize by reference): slot waits and delegate_task share it.
+      slots: yield* SlotGate.SlotGate,
     });
     yield* forkParked(
       Stream.runForEach(orchestrator.streamDomainEvents, (event) =>
