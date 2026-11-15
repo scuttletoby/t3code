@@ -24,7 +24,7 @@ Time (the dispatcher, fork-fleet.py Host, gives a launch command 120 s):
                    could come up after the next pass deleted its registration.
   serve_seconds    limit + SERVE_MARGIN: serve answers UNKNOWN itself when the agent has not answered by then.
   seconds(verb)    limit + MARGIN: `launch`'s whole time, connect and send included; it then exits UNKNOWN.
-                   The longest verb the dispatcher calls (start, stop, prune) ends by 110 s, under its 120 s.
+                   The longest verb the dispatcher calls (start, stop, prune, refresh-net) ends by 110 s, under its 120 s.
 Exit codes of `launch`: the launcher's own (0-255), except NO_SESSION (3: nothing was sent; a launcher's own 3 is
 turned into 1), UNKNOWN (75: the verb may or may not have run; the agent answers 75 only for a verb it killed, and
 answers a launcher's own 75 as 1), 2 (refused before sending) and 1 (any other failure). Standard library only.
@@ -51,10 +51,11 @@ VERBS = {
     'stop': ((NAME,), None, 100),
     'prune': ((), None, 100),
     'check-net': ((URL, HOST_PORT), HOST_PORT, 300),
+    'refresh-net': ((), None, 100),   # each dispatcher pass: the address lookups (10 s each) and the units' new deny lists
 }
-# The launcher's verbs that only its own machine runs (a root timer or a person at the machine), never the link:
-# `serve` and the agent refuse them like an unknown verb, and the contract test counts them as the launcher's.
-LOCAL_ONLY = frozenset({'refresh'})
+# The launcher's verbs that only its own machine runs (a root timer, the walls check or a person at the machine), never
+# the link: `serve` and the agent refuse them like an unknown verb, and the contract test counts them as the launcher's.
+LOCAL_ONLY = frozenset({'refresh', 'paths'})
 MARGIN = 10                   # seconds `launch` waits beyond a verb's limit, all told
 SERVE_MARGIN = 5              # seconds `serve` waits beyond it before it answers UNKNOWN itself
 UNKNOWN = 75                  # launch's exit when the verb may or may not have run (EX_TEMPFAIL)

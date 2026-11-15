@@ -855,6 +855,10 @@ class Host:
         """HostError (with the launcher's reason) unless the pool's runner template is not older than `newest`."""
         self._must('ready', newest)
 
+    def refresh_net(self):
+        """HostError unless the host looked its own public address up again and blocks it for running jobs too."""
+        self._must('refresh-net')
+
     def start(self, name, env_text):
         self._must('start', name, stdin=env_text)
 
@@ -980,7 +984,7 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
     queued = [(run, j) for run in runs.values() for j in gh.pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
               if j.get('status') == 'queued' and not j.get('runner_name')]
     queued_ids = {j['id'] for _, j in queued}
-    state['said'] = {k for k in state['said'] if k[0] in queued_ids or k[0] == 'ready'}
+    state['said'] = {k for k in state['said'] if k[0] in queued_ids or k[0] in ('ready', 'net')}
     state['tries'] = {k: v for k, v in state['tries'].items() if k in queued_ids}
     newest = newest_runner(gh, state, now())
     units = {}
@@ -994,6 +998,15 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
         except HostError as e:
             closed[p['name']] = str(e)
             once(state, ('ready', p['name'], str(e)), f'::warning::fork-fleet: {e}')
+        # This host's own public address, again every pass: it may change while a job runs. The launcher re-applies
+        # the block for the running jobs too; when no lookup answers, the last block stays and no runner starts.
+        try:
+            hosts[p['name']].refresh_net()
+            state['said'] = {k for k in state['said'] if k[:2] != ('net', p['name'])}
+        except HostError as e:
+            closed[p['name']] = str(e)
+            once(state, ('net', p['name'], str(e)), f'::warning::fork-fleet: {e}; no runner starts on pool '
+                                                    f'{p["name"]} until it answers (the last block stays)')
     ours = {}
     for r in gh.pages('actions/runners', 'runners'):
         for p in pools:

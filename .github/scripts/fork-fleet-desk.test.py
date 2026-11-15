@@ -505,7 +505,7 @@ class Wire(unittest.TestCase):
         limit = int(re.search(r'timeout=([0-9]+)', inspect.getsource(ff.Host._do)).group(1))
         src = ''.join(inspect.getsource(f) for f in vars(ff.Host).values() if inspect.isfunction(f))
         verbs = set(re.findall(r"self\._(?:must|do)\('([a-z-]+)'", src))
-        self.assertEqual(verbs, {'start', 'ready', 'active', 'fits', 'stop', 'prune'})
+        self.assertEqual(verbs, {'start', 'ready', 'active', 'fits', 'stop', 'prune', 'refresh-net'})
         for verb in wire.VERBS:
             self.assertLess(wire.limit(verb), wire.serve_seconds(verb), verb)
             self.assertLess(wire.serve_seconds(verb), wire.seconds(verb), verb)
