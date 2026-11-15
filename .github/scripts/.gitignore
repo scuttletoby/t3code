@@ -1,0 +1,3 @@
+# Fork only: Python byte-code from running the tests here (it holds local paths).
+__pycache__/
+*.pyc
