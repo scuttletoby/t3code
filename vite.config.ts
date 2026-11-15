@@ -182,6 +182,8 @@ export default defineConfig({
       "infra/task-cache/vendor/**",
       // Macroscope requires one glob per line; Markdown formatting corrupts it.
       ".macroscope/ignore.md",
+      // gitleaks' default rules, byte for byte (fork-secret-scan.test.sh compares them with the binary).
+      ".gitleaks.toml",
       ".alchemy",
       "dist",
       "dist-electron",

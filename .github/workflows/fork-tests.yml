@@ -244,6 +244,7 @@ jobs:
       # docs/fork/: the fork's pages whose commands and links a test runs (fork-gate-trust-docs.test.py).
       # apps/, packages/: only the T3 source files the go-live kit's contract test pins
       # (fork-kit/golive/tests/contract.test.py); keep the two lists in step.
+      # .gitleaks.toml: fork-secret-scan.test.sh checks the repository's gitleaks rules.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -256,6 +257,7 @@ jobs:
             /fork-ci/
             /fork-kit/
             /scripts/
+            /.gitleaks.toml
             /apps/server/src/cli/forkReport.ts
             /apps/server/src/cloud/bootService.ts
             /apps/server/src/cloud/serviceProtocol.ts
