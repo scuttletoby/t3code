@@ -73,7 +73,7 @@ class Machine:
         self.bin = self.path('bin')
         self.server = None
         self._saved = (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
-                       os.environ.get('PATH'))
+                       osadapter.CGROUP_FILE, os.environ.get('PATH'))
         for d in (self.bin, self.backups, self.path('etc')):
             os.makedirs(d)
             os.chmod(d, 0o755)  # a umask of 002 would leave them group-writable, which the loader refuses
@@ -83,6 +83,9 @@ class Machine:
         config.MACHINE_FILE, config.MACHINE_OWNER = self.path('etc/machine.json'), os.getuid()
         osadapter.SYSTEMCTL = os.path.join(self.bin, 'systemctl')
         osadapter.SYSTEMD_RUN = os.path.join(self.bin, 'systemd-run')
+        # This test may itself run inside a T3 terminal: never let that decide what the kit sees.
+        osadapter.CGROUP_FILE = self.write('cgroup', '0::/user.slice/user-1000.slice/user@1000.service/app.slice/'
+                                                     'some-shell.scope\n')
 
     def path(self, rel):
         return os.path.join(self.root, rel)
@@ -99,7 +102,8 @@ class Machine:
         if self.server is not None:
             kill(self.server)
             self.server = None
-        (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN, path) = self._saved
+        (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
+         osadapter.CGROUP_FILE, path) = self._saved
         os.environ['PATH'] = path or ''
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -129,6 +133,13 @@ class Machine:
         self.write('home/userdata/statev2.sqlite', b'SQLite format 3\0' + b'x' * 4096)
         self.write('home/userdata/statev2.sqlite-wal', b'w' * 1024)
         self.write('home/userdata/settings.json', '{}')
+        self.spawn_server(version)
+
+    def spawn_server(self, version=LIVE):
+        """The fake server of `version`: a child of this test process (the unit's MainPID), with its runtime file."""
+        runtime = self.path(f'home/runtime/versions/{version}/t3')
+        if self.server is not None:
+            kill(self.server)  # reap the one the fake stop killed
         self.server = subprocess.Popen([runtime, '600'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL, start_new_session=True)
         self.runtime_file(pid=self.server.pid, serverVersion=version)
@@ -185,6 +196,54 @@ class Machine:
                 digest = hashlib.sha256(open(p, 'rb').read()).hexdigest() if os.path.isfile(p) else None
                 out[os.path.relpath(p, top)] = (digest, st.st_size, st.st_mtime_ns, st.st_mode)
         return out
+
+
+class FakeAdapter(osadapter.SystemdUser):
+    """The systemd adapter with stop, start and run_detached faked on the test machine (service() still reads the
+    stub systemctl): stop kills the fake server and marks the unit inactive; start spawns a new one of the version
+    in the home's service state (needs `machine`: only the test process can be its parent). Calls are recorded in
+    fake-adapter-calls.jsonl; `on` maps a call name to a function run after it (a test's kill or failure)."""
+
+    def __init__(self, root, machine=None, on=None):
+        self.root, self.machine, self.on = root, machine, on or {}
+
+    def _svc(self, **props):
+        path = os.path.join(self.root, 'service.json')
+        with open(path) as f:
+            svc = json.load(f)
+        svc.update(props)
+        with open(path, 'w') as f:
+            json.dump(svc, f)
+
+    def _record(self, *call):
+        with open(os.path.join(self.root, 'fake-adapter-calls.jsonl'), 'a') as f:
+            f.write(json.dumps(call) + '\n')
+        if call[0] in self.on:
+            self.on[call[0]](*call[1:])
+
+    def stop(self):
+        try:
+            with open(os.path.join(self.root, 'home/userdata/server-runtime.json')) as f:
+                os.kill(json.load(f)['pid'], signal.SIGKILL)
+        except (OSError, ValueError, KeyError):
+            pass
+        if self.machine is not None and self.machine.server is not None:
+            self.machine.server.wait()
+        self._svc(ActiveState='inactive', MainPID=0)
+        self._record('stop')
+
+    def start(self):
+        with open(os.path.join(self.root, 'home/runtime/service-state.json')) as f:
+            version = json.load(f)['activeVersion']
+        if self.machine is not None:
+            self.machine.spawn_server(version)
+        self._svc(ActiveState='active', MainPID=os.getpid())
+        self._record('start')
+
+    def run_detached(self, unit, argv, guard_after_seconds=None, guard_argv=None):
+        if not osadapter._UNIT_NAME.match(unit):
+            raise osadapter.AdapterError(f'not a safe unit name: {unit!r}')
+        self._record('run_detached', unit, argv)
 
 
 def kill(proc):

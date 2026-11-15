@@ -2,7 +2,7 @@
 
 `t3-golive` moves a T3 home that runs as a boot service from its current build to a newer one (for example a
 fork build), with a cold copy of the data first and a way back. It is built in steps; this folder has the
-**core** so far:
+**core** and the **copy** so far:
 
 | Part              | File                      | What it does                                                 |
 | ----------------- | ------------------------- | ------------------------------------------------------------ |
@@ -11,8 +11,9 @@ fork build), with a cold copy of the data first and a way back. It is built in s
 | live T3           | `lib/golive/live.py`      | finds the running server from its own files and process      |
 | `check`, `settle` | `lib/golive/check.py`     | read only: may this home move to the target build now?       |
 | OS adapter        | `lib/golive/osadapter.py` | systemd user units only; other systems refuse until written  |
+| `copy`, restore   | `lib/golive/coldcopy.py`  | the practice stop: a cold copy; the restore primitive        |
 
-Later parts (copy, rehearse, switch, back) come in their own PRs. Install from `ci-release` comes with them.
+Later parts (rehearse, switch, back) come in their own PRs. Install from `ci-release` comes with them.
 
 ## `t3-golive check`
 
@@ -43,6 +44,44 @@ lock of its own (the run holds it exclusively, so there is no gap) and does not 
 A run that does not hold the lock on this `stateDir` is refused (`ValueError`), so this opens the lock to no one
 else.
 
+## `t3-golive copy [--owner-says-go]`: the practice stop
+
+The first change the kit makes, and a rehearsal of the stop the switch will need. It runs detached (a transient
+user unit, printed with how to follow it), because stopping T3 kills everything inside its service, a T3
+terminal included; `--here` runs it in the calling process and is refused inside the boot service. In order:
+
+1. **Checks** (no change yet): `check` must pass (or say nothing to do: then it refuses), the backup disk must
+   hold the copy plus the floor, and a quiet command must be set unless the owner says go.
+2. **Quiet point** (no change yet): `quietCommand` (the fork setting `automaticUpdatesQuietCommand`'s contract:
+   absolute path, no arguments, run in the home with both versions in its environment, exit 0 = quiet) must say
+   quiet twice, 60 s apart, within `quietWaitSeconds`; else it refuses. `--owner-says-go` skips the wait.
+3. **Guard**: a second detached unit (`t3-golive guard`) waits for this run to end however it ends; if the run
+   stopped T3 and left it stopped (killed, crashed), it starts T3 again, and it runs the post hooks if the run
+   ran the pre hooks but not the post hooks. It logs to `<stateDir>/guard.log` and writes no journal line.
+4. **Pre hooks** (`preHooks`, in order), then one more quiet sample. A failure runs the post hooks and refuses:
+   T3 was never stopped.
+5. **Stop** the boot service; wait until it is inactive and its server is gone; take upstream's ownership lock
+   of the home (`userdata/server-owner.sqlite`), so no server can start on it during the copy.
+6. **Cold copy** of `userdata/` into a new folder `<backupDir>/t3-copy-<time>-<live version>/` (mode 700; never
+   over an old one): the database with its WAL, settings, attachments and the other small files, with their
+   modes; links as links. Left out: `logs`, `server-runtime.json`, the ownership lock and SQLite's `-shm` (an index
+   SQLite rebuilds from the WAL on the first open). Each file is hashed while it is copied and fsynced.
+7. **Read-back**: both the copy and the source are read from disk again; every SHA256 must match.
+8. **Manifest**, written LAST (temp file, fsync, rename): every entry with its size, mode and SHA256.
+9. **Start** the same build again, **verify** a new server of the same version runs for the home, then the
+   **post hooks**. These run however steps 5-8 ended. `stopLimitSeconds` bounds steps 6-7: past it the copy gives
+   up and T3 starts again.
+
+**A copy folder without a finished manifest is incomplete and is never used** (`coldcopy.read_manifest`,
+`verify_copy`). Nothing is ever deleted. A refusal before T3 stopped (every started step done) ends the run
+"refused" and needs no settling; any failure after T3 stopped needs `settle`, after T3 was started again.
+
+Restore primitive (`coldcopy.restore(run, copy_dir, home)`, for the later `rehearse` and `back`; only inside a
+journalled step, with the home's server stopped): reads the copy back against its manifest first, refuses while
+any server holds the ownership lock, copies the database family and `settings.json` in under temp names, moves
+the home's own files (`-wal`, `-journal` and `-shm` included) aside to `<name>.golive-aside-<time>`, then renames
+the copies into place. Running it again after a stop half-way starts again from the untouched copy.
+
 ## `t3-golive settle --reason "<what you did>"`
 
 After a run stopped half-way or ended with an error, look at the T3 home and put it right, then run this: it
@@ -66,7 +105,10 @@ There is no flag or environment variable to point elsewhere. Placeholder values:
     "stageDir": "/path/to/the/downloaded/release",
     "backupDir": "/path/to/the/backups",
     "stateDir": "/path/to/the/kit/state",
-    "freeFloorMb": 2048
+    "freeFloorMb": 2048,
+    "quietCommand": "/path/to/a/quiet/check",
+    "preHooks": ["/path/to/pause/background/jobs"],
+    "postHooks": ["/path/to/resume/background/jobs"]
   }
 }
 ```
@@ -75,7 +117,10 @@ There is no flag or environment variable to point elsewhere. Placeholder values:
 `<stageDir>/<version>/` (`tar -xzf <archive> -C <stageDir>/<version> --strip-components=1`). `stateDir` holds
 the lock and the journal; it is required, and no environment variable moves it, so a detached `switch` and a
 `check` from a shell always find the same lock and journal. `stateDir`, `backupDir` and `stageDir` must be
-outside the T3 home (check writes nothing there). `freeFloorMb` is optional (default 2048). An unknown key, a
+outside the T3 home (check writes nothing there). `freeFloorMb` is optional (default 2048). For `copy`:
+`quietCommand` (optional; without it `copy` needs `--owner-says-go`), `preHooks` and `postHooks` (optional
+lists of absolute paths, run with no arguments; each must be safe to run twice), `quietWaitSeconds` (default
+7200) and `stopLimitSeconds` (default 1800). An unknown key, a
 missing key, a wrong type or a newer `version` is refused by name (the shared loader, `fork-kit/common`).
 
 ## Lock and journal
@@ -86,7 +131,11 @@ fsynced before the step it names starts and carries the hash of the line before 
 leaves a run with no end; a run that ended with an error after its first step started may have left the home
 just as half-applied. Either needs settling: every later `check` refuses and says where it stopped, and a
 changing run refuses to start until the owner runs `settle`. (A run that failed before its first step changed
-nothing and is only a note.) A torn last line is reported and ignored; damage anywhere else refuses, naming the
+nothing and is only a note.) The rule every changing command keeps: every change is made inside a journalled
+step (kit code calls `run.require_step()` first, so a change outside one is an error), and pre-checks, `check`
+included, run before the first step (`run_check` refuses inside a step). A command that stops on purpose after
+every step it started is done raises `journal.Refused`: the run ends "refused" and needs no settling. The guard
+takes the lock with `wait=True`: it blocks until the run it watches ends. A torn last line is reported and ignored; damage anywhere else refuses, naming the
 file and how to settle it; a line from a newer kit refuses with "update the kit".
 
 ## Tests
@@ -94,10 +143,11 @@ file and how to settle it; a line from a newer kit refuses with "update the kit"
 ```
 python3 -I -B fork-kit/golive/tests/check.test.py      # check on a fake machine
 python3 -I -B fork-kit/golive/tests/journal.test.py    # lock, journal, adapter, version order
+python3 -I -B fork-kit/golive/tests/copy.test.py       # copy, guard, restore on a fake machine
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
 python3 -I -B fork-kit/common/tests/machine_file.test.py
 ```
 
 The tests fake the service manager (stub `systemctl` and `systemd-run`) and the T3 home (a temporary folder,
-with a copy of `sleep` standing in for the server). They need no root and no systemd, and never touch a real
+with a copy of `sleep` standing in for the server; `copy.test.py` fakes stop and start on it too). They need no root and no systemd, and never touch a real
 T3 home, unit or `~/.t3`.
