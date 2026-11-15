@@ -237,7 +237,7 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       # scripts/: some tests are run by a script there (.github/fork-ci-tests.txt).
       # fork-ci/: the composite actions and their tests. fork-kit/: host kits and their tests.
@@ -368,7 +368,8 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
 
       # The range rules against this gitleaks: a key added and deleted again
-      # before a merge of main, a key only a merge commit adds, push ranges.
+      # before a merge of main, a key only a merge commit adds, push ranges,
+      # settings the pull request cannot change, octopus merges.
       - name: Test the scan ranges
         env:
           GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
@@ -382,6 +383,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
+          # A pull request's gitleaks settings come from this branch's tip, never from the PR.
+          CONFIG_BRANCH: ${{ github.event.repository.default_branch }}
           PARENT_TOKEN: ${{ github.token }}
         # A push leaves out the commits upstream (this fork's parent, as in fork-follow.yml)
         # already has. Parent not readable: UPSTREAM stays empty and the full range is scanned.
