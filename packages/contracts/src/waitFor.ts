@@ -74,7 +74,7 @@ const WAIT_CHECK_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/u;
  * never `-` (an option), `=`, `@` or `+`, which some programs read as an option, an
  * assignment, a response file or a command. Checks saved with the older default keep it.
  */
-export const DEFAULT_WAIT_CHECK_ARG_PATTERN = "^[A-Za-z0-9._:/][A-Za-z0-9._:/@=+-]{0,199}$";
+const DEFAULT_WAIT_CHECK_ARG_PATTERN = "^[A-Za-z0-9._:/][A-Za-z0-9._:/@=+-]{0,199}$";
 
 export const WaitCheckName = Schema.String.check(Schema.isPattern(WAIT_CHECK_NAME_PATTERN));
 export type WaitCheckName = typeof WaitCheckName.Type;

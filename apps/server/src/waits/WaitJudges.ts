@@ -211,9 +211,9 @@ function parseChildAnswer(
 }
 
 /** The most a check or `systemctl` may print on each of stdout and stderr; more is an error. */
-export const CHECK_MAX_OUTPUT_BYTES = 8192;
+const CHECK_MAX_OUTPUT_BYTES = 8192;
 /** A `systemctl show` that has not answered by then is killed. */
-export const UNIT_LIMIT_MS = 5_000;
+const UNIT_LIMIT_MS = 5_000;
 
 /**
  * Where a check runs: the project the wait's thread is in now (it follows a thread that moved),
@@ -330,8 +330,8 @@ export const lookUpCheck: (
  * what stops it. It gets this much more time than the server's own limit, so the server's limit
  * normally comes first.
  */
-export const CHECK_ORPHAN_EXTRA_SECONDS = 5;
-export const TIMEOUT_PROGRAMS: ReadonlyArray<string> = ["/usr/bin/timeout", "/bin/timeout"];
+const CHECK_ORPHAN_EXTRA_SECONDS = 5;
+const TIMEOUT_PROGRAMS: ReadonlyArray<string> = ["/usr/bin/timeout", "/bin/timeout"];
 /** `timeout` options that GNU coreutils and BusyBox (1.36 and later) both take. */
 const timeoutOptions = (seconds: number) => ["-k", "2", `${seconds}`];
 /** The exit code the `timeout` test run asks for, so a usage error (exit 1) cannot pass it. */

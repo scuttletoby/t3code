@@ -124,7 +124,7 @@ export function clipStored(text: string, maxBytes = MAX_STORED_TEXT_BYTES): stri
 }
 
 /** A check's `argPattern` as it is tested: the whole argument must match, whatever anchors it has. */
-export function argPatternRegExp(argPattern: string): RegExp {
+function argPatternRegExp(argPattern: string): RegExp {
   return new RegExp(`^(?:${argPattern})$`, "u");
 }
 
