@@ -999,6 +999,83 @@ describe("SlotGate", () => {
         }),
     );
 
+    // While a re-ask on another account (or none) is not kept, the old hold still counts
+    // against its own account, so a dropped re-ask never leaves that account booked twice.
+    it.effect(
+      "a re-ask not kept yet still counts the old hold against its account, once on the machine",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          const third = ThreadId.make("thread:slot-third");
+          yield* run(
+            world,
+            waitsOn({ maxPerMachine: 2, maxPerAccount: { [SECOND]: 1 }, reserveSeconds: 60 }),
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              assert.deepStrictEqual(
+                types(yield* grant({ key: "h0", threadId: holder, account: SECOND })),
+                ["granted"],
+              );
+              yield* gate.keep(["h0"]);
+              // One sweep: the holder re-asks with no account, then `other` asks for SECOND.
+              // The holder's SECOND hold is hidden but still counts there: `other` waits.
+              assert.deepStrictEqual(
+                types(
+                  yield* grant(
+                    { key: "w1", threadId: holder },
+                    { key: "w2", threadId: other, account: SECOND },
+                  ),
+                ),
+                ["granted", "full"],
+              );
+              assert.strictEqual((yield* acquireAs(other, SECOND)).type, "refuse");
+              // Not twice against the machine: the holder counts once (its new hold), so a
+              // third thread still gets the second machine slot.
+              assert.deepStrictEqual(types(yield* grant({ key: "w3", threadId: third })), [
+                "granted",
+              ]);
+              // The re-ask is cancelled before it is written: the old hold is back, and SECOND
+              // holds it once (not over its limit), for the holder only.
+              yield* gate.drop(["w1"]);
+              assert.deepStrictEqual(
+                types(yield* grant({ key: "w2", threadId: other, account: SECOND })),
+                ["full"],
+              );
+              const usage = yield* gate.usage;
+              assert.deepStrictEqual(
+                usage?.accounts.find((account) => account.id === SECOND),
+                { id: SECOND, used: 1, max: 1 },
+              );
+              assert.strictEqual((yield* acquireAs(holder, SECOND)).type, "allow");
+            }),
+          );
+          // Kept this time: the old SECOND hold is used up, and `other` gets SECOND next sweep.
+          yield* run(
+            newWorld(),
+            waitsOn({ maxPerMachine: 3, maxPerAccount: { [SECOND]: 1 }, reserveSeconds: 60 }),
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              yield* grant({ key: "h0", threadId: holder, account: SECOND });
+              yield* gate.keep(["h0"]);
+              assert.deepStrictEqual(
+                types(
+                  yield* grant(
+                    { key: "w1", threadId: holder },
+                    { key: "w2", threadId: other, account: SECOND },
+                  ),
+                ),
+                ["granted", "full"],
+              );
+              yield* gate.keep(["w1"]);
+              assert.deepStrictEqual(
+                types(yield* grant({ key: "w2", threadId: other, account: SECOND })),
+                ["granted"],
+              );
+            }),
+          );
+        }),
+    );
+
     it.effect("a thread already holding a slot that is refused keeps the slot it holds", () =>
       Effect.gen(function* () {
         const world = newWorld();

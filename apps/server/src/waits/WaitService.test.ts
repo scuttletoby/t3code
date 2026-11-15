@@ -3,6 +3,7 @@ import { assert, it } from "@effect/vitest";
 import { ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WaitForInput, WaitRecord } from "@t3tools/contracts/waitFor";
 import { type Judgement, MAX_OPEN_WAITS } from "@t3tools/shared/waitFor";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -2540,5 +2541,226 @@ it.layer(NodeServices.layer)("WaitService: carry from #90 (fix round 2 on #91)",
         assert.isAtLeast(mostChildLive, 1, "file checks reached their own processes");
         assert.strictEqual(mostChildLive, 2, "never more stuck file check processes than places");
       }).pipe(inMemory, Effect.provide(ServerSettingsService.layerTest(ON))),
+  );
+});
+
+it.layer(NodeServices.layer)("WaitService: monotonic clock and early messages (#95)", (it) => {
+  const ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+  const idOf = (n: number) =>
+    `w_${Array.from({ length: 10 }, (_, index) => ALPHABET[Math.floor(n / 32 ** (9 - index)) % 32]).join("")}`;
+  // In memory (see `memoryFileSystem`), so every write answers at once while the test clock moves.
+  const filePath = `/waits/state/${WAIT_STORE_FILE}`;
+  const watched = (name: string) => `/waits/${name}`;
+  const letFibersRun = Effect.gen(function* () {
+    for (let turn = 0; turn < 20; turn += 1) yield* Effect.yieldNow;
+  });
+  const fileRecord = (n: number, path: string) =>
+    record({ id: idOf(n), key: n.toString(16).padStart(16, "0"), spec: { path, until: "exists" } });
+
+  /**
+   * The test clock, with its wall time and its monotonic time moved by their own `shift`: a time
+   * sync or a restored snapshot moves the wall clock only (timers keep running, as Node's are
+   * monotonic), and a new process starts its monotonic clock again.
+   */
+  const shiftedClock = Effect.gen(function* () {
+    const test = yield* TestClock.testClockWith(Effect.succeed);
+    const shift = { wall: 0, monotonic: 0 };
+    const wall = () => test.currentTimeMillisUnsafe() + shift.wall;
+    const monotonic = () => test.monotonicTimeNanosUnsafe() + BigInt(shift.monotonic) * 1_000_000n;
+    const clock = {
+      ...test,
+      currentTimeMillisUnsafe: wall,
+      currentTimeMillis: Effect.sync(wall),
+      currentTimeNanosUnsafe: () => BigInt(wall()) * 1_000_000n,
+      currentTimeNanos: Effect.sync(() => BigInt(wall()) * 1_000_000n),
+      monotonicTimeNanosUnsafe: monotonic,
+      monotonicTimeNanos: Effect.sync(monotonic),
+    } as unknown as Clock.Clock;
+    return { clock, shift };
+  });
+
+  /**
+   * Three stored file waits: `dead/a` and `dead/b` hang in the server (a dead mount), `ready`
+   * exists. A file check in its own process answers, and is counted.
+   */
+  const deadMount = Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    yield* fs.writeFileString(watched("ready"), "");
+    yield* seed(filePath, [
+      fileRecord(1, watched("dead/a")),
+      fileRecord(2, watched("dead/b")),
+      fileRecord(3, watched("ready")),
+    ]);
+    const exists = (path: string) =>
+      fs.exists(path).pipe(
+        Effect.orDie,
+        Effect.map((found): Judgement =>
+          found ? { type: "met", outcome: "exists", detail: "It exists." } : { type: "notYet" },
+        ),
+      );
+    const childChecks: string[] = [];
+    const service = yield* makeService({
+      filePath,
+      judges: {
+        file: (target) =>
+          target.spec.path.includes("/dead/")
+            ? (Effect.never as Effect.Effect<Judgement>)
+            : exists(target.spec.path),
+      },
+      fileChildJudge: (target) =>
+        Effect.sync(() => childChecks.push(target.spec.path)).pipe(
+          Effect.andThen(exists(target.spec.path)),
+        ),
+    });
+    const ready = Effect.map(
+      storedWaits(filePath),
+      (waits) => waits.find((wait) => wait.id === idOf(3))?.state,
+    );
+    return { service, childChecks, ready };
+  });
+
+  /** One pass, with 15 s of the test clock for its checks. */
+  const pass = (service: WaitService.WaitService) =>
+    Effect.gen(function* () {
+      const running = yield* Effect.forkChild(service.judgeDue());
+      yield* letFibersRun;
+      yield* stepSeconds(15);
+      yield* letFibersRun;
+      const done = running.pollUnsafe() !== undefined;
+      if (!done) yield* Fiber.interrupt(running);
+      return done;
+    });
+
+  it.effect(
+    "a met file wait's message goes out at once, while slow checks of another kind still run",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(watched("ready"), "");
+        yield* seed(filePath, [
+          fileRecord(1, watched("ready")),
+          record({
+            id: idOf(2),
+            key: "2".padStart(16, "0"),
+            kind: "pr",
+            spec: { number: 1, until: "checks" },
+          }),
+          record({
+            id: idOf(3),
+            key: "3".padStart(16, "0"),
+            kind: "pr",
+            spec: { number: 2, until: "checks" },
+          }),
+        ]);
+        const sentAt: number[] = [];
+        const service = yield* makeService({
+          filePath,
+          delivery: {
+            receiver: () => Effect.succeed({ type: "ok" }),
+            deliver: () =>
+              Effect.map(Clock.currentTimeMillis, (now) => {
+                sentAt.push(now - NOW);
+                return { type: "delivered" } as const;
+              }),
+          },
+          judges: {
+            file: () =>
+              Effect.succeed<Judgement>({ type: "met", outcome: "exists", detail: "It exists." }),
+            // Healthy but slow (under their 60 s limit), like a slow pull request host.
+            pr: () => Effect.sleep(55_000).pipe(Effect.as<Judgement>({ type: "notYet" })),
+          },
+        });
+        const sweep = yield* Effect.forkChild(service.runDue());
+        yield* letFibersRun;
+        yield* stepSeconds(5);
+        assert.strictEqual(sweep.pollUnsafe(), undefined, "the pull request checks still run");
+        assert.deepStrictEqual(sentAt, [0]);
+        yield* stepSeconds(60);
+        yield* letFibersRun;
+        assert.isDefined(sweep.pollUnsafe(), "the sweep ended");
+        // Sent once: the deliver step after the checks finds nothing more to send.
+        assert.deepStrictEqual(sentAt, [0]);
+        assert.strictEqual(
+          (yield* storedWaits(filePath)).find((wait) => wait.id === idOf(1))?.state,
+          "delivered",
+        );
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),
+        Effect.provide(ServerSettingsService.layerTest(ON)),
+      ),
+  );
+
+  it.effect(
+    "the wall clock set back an hour while two file checks hang: they still turn late, so the met wait is judged in its own process",
+    () =>
+      Effect.gen(function* () {
+        const { clock, shift } = yield* shiftedClock;
+        yield* Effect.gen(function* () {
+          yield* TestClock.setTime(NOW);
+          const { service, childChecks, ready } = yield* deadMount;
+          // a and b take both places and hang; ready waits for a place past the start window.
+          assert.isTrue(yield* pass(service));
+          assert.strictEqual(yield* ready, "waiting");
+          shift.wall = -HOUR;
+          yield* TestClock.adjust(5_000);
+          assert.isTrue(yield* pass(service));
+          assert.deepStrictEqual(childChecks, [watched("ready")]);
+          assert.strictEqual(yield* ready, "delivering");
+        }).pipe(Effect.provideService(Clock.Clock, clock));
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),
+        Effect.provide(ServerSettingsService.layerTest(ON)),
+      ),
+  );
+
+  it.effect("the wall clock set back an hour in the middle of a pass does not hold the pass", () =>
+    Effect.gen(function* () {
+      const { clock, shift } = yield* shiftedClock;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const { service } = yield* deadMount;
+        const running = yield* Effect.forkChild(service.judgeDue());
+        yield* letFibersRun;
+        yield* stepSeconds(5);
+        shift.wall = -HOUR;
+        // Every timer of the pass is at most 12 s long.
+        yield* stepSeconds(30);
+        yield* letFibersRun;
+        const done = running.pollUnsafe() !== undefined;
+        if (!done) yield* Fiber.interrupt(running);
+        assert.isTrue(done, "the pass is still waiting after the clock moved back");
+      }).pipe(Effect.provideService(Clock.Clock, clock));
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),
+      Effect.provide(ServerSettingsService.layerTest(ON)),
+    ),
+  );
+
+  it.effect(
+    "after a restart (a new monotonic clock, far behind the old one) every wait is judged at once and stuck checks still turn late",
+    () =>
+      Effect.gen(function* () {
+        const { clock, shift } = yield* shiftedClock;
+        yield* Effect.gen(function* () {
+          yield* TestClock.setTime(NOW);
+          const before = yield* deadMount;
+          assert.isTrue(yield* pass(before.service));
+          // The server restarts: its monotonic clock starts again, a day behind; nothing of the
+          // old run's timing is in the store.
+          shift.monotonic = -24 * HOUR;
+          yield* TestClock.adjust(5_000);
+          const after = yield* deadMount;
+          assert.isTrue(yield* pass(after.service));
+          assert.strictEqual(yield* after.ready, "waiting");
+          yield* TestClock.adjust(5_000);
+          assert.isTrue(yield* pass(after.service));
+          assert.deepStrictEqual(after.childChecks, [watched("ready")]);
+          assert.strictEqual(yield* after.ready, "delivering");
+        }).pipe(Effect.provideService(Clock.Clock, clock));
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, memoryFileSystem().fs),
+        Effect.provide(ServerSettingsService.layerTest(ON)),
+      ),
   );
 });

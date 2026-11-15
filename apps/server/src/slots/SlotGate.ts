@@ -140,8 +140,9 @@ const make = Effect.gen(function* () {
   /** Keys used up, until their end: the store's copy stops counting even if clearing it failed. */
   const usedKeys = new Map<string, number>();
   /**
-   * A re-ask's grant not kept yet, by its key: the thread's earlier holds, hidden (they do not
-   * count) but not used up, so a grant that is dropped gives them back.
+   * A re-ask's grant not kept yet, by its key: the thread's earlier holds, hidden (they count only
+   * against their own account, see `hiddenHeld`) but not used up, so a grant that is dropped gives
+   * them back.
    */
   const replacing = new Map<string, ReadonlyArray<SlotReservation>>();
   const hiddenKeys = () =>
@@ -208,6 +209,18 @@ const make = Effect.gen(function* () {
       (reservation) => !usedKeys.has(reservation.key) && !hidden.has(reservation.key),
     );
   });
+
+  /**
+   * The live holds that re-asks not kept yet hide, of threads other than `threadId`. They still
+   * count against their own account (never the machine, where the new hold counts), so a slot
+   * that a dropped re-ask gives back is never booked twice. None while waits are off.
+   */
+  const hiddenHeld = (waitsOn: boolean, nowMs: number, threadId: string) =>
+    waitsOn
+      ? liveReservations([...replacing.values()].flat(), nowMs).filter(
+          (old) => old.threadId !== threadId && !usedKeys.has(old.key),
+        )
+      : [];
 
   const freeMemoryBytes = (limits: SlotLimits) =>
     limits.minFreeMemoryBytes === null
@@ -294,6 +307,7 @@ const make = Effect.gen(function* () {
         reservations: onePerThread(
           reservations.filter((reservation) => reservation.threadId !== input.callerThreadId),
         ),
+        accountOnly: hiddenHeld(waitsOn, nowMs, input.callerThreadId),
         targetInstanceId: input.targetInstanceId,
         freeMemoryBytes: yield* freeMemoryBytes(limits),
       });
@@ -374,6 +388,8 @@ const make = Effect.gen(function* () {
           reservations: onePerThread(
             reservations.filter((reservation) => reservation.threadId !== request.threadId),
           ),
+          // Read again for each request: a grant earlier in this call may have hidden holds.
+          accountOnly: hiddenHeld(settings.value.waitFor.enabled, nowMs, request.threadId),
           targetInstanceId: request.account ?? "",
           freeMemoryBytes: memoryBytes,
         });

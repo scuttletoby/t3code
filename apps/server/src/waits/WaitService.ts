@@ -59,6 +59,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Latch from "effect/Latch";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
@@ -122,6 +123,12 @@ const SWEEP_START_WINDOW_MS = 10_000;
  */
 const FILE_CHILD_LATE_MS = FILE_CHILD_LIMIT_MS + 2_000;
 const SEND_CONCURRENCY = 4;
+/**
+ * Now on the monotonic clock, in ms: when a check counts as late and how long a pass starts and
+ * waits, so a wall clock set back (a time sync, a restored snapshot) never stretches them. Only
+ * ever kept in memory, so a restart starts from nothing.
+ */
+const monotonicMillis = Effect.map(Clock.monotonicTimeNanos, (nanos) => Number(nanos / 1_000_000n));
 /**
  * A send, or a look at a receiver, that has not answered by then counts as "try again later". The
  * late send is stopped in the background, and its message is not sent again while it still runs;
@@ -330,8 +337,9 @@ interface RunningJudge extends JudgeRun {
   /** How long it may run before it counts as late. */
   readonly limitMs: number;
   /**
-   * When it counts as late (stuck while it still runs), fixed when it starts: whoever started it
-   * may stop waiting for it at any time, even be cut off before it waits at all.
+   * When it counts as late (stuck while it still runs), on the monotonic clock
+   * (`monotonicMillis`), fixed when it starts: whoever started it may stop waiting for it at any
+   * time, even be cut off before it waits at all.
    */
   readonly lateAt: number;
 }
@@ -342,7 +350,7 @@ interface StartedJudge {
 }
 
 /** A started check; or none, because every place is held by a check that may still answer in time
- * (`busy`, until `wakeAt` at the latest), or by late ones (`stuck`), or the thread already runs a
+ * (`busy`, until `wakeAt` at the latest, monotonic), or by late ones (`stuck`), or the thread already runs a
  * check (`threadBusy`). */
 type JudgeStart =
   | { readonly type: "started"; readonly started: StartedJudge }
@@ -684,17 +692,27 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       Effect.gen(function* () {
         const settings = yield* readSettingsOrNull;
         if (settings === null || !settings.waitFor.enabled) return;
-        const loaded = yield* ensureLoaded(true);
-        if (!loaded.ok) return;
-        const wait = loaded.contents.waits.find((candidate) => candidate.id === id);
-        if (wait === undefined || wait.state !== "waiting" || wait.kind !== pinned.kind) return;
-        if (waitKey(wait.threadId, targetOf(wait)) !== waitKey(wait.threadId, judged)) return;
-        const waits = loaded.contents.waits.map((candidate) =>
-          candidate.id === id ? ({ ...candidate, spec: pinned.spec } as WaitRecord) : candidate,
-        );
-        yield* commitWaits(loaded.contents, waits, "it is pinned at its next read.", settings);
+        yield* pinInStore(id, judged, pinned, settings);
       }),
     );
+
+  /** `pinStored`'s write, under `lock`. */
+  const pinInStore = Effect.fnUntraced(function* (
+    id: string,
+    judged: WaitTarget,
+    pinned: WaitTarget,
+    settings: ServerSettings,
+  ) {
+    const loaded = yield* ensureLoaded(true);
+    if (!loaded.ok) return;
+    const wait = loaded.contents.waits.find((candidate) => candidate.id === id);
+    if (wait === undefined || wait.state !== "waiting" || wait.kind !== pinned.kind) return;
+    if (waitKey(wait.threadId, targetOf(wait)) !== waitKey(wait.threadId, judged)) return;
+    const waits = loaded.contents.waits.map((candidate) =>
+      candidate.id === id ? ({ ...candidate, spec: pinned.spec } as WaitRecord) : candidate,
+    );
+    yield* commitWaits(loaded.contents, waits, "it is pinned at its next read.", settings);
+  });
 
   /** The gate let a holder start its agent: its wait's `reservedUntil` is cleared (row 15). */
   const useStoredSlot = (key: string) =>
@@ -816,7 +834,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
 
     return yield* Effect.gen(function* () {
       // Waits for a free place within its limit; with none, the next sweep judges it first.
-      const until = now + REGISTER_JUDGE_LIMIT_MS;
+      const until = (yield* monotonicMillis) + REGISTER_JUDGE_LIMIT_MS;
       const context: WaitJudgeContext = {
         waitId: null,
         now,
@@ -874,6 +892,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           const contents = yield* loadedOrFail(true);
           const again = yield* findOrRefuse(contents);
           if (Option.isSome(again)) return waitingResult(again.value, true);
+          const builtWith = pinned;
           const record = {
             id: waitId,
             threadId,
@@ -896,6 +915,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           if (started !== null && Option.isNone(answer)) {
             // Still running in time: it is the wait's one run, and the next pass takes its answer.
             adopted = true;
+            // A pin the run made while the wait was being written is saved now, not lost until
+            // its next check, which might judge a changed remote.
+            if (pinned !== null && pinned !== builtWith) {
+              yield* pinInStore(waitId, target, pinned, settings);
+            }
             yield* carry(waitId, started);
           } else if (started !== null) {
             // Not checked here: the next sweep judges it, and before the waits it judged last time.
@@ -1068,7 +1092,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   ): Effect.Effect<JudgeStart> =>
     Effect.uninterruptible(
       Effect.gen(function* () {
-        const now = yield* Clock.currentTimeMillis;
+        const now = yield* monotonicMillis;
         const set = runningOf(pool);
         if (pool === "check" && [...set].some((entry) => entry.threadId === run.threadId)) {
           return { type: "threadBusy" } as const;
@@ -1124,9 +1148,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       }),
     );
 
-  /** The check's answer by `until` (epoch ms), or none; the check itself runs on either way. */
+  /** The check's answer by `until` (monotonic), or none; the check itself runs on either way. */
   const awaitJudge = (started: StartedJudge, until: number) =>
-    Effect.flatMap(Clock.currentTimeMillis, (now) =>
+    Effect.flatMap(monotonicMillis, (now) =>
       Fiber.join(started.fiber).pipe(
         Effect.timeoutOption(Duration.millis(Math.max(0, until - now))),
       ),
@@ -1139,7 +1163,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   const carry = Effect.fnUntraced(function* (waitId: string, started: StartedJudge) {
     const kept: CarriedJudge = { entry: started.entry, answer: null };
     carried.set(waitId, kept);
-    nextCheckAt.set(waitId, started.entry.lateAt);
+    // When it turns late, on the wall clock that times the waits.
+    const left = Math.max(0, started.entry.lateAt - (yield* monotonicMillis));
+    nextCheckAt.set(waitId, (yield* Clock.currentTimeMillis) + left);
     yield* Effect.forkIn(
       Fiber.join(started.fiber).pipe(
         Effect.flatMap((judgement) =>
@@ -1200,7 +1226,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   });
 
   /**
-   * At registration: a check started within `until` (epoch ms), waiting for a free slot while one
+   * At registration: a check started within `until` (monotonic), waiting for a free slot while one
    * may still free up in time; null when the checks are stuck, the thread runs a check already, or
    * the time is up.
    */
@@ -1217,7 +1243,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       const result = yield* tryStartJudge(kind, run, judge, childJudge, limitMs);
       if (result.type === "started") return result.started;
       if (result.type === "stuck" || result.type === "threadBusy") return null;
-      const now = yield* Clock.currentTimeMillis;
+      const now = yield* monotonicMillis;
       if (now >= until) return null;
       // Woken when a check returns, or when the first running one turns late.
       yield* Deferred.await(changed).pipe(
@@ -1309,7 +1335,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         carried.delete(wait.id);
         return answered(yield* confirmMet(wait, waiting.answer, settings));
       }
-      if (now < waiting.entry.lateAt) return { type: "skip" } as const;
+      if ((yield* monotonicMillis) < waiting.entry.lateAt) return { type: "skip" } as const;
       carried.delete(wait.id);
       return answered(
         lateJudgement(
@@ -1504,9 +1530,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
    * Due when its next check time has come, or lies more than one interval ahead: the wall clock
    * was set back (a time sync or a restored snapshot), which must not pause judging.
    */
-  const isDue = (wait: WaitRecord, now: number, settings: ServerSettings) => {
+  const isDue = (wait: WaitRecord, now: number, monoNow: number, settings: ServerSettings) => {
     const kept = carried.get(wait.id);
-    if (kept !== undefined) return kept.answer !== null || now >= kept.entry.lateAt;
+    if (kept !== undefined) return kept.answer !== null || monoNow >= kept.entry.lateAt;
     const next = nextCheckAt.get(wait.id);
     return (
       next === undefined ||
@@ -1566,9 +1592,14 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       { discard: true },
     );
 
-  const judgeSweep = Effect.fnUntraced(function* (settings: ServerSettings) {
+  /** `onEnded` runs each time an answer that ends its wait was saved, while the pass goes on. */
+  const judgeSweep = Effect.fnUntraced(function* (
+    settings: ServerSettings,
+    onEnded: Effect.Effect<void> = Effect.void,
+  ) {
     yield* stopRemovedChecks(settings);
     const startedAt = yield* Clock.currentTimeMillis;
+    const monoStartedAt = yield* monotonicMillis;
     const due = yield* lock.withPermits(1)(
       Effect.gen(function* () {
         const loaded = yield* ensureLoaded(true);
@@ -1579,7 +1610,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           if (wait.state !== "waiting") continue;
           waiting.add(wait.id);
           // Slot waits are granted by their own step, oldest first.
-          if (wait.kind !== "slot" && isDue(wait, startedAt, settings)) due.push(wait);
+          if (wait.kind !== "slot" && isDue(wait, startedAt, monoStartedAt, settings))
+            due.push(wait);
         }
         for (const id of nextCheckAt.keys()) if (!waiting.has(id)) nextCheckAt.delete(id);
         yield* stopEndedRuns;
@@ -1595,8 +1627,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     // is full, and starts nothing after `SWEEP_START_WINDOW_MS` (those waits go first next pass).
     // An answer that ends its wait is saved at once; the others in one write at the end. A late
     // answer is ignored and its wait judged again later.
-    const startUntil = startedAt + SWEEP_START_WINDOW_MS;
-    const answerUntil = startedAt + SWEEP_ANSWER_WINDOW_MS;
+    const startUntil = monoStartedAt + SWEEP_START_WINDOW_MS;
+    const answerUntil = monoStartedAt + SWEEP_ANSWER_WINDOW_MS;
     const taken = new Set<string>();
     const later: Array<readonly [string, Judgement]> = [];
     let judged = 0;
@@ -1606,7 +1638,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     const takeNext = Effect.gen(function* () {
       for (;;) {
         // Past the window nothing new starts, not even in a slot that has just been freed.
-        if ((yield* Clock.currentTimeMillis) >= startUntil) return null;
+        if ((yield* monotonicMillis) >= startUntil) return null;
         const changed = judgesChanged;
         let wakeAt = Number.POSITIVE_INFINITY;
         let left = false;
@@ -1633,7 +1665,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           wakeAt = Math.min(wakeAt, start.wakeAt);
         }
         if (!left) return null;
-        const now = yield* Clock.currentTimeMillis;
+        const now = yield* monotonicMillis;
         // Woken when a check returns, or when the first running one turns late.
         yield* Deferred.await(changed).pipe(
           Effect.timeoutOption(Duration.millis(Math.min(startUntil, wakeAt) - now)),
@@ -1655,8 +1687,10 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         if (judgement === null) continue;
         judged += 1;
         const saved = yield* saveIfEnds(wait.id, judgement, settings);
-        if (saved === "ended") ended += 1;
-        else if (saved === "later") later.push([wait.id, judgement]);
+        if (saved === "ended") {
+          ended += 1;
+          yield* onEnded;
+        } else if (saved === "later") later.push([wait.id, judgement]);
       }
     });
     yield* Effect.all(
@@ -2314,8 +2348,47 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   });
 
   /**
-   * One sweep: deliver, judge, deliver what that ended, prune, notices; returns when the next one
-   * has work. Settings are read again before each step, so "off" stops it at the next step; a
+   * Runs `step` while sending the message of each wait it ends as soon as that is saved (a deliver
+   * step after each, one at a time), so a met wait's message never waits for slow checks.
+   * Returns once `step` and the last of those deliver steps are done.
+   */
+  const withEarlyDelivery = Effect.fnUntraced(function* <A>(
+    step: (onEnded: Effect.Effect<void>) => Effect.Effect<A>,
+  ) {
+    let pending = false;
+    let finished = false;
+    const wake = yield* Latch.make(false);
+    const none = { sent: 0, ended: 0 };
+    const deliverer = yield* Effect.forkChild(
+      Effect.gen(function* () {
+        for (;;) {
+          if (!pending) {
+            if (finished) return;
+            yield* wake.await;
+            yield* wake.close;
+            continue;
+          }
+          pending = false;
+          // Waits were switched off: the step after this one stops the sweep.
+          if ((yield* phase("deliver", deliverSweep, none)) === null) return;
+        }
+      }),
+    );
+    const result = yield* step(
+      Effect.suspend(() => {
+        pending = true;
+        return Effect.asVoid(wake.open);
+      }),
+    );
+    finished = true;
+    yield* wake.open;
+    yield* Fiber.join(deliverer);
+    return result;
+  });
+
+  /**
+   * One sweep: deliver, judge (sending each message it ends at once), deliver what that ended,
+   * prune, notices; returns when the next one has work. Settings are read again before each step, so "off" stops it at the next step; a
    * failing step is logged and skipped. It never overlaps itself.
    */
   const runDue = Effect.fn("WaitService.runDue")(function* () {
@@ -2334,7 +2407,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       Effect.gen(function* () {
         const none = { sent: 0, ended: 0 };
         if ((yield* phase("deliver", deliverSweep, none)) === null) return stopped;
-        const judged = yield* phase("judge", judgeSweep, { judged: 0, ended: 0 });
+        const judged = yield* withEarlyDelivery((onEnded) =>
+          phase("judge", (latest) => judgeSweep(latest, onEnded), { judged: 0, ended: 0 }),
+        );
         if (judged === null) return stopped;
         const granted = yield* phase("grant", grantSweep, 0);
         if (granted === null) return stopped;
