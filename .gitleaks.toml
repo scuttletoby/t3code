@@ -4,9 +4,11 @@
 #
 # What this is: gitleaks 8.30.1's built-in default config (config/gitleaks.toml of that release,
 # MIT License, Copyright (c) 2019 Zachary Rice), with its global allowlist replaced by the
-# fork's part below. Everything from the first [[rules]] to the end is the default file unchanged;
-# fork-secret-scan.test.sh checks that it is byte for byte in the gitleaks binary the workflow
-# installs, so a gitleaks update must copy the new release's rules here.
+# fork's part below. Everything from the first [[rules]] to the end is the default file unchanged.
+# fork-secret-scan.test.sh checks, against the gitleaks binary the workflow installs, that the rules
+# are its default rules byte for byte and the first entry below is its global value allowlist, so a
+# gitleaks update must copy both here. It also refuses an [extend] or [allowlist] table, and any
+# later entry that is not narrow (see "The fork's skip list").
 #
 # Why not `[extend] useDefault = true`: gitleaks then appends the default's global allowlist,
 # and that skips whole paths whatever they hold, among them anything named gitleaks.toml
@@ -15,10 +17,22 @@
 # A key in any of them would pass. (`[extend] path` is not supported either: the scan copies only
 # this file, so gitleaks cannot load the other one and the job fails.)
 #
-# The fork's skip list: no path is skipped. Each entry below is narrow (one rule, one path or one
-# exact line) and says why. Measured over main's full history (11,292 commits) with these settings
-# and `git log --text`: 7 findings the default settings skipped, all the pnpm-lock.yaml version
-# strings of the first entry, and the one line of this file in the second.
+# The fork's skip list: no path is skipped. Each entry after the first names its rules
+# (targetRules) and the values it allows (regexes, anchored); one with paths also has
+# condition = "AND", so it never skips a whole file. Each says why.
+#
+# A reviewed fake key in a test (the way to allow one): an entry with the rule, the file and the
+# exact value, as the #91 entry below. It matches that value in every commit, whatever its line
+# number or commit id, so it survives a squash merge, a line added above it and a fork-follow
+# rebase, and it never hides another key on the same line. Write the value so this file does not
+# match its own rules (the entries here are scanned too). A `gitleaks:allow` comment on the line
+# itself works as well where the file allows a comment. Not .gitleaksignore: see its header.
+#
+# Measured over main's full history (11,292 commits) with these settings and `git log --text`:
+# 7 findings the default settings skipped, all the pnpm-lock.yaml version strings of the first
+# entry, and the one line of this file in the second. A fork-follow rebase re-scans every fork
+# commit (new ids): over main's 79 fork-only commits these settings find nothing; without the #91
+# entry they find its 3 values.
 
 title = "gitleaks config"
 minVersion = "v8.25.0"
@@ -50,15 +64,17 @@ stopwords = [
 
 # pnpm-lock.yaml names packages with "key" in them (@clerk/electron-passkeys...), and
 # generic-api-key reads the version after the name as a key. Only that rule, only in pnpm-lock.yaml,
-# and only a found value that is a version number (1.2.3, with an optional -pre.release and
-# +build part). Integrity hashes (sha512-...) gave no finding over main's history, so they need
-# no entry.
+# and only a found value shaped like a version: 1.2.3, optionally -pre.release with at most three
+# parts, each a lowercase word (canary) or a number with at most two letters before it (v2026...,
+# rc1). A token after `1.0.0-` (mixed case, or letters and digits mixed) is still found. The one
+# such value in main's history: 0.0.4-canary.v20260819050620. Integrity hashes (sha512-...) gave
+# no finding over main's history, so they need no entry.
 [[allowlists]]
 description = "pnpm-lock.yaml: package versions after a name with 'key' in it"
 targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''(?:^|/)pnpm-lock\.yaml$''']
-regexes = ['''^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$''']
+regexes = ['''^\d{1,8}\.\d{1,8}\.\d{1,8}(?:-(?:[a-z]{1,10}|[a-z]{0,2}\d{1,14})(?:\.(?:[a-z]{1,10}|[a-z]{0,2}\d{1,14})){0,2})?$''']
 
 # This file's own rule for short-lived Amazon Bedrock keys is a fixed prefix that matches itself.
 # Only that rule, only this file, and only the exact rule line (any other text on the line, a key
@@ -70,6 +86,17 @@ condition = "AND"
 paths = ['''^\.gitleaks\.toml$''']
 regexTarget = "line"
 regexes = ['''^\s*regex = '{3}bedrock-api-key-[Y]mVkcm9jay5hbWF6b25hd3MuY29t'{3}\s*$''']
+
+# Fake values in the fork's wait tests (#91): fixed 16-character strings that generic-api-key reads
+# as keys. Only that rule, only those two files, only these exact values; any other value there is
+# still found. They are in main's history, and a fork-follow rebase re-scans every fork commit with
+# a new id, so this entry stays while that commit is in the series.
+[[allowlists]]
+description = "fork wait tests: fixed fake values (#91)"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^apps/server/src/waits/Wait(?:Delivery|Service)\.test\.ts$''']
+regexes = ['''^[01f]123456789abcdef$''']
 
 [[rules]]
 id = "1password-secret-key"

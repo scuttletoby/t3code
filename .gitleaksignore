@@ -1,12 +1,13 @@
-# Fork: findings the secret scan (.github/scripts/fork-secret-scan.sh) may skip, one per line, each
-# with a comment saying what it is and why it is safe.
+# Fork: findings the secret scan (.github/scripts/fork-secret-scan.sh) may skip, by fingerprint.
+# Keep it empty: allow a reviewed fake key with an exact-value entry in .gitleaks.toml instead (the
+# rule, the file and the value; see "A reviewed fake key" there), or a `gitleaks:allow` comment on
+# the line itself where the file allows one.
 #
-# Form: file:rule:line (no commit), for example
-#   apps/server/src/example.test.ts:generic-api-key:12
-# Such a line matches that finding in every commit, so it still matches after a squash merge gives
-# the commit a new id. A line pinned to a commit (commit:file:rule:line) stops matching then, and the
-# default branch's push scan fails on the same finding; the scan warns about such lines.
-# Prefer a `gitleaks:allow` comment on the line itself where the file allows one.
+# Why not here: a fingerprint names a line number, not a value.
+#   file:rule:line (no commit) hides every key of that rule on that line, in every commit, including
+#   a real key a later commit puts there. The scan refuses such lines (the job fails).
+#   commit:file:rule:line matches only that commit, but a squash merge gives the commit a new id, so
+#   the default branch's push scan fails on the same finding; the scan warns about such lines.
 #
 # The scan reads this file from the default branch (a pull request) or the tip before the push, so a
 # change here applies once it is merged: land it in a pull request of its own first.

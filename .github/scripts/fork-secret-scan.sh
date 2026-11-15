@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fork only: the Secret scan job of fork-tests.yml. Picks the commits a pull request or a push adds
+# Fork only: the scan job of fork-secret-scan.yml. Picks the commits a pull request or a push adds
 # and runs gitleaks over them. Tests: fork-secret-scan.test.sh.
 #
 # Environment:
@@ -25,7 +25,9 @@
 #                  fires `edited`, which does not re-run the scan; this range does not depend on the
 #                  base, so a retarget changes nothing. The default branch's own commits were scanned
 #                  by its push runs. A squash merge never brings the PR's own commits to main, but
-#                  they stay public under refs/pull/N/head, so they are scanned here.
+#                  they stay public under refs/pull/N/head, so they are scanned here. Each push
+#                  of the head gets a run that nothing cancels (fork-secret-scan.yml), so a head
+#                  a force push replaced, still served by id, is scanned to the end too.
 #   push           BEFORE..AFTER. After a force push that is every commit the new tip has and the
 #                  old one had not; commits both share were scanned when they were first pushed.
 #   push, no BEFORE  a new branch (BEFORE all zeros) or an old tip that can no longer be fetched:
@@ -59,10 +61,20 @@
 # A range that changes the settings gets a notice saying when the change applies. The reviewed path
 # for a change is a pull request of its own that changes only these files (its own scan uses the
 # old settings, and it adds no key); once it is merged, re-run the scan of the pull request that
-# needs it. An ignore line takes the form file:rule:line (no commit), which matches that line in
-# every commit, so it survives a squash merge: the merged commit has a new id, and a commit-pinned
-# line (commit:file:rule:line) would stop matching, so main's push scan would fail. Pinned lines
-# get a warning. Prefer a `gitleaks:allow` comment on the line itself where the file allows one.
+# needs it.
+# A reviewed fake key in a test: allow its exact value in .gitleaks.toml (an entry with the rule, the
+# file and the value; see "A reviewed fake key" there), or put a `gitleaks:allow` comment on the line.
+# A value matches in every commit, whatever its line number or commit id, so it survives a squash
+# merge (a new id), a later commit that moves the line, and a fork-follow rebase (which scans every
+# fork commit again, with new ids); and it hides no other key on that line. .gitleaksignore lines
+# name a line number instead: a line without a commit (file:rule:line) hides every key of that rule
+# on that line in every commit, a real key a later commit puts there included, so the scan refuses
+# such a line (exit 2); a line pinned to a commit (commit:file:rule:line) stops matching after a
+# squash merge, so it gets a warning. With no .gitleaks.toml at all, gitleaks' built-in settings
+# apply, whose path skip list hides whole files: a warning.
+# A squash merge's own commit adds no line the PR's commits did not add (only line numbers and the
+# commit id change), and a value entry does not depend on either, so the PR scan does not scan the
+# squash result as one more diff.
 #
 # Not covered: a `gitleaks:allow` comment on the line itself (visible in the diff); a pull request
 # that edits this script or the workflow (pull_request runs take both from the pull request); text
@@ -73,7 +85,9 @@
 # its lines. A path whose contents in the range start with a UTF-16 byte-order mark goes through a
 # textconv filter that prints it as stored and decoded to UTF-8 as well (a key in a UTF-16 .env as
 # some Windows editors save it). The filter only adds lines, so a file that merely starts with those
-# two bytes is still read as stored. Line numbers in the decoded part follow the stored lines.
+# two bytes is still read as stored. Line numbers in the decoded part follow the stored lines. A
+# stray last byte (an odd length) is dropped before decoding; when iconv cannot decode (it lacks
+# UTF-16, or says anything), the filter fails and so does the job (exit 2), with iconv's message.
 #
 # Attributes: a .gitattributes in the range could mark a file `-diff` or binary, so git log shows
 # "Binary files differ" instead of its lines. Both git logs below read attributes from a tree the
@@ -210,7 +224,7 @@ work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/fork-secret-scan.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 log="$work/gitleaks.log"
 cannot_read() {
-  echo "::error::Secret scan: cannot read the commits to scan (a file content fetch failed?)" >&2
+  echo "::error::Secret scan: cannot read the commits to scan (a file content fetch failed, or a file with a UTF-16 byte-order mark could not be decoded: see the messages above)" >&2
   summary "### Secret scan" "" "Failed: the contents of $what could not be read, so nothing was scanned."
   exit 2
 }
@@ -242,11 +256,26 @@ for name in .gitleaks.toml .gitleaksignore; do
   git cat-file blob "$oid" > "$config/$name" || cannot_read
 done
 echo "gitleaks settings (.gitleaks.toml, .gitleaksignore) from $settings_what"
-# Ignore lines pinned to a commit stop matching after a squash merge (see the header).
+config_args=()
+if [[ -f "$config/.gitleaks.toml" ]]; then
+  config_args=(--config "$config/.gitleaks.toml")
+else
+  echo "::warning title=Secret scan::No .gitleaks.toml on $settings_what, so gitleaks' built-in settings apply: they skip whole paths (lock files, .svg, node_modules and more), where a key goes unseen. Add a .gitleaks.toml (this repository's shows how) to scan them."
+fi
+# .gitleaksignore lines name a line number, not a value (see the header). A line without a commit
+# hides every key of its rule on that line in every commit: refused. A line pinned to a commit
+# stops matching once a squash merge gives the commit a new id: a warning.
 if [[ -f "$config/.gitleaksignore" ]]; then
-  pinned="$(grep -cE '^[[:space:]]*[0-9a-f]{40}([0-9a-f]{24})?:' "$config/.gitleaksignore" || true)"
-  if [[ "$pinned" -gt 0 ]]; then
-    echo "::warning title=Secret scan::.gitleaksignore on $settings_what has $pinned line(s) pinned to a commit (commit:file:rule:line). Such a line stops matching once a squash merge gives the commit a new id, so the default branch's push scan fails on the same finding. Write it as file:rule:line instead."
+  lines="$(grep -vE '^[[:space:]]*(#|$)' "$config/.gitleaksignore" || true)"
+  unpinned="$(grep -cvE '^[[:space:]]*[0-9a-f]{40}([0-9a-f]{24})?:' <<< "$lines" || true)"
+  if [[ -n "$lines" && "$unpinned" -gt 0 ]]; then
+    echo "::error::Secret scan: .gitleaksignore on $settings_what has $unpinned line(s) without a commit (file:rule:line). Such a line hides every key of that rule on that line of that file, in every commit, a real one included, so the scan refuses it. Allow a reviewed fake key by its exact value in .gitleaks.toml instead (see \"A reviewed fake key\" there), or with a gitleaks:allow comment on the line." >&2
+    summary "### Secret scan" "" "Failed: .gitleaksignore on $settings_what has line(s) without a commit (file:rule:line), which the scan refuses; nothing was scanned."
+    exit 2
+  fi
+  pinned="$(grep -c . <<< "$lines" || true)"
+  if [[ -n "$lines" && "$pinned" -gt 0 ]]; then
+    echo "::warning title=Secret scan::.gitleaksignore on $settings_what has $pinned line(s) pinned to a commit (commit:file:rule:line). Such a line stops matching once a squash merge gives the commit a new id, so the default branch's push scan fails on the same finding. Allow the exact value in .gitleaks.toml instead."
   fi
 fi
 # Only a message: when the diff fails (no merge base, say), there is none.
@@ -308,7 +337,10 @@ if [[ -s "$work/utf16-paths" ]]; then
 fi
 cat > "$work/textconv" <<'FILTER'
 # $1: a temporary file holding one side of a diff. Print it as stored; when it starts with a
-# UTF-16 byte-order mark, print it decoded to UTF-8 after it. A failure (no iconv) fails git log.
+# UTF-16 byte-order mark, print it decoded to UTF-8 after it. iconv -c leaves out what is not valid
+# UTF-16 (a lone surrogate) and exits 1; a stray last byte (an odd length) is dropped first, as it
+# is half a character. Any other iconv failure, or any message from it, fails the filter and so
+# git log, with a message naming the reason: never a pass with the decoded part missing.
 case "$(od -An -N2 -tx1 -- "$1")" in
   *"ff fe"*) encoding=UTF-16LE ;;
   *"fe ff"*) encoding=UTF-16BE ;;
@@ -316,9 +348,14 @@ case "$(od -An -N2 -tx1 -- "$1")" in
 esac
 cat -- "$1" || exit 1
 echo
-# iconv -c leaves out what is not valid UTF-16 and then exits 1.
-tail -c +3 -- "$1" | iconv -c -f "$encoding" -t UTF-8
-[ $? -le 1 ]
+size=$(($(wc -c < "$1") - 2))
+exec 3>&1
+err="$(tail -c +3 -- "$1" | head -c $((size - size % 2)) | iconv -c -f "$encoding" -t UTF-8 2>&1 >&3)"
+status=$?
+if [ "$status" -gt 1 ] || [ -n "$err" ]; then
+  echo "fork-secret-scan: cannot decode a file with a UTF-16 byte-order mark ($encoding; iconv exit $status): $err" >&2
+  exit 1
+fi
 FILTER
 n="${GIT_CONFIG_COUNT:-0}"
 export "GIT_CONFIG_KEY_$n=diff.fork-secret-scan-text.textconv"
@@ -358,8 +395,6 @@ if url="$(git config --get remote.origin.url)"; then git --git-dir="$view" confi
 # .gitleaksignore it can find are the ones copied there; GIT_DIR points its git at the view.
 gitleaks="$GITLEAKS"
 if [[ "$gitleaks" == */* ]]; then gitleaks="$(realpath "$gitleaks")"; fi
-config_args=()
-if [[ -f "$config/.gitleaks.toml" ]]; then config_args=(--config "$config/.gitleaks.toml"); fi
 set +e
 (cd "$config" && env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML GIT_DIR="$view" GIT_NO_LAZY_FETCH=1 \
   "$gitleaks" git --no-banner --no-color --redact --verbose "${config_args[@]}" \
