@@ -13,9 +13,11 @@ import {
   MCP_SUBAGENT_INHERIT,
   MCP_THREAD_PROFILES_KEEP_NEWEST,
   McpProfileName,
+  McpProfilePatch,
   McpProfileRef,
   McpProfilesFromSettingsFile,
   McpProfilesPatch,
+  McpProjectProfileRefPatch,
   McpThreadProfiles,
   McpThreadProfilesPatch,
 } from "./mcpProfile.ts";
@@ -74,7 +76,7 @@ export const ForkServerSettingsFields = {
   ),
   /** Named MCP profiles besides the built-in `all` and `t3-only`; each checked when used. */
   mcpProfiles: McpProfilesFromSettingsFile,
-  /** The MCP profile a thread gets; `all` (or empty) is today's behaviour. */
+  /** The MCP profile a thread gets; `all` (or empty) is today's behaviour. Read leniently. */
   mcpProfile: McpProfileRef.pipe(Schema.withDecodingDefault(Effect.succeed(MCP_PROFILE_ALL))),
   /** The MCP profile of a delegated child thread; `inherit` (or empty) follows `mcpProfile`. */
   mcpSubagentProfile: McpProfileRef.pipe(
@@ -102,7 +104,9 @@ export const ForkServerSettingsPatchFields = {
   headlessUsageRefreshInterval: Schema.optionalKey(Schema.DurationFromMillis),
   /** Strict: a save refuses a bad profile or a built-in name (reading the file keeps it as is). */
   mcpProfiles: Schema.optionalKey(McpProfilesPatch),
-  mcpProfile: Schema.optionalKey(McpProfileName),
+  /** A profile name, not `inherit`; the server also refuses a name no profile has. */
+  mcpProfile: Schema.optionalKey(McpProfilePatch),
+  /** `inherit` or a profile name; the server also refuses a name no profile has. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileName),
   mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
@@ -154,9 +158,9 @@ export const FORK_PROJECT_SCOPED_KEYS = [
 export const ForkProjectOverrideFields = {
   /** Bad entries are dropped on read; the settings patch refuses them. */
   waitChecks: Schema.optionalKey(WaitChecksFromSettingsFile),
-  /** Absent or empty: the server's `mcpProfile`. */
+  /** Absent or empty: the server's `mcpProfile`. Read leniently, as the server's. */
   mcpProfile: Schema.optionalKey(McpProfileRef),
-  /** Absent or empty: the server's `mcpSubagentProfile`. */
+  /** Absent or empty: the server's `mcpSubagentProfile`. Read leniently, as the server's. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileRef),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
@@ -164,8 +168,12 @@ export const ForkProjectOverrideFields = {
 export const ForkProjectOverridePatchFields = {
   /** A save refuses a bad check. */
   waitChecks: Schema.optionalKey(WaitChecks),
-  mcpProfile: Schema.optionalKey(McpProfileName),
-  mcpSubagentProfile: Schema.optionalKey(McpProfileName),
+  /**
+   * Any text, as reading keeps it: clients resend a project's whole entry when they save its other
+   * settings. The server refuses only a changed value that names no profile (forkSettingsPatch.ts).
+   */
+  mcpProfile: Schema.optionalKey(McpProjectProfileRefPatch),
+  mcpSubagentProfile: Schema.optionalKey(McpProjectProfileRefPatch),
 } satisfies Record<keyof typeof ForkProjectOverrideFields, unknown>;
 
 /**

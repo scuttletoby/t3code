@@ -26,18 +26,24 @@ The defaults, "off" and "decided in" below come from one table in the code,
 (`packages/shared/src/forkDocs.test.ts`) fails when this table and that one differ, or a setting has
 no section below. "Off" means the default leaves the machine as upstream's would be.
 
-| Setting                                                                      | Default             | Off | Decided in                                             |
-| ---------------------------------------------------------------------------- | ------------------- | --- | ------------------------------------------------------ |
-| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`             | yes | [#41](https://github.com/scuttletoby/t3code/issues/41) |
-| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)   |
-| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                | yes | [#52](https://github.com/scuttletoby/t3code/issues/52) |
-| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`             | yes | [#73](https://github.com/scuttletoby/t3code/issues/73) |
-| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                | yes | [#73](https://github.com/scuttletoby/t3code/issues/73) |
-| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84) |
-| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84) |
-| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84) |
-| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42) |
-| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84) |
+| Setting                                                                      | Default             | Off | Decided in                                               |
+| ---------------------------------------------------------------------------- | ------------------- | --- | -------------------------------------------------------- |
+| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`             | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
+| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
+| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
+| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`             | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
+| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`         | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 
 For `waitFor` and `agentSlots` only the `enabled` switch is pinned; their other fields are tuning
 that does nothing while the switch is off.
@@ -139,12 +145,50 @@ thread, setting or install. Never more often than the provider status refresh.
 
 Switch off in `settings.json`: `"headlessUsageRefreshInterval": 0`.
 
+### `server.mcpProfiles`
+
+Named MCP profiles. A profile says which outside MCP servers (`servers`) and which groups of T3's
+own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Two profiles are built in: `all`
+(everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool). Nothing applies
+a profile yet: the provider adapters and the T3 tool filter come in later pull requests.
+
+```json
+{ "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
+```
+
+Only the person can change MCP profile settings; agents cannot.
+
+### `server.mcpProfile`
+
+The profile a top-level thread gets when nobody picked one for it. `all` (the default) gives every
+thread everything, as today. A name with no profile is refused when saved, and a thread that meets
+one (for example after a hand edit) is refused instead of getting `all`.
+
+### `server.mcpSubagentProfile`
+
+The profile a delegated child gets when nobody picked one for it. `inherit` (the default) gives it
+its parent's profile. A child never gets more than its parent.
+
+### `server.mcpThreadProfiles`
+
+The person's pick of profile per thread, by thread id. A pick wins over every default. The newest
+500 picks are kept; a thread whose pick was dropped falls back to its default.
+
 ### `projectOverride.waitChecks`
 
 A project's own list of wait checks. It replaces the server's list for that project as a whole (a
 project lists every check it uses). Not set: the project uses the server's checks.
 
 Set: **Settings**, choose the project at the top, then **Wait checks**.
+
+### `projectOverride.mcpProfile`
+
+A project's own default profile for its top-level threads. Not set: the server's `mcpProfile`.
+
+### `projectOverride.mcpSubagentProfile`
+
+A project's own profile rule for delegated children (`inherit` or a profile name). Not set: the
+server's `mcpSubagentProfile`.
 
 ### A setting the fork removed
 

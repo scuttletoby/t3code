@@ -3,6 +3,7 @@
 import {
   DEFAULT_SERVER_SETTINGS,
   MCP_THREAD_PROFILES_KEEP_NEWEST,
+  ProjectId,
   ProviderInstanceId,
   type ServerSettings,
   ThreadId,
@@ -12,7 +13,11 @@ import * as Duration from "effect/Duration";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { applyForkSettingsPatch, splitForkSettingsPatch } from "./forkSettingsPatch.ts";
+import {
+  applyForkSettingsPatch,
+  forkSettingsWriteProblem,
+  splitForkSettingsPatch,
+} from "./forkSettingsPatch.ts";
 import { applyServerSettingsPatch } from "./serverSettings.ts";
 // The source text, to pin the fork's lines in upstream's file.
 import SERVER_SETTINGS_SOURCE from "./serverSettings.ts?raw";
@@ -179,5 +184,105 @@ describe("fork settings patch", () => {
       ),
     ).toHaveLength(4);
     expect(lines.filter((line) => /\bFork:/.test(line))).toHaveLength(1);
+  });
+});
+
+describe("fork settings save check (MCP profile references)", () => {
+  const project = ProjectId.make("project-1");
+  const stored: ServerSettings = {
+    ...DEFAULT_SERVER_SETTINGS,
+    mcpProfiles: { lean: { servers: [], t3Tools: ["threads"] } },
+    mcpThreadProfiles: { "thread-old": "(unreadable number)" },
+    // Odd values a hand edit or an older build left; reading keeps them.
+    projectSettingsOverrides: {
+      [project]: { mcpProfile: "Lean", mcpSubagentProfile: "" },
+    },
+  };
+  const problemAfter = (patch: Parameters<typeof applyServerSettingsPatch>[1]) =>
+    forkSettingsWriteProblem(stored, applyServerSettingsPatch(stored, patch));
+
+  it("lets a project save its other settings while an odd stored reference stays as it was", () => {
+    expect(
+      problemAfter({
+        projectSettingsOverrides: {
+          [project]: {
+            mcpProfile: "Lean",
+            mcpSubagentProfile: "",
+            enableAgentBrowserAccess: true,
+          },
+        },
+      }),
+    ).toBeUndefined();
+    expect(problemAfter({ enableAgentBrowserAccess: false })).toBeUndefined();
+    // An unreadable pick left as it was does not block another thread's pick.
+    expect(problemAfter({ mcpThreadProfiles: { "thread-1": "lean" } })).toBeUndefined();
+  });
+
+  it.each([
+    ["a default that names a profile", { mcpProfile: "lean" }],
+    ["a built-in default", { mcpProfile: "t3-only" }],
+    ["inherit as the sub-agent rule", { mcpSubagentProfile: "inherit" }],
+    ["a pick of a built-in", { mcpThreadProfiles: { "thread-1": "all" } }],
+    [
+      "a default added in the same save",
+      { mcpProfiles: { docs: { servers: ["docs"], t3Tools: "all" } }, mcpProfile: "docs" },
+    ],
+    [
+      "a project's reference cleared",
+      { projectSettingsOverrides: { [project]: { mcpProfile: "" } } },
+    ],
+    [
+      "inherit as a project's sub-agent rule",
+      {
+        projectSettingsOverrides: {
+          [project]: { mcpProfile: "Lean", mcpSubagentProfile: "inherit" },
+        },
+      },
+    ],
+  ] as const)("takes %s", (_name, patch) => {
+    expect(problemAfter(patch)).toBeUndefined();
+  });
+
+  it.each([
+    [
+      "a default that names no profile",
+      { mcpProfile: "gone" },
+      /^mcpProfile names MCP profile "gone", which is not set up: add that profile first, or pick "all" or "t3-only"\.$/,
+    ],
+    ["inherit as the default", { mcpProfile: "inherit" }, /^mcpProfile cannot be "inherit"/],
+    [
+      "a sub-agent rule that names no profile",
+      { mcpSubagentProfile: "gone" },
+      /^mcpSubagentProfile names MCP profile "gone"/,
+    ],
+    [
+      "a pick that names no profile",
+      { mcpThreadProfiles: { "thread-1": "gone" } },
+      /^The pick for thread thread-1 names MCP profile "gone"/,
+    ],
+    [
+      "inherit as a pick",
+      { mcpThreadProfiles: { "thread-1": "inherit" } },
+      /^The pick for thread thread-1 cannot be "inherit"/,
+    ],
+    [
+      "a project's changed reference to no profile",
+      { projectSettingsOverrides: { [project]: { mcpProfile: "Docs" } } },
+      /^Project project-1's mcpProfile names MCP profile "Docs"/,
+    ],
+    [
+      "inherit as a project's default",
+      { projectSettingsOverrides: { [project]: { mcpProfile: "inherit" } } },
+      /^Project project-1's mcpProfile cannot be "inherit"/,
+    ],
+    [
+      "a new project's reference to no profile",
+      {
+        projectSettingsOverrides: { [ProjectId.make("project-2")]: { mcpSubagentProfile: "gone" } },
+      },
+      /^Project project-2's mcpSubagentProfile names MCP profile "gone"/,
+    ],
+  ] as const)("refuses %s, saying how to fix it", (_name, patch, message) => {
+    expect(problemAfter(patch)).toMatch(message);
   });
 });

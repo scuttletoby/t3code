@@ -8,6 +8,7 @@ import {
   MCP_PROFILE_T3_ONLY,
   MCP_SUBAGENT_INHERIT,
   MCP_T3_TOOL_GROUPS,
+  MCP_T3_UNGROUPED_TOOLS,
   type McpT3ToolGroup,
   type ServerSettings,
   isDefinableMcpProfileName,
@@ -75,6 +76,43 @@ export interface McpProfileCannotApply {
 }
 
 export type McpProfileResolution = McpProfileResolved | McpProfileCannotApply;
+
+/**
+ * Each T3 toolkit's group, by its folder under src/mcp/toolkits; `null` for a toolkit that holds
+ * only tools of `MCP_T3_UNGROUPED_TOOLS`. The T3 tool filter (a later PR) uses it. The test in
+ * personOnlySettings.test.ts fails when a toolkit or tool maps to nothing.
+ */
+export const MCP_T3_TOOLKIT_GROUPS: Readonly<Record<string, McpT3ToolGroup | null>> = {
+  orchestrator: "orchestration",
+  preview: "preview",
+  previewControls: "preview",
+  pullRequests: "pull-requests",
+  thread: "threads",
+  project: "projects",
+  device: "device",
+  worktree: "worktree",
+  attachment: "attachments",
+  environment: "environment",
+  theme: "theme",
+  html: "html",
+  waits: "waits",
+  message: null,
+  toolSearch: null,
+};
+
+/**
+ * A T3 tool's group, or `"ungrouped"` for one every profile keeps; `undefined` when its toolkit
+ * has no row in {@link MCP_T3_TOOLKIT_GROUPS} or it is an ungrouped toolkit's unlisted tool.
+ */
+export function mcpT3ToolGroup(
+  toolkit: string,
+  tool: string,
+): McpT3ToolGroup | "ungrouped" | undefined {
+  if (MCP_T3_UNGROUPED_TOOLS.includes(tool)) return "ungrouped";
+  return Object.hasOwn(MCP_T3_TOOLKIT_GROUPS, toolkit)
+    ? (MCP_T3_TOOLKIT_GROUPS[toolkit] ?? undefined)
+    : undefined;
+}
 
 /** Longer lineages are refused; real delegation chains are a few threads deep. */
 export const MCP_PROFILE_MAX_LINEAGE = 64;

@@ -214,6 +214,26 @@ describe("MCP profile resolver: never falls back to all", () => {
     ["`inherit` as a thread's profile", { mcpProfile: "inherit" }, [top("t1")], "inherit"],
     // Plain-object keys must not resolve to Object.prototype's members.
     ["a prototype key", { mcpProfile: "constructor" }, [top("t1")], "constructor"],
+    // Values that are not text read as a marker no profile can have, so they never widen to all.
+    ["a default that is a number", { mcpProfile: 5 }, [top("t1")], "(unreadable number)"],
+    [
+      "a sub-agent rule that is a list",
+      { mcpSubagentProfile: ["lean"] },
+      [child("c1"), top("t1")],
+      "(unreadable list)",
+    ],
+    [
+      "a thread pick that is an object",
+      { mcpThreadProfiles: { t1: { profile: "lean" } } },
+      [top("t1")],
+      "(unreadable object)",
+    ],
+    [
+      "a project reference that is a number",
+      {},
+      [top("t1", { mcpProfile: "(unreadable number)" })],
+      "(unreadable number)",
+    ],
   ] as const)("%s: refuses and names it", (_name, file, lineage, name) => {
     const result = refused(
       resolveMcpProfile(fromFile({ mcpProfiles: PROFILES, ...file }), lineage),

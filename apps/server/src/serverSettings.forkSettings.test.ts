@@ -218,3 +218,48 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork settings ro
     }).pipe(Effect.provide(layerServerSettings())),
   );
 });
+
+it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork MCP profile keys", (it) => {
+  it.effect("keeps every other setting when an MCP key in the file holds a bad value", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(
+        config.settingsPath,
+        JSON.stringify({ ...FULL_FILE, mcpThreadProfiles: { t1: null }, mcpProfile: 5 }),
+      );
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const settings = yield* service.getSettings;
+      assert.strictEqual(settings.enableAgentBrowserAccess, false);
+      assert.strictEqual(settings.usagePacingGate, "advise");
+      assert.strictEqual(settings.agentSlots.maxPerMachine, 4);
+      assert.deepStrictEqual(Object.keys(settings.waitChecks).toSorted(), [
+        "build-done",
+        "ci-green",
+      ]);
+      // The unset pick is dropped; the bad default reads as a name no profile can have, so the
+      // resolver refuses it instead of widening it to "all".
+      assert.deepStrictEqual(settings.mcpThreadProfiles, {});
+      assert.strictEqual(settings.mcpProfile, "(unreadable number)");
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("refuses a save that names a profile that is not set up, saying how to fix it", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(config.settingsPath, JSON.stringify(FULL_FILE));
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const error = yield* service
+        .updateSettings(decodePatch({ mcpProfile: "lean" }))
+        .pipe(Effect.flip);
+      assert.strictEqual(
+        error.message,
+        'mcpProfile names MCP profile "lean", which is not set up: add that profile first, or pick "all" or "t3-only".',
+      );
+      // Nothing was written: the file still has no MCP keys.
+      const file = (yield* readFile) as Record<string, unknown>;
+      assert.isFalse("mcpProfile" in file);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+});

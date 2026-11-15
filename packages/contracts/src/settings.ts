@@ -1748,6 +1748,8 @@ export const ServerSettingsOperation = Schema.Literals([
   "prepare-directory",
   "write-managed-setting",
   "use-disallowed-provider",
+  // Fork: a fork setting's save refused by the fork's save check; `detail` says why.
+  "write-fork-setting",
 ]);
 export type ServerSettingsOperation = typeof ServerSettingsOperation.Type;
 
@@ -1767,10 +1769,13 @@ export class ServerSettingsError extends Schema.TaggedError<ServerSettingsError>
     managedBy: Schema.optional(Schema.String),
     /** For `use-disallowed-provider`: the provider's name as users know it. */
     providerLabel: Schema.optional(Schema.String),
+    /** Fork: for `write-fork-setting`, what is wrong and how to fix it. */
+    detail: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
+    if (this.operation === "write-fork-setting" && this.detail !== undefined) return this.detail;
     if (this.operation === "write-managed-setting") {
       return `${this.managedSetting ?? "This setting"} is managed by ${this.managedBy ?? "your organization"} and cannot be changed.`;
     }

@@ -14,7 +14,7 @@ export const MCP_PROFILE_ALL = "all";
 /** No outside servers, every T3 tool. */
 export const MCP_PROFILE_T3_ONLY = "t3-only";
 /** The two profiles every build knows; `mcpProfiles` cannot redefine them. */
-const MCP_BUILT_IN_PROFILE_NAMES = [MCP_PROFILE_ALL, MCP_PROFILE_T3_ONLY] as const;
+const MCP_BUILT_IN_PROFILE_NAMES: ReadonlyArray<string> = [MCP_PROFILE_ALL, MCP_PROFILE_T3_ONLY];
 /** `mcpSubagentProfile` value: a delegated child follows `mcpProfile` like any other thread. */
 export const MCP_SUBAGENT_INHERIT = "inherit";
 
@@ -24,15 +24,27 @@ const MCP_PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/u;
 export const McpProfileName = Schema.String.check(Schema.isPattern(MCP_PROFILE_NAME_PATTERN));
 export type McpProfileName = typeof McpProfileName.Type;
 
+/** True for `all` and `t3-only`. */
+export const isBuiltInMcpProfileName = (name: string): boolean =>
+  MCP_BUILT_IN_PROFILE_NAMES.includes(name);
+
 /** True for a name a profile in `mcpProfiles` may have: valid, not built in, not `inherit`. */
 export const isDefinableMcpProfileName = (name: string): boolean =>
   MCP_PROFILE_NAME_PATTERN.test(name) &&
   name !== MCP_SUBAGENT_INHERIT &&
-  !(MCP_BUILT_IN_PROFILE_NAMES as ReadonlyArray<string>).includes(name);
+  !isBuiltInMcpProfileName(name);
+
+/** A profile name a thread can run with: a valid name other than `inherit`. */
+const McpProfileChoice = McpProfileName.check(
+  Schema.makeFilter((name: string) => name !== MCP_SUBAGENT_INHERIT, {
+    expected: `a profile name other than ${MCP_SUBAGENT_INHERIT} (only mcpSubagentProfile takes ${MCP_SUBAGENT_INHERIT})`,
+  }),
+);
 
 /**
- * Groups of T3's own tools, one per toolkit. The two message tools (`request_secret`,
- * `send_to_user`) are in no group: every profile keeps them.
+ * Groups of T3's own tools, one per toolkit (`preview` has the preview and preview-controls
+ * toolkits). The tools in {@link MCP_T3_UNGROUPED_TOOLS} are in no group. The server's
+ * apps/server/src/fork/mcpProfile.ts maps every toolkit to its group, and a test checks every tool.
  */
 export const MCP_T3_TOOL_GROUPS = [
   "orchestration",
@@ -48,77 +60,128 @@ export const MCP_T3_TOOL_GROUPS = [
   "html",
   "waits",
 ] as const;
-export const McpT3ToolGroup = Schema.Literals(MCP_T3_TOOL_GROUPS);
-export type McpT3ToolGroup = typeof McpT3ToolGroup.Type;
-
-/** An outside MCP server's name as the provider's config spells it. */
-export const McpServerName = TrimmedString.check(Schema.isNonEmpty());
+export type McpT3ToolGroup = (typeof MCP_T3_TOOL_GROUPS)[number];
 
 /**
- * One profile. `servers` and `t3Tools` are each `"all"` or a keep-list; a keep-list leaves out
- * anything not named, so a server added later is left out until the owner adds it. An empty list
- * keeps none.
+ * T3 tools every profile keeps, in no group: the two message tools, and `tool_search`, which only
+ * finds tools the thread may already use (the T3 tool filter, a later PR, leaves the others out of
+ * its results).
  */
-export const McpProfile = Schema.Struct({
-  servers: Schema.Union([Schema.Literal("all"), Schema.Array(McpServerName)]),
-  t3Tools: Schema.Union([Schema.Literal("all"), Schema.Array(McpT3ToolGroup)]),
-});
-export type McpProfile = typeof McpProfile.Type;
+export const MCP_T3_UNGROUPED_TOOLS: ReadonlyArray<string> = [
+  "request_secret",
+  "send_to_user",
+  "tool_search",
+];
+
+const isRecord = (value: unknown): value is { readonly [key: string]: unknown } =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 
 /**
  * The settings file's profiles. Each entry is kept as written and checked only when a thread uses
  * it, so one bad entry (or one written by a newer build, with fields this build does not know)
  * never stops the settings file from loading, and a save keeps it as it was.
  */
-export const McpProfilesFromSettingsFile = Schema.Record(Schema.String, Schema.Unknown).pipe(
+export const McpProfilesFromSettingsFile = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    Schema.Record(Schema.String, Schema.Unknown),
+    SchemaTransformation.transform({
+      // A map that is not an object (a hand edit gone wrong) reads as no profiles; a thread that
+      // names one is then refused, never widened.
+      decode: (raw): { readonly [name: string]: unknown } => (isRecord(raw) ? raw : {}),
+      encode: (profiles) => profiles,
+    }),
+  ),
   Schema.withDecodingDefault(Effect.succeed({})),
 );
 
 const MCP_PROFILE_FIELDS: ReadonlyArray<string> = ["servers", "t3Tools"];
+const KNOWN_GROUPS: ReadonlyArray<string> = MCP_T3_TOOL_GROUPS;
+
+const isAllOrListOf = (value: unknown, isEntry: (entry: unknown) => boolean): boolean =>
+  value === "all" || (Array.isArray(value) && value.every(isEntry));
 
 /**
- * A profile in a settings patch: a field this build does not know is refused, not dropped, so a
- * save never stores a profile cut down from what the person wrote. (Effect strips excess fields
- * unless the decode call itself asks for errors, so the check runs on the input first.)
+ * A profile a save may store: exactly `servers` (non-blank names) and `t3Tools` (known groups), each
+ * `"all"` or a keep-list; a keep-list leaves out anything not named. An unknown field is refused, not
+ * dropped, so a save never stores a profile cut down from what the person wrote.
  */
-const McpProfileInPatch = Schema.Record(Schema.String, Schema.Unknown)
+const isSavableMcpProfile = (entry: unknown): boolean =>
+  isRecord(entry) &&
+  Object.keys(entry).length === MCP_PROFILE_FIELDS.length &&
+  Object.keys(entry).every((field) => MCP_PROFILE_FIELDS.includes(field)) &&
+  isAllOrListOf(entry.servers, (name) => typeof name === "string" && name.trim() !== "") &&
+  isAllOrListOf(
+    entry.t3Tools,
+    (group) => typeof group === "string" && KNOWN_GROUPS.includes(group),
+  );
+
+/**
+ * Profiles in a settings patch: each entry replaces the stored one whole; `null` removes it. Typed
+ * as the settings file's map (each entry `unknown`), so a client may send back what it read; the
+ * check refuses a bad name or entry. (Effect drops, rather than refuses, a record key its key
+ * schema rejects, so names are checked on the whole map.)
+ */
+export const McpProfilesPatch = Schema.Record(Schema.String, Schema.Unknown)
   .check(
     Schema.makeFilter(
-      (fields: { readonly [name: string]: unknown }) =>
-        Object.keys(fields).every((name) => MCP_PROFILE_FIELDS.includes(name)),
-      { expected: `a profile with only the fields ${MCP_PROFILE_FIELDS.join(", ")}` },
+      (profiles: { readonly [name: string]: unknown }) =>
+        Object.keys(profiles).every(isDefinableMcpProfileName),
+      {
+        expected: `profile names of lower-case letters, digits and dashes (at most 40), other than ${MCP_BUILT_IN_PROFILE_NAMES.join(", ")} and ${MCP_SUBAGENT_INHERIT}`,
+      },
     ),
   )
-  .pipe(Schema.decodeTo(McpProfile, SchemaTransformation.passthrough({ strict: false })));
+  .check(
+    Schema.makeFilter(
+      (profiles: { readonly [name: string]: unknown }) =>
+        Object.values(profiles).every((entry) => entry === null || isSavableMcpProfile(entry)),
+      {
+        expected: `profiles with only ${MCP_PROFILE_FIELDS.join(" and ")}, each "all" or a list (servers: non-blank names; t3Tools: ${MCP_T3_TOOL_GROUPS.join(", ")}), or null to remove one`,
+      },
+    ),
+  );
 
 /**
- * Profiles in a settings patch: each entry replaces the stored one whole; `null` removes it. Names
- * are checked on the whole map: Effect drops, rather than refuses, a record key its key schema
- * rejects.
+ * What a profile reference in the settings file reads as. Text is trimmed (empty means "not set");
+ * `null` reads as not set. Any other value (a hand edit gone wrong, or a newer build's) reads as a
+ * marker no profile can have, so a thread that uses it is refused, never widened, and the rest of
+ * the file still loads.
  */
-export const McpProfilesPatch = Schema.Record(
-  Schema.String,
-  Schema.NullOr(McpProfileInPatch),
-).check(
-  Schema.makeFilter(
-    (profiles: { readonly [name: string]: unknown }) =>
-      Object.keys(profiles).every(isDefinableMcpProfileName),
-    {
-      expected: `profile names of lower-case letters, digits and dashes (at most 40), other than ${MCP_BUILT_IN_PROFILE_NAMES.join(", ")} and ${MCP_SUBAGENT_INHERIT}`,
-    },
+const readMcpProfileRef = (value: unknown): string =>
+  typeof value === "string"
+    ? value.trim()
+    : value === null || value === undefined
+      ? ""
+      : `(unreadable ${Array.isArray(value) ? "list" : typeof value})`;
+
+/** A profile reference as the settings file holds it; see {@link readMcpProfileRef}. */
+export const McpProfileRef = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    Schema.String,
+    SchemaTransformation.transform<string, unknown>({
+      decode: readMcpProfileRef,
+      encode: (ref) => ref,
+    }),
   ),
 );
 
-/** A profile reference as the settings file holds it; empty means "not set". */
-export const McpProfileRef = TrimmedString;
+/**
+ * A project's profile reference in a settings patch: any text, as reading the file keeps it, so a
+ * client that saves a project's other settings can send back what it read. The server refuses a
+ * new value that names no profile when it saves (packages/shared/src/forkSettingsPatch.ts).
+ */
+export const McpProjectProfileRefPatch = TrimmedString;
+
+/** The server's default profile in a settings patch: a profile name, not `inherit`. */
+export const McpProfilePatch = McpProfileChoice;
 
 /**
- * The owner's pick per thread in a settings patch; `null` removes the pick. Thread ids are checked
- * on the whole map, as for {@link McpProfilesPatch}.
+ * The owner's pick per thread in a settings patch; `null` removes the pick. A pick is a profile
+ * name, not `inherit`. Thread ids are checked on the whole map, as for {@link McpProfilesPatch}.
  */
 export const McpThreadProfilesPatch = Schema.Record(
   Schema.String,
-  Schema.NullOr(McpProfileName),
+  Schema.NullOr(McpProfileChoice),
 ).check(
   Schema.makeFilter(
     (picks: { readonly [threadId: string]: unknown }) =>
@@ -127,10 +190,30 @@ export const McpThreadProfilesPatch = Schema.Record(
   ),
 );
 
-/** The newest thread picks kept; a write that goes over drops the oldest. */
+/**
+ * The newest thread picks kept; a write that goes over drops the oldest, which then falls back to
+ * its role default. Pruning deleted threads' picks comes later.
+ */
 export const MCP_THREAD_PROFILES_KEEP_NEWEST = 500;
 
-/** The settings file's thread picks: thread id to profile name. */
-export const McpThreadProfiles = Schema.Record(Schema.String, Schema.String).pipe(
+/**
+ * The settings file's thread picks: thread id to profile name. Read leniently, like
+ * {@link McpProfileRef}: a `null` pick is dropped (no pick), any other non-text pick is kept as a
+ * marker the resolver refuses, and a map that is not an object reads as no picks. One bad pick never
+ * stops the settings file from loading.
+ */
+export const McpThreadProfiles = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    Schema.Record(Schema.String, Schema.String),
+    SchemaTransformation.transform({
+      decode: (raw): { readonly [threadId: string]: string } =>
+        Object.fromEntries(
+          Object.entries(isRecord(raw) ? raw : {})
+            .filter(([, pick]) => pick !== null && pick !== undefined)
+            .map(([threadId, pick]) => [threadId, readMcpProfileRef(pick)]),
+        ),
+      encode: (picks) => picks,
+    }),
+  ),
   Schema.withDecodingDefault(Effect.succeed({})),
 );

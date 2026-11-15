@@ -4,10 +4,15 @@
  */
 import {
   FORK_PATCH_RULES,
+  MCP_PROFILE_ALL,
+  MCP_PROFILE_T3_ONLY,
+  MCP_SUBAGENT_INHERIT,
   type ForkPatchRule,
   type ForkServerSettingKey,
   type ServerSettings,
   type ServerSettingsPatch,
+  isBuiltInMcpProfileName,
+  isDefinableMcpProfileName,
 } from "@t3tools/contracts";
 
 const FORK_PATCH_KEYS = Object.keys(FORK_PATCH_RULES) as ReadonlyArray<ForkServerSettingKey>;
@@ -82,4 +87,82 @@ export function applyForkSettingsPatch(
     next[key] = applyRule(FORK_PATCH_RULES[key], current[key], value);
   }
   return next as Partial<Pick<ServerSettings, ForkServerSettingKey>>;
+}
+
+/**
+ * A profile reference a save sets anew that no thread could run with: `inherit` where only
+ * `mcpSubagentProfile` takes it, or a name no profile has. A reference the save leaves as it was is
+ * never refused, so an old or odd stored value does not block saving anything else (a thread that
+ * uses it is refused when it starts). Empty means "not set" and is always fine.
+ */
+function mcpProfileRefProblem(
+  next: ServerSettings,
+  setting: string,
+  value: string | undefined,
+  before: string | undefined,
+  takesInherit: boolean,
+): string | undefined {
+  const name = value?.trim() ?? "";
+  if (name === "" || name === (before?.trim() ?? "")) return undefined;
+  if (name === MCP_SUBAGENT_INHERIT) {
+    return takesInherit
+      ? undefined
+      : `${setting} cannot be "${MCP_SUBAGENT_INHERIT}" (only a sub-agent rule takes it): pick "${MCP_PROFILE_ALL}", "${MCP_PROFILE_T3_ONLY}" or a profile name.`;
+  }
+  if (isBuiltInMcpProfileName(name)) return undefined;
+  if (isDefinableMcpProfileName(name) && Object.hasOwn(next.mcpProfiles, name)) return undefined;
+  return `${setting} names MCP profile "${name}", which is not set up: add that profile first, or pick "${MCP_PROFILE_ALL}" or "${MCP_PROFILE_T3_ONLY}".`;
+}
+
+/**
+ * Why the server must refuse this save of fork settings, or `undefined`. Checks `next` (the
+ * settings after the patch) against `current`, so it also sees a project's or thread's value that
+ * a client sent back unchanged. Deleting a profile still in use is not refused yet (a later PR).
+ */
+export function forkSettingsWriteProblem(
+  current: ServerSettings,
+  next: ServerSettings,
+): string | undefined {
+  const problems: Array<string | undefined> = [
+    mcpProfileRefProblem(next, "mcpProfile", next.mcpProfile, current.mcpProfile, false),
+    mcpProfileRefProblem(
+      next,
+      "mcpSubagentProfile",
+      next.mcpSubagentProfile,
+      current.mcpSubagentProfile,
+      true,
+    ),
+  ];
+  for (const [threadId, pick] of Object.entries(next.mcpThreadProfiles)) {
+    const before = Object.hasOwn(current.mcpThreadProfiles, threadId)
+      ? current.mcpThreadProfiles[threadId]
+      : undefined;
+    problems.push(
+      mcpProfileRefProblem(next, `The pick for thread ${threadId}`, pick, before, false),
+    );
+  }
+  for (const [projectId, overrides] of Object.entries(next.projectSettingsOverrides)) {
+    const stored = Object.hasOwn(current.projectSettingsOverrides, projectId)
+      ? current.projectSettingsOverrides[
+          projectId as keyof ServerSettings["projectSettingsOverrides"]
+        ]
+      : undefined;
+    problems.push(
+      mcpProfileRefProblem(
+        next,
+        `Project ${projectId}'s mcpProfile`,
+        overrides.mcpProfile,
+        stored?.mcpProfile,
+        false,
+      ),
+      mcpProfileRefProblem(
+        next,
+        `Project ${projectId}'s mcpSubagentProfile`,
+        overrides.mcpSubagentProfile,
+        stored?.mcpSubagentProfile,
+        true,
+      ),
+    );
+  }
+  return problems.find((problem) => problem !== undefined);
 }

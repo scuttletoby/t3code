@@ -8,20 +8,56 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
-import { FORK_AGENT_WRITABLE_KEYS, FORK_PERSON_ONLY_KEYS } from "@t3tools/contracts";
+import {
+  FORK_AGENT_WRITABLE_KEYS,
+  FORK_PERSON_ONLY_KEYS,
+  MCP_T3_TOOL_GROUPS,
+  MCP_T3_UNGROUPED_TOOLS,
+} from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 import { beforeAll, describe, expect, it } from "vite-plus/test";
 
+import { MCP_T3_TOOLKIT_GROUPS, mcpT3ToolGroup } from "./mcpProfile.ts";
+
 const TOOLKITS_DIR = NodePath.resolve(import.meta.dirname, "../mcp/toolkits");
-/** Every toolkit module; each defines its tools with `Tool.make` and exports its toolkits. */
-const loadToolkitModules = (): Promise<ReadonlyArray<Record<string, unknown>>> =>
-  Promise.all(
-    NodeFS.readdirSync(TOOLKITS_DIR, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => NodePath.join(TOOLKITS_DIR, entry.name, "tools.ts"))
-      .filter((path) => NodeFS.existsSync(path))
-      .map((path) => import(path) as Promise<Record<string, unknown>>),
+/** Every toolkit folder; each must define its tools in `tools.ts` and export its toolkits there. */
+const toolkitFolders = (): ReadonlyArray<string> =>
+  NodeFS.readdirSync(TOOLKITS_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+const toolsFile = (folder: string) => NodePath.join(TOOLKITS_DIR, folder, "tools.ts");
+
+const escapeRegExp = (text: string) => text.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * How a source file can call effect/ai's `Tool.make`, read from its imports so an alias counts:
+ * `Tool.make`, `T.make` (`{ Tool as T }`), `Ai.Tool.make` (`* as Ai`), or `make` from effect/ai/Tool.
+ */
+const toolMakeCallees = (source: string): ReadonlyArray<string> => {
+  const callees: Array<string> = [];
+  for (const [, names = "", from] of source.matchAll(
+    /import\s+\{([^}]*)\}\s*from\s*["'](effect\/ai(?:\/Tool)?)["']/g,
+  )) {
+    for (const spec of names.split(",")) {
+      const [imported = "", local = imported] = spec.trim().split(/\s+as\s+/);
+      if (from === "effect/ai" && imported === "Tool") callees.push(`${local}.make`);
+      if (from === "effect/ai/Tool" && imported === "make") callees.push(local);
+    }
+  }
+  for (const [, local = "", from] of source.matchAll(
+    /import\s+\*\s+as\s+(\w+)\s+from\s*["'](effect\/ai(?:\/Tool)?)["']/g,
+  )) {
+    callees.push(from === "effect/ai" ? `${local}.Tool.make` : `${local}.make`);
+  }
+  return callees;
+};
+/** How many times a source file calls `Tool.make`, under any alias. */
+const toolMakeCalls = (source: string): number =>
+  toolMakeCallees(source).reduce(
+    (count, callee) =>
+      count +
+      [...source.matchAll(new RegExp(`(?<![\\w.$])${escapeRegExp(callee)}\\(`, "g"))].length,
+    0,
   );
 /** Server sources (relative to src/) that call `Tool.make` outside the toolkit modules. */
 const toolsDefinedElsewhere = (): ReadonlyArray<string> => {
@@ -30,9 +66,7 @@ const toolsDefinedElsewhere = (): ReadonlyArray<string> => {
     .filter((path) => path.endsWith(".ts") && !path.endsWith(".test.ts"))
     .map((path) => path.split(NodePath.sep).join("/"))
     .filter((path) => !/^mcp\/toolkits\/[^/]+\/tools\.ts$/.test(path))
-    .filter((path) =>
-      /\bTool\.make\(/.test(NodeFS.readFileSync(NodePath.join(root, path), "utf8")),
-    );
+    .filter((path) => toolMakeCalls(NodeFS.readFileSync(NodePath.join(root, path), "utf8")) > 0);
 };
 /** Files that call `Tool.make` but advertise nothing: each with the reason. */
 const NOT_ADVERTISED: Readonly<Record<string, string>> = {
@@ -55,12 +89,21 @@ const isToolkit = (value: unknown): value is Toolkit.Toolkit<Record<string, Tool
 };
 
 const tools = new Map<string, Tool.Any>();
+/** Each toolkit folder's tools, as its exported toolkits hold them. */
+const toolsByFolder = new Map<string, ReadonlySet<string>>();
 beforeAll(async () => {
-  for (const module of await loadToolkitModules()) {
+  for (const folder of toolkitFolders()) {
+    if (!NodeFS.existsSync(toolsFile(folder))) continue;
+    const module = (await import(toolsFile(folder))) as Record<string, unknown>;
+    const names = new Set<string>();
     for (const value of Object.values(module)) {
       if (!isToolkit(value)) continue;
-      for (const tool of Object.values(value.tools)) tools.set(tool.name, tool);
+      for (const tool of Object.values(value.tools)) {
+        tools.set(tool.name, tool);
+        names.add(tool.name);
+      }
     }
+    toolsByFolder.set(folder, names);
   }
 });
 
@@ -122,6 +165,30 @@ describe("person-only fork settings", () => {
     expect(toolsDefinedElsewhere().toSorted()).toEqual(Object.keys(NOT_ADVERTISED).toSorted());
   });
 
+  it("loads every toolkit file, and every tool each one makes is in an exported toolkit", () => {
+    const folders = toolkitFolders();
+    expect(folders.filter((folder) => !NodeFS.existsSync(toolsFile(folder)))).toEqual([]);
+    expect([...toolsByFolder.keys()].toSorted()).toEqual(folders.toSorted());
+    // A tool made but left out of every exported toolkit would never be checked.
+    const counts = (count: (folder: string) => number) =>
+      Object.fromEntries(folders.map((folder) => [folder, count(folder)]));
+    expect(counts((folder) => toolsByFolder.get(folder)?.size ?? 0)).toEqual(
+      counts((folder) => toolMakeCalls(NodeFS.readFileSync(toolsFile(folder), "utf8"))),
+    );
+  });
+
+  it("counts `Tool.make` under any import alias", () => {
+    const cases: ReadonlyArray<readonly [string, number]> = [
+      ['import { Tool, Toolkit } from "effect/ai";\nTool.make("a", {});', 1],
+      ['import { Toolkit, Tool as T } from "effect/ai";\nT.make("a", {}); T.make("b", {});', 2],
+      ['import * as Ai from "effect/ai";\nAi.Tool.make("a", {});', 1],
+      ['import * as AiTool from "effect/ai/Tool";\nAiTool.make("a", {});', 1],
+      ['import { make as makeTool } from "effect/ai/Tool";\nmakeTool("a", {});', 1],
+      ['import { Schema } from "effect";\nSchema.make(1); Tool.make("a", {});', 0],
+    ];
+    for (const [source, calls] of cases) expect(toolMakeCalls(source), source).toBe(calls);
+  });
+
   it("finds no person-only setting in any T3 tool's input", () => {
     const found = [...tools.values()].flatMap((tool) =>
       personOnlyKeysIn(tool).map((key) => `${tool.name}: ${key}`),
@@ -139,5 +206,25 @@ describe("person-only fork settings", () => {
       });
       expect(personOnlyKeysIn(tool), field).toEqual(["mcpProfile"]);
     }
+  });
+});
+
+describe("MCP profile T3 tool groups", () => {
+  it("maps every T3 tool to a group or to the ungrouped list", () => {
+    const unmapped = [...toolsByFolder].flatMap(([folder, names]) =>
+      [...names].filter((name) => mcpT3ToolGroup(folder, name) === undefined),
+    );
+    expect(unmapped).toEqual([]);
+  });
+
+  it("has a row for each toolkit and uses every group", () => {
+    expect(Object.keys(MCP_T3_TOOLKIT_GROUPS).toSorted()).toEqual(toolkitFolders().toSorted());
+    const used = new Set(
+      [...toolsByFolder].flatMap(([folder, names]) =>
+        [...names].map((name) => mcpT3ToolGroup(folder, name)),
+      ),
+    );
+    expect(MCP_T3_TOOL_GROUPS.filter((group) => !used.has(group))).toEqual([]);
+    expect(MCP_T3_UNGROUPED_TOOLS.filter((name) => !tools.has(name))).toEqual([]);
   });
 });

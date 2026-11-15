@@ -55,6 +55,7 @@ import {
   fallbackTextGenerationModelSelection,
   isModelSelectionProviderEnabled,
 } from "@t3tools/shared/serverSettings";
+import { forkSettingsWriteProblem } from "@t3tools/shared/forkSettingsPatch";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
@@ -231,6 +232,20 @@ function ensureSecretProviderWritesAllowed(
   return Effect.void;
 }
 
+// Fork: refuses a fork setting's save that could not apply (forkSettingsPatch.ts says why).
+function ensureForkSettingsWriteAllowed(
+  current: ServerSettings,
+  next: ServerSettings,
+  settingsPath: string,
+): Effect.Effect<void, ServerSettingsError> {
+  const detail = forkSettingsWriteProblem(current, next);
+  return detail === undefined
+    ? Effect.void
+    : Effect.fail(
+        new ServerSettingsError({ settingsPath, operation: "write-fork-setting", detail }),
+      );
+}
+
 function ensureProviderInstanceMutationAllowed(
   settings: ServerSettings,
   mutation: ProviderInstanceMutation,
@@ -313,7 +328,11 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
   ): Effect.Effect<ServerSettings, ServerSettingsError> =>
     writeSemaphore.withPermits(1)(
       Ref.get(currentSettingsRef).pipe(
-        Effect.flatMap(update),
+        Effect.flatMap((current) =>
+          update(current).pipe(
+            Effect.tap((next) => ensureForkSettingsWriteAllowed(current, next, "test settings")),
+          ),
+        ),
         Effect.flatMap(normalizeServerSettings),
         Effect.tap((nextSettings) => Ref.set(currentSettingsRef, nextSettings)),
         Effect.map(resolveTextGenerationProvider),
@@ -1226,6 +1245,7 @@ const make = Effect.gen(function* () {
         // An older client echoes a reference as the redacted marker; restore it before vetting so
         // a removed provider's reference is cleared below rather than restored by persistence.
         const updated = withEchoedSecretReferences(current, yield* update(current));
+        yield* ensureForkSettingsWriteAllowed(current, updated, settingsPath);
         // Vet before secrets: a variable the policy hides from clients is not one they removed.
         const vetted = managed.vetWrite(current, yield* normalizeServerSettings(updated), patch);
         if (vetted._tag === "Locked") {

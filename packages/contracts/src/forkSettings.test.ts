@@ -79,8 +79,11 @@ describe("fork settings seam", () => {
     const lines = SETTINGS_SOURCE.split("\n");
     // The import, `export *` and six spreads.
     expect(lines.filter((line) => /forkSettings|ForkSettings/.test(line))).toHaveLength(8);
-    // The inline `automaticUpdates`: its comment, its field and its patch field.
-    expect(lines.filter((line) => line.includes("Fork:"))).toHaveLength(1);
+    // Three `Fork:` comments: the inline `automaticUpdates`, and the save error for a refused fork
+    // setting (its operation and its `detail` field). That error's operation, the comment on
+    // `detail` and the line of `message` that shows the detail name `write-fork-setting`.
+    expect(lines.filter((line) => line.includes("Fork:"))).toHaveLength(3);
+    expect(lines.filter((line) => line.includes("write-fork-setting"))).toHaveLength(3);
     expect(lines.filter((line) => /^ {2}automaticUpdates:/.test(line))).toHaveLength(2);
     // forkSettings.ts never imports settings.ts, so upstream's file stays the only one with seams.
     expect(FORK_SOURCE).not.toMatch(/from "\.\/settings(\.ts)?"/);
