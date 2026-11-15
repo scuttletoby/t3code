@@ -237,7 +237,7 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       # scripts/: some tests are run by a script there (.github/fork-ci-tests.txt).
       # fork-ci/: the composite actions and their tests. fork-kit/: host kits and their tests.

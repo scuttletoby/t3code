@@ -574,6 +574,35 @@ old `/run/fork-fleet-desk` first (`serve` refuses a lock file or directory left
 by root, with a message that says so). A desk agent of an older wire version
 gets exit 76 and a line that says to upgrade it.
 
+**The desktop's side** (`fork-fleet-desk-agent.py`, as root on the desktop; on
+WSL2 inside the distro, which runs systemd). Install it and
+`fork-fleet-desk-wire.py` from the same pinned commit as step 3, beside the
+launcher and the walls (`fork-fleet-walls.py`) in `/opt/fork-fleet`; the
+launcher and its setup are as on a vm-pool host. Then, once per desktop:
+
+```sh
+install -d -m 755 /etc/fork-fleet
+ssh-keygen -t ed25519 -N '' -C desk-POOL -f /etc/fork-fleet/desk-key   # desk-key.pub goes to the always-on host
+# The always-on host's own key, from that host (`cat /etc/ssh/ssh_host_ed25519_key.pub`), as one line;
+# with another PORT the name is [HOST]:PORT. Nothing else is ever trusted.
+echo 'HOST ssh-ed25519 AAAA...' > /etc/fork-fleet/desk-known_hosts
+printf 'POOL=POOL\nHOST=HOST\n' > /etc/fork-fleet/desk.conf && chmod 600 /etc/fork-fleet/desk.conf
+python3 -I /opt/fork-fleet/fork-fleet-desk-agent.py check
+install -m 644 fork-fleet-desk-agent.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now fork-fleet-desk-agent
+```
+
+The agent checks each verb again against the wire rules (anything else ends
+the session), runs `start` only after `fork-fleet-walls.py check` passes, gives
+the launcher and the walls only `PATH` and `LC_ALL` (they read their own
+settings files), kills a verb at its limit (answer 75) and every running verb
+when the session ends, and dials again with backoff and jitter (at once after
+a sleep, also on WSL2, where only the wall clock jumps). One agent per desktop
+(a lock in `/run/fork-fleet-desk-agent`); the other settings and their
+defaults are in the script's header. `check-net` (step 6) never comes over the
+link, so the always-on host cannot use it to probe the desktop's own network:
+run it by hand on the desktop.
+
 **What jobs need on the host.** The jobs run without sudo, so the host must
 already have:
 
