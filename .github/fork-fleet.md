@@ -501,11 +501,11 @@ echo 'd /run/fork-fleet-desk 0710 fleet-desk fleet-desk -' > /etc/tmpfiles.d/for
 systemd-tmpfiles --create /etc/tmpfiles.d/fork-fleet-desk.conf
 # Per desk pool: the desktop's public key, as the desk-link user, with the key tool fork-fleet-desk-key.py
 # (row D4 of the desktop-pool design; install it beside the others).
-sudo -u fleet-desk -H python3 -I /opt/fork-fleet/fork-fleet-desk-key.py add POOL < desk-POOL.pub
+sudo -u fleet-desk -H /usr/bin/python3 -I /opt/fork-fleet/fork-fleet-desk-key.py --config /opt/fork-fleet/fork-fleet.json add POOL < desk-POOL.pub
 ```
 
 The line it writes (and the only kind of line that user's key file holds) is
-`restrict,command="python3 -I /opt/fork-fleet/fork-fleet-desk.py serve POOL" ssh-ed25519 AAAA... fork-fleet-desk:POOL`
+`restrict,command="/usr/bin/python3 -I /opt/fork-fleet/fork-fleet-desk.py serve POOL" ssh-ed25519 AAAA... fork-fleet-desk:POOL`
 in `~fleet-desk/.ssh/authorized_keys`. The pool's launch command in the
 project's fleet config is
 `"launch": ["python3", "-I", "/opt/fork-fleet/fork-fleet-desk.py", "launch", "POOL"]`.
