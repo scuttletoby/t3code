@@ -1,20 +1,28 @@
 #!/usr/bin/env bash
 # Fork only: the scan job of fork-secret-scan.yml. Picks the commits a pull request or a push adds
-# and runs gitleaks over them. Tests: fork-secret-scan.test.sh.
+# (or, in the daily sweep, every ref of origin holds but pull request heads) and runs gitleaks over
+# their changes and their commit objects (message, author, committer). Tests:
+# fork-secret-scan.test.sh.
 #
 # Environment:
 #   GITLEAKS     gitleaks binary
-#   EVENT_NAME   pull_request or push
+#   EVENT_NAME   pull_request, push, or schedule / workflow_dispatch (the sweep, fork-secret-sweep.yml)
 #   HEAD_SHA     pull_request: the PR head
-#   BEFORE       push: the branch tip before the push (all zeros when the branch is new)
+#   BEFORE       push: the branch tip before the push (all zeros when the branch is new);
+#                pull_request: the head before this push of it (synchronize), else empty
+#   OLD_HEADS    pull_request: every tip the PR's branch has had, as far as the workflow could list
+#                them (whitespace-separated commit ids; may be empty)
 #   AFTER        push: the branch tip after the push
-#   UPSTREAM     push: owner/name of the repository this fork follows (the workflow reads this
-#                fork's parent, as fork-follow.yml does); empty when it could not be read
-#   UPSTREAM_URL push: git URL of upstream (default https://github.com/$UPSTREAM.git, as in
+#   PUSH_REF     push: the ref pushed (refs/heads/<name> or refs/tags/<name>); empty is read as the
+#                default branch
+#   UPSTREAM     owner/name of the repository this fork follows (the workflow reads this fork's
+#                parent, as fork-follow.yml does); empty when it could not be read
+#   UPSTREAM_URL git URL of upstream (default https://github.com/$UPSTREAM.git, as in
 #                fork-follow.sh)
-#   CONFIG_BRANCH  pull_request: the repository's default branch (the branch whose pushes this job
-#                scans); its tip holds the gitleaks settings the scan uses (see "Settings" below)
-#                and is what the range leaves out
+#   FETCH_RETRY_DELAY  seconds between tries of an earlier head's fetch, times the try (default 5)
+#   CONFIG_BRANCH  the repository's default branch; for a pull request and a push to any other
+#                ref, its tip holds the gitleaks settings the scan uses (see "Settings" below) and
+#                is what the range leaves out
 #   RUNNER_TEMP  folder for the scan's temporary files (else TMPDIR, else /tmp)
 #
 # Ranges:
@@ -25,15 +33,34 @@
 #                  fires `edited`, which does not re-run the scan; this range does not depend on the
 #                  base, so a retarget changes nothing. The default branch's own commits were scanned
 #                  by its push runs. A squash merge never brings the PR's own commits to main, but
-#                  they stay public under refs/pull/N/head, so they are scanned here. Each push
-#                  of the head gets a run that nothing cancels (fork-secret-scan.yml), so a head
-#                  a force push replaced, still served by id, is scanned to the end too.
-#   push           BEFORE..AFTER. After a force push that is every commit the new tip has and the
-#                  old one had not; commits both share were scanned when they were first pushed.
-#   push, no BEFORE  a new branch (BEFORE all zeros) or an old tip that can no longer be fetched:
-#                  only AFTER itself, with a warning. Everything before it is history this fork
-#                  already had (upstream's, or scanned by earlier runs), and there is no older tip
-#                  to tell new commits from old ones.
+#                  they stay public under refs/pull/N/head, so they are scanned here.
+#   pull_request, replaced heads  a force push replaces the head, but GitHub still serves the old
+#                  head's commits by id: a key there is public. The check the ruleset requires
+#                  runs on the newest head only (older runs are cancelled or no longer shown), so
+#                  the range also holds every earlier head (BEFORE and OLD_HEADS) that is neither
+#                  in the new head nor on the default branch: `HEAD_SHA <earlier heads>
+#                  ^<default tip>`, minus what upstream has (as for a push, below: a head from
+#                  before a fork-follow rebase holds the upstream commits main was rebased away
+#                  from). The pull request stays red until the key is rotated and its
+#                  exact, now dead, value is allowed in .gitleaks.toml (a pull request of its own),
+#                  or the work moves to a branch of another name. An earlier head origin says it
+#                  no longer has ("not our ref", "no such object") gets a warning (GitHub no longer
+#                  serves it; its push was scanned by the push run). Any other fetch failure (the
+#                  network, a 5xx) is tried 4 times, then fails the job (exit 2): re-run it. Each
+#                  push of the head also gets a run of its own that nothing cancels
+#                  (fork-secret-scan.yml).
+#   push, other ref  a push to any branch but the default one, or a tag: AFTER ^<default tip>, every
+#                  commit the pushed tip has that the default branch has not (a new branch
+#                  included), with the default branch's settings, as for a pull request. Such a
+#                  branch is unreviewed, so neither its range nor its settings may depend on its
+#                  own earlier pushes.
+#   push           (the default branch) BEFORE..AFTER. After a force push that is every commit the
+#                  new tip has and the old one had not; commits both share were scanned when they
+#                  were first pushed.
+#   push, no BEFORE  (the default branch) an old tip that can no longer be fetched, or a new
+#                  branch: only AFTER itself, with a warning. Everything before it is history this
+#                  fork already had (upstream's, or scanned by earlier runs), and there is no older
+#                  tip to tell new commits from old ones.
 #   push, upstream  every push range leaves out the commits upstream's default branch or one of its
 #                  v* tags holds. A fork-follow rebase force-pushes the series onto a newer upstream
 #                  tag, so BEFORE..AFTER would otherwise hold hundreds of upstream's commits (and
@@ -41,6 +68,22 @@
 #                  Upstream is fetched read-only, commits only, into refs/scan-upstream/*, which
 #                  each run empties first. Fail closed: when UPSTREAM is empty or the fetch fails,
 #                  nothing is left out (the full range, with a warning).
+#   schedule, workflow_dispatch  the sweep: every ref origin lists but refs/pull/* (branches, tags,
+#                  notes such as refs/notes/commits, any other refs/<name>/*; fetched into
+#                  refs/scan-sweep/*, which each run empties first), minus what upstream has, with
+#                  the default branch's settings. It catches what no push run read: GitHub starts
+#                  no push run for a push with [skip ci] in its message, for a push of more than 3
+#                  tags at once, for a push made with a workflow's GITHUB_TOKEN, or for a ref that
+#                  is not a branch or tag (notes), and branches older than this scan were never
+#                  read. A finding is old by then: rotate it. A failed sweep opens (or comments on)
+#                  an issue (fork-secret-sweep.yml), as a schedule run alerts no one otherwise.
+#
+# Commit objects: each commit of the range as git stores it (`git cat-file`: its message, author
+# and committer names and emails, signature and other headers), and on a tag push the pushed tag's
+# object (each annotated tag in the chain, with its message and tagger; the sweep reads every
+# ref's, but those of tag objects upstream also has), go through `gitleaks stdin` with the same
+# settings. A finding names the commit or tag. (Not `git log --format=%B`: that is the message
+# alone, and a key in an author or committer field would pass.)
 # Merge commits are diffed with --remerge-diff: only what the merge itself changed beyond an
 # automatic merge of its parents (a conflict resolution, or a file added in the merge). Without it
 # git log shows merges with no diff at all, so gitleaks would never read them. --remerge-diff knows
@@ -48,14 +91,14 @@
 # one fails the job (exit 2); merge the branches one at a time instead.
 #
 # Settings: gitleaks reads .gitleaks.toml and .gitleaksignore, which can allow any finding. They
-# never come from the checkout (the pull request's head). For a pull request: the default branch's
-# tip (CONFIG_BRANCH, fetched each run), which the range leaves out. For a push: the tip before the
-# push (BEFORE). A push with no fetchable BEFORE (a new branch, or an old tip that is gone) reads
+# never come from the checkout (the pull request's head). For a pull request and a push to any
+# other ref: the default branch's tip (CONFIG_BRANCH, fetched each run), which the range leaves out.
+# For a push to the default branch: the tip before the push (BEFORE). A push with no fetchable BEFORE (a new branch, or an old tip that is gone) reads
 # AFTER's first parent, a commit of the same push that no scan reads, so there the push can set
 # its own settings: gitleaks' built-in defaults instead would bring back the broad path skip list
 # .gitleaks.toml removes, and a push run takes this script and the workflow from the pushed commit
-# anyway. A root commit uses gitleaks' defaults. In this repository pushes are scanned only on the
-# default branch, which is never new. gitleaks runs in a temporary folder holding only those two
+# anyway. A root commit uses gitleaks' defaults. In this repository that case is the default
+# branch only (other refs read the default branch's settings), which is never new. gitleaks runs in a temporary folder holding only those two
 # files, so it finds no other; `[extend] path` therefore cannot load, and settings gitleaks cannot
 # load fail the job (exit 2) with that reason.
 # A range that changes the settings gets a notice saying when the change applies. The reviewed path
@@ -76,8 +119,13 @@
 # commit id change), and a value entry does not depend on either, so the PR scan does not scan the
 # squash result as one more diff.
 #
-# Not covered: a `gitleaks:allow` comment on the line itself (visible in the diff); a pull request
-# that edits this script or the workflow (pull_request runs take both from the pull request); text
+# Not covered (the job summary lists these too): a `gitleaks:allow` comment on the line itself
+# (visible in the diff); ref names (branch, tag and note names); the pull request's title, body and
+# comments (GitHub data, not git); commits only an outside pull request (refs/pull/N/head) holds, as
+# the sweep leaves refs/pull/* out; a ref that names a tree or blob rather than a commit (the sweep
+# warns, and reads only its tag messages); a pull request
+# that edits the workflow (pull_request runs take it from the pull request; the workflow runs this
+# script from the default branch's tip, so an edit of the script alone changes nothing); text
 # in another encoding than UTF-8 or UTF-16 with a byte-order mark (UTF-16 without one, UTF-32);
 # compressed or packed contents (zip, gzip, images' compressed data); a key split across lines.
 #
@@ -123,7 +171,24 @@ fetch() {
   have "$1" || git fetch --no-tags --quiet --filter=blob:none origin "$1" 2>/dev/null || true
   have "$1"
 }
+# An earlier head of a pull request (see "replaced heads"): 0 when it is here; 1 when origin answers
+# that it does not have it ("not our ref", "no such object": GitHub no longer serves it); 2 when the
+# fetch still fails after 4 tries for any other reason (network, a 5xx), with git's message.
+fetch_earlier() {
+  local try err=""
+  have "$1" && return 0
+  for try in 1 2 3 4; do
+    if err="$(timeout 300 git fetch --no-tags --quiet --filter=blob:none origin "$1" 2>&1)" && have "$1"; then
+      return 0
+    fi
+    if grep -qiE 'not our ref|no such object' <<< "$err"; then return 1; fi
+    if [[ $try -lt 4 ]]; then sleep "$(( ${FETCH_RETRY_DELAY:-5} * try ))"; fi
+  done
+  printf '%s\n' "$err" >&2
+  return 2
+}
 zero() { [[ -z "$1" || "$1" =~ ^0+$ ]]; }
+short() { printf '%s ' "$@" | sed -E 's/([0-9a-f]{12})[0-9a-f]+/\1/g; s/ $//'; }
 # Upstream's default branch and v* tags (the same tags fork-follow.sh reads), commits only, into
 # refs/scan-upstream/*. Refs from an earlier run go first, so a tag upstream has deleted since is
 # not left out. A failed fetch adds no exclusion at all.
@@ -134,6 +199,32 @@ fetch_upstream() {
   timeout 600 git fetch --quiet --no-tags --filter=blob:none "$url" \
     "+HEAD:refs/scan-upstream/head" "+refs/tags/v*:refs/scan-upstream/tags/v*" >&2 || return 1
   git rev-parse --quiet --verify refs/scan-upstream/head > /dev/null
+}
+# Leave upstream's commits out of $range (see "push, upstream"), and say so in $what; when upstream is
+# unknown or cannot be fetched, nothing is left out, with a warning.
+without_upstream() {
+  local full="$range" reason
+  if fetch_upstream; then
+    upstream_used=1
+    range="$range --not --glob=refs/scan-upstream"
+    # shellcheck disable=SC2086
+    what="$what, minus the $(( $(git rev-list --count $full) - $(git rev-list --count $range) )) commit(s) upstream $UPSTREAM already has"
+  else
+    if [[ -z "${UPSTREAM:-}" ]]; then
+      reason="upstream is not known (UPSTREAM is empty)"
+    else
+      reason="upstream $UPSTREAM could not be fetched"
+    fi
+    warning="${warning:+$warning; }$reason, so its commits in the range are scanned too"
+  fi
+}
+# The tag objects from $1 down to the commit (or other object) it names, one per line.
+tag_chain() {
+  local obj="$1"
+  while [[ "$(git cat-file -t "$obj")" == tag ]]; do
+    echo "$obj"
+    obj="$(git cat-file tag "$obj" | sed -n '1s/^object //p')"
+  done
 }
 summary() { if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; fi; }
 # The settings commit for a pull request: the default branch's tip, commits only, into
@@ -148,6 +239,9 @@ fetch_config_branch() {
 }
 
 warning=""
+other_ref=""
+tag_objects=()
+upstream_used=""
 case "$EVENT_NAME" in
   pull_request)
     if ! fetch "$HEAD_SHA"; then
@@ -162,16 +256,66 @@ case "$EVENT_NAME" in
     changes=("$settings...$HEAD_SHA")
     # Everything the head has that the default branch has not, whatever the PR's base (see the header).
     range="$settings..$HEAD_SHA"
-    opts="--remerge-diff --text $range"
     what="the pull request's $(git rev-list --count "$range") commit(s) not on $CONFIG_BRANCH, merges included"
+    # Earlier heads a force push replaced (see the header): what they had that neither the head nor
+    # the default branch has is scanned too.
+    tips=()
+    gone=()
+    for old in ${BEFORE:-} ${OLD_HEADS:-}; do
+      zero "$old" && continue
+      if ! [[ "$old" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+        echo "::error::Secret scan: '$old' in BEFORE or OLD_HEADS is not a commit id" >&2
+        exit 2
+      fi
+      [[ " $HEAD_SHA ${tips[*]} ${gone[*]} " != *" $old "* ]] || continue
+      got=0
+      fetch_earlier "$old" || got=$?
+      if [[ $got -eq 1 ]]; then gone+=("$old"); continue; fi
+      if [[ $got -ne 0 ]]; then
+        echo "::error::Secret scan: cannot fetch the earlier head $old of this pull request, and origin did not say it no longer has it (a network or server failure?), so what it had cannot be scanned. Re-run the job." >&2
+        exit 2
+      fi
+      if git merge-base --is-ancestor "$old" "$HEAD_SHA" || git merge-base --is-ancestor "$old" "$settings"; then
+        continue
+      fi
+      tips+=("$old")
+    done
+    if [[ ${#gone[@]} -gt 0 ]]; then
+      warning="${#gone[@]} earlier head(s) of this pull request cannot be fetched ($(short "${gone[@]}")), so they are not scanned here (each push of them had a push scan of its own)"
+    fi
+    if [[ ${#tips[@]} -gt 0 ]]; then
+      range="$HEAD_SHA ${tips[*]} ^$settings"
+      what="$what, and what the ${#tips[@]} earlier head(s) a force push replaced ($(short "${tips[@]}")) had"
+      # An earlier head from before a fork-follow rebase holds the upstream commits main was rebased
+      # away from (see the header).
+      without_upstream
+      # shellcheck disable=SC2086
+      what="$what: $(git rev-list --count $range) commit(s) in all"
+    fi
     ;;
   push)
-    if ! zero "$BEFORE" && fetch "$BEFORE"; then
+    if [[ -n "${PUSH_REF:-}" && "$PUSH_REF" != "refs/heads/${CONFIG_BRANCH:-}" ]]; then
+      # A push to any other branch (or a tag): everything its tip has that the default branch has
+      # not, read with the default branch's settings, as for a pull request (see the header).
+      if ! fetch "$AFTER"; then
+        echo "::error::Secret scan: cannot fetch commit $AFTER" >&2
+        exit 2
+      fi
+      if ! settings="$(fetch_config_branch)"; then
+        echo "::error::Secret scan: cannot fetch the default branch '${CONFIG_BRANCH:-}' (CONFIG_BRANCH), whose gitleaks settings the scan uses" >&2
+        exit 2
+      fi
+      settings_what="the default branch $CONFIG_BRANCH (${settings:0:12})"
+      other_ref=1
+      changes=("$settings...$AFTER")
+      range="$AFTER ^$settings"
+      # shellcheck disable=SC2086
+      what="the $(git rev-list --count $range) commit(s) $PUSH_REF has that $CONFIG_BRANCH has not"
+    elif ! zero "$BEFORE" && fetch "$BEFORE"; then
       settings="$BEFORE"
       settings_what="the tip before the push (${BEFORE:0:12})"
       changes=("$BEFORE" "$AFTER")
       range="$BEFORE..$AFTER"
-      opts="--remerge-diff --text $range"
       if git merge-base --is-ancestor "$BEFORE" "$AFTER"; then
         what="the $(git rev-list --count "$range") commit(s) pushed after ${BEFORE:0:12}"
       else
@@ -187,7 +331,6 @@ case "$EVENT_NAME" in
         changes=()
       fi
       range="--max-count=1 $AFTER"
-      opts="--remerge-diff --text $range"
       if zero "$BEFORE"; then
         warning="a new branch has no earlier tip, so only its newest commit ${AFTER:0:12} is scanned"
       else
@@ -195,21 +338,58 @@ case "$EVENT_NAME" in
       fi
       what="the pushed commit ${AFTER:0:12}"
     fi
-    # Leave out upstream's commits (see the header). --glob takes every ref under the prefix.
-    if fetch_upstream; then
-      full="$range"
-      range="$range --not --glob=refs/scan-upstream"
-      opts="--remerge-diff --text $range"
-      # shellcheck disable=SC2086
-      what="$what, minus the $(( $(git rev-list --count $full) - $(git rev-list --count $range) )) commit(s) upstream $UPSTREAM already has"
-    else
-      if [[ -z "${UPSTREAM:-}" ]]; then
-        reason="upstream is not known (UPSTREAM is empty)"
+    # Leave out upstream's commits (see the header).
+    without_upstream
+    # A tag push: the tag's own message too (see "Commit objects" in the header). The tag is fetched as
+    # pushed; when it is gone already (deleted, or moved by a later push), that push's run reads it.
+    if [[ "${PUSH_REF:-}" == refs/tags/* ]]; then
+      if git check-ref-format "$PUSH_REF" &&
+        timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "+$PUSH_REF:refs/scan-tag/pushed" >&2 &&
+        [[ "$(git rev-parse --quiet --verify 'refs/scan-tag/pushed^{commit}')" == "$(git rev-parse --quiet --verify "$AFTER^{commit}")" ]]; then
+        mapfile -t tag_objects < <(tag_chain refs/scan-tag/pushed)
       else
-        reason="upstream $UPSTREAM could not be fetched"
+        warning="${warning:+$warning; }the tag $PUSH_REF cannot be fetched as pushed (deleted or moved since?), so its message is not scanned here"
       fi
-      warning="${warning:+$warning; }$reason, so its commits in the range are scanned too"
     fi
+    ;;
+  schedule | workflow_dispatch)
+    # The daily sweep (see "sweep" in the header): every ref of origin but refs/pull/*, with the
+    # default branch's settings, minus what upstream has.
+    if ! settings="$(fetch_config_branch)"; then
+      echo "::error::Secret scan: cannot fetch the default branch '${CONFIG_BRANCH:-}' (CONFIG_BRANCH), whose gitleaks settings the scan uses" >&2
+      exit 2
+    fi
+    settings_what="the default branch $CONFIG_BRANCH (${settings:0:12})"
+    changes=()
+    if ! git for-each-ref --format='delete %(refname)' refs/scan-sweep/ | git update-ref --stdin ||
+      ! timeout 900 git fetch --quiet --no-tags --filter=blob:none origin \
+        "+refs/*:refs/scan-sweep/*" "^refs/pull/*" >&2; then
+      echo "::error::Secret scan: cannot fetch the refs of origin. Re-run the job." >&2
+      exit 2
+    fi
+    tips=()
+    odd=()
+    while read -r ref; do
+      if tip="$(git rev-parse --quiet --verify "$ref^{commit}")"; then
+        tips+=("$tip")
+      else
+        odd+=("${ref#refs/scan-sweep/}")
+      fi
+      mapfile -t -O "${#tag_objects[@]}" tag_objects < <(tag_chain "$ref")
+    done < <(git for-each-ref --format='%(refname)' refs/scan-sweep/)
+    if [[ ${#tips[@]} -eq 0 ]]; then
+      echo "::error::Secret scan: origin has no ref naming a commit to scan" >&2
+      exit 2
+    fi
+    if [[ ${#odd[@]} -gt 0 ]]; then
+      warning="${#odd[@]} ref(s) name no commit (${odd[*]:0:5}), so their contents are not scanned, only their tag messages"
+    fi
+    mapfile -t tips < <(printf '%s\n' "${tips[@]}" | sort -u)
+    range="${tips[*]}"
+    what="every ref of origin but refs/pull/* (${#tips[@]} distinct tip(s))"
+    without_upstream
+    # shellcheck disable=SC2086
+    what="$what: $(git rev-list --count $range) commit(s)"
     ;;
   *)
     echo "::error::Secret scan: unexpected event $EVENT_NAME" >&2
@@ -217,6 +397,7 @@ case "$EVENT_NAME" in
     ;;
 esac
 
+opts="--remerge-diff --text $range"
 echo "Scanning $what ($range)"
 if [[ -n "$warning" ]]; then echo "::warning title=Secret scan::$warning"; fi
 
@@ -283,7 +464,9 @@ if [[ ${#changes[@]} -gt 0 ]]; then
   changed="$(git diff --no-renames --name-only "${changes[@]}" -- .gitleaks.toml .gitleaksignore 2> /dev/null)" || changed=""
   if [[ -n "$changed" ]]; then
     files="$(tr '\n' ' ' <<< "$changed")"
-    if [[ "$EVENT_NAME" == push ]]; then
+    if [[ -n "$other_ref" ]]; then
+      echo "::notice title=Secret scan::This push changes ${files}but the scan reads them from $settings_what. A change to them takes effect once it is on the default branch (a pull request of its own)."
+    elif [[ "$EVENT_NAME" == push ]]; then
       echo "::notice title=Secret scan::This push changes ${files}but this scan read them from $settings_what. The change applies from the next push."
     elif [[ "$(git diff --no-renames --name-only "${changes[@]}" 2> /dev/null)" == "$changed" ]]; then
       echo "::notice title=Secret scan::This pull request changes only ${files}(the reviewed path for a settings change): this scan read them from $settings_what, and the change applies once it is merged."
@@ -430,9 +613,61 @@ if [[ $status -ne 0 ]] && ! grep -aqE 'leaks found: [1-9][0-9]*' <<< "$plain"; t
   summary "Failed: gitleaks stopped without a result while scanning $what (settings from $settings_what could not be loaded?), so nothing was checked."
   exit 2
 fi
-if [[ $status -eq 0 ]]; then
-  summary "No secrets found in $what ($scanned commit(s) with changes scanned)."
+
+# Commit objects (see the header): each of the range's commits and tag objects as stored (message,
+# author, committer, tagger), each under a line naming it, through gitleaks stdin with the same
+# settings. A tag object upstream also has is upstream's, as its commits are.
+messages="$work/messages"
+# shellcheck disable=SC2086
+if ! git cat-file --batch='--- fork-secret-scan: commit %(objectname)' < "$work/commits" > "$messages"; then cannot_read; fi
+if [[ ${#tag_objects[@]} -gt 0 ]]; then
+  upstream_tags=" "
+  if [[ -n "$upstream_used" ]]; then
+    while read -r ref; do
+      upstream_tags+="$(tag_chain "$ref" | tr '\n' ' ')"
+    done < <(git for-each-ref --format='%(refname)' refs/scan-upstream/tags/)
+  fi
+  tags_read=0
+  for obj in $(printf '%s\n' "${tag_objects[@]}" | sort -u); do
+    [[ "$upstream_tags" != *" $obj "* ]] || continue
+    { echo "--- fork-secret-scan: tag object $obj"; git cat-file tag "$obj"; } >> "$messages" || cannot_read
+    tags_read=$((tags_read + 1))
+  done
+fi
+message_count="$(grep -c '^--- fork-secret-scan: ' "$messages" || true)"
+echo "Scanning the commit objects of the range (message, author, committer) and ${tags_read:-0} tag object(s): $message_count in all"
+set +e
+(cd "$config" && env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML \
+  "$gitleaks" stdin --no-banner --no-color --redact --verbose "${config_args[@]}" \
+  --gitleaks-ignore-path "$config" --report-format json --report-path "$work/messages.json" < "$messages") > "$work/messages.log" 2>&1
+mstatus=$?
+set -e
+cat "$work/messages.log"
+mplain="$(tr -d '\000' < "$work/messages.log" | sed -E 's/\x1b\[[0-9;]*m//g')"
+merrors="$(grep -aE '^([^[:space:]]+[[:space:]]+)?(ERR|FTL)[[:space:]]' <<< "$mplain" || true)"
+mleaks=""
+if grep -aqE 'leaks found: [1-9][0-9]*' <<< "$mplain"; then mleaks=1; fi
+if [[ $mstatus -eq 0 && -n "$merrors" ]] || [[ $mstatus -ne 0 && -z "$mleaks" ]]; then
+  echo "::error::Secret scan: gitleaks stopped or logged an error while reading the messages (exit $mstatus), so they were not all checked: ${merrors:-see the log above}" >&2
+  summary "Failed: gitleaks could not read the commit and tag objects of $what (see the job log), so they were not checked."
+  exit 2
+fi
+if [[ $mstatus -ne 0 ]]; then
+  # Which messages: the line each finding starts on, under the nearest naming line above it.
+  sed -nE 's/^[[:space:]]*"StartLine": ([0-9]+),?$/\1/p' "$work/messages.json" | sort -nu > "$work/message-lines"
+  while read -r name; do
+    echo "::error title=Secret scan::A possible secret in the message, author or committer of $name (value redacted). Rotate any real secret: it is already public."
+  done < <(awk 'NR == FNR { want[$1] = 1; next }
+      /^--- fork-secret-scan: / { name = substr($0, 23) }
+      (FNR in want) && !(name in said) { said[name] = 1; print name }' "$work/message-lines" "$messages")
+fi
+
+if [[ $status -eq 0 && $mstatus -eq 0 ]]; then
+  summary "No secrets found in $what ($scanned commit(s) with changes scanned; $message_count commit and tag object(s): messages, authors, committers)."
 else
   summary "gitleaks found possible secrets in $what (values redacted; see the job log). Rotate any real secret: it is already public."
 fi
-exit "$status"
+summary "" "Not covered: ref names; pull request titles, bodies and comments; commits only an outside pull request's head (refs/pull/*) holds; refs that name a tree or blob; a \`gitleaks:allow\` line; text in other encodings; packed or compressed contents; a key split across lines (see the header of fork-secret-scan.sh)."
+
+if [[ $status -ne 0 ]]; then exit "$status"; fi
+exit "$mstatus"
