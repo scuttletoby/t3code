@@ -35,7 +35,8 @@ def usage_runs_on():
 
 def evaluate(expression, context):
     """A GitHub Actions expression, as the runner evaluates the operators the README uses: literals, context paths,
-    property access, fromJSON, ==, !=, !, && and || (which return an operand and short-circuit), and parentheses.
+    property access, fromJSON, format, contains, ==, !=, !, && and || (which return an operand and short-circuit), and
+    parentheses.
     Strings compare case-insensitively; a missing property is null."""
     tokens = re.findall(r"\s*('(?:[^']|'')*'|&&|\|\||==|!=|!|\(|\)|\.|[A-Za-z_][\w-]*|\S)", expression)
     pos = [0]
@@ -52,6 +53,10 @@ def evaluate(expression, context):
 
     def truthy(v):
         return v not in (None, False, 0, '') and v == v
+
+    def text(v):
+        return {None: '', True: 'true', False: 'false'}.get(v, v) if not isinstance(v, (int, float)) or isinstance(
+            v, bool) else str(v)
 
     def equal(a, b):
         if isinstance(a, str) and isinstance(b, str):
@@ -108,11 +113,24 @@ def evaluate(expression, context):
             return {'true': True, 'false': False, 'null': None}[got]
         if peek() == '(':
             take('(')
-            arg = expr(run)
+            args = [expr(run)]
+            while peek() == ',':
+                take()
+                args.append(expr(run))
             take(')')
-            if got != 'fromJSON':
+            if got not in ('fromJSON', 'format', 'contains'):
                 raise SyntaxError(got)
-            return json.loads(arg) if run else None
+            if not run:
+                return None
+            if got == 'fromJSON':
+                return json.loads(*args)
+            if got == 'format':
+                return re.sub(r'\{\{|\}\}|\{(\d+)\}', lambda m: text(args[int(m[1]) + 1]) if m[1] else m[0][0],
+                              args[0])
+            seek, item = args
+            if isinstance(seek, list):
+                return any(equal(x, item) for x in seek)
+            return text(item).lower() in text(seek).lower()
         return context.get(got)
 
     expr = binary('||', binary('&&', equality))
@@ -298,6 +316,34 @@ class Action(unittest.TestCase):
                             elif result == 'failure' and not ours:
                                 self.assertEqual(labels, 'ubuntu-latest')
 
+    def test_the_readme_runs_on_sends_a_persons_rerun_to_the_reruns_pool_and_a_bots_to_fallback(self):
+        """Issue 224 item 4, the README's runs-on with the action's real outputs: a re-run of failed jobs that a
+        trusted person started asks for the `reruns` pool and its run label for this attempt; one that a bot (the
+        sweep, fleet-watch) or anyone else started takes `fallback`; attempt 1 keeps the route's own labels."""
+        expression = usage_runs_on()
+        repo, person = self.cfg['repository'], self.cfg['trusted']['actors'][0]
+        fresh = {'FLEET_BEACON_DESKTOP': json.dumps({'at': int(__import__('time').time()), 'free': 0})}
+        code, outputs, log = self.run_step(self.own(), vars=json.dumps(fresh))
+        self.assertEqual(code, 0, log)
+        rerun = json.loads(outputs['rerun'])
+        self.assertEqual(rerun['pool'], 'example-desktop')
+
+        def runs_on(attempt, actor, got=outputs):
+            return evaluate(expression, {
+                'needs': {'route': {'result': 'success', 'outputs': got}},
+                'github': {'event_name': 'push', 'run_attempt': attempt, 'repository': repo, 'event': self.own(),
+                           'triggering_actor': actor}})
+        self.assertEqual(runs_on('1', person), json.loads(outputs['runners'])['plugins'])
+        for attempt in ('2', '3'):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(runs_on(attempt, person.upper()),   # logins compare case-insensitively
+                                 ['example-desktop', rerun['labels']['plugins'] + f'-a{attempt}'])
+                for actor in ('github-actions[bot]', 'someone'):
+                    self.assertEqual(runs_on(attempt, actor), json.loads(outputs['fallback']))
+        _, stale, _ = self.run_step(self.own())   # no heartbeat: re-runs take fallback whoever starts them
+        self.assertEqual(stale['rerun'], '{}')
+        self.assertEqual(runs_on('2', person, stale), json.loads(stale['fallback']))
+
     def test_a_missing_or_broken_config_or_setting_fails_and_puts_out_nothing(self):
         broken = os.path.join(self.d, 'broken.json')
         with open(broken, 'w') as f:
@@ -323,7 +369,7 @@ class Action(unittest.TestCase):
             outputs = yaml.safe_load(f)['outputs']
         self.assertEqual({k: v['value'] for k, v in outputs.items()},
                          {k: f'${{{{ steps.route.outputs.{k} }}}}'
-                          for k in ('runners', 'mode', 'attempt', 'fallback', 'watch')})
+                          for k in ('runners', 'mode', 'attempt', 'fallback', 'rerun', 'watch')})
 
     def test_the_router_ships_in_every_release(self):
         """A release commit holds only the configured paths: the router must be one of them."""
