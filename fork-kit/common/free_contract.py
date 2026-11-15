@@ -77,7 +77,7 @@ def judge(code, out, now, need_mb=None):
 def unsafe(command, uid=None):
     """Why COMMAND must not run, or None: an absolute plain path to an executable file that it and every folder
     above it belong to root or to this user and that no one else may change (a sticky folder like /tmp is fine).
-    A link is judged by the file it leads to, and ask() runs that file, never the link (it could be repointed).
+    A link is judged by the file it leads to; ask() resolves the link once and both judges and runs that file.
     Plain mode bits only: an ACL that lets others write is not seen."""
     uid = os.geteuid() if uid is None else uid
     if not os.path.isabs(command) or os.path.normpath(command) != command:
@@ -119,10 +119,11 @@ def ask(command, need_mb=None, timeout=LIMIT_SECONDS):
     reason, facts). After it, its whole process group is ended, and so is any other process that still holds its
     stdout (a child that left the group with setsid). A child that leaves the group and closes stdout is not seen:
     FREE.md asks scripts to leave nothing running."""
-    why = unsafe(command)
+    plain = os.path.isabs(command) and os.path.normpath(command) == command
+    path = os.path.realpath(command) if plain else command   # resolved once: a link repointed later changes nothing
+    why = unsafe(path)
     if why:
         return 'unavailable', why, None
-    path = os.path.realpath(command)   # what unsafe() judged; the link itself may be repointed after the check
     try:
         p = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              env=ENV, cwd='/', start_new_session=True)

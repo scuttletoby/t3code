@@ -88,7 +88,7 @@ mode=$(wslinfo --networking-mode 2>/dev/null || true)
 [ -z "$mode" ] || [ "$mode" = nat ] || echo "restart: the networking mode is $mode, not nat"
 '@
 # .wslconfig, read and written as UTF-8 without a BOM: Windows PowerShell 5.1's Get-Content reads a file without a
-# BOM as ANSI and Set-Content -Encoding ascii turns every other letter into '?' (a kernel= path with an accent in it
+# BOM as ANSI and Set-Content with the ASCII encoding turns every other letter into '?' (a kernel= path with an accent in it
 # then stops every distro). The tests run this part alone (between the two marker lines) under pwsh.
 # --- wslconfig ---
 function Read-WslConfig([string]$path) {
