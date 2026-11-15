@@ -13,6 +13,7 @@
 .github/scripts/fork-fleet.test.py
 .github/scripts/fork-fleet-refresh.test.py
 .github/scripts/fork-fleet-walls.test.py
+.github/scripts/fork-fleet-walls-wsl2.test.py
 .github/scripts/fork-gate-trust-docs.test.py
 .github/scripts/fork-head-gate-workflow.test.py
 .github/scripts/fork-follow.test.sh
