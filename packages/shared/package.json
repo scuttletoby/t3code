@@ -175,6 +175,18 @@
       "types": "./src/agentSlots.ts",
       "import": "./src/agentSlots.ts"
     },
+    "./capacityRule": {
+      "types": "./src/capacityRule.ts",
+      "import": "./src/capacityRule.ts"
+    },
+    "./capacityFormat": {
+      "types": "./src/capacityFormat.ts",
+      "import": "./src/capacityFormat.ts"
+    },
+    "./capacityVectors": {
+      "types": "./src/capacityVectors.ts",
+      "import": "./src/capacityVectors.ts"
+    },
     "./backgroundActivitySettings": {
       "types": "./src/backgroundActivitySettings.ts",
       "import": "./src/backgroundActivitySettings.ts"

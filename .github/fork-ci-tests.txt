@@ -7,6 +7,8 @@
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs
 .github/scripts/fork-contracts.test.py
+.github/scripts/fork-fleet-desk-key.test.py
+.github/scripts/fork-fleet-desk.test.py
 .github/scripts/fork-fleet.test.py
 .github/scripts/fork-fleet-walls.test.py
 .github/scripts/fork-gate-trust-docs.test.py
@@ -19,6 +21,7 @@
 .github/scripts/fork-release.test.sh
 .github/scripts/fork-reusable-permissions.test.py
 .github/scripts/fork-schema-check.test.cjs
+.github/scripts/fork-seam-check.test.cjs
 .github/scripts/fork-secret-scan.test.sh
 .github/scripts/fork-test-shards.test.cjs
 .github/scripts/fork-tests-drift.test.cjs
@@ -35,6 +38,10 @@ fork-ci/actions/pinned/pinned.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
+fork-kit/common/tests/machine_file.test.py
+fork-kit/golive/tests/check.test.py
+fork-kit/golive/tests/contract.test.py
+fork-kit/golive/tests/journal.test.py
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py
 fork-kit/gh-apps/tests/policy.test.py
@@ -43,6 +50,7 @@ fork-kit/gh-apps/tests/wrapper.test.py
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
 fork-kit/heavy/tests/install.test.py
+fork-kit/heavy/tests/sweep.test.py
 # A real systemd user manager (the step starts one for the runner user).
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml
 

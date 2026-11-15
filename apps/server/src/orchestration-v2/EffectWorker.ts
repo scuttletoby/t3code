@@ -950,14 +950,12 @@ const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
 // while the execution keeps its running row (which blocks its own thread) and settles it later.
 const EFFECT_WORKER_SLOT_WAIT = Duration.seconds(30);
 
-export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions = {}) =>
+const runRegisteredDaemon = (options: OrchestrationEffectDaemonOptions) =>
   Effect.scoped(
     Effect.gen(function* () {
       const worker = yield* OrchestrationEffectWorkerV2;
       const scope = yield* Effect.scope;
       const admission = yield* WorkAdmission;
-      // Held effects stay pending, unclaimed: startup recovery decides what they become.
-      yield* admission.register("outbox");
       const requestedConcurrency = options.concurrency ?? DEFAULT_EFFECT_WORKER_CONCURRENCY;
       const concurrency = Number.isFinite(requestedConcurrency)
         ? Math.max(1, Math.floor(requestedConcurrency))
@@ -1043,4 +1041,20 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
     }),
   );
 
+/** Registers the outbox with the gate in context and returns the daemon, which admits every claim
+ * through that same gate. Startup registers before activation, so a held boot can check every
+ * consumer before any parked work runs. */
+const prepareDaemonWithOptions = Effect.fn("EffectWorker.prepareDaemon")(function* (
+  options: OrchestrationEffectDaemonOptions = {},
+) {
+  const admission = yield* WorkAdmission;
+  // Held effects stay pending, unclaimed: startup recovery decides what they become.
+  yield* admission.register("outbox");
+  return runRegisteredDaemon(options).pipe(Effect.provideService(WorkAdmission, admission));
+});
+
+export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions = {}) =>
+  Effect.flatten(prepareDaemonWithOptions(options));
+
 export const runDaemon = runDaemonWithOptions();
+export const prepareDaemon = prepareDaemonWithOptions();

@@ -109,6 +109,8 @@ export class ServerConfig extends Context.Service<
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;
     readonly tailscaleServePort: number;
+    /** Fork: `serve --hold-work`. No agent work starts in this process (see workAdmission.ts). */
+    readonly holdWork?: boolean | undefined;
   }
 >()("t3/config/ServerConfig") {
   static readonly layerTest = (
