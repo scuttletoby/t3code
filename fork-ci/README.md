@@ -80,6 +80,10 @@ release through [`actions/pinned`](actions/pinned/README.md): a module and comma
 files a pin config names, checks each by git blob id, caches them and runs the checked bytes. Modules that are meant
 for this say which names callers may import in their README's "Python API" section (docs-scope, gradle-cache).
 
+[`actions/ci-demand`](actions/ci-demand/README.md) is such a command only: a read-only measure of a repository's CI
+per day (CI hours, runs per workflow, queue wait per runner label, cancelled and failed share), for a before/after
+record of a CI change.
+
 ## How a release is made
 
 [`.github/workflows/fork-ci-release.yml`](../.github/workflows/fork-ci-release.yml) runs once a day
