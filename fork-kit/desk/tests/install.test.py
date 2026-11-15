@@ -471,6 +471,7 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.install()[0], 0)
         self.write(os.path.join(self.fakes, 'active'), 'desktop-1\n')
         self.write(self.path('/var/lib/fork-fleet/runners/x'), '')
+        self.write(os.path.join(self.fakes, 'netns'), 'fork-fleet-fork-runner-1\n')   # the namespaces that are there
         self.clear_calls()
         code, out, err = self.run_main('uninstall')
         self.assertEqual(code, 0, err)
