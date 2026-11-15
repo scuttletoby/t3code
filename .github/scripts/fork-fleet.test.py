@@ -1131,6 +1131,23 @@ class Dispatch(unittest.TestCase):
         self.assertNotIn(self.name(40, FIRST), [r['name'] for r in self.gh.runners])
         self.assertNotIn('why', json.loads(self.gh.variables[POOLS[FIRST]['beacon']]))
 
+    def test_a_pool_down_for_the_same_reason_is_said_once_then_every_ten_minutes(self):
+        """A desktop asleep all night: its pool's host fails every pass (20 s); the log gets a line, then one every
+        DOWN_EVERY s with the count, then one when it answers again; not one per pass."""
+        self.fake[FIRST].fail = 'active'
+        for _ in range(5):
+            self.dispatch()
+            self.clock[0] += 20
+        self.assertEqual(self.log.count(f'pool {FIRST} is left alone'), 1)
+        self.assertNotIn('still left alone', self.log)
+        self.clock[0] += ff.DOWN_EVERY
+        self.assertIn(f'pool {FIRST} is still left alone (6 passes in a row)', self.dispatch())
+        self.assertNotIn('still left alone', self.dispatch())
+        self.fake[FIRST].fail = None
+        self.assertIn(f'pool {FIRST} answers again, after 7 passes left alone', self.dispatch())
+        self.fake[FIRST].fail = 'active'
+        self.assertIn(f'pool {FIRST} is left alone for this pass', self.dispatch())   # a new outage: said at once
+
     def test_a_failed_start_skips_only_its_pool_and_is_tried_again(self):
         self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')), a_job(12, job_labels(WAITING, 'rust')))
         self.gh.add(a_run(6), a_job(13, job_labels(FIRST, 'build')))
