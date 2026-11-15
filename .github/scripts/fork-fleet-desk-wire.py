@@ -52,6 +52,9 @@ VERBS = {
     'prune': ((), None, 100),
     'check-net': ((URL, HOST_PORT), HOST_PORT, 300),
 }
+# The launcher's verbs that only its own machine runs (a root timer or a person at the machine), never the link:
+# `serve` and the agent refuse them like an unknown verb, and the contract test counts them as the launcher's.
+LOCAL_ONLY = frozenset({'refresh'})
 MARGIN = 10                   # seconds `launch` waits beyond a verb's limit, all told
 SERVE_MARGIN = 5              # seconds `serve` waits beyond it before it answers UNKNOWN itself
 UNKNOWN = 75                  # launch's exit when the verb may or may not have run (EX_TEMPFAIL)
