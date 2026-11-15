@@ -1335,7 +1335,8 @@ class Launcher(unittest.TestCase):
                        'for a in "$@"; do case $a in EnvironmentFile=*) f=${a#EnvironmentFile=}; '
                        'cp -- "$f" "$REC/env"; stat -c %a -- "$f" > "$REC/env-mode" ;; esac; done\n'
                        # check-net's probe (--wait): exits $REC/probe-exit when that file exists, else runs here.
-                       'if [[ " $* " == *" --wait "* ]]; then '
+                       'if [[ " $* " == *" --wait "* ]]; then a=("$@"); for i in "${!a[@]}"; do '
+                       '[[ ${a[i]} != --unit ]] || cp -- "$REC/systemd-run.0" "$REC/${a[i+1]}.0"; done; '
                        '[[ ! -e $REC/probe-exit ]] || exit "$(cat "$REC/probe-exit")"; '
                        'while [[ $1 != -- ]]; do shift; done; shift; exec "$@"; fi\n'
                        'code=$(cat "$REC/systemd-run-exit" 2>/dev/null || echo 0)\n'
@@ -1363,11 +1364,21 @@ class Launcher(unittest.TestCase):
                     '-C) [[ ! -e $REC/iptables-C-exit ]] || exit "$(cat "$REC/iptables-C-exit")"; '
                     'grep -qxF -- "${*:5}" "$REC/docker-user" ;; '
                     '-I) printf "%s\\n" "${*:6}" >> "$REC/docker-user" ;; *) exit 2 ;; esac\n',
+        # The own-address lookups (OWN_ADDRESS_URLS https://own-X.test/): answer $REC/own-X, or fail when it is
+        # missing; any other URL (check-net's probe) goes to the real curl.
+        'curl': '#!/usr/bin/env bash\nfor a; do case $a in https://own-*.test/) a=${a#https://}; '
+                '[[ -e $REC/${a%.test/} ]] || { echo "curl: (6) no answer" >&2; exit 6; }; '
+                'exec cat -- "$REC/${a%.test/}" ;; esac; done\nexec /usr/bin/curl "$@"\n',
         'id': '#!/usr/bin/env bash\nf=$REC/id${1}-${!#}\nif [[ -e $f ]]; then cat -- "$f"; exit 0; fi\n'
               'for p in /usr/bin/id /bin/id; do [[ -x $p ]] && exec "$p" "$@"; done\nexit 127\n',
     }
     PRIVATE4 = ('0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 '
                 '192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4')
+    OWN = '198.51.100.20'          # this host's own public address, as the fake lookups answer
+    OWN_URLS = 'https://own-a.test/,https://own-b.test/'
+    WALL_PROPS = ('RestrictAddressFamilies=~AF_VSOCK',
+                  'SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS',
+                  'SystemCallArchitectures=native')
     USERS = ('nobody', 'daemon')   # two slots: two users of their own (in CI and here, each in its own group only)
     NAME = 'fleet-vm-t3code-11'
     JIT = 'SklUc2VjcmV0'
@@ -1397,6 +1408,8 @@ class Launcher(unittest.TestCase):
         os.mkdir(self.path('linger'))
         self.write('resolv.conf', 'nameserver 1.1.1.1\n', 0o644)
         self.write('ip_forward', '1\n', 0o644)
+        for x in 'ab':
+            self.write(f'rec/own-{x}', f'{self.OWN}\n', 0o644)
         for d in ('template', 'template/bin'):
             os.chmod(self.path(d), 0o755)   # whatever this machine's umask is
         self.hook = self.write('hook.sh', '#!/bin/sh\n', 0o755)
@@ -1417,7 +1430,7 @@ class Launcher(unittest.TestCase):
         settings = dict(RUNNER_USERS=','.join(self.USERS), TEMPLATE=self.template, WORK_ROOT=self.path('var/runners'),
                         RUN_DIR=self.path('run'), HOOK=self.hook, LINGER_DIR=self.path('linger'),
                         RESERVE_MB='2048', MAX_SECONDS='3600', NET_BASE='10.204', RESOLV_CONF=self.path('resolv.conf'),
-                        IP_FORWARD=self.path('ip_forward'),
+                        IP_FORWARD=self.path('ip_forward'), OWN_ADDRESS_URLS=self.OWN_URLS,
                         MEMINFO=self.path('meminfo'), SYSTEMD_RUN=self.path('bin/systemd-run'),
                         SYSTEMCTL=self.path('bin/systemctl'))
         settings.update(over)
@@ -1440,13 +1453,13 @@ class Launcher(unittest.TestCase):
     def sandbox(self, user):
         """The unit's sandbox, start's and check-net's alike: its own network namespace, the private ranges refused in
         the kernel too, its own /run, /dev/shm, /tmp and /var/tmp (so root never cleans a shared one), no /home, no
-        other user's processes, its own IPC."""
-        props = (f'NetworkNamespacePath=/run/netns/fork-fleet-{user}', f'IPAddressDeny={self.PRIVATE4} ::/0',
+        other user's processes, its own IPC, and the walls (no AF_VSOCK, io_uring or 32-bit system calls)."""
+        props = (f'NetworkNamespacePath=/run/netns/fork-fleet-{user}', f'IPAddressDeny={self.PRIVATE4} {self.OWN} ::/0',
                  'IPAddressAllow=localhost',
                  'TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777',
                  f'BindReadOnlyPaths={self.path("resolv.conf")}:{os.path.realpath("/etc/resolv.conf")}',
                  'NoNewPrivileges=yes', 'ProtectSystem=strict', 'ProtectHome=yes', 'ProtectProc=invisible',
-                 'PrivateIPC=yes', 'RemoveIPC=yes')
+                 'PrivateIPC=yes', 'RemoveIPC=yes', *self.WALL_PROPS)
         return [a for prop in props for a in ('-p', prop)]
 
     def test_start(self):
@@ -1712,19 +1725,20 @@ class Launcher(unittest.TestCase):
         for rule in ('type filter hook input priority -10; policy accept;',
                      'iifname "ffh-*" counter reject with icmpx admin-prohibited',   # the host itself: nothing of it
                      'iifname "ffh-*" ip daddr @private4 counter reject with icmpx admin-prohibited',
+                     f'iifname "ffh-*" ip daddr {self.OWN} counter reject with icmpx admin-prohibited',
                      'iifname "ffh-*" meta nfproto ipv6 counter drop',
                      'oifname "ffh-*" ct state != { established, related } counter drop',   # nothing opens to it
                      'ip saddr 10.204.0.0/16 oifname != "ffh-*" masquerade'):
             with self.subTest(rule):
                 self.assertIn(f'    {rule}\n', table)
-        self.assertEqual(len(re.findall(r'iifname "ffh-\*"', table)), 3)
+        self.assertEqual(len(re.findall(r'iifname "ffh-\*"', table)), 4)
         self.assertEqual(self.start('fleet-vm-t3code-12'), 'daemon')
         self.assertEqual(self.rec_text('ip').splitlines(),
                          self.ip_calls('nobody', self.NOBODY_NET) + self.ip_calls('daemon', self.DAEMON_NET))
         # The unit is put in it, and refused the same ranges again in the kernel (IPAddressDeny), should the table go.
         args = self.rec_text('systemd-run').splitlines()
         self.assertEqual(args[args.index('NetworkNamespacePath=/run/netns/fork-fleet-daemon') - 1], '-p')
-        self.assertIn(f'IPAddressDeny={self.PRIVATE4} ::/0', args)
+        self.assertIn(f'IPAddressDeny={self.PRIVATE4} {self.OWN} ::/0', args)
         # The next job of that user: its namespace and link are there, nothing is made twice, the table is made again.
         os.remove(os.path.join(self.rec, 'ip'))
         self.write('rec/units', 'fork-fleet-fleet-vm-t3code-12.service loaded active running x\n', 0o644)
@@ -1771,6 +1785,34 @@ class Launcher(unittest.TestCase):
         self.write('rec/units', '', 0o644)
         self.write('rec/iptables-C-exit', '4', 0o644)
         self.refused('iptables -C DOCKER-USER gave no answer (exit 4)', 'start', 'fleet-vm-t3code-13')
+
+    def test_own_address_is_looked_up_before_every_start_and_refused(self):
+        """D1: this host's own public address (the way back into its forwarded ports): looked up at each URL before
+        every start, blocked by the table and the unit. A failed, odd, private or disagreeing lookup: no runner."""
+        self.write('rec/own-a', ' 203.0.113.9\r\n', 0o644)
+        self.write('rec/own-b', '203.0.113.9', 0o644)
+        self.start('fleet-vm-t3code-11')
+        self.assertIn('    iifname "ffh-*" ip daddr 203.0.113.9 counter reject with icmpx admin-prohibited\n',
+                      self.rec_text('nft'))
+        self.assertIn(f'IPAddressDeny={self.PRIVATE4} 203.0.113.9 ::/0', self.rec_text('systemd-run').splitlines())
+        os.remove(os.path.join(self.rec, 'systemd-run'))
+        self.write('rec/units', '', 0o644)
+        cases = {'no answer': (None, 'own-b.test/ gave no answer'), 'two answers': ('203.0.113.8', 'lookups differ'),
+                 'a web page': ('<html>', 'answered no IPv4 address'), 'leading zero': ('203.0.113.09', 'no IPv4'),
+                 'too big': ('203.0.113.256', 'no IPv4'), 'a LAN address': ('192.168.1.1', 'not a public address'),
+                 'CGNAT': ('100.64.0.1', 'not a public address'), 'loopback': ('127.0.0.1', 'not a public address')}
+        for name, (answer, word) in cases.items():
+            with self.subTest(name):
+                if answer is None:
+                    os.remove(self.path('rec/own-b'))
+                else:
+                    self.write('rec/own-b', answer + '\n', 0o644)
+                self.refused(word)
+                self.refused(word, 'check-net', 'https://example.com/', f'127.0.0.1:{self.server()}')
+        for bad in ('http://own-a.test/', 'https://own-a.test/,', 'https://a.test/;id', ''):
+            with self.subTest(bad):
+                self.conf(OWN_ADDRESS_URLS=bad)
+                self.refused('OWN_ADDRESS_URLS is a comma-separated list of https URLs', 'active')
 
     def test_a_runner_user_in_another_group_is_refused(self):
         """A runner user also in, say, docker (root on the host) or adm (the logs) is never handed a job."""
@@ -1840,30 +1882,57 @@ class Launcher(unittest.TestCase):
         self.write('rec/probe-exit', '0', 0o644)
         got = self.check_net(f'127.0.0.1:{port}')
         self.assertEqual(got.returncode, 0, got.stderr)
-        self.assertIn('the runners reach https://example.com/ and none of the 1 services named', got.stdout)
-        with open(os.path.join(self.rec, 'systemd-run.0')) as f:
-            args = f.read().split('\0')[:-1]
+        self.assertIn('the runners reach https://example.com/ and none of the 1 services named nor this host\'s own '
+                      'public address; AF_VSOCK, io_uring and 32-bit system calls are closed', got.stdout)
+        self.assertIn('host: io_uring ', got.stdout)   # the control, outside: what this host has
+        args = self.waited('fork-fleet-check-net')
         dash = args.index('--')
         # The very sandbox a job gets (the same props as start), as a free runner user, in its namespace.
         self.assertEqual(args[:dash], ['--quiet', '--wait', '--pipe', '--collect', '--unit', 'fork-fleet-check-net',
                                        '--uid', 'nobody', *self.sandbox('nobody'), '-p', 'RuntimeMaxSec=120'])
         self.assertEqual(args[dash + 1:dash + 4], ['/bin/bash', '--norc', '--noprofile'])
         self.assertEqual(args[dash + 4], '-c')
-        self.assertEqual(args[dash + 6:], ['check-net', 'https://example.com/', '127.0.0.1', str(port)])
+        self.assertEqual(args[dash + 6:], ['check-net', 'https://example.com/', self.OWN, '127.0.0.1', str(port)])
+        # The walls' probe: a unit of its own, the same sandbox.
+        args = self.waited('fork-fleet-check-walls')
+        dash = args.index('--')
+        self.assertEqual(args[:dash], ['--quiet', '--wait', '--pipe', '--collect', '--unit', 'fork-fleet-check-walls',
+                                       '--uid', 'nobody', *self.sandbox('nobody'), '-p', 'RuntimeMaxSec=60'])
+        self.assertEqual([args[dash + 1:dash + 4], args[-1]], [['/usr/bin/python3', '-I', '-c'], 'job'])
         self.assertEqual(self.rec_text('ip').splitlines(), self.ip_calls('nobody', self.NOBODY_NET))
         self.write('rec/probe-exit', '1', 0o644)
         got = self.check_net(f'127.0.0.1:{port}')
         self.assertNotEqual(got.returncode, 0)
-        self.assertIn('NOT as it must be', got.stderr)
+        self.assertIn('NOT as they must be', got.stderr)
+
+    def waited(self, unit):
+        with open(os.path.join(self.rec, f'{unit}.0')) as f:
+            return f.read().split('\0')[:-1]
 
     def test_check_nets_probe_fails_on_anything_reachable(self):
-        """The probe itself, run here outside any namespace: the service this host reaches is reachable, so it fails."""
+        """The probes themselves, run here outside any namespace or filter: the service this host reaches is
+        reachable, its own address is not refused by a wall, io_uring gives a ring, so they fail."""
         port = self.server()
+        self.write('rec/own-a', '127.0.0.2\n', 0o644)   # the lookup refuses it; only its probe's own check is wanted
+        got = self.check_net(f'127.0.0.1:{port}', url=f'http://127.0.0.1:{port}/')
+        self.assertIn('not a public address', got.stderr)
+        self.write('rec/own-a', f'{self.OWN}\n', 0o644)
         got = self.check_net(f'127.0.0.1:{port}', url=f'http://127.0.0.1:{port}/')
         self.assertNotEqual(got.returncode, 0)
         self.assertIn(f'FAIL  127.0.0.1:{port} is reachable from inside', got.stdout)
+        self.assertIn(f'FAIL  this host\'s own public address {self.OWN} is not refused by the walls', got.stdout)
+        if os.path.exists('/proc/sys/kernel/io_uring_disabled'):   # a kernel with io_uring
+            self.assertRegex(got.stdout, r'FAIL  io_uring (gives a ring inside|is not refused by the unit)')
         self.assertIn(f'ok    http://127.0.0.1:{port}/ answers (HTTP 200)', got.stdout)
-        self.assertIn('NOT as it must be', got.stderr)
+        self.assertIn('NOT as they must be', got.stderr)
+
+    def test_the_walls_hold_in_a_real_systemd_unit(self):
+        """The walls' probe in a real unit of this user's systemd, with the walls check-net gives it: AF_VSOCK,
+        io_uring and 32-bit system calls are closed. Without them (the red check) the probe fails on this host."""
+        port = self.server()
+        self.write('rec/probe-exit', '0', 0o644)
+        self.assertEqual(self.check_net(f'127.0.0.1:{port}').returncode, 0)
+        real_walls(self, self.waited('fork-fleet-check-walls'), ['systemd-run', '--user'])
 
     def test_usage(self):
         for args in ((), ('start',), ('active', 'x'), ('nope',), ('ready',)):
@@ -1871,6 +1940,46 @@ class Launcher(unittest.TestCase):
                 self.assertIn('usage', self.launch(*args).stderr)
         self.assertIn('ready NEWEST', self.launch().stderr)
         self.assertIn('check-net URL HOST:PORT...', self.launch().stderr)
+
+    def test_the_walls_proof_parses_and_needs_root(self):
+        """The proof for a real host (WSL2 first) runs as root only, so here: it parses, refuses to run, changes
+        nothing, and drives this launcher's check-net."""
+        proof = os.path.join(HERE, 'fork-fleet-walls-proof.sh')
+        self.assertEqual(subprocess.run(['bash', '-n', proof]).returncode, 0)
+        if os.geteuid() != 0:
+            got = subprocess.run(['bash', proof], capture_output=True, text=True, timeout=30)
+            self.assertEqual((got.returncode, got.stdout), (1, ''))
+            self.assertIn('run it as root', got.stderr)
+        with open(proof) as f:
+            self.assertIn('"$launch" check-net https://github.com', f.read())
+
+
+def real_walls(test, args, systemd_run, *more):
+    """Runs check-net's walls' probe (args: its recorded systemd-run argv) in a real unit of `systemd_run` with only
+    the walls and NoNewPrivileges of the recorded sandbox (the rest, a namespace and a runner user, is not this test's):
+    every wall line says ok. Then without the walls: where this host has io_uring, the probe fails."""
+    if subprocess.run([*systemd_run, '--wait', '--quiet', '--collect', '--', '/bin/true'], capture_output=True,
+                      timeout=60).returncode != 0:
+        test.skipTest(f'no systemd to run a unit with: {" ".join(systemd_run)}')
+    dash = args.index('--')
+    walls = [args[i + 1] for i in range(dash) if args[i] == '-p' and args[i + 1].split('=')[0] in
+             ('RestrictAddressFamilies', 'SystemCallFilter', 'SystemCallArchitectures', 'NoNewPrivileges')]
+    test.assertEqual(len(walls), 4, walls)
+    unit = [*systemd_run, '--wait', '--pipe', '--quiet', '--collect', *more]
+    probe = args[dash + 1:]
+    got = subprocess.run([*unit, *(a for w in walls for a in ('-p', w)), '--', *probe], capture_output=True, text=True,
+                         timeout=120)
+    test.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+    test.assertRegex(got.stdout, r'ok    AF_VSOCK is refused')
+    test.assertIn('ok    io_uring is refused (ENOSYS)', got.stdout)
+    if os.uname().machine == 'x86_64':
+        test.assertRegex(got.stdout, r'ok    i386 system calls (end the process \(SIGSYS\)|do not work on this kernel)')
+        test.assertRegex(got.stdout, r'ok    x32 system calls (end the process \(SIGSYS\)|do not work on this kernel)')
+    test.assertNotIn('FAIL', got.stdout)
+    bare = subprocess.run([*unit, '-p', 'NoNewPrivileges=yes', '--', *probe], capture_output=True, text=True, timeout=120)
+    if 'io_uring gives a ring' in subprocess.run(probe, capture_output=True, text=True, timeout=60).stdout:
+        test.assertEqual(bare.returncode, 1, bare.stdout + bare.stderr)
+        test.assertIn('FAIL  io_uring gives a ring inside', bare.stdout)
 
 
 # LauncherAsRoot's systemd-run for check-net: the unit's namespace and user, the rest of its sandbox left out.
@@ -1885,6 +1994,8 @@ while (($#)); do
   shift
 done
 [[ -n $ns && -n $user ]] || { echo "fake systemd-run: no namespace or no user" >&2; exit 99; }
+# The walls' probe needs the unit's filters, which this fake cannot give: test_the_walls_hold_in_a_real_systemd_unit.
+[[ $1 != /usr/bin/python3 ]] || exit 0
 exec nsenter --net="$ns" -- setpriv --reuid="$(id -u -- "$user")" --regid="$(id -g -- "$user")" --clear-groups -- "$@"
 """
 
@@ -1926,8 +2037,10 @@ class LauncherAsRoot(unittest.TestCase):
         for d in ('rec', 'bin', 'template/bin', 'linger'):
             os.makedirs(self.path(d))
         os.chmod(self.rec, 0o700)
-        for name in ('systemd-run', 'systemctl', 'ip', 'nft', 'iptables'):
+        for name in ('systemd-run', 'systemctl', 'ip', 'nft', 'iptables', 'curl'):
             Launcher.write(self, f'bin/{name}', Launcher.FAKES[name].replace('$REC', self.rec), 0o755)
+        for x in 'ab':
+            Launcher.write(self, f'rec/own-{x}', f'{Launcher.OWN}\n', 0o644)
         self.template = self.path('template')
         Launcher.write(self, 'template/run.sh', '#!/bin/sh\n', 0o755)
         Launcher.write(self, 'template/.fork-fleet-version', f'{NEWEST_RUNNER}\n', 0o644)
@@ -1946,7 +2059,7 @@ class LauncherAsRoot(unittest.TestCase):
                         RUN_DIR=self.path('run'), HOOK=self.hook, LINGER_DIR=self.path('linger'),
                         MEMINFO=self.path('meminfo'), RESOLV_CONF=self.path('resolv.conf'),
                         IP_FORWARD=self.path('ip_forward'), SYSTEMD_RUN=self.path('bin/systemd-run'),
-                        SYSTEMCTL=self.path('bin/systemctl'))
+                        SYSTEMCTL=self.path('bin/systemctl'), OWN_ADDRESS_URLS=Launcher.OWN_URLS)
         settings.update(over)
         Launcher.write(self, 'launch.conf', ''.join(f'{k}={v}\n' for k, v in settings.items() if v), 0o600)
 
@@ -2101,6 +2214,7 @@ class LauncherAsRoot(unittest.TestCase):
             ip('-n', ns, 'link', 'set', 'eth0', 'up')
             ip('-n', ns, 'link', 'set', 'lo', 'up')
         ip('-n', 'fft-lan', 'addr', 'add', '100.100.100.100/32', 'dev', 'lo')
+        ip('-n', 'fft-wan', 'addr', 'add', '203.0.113.3/24', 'dev', 'eth0')   # this host's own public address (D1)
         ip('route', 'add', '100.100.100.100/32', 'via', '192.168.77.2')
         later('ip', 'link', 'del', 'fft-dummy')
         ip('link', 'add', 'fft-dummy', 'type', 'dummy')
@@ -2117,12 +2231,15 @@ class LauncherAsRoot(unittest.TestCase):
                      'import socket, time\nss = [socket.create_server(("0.0.0.0", p)) for p in (22, 53)]\n'
                      'time.sleep(600)'],
                     ['nsenter', '--net=/run/netns/fft-wan', 'python3', '-I', '-m', 'http.server', '80', '--bind',
-                     '203.0.113.2', '--directory', web]):
+                     '203.0.113.2', '--directory', web],
+                    # a port forwarded back into the home, on its own public address: the walls must refuse it
+                    ['nsenter', '--net=/run/netns/fft-wan', 'python3', '-I', '-c',
+                     'import socket, time\ns = socket.create_server(("203.0.113.3", 443))\ntime.sleep(600)']):
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.addCleanup(proc.wait)
             self.addCleanup(proc.kill)
         import time
-        for host, port in (('192.168.77.2', 22), ('100.100.100.100', 53), ('203.0.113.2', 80)):
+        for host, port in (('192.168.77.2', 22), ('100.100.100.100', 53), ('203.0.113.2', 80), ('203.0.113.3', 443)):
             for _ in range(100):
                 try:
                     socket.create_connection((host, port), 1).close()
@@ -2133,6 +2250,9 @@ class LauncherAsRoot(unittest.TestCase):
                 self.fail(f'{host}:{port} never listened')
         os.makedirs(self.path('netbin'))
         Launcher.write(self, 'netbin/systemd-run', NETNS_SYSTEMD_RUN, 0o755)
+        Launcher.write(self, 'netbin/curl', Launcher.FAKES['curl'].replace('$REC', self.rec), 0o755)
+        for x in 'ab':
+            Launcher.write(self, f'rec/own-{x}', '203.0.113.3\n', 0o644)
         self.conf(SYSTEMD_RUN=self.path('netbin/systemd-run'), IP_FORWARD=forward)
         targets = ('127.0.0.1:8384', '192.168.77.1:3773', '198.51.100.7:3773', '100.64.7.1:3773', '192.168.77.2:22',
                    '100.100.100.100:53')
@@ -2141,7 +2261,21 @@ class LauncherAsRoot(unittest.TestCase):
         for target in targets:
             self.assertIn(f'ok    {target} is closed', got.stdout)
         self.assertIn('ok    http://203.0.113.2/ answers (HTTP 200)', got.stdout)
+        self.assertIn("ok    this host's own public address 203.0.113.3 is refused (No route to host)", got.stdout)
         self.assertIn(f'check-net: as {self.USERS[0]}, in its namespace fork-fleet-{self.USERS[0]}', got.stdout)
+
+    def test_the_walls_hold_in_a_real_systemd_unit(self):
+        """As Launcher's, in a unit of the system's systemd as a real runner user (CI: the hosted runner's)."""
+        import http.server, threading
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        Launcher.write(self, 'rec/probe-exit', '0', 0o644)
+        got = self.launch('check-net', 'https://example.com/', f'127.0.0.1:{srv.server_address[1]}')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        real_walls(self, Launcher.waited(self, 'fork-fleet-check-walls'), ['systemd-run'], '--uid', self.USERS[0])
+
 
 class Wiring(unittest.TestCase):
     """fork-tests.yml, fork-fleet.yml, fork-release.yml and the hook against the config."""

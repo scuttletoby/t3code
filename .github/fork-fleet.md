@@ -151,10 +151,20 @@ Two more things limit what a job can do:
   it. Its one link goes out through the host to the public internet only. The
   nft table `inet fork_fleet` refuses the host itself, RFC 1918 (the LAN and its
   other machines), CGNAT `100.64.0.0/10` (Tailscale and the like), link-local,
-  the other reserved ranges and all of IPv6. The unit's `IPAddressDeny` refuses the same
-  ranges again, in the kernel, should the table ever go. The launcher (re)makes
-  the namespace and the table at every start and starts no runner when either
-  fails. Host step 6 proves it from inside a runner.
+  the other reserved ranges, all of IPv6, and the host's own public IPv4 address
+  (the router's admin page and every port forwarded back into the home answer
+  there; looked up before every start at `OWN_ADDRESS_URLS`, two by default
+  that must agree). The unit's `IPAddressDeny` refuses the same again, in the
+  kernel, should the table ever go. The launcher (re)makes the namespace and the
+  table at every start and starts no runner when either fails or the lookup
+  fails.
+- **Walls (every pool):** the unit gets no `AF_VSOCK` socket (a VM's channel to
+  its host, not namespaced; WSL2's way to Windows), and none through the two
+  ways around that filter: `io_uring` (fails with ENOSYS, so tools use plain
+  calls) and 32-bit system calls (they end the process). Host step 6 proves the
+  network and the walls from inside a runner. Before a new kind of host joins a
+  pool (a Windows PC's WSL2 first), `sudo bash .github/scripts/fork-fleet-walls-proof.sh`
+  runs that proof there with throwaway users and undoes all it made.
 
 Fleet jobs read no secrets (a test checks this). The fleet's GitHub token lives
 only on the fleet host, readable by root.
@@ -422,6 +432,8 @@ chmod 600 /etc/fork-fleet/launch.conf
 # RUNNER_USERS: one user per slot of the pool (step 1). WORK_ROOT (/var/lib/fork-fleet/runners): the launcher makes
 # it 0711. Every directory above it must let the runner users through (o+x), or no runner can reach its copy.
 # NET_BASE (10.204) and RESOLV_CONF (/etc/fork-fleet/resolv.conf): add a line only to change one (step 1b).
+# OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is
+# looked up before every start; each must answer, all alike. Add a line only to use other https lookups.
 
 # 5. The dispatcher, for the vm pool only.
 cat > /etc/systemd/system/t3code-fleet-dispatcher.service <<'EOF'
@@ -447,6 +459,9 @@ journalctl -u t3code-fleet-dispatcher -n 20      # each runner it starts or skip
 #    its Tailscale (100.64.0.0/10) address, its Docker bridges. check-net refuses a target the host itself does not
 #    reach (its refusal inside would prove nothing): if a listener just closed, run it again. Expect "ok" on every
 #    line and exit 0. Run it again after any network change on the host, and whenever a new service listens.
+#    It also proves, inside, that this host's own public address is refused and that AF_VSOCK, io_uring and 32-bit
+#    system calls are closed ("host:" lines first say which of these this host has outside: where it has none, the
+#    refusal inside shows nothing there).
 mapfile -t addrs < <(ip -4 -o addr show | awk '{ sub("/.*", "", $4); print $4 }')
 mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
     n = split($4, hp, ":"); h = hp[1]; p = hp[n]; sub(/%.*/, "", h)
