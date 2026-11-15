@@ -1,0 +1,15 @@
+# Fork only: the fleet host's daily runner template refresh (fork-fleet-launch.sh refresh). Install as
+# /etc/systemd/system/t3code-fleet-refresh.service with its timer (.github/fork-fleet.md, host step 7); not as
+# fork-fleet-*, the runner units' prefix. Safe to start by hand: a second refresh waits for the first (refresh.lock),
+# then finds the template new already.
+[Unit]
+Description=t3code fork fleet: refresh the runner template
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fork-fleet/fork-fleet-launch.sh refresh
+TimeoutStartSec=1h
+Nice=10
+IOSchedulingClass=idle

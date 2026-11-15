@@ -14,6 +14,10 @@
 #   ready NEWEST exit 0 when the template's runner version (TEMPLATE/.fork-fleet-version, written by the runbook) is
 #                not older than NEWEST, the newest actions/runner release. An older runner would update itself in
 #                its copy before the job, which this fleet refuses: the owner refreshes the template instead.
+#   refresh      makes TEMPLATE the newest actions/runner release when it is older or missing (the daily timer
+#                fork-fleet-refresh.timer, or by hand): reads the release, downloads its linux tarball, checks the
+#                release's sha256 before unpacking, unpacks beside TEMPLATE and swaps the two by one rename under the
+#                launch lock. Running jobs keep their copies; any failure leaves the old template. Below.
 #   active       the NAME of every fork-fleet-* unit that is loaded (starting, running or stopping).
 #   fits MB      exit 0 when MemAvailable minus RESERVE_MB leaves MB megabytes.
 #   stop NAME    stops that unit (a job on it fails: its runner is gone).
@@ -34,7 +38,8 @@
 # unconfigured actions/runner, owned by this user, on WORK_ROOT's filesystem) are required; WORK_ROOT, RUN_DIR, HOOK,
 # LINGER_DIR, RESERVE_MB, MAX_SECONDS, MEMINFO, NET_BASE (10.N: the runners' 10.N.0.0/16, one /30 per user from its
 # uid, unused by anything else on the host), RESOLV_CONF (the jobs' resolv.conf: public nameservers, as this host's
-# own resolver is on its loopback), IP_FORWARD, SYSTEMD_RUN and SYSTEMCTL have defaults below.
+# own resolver is on its loopback), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an
+# https URL) and RUNNER_DOWNLOAD (the https base of its tarballs) have defaults below.
 set -euo pipefail
 umask 077
 
@@ -57,8 +62,9 @@ owned_safe "$conf"
 RUNNER_USERS='' TEMPLATE='' WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
-SYSTEMCTL=systemctl
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL)=([^[:space:]]*)$'
+SYSTEMCTL=systemctl RUNNER_RELEASE=https://api.github.com/repos/actions/runner/releases/latest
+RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|RUNNER_RELEASE|RUNNER_DOWNLOAD)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -109,20 +115,172 @@ template_version() {
 # itself in its copy before the job; this fleet does not rely on that, so it starts no runner until the owner
 # refreshes the template.
 ready() {
-  local have i
-  local -a a b
+  local have
   [[ $1 =~ $VERSION ]] || die "ready: not a version: $1"
+  [[ -e $TEMPLATE || -L $TEMPLATE ]] ||
+    die "there is no runner template ($TEMPLATE): no runner starts until \`fork-fleet-launch.sh refresh\` makes one" \
+      "(.github/fork-fleet.md, host step 2)"
   owned_safe "$TEMPLATE"
   have=$(template_version)
-  IFS=. read -ra a <<<"$have"
-  IFS=. read -ra b <<<"$1"
+  if older "$have" "$1"; then
+    die "the runner template is actions/runner $have, older than the newest release $1: no runner starts until" \
+      "the owner refreshes the template (.github/fork-fleet.md, host step 2)"
+  fi
+}
+
+# Exit 0 when version $1 is older than version $2 (both x.y.z).
+older() {
+  local i
+  local -a a b
+  IFS=. read -ra a <<<"$1"
+  IFS=. read -ra b <<<"$2"
   for i in 0 1 2; do
-    ((10#${a[i]} > 10#${b[i]})) && return 0
-    ((10#${a[i]} < 10#${b[i]})) &&
-      die "the runner template is actions/runner $have, older than the newest release $1: no runner starts until" \
-        "the owner refreshes the template (.github/fork-fleet.md, host step 2)"
+    if ((10#${a[i]} != 10#${b[i]})); then
+      ((10#${a[i]} < 10#${b[i]}))
+      return
+    fi
   done
-  return 0
+  return 1
+}
+
+# refresh's reader of the release record (stdin; $1 the platform, like linux-x64): prints "VERSION SHA256" of the
+# tarball actions-runner-PLATFORM-VERSION.tar.gz. The sha256 is the asset's digest and the one the release notes give
+# (<!-- BEGIN SHA PLATFORM -->); at least one must be there, and the two must agree.
+read -r -d '' RELEASE_PY <<'EOF' || true
+import json, re, sys
+plat = sys.argv[1]
+try:
+    r = json.load(sys.stdin)
+except ValueError:
+    sys.exit('the release record is not JSON')
+tag = r.get('tag_name') if isinstance(r, dict) else None
+m = re.fullmatch(r'v?([0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5})', str(tag))
+if not m:
+    sys.exit(f'the newest release is {tag!r}, not a version')
+v = m.group(1)
+name = f'actions-runner-{plat}-{v}.tar.gz'
+assets = [a for a in r.get('assets') or [] if isinstance(a, dict) and a.get('name') == name]
+if not assets:
+    sys.exit(f'release {v} has no {name}')
+sums = set()
+for a in assets:
+    if a.get('digest') is not None:
+        d = re.fullmatch(r'sha256:([0-9a-f]{64})', str(a['digest']))
+        if not d:
+            sys.exit(f'release {v}: the digest of {name} is not a sha256')
+        sums.add(d.group(1))
+p = re.escape(plat)
+for d in re.findall(rf'<!-- BEGIN SHA {p} -->(.*?)<!-- END SHA {p} -->', str(r.get('body') or ''), re.S):
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', d.strip()):
+        sys.exit(f'release {v}: the sha256 of {name} in its notes is not one')
+    sums.add(d.strip().lower())
+if len(sums) != 1:
+    sys.exit(f'release {v} gives ' + ('no sha256' if not sums else 'two different sha256') + f' for {name}')
+print(v, sums.pop())
+EOF
+
+# renameat2(RENAME_EXCHANGE): the two directories swap names in one step, or nothing changes. (mv --exchange is
+# coreutils 9.5, newer than some hosts have.)
+read -r -d '' EXCHANGE_PY <<'EOF' || true
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 2) != 0:
+    sys.exit(os.strerror(ctypes.get_errno()))
+EOF
+
+# The release's name for this machine. The launcher itself runs on Linux (systemd, nft), WSL2 included; another OS
+# needs its own sandbox first (the per-OS walls layer).
+runner_platform() {
+  local os arch
+  os=$(uname -s) arch=$(uname -m)
+  [[ $os == Linux ]] || die "refresh: no runner template for $os here (the launcher runs on Linux only)"
+  case $arch in
+    x86_64) printf 'linux-x64\n' ;;
+    aarch64 | arm64) printf 'linux-arm64\n' ;;
+    armv7l) printf 'linux-arm\n' ;;
+    *) die "refresh: actions/runner has no release for $arch" ;;
+  esac
+}
+
+# The newest runner into TEMPLATE, or nothing when it has it already. The new one is unpacked in a temp folder beside
+# TEMPLATE (one filesystem, so the swap is a rename), checked, flushed to disk, then swapped in under the launch lock:
+# no start copies a half-swapped template, and running jobs keep their copies (hard links of the old files). A cut
+# download, a bad checksum or any other failure leaves the old template as it was; the temp folder goes on exit, and a
+# leftover of a run that was killed goes with the next one. Two refreshes run one after the other (refresh.lock).
+refresh() {
+  local base parent platform meta out newest sum have='' tmp url
+  base=${TEMPLATE##*/} parent=${TEMPLATE%/*}
+  [[ $TEMPLATE =~ ^/[A-Za-z0-9._/-]+$ && $base =~ ^[A-Za-z0-9._-]+$ && $base != . && $base != .. ]] ||
+    die "$conf: TEMPLATE is not a plain absolute path: $TEMPLATE"
+  [[ $RUNNER_RELEASE =~ ^https://[A-Za-z0-9.:/_-]+$ && $RUNNER_DOWNLOAD =~ ^https://[A-Za-z0-9.:/_-]+$ ]] ||
+    die "$conf: RUNNER_RELEASE and RUNNER_DOWNLOAD are https URLs"
+  platform=$(runner_platform)
+  owned_safe "${parent:-/}"
+  mkdir -p -- "$RUN_DIR"
+  owned_safe "$RUN_DIR"
+  chmod 0700 -- "$RUN_DIR"
+  exec {rlock}>"$RUN_DIR/refresh.lock"
+  flock -w 1800 "$rlock" || die "refresh: another refresh still holds $RUN_DIR/refresh.lock after 30 minutes"
+  for tmp in "$parent/.$base.refresh."*; do
+    if [[ -e $tmp || -L $tmp ]]; then rm -rf --one-file-system -- "$tmp"; fi
+  done
+  if [[ -e $TEMPLATE || -L $TEMPLATE ]]; then
+    owned_safe "$TEMPLATE"
+    [[ -d $TEMPLATE ]] || die "$TEMPLATE is not a directory"
+    if [[ -f $TEMPLATE/.fork-fleet-version && ! -L $TEMPLATE/.fork-fleet-version ]]; then
+      have=$(<"$TEMPLATE/.fork-fleet-version")
+      [[ $have =~ $VERSION ]] || have=''
+    fi
+  fi
+  meta=$(curl -fsSL --proto =https --max-time 120 --max-filesize 10485760 -H 'Accept: application/vnd.github+json' \
+    -- "$RUNNER_RELEASE") || die "refresh: could not read the newest release ($RUNNER_RELEASE): the template stays as it is"
+  out=$(python3 -I -c "$RELEASE_PY" "$platform" <<<"$meta") || die "refresh: the template stays as it is"
+  read -r newest sum <<<"$out"
+  [[ $newest =~ $VERSION && $sum =~ ^[0-9a-f]{64}$ ]] || die "refresh: an unexpected release record: $out"
+  if [[ -n $have ]] && ! older "$have" "$newest"; then
+    echo "refresh: the template is actions/runner $have, the newest release is $newest: nothing to do"
+    return 0
+  fi
+
+  tmp=$(mktemp -d -- "$parent/.$base.refresh.XXXXXX")
+  # Expanded now (the trap runs after this function's locals are gone). TERM and the like end the script through it.
+  # shellcheck disable=SC2064
+  trap "rm -rf --one-file-system -- $(printf '%q' "$tmp")" EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  url=$RUNNER_DOWNLOAD/v$newest/actions-runner-$platform-$newest.tar.gz
+  curl -fsSL --proto =https --max-time 1800 --max-filesize 1073741824 -o "$tmp/runner.tar.gz" -- "$url" ||
+    die "refresh: the download of $url failed: the template stays as it is"
+  printf '%s  %s\n' "$sum" "$tmp/runner.tar.gz" | sha256sum --check --strict --status - ||
+    die "refresh: $url does not match the release's sha256 $sum: refused, the template stays as it is"
+  mkdir -m 0755 -- "$tmp/new"
+  tar -xzf "$tmp/runner.tar.gz" -C "$tmp/new" --no-same-owner --same-permissions ||
+    die "refresh: $url did not unpack: the template stays as it is"
+  rm -f -- "$tmp/runner.tar.gz"
+  [[ -x $tmp/new/run.sh && -x $tmp/new/bin/Runner.Listener ]] ||
+    die "refresh: $url has no run.sh or bin/Runner.Listener: the template stays as it is"
+  for f in .env .path .runner .credentials .credentials_rsaparams; do
+    [[ ! -e $tmp/new/$f ]] || die "refresh: $url has a $f: the template stays as it is"
+  done
+  printf '%s\n' "$newest" >"$tmp/new/.fork-fleet-version"
+  chmod -R go-w -- "$tmp/new"
+  chmod 0755 -- "$tmp/new"
+  chmod 0644 -- "$tmp/new/.fork-fleet-version"
+  sync -f -- "$tmp/new" # the files are on disk before their name is: a power cut leaves the old or the new one
+
+  setup
+  if [[ -e $TEMPLATE || -L $TEMPLATE ]]; then
+    owned_safe "$TEMPLATE"
+    python3 -I -c "$EXCHANGE_PY" "$tmp/new" "$TEMPLATE" ||
+      die "refresh: could not swap $TEMPLATE for the new one (a filesystem without RENAME_EXCHANGE?): the template" \
+        "stays as it is"
+  else
+    mv -T -- "$tmp/new" "$TEMPLATE"
+  fi
+  sync -f -- "$parent"
+  flock -u "$lock"
+  echo "refresh: the template is actions/runner $newest (was ${have:-none})"
 }
 
 # The runner users: each a user of its own, in no group but its own, not lingering, with a network of its own.
@@ -441,10 +599,11 @@ case "${1-}:$#" in
     "$SYSTEMCTL" stop -- "fork-fleet-$2.service"
     ;;
   prune:1) prune ;;
+  refresh:1) refresh ;;
   check-net:*)
     (($# >= 3)) || die "usage: check-net URL HOST:PORT..."
     shift
     check_net "$@"
     ;;
-  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | check-net URL HOST:PORT..." ;;
+  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh | check-net URL HOST:PORT..." ;;
 esac

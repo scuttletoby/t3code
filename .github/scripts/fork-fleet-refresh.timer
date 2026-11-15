@@ -1,0 +1,12 @@
+# Fork only: runs t3code-fleet-refresh.service once a day, at a random time in the first 6 hours of it (so fleet hosts
+# do not all ask GitHub at once), and at boot when a day's run was missed (a desktop that was off).
+[Unit]
+Description=t3code fork fleet: daily runner template refresh
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

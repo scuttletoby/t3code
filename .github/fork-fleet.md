@@ -12,7 +12,8 @@ after the job. A job that names a fleet label by itself finds no runner.
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `.github/fork-fleet.json`              | Every fact about the repository and its fleet: the setting's name, the trust rule (workflows, actors, branches), the pools (label, slots, heartbeat variable, launch command, which pool `fleet` mode queues on), the jobs (shards, change gates, memory), and the time limits. |
 | `.github/scripts/fork-fleet.py`        | `route`, `watch`, `sweep`, `dispatch` and `gate`. Standard library only. It holds no repository facts.                                                                                                                                                                          |
-| `.github/scripts/fork-fleet-launch.sh` | Runs on a fleet host, as root, for `dispatch`: `start`, `ready`, `active`, `fits`, `stop` and `prune` of one-job runners.                                                                                                                                                       |
+| `.github/scripts/fork-fleet-launch.sh` | Runs on a fleet host, as root, for `dispatch`: `start`, `ready`, `active`, `fits`, `stop` and `prune` of one-job runners. Its `refresh` keeps the runner template new (host step 7).                                                                                            |
+| `.github/scripts/fork-fleet-refresh.*` | The daily timer and service of `refresh` (installed as `t3code-fleet-refresh`, host step 7). `fork-fleet-refresh.test.py` tests both, with a fake release server.                                                                                                               |
 | `.github/scripts/fork-fleet-hook.sh`   | Each fleet runner's job-started hook. It runs `gate` from the installed copy.                                                                                                                                                                                                   |
 | `.github/scripts/fork-fleet.test.py`   | The tests, and checks that the workflows match the config. Run by the `workflows` job.                                                                                                                                                                                          |
 | `.github/workflows/fork-tests.yml`     | The `Route` step of `changes` feeds each Linux job's `runs-on`. The `fleet_watch` job bounds the wait for a fleet runner.                                                                                                                                                       |
@@ -265,9 +266,11 @@ does leave the marker, and that turns the test red.
   template's `.fork-fleet-version` (written in host step 2). When the template
   is older, or has no version file, no runner starts on that pool. The
   heartbeat then reports `free: 0` with a `why` that says to refresh the
-  template, so `auto` goes GitHub-hosted. Running jobs and cleanup go on. Fix:
-  host step 2 with the new release. If the release cannot be read, the last
-  version read is kept; before the first read, nothing starts.
+  template, so `auto` goes GitHub-hosted. Running jobs and cleanup go on. The
+  refresh timer (host step 7) fixes this within a day; to fix it at once, run
+  `fork-fleet-launch.sh refresh`. If the release cannot be read, the last
+  version read is kept; before the first read, nothing starts. With no template
+  at all, `ready` says so and no runner starts.
 - **Per-pool locks.** Each dispatcher takes `dispatch-<pool>.lock` in
   `--lock-dir` (default `/run/fork-fleet`) for each pool it serves. Two
   dispatchers can serve different pools, never the same one.
@@ -354,39 +357,12 @@ done
   ! ip -4 route | grep -q '^10\.204\.' || echo "10.204 is in use here: pick another NET_BASE in step 4"
 )
 
-# 2. The runner template: an unconfigured actions/runner release, owned by root, checked by sha256.
-#    Take the newest version and its linux-x64 sha256 from https://github.com/actions/runner/releases
-#    Run this again for each new release: the fleet starts no runner while the template is older than the newest one.
-#    /opt and /var/lib must be on one filesystem: each copy hard-links the template (the launcher checks it).
-#    The new template is checked (sha256, unconfigured, its version file) before anything is replaced; the old one
-#    stays in place until then, and a failure stops here with the dispatcher still running the old one.
-(
-  set -euo pipefail
-  ver=X.Y.Z; sum=SHA256_FROM_THE_RELEASE_PAGE
-  [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $sum =~ ^[0-9a-f]{64}$ ]] || { echo "set ver and sum first"; exit 1; }
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-  new=/opt/fork-fleet/runner-template.new live=/opt/fork-fleet/runner-template old=/opt/fork-fleet/runner-template.old
-  curl -fsSLo "$tmp/runner.tgz" "https://github.com/actions/runner/releases/download/v$ver/actions-runner-linux-x64-$ver.tar.gz"
-  echo "$sum  $tmp/runner.tgz" | sha256sum -c --strict -
-  install -d -m 755 /opt/fork-fleet
-  rm -rf "$new" && install -d -m 755 "$new"
-  tar -xzf "$tmp/runner.tgz" -C "$new" --no-same-owner
-  printf '%s\n' "$ver" > "$new/.fork-fleet-version"
-  chmod -R go-w "$new"
-  "$new/bin/installdependencies.sh"              # the runner's own libraries
-  [ -x "$new/run.sh" ] && [ -x "$new/bin/Runner.Listener" ] && [ "$(cat "$new/.fork-fleet-version")" = "$ver" ]
-  for f in .env .path .runner .credentials .credentials_rsaparams; do [ ! -e "$new/$f" ]; done   # never config.sh here
-  # Swap with no runner starting: stop the dispatcher (running jobs keep their own copies), swap, start it again.
-  systemctl stop t3code-fleet-dispatcher 2>/dev/null || true
-  rm -rf "$old"
-  [ ! -e "$live" ] || mv -T "$live" "$old"
-  mv -T "$new" "$live"
-  rm -rf "$old"
-  systemctl start t3code-fleet-dispatcher 2>/dev/null || true   # on a first install, step 5 starts it
-  echo "template: actions/runner $(cat "$live/.fork-fleet-version")"
-)
+# 2. The runner template: an unconfigured actions/runner release, owned by root. The launcher's `refresh` makes it,
+#    checked by sha256, and keeps it new (step 7, right after step 4: it needs the launcher and its settings). Until
+#    then the pool stays closed ("there is no runner template"). /opt and /var/lib must be on one filesystem: each
+#    copy hard-links the template (the launcher checks it).
 
-# 3. The fleet files, from one pinned main commit. All four are fetched first and installed only when each came;
+# 3. The fleet files, from one pinned main commit. All six are fetched first and installed only when each came;
 #    SOURCE is written last, so it never names a commit whose files are not all in place.
 (
   set -euo pipefail
@@ -395,7 +371,9 @@ done
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   base=https://raw.githubusercontent.com/scuttletoby/t3code/$sha/.github
   files="fork-fleet.json:fork-fleet.json:644 scripts/fork-fleet.py:fork-fleet.py:644
-         scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755"
+         scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755
+         scripts/fork-fleet-refresh.service:fork-fleet-refresh.service:644
+         scripts/fork-fleet-refresh.timer:fork-fleet-refresh.timer:644"
   for f in $files; do
     IFS=: read -r src dst mode <<<"$f"
     curl -fsSLo "$tmp/$dst" "$base/$src"
@@ -453,6 +431,21 @@ mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
     if (h == "0.0.0.0" || h == "*") { k = split(addrs, a, " "); for (i = 1; i <= k; i++) print a[i] ":" p } else print h ":" p
   }' | sort -u)
 /opt/fork-fleet/fork-fleet-launch.sh check-net https://github.com "${targets[@]}"; echo "exit $?"
+
+# 7. The runner template and its daily refresh. `refresh` reads the newest actions/runner release, downloads its
+#    tarball, checks the release's sha256 before unpacking, unpacks it beside the template and swaps the two in one
+#    rename under the launch lock: running jobs keep their copies, and a cut download, a bad checksum or any other
+#    failure leaves the old template. The same version: nothing. Safe to run by hand at any time (a second refresh
+#    waits for the first). The timer runs it once a day at a random time, and after boot when a day was missed.
+#    Re-run the two install lines after step 3 brings new unit files.
+/opt/fork-fleet/fork-fleet-launch.sh refresh                   # the first template, or the newest one now
+/opt/fork-fleet/runner-template/bin/installdependencies.sh     # once, and again if a release needs new libraries:
+                                                               # refresh installs no system packages
+install -o root -g root -m 644 /opt/fork-fleet/fork-fleet-refresh.service /etc/systemd/system/t3code-fleet-refresh.service
+install -o root -g root -m 644 /opt/fork-fleet/fork-fleet-refresh.timer /etc/systemd/system/t3code-fleet-refresh.timer
+systemctl daemon-reload && systemctl enable --now t3code-fleet-refresh.timer
+systemctl list-timers t3code-fleet-refresh.timer               # its next run
+journalctl -u t3code-fleet-refresh -n 20                       # what each refresh did
 ```
 
 Do not name the dispatcher's unit `fork-fleet-*`: that prefix is for runner
