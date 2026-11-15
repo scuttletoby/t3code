@@ -1,0 +1,34 @@
+{
+  "//": "Upstream files with fork lines, and every line the fork may add to each (indentation and blank lines ignored). Checked by .github/scripts/fork-seam-check.cjs; see docs/fork/updates.md.",
+  "files": {
+    "packages/contracts/src/settings.ts": {
+      "why": "Fork settings live in forkSettings.ts; settings.ts takes them with one spread per struct. automaticUpdates stays inline: upstream's pending setting has the same name and place.",
+      "added": [
+        "import * as ForkSettings from \"./forkSettings.ts\";",
+        "export * from \"./forkSettings.ts\";",
+        "...ForkSettings.ForkClientSettingsFields,",
+        "...ForkSettings.FORK_PROJECT_SCOPED_KEYS,",
+        "...ForkSettings.ForkProjectOverrideFields,",
+        "...ForkSettings.ForkServerSettingsFields,",
+        "...ForkSettings.ForkServerSettingsPatchFields,",
+        "...ForkSettings.ForkProjectOverridePatchFields,",
+        "/**",
+        "* Fork: a boot-service server installs newer releases by itself once nothing is working.",
+        "* Same name and place as upstream's pending automatic-updates setting, whose line replaces this",
+        "* one when it lands (upstream defaults it on). A file saying `autoUpdateServer` is renamed on load.",
+        "*/",
+        "automaticUpdates: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),",
+        "automaticUpdates: Schema.optionalKey(Schema.Boolean),"
+      ]
+    },
+    "packages/shared/src/serverSettings.ts": {
+      "why": "A settings patch's fork fields are applied by forkSettingsPatch.ts, by the rules in forkSettings.ts.",
+      "added": [
+        "import { applyForkSettingsPatch, splitForkSettingsPatch } from \"./forkSettingsPatch.ts\";",
+        "const [forkPatch, upstreamPatch] = splitForkSettingsPatch(patch); // Fork: forkSettingsPatch.ts",
+        "} = upstreamPatch;",
+        "...applyForkSettingsPatch(current, forkPatch),"
+      ]
+    }
+  }
+}

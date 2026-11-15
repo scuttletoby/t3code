@@ -18,6 +18,7 @@
 .github/scripts/fork-release.test.sh
 .github/scripts/fork-reusable-permissions.test.py
 .github/scripts/fork-schema-check.test.cjs
+.github/scripts/fork-seam-check.test.cjs
 .github/scripts/fork-secret-scan.test.sh
 .github/scripts/fork-test-shards.test.cjs
 .github/scripts/fork-tests-drift.test.cjs
