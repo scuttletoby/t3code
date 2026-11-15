@@ -18,20 +18,26 @@
 #   fits MB      exit 0 when MemAvailable minus RESERVE_MB leaves MB megabytes.
 #   stop NAME    stops that unit (a job on it fails: its runner is gone).
 #   prune        removes the copies and environment files whose unit is gone.
+#   refresh-net  every dispatcher pass: looks this host's own public address up again and, when what is blocked would
+#                change or the table is gone, re-applies the table (it covers running jobs too) and adds the new
+#                addresses to each running unit's IPAddressDeny. No lookup answers: it fails and changes nothing (the
+#                last block stays), and the dispatcher starts no runner on the pool this pass.
 #   check-net URL HOST:PORT...
 #                the proof of the network and the walls (.github/fork-fleet.md, host step 6): runs two probes in a
 #                runner's real sandbox, as a free runner user. Exit 0 only when URL (public) answers, every HOST:PORT
 #                (services this host reaches: its loopback, its LAN address, Tailscale) is closed from inside, this
-#                host's own public address is refused, and no AF_VSOCK socket, io_uring ring or 32-bit system call
-#                works inside.
+#                host's own public address is refused, no AF_VSOCK socket, io_uring ring or 32-bit system call
+#                works inside, only the pseudo devices and no socket are there, the unit sees no mount but the ones
+#                job_fs allows, and none of them receives a mount the host makes later.
 #
 # The network: each runner user has a namespace of its own, fork-fleet-USER, so a job has its own loopback and reaches
 # no service on this host's (nor an abstract socket). Its only link, ffh-UID (host side), goes to the public internet:
 # the nft table inet fork_fleet refuses the host itself, RFC 1918, CGNAT (Tailscale), link-local, every IPv6 packet
-# and this host's own public IPv4 address (looked up before every start: own_address), and the unit's IPAddressDeny
-# refuses the same again, in the kernel, should the table ever go. Every start (re)makes the namespace and the table
-# under the launch lock and fails closed: no runner starts when either fails. The walls (sandbox): no AF_VSOCK, no
-# io_uring, no 32-bit system calls in the unit.
+# and this host's own public IPv4 addresses (own_address, before every start and every pass), and the unit's
+# IPAddressDeny refuses the same again, in the kernel, should the table ever go. Every start (re)makes the namespace
+# and the table under the launch lock and fails closed: no runner starts when either fails. The walls (sandbox): no
+# AF_VSOCK, io_uring or 32-bit system calls, only the pseudo devices, and of this host's files only what job_fs
+# allows (an allow list: a disk or share mounted anywhere else is not in the unit).
 #
 # Settings: /etc/fork-fleet/launch.conf (or $FORK_FLEET_LAUNCH_CONF), KEY=value lines, owned by this user and
 # writable by it alone. RUNNER_USERS (user names, comma-separated: at least the pool's slots) and TEMPLATE (an
@@ -39,12 +45,15 @@
 # LINGER_DIR, RESERVE_MB, MAX_SECONDS, MEMINFO, NET_BASE (10.N: the runners' 10.N.0.0/16, one /30 per user from its
 # uid, unused by anything else on the host), RESOLV_CONF (the jobs' resolv.conf: public nameservers, as this host's
 # own resolver is on its loopback), OWN_ADDRESS_URLS (https URLs, comma-separated, that answer with the address
-# they see: each must answer, all alike), IP_FORWARD, SYSTEMD_RUN and SYSTEMCTL have defaults below.
+# they see: every public address they give is blocked, at least one must answer), JOB_PATHS (the system paths every
+# job sees: fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only,
+# comma-separated, say a tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN and SYSTEMCTL have defaults below.
 set -euo pipefail
 umask 077
 
+warn() { printf 'fork-fleet-launch: %s\n' "$*" >&2; }
 die() {
-  printf 'fork-fleet-launch: %s\n' "$*" >&2
+  warn "$@"
   exit 1
 }
 
@@ -62,8 +71,9 @@ owned_safe "$conf"
 RUNNER_USERS='' TEMPLATE='' WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
-SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS)=([^[:space:]]*)$'
+SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com ALLOW_PATHS=''
+JOB_PATHS=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fork-fleet-job-paths.txt
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|JOB_PATHS|ALLOW_PATHS)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -74,6 +84,8 @@ done <"$conf"
 { [[ $NET_BASE =~ ^10\.(0|[1-9][0-9]{0,2})$ ]] && ((BASH_REMATCH[1] <= 255)); } || die "$conf: NET_BASE is 10.N (N up to 255)"
 own_url='https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?'
 [[ $OWN_ADDRESS_URLS =~ ^$own_url(,$own_url)*$ ]] || die "$conf: OWN_ADDRESS_URLS is a comma-separated list of https URLs"
+PLAIN_PATH='(/[A-Za-z0-9._@+-]+)+'
+[[ $ALLOW_PATHS =~ ^($PLAIN_PATH(,$PLAIN_PATH)*)?$ ]] || die "$conf: ALLOW_PATHS is a comma-separated list of plain paths"
 
 NAME='^[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}$'
 name_ok() { [[ $1 =~ $NAME ]] || die "not a runner name: $1"; }
@@ -207,28 +219,52 @@ fits() {
 PRIVATE4=(0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16
   198.18.0.0/15 224.0.0.0/4 240.0.0.0/4)
 
-# This host's own public IPv4 address, as each OWN_ADDRESS_URLS sees it (curl over IPv4, https only): a job must not
-# reach it, as the router's admin page and every port forwarded back into this home or host answer there. Looked up
-# before every start and check-net, so a new address is blocked from the next start on. A lookup that fails, an
-# answer that is no public IPv4 address, or two answers that differ: no runner.
+# This host's own public IPv4 addresses, as OWN_ADDRESS_URLS see them (curl over IPv4, https only, no proxy): a job
+# must not reach them, as the router's admin page and every port forwarded back into this home or host answer there.
+# Every public address a lookup gives is blocked (two WAN links: each lookup may see another one); a lookup that
+# fails or answers no public IPv4 address is said and left out. None at all: no runner.
 own_address() {
-  local u got own='' cidr n m
+  local u got own='' cidr n m bad
   local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
   for u in ${OWN_ADDRESS_URLS//,/ }; do
-    got=$(curl -4 -fsS --max-time 10 --proto =https -- "$u" 2>&1) ||
-      die "own address: $u gave no answer (${got:0:200}): no runner, as the job's walls could not block this" \
-        "host's own public address (OWN_ADDRESS_URLS)"
+    if ! got=$(curl -4 -fsS --noproxy '*' --max-time 10 --proto =https -- "$u" 2>&1); then
+      warn "own address: $u gave no answer (${got:0:200})"
+      continue
+    fi
     got=${got//[[:space:]]/}
-    [[ $got =~ ^$octet(\.$octet){3}$ ]] || die "own address: $u answered no IPv4 address (${got:0:60}): no runner"
-    n=$(ip4_int "$got")
+    if [[ ! $got =~ ^$octet(\.$octet){3}$ ]]; then
+      warn "own address: $u answered no IPv4 address (${got:0:60})"
+      continue
+    fi
+    n=$(ip4_int "$got") bad=''
     for cidr in "${PRIVATE4[@]}"; do
       m=$(((0xffffffff << (32 - ${cidr#*/})) & 0xffffffff))
-      (((n & m) != $(ip4_int "${cidr%/*}"))) || die "own address: $u answered $got, not a public address: no runner"
+      (((n & m) != $(ip4_int "${cidr%/*}"))) || bad=1
     done
-    [[ -z $own || $own == "$got" ]] || die "own address: the lookups differ ($own, $got): no runner"
-    own=$got
+    if [[ -n $bad ]]; then
+      warn "own address: $u answered $got, not a public address"
+      continue
+    fi
+    [[ " $own " == *" $got "* ]] || own+="${own:+ }$got"
   done
+  [[ -n $own ]] || die "own address: no lookup (OWN_ADDRESS_URLS) gave this host's public IPv4 address: no runner," \
+    "as the job's walls could not block it"
   printf '%s\n' "$own"
+}
+
+# What the table and the units block (sets blocked): the addresses own_address found now ($1), then those blocked
+# before (RUN_DIR/own-address), at most 4, newest first: a lookup that is down this time (each WAN link seen by
+# another one) or an address that just changed opens nothing that was blocked. Under the launch lock.
+merge_own() {
+  local a old=''
+  local -a all
+  blocked=$1
+  [[ ! -f $RUN_DIR/own-address ]] || old=$(<"$RUN_DIR/own-address")
+  for a in $old; do
+    if [[ $a =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ && " $blocked " != *" $a "* ]]; then blocked+=" $a"; fi
+  done
+  read -ra all <<<"$blocked"
+  blocked=${all[*]:0:4}
 }
 
 ip4_int() {
@@ -239,20 +275,11 @@ ip4_int() {
 
 must() { "$@" || die "network: $* failed: no runner starts without its network (.github/fork-fleet.md, host step 1)"; }
 
-# Makes what is missing of runner user $1's network (and blocks $2, this host's own public address) and (re)applies the table; changes nothing that is right already
-# and interrupts no connection (the table is replaced in one transaction; conntrack keeps the flows). Dies on any
-# failure, so start never runs a unit without it. Under the launch lock: two launchers never apply it at once.
-net_up() {
-  local user=$1 own=$2 uid ns host peer off net gw addr private
-  uid=$(id -u -- "$user")
-  ns=fork-fleet-$user host=ffh-$uid peer=ffp-$uid
-  # Its /30 in NET_BASE.0.0/16: the host side .1, the namespace .2 (off is a multiple of 4, so both stay in it).
-  off=$((uid % 16384 * 4))
-  net=$NET_BASE.$((off / 256))
-  gw=$net.$((off % 256 + 1)) addr=$net.$((off % 256 + 2))
-  [[ $(<"$IP_FORWARD") == 1 ]] ||
-    die "network: $IP_FORWARD is not 1: the runners would reach nothing (.github/fork-fleet.md, host step 1)"
-  private=${PRIVATE4[*]}
+# (Re)applies the table, blocking $blocked (merge_own), and keeps that list in RUN_DIR/own-address. Interrupts no
+# connection (the table is replaced in one transaction; conntrack keeps the flows). Under the launch lock.
+table_up() {
+  local private=${PRIVATE4[*]} a own=''
+  for a in $blocked; do own+="    iifname \"ffh-*\" ip daddr $a counter reject with icmpx admin-prohibited"$'\n'; done
   must nft -f - <<EOF
 table inet fork_fleet
 delete table inet fork_fleet
@@ -268,8 +295,7 @@ table inet fork_fleet {
   chain forward {
     type filter hook forward priority -10; policy accept;
     iifname "ffh-*" ip daddr @private4 counter reject with icmpx admin-prohibited
-    iifname "ffh-*" ip daddr $own counter reject with icmpx admin-prohibited
-    iifname "ffh-*" meta nfproto ipv6 counter drop
+${own}    iifname "ffh-*" meta nfproto ipv6 counter drop
     oifname "ffh-*" ct state != { established, related } counter drop
   }
   chain postrouting {
@@ -278,6 +304,24 @@ table inet fork_fleet {
   }
 }
 EOF
+  printf '%s\n' "$blocked" >"$RUN_DIR/own-address.new"
+  mv -f -- "$RUN_DIR/own-address.new" "$RUN_DIR/own-address"
+}
+
+# Makes what is missing of runner user $1's network and (re)applies the table; changes nothing that is right already.
+# Dies on any failure, so start never runs a unit without it. Under the launch lock: two launchers never apply it at
+# once.
+net_up() {
+  local user=$1 uid ns host peer off net gw addr
+  uid=$(id -u -- "$user")
+  ns=fork-fleet-$user host=ffh-$uid peer=ffp-$uid
+  # Its /30 in NET_BASE.0.0/16: the host side .1, the namespace .2 (off is a multiple of 4, so both stay in it).
+  off=$((uid % 16384 * 4))
+  net=$NET_BASE.$((off / 256))
+  gw=$net.$((off % 256 + 1)) addr=$net.$((off % 256 + 2))
+  [[ $(<"$IP_FORWARD") == 1 ]] ||
+    die "network: $IP_FORWARD is not 1: the runners would reach nothing (.github/fork-fleet.md, host step 1)"
+  table_up
   docker_rules
   ip -n "$ns" link show lo >/dev/null 2>&1 || must ip netns add "$ns"
   ip link show "$host" >/dev/null 2>&1 || must ip link add "$host" type veth peer name "$peer" netns "$ns"
@@ -306,6 +350,22 @@ docker_rules() {
   done
 }
 
+# refresh-net (each dispatcher pass): the address may change while a job runs (a new lease, a VPN that went down).
+# The table covers every runner's link, so re-applying it covers running jobs; their units get the new addresses too.
+refresh_net() {
+  local own name blocked old=''
+  own=$(own_address)
+  setup
+  [[ ! -f $RUN_DIR/own-address ]] || old=$(<"$RUN_DIR/own-address")
+  merge_own "$own"
+  if [[ $blocked == "$old" ]] && nft list table inet fork_fleet >/dev/null 2>&1; then return 0; fi
+  table_up
+  for name in $(active); do
+    "$SYSTEMCTL" set-property --runtime -- "fork-fleet-$name.service" "IPAddressDeny=$blocked" ||
+      warn "refresh-net: IPAddressDeny of fork-fleet-$name not changed (the table blocks $blocked)"
+  done
+}
+
 # The jobs' resolv.conf: this host's resolver listens on its loopback, which a job's namespace does not have.
 resolv_target() {
   local target
@@ -317,10 +377,60 @@ resolv_target() {
   printf '%s\n' "$target"
 }
 
+# THE rule of what a job sees of this host's files, in one place (the per-OS walls read the same JOB_PATHS file): an
+# allow list, never a list of what to hide, as a disk or share may be mounted anywhere (/mnt, /media, /srv, /data,
+# /net). The unit's root is an empty directory of its own ($1, root's) holding only: each path of JOB_PATHS and
+# ALLOW_PATHS that exists here, read-only (a symlink here, like /bin -> usr/bin, is the same symlink there); the hook
+# and the two files it runs, read-only; its own copy ($2), read-write; the jobs' resolv.conf; and systemd's own /proc,
+# /sys, a /dev of pseudo devices and memory file systems for /run, /tmp, /var/tmp and /dev/shm. Each path is one mount,
+# not its submounts (norbind: WSL2's driver share under /usr/lib/wsl, a disk under /etc stay out), and no mount the
+# host makes later reaches the unit (MountFlags=private: no mount of the unit receives the host's). Sets props_fs, and
+# seen: the mount points check-net's probe allows (its own /proc, /sys, /dev and memory file systems are allowed there).
+job_fs() {
+  local root=$1 rw=$2 line p hook_dir=${HOOK%/*}
+  local -a paths=() ro=()
+  [[ $HOOK =~ ^$PLAIN_PATH$ && $rw =~ ^($PLAIN_PATH)?$ ]] || die "HOOK ($HOOK) and WORK_ROOT must be plain paths"
+  owned_safe "$JOB_PATHS"
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    paths+=("$line")
+  done <"$JOB_PATHS"
+  # shellcheck disable=SC2206 # plain paths only, checked below
+  paths+=(${ALLOW_PATHS//,/ })
+  for p in "${paths[@]}"; do
+    [[ $p =~ ^$PLAIN_PATH$ && /$p/ != */./* && /$p/ != */../* ]] || die "$JOB_PATHS or ALLOW_PATHS: not a plain path: $p"
+    case $p/ in /proc/* | /sys/* | /dev/* | /run/* | /tmp/* | /var/tmp/* | /home/* | /root/*)
+      die "$p: a job never sees it from this host (its own or none): not a path to allow" ;;
+    esac
+  done
+  rm -rf --one-file-system -- "$root"
+  mkdir -m 0755 -- "$root"
+  seen='/'
+  for p in "${paths[@]}"; do
+    if [[ -L $p ]]; then
+      mkdir -p -m 0755 -- "$root${p%/*}"
+      ln -s -- "$(readlink -- "$p")" "$root$p"
+    elif [[ -e $p ]]; then
+      ro+=("$p:$p:norbind") seen+=" $p"
+    fi
+  done
+  for p in "$HOOK" "$hook_dir/fork-fleet.py" "$hook_dir/fork-fleet.json"; do
+    [[ $p == "$HOOK" || -e $p ]] || continue
+    ro+=("$p:$p:norbind") seen+=" $p"
+  done
+  props_fs=(-p "RootDirectory=$root" -p MountAPIVFS=yes -p MountFlags=private -p "BindReadOnlyPaths=${ro[*]}")
+  if [[ -n $rw ]]; then
+    props_fs+=(-p "BindPaths=$rw:$rw:norbind")
+    seen+=" $rw"
+  fi
+}
+
 # The sandbox of every runner unit, and of check-net's probes (which prove it): the props array. Its own network
-# namespace, the private ranges and this host's own public address ($3) refused again in the kernel, its own /run,
-# /dev/shm, /tmp and /var/tmp (memory, gone with the unit), no /home, no other user's processes, its own IPC, the
-# system read-only, and the walls below.
+# namespace, the private ranges and this host's own public addresses ($3) refused again in the kernel, of this host's
+# files only what job_fs allows ($4 the unit's root, $5 its copy), its own /run, /dev/shm, /tmp and /var/tmp (memory,
+# gone with the unit), no /home, no other user's processes, its own IPC, the system read-only, only the pseudo devices
+# (PrivateDevices: /dev/null, zero, full, random, urandom, tty and ptys; no GPU, /dev/dxg (WSL2's channel to Windows),
+# disk, kvm, fuse or tun: Docker's client, Node, git and Java need none), and the walls below.
 # AF_VSOCK is not namespaced: it is a VM's channel to its host (virtio-vsock, Hyper-V sockets: WSL2's way to
 # Windows). RestrictAddressFamilies refuses it to socket(), but io_uring's IORING_OP_SOCKET opens sockets no seccomp
 # filter sees, and on x86_64 a 64-bit process can make i386 (int 0x80) or x32 system calls, which a filter for the
@@ -328,13 +438,17 @@ resolv_target() {
 # system call of another arch ends the process (SIGSYS).
 sandbox() {
   local user=$1 resolv=$2 own=$3
+  local -a props_fs
+  job_fs "$4" "$5"
+  seen+=" $resolv"
   props=(
     -p "NetworkNamespacePath=/run/netns/fork-fleet-$user"
     -p "IPAddressDeny=${PRIVATE4[*]} $own ::/0" -p IPAddressAllow=localhost
+    "${props_fs[@]}"
     -p "TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777"
     -p "BindReadOnlyPaths=$RESOLV_CONF:$resolv"
     -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p ProtectProc=invisible -p PrivateIPC=yes
-    -p RemoveIPC=yes
+    -p RemoveIPC=yes -p PrivateDevices=yes
     -p RestrictAddressFamilies=~AF_VSOCK
     -p "SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS"
     -p SystemCallArchitectures=native
@@ -342,7 +456,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv own
+  local name=$1 dir env_file line key value user resolv own blocked seen
   local -a props
   local -A got=()
   name_ok "$name"
@@ -382,8 +496,9 @@ start() {
   [[ ! -e $dir ]] || die "$dir exists: a runner of that name ran already (prune removes it once its unit is gone)"
   user=$(free_user)
   reset_user "$user"
-  net_up "$user" "$own"
-  sandbox "$user" "$resolv" "$own"
+  merge_own "$own"
+  net_up "$user"
+  sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/$name.root" "$dir"
   # Expanded now: the trap runs at exit, after this function's locals are gone (set -u would fail it, file left).
   # shellcheck disable=SC2064
   trap "rm -f -- $(printf '%q' "$env_file")" EXIT
@@ -406,21 +521,23 @@ start() {
     -p "RuntimeMaxSec=$MAX_SECONDS" -- "$dir/run.sh"
 }
 
-# Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public address, which the
+# Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public addresses, which the
 # walls must refuse (a refusal, not a timeout: a router that drops the packet would prove nothing), then HOST PORT
 # pairs that must be closed.
 read -r -d '' PROBE <<'EOF' || true
-url=$1 own=$2 bad=0
+url=$1 bad=0
+for own in $2; do
+  if err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1); then
+    echo "FAIL  this host's own public address $own is reachable from inside"
+    bad=1
+  elif [[ $err =~ (Operation\ not\ permitted|No\ route\ to\ host|Permission\ denied|Network\ is\ unreachable) ]]; then
+    echo "ok    this host's own public address $own is refused (${BASH_REMATCH[1]})"
+  else
+    echo "FAIL  this host's own public address $own is not refused by the walls (${err:-no answer in 5 s})"
+    bad=1
+  fi
+done
 shift 2
-if err=$(LC_ALL=C timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/443"' "$own" 2>&1); then
-  echo "FAIL  this host's own public address $own is reachable from inside"
-  bad=1
-elif [[ $err =~ (Operation\ not\ permitted|No\ route\ to\ host|Permission\ denied|Network\ is\ unreachable) ]]; then
-  echo "ok    this host's own public address $own is refused (${BASH_REMATCH[1]})"
-else
-  echo "FAIL  this host's own public address $own is not refused by the walls (${err:-no answer in 5 s})"
-  bad=1
-fi
 while (($# >= 2)); do
   if timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null; then
     echo "FAIL  $1:$2 is reachable from inside"
@@ -439,13 +556,18 @@ fi
 exit "$bad"
 EOF
 
-# The walls' probe (python3 -I -c, argument job or host). job: in the sandbox, as the runner user; a line per wall,
-# exit 1 when one is open or could not be tried. host: as root, outside, the control: whether this host has what the
-# walls close (where it has not, the refusal inside shows nothing; the walls are still set). Each 32-bit call is made
-# in a child that may not dump core: the filter ends it with SIGSYS; another signal means this kernel has no such
-# calls. i386: getpid (20) through int 0x80; x32: getpid (39 | 0x40000000).
+# The walls' probe (python3 -I -c, arguments job or host, then the mount points job_fs allows). job: in the sandbox,
+# as the runner user; a line per wall, exit 1 when one is open or could not be tried. host: as root, outside, the
+# control: whether this host has what the walls close (where it has not, the refusal inside shows nothing; the walls
+# are still set). Each 32-bit call is made in a child that may not dump core: the filter ends it with SIGSYS; another
+# signal means this kernel has no such calls. i386: getpid (20) through int 0x80; x32: getpid (39 | 0x40000000).
+# Then what the files show: device nodes besides the pseudo ones (a GPU, /dev/dxg); every mount point the unit has
+# (the allowed ones, its own /proc, /sys and /dev, and nothing else); whether any of its mounts receives the host's
+# mounts (mountinfo's master: or shared: tag: a disk mounted after the job started would show up in it); entries in
+# /mnt or /media; and sockets in the places a desktop keeps them (WSLg's X11 and PulseAudio). Mount points are read
+# from mountinfo, never looked at: a share that hangs cannot stop the probe.
 read -r -d '' WALLS <<'EOF' || true
-import ctypes, errno, mmap, os, signal, socket, sys
+import ctypes, errno, mmap, os, re, signal, socket, stat, sys
 libc = ctypes.CDLL(None, use_errno=True)
 def alone(f):
     pid = os.fork()
@@ -474,6 +596,64 @@ uring = 'open' if ring >= 0 else errno.errorcode.get(ctypes.get_errno(), '?')
 calls = {}
 if os.uname().machine == 'x86_64':
     calls = {'i386': alone(i386), 'x32': alone(lambda: libc.syscall(0x40000027))}
+budget = [20000]
+def walk(top, keep, depth=4):
+    """What keep() takes under top, on top's own file system, at most depth levels down and budget entries in all."""
+    try:
+        dev = os.lstat(top).st_dev
+    except OSError:
+        return
+    todo = [(top, 0)]
+    while todo:
+        d, n = todo.pop()
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for x in names:
+            budget[0] -= 1
+            if budget[0] < 0:
+                return
+            p = os.path.join(d, x)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if keep(st.st_mode):
+                yield p
+            if stat.S_ISDIR(st.st_mode) and st.st_dev == dev and n < depth and p != '/dev/pts':
+                todo.append((p, n + 1))
+mounts = []
+for m in open('/proc/self/mountinfo', 'rb'):
+    f = m.split()
+    sep = f.index(b'-')
+    point = os.fsdecode(re.sub(rb'\\([0-7]{3})', lambda o: bytes([int(o[1], 8)]), f[4]))
+    mounts.append((point, f[sep + 1].decode(), [t.decode() for t in f[6:sep]], f[2], os.fsdecode(f[3])))
+allowed = set(sys.argv[2].split()) if len(sys.argv) > 2 else set()
+top = [(dev, root) for p, _, _, dev, root in mounts if p == '/'][-1:]
+def own(point, dev, root):
+    # The allowed ones; the unit's own memory and API file systems; systemd's own in every unit with a root directory
+    # (empty, or the host's os-release); a part of the unit's own root (a stand-in ProtectHome/ProtectSystem make
+    # there) or an empty, unreadable one of systemd's (/systemd/inaccessible/).
+    return point in allowed or point in ('/run', '/tmp', '/var/tmp', '/run/systemd/incoming',
+                                         '/run/host/.os-release-stage') or \
+        any(point == a or point.startswith(a + '/') for a in ('/proc', '/sys', '/dev')) or \
+        root.startswith('/systemd/inaccessible/') or \
+        (point != '/' and top == [(dev, top[0][1])] and root.startswith(top[0][1].rstrip('/') + '/'))
+foreign = [f'{p} ({k})' for p, k, _, dev, root in mounts if not own(p, dev, root)]
+receive = [p for p, _, tags, _, _ in mounts if any(t.startswith(('master:', 'shared:')) for t in tags)]
+devs = [p[5:] for p in walk('/dev', lambda m: stat.S_ISCHR(m) or stat.S_ISBLK(m))
+        if p[5:] not in ('null', 'zero', 'full', 'random', 'urandom', 'tty', 'ptmx')]
+def entries(d):
+    try:
+        return [os.path.join(d, x) for x in os.listdir(d)]
+    except OSError:
+        return []
+mnt = entries('/mnt') + entries('/media')
+socks = [p for d in ('/tmp', '/var/tmp', '/run', '/dev/shm') for p in walk(d, stat.S_ISSOCK)]
+whole = budget[0] >= 0
+def few(xs):
+    return ', '.join(sorted(xs)[:8]) + (' ...' if len(xs) > 8 else '')
 if sys.argv[1] == 'host':
     print('host: AF_VSOCK ' + ('opens here: the wall matters' if vsock == 'open' else
                                f'does not open here either ({vsock}): the refusal inside shows nothing on this host'))
@@ -481,6 +661,10 @@ if sys.argv[1] == 'host':
                                f'gives no ring here either ({uring})'))
     for k, v in calls.items():
         print(f'host: {k} system calls ' + ('work here: the wall matters' if v == 'open' else 'do not work here'))
+    for what, xs in (('devices besides the pseudo ones', devs), ('mounts no unit has', foreign),
+                     ('mounts that receive later mounts', receive), ('entries in /mnt and /media', mnt),
+                     ('sockets', socks)):
+        print(f'host: {what}: ' + (few(xs) if xs else 'none here either: the refusal inside shows nothing'))
     sys.exit(0)
 bad = 0
 def line(ok, text):
@@ -495,11 +679,19 @@ for k, v in calls.items():
     line(v in ('killed', 'none'), f'{k} system calls ' + {
         'killed': 'end the process (SIGSYS)', 'none': 'do not work on this kernel', 'open': 'work inside',
         'untried': 'could not be tried'}[v])
+line(not devs, 'devices: ' + (f'host ones inside: {few(devs)}' if devs else 'only the pseudo ones'))
+line(bool(allowed) and not foreign, 'mounts: ' + (f'not allowed inside: {few(foreign)}' if foreign else
+                                                  'only the allowed ones' if allowed else 'no allow list given'))
+line(not receive, 'later mounts: ' + (f'the host\'s reach {few(receive)}' if receive else
+                                      'no mount inside receives the host\'s'))
+line(not mnt, '/mnt and /media: ' + (f'hold {few(mnt)} inside' if mnt else 'nothing inside'))
+line(whole and not socks, 'sockets: ' + (f'{few(socks)} inside' if socks else 'none in /tmp, /var/tmp, /run, /dev/shm'
+                                         if whole else 'too many files to look through'))
 sys.exit(bad)
 EOF
 
 check_net() {
-  local url=$1 target host port user resolv own rc=0
+  local url=$1 target host port user resolv own blocked seen rc=0
   local -a pairs=() props
   shift
   [[ $url =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] || die "check-net: not a plain http(s) URL: $url"
@@ -517,21 +709,23 @@ check_net() {
   check_users
   resolv=$(resolv_target)
   own=$(own_address)
-  /usr/bin/python3 -I -c "$WALLS" host
   setup
   user=$(free_user)
   reset_user "$user"
-  net_up "$user" "$own"
-  sandbox "$user" "$resolv" "$own"
+  merge_own "$own"
+  net_up "$user"
+  sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/check-net.root" ''
+  /usr/bin/python3 -I -c "$WALLS" host "$seen"
   echo "check-net: as $user, in its namespace fork-fleet-$user"
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-net --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$own" "${pairs[@]}" </dev/null ||
+    -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null ||
     rc=$?
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-walls --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job </dev/null || rc=$((rc | 2))
+    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" </dev/null || rc=$((rc | 2))
   ((rc == 0)) || die "check-net: the runners' network or walls are NOT as they must be (see above): do not use this pool"
   echo "check-net: the runners reach $url and none of the $((${#pairs[@]} / 2)) services named nor this host's own" \
-    "public address; AF_VSOCK, io_uring and 32-bit system calls are closed"
+    "public address; AF_VSOCK, io_uring and 32-bit system calls are closed; no host device, socket or mount but the" \
+    "allowed ones is there, and no mount of the host's reaches it later"
 }
 
 prune() {
@@ -540,16 +734,17 @@ prune() {
 }
 
 # Root's rm -rf here cannot be led astray (no directory in it swapped for a symlink mid-walk, as in /dev/shm before):
-# it removes a copy, or an env file in root's 0700 RUN_DIR, only once no unit of that name is loaded. The unit's
-# processes went with its cgroup, a runner user has no other way to run anything (no login, lingering, cron or at),
-# and every other unit, of that user too, sees the copy read-only (ProtectSystem=strict, ReadWritePaths=its own copy).
+# it removes a copy, or an env file or unit root (job_fs) in root's 0700 RUN_DIR, only once no unit of that name is
+# loaded. The unit's processes went with its cgroup, a runner user has no other way to run anything (no login,
+# lingering, cron or at), and no other unit, of that user too, has the copy in its file system (job_fs).
 prune_now() {
   local live entry name
   live=$(active)
-  for entry in "$WORK_ROOT"/* "$RUN_DIR"/*.env; do
+  for entry in "$WORK_ROOT"/* "$RUN_DIR"/*.env "$RUN_DIR"/*.root; do
     [[ -e $entry && ! -L $entry ]] || continue
     name=${entry##*/}
     name=${name%.env}
+    name=${name%.root}
     [[ $name =~ $NAME ]] || continue
     if grep -qxF -- "$name" <<<"$live"; then continue; fi
     rm -rf --one-file-system -- "$entry"
@@ -566,10 +761,11 @@ case "${1-}:$#" in
     "$SYSTEMCTL" stop -- "fork-fleet-$2.service"
     ;;
   prune:1) prune ;;
+  refresh-net:1) refresh_net ;;
   check-net:*)
     (($# >= 3)) || die "usage: check-net URL HOST:PORT..."
     shift
     check_net "$@"
     ;;
-  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | check-net URL HOST:PORT..." ;;
+  *) die "usage: start NAME | ready NEWEST | active | fits MB | stop NAME | prune | refresh-net | check-net URL HOST:PORT..." ;;
 esac

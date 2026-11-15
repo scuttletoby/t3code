@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
-import copy, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, stat, subprocess, sys, tempfile
+import copy, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat, subprocess, sys
+import tempfile
 import unittest, urllib.error, urllib.parse
 from contextlib import redirect_stdout
 from functools import partial
@@ -11,6 +12,12 @@ sys.dont_write_bytecode = True   # importing fork-fleet.py must not leave __pyca
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 LAUNCH = os.path.join(HERE, 'fork-fleet-launch.sh')
+
+
+def job_paths():
+    """THE allow list of system paths a fleet job sees (fork-fleet-job-paths.txt, as the launcher reads it)."""
+    with open(os.path.join(HERE, 'fork-fleet-job-paths.txt')) as f:
+        return [x.strip() for x in f if x.strip() and not x.lstrip().startswith('#')]
 _spec = importlib.util.spec_from_file_location('fork_fleet', os.path.join(HERE, 'fork-fleet.py'))
 ff = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ff)
@@ -868,6 +875,7 @@ class FakeLauncher:
     def __init__(self, pool):
         self.pool, self.units, self.memory_ok, self.template = pool, set(), True, NEWEST_RUNNER
         self.started, self.stopped, self.fits_asked, self.pruned, self.fail = [], [], [], 0, None
+        self.refreshed = 0
 
     def run(self, cmd, input=None, capture_output=True, text=True, timeout=None):
         launch = POOLS[self.pool]['launch']
@@ -890,6 +898,8 @@ class FakeLauncher:
             self.units.discard(args[0])
         elif verb == 'prune':
             self.pruned += 1
+        elif verb == 'refresh-net':
+            self.refreshed += 1
         elif verb == 'ready':
             if tuple(map(int, self.template.split('.'))) < tuple(map(int, args[0].split('.'))):
                 return subprocess.CompletedProcess(cmd, 1, '', f'fork-fleet-launch: the runner template is actions/runner '
@@ -1177,6 +1187,31 @@ class Dispatch(unittest.TestCase):
         self.dispatch()
         self.assertEqual(self.started(), [self.name(11)])
 
+    def test_the_own_address_is_looked_up_every_pass_and_a_failed_lookup_starts_nothing(self):
+        """Fix round 1 (#191, both lenses' minor 1): every pass the launcher looks this host's own public address up
+        again (refresh-net blocks a new one for running jobs too). When no lookup answers, the last block stays and
+        no runner starts on that pool, its leftovers are still cleaned up, it is said once, and the next pass that
+        gets an answer starts the job."""
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+        self.registration(40, status='offline')
+        self.fake[WAITING].fail = 'refresh-net'
+        self.dispatch()
+        log = self.dispatch()
+        self.assertEqual((self.jits(), self.started()), ([], []))
+        self.assertEqual(self.log.count(f'until it answers (the last block stays)'), 1)
+        self.assertEqual(log, '')
+        self.assertNotIn(self.name(40), [r['name'] for r in self.gh.runners])   # cleanup goes on
+        self.assertEqual(self.fake[WAITING].pruned, 2)
+        self.assertEqual(json.loads(self.gh.variables[POOLS[WAITING]['beacon']])['free'], 0)
+        self.fake[WAITING].fail = None
+        self.dispatch()
+        self.assertEqual(self.started(), [self.name(11)])
+        self.assertEqual({n: f.refreshed for n, f in self.fake.items()}, {n: 3 for n in self.fake if n != WAITING} |
+                         {WAITING: 1})   # every pass, each pool (the failed ones are not counted)
+        self.fake[WAITING].fail = 'refresh-net'
+        self.dispatch()
+        self.assertEqual(self.log.count(f'until it answers (the last block stays)'), 2)   # a new outage: said again
+
     def test_the_newest_runner_release_is_read_hourly(self):
         reads = lambda: len([c for c in self.gh.calls if c[1] == '/repos/actions/runner/releases/latest'])
         self.gh.trouble.append(('GET /repos/actions/runner/releases/latest', http_error(502)))
@@ -1346,14 +1381,17 @@ class Launcher(unittest.TestCase):
         'systemctl': '#!/usr/bin/env bash\n[[ ! -e $REC/systemctl-fails ]] || exit 1\n'
                      'case $1 in list-units) cat -- "$REC/units" 2>/dev/null; exit 0 ;; '
                      'show) cat -- "$REC/user-${!#}" 2>/dev/null; exit 0 ;; '
-                     'stop) printf "%s\\n" "$*" >> "$REC/stopped" ;; *) exit 2 ;; esac\n',
+                     'stop) printf "%s\\n" "$*" >> "$REC/stopped" ;; '
+                     'set-property) printf "%s\\n" "$*" >> "$REC/set-property" ;; *) exit 2 ;; esac\n',
         'chown': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/chown"\n',
         # Processes of a runner user: a file $REC/procs-UID; setpriv's kill(-1) ends them unless procs-stay exists.
         'pgrep': '#!/usr/bin/env bash\n[[ $1 == -u ]] || exit 3\nprintf "%s\\n" "$2" >> "$REC/pgrep"\n'
                  '[[ -e $REC/procs-$2 ]]\n',
         'setpriv': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/setpriv"\n'
                    '[[ -e $REC/procs-stay ]] || rm -f -- "$REC"/procs-*\n',
-        'nft': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/nft-args"\ncat > "$REC/nft"\n[[ ! -e $REC/nft-fails ]]\n',
+        # nft list: the table is there when $REC/nft is (the last one applied); nft -f -: applies (records) it.
+        'nft': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/nft-args"\n'
+               'if [[ $1 == list ]]; then [[ -e $REC/nft ]]; exit; fi\ncat > "$REC/nft"\n[[ ! -e $REC/nft-fails ]]\n',
         'ip': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/ip"\n[[ ! -e $REC/ip-fails ]] || exit 1\n'
               'case "$*" in "-n "*" link show lo") grep -qxF -- "$2" "$REC/netns" 2>/dev/null ;; '
               '"netns add "*) printf "%s\\n" "$3" >> "$REC/netns" ;; '
@@ -1413,6 +1451,8 @@ class Launcher(unittest.TestCase):
         for d in ('template', 'template/bin'):
             os.chmod(self.path(d), 0o755)   # whatever this machine's umask is
         self.hook = self.write('hook.sh', '#!/bin/sh\n', 0o755)
+        with open(os.path.join(os.path.dirname(LAUNCH), 'fork-fleet-job-paths.txt')) as f:
+            self.job_paths = self.write('job-paths.txt', f.read(), 0o644)   # as installed: writable by root only
         self.write('meminfo', 'MemTotal:       16384000 kB\nMemAvailable:    8388608 kB\n', 0o644)
         self.conf()
 
@@ -1432,7 +1472,7 @@ class Launcher(unittest.TestCase):
                         RESERVE_MB='2048', MAX_SECONDS='3600', NET_BASE='10.204', RESOLV_CONF=self.path('resolv.conf'),
                         IP_FORWARD=self.path('ip_forward'), OWN_ADDRESS_URLS=self.OWN_URLS,
                         MEMINFO=self.path('meminfo'), SYSTEMD_RUN=self.path('bin/systemd-run'),
-                        SYSTEMCTL=self.path('bin/systemctl'))
+                        SYSTEMCTL=self.path('bin/systemctl'), JOB_PATHS=self.job_paths)
         settings.update(over)
         self.write('launch.conf', '# fleet\n\n' + ''.join(f'{k}={v}\n' for k, v in settings.items()) + extra, 0o600)
 
@@ -1450,17 +1490,30 @@ class Launcher(unittest.TestCase):
         except FileNotFoundError:
             return None
 
-    def sandbox(self, user):
+    def sandbox(self, user, root, rw=''):
         """The unit's sandbox, start's and check-net's alike: its own network namespace, the private ranges refused in
-        the kernel too, its own /run, /dev/shm, /tmp and /var/tmp (so root never cleans a shared one), no /home, no
-        other user's processes, its own IPC, and the walls (no AF_VSOCK, io_uring or 32-bit system calls)."""
+        the kernel too, of this host's files only the allow list (job_fs: its own root, the system paths read-only
+        and one mount each, its copy, no mount of the host's later), its own /run, /dev/shm, /tmp and /var/tmp (so
+        root never cleans a shared one), no /home, no other user's processes, its own IPC, only the pseudo devices,
+        and the walls (no AF_VSOCK, io_uring or 32-bit system calls)."""
         props = (f'NetworkNamespacePath=/run/netns/fork-fleet-{user}', f'IPAddressDeny={self.PRIVATE4} {self.OWN} ::/0',
-                 'IPAddressAllow=localhost',
+                 'IPAddressAllow=localhost', f'RootDirectory={root}', 'MountAPIVFS=yes', 'MountFlags=private',
+                 'BindReadOnlyPaths=' + ' '.join(f'{p}:{p}:norbind' for p in self.allowed()),
+                 *([f'BindPaths={rw}:{rw}:norbind'] if rw else []),
                  'TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 /var/tmp:size=1G,mode=1777',
                  f'BindReadOnlyPaths={self.path("resolv.conf")}:{os.path.realpath("/etc/resolv.conf")}',
                  'NoNewPrivileges=yes', 'ProtectSystem=strict', 'ProtectHome=yes', 'ProtectProc=invisible',
-                 'PrivateIPC=yes', 'RemoveIPC=yes', *self.WALL_PROPS)
+                 'PrivateIPC=yes', 'RemoveIPC=yes', 'PrivateDevices=yes', *self.WALL_PROPS)
         return [a for prop in props for a in ('-p', prop)]
+
+    def allowed(self, extra=()):
+        """The paths job_fs binds read-only here: JOB_PATHS's (one source: the file itself) and ALLOW_PATHS's that are
+        here and no symlink, then the hook."""
+        return [p for p in (*job_paths(), *extra) if os.path.exists(p) and not os.path.islink(p)] + [self.hook]
+
+    def seen(self, rw=''):
+        """The mount points check-net's probe is told to allow."""
+        return ' '.join(['/', *self.allowed(), *([rw] if rw else []), os.path.realpath('/etc/resolv.conf')])
 
     def test_start(self):
         got = self.launch('start', self.NAME, stdin=self.INPUT)
@@ -1470,7 +1523,8 @@ class Launcher(unittest.TestCase):
         # Exactly these: no PrivateTmp (it leaves /dev/shm shared), nothing dropped.
         self.assertEqual(args, ['--quiet', '--unit', f'fork-fleet-{self.NAME}', '--collect', '--uid', 'nobody',
                                 '--working-directory', dest, '-p', 'Type=exec', '-p', 'KillMode=control-group',
-                                '-p', f'EnvironmentFile={run_dir}/{self.NAME}.env', *self.sandbox('nobody'),
+                                '-p', f'EnvironmentFile={run_dir}/{self.NAME}.env',
+                                *self.sandbox('nobody', f'{run_dir}/{self.NAME}.root', dest),
                                 '-p', f'ReadWritePaths={dest}', '-p', 'RuntimeMaxSec=3600', '--', f'{dest}/run.sh'])
         # HOME and TMPDIR inside the copy, which goes once its unit is gone: nothing of a job reaches the next one.
         self.assertEqual(self.rec_text('env'), self.INPUT + f'HOME={dest}/home\nTMPDIR={dest}/tmp\n'
@@ -1538,6 +1592,54 @@ class Launcher(unittest.TestCase):
         self.assertNotEqual(got.returncode, 0)
         self.assertIn(word, got.stderr)
         self.assertIsNone(self.rec_text('systemd-run'))
+        return got
+
+    def test_a_job_sees_only_the_allow_list(self):
+        """Fix round 1 (#191, security minor 3), the one mount rule (fork-fleet-job-paths.txt, read by job_fs): the
+        unit's root is an empty folder of its own holding only the list's symlinks, and of this host's files it gets
+        the list's paths (one mount each, read-only), ALLOW_PATHS's, the hook and its copy, nothing else. So a drive
+        mounted anywhere else (a Windows drive at /c, a share at /data, /mnt, /media) is not in it, before or after the
+        job starts, and the host's /run (WSL's interop sockets) is a new, empty one. LauncherAsRoot proves it for real
+        (hidden_from_job)."""
+        extra = '/var/cache'
+        self.conf(ALLOW_PATHS=f'{extra},/no-such-fork-fleet-path')
+        self.start(self.NAME)
+        dest, root = self.path(f'var/runners/{self.NAME}'), self.path(f'run/{self.NAME}.root')
+        args = self.rec_text('systemd-run').splitlines()
+        props = [args[i + 1] for i, a in enumerate(args) if a == '-p']
+        self.assertIn(f'RootDirectory={root}', props)
+        self.assertIn('MountFlags=private', props)
+        binds = [x.split(':')[0] for p in props if p.startswith(('BindReadOnlyPaths=', 'BindPaths='))
+                 for x in p.split('=', 1)[1].split()]
+        self.assertEqual(sorted(binds), sorted([*self.allowed([extra]), dest, self.path('resolv.conf')]))
+        self.assertIn('TemporaryFileSystem=/run /dev/shm:size=1G,mode=1777 /tmp:size=1G,mode=1777 '
+                      '/var/tmp:size=1G,mode=1777', props)
+        links = {os.path.join('/', os.path.relpath(os.path.join(d, x), root)): os.readlink(os.path.join(d, x))
+                 for d, dirs, files in os.walk(root) for x in dirs + files if os.path.islink(os.path.join(d, x))}
+        self.assertEqual(links, {p: os.readlink(p) for p in job_paths() if os.path.islink(p)})
+        for d, dirs, files in os.walk(root):
+            for x in files:
+                self.assertTrue(os.path.islink(os.path.join(d, x)), os.path.join(d, x))
+        self.write('rec/units', '', 0o644)
+        self.assertEqual(self.launch('prune').returncode, 0)
+        self.assertFalse(os.path.lexists(root))   # it goes with its unit
+
+    def test_a_path_that_may_hold_data_is_never_allowed(self):
+        """ALLOW_PATHS and the list itself: a plain absolute path, never one a job has its own of or that holds
+        data of this host's; the list is root's only."""
+        for bad in ('/home/x', '/root', '/tmp/x', '/run/x', '/proc', '/a/../b', '/a/./b', 'usr', '/a:b', '/a b'):
+            with self.subTest(bad):
+                self.conf(ALLOW_PATHS=bad)
+                got = self.launch('start', self.NAME, stdin=self.INPUT)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIsNone(self.rec_text('systemd-run'))
+        self.conf()
+        os.chmod(self.job_paths, 0o664)
+        self.refused('must be writable by its owner only')
+        os.chmod(self.job_paths, 0o644)
+        with open(self.job_paths, 'a') as f:
+            f.write('/home\n')
+        self.refused('a job never sees it from this host')
 
     def test_a_configured_template_is_refused(self):
         for f in ('.env', '.path', '.runner', '.credentials', '.credentials_rsaparams'):
@@ -1788,7 +1890,8 @@ class Launcher(unittest.TestCase):
 
     def test_own_address_is_looked_up_before_every_start_and_refused(self):
         """D1: this host's own public address (the way back into its forwarded ports): looked up at each URL before
-        every start, blocked by the table and the unit. A failed, odd, private or disagreeing lookup: no runner."""
+        every start, blocked by the table and the unit. An odd, private or missing answer is left out; no answer at
+        all: no runner."""
         self.write('rec/own-a', ' 203.0.113.9\r\n', 0o644)
         self.write('rec/own-b', '203.0.113.9', 0o644)
         self.start('fleet-vm-t3code-11')
@@ -1797,22 +1900,82 @@ class Launcher(unittest.TestCase):
         self.assertIn(f'IPAddressDeny={self.PRIVATE4} 203.0.113.9 ::/0', self.rec_text('systemd-run').splitlines())
         os.remove(os.path.join(self.rec, 'systemd-run'))
         self.write('rec/units', '', 0o644)
-        cases = {'no answer': (None, 'own-b.test/ gave no answer'), 'two answers': ('203.0.113.8', 'lookups differ'),
-                 'a web page': ('<html>', 'answered no IPv4 address'), 'leading zero': ('203.0.113.09', 'no IPv4'),
+        cases = {'a web page': ('<html>', 'answered no IPv4 address'), 'leading zero': ('203.0.113.09', 'no IPv4'),
                  'too big': ('203.0.113.256', 'no IPv4'), 'a LAN address': ('192.168.1.1', 'not a public address'),
-                 'CGNAT': ('100.64.0.1', 'not a public address'), 'loopback': ('127.0.0.1', 'not a public address')}
+                 'CGNAT': ('100.64.0.1', 'not a public address'), 'loopback': ('127.0.0.1', 'not a public address'),
+                 'no answer': (None, 'gave no answer')}
         for name, (answer, word) in cases.items():
             with self.subTest(name):
-                if answer is None:
-                    os.remove(self.path('rec/own-b'))
-                else:
-                    self.write('rec/own-b', answer + '\n', 0o644)
-                self.refused(word)
-                self.refused(word, 'check-net', 'https://example.com/', f'127.0.0.1:{self.server()}')
+                for x in 'ab':
+                    if answer is None:
+                        os.remove(self.path(f'rec/own-{x}'))
+                    else:
+                        self.write(f'rec/own-{x}', answer + '\n', 0o644)
+                got = self.refused('no lookup (OWN_ADDRESS_URLS) gave this host\'s public IPv4 address')
+                self.assertIn(word, got.stderr)
+                self.refused('no lookup', 'check-net', 'https://example.com/', f'127.0.0.1:{self.server()}')
         for bad in ('http://own-a.test/', 'https://own-a.test/,', 'https://a.test/;id', ''):
             with self.subTest(bad):
                 self.conf(OWN_ADDRESS_URLS=bad)
                 self.refused('OWN_ADDRESS_URLS is a comma-separated list of https URLs', 'active')
+
+    def test_every_address_the_lookups_give_is_blocked(self):
+        """Fix round 1 (#191, correctness minor 2): two WAN links (each lookup sees another address) and one lookup
+        that is down keep the pool open: every public address any lookup gives is blocked (the union), and an address
+        blocked before stays blocked (the last 4, newest first), so a lookup that is down this time opens nothing."""
+        self.write('rec/own-a', '203.0.113.8\n', 0o644)
+        self.write('rec/own-b', '203.0.113.9\n', 0o644)
+        self.start('fleet-vm-t3code-11')
+        for a in ('203.0.113.8', '203.0.113.9'):
+            self.assertIn(f'    iifname "ffh-*" ip daddr {a} counter reject with icmpx admin-prohibited\n',
+                          self.rec_text('nft'))
+        self.assertIn(f'IPAddressDeny={self.PRIVATE4} 203.0.113.8 203.0.113.9 ::/0',
+                      self.rec_text('systemd-run').splitlines())
+        os.remove(self.path('rec/own-b'))   # one lookup down, the other one answers: the pool stays open
+        self.write('rec/units', '', 0o644)
+        got = self.launch('start', 'fleet-vm-t3code-12', stdin=self.INPUT)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn('own-b.test/ gave no answer', got.stderr)
+        self.assertIn(f'IPAddressDeny={self.PRIVATE4} 203.0.113.8 203.0.113.9 ::/0',
+                      self.rec_text('systemd-run').splitlines())   # .9, seen before, stays blocked
+        for i, new in enumerate(('198.51.100.1', '198.51.100.2', '198.51.100.3', '198.51.100.4')):
+            self.write('rec/own-a', f'{new}\n', 0o644)
+            self.write('rec/units', '', 0o644)
+            self.start(f'fleet-vm-t3code-{13 + i}')
+        self.assertIn(f'IPAddressDeny={self.PRIVATE4} 198.51.100.4 198.51.100.3 198.51.100.2 198.51.100.1 ::/0',
+                      self.rec_text('systemd-run').splitlines())
+        self.assertEqual(self.rec_text('nft').count('ip daddr 198.51.100.'), 4)
+        self.assertNotIn('203.0.113.', self.rec_text('nft'))
+
+    def test_refresh_net_blocks_a_new_address_for_running_jobs(self):
+        """Fix round 1 (#191, both lenses' minor 1): the address changes while a job runs. refresh-net (every
+        dispatcher pass) looks it up again, re-applies the table (it covers every runner's link) and adds it to each
+        running unit's IPAddressDeny; nothing changes when nothing would; no answer at all fails and keeps the last
+        block."""
+        self.start(self.NAME)
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        self.assertEqual(self.rec_text('nft-args'), '-f -\nlist table inet fork_fleet\n')   # the same: not applied
+        self.assertIsNone(self.rec_text('set-property'))
+        for x in 'ab':
+            self.write(f'rec/own-{x}', '203.0.113.77\n', 0o644)
+        got = self.launch('refresh-net')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        for a in ('203.0.113.77', self.OWN):   # the new one, and the old one stays
+            self.assertIn(f'    iifname "ffh-*" ip daddr {a} counter reject with icmpx admin-prohibited\n',
+                          self.rec_text('nft'))
+        self.assertEqual(self.rec_text('set-property'),
+                         f'set-property --runtime -- fork-fleet-{self.NAME}.service IPAddressDeny=203.0.113.77 {self.OWN}\n')
+        os.remove(os.path.join(self.rec, 'nft'))   # the table went (someone flushed the ruleset): made again
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        self.assertIn('ip daddr 203.0.113.77 counter reject', self.rec_text('nft'))
+        table = self.rec_text('nft')
+        for x in 'ab':
+            os.remove(self.path(f'rec/own-{x}'))
+        got = self.launch('refresh-net')
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('no lookup', got.stderr)
+        self.assertEqual(self.rec_text('nft'), table)   # the last block stays
+        self.assertIn('refresh-net', self.launch('nope').stderr)
 
     def test_a_runner_user_in_another_group_is_refused(self):
         """A runner user also in, say, docker (root on the host) or adm (the logs) is never handed a job."""
@@ -1889,7 +2052,8 @@ class Launcher(unittest.TestCase):
         dash = args.index('--')
         # The very sandbox a job gets (the same props as start), as a free runner user, in its namespace.
         self.assertEqual(args[:dash], ['--quiet', '--wait', '--pipe', '--collect', '--unit', 'fork-fleet-check-net',
-                                       '--uid', 'nobody', *self.sandbox('nobody'), '-p', 'RuntimeMaxSec=120'])
+                                       '--uid', 'nobody', *self.sandbox('nobody', self.path('run/check-net.root')),
+                                       '-p', 'RuntimeMaxSec=120'])
         self.assertEqual(args[dash + 1:dash + 4], ['/bin/bash', '--norc', '--noprofile'])
         self.assertEqual(args[dash + 4], '-c')
         self.assertEqual(args[dash + 6:], ['check-net', 'https://example.com/', self.OWN, '127.0.0.1', str(port)])
@@ -1897,8 +2061,10 @@ class Launcher(unittest.TestCase):
         args = self.waited('fork-fleet-check-walls')
         dash = args.index('--')
         self.assertEqual(args[:dash], ['--quiet', '--wait', '--pipe', '--collect', '--unit', 'fork-fleet-check-walls',
-                                       '--uid', 'nobody', *self.sandbox('nobody'), '-p', 'RuntimeMaxSec=60'])
-        self.assertEqual([args[dash + 1:dash + 4], args[-1]], [['/usr/bin/python3', '-I', '-c'], 'job'])
+                                       '--uid', 'nobody', *self.sandbox('nobody', self.path('run/check-net.root')),
+                                       '-p', 'RuntimeMaxSec=60'])
+        self.assertEqual(args[dash + 1:dash + 4], ['/usr/bin/python3', '-I', '-c'])
+        self.assertEqual(args[dash + 5:], ['job', self.seen()])
         self.assertEqual(self.rec_text('ip').splitlines(), self.ip_calls('nobody', self.NOBODY_NET))
         self.write('rec/probe-exit', '1', 0o644)
         got = self.check_net(f'127.0.0.1:{port}')
@@ -1925,6 +2091,16 @@ class Launcher(unittest.TestCase):
             self.assertRegex(got.stdout, r'FAIL  io_uring (gives a ring inside|is not refused by the unit)')
         self.assertIn(f'ok    http://127.0.0.1:{port}/ answers (HTTP 200)', got.stdout)
         self.assertIn('NOT as they must be', got.stderr)
+        # This host's own file system, as no unit has it: its devices, its mounts outside the list, and mounts that
+        # receive the host's later ones (systemd makes / shared) all fail.
+        with open('/proc/self/mountinfo') as f:
+            info = [line.split() for line in f]
+        if os.path.exists('/dev/console'):
+            self.assertIn('FAIL  devices: host ones inside:', got.stdout)
+        if any(f[4].startswith(('/boot', '/home', '/mnt', '/media', '/srv', '/run/')) for f in info):
+            self.assertIn('FAIL  mounts: not allowed inside:', got.stdout)
+        if any(t.startswith(('shared:', 'master:')) for f in info for t in f[6:f.index('-')]):
+            self.assertIn("FAIL  later mounts: the host's reach", got.stdout)
 
     def test_the_walls_hold_in_a_real_systemd_unit(self):
         """The walls' probe in a real unit of this user's systemd, with the walls check-net gives it: AF_VSOCK,
@@ -1941,45 +2117,122 @@ class Launcher(unittest.TestCase):
         self.assertIn('ready NEWEST', self.launch().stderr)
         self.assertIn('check-net URL HOST:PORT...', self.launch().stderr)
 
-    def test_the_walls_proof_parses_and_needs_root(self):
-        """The proof for a real host (WSL2 first) runs as root only, so here: it parses, refuses to run, changes
-        nothing, and drives this launcher's check-net."""
-        proof = os.path.join(HERE, 'fork-fleet-walls-proof.sh')
-        self.assertEqual(subprocess.run(['bash', '-n', proof]).returncode, 0)
-        if os.geteuid() != 0:
-            got = subprocess.run(['bash', proof], capture_output=True, text=True, timeout=30)
-            self.assertEqual((got.returncode, got.stdout), (1, ''))
-            self.assertIn('run it as root', got.stderr)
-        with open(proof) as f:
-            self.assertIn('"$launch" check-net https://github.com', f.read())
 
-
-def real_walls(test, args, systemd_run, *more):
-    """Runs check-net's walls' probe (args: its recorded systemd-run argv) in a real unit of `systemd_run` with only
-    the walls and NoNewPrivileges of the recorded sandbox (the rest, a namespace and a runner user, is not this test's):
-    every wall line says ok. Then without the walls: where this host has io_uring, the probe fails."""
+def real_walls(test, args, systemd_run, *more, full=False):
+    """Runs check-net's walls' probe (args: its recorded systemd-run argv) in a real unit of `systemd_run`. Here (a
+    user's systemd, no mount namespace) only with the walls and NoNewPrivileges of the recorded sandbox: every system
+    call line says ok. full (root, CI): with all of the recorded sandbox but its network (a namespace that is not this
+    test's): every line says ok (devices, mounts, later mounts, sockets too), the tools a job uses work inside, and a
+    mount the host makes after the unit started does not reach it (the red check: without MountFlags=private it does).
+    Then without the walls: where this host has io_uring, the probe fails."""
     if subprocess.run([*systemd_run, '--wait', '--quiet', '--collect', '--', '/bin/true'], capture_output=True,
                       timeout=60).returncode != 0:
         test.skipTest(f'no systemd to run a unit with: {" ".join(systemd_run)}')
     dash = args.index('--')
-    walls = [args[i + 1] for i in range(dash) if args[i] == '-p' and args[i + 1].split('=')[0] in
+    props = [args[i + 1] for i in range(dash) if args[i] == '-p']
+    walls = [p for p in props if p.split('=')[0] in
              ('RestrictAddressFamilies', 'SystemCallFilter', 'SystemCallArchitectures', 'NoNewPrivileges')]
     test.assertEqual(len(walls), 4, walls)
-    unit = [*systemd_run, '--wait', '--pipe', '--quiet', '--collect', *more]
+    if full:
+        walls = [p for p in props if p.split('=')[0] not in ('NetworkNamespacePath', 'IPAddressDeny', 'IPAddressAllow')]
+    unit = [*systemd_run, '--wait', '--pipe', '--quiet', '--collect', *more, *(a for w in walls for a in ('-p', w))]
     probe = args[dash + 1:]
-    got = subprocess.run([*unit, *(a for w in walls for a in ('-p', w)), '--', *probe], capture_output=True, text=True,
-                         timeout=120)
-    test.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+    got = subprocess.run([*unit, '--', *probe], capture_output=True, text=True, timeout=120)
     test.assertRegex(got.stdout, r'ok    AF_VSOCK is refused')
     test.assertIn('ok    io_uring is refused (ENOSYS)', got.stdout)
     if os.uname().machine == 'x86_64':
         test.assertRegex(got.stdout, r'ok    i386 system calls (end the process \(SIGSYS\)|do not work on this kernel)')
         test.assertRegex(got.stdout, r'ok    x32 system calls (end the process \(SIGSYS\)|do not work on this kernel)')
-    test.assertNotIn('FAIL', got.stdout)
-    bare = subprocess.run([*unit, '-p', 'NoNewPrivileges=yes', '--', *probe], capture_output=True, text=True, timeout=120)
+    test.assertNotRegex(got.stdout, r'FAIL  (AF_VSOCK|io_uring|i386|x32)')
+    if full:
+        test.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        test.assertNotIn('FAIL', got.stdout)
+        for want in ('ok    devices: only the pseudo ones', 'ok    mounts: only the allowed ones',
+                     "ok    later mounts: no mount inside receives the host's", 'ok    /mnt and /media: nothing inside',
+                     'ok    sockets: none in /tmp, /var/tmp, /run, /dev/shm'):
+            test.assertIn(want, got.stdout)
+        tools = [t for t in (['git', '--version'], ['node', '--version'], ['java', '-version'], ['docker', '--version'])
+                 if shutil.which(t[0]) and os.path.realpath(shutil.which(t[0])).startswith(('/usr/', '/etc/'))]
+        for t in tools + [['head', '-c', '16', '/dev/urandom']]:
+            ran = subprocess.run([*unit, '--', shutil.which(t[0]), *t[1:]], capture_output=True, timeout=120)
+            test.assertEqual(ran.returncode, 0, (t, ran.stdout, ran.stderr))
+        hidden_from_job(test, unit, walls)
+    bare = subprocess.run([*systemd_run, '--wait', '--pipe', '--quiet', '--collect', *more, '-p', 'NoNewPrivileges=yes',
+                           '--', *probe], capture_output=True, text=True, timeout=120)
     if 'io_uring gives a ring' in subprocess.run(probe, capture_output=True, text=True, timeout=60).stdout:
         test.assertEqual(bare.returncode, 1, bare.stdout + bare.stderr)
         test.assertIn('FAIL  io_uring gives a ring inside', bare.stdout)
+
+
+LATE = """import json, os, sys
+print('started', flush=True)
+sys.stdin.readline()
+print(json.dumps({p: os.path.lexists(p) for p in sys.argv[1:]}), flush=True)
+"""
+
+
+def without(cmd, prop):
+    """cmd without its `-p prop` pair."""
+    out = []
+    for a in cmd:
+        if a == prop and out and out[-1] == '-p':
+            out.pop()
+        else:
+            out.append(a)
+    return out
+
+
+def hidden_from_job(test, unit, props):
+    """What a job must never see, whenever the host makes it (as root, in a real unit with the recorded sandbox):
+    a drive mounted outside /mnt and /media (a Windows drive at /c, a share at /data) before the job starts and one
+    mounted after it started; a socket in the host's /run (where WSL's interop sockets live, /run/WSL); and a mount the
+    host makes under an ALLOWED path after the job started (a share mounted while a job runs). The red check: without
+    MountFlags=private the last one does reach the job (the rest stay hidden: they are not in its root at all)."""
+    import json
+    allow = [p for p in props if p.startswith('BindReadOnlyPaths=') and ':norbind' in p][0]
+    late = [x.split(':')[0] for x in allow.split('=', 1)[1].split() if x.split(':')[0].startswith('/var/lib/')][0]
+    sub = os.path.join(late, 'share')
+    os.makedirs(sub, exist_ok=True)
+    drives = [tempfile.mkdtemp(prefix=f'fork-fleet-drive-{x}-', dir='/') for x in ('before', 'after')]
+    run = tempfile.mkdtemp(prefix='fork-fleet-interop-', dir='/run')
+    for d in (*drives, run):
+        test.addCleanup(os.rmdir, d)
+    mounted = []
+
+    def mount(d):
+        subprocess.run(['mount', '-t', 'tmpfs', '-o', 'size=1m', 'fork-fleet-test', d], check=True)
+        mounted.append(d)
+        with open(os.path.join(d, 'marker'), 'w') as f:
+            f.write('x')
+
+    def umount_all():
+        while mounted:
+            subprocess.run(['umount', mounted.pop()], check=True)
+    test.addCleanup(umount_all)
+    mount(drives[0])
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(os.path.join(run, 'interop'))
+    test.addCleanup(os.remove, os.path.join(run, 'interop'))
+    test.addCleanup(sock.close)
+    paths = [os.path.join(drives[0], 'marker'), drives[0], os.path.join(drives[1], 'marker'), drives[1],
+             os.path.join(run, 'interop'), run, os.path.join(sub, 'marker')]
+
+    def seen(cmd):
+        with subprocess.Popen([*cmd, '--', '/usr/bin/python3', '-I', '-c', LATE, *paths], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True) as job:
+            test.assertEqual(job.stdout.readline().strip(), 'started')
+            mount(drives[1])
+            mount(sub)
+            try:
+                answer, _ = job.communicate('go\n', timeout=60)
+            finally:
+                for d in (sub, drives[1]):
+                    mounted.remove(d)
+                    subprocess.run(['umount', d], check=True)
+        return {p for p, there in json.loads(answer).items() if there}
+
+    test.assertEqual(seen(unit), set())
+    test.assertEqual(seen(without(unit, 'MountFlags=private')), {os.path.join(sub, 'marker')})
 
 
 # LauncherAsRoot's systemd-run for check-net: the unit's namespace and user, the rest of its sandbox left out.
@@ -2050,6 +2303,8 @@ class LauncherAsRoot(unittest.TestCase):
         Launcher.write(self, 'meminfo', 'MemAvailable:    8388608 kB\n', 0o644)
         Launcher.write(self, 'resolv.conf', 'nameserver 1.1.1.1\n', 0o644)
         Launcher.write(self, 'ip_forward', '1\n', 0o644)
+        with open(os.path.join(os.path.dirname(LAUNCH), 'fork-fleet-job-paths.txt')) as f:
+            self.job_paths = Launcher.write(self, 'job-paths.txt', f.read(), 0o644)   # root's, as installed
         self.conf()
 
     path = Launcher.path
@@ -2059,7 +2314,8 @@ class LauncherAsRoot(unittest.TestCase):
                         RUN_DIR=self.path('run'), HOOK=self.hook, LINGER_DIR=self.path('linger'),
                         MEMINFO=self.path('meminfo'), RESOLV_CONF=self.path('resolv.conf'),
                         IP_FORWARD=self.path('ip_forward'), SYSTEMD_RUN=self.path('bin/systemd-run'),
-                        SYSTEMCTL=self.path('bin/systemctl'), OWN_ADDRESS_URLS=Launcher.OWN_URLS)
+                        SYSTEMCTL=self.path('bin/systemctl'), OWN_ADDRESS_URLS=Launcher.OWN_URLS,
+                        JOB_PATHS=self.job_paths)
         settings.update(over)
         Launcher.write(self, 'launch.conf', ''.join(f'{k}={v}\n' for k, v in settings.items() if v), 0o600)
 
@@ -2265,7 +2521,14 @@ class LauncherAsRoot(unittest.TestCase):
         self.assertIn(f'check-net: as {self.USERS[0]}, in its namespace fork-fleet-{self.USERS[0]}', got.stdout)
 
     def test_the_walls_hold_in_a_real_systemd_unit(self):
-        """As Launcher's, in a unit of the system's systemd as a real runner user (CI: the hosted runner's)."""
+        """As Launcher's, in a unit of the system's systemd as a real runner user (CI: the hosted runner's), and with
+        all of the sandbox but its network: only the allowed mounts, the pseudo devices, no socket of the host's, no
+        later mount, git, node, java and docker work, and a drive outside /mnt and /media (before or after the job
+        started), the host's /run and a share mounted later under an allowed path stay hidden (hidden_from_job)."""
+        late = tempfile.mkdtemp(prefix='fork-fleet-allowed-', dir='/var/lib')   # ALLOW_PATHS: no /tmp path is
+        self.addCleanup(shutil.rmtree, late, True)
+        os.chmod(late, 0o755)
+        self.conf(ALLOW_PATHS=late)
         import http.server, threading
         srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -2274,7 +2537,8 @@ class LauncherAsRoot(unittest.TestCase):
         Launcher.write(self, 'rec/probe-exit', '0', 0o644)
         got = self.launch('check-net', 'https://example.com/', f'127.0.0.1:{srv.server_address[1]}')
         self.assertEqual(got.returncode, 0, got.stderr)
-        real_walls(self, Launcher.waited(self, 'fork-fleet-check-walls'), ['systemd-run'], '--uid', self.USERS[0])
+        real_walls(self, Launcher.waited(self, 'fork-fleet-check-walls'), ['systemd-run'], '--uid', self.USERS[0],
+                   full=True)
 
 
 class Wiring(unittest.TestCase):

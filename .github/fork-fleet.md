@@ -8,16 +8,17 @@ No fleet runner waits for work. A dispatcher on each fleet host starts a
 one-job runner for one queued job of a trusted run, and that runner is gone
 after the job. A job that names a fleet label by itself finds no runner.
 
-| File                                   | What it does                                                                                                                                                                                                                                                                    |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.github/fork-fleet.json`              | Every fact about the repository and its fleet: the setting's name, the trust rule (workflows, actors, branches), the pools (label, slots, heartbeat variable, launch command, which pool `fleet` mode queues on), the jobs (shards, change gates, memory), and the time limits. |
-| `.github/scripts/fork-fleet.py`        | `route`, `watch`, `sweep`, `dispatch` and `gate`. Standard library only. It holds no repository facts.                                                                                                                                                                          |
-| `.github/scripts/fork-fleet-launch.sh` | Runs on a fleet host, as root, for `dispatch`: `start`, `ready`, `active`, `fits`, `stop` and `prune` of one-job runners.                                                                                                                                                       |
-| `.github/scripts/fork-fleet-hook.sh`   | Each fleet runner's job-started hook. It runs `gate` from the installed copy.                                                                                                                                                                                                   |
-| `.github/scripts/fork-fleet.test.py`   | The tests, and checks that the workflows match the config. Run by the `workflows` job.                                                                                                                                                                                          |
-| `.github/workflows/fork-tests.yml`     | The `Route` step of `changes` feeds each Linux job's `runs-on`. The `fleet_watch` job bounds the wait for a fleet runner.                                                                                                                                                       |
-| `.github/workflows/fork-fleet.yml`     | The sweep, every 10 minutes (GitHub-hosted).                                                                                                                                                                                                                                    |
-| `.github/workflows/fork-release.yml`   | Grants `actions: write` to the called Fork tests, because `fleet_watch` asks for it. A release run is always GitHub-hosted.                                                                                                                                                     |
+| File                                       | What it does                                                                                                                                                                                                                                                                    |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.github/fork-fleet.json`                  | Every fact about the repository and its fleet: the setting's name, the trust rule (workflows, actors, branches), the pools (label, slots, heartbeat variable, launch command, which pool `fleet` mode queues on), the jobs (shards, change gates, memory), and the time limits. |
+| `.github/scripts/fork-fleet.py`            | `route`, `watch`, `sweep`, `dispatch` and `gate`. Standard library only. It holds no repository facts.                                                                                                                                                                          |
+| `.github/scripts/fork-fleet-launch.sh`     | Runs on a fleet host, as root, for `dispatch`: `start`, `ready`, `active`, `fits`, `stop`, `prune` and `refresh-net` of one-job runners.                                                                                                                                        |
+| `.github/scripts/fork-fleet-job-paths.txt` | The one mount rule: the host's system paths every fleet job sees (read-only). The launcher's `job_fs` reads it; the per-OS walls read it too.                                                                                                                                   |
+| `.github/scripts/fork-fleet-hook.sh`       | Each fleet runner's job-started hook. It runs `gate` from the installed copy.                                                                                                                                                                                                   |
+| `.github/scripts/fork-fleet.test.py`       | The tests, and checks that the workflows match the config. Run by the `workflows` job.                                                                                                                                                                                          |
+| `.github/workflows/fork-tests.yml`         | The `Route` step of `changes` feeds each Linux job's `runs-on`. The `fleet_watch` job bounds the wait for a fleet runner.                                                                                                                                                       |
+| `.github/workflows/fork-fleet.yml`         | The sweep, every 10 minutes (GitHub-hosted).                                                                                                                                                                                                                                    |
+| `.github/workflows/fork-release.yml`       | Grants `actions: write` to the called Fork tests, because `fleet_watch` asks for it. A release run is always GitHub-hosted.                                                                                                                                                     |
 
 No upstream file changes. Upstream's `ci.yml` and `release.yml` are untouched, so
 the fork-follow sweep and the drift check behave as before.
@@ -153,18 +154,36 @@ Two more things limit what a job can do:
   other machines), CGNAT `100.64.0.0/10` (Tailscale and the like), link-local,
   the other reserved ranges, all of IPv6, and the host's own public IPv4 address
   (the router's admin page and every port forwarded back into the home answer
-  there; looked up before every start at `OWN_ADDRESS_URLS`, two by default
-  that must agree). The unit's `IPAddressDeny` refuses the same again, in the
-  kernel, should the table ever go. The launcher (re)makes the namespace and the
-  table at every start and starts no runner when either fails or the lookup
-  fails.
+  there; looked up at `OWN_ADDRESS_URLS`, two by default, before every start
+  and on every dispatcher pass). Every address any lookup gives is blocked (two
+  WAN links each show another one), and the last 4 stay blocked, so one lookup
+  that is down opens nothing. When the address changes while jobs run,
+  `refresh-net` re-applies the table and adds the new address to each running
+  unit's `IPAddressDeny`. The unit's `IPAddressDeny` refuses the same again, in
+  the kernel, should the table ever go. The launcher (re)makes the namespace and
+  the table at every start and starts no runner when either fails or no lookup
+  answers; a dispatcher pass whose `refresh-net` fails starts nothing on that
+  pool (the last block stays) until it works again.
 - **Walls (every pool):** the unit gets no `AF_VSOCK` socket (a VM's channel to
   its host, not namespaced; WSL2's way to Windows), and none through the two
   ways around that filter: `io_uring` (fails with ENOSYS, so tools use plain
   calls) and 32-bit system calls (they end the process). Host step 6 proves the
-  network and the walls from inside a runner. Before a new kind of host joins a
-  pool (a Windows PC's WSL2 first), `sudo bash .github/scripts/fork-fleet-walls-proof.sh`
-  runs that proof there with throwaway users and undoes all it made.
+  network and the walls from inside a runner.
+- **Files and devices (every pool), one rule:** a job's unit has a root
+  folder of its own, empty but for symlinks. Of the host's files it sees only
+  the paths in `fork-fleet-job-paths.txt` (`/usr`, `/etc`, the `/bin` and `/lib`
+  links), each read-only and one mount (nothing mounted under it), the
+  launcher's `ALLOW_PATHS`, the hook and its own copy. So a share or drive
+  mounted anywhere else (`/mnt`, `/media`, `/srv`, `/data`, a Windows drive at
+  `/c`) is not there. `MountFlags=private`: a mount the host makes after the job
+  started never reaches it. `/run`, `/tmp`, `/var/tmp` and `/dev/shm` are new
+  and empty, so no socket of the host's (X11, PulseAudio, WSL's interop) is
+  there. `PrivateDevices=yes`: `/dev` holds only `null`, `zero`, `full`,
+  `random`, `urandom`, `tty` and the job's own ptys; no GPU (`/dev/dri`,
+  `/dev/dxg`), disk, `kvm`, `fuse` or `tun`. Git, Node, Java and the Docker
+  client need none of these; a job never gets the Docker daemon (its socket is
+  root on the host). Step 6 proves each of these from inside a runner. The
+  per-OS walls read the same file instead of keeping a list of their own.
 
 Fleet jobs read no secrets (a test checks this). The fleet's GitHub token lives
 only on the fleet host, readable by root.
@@ -396,7 +415,7 @@ done
   echo "template: actions/runner $(cat "$live/.fork-fleet-version")"
 )
 
-# 3. The fleet files, from one pinned main commit. All four are fetched first and installed only when each came;
+# 3. The fleet files, from one pinned main commit. All five are fetched first and installed only when each came;
 #    SOURCE is written last, so it never names a commit whose files are not all in place.
 (
   set -euo pipefail
@@ -405,7 +424,8 @@ done
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   base=https://raw.githubusercontent.com/scuttletoby/t3code/$sha/.github
   files="fork-fleet.json:fork-fleet.json:644 scripts/fork-fleet.py:fork-fleet.py:644
-         scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755"
+         scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755
+         scripts/fork-fleet-job-paths.txt:fork-fleet-job-paths.txt:644"
   for f in $files; do
     IFS=: read -r src dst mode <<<"$f"
     curl -fsSLo "$tmp/$dst" "$base/$src"
@@ -433,7 +453,10 @@ chmod 600 /etc/fork-fleet/launch.conf
 # it 0711. Every directory above it must let the runner users through (o+x), or no runner can reach its copy.
 # NET_BASE (10.204) and RESOLV_CONF (/etc/fork-fleet/resolv.conf): add a line only to change one (step 1b).
 # OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is
-# looked up before every start; each must answer, all alike. Add a line only to use other https lookups.
+# looked up before every start and every dispatcher pass; every address any of them gives is blocked, and no answer
+# at all starts nothing. Add a line only to use other https lookups.
+# ALLOW_PATHS (empty): more paths jobs see read-only, comma-separated (a tool cache); never one that holds data.
+# JOB_PATHS (fork-fleet-job-paths.txt beside the launcher): the system paths every job sees; leave it.
 
 # 5. The dispatcher, for the vm pool only.
 cat > /etc/systemd/system/t3code-fleet-dispatcher.service <<'EOF'
@@ -459,9 +482,10 @@ journalctl -u t3code-fleet-dispatcher -n 20      # each runner it starts or skip
 #    its Tailscale (100.64.0.0/10) address, its Docker bridges. check-net refuses a target the host itself does not
 #    reach (its refusal inside would prove nothing): if a listener just closed, run it again. Expect "ok" on every
 #    line and exit 0. Run it again after any network change on the host, and whenever a new service listens.
-#    It also proves, inside, that this host's own public address is refused and that AF_VSOCK, io_uring and 32-bit
-#    system calls are closed ("host:" lines first say which of these this host has outside: where it has none, the
-#    refusal inside shows nothing there).
+#    It also proves, inside, that this host's own public address is refused, that AF_VSOCK, io_uring and 32-bit
+#    system calls are closed, that only the pseudo devices are there, only the allowed mounts, none that receives
+#    the host's later mounts, nothing in /mnt and /media, and no socket of the host's ("host:" lines first say which
+#    of these this host has outside: where it has none, the refusal inside shows nothing there).
 mapfile -t addrs < <(ip -4 -o addr show | awk '{ sub("/.*", "", $4); print $4 }')
 mapfile -t targets < <(ss -4ltnH | awk -v addrs="${addrs[*]}" '{
     n = split($4, hp, ":"); h = hp[1]; p = hp[n]; sub(/%.*/, "", h)
@@ -527,7 +551,7 @@ the owner.
 
 Set it up on the workspace machine next to the real install, with its own paths:
 
-- Install the same four files under `/opt/fork-fleet-proof/`. In its
+- Install the same five files under `/opt/fork-fleet-proof/`. In its
   `fork-fleet.json`, set `repository` to the proof repository, keep one pool
   `proof` with label `fleet-proof-t3code`, `slots: 1`, `waits: true`, beacon
   `FLEET_BEACON_PROOF` and launch
