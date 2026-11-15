@@ -15,8 +15,10 @@ own beside the agent's:
                      stderr line is the trailer `seed NAME BYTES SHA256 MADE` (MADE: the file's mtime, epoch seconds)
   python3 -I fork-fleet-desk-seed.py [--config FILE] run
                      the desktop, as root, hourly (t3code-fleet-seed.timer), with the agent's settings (FILE, default
-                     its CONF). Each new seed is unpacked with tarfile's data filter into a folder of its own, checked
-                     against the trailer, flushed, and swapped in by rename: SEEDS/NAME is a link to
+                     its CONF). Only names its own installed fleet config lists for its POOL, held to its own
+                     every_hours and max_age_hours and the smaller of its own and the host's max_mb. Each new seed is
+                     unpacked with tarfile's data filter into a folder of its own, checked against the trailer, walked
+                     (a link out of it is refused; all made readable), flushed, and swapped in by rename: SEEDS/NAME is a link to
                      .v/NAME.STAMP/data, root's (folders 0755, files no one else may write), unpacked in .new
                      (one folder: a rename never crosses a mount of the unit's sandbox). Jobs see SEEDS read-only
                      (the launcher's ALLOW_PATHS): a job uses /var/lib/fork-fleet/seeds/NAME when it is there and runs
@@ -42,7 +44,7 @@ in place, not by rename), 1 when the desktop stops reading for STALL seconds (th
 Standard library only.
 """
 import argparse, fcntl, hashlib, importlib.util, json, os, re, shutil, signal, stat, subprocess, sys, tarfile
-import tempfile, threading, time
+import threading, time
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -61,6 +63,7 @@ CONFIG = os.path.join(HERE, 'fork-fleet.json')
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
 LINK = re.compile(r'\.v/((?P<name>[a-z0-9][a-z0-9_-]{0,39})\.[0-9]{1,20})/data')
 LIST_WAIT, FETCH_WAIT = 30, 30 * 60   # seconds for the list, and for one seed's whole stream
+LIST_MOST, ERR_KEEP, MEMBERS = 1 << 20, 4096, 200_000   # the list's bytes, ssh's stderr kept, a seed's tar members
 KEEP_OLD, SKEW = 24 * 3600, 3600       # SKEW: how far the host's clock may be ahead of the desktop's
 PIECE, STALL, AHEAD = 1 << 20, 120, 300   # AHEAD: seconds a file's date may be ahead of now (a clock set back)
 ITEM = {'everyHours': 'every_hours', 'maxAgeHours': 'max_age_hours', 'maxMb': 'max_mb'}
@@ -214,20 +217,52 @@ def ssh(agent, conf, *words):
     return agent.ssh_argv(conf)[:-2] + list(words)   # the agent's ssh, another command than `serve POOL`
 
 
+class Tail(threading.Thread):
+    """Reads a pipe to its end and keeps only its last ERR_KEEP bytes (ssh's stderr: the host may write without
+    end; the trailer is its last line)."""
+
+    def __init__(self, f):
+        super().__init__(daemon=True)
+        self.f, self.data = f, b''
+        self.start()
+
+    def run(self):
+        while chunk := os.read(self.f.fileno(), 65536):
+            self.data = (self.data + chunk)[-ERR_KEEP:]
+
+    def text(self):
+        self.join(5)
+        return ' '.join(self.data.decode('utf-8', 'replace').split())[-300:] or 'nothing on stderr'
+
+
 def listing(agent, conf):
-    """{name: item} of the host's list; Torn when it cannot be had or is not well formed."""
-    with tempfile.TemporaryFile() as err:
-        try:
-            r = subprocess.run(ssh(agent, conf, 'seeds'), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err,
-                               env=agent.ENV, timeout=LIST_WAIT, start_new_session=True)
-        except subprocess.TimeoutExpired:
-            raise Torn(f'no list in {LIST_WAIT} s') from None
-        except OSError as e:
-            raise Torn(f'no ssh: {e}') from None
-        if r.returncode:
-            raise Torn(f'no list (exit {r.returncode}): {tail(err)}')
+    """{name: item} of the host's list (at most LIST_MOST bytes); Torn when it cannot be had or is not well formed."""
     try:
-        got = json.loads(r.stdout)
+        p = subprocess.Popen(ssh(agent, conf, 'seeds'), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=agent.ENV, start_new_session=True)
+    except OSError as e:
+        raise Torn(f'no ssh: {e}') from None
+    late = threading.Event()
+    timer = threading.Timer(LIST_WAIT, lambda: (late.set(), p.kill()))
+    timer.start()
+    out = b''
+    try:
+        err = Tail(p.stderr)
+        while len(out) <= LIST_MOST and (chunk := os.read(p.stdout.fileno(), 65536)):
+            out += chunk
+    finally:
+        timer.cancel()
+        p.kill()
+        code = p.wait()
+        p.stdout.close()
+    if late.is_set():
+        raise Torn(f'no list in {LIST_WAIT} s')
+    if len(out) > LIST_MOST:
+        raise Torn(f'the host\'s list is above {LIST_MOST} bytes')
+    if code:
+        raise Torn(f'no list (exit {code}): {err.text()}')
+    try:
+        got = json.loads(out, parse_constant=no_constant)
         assert isinstance(got, dict) and got.get('v') == 1 and isinstance(got.get('seeds'), list)
         out = {}
         for s in got['seeds']:
@@ -240,43 +275,78 @@ def listing(agent, conf):
         raise Torn('the host\'s list is not well formed') from None
 
 
+def no_constant(name):
+    raise ValueError(f'{name} is not JSON')
+
+
 def whole(x):
     return isinstance(x, int) and not isinstance(x, bool) and x >= 0
 
 
-def tail(f):
-    f.seek(0)
-    return ' '.join(f.read()[-2000:].decode('utf-8', 'replace').split())[-300:] or 'nothing on stderr'
+def guarded(most):
+    """tarfile's data filter, and a limit on what the tar says it holds: members' sizes together at most MOST
+    bytes (a sparse member is small in the stream, not on disk) and at most MEMBERS members (each is kept in memory)."""
+    seen = [0, 0]
+
+    def check(member, path):
+        seen[0] += 1
+        seen[1] += member.size
+        if seen[0] > MEMBERS or seen[1] > most:
+            raise Torn(f'the tar holds more than {MEMBERS} members or {most >> 20} MB (max_mb)')
+        return tarfile.data_filter(member, path)
+    return check
+
+
+def settle(data):
+    """After unpacking: every entry a folder, a plain file or a link that stays inside DATA (a check of its own,
+    besides the data filter, which some Python releases let links slip past); folders and files readable by all
+    (jobs run as other users; a cache may hold 0600 files), writable by root only. Torn otherwise."""
+    top = os.path.realpath(data)
+    for d, dirs, names in os.walk(data):
+        for n in dirs + names:
+            path = os.path.join(d, n)
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                if os.path.commonpath([top, os.path.realpath(path)]) != top:
+                    raise Torn(f'{os.path.relpath(path, data)} is a link that leads out of the seed')
+            elif stat.S_ISDIR(st.st_mode):
+                os.chmod(path, (st.st_mode & 0o755) | 0o555)
+            elif stat.S_ISREG(st.st_mode):
+                os.chmod(path, (st.st_mode & 0o755) | 0o444)
+            else:
+                raise Torn(f'{os.path.relpath(path, data)} is not a folder, a file or a link')
 
 
 def fetch(agent, conf, item, root, now):
-    """The seed `item` into a new version, swapped in; its label. Torn (or OSError, TarError) leaves the old one."""
-    name, stamp = item['name'], time.time_ns()
+    """The seed `item` (its maxMb: the smaller of the host's and the desktop's own) into a new version, swapped in;
+    its label. Torn (or OSError, TarError) leaves the old one."""
+    name, stamp, most = item['name'], time.time_ns(), item['maxMb'] << 20
     new = os.path.join(root + '/.new', f'{name}.{stamp}')
     os.mkdir(new, 0o755)
     os.mkdir(os.path.join(new, 'data'), 0o755)
-    with tempfile.TemporaryFile() as err:
-        p = subprocess.Popen(ssh(agent, conf, 'seed', name), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=err, env=agent.ENV, start_new_session=True)
-        timer = threading.Timer(FETCH_WAIT, p.kill)
-        timer.start()
-        try:
-            got = Summed(p.stdout, item['maxMb'] << 20)
-            with tarfile.open(fileobj=got, mode='r|') as t:
-                t.extractall(os.path.join(new, 'data'), filter='data')
-            while got.read(PIECE):   # the tar's end blocks and padding count in the trailer's size and sha256
-                pass
-            code = p.wait(timeout=30)
-        finally:
-            timer.cancel()
-            p.kill()
-            p.wait()
-            p.stdout.close()
-        err.seek(0)
-        last = (err.read()[-4096:].decode('utf-8', 'replace').strip().splitlines() or [''])[-1].split()
-        if code or last[:4] != ['seed', name, str(got.size), got.sha.hexdigest()] or len(last) != 5 or \
-                not last[4].isdigit():
-            raise Torn(f'exit {code}, {got.size} bytes, the trailer does not match: {tail(err)}')
+    p = subprocess.Popen(ssh(agent, conf, 'seed', name), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=agent.ENV, start_new_session=True)
+    timer = threading.Timer(FETCH_WAIT, p.kill)
+    timer.start()
+    try:
+        err = Tail(p.stderr)
+        got = Summed(p.stdout, most)
+        with tarfile.open(fileobj=got, mode='r|') as t:
+            t.extractall(os.path.join(new, 'data'), filter=guarded(most))
+        while got.read(PIECE):   # the tar's end blocks and padding count in the trailer's size and sha256
+            pass
+        code = p.wait(timeout=30)
+    finally:
+        timer.cancel()
+        p.kill()
+        p.wait()
+        p.stdout.close()
+    err.join(5)
+    last = (err.data.decode('utf-8', 'replace').strip().splitlines() or [''])[-1].split()
+    if code or len(last) != 5 or last[:4] != ['seed', name, str(got.size), got.sha.hexdigest()] or \
+            not re.fullmatch(r'[0-9]{1,20}', last[4]):
+        raise Torn(f'exit {code}, {got.size} bytes, the trailer does not match: {err.text()}')
+    settle(os.path.join(new, 'data'))
     label = {'v': 1, 'name': name, 'bytes': got.size, 'sha256': got.sha.hexdigest(), 'made': int(last[4]),
              'fetched': int(now()), 'maxAgeHours': item['maxAgeHours']}
     with open(os.path.join(new, 'label.json'), 'x', encoding='utf-8') as f:
@@ -330,9 +400,22 @@ def drop(root, name, version, now):
     remove(os.path.join(root, name))
 
 
-def run(agent, conf, root=SEEDS, now=time.time, say=print):
-    if not hasattr(tarfile, 'data_filter'):
+def own_seeds(conf, config):
+    """{name: seed} of this desktop's pool in its own installed fleet config: the only names it takes, and the
+    every_hours, max_age_hours and max_mb it holds them to (the host's list never raises them)."""
+    try:
+        return pool_seeds(conf['POOL'], config)
+    except Refused as e:
+        raise Torn(f'its own {e}') from None
+
+
+def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
+    if not hasattr(tarfile, 'data_filter'):   # releases with known filter bypasses pass this: settle() checks again
         raise agent.Bad('this Python has no tarfile data filter (3.12, or 3.8.17 and later): no seeds')
+    try:
+        own = own_seeds(conf, config)
+    except Torn as e:
+        raise agent.Bad(f'{e}: no seeds') from None
     os.umask(0o022)
     for d in (root, root + '/.new', root + '/.v'):   # root: made by the unit (StateDirectory) or here
         os.makedirs(d, 0o755, exist_ok=True)
@@ -345,8 +428,13 @@ def run(agent, conf, root=SEEDS, now=time.time, say=print):
         for e in os.listdir(root + '/.new'):   # a run that stopped half-way
             if e != '.lock':
                 remove(os.path.join(root + '/.new', e))
+        for e in os.listdir(root):   # a link made but not yet swapped in
+            if e.startswith('.') and e.endswith('.link'):
+                remove(os.path.join(root, e))
         try:
-            items = listing(agent, conf)
+            host = listing(agent, conf)
+            items = {n: {**host[n], 'everyHours': s['every_hours'], 'maxAgeHours': s['max_age_hours'],
+                         'maxMb': min(host[n]['maxMb'], s['max_mb'])} for n, s in own.items() if n in host}
         except Torn as e:
             items = None
             say(f'seeds: {e}: each seed stays until its age drops it')
@@ -354,11 +442,11 @@ def run(agent, conf, root=SEEDS, now=time.time, say=print):
             version, label = current(root, name)
             if label is None:
                 why = 'its label is missing or cannot be read (fetched again now)'
-            elif items is not None and name not in items:
+            elif name not in own:
                 why = 'no longer one of the pool\'s seeds'
             else:
                 age = now() - label['made']
-                hours = items[name]['maxAgeHours'] if items else label['maxAgeHours']
+                hours = own[name]['max_age_hours']
                 why = (f'older than {hours} h (max_age_hours)' if age > hours * 3600
                        else 'made in the future (the clocks disagree)' if age < -SKEW else None)
             if why:
@@ -380,7 +468,7 @@ def run(agent, conf, root=SEEDS, now=time.time, say=print):
             try:
                 got = fetch(agent, conf, item, root, now)
                 say(f'seed {name}: {got["bytes"] >> 20} MB, sha256 checked, swapped in')
-            except (Torn, OSError, tarfile.TarError, subprocess.SubprocessError) as e:
+            except (Torn, OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as e:
                 for e2 in os.listdir(root + '/.new'):
                     if e2 != '.lock':
                         remove(os.path.join(root + '/.new', e2))

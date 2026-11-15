@@ -44,7 +44,12 @@ if mode == 'down':
     print('ssh: connect to host h port 22: No route to host', file=sys.stderr)
     sys.exit(255)
 kw = dict(config={t!r} + '/fork-fleet.json', files={t!r} + '/files')
-if words[0] == 'seed' and mode in ('cut', 'trailer'):
+if words[0] == 'seeds' and mode == 'biglist':
+    os.write(1, b' ' * (2 << 20))
+if mode == 'noisy':
+    for _ in range(64):
+        os.write(2, b'x' * (1 << 16) + b'\n')
+if words[0] == 'seed' and mode in ('cut', 'trailer', 'odd'):
     with open({t!r} + '/sent', 'w+b') as out:
         err = io.StringIO()
         code = seed.offer({pool!r}, ' '.join(words), {t!r} + '/run', out=out.fileno(), err=err, **kw)
@@ -54,7 +59,10 @@ if words[0] == 'seed' and mode in ('cut', 'trailer'):
         os.write(1, data[:len(data) // 2])
         sys.exit(255)
     os.write(1, data)
-    print(err.getvalue().rsplit(' ', 2)[0] + ' ' + '0' * 64 + ' 1', file=sys.stderr)   # a wrong sha256
+    if mode == 'odd':   # a MADE that str.isdigit() takes but int() does not
+        print(err.getvalue().rsplit(' ', 1)[0] + ' \u00b2', file=sys.stderr)
+    else:
+        print(err.getvalue().rsplit(' ', 2)[0] + ' ' + '0' * 64 + ' 1', file=sys.stderr)   # a wrong sha256
     sys.exit(code)
 sys.exit(seed.offer({pool!r}, ' '.join(words), {t!r} + '/run', **kw))
 '''
@@ -74,13 +82,13 @@ class Base(unittest.TestCase):
         with open(os.path.join(self.t, 'fork-fleet.json'), 'w', encoding='utf-8') as f:
             json.dump(cfg, f)
 
-    def make(self, name, members, mtime=None):
+    def make(self, name, members, mtime=None, mode=0o644):
         """FILES/POOL/NAME.tar of `members` ({path: bytes}), made as a project would: a temp file, then a rename."""
         tmp = os.path.join(self.t, 'files', POOL, f'.{name}.tmp')
         with tarfile.open(tmp, 'w', format=tarfile.PAX_FORMAT) as tar:
             for path, data in members.items():
                 info = tarfile.TarInfo(path)
-                info.size, info.mode = len(data), 0o644
+                info.size, info.mode = len(data), mode
                 tar.addfile(info, io.BytesIO(data))
         if mtime is not None:
             os.utime(tmp, (mtime, mtime))
@@ -296,13 +304,22 @@ class Desktop(Base):
         self.conf = {'SSH': ssh, 'KEY': '/nonexistent/key', 'KNOWN_HOSTS': '/nonexistent/known', 'PORT': '22',
                      'USER': 'fleet-desk', 'HOST': 'fleet-host.example', 'POOL': POOL}
         self.said = []
+        self.own(SEEDS)
         sync = mock.patch.object(seed.os, 'sync')
         sync.start()
         self.addCleanup(sync.stop)
 
+    def own(self, seeds):
+        """The desktop's own installed fleet config (/opt/fork-fleet/fork-fleet.json); self.config is the host's."""
+        cfg = json.loads(json.dumps(CONFIG))
+        cfg['pools'][0]['seeds'] = seeds
+        with open(os.path.join(self.t, 'own.json'), 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+
     def run_seed(self, now=None):
         self.said = []
-        return seed.run(agent, self.conf, self.root, now=now or time.time, say=self.said.append)
+        return seed.run(agent, self.conf, self.root, now=now or time.time, say=self.said.append,
+                        config=os.path.join(self.t, 'own.json'))
 
     def mode(self, text):
         with open(os.path.join(self.t, 'mode'), 'w') as f:
@@ -340,7 +357,7 @@ class Desktop(Base):
                 if not stat.S_ISLNK(st.st_mode):   # a link's own mode is always 0777 and means nothing
                     self.assertFalse(st.st_mode & 0o022, os.path.join(d, n))
         label = json.load(open(os.path.join(seed.current(self.root, 'm2')[0], 'label.json')))
-        self.assertEqual(label['bytes'], os.path.getsize(os.path.join(self.t, 'files', 'm2.tar')))
+        self.assertEqual(label['bytes'], os.path.getsize(self.tar('m2')))
         self.assertEqual(self.run_seed(), 0)   # the same seed on the host: nothing fetched
         self.assertEqual(self.fetches(), ['seed m2'])
         self.assertEqual(os.listdir(os.path.join(self.root, '.new')), ['.lock'])
@@ -394,6 +411,78 @@ class Desktop(Base):
         self.assertEqual(self.files('m2'), {'a': b'one'})
         self.assertTrue(any('max_mb' in s for s in self.said), self.said)
 
+    def test_max_mb_is_the_desktops_not_the_hosts(self):
+        self.config([{**SEEDS[0], 'max_mb': 3}, SEEDS[1]])   # the host lists 3; the desktop's own copy says 2
+        self.make('m2', {'a': os.urandom(5 << 19)})            # 2.5 MB
+        self.run_seed()
+        self.assertIsNone(self.files('m2'), self.said)
+        self.assertTrue(any('max_mb' in s for s in self.said), self.said)
+
+    def test_every_and_max_age_hours_are_the_desktops_and_unknown_names_are_ignored(self):
+        self.config([{**SEEDS[0], 'every_hours': 1, 'max_age_hours': 100000}, SEEDS[1],
+                     {'name': 'extra', 'every_hours': 1, 'max_age_hours': 2, 'max_mb': 1}])
+        self.make('m2', {'a': b'one'})
+        self.make('extra', {'a': b'x'})
+        self.run_seed()
+        self.assertIsNone(self.files('extra'))                 # not in the desktop's own list: never fetched
+        self.assertNotIn('seed extra', self.fetches())
+        self.make('m2', {'a': b'two'}, mtime=time.time() + 5)
+        self.run_seed(now=lambda: time.time() + 2 * 3600)     # the host says every 1 h; the desktop's own, 6 h
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+        self.mode('down')
+        self.run_seed(now=lambda: time.time() + 1001 * 3600)  # the desktop's own max_age_hours (1000), not 100000
+        self.assertIsNone(self.files('m2'))
+
+    def test_stderr_is_never_kept_whole_and_a_huge_list_is_refused(self):
+        self.mode('noisy')                                     # 4 MB on stderr before the trailer
+        self.make('m2', {'a': b'one'})
+        with mock.patch('tempfile.TemporaryFile', side_effect=AssertionError('stderr kept on disk')):
+            self.assertEqual(self.run_seed(), 0)
+        self.assertEqual(self.files('m2'), {'a': b'one'}, self.said)
+        self.mode('biglist')
+        self.make('m2', {'a': b'two'}, mtime=time.time() + 5)
+        self.run_seed(now=lambda: time.time() + 7 * 3600)
+        self.assertTrue(any('above' in s and 'bytes' in s for s in self.said), self.said)
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+
+    def test_a_0600_file_is_readable_by_jobs(self):
+        self.make('m2', {'cache/entry': b'x', 'cache/tool': b'#!/bin/sh\n'}, mode=0o600)
+        self.run_seed()
+        top = os.path.realpath(os.path.join(self.root, 'm2'))
+        for d, dirs, names in os.walk(top):
+            for n in dirs + names:
+                mode = os.lstat(os.path.join(d, n)).st_mode
+                self.assertEqual(mode & 0o444, 0o444, (n, oct(mode)))
+                self.assertFalse(mode & 0o022, (n, oct(mode)))
+                if stat.S_ISDIR(mode):
+                    self.assertEqual(mode & 0o111, 0o111, (n, oct(mode)))
+
+    def test_a_link_out_of_the_seed_is_refused_even_past_the_filter(self):
+        self.make('m2', {'a': b'one'})
+        self.run_seed()
+        tmp = os.path.join(self.t, 'files', POOL, '.m2.tmp')
+        with tarfile.open(tmp, 'w') as tar:
+            for name, target in (('inside', 'a'), ('escaped', '/')):
+                info = tarfile.TarInfo(name)
+                info.type, info.linkname = tarfile.SYMTYPE, target
+                tar.addfile(info)
+        os.utime(tmp, (time.time() + 5,) * 2)
+        os.replace(tmp, self.tar('m2'))
+        with mock.patch.object(seed.tarfile, 'data_filter', lambda member, path: member):   # a filter bypass
+            self.run_seed(now=lambda: time.time() + 7 * 3600)
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+        self.assertTrue(any('leads out of the seed' in s for s in self.said), self.said)
+        for d, dirs, names in os.walk(self.root):
+            self.assertNotIn('escaped', dirs + names, d)
+
+    def test_an_odd_trailer_keeps_the_old_seed_and_the_run_goes_on(self):
+        self.torn(lambda: (self.make('m2', {'a': b'two'}, mtime=time.time() + 5), self.mode('odd')),
+                  'trailer does not match')
+
+    def test_too_many_members_keep_the_old_seed(self):
+        with mock.patch.object(seed, 'MEMBERS', 2):
+            self.torn(lambda: self.make('m2', {'a': b'1', 'b': b'2', 'c': b'3'}, mtime=time.time() + 5), 'members')
+
     def test_a_tar_that_would_leave_its_folder_writes_nothing_outside(self):
         bad = {'a ../ path': ('../../escaped', tarfile.REGTYPE, ''), 'a device': ('escaped', tarfile.CHRTYPE, ''),
                'an absolute link': ('escaped', tarfile.SYMTYPE, '/'),
@@ -401,7 +490,7 @@ class Desktop(Base):
                'a hard link out': ('escaped', tarfile.LNKTYPE, '/etc/hostname')}
         for why, (name, kind, target) in bad.items():
             def evil():
-                tmp = os.path.join(self.t, 'files', '.m2.tmp')
+                tmp = os.path.join(self.t, 'files', POOL, '.m2.tmp')
                 with tarfile.open(tmp, 'w') as tar:   # one bad member each: the filter stops at the first
                     ok = tarfile.TarInfo('ok')
                     ok.size = 1
@@ -410,7 +499,7 @@ class Desktop(Base):
                     info.type, info.linkname = kind, target
                     tar.addfile(info)
                 os.utime(tmp, (time.time() + 5,) * 2)
-                os.replace(tmp, os.path.join(self.t, 'files', 'm2.tar'))
+                os.replace(tmp, self.tar('m2'))
             with self.subTest(why):
                 shutil.rmtree(self.root, True)
                 self.torn(evil, 'Error')
@@ -431,7 +520,10 @@ class Desktop(Base):
         self.assertTrue(os.path.isdir(old))                 # dropped, but a job still reading it keeps it
         self.assertTrue(any('older than 1000 h' in s for s in self.said), self.said)
         self.run_seed()
-        self.config([SEEDS[1]])
+        self.config([SEEDS[1]])   # the host no longer lists it: the desktop's own list still does, it stays
+        self.run_seed()
+        self.assertIsNotNone(self.files('m2'))
+        self.own([SEEDS[1]])      # the desktop's own list no longer does: dropped
         self.run_seed()
         self.assertIsNone(self.files('m2'))
         self.assertTrue(any('no longer one of the pool' in s for s in self.said), self.said)
@@ -451,11 +543,13 @@ class Desktop(Base):
         self.run_seed()
         os.makedirs(os.path.join(self.root, '.new', 'm2.123', 'data'))         # a torn unpack
         os.symlink('.v/m2.999/data', os.path.join(self.root, '.m2.link'))      # a link made, not yet swapped in
+        os.symlink('.v/npm.999/data', os.path.join(self.root, '.npm.link'))    # one of a seed not fetched now
         os.symlink('/etc', os.path.join(self.root, 'npm'))                    # not a link this program makes
         os.unlink(os.path.join(seed.current(self.root, 'm2')[0], 'label.json'))
         self.run_seed()
         self.assertEqual(os.listdir(os.path.join(self.root, '.new')), ['.lock'])
         self.assertFalse(os.path.lexists(os.path.join(self.root, 'npm')))
+        self.assertFalse(os.path.lexists(os.path.join(self.root, '.npm.link')))
         self.assertTrue(os.path.isdir('/etc'))
         self.assertEqual(self.files('m2'), {'a': b'one'})   # fetched again in the same run
         self.assertEqual(len(self.fetches()), 2)

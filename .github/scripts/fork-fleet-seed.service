@@ -6,6 +6,8 @@
 # (StateDirectory makes it, 0755; new copies are unpacked inside it, so a rename never crosses a mount), reads the
 # desk link's settings and key in /etc/fork-fleet, reaches the network (ssh to the always-on host only, with the
 # agent's pinned host key) and has a memory, CPU and task limit.
+# The sandbox lines below are safety-critical: they bound what a tar that slips past Python's data filter (some
+# releases have known bypasses; the script also checks every link after unpacking) could reach. Do not loosen them.
 [Unit]
 Description=t3code fork fleet: warm caches for a desk pool's jobs
 Wants=network-online.target

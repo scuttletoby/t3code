@@ -715,11 +715,20 @@ size and SHA-256; anything else is refused. One stream per pool at a time; a
 desktop that takes nothing for two minutes is cut off and the next one may go.
 
 The desktop's side is the same script's `run`, hourly from
-`t3code-fleet-seed.timer` (the desk kit installs both). Each new seed is
-unpacked with Python's tar data filter, checked against the trailer, and
-swapped in by a rename; jobs see `/var/lib/fork-fleet/seeds/NAME` read-only
-(the launcher's `ALLOW_PATHS`), copy what they need from it when it is there,
-and run cold when it is not. The state table (a torn download, the host down,
+`t3code-fleet-seed.timer` (the desk kit installs both). It takes only the
+names its own installed fleet config lists for its pool, and holds them to
+its own `every_hours` and `max_age_hours` and the smaller of its own and the
+host's `max_mb`: a host cannot make a desktop take more. Each new seed is
+unpacked with Python's tar data filter (members' sizes and count limited
+too), checked against the trailer, checked again for links that lead out of
+it, made readable by every job (a cache's 0600 files too), and swapped in by a
+rename; ssh's stderr and the list are read with a limit. Jobs see
+`/var/lib/fork-fleet/seeds/NAME` read-only (the launcher's `ALLOW_PATHS`;
+the unpacking and old copies beside it, `.new` and `.v`, are visible too and
+hold the same data), copy what they need from it when it is there, and run
+cold when it is not. A replaced copy is kept 24 hours for a job still reading
+it; there is no free-space check before unpacking (a full disk ends that seed's
+fetch and keeps the old one). The state table (a torn download, the host down,
 clocks that disagree, a run that stopped half-way) is in the script's header.
 
 ## Owner steps on the repository
