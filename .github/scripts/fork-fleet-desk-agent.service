@@ -19,6 +19,9 @@ RestartPreventExitStatus=2
 KillMode=control-group
 TimeoutStopSec=20
 UMask=0077
+# A backstop for the agent and the verbs it runs (the launcher, the walls check); runners live in their own transient
+# units, so this never limits a CI job. The agent itself reads the link in bounded pieces.
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target

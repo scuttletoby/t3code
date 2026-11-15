@@ -58,6 +58,7 @@ TERM_BEFORE, KILL_BEFORE = 3, 1   # seconds before a verb's limit: SIGTERM to it
 MAX_VERBS = 8
 OUT_MAX = 64   # frames waiting to be sent (at most MAX_FRAME bytes each): more, and the session ends
 SLEPT = 10   # BOOTTIME ran this many seconds ahead of MONOTONIC, or the wall clock ahead of BOOTTIME: the desktop slept
+ERR_PIECE = 4096   # bytes of ssh's stderr read at a time (one endless line from the host stays small)
 SSH_EXIT = 2   # seconds ssh has to exit on its own after its stdout ends (it passes on serve's exit code, e.g. 76)
 
 
@@ -71,20 +72,21 @@ def slept_for():
 
 class Clock:
     """Seconds that count a sleep and never go back: BOOTTIME, plus each forward step of the wall clock against it of
-    more than SLEPT s between two reads. On a Linux sleep both move together (nothing added); on WSL2 Windows' sleep
-    pauses the distro and only the wall clock is stepped on resume. A wall clock set forward by hand (or a first time
-    sync that steps it) counts as a sleep too: the link is dialled again and running verbs are answered 75."""
+    more than SLEPT s past the furthest it has been ahead so far. On a Linux sleep both move together (nothing added);
+    on WSL2 Windows' sleep pauses the distro and only the wall clock is stepped on resume. A wall clock set back and
+    later put right adds nothing (the correction only returns to where it was); one set forward by hand (or a first
+    time sync that steps it) counts as a sleep: the link is dialled again and running verbs are answered 75."""
 
     def __init__(self):
-        self.lock, self.added, self.skew = threading.Lock(), 0.0, None
+        self.lock, self.added, self.top = threading.Lock(), 0.0, None
 
     def __call__(self):
         with self.lock:
             now = boottime()
             skew = time.time() - now
-            if self.skew is not None and skew - self.skew > SLEPT:
-                self.added += skew - self.skew
-            self.skew = skew
+            if self.top is not None and skew - self.top > SLEPT:
+                self.added += skew - self.top
+            self.top = skew if self.top is None else max(self.top, skew)
             return now + self.added
 
 
@@ -347,9 +349,14 @@ class Session:
             pass
 
     def relay(self):
-        """ssh's own stderr (and serve's log lines): to the log, cleaned, each line cut to 500 characters."""
-        for line in self.proc.stderr:
-            self.say(f'ssh: {wire.clean(line.decode("utf-8", "replace").rstrip())[:500]}')
+        """ssh's own stderr (and serve's log lines): to the log, cleaned, each line cut to 500 characters. Read in
+        pieces of at most ERR_PIECE bytes: the host's side can send one endless line, and the agent never holds it,
+        and logs only its first piece (the rest of a long line is skipped, not logged piece by piece)."""
+        whole = True   # the last piece ended its line
+        while piece := self.proc.stderr.readline(ERR_PIECE):
+            if whole:
+                self.say(f'ssh: {wire.clean(piece[:2000].decode("utf-8", "replace").rstrip())[:500]}')
+            whole = piece.endswith(b'\n')
 
 
 def wait(seconds, stopping, now=boottime, gap=slept_for):

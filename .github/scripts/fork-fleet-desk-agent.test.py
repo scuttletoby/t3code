@@ -2,7 +2,7 @@
 """Tests of fork-fleet-desk-agent.py, the desk link's desktop side: through the real `serve` and `launch` of
 fork-fleet-desk.py (row D2) behind a fake ssh, and against a scripted fake serve for a broken or hostile always-on
 host. Fake launcher and walls in a temp folder; no root, no ssh connection, no network. Run: python3 <this>. Linux."""
-import configparser, glob, importlib.util, io, json, os, signal, subprocess, sys, tempfile, threading, time, unittest
+import configparser, glob, importlib.util, io, json, os, resource, signal, subprocess, sys, tempfile, threading, time, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -347,6 +347,32 @@ class Desk(unittest.TestCase):
             boot[0] += 1; wall[0] += 1 + 5        # a small step (time sync): not a sleep
             self.assertEqual(clock(), 4301)
 
+    def test_a_wall_clock_set_back_and_then_corrected_is_no_sleep(self):
+        boot, wall = [100.0], [5000.0]
+        with mock.patch.object(A, 'boottime', lambda: boot[0]), mock.patch.object(A.time, 'time', lambda: wall[0]):
+            clock = A.Clock()
+            self.assertEqual(clock(), 100)
+            wall[0] -= 3600; boot[0] += 1        # set back an hour (by hand, or a bad RTC read)
+            self.assertEqual(clock(), 101)
+            wall[0] += 3600 + 1; boot[0] += 1    # time sync puts it right: no time was lost
+            self.assertEqual(clock(), 102)
+            wall[0] += 600                       # then a real WSL2 sleep still counts (past the furthest-ahead mark)
+            self.assertEqual(clock(), 701)
+
+    def test_a_hostile_host_cannot_grow_the_agents_memory_through_sshs_stderr(self):
+        # the host's side (serve, or its sshd) sends one endless stderr line; the agent reads it in bounded pieces
+        mb = 256
+        self.file('noisy-ssh', '#!/bin/sh\nhead -c %d /dev/zero | tr "\\\\0" x >&2\nsleep 5\n' % (mb << 20), 0o755)
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+        log = io.StringIO()
+        session = A.Session(A.load(self.settings(ssh='noisy-ssh')), log, threading.Event())
+        t = threading.Thread(target=session.run, daemon=True)
+        t.start()
+        t.join(30)
+        grew = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024 - before
+        self.assertLess(grew, 32, f'the agent grew by {grew} MB for {mb} MB of ssh stderr with no newline')
+        self.assertEqual(log.getvalue().count('ssh: x'), 1)   # one log line for the one long line, not one per piece
+
     def test_time_is_clock_boottime(self):
         # the sleep tests patch boottime(); this one fails if it reads a clock that stops in a sleep
         clocks = {time.CLOCK_BOOTTIME: 5000.0, time.CLOCK_MONOTONIC: 10.0}
@@ -468,6 +494,7 @@ class Desk(unittest.TestCase):
         self.assertNotIn('Environment', s)
         self.assertNotIn('User', s)
         self.assertNotIn('EnvironmentFile', s)
+        self.assertEqual(s['MemoryMax'], '512M')
         self.assertEqual(A.DEFAULTS['LAUNCH'], '/opt/fork-fleet/fork-fleet-launch.sh')
 
 
