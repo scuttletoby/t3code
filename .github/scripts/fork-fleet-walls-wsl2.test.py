@@ -94,6 +94,12 @@ def walls_with(test, root, launcher_text=None):
     m = load('wsl2', root)
     m.LINUX = load('linux', root)
     m.LINUX.KIT, m.LINUX.LAUNCHER = kit, os.path.join(kit, 'fork-fleet-launch.sh')
+    # The walls hand FORK_FLEET_WALLS_ROOT to the launcher when they run it (job_view), not only at load: keep it set
+    # for the whole test, or `paths` checks this test machine's own /opt (open to all on some CI runners).
+    old = os.environ.get('FORK_FLEET_WALLS_ROOT')
+    os.environ['FORK_FLEET_WALLS_ROOT'] = root
+    test.addCleanup(lambda: os.environ.pop('FORK_FLEET_WALLS_ROOT') if old is None
+                    else os.environ.__setitem__('FORK_FLEET_WALLS_ROOT', old))
     return m
 
 
