@@ -11,7 +11,9 @@ import type { Judgement } from "@t3tools/shared/waitFor";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
+import { TestClock } from "effect/testing";
 
 import * as ProcessRunner from "../processRunner.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
@@ -22,7 +24,7 @@ import {
   makeCheckJudge,
   makeChildFileJudge,
   makeUnitJudge,
-  timeoutProgramWorks,
+  testTimeoutProgram,
 } from "./WaitJudges.ts";
 
 const fileTarget = (path: string) => ({ kind: "file", spec: { path, until: "exists" } }) as const;
@@ -371,6 +373,10 @@ exit 1
       },
     }),
   );
+  /** Like GNU coreutils `timeout` on a very busy host: its first run hangs, later ones work. */
+  const HANGS_ONCE = `#!/bin/sh
+if [ ! -e "$0.hung" ]; then touch "$0.hung"; exec sleep 30; fi
+${GNU_LIKE.split("\n").slice(1).join("\n")}`;
   const fakes = Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -385,6 +391,7 @@ exit 1
     return {
       gnu: yield* write("gnu-timeout", GNU_LIKE),
       old: yield* write("old-busybox-timeout", OLD_BUSYBOX_LIKE),
+      hangsOnce: yield* write("busy-timeout", HANGS_ONCE),
       used: (file: string) => fs.exists(`${file}.used`),
     };
   });
@@ -397,10 +404,16 @@ exit 1
     () =>
       Effect.gen(function* () {
         const { gnu, old, used } = yield* fakes;
-        assert.isTrue(yield* timeoutProgramWorks(gnu));
-        assert.isFalse(yield* timeoutProgramWorks(old));
-        assert.strictEqual(yield* findTimeoutProgram([old, gnu]), gnu);
-        assert.isNull(yield* findTimeoutProgram([old, "/nonexistent/timeout"]));
+        assert.strictEqual(yield* testTimeoutProgram(gnu), "works");
+        assert.strictEqual(yield* testTimeoutProgram(old), "refused");
+        assert.deepStrictEqual(yield* findTimeoutProgram([old, gnu]), {
+          program: gnu,
+          known: true,
+        });
+        assert.deepStrictEqual(yield* findTimeoutProgram([old, "/nonexistent/timeout"]), {
+          program: null,
+          known: true,
+        });
 
         const plain = yield* makeCheckJudge({ placeOf: place, timeoutPrograms: [old] });
         assert.strictEqual((yield* plain(checkTarget("yes"), context)).type, "met");
@@ -415,6 +428,45 @@ exit 1
         Effect.provide(layer),
         Effect.provideService(HostProcess.Platform, "linux"),
       ),
+  );
+
+  it.effect.skipIf(!SH)(
+    "a timeout whose test run hangs is tested again later, and the log names a hang (#108)",
+    () => {
+      const warnings: string[] = [];
+      const logger = Logger.make(({ logLevel, message }) => {
+        if (logLevel === "Warn")
+          warnings.push(String(Array.isArray(message) ? message[0] : message));
+      });
+      return Effect.gen(function* () {
+        const { hangsOnce, used } = yield* fakes;
+        const timing = { limitMs: 300, retryMs: 1_000 };
+        const judge = yield* makeCheckJudge({
+          placeOf: place,
+          timeoutPrograms: [hangsOnce],
+          timeoutTest: timing,
+        });
+        // The test run hangs: the check runs without the wrapper, and is answered all the same.
+        assert.strictEqual((yield* judge(checkTarget("yes"), context)).type, "met");
+        assert.isFalse(yield* used(hangsOnce), "no wrapper while its test run said nothing");
+        assert.strictEqual(warnings.length, 1);
+        assert.include(warnings[0] ?? "", "did not answer its test run");
+        assert.notInclude(warnings[0] ?? "", "does not take");
+        // Before the retry time it is not tested again.
+        assert.strictEqual((yield* judge(checkTarget("no"), context)).type, "notYet");
+        assert.isFalse(yield* used(hangsOnce));
+        // After it, the test run works, and from then on checks run under it.
+        yield* TestClock.adjust(1_100);
+        assert.strictEqual((yield* judge(checkTarget("yes"), context)).type, "met");
+        assert.isTrue(yield* used(hangsOnce), "the check ran under the timeout found later");
+        assert.strictEqual((yield* judge(checkTarget("no"), context)).type, "notYet");
+        assert.strictEqual(warnings.length, 1, "nothing more is logged once it works");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(Layer.merge(layer, Logger.layer([logger], { mergeWithExisting: false }))),
+        Effect.provideService(HostProcess.Platform, "linux"),
+      );
+    },
   );
 
   const BUSYBOX = ["/usr/bin/busybox", "/bin/busybox"].find((file) => NodeFS.existsSync(file));
