@@ -19,14 +19,18 @@ heavy never runs a command uncapped: it refuses (exit 1) when the systemd user m
 slice has no unit or no memory limit. Inside another heavy command it runs the command in the outer scope, which
 the outer heavy cleans up (HEAVY_KEEP=1 still gets a scope of its own).
 
-Settings: /etc/heavy/config.json ({"slice": "heavy.slice", "grace_seconds": 5}), or the file HEAVY_CONFIG names;
-HEAVY_SLICE and HEAVY_GRACE override single values. Standard library only; Linux with systemd and cgroup v2.
+The command's environment is exactly heavy's, plus HEAVY_SCOPE (the scope's unit name). Kept scopes are named
+heavy-keep-<name>-<random>.scope, all others heavy-<name>-<random>.scope (never heavy-keep-...).
+
+Settings: /etc/heavy/config.json ({"slice": "heavy.slice", "grace_seconds": 30}), or the file HEAVY_CONFIG names;
+HEAVY_SLICE and HEAVY_GRACE override single values (HEAVY_SYSTEMCTL: another systemctl, for tests). Standard library
+only; Linux with systemd and cgroup v2.
 """
 import hashlib, json, os, re, secrets, signal, subprocess, sys, time
 
 CONFIG = '/etc/heavy/config.json'
 INSTALLED = '/etc/heavy/installed.tsv'
-DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 5}
+DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 30}
 SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 CGROUP_ROOTS = ('/sys/fs/cgroup', '/sys/fs/cgroup/unified')
 WATCH = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)   # stop the scope after the grace time
@@ -37,6 +41,9 @@ RERAISE = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGKILL, signal.
            signal.SIGUSR2, signal.SIGALRM}
 PR_SET_PDEATHSIG = 1
 MAX_NAMES = 5
+# Python sets these to SIG_IGN at startup, and SIG_IGN survives exec: put them back before the command starts
+# (subprocess does the same for its children)
+PYTHON_IGNORED = [getattr(signal, n) for n in ('SIGPIPE', 'SIGXFSZ', 'SIGXFZ') if hasattr(signal, n)]
 
 
 class Refused(Exception):
@@ -52,6 +59,11 @@ def say(msg):
 
 
 def tool(name):
+    if name == 'systemctl' and os.environ.get('HEAVY_SYSTEMCTL'):     # tests: a systemctl that fails on purpose
+        path = os.environ['HEAVY_SYSTEMCTL']
+        if os.path.isabs(path) and os.access(path, os.X_OK):
+            return path
+        raise Refused(f'HEAVY_SYSTEMCTL {path!r} is not an absolute path to a program')
     for folder in ('/usr/bin', '/bin'):
         path = os.path.join(folder, name)
         if os.access(path, os.X_OK):
@@ -136,9 +148,31 @@ def in_heavy_scope(slice_cg):
     return parent == slice_cg and leaf.startswith('heavy-') and leaf.endswith('.scope')
 
 
-def unit_name(cmd):
+def unit_name(cmd, keep):
+    """heavy-keep-<label>-<random>.scope with HEAVY_KEEP=1, else heavy-<label>-<random>.scope, which never starts with
+    heavy-keep- (the leftover sweep tells kept scopes apart by that name). The label has no '-'."""
     label = re.sub(r'[^A-Za-z0-9_.]', '_', os.path.basename(cmd))[:32].strip('.') or 'cmd'
+    if keep:
+        return f'heavy-keep-{label}-{secrets.token_hex(4)}.scope'
+    if label == 'keep':
+        label = 'keep_'
     return f'heavy-{label}-{secrets.token_hex(4)}.scope'
+
+
+def caller_environ():
+    """The environment heavy was started with. Python's C-locale coercion (PEP 538, which -I cannot switch off) adds
+    LC_CTYPE=C.UTF-8 to its own environment; /proc/self/environ still holds what the caller passed."""
+    try:
+        with open('/proc/self/environ', 'rb') as f:
+            data = f.read()
+    except OSError:
+        return dict(os.environb)
+    env = {}
+    for item in data.split(b'\0'):
+        key, sep, value = item.partition(b'=')
+        if sep and key:
+            env.setdefault(key, value)     # the first one wins, as for getenv() and os.environ
+    return env
 
 
 def cgroup_pids(cg):
@@ -222,12 +256,102 @@ def stop_scope(systemctl, unit, cg, grace):
     return left
 
 
-def child_setup(restore_ignored, mask):
-    try:   # loaded before the fork: the child only calls it
+def load_prctl():
+    try:   # loaded before a fork: the child only calls it
         import ctypes
-        prctl = ctypes.CDLL(None, use_errno=True).prctl
+        return ctypes.CDLL(None, use_errno=True).prctl
     except (ImportError, OSError, AttributeError):
-        prctl = None
+        return None
+
+
+class GroupProbe:
+    """A child of heavy in heavy's process group that keeps the watched signals blocked. A signal sent to the whole
+    group (kill -INT -PGID, timeout(1), a shell's `kill %1`) stays pending in it; one sent to heavy alone does not. So
+    heavy passes a signal on to the command only when the command did not get it already."""
+
+    def __init__(self, signals):
+        self.pid = None
+        prctl = load_prctl()
+        try:
+            r_cmd, self.w_cmd = os.pipe()
+            self.r_ack, w_ack = os.pipe()
+            pid = os.fork()
+        except OSError:
+            return
+        if pid == 0:
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+                null = os.open('/dev/null', os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(null, fd)
+                for fd in [int(x) for x in os.listdir('/proc/self/fd')]:
+                    if fd > 2 and fd not in (r_cmd, w_ack):
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                if prctl is not None:
+                    prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+                while os.read(r_cmd, 1):                      # 'd': drain; end of file: heavy is done
+                    while signal.sigtimedwait(signals, 0) is not None:
+                        pass
+                    os.write(w_ack, b'k')
+            finally:
+                os._exit(0)
+        os.close(r_cmd)
+        os.close(w_ack)
+        self.pid = pid
+
+    def got(self, sig):
+        """True when sig is pending in the probe: it was sent to the whole process group."""
+        if self.pid is None:
+            return False
+        try:
+            with open(f'/proc/{self.pid}/status', encoding='ascii') as f:
+                for line in f:
+                    if line.startswith(('ShdPnd:', 'SigPnd:')) and int(line.split()[1], 16) >> (sig - 1) & 1:
+                        return True
+        except (OSError, ValueError, IndexError):
+            pass
+        return False
+
+    def drain(self):
+        if self.pid is None:
+            return
+        import select
+        try:
+            os.write(self.w_cmd, b'd')
+            if select.select([self.r_ack], [], [], 2)[0] and os.read(self.r_ack, 1):
+                return
+        except OSError:
+            pass
+        self.close()        # no answer: forward every signal from now on, as without a probe
+
+    def close(self):
+        if self.pid is None:
+            return
+        for fd in (self.w_cmd, self.r_ack):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+            os.waitpid(self.pid, 0)
+        except OSError:
+            pass
+        self.pid = None
+
+
+def same_group(pid):
+    try:
+        return os.getpgid(pid) == os.getpgrp()
+    except OSError:
+        return False
+
+
+def child_setup(restore_ignored, mask):
+    prctl = load_prctl()
 
     def setup():
         for sig in restore_ignored:
@@ -268,14 +392,19 @@ def run(argv, cfg):
     systemd_run = tool('systemd-run')
     keep = os.environ.get('HEAVY_KEEP') == '1'
     slice_cg = check_slice(systemctl, cfg['slice'])
+    env = caller_environ()
     if not keep and in_heavy_scope(slice_cg):
+        env[b'HEAVY_SCOPE'] = own_cgroup().rpartition('/')[2].encode()
+        for sig in PYTHON_IGNORED:
+            signal.signal(sig, signal.SIG_DFL)
         try:
-            os.execvp(argv[0], argv)
+            os.execvpe(argv[0], argv, env)
         except OSError as e:
             say(f'{argv[0]}: {e.strerror}')
             return 127 if isinstance(e, FileNotFoundError) else 126
     grace = cfg['grace_seconds']
-    unit = unit_name(argv[0])
+    unit = unit_name(argv[0], keep)
+    env[b'HEAVY_SCOPE'] = unit.encode()
 
     ignored = [s for s in WATCH + FORWARD if signal.getsignal(s) == signal.SIG_IGN]
     watch = [s for s in WATCH if s not in ignored]
@@ -286,11 +415,25 @@ def run(argv, cfg):
     restore = ignored + ([signal.SIGCHLD] if chld_ignored else [])
     cmd = [systemd_run, '--user', '--scope', '--quiet', '--collect', f'--slice={cfg["slice"]}', f'--unit={unit}',
            '-p', f'TimeoutStopSec={grace:g}s', '--', *argv]
+    probe = GroupProbe(list(WATCH + FORWARD))
     try:
-        child = subprocess.Popen(cmd, close_fds=False, preexec_fn=child_setup(restore, old_mask))
+        child = subprocess.Popen(cmd, close_fds=False, env=env, preexec_fn=child_setup(restore, old_mask))
     except OSError as e:
+        probe.close()
         say(f'cannot start systemd-run: {e}')
         return 1
+    try:
+        return wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward)
+    finally:
+        probe.close()
+
+
+def unchecked(why, unit):
+    say(f'{why}could not check {unit} for leftovers (the systemd user manager did not answer); '
+        f'look with: systemctl --user status {unit}')
+
+
+def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward):
 
     # The first INT/TERM/HUP/QUIT reaches the command (heavy passes it on when it was sent to heavy alone); heavy
     # gives the command the grace time to end, then stops the whole scope. A second one stops the scope at once.
@@ -307,19 +450,28 @@ def run(argv, cfg):
                 else signal.sigtimedwait(wanted, max(0.0, deadline - time.monotonic())))
         if info is None or info.si_signo == signal.SIGCHLD:
             continue
-        sender_is_process = info.si_code <= 0      # kill(), sigqueue(), tkill(); a terminal's signal is SI_KERNEL
-        if info.si_signo in forward:
-            if sender_is_process:
+        sig = info.si_signo
+        # A sender that signals heavy and then the whole group (timeout(1)) has done both after this moment; the
+        # same signal again now is the same event, not a second signal.
+        time.sleep(0.05)
+        while signal.sigtimedwait([sig], 0) is not None:
+            pass
+        group = probe.got(sig) and same_group(child.pid)    # the command got this one itself
+        probe.drain()
+        # heavy passes on what a process sent to heavy alone; a terminal's signal (SI_KERNEL) reaches the command too
+        pass_on = info.si_code <= 0 and not group
+        if sig in forward:
+            if pass_on:
                 try:
-                    os.kill(child.pid, info.si_signo)
+                    os.kill(child.pid, sig)
                 except OSError:
                     pass
             continue
         if got is not None:                         # a second signal: stop now
-            got = info.si_signo
+            got = sig
             break
-        got = info.si_signo
-        if sender_is_process:
+        got = sig
+        if pass_on:
             try:
                 os.kill(child.pid, got)
             except OSError:
@@ -328,6 +480,8 @@ def run(argv, cfg):
 
     if status is None:                              # a signal to heavy, and the command is still running
         cg, pids = scope_state(systemctl, unit)
+        if pids is None and not cg:
+            unchecked(f'{signal.Signals(got).name}: ', unit)
         text = describe(pids) if pids else ''       # names now: the processes are gone after the stop
         left = stop_scope(systemctl, unit, cg, grace) if cg else []
         try:
@@ -345,7 +499,9 @@ def run(argv, cfg):
     why = f'{signal.Signals(got).name}: ' if got is not None else ''   # the command ended after a signal to heavy
 
     cg, pids = scope_state(systemctl, unit)
-    if pids is None and cg:                          # the scope is still there, but its cgroup cannot be read
+    if pids is None and not cg:                      # systemctl failed or timed out
+        unchecked(why, unit)
+    elif pids is None:                               # the scope is still there, but its cgroup cannot be read
         if keep and got is None:
             say(f'kept {unit} (HEAVY_KEEP=1; its processes cannot be read); stop it with: systemctl --user stop {unit}')
         else:

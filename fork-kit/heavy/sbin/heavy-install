@@ -33,7 +33,7 @@ LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-inst
 
 SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md')
 EXECUTABLE = {'bin/heavy', 'sbin/heavy-install'}
-DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 5}
+DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 30}
 SHA_RE = re.compile(r'^[0-9a-f]{40}\Z')
 SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 SIZE_RE = re.compile(r'^(?:[0-9]+[KMGT]?|[0-9]{1,3}%|infinity)\Z')

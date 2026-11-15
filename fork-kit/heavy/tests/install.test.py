@@ -68,7 +68,7 @@ class Install(unittest.TestCase):
         self.assertEqual(os.readlink(self.path('/usr/local/bin/heavy')), '/usr/local/libexec/heavy/current/bin/heavy')
         self.assertEqual(os.readlink(self.path('/usr/local/libexec/heavy/current')),
                          f'/usr/local/libexec/heavy/versions/{SHA1}')
-        self.assertEqual(self.config(), {'version': 1, 'slice': 'heavy.slice', 'grace_seconds': 5})
+        self.assertEqual(self.config(), {'version': 1, 'slice': 'heavy.slice', 'grace_seconds': 30})
         self.assertFalse(os.path.exists(self.path('/etc/systemd/user')))
         self.assertEqual(self.run_main('self-check')[0], 0)
         # the installed wrapper runs from its version folder

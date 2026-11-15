@@ -18,17 +18,23 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 | Command                      | What happens                                                                                      |
 | ---------------------------- | ------------------------------------------------------------------------------------------------- |
 | `heavy <command> [args...]`  | runs the command in `heavy-<name>-<random>.scope` in the slice; stops leftovers when it ends      |
-| `HEAVY_KEEP=1 heavy <cmd>`   | the same, but leftovers keep running (a command that must start a daemon); heavy prints the scope |
+| `HEAVY_KEEP=1 heavy <cmd>`   | the same in `heavy-keep-<name>-<random>.scope`, but leftovers keep running (a daemon)             |
 | `heavy --self-check`         | checks the config, that the slice has a unit with a memory limit, and the installed files         |
 | `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                                   |
 
 The command gets the same folder, environment, stdin, stdout, stderr and open files. heavy exits with the command's
-exit code, or dies of the same signal (a shell sees `128+N`), so scripts and `make` see what they saw before.
+exit code, or dies of the same signal (a shell sees `128+N`), so scripts and `make` see what they saw before. The
+environment is exactly the caller's (Python's own locale change is not passed on), plus `HEAVY_SCOPE`, the name of
+the scope (a test can label what it starts with it). Signal settings are the caller's too: SIGPIPE and SIGXFSZ are
+back to the default, so a writer into a closed pipe ends as before. Only `HEAVY_KEEP=1` makes a `heavy-keep-*`
+scope (a command named `keep` gets `heavy-keep_-<random>.scope`), so the leftover sweep can tell kept ones apart.
 
 **Signals.** When heavy gets INT, TERM, HUP or QUIT, the command gets it too: from the terminal (Ctrl-C reaches
-both) or from heavy (when someone sent it to heavy alone). heavy then waits up to the grace time for the command,
-and stops the whole scope (TERM, then KILL after the grace time again). A second signal stops it at once. A command
-that handles the signal and exits keeps its own exit code. USR1 and USR2 are passed on. If heavy is killed with
+both) or from heavy (when someone sent it to heavy alone; a signal sent to the whole process group, as `timeout`
+or a shell's `kill %1` do, reaches the command once). heavy then waits up to the grace time (30 s by default, so a
+command that handles Ctrl-C, a REPL or a server saving its data, has time) for the command, and stops the whole
+scope (TERM, then KILL after the grace time again). A second signal stops it at once. A command that handles the
+signal and exits keeps its own exit code. USR1 and USR2 are passed on. If heavy is killed with
 `kill -9`, the command is killed with it (as before, when heavy and the command were one process); anything the
 command had started keeps running in its scope (the leftover sweep of issue #159 is for that case).
 
@@ -45,11 +51,13 @@ up and prints the one line. With `HEAVY_KEEP=1`, the inner one gets a scope of i
 `/etc/heavy/config.json` (written by the installer):
 
 ```json
-{ "version": 1, "slice": "heavy.slice", "grace_seconds": 5 }
+{ "version": 1, "slice": "heavy.slice", "grace_seconds": 30 }
 ```
 
-`HEAVY_CONFIG` names another file; `HEAVY_SLICE` and `HEAVY_GRACE` override one value (tests use them). Without a
-config file the defaults above apply. The limits live in the slice unit, not here: either a unit you already have
+`HEAVY_CONFIG` names another file; `HEAVY_SLICE` and `HEAVY_GRACE` override one value (tests use them;
+`HEAVY_SYSTEMCTL` names another systemctl). Without a config file the defaults above apply. `grace_seconds` is how
+long a command gets after a signal, and leftovers after TERM, before KILL. If the last check of the scope fails (an
+overloaded host: systemctl errors or times out), heavy says it could not check for leftovers, never nothing. The limits live in the slice unit, not here: either a unit you already have
 (for example `~/.config/systemd/user/heavy.slice`), or one the installer writes to `/etc/systemd/user/` when given
 limit options. A user's own unit in `~/.config/systemd/user/` wins over the one in `/etc/systemd/user/`.
 

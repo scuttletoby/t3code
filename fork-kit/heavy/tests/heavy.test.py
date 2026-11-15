@@ -186,12 +186,33 @@ class Heavy(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         lines = self.heavy_lines(r.stderr)
         self.assertEqual(len(lines), 1, r.stderr)
-        m = re.fullmatch(r'heavy: kept 1 leftover process \(sleeper\) in (heavy-sh-[0-9a-f]{8}\.scope) \(HEAVY_KEEP=1\);'
+        m = re.fullmatch(r'heavy: kept 1 leftover process \(sleeper\) in (heavy-keep-sh-[0-9a-f]{8}\.scope) \(HEAVY_KEEP=1\);'
                          r' stop them with: systemctl --user stop \1', lines[0])
         self.assertTrue(m, lines[0])
         self.assertEqual(len(self.ours()), 1, 'the kept process is not running')
         subprocess.run(['systemctl', '--user', 'stop', m.group(1)], check=True, timeout=60)
         wait_for(lambda: not self.ours(), what='the kept process to stop')
+
+    def test_a_command_named_keep_gets_a_plain_scope(self):
+        # only HEAVY_KEEP=1 makes a heavy-keep-* scope: the leftover sweep (#159) keeps those by their name
+        keep = self.script('keep', 'cat /proc/self/cgroup')
+        r = self.heavy(keep)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        leaf = r.stdout.strip().rpartition('/')[2]
+        self.assertRegex(leaf, r'^heavy-keep_-[0-9a-f]{8}\.scope$')
+        self.assertFalse(leaf.startswith('heavy-keep-'), leaf)
+
+    def test_leftovers_that_cannot_be_checked_are_reported(self):
+        # the last systemctl query fails (an overloaded host: bus error or timeout): heavy says so, never silent
+        self.leaves_on_purpose = True
+        real = shutil.which('systemctl')
+        fake = self.script('systemctl', f'case "$*" in *" show heavy-"*) echo "bus error" >&2; exit 1;; esac\n'
+                                        f'exec {real} "$@"')
+        r = self.heavy('sh', '-c', f'{self.sleeper} & exit 0', env=dict(self.env, HEAVY_SYSTEMCTL=fake))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = self.heavy_lines(r.stderr)
+        self.assertEqual(len(lines), 1, r.stderr)
+        self.assertRegex(lines[0], r'^heavy: could not check heavy-sh-[0-9a-f]{8}\.scope for leftovers ')
 
     # --- passthrough ---------------------------------------------------------------------------------------------
 
@@ -218,6 +239,41 @@ class Heavy(unittest.TestCase):
             os.close(7)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, f'from stdin\n{self.dir}\nkept as is\nfrom fd 7\n')
+
+    def test_environment_is_the_callers_in_a_c_locale_too(self):
+        # Python's C-locale coercion (PEP 538) adds LC_CTYPE=C.UTF-8 to heavy's own environment: not to the command's
+        env = {k: v for k, v in self.env.items() if k in ('PATH', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
+                                                          'HEAVY_SLICE', 'HEAVY_CONFIG', 'HEAVY_GRACE')}
+        env['LANG'] = 'C'
+        r = self.heavy('env', '-0', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = dict(item.split('=', 1) for item in r.stdout.split('\0') if item)
+        self.assertRegex(got.pop('HEAVY_SCOPE', ''), r'^heavy-env-[0-9a-f]{8}\.scope$')
+        got.pop('INVOCATION_ID', None)      # systemd-run --scope sets it (the old wrapper too)
+        self.assertEqual(got, env)
+
+    def test_scope_name_is_in_the_environment_nested_too(self):
+        r = self.heavy('sh', '-c', 'echo "$HEAVY_SCOPE"; "$0" sh -c \'echo "$HEAVY_SCOPE"; cat /proc/self/cgroup\'',
+                       HEAVY)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        outer, inner, cgroup = r.stdout.split()
+        self.assertRegex(outer, r'^heavy-sh-[0-9a-f]{8}\.scope$')
+        self.assertEqual((inner, cgroup.rpartition('/')[2]), (outer, outer))
+
+    def test_nested_command_gets_default_sigpipe_and_sigxfsz(self):
+        # the nested heavy execs from Python, which ignores SIGPIPE and SIGXFSZ; SIG_IGN survives exec
+        r = self.heavy('sh', '-c', '"$0" sh -c "grep SigIgn /proc/self/status"', HEAVY)
+        ign = int(r.stdout.split()[-1], 16)
+        for sig in (signal.SIGPIPE, signal.SIGXFSZ):
+            self.assertEqual(ign >> (sig - 1) & 1, 0, f'{sig.name} ignored in the nested command: {r.stdout}')
+
+    def test_nested_writer_into_a_closed_pipe_ends_quietly(self):
+        r = self.heavy('sh', '-c', '"$0" yes | head -1', HEAVY)
+        self.assertEqual((r.returncode, r.stdout), (0, 'y\n'), r.stderr)
+        self.assertNotIn('Broken pipe', r.stderr)
+        # a writer that ignores write errors dies of SIGPIPE too, instead of spinning
+        r = self.heavy('sh', '-c', '"$0" sh -c "while :; do echo x; done" | head -1', HEAVY)
+        self.assertEqual((r.returncode, r.stdout), (0, 'x\n'), r.stderr)
 
     def test_runs_in_its_own_scope_in_the_slice(self):
         r = self.heavy('cat', '/proc/self/cgroup')
@@ -260,6 +316,65 @@ class Heavy(unittest.TestCase):
         self.assertEqual(p.returncode, 0, err)   # the command's own exit code, as before
         self.assertEqual(self.ours(), [])
         self.assertIn('heavy: SIGHUP: stopped 1 leftover process (sleeper)', err)
+
+    def counter(self, seconds):
+        """A command that handles INT and USR1 and keeps running: it counts both, prints int=N usr1=M at the end."""
+        path = os.path.join(self.dir, 'counter')
+        with open(path, 'w') as f:
+            f.write('#!/usr/bin/python3 -I\n'
+                    'import signal, time\n'
+                    'sigs = [signal.SIGINT, signal.SIGUSR1]\n'
+                    'signal.pthread_sigmask(signal.SIG_BLOCK, sigs)\n'
+                    'print("ready", flush=True)\n'
+                    f'n, end = {{s: 0 for s in sigs}}, time.monotonic() + {seconds}\n'
+                    'while (left := end - time.monotonic()) > 0:\n'
+                    '    info = signal.sigtimedwait(sigs, left)\n'
+                    '    if info:\n'
+                    '        n[info.si_signo] += 1\n'
+                    'print(f"int={n[signal.SIGINT]} usr1={n[signal.SIGUSR1]}", flush=True)\n')
+        os.chmod(path, 0o755)
+        return path
+
+    def wait_ready(self, p):
+        self.assertEqual(p.stdout.readline(), 'ready\n')
+
+    def test_default_grace_lets_a_command_that_handles_int_finish(self):
+        # Ctrl-C to a command that handles it (a REPL, a server saving its world): 30 s by default before heavy stops it
+        env = dict(self.env)
+        env.pop('HEAVY_GRACE')
+        p = self.start(self.counter(8), env=env)
+        self.wait_ready(p)
+        os.killpg(p.pid, signal.SIGINT)
+        out, err = p.communicate(timeout=60)
+        self.assertEqual((p.returncode, out), (0, 'int=1 usr1=0\n'), err)
+
+    def test_group_signal_reaches_the_command_once(self):
+        # heavy and the command both get a signal sent to the process group: heavy must not pass it on as well.
+        # Five USR1 rounds (passed on, never a stop), because the kernel sometimes merges a doubled signal
+        p = self.start(self.counter(3), env=dict(self.env, HEAVY_GRACE='10'))
+        self.wait_ready(p)
+        for _ in range(5):
+            os.killpg(p.pid, signal.SIGUSR1)
+            time.sleep(0.2)
+        os.killpg(p.pid, signal.SIGINT)
+        out, err = p.communicate(timeout=60)
+        self.assertEqual((p.returncode, out), (0, 'int=1 usr1=5\n'), err)
+
+    def test_signal_to_heavy_alone_is_passed_on(self):
+        p = self.start(self.counter(2), env=dict(self.env, HEAVY_GRACE='10'))
+        self.wait_ready(p)
+        for sig in (signal.SIGUSR1, signal.SIGUSR1, signal.SIGINT):
+            p.send_signal(sig)
+            time.sleep(0.2)
+        out, err = p.communicate(timeout=60)
+        self.assertEqual((p.returncode, out), (0, 'int=1 usr1=2\n'), err)
+
+    def test_timeout_signal_to_heavy_and_its_group_counts_once(self):
+        # timeout(1) sends the signal to heavy, then to its whole process group: one event, not a second signal
+        r = subprocess.run(['timeout', '-s', 'INT', '1', HEAVY, self.counter(3)], capture_output=True, text=True,
+                           timeout=60, env=dict(self.env, HEAVY_GRACE='10'), cwd=self.dir)
+        self.assertEqual((r.returncode, r.stdout), (124, 'ready\nint=1 usr1=0\n'), r.stderr)
+        self.assertEqual(self.heavy_lines(r.stderr), [])
 
     def test_kill_9_on_heavy_takes_the_command_with_it(self):
         p = self.start('sh', '-c', f'exec {self.sleeper}')
