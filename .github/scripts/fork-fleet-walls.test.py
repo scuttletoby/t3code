@@ -436,6 +436,90 @@ class EveryWallsFile(Case):
         self.assertRegex(line, fw.LINE)
         self.assertIn('cg\\x1b[2J\\u202eb\\u200e\\u200f\\u061c', line)
 
+    def test_linux_etc_secrets_reads_mount_units_and_the_login_environment(self):
+        """Fix round 3 (#194 re-check S2): a share mounted by a systemd unit keeps its password in Options= (0644 as
+        installed, so every job reads it), and /etc/environment and /etc/profile.d set every login's variables: a
+        credential in either FAILS, as the same line in /etc/fstab does (the control)."""
+        opts = 'username=me,password=hunter2,uid=1000'
+        unit = f'[Mount]\nWhat=//nas/share\nWhere=/srv/nas\nType=cifs\nOptions={opts}\n'
+        for name, change in (('fstab (control)', {'etc/fstab': f'//nas/share /srv/nas cifs {opts} 0 0\n'}),
+                             ('mount unit', {'etc/systemd/system/srv-nas.mount': unit}),
+                             ('automount drop-in', {'etc/systemd/system/srv-nas.automount.d/x.conf':
+                                                    '[Mount]\nOptions=credentials=/etc/nas.txt\n',
+                                                    'etc/nas.txt': 'username=me\npassword=hunter2\n'}),
+                             ('environment', {'etc/environment': 'GITHUB_TOKEN="ghp_x"\n'}),
+                             ('profile.d', {'etc/profile.d/x.sh': 'export AWS_SECRET_ACCESS_KEY=abc\n'})):
+            with self.subTest(name):
+                root = self.root(overlay(LINUX, change))
+                self.assertIn('etc-secrets', self.walls('linux', 'describe', root)[1])
+        for name, change in (('a mount unit only root reads', {'etc/systemd/system/srv-nas.mount':
+                                                               {'text': unit, 'mode': '600'}}),
+                             ('a variable named, not set', {'etc/profile.d/x.sh': 'export GH_TOKEN=$(cat ~/.t)\n'})):
+            with self.subTest(name):
+                root = self.root(overlay(LINUX, change))
+                self.assertNotIn('etc-secrets', self.walls('linux', 'describe', root)[1])
+
+    def test_linux_etc_secrets_reads_every_login_file_and_form(self):
+        """Fix round 4 (#208 lenses S2 and C1): a secret every job can read in the login or session environment, in
+        the places and forms a host has it: bash's, zsh's, csh's and pam_env's start files and systemd's
+        environment.d; several assignments on a line, declare/typeset/readonly/export -n, a guard, a default in
+        ${X:-...}; GitHub's PAT names; a password in a proxy URL; a known token's shape under any name (a comment
+        too); a systemd unit's Environment= and an EnvironmentFile= others can read. Each FAILS; the forms with no
+        literal secret still pass."""
+        tok = 'ghp_' + 'FAKE' * 9   # a GitHub token's shape, obviously not one (built here: no scanner sees it whole)
+        fails = {
+            'environment.d': {'etc/environment.d/50-ci.conf': 'GH_TOKEN=x1\n'},
+            'etc/profile': {'etc/profile': '\nexport GH_TOKEN=x1\n'},
+            'etc/bash.bashrc': {'etc/bash.bashrc': '\nexport GH_TOKEN=x1\n'},
+            'zsh': {'etc/zsh/zshenv': 'export GH_TOKEN=x1\n'},
+            'pam_env': {'etc/security/pam_env.conf': 'GH_TOKEN DEFAULT=x1\n'},
+            'two on a line': {'etc/profile.d/ci.sh': 'export EDITOR=vi GH_TOKEN=x1\n'},
+            'declare -x': {'etc/profile.d/ci.sh': 'declare -x GH_TOKEN=x1\n'},
+            'typeset -x': {'etc/profile.d/ci.sh': 'typeset -x GH_TOKEN=x1\n'},
+            'readonly': {'etc/profile.d/ci.sh': 'readonly GH_TOKEN=x1\n'},
+            'export -n': {'etc/profile.d/ci.sh': 'export -n GH_TOKEN=x1\n'},
+            'guard ||': {'etc/profile.d/ci.sh': '[ -n "$GH_TOKEN" ] || export GH_TOKEN=x1\n'},
+            'guard &&': {'etc/profile.d/ci.sh': '[ -z "$GH_TOKEN" ] && GH_TOKEN=x1\n'},
+            'default :-': {'etc/profile.d/ci.sh': 'export GH_TOKEN="${GH_TOKEN:-x1}"\n'},
+            'default :=': {'etc/profile.d/ci.sh': ': ${GH_TOKEN:=x1}\n'},
+            'GH_PAT': {'etc/profile.d/ci.sh': 'GH_PAT=x1\n'},
+            'GITHUB_PAT': {'etc/profile.d/ci.sh': 'export GITHUB_PAT=x1\n'},
+            'proxy URL': {'etc/environment': 'https_proxy=http://me:hunter2@proxy.example:3128\n'},
+            'token shape, other name': {'etc/profile.d/ci.sh': f'export MY_GH={tok}\n'},
+            'token shape, a comment': {'etc/profile.d/ci.sh': f'# old: {tok}\n'},
+            'csh setenv': {'etc/csh.cshrc': 'setenv GH_TOKEN x1\n'},
+            'unit Environment=': {'etc/systemd/system/backup.service':
+                                  '[Service]\nEnvironment=RESTIC_PASSWORD=hunter2\nExecStart=/usr/bin/restic\n'},
+            'drop-in, quoted': {'etc/systemd/system/backup.service.d/env.conf':
+                                '[Service]\nEnvironment="LANG=C" "RESTIC_PASSWORD=hunter 2"\n'},
+            'user unit': {'etc/systemd/user/sync.service': '[Service]\nEnvironment=GH_TOKEN=x1\n'},
+            'system.conf': {'etc/systemd/system.conf': '[Manager]\nDefaultEnvironment=GH_TOKEN=x1\n'},
+            'EnvironmentFile': {'etc/systemd/system/backup.service': '[Service]\nEnvironmentFile=-/etc/backup.env\n',
+                                'etc/backup.env': 'RESTIC_PASSWORD=hunter2\n'},
+            'unit token shape': {'etc/systemd/system/x.service': f'[Service]\nExecStart=/usr/bin/x --auth {tok}\n'},
+        }
+        for name, change in fails.items():
+            with self.subTest(name):
+                root = self.root(overlay(LINUX, change))
+                self.assertIn('etc-secrets', self.walls('linux', 'describe', root)[1])
+        passes = {
+            'from a command': {'etc/profile.d/ci.sh': 'export GH_TOKEN=$(cat ~/.t) EDITOR=vi\n'},
+            'from a variable': {'etc/profile.d/ci.sh': 'export GH_TOKEN="$OTHER" PAT=${OTHER}\n'},
+            'an empty default': {'etc/profile.d/ci.sh': 'export GH_TOKEN="${GH_TOKEN:-}"\n'},
+            'a name in a comment': {'etc/profile.d/ci.sh': '# export GH_TOKEN=x1\n'},
+            'PATH is no PAT': {'etc/profile.d/ci.sh': 'PATH=/x:$PATH\nPATTERN=a\n'},
+            'proxy without a password': {'etc/environment': 'https_proxy=http://proxy.example:3128\n'},
+            'proxy, password from a variable': {'etc/profile.d/ci.sh': 'export https_proxy=http://me:$PW@proxy:3128\n'},
+            'unit, other names': {'etc/systemd/system/x.service': '[Service]\nEnvironment=LANG=C TZ=UTC\n'},
+            'EnvironmentFile only root reads': {'etc/systemd/system/x.service': '[Service]\nEnvironmentFile=/etc/x.env\n',
+                                                'etc/x.env': {'text': 'GH_TOKEN=x1\n', 'mode': '600'}},
+            'an owner-only profile': {'etc/profile': {'text': 'export GH_TOKEN=x1\n', 'mode': '600'}},
+        }
+        for name, change in passes.items():
+            with self.subTest(name):
+                root = self.root(overlay(LINUX, change))
+                self.assertNotIn('etc-secrets', self.walls('linux', 'describe', root)[1])
+
     def test_linux_cgroup_bpf_from_the_kernel_config(self):   # the config in /boot decides before /proc/kallsyms
         for config, want in (('CONFIG_CGROUP_BPF=y\n', []), ('# CONFIG_CGROUP_BPF is not set\n', ['cgroup-bpf'])):
             with self.subTest(config):
