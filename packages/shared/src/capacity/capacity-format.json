@@ -1,0 +1,137 @@
+{
+  "format": "capacity-format/1",
+  "//": "The shape of capacity-rule.json and capacity-vectors.json, in a small language every evaluator checks the same way (README.md beside this file). A key ending in ? is optional; keys starting with // are notes.",
+  "types": {
+    "nonneg": "number>=0",
+    "kindSpec": {
+      "object": {
+        "group": "=agent|=job",
+        "startMb": "uint",
+        "startCentiCores": "uint",
+        "maxAtOnce?": "uint",
+        "plusDeclared?": "bool",
+        "declaredFallbackMb?": "uint"
+      }
+    },
+    "rule": {
+      "object": {
+        "format": "=capacity-rule/1",
+        "margin": {
+          "object": { "minMb": "uint", "totalPercent": "uint", "noSwapOrNoCapsPercent": "uint" }
+        },
+        "readingBounds": {
+          "object": { "minTotalMb": "uint", "maxTotalMb": "uint", "maxCpuCores": "uint" }
+        },
+        "kinds": { "map": "@kindSpec" },
+        "unknownKinds": { "object": { "jobPrefix": "string", "job": "string", "other": "string" } },
+        "learnedBounds": { "object": { "minPercent": "uint", "maxPercent": "uint" } },
+        "jobCoresPercent": "uint",
+        "writers": {
+          "object": {
+            "kind": "string",
+            "buildKind": "string",
+            "perBuildThatFits": "uint",
+            "min": "uint"
+          }
+        },
+        "floors": "@perGroup",
+        "ceilings": "@perGroup",
+        "pressure": {
+          "object": {
+            "elevated": {
+              "object": {
+                "psiSomeAvg10Pct": "@nonneg",
+                "psiFullAvg10Pct": "@nonneg",
+                "availableBelowMarginPercent": "uint",
+                "swapFreeBelowPercent": "uint"
+              }
+            },
+            "severe": {
+              "object": { "psiFullAvg10Pct": "@nonneg", "availableBelowMarginPercent": "uint" }
+            },
+            "calm": {
+              "object": {
+                "psiSomeAvg10Pct": "@nonneg",
+                "psiFullAvg10Pct": "@nonneg",
+                "availableAtLeastMarginPercent": "uint",
+                "swapFreeAtLeastPercent": "uint"
+              }
+            },
+            "elevatedClearSeconds": "uint",
+            "severeClearSeconds": "uint"
+          }
+        }
+      }
+    },
+    "perGroup": { "object": { "agent": "uint", "job": "uint" } },
+    "level": "=ok|=elevated|=severe",
+    "reason": "=fits|=floor|=unreadable|=ceiling|=severe|=elevated|=kind-limit|=writers|=cores|=budget",
+    "facts": {
+      "object": {
+        "totalMb?": "any",
+        "availableMb?": "any",
+        "cpuCores?": "any",
+        "pieceCaps": "bool",
+        "swap?": "any",
+        "psi?": "any",
+        "osLevel?": "any",
+        "pieces?": "any",
+        "reservations?": "any"
+      }
+    },
+    "factsPatch": {
+      "object": {
+        "totalMb?": "any",
+        "availableMb?": "any",
+        "cpuCores?": "any",
+        "pieceCaps?": "bool",
+        "swap?": "any",
+        "psi?": "any",
+        "osLevel?": "any",
+        "pieces?": "any",
+        "reservations?": "any"
+      }
+    },
+    "pressureState": { "object": { "level": "@level", "calmSinceMs": "number|null" } },
+    "learned": { "map": { "object": { "mb": "any", "centiCores?": "any" } } },
+    "vector": {
+      "object": {
+        "name": "string",
+        "why": "string",
+        "facts": "string|@facts",
+        "patch?": "@factsPatch",
+        "ask?": { "object": { "kind": "string", "declaredMb?": "any" } },
+        "fill?": {
+          "array": { "object": { "kind": "string", "count": "uint", "declaredMb?": "any" } }
+        },
+        "previous?": "@pressureState|null",
+        "nowMs?": "number",
+        "learned?": "@learned",
+        "floors?": "@perGroup",
+        "ceilings?": "@perGroup",
+        "expect": {
+          "object": {
+            "admit?": "bool",
+            "reason?": "@reason",
+            "level?": "@level",
+            "calmSinceMs?": "number|null",
+            "freeMb?": "number|null",
+            "marginMb?": "number|null",
+            "owedMb?": "number|null",
+            "reservedMb?": "number|null",
+            "costMb?": "number|null",
+            "admitted?": { "array": "uint" },
+            "stoppedBy?": { "array": "@reason|null" }
+          }
+        }
+      }
+    },
+    "vectors": {
+      "object": {
+        "format": "=capacity-vectors/1",
+        "factSets": { "map": "@facts" },
+        "vectors": { "array": "@vector", "minItems": 1 }
+      }
+    }
+  }
+}

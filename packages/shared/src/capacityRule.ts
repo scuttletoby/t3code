@@ -1,0 +1,561 @@
+/**
+ * Fork: the capacity rule of dynamic slots. One budget per machine; pure (no I/O, no clock). Numbers:
+ * `capacity/capacity-rule.json`; every evaluator passes `capacity/capacity-vectors.json` (README.md
+ * beside them). `...Mb` is whole MB (1048576 bytes), `...CentiCores` hundredths of a core.
+ */
+import { capacityFormatErrors, isFiniteNumber, isPlainObject } from "./capacityFormat.ts";
+import ruleJson from "./capacity/capacity-rule.json" with { type: "json" };
+
+export type CapacityLevel = "ok" | "elevated" | "severe";
+export type CapacityGroup = "agent" | "job";
+export type CapacityReason =
+  | "fits"
+  | "floor"
+  | "unreadable"
+  | "ceiling"
+  | "severe"
+  | "kind-limit"
+  | "elevated"
+  | "writers"
+  | "cores"
+  | "budget";
+
+export interface CapacityKindSpec {
+  readonly group: CapacityGroup;
+  readonly startMb: number;
+  readonly startCentiCores: number;
+  readonly maxAtOnce?: number;
+  /** The cost is `startMb` plus the size the piece declares (a test server's heap). */
+  readonly plusDeclared?: boolean;
+  readonly declaredFallbackMb?: number;
+}
+
+export type CapacityPerGroup = { readonly agent: number; readonly job: number };
+
+export interface CapacityRule {
+  readonly format: "capacity-rule/1";
+  readonly margin: {
+    readonly minMb: number;
+    readonly totalPercent: number;
+    readonly noSwapOrNoCapsPercent: number;
+  };
+  readonly readingBounds: {
+    readonly minTotalMb: number;
+    readonly maxTotalMb: number;
+    readonly maxCpuCores: number;
+  };
+  readonly kinds: Readonly<Record<string, CapacityKindSpec>>;
+  readonly unknownKinds: {
+    readonly jobPrefix: string;
+    readonly job: string;
+    readonly other: string;
+  };
+  readonly learnedBounds: { readonly minPercent: number; readonly maxPercent: number };
+  readonly jobCoresPercent: number;
+  readonly writers: {
+    readonly kind: string;
+    readonly buildKind: string;
+    readonly perBuildThatFits: number;
+    readonly min: number;
+  };
+  readonly floors: CapacityPerGroup;
+  readonly ceilings: CapacityPerGroup;
+  readonly pressure: {
+    readonly elevated: {
+      readonly psiSomeAvg10Pct: number;
+      readonly psiFullAvg10Pct: number;
+      readonly availableBelowMarginPercent: number;
+      readonly swapFreeBelowPercent: number;
+    };
+    readonly severe: {
+      readonly psiFullAvg10Pct: number;
+      readonly availableBelowMarginPercent: number;
+    };
+    readonly calm: {
+      readonly psiSomeAvg10Pct: number;
+      readonly psiFullAvg10Pct: number;
+      readonly availableAtLeastMarginPercent: number;
+      readonly swapFreeAtLeastPercent: number;
+    };
+    readonly elevatedClearSeconds: number;
+    readonly severeClearSeconds: number;
+  };
+}
+
+/** The rule from parsed JSON, or the reasons it cannot be used (shape, then cross-references). */
+export function parseCapacityRule(
+  value: unknown,
+):
+  | { readonly ok: true; readonly rule: CapacityRule }
+  | { readonly ok: false; readonly errors: ReadonlyArray<string> } {
+  const errors = [...capacityFormatErrors(value, "rule")];
+  if (errors.length > 0) return { ok: false, errors };
+  const rule = value as CapacityRule;
+  const needKind = (name: string, group: CapacityGroup, where: string) => {
+    if (rule.kinds[name]?.group !== group)
+      errors.push(`rule.${where}: "${name}" is not a ${group} kind`);
+  };
+  needKind(rule.unknownKinds.job, "job", "unknownKinds.job");
+  needKind(rule.unknownKinds.other, "agent", "unknownKinds.other");
+  needKind(rule.writers.kind, "agent", "writers.kind");
+  needKind(rule.writers.buildKind, "job", "writers.buildKind");
+  if (rule.learnedBounds.minPercent > rule.learnedBounds.maxPercent) {
+    errors.push("rule.learnedBounds: minPercent is above maxPercent");
+  }
+  if (rule.readingBounds.minTotalMb > rule.readingBounds.maxTotalMb) {
+    errors.push("rule.readingBounds: minTotalMb is above maxTotalMb");
+  }
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, rule };
+}
+
+const shipped = parseCapacityRule(ruleJson);
+if (!shipped.ok) throw new Error(`capacity-rule.json: ${shipped.errors.join("; ")}`);
+/** The rule this build ships (checked when the module loads). */
+export const CAPACITY_RULE: CapacityRule = shipped.rule;
+
+/** A live piece. `demandMb`: anon + shmem + swap now; `null` while not measured (owes its full cost). */
+export interface CapacityPiece {
+  readonly kind: string;
+  readonly demandMb: number | null;
+  readonly declaredMb?: number;
+}
+
+/** MB held for a folder or a name; `useMb` is what the holder uses now (`null`: unknown, holds all). */
+export interface CapacityReservation {
+  readonly mb: number;
+  readonly useMb: number | null;
+}
+
+/**
+ * What the machine said. A missing or broken `totalMb`, `availableMb`, `cpuCores` or `pieces` means
+ * nothing can be admitted ("unreadable"). `swap`/`psi`/`osLevel`: `null` or absent when the machine
+ * has none, `"unreadable"` when it has one that could not be read (level at least "elevated").
+ */
+export interface CapacityFacts {
+  readonly totalMb?: number | null;
+  readonly availableMb?: number | null;
+  readonly cpuCores?: number | null;
+  /** Each piece runs under its own memory cap (full tier). Without it the margin is wider. */
+  readonly pieceCaps: boolean;
+  readonly swap?: { readonly totalMb: number; readonly freeMb: number } | null | "unreadable";
+  readonly psi?:
+    | { readonly someAvg10Pct: number; readonly fullAvg10Pct: number }
+    | null
+    | "unreadable";
+  readonly osLevel?: CapacityLevel | null | "unreadable";
+  readonly pieces?: ReadonlyArray<CapacityPiece> | null;
+  readonly reservations?: ReadonlyArray<CapacityReservation> | null;
+}
+
+/** Learned costs by kind (later PR). Clamped to the rule's bounds around the start cost. */
+export type CapacityLearned = Readonly<
+  Record<string, { readonly mb: number; readonly centiCores?: number }>
+>;
+
+/** The pressure level the caller keeps between reads (hysteresis). */
+export interface PressureState {
+  readonly level: CapacityLevel;
+  /** When the readings last became quiet enough to step down; `null` when they are not. */
+  readonly calmSinceMs: number | null;
+}
+
+interface Readings {
+  readonly totalMb: number;
+  readonly availableMb: number;
+  readonly centiCores: number;
+  readonly pieces: ReadonlyArray<{
+    readonly kind: string;
+    readonly demandMb: number;
+    readonly declaredMb: unknown;
+  }>;
+  readonly demandSumMb: number;
+  readonly reservedMb: number;
+  readonly swap: { readonly totalMb: number; readonly freeMb: number } | null | "unreadable";
+  readonly psi:
+    | { readonly someAvg10Pct: number; readonly fullAvg10Pct: number }
+    | null
+    | "unreadable";
+  readonly osLevel: CapacityLevel | null | "unreadable";
+}
+
+/** Whole MB, rounded down (a reading never claims more than it saw). */
+const floorMb = (value: number): number => Math.floor(value);
+const ceilDiv = (numerator: number, denominator: number): number =>
+  Math.ceil(numerator / denominator);
+
+function readFacts(rule: CapacityRule, facts: CapacityFacts): Readings | null {
+  const bounds = rule.readingBounds;
+  const { totalMb, availableMb, cpuCores } = facts;
+  if (!isFiniteNumber(totalMb) || !isFiniteNumber(availableMb) || !isFiniteNumber(cpuCores))
+    return null;
+  const total = floorMb(totalMb);
+  // Bounds catch unit mix-ups: bytes or KB passed as MB, or GB passed as MB.
+  if (total < bounds.minTotalMb || total > bounds.maxTotalMb) return null;
+  if (availableMb < 0 || availableMb > totalMb) return null;
+  if (cpuCores <= 0 || cpuCores > bounds.maxCpuCores) return null;
+  if (!Array.isArray(facts.pieces)) return null;
+  const pieces = facts.pieces.map((piece: unknown) => {
+    const record = isPlainObject(piece) ? piece : {};
+    const demand = record.demandMb;
+    return {
+      kind: typeof record.kind === "string" ? record.kind : "",
+      // An impossible demand (negative, larger than the machine) is not trusted: it owes in full.
+      demandMb: isFiniteNumber(demand) && demand >= 0 && demand <= totalMb ? floorMb(demand) : 0,
+      declaredMb: record.declaredMb,
+    };
+  });
+  const reservations: unknown = facts.reservations ?? [];
+  if (!Array.isArray(reservations)) return null;
+  let reservedMb = 0;
+  for (const reservation of reservations as Array<unknown>) {
+    const record = isPlainObject(reservation) ? reservation : {};
+    const mb = isFiniteNumber(record.mb) && record.mb > 0 ? Math.ceil(record.mb) : 0;
+    const use = record.useMb;
+    const useMb = isFiniteNumber(use) && use >= 0 && use <= totalMb ? floorMb(use) : 0;
+    reservedMb += Math.max(0, mb - useMb);
+  }
+  const swap: Readings["swap"] = (() => {
+    const value: unknown = facts.swap;
+    if (value === null || value === undefined) return null;
+    if (!isPlainObject(value)) return "unreadable";
+    const { totalMb: swapTotal, freeMb: swapFree } = value;
+    if (!isFiniteNumber(swapTotal) || !isFiniteNumber(swapFree)) return "unreadable";
+    if (swapTotal < 0 || swapFree < 0 || swapFree > swapTotal) return "unreadable";
+    return swapTotal === 0 ? null : { totalMb: floorMb(swapTotal), freeMb: floorMb(swapFree) };
+  })();
+  const psi: Readings["psi"] = (() => {
+    const value: unknown = facts.psi;
+    if (value === null || value === undefined) return null;
+    if (!isPlainObject(value)) return "unreadable";
+    const { someAvg10Pct, fullAvg10Pct } = value;
+    const valid = (pct: unknown): pct is number => isFiniteNumber(pct) && pct >= 0 && pct <= 100;
+    return valid(someAvg10Pct) && valid(fullAvg10Pct)
+      ? { someAvg10Pct, fullAvg10Pct }
+      : "unreadable";
+  })();
+  const os: unknown = facts.osLevel;
+  const osLevel: Readings["osLevel"] =
+    os === null || os === undefined
+      ? null
+      : os === "ok" || os === "elevated" || os === "severe"
+        ? os
+        : "unreadable";
+  return {
+    totalMb: total,
+    availableMb: floorMb(availableMb),
+    centiCores: Math.floor(cpuCores * 100),
+    pieces,
+    demandSumMb: pieces.reduce((sum, piece) => sum + piece.demandMb, 0),
+    reservedMb,
+    swap,
+    psi,
+    osLevel,
+  };
+}
+
+/** The kind a name stands for: itself when known, else the rule's expensive default for its group. */
+function capacityKind(rule: CapacityRule, kind: string): string {
+  if (Object.hasOwn(rule.kinds, kind)) return kind;
+  return kind.startsWith(rule.unknownKinds.jobPrefix)
+    ? rule.unknownKinds.job
+    : rule.unknownKinds.other;
+}
+
+interface Cost {
+  readonly mb: number;
+  readonly centiCores: number;
+  /** The cost before learning (still with the declared size): what a floor may count. */
+  readonly unlearnedMb: number;
+}
+
+function costOf(
+  rule: CapacityRule,
+  kind: string,
+  learned: CapacityLearned | undefined,
+  declaredMb: unknown,
+): Cost {
+  const spec = rule.kinds[kind]!;
+  if (spec.plusDeclared === true) {
+    const declared =
+      isFiniteNumber(declaredMb) && declaredMb > 0 && declaredMb <= rule.readingBounds.maxTotalMb
+        ? Math.ceil(declaredMb)
+        : (spec.declaredFallbackMb ?? 0);
+    const mb = spec.startMb + declared;
+    return { mb, centiCores: spec.startCentiCores, unlearnedMb: mb };
+  }
+  const { minPercent, maxPercent } = rule.learnedBounds;
+  const clamp = (value: unknown, start: number): number =>
+    isFiniteNumber(value) && value > 0
+      ? Math.min(
+          Math.max(Math.ceil(value), ceilDiv(start * minPercent, 100)),
+          Math.floor((start * maxPercent) / 100),
+        )
+      : start;
+  const own = learned !== undefined && Object.hasOwn(learned, kind) ? learned[kind] : undefined;
+  return {
+    mb: clamp(own?.mb, spec.startMb),
+    centiCores: clamp(own?.centiCores, spec.startCentiCores),
+    unlearnedMb: spec.startMb,
+  };
+}
+
+/** `max(minMb, totalPercent of total)`, x `noSwapOrNoCapsPercent` without swap or per-piece caps. */
+function marginOf(rule: CapacityRule, readings: Readings, pieceCaps: boolean): number {
+  const base100 = Math.max(rule.margin.minMb * 100, readings.totalMb * rule.margin.totalPercent);
+  const wide = !pieceCaps || readings.swap === null || readings.swap === "unreadable";
+  return wide
+    ? ceilDiv(base100 * rule.margin.noSwapOrNoCapsPercent, 10_000)
+    : ceilDiv(base100, 100);
+}
+
+function rawLevel(
+  rule: CapacityRule,
+  readings: Readings,
+  marginMb: number,
+): { readonly level: CapacityLevel; readonly calm: boolean } {
+  const { elevated, severe, calm } = rule.pressure;
+  const { psi, swap, osLevel } = readings;
+  const available100 = readings.availableMb * 100;
+  if (
+    (typeof psi === "object" && psi !== null && psi.fullAvg10Pct >= severe.psiFullAvg10Pct) ||
+    available100 < marginMb * severe.availableBelowMarginPercent ||
+    osLevel === "severe"
+  ) {
+    return { level: "severe", calm: false };
+  }
+  const psiRead = typeof psi === "object" && psi !== null ? psi : null;
+  const swapRead = typeof swap === "object" && swap !== null ? swap : null;
+  if (
+    psi === "unreadable" ||
+    swap === "unreadable" ||
+    osLevel === "unreadable" ||
+    osLevel === "elevated" ||
+    (psiRead !== null &&
+      (psiRead.someAvg10Pct >= elevated.psiSomeAvg10Pct ||
+        psiRead.fullAvg10Pct >= elevated.psiFullAvg10Pct)) ||
+    available100 < marginMb * elevated.availableBelowMarginPercent ||
+    (swapRead !== null && swapRead.freeMb * 100 < swapRead.totalMb * elevated.swapFreeBelowPercent)
+  ) {
+    return { level: "elevated", calm: false };
+  }
+  const quiet =
+    (psiRead === null ||
+      (psiRead.someAvg10Pct < calm.psiSomeAvg10Pct &&
+        psiRead.fullAvg10Pct < calm.psiFullAvg10Pct)) &&
+    available100 >= marginMb * calm.availableAtLeastMarginPercent &&
+    (swapRead === null || swapRead.freeMb * 100 >= swapRead.totalMb * calm.swapFreeAtLeastPercent);
+  return { level: "ok", calm: quiet };
+}
+
+/**
+ * The next level from this read's raw level and the kept state. Up at once; "severe" steps down to
+ * "elevated" after `severeClearSeconds` without severe readings, "elevated" to "ok" after
+ * `elevatedClearSeconds` of calm readings. No previous state (first read, restart): the raw level.
+ * No `nowMs`: never steps down. A clock that went back restarts the wait.
+ */
+function nextPressure(
+  rule: CapacityRule,
+  raw: { readonly level: CapacityLevel; readonly calm: boolean },
+  previous: PressureState | null | undefined,
+  nowMs: number | undefined,
+): PressureState {
+  if (raw.level === "severe") return { level: "severe", calmSinceMs: null };
+  if (previous === null || previous === undefined || previous.level === "ok") {
+    return { level: raw.level, calmSinceMs: null };
+  }
+  const stepDown = (to: CapacityLevel, seconds: number): PressureState => {
+    if (!isFiniteNumber(nowMs)) return { level: previous.level, calmSinceMs: previous.calmSinceMs };
+    const since =
+      isFiniteNumber(previous.calmSinceMs) && previous.calmSinceMs <= nowMs
+        ? previous.calmSinceMs
+        : nowMs;
+    return nowMs - since >= seconds * 1000
+      ? { level: to, calmSinceMs: null }
+      : { level: previous.level, calmSinceMs: since };
+  };
+  if (previous.level === "severe") return stepDown("elevated", rule.pressure.severeClearSeconds);
+  if (raw.level === "elevated" || !raw.calm) return { level: "elevated", calmSinceMs: null };
+  return stepDown("ok", rule.pressure.elevatedClearSeconds);
+}
+
+export interface CapacityInput {
+  readonly facts: CapacityFacts;
+  readonly ask: { readonly kind: string; readonly declaredMb?: number };
+  readonly learned?: CapacityLearned;
+  readonly previous?: PressureState | null;
+  readonly nowMs?: number;
+}
+
+export interface CapacityDecision {
+  readonly admit: boolean;
+  readonly reason: CapacityReason;
+  /** The kind the ask was counted as. */
+  readonly kind: string;
+  readonly level: CapacityLevel;
+  /** Keep this for the next read. */
+  readonly pressure: PressureState;
+  /** `null` when the readings were unreadable. Can be negative. */
+  readonly freeMb: number | null;
+  readonly marginMb: number | null;
+  readonly owedMb: number | null;
+  readonly reservedMb: number | null;
+  readonly costMb: number;
+}
+
+/**
+ * Admit one piece of `ask.kind` or not, and why. Absolute refusals first (unreadable, ceiling,
+ * severe, the kind's own limit); then the rule (level ok, writers, job cores, budget). A refused
+ * piece still starts under its group's floor when that keeps the machine above the severe line;
+ * the floor never passes a ceiling, "severe" or an unreadable reading.
+ */
+export function capacityDecision(rule: CapacityRule, input: CapacityInput): CapacityDecision {
+  const kind = capacityKind(rule, input.ask.kind);
+  const spec = rule.kinds[kind]!;
+  const cost = costOf(rule, kind, input.learned, input.ask.declaredMb);
+  const readings = readFacts(rule, input.facts);
+  if (readings === null) {
+    const level: CapacityLevel = input.previous?.level === "severe" ? "severe" : "elevated";
+    return {
+      admit: false,
+      reason: "unreadable",
+      kind,
+      level,
+      pressure: { level, calmSinceMs: null },
+      freeMb: null,
+      marginMb: null,
+      owedMb: null,
+      reservedMb: null,
+      costMb: cost.mb,
+    };
+  }
+  const marginMb = marginOf(rule, readings, input.facts.pieceCaps === true);
+  const live = readings.pieces.map((piece) => {
+    const pieceKind = capacityKind(rule, piece.kind);
+    const pieceCost = costOf(rule, pieceKind, input.learned, piece.declaredMb);
+    return {
+      kind: pieceKind,
+      group: rule.kinds[pieceKind]!.group,
+      cost: pieceCost,
+      demandMb: piece.demandMb,
+    };
+  });
+  const owedMb = live.reduce((sum, piece) => sum + Math.max(0, piece.cost.mb - piece.demandMb), 0);
+  const freeMb = readings.availableMb - marginMb - owedMb - readings.reservedMb;
+  const pressure = nextPressure(
+    rule,
+    rawLevel(rule, readings, marginMb),
+    input.previous,
+    input.nowMs,
+  );
+  const result = (admit: boolean, reason: CapacityReason): CapacityDecision => ({
+    admit,
+    reason,
+    kind,
+    level: pressure.level,
+    pressure,
+    freeMb,
+    marginMb,
+    owedMb,
+    reservedMb: readings.reservedMb,
+    costMb: cost.mb,
+  });
+
+  const groupLive = live.filter((piece) => piece.group === spec.group).length;
+  if (groupLive >= rule.ceilings[spec.group]) return result(false, "ceiling");
+  if (pressure.level === "severe") return result(false, "severe");
+  if (
+    spec.maxAtOnce !== undefined &&
+    live.filter((piece) => piece.kind === kind).length >= spec.maxAtOnce
+  ) {
+    return result(false, "kind-limit");
+  }
+
+  const coreLimit = Math.floor((readings.centiCores * rule.jobCoresPercent) / 100);
+  const fail = ((): CapacityReason | null => {
+    if (pressure.level !== "ok") return "elevated";
+    if (kind === rule.writers.kind) {
+      const build = costOf(rule, rule.writers.buildKind, input.learned, undefined);
+      const idleFreeMb =
+        readings.availableMb + readings.demandSumMb - marginMb - readings.reservedMb;
+      const byMemory = Math.floor(Math.max(0, idleFreeMb) / build.mb);
+      const byCores = build.centiCores > 0 ? Math.floor(coreLimit / build.centiCores) : byMemory;
+      const writerCap = Math.max(
+        rule.writers.min,
+        rule.writers.perBuildThatFits * Math.min(byMemory, byCores),
+      );
+      if (live.filter((piece) => piece.kind === kind).length >= writerCap) return "writers";
+    }
+    if (spec.group === "job") {
+      const jobCores = live.reduce(
+        (sum, piece) => sum + (piece.group === "job" ? piece.cost.centiCores : 0),
+        0,
+      );
+      if (jobCores + cost.centiCores > coreLimit) return "cores";
+    }
+    return cost.mb <= freeMb ? null : "budget";
+  })();
+  if (fail === null) return result(true, "fits");
+
+  // The floor: a badly learned cost or a full budget never locks the machine, but the floor never
+  // takes it below the severe line either (on a small machine physical memory wins).
+  const floorCostMb = Math.min(cost.mb, cost.unlearnedMb);
+  const afterMb = readings.availableMb - owedMb - floorCostMb;
+  if (
+    groupLive < rule.floors[spec.group] &&
+    afterMb * 100 >= marginMb * rule.pressure.severe.availableBelowMarginPercent
+  ) {
+    return result(true, "floor");
+  }
+  return result(false, fail);
+}
+
+export interface CapacityFillStep {
+  readonly kind: string;
+  readonly count: number;
+  readonly declaredMb?: number;
+}
+
+/**
+ * Ask for pieces one by one, as at second zero: each admitted piece joins the live list with no
+ * demand yet. Per step: how many were admitted and the reason the first refused one gave (`null`
+ * when all were). A step stops at its first refusal (nothing else changes).
+ */
+export function capacityFill(
+  rule: CapacityRule,
+  input: Omit<CapacityInput, "ask">,
+  steps: ReadonlyArray<CapacityFillStep>,
+): {
+  readonly admitted: ReadonlyArray<number>;
+  readonly stoppedBy: ReadonlyArray<CapacityReason | null>;
+} {
+  const pieces: Array<CapacityPiece> = Array.isArray(input.facts.pieces)
+    ? [...input.facts.pieces]
+    : [];
+  const piecesReadable = Array.isArray(input.facts.pieces);
+  const admitted: Array<number> = [];
+  const stoppedBy: Array<CapacityReason | null> = [];
+  for (const step of steps) {
+    let count = 0;
+    let stop: CapacityReason | null = null;
+    for (let index = 0; index < step.count; index += 1) {
+      const ask =
+        step.declaredMb === undefined
+          ? { kind: step.kind }
+          : { kind: step.kind, declaredMb: step.declaredMb };
+      const decision = capacityDecision(rule, {
+        ...input,
+        facts: piecesReadable ? { ...input.facts, pieces } : input.facts,
+        ask,
+      });
+      if (!decision.admit) {
+        stop = decision.reason;
+        break;
+      }
+      count += 1;
+      pieces.push({ ...ask, demandMb: null });
+    }
+    admitted.push(count);
+    stoppedBy.push(stop);
+  }
+  return { admitted, stoppedBy };
+}
