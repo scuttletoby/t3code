@@ -97,11 +97,13 @@ def docker(state, args):
         return (1 if missing else 0), json.dumps([{k: v for k, v in c.items() if k[0].isupper()} for c in found]), err
     if verb == 'rm':
         cid = args[-1]
-        match = [c for c in containers if c['Id'].startswith(cid)]
-        if not match or cid in state.get('vanishOnRm', []):
-            state['containers'] = [c for c in containers if not c['Id'].startswith(cid)]
+        # as Docker resolves a reference: the full id, then an exact name, then an id prefix
+        match = ([c for c in containers if c['Id'] == cid] or
+                 [c for c in containers if c.get('Name', '').lstrip('/') == cid] or
+                 [c for c in containers if c['Id'].startswith(cid)])[:1]
+        state['containers'] = [c for c in containers if c not in match]
+        if not match or match[0]['Id'] in state.get('vanishOnRm', []):
             return 1, '', f'Error response from daemon: No such container: {cid}'
-        state['containers'] = [c for c in containers if not c['Id'].startswith(cid)]
         return 0, cid + '\n', ''
     return 1, '', f'fake docker: unknown verb {verb}'
 

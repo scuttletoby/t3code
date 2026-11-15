@@ -1,15 +1,21 @@
 """Contract tests for fork-kit/common/machine_file.py: every rule of the machine file (README.md next to it).
-No root: the tests pass a path and the uid that must own it.
+No root: the tests pass a path and the uid that must own it. RedCheck breaks each file-safety rule in a copy of
+machine_file.py and shows its test then fails.
 
   python3 -I -B fork-kit/common/tests/machine_file.test.py
 """
-import importlib.machinery, importlib.util, json, os, shutil, tempfile, unittest
+import importlib.machinery, importlib.util, json, os, shutil, tempfile, types, unittest
+from unittest import mock
 
 COMMON = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def load():
+def load(source=None):
     path = os.path.join(COMMON, 'machine_file.py')
+    if source is not None:
+        mod = types.ModuleType('machine_file')
+        exec(compile(source, path, 'exec'), mod.__dict__)
+        return mod
     loader = importlib.machinery.SourceFileLoader('machine_file', path)
     spec = importlib.util.spec_from_loader('machine_file', loader)
     mod = importlib.util.module_from_spec(spec)
@@ -22,6 +28,8 @@ GOOD = {'version': 1, 'heavy': {'sweep': {'stop': True}}, 'homelab': {'anything'
 
 
 class MachineFile(unittest.TestCase):
+    mf = mf
+
     def setUp(self):
         self.umask = os.umask(0o022)
         self.dir = tempfile.mkdtemp(prefix='machine-file-test-')
@@ -39,10 +47,10 @@ class MachineFile(unittest.TestCase):
         os.chmod(self.path, mode)
 
     def read(self, kit='heavy', uid=None):
-        return mf.read_section(kit, self.path, os.getuid() if uid is None else uid)
+        return self.mf.read_section(kit, self.path, os.getuid() if uid is None else uid)
 
     def refused(self, *words, kit='heavy', uid=None):
-        with self.assertRaises(mf.MachineFileError) as cm:
+        with self.assertRaises(self.mf.MachineFileError) as cm:
             self.read(kit, uid)
         for w in words:
             self.assertIn(w, str(cm.exception))
@@ -93,6 +101,61 @@ class MachineFile(unittest.TestCase):
         os.chmod(self.dir, 0o755)
         self.assertEqual(self.read(), GOOD['heavy'])
 
+    def test_symbolic_links_are_refused(self):
+        # a link in a root-owned folder could point into a folder anyone can write (#183 security finding)
+        shared = os.path.join(self.dir, 'shared')
+        os.mkdir(shared)
+        os.chmod(shared, 0o777)
+        real = os.path.join(shared, 'machine.json')
+        with open(real, 'w') as f:
+            json.dump(GOOD, f)
+        os.chmod(real, 0o644)
+        os.symlink(real, self.path)
+        self.refused('is a symbolic link')
+        os.unlink(self.path)
+        folder = os.path.join(self.dir, 'real-folder')
+        os.mkdir(folder, 0o755)
+        shutil.copy(real, os.path.join(folder, 'machine.json'))
+        link = os.path.join(self.dir, 'linked-folder')
+        os.symlink(folder, link)
+        self.path = os.path.join(link, 'machine.json')
+        self.refused('is a symbolic link')
+
+    def test_the_opened_file_is_checked_not_the_path(self):
+        # swapped for a file anyone can write between a check of the path and the open: the open file is checked
+        self.write(GOOD)
+        real_open = os.open
+
+        def swap_then_open(path, *args, **kw):
+            if path == self.path:
+                self.write({'version': 1, 'heavy': {'sweep': {'stop': 'evil'}}}, mode=0o666)
+            return real_open(path, *args, **kw)
+        with mock.patch.object(self.mf.os, 'open', swap_then_open):
+            self.refused('writable by group or others')
+
+    def test_only_a_plain_file_of_at_most_1_mib(self):
+        os.mkfifo(self.path, 0o644)                    # would block a plain open
+        self.refused('not a plain file')
+        os.unlink(self.path)
+        os.mkdir(self.path, 0o755)
+        self.refused('not a plain file')
+        os.rmdir(self.path)
+        self.write('{"version": 1, "heavy": {}, "pad": "' + 'x' * (1 << 20) + '"}')
+        self.refused('larger than')
+        with open(self.path, 'wb') as f:
+            f.write(b'{"version": 1, "heavy": {"x": "\xff"}}')
+        self.refused('not UTF-8')
+
+    def test_deep_json_is_refused_cleanly(self):
+        self.write('{"version": 1, "heavy": ' + '[' * 200000 + ']' * 200000 + '}')
+        self.refused('nested too deeply')
+
+    def test_a_key_given_twice_is_refused(self):
+        self.write('{"version": 1, "heavy": {"sweep": {"stop": false, "stop": true}}}')
+        self.refused("'stop' is given twice")
+        self.write('{"version": 1, "heavy": {}, "version": 2}')
+        self.refused("'version' is given twice")
+
     def test_secrets_only_as_file_references(self):
         for key in ('token', 'apiToken', 'password', 'clientSecret', 'privateKey', 'apiKey'):
             with self.subTest(key=key):
@@ -130,6 +193,34 @@ class MachineFile(unittest.TestCase):
         self.assertTrue(mf.default_path('win32').endswith(os.path.join('fork-kit', 'machine.json')))
         with self.assertRaises(mf.MachineFileError):
             mf.default_path('plan9')
+
+
+# Each file-safety rule broken on purpose in a copy of machine_file.py: (text, broken text, the test that must fail)
+MUTATIONS = {
+    'no link followed': ('os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK', 'os.O_RDONLY | os.O_NONBLOCK',
+                         'test_symbolic_links_are_refused'),
+    'opened file checked': ('        _check_owner(path, path, st, owner_uid)\n', '',
+                            'test_the_opened_file_is_checked_not_the_path'),
+    'plain file only': ('if not stat.S_ISREG(st.st_mode):', 'if False:', 'test_only_a_plain_file_of_at_most_1_mib'),
+    'size limit': ('if len(data) > MAX_BYTES:', 'if False:', 'test_only_a_plain_file_of_at_most_1_mib'),
+    'deep JSON': ('    except RecursionError:\n', '    except ZeroDivisionError:\n',
+                  'test_deep_json_is_refused_cleanly'),
+    'no key twice': ('json.loads(text, object_pairs_hook=_no_duplicates)', 'json.loads(text)',
+                     'test_a_key_given_twice_is_refused'),
+}
+
+
+class RedCheck(unittest.TestCase):
+    def test_each_rule_has_a_test_that_fails_without_it(self):
+        with open(os.path.join(COMMON, 'machine_file.py')) as f:
+            source = f.read()
+        for rule, (text, broken, test) in MUTATIONS.items():
+            with self.subTest(rule=rule):
+                self.assertEqual(source.count(text), 1, f'the red check for {rule!r} no longer matches the code')
+                cls = type('Broken', (MachineFile,), {'mf': load(source.replace(text, broken))})
+                result = unittest.TestResult()
+                cls(test).run(result)
+                self.assertFalse(result.wasSuccessful(), f'{test} still passes with the rule {rule!r} broken')
 
 
 if __name__ == '__main__':

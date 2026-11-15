@@ -126,6 +126,11 @@ class Install(unittest.TestCase):
                 # until the links step, the old wrapper is what runs
                 if self.m.STEPS.index(step) < self.m.STEPS.index('links'):
                     self.assertFalse(os.path.islink(self.path('/usr/local/bin/heavy')))
+                # a timer only once the release it runs is the one in use (#183 nit d)
+                if os.path.exists(self.path('/etc/systemd/user/heavy-sweep.service')):
+                    current = os.readlink(self.path('/usr/local/libexec/heavy/current'))     # absolute, as installed
+                    self.assertTrue(os.path.isfile(self.path(current + '/lib/heavy_sweep.py')))
+                    self.assertTrue(os.path.islink(self.path('/usr/local/bin/heavy')))
                 code, _, err = self.install('--memory-high', '5G', '--sweep-timer')
                 self.assertEqual(code, 0, err)
                 self.assertTrue(os.path.isfile(self.path('/etc/systemd/user/heavy-sweep.timer')))
@@ -223,7 +228,10 @@ class Install(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn('systemctl --user enable --now heavy-sweep.timer', out)
         with open(units[0]) as f:
-            self.assertIn('ExecStart=/usr/local/bin/heavy sweep\n', f.read())
+            text = f.read()
+            self.assertIn('ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/heavy/current/lib/heavy_sweep.py '
+                          'sweep\n', text)
+            self.assertIn('ConditionPathExists=/usr/local/libexec/heavy/current/lib/heavy_sweep.py\n', text)
         with open(units[1]) as f:
             self.assertIn('WantedBy=timers.target\n', f.read())
         self.assertTrue(self.config()['sweep_timer'])

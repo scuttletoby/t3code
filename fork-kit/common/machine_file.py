@@ -9,8 +9,9 @@ contain. There is one per machine, at a fixed path per OS:
 
 Shape: {"version": 1, "<kit folder name>": {...}, ...}, camelCase keys. Rules, all checked here:
 
-- root-owned and not writable by group or others (the file and its folder; not checked on Windows);
-- a JSON object whose "version" is a whole number this loader knows (1);
+- root-owned and not writable by group or others (the file and its folder; not checked on Windows); neither may
+  be a symbolic link, and the file must be a plain file of at most 1 MiB;
+- a JSON object with no key given twice whose "version" is a whole number this loader knows (1);
 - no secrets: a key whose name says secret, token, password or private key holds only "file:<path>";
 - a kit reads "version" and its own section only; a missing section, an unknown key in it or a value of the
   wrong type is refused, with the reason named.
@@ -18,11 +19,12 @@ Shape: {"version": 1, "<kit folder name>": {...}, ...}, camelCase keys. Rules, a
 Tools never write it. Kits call read_section() and then fields() for each object in their section.
 Plain Python 3 standard library; each kit's installer copies this file into its version folder.
 """
-import json, os, re, stat, sys
+import errno, json, os, re, stat, sys
 
 SUPPORTED_VERSION = 1
 SECRET_KEY = re.compile(r'(secret|token|password|passwd|privatekey|private_key|apikey|api_key)', re.I)
 REQUIRED = object()
+MAX_BYTES = 1 << 20
 
 
 class MachineFileError(Exception):
@@ -40,15 +42,59 @@ def default_path(platform=None):
     raise MachineFileError(f'no machine file path for platform {platform!r}')
 
 
-def _check_owner(path, owner_uid):
+def _check_owner(path, what, st, owner_uid):
+    if st.st_uid != owner_uid:
+        raise MachineFileError(f'{path}: {what} is owned by uid {st.st_uid}, not {owner_uid} (root)')
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise MachineFileError(f'{path}: {what} is writable by group or others (mode {stat.S_IMODE(st.st_mode):o})')
+
+
+def _read(path, owner_uid):
+    """The file's text. The folder is checked without following a link; the file is opened without following one,
+    and the opened file itself (not the path, which could be swapped in between) is checked."""
     if os.name == 'nt':
-        return
-    for what in (path, os.path.dirname(path) or '.'):
-        st = os.stat(what)
-        if st.st_uid != owner_uid:
-            raise MachineFileError(f'{path}: {what} is owned by uid {st.st_uid}, not {owner_uid} (root)')
-        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise MachineFileError(f'{path}: {what} is writable by group or others (mode {stat.S_IMODE(st.st_mode):o})')
+        with open(path, encoding='utf-8') as f:
+            text = f.read(MAX_BYTES + 1)
+        if len(text) > MAX_BYTES:
+            raise MachineFileError(f'{path}: larger than {MAX_BYTES} bytes')
+        return text
+    folder = os.path.dirname(path) or '.'
+    st = os.lstat(folder)
+    if stat.S_ISLNK(st.st_mode):
+        raise MachineFileError(f'{path}: {folder} is a symbolic link')
+    _check_owner(path, folder, st, owner_uid)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise MachineFileError(f'{path}: is a symbolic link') from None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise MachineFileError(f'{path}: is not a plain file')
+        _check_owner(path, path, st, owner_uid)
+        f = os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+    with f:
+        data = f.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise MachineFileError(f'{path}: larger than {MAX_BYTES} bytes')
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError as e:
+        raise MachineFileError(f'{path}: not UTF-8 ({e})') from None
+
+
+def _no_duplicates(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f'key {k!r} is given twice')
+        out[k] = v
+    return out
 
 
 def _check_no_secrets(value, where):
@@ -68,17 +114,17 @@ def read_section(kit, path=None, owner_uid=0):
     tests; shipped commands use the default path and root."""
     path = path or default_path()
     try:
-        _check_owner(path, owner_uid)
-        with open(path, encoding='utf-8') as f:
-            text = f.read()
+        text = _read(path, owner_uid)
     except FileNotFoundError:
         raise MachineFileError(f'{path}: not there (the owner writes it; see fork-kit/common/README.md)') from None
     except OSError as e:
         raise MachineFileError(f'{path}: cannot be read ({e.strerror or e})') from None
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=_no_duplicates)
     except ValueError as e:
         raise MachineFileError(f'{path}: not valid JSON ({e})') from None
+    except RecursionError:
+        raise MachineFileError(f'{path}: nested too deeply') from None
     if not isinstance(data, dict):
         raise MachineFileError(f'{path}: must hold a JSON object')
     version = data.get('version')

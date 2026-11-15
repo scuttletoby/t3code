@@ -45,7 +45,7 @@ SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 SIZE_RE = re.compile(r'^(?:[0-9]+[KMGT]?|[0-9]{1,3}%|infinity)\Z')
 LIMITS = {'memory_high': 'MemoryHigh', 'memory_max': 'MemoryMax', 'swap_max': 'MemorySwapMax',
           'cpu_weight': 'CPUWeight'}
-STEPS = ('check', 'folders', 'copy', 'self-test', 'config', 'slice-unit', 'sweep-units', 'switch', 'links', 'record')
+STEPS = ('check', 'folders', 'copy', 'self-test', 'config', 'slice-unit', 'switch', 'links', 'sweep-units', 'record')
 
 
 class Refused(Exception):
@@ -355,6 +355,13 @@ def install(a, stop_after=None):
     if old.get('slice_unit') and old['slice_unit'] != unit_path:
         say(f'note: {old["slice_unit"]} (written by an earlier install) is no longer used: remove it by hand')
     done('slice-unit')
+    switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
+    done('switch')
+    keep_old_wrapper()
+    for path, target in LINKS.items():
+        switch_link(path, target)
+    done('links')
+    # after the links: the timer is only written once the release it runs is the one in use
     for name, path in zip(SWEEP_UNITS, sweep_unit_paths()):
         if sweep_timer:
             if os.path.lexists(p(path)) and not ours_unit(path):
@@ -368,12 +375,6 @@ def install(a, stop_after=None):
             os.unlink(p(path))
             say(f'removed {path} (users run `systemctl --user disable --now heavy-sweep.timer`)')
     done('sweep-units')
-    switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
-    done('switch')
-    keep_old_wrapper()
-    for path, target in LINKS.items():
-        switch_link(path, target)
-    done('links')
     rows = record_rows(a.sha, unit_path, sweep_timer)
     write_file(INSTALLED, '# path\tkind\twant (written by heavy-install; read by heavy --self-check)\n'
                + ''.join('\t'.join(r) + '\n' for r in rows))

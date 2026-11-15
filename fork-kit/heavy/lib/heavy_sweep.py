@@ -5,25 +5,29 @@ the rest (fork-kit/heavy/README.md, "Leftover sweep").
   heavy sweep --dry-run     the same, but stop nothing (also the default until heavy.sweep.stop is true)
   heavy sweep --json        look only (no stop, no log, no lock): {"v": 1, "leftovers": [...], ...} on stdout
   heavy docker-label        print the owner label for a container a test starts: fork-kit.heavy.owner=<owner>
-  heavy docker-label --value [--pid PID]   only the value; --pid names the owner process
+  heavy docker-label --value [--owner-pid PID]   only the value; --owner-pid names the owner process
 
 It finds, for the user it runs as:
   (a) processes whose owner is gone: reparented to the user manager (or pid 1), not a unit's own main or control
       process, not in a unit of heavy.sweep.knownUnits, not in a live heavy scope, older than minAgeSeconds, and
-      busy (busyCpuPercent over a one-second sample) or long-lived (longLivedSeconds). A test-shaped one (its
-      command line matches heavy.sweep.testPatterns) is stopped with what it started; the others are reported.
+      busy (busyCpuPercent over a one-second sample) or long-lived (longLivedSeconds). A test-shaped one (its own
+      command, the program and its script, matches heavy.sweep.testPatterns) is stopped with what it started in
+      its own unit; the others are reported. Session leaders and terminal multiplexers (tmux, screen, sshd, a
+      login or interactive shell) are never stopped, and what runs inside them is never stopped with anything.
+      A heavy that runs a live scope is never stopped, whatever its age.
       A heavy scope whose heavy is gone (heavy killed with kill -9) is stopped as a whole, as heavy would have
       done; one kept on purpose (HEAVY_KEEP=1) is only reported.
   (b) Docker containers with the label fork-kit.heavy.owner of this user whose owner (a heavy scope, or a pid
-      with its start time) is gone: removed with their anonymous volumes. Running containers without the label
-      are reported, never touched.
-  (c) heavy scopes with no process left in them (a heavy killed while it started): stopped.
+      with its start time) is gone: removed (by full id) with their anonymous volumes. Running containers
+      without the label are reported, never touched.
+  (c) heavy scopes with no process left in them (a heavy killed while it started): stopped. One that holds only
+      another user's processes is reported.
 
 Settings: the "heavy" section of the machine file (fork-kit/common/README.md), key "sweep". No file, no
 section, an unknown key or a newer version: nothing is checked or stopped, the reason is printed, exit 1.
 """
-import contextlib, datetime, fcntl, fnmatch, importlib.machinery, importlib.util, json, os, re, signal, subprocess
-import sys, tempfile, time
+import contextlib, datetime, fcntl, fnmatch, importlib.machinery, importlib.util, json, os, re, signal, stat
+import subprocess, sys, tempfile, time
 
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 LABEL = 'fork-kit.heavy.owner'
@@ -31,6 +35,37 @@ KEEP_PREFIX = 'heavy-keep-'        # heavy names a scope kept with HEAVY_KEEP=1 
 DEFAULT_REPORT = '~/.local/state/heavy-sweep'
 LOG_MAX = 1 << 20
 MAX_TEXT = 160
+# Session leaders and terminal multiplexers: their command line can name a program they only started (`tmux new
+# python3 a.test.py`), and they host other sessions. Never test-shaped, never stopped, never entered by a stop.
+SESSION_PROGRAMS = frozenset({'tmux', 'screen', 'SCREEN', 'sshd', 'systemd', 'login', 'su', 'sudo', 'dtach',
+                              'abduco', 'zellij', 'mosh-server', 'byobu'})
+SHELLS = frozenset({'sh', 'bash', 'dash', 'zsh', 'ksh', 'mksh', 'ash', 'fish', 'tcsh', 'csh'})
+# Programs whose script (the first argument that is not an option) is what they run; options that take a value
+OPTION_VALUES = {
+    'python': {'-W', '-X', '-Q'},
+    'node': {'-r', '--require', '--import', '--loader', '--experimental-loader', '--input-type', '-C', '--conditions'},
+    'java': {'-cp', '-classpath', '--class-path', '-p', '--module-path', '--add-modules', '--add-opens',
+             '--add-exports', '--add-reads', '--patch-module', '--limit-modules', '--upgrade-module-path'},
+    'shell': {'-o', '+o', '-O', '+O'},
+    'other': {'-I', '-x'},
+}
+# options whose next word is the program itself (inline code, a module, a jar)
+INLINE = {'python': {'-c', '-m'}, 'node': {'-e', '-p', '--eval', '--print'}, 'java': {'-jar', '-m', '--module'},
+          'shell': {'-c'}, 'other': {'-e', '-E', '-r'}}
+INTERPRETERS = {'node': 'node', 'nodejs': 'node', 'bun': 'node', 'deno': 'node', 'java': 'java', 'ruby': 'other',
+                'perl': 'other', 'php': 'other', 'Rscript': 'other', 'lua': 'other', 'tclsh': 'other'}
+# Wrappers that run one command for as long as they live: their own command is the wrapper plus that command's
+WRAPPERS = {'timeout': ({'-s', '--signal', '-k', '--kill-after'}, 1), 'env': ({'-u', '--unset', '-C', '--chdir'}, 0),
+            'nice': ({'-n', '--adjustment'}, 0), 'nohup': (set(), 0), 'setsid': (set(), 0), 'stdbuf': (set(), 0),
+            'time': ({'-f', '--format', '-o', '--output'}, 0),
+            'xvfb-run': ({'-s', '--server-args', '-n', '--server-num', '-e', '--error-file', '-f', '--auth-file',
+                          '-p', '--xauth-protocol', '-w', '--wait'}, 0)}
+# Left alone and not reported (whole command line). The code never stops a session leader or multiplexer anyway.
+DEFAULT_IGNORE = ('^(tmux|screen|SCREEN)( |:|$)', '^-')
+SECRET_WORD = re.compile(r'(token|secret|passw|pwd|apikey|api[_-]key|auth|credential|cookie|bearer|private[_-]?key)',
+                         re.I)
+TOKEN_SHAPE = re.compile(r'(gh[pousr]_|github_pat_|glpat-|xox[abposr]-|sk-|AKIA|eyJ)[^\s\'"]*|'
+                         r'[A-Za-z0-9+/_=.-]{32,}')
 
 
 def _load_machine_file():
@@ -79,7 +114,7 @@ SPEC = {
     'knownUnits': (list, [], _globs),
     'knownContainers': (list, [], _globs),
     'testPatterns': (list, [], _regexes),
-    'ignorePatterns': (list, [], _regexes),
+    'ignorePatterns': (list, list(DEFAULT_IGNORE), _regexes),
 }
 SECTION_SPEC = {'sweep': (dict, machine_file.REQUIRED, None)}
 
@@ -89,17 +124,122 @@ class Refused(Exception):
 
 
 class Proc:
-    __slots__ = ('pid', 'ppid', 'uid', 'state', 'comm', 'cmdline', 'cgroup', 'unit', 'start', 'ticks', 'age', 'cpu')
+    __slots__ = ('pid', 'ppid', 'uid', 'state', 'comm', 'argv', 'cmdline', 'cgroup', 'unit', 'start', 'ticks', 'age',
+                 'cpu')
 
     def __init__(self, **kw):
         for k in self.__slots__:
             setattr(self, k, kw.get(k))
 
     def text(self):
-        cmd = self.cmdline or f'[{self.comm}]'
+        """For the log, the report and the journal: the program and its script only (never the other arguments),
+        with anything that looks like a secret masked."""
+        argv = self.argv or []
+        own = own_command(argv) if not is_session(self) else argv[:1]
+        cmd = redact(' '.join(own)) if own else f'[{self.comm}]'
+        if len(argv) > len(own):
+            cmd += f' (+{len(argv) - len(own)} args)'
         cmd = cmd if len(cmd) <= MAX_TEXT else cmd[:MAX_TEXT - 3] + '...'
         return (f'pid {self.pid} {self.comm} ({duration(self.age)} old, cpu {self.cpu:.0f}%, '
                 f'unit {self.unit or "?"}): {cmd}')
+
+
+def program(arg0):
+    return os.path.basename(arg0 or '')
+
+
+def is_session(p):
+    """A session leader or terminal multiplexer (tmux, screen, sshd, systemd, a login shell `-bash`, an interactive
+    shell with no script): it hosts other sessions, and its command line can name a program it only started."""
+    argv = p.argv or []
+    first = argv[0] if argv else ''
+    if first.startswith('-'):
+        return True
+    if program(first) in SESSION_PROGRAMS or (p.comm or '').split(':')[0].strip() in SESSION_PROGRAMS:
+        return True
+    if program(first) in SHELLS:
+        return own_command(argv) == argv[:1]
+    return False
+
+
+def interpreter_kind(name):
+    if re.fullmatch(r'python[0-9.]*|pypy[0-9.]*', name):
+        return 'python'
+    if name in SHELLS:
+        return 'shell'
+    return INTERPRETERS.get(name)
+
+
+def own_command(argv):
+    """The part of a command line that is the process's own program: the executable and, for an interpreter (python,
+    node, java, a shell, ...), its script, module, jar or -c text; for a wrapper that runs one command for as long
+    as it lives (timeout, env, nohup, xvfb-run, ...), the wrapper plus that command's own part. Other arguments
+    (which can name anything: a prompt, a file to edit, a program to start in a session) are left out."""
+    if not argv:
+        return []
+    name = program(argv[0])
+    if name in WRAPPERS:
+        takes, positional = WRAPPERS[name]
+        i = 1
+        while i < len(argv):
+            a = argv[i]
+            if a == '--':
+                i += 1
+                break
+            if a in takes:
+                i += 2
+            elif a.startswith('-') or (name == 'env' and '=' in a and not a.startswith('=')):
+                i += 1
+            elif positional:
+                positional -= 1
+                i += 1
+            else:
+                break
+        rest = own_command(argv[i:])
+        return argv[:1] + rest
+    kind = interpreter_kind(name)
+    if kind is None:
+        return argv[:1]
+    takes = OPTION_VALUES.get(kind, set())
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '--':
+            return argv[:1] + argv[i + 1:i + 2]
+        if a in INLINE.get(kind, ()):
+            return argv[:1] + argv[i:i + 2]
+        if a in takes:
+            i += 2
+        elif a.startswith(('-', '@')) or (kind == 'shell' and a.startswith('+')):
+            i += 1
+        else:
+            return argv[:1] + [a]
+    return argv[:1]
+
+
+def redact(text):
+    """Mask what looks like a secret: the value after a secret-looking name (--token=X, --token X, PASSWORD=X,
+    Authorization: Bearer X), a password in a URL, and token-shaped words (ghp_..., long random strings)."""
+    out, hide = [], False
+    for word in text.split(' '):
+        if hide and word and not word.startswith('-'):
+            out.append('***')
+            hide = SECRET_WORD.search(word) is not None
+            continue
+        m = re.match(r'^([^=:]*[=:])(.+)$', word)
+        if m and SECRET_WORD.search(m.group(1)):
+            word = m.group(1) + '***'
+            hide = False
+        else:
+            hide = SECRET_WORD.search(word) is not None
+        word = re.sub(r'(://[^/@:\s]*:)[^/@\s]+@', r'\1***@', word)
+        out.append(TOKEN_SHAPE.sub('***', word))
+    return ' '.join(out)
+
+
+def clip(text, n=60):
+    text = redact(str(text))
+    return text if len(text) <= n else text[:n - 3] + '...'
 
 
 def duration(seconds):
@@ -172,6 +312,7 @@ class Sweep:
         self._pidfd_send = getattr(signal, 'pidfd_send_signal', None)
         self._close = os.close
         self.notes, self.items, self.log_file = [], [], None
+        self.foreign_units = set()      # units that hold a process of another user
 
     # ---------- settings ----------
 
@@ -210,10 +351,10 @@ class Sweep:
             left, right = stat.find('('), stat.rfind(')')
             rest = stat[right + 2:].split()
             uid = next(int(line.split()[1]) for line in status.splitlines() if line.startswith('Uid:'))
+            argv = [a.decode('utf-8', 'replace') for a in cmdline.split(b'\0') if a]
             return Proc(pid=int(pid), comm=stat[left + 1:right], state=rest[0], ppid=int(rest[1]),
-                        ticks=int(rest[11]) + int(rest[12]), start=int(rest[19]), uid=uid,
-                        cmdline=' '.join(a.decode('utf-8', 'replace') for a in cmdline.split(b'\0') if a),
-                        cgroup=cgroup, unit=unit_of(cgroup), cpu=0.0)
+                        ticks=int(rest[11]) + int(rest[12]), start=int(rest[19]), uid=uid, argv=argv,
+                        cmdline=' '.join(argv), cgroup=cgroup, unit=unit_of(cgroup), cpu=0.0)
         except (ValueError, IndexError, StopIteration):
             return None
 
@@ -228,6 +369,8 @@ class Sweep:
                 p = self.read_proc(name)
                 if p is not None and p.uid == self.uid and p.state != 'Z':
                     out[p.pid] = p
+                elif p is not None and p.uid != self.uid:
+                    self.foreign_units.add(p.unit)
         return out
 
     def sample(self):
@@ -442,14 +585,19 @@ class Sweep:
             children.setdefault(p.ppid, []).append(p)
 
         def tree(p):
-            out, todo = [], [p]
+            """p and what it started in its own unit. A process in another unit, a session leader or multiplexer, a
+            heavy of a live scope, the sweep and what started it are left alone, with everything below them."""
+            out, left, todo = [], [], [p]
             while todo:
                 q = todo.pop()
-                if q.pid in mine or q in out:
+                if q.pid in mine or q in out or q in left:
+                    continue
+                if q is not p and (q.unit != p.unit or is_session(q) or q.pid in heavies):
+                    left.append(q)
                     continue
                 out.append(q)
                 todo += children.get(q.pid, [])
-            return out
+            return out, left
 
         plan, live_scopes, kept_scopes = [], set(), set()
         for unit, ps in sorted(members.items()):
@@ -458,19 +606,34 @@ class Sweep:
                 live_scopes.add(unit)
             elif is_kept_scope(unit):
                 kept_scopes.add(unit)
+            elif any(is_session(p) for p in ps):
+                plan.append({'kind': 'scope', 'action': 'report', 'unit': unit, 'procs': ps,
+                             'why': 'its heavy is gone, but it holds a session or multiplexer'})
             elif max(p.age for p in ps) >= cfg['minAgeSeconds']:
                 plan.append({'kind': 'scope', 'action': 'stop', 'unit': unit, 'procs': ps,
                              'why': 'its heavy is gone'})
             else:
                 live_scopes.add(unit)       # young: its heavy may be stopping it right now; next sweep
+        # a heavy whose command runs in a live scope (heavy itself detached with nohup or setsid included)
+        heavies = set()
+        for unit in live_scopes:
+            pids = {q.pid for q in members[unit]}
+            heavies |= {q.ppid for q in members[unit] if q.ppid not in pids and q.ppid not in orphan_parents}
         for unit in listed:
-            if unit not in members and not is_kept_scope(unit):
+            if unit in members or is_kept_scope(unit):
+                continue
+            if unit in self.foreign_units:
+                plan.append({'kind': 'empty-scope', 'action': 'report', 'unit': unit, 'procs': [],
+                             'why': "holds only another user's processes"})
+            else:
                 plan.append({'kind': 'empty-scope', 'action': 'stop', 'unit': unit, 'procs': [],
                              'why': 'no process left in it'})
 
         for p in sorted(procs.values(), key=lambda q: q.pid):
             if p.pid in mine or p.pid in (1, manager) or p.ppid not in orphan_parents:
                 continue
+            if is_session(p) or p.pid in heavies:
+                continue                     # a session leader or multiplexer, or the heavy of a live scope
             if p.unit in live_scopes or (is_heavy_scope(p.unit) and p.unit not in kept_scopes):
                 continue                     # a live heavy scope, or a dead one stopped as a whole above
             if any(fnmatch.fnmatchcase(p.unit, g) for g in cfg['knownUnits']):
@@ -484,18 +647,22 @@ class Sweep:
             if not (busy or long_lived):
                 continue
             why = ' and '.join(w for w, on in (('busy', busy), ('long-lived', long_lived)) if on)
-            test = next((r for r in cfg['testPatterns'] if re.search(r, p.cmdline)), None)
+            own = ' '.join(own_command(p.argv or []))
+            test = next((r for r in cfg['testPatterns'] if re.search(r, own)), None)
+            ps, left = tree(p)
+            if left:
+                why += f'; {len(left)} it started left alone (another unit, a session or a live heavy)'
             if p.unit in kept_scopes:
-                plan.append({'kind': 'process', 'action': 'report', 'procs': tree(p),
+                plan.append({'kind': 'process', 'action': 'report', 'procs': ps,
                              'why': f'{why}; kept on purpose (HEAVY_KEEP=1 in {p.unit})'})
             elif test:
-                plan.append({'kind': 'process', 'action': 'stop', 'procs': tree(p),
+                plan.append({'kind': 'process', 'action': 'stop', 'procs': ps,
                              'why': f'{why}; test-shaped ({test!r})'})
             else:
-                plan.append({'kind': 'process', 'action': 'report', 'procs': tree(p),
+                plan.append({'kind': 'process', 'action': 'report', 'procs': ps,
                              'why': f'{why}; not test-shaped'})
 
-        stopping = {item['unit'] for item in plan if item['kind'] == 'scope'}
+        stopping = {item['unit'] for item in plan if item['kind'] == 'scope' and item['action'] == 'stop'}
         for c in self.containers() or []:
             item = self.judge_container(c, cfg, procs, members, stopping)
             if item:
@@ -504,7 +671,10 @@ class Sweep:
 
     def judge_container(self, c, cfg, procs, members, stopping):
         try:
-            cid = c['Id'][:12]
+            full = c['Id']
+            if not re.fullmatch(r'[0-9a-f]{64}', full):
+                return None
+            cid = full[:12]
             name = (c.get('Name') or '').lstrip('/')
             labels = (c.get('Config') or {}).get('Labels') or {}
             image = (c.get('Config') or {}).get('Image') or '?'
@@ -515,7 +685,7 @@ class Sweep:
             return None
         created = parse_created(c.get('Created'))
         age = self._now() - created if created is not None else 0
-        base = {'kind': 'container', 'id': cid, 'name': name, 'image': image, 'age': age, 'running': running,
+        base = {'kind': 'container', 'id': cid, 'full_id': full, 'name': clip(name), 'image': clip(image), 'age': age, 'running': running,
                 'procs': []}
         if LABEL not in labels:
             if running and age >= cfg['minAgeSeconds']:
@@ -523,7 +693,7 @@ class Sweep:
             return None
         owner = parse_owner(labels[LABEL])
         if owner is None:
-            return dict(base, action='report', why=f'bad owner label {labels[LABEL]!r}') if running else None
+            return dict(base, action='report', why=f'bad owner label {clip(labels[LABEL])!r}') if running else None
         if owner['uid'] != self.uid:
             return None                      # another user's: their sweep decides
         if 'scope' in owner:
@@ -545,6 +715,11 @@ class Sweep:
             ps = item['procs']
             if item['kind'] in ('scope', 'empty-scope'):
                 head = f'{item["unit"]}: {item["why"]}' + (f'; {len(ps)} processes' if ps else '')
+                if item['action'] == 'report':
+                    counts['reported'] += 1
+                    lines.append(f'report only: {head}')
+                    self.log(f'report-only {head}')
+                    continue
                 if not act:
                     lines.append(f'would stop {head}')
                     self.log(f'would-stop {head}')
@@ -594,7 +769,7 @@ class Sweep:
                     self.log(f'{verb.replace(" ", "-")} {head}')
                     continue
                 self.log(f'removing {head}')
-                result = self.remove_container(item['id'])
+                result = self.remove_container(item['full_id'])
                 if result in ('removed', 'already gone'):
                     counts['removed'] += result == 'removed'
                 else:
@@ -663,6 +838,9 @@ def sweep_main(argv, sweep=None, out=None, err=None):
     folder = cfg['report']
     try:
         os.makedirs(folder, mode=0o700, exist_ok=True)
+        problem = folder_problem(folder, s.uid)
+        if problem:
+            return refuse(f'the report folder {folder} {problem}; nothing checked or stopped', False, out, err)
         lock = open(os.path.join(folder, 'sweep.lock'), 'a+', encoding='utf-8')
     except OSError as e:
         return refuse(f'cannot use the report folder {folder} ({e.strerror}); nothing checked or stopped',
@@ -704,6 +882,18 @@ def sweep_main(argv, sweep=None, out=None, err=None):
         return 1 if counts['problems'] else 0
 
 
+def folder_problem(folder, uid):
+    """Why the report folder must not be used (it holds the log, the report and the lock), or None."""
+    st = os.lstat(folder)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return 'is not a folder (a link or a file)'
+    if st.st_uid != uid:
+        return f'is owned by uid {st.st_uid}, not {uid}'
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f'is writable by group or others (mode {stat.S_IMODE(st.st_mode):o})'
+    return None
+
+
 def item_json(item):
     out = {'kind': item['kind'], 'action': item['action'], 'why': item['why']}
     if item['kind'] in ('scope', 'empty-scope'):
@@ -723,10 +913,31 @@ def refuse(text, as_json, out, err):
     return 1
 
 
+SHORT_LIVED = SHELLS | {'make', 'gmake', 'env', 'xargs', 'timeout', 'nohup', 'nice', 'setsid', 'stdbuf', 'time',
+                        'sudo', 'su', 'npm', 'npx', 'yarn', 'pnpm'}
+
+
+class LabelRefused(Exception):
+    pass
+
+
+def read_owner(pid, proc='/proc'):
+    """(uid, start time, comm) of a process, from /proc."""
+    with open(f'{proc}/{pid}/stat', encoding='utf-8', errors='replace') as f:
+        stat_text = f.read()
+    with open(f'{proc}/{pid}/status', encoding='utf-8', errors='replace') as f:
+        uid = next(int(line.split()[1]) for line in f if line.startswith('Uid:'))
+    comm = stat_text[stat_text.find('(') + 1:stat_text.rfind(')')]
+    return uid, int(stat_text[stat_text.rfind(')') + 2:].split()[19]), comm
+
+
 def owner_value(pid=None, proc='/proc'):
     """The fork-kit.heavy.owner label value for a container: the heavy scope this runs in (HEAVY_SCOPE, which heavy
-    gives its command, or else the own cgroup), or a process (the caller's parent, or pid) with its start time, so a
-    reused pid never counts as the owner."""
+    gives its command, or else the own cgroup), or a process with its start time, so a reused pid never counts as
+    the owner. The process is `pid` (--owner-pid), which must be the caller's own user's; without it, the caller's
+    parent, refused when that is a shell or a script runner (make, env, npm, ...): those usually exit while the
+    container is still in use (`docker run --label "$(heavy docker-label)"` in a setup script), and the sweep
+    would then remove the container under the running test."""
     uid = os.getuid()
     if pid is None:
         scope = os.environ.get('HEAVY_SCOPE', '')
@@ -740,9 +951,16 @@ def owner_value(pid=None, proc='/proc'):
         if is_heavy_scope(leaf):
             return f'uid={uid},scope={leaf}'
         pid = os.getppid()
-    with open(f'{proc}/{pid}/stat', encoding='utf-8', errors='replace') as f:
-        stat = f.read()
-    start = int(stat[stat.rfind(')') + 2:].split()[19])
+        owner_uid, start, comm = read_owner(pid, proc)
+        if comm in SHORT_LIVED:
+            raise LabelRefused(f'the caller (pid {pid}, {comm}) is a shell or a script runner, which usually exits '
+                               f'before the container is done, and the sweep would then remove it. Run the test '
+                               f'under heavy, or pass --owner-pid PID of the long-lived test process')
+    else:
+        owner_uid, start, comm = read_owner(pid, proc)
+    if owner_uid != uid:
+        raise LabelRefused(f'pid {pid} belongs to uid {owner_uid}, not {uid}: the sweep sees only its own '
+                           f"user's processes and would remove the container")
     return f'uid={uid},pid={pid},start={start}'
 
 
@@ -753,15 +971,30 @@ def label_main(argv, out=None, err=None):
         a = args.pop(0)
         if a == '--value':
             value_only = True
-        elif a == '--pid' and args and args[0].isdigit():
+        elif a in ('--owner-pid', '--pid') and args and args[0].isdigit():
             pid = int(args.pop(0))
         else:
-            print('usage: heavy docker-label [--value] [--pid PID]', file=err)
+            print('usage: heavy docker-label [--value] [--owner-pid PID]', file=err)
             return 2
     try:
         value = owner_value(pid)
-    except (OSError, ValueError, IndexError) as e:
+    except LabelRefused as e:
+        print(f'heavy docker-label: {e}', file=err)
+        return 1
+    except (OSError, ValueError, IndexError, StopIteration) as e:
         print(f'heavy docker-label: cannot read the owner process ({e})', file=err)
         return 1
     print(value if value_only else f'{LABEL}={value}', file=out)
     return 0
+
+
+if __name__ == '__main__':
+    # the timer runs this file from the installed version folder (systemd/heavy-sweep.service)
+    verb, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ('', [])
+    if verb == 'sweep':
+        sys.exit(sweep_main(rest))
+    if verb == 'docker-label':
+        sys.exit(label_main(rest))
+    print('usage: heavy_sweep.py sweep [--dry-run|--json] | docker-label [--value] [--owner-pid PID]',
+          file=sys.stderr)
+    sys.exit(2)

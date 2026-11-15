@@ -6,6 +6,7 @@
   heavy --self-check              check the config, the slice and the installed files; exit 1 on a problem
   heavy sweep [--dry-run|--json]  stop or report what commands left behind outside heavy (lib/heavy_sweep.py)
   heavy docker-label [--value]    the owner label for a container a test starts, so the sweep can remove it
+                                  (--owner-pid PID: the long-lived test process that uses it; README)
   heavy -- <command> [args...]    run a command that is named sweep or docker-label
 
 The command runs with the same folder, environment, stdin, stdout, stderr and open files, and heavy exits with

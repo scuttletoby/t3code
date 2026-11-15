@@ -29,7 +29,11 @@ Rules (all checked by [machine_file.py](machine_file.py); a kit that finds one b
 the reason, and changes nothing):
 
 - **Owned by root**, and neither the file nor its folder writable by group or others (not checked on Windows).
-- **Shape:** a JSON object, `"version"` a whole number, one section per kit named after the kit's folder
+- **A plain file of at most 1 MiB, not a symbolic link, in a folder that is not one either.** The loader opens the
+  file without following a link and checks the file it opened (owner, mode, kind), not the path, so a file
+  swapped in between is caught.
+- **Shape:** a JSON object with no key given twice and no deeper nesting than Python's JSON reader takes,
+  `"version"` a whole number, one section per kit named after the kit's folder
   (`"heavy"`, ...), camelCase keys.
 - **Version:** a file newer than the kit knows is refused ("update the kit"); the kit never guesses.
 - **Each kit reads `version` and its own section only.** A missing section, an unknown key in it, or a value of
@@ -59,4 +63,5 @@ standard library.
 
 ## Tests
 
-`python3 -I -B fork-kit/common/tests/machine_file.test.py` (temporary files only, no root).
+`python3 -I -B fork-kit/common/tests/machine_file.test.py` (temporary files only, no root). Its red check breaks
+each file-safety rule in a copy of the loader and shows the test for that rule then fails.
