@@ -1,0 +1,44 @@
+# Fork only: a desk pool's warm caches, the desktop's side (fork-fleet-desk-seed.py run; .github/fork-fleet.md,
+# "Seeds"). The desk kit installs it as /etc/systemd/system/t3code-fleet-seed.service with its timer; not as
+# fork-fleet-*, the runner units' prefix. Safe to start by hand: a second run while one runs exits at once (a lock).
+#
+# Root, so the seeds are root's and no job can change one; sandboxed: it may write only the seeds' folder
+# (StateDirectory makes it, 0755; new copies are unpacked inside it, so a rename never crosses a mount), reads the
+# desk link's settings and key in /etc/fork-fleet, reaches the network (ssh to the always-on host only, with the
+# agent's pinned host key) and has a memory, CPU and task limit.
+[Unit]
+Description=t3code fork fleet: warm caches for a desk pool's jobs
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/fork-fleet/fork-fleet-desk-seed.py run
+TimeoutStartSec=3h
+Nice=10
+IOSchedulingClass=idle
+UMask=0022
+StateDirectory=fork-fleet/seeds
+StateDirectoryMode=0755
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+MemoryMax=512M
+MemorySwapMax=0
+CPUQuota=100%
+TasksMax=32

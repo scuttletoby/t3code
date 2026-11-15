@@ -8,8 +8,8 @@
 install reads the `desk` section of the machine file, makes the runner users, stages the fleet files of one release
 (launcher, walls, desk agent, gate hook and the fleet config), checks the staged copy, stops the agent, moves each
 file into /opt/fork-fleet, writes MANIFEST.sha256 and then SOURCE (last), writes the settings in /etc/fork-fleet and
-the units, makes the desk key once, and starts the agent and the refresh timer. Safe to run again and to stop at
-any step: a stopped run leaves SOURCE naming the old release (check says what differs) and the next run ends it.
+the units, makes the desk key once, and starts the agent and the refresh and seed timers. Safe to run again and to
+stop at any step: a stopped run leaves SOURCE naming the old release (check says what differs) and the next run ends it.
 """
 import argparse, contextlib, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile
 
@@ -27,6 +27,7 @@ FILES = {'fork-fleet-launch.sh': '.github/scripts/fork-fleet-launch.sh',
          'fork-fleet-walls.py': '.github/scripts/fork-fleet-walls.py',
          'fork-fleet-desk-agent.py': '.github/scripts/fork-fleet-desk-agent.py',
          'fork-fleet-desk-wire.py': '.github/scripts/fork-fleet-desk-wire.py',
+         'fork-fleet-desk-seed.py': '.github/scripts/fork-fleet-desk-seed.py',
          'hook.sh': '.github/scripts/fork-fleet-hook.sh', 'fork-fleet.py': '.github/scripts/fork-fleet.py',
          'fork-fleet.json': '.github/fork-fleet.json', 'desk-install': 'fork-kit/desk/sbin/desk-install',
          'machine_file.py': 'fork-kit/common/machine_file.py', 'README.md': 'fork-kit/desk/README.md',
@@ -34,8 +35,12 @@ FILES = {'fork-fleet-launch.sh': '.github/scripts/fork-fleet-launch.sh',
 WALLS = '.github/scripts/fork-fleet-walls'   # copied whole: every OS's walls file and fixture
 UNITS = {'fork-fleet-desk-agent.service': '.github/scripts/fork-fleet-desk-agent.service',
          't3code-fleet-refresh.service': '.github/scripts/fork-fleet-refresh.service',
-         't3code-fleet-refresh.timer': '.github/scripts/fork-fleet-refresh.timer'}
+         't3code-fleet-refresh.timer': '.github/scripts/fork-fleet-refresh.timer',
+         't3code-fleet-seed.service': '.github/scripts/fork-fleet-seed.service',
+         't3code-fleet-seed.timer': '.github/scripts/fork-fleet-seed.timer'}
 AGENT, TIMER, REFRESH = 'fork-fleet-desk-agent.service', 't3code-fleet-refresh.timer', 't3code-fleet-refresh.service'
+SEED_TIMER, SEED = 't3code-fleet-seed.timer', 't3code-fleet-seed.service'
+SEEDS = WORK + '/seeds'   # the warm caches (fork-fleet-desk-seed.py); jobs see them read-only (ALLOW_PATHS)
 FOREIGN = (OPT + '/fork-fleet-launch.sh', ETC + '/launch.conf', ETC + '/desk.conf', KEY,
            *(f'{UNIT_DIR}/{u}' for u in UNITS))
 CMD = {k: [k] for k in ('useradd', 'userdel', 'loginctl', 'systemctl', 'sysctl', 'ssh-keygen', 'ip', 'nft', 'bash',
@@ -252,7 +257,7 @@ def make_users(users, state):
 
 def settings(m, users):
     known = (m['host'] if m['port'] == 22 else f'[{m["host"]}]:{m["port"]}') + ' ' + m['hostKey']
-    files = {ETC + '/launch.conf': (f'RUNNER_USERS={",".join(users)}\n'
+    files = {ETC + '/launch.conf': (f'RUNNER_USERS={",".join(users)}\nALLOW_PATHS={SEEDS}\n'
                                     + (f'RESERVE_MB={m["reserveMb"]}\n' if m['reserveMb'] is not None else '')
                                     + (f'NET_BASE={m["netBase"]}\n' if m['netBase'] else '')
                                     + (f'FREE_COMMAND={m["freeCommand"]}\n' if m['freeCommand'] else ''), 0o600),
@@ -334,7 +339,7 @@ def install(a, stop_after=None):
     if r.returncode:
         raise Refused(f'the desk agent refuses its settings (not started): {r.stderr.strip()[:300]}')
     run('systemctl', 'daemon-reload')
-    run('systemctl', 'enable', '--now', TIMER)
+    run('systemctl', 'enable', '--now', TIMER, SEED_TIMER)
     if not os.path.exists(p(OPT + '/template/runner-template/.fork-fleet-version')):
         run(p(OPT + '/fork-fleet-launch.sh'), 'prune', check=False)   # makes the launch lock refresh opens
         run('systemctl', 'start', '--no-block', REFRESH)              # the first runner template, in the background
@@ -369,7 +374,7 @@ def check():
         row(False, 'walls', f'exit {walls.returncode}: {walls.stderr.strip()[:200]}')
     r = py(p(OPT + '/fork-fleet-desk-agent.py'), 'check')
     row(r.returncode == 0, 'agent-settings', (r.stdout or r.stderr).strip()[:200])
-    for unit in (AGENT, TIMER):
+    for unit in (AGENT, TIMER, SEED_TIMER):
         on = run('systemctl', 'is-active', '--quiet', unit, check=False).returncode == 0
         row(on and run('systemctl', 'is-enabled', '--quiet', unit, check=False).returncode == 0, 'unit',
             f'{unit} enabled and active')
@@ -429,7 +434,7 @@ def uninstall():
     if state is None:
         say(f'no {STATE}: nothing here was installed by this kit (nothing changed)')
         return 0
-    for unit in (AGENT, TIMER, REFRESH):
+    for unit in (AGENT, TIMER, REFRESH, SEED_TIMER, SEED):
         run('systemctl', 'disable', '--now', unit, check=False)
     launcher = p(OPT + '/fork-fleet-launch.sh')
     if os.path.exists(launcher):

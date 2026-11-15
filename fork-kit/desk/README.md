@@ -48,6 +48,9 @@ the refresh timer; `check` says FAIL for `template` until it is there.
 `check` only reads: the installed files against their manifest, every wall of this OS (`fork-fleet-walls.py
 describe`), the agent's settings, the units, the template, the runner users and IPv4 forwarding.
 
+The seed timer (`t3code-fleet-seed.timer`) fetches the pool's warm caches, if its fleet config lists any, into
+`/var/lib/fork-fleet/seeds`, which jobs see read-only ([fork-fleet.md](../../.github/fork-fleet.md), "Seeds").
+
 ## Windows (WSL2)
 
 [windows/start-desk.ps1](windows/start-desk.ps1) does the Windows side and then this kit inside one WSL2 distro.
@@ -80,8 +83,8 @@ stay (`wsl --unregister DISTRO` removes the distro).
   before anything changes. Remove the older (by hand) install first, the runbook's steps in reverse.
 - **Empty:** `check` before an install says FAIL and writes nothing; `uninstall` with no record does nothing.
 
-Uninstall stops every runner, removes the namespaces and the `fork_fleet` nft table, the kit's units, files and
-settings, and only the users it made itself.
+Uninstall stops every runner, removes the namespaces and the `fork_fleet` nft table, the kit's units, files,
+settings and seeds, and only the users it made itself.
 
 ## Why one flat folder
 

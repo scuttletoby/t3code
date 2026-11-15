@@ -709,6 +709,14 @@ own: the same forced command answers `seeds` with the pool's list and
 size and SHA-256 (`fork-fleet-desk-seed.py`, which step 3 installs; its header
 has the exit codes).
 
+The desktop's side is the same script's `run`, hourly from
+`t3code-fleet-seed.timer` (the desk kit installs both). Each new seed is
+unpacked with Python's tar data filter, checked against the trailer, and
+swapped in by a rename; jobs see `/var/lib/fork-fleet/seeds/NAME` read-only
+(the launcher's `ALLOW_PATHS`), copy what they need from it when it is there,
+and run cold when it is not. The state table (a torn download, the host down,
+clocks that disagree, a run that stopped half-way) is in the script's header.
+
 ## Owner steps on the repository
 
 Run these from a machine where `gh` is logged in as the owner. None of them
