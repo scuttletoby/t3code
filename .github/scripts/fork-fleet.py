@@ -92,6 +92,9 @@ def positive(x):
     return isinstance(x, int) and not isinstance(x, bool) and x > 0
 
 
+JOB_FIELDS = frozenset({'job', 'memory_mb', 'shards', 'gates', 'avoid'})
+
+
 def check_config(cfg):
     out = []
     for key in ('repository', 'hosted', 'trusted', 'pools', 'jobs', 'stuck_seconds', 'fleet_stuck_seconds'):
@@ -170,6 +173,10 @@ def check_config(cfg):
             out.append(f'with "hosted": false a static pool must take {kind} runs (where jobs that are not routed, '
                        're-runs of failed jobs and runs the dispatchers refuse go)')
     for j in cfg['jobs']:
+        unknown = sorted(set(j) - JOB_FIELDS) if isinstance(j, dict) else []
+        if unknown:
+            out.append(f'job {j.get("job")!r}: unknown key {", ".join(map(repr, unknown))} (a job takes only '
+                       f'{", ".join(sorted(JOB_FIELDS))}; a misspelled key would be ignored)')
         if not (isinstance(j.get('job'), str) and JOB_ID.fullmatch(j['job'])):
             out.append(f'job {j.get("job")!r}: the id must be a-z, 0-9 and _')
         if not positive(j.get('memory_mb')):

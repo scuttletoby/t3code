@@ -216,7 +216,8 @@ A job's `avoid` keeps it off a pool for some kinds of run: `{"job": "plugins", "
 ["push"]}}` never sends `plugins` of a push to `desktop` (say the jars a deploy ships are built on the always-on pool
 only), while drafts may still use it. The pool's slots then go to the next job in `jobs` order. Only a dispatcher pool
 that does not wait may be avoided: the pool that waits and the static pools are where a job goes when nothing else takes
-it. The pool must be in the config and the kinds from `push`, `draft` and `ready`.
+it. The pool must be in the config and the kinds from `push`, `draft` and `ready`. A job may have only the keys `job`,
+`memory_mb`, `shards`, `gates` and `avoid`; any other key (a misspelling such as `avoids`) is refused.
 
 A config that breaks any rule above fails the step with the list of problems and puts out nothing.
 
@@ -228,6 +229,8 @@ that uses only the action has neither. So:
 
 - **Old runner labels:** keep the old label on its runners, and in `retired_labels`, for a week after a pool's label
   changes. Runs routed before the change queue on it and still find a runner.
+- **Removing a pool:** take it out of every job's `avoid` too (a config that still names it is refused, and the error
+  names the pool).
 - **Queued runs on a removed label** wait until GitHub drops them (24 hours). Cancel such a run by hand and re-run
   it; the re-run is routed by the new config.
 

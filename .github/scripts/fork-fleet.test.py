@@ -3680,6 +3680,14 @@ class AnyRepository(unittest.TestCase):
         waiting['jobs'][0]['avoid'] = {WAITING: ['push']}
         self.assertTrue(any('does not wait' in p for p in ff.check_config(waiting)), ff.check_config(waiting))
 
+    def test_an_unknown_job_key_is_refused(self):
+        # A misspelled `avoid` would otherwise be ignored and the job sent to the pool it meant to avoid.
+        bad = copy.deepcopy(GEN)
+        bad['jobs'][0]['avoids'] = {'pc': ['push']}
+        problems = ff.check_config(bad)
+        self.assertTrue(any("unknown key 'avoids'" in p for p in problems), problems)
+        self.assertEqual(ff.check_config(copy.deepcopy(GEN)), [])
+
     def test_pool_by_draft_state(self):
         _, out, _ = self.route(pc=beacon(2), e=env(**PR_ENV), event=draft(True))
         self.assertEqual(out['plugins'][0], 'proj-pc')
