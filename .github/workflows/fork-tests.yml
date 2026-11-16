@@ -100,16 +100,18 @@ jobs:
       # Release runs: the commit every job checks out. Empty on pull_request and
       # push, where each checkout already takes the run's own commit.
       sha: ${{ steps.resolve.outputs.sha }}
-      typecheck: ${{ steps.release.outputs.typecheck || steps.detect.outputs.typecheck }}
-      build: ${{ steps.release.outputs.build || steps.detect.outputs.build }}
-      desktop_launch: ${{ steps.release.outputs.desktop_launch || steps.detect.outputs.desktop_launch }}
-      test: ${{ steps.release.outputs.test || steps.detect.outputs.test }}
-      test_packages: ${{ steps.release.outputs.test_packages || steps.detect.outputs.test_packages }}
-      test_web: ${{ steps.release.outputs.test_web || steps.detect.outputs.test_web }}
-      test_server: ${{ steps.release.outputs.test_server || steps.detect.outputs.test_server }}
-      rust: ${{ steps.release.outputs.rust || steps.detect.outputs.rust }}
-      release_smoke: ${{ steps.release.outputs.release_smoke || steps.detect.outputs.release_smoke }}
-      mobile_native: ${{ steps.release.outputs.mobile_native || steps.fork.outputs.mobile_native }}
+      typecheck: ${{ steps.release.outputs.typecheck || steps.fork_only.outputs.typecheck || steps.detect.outputs.typecheck }}
+      build: ${{ steps.release.outputs.build || steps.fork_only.outputs.build || steps.detect.outputs.build }}
+      desktop_launch: ${{ steps.release.outputs.desktop_launch || steps.fork_only.outputs.desktop_launch || steps.detect.outputs.desktop_launch }}
+      test: ${{ steps.release.outputs.test || steps.fork_only.outputs.test || steps.detect.outputs.test }}
+      test_packages: ${{ steps.release.outputs.test_packages || steps.fork_only.outputs.test_packages || steps.detect.outputs.test_packages }}
+      test_web: ${{ steps.release.outputs.test_web || steps.fork_only.outputs.test_web || steps.detect.outputs.test_web }}
+      test_server: ${{ steps.release.outputs.test_server || steps.fork_only.outputs.test_server || steps.detect.outputs.test_server }}
+      rust: ${{ steps.release.outputs.rust || steps.fork_only.outputs.rust || steps.detect.outputs.rust }}
+      release_smoke: ${{ steps.release.outputs.release_smoke || steps.fork_only.outputs.release_smoke || steps.detect.outputs.release_smoke }}
+      mobile_native: ${{ steps.release.outputs.mobile_native || steps.fork_only.outputs.mobile_native || steps.fork.outputs.mobile_native }}
+      # 'true' only on a pull request whose every changed path is fork-owned (the `fork_only` step).
+      fork_only: ${{ steps.fork_only.outputs.fork_only || 'false' }}
       # Where each Linux job runs (the `route` step; empty in a release run, which is GitHub-hosted).
       runners: ${{ steps.route.outputs.runners }}
       fleet_mode: ${{ steps.route.outputs.mode }}
@@ -125,6 +127,8 @@ jobs:
             /pnpm-workspace.yaml
             /.github/scripts/ci-changes.cjs
             /.github/actions/ci-changes/
+            /.github/fork-owned-paths.txt
+            /.github/scripts/fork-owned-paths.cjs
             /*/package.json
             /*/*/package.json
             /.github/fork-fleet.json
@@ -150,6 +154,15 @@ jobs:
             value=true
           fi
           echo "mobile_native=$value" >> "$GITHUB_OUTPUT"
+
+      # A pull request that changes only fork-owned paths (.github/fork-owned-paths.txt: fork-ci/, fork-kit/, the
+      # fork's own .github scripts) skips the app jobs: its gates are upstream's detector's answer for a change with
+      # no path left, all false. Anything unclear keeps the detector's answer (.github/scripts/fork-owned-paths.cjs).
+      # Not on a push to main or a release run: those always run every job.
+      - name: Fork-only pull request
+        id: fork_only
+        if: inputs.ref == '' && github.event_name == 'pull_request'
+        run: node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"
 
       # A branch name is resolved once, here: jobs start minutes apart, and a
       # branch that moves in between would otherwise test two commits in one run.
@@ -198,7 +211,7 @@ jobs:
           FLEET_MODE: ${{ vars.CI_RUNNERS }}
           FLEET_BEACON_PC: ${{ vars.FLEET_BEACON_PC }}
           FLEET_BEACON_VM: ${{ vars.FLEET_BEACON_VM }}
-          GATES: ${{ toJSON(steps.detect.outputs) }}
+          GATES: ${{ steps.fork_only.outputs.fork_only == 'true' && toJSON(steps.fork_only.outputs) || toJSON(steps.detect.outputs) }}
         run: python3 -I .github/scripts/fork-fleet.py route
 
   # A fleet job that waits too long for its runner cancels the run with an
@@ -805,10 +818,11 @@ jobs:
   # themselves, so the steps follow ci.yml one for one; a shard the change
   # cannot affect says so in its summary. They wait for `changes` only for a
   # release run's resolved commit (seconds; every other job waits for it too).
+  # Fork only: a fork-only pull request skips all of them (`changes`, step fork_only).
   test_server:
     name: Test Server ${{ matrix.shard }}
     needs: changes
-    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) && (needs.changes.outputs.fork_only != 'true') }}
     # Fleet or GitHub-hosted: the `route` step of `changes` (.github/fork-fleet.md).
     runs-on: ${{ vars.CI_RUNNERS != 'github' && (needs.changes.outputs.fleet_attempt == github.run_attempt || (needs.changes.outputs.fleet_mode == 'fleet' && vars.CI_RUNNERS == 'fleet')) && fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][1] && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][0], fromJSON(needs.changes.outputs.runners || '{}')[format('test_server-{0}', matrix.shard)][1], github.run_attempt)) || 'ubuntu-24.04' }}
     timeout-minutes: 20
@@ -1089,6 +1103,7 @@ jobs:
             build: "the change affects neither desktop, server nor web, and no package needs a typecheck",
             test: "the change affects no package this job tests",
             test_web: "the change affects nothing @t3tools/web depends on",
+            test_server: "fork-only pull request: every changed path is fork-owned",
             rust: "the change touches none of the native Rust crates",
             mobile_native_static_analysis: (if $release == "true"
               then "release run: upstream release.yml has no macOS lint"
@@ -1106,7 +1121,10 @@ jobs:
             echo "$RESULTS" | jq -r --arg release "$RELEASE_RUN" "$why as \$why
               | to_entries[]
               | \"| \(.key) | \(.value.result) | \(if .value.result == \"skipped\" then (\$why[.key] // \"no reason: fails\") else \"\" end) |\""
-            if [[ "$(echo "$RESULTS" | jq -r '.changes.outputs.test_server')" == false ]]; then
+            if [[ "$(echo "$RESULTS" | jq -r '.changes.outputs.fork_only')" == true ]]; then
+              echo
+              echo "Fork-only pull request: every changed path is fork-owned (.github/fork-owned-paths.txt), so the app jobs were skipped."
+            elif [[ "$(echo "$RESULTS" | jq -r '.changes.outputs.test_server')" == false ]]; then
               echo
               echo "Server shards passed without running tests: the change affects nothing t3 (apps/server) depends on."
             fi
