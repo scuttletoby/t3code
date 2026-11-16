@@ -30,5 +30,12 @@
     "postHooks": ["/srv/example/golive/bin/resume-jobs"],
     "quietWaitSeconds": 7200,
     "stopLimitSeconds": 1800
+  },
+  "desk": {
+    "pool": "pc",
+    "host": "fleet-host.example",
+    "hostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "slots": 2,
+    "reserveMb": 4096
   }
 }
