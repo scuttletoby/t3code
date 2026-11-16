@@ -3,7 +3,7 @@
 offer in-process, the desktop's run end to end through a fake ssh that runs the host's side, and the forced command's
 divert in fork-fleet-desk.py. Temp folders only; no root, no ssh, no network. Run: python3 -I -B <this>. Linux only."""
 import contextlib, fcntl, hashlib, importlib.util, io, json, os, shutil, stat, subprocess, sys, tarfile, tempfile, threading
-import time, unittest
+import signal, time, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -46,6 +46,9 @@ if mode == 'down':
     sys.exit(255)
 if words[0] == 'seeds' and mode == 'oldhost':   # a host on an older kit: a serve session, not a list
     print('fork-fleet-desk: serving')
+    sys.exit(0)
+if words[0] == 'seeds' and mode == 'deep':      # a list nested deeper than json can go
+    print('[' * 200000)
     sys.exit(0)
 if words[0] == 'seeds' and mode == 'exit1':     # a host stopped half-way through its install
     print('fork-fleet-desk: no config', file=sys.stderr)
@@ -651,10 +654,10 @@ class Desktop(Base):
         self.deep_tar('m2', 1500)
         real = seed.fetch
 
-        def broken(agent_, conf, item, root, now):
+        def broken(agent_, conf, item, root, now, **kw):
             if item['name'] == 'm2':
                 raise RuntimeError('anything at all')
-            return real(agent_, conf, item, root, now)
+            return real(agent_, conf, item, root, now, **kw)
         with mock.patch.object(seed, 'fetch', broken):
             self.assertEqual(self.run_seed(), 0)
         self.assertEqual(self.files('npm'), {'a': b'n'})
@@ -669,6 +672,197 @@ class Desktop(Base):
         self.assertEqual(self.files('npm'), {'a': b'n'})
         self.assertIsNone(self.files('m2'))
         self.assertEqual(os.listdir(os.path.join(self.root, '.new')), ['.lock'])
+
+    def raw(self, name, blob):
+        """FILES/POOL/NAME.tar holding BLOB (tar blocks made by hand), newer than any made before."""
+        tmp = os.path.join(self.t, 'files', POOL, f'.{name}.tmp')
+        with open(tmp, 'wb') as f:
+            f.write(blob + b'\0' * 1024)
+        os.chmod(tmp, 0o644)
+        os.utime(tmp, (time.time() + 5,) * 2)
+        os.replace(tmp, self.tar(name))
+
+    @staticmethod
+    def block(info, data=b'', fmt=tarfile.GNU_FORMAT):
+        """One member: INFO's header (its size is DATA's) and DATA padded to whole blocks."""
+        info.size = len(data)
+        return info.tobuf(format=fmt) + data + b'\0' * (-len(data) % 512)
+
+    @staticmethod
+    def pax(**records):
+        out = b''
+        for k, v in records.items():
+            line = f' {k}={v}\n'.encode()
+            n = len(line) + 1
+            while n != len(line) + len(str(n)):   # the length counts its own digits
+                n = len(line) + len(str(n))
+            out += str(n).encode() + line
+        return out
+
+    def test_a_run_killed_in_every_fetch_still_prunes(self):   # lens237sr2: the MUST
+        os.makedirs(os.path.join(self.root, '.v', 'm2.1', 'data'))   # long replaced, no link names it
+        os.utime(os.path.join(self.root, '.v', 'm2.1'), (1, 1))
+        self.make('m2', {'a': b'm'})
+        self.make('npm', {'a': b'n'})
+        real = seed.fetch
+
+        def oom(agent_, conf, item, root, now, **kw):   # MemoryMax or TimeoutStartSec: SIGKILL, no finally runs
+            if item['name'] == 'npm':
+                os.kill(os.getpid(), signal.SIGKILL)
+            return real(agent_, conf, item, root, now, **kw)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                with mock.patch.object(seed, 'fetch', oom):
+                    self.run_seed()
+            finally:
+                os._exit(0)
+        self.assertEqual(os.waitpid(pid, 0)[1] & 0x7f, signal.SIGKILL)
+        self.assertEqual(self.files('m2'), {'a': b'm'})
+        self.assertFalse(os.path.exists(os.path.join(self.root, '.v', 'm2.1')))
+        with open(os.path.join(self.root, '.torn.json')) as f:   # the killed fetch counts as torn
+            self.assertEqual(json.load(f)['npm']['tries'], 1)
+
+    def test_a_pax_header_seed_stays_under_the_units_memory(self):   # lens237sr2: the MUST
+        big = [{**SEEDS[0], 'max_mb': 64}, SEEDS[1]]   # a realistic max_mb (fork-fleet.md shows 4096)
+        self.config(big)
+        self.own(big)
+        body = b''.join(b'%d a.%07d=x\n' % (len(b' a.0000000=x\n') + 2, i) for i in range(2_500_000))
+        info = tarfile.TarInfo('pax')
+        info.type = tarfile.XGLTYPE
+        self.raw('m2', self.block(info, body, tarfile.USTAR_FORMAT))
+        del body
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            import resource
+            code = 2
+            try:
+                os.close(r)
+                self.run_seed()
+                os.write(w, json.dumps(self.said).encode())
+                code = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >= 512 << 10   # MemoryMax=512M, in KB
+            finally:
+                os._exit(code)
+        os.close(w)
+        with os.fdopen(r) as f:
+            said = f.read()
+        self.assertEqual(os.waitpid(pid, 0)[1] >> 8, 0, said)   # a ~35 MB stream (under max_mb) within 512 MB
+        self.assertIn('extended (pax or long-name) headers hold more than 1 MB', said)
+
+    def test_extended_headers_and_sparse_members_are_held_to_limits(self):
+        long_name = tarfile.TarInfo('././@LongLink')
+        long_name.type = tarfile.GNUTYPE_LONGNAME
+        chain = tarfile.TarInfo('pax')
+        chain.type = tarfile.XHDTYPE
+        old_sparse = tarfile.TarInfo('s')
+        old_sparse.type = tarfile.GNUTYPE_SPARSE
+        pax_sparse = tarfile.TarInfo('pax')
+        pax_sparse.type = tarfile.XHDTYPE
+        cases = {
+            'a GNU long name of 1.5 MB': (self.block(long_name, b'n' * (3 << 19) + b'\0')
+                                        + self.block(tarfile.TarInfo('f'), b'x'), 'extended'),
+            'pax headers of 400 KB each, three before one member': (
+                self.block(chain, self.pax(comment='c' * (400 << 10))) * 3 + self.block(tarfile.TarInfo('f'), b'x'),
+                'extended'),
+            'an old GNU sparse member': (self.block(old_sparse), 'sparse member'),
+            'a pax (1.0) sparse member': (
+                self.block(pax_sparse, self.pax(**{'GNU.sparse.major': 1, 'GNU.sparse.minor': 0,
+                                                   'GNU.sparse.name': 's', 'GNU.sparse.realsize': 0}))
+                + self.block(tarfile.TarInfo('s'), b'0\n'.ljust(512, b'\0')), 'sparse member'),
+        }
+        for what, (blob, why) in cases.items():
+            with self.subTest(what):
+                self.raw('m2', blob)
+                self.run_seed()
+                self.assertIsNone(self.files('m2'))
+                self.assertTrue(any('m2' in x and why in x for x in self.said), self.said)
+                with contextlib.suppress(FileNotFoundError):   # each case tried at once, not after a wait
+                    os.unlink(os.path.join(self.root, '.torn.json'))
+        for k in ('_proc_member', '_proc_sparse', '_proc_gnusparse_00', '_proc_gnusparse_01', '_proc_gnusparse_10'):
+            self.assertTrue(callable(getattr(tarfile.TarInfo, k, None)), f'tarfile.TarInfo.{k} is gone: see Info')
+
+    def test_members_are_let_go_as_they_are_unpacked(self):
+        self.make('m2', {f'd/{i}': b'x' for i in range(300)})
+        most, real = [0], tarfile.TarFile.next
+
+        def counted(t):
+            got = real(t)
+            most[0] = max(most[0], len(t.members))
+            return got
+        with mock.patch.object(tarfile.TarFile, 'next', counted):
+            self.run_seed()
+        self.assertEqual(len(self.files('m2')), 300)
+        self.assertLessEqual(most[0], 2)
+
+    def test_a_hard_link_must_name_a_file_unpacked_before_it(self):
+        def hard(name, target):
+            info = tarfile.TarInfo(name)
+            info.type, info.linkname = tarfile.LNKTYPE, target
+            return self.block(info)
+        self.raw('m2', self.block(tarfile.TarInfo('a'), b'one') + hard('b', 'a'))
+        self.run_seed()
+        self.assertEqual(self.files('m2'), {'a': b'one', 'b': b'one'})
+        self.raw('m2', self.block(tarfile.TarInfo('a'), b'two') + hard('b', 'later') +
+                 self.block(tarfile.TarInfo('later'), b'x'))
+        self.run_seed(now=lambda: time.time() + 7 * 3600)
+        self.assertEqual(self.files('m2'), {'a': b'one', 'b': b'one'})   # the old one stays
+        self.assertTrue(any('hard link' in x for x in self.said), self.said)
+
+    def test_a_deeply_nested_list_means_no_list(self):   # lens237cr2
+        self.make('m2', {'a': b'one'})
+        self.run_seed()
+        self.mode('deep')
+        self.assertEqual(self.run_seed(now=lambda: time.time() + 7 * 3600), 0)
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+        self.assertTrue(any('not well formed' in x for x in self.said), self.said)
+
+    def test_a_folder_that_cannot_be_listed_tears_the_seed(self):
+        self.make('m2', {'a/b/c': b'one'})
+        real = os.scandir
+
+        def scandir(path='.'):
+            if isinstance(path, str) and path.endswith(os.sep + 'b'):
+                raise OSError(36, 'File name too long', path)
+            return real(path)
+        with mock.patch.object(os, 'scandir', scandir):
+            self.run_seed()
+        self.assertIsNone(self.files('m2'))
+        self.assertTrue(any('cannot be listed' in x for x in self.said), self.said)
+
+    def test_a_run_stops_fetching_when_its_time_is_used(self):
+        self.make('m2', {'a': b'one'})
+        with mock.patch.object(seed, 'RUN_WAIT', 30):
+            self.assertEqual(self.run_seed(), 0)
+        self.assertIsNone(self.files('m2'))
+        self.assertEqual(self.fetches(), [])
+        self.assertTrue(any('this run has used its' in x for x in self.said), self.said)
+        waits = []
+        real = seed.fetch
+
+        def timed(agent_, conf, item, root, now, wait=None):
+            waits.append(wait)
+            return real(agent_, conf, item, root, now, wait=wait)
+        with mock.patch.object(seed, 'RUN_WAIT', 600), mock.patch.object(seed, 'fetch', timed):
+            self.run_seed()
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+        self.assertTrue(waits and all(500 < w <= 600 for w in waits), waits)   # each fetch within what is left
+
+    def test_a_seed_torn_every_time_backs_off_then_fails_the_run_after_a_day(self):
+        self.make('m2', {'a': b'one'})
+        start, tried = int(time.time()), []
+
+        def torn(agent_, conf, item, root, now, **kw):
+            tried.append(now() - start)
+            raise seed.Torn('cut off')
+        with mock.patch.object(seed, 'fetch', torn):
+            codes = {h: self.run_seed(now=lambda h=h: start + h * 3600) for h in range(0, 33)}
+        self.assertEqual([round(x / 3600) for x in tried], [0, 1, 3, 7, 15, 31])   # 1, 2, 4, 8, 16 h apart
+        self.assertEqual({h for h, c in codes.items() if c}, set(range(25, 33)))   # torn for more than 24 h: exit 1
+        self.assertTrue(any('torn on every try' in x for x in self.said), self.said)
+        self.assertEqual(self.run_seed(now=lambda: start + 63 * 3600), 0)   # fetched at last: the record goes
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+        self.assertEqual(self.run_seed(now=lambda: start + 64 * 3600), 0)
 
     def test_a_tree_deeper_than_recursion_left_by_an_older_run_is_removed(self):
         self.make('m2', {'a': b'one'})

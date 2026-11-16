@@ -19,8 +19,9 @@ own beside the agent's:
                      every_hours and max_age_hours and the smaller of its own and the host's max_mb. Each new seed is
                      unpacked with tarfile's data filter into a folder of its own (what it would make on disk held
                      to max_mb, ENTRY bytes counted for each member and folder; no member over DEPTH folders deep or
-                     a name over NAME_MOST bytes), checked against the trailer (bytes and MADE the list's too), walked
-                     (a link out of it is refused; all made readable), flushed, and swapped in by rename: SEEDS/NAME is a link to
+                     a name over NAME_MOST bytes; memory held too: see Info and unpack), checked against the
+                     trailer (bytes and MADE the list's too), walked (a link out of it is refused; all made
+                     readable), flushed, and swapped in by rename: SEEDS/NAME is a link to
                      .v/NAME.STAMP/data, root's (folders 0755, files no one else may write), unpacked in .new
                      (one folder: a rename never crosses a mount of the unit's sandbox). Jobs see SEEDS read-only
                      (the launcher's ALLOW_PATHS): a job uses /var/lib/fork-fleet/seeds/NAME when it is there and runs
@@ -31,8 +32,12 @@ Each run (one at a time: a lock) meets this state:
   a new one under every_hours after the last   nothing yet
   a torn copy (the stream cut or past FETCH_WAIT, a trailer that does not match it or the list, more than max_mb,
   a tar member that would leave its folder, is a device, too deep or too long, or any other error)
-                                               the copy is removed, the old seed stays, the next hour tries again;
-                                               the other seeds go on, old versions are still pruned
+                                               the copy is removed, the old seed stays, the other seeds go on, old
+                                               versions are still pruned; tried again after 1, 2, 4, 8, 16, then 24
+                                               hours (TornLog); torn on every try for over TORN_DAY: the run exits 1
+  a fetch that kills the run (MemoryMax, TimeoutStartSec)
+                                               counted as torn before it began; the next run prunes first
+  the run's RUN_WAIT used                      the seeds left are tried next hour
   no seed (never fetched, the host down)       jobs run cold
   no list (the host down, an older kit that answers with a session or not JSON, exit 1 of a half-done install)
                                                nothing fetched; each seed stays until its age drops it
@@ -74,11 +79,14 @@ CONFIG = os.path.join(HERE, 'fork-fleet.json')
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
 LINK = re.compile(r'\.v/((?P<name>[a-z0-9][a-z0-9_-]{0,39})\.[0-9]{1,20})/data')
 LIST_WAIT, FETCH_WAIT = 30, 30 * 60   # seconds for the list, and for one seed's whole stream
+RUN_WAIT = 2 * 3600   # seconds a run may spend fetching, all seeds together (the unit's TimeoutStartSec is 3 h)
+TORN_DAY = 24 * 3600  # a seed torn on every try for this long makes the run exit 1 (the unit's result: `check` FAIL)
 LIST_MOST, ERR_KEEP, MEMBERS = 1 << 20, 4096, 200_000   # the list's bytes, ssh's stderr kept, a seed's tar members
 KEEP_OLD, SKEW = 24 * 3600, 3600       # SKEW: how far the host's clock may be ahead of the desktop's
 PIECE, WRITE, STALL, AHEAD = 1 << 20, 64 << 10, 120, 300   # AHEAD: seconds a file's date may be ahead of now
 GRACE, MIN_RATE = 600, 256 << 10   # a stream's deadline: GRACE seconds plus one second per MIN_RATE bytes
 DEPTH, NAME_MOST, ENTRY = 64, 1024, 4096   # a member's most folders deep and name bytes; the disk an entry costs
+HEADER_MOST, FOLDER_NAMES = 1 << 20, 16 << 20   # extended header bytes (see Info); folder name bytes kept
 ITEM = {'everyHours': 'every_hours', 'maxAgeHours': 'max_age_hours', 'maxMb': 'max_mb'}
 
 
@@ -309,7 +317,7 @@ def listing(agent, conf):
                                                                        and whole(s['made']))
             out[s['name']] = s
         return out
-    except (ValueError, AssertionError):
+    except (ValueError, AssertionError, RecursionError):   # RecursionError: a list nested deeper than json can go
         raise Torn('the host\'s list is not well formed') from None
 
 
@@ -321,13 +329,65 @@ def whole(x):
     return isinstance(x, int) and not isinstance(x, bool) and x >= 0
 
 
+EXTENDED = (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE, tarfile.GNUTYPE_LONGNAME,
+            tarfile.GNUTYPE_LONGLINK)
+
+
+class Info(tarfile.TarInfo):
+    """A tar header read with limits tarfile has not: it reads an extended header (pax, or a GNU long name) into
+    memory whole and its parsed form takes many times its size, and a sparse member's map can grow without end. So the
+    extended headers before one member may hold at most HEADER_MOST bytes together, the global pax headers of the
+    whole tar too, and a sparse member is refused (make a seed without --sparse). Torn before tarfile reads one."""
+
+    def _proc_member(self, tarfile_):
+        used = tarfile_.__dict__.setdefault('fork_headers', [0, 0])   # [before this member, global in all]
+        if self.type in EXTENDED:
+            used[0] += self.size
+            used[1] += self.size if self.type == tarfile.XGLTYPE else 0
+            if max(used) > HEADER_MOST:
+                raise Torn(f'the tar\'s extended (pax or long-name) headers hold more than {HEADER_MOST >> 20} MB')
+        else:
+            used[0] = 0
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            self.sparse_refused()
+        return super()._proc_member(tarfile_)
+
+    def sparse_refused(self, member=None, *_):
+        raise Torn(f'{(member or self).name[:80]!r} is a sparse member (make the seed without --sparse)')
+
+    _proc_gnusparse_00 = _proc_gnusparse_01 = _proc_gnusparse_10 = sparse_refused   # pax sparse forms
+
+
+def unpack(t, data, most):
+    """The members of the open stream T into DATA, one at a time: tarfile keeps every member it has read in
+    `members` (and extractall each folder besides), so they are let go as they are made; only `guarded`'s count of
+    folders stays. A hard link must name a file already unpacked (otherwise tarfile would read the rest of the
+    stream into memory to find it)."""
+    check = guarded(most)
+
+    def linked(member, path):
+        got = check(member, path)
+        if got is not None and got.islnk():
+            try:
+                plain = stat.S_ISREG(os.lstat(os.path.join(path, got.linkname)).st_mode)
+            except OSError:
+                plain = False
+            if not plain:
+                raise Torn(f'{got.name[:80]!r} is a hard link to {got.linkname[:80]!r}, not a file unpacked before it')
+        return got
+    while (member := t.next()) is not None:
+        t.members.clear()
+        t.extract(member, data, set_attrs=not member.isdir(), filter=linked)   # data_filter keeps no folder mode
+
+
 def guarded(most):
     """tarfile's data filter, and a limit on what the tar would make on disk: each member's size (a sparse member is
     small in the stream, not on disk) plus ENTRY bytes for it and for each folder it makes, together at most MOST
     bytes (a stream of empty files or deep paths is small but would fill the disk with entries); at most MEMBERS
     members and MEMBERS folders (each is kept in memory); no member more than DEPTH folders deep (unpacking and
-    removing a tree goes folder by folder) or with a name or link target over NAME_MOST bytes."""
-    seen, folders = [0, 0], {}   # folders: {(its parent's number, its name): its number}, a name kept once
+    removing a tree goes folder by folder) or with a name or link target over NAME_MOST bytes; the folder names
+    kept to count them at most FOLDER_NAMES bytes."""
+    seen, folders = [0, 0, 0], {}   # folders: {(its parent's number, its name): its number}, a name kept once
 
     def check(member, path):
         parts = [x for x in member.name.split('/') if x not in ('', '.')]
@@ -340,13 +400,15 @@ def guarded(most):
         for i, part in enumerate(parts if member.isdir() else parts[:-1], 1):   # the folders it makes
             if (up, part) not in folders:
                 folders[up, part] = len(folders) + 1
+                seen[2] += len(part)
                 new += i < len(parts)                      # a folder member pays ENTRY once, as a member
             up = folders[up, part]
         seen[0] += 1
         seen[1] += member.size + ENTRY * (1 + new)
-        if seen[0] > MEMBERS or len(folders) > MEMBERS or seen[1] > most:
-            raise Torn(f'the tar holds more than {MEMBERS} members or folders, or more than {most >> 20} MB '
-                       f'(max_mb; {ENTRY} bytes counted for each member and folder)')
+        if seen[0] > MEMBERS or len(folders) > MEMBERS or seen[1] > most or seen[2] > FOLDER_NAMES:
+            raise Torn(f'the tar holds more than {MEMBERS} members or folders, folder names over '
+                       f'{FOLDER_NAMES >> 20} MB, or more than {most >> 20} MB (max_mb; {ENTRY} bytes counted for '
+                       f'each member and folder)')
         return tarfile.data_filter(member, path)
     return check
 
@@ -356,7 +418,10 @@ def settle(data):
     besides the data filter, which some Python releases let links slip past); folders and files readable by all
     (jobs run as other users; a cache may hold 0600 files), writable by root only. Torn otherwise."""
     top = os.path.realpath(data)
-    for d, dirs, names in os.walk(data):
+
+    def unlisted(e):   # a folder os.walk cannot list (a path past PATH_MAX, say) would go unchecked
+        raise Torn(f'{os.path.relpath(e.filename or data, data)[:80]} cannot be listed: {e.strerror}')
+    for d, dirs, names in os.walk(data, onerror=unlisted):
         for n in dirs + names:
             path = os.path.join(d, n)
             st = os.lstat(path)
@@ -371,22 +436,22 @@ def settle(data):
                 raise Torn(f'{os.path.relpath(path, data)} is not a folder, a file or a link')
 
 
-def fetch(agent, conf, item, root, now):
+def fetch(agent, conf, item, root, now, wait=FETCH_WAIT):
     """The seed `item` (its maxMb: the smaller of the host's and the desktop's own) into a new version, swapped in;
-    its label. Torn (or OSError, TarError) leaves the old one."""
+    its label. The stream is cut after WAIT seconds. Torn (or OSError, TarError) leaves the old one."""
     name, stamp, most = item['name'], time.time_ns(), item['maxMb'] << 20
     new = os.path.join(root + '/.new', f'{name}.{stamp}')
     os.mkdir(new, 0o755)
     os.mkdir(os.path.join(new, 'data'), 0o755)
     p = subprocess.Popen(ssh(agent, conf, 'seed', name), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, env=agent.ENV, start_new_session=True)
-    timer = threading.Timer(FETCH_WAIT, p.kill)
+    timer = threading.Timer(wait, p.kill)
     timer.start()
     err = Tail(p.stderr)
     try:
         got = Summed(p.stdout, most)
-        with tarfile.open(fileobj=got, mode='r|') as t:
-            t.extractall(os.path.join(new, 'data'), filter=guarded(most))
+        with tarfile.open(fileobj=got, mode='r|', tarinfo=Info) as t:
+            unpack(t, os.path.join(new, 'data'), most)
         while got.read(PIECE):   # the tar's end blocks and padding count in the trailer's size and sha256
             pass
         code = p.wait(timeout=30)
@@ -521,6 +586,7 @@ def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
             for e in os.listdir(root):   # a link made but not yet swapped in
                 if e.startswith('.') and e.endswith('.link'):
                     each(say, f'seed link {e}', remove, os.path.join(root, e))
+            prune(root, now, say)   # first too: a run killed later (its memory or time limit) skips the finally
             for name in sorted(n for n in os.listdir(root) if NAME.fullmatch(n)):
                 each(say, f'seed {name}', age_out, root, name, own, now, say)
             if cannot:
@@ -532,12 +598,76 @@ def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
             except Torn as e:   # the host down, or a host on an older kit (no list, or not one this reads)
                 items = {}
                 say(f'seeds: {e}: each seed stays until its age drops it')
+            torn, end = TornLog(root, now), time.monotonic() + RUN_WAIT
+            torn.keep(items)
             for name, item in sorted(items.items()):
-                if not each(say, f'seed {name}', take, agent, conf, item, root, now, say):
+                if not each(say, f'seed {name}', take, agent, conf, item, root, now, say, torn, end):
                     clean(root, say)
+            each(say, 'seeds: .torn.json', torn.save)
+            if late := torn.late():
+                say(f'seeds: {", ".join(late)} torn on every try for more than {TORN_DAY // 3600} h: exit 1 '
+                    f'(desk-install check shows it)')
+                return 1
         finally:
             prune(root, now, say)
     return 0
+
+
+class TornLog:
+    """SEEDS/.torn.json, {name: {"first", "last", "tries", "why"}}: the seeds whose last fetch was torn, written
+    before each fetch (so a fetch that kills the run, by its memory or time limit, counts as torn too) and cleared
+    when the seed is fetched or the same as the host's. A seed torn TRIES times in a row is tried again only
+    min(2 ** (TRIES - 1), 24) hours after the last try (a link too slow for it, a host that cuts it: not every
+    hour); one torn on every try since more than TORN_DAY is `late`. Only seeds in the host's list are kept. A
+    missing or unreadable file is an empty record."""
+
+    def __init__(self, root, now):
+        self.path, self.now, self.seeds = root and os.path.join(root, '.torn.json'), now, {}
+        try:
+            with open(self.path, encoding='utf-8') as f:
+                got = json.load(f)
+            self.seeds = {n: r for n, r in got.items() if NAME.fullmatch(n) and isinstance(r, dict) and all(
+                whole(r.get(k)) for k in ('first', 'last', 'tries'))}
+        except (OSError, TypeError, ValueError, AttributeError, RecursionError):   # TypeError: no path
+            pass
+
+    def keep(self, items):
+        self.seeds = {n: r for n, r in self.seeds.items() if n in items}
+
+    def due(self, name):
+        """None when the seed may be tried now, else the hours until it may."""
+        r = self.seeds.get(name)
+        if not r:
+            return None
+        wait = min(2 ** (min(r['tries'], 6) - 1), 24) * 3600 - 300   # 5 min early: the hourly timer drifts
+        left = r['last'] + wait - self.now()
+        return math.ceil(left / 3600) if 0 < left <= wait else None   # a date ahead of the clock: try now
+
+    def trying(self, name):
+        """Counted as torn before the fetch, saved: `why` says so until the fetch ends."""
+        r = self.seeds.get(name) or {'first': int(self.now()), 'tries': 0}
+        self.seeds[name] = {**r, 'last': int(self.now()), 'tries': r['tries'] + 1,
+                            'why': 'the run stopped during the fetch (its memory or time limit?)'}
+        self.save()
+
+    def torn(self, name, why):
+        self.seeds[name]['why'] = why[:300]
+        self.save()
+
+    def fine(self, name):
+        if self.seeds.pop(name, None):
+            self.save()
+
+    def late(self):
+        return sorted(n for n, r in self.seeds.items() if self.now() - r['first'] > TORN_DAY)
+
+    def save(self):
+        if self.path is None:
+            return
+        tmp = self.path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(self.seeds, f)
+        os.replace(tmp, self.path)
 
 
 def each(say, what, step, *args):
@@ -572,27 +702,43 @@ def age_out(root, name, own, now, say):
         say(f'seed {name}: dropped, {why}; jobs run cold until a new one comes')
 
 
-def take(agent, conf, item, root, now, say):
-    """The listed seed `item`, fetched when it is new and due. False when its fetch failed (the old one stays)."""
+def take(agent, conf, item, root, now, say, torn=None, end=None):
+    """The listed seed `item`, fetched when it is new and due (and not held back after torn tries, and while the
+    run has time left: END, monotonic). False when its fetch failed (the old one stays)."""
     name = item['name']
+    torn = torn or TornLog(None, now)   # one take() alone: nothing saved
+    end = time.monotonic() + RUN_WAIT if end is None else end
     label = current(root, name)[1]
     if 'made' not in item:
         say(f'seed {name}: the host offers none ({item.get("why", "no reason")}): '
             f'{"the one here stays" if label else "jobs run cold"}')
+        torn.fine(name)   # nothing to fetch is not a torn fetch
         return
     if label and (label['bytes'], label['made']) == (item['bytes'], item['made']):
+        torn.fine(name)
         return
     if label and 0 <= now() - label['fetched'] < item['everyHours'] * 3600:
         return
     if not -SKEW <= now() - item['made'] <= item['maxAgeHours'] * 3600:
         say(f'seed {name}: the host\'s is too old or made in the future (the clocks disagree): not fetched')
         return
+    if (hours := torn.due(name)) is not None:
+        say(f'seed {name}: torn {torn.seeds[name]["tries"]} times in a row; tried again in about {hours} h')
+        return
+    left = end - time.monotonic()
+    if left < 60:
+        say(f'seed {name}: this run has used its {RUN_WAIT // 60} minutes; tried again next hour')
+        return
+    torn.trying(name)
     try:
-        got = fetch(agent, conf, item, root, now)
+        got = fetch(agent, conf, item, root, now, wait=min(FETCH_WAIT, left))
     except Exception as e:   # any: a torn stream, a full disk, a tar this Python cannot unpack
-        say(f'seed {name}: keeps {"the old one" if label else "none"}: {e.__class__.__name__}: {str(e)[:300]}; '
-            f'tried again next hour')
+        why = f'{e.__class__.__name__}: {str(e)[:300]}'
+        torn.torn(name, why)
+        hours = min(2 ** (min(torn.seeds[name]['tries'], 6) - 1), 24)
+        say(f'seed {name}: keeps {"the old one" if label else "none"}: {why}; tried again in {hours} h')
         return False
+    torn.fine(name)
     say(f'seed {name}: {got["bytes"] >> 20} MB, sha256 checked, swapped in')
 
 

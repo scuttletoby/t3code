@@ -65,6 +65,9 @@ names the fix (`usermod -s /usr/sbin/nologin`, `passwd -l`). One install or unin
 
 The seed timer (`t3code-fleet-seed.timer`) fetches the pool's warm caches, if its fleet config lists any, into
 `/var/lib/fork-fleet/seeds`, which jobs see read-only ([fork-fleet.md](../../.github/fork-fleet.md), "Seeds").
+A torn seed is tried again after 1, 2, 4, 8, 16, then 24 hours; one torn on every try for more than a day makes each
+run exit 1, so `check` shows the seed service's last run as failed. `/var/lib/fork-fleet/seeds/.torn.json` names it
+and the host's reason (jobs can read that file too).
 
 ## Windows (WSL2)
 
