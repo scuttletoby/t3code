@@ -798,6 +798,13 @@ class Restore(CopyBase):
             facts = self.restore()
         self.assertEqual(facts['removedTemps'], sorted(leftover))
         self.assertFalse([n for n in os.listdir(self.userdata) if coldcopy.RESTORE_TEMP in n])
+        # Life goes on after the restore (a home that is exactly the copy's would keep nothing: alreadyRestored).
+        self.m.write('home/userdata/settings.json', '{"after the restore": true}')
+        need = (sum(files[n]['bytes'] for n in want)
+                + sum(os.path.getsize(os.path.join(self.userdata, n)) for n in coldcopy._replaced(self.userdata,
+                                                                                               coldcopy.DEFAULT_RESTORE)))
+        with mock.patch.object(coldcopy, '_free_bytes', return_value=need):
+            coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
         with mock.patch.object(coldcopy, '_free_bytes', return_value=need - 1), self.assertRaises(OSError) as e:
             coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
         self.assertIn('kept copy of each file it replaces', str(e.exception))
@@ -841,16 +848,52 @@ class Restore(CopyBase):
         self.assertLessEqual(set(self.newer.values()), self.all_hashes())
         self.assertFalse(os.path.lexists(os.path.join(self.userdata, coldcopy.RESTORE_MARK)))
 
-    def test_a_refusal_for_restore_disk_names_kept_files_but_not_the_old_home_of_a_stopped_restore(self):
+    def test_a_refusal_for_restore_disk_names_kept_files_and_apart_the_ones_a_stopped_restore_needs(self):
+        # r3 data 1: the refusal named nothing of the old home, so the owner could not see where the disk went.
         old = 'statev2.sqlite.golive-aside-20260101T000000Z'
+        also = 'statev2.sqlite.golive-aside-20260101T000001Z'
         other = 'settings.json.golive-aside-20250101T000000Z'
-        for n in (old, other):
+        for n in (old, also, other):
             self.m.write(f'home/userdata/{n}', b'old')
-        self.m.write(f'home/userdata/{coldcopy.RESTORE_MARK}', json.dumps({'oldHome': [old]}))
+        self.m.write(f'home/userdata/{coldcopy.RESTORE_MARK}', json.dumps({'oldHome': [old], 'alsoKept': [also]}))
         with mock.patch.object(coldcopy, '_free_bytes', return_value=0), self.assertRaises(OSError) as e:
             coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
-        self.assertIn(os.path.join(self.userdata, other), str(e.exception))
-        self.assertNotIn(old, str(e.exception))
+        may_go, must_stay = str(e.exception).split('they must stay until it is done')
+        self.assertIn(os.path.join(self.userdata, other), may_go)
+        self.assertNotIn(old, may_go)
+        self.assertNotIn(also, may_go)
+        self.assertIn(os.path.join(self.userdata, old), must_stay)
+        self.assertIn(os.path.join(self.userdata, also), must_stay)
+
+    def test_a_rerun_after_a_finished_restore_never_names_the_restored_data_as_the_old_home(self):
+        # r3 correctness nit 2: killed right after the record was removed, before the step ended. The rerun found
+        # no record and kept the restored (copy's) data as the "old home".
+        first = self.restore()
+        before = sorted(os.listdir(self.userdata))
+        again = self.restore()
+        self.assertEqual(again['movedAside'], [])
+        self.assertIn('alreadyRestored', again)
+        self.assertEqual(sorted(os.listdir(self.userdata)), before, 'the restored data was kept again')
+        self.assertLessEqual(set(self.newer.values()), self.all_hashes())
+        self.assertTrue(all(os.path.exists(os.path.join(self.userdata, n)) for n in first['movedAside']))
+        # A home that differs in one file is kept whole as before.
+        self.m.write('home/userdata/settings.json', '{"changed": true}')
+        third = self.restore()
+        self.assertNotIn('alreadyRestored', third)
+        self.assertEqual(sorted(n.split(coldcopy.ASIDE)[0] for n in third['movedAside']),
+                         ['settings.json', 'statev2.sqlite', 'statev2.sqlite-wal'])
+
+    def test_a_record_put_back_in_full_by_moving_or_copying_is_stale(self):
+        stamp = '20260101T000000Z'
+        names = {n: f'{n}{coldcopy.ASIDE}{stamp}' for n in ('statev2.sqlite', 'statev2.sqlite-wal',
+                                                           'statev2.sqlite-shm', 'settings.json')}
+        for n, k in names.items():  # the home is the old home; its kept files are copies of it
+            shutil.copy2(os.path.join(self.userdata, n), os.path.join(self.userdata, k))
+        os.unlink(os.path.join(self.userdata, names['statev2.sqlite']))  # moved back
+        os.unlink(os.path.join(self.userdata, 'statev2.sqlite-shm'))      # the kept -shm need not go back
+        self.m.write(f'home/userdata/{coldcopy.RESTORE_MARK}', json.dumps({'oldHome': sorted(names.values())}))
+        self.assertIsNone(coldcopy.stopped_restore(self.m.home))
+        self.assertIn('staleRecord', self.restore())
 
     def test_a_restore_stopped_at_any_point_loses_nothing_and_never_pairs_a_wal_wrongly(self):
         # Should fix 2: was "moved aside one by one", which could leave a -wal without its database.
@@ -1170,6 +1213,104 @@ class RealSqlite(CopyBase):
                 shutil.copy2(os.path.join(self.userdata, n), os.path.join(scratch, n.split(coldcopy.ASIDE)[0]))
         self.assertEqual(self.open_rows(scratch), ('ok', 120))
         self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+
+
+    def stop_before_the_db_rename(self, dest, stamp):
+        """A restore stopped between the WAL removal and the database rename (the r2 probe's stop)."""
+        real = os.rename
+
+        def rn(a, b, *k, **kw):
+            if b.endswith('statev2.sqlite'):
+                raise OSError(5, 'killed before the db rename')
+            return real(a, b, *k, **kw)
+        with mock.patch.object(coldcopy.os, 'rename', rn), self.assertRaises(OSError):
+            self.restore_at(dest, stamp)
+        journal.settle(self.m.state, 'probe')
+        self.assertFalse(os.path.exists(self.db + '-wal'), 'not stopped where the probe means')
+
+    def restore_at(self, dest, stamp):
+        with mock.patch.object(coldcopy, '_stamp', return_value=stamp), \
+                journal.run(self.m.state, 'back') as r, r.step('restore'):
+            return coldcopy.restore(r, dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+
+    def home_hashes(self):
+        return {n: sha(os.path.join(self.userdata, n)) for n in os.listdir(self.userdata)
+                if os.path.isfile(os.path.join(self.userdata, n)) and not n.startswith('server-owner')}
+
+    def test_a_partly_put_back_record_still_names_the_old_wal(self):
+        # r3 correctness 1 / data 2 (PartPutBackProbe): the owner moved back only the kept database, not its WAL;
+        # the rerun called the record stale and kept the half-way home (no WAL) as the old home.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'checkpoint')
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+        self.stop_before_the_db_rename(dest, '20990101T000001Z')
+        os.rename(os.path.join(self.userdata, 'statev2.sqlite' + coldcopy.ASIDE + '20990101T000001Z'), self.db)
+        before = self.home_hashes()
+        for call in (lambda: coldcopy.plan_restore(dest, self.m.home, from_home=self.m.home, version=fx.LIVE),
+                     lambda: self.restore_at(dest, '20990101T000002Z')):
+            with self.assertRaises(RuntimeError) as e:
+                call()
+            self.assertIn('only partly put back', str(e.exception))
+            self.assertIn('statev2.sqlite-wal' + coldcopy.ASIDE, str(e.exception))
+        self.assertEqual(self.home_hashes(), before, 'a refused restore changed the home')
+        journal.settle(self.m.state, 'probe: looked')
+        # Finishing the put-back makes the home the old home again: the rerun keeps it whole, every commit in it.
+        os.rename(os.path.join(self.userdata, 'statev2.sqlite-wal' + coldcopy.ASIDE + '20990101T000001Z'),
+                  self.db + '-wal')
+        result = self.restore_at(dest, '20990101T000003Z')
+        self.assertIn('staleRecord', result)
+        kept = {n.split(coldcopy.ASIDE)[0]: n for n in result['movedAside']}
+        self.assertLessEqual({'statev2.sqlite', 'statev2.sqlite-wal', 'settings.json'}, set(kept))
+        scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+        for n in ('statev2.sqlite', 'statev2.sqlite-wal'):
+            shutil.copy2(os.path.join(self.userdata, kept[n]), os.path.join(scratch, n))
+        self.assertEqual(self.open_rows(scratch), ('ok', 120))
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+
+    def test_a_rerun_after_a_stop_fits_on_the_disk_the_first_run_fit(self):
+        # r3 data 1: the rerun counted a kept copy of every home file again, though the record holds the old home.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(3000, 'checkpoint')
+        self.write_rows(5, 'leave-in-wal')
+        self.adapter.stop()
+
+        def used():
+            return sum(os.lstat(os.path.join(self.userdata, n)).st_size for n in os.listdir(self.userdata)
+                       if os.path.isfile(os.path.join(self.userdata, n)))
+        files, want = coldcopy.plan_restore(dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+        budget = (used() + sum(files[n]['bytes'] for n in want)
+                  + sum(os.lstat(os.path.join(self.userdata, n)).st_size
+                        for n in coldcopy._replaced(self.userdata, coldcopy.DEFAULT_RESTORE)))
+        with mock.patch.object(coldcopy, '_free_bytes', lambda path: budget - used()):
+            self.stop_before_the_db_rename(dest, '20990101T000001Z')
+            result = self.restore_at(dest, '20990101T000002Z')
+        self.assertIn('statev2.sqlite-wal', {n.split(coldcopy.ASIDE)[0] for n in result['movedAside']})
+        self.assertEqual(result['alsoKept'], [])
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+
+    def test_a_third_run_still_names_what_a_stopped_rerun_kept(self):
+        # r3 nit (data 3, correctness 3): a rerun's alsoKept was not added to the record.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'checkpoint')
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+        self.stop_before_the_db_rename(dest, '20990101T000001Z')
+        c = sqlite3.connect(self.db)  # a T3 started at boot on the half-way home writes
+        c.execute("UPDATE t SET body='NEW SERVER' WHERE id <= 3")
+        c.commit()
+        c.close()
+        wrote = sha(self.db)
+        self.stop_before_the_db_rename(dest, '20990101T000002Z')
+        with open(os.path.join(self.userdata, coldcopy.RESTORE_MARK)) as f:
+            record = json.load(f)
+        self.assertTrue(record['alsoKept'] and all('20990101T000002Z' in n for n in record['alsoKept']), record)
+        self.assertTrue(all('20990101T000001Z' in n for n in record['oldHome']), record)
+        result = self.restore_at(dest, '20990101T000003Z')
+        self.assertEqual(result['alsoKept'], record['alsoKept'])
+        self.assertEqual(result['movedAside'], record['oldHome'])
+        self.assertIn(wrote, {sha(os.path.join(self.userdata, n)) for n in result['alsoKept']})
+        self.assertFalse([n for n in os.listdir(self.userdata) if '20990101T000003Z' in n], 'kept again')
 
 
 class CommandLine(CopyBase):

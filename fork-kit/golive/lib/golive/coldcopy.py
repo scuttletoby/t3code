@@ -259,10 +259,14 @@ def kept_files(home):
 
 def stopped_restore(home):
     """Read only: the record (RESTORE_MARK) a restore stopped half-way left in userdata/, or None. Its 'oldHome'
-    names the kept files that are the home as it was before that restore. None as well when a file it names is
-    gone (put back by hand): the home is then the old home again. RuntimeError when the record cannot be read: which
-    kept files are the old home is then unknown, and the owner looks."""
-    path = os.path.join(home, 'userdata', RESTORE_MARK)
+    names the kept files that are the home as it was before that restore; its 'alsoKept' (when there) what reruns
+    kept from the half-way home. None as well when the old home was put back by hand: every file 'oldHome' names
+    is gone (moved back), or each one still there holds what the home's file of that name holds (copied back; a
+    kept -shm need not go back). RuntimeError when the record cannot be read (which kept files are the old home is
+    then unknown), or when the old home was put back only in part (a rerun would keep that mix as the old home and
+    name no more the kept files still out, such as the WAL with the commits): the owner looks."""
+    userdata = os.path.join(home, 'userdata')
+    path = os.path.join(userdata, RESTORE_MARK)
     try:
         with open(path, encoding='utf-8') as f:
             mark = json.load(f)
@@ -270,14 +274,40 @@ def stopped_restore(home):
         return None
     except (OSError, ValueError) as e:
         mark = e
-    if not (isinstance(mark, dict) and isinstance(mark.get('oldHome'), list)
-            and all(isinstance(n, str) and ASIDE in n and '/' not in n for n in mark['oldHome'])):
+    def names_ok(v):
+        return isinstance(v, list) and all(isinstance(n, str) and ASIDE in n and '/' not in n for n in v)
+    if not (isinstance(mark, dict) and names_ok(mark.get('oldHome')) and names_ok(mark.get('alsoKept', []))):
         raise RuntimeError(f'{path} cannot be read ({mark if isinstance(mark, Exception) else "not a record"}): a '
                            'restore stopped half-way and which kept files are the old home is unknown; look at the '
                            f'*{ASIDE}* files, put the home right, then remove it')
-    if not all(os.path.lexists(os.path.join(home, 'userdata', n)) for n in mark['oldHome']):
-        return None
-    return mark
+    gone = [n for n in mark['oldHome'] if not os.path.lexists(os.path.join(userdata, n))]
+    if not gone:
+        return mark
+    out = [n for n in mark['oldHome'] if n not in gone and not n.split(ASIDE)[0].endswith('-shm')
+           and not _same_file(os.path.join(userdata, n), os.path.join(userdata, n.split(ASIDE)[0]))]
+    if out:
+        raise RuntimeError(f'{path} names the kept files of the old home, but they are only partly put back '
+                           f'({", ".join(gone)} gone from the kept files; {", ".join(out)} not back in the home): '
+                           'finish putting the kept files back, or remove the record once the home is right; '
+                           'nothing was changed')
+    return None
+
+
+def _record_names(record):
+    """The kept files a record of a restore stopped half-way names (its old home, then what reruns kept)."""
+    return (record or {}).get('oldHome', []) + (record or {}).get('alsoKept', [])
+
+
+def _same_file(a, b):
+    """True when a and b are both regular files with the same bytes, or both links to the same target."""
+    try:
+        sa, sb = os.lstat(a), os.lstat(b)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(sa.st_mode) and stat.S_ISLNK(sb.st_mode):
+        return os.readlink(a) == os.readlink(b)
+    return (stat.S_ISREG(sa.st_mode) and stat.S_ISREG(sb.st_mode) and sa.st_size == sb.st_size
+            and _hash(a, drop_cache=True) == _hash(b, drop_cache=True))
 
 
 def _free_name(folder, name):
@@ -320,10 +350,11 @@ def plan_restore(copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     restored data: it must be the build the copy was taken under (WrongCopy otherwise). Returns
     ({path: manifest entry}, [files to put back]); raises Incomplete (no finished manifest, no database, a file
     that differs from the manifest), ValueError (a name that is not a top-level userdata file), RuntimeError (the
-    record of a restore stopped half-way cannot be read, see stopped_restore) or OSError (not enough free disk:
-    the copy's files plus a kept copy of each home file they replace plus the floor; the temp files of a restore
-    stopped half-way count as free, since restore() removes them first; the refusal names the files earlier
-    restores kept, except the old home of a restore stopped half-way). A caller runs it as a
+    record of a restore stopped half-way cannot be read or was put back only in part, see stopped_restore) or
+    OSError (not enough free disk: the copy's files plus a kept copy of each home file restore() will keep (see
+    _to_keep) plus the floor; the temp files of a restore stopped half-way count as free, since restore() removes
+    them first; the refusal names the files earlier restores kept that may be removed, and apart from them the
+    kept files the record of a restore stopped half-way names, which must stay). A caller runs it as a
     pre-check before its restore step, so a refusal changes nothing and needs no settling; restore() runs it
     again."""
     m = read_manifest(copy_dir, from_home, version)
@@ -341,14 +372,18 @@ def plan_restore(copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
         got = _hash(os.path.join(copy_dir, 'userdata', n), drop_cache=True)
         if got != files[n].get('sha256'):
             raise Incomplete(f'{copy_dir}/userdata/{n} does not match its manifest: the copy is not used')
-    kept = sum(os.lstat(os.path.join(userdata, n)).st_size for n in _replaced(userdata, names))
+    keep = _to_keep(userdata, names, prior, files, want)[0]
+    kept = sum(os.lstat(os.path.join(userdata, n)).st_size for n in keep)
     leftover = sum(os.lstat(os.path.join(userdata, n)).st_size for n in _leftover_temps(userdata))
     need = sum(files[n]['bytes'] for n in want) + kept + floor_bytes
     if _free_bytes(userdata) + leftover < need:
-        old_home = {os.path.join(userdata, n) for n in (prior or {}).get('oldHome', ())}
+        named = [os.path.join(userdata, n) for n in _record_names(prior)]
+        note = _room_note((), [(p, b) for p, b in kept_files(home) if p not in named])
+        if named:
+            note += ('; the record of the restore stopped half-way names these kept files (the old home, and what '
+                     f'reruns kept): they must stay until it is done: {", ".join(named)}')
         raise OSError(f'not enough free disk in {userdata} for the restore ({need // MB} MB needed: the copy, a '
-                      'kept copy of each file it replaces, the floor)'
-                      f'{_room_note((), [(p, b) for p, b in kept_files(home) if p not in old_home])}')
+                      f'kept copy of each file it replaces that holds something not kept yet, the floor){note}')
     return files, want
 
 
@@ -370,8 +405,26 @@ def _leftover_temps(userdata):
                   and stat.S_ISREG(os.lstat(os.path.join(userdata, n)).st_mode))
 
 
-def _unchanged(userdata, n, kept_name, copied):
-    """True when home file n holds exactly the old home's kept file kept_name or the copy's file (manifest entry
+def _to_keep(userdata, names, prior, files, want):
+    """(home files a restore keeps in step 2, whether the home already holds exactly the copy's files).
+    With no record (prior None): every file it replaces, unless the home is exactly the copy's files (`want`, same
+    bytes): a restore that stopped after removing its record, before its step ended. Then nothing is kept, so the
+    restored data is never named as the old home (the old home is the kept set that restore made; kept_files lists
+    it). With a record: only files that hold something new (see _unchanged), against the kept files the record
+    names and the copy's."""
+    replaced = _replaced(userdata, names)
+    if prior is None:
+        if sorted(replaced) == sorted(want) and all(_unchanged(userdata, n, (), files[n]) for n in replaced):
+            return [], True
+        return replaced, False
+    named = {}
+    for k in _record_names(prior):
+        named.setdefault(k.split(ASIDE)[0], []).append(k)
+    return [n for n in replaced if not _unchanged(userdata, n, named.get(n, ()), files.get(n))], False
+
+
+def _unchanged(userdata, n, kept_names, copied):
+    """True when home file n holds exactly one of the kept files kept_names or the copy's file (manifest entry
     `copied`): a rerun has nothing new to keep from it."""
     path = os.path.join(userdata, n)
     st = os.lstat(path)
@@ -382,11 +435,16 @@ def _unchanged(userdata, n, kept_name, copied):
         digest = _hash(path, drop_cache=True)
         if digest == copied.get('sha256'):
             return True
-    if kept_name is not None:
+    for kept_name in kept_names:
         kept = os.path.join(userdata, kept_name)
-        kst = os.lstat(kept)
+        try:
+            kst = os.lstat(kept)
+        except FileNotFoundError:
+            continue
         if stat.S_ISREG(kst.st_mode) and kst.st_size == st.st_size:
-            return (digest or _hash(path, drop_cache=True)) == _hash(kept, drop_cache=True)
+            digest = digest or _hash(path, drop_cache=True)
+            if digest == _hash(kept, drop_cache=True):
+                return True
     return False
 
 
@@ -438,7 +496,11 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     6. RESTORE_MARK is removed: the restore is done.
     Running it again starts again from the untouched copy. A rerun after a stop in steps 4-6 finds RESTORE_MARK:
     the home is then half-way, not the old home, so its result names the old home from the record ('movedAside')
-    and it keeps only home files that hold anything new ('alsoKept': what a T3 started after the stop wrote).
+    and it keeps only home files that hold anything new ('alsoKept': what a T3 started after the stop wrote; the
+    record is rewritten to name them before anything leaves the home, so a later rerun names them too). A record
+    put back only in part refuses before any change (see stopped_restore). A rerun after a stop between step 6 and
+    the end of the caller's step finds no record and the home exactly the copy's: it keeps nothing
+    ('alreadyRestored'), so the restored data is never named as the old home.
     The CALLER keeps T3 from starting until the step is done (a T3 started after a stop in steps 4-6 serves that
     older database file or the copy's without its WAL; the kept files stay the old home either way): settling such
     a stop means running the restore again, or putting the kept files RESTORE_MARK names back and removing it,
@@ -463,14 +525,15 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
                 raise Incomplete(f'{tmp} does not read back as the manifest says')
             temps[n] = tmp
         _fsync_dir(userdata)
-        old = {k.split(ASIDE)[0]: k for k in prior['oldHome']} if prior else {}
-        for n in _replaced(userdata, names):
-            if prior is not None and _unchanged(userdata, n, old.get(n), files.get(n)):
-                continue  # the old home is kept already, or it is the copy's file: nothing new in it
+        keep, already = _to_keep(userdata, names, prior, files, want)  # nothing new in the others
+        for n in keep:
             kept.append(_keep(userdata, n, stamp))
             _fsync_dir(userdata)
         if prior is None:
             _write_mark(userdata, {'oldHome': kept, 'at': stamp, 'copy': copy_dir}, stamp)
+        elif kept:  # a rerun: the record names what it kept too, before anything leaves the home
+            prior = {**prior, 'alsoKept': prior.get('alsoKept', []) + kept}
+            _write_mark(userdata, prior, stamp)
         for name in names:
             for n in _companions(name) + ([name] if name not in temps else []):
                 if os.path.lexists(os.path.join(userdata, n)):
@@ -486,10 +549,13 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     finally:
         lock.close()
     result = {'copy': copy_dir, 'restored': want, 'movedAside': prior['oldHome'] if prior else kept,
-              'alsoKept': kept if prior else [], 'removedTemps': cleaned}
+              'alsoKept': prior.get('alsoKept', []) if prior else [], 'removedTemps': cleaned}
+    if already:
+        result['alreadyRestored'] = ('the home already held exactly the copy\'s files (a restore that stopped after '
+                                     'it was done): nothing was kept')
     if stale:
-        result['staleRecord'] = ('a file the record of a stopped restore named was gone (put back by hand): the home '
-                                 'was kept as the old home')
+        result['staleRecord'] = ('the kept files the record of a stopped restore named were put back by hand: the '
+                                 'home was kept as the old home')
     return result
 
 
