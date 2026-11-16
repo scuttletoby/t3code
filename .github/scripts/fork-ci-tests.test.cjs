@@ -103,7 +103,9 @@ test("the list ignores comments and blank lines and reads `run by` and weights",
 });
 
 test("the heaviest tests start first, tests without a weight before them, ties in list order", () => {
-  const entries = readList("a.test.sh ~10s\nb.test.sh\nc.test.sh ~90s\nd.test.sh ~10s\ne.test.sh\n");
+  const entries = readList(
+    "a.test.sh ~10s\nb.test.sh\nc.test.sh ~90s\nd.test.sh ~10s\ne.test.sh\n",
+  );
   assert.deepEqual(
     order(["a.test.sh", "b.test.sh", "c.test.sh", "d.test.sh", "e.test.sh"], entries),
     ["b.test.sh", "e.test.sh", "c.test.sh", "a.test.sh", "d.test.sh"],
@@ -119,7 +121,8 @@ test("a part is the files under its prefixes and under none of its `!` prefixes"
   assert.deepEqual(pick("!fork-kit/"), files.slice(2));
   assert.deepEqual(pick("fork-kit/", "!fork-kit/x/"), files.slice(0, 1));
   // Every file is in exactly one of the two parts the workflow runs.
-  for (const file of files) assert.notEqual(inPart(file, ["fork-kit/"]), inPart(file, ["!fork-kit/"]));
+  for (const file of files)
+    assert.notEqual(inPart(file, ["fork-kit/"]), inPart(file, ["!fork-kit/"]));
 });
 
 test("a long test without a weight, or one far from its weight, gets a note", () => {

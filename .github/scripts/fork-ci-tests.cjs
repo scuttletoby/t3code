@@ -72,7 +72,11 @@ function readList(text) {
         throw new Error(
           `${LIST}: cannot read "${line}" (expected "<test>", "<test> ~<seconds>s" or "<test> run by <file>")`,
         );
-      return { file: match[1], runBy: match[3] ?? null, weight: match[2] ? Number(match[2]) : null };
+      return {
+        file: match[1],
+        runBy: match[3] ?? null,
+        weight: match[2] ? Number(match[2]) : null,
+      };
     });
 }
 
@@ -99,7 +103,9 @@ function inPart(file, parts) {
 // A note for the log when a test's weight is missing or far from its time: the order then needs a new weight.
 function weightNote(file, weight, seconds) {
   if (weight === null)
-    return seconds > 30 ? `${file} took ${Math.round(seconds)} s and has no weight: add "~${Math.round(seconds)}s"` : null;
+    return seconds > 30
+      ? `${file} took ${Math.round(seconds)} s and has no weight: add "~${Math.round(seconds)}s"`
+      : null;
   // Off by more than half or double and by more than 30 s: load on the runner moves times less than that.
   return Math.abs(seconds - weight) > 30 && (seconds > 2 * weight || seconds < weight / 2)
     ? `${file} took ${Math.round(seconds)} s, its weight is ~${weight}s: update it`
@@ -264,7 +270,17 @@ async function main(parts = process.argv.slice(2)) {
   if (failed) process.exitCode = 1;
 }
 
-module.exports = { plan, readList, order, inPart, weightNote, findTests, presentTests, runAll, jobCount };
+module.exports = {
+  plan,
+  readList,
+  order,
+  inPart,
+  weightNote,
+  findTests,
+  presentTests,
+  runAll,
+  jobCount,
+};
 
 if (require.main === module)
   main().catch((error) => {
