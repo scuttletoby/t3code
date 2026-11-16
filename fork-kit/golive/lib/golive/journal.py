@@ -8,10 +8,15 @@ The journal is <stateDir>/journal.jsonl, append-only, one JSON object per line, 
 the step it names starts. Each line carries the sha256 of the line before it, so an edited or lost line is found.
 A run is: begin, then per step "started" and "done" (with its facts, such as hashes), then end.
 
-A run needs settling when it has no end (killed, or the machine went down) or when it ended with an error after
-its first step started (an error can leave the same half-applied state as a kill). Every later run reports it,
-and a changing run refuses to start until the owner puts the home right and runs `t3-golive settle` (settle()).
-A run that failed before its first step changed nothing and needs no settling.
+A run needs settling when it stopped (killed, or the machine went down) or ended with an error after its first
+step started: either can leave a half-applied state. Every later run reports it, and a changing run refuses to
+start until the owner puts the home right and runs `t3-golive settle` (settle()). A run that failed or was
+killed before its first step changed nothing (every change is made inside a step) and needs no settling.
+
+The rule every changing command keeps (fork #186): every change is made inside `r.step()`, and pre-checks run
+before the first step. Kit code that changes something calls `r.require_step()` first, so a change outside a step
+is an error instead of a run that later reads as "changed nothing". A command that stops and has undone every step
+it started (each one journalled "done") raises Refused: the run ends "refused" and needs no settling.
 A torn last line (killed while writing) is reported and ignored. Damage anywhere else refuses until settle moves
 the journal aside; a journal written by a newer kit refuses with "update the kit".
 """
@@ -31,6 +36,10 @@ class Unfinished(Exception):
     def __init__(self, run):
         self.run = run
         super().__init__(f'{describe(run)}; {SETTLE_HINT}')
+
+
+class Refused(Exception):
+    """A changing run stopped on purpose and undid every step it started; nothing is half-applied."""
 
 
 class Damaged(Exception):
@@ -62,14 +71,15 @@ def _fsync_dir(path):
 
 
 @contextlib.contextmanager
-def lock(state_dir, command, exclusive):
-    """Hold the kit's lock for a command; Busy when a changing run (or, for one, any command) holds it."""
+def lock(state_dir, command, exclusive, wait=False):
+    """Hold the kit's lock for a command; Busy when a changing run (or, for one, any command) holds it.
+    wait=True blocks until the lock is free instead (the guard waits for the run it watches to end)."""
     _ensure_dir(state_dir)
     path, _ = _paths(state_dir)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
         try:
-            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if wait else fcntl.LOCK_NB))
         except OSError as e:
             if e.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
                 raise
@@ -91,12 +101,23 @@ def _holder_text(fd, wanted_exclusive):
         holder = json.loads(os.pread(fd, 4096, 0) or b'null')
     except ValueError:
         holder = None
-    if isinstance(holder, dict) and {'command', 'pid', 'at'} <= set(holder):
+    if isinstance(holder, dict) and {'command', 'pid', 'at'} <= set(holder) and _alive(holder['pid']):
         return f'another golive run is active: {holder["command"]} (pid {holder["pid"]}, since {holder["at"]})'
-    # An empty lock file: a shared holder (a check), or a changing run in the instant before it wrote its name.
+    # An empty lock file, or the name of a run that was killed (its name stays; the holder now is a check): a shared
+    # holder, or a changing run in the instant before it wrote its name.
     if wanted_exclusive:
         return 'a golive check is running (or a run is just starting); try again when it ends'
     return 'a golive run is just starting; try again in a moment'
+
+
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, TypeError, OverflowError):
+        return True
+    return True
 
 
 def _damaged(path, what):
@@ -152,13 +173,11 @@ def read(state_dir):
 
 
 def needs_settling(run):
-    """True when the run stopped half-way, or ended with an error after its first step started, and the owner
-    has not settled it."""
-    if run['settled'] is not None:
+    """True when the run stopped half-way, or ended with an error, after its first step started, and the owner
+    has not settled it. Killed before its first step (a copy waiting for a quiet point), it changed nothing."""
+    if run['settled'] is not None or not run['steps']:
         return False
-    if run['end'] is None:
-        return True
-    return run['end']['result'] != 'ok' and bool(run['steps'])
+    return run['end'] is None or run['end']['result'] not in ('ok', 'refused')
 
 
 def unfinished(state_dir):
@@ -184,6 +203,18 @@ class Run:
         self.id = f'{_now()}-{os.getpid()}-{os.urandom(4).hex()}'
         self._path = _paths(state_dir)[1]
         self._holds_lock = False
+        self._step = None
+        self._broken = None  # the step an exception left without "done"
+
+    @property
+    def in_step(self):
+        """The name of the step running now, or None."""
+        return self._step
+
+    def require_step(self, what):
+        """Kit code calls this before any change: a change outside a step is an error (see the module text)."""
+        if self._step is None:
+            raise RuntimeError(f'{what}: a change outside a journalled step; make it inside r.step()')
 
     @property
     def holds_lock(self):
@@ -217,17 +248,32 @@ class Run:
     @contextlib.contextmanager
     def step(self, name, **facts):
         """Journal "started" before the body and "done" after it; the body may add facts to the dict it gets."""
+        if self._step is not None:
+            raise RuntimeError(f'step "{name}" inside step "{self._step}": steps do not nest')
         self._append('step', step=name, phase='started', data=facts or None)
-        done = {}
-        yield done
+        self._step, done = name, {}
+        try:
+            yield done
+        except BaseException:
+            self._broken = name
+            raise
+        finally:
+            self._step = None
         self._append('step', step=name, phase='done', data=done or None)
+
+
+def _detail(error):
+    """An error for the journal, with its notes (a later error while putting things right, for example)."""
+    notes = ''.join(f'; {n}' for n in getattr(error, '__notes__', ()))
+    return f'{type(error).__name__}: {error}{notes}'[:500]
 
 
 @contextlib.contextmanager
 def run(state_dir, command):
     """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished), journal begin
-    and end. An exception ends the run "failed" and goes on (after a started step it then needs settling); a kill
-    leaves it with no end for the next run to report."""
+    and end. An exception ends the run "failed" and goes on (after a started step it then needs settling); Refused
+    after every started step is done ends it "refused" (no settling); a kill leaves it with no end for the next run
+    to report."""
     with lock(state_dir, command, exclusive=True):
         last = unfinished(state_dir)
         if last is not None:
@@ -238,8 +284,13 @@ def run(state_dir, command):
         try:
             try:
                 yield r
+            except Refused as e:
+                # Refused inside a step, or after a step that never reached "done", is a failure like any other.
+                result = 'failed' if r._broken else 'refused'
+                r._append('end', result=result, detail=_detail(e))
+                raise
             except BaseException as e:
-                r._append('end', result='failed', detail=f'{type(e).__name__}: {e}'[:500])
+                r._append('end', result='failed', detail=_detail(e))
                 raise
             r._append('end', result='ok', detail=None)
         finally:

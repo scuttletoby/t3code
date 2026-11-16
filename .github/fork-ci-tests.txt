@@ -22,6 +22,7 @@
 .github/scripts/fork-ci-release.test.py
 .github/scripts/fork-release-workflow.test.py
 .github/scripts/fork-release.test.sh
+.github/scripts/fork-run-alert.test.sh
 .github/scripts/fork-reusable-permissions.test.py
 .github/scripts/fork-schema-check.test.cjs
 .github/scripts/fork-seam-check.test.cjs
@@ -33,6 +34,7 @@
 fork-ci/actions/ci-demand/ci_demand.test.py
 fork-ci/actions/docs-scope/docs-scope.test.py
 fork-ci/actions/fleet-route/fleet_route.test.py
+fork-ci/actions/fleet-watch/fleet_watch.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/head-check/head_check.test.py
 fork-ci/actions/head-check/head_gate.test.py
@@ -46,6 +48,7 @@ fork-kit/desk/tests/install.test.py
 fork-kit/desk/tests/windows.test.py
 fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
+fork-kit/golive/tests/copy.test.py
 fork-kit/golive/tests/journal.test.py
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py
