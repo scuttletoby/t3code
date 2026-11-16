@@ -48,6 +48,10 @@ install -d -m 755 /etc/fork-kit && install -m 644 /dev/stdin /etc/fork-kit/machi
 EOF
 ```
 
+## free/v1
+
+The "is this machine free?" contract, its one reader and example scripts: [FREE.md](FREE.md).
+
 ## Loader
 
 ```python
