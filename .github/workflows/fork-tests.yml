@@ -4,7 +4,7 @@ name: Fork tests
 # fork has none of upstream's runners and upstream's workflows are disabled here.
 # Commands follow ci.yml step for step. Only the runners, time limits, apt
 # setup and the task cache differ (kept with actions/cache instead of upstream's
-# private remote cache), and Test and Test Web split over two runners each.
+# private remote cache), Test splits over two runners and Test Web over three.
 # Upstream's composite actions and change detector (.github/actions,
 # .github/scripts/ci-changes.cjs) are used as they are, so a rebase brings their
 # changes. The `workflows` job lints the fork workflows (actionlint) and fails
@@ -690,7 +690,7 @@ jobs:
           exit "$status"
 
   # Upstream runs this on one large runner; on a 4-CPU runner the 548 files
-  # took 7.5 minutes, so two runners each take a vitest slice.
+  # took 7.5 minutes, so each of the shards below takes a vitest slice.
   test_web:
     name: Test Web ${{ matrix.shard }}
     needs: changes
@@ -701,7 +701,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        # Three shards, not upstream's two: with a garbage collection after every file (below) one
+        # shard of two took up to 7 minutes; three keep each near the time of two without it.
+        # .github/fork-fleet.json's test_web shards must match.
+        shard: [1, 2, 3]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -742,13 +745,24 @@ jobs:
             node apps/web/node_modules/playwright/cli.js install-deps chromium
           fi
 
+      # The Test step's VITEST_CHROMIUM_GC_DISK_THRESHOLD_GB is not a documented vitest option: fail
+      # here, not with browser crashes later, when the installed vitest no longer reads it.
+      - name: Check vitest still reads the garbage collection setting
+        working-directory: apps/web
+        run: node ../../.github/scripts/fork-vitest-gc-check.cjs
+
       # Upstream: `vp run --filter @t3tools/web test --shard N/total`. The same
       # script, run in its directory with the slice, as on the Test shards.
       # Upstream's release test_web also boots the built client on shard 1;
       # here the Build job does that, for CI and release runs alike.
+      # Chromium's test pages kept 1.0-1.6 GB each of garbage it did not collect by itself, and late in
+      # a shard the browser connection then closed ("Browser connection was closed", fork issue #245).
+      # Vitest collects it after every file only when free space under the temp folder is below this
+      # many GB (its default is 4), so a number no disk reaches makes it collect after every file.
       - name: Test
         env:
           SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          VITEST_CHROMIUM_GC_DISK_THRESHOLD_GB: "1000000"
         working-directory: apps/web
         run: eval "$(jq -r .scripts.test package.json) --shard=$SHARD"
 

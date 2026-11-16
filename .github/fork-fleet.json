@@ -50,7 +50,7 @@
   "dispatch": { "every_seconds": 20, "beacon_seconds": 60, "idle_passes": 3 },
   "jobs": [
     { "job": "test", "shards": 2, "gates": ["test"], "memory_mb": 4096 },
-    { "job": "test_web", "shards": 2, "gates": ["test_web"], "memory_mb": 4096 },
+    { "job": "test_web", "shards": 3, "gates": ["test_web"], "memory_mb": 4096 },
     { "job": "build", "gates": ["build", "typecheck"], "memory_mb": 4096 },
     { "job": "lint", "gates": [], "memory_mb": 3072 },
     { "job": "rust", "gates": ["rust"], "memory_mb": 2048 },
