@@ -21,8 +21,8 @@ $OutputEncoding = [Text.UTF8Encoding]::new($false)   # what is piped into wsl.ex
 $Task = "fork-desk-$Distro"
 $WslConfig = Join-Path $env:USERPROFILE '.wslconfig'
 # Marks on the Windows side, for a run that stops: `DISTRO.made` (this script is installing the distro: a later run
-# asks no takeover question), `wslconfig.restart` (.wslconfig changed and its `wsl --shutdown` is still owed: VM
-# uptime skips sleep). .wslconfig is shared by every distro, so its mark is too: a run for another -Distro still owes it.
+# asks no takeover question), `wslconfig.restart` (.wslconfig or the distro's wsl.conf changed and its `wsl --shutdown`
+# is still owed: VM uptime and clock skip sleep). .wslconfig is shared by every distro, so its mark is too: a run for another -Distro still owes it.
 $Marks = Join-Path $env:LOCALAPPDATA 'fork-desk'
 $Made = Join-Path $Marks "$Distro.made"; $Owed = Join-Path $Marks 'wslconfig.restart'
 function Mark([string]$path) { New-Item -ItemType Directory -Force -Path $Marks | Out-Null; Set-Content -LiteralPath $path 'start-desk.ps1' }
@@ -61,6 +61,10 @@ enabled=false
 appendWindowsPath=false
 [network]
 generateResolvConf=false'
+if [ -n "${CHECK_ONLY:-}" ]; then   # only say whether wsl.conf will change: the owed mark is written before it is
+  [ "$(cat "$ROOT/etc/wsl.conf" 2>/dev/null)" = "$want" ] || echo 'differs: /etc/wsl.conf'
+  exit 0
+fi
 mkdir -p "$ROOT/etc/binfmt.d"
 if [ "$(cat "$ROOT/etc/wsl.conf" 2>/dev/null)" != "$want" ]; then
   [ ! -e "$ROOT/etc/wsl.conf" ] || cp -p "$ROOT/etc/wsl.conf" "$ROOT/etc/wsl.conf.bak-$(date +%Y%m%d-%H%M%S)"
@@ -125,30 +129,35 @@ function SectionKeys([string[]]$lines, [string]$section) {   # the keys of one s
   $keys
 }
 function Wsl2Keys([string[]]$lines) { SectionKeys $lines 'wsl2' }
-function Changes([string[]]$lines, $want) {   # what Merge-WslConfig would change, one line each: old -> new
-  $now = Wsl2Keys $lines; $old = SectionKeys $lines 'experimental'
-  foreach ($k in $want.Keys) {
-    if ($now[$k] -ne $want[$k]) { "  [wsl2] ${k}: $(if ($null -ne $now[$k]) { $now[$k] } else { '(not set)' }) -> $($want[$k])" }
-  }
-  foreach ($k in $Experimental) { if ($old.ContainsKey($k)) { "  [experimental] $k=$($old[$k]): removed (the [wsl2] one is used)" } }
-}
-function Merge-WslConfig([string]$path, $want, [scriptblock]$before = {}) {   # True when it changed the file (a dated copy of the old one kept; $before runs first)
-  $lines = Read-WslConfig $path
-  $out = [Collections.Generic.List[string]]::new(); $sec = ''; $done = @{}
-  function AddMissing { foreach ($k in $want.Keys) { if (-not $done[$k]) { $out.Add("$k=$($want[$k])"); $done[$k] = 1 } } }
+# The merged lines and one note per change (old -> new). The question shows these notes and the file is written only
+# when there is one, so "no change" always means the file is left alone. A [wsl2] line whose value already matches
+# (trimmed, any case: as the final check compares) is kept as it is; a repeated key's later lines are removed.
+function MergeLines([string[]]$lines, $want) {
+  $out = [Collections.Generic.List[string]]::new(); $notes = [Collections.Generic.List[string]]::new(); $sec = ''; $done = @{}
+  function AddMissing { foreach ($k in $want.Keys) { if (-not $done[$k]) { $out.Add("$k=$($want[$k])"); $done[$k] = 1; $notes.Add("  [wsl2] ${k}: (not set) -> $($want[$k])") } } }
   foreach ($l in $lines) {
     if ($l -match '^\s*\[(.+)\]\s*$') { if ($sec -eq 'wsl2') { AddMissing }; $sec = $Matches[1].Trim().ToLower(); $out.Add($l); continue }
-    if ($sec -eq 'wsl2' -and $l -match '^\s*([^=#;\s]+)\s*=' -and $want.Contains($Matches[1])) {
-      $k = $Matches[1]; if (-not $done[$k]) { $out.Add("$k=$($want[$k])"); $done[$k] = 1 }; continue }
-    if ($sec -eq 'experimental' -and $l -match '^\s*([^=#;\s]+)\s*=' -and $Matches[1] -in $Experimental) { continue }
+    if ($sec -eq 'wsl2' -and $l -match '^\s*([^=#;\s]+)\s*=\s*(.*?)\s*$' -and $want.Contains($Matches[1])) {
+      $k = $Matches[1]; $v = $Matches[2]
+      if ($done[$k]) { $notes.Add("  [wsl2] $k=${v}: a repeated line, removed"); continue }
+      $done[$k] = 1
+      if ($v -eq $want[$k]) { $out.Add($l) } else { $out.Add("$k=$($want[$k])"); $notes.Add("  [wsl2] ${k}: $v -> $($want[$k])") }
+      continue }
+    if ($sec -eq 'experimental' -and $l -match '^\s*([^=#;\s]+)\s*=\s*(.*?)\s*$' -and $Matches[1] -in $Experimental) {
+      $notes.Add("  [experimental] $($Matches[1])=$($Matches[2]): removed (the [wsl2] one is used)"); continue }
     $out.Add($l)
   }
   if ($sec -eq 'wsl2') { AddMissing }
   if ($done.Count -lt $want.Count) { $out.Add('[wsl2]'); AddMissing }
-  if (($out -join "`n") -eq ($lines -join "`n")) { return $false }
+  [pscustomobject]@{ Out = $out; Notes = $notes }
+}
+function Changes([string[]]$lines, $want) { (MergeLines $lines $want).Notes }   # what Merge-WslConfig changes
+function Merge-WslConfig([string]$path, $want, [scriptblock]$before = {}) {   # True when it changed the file (a dated copy of the old one kept; $before runs first)
+  $merged = MergeLines (Read-WslConfig $path) $want
+  if ($merged.Notes.Count -eq 0) { return $false }   # the same test as the question's
   & $before
   if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path "$path.bak-$(Get-Date -Format yyyyMMdd-HHmmss)" }
-  [IO.File]::WriteAllLines("$path.new", [string[]]$out, [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllLines("$path.new", [string[]]$merged.Out, [Text.UTF8Encoding]::new($false))
   Move-Item -LiteralPath "$path.new" $path -Force
   $true
 }
@@ -234,6 +243,9 @@ try {
   if ($restart) { 'changed: .wslconfig' }
 
   Head "the distro's own settings"
+  # The owed mark before wsl.conf changes too: a run stopped before its shutdown restarts next time even when the
+  # start of PID 1 (read from the VM's clock, which skips sleep) looks later than the change.
+  if (InDistro 'reading /etc/wsl.conf' ("CHECK_ONLY=1`n" + $Prepare)) { Mark $Owed }
   $changed = InDistro "the distro's settings" $Prepare
   $changed
   Remove-Item -LiteralPath $Made -ErrorAction SilentlyContinue   # the distro's own mark is there now
@@ -243,7 +255,7 @@ try {
   if ((Test-Path $WslConfig) -and ((Get-Date) - (Get-Item -LiteralPath $WslConfig).LastWriteTime).TotalSeconds -lt $up) {
     $live += 'restart: .wslconfig is newer than the running WSL'
   }
-  if (Test-Path -LiteralPath $Owed) { $live += 'restart: .wslconfig changed and its wsl --shutdown is still owed' }
+  if (Test-Path -LiteralPath $Owed) { $live += 'restart: a change (.wslconfig or wsl.conf) still owes its wsl --shutdown' }
   $live
   if ($restart -or $changed -or $live) {
     Head 'wsl --shutdown (the new settings apply at the next start)'
