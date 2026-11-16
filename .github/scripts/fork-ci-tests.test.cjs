@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { plan, readList, findTests, presentTests } = require("./fork-ci-tests.cjs");
+const { plan, readList, findTests, presentTests, runAll, jobCount } = require("./fork-ci-tests.cjs");
 
 const never = () => false;
 const here = (...files) => files.map((file) => ({ file, runBy: null }));
@@ -140,6 +140,94 @@ test("an unlisted test under .github/scripts or fork-ci fails the run", () => {
         `${file} not reported: ${run.stdout}`,
       );
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runAll runs at most `jobs` at once, starts the next as soon as a slot frees, keeps the order", async () => {
+  let running = 0;
+  let most = 0;
+  const started = [];
+  const results = await runAll([30, 5, 5, 5, 5], 2, async (ms) => {
+    started.push(ms);
+    running += 1;
+    most = Math.max(most, running);
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    running -= 1;
+    return ms * 2;
+  });
+  assert.equal(most, 2);
+  assert.deepEqual(results, [60, 10, 10, 10, 10]);
+  assert.equal(started.length, 5);
+  assert.deepEqual(await runAll([], 4, async () => 1), []);
+});
+
+test("jobCount reads FORK_CI_TEST_JOBS, else the CPU count", () => {
+  assert.equal(jobCount({ FORK_CI_TEST_JOBS: "3" }), 3);
+  for (const bad of [undefined, "", "0", "-2", "1.5", "many"])
+    assert.equal(jobCount({ FORK_CI_TEST_JOBS: bad }), os.availableParallelism(), String(bad));
+});
+
+// Runs the real script in a scratch tree whose list names `tests` ({ file: shell text }).
+function runScript(tests, jobs) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-tests-"));
+  const write = (file, text) => {
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    fs.writeFileSync(path.join(root, file), text);
+  };
+  write(".github/scripts/fork-ci-tests.cjs", fs.readFileSync(require.resolve("./fork-ci-tests.cjs")));
+  write(".github/fork-ci-tests.txt", Object.keys(tests).join("\n") + "\n");
+  for (const [file, text] of Object.entries(tests)) write(file, text);
+  const env = { ...process.env, FORK_CI_TEST_JOBS: String(jobs), LEFT: path.join(root, "left.pid") };
+  delete env.GITHUB_STEP_SUMMARY;
+  const started = Date.now();
+  const run = childProcess.spawnSync("node", [".github/scripts/fork-ci-tests.cjs"], {
+    cwd: root,
+    env,
+    encoding: "utf8",
+    timeout: 60000,
+  });
+  return { root, run, seconds: (Date.now() - started) / 1000 };
+}
+
+test("test files run in parallel, each one's output in its own group, and a failure fails the run", () => {
+  const { root, run, seconds } = runScript(
+    {
+      "fork-ci/a.test.sh": "echo a-start; sleep 2; echo a-end\n",
+      "fork-ci/b.test.sh": "echo b-start; sleep 2; echo b-end\n",
+      "fork-ci/c.test.sh": "echo c-start; sleep 2; echo c-end; exit 3\n",
+    },
+    3,
+  );
+  try {
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    // One after another they take 6 s.
+    assert.ok(seconds < 5, `took ${seconds} s`);
+    for (const name of ["a", "b", "c"])
+      assert.match(
+        run.stdout,
+        new RegExp(`::group::fork-ci/${name}\\.test\\.sh \\([0-9.]+ s\\)\\n${name}-start\\n${name}-end\\n`),
+      );
+    assert.match(run.stdout, /::error file=fork-ci\/c\.test\.sh::fork-ci\/c\.test\.sh failed \(exit 3\)/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a process a test leaves behind holding its output does not hang the run", () => {
+  const { root, run, seconds } = runScript(
+    { "fork-ci/left.test.sh": 'sleep 60 & echo $! > "$LEFT"; echo done\n' },
+    1,
+  );
+  try {
+    assert.equal(run.error, undefined, String(run.error));
+    assert.equal(run.status, 0, run.stdout + run.stderr);
+    assert.ok(seconds < 20, `took ${seconds} s`);
+    assert.match(run.stdout, /::group::fork-ci\/left\.test\.sh[^\n]*\ndone\n/);
+  } finally {
+    try {
+      process.kill(Number(fs.readFileSync(path.join(root, "left.pid"), "utf8")));
+    } catch {}
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
