@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rep: [1, 2, 3, 4]
+        rep: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -71,7 +71,7 @@ jobs:
         working-directory: apps/web
         env:
           SHARD: 1/2
-          DEBUG: vitest:browser:gc
+          DEBUG: vitest:browser:gc,pw:browser*
         run: |
           log="$RUNNER_TEMP/res.log"
           (
@@ -80,8 +80,9 @@ jobs:
               shm=$(df -BM --output=used /dev/shm | tail -1 | tr -dc 0-9)
               mem=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
               chrome=$(ps -eo rss=,args= | awk '/ms-playwrigh[t]/{s+=$1; if($1>m)m=$1; n++} END{printf "%d %d %d", s/1024, m/1024, n}')
+              types=$(ps -eo rss=,args= | awk '/ms-playwrigh[t]/{t="browser"; if(match($0,/--type=[a-z-]+/))t=substr($0,RSTART+7,RLENGTH-7); if(match($0,/--utility-sub-type=[a-z.]+/))t=t"/"substr($0,RSTART+19,RLENGTH-19); printf "%s:%d ", t, $1/1024}')
               node=$(ps -eo rss=,comm= | awk '$2=="node"{s+=$1} END{printf "%d", s/1024}')
-              echo "$(date +%T) tmpfree=$tmp shmused=$shm memavail=$mem chrome_sum_max_n=$chrome node=$node"
+              echo "$(date +%T) tmpfree=$tmp shmused=$shm memavail=$mem chrome_sum_max_n=$chrome node=$node | $types"
               sleep 3
             done
           ) > "$log" 2>&1 &
@@ -89,7 +90,10 @@ jobs:
           status=0
           eval "$(jq -r .scripts.test package.json) --shard=$SHARD" > "$RUNNER_TEMP/test.log" 2>&1 || status=$?
           kill "$sampler" || true
-          grep -v "vitest:browser:gc" "$RUNNER_TEMP/test.log" | tail -n 60
+          grep -v "vitest:browser:gc\|pw:browser" "$RUNNER_TEMP/test.log" | tail -n 60
+          echo "::group::browser stderr (pw:browser), last 80 lines"
+          grep "pw:browser" "$RUNNER_TEMP/test.log" | grep -v "DevTools listening" | tail -n 80
+          echo "::endgroup::"
           echo "::group::gc debug (first and last 5)"
           grep "vitest:browser:gc" "$RUNNER_TEMP/test.log" | head -n 5
           grep "vitest:browser:gc" "$RUNNER_TEMP/test.log" | tail -n 5
