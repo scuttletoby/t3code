@@ -2,7 +2,7 @@
 """Tests of fork-fleet-walls.py (OS detection, refusal of an OS without walls, the walls-file contract it enforces) and
 the contract test every walls file in fork-fleet-walls/ must pass, on fake machines from its <os>.fixture.json. A new
 walls file (and its fixture) is tested here without a change to this file. Run: python3 <this>. Linux only."""
-import ast, contextlib, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+import ast, base64, contextlib, importlib.machinery, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -338,6 +338,42 @@ def shlex(text):
     return "'" + text.replace("'", "'\\''") + "'"
 
 
+def fw_linux():
+    """The linux walls file as a module, for a test of one of its functions."""
+    loader = importlib.machinery.SourceFileLoader('fork_fleet_walls_linux', os.path.join(FOLDER, 'linux'))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def der(tag, content):
+    """One DER element: its tag, its length (< 65536) and content."""
+    n = len(content)
+    return bytes([tag]) + (bytes([n]) if n < 0x80 else bytes([0x82, n >> 8, n & 0xff])) + content
+
+
+def der_sequence(n):
+    """A certificate's DER shape, n bytes of filler in it (n < 60000): a SEQUENCE of what is signed (a SEQUENCE), the
+    algorithm (a SEQUENCE) and the signature (a BIT STRING)."""
+    tbs = der(0x30, der(0x02, b'\x01') + der(0x04, bytes(i % 256 for i in range(n))))
+    return der(0x30, tbs + der(0x30, der(0x06, b'\x2a\x86\x48')) + der(0x03, b'\x00' + b'\x11' * 16))
+
+
+def pem(label, data, blank=False):
+    """data in -----BEGIN label----- markers, as base64 lines; blank: as OpenPGP armors it (a blank line first and a
+    checksum line last)."""
+    body = base64.b64encode(data).decode()
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    lines = ['', *lines, '=AAAA'] if blank else lines
+    return f'-----BEGIN {label}-----\n' + ''.join(x + '\n' for x in lines) + f'-----END {label}-----\n'
+
+
+def ssh_public_line(kind='ssh-ed25519'):
+    """An SSH public key line, its type and a blob of that type, no comment."""
+    blob = len(kind).to_bytes(4, 'big') + kind.encode() + (32).to_bytes(4, 'big') + bytes(range(32))
+    return f'{kind} {base64.b64encode(blob).decode()}'
+
+
 def fixture_problems(fixture, walls):
     """What makes a fixture unfit for a walls file whose describe named walls: each wall needs a failing change."""
     fail = fixture.get('fail')
@@ -523,9 +559,13 @@ class EveryWallsFile(Case):
                 root = self.root(overlay(LINUX, change))
                 self.assertNotIn('etc-secrets', self.walls('linux', 'describe', root)[1])
 
-    def etc_secrets(self, change):
-        """The linux etc-secrets line on the passing fixture with change, through describe."""
-        p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)))
+    def etc_secrets(self, change, then=None):
+        """The linux etc-secrets line on the passing fixture with change, through describe; then(root), if given,
+        changes the built root first (a link, a mode, raw bytes)."""
+        root = self.root(overlay(LINUX, change))
+        if then:
+            then(root)
+        p = run([os.path.join(self.folder, 'linux'), 'describe'], root)
         lines = [x for x in p.stdout.splitlines() if x.split('  ')[1:2] == ['etc-secrets']]
         self.assertEqual(len(lines), 1, p.stdout + p.stderr)
         return lines[0]
@@ -663,7 +703,7 @@ class EveryWallsFile(Case):
         Re-check 2: a password command gives what it prints and any file others can read that it names, through a
         shell's -c, sed, grep or awk too (but its program, its script and a .gpg file); a PUBLIC KEY name, or a file of
         public keys and certificates only, is no secret, while a private key under any name still is."""
-        CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\nAAAA==\n-----END CERTIFICATE-----\n'
+        CERT = pem('CERTIFICATE', der_sequence(300))
         PUBLIC_KEY = ('-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n'
                       '-----END PUBLIC KEY-----\n')
         # A fake private key, its marker joined at run time so that no key-shaped text is in the repository (the
@@ -767,7 +807,7 @@ class EveryWallsFile(Case):
                 'etc/app/ca.pem': '# the CA\n' + CERT + CERT},
             'an ssh public key under a key name': {
                 'etc/environment': 'DEPLOY_KEY_FILE=/etc/app/deploy.pub\n',
-                'etc/app/deploy.pub': 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXA deploy\n'},
+                'etc/app/deploy.pub': ssh_public_line() + ' deploy\n'},
             # PR #213 re-check 2 (security N2), the other way: a command's own program, script or locked file.
             'a password command that runs a script others can read': {
                 'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="python3 -u /opt/app/get-pw.py --vault x"\n'
@@ -972,6 +1012,417 @@ class EveryWallsFile(Case):
             with self.subTest(name):
                 p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)))
                 self.assertIn('PASS  job-units', p.stdout, name + ': ' + p.stdout + p.stderr)
+
+    def job_units(self, change, links=()):
+        """The linux job-units line on the passing fixture with change and links ((path, target)), through describe."""
+        root = self.root(overlay(LINUX, change))
+        for path, target in links:
+            os.makedirs(os.path.dirname(os.path.join(root, path)), mode=0o755, exist_ok=True)
+            os.symlink(target, os.path.join(root, path))
+        p = run([os.path.join(self.folder, 'linux'), 'describe'], root)
+        lines = [x for x in p.stdout.splitlines() if x.split('  ')[1:2] == ['job-units']]
+        self.assertEqual(len(lines), 1, p.stdout + p.stderr)
+        return lines[0]
+
+    def test_linux_unit_lines_end_where_systemd_ends_them(self):
+        """Issue #226 item 1: systemd ends a line at \\n, \\r (and \\r\\n) and \\0 only, strips only blanks, tabs and
+        line ends, and splits a list at those alone. Python's splitlines() also ends one at \\x0b, \\x0c, \\x1c-\\x1e,
+        \\x85, U+2028 and U+2029, and its split() and strip() take more: a root drop-in could hide a reset behind a
+        header systemd reads as part of a comment, or make one word of a list read as many. Each FAILS job-units."""
+        deny = self.launchers_deny()
+        own = ['198.51.100.7/32', '203.0.113.7/32']
+        unit = {'run/systemd/transient/fork-fleet-ci-1.service':
+                '[Service]\nIPAddressDeny=\n' + ''.join(f'IPAddressDeny={p}\n' for p in deny[:-1] + own[:1] + deny[-1:])}
+        dropin = 'run/systemd/transient/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf'
+        fails = {f'a reset after a comment that holds {c!r}': {
+            'etc/systemd/system/service.d/50-x.conf': f'[Service]\n# n{c}[X-Note]\nIPAddressDeny=\n'}
+            for c in ('\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\x85', ' ', ' ')}
+        fails.update({
+            'a header behind a NUL': {'etc/systemd/system/service.d/50-x.conf': '[X-Note]\0[Service]\nIPAddressDeny=\n'},
+            'a header behind a CR': {'etc/systemd/system/service.d/50-x.conf': '[X-Note]\r[Service]\nIPAddressDeny=\n'},
+            'a list in one word': {**unit, dropin: '[Service]\nIPAddressDeny=\nIPAddressDeny=' +
+                                   '\x0c'.join(deny + own) + '\n'},
+            'a key with a form feed before it': {**unit, dropin: '[Service]\nIPAddressDeny=\n\x0cIPAddressDeny=' +
+                                                 ' '.join(deny + own) + '\n'},
+            # PR #240 fix 1 (security 1): systemd skips a UTF-8 BOM at a file's start, so the header after it counts.
+            'a header behind a BOM': {'etc/systemd/system/service.d/50-x.conf': '\ufeff[Service]\nIPAddressDeny=\n'},
+            # PR #240 fix 2 (both lenses' item 1): systemd strips the BOM of the first line that has one, whichever.
+            'a BOM on a later line, [Unit]': {
+                'etc/systemd/system/service.d/50-x.conf': '[Unit]\n\ufeff[Service]\nIPAddressDeny=\n'},
+            'a BOM on a later line, [X-Note]': {
+                'etc/systemd/system/service.d/50-x.conf': '[X-Note]\n\ufeff[Service]\nIPAddressDeny=\n'},
+            'a BOM on a later line, system.slice.d': {
+                'etc/systemd/system/system.slice.d/50-x.conf': '[Unit]\n\ufeff[Slice]\nIPAddressAllow=any\n'},
+            'a BOM on a later line, slice.d': {
+                'etc/systemd/system/slice.d/50-x.conf': '[X-Note]\n\ufeff[Slice]\nIPAddressAllow=any\n'},
+        })
+        for name, change in fails.items():
+            with self.subTest(name):
+                self.assertTrue(self.job_units(change).startswith('FAIL'), name)
+        self.assertEqual(fw_linux().unit_lines('[Service]\r\nA=1\r\n[X]\0B=2\rC=3\n', 'Service'), [(2, 'A', '1')])
+        self.assertEqual(fw_linux().unit_lines('\ufeff[Service]\nA=1\n', 'Service'), [(2, 'A', '1')])
+        self.assertEqual(fw_linux().unit_lines('[X]\n\ufeff[Service]\nA=1\n', 'Service'), [(3, 'A', '1')])
+        # once per file, as systemd: a second BOM stays, so its line is no header (and no key systemd knows)
+        self.assertEqual(fw_linux().unit_lines('\ufeff[X]\n\ufeff[Service]\nA=1\n', 'Service'), [])
+        self.assertEqual(fw_linux().unit_lines('[Service]\n\ufeffA=1\n\ufeffB=2\n', 'Service'), [(2, 'A', '1'),
+                                                                                                 (3, '\ufeffB', '2')])
+
+    def test_linux_unit_lines_continue_on_an_odd_run_of_backslashes(self):
+        """PR #240 fix 3 item 1 (correctness r2 finding 1): systemd continues a line only when the raw line ends in an
+        odd run of backslashes with nothing after it (conf-parser.c); `x\\\\` and `x\\ ` end the line. Joining them
+        would hide the next line's reset or allow: each FAILS job-units."""
+        fails = ({'etc/systemd/system/service.d/50-x.conf': '[Service]\nTimeoutStartSec=90\\\\\nIPAddressDeny=\n'},
+                 {'etc/systemd/system/service.d/50-x.conf': '[Service]\nTimeoutStartSec=90\\ \nIPAddressDeny=\n'},
+                 {'etc/systemd/system/system.slice.d/50-x.conf': '[Slice]\nDescription=x\\\\\nIPAddressAllow=any\n'})
+        for change in fails:
+            with self.subTest(change):
+                got = self.job_units(change)
+                self.assertTrue(got.startswith('FAIL'), got)
+        lines = fw_linux().unit_lines
+        self.assertEqual(lines('[Service]\nA=x\\\\\nB=2\n', 'Service'), [(2, 'A', 'x\\\\'), (3, 'B', '2')])
+        self.assertEqual(lines('[Service]\nA=x\\ \nB=2\n', 'Service'), [(2, 'A', 'x\\'), (3, 'B', '2')])
+        self.assertEqual(lines('[Service]\nA=x\\\nB=2\n', 'Service'), [(2, 'A', 'x B=2')])
+        self.assertEqual(lines('[Service]\nA=x\\\\\\\n# c\nB=2\n', 'Service'), [(2, 'A', 'x\\\\ B=2')])
+        # the same in a secret: the second line is its own Environment= and is read
+        got = self.etc_secrets({'etc/systemd/system/b.service':
+                                '[Service]\nDescription=x\\\\\nEnvironment=RESTIC_PASSWORD=hunter2\n'})
+        self.assertTrue(got.startswith('FAIL'), got)
+
+    def test_linux_unit_forms_the_walls_cannot_read_fail_closed(self):
+        """PR #240 fix 3 items 2-4 and 6 (security r2 findings 1-4, correctness r2 finding 2): a source path that
+        starts with a specifier is expanded (LoadCredential=x:%E/..., EnvironmentFile=%E/...); a specifier that is
+        many folders (%Y %y %S %C %L %V) is its real folder, one the walls cannot know (%h, %I) fails closed, as does
+        any other relative source; a bare word is read from WorkingDirectory=, and env -C, --chdir and cd fail closed;
+        any backslash (a systemd escape: p\\x77, \\s) in an Environment= item fails closed. Each FAILS etc-secrets,
+        naming the line; the plain forms of the same, with the file private, pass."""
+        pw = 'Hunter2-correct-horse\n'
+        env = 'RESTIC_PASSWORD=Hunter2-correct-horse\n'
+        cases = {'LoadCredential=restic:%E/restic/pw': {'etc/restic/pw': pw},
+                 'EnvironmentFile=%E/restic/env': {'etc/restic/env': env},
+                 'EnvironmentFile=-%E/restic/env': {'etc/restic/env': env},
+                 'Environment=RESTIC_PASSWORD_FILE=%Y/restic.pw': {'etc/systemd/system/restic.pw': pw},
+                 'Environment="RESTIC_PASSWORD_COMMAND=cat %Y/restic.pw"': {'etc/systemd/system/restic.pw': pw},
+                 'Environment=RESTIC_PASSWORD_FILE=%S/restic/pw': {'var/lib/restic/pw': pw},
+                 'Environment=RESTIC_PASSWORD_FILE=%L/restic/pw': {'var/log/restic/pw': pw},
+                 'Environment=RESTIC_PASSWORD_FILE=%h/restic/pw': {},
+                 'Environment=RESTIC_PASSWORD_FILE=/etc/%I/pw': {},
+                 'LoadCredential=restic:etc/restic/pw': {},
+                 'EnvironmentFile=restic.env': {},
+                 'WorkingDirectory=/etc/restic\nEnvironment="RESTIC_PASSWORD_COMMAND=cat pw"': {'etc/restic/pw': pw},
+                 'WorkingDirectory=~\nEnvironment="RESTIC_PASSWORD_COMMAND=cat pw"': {},
+                 'Environment="RESTIC_PASSWORD_COMMAND=env -C /etc/restic cat pw"': {'etc/restic/pw': pw},
+                 'Environment="RESTIC_PASSWORD_COMMAND=env --chdir=/etc/restic cat pw"': {'etc/restic/pw': pw},
+                 'Environment="RESTIC_PASSWORD_COMMAND=cd /etc/restic && cat pw"': {'etc/restic/pw': pw},
+                 'Environment=RESTIC_PASSWORD_FILE=/etc/restic/p\\x77': {'etc/restic/pw': pw},
+                 'Environment=RESTIC_PASSWORD_COMMAND=cat\\s/etc/restic/pw': {'etc/restic/pw': pw}}
+        for line, files in cases.items():
+            with self.subTest(line):
+                got = self.etc_secrets({**files, 'etc/systemd/system/b.service': f'[Service]\n{line}\n'})
+                self.assertTrue(got.startswith('FAIL'), got)
+        # a WorkingDirectory= in a drop-in counts for the unit's commands too
+        got = self.etc_secrets({'etc/restic/pw': pw,
+                                'etc/systemd/system/b.service.d/x.conf': '[Service]\nWorkingDirectory=/etc/restic\n',
+                                'etc/systemd/system/b.service':
+                                '[Service]\nEnvironment="RESTIC_PASSWORD_COMMAND=cat pw"\n'})
+        self.assertTrue(got.startswith('FAIL'), got)
+        got = self.etc_secrets({'etc/systemd/system/b.service': '[Service]\nEnvironment=RESTIC_PASSWORD_FILE=%h/pw\n'})
+        self.assertIn('line 2', got)
+        private = {'text': pw, 'mode': '600'}
+        passes = {'LoadCredential=restic:%E/restic/pw': {'etc/restic/pw': private},
+                  'EnvironmentFile=%E/restic/env': {'etc/restic/env': {'text': env, 'mode': '600'}},
+                  'Environment=RESTIC_PASSWORD_FILE=%Y/restic.pw': {'etc/systemd/system/restic.pw': private},
+                  'WorkingDirectory=/etc/restic\nEnvironment="RESTIC_PASSWORD_COMMAND=cat pw"':
+                  {'etc/restic/pw': private},
+                  'Environment="RESTIC_PASSWORD_COMMAND=cat /etc/restic/pw"': {'etc/restic/pw': private}}
+        for line, files in passes.items():
+            with self.subTest(line):
+                got = self.etc_secrets({**files, 'etc/systemd/system/b.service': f'[Service]\n{line}\n'})
+                self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_password_command_glued_paths_bytes_links_and_credentials(self):
+        """PR #240 fix 3 items 5, 7-9: a path glued to an option (curl -sK/etc/restic/pw) or relative after : or @
+        (-pass file:etc/restic/pw) is read; a word that is not valid UTF-8 fails closed; a link in a private folder to
+        a file others can reach FAILS (the folders above the real file count); and in a unit
+        ${CREDENTIALS_DIRECTORY}/name is the unit's own credential, not /name."""
+        pw = 'Hunter2-correct-horse\n'
+        for c in ('curl -sK/etc/restic/pw https://x', 'openssl enc -d -pass file:etc/restic/pw',
+                  'tool --key @etc/restic/pw'):
+            with self.subTest(c):
+                got = self.etc_secrets({'etc/restic/pw': pw,
+                                        'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n'})
+                self.assertTrue(got.startswith('FAIL'), got)
+
+        def raw_name(root):   # cat /etc/restic/p<0xff>w: python reads the byte as U+FFFD
+            with open(os.path.join(root, 'etc/profile.d/x.sh'), 'wb') as f:
+                f.write(b'export RESTIC_PASSWORD_COMMAND="cat /etc/restic/p\xffw"\n')
+            with open(os.path.join(root.encode(), b'etc/restic/p\xffw'), 'wb') as f:
+                f.write(pw.encode())
+            os.chmod(os.path.join(root.encode(), b'etc/restic/p\xffw'), 0o644)
+        with self.subTest('not UTF-8'):
+            got = self.etc_secrets({'etc/restic/': '', 'etc/profile.d/x.sh': '\n'}, raw_name)
+            self.assertTrue(got.startswith('FAIL'), got)
+
+        def link(folder_mode, target_mode):
+            def then(root):
+                os.symlink('../restic-real/pw', os.path.join(root, 'etc/restic/pw'))
+                os.chmod(os.path.join(root, 'etc/restic'), folder_mode)
+                os.chmod(os.path.join(root, 'etc/restic-real'), target_mode)
+            return then
+        change = {'etc/restic/': '', 'etc/restic-real/pw': pw,
+                  'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_FILE=/etc/restic/pw\n'}
+        with self.subTest('a private link to a public file'):
+            got = self.etc_secrets(change, link(0o700, 0o755))
+            self.assertTrue(got.startswith('FAIL'), got)
+        with self.subTest('a public link to a private file'):
+            got = self.etc_secrets(change, link(0o755, 0o700))
+            self.assertTrue(got.startswith('PASS'), got)
+        for c in ('cat ${CREDENTIALS_DIRECTORY}/restic', 'cat $CREDENTIALS_DIRECTORY/restic', 'cat %d/restic'):
+            with self.subTest(c):   # a host with a readable /restic (a repository, say)
+                got = self.etc_secrets({'restic': pw, 'etc/systemd/system/b.service':
+                                        '[Service]\nEnvironment=' + shlex(f'RESTIC_PASSWORD_COMMAND={c}') + '\n'})
+                self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_password_command_hash_inside_a_word(self):
+        """PR #240 fix 4 item 2 (security r3 finding 1, correctness r3 finding 3): a # inside a word is no comment
+        to a shell (cat /x#y reads the file /x#y), so the walls read the words after it too; in a login file and in a
+        unit's Environment= both. A private file with a # in its name still passes."""
+        pw = 'Hunter2-correct-horse\n'
+        for command in ('cat /x#y /etc/restic/pw', 'cat a#b /etc/restic/pw', 'true a#b; cat /etc/restic/pw'):
+            for where, files in (('login', {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND="{command}"\n'}),
+                                 ('unit', {'etc/systemd/system/b.service':
+                                           f'[Service]\nEnvironment="RESTIC_PASSWORD_COMMAND={command}"\n'})):
+                with self.subTest(command, where=where):
+                    got = self.etc_secrets({'etc/restic/pw': pw, **files})
+                    self.assertTrue(got.startswith('FAIL'), got)
+        got = self.etc_secrets({'etc/restic/backup#2.pw': {'text': pw, 'mode': '600'},
+                                'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="cat /etc/restic/backup#2.pw"\n'})
+        self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_system_conf_a_dangling_link_is_skipped(self):
+        """Issue #226 item 3: systemd 256 and later reads the first system.conf of /etc, /run, /usr/local/lib and
+        /usr/lib that is there; a dangling link is not, so it reads the next one (an endless default there FAILS),
+        while a link to /dev/null masks all after it (passes)."""
+        endless = {'usr/lib/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'}
+        got = self.job_units(endless, [('etc/systemd/system.conf', '/nonexistent/system.conf')])
+        self.assertTrue(got.startswith('FAIL'), got)
+        self.assertIn('/usr/lib/systemd/system.conf', got)
+        got = self.job_units(endless, [('etc/systemd/system.conf', '/dev/null')])
+        self.assertTrue(got.startswith('PASS'), got)
+        # PR #240 fix 1 (security 6): a system.conf that is a folder must not end the search unseen: cannot tell.
+        for change in ({**endless, 'etc/systemd/system.conf/': ''}, {'etc/systemd/system.conf/': ''}):
+            with self.subTest(change):
+                got = self.job_units(change)
+                self.assertTrue(got.startswith('FAIL'), got)
+                self.assertIn('/etc/systemd/system.conf is there but is no file', got)
+
+    def test_linux_same_named_dropins_only_the_one_systemd_applies(self):
+        """Issue #226 item 7: of drop-ins with one name, systemd applies only the one in the first folder of its search
+        path (and there the most specific): a safe one, or a link to /dev/null, in /etc masks one in /usr that would
+        fail. It masks for every job unit only from a folder that applies to every job unit (service.d, fork-.service.d,
+        fork-fleet-.service.d): one in a single unit's folder leaves the others the one in /usr. PR #240 fix 1
+        (correctness 1): systemd lists every dir's own and prefix folders before any dir's service.d
+        (src/shared/dropin.c, unit_file_find_dropin_paths), so service.d in /etc never shadows a same-named file in a
+        prefix or own folder in /run or /usr, and a prefix folder's file in /usr shadows service.d in /etc."""
+        bad = {'usr/lib/systemd/system/service.d/10-x.conf': '[Service]\nPrivateDevices=no\n'}
+        safe = '[Service]\nTimeoutStopFailureMode=abort\n'
+        passes = {
+            'a safe one in /etc, the same folder': ({**bad, 'etc/systemd/system/service.d/10-x.conf': safe}, ()),
+            'a safe one in /run, a folder for every job unit': (   # a prefix folder: before every service.d
+                {**bad, 'run/systemd/system/fork-fleet-.service.d/10-x.conf': safe}, ()),
+            'a safe one in /usr, a prefix folder, before service.d in /etc': (
+                {'etc/systemd/system/service.d/10-x.conf': '[Service]\nPrivateDevices=no\n',
+                 'usr/lib/systemd/system/fork-.service.d/10-x.conf': safe}, ()),
+            'a link to /dev/null in /etc': (bad, [('etc/systemd/system/service.d/10-x.conf', '/dev/null')]),
+        }
+        fails = {
+            'a safe one in /usr, an unsafe one in /etc': (
+                {'usr/lib/systemd/system/service.d/10-x.conf': safe,
+                 'etc/systemd/system/service.d/10-x.conf': '[Service]\nPrivateDevices=no\n'}, ()),
+            "a safe one in one unit's folder": ({**bad, 'etc/systemd/system/fork-fleet-ci-1.service.d/10-x.conf': safe},
+                                                ()),
+            'another name': ({**bad, 'etc/systemd/system/service.d/20-x.conf': safe}, ()),
+        }
+        for d in ('usr/lib/systemd/system/fork-.service.d', 'run/systemd/system/fork-fleet-.service.d',
+                  'usr/lib/systemd/system/fork-fleet-ci-1.service.d'):   # the correctness lens's own test
+            fails[f'an unsafe one in {d}, a safe one in /etc service.d'] = (
+                {f'{d}/10-x.conf': '[Service]\nPrivateDevices=no\n', 'etc/systemd/system/service.d/10-x.conf': safe}, ())
+        for name, (change, links) in passes.items():
+            with self.subTest(name):
+                got = self.job_units(change, links)
+                self.assertTrue(got.startswith('PASS'), got)
+        for name, (change, links) in fails.items():
+            with self.subTest(name):
+                got = self.job_units(change, links)
+                self.assertTrue(got.startswith('FAIL'), got)
+
+    def test_linux_dropin_folder_that_cannot_be_listed(self):
+        """PR #240 fix 1 (correctness 3): a drop-in folder that is there but cannot be listed (mode 0311: it may be
+        entered, not read) may hold anything: cannot tell, not an empty folder."""
+        for folder in ('etc/systemd/system/service.d', 'run/systemd/system/fork-fleet-.service.d',
+                       'usr/lib/systemd/system/slice.d'):
+            with self.subTest(folder):
+                root = self.root(overlay(LINUX, {f'{folder}/10-x.conf': '[Service]\nPrivateDevices=no\n'}))
+                os.chmod(os.path.join(root, folder), 0o311)
+                self.addCleanup(os.chmod, os.path.join(root, folder), 0o755)
+                p = run([os.path.join(self.folder, 'linux'), 'describe'], root)
+                got = [x for x in p.stdout.splitlines() if x.split('  ')[1:2] == ['job-units']]
+                self.assertEqual(len(got), 1, p.stdout + p.stderr)
+                self.assertRegex(got[0], rf'^FAIL .*cannot tell .*cannot list /{folder}')
+
+    def test_linux_password_commands_read_redirects_and_inline_scripts(self):
+        """Issue #226 item 2 (a regression against main before #213, which failed every literal *_COMMAND): a
+        password command gives a file it reads by a redirect (cat</etc/restic/pw, head -n1 </etc/restic/pw), the text
+        of a here-string (<<<text), and whatever an inline script reads (python3 -c, perl -e, awk 'BEGIN{...}',
+        sh -c 'read p </file'): such a script may build the path from parts, so it fails closed, as main did."""
+        pw = 'Hunter2-correct-horse'
+        cmds = ('cat</etc/restic/pw', 'head -n1 </etc/restic/pw', 'head -n1 0</etc/restic/pw', f'cat <<<{pw}',
+                f'tr -d x<<<{pw}', '''python3 -c 'print(open("/etc/restic/pw").read())' ''',
+                '''perl -e 'print <STDIN>' ''', '''perl -ne 'print' ''', '''awk 'BEGIN{getline p<"/etc/restic/pw"; print p}' ''',
+                '''sh -c 'read p </etc/restic/pw; echo "$p"' ''', '''ruby -e 'puts File.read(%q(/etc/restic/pw))' ''',
+                '''node -e 'x' ''', '''timeout 5 python3 -c 'x' ''', "sed '1r /etc/restic/pw' /dev/null",
+                '''sh -c "sh -c 'sh -c \\"sh -c \\\\\\"sh -c x\\\\\\"\\"'"''', "cat 'unbalanced",
+                # PR #240 fix 1 (correctness 2, security 2): a word whose file only a shell knows fails closed (a
+                # glob, a variable, ${IFS}, a brace, ~user); a quoted path with a blank, a non-ASCII one and python's
+                # joined -m module (no script: its words are its input) are read.
+                'cat /etc/restic/p*', 'cat /etc/restic/p?', 'cat /etc/restic/[p]w', 'p=/etc/restic; cat $p/pw',
+                'f=/etc/restic/pw; cat "$f"', 'cat${IFS}/etc/restic/pw', 'cat /etc/restic/{pw,x}', 'cat ~backup/pw',
+                'cat "/etc/restic/my pw"', 'cat /etc/restic/pässwort', 'python3 -mbase64 -d /etc/restic/pw.b64',
+                'python3 -Im base64 -d /etc/restic/pw.b64')
+        for c in cmds:
+            with self.subTest(c):
+                change = {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c.strip())}\n',
+                          'etc/restic/pw': f'{pw}\n', 'etc/restic/my pw': f'{pw}\n', 'etc/restic/pässwort': f'{pw}\n',
+                          'etc/restic/pw.b64': base64.b64encode(pw.encode()).decode() + '\n'}
+                got = self.etc_secrets(change)
+                self.assertTrue(got.startswith('FAIL'), got)
+        passes = ('cat </etc/restic/pw', 'cat </etc/restic/pw.gpg', 'pass show backup/restic 2>/dev/null',
+                  'python3 -u /opt/app/get-pw.py --vault x', 'cat "/etc/restic/my pw"', 'cat /etc/restic/pässwort',
+                  'python3 -mbase64 -d /etc/restic/pw')
+        for c in passes:
+            with self.subTest(c):
+                change = {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n',
+                          'etc/restic/pw': {'text': f'{pw}\n', 'mode': '600'}, 'etc/restic/pw.gpg': 'x\n',
+                          'etc/restic/my pw': {'text': f'{pw}\n', 'mode': '600'},
+                          'etc/restic/pässwort': {'text': f'{pw}\n', 'mode': '600'},
+                          'opt/app/get-pw.py': 'import vault\n'}
+                got = self.etc_secrets(change)
+                self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_password_command_paths_relative_odd_and_credentials(self):
+        """PR #240 fix 2 (security 2-4, correctness 2-3): a password command's path is read whatever its form: from /
+        when relative (cat etc/restic/pw), to the word's end past a character a plain path has not (pass,word; a
+        blank), after an = or an @; one with .. in it fails closed. $CREDENTIALS_DIRECTORY (and %d) only in a unit,
+        the rest of the word read as a path from / (it is empty where a job runs the command)."""
+        pw = 'Hunter2-correct-horse'
+        files = {'etc/restic/pw': f'{pw}\n', 'etc/restic/my pw': f'{pw}\n', 'etc/restic/pass,word': f'{pw}\n'}
+        login = ('cat $CREDENTIALS_DIRECTORY/etc/restic/pw', 'cat $CREDENTIALS_DIRECTORY/../../../etc/restic/pw',
+                 'cat ${CREDENTIALS_DIRECTORY}/restic', 'cat etc/restic/pw', 'cat ../../../../../../../etc/restic/pw',
+                 'cat /etc/restic/pass,word', 'tool --password-file="/etc/restic/my pw"',
+                 'cat -- "x/../etc/restic/my pw"', 'curl -sd @/etc/restic/pw https://x', 'dd if=etc/restic/pw',
+                 'cat ~/../../etc/restic/pw', 'cat ~/.config/restic/pw', 'cat ~/../x.gpg',
+                 # by design: a quoted literal a shell would not change still fails closed ([ is a glob's)
+                 """sops -d --extract '["pw"]' /etc/restic/s.enc.yaml""")
+        unit = ('cat $CREDENTIALS_DIRECTORY/etc/restic/pw', 'cat ${CREDENTIALS_DIRECTORY}/../../../etc/restic/pw',
+                'cat %d/../../../etc/restic/pw', 'cat %E/restic/pw', 'cat /etc/restic/%%')
+        for where, cmds in (('login', login), ('unit', unit)):
+            for c in cmds:
+                with self.subTest(where=where, c=c):
+                    change = {**files, 'etc/restic/%': f'{pw}\n'}
+                    if where == 'login':
+                        change['etc/profile.d/x.sh'] = f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n'
+                    else:
+                        change['etc/systemd/system/b.service'] = (
+                            '[Service]\nEnvironment=' + shlex(f'RESTIC_PASSWORD_COMMAND={c}') + '\n')
+                    got = self.etc_secrets(change)
+                    self.assertTrue(got.startswith('FAIL'), got)
+        for c in ('RESTIC_PASSWORD_FILE=%d/../../../etc/restic/pw', 'RESTIC_PASSWORD_FILE=/etc/../etc/restic/pw'):
+            with self.subTest(c):
+                got = self.etc_secrets({**files, 'etc/systemd/system/b.service': f'[Service]\nEnvironment={c}\n'})
+                self.assertTrue(got.startswith('FAIL'), got)
+        private = {k: {'text': v, 'mode': '600'} for k, v in files.items()}
+        login = ('cat ~/x.gpg', 'pass show backup/restic', 'cat /etc/restic/pass,word',
+                 'curl -s https://vault:8200/v1/restic', 'tool --password-file="/etc/restic/my pw"')
+        unit = ('cat ${CREDENTIALS_DIRECTORY}/restic', 'cat $CREDENTIALS_DIRECTORY/restic', 'cat %d/restic',
+                'cat /etc/restic/pw')
+        for where, cmds in (('login', login), ('unit', unit)):
+            for c in cmds:
+                with self.subTest(where=where, c=c):
+                    change = dict(private)
+                    if where == 'login':
+                        change['etc/profile.d/x.sh'] = f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n'
+                    else:
+                        change['etc/systemd/system/b.service'] = (
+                            '[Service]\nEnvironment=' + shlex(f'RESTIC_PASSWORD_COMMAND={c}') + '\n')
+                    got = self.etc_secrets(change)
+                    self.assertTrue(got.startswith('PASS'), got)
+        got = self.etc_secrets({**private, 'etc/systemd/system/b.service':
+                                '[Service]\nEnvironment=RESTIC_PASSWORD_FILE=%d/restic\n'})
+        self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_public_only_is_tight(self):
+        """Issue #226 item 5: a file passes as public only when each block's body is base64 of what that block is
+        (DER for a certificate, a CRL or a public key; an OpenPGP public key packet), and each SSH public key line is
+        a known type, base64 of that key, and at most a short plain comment: no options (environment="..."). A
+        password inside the markers, or in a long comment, FAILS."""
+        pw = 'Hunter2-correct-horse'
+        cert = pem('CERTIFICATE', der_sequence(64))
+        line = ssh_public_line()
+        fails = {
+            'a password inside certificate markers': '-----BEGIN CERTIFICATE-----\nHunter2-correct horse\n'
+                                                     '-----END CERTIFICATE-----\n',
+            'base64 that is no DER': '-----BEGIN CERTIFICATE-----\nSHVudGVyMmNvcnJlY3Q=\n-----END CERTIFICATE-----\n',
+            'a DER sequence cut short': pem('CERTIFICATE', der_sequence(64)[:-3]),
+            'a PGP block that is no public key': pem('PGP PUBLIC KEY BLOCK', b'\xc5\x05hello'),
+            'a password in a comment': f'{line} {pw} and some more words of it\n',
+            'ssh options before the key': f'environment="GH_TOKEN={pw}" {line}\n',
+            'a password as the key': f'ssh-ed25519 SHVudGVyMmNvcnJlY3Q= x\n',
+            'a key of another type than it says': line.replace('ssh-ed25519', 'ssh-rsa', 1) + '\n',
+            # PR #240 fix 1 (security 3, correctness nit): each block read in full, its first inner element too.
+            'a PKCS#8 private key between PUBLIC KEY markers': pem(
+                'PUBLIC KEY', bytes.fromhex('30150201000410') + bytes(range(16))),
+            'an RSA private key between RSA PUBLIC KEY markers': pem(
+                'RSA PUBLIC KEY', der(0x30, b''.join(der(0x02, bytes([i + 1])) for i in range(9)))),
+            'an encrypted private key between PUBLIC KEY markers': pem(
+                'PUBLIC KEY', der(0x30, der(0x30, der(0x06, b'\x2a')) + der(0x04, bytes(range(16))))),
+            'a certificate whose inside is no DER': pem('CERTIFICATE', der(0x30, der(0x30, b'\x99' * 8) +
+                                                                         der(0x30, b'') + der(0x03, b'\x00'))),
+            'a PGP public key, then a secret key packet': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x05\x04abcd'
+                                                              b'\x95\x00\x05\x04abcd', blank=True),
+            'a PGP public key, then bytes left over': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x04\x04abcd', blank=True),
+            # PR #240 fix 1 (security 4): a known_hosts host field is 64 characters at most.
+            'a 300-character host before a key': f'{"h" * 300} {line}\n',
+            # PR #240 fix 2 (correctness 4): each host name 253 characters at most; a marker packet only as RFC 9580's.
+            'a 254-character host name in a list': f'a.example,{"h" * 254} {line}\n',
+            'a PGP marker packet that is not "PGP"': pem('PGP PUBLIC KEY BLOCK', b'\xca\x03XYZ\x99\x00\x05\x04abcd',
+                                                         blank=True),
+        }
+        for name, text in fails.items():
+            with self.subTest(name):
+                got = self.etc_secrets({'etc/environment': 'TLS_KEY_FILE=/etc/app/k.pem\n', 'etc/app/k.pem': text})
+                self.assertTrue(got.startswith('FAIL'), got)
+        passes = {
+            'certificates and a comment': '# the CA\n' + cert + cert,
+            'a PGP public key': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x05\x04abcd', blank=True),
+            'a PGP public key, a user id and a signature': pem(
+                'PGP PUBLIC KEY BLOCK', b'\x99\x00\x05\x04abcd\xcd\x03a@b\xc2\x02\x04\x00', blank=True),
+            'a public key': pem('PUBLIC KEY', der(0x30, der(0x30, der(0x06, b'\x2b\x65\x70')) +
+                                                 der(0x03, b'\x00' + bytes(range(32))))),
+            'an RSA public key': pem('RSA PUBLIC KEY', der(0x30, der(0x02, b'\x00\xc1' + bytes(63)) +
+                                                           der(0x02, b'\x01\x00\x01'))),
+            'a hashed known_hosts line': f'|1|{"A" * 27}=|{"B" * 27}= {line}\n',
+            'an ssh key with a short comment': f'{line} deploy@build-1\n',
+            'an ssh key with no comment': f'{line}\n',
+            # PR #240 fix 2 (correctness 4): a long known_hosts list (OpenSSH has no limit), RFC 9580's marker and
+            # padding packets
+            'a long known_hosts host list': f'{"build-1." + "a" * 60 + ".example.internal"},[2001:db8::1]:2222,'
+                                            f'{"h" * 253},192.0.2.1 {line}\n',
+            'a PGP public key with a marker and padding': pem(
+                'PGP PUBLIC KEY BLOCK', b'\xca\x03PGP\x99\x00\x05\x04abcd\xd5\x04\x01\x02\x03\x04', blank=True),
+        }
+        for name, text in passes.items():
+            with self.subTest(name):
+                got = self.etc_secrets({'etc/environment': 'TLS_KEY_FILE=/etc/app/k.pem\n', 'etc/app/k.pem': text})
+                self.assertTrue(got.startswith('PASS'), got)
 
     def test_linux_etc_secrets_advice_fits_the_file(self):
         """Issue #211: a file every login reads (/etc/environment, a shell's start file, fish's) cannot be made

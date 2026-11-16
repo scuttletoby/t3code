@@ -218,8 +218,9 @@ Two more things limit what a job can do:
   binds made outside `job_view`), so that none of the edits the scan cannot follow comes back
   with a moved pin unseen. A bind that `paths` did not make, or
   `PrivateDevices=` that is not yes, fails them, and a property they cannot
-  read fails them too. One rule for every folder on the way to a bound path:
-  only its owner may write it, or it is sticky; in a sticky folder others may
+  read fails them too. One rule for every folder on the way to a bound path,
+  `/` too: it is root's (or the launcher user's), and only its owner may write
+  it, or it is sticky; in a sticky folder others may
   write, the next folder on the way must be root's or the launcher user's; a
   symlink there must also be root's, in a folder of root's. Otherwise another
   user, or any member of the folder's group, could repoint the link, or swap a
@@ -482,8 +483,9 @@ chmod 600 /etc/fork-fleet/launch.conf
 # also through a symlink). A bind mount is not seen (it has no link to resolve): never bind-mount a data folder at
 # one of them, or at a folder above one (prune also deletes runner copies in WORK_ROOT). The hook's folder must be
 # root's and writable by root alone (start refuses a shared one such as /var/tmp), and every symlink on the way to
-# these paths root's, in a folder of root's; every folder on the way only its owner may write (or sticky, and then
-# the folder below it root's or the launcher user's; not group-writable), a plain folder as much as a link's.
+# these paths root's, in a folder of root's; every folder on the way (`/` too) root's, and only its owner may write
+# it (or sticky, and then the folder below it root's or the launcher user's; not group-writable), a plain folder as
+# much as a link's.
 # NET_BASE (10.204), RESOLV_CONF (/etc/fork-fleet/resolv.conf), TEMPLATE (/opt/fork-fleet/template/runner-template)
 # and RUNNER_MIN (none: the oldest runner version refresh may install): add a line only to change one (step 1b).
 # OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is
