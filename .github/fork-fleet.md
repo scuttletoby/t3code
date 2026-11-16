@@ -449,6 +449,7 @@ done
   files="fork-fleet.json:fork-fleet.json:644 scripts/fork-fleet.py:fork-fleet.py:644
          scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755
          scripts/fork-fleet-desk.py:fork-fleet-desk.py:644 scripts/fork-fleet-desk-wire.py:fork-fleet-desk-wire.py:644
+         scripts/fork-fleet-desk-seed.py:fork-fleet-desk-seed.py:644
          scripts/fork-fleet-refresh.service:fork-fleet-refresh.service:644
          scripts/fork-fleet-refresh.timer:fork-fleet-refresh.timer:644
          scripts/fork-fleet-job-paths.txt:fork-fleet-job-paths.txt:644"
@@ -684,6 +685,51 @@ already have:
 Bun, Node and Rust are installed per job by the setup actions, into the job's
 own home, which goes with its copy. Leave a few tens of GB of disk for
 `/var/lib/fork-fleet/runners`.
+
+#### Seeds (warm caches for a desk pool)
+
+A job's copy starts empty, so each job would download its tools and
+dependencies again. A desk pool may list **seeds** in its fleet config entry,
+ready-made caches the desktop keeps and its jobs start from:
+
+```json
+"seeds": [{"name": "gradle", "every_hours": 6, "max_age_hours": 72, "max_mb": 4096}]
+```
+
+`every_hours` is how often a desktop takes a new one, `max_age_hours` (at
+least `every_hours`) the age, from when it was made, at which it is dropped,
+`max_mb` its largest size (at most 16384). Nothing in the fleet makes a seed: on the always-on
+host the project's own timer or job writes a tar of a cache folder's contents
+to `/var/lib/fork-fleet/seed-files/POOL/NAME.tar` (a folder per pool, so two
+pools never share a file), by a temp file and a rename. A file changed in place
+while it is sent (size, mtime or ctime) is refused; one replaced by a rename while
+it is sent is fine (the old one is sent whole). A file dated more than five minutes in the future, older
+than `max_age_hours` or above `max_mb` is refused. Both folders and the files are
+root's (or the project's), readable by the desk-link user and writable by no one
+else (the owner itself is not checked, only that no one else may write); never
+put a secret in a seed: every job of the pool reads it. **Make a seed only from
+trusted code (the default branch), never in a job that runs pull request code:**
+every later job of the pool starts from it, so a poisoned seed reaches them all.
+A file replaced by a rename while another hard link to the old one stays (a
+backup copy, say) is still "in place" for this check and is refused (exit 4):
+keep no second link to a seed file.
+
+The desktop asks for them with the desk link's key, in an ssh session of its
+own: the same forced command sends every command that starts with `seed` to
+`fork-fleet-desk-seed.py` (which step 3 installs; its header has the exit
+codes), never to a session. It answers `seeds` with the pool's list and
+`seed NAME` with that one file, only a name of that list, and a trailer with its
+size and SHA-256; anything else is refused. One stream per pool at a time; a
+desktop that takes less than 64 KiB in two minutes, or not the whole file within
+ten minutes plus one second per 256 KiB, is cut off and the next one may go.
+So a link must carry at least about 256 KiB a second (2 Mbit/s) for a large
+seed: at 100 KiB a second, a seed above about 96 MiB is always cut off. Size
+`max_mb` to the desktop's link. A desktop just fast enough not to stall can hold
+its pool's lock for a long time (16 GiB at 256 KiB a second is about 18 hours);
+only that pool's own seed streams wait, nothing else. The host does not limit
+how often a desktop asks: the key belongs to the pool's own desktop, one stream
+per pool runs at a time, and each is cut off at its deadline, so the most it
+costs is one file's reads and upload at a time.
 
 ## Owner steps on the repository
 
