@@ -404,6 +404,28 @@ describe("a project save keeps the fork keys its entry leaves out", () => {
     expect(next.projectSettingsOverrides).toEqual({ [other]: { defaultAutoPull: false } });
   });
 
+  it("does not keep a stored blank MCP key an older client left out", () => {
+    // A hand edit's `""` or `null` reads as `""` (not set); it is not carried into the next save.
+    const s = {
+      ...base,
+      projectSettingsOverrides: { [project]: { mcpProfile: "", defaultAutoPull: true } },
+    } as ServerSettings;
+    const patch = { projectSettingsOverrides: { [project]: { defaultAutoPull: false } } };
+    const next = save(s, patch);
+    expect(next.projectSettingsOverrides[project]).toEqual({ defaultAutoPull: false });
+    expect(save(next, patch)).toEqual(next);
+    // Only the blank key goes: a set one beside it is still kept.
+    const mixed = {
+      ...base,
+      projectSettingsOverrides: { [project]: { mcpProfile: "", mcpSubagentProfile: "lean" } },
+    } as ServerSettings;
+    expect(
+      save(mixed, { projectSettingsOverrides: { [project]: {} } }).projectSettingsOverrides[
+        project
+      ],
+    ).toEqual({ mcpSubagentProfile: "lean" });
+  });
+
   it("returns the settings untouched when no project entry leaves a stored key out", () => {
     const patch = { enableAgentBrowserAccess: false };
     const next = applyServerSettingsPatch(base, patch);
@@ -464,6 +486,23 @@ describe("clearing a project's MCP profile (reset to inherited)", () => {
         },
       }).projectSettingsOverrides,
     ).toEqual({});
+  });
+
+  it("does not send a stored blank MCP key back when clearing it", () => {
+    const blank = {
+      ...base,
+      projectSettingsOverrides: { [p1]: { mcpProfile: "", defaultAutoPull: true } },
+    } as ServerSettings;
+    // Nothing to clear: the key is left out, and the server keeps a blank value no longer.
+    expect(clearProjectSettingsOverridesWithForkKeys(blank, p1, ["mcpProfile"])).toEqual({
+      defaultAutoPull: true,
+    });
+    const patch = {
+      projectSettingsOverrides: {
+        [p1]: clearProjectSettingsOverridesWithForkKeys(blank, p1, ["mcpProfile"]),
+      },
+    };
+    expect(save(blank, patch).projectSettingsOverrides[p1]).toEqual({ defaultAutoPull: true });
   });
 
   it("is upstream's clear helper when no stored MCP key is cleared", () => {

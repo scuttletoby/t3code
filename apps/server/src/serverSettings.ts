@@ -54,12 +54,9 @@ import {
   fallbackTextGenerationModelSelection,
   isModelSelectionProviderEnabled,
 } from "@t3tools/shared/serverSettings";
-// Fork: the save check, and upstream's patch that keeps a project's MCP profile a client left out.
-import {
-  ForkSettingsWriteError,
-  forkSettingsWriteProblem,
-} from "@t3tools/shared/forkSettingsPatch";
+// Fork: upstream's patch keeping a project's MCP profile a client left out, and the save check.
 import { applyServerSettingsPatchKeepingForkProjectKeys as applyServerSettingsPatch } from "./fork/serverSettingsPatch.ts";
+import * as ForkSettingsWrite from "./fork/serverSettingsWriteCheck.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
@@ -236,24 +233,6 @@ function ensureSecretProviderWritesAllowed(
   return Effect.void;
 }
 
-// Fork: refuses a fork setting's save that could not apply; the cause says why and how to fix it.
-function ensureForkSettingsWriteAllowed(
-  current: ServerSettings,
-  next: ServerSettings,
-  settingsPath: string,
-): Effect.Effect<void, ServerSettingsError> {
-  const problem = forkSettingsWriteProblem(current, next);
-  return problem === undefined
-    ? Effect.void
-    : Effect.fail(
-        new ServerSettingsError({
-          settingsPath,
-          operation: "normalize",
-          cause: new ForkSettingsWriteError({ problem }),
-        }),
-      );
-}
-
 function ensureProviderInstanceMutationAllowed(
   settings: ServerSettings,
   mutation: ProviderInstanceMutation,
@@ -336,12 +315,7 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
   ): Effect.Effect<ServerSettings, ServerSettingsError> =>
     writeSemaphore.withPermits(1)(
       Ref.get(currentSettingsRef).pipe(
-        // Fork: refuses a fork setting's save that could not apply, as the real layer does.
-        Effect.flatMap((current) =>
-          update(current).pipe(
-            Effect.tap((next) => ensureForkSettingsWriteAllowed(current, next, "test settings")),
-          ),
-        ),
+        Effect.flatMap(ForkSettingsWrite.withCheck(update, "test settings")), // Fork: save check
         Effect.flatMap(normalizeServerSettings),
         Effect.tap((nextSettings) => Ref.set(currentSettingsRef, nextSettings)),
         Effect.map(resolveTextGenerationProvider),
@@ -1254,7 +1228,7 @@ const make = Effect.gen(function* () {
         // An older client echoes a reference as the redacted marker; restore it before vetting so
         // a removed provider's reference is cleared below rather than restored by persistence.
         const updated = withEchoedSecretReferences(current, yield* update(current));
-        yield* ensureForkSettingsWriteAllowed(current, updated, settingsPath); // Fork: save check
+        yield* ForkSettingsWrite.check(current, updated, settingsPath); // Fork: save check
         // Vet before secrets: a variable the policy hides from clients is not one they removed.
         const vetted = managed.vetWrite(current, yield* normalizeServerSettings(updated), patch);
         if (vetted._tag === "Locked") {

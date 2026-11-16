@@ -97,7 +97,8 @@ const KEPT_KEYS: ReadonlyArray<string> = FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT;
 /**
  * `next` with each {@link FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT} key a patched project entry leaves
  * out kept as stored, so an older client's whole-entry save cannot widen the project. A removed
- * project keeps nothing; `""` clears the key (not stored; an entry left empty is dropped).
+ * project keeps nothing, nor does a stored blank value; `""` clears the key (not stored; an entry
+ * left empty is dropped).
  */
 export function keepLeftOutForkProjectKeys(
   current: ServerSettings,
@@ -115,7 +116,8 @@ export function keepLeftOutForkProjectKeys(
     for (const key of FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT) {
       const value = stored?.[key];
       if (!Object.hasOwn(entry, key)) {
-        if (value !== undefined) kept[key] = value;
+        // A blank value (a hand edit's `""` or `null`) means not set: nothing to keep.
+        if (value !== undefined && value.trim() !== "") kept[key] = value;
       } else if (entry[key] === "") {
         cleared.push(key);
       }
@@ -150,7 +152,10 @@ export function clearProjectSettingsOverridesWithForkKeys(
   // Everything cleared: upstream removes the project's entry (`null`), which keeps nothing.
   if (Object.keys(next).length === 0) return null;
   for (const key of keys) {
-    if (KEPT_KEYS.includes(key) && current[key] !== undefined) next[key] = "";
+    const stored = current[key];
+    if (KEPT_KEYS.includes(key) && typeof stored === "string" && stored.trim() !== "") {
+      next[key] = "";
+    }
   }
   return next as ProjectSettingsOverrides;
 }
