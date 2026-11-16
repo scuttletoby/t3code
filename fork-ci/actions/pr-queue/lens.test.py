@@ -528,6 +528,10 @@ class Config(unittest.TestCase):
     def test_every_problem_is_named_at_once(self):
         self.refused('merge_method', 'delete_branch', merge_method='fast-forward', delete_branch='yes')
 
+    def test_delete_branch_is_optional_and_never_turns_deletion_on(self):   # old configs stay valid (#stacked PRs)
+        self.assertFalse(self.parse(delete_branch=...).delete_branch)
+        self.assertTrue(self.parse(delete_branch=True).delete_branch, 'read, so a project can see it is ignored')
+
     def test_the_override_needs_a_write_access_association(self):
         self.refused('override', override={'prefix': 'x', 'author_association': 'CONTRIBUTOR'})
         self.refused('override', override={'prefix': '', 'author_association': 'OWNER'})
