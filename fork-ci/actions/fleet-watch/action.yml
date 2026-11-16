@@ -3,9 +3,10 @@ description: >-
   Re-runs, once, the failed jobs of a run whose job on a dispatcher pool (a machine that comes and goes) was cut off:
   its runner stopped or lost its network, was killed for memory, its gate refused the job, or the job waited too long
   and never started. The re-run's jobs take fleet-route's fallback (an always-on pool or GitHub-hosted). Also cancels a
-  run whose job waits too long for a dispatcher pool (sweep), and tells a red-run report whether a re-run is coming
-  (pending). Only runs of the config's trusted workflows, repository and actors; GitHub's record of each run is the
-  only state. Needs a token with actions write (the job's GITHUB_TOKEN: a re-run it starts is never re-run again).
+  run whose job waits too long for a dispatcher pool and lists the red attempts its re-runs ended in (sweep), and
+  tells a red-run report, after the watch, whether a newer attempt decides (pending). Only runs of the config's
+  trusted workflows, repository and actors; GitHub's record of each run is the only state. Needs a token with actions
+  write (the job's GITHUB_TOKEN: a re-run it starts is never re-run again).
 inputs:
   config:
     description: The project's fleet config (fleet-route README, "Config"), a path in the checkout of the default branch.
@@ -22,9 +23,11 @@ inputs:
     required: false
     default: ""
   vars:
-    description: The repository variables as a JSON object, ${{ toJSON(vars) }} (the setting decides how long a job may wait).
+    description: >-
+      watch and sweep - the repository variables as a JSON object, ${{ toJSON(vars) }} (the setting decides how long a
+      job may wait). Missing or not a JSON object fails the step; an unset setting is auto.
     required: false
-    default: "{}"
+    default: ""
   token:
     description: A token with actions write on this repository. Keep the default; a person's token would make its re-runs trusted.
     required: false
@@ -35,9 +38,15 @@ outputs:
     value: ${{ steps.watch.outputs.rerun }}
   pending:
     description: >-
-      pending - true only when this red attempt will be re-run (or a newer attempt runs); false or empty (the step
-      failed) means report the red. Test it with == 'true'.
+      pending - true only when a newer attempt of the run is there (ask after the watch step); false or empty (the
+      step failed) means report the red. Test it with == 'true'.
     value: ${{ steps.watch.outputs.pending }}
+  reds:
+    description: >-
+      sweep - a JSON list of {"run_id", "attempt"}: red attempts of the last hour that a re-run of this action ended
+      in, for the red-run report (a re-run started with GITHUB_TOKEN may fire no workflow_run). Listed by each sweep
+      of that hour: report each run id and attempt once.
+    value: ${{ steps.watch.outputs.reds }}
 runs:
   using: composite
   steps:

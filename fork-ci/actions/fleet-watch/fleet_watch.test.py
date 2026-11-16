@@ -2,7 +2,7 @@
 """Tests of fleet_watch.py (watch, sweep, pending) against a fake of GitHub's API, and of action.yml's step run as a
 runner runs it, with no token. Run: python3 <this>."""
 import calendar, contextlib, importlib.util, io, json, os, re, subprocess, sys, tempfile, time, unittest
-import urllib.error, urllib.request
+import urllib.error, urllib.parse, urllib.request
 from unittest import mock
 
 import yaml
@@ -78,7 +78,13 @@ class FakeGitHub:
         return [(m, p) for m, p in self.calls if m != 'GET']
 
     def pages(self, path, key, most=10):
-        return self.call(f'{path}{"&" if "?" in path else "?"}per_page=100&page=1')[key]
+        out = []
+        for page in range(1, most + 1):
+            got = self.call(f'{path}{"&" if "?" in path else "?"}per_page=100&page={page}')[key]
+            out += got
+            if len(got) < 100:
+                break
+        return out
 
     def log(self, job_id):
         self.calls.append(('GET', f'actions/jobs/{job_id}/logs'))
@@ -94,20 +100,29 @@ class FakeGitHub:
                 raise error
         if m := re.fullmatch(r'actions/runs/(\d+)', path):
             return dict(self.runs[int(m[1])])
-        if m := re.fullmatch(r'actions/runs/(\d+)/attempts/(\d+)/jobs\?per_page=100&page=1', path):
-            return {'jobs': self.jobs.get((int(m[1]), int(m[2])), [])}
+        if m := re.fullmatch(r'actions/runs/(\d+)/attempts/(\d+)/jobs\?per_page=100&page=(\d+)', path):
+            page = int(m[3])
+            return {'jobs': self.jobs.get((int(m[1]), int(m[2])), [])[(page - 1) * 100:page * 100]}
         if m := re.fullmatch(r'actions/workflows/([\w.-]+)/runs\?(.*)', path):
             q = dict(x.split('=', 1) for x in m[2].split('&'))
+            since = urllib.parse.unquote(q.get('created', '')).removeprefix('>=')
             got = [r for r in sorted(self.runs.values(), key=lambda r: -r['id']) if r['path'].endswith('/' + m[1])
                    and (r['head_branch'] == q.get('branch', r['head_branch']))
-                   and r['event'] == q.get('event', r['event']) and r['status'] == q.get('status', r['status'])]
-            return {'workflow_runs': got[:int(q['per_page'])]}
+                   and r['event'] == q.get('event', r['event']) and r['status'] == q.get('status', r['status'])
+                   and r['created_at'] >= since]
+            per, page = int(q['per_page']), int(q.get('page', 1))
+            return {'workflow_runs': got[(page - 1) * per:page * per]}
         run = self.runs[int(re.fullmatch(r'actions/runs/(\d+)/[a-z-]+', path)[1])]
         if path.endswith('/rerun-failed-jobs') and method == 'POST':
             if run['status'] != 'completed':
                 raise http_error(403)
+            old = self.jobs.get((run['id'], run['run_attempt']), [])
             run.update(run_attempt=run['run_attempt'] + 1, triggering_actor={'login': BOT}, status='queued',
                        conclusion=None)
+            # GitHub's new attempt: the red jobs again, queued on the fallback; the jobs that passed, as they were.
+            self.jobs[(run['id'], run['run_attempt'])] = [
+                dict(j, id=j['id'] + 1000, labels=list(HOSTED), status='queued', runner_name=None, conclusion=None,
+                     completed_at=None, steps=[]) if j['conclusion'] != 'success' else dict(j) for j in old]
             return {}
         if path.endswith('/cancel') and method == 'POST':
             if run['status'] == 'completed':
@@ -147,8 +162,8 @@ class Watch(unittest.TestCase):
         self.assertEqual(gh.writes(), [('POST', 'actions/runs/5/rerun-failed-jobs')])
         self.assertIn('no failed step', out)
         # The re-run is the bot's: it ends red again, and a second watch (or the same event again) leaves it.
+        self.assertEqual([j['status'] for j in gh.jobs[(5, 2)]], ['queued', 'completed'])
         gh.runs[5].update(status='completed', conclusion='failure')
-        gh.jobs[(5, 2)] = gh.jobs[(5, 1)]
         got, out = watch(gh)
         self.assertFalse(got)
         self.assertEqual(len(gh.writes()), 1)
@@ -176,7 +191,8 @@ class Watch(unittest.TestCase):
             'short wait': (dict(runner=None, conclusion='cancelled', completed=T0 + 599, steps=()), 'cancelled'),
             'vm, fleet mode': (dict(runner=None, conclusion='cancelled', completed=T0 + 3600, steps=()), 'cancelled'),
             'cancelled while it ran': (dict(conclusion='cancelled'), 'cancelled'),
-            'run cancelled': (dict(conclusion='failure', steps=()), 'cancelled'),
+            'run cancelled': (dict(conclusion='cancelled', steps=[{'name': 'Build', 'conclusion': 'cancelled'}]),
+                              'cancelled'),
         }
         for case, (kw, run_conclusion) in cases.items():
             with self.subTest(case):
@@ -294,15 +310,71 @@ class Watch(unittest.TestCase):
         gh = FakeGitHub()
         cut_run(gh)
         run = gh.call('actions/runs/5')
-        quiet(fw.rerun, gh, run, [])
-        got, out = quiet(fw.rerun, gh, run, [])
+        quiet(fw.rerun, CONFIG, gh, run, [])
+        got, out = quiet(fw.rerun, CONFIG, gh, run, [])
+        self.assertFalse(got)
+        self.assertIn('attempt 2 started since it was read', out)
+        self.assertEqual(len(gh.writes()), 1)
+
+        class Late(FakeGitHub):   # the other re-run lands between the read and the POST: GitHub refuses this one
+            def call(self, path, method='GET', data=None):
+                if method == 'POST' and self.runs[5]['run_attempt'] == 1:
+                    super().call(path, method, data)
+                    raise http_error(403)
+                return super().call(path, method, data)
+        gh = Late()
+        cut_run(gh)
+        got, out = quiet(fw.rerun, CONFIG, gh, gh.call('actions/runs/5'), [])
         self.assertFalse(got)
         self.assertIn('already going', out)
         gh = FakeGitHub()
         cut_run(gh)
         gh.trouble = [(r'POST .*/rerun-failed-jobs', http_error(403))]
         with self.assertRaises(urllib.error.HTTPError):
-            quiet(fw.rerun, gh, gh.call('actions/runs/5'), [])
+            quiet(fw.rerun, CONFIG, gh, gh.call('actions/runs/5'), [])
+
+    def test_the_run_is_read_again_just_before_the_re_run(self):
+        # A bot attempt 2 that ended red while this one planned (here: at its newest-run check) gets no attempt 3.
+        class Race(FakeGitHub):
+            def call(self, path, method='GET', data=None):
+                if method == 'GET' and '?branch=' in path and self.runs[5]['run_attempt'] == 1:
+                    self.runs[5] = dict(self.runs[5], run_attempt=2, triggering_actor={'login': BOT},
+                                        status='completed', conclusion='failure')
+                return super().call(path, method, data)
+        ways = {'watch': lambda gh: watch(gh), 'sweep': lambda gh: quiet(fw.sweep, CONFIG, gh, 'auto', gh.now, [])}
+        for case, run in ways.items():
+            with self.subTest(case):
+                gh = Race()
+                cut_run(gh)
+                run(gh)
+                self.assertEqual(gh.runs[5]['run_attempt'], 2)
+                self.assertEqual(gh.writes(), [])
+
+    def test_a_job_that_hit_its_own_timeout_is_its_own_failure(self):
+        gh = FakeGitHub()
+        gh.add(a_run(), a_job(51, DESK, conclusion='timed_out', steps=[{'name': 'Test', 'conclusion': 'cancelled'}]))
+        got, out = watch(gh)
+        self.assertFalse(got)
+        self.assertIn('failed by itself', out)
+        self.assertEqual(gh.writes(), [])
+
+    def test_a_job_that_failed_by_itself_in_a_run_the_sweep_cancelled_keeps_the_red(self):
+        gh = FakeGitHub()
+        gh.add(a_run(conclusion='cancelled'),
+               a_job(51, DESK, runner=None, conclusion='cancelled', completed=T0 + 700, steps=()),
+               a_job(52, HOSTED, name='lint', conclusion='failure', steps=failed_in('Lint')))
+        got, out = watch(gh)
+        self.assertFalse(got)
+        self.assertIn('lint failed by itself', out)
+        self.assertEqual(gh.writes(), [])
+
+    def test_a_run_with_more_jobs_than_are_read_is_unsure(self):
+        gh = FakeGitHub()
+        gh.add(a_run(), *[a_job(1000 + i, HOSTED) for i in range(300)],
+               a_job(51, DESK, conclusion='failure', steps=()))
+        got, out = watch(gh)
+        self.assertFalse(got)
+        self.assertIn('not all read', out)
 
     def test_a_stop_half_way_is_finished_by_the_next_watch(self):
         gh = FakeGitHub()
@@ -393,6 +465,59 @@ class Sweep(unittest.TestCase):
         self.assertIn('the next sweep tries again', out)
         self.assertEqual(gh.writes(), [('POST', 'actions/runs/5/rerun-failed-jobs')])
 
+    def test_catch_up_re_runs_only_what_the_jobs_alone_decide(self):
+        gh = FakeGitHub()
+        gh.add(a_run(), a_job(51, DESK, conclusion='failure', steps=failed_in('Build')))
+        gh.logs[51] = '##[error]Process completed with exit code 137.'
+        _, out, _ = self.sweep(gh)
+        self.assertEqual(gh.writes(), [])
+        self.assertNotIn(('GET', 'actions/jobs/51/logs'), gh.calls)
+        self.assertIn('left to its watch', out)
+
+    def test_a_run_that_changed_since_it_was_listed_is_not_cancelled(self):
+        class Race(FakeGitHub):   # a person re-runs it while the sweep reads its jobs
+            def call(self, path, method='GET', data=None):
+                if '/attempts/1/jobs' in path:
+                    self.runs[5] = dict(self.runs[5], run_attempt=2)
+                    self.jobs[(5, 2)] = []
+                return super().call(path, method, data)
+        gh = Race(now=T0 + 600)
+        self.waiting(gh)
+        self.sweep(gh)
+        self.assertEqual(gh.writes(), [])
+
+    def test_red_attempts_of_its_own_re_runs_are_listed_for_the_report(self):
+        gh = FakeGitHub(now=T0 + 1000)
+        cut_run(gh)
+        self.sweep(gh)   # catch-up: attempt 2, the bot's
+        gh.runs[5].update(status='completed', conclusion='failure', updated_at=iso(T0 + 990))
+        reds = []
+        quiet(fw.sweep, CONFIG, gh, 'auto', gh.now, [], reds)
+        self.assertEqual(reds, [{'run_id': 5, 'attempt': 2}])
+        self.assertEqual(len(gh.writes()), 1)   # and it is never re-run again
+        cases = {
+            'an hour later': (dict(), gh.now + 3600),
+            'passed': (dict(conclusion='success'), gh.now),
+            'a person re-ran it': (dict(triggering_actor={'login': OWNER}), gh.now),
+            'other branch': (dict(head_branch='topic'), gh.now),
+        }
+        for case, (change, now) in cases.items():
+            with self.subTest(case):
+                other = FakeGitHub(now=now)
+                other.add(dict(gh.runs[5], **change))
+                reds = []
+                quiet(fw.sweep, CONFIG, other, 'auto', now, [], reds)
+                self.assertEqual(reds, [])
+
+    def test_each_sweep_starts_at_another_workflow(self):
+        cfg = dict(CONFIG, trusted=dict(CONFIG['trusted'], workflows=[CI, '.github/workflows/other.yml']))
+        firsts = set()
+        for ms in range(2):
+            gh = FakeGitHub()
+            quiet(fw.sweep, cfg, gh, 'auto', T0 + ms / 1000, [])
+            firsts.add(gh.calls[0][1].split('/')[2])
+        self.assertEqual(firsts, {'ci.yml', 'other.yml'})
+
     def test_an_empty_repository_is_quiet(self):
         gh = FakeGitHub()
         self.assertEqual(self.sweep(gh)[0], 0)
@@ -433,12 +558,12 @@ class Budget(unittest.TestCase):
 
 class Pending(unittest.TestCase):
     def pending(self, gh, attempt=1):
-        return quiet(fw.pending, CONFIG, gh, 5, attempt, 'auto', gh.now)[0]
+        return quiet(fw.pending, gh, 5, attempt)[0]
 
-    def test_a_cut_off_attempt_is_pending_until_its_re_run_decides(self):
+    def test_a_cut_off_attempt_is_pending_once_its_re_run_is_there(self):
         gh = FakeGitHub()
         cut_run(gh)
-        self.assertEqual(self.pending(gh)[0], True)
+        self.assertEqual(self.pending(gh)[0], False)   # asked before the watch: the red is reported
         watch(gh)
         self.assertEqual(self.pending(gh)[0], True)   # attempt 2 runs: it decides
         gh.runs[5].update(status='completed', conclusion='failure')
@@ -457,8 +582,29 @@ class Pending(unittest.TestCase):
             with self.subTest(case):
                 gh = FakeGitHub()
                 make(gh)
+                watch(gh)
                 self.assertEqual(self.pending(gh)[0], False)
-                self.assertEqual(gh.writes(), [])
+                self.assertEqual(len(gh.writes()), 0)
+
+    def test_pending_and_watch_agree_whatever_the_mode(self):
+        # A vm job cancelled after 700 s: auto would re-run it, fleet mode (the watch's setting) does not.
+        for mode in ('auto', 'fleet'):
+            with self.subTest(mode):
+                gh = FakeGitHub()
+                gh.add(a_run(conclusion='cancelled'),
+                       a_job(51, VM, runner=None, conclusion='cancelled', completed=T0 + 700, steps=()))
+                rerun = watch(gh, mode=mode)[0]
+                self.assertEqual(self.pending(gh)[0], rerun)
+
+    def test_a_refused_re_run_is_not_pending(self):
+        for code in (403, 422, 502):
+            with self.subTest(code):
+                gh = FakeGitHub()
+                cut_run(gh)
+                gh.trouble.append((r'POST actions/runs/5/rerun-failed-jobs', http_error(code)))
+                with self.assertRaises(urllib.error.HTTPError):
+                    watch(gh)
+                self.assertEqual(self.pending(gh)[0], False)
 
 
 class Config(unittest.TestCase):
@@ -510,19 +656,42 @@ class Action(unittest.TestCase):
     def test_main_writes_its_output(self):
         gh = FakeGitHub()
         cut_run(gh)
-        code, _ = quiet(fw.main, ['--config', self.config, 'pending', '--run-id', '5', '--attempt', '1'],
-                        {'GITHUB_OUTPUT': self.output}, gh, gh.now)
+        env = {'GITHUB_OUTPUT': self.output, 'FLEET_VARS': '{}'}
+        code, _ = quiet(fw.main, ['--config', self.config, 'watch', '--run-id', '5'], env, gh, gh.now)
         self.assertEqual(code, 0)
-        code, _ = quiet(fw.main, ['--config', self.config, 'watch', '--run-id', '5'], {'GITHUB_OUTPUT': self.output},
-                        gh, gh.now)
+        code, _ = quiet(fw.main, ['--config', self.config, 'pending', '--run-id', '5', '--attempt', '1'], env, gh,
+                        gh.now)
+        self.assertEqual(code, 0)
+        gh.runs[5].update(status='completed', conclusion='failure')
+        code, _ = quiet(fw.main, ['--config', self.config, 'sweep'], env, gh, gh.now)
         with open(self.output) as f:
-            self.assertEqual(f.read(), 'pending=true\nrerun=true\n')
+            self.assertEqual(f.read(), 'rerun=true\npending=true\nreds=[{"run_id":5,"attempt":2}]\n')
+
+    def test_watch_and_sweep_refuse_missing_or_garbled_vars(self):
+        cases = {'missing': '', 'not json': '{x', 'not an object': '[]', 'not a mode': '{"PROJ_RUNNERS": "flet"}'}
+        for verb in ('watch', 'sweep'):
+            for case, raw in cases.items():
+                with self.subTest(verb=verb, case=case):
+                    gh = FakeGitHub()
+                    cut_run(gh)
+                    with self.assertRaises(ValueError):
+                        quiet(fw.main, ['--config', self.config, verb, '--run-id', '5'],
+                              {'GITHUB_OUTPUT': self.output, 'FLEET_VARS': raw}, gh, gh.now)
+                    self.assertEqual(gh.calls, [])
+                    got = self.run_step(verb=verb, vars=raw, **{'run-id': '5'})
+                    self.assertNotEqual(got.returncode, 0)
+                    self.assertRegex(got.stdout, r'::error::fleet-watch: ValueError: .*(vars input|flet)')
 
     def test_the_example_caller_asks_for_actions_write_only(self):
         with open(os.path.join(HERE, 'fleet-watch-caller.example.yml')) as f:
             workflow = yaml.safe_load(f)
         self.assertEqual(workflow['permissions'], {})
         self.assertEqual(workflow['jobs']['watch']['permissions'], {'actions': 'write', 'contents': 'read'})
+        steps = workflow['jobs']['watch']['steps']
+        self.assertIs(steps[0]['with']['persist-credentials'], False)
+        uses = [s.get('with', {}).get('verb') for s in steps if 'fleet-watch' in (s.get('uses') or '')]
+        self.assertEqual(uses[:2], [steps[1]['with']['verb'], 'pending'])   # pending is asked after the watch
+        self.assertEqual(steps[1]['with']['vars'], '${{ toJSON(vars) }}')
 
 
 if __name__ == '__main__':

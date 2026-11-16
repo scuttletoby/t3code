@@ -29,9 +29,31 @@ jobs:
         with:
           sparse-checkout: .github/fleet.json
           sparse-checkout-cone-mode: false
-      - uses: scuttletoby/t3code/fork-ci/actions/fleet-watch@<release sha of ci/vN> # ci/vN
+          persist-credentials: false
+      - id: watch
+        uses: scuttletoby/t3code/fork-ci/actions/fleet-watch@<release sha of ci/vN> # ci/vN
         with:
           config: .github/fleet.json
           verb: ${{ github.event_name == 'schedule' && 'sweep' || 'watch' }}
           run-id: ${{ github.event.workflow_run.id }}
           vars: ${{ toJSON(vars) }}
+      # Optional: a red-run report (for example, one that files an issue when the default branch goes red). Asked
+      # after the watch step, so a re-run it started is there; a re-run it could not start is not pending.
+      - id: pending
+        if: always() && github.event_name == 'workflow_run'
+        uses: scuttletoby/t3code/fork-ci/actions/fleet-watch@<release sha of ci/vN> # ci/vN
+        continue-on-error: true # a failed step leaves pending empty: report the red
+        with:
+          config: .github/fleet.json
+          verb: pending
+          run-id: ${{ github.event.workflow_run.id }}
+          attempt: ${{ github.event.workflow_run.run_attempt }}
+      - if: always() && github.event_name == 'workflow_run' && steps.pending.outputs.pending != 'true'
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: REPORT RED COMMAND "$RUN_ID" "$ATTEMPT" # once per run id and attempt
+      - if: always() && github.event_name == 'schedule' && steps.watch.outputs.reds != '' && steps.watch.outputs.reds != '[]'
+        env:
+          REDS: ${{ steps.watch.outputs.reds }} # [{"run_id": N, "attempt": A}, ...]
+        run: REPORT RED ATTEMPTS COMMAND "$REDS" # once per run id and attempt: the sweeps of an hour list it again

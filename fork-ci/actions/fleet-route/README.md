@@ -204,7 +204,7 @@ for pull requests ready for review.
 | `reruns`               | no                     | a dispatcher pool where a trusted person's re-run of failed jobs may go (below)                                                          |
 | `retired_labels`       | no                     | old pool labels (keep a label here for a week after changing it): never `hosted` or a static pool's label                                |
 | `stuck_seconds`        | yes                    | auto: how long a fleet job may wait before the watch cancels its run (the sweep re-runs it)                                              |
-| `fleet_stuck_seconds`  | yes                    | the same in fleet mode (cancelled with an error, not re-run)                                                                             |
+| `fleet_stuck_seconds`  | yes                    | the same in fleet mode (cancelled with an error; the sweep re-runs nothing, fleet-watch re-runs it once on `fallback`)                   |
 | `beacon_fresh_seconds` | with a dispatcher pool | a heartbeat older than this counts no free slot, with an `::error::`                                                                     |
 | `dispatch`             | with a dispatcher pool | the dispatcher's pace: `every_seconds`, `beacon_seconds`, `idle_passes`                                                                  |
 
