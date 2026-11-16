@@ -688,6 +688,7 @@ def command_secret(value, unit=False, depth=0):
     try:
         lex = shlex.shlex(value, posix=True, punctuation_chars=';&|()<>')
         lex.whitespace_split = True
+        lex.commenters = ''   # a # inside a word is no comment to a shell (cat /x#y); a real one is read too
         words = list(lex)
     except ValueError:
         raise Unsure('its quotes do not close') from None
@@ -1233,16 +1234,30 @@ def token_file(path):
 
 
 def etc_secrets_wall():
-    """Jobs see this host's /etc (the launcher's list has it) and /usr: no secret may be in either that they can
-    read. A credentials file (smbcredentials, *.cred, ...) readable by others; a line of a mount table (MOUNT_TABLES:
-    fstab, autofs maps, systemd mount and automount units and their drop-ins) with password= or pass=, or with a
-    credentials= or cred= file others can read; a secret in a login or session environment file (ENV_FILES) or a
-    service's (SERVICE_FILES: by name and value, by a token's shape, or a URL's password); a secret in a systemd unit
-    (UNIT_DIRS: Environment=, SetCredential=, or a LoadCredential= or EnvironmentFile= others can read); a credential
-    in systemd's credential stores (CREDSTORES) others can read; a known token's shape in any other file of /etc. A
-    file only its owner reads is fine. The advice fits the file (ADVICE): a file every login reads cannot be made
-    private, so its secret must move out. Not covered: see ENV_FILES' comment; a
-    secret with no known name or shape in some other file of /etc; a unit's secret on its command line (ExecStart=)."""
+    """A lint, not a proof (PR #240 round 4): no secret found in the common places of /etc and /usr, which jobs see
+    (the launcher's list has them). It reads files and guesses which hold a secret; it cannot prove that no file a job
+    can read holds one (a *_COMMAND is a program; which file it reads depends on bash and every program it calls). The
+    real fix is to show jobs only an allow list of /etc (issue #243); the open forms below are closed by that design,
+    not by more parsing here. What it finds: a credentials file (smbcredentials, *.cred, ...) readable by others; a
+    line of a mount table (MOUNT_TABLES: fstab, autofs maps, systemd mount and automount units and their drop-ins)
+    with password= or pass=, or with a credentials= or cred= file others can read; a secret in a login or session
+    environment file (ENV_FILES) or a service's (SERVICE_FILES: by name and value, by a token's shape, or a URL's
+    password); a secret in a systemd unit (UNIT_DIRS: Environment=, SetCredential=, or a LoadCredential= or
+    EnvironmentFile= others can read); a credential in systemd's credential stores (CREDSTORES) others can read; a
+    known token's shape in any other file of /etc. A file only its owner reads is fine. The advice fits the file
+    (ADVICE): a file every login reads cannot be made private, so its secret must move out.
+    Known open forms (each PASSes with a secret a job can read; see ENV_FILES' comment too):
+    - BORG_PASSCOMMAND="cat <readable file>" (PASSCOMMAND is one word, no secret word); a secret under a name with
+      no secret word; a readable password file nothing points at;
+    - a password in /etc/cron.d or /etc/crontab, in a script under /usr/local/bin, or on a unit's ExecStart= line;
+    - EnvironmentFile= and /etc/default files are read with shell regexes, not systemd's env-file parser (blanks
+      around =, unquoted blanks, escapes, quotes mid-value, continued lines);
+    - login files are read with regexes too: "pw" quoted mid-path, p\\w, a value continued with \\, a quoted value or
+      command over several lines, %xx (curl decodes file:///etc/restic/p%77), a newline in sh -c that hides a cd;
+    - unit settings that change the unit's view of files (BindPaths=, BindReadOnlyPaths=, RootDirectory=,
+      RootImage=, TemporaryFileSystem=, MountImages=); a % specifier inside an Environment= NAME;
+    - a folder read recursively (grep -r /etc/restic); a file the job reads through its group or an ACL
+      (others_read looks only at the other bits)."""
     found, plain = [], []
     for folder, dirs, files in os.walk(ROOT + '/etc'):
         dirs[:] = [d for d in dirs if others_read(os.path.join(folder, d)[len(ROOT):], 0o001)]   # else no entry
@@ -1293,8 +1308,8 @@ WALLS = [
                'mount', mounts_wall),
     ('job-units', 'no systemd drop-in nor launcher setting changes the job units the launcher asks for',
      job_units_wall),
-    ('etc-secrets', 'no password for a share, nor a secret in the login environment or a unit, in /etc or /usr '
-                    'that jobs can read', etc_secrets_wall),
+    ('etc-secrets', 'no secret found in the common places of /etc and /usr, which jobs see (a lint, not a proof: '
+                    'issue #243)', etc_secrets_wall),
 ]
 
 

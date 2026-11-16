@@ -1182,6 +1182,22 @@ class EveryWallsFile(Case):
                                         '[Service]\nEnvironment=' + shlex(f'RESTIC_PASSWORD_COMMAND={c}') + '\n'})
                 self.assertTrue(got.startswith('PASS'), got)
 
+    def test_linux_password_command_hash_inside_a_word(self):
+        """PR #240 fix 4 item 2 (security r3 finding 1, correctness r3 finding 3): a # inside a word is no comment
+        to a shell (cat /x#y reads the file /x#y), so the walls read the words after it too; in a login file and in a
+        unit's Environment= both. A private file with a # in its name still passes."""
+        pw = 'Hunter2-correct-horse\n'
+        for command in ('cat /x#y /etc/restic/pw', 'cat a#b /etc/restic/pw', 'true a#b; cat /etc/restic/pw'):
+            for where, files in (('login', {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND="{command}"\n'}),
+                                 ('unit', {'etc/systemd/system/b.service':
+                                           f'[Service]\nEnvironment="RESTIC_PASSWORD_COMMAND={command}"\n'})):
+                with self.subTest(command, where=where):
+                    got = self.etc_secrets({'etc/restic/pw': pw, **files})
+                    self.assertTrue(got.startswith('FAIL'), got)
+        got = self.etc_secrets({'etc/restic/backup#2.pw': {'text': pw, 'mode': '600'},
+                                'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_COMMAND="cat /etc/restic/backup#2.pw"\n'})
+        self.assertTrue(got.startswith('PASS'), got)
+
     def test_linux_system_conf_a_dangling_link_is_skipped(self):
         """Issue #226 item 3: systemd 256 and later reads the first system.conf of /etc, /run, /usr/local/lib and
         /usr/lib that is there; a dangling link is not, so it reads the next one (an endless default there FAILS),
