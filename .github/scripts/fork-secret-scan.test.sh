@@ -65,7 +65,7 @@ elif [[ -n "${GITLEAKS_CONFIG:-}" ]]; then settings="$(cat "$GITLEAKS_CONFIG")"
 elif [[ -n "${GITLEAKS_CONFIG_TOML:-}" ]]; then settings="$GITLEAKS_CONFIG_TOML"
 elif [[ -f "$source/.gitleaks.toml" ]]; then settings="$(cat "$source/.gitleaks.toml")"
 fi
-extend_path="$(sed -nE "s/^[[:space:]]*path[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'].*/\1/p" <<< "$settings" | head -n 1)"
+extend_path="$(sed -nE "s/^[[:space:]]*path[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'].*/\1/p" <<< "$settings" | sed -n 1p)"
 if [[ "$settings" == *"[extend]"* && -n "$extend_path" && ! -f "$extend_path" ]]; then
   echo "FTL Failed to load config error=\"failed to load extended config, err: open $extend_path: no such file or directory\""
   exit 1
