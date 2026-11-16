@@ -24,6 +24,32 @@
     "stageDir": "/srv/example/golive/stage",
     "backupDir": "/srv/example/golive/backups",
     "stateDir": "/srv/example/golive/state",
-    "freeFloorMb": 2048
+    "freeFloorMb": 2048,
+    "quietCommand": "/srv/example/golive/bin/quiet",
+    "preHooks": ["/srv/example/golive/bin/pause-jobs"],
+    "postHooks": ["/srv/example/golive/bin/resume-jobs"],
+    "quietWaitSeconds": 7200,
+    "stopLimitSeconds": 1800
+  },
+  "pc-agents": {
+    "organization": "Example home lab",
+    "t3Version": "0.0.30",
+    "t3ReleaseBaseUrl": "https://github.com/example/t3code/releases/download",
+    "port": 3773,
+    "maxRuntimeMode": "full-access",
+    "lockedSettings": { "agentSlots.enabled": true, "agentSlots.maxPerMachine": 2 },
+    "memoryMax": "8G",
+    "cpuQuota": "400%",
+    "nameservers": ["1.1.1.1", "9.9.9.9"],
+    "peers": ["100.101.102.103/32"],
+    "tailscaleTag": "tag:pc-agents"
+  },
+  "desk": {
+    "pool": "pc",
+    "host": "fleet-host.example",
+    "hostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "slots": 2,
+    "reserveMb": 4096,
+    "freeCommand": "/opt/fork-fleet/free-memory"
   }
 }

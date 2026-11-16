@@ -1,0 +1,840 @@
+#!/usr/bin/python3 -IB
+"""desk-install: a desktop's side of a fork fleet desk pool, as root (fork-kit/desk/README.md).
+
+  desk-install install --source RELEASE_FOLDER --sha RELEASE_SHA [--fleet-config FILE | --release-fleet-config]
+  desk-install check       every part and wall, PASS or FAIL; reads only (safe while a job runs)
+  desk-install uninstall
+
+install reads the `desk` section of the machine file, makes the runner users, stages the fleet files of one release
+(launcher, walls, desk agent, gate hook and the fleet config), checks the staged copy, stops the agent, moves each
+file into /opt/fork-fleet, writes MANIFEST.sha256 and then SOURCE (last), writes the settings in /etc/fork-fleet and
+the units, makes the desk key once, and starts the agent and the refresh timer (restarting the agent only when
+something changed). Safe to run again and to stop at any step: a stopped run leaves SOURCE naming the old release
+(check says what differs) and the next run ends it. uninstall removes only what the kit made, its record last.
+"""
+import argparse, contextlib, fcntl, hashlib, importlib.util, json, os, pwd, re, shutil, stat, subprocess, sys, tempfile
+
+PREFIX = ''          # tests only: every fixed path below is read under this folder
+ROOT_UID = 0         # tests only: who must run this and own the installed files
+MACHINE = None       # tests only: the machine file (None: the fixed path)
+OPT, ETC, WORK = '/opt/fork-fleet', '/etc/fork-fleet', '/var/lib/fork-fleet'
+STATE = ETC + '/desk-kit.json'
+KEY = ETC + '/desk-key'
+UNIT_DIR = '/etc/systemd/system'
+DROPIN_ROOTS = ('/etc/systemd/system', '/run/systemd/system', '/usr/local/lib/systemd/system', '/usr/lib/systemd/system',
+                '/lib/systemd/system')
+DENY = ('/etc/cron.deny', '/etc/at.deny')
+PROJECT = ETC + '/fleet-config.json'   # the project's fleet config (--fleet-config), kept for later installs
+SETTINGS = ('launch.conf', 'desk.conf', 'desk-known_hosts', 'resolv.conf', 'desk-key', 'desk-key.pub',
+            'fleet-config.json')
+SYSCTL = '/etc/sysctl.d/60-fork-fleet.conf'
+HEADER = '# desk kit: written by desk-install. Do not edit: change the machine file and install again.\n'
+FILES = {'fork-fleet-launch.sh': '.github/scripts/fork-fleet-launch.sh',
+         'fork-fleet-job-paths.txt': '.github/scripts/fork-fleet-job-paths.txt',
+         'fork-fleet-walls.py': '.github/scripts/fork-fleet-walls.py',
+         'fork-fleet-desk-agent.py': '.github/scripts/fork-fleet-desk-agent.py',
+         'fork-fleet-desk-wire.py': '.github/scripts/fork-fleet-desk-wire.py',
+         'hook.sh': '.github/scripts/fork-fleet-hook.sh', 'fork-fleet.py': '.github/scripts/fork-fleet.py',
+         'fork-fleet.json': '.github/fork-fleet.json', 'desk-install': 'fork-kit/desk/sbin/desk-install',
+         'machine_file.py': 'fork-kit/common/machine_file.py', 'README.md': 'fork-kit/desk/README.md',
+         'free_contract.py': 'fork-kit/common/free_contract.py', 'free-memory': 'fork-kit/common/free/memory'}
+WALLS = '.github/scripts/fork-fleet-walls'   # copied whole: every OS's walls file and fixture
+SUBDIRS = ('units', 'fork-fleet-walls')   # the folders the manifest makes inside /opt/fork-fleet
+UNITS = {'fork-fleet-desk-agent.service': '.github/scripts/fork-fleet-desk-agent.service',
+         't3code-fleet-refresh.service': '.github/scripts/fork-fleet-refresh.service',
+         't3code-fleet-refresh.timer': '.github/scripts/fork-fleet-refresh.timer'}
+AGENT, TIMER, REFRESH = 'fork-fleet-desk-agent.service', 't3code-fleet-refresh.timer', 't3code-fleet-refresh.service'
+FOREIGN = (OPT + '/fork-fleet-launch.sh', ETC + '/launch.conf', ETC + '/desk.conf', KEY,
+           *(f'{UNIT_DIR}/{u}' for u in UNITS))
+CMD = {k: [k] for k in ('useradd', 'userdel', 'loginctl', 'systemctl', 'sysctl', 'ssh-keygen', 'ip', 'nft', 'bash',
+                        'id', 'getent')}
+NOLOGIN = ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false')
+CMD['python3'] = ['/usr/bin/python3']
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C.UTF-8'}
+SHA = re.compile(r'[0-9a-f]{40}')
+SHAPES = {'pool': r'[a-z0-9][a-z0-9_-]{0,39}', 'host': r'[A-Za-z0-9][A-Za-z0-9.-]{0,252}',
+          'user': r'[a-z_][a-z0-9_-]{0,31}', 'netBase': r'10\.(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])',
+          'freeCommand': r'(/[A-Za-z0-9._@+-]+)+',
+          'hostKey': r'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}'}
+RUNNER_UNIT = re.compile(r'fork-fleet-[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}\.service')   # the launcher's runner units
+
+
+class Refused(Exception):
+    pass
+
+
+def p(path):
+    return PREFIX + path
+
+
+def say(msg):
+    print(f'desk-install: {msg}', flush=True)
+
+
+def run(name, *args, check=True, **kw):
+    r = subprocess.run([*CMD.get(name, [name]), *args], env=ENV, stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, timeout=kw.pop('timeout', 120), **kw)
+    if check and r.returncode:
+        raise Refused(f'{name} {" ".join(args)} failed: {(r.stderr or r.stdout).strip()[:300]}')
+    return r
+
+
+def py(script, *args):
+    return run('python3', '-I', '-B', script, *args, check=False)
+
+
+def sha256(path):
+    with open(path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def user_exists(name):
+    return run('id', '-u', name, check=False).returncode == 0
+
+
+def user_problem(u):
+    """Why runner user u (made by the kit or by hand) could be used for more than one-job runners: a login shell, a
+    usable password (or none), uid 0, a main group that is not the group named after it (gid 0 from `useradd -g 0`),
+    another group besides it, a home that is there, a line in cron.allow/at.allow; None when it is fine. The
+    launcher's check_users refuses uid 0 and more than one group at each job start. Read through getent and id (as
+    root)."""
+    r = run('getent', 'passwd', u, check=False)
+    fields = r.stdout.strip().split(':')
+    if r.returncode or len(fields) < 7:
+        return f'{u}: its passwd entry cannot be read'
+    if fields[6] not in NOLOGIN:
+        return f'{u} has the login shell {fields[6]!r} (usermod -s /usr/sbin/nologin {u})'
+    if fields[2] == '0' or not fields[2].isdigit():
+        return f'{u} has uid {fields[2]}: a runner user is a user of its own, not root (userdel {u}; install makes it)'
+    own = run('getent', 'group', u, check=False).stdout.strip().split(':')
+    if len(own) < 3 or own[0] != u or own[2] != fields[3]:
+        return (f'{u} has the main group {fields[3]}, not its own group {u}: a runner user is in its own group only '
+                f'(userdel {u}; install makes it with its own group)')
+    gid, groups = run('id', '-g', u, check=False), run('id', '-G', u, check=False)
+    if gid.returncode or groups.returncode or groups.stdout.split() != gid.stdout.split():
+        return f'{u} is in other groups ({groups.stdout.strip()}): a runner user is in its own group only (gpasswd -d)'
+    if fields[5] not in ('', '/nonexistent') and os.path.lexists(p(fields[5])):
+        return f'{u} has the home {fields[5]} (usermod -d /nonexistent {u}): a home could hold its ssh keys'
+    r = run('getent', 'shadow', u, check=False)
+    fields = r.stdout.strip().split(':')
+    if r.returncode or len(fields) < 2:
+        return f'{u}: its shadow entry cannot be read'
+    if not fields[1].startswith(('!', '*')):
+        return f'{u} has a usable password or none (passwd -l {u})'
+    for f in DENY:
+        allow = f.replace('.deny', '.allow')
+        if u in lines_of(allow):
+            return f'{u} is in {allow} (remove that line)'
+    return None
+
+
+def not_root_owned(path, kind):
+    """Why a folder or file the root-run kit trusts is not safe (a link, another kind, not owned by root); None when it
+    is, or absent. Install refuses such a path rather than follow it or fix it (chown would follow a link)."""
+    try:
+        st = os.lstat(p(path))
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        return f'{path} is a link (a hand setup?): remove the link and run again'
+    if not kind(st.st_mode):
+        return f'{path} is not a {"folder" if kind is stat.S_ISDIR else "plain file"}: remove it and run again'
+    if st.st_uid != ROOT_UID:
+        return f'{path} is not owned by root (uid {st.st_uid}): chown root {path} (or remove it) and run again'
+    return None
+
+
+def same_file(real, text, mode):
+    """The file (not a link) holds text, has mode and is owned by root. Not a plain file: not opened (a FIFO would
+    hang the run)."""
+    try:
+        st = os.lstat(real)
+        if not (stat.S_ISREG(st.st_mode) and st.st_uid == ROOT_UID and stat.S_IMODE(st.st_mode) == mode):
+            return False
+        with open(real, encoding='utf-8') as f:
+            return f.read() == text
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def job_writable(path):
+    """Why a job could change this file (it, or a folder above it, writable by others or by a runner user's group, or
+    owned by a runner user); None when only root or the caller can. A sticky folder (/tmp) is fine: nobody else may
+    rename or remove what is in it. A link is followed: the folders of the path as given and of the file it names are
+    both checked (the install reads the file it names)."""
+    uids, gids = set(), set()
+    for i in range(1, 9):
+        with contextlib.suppress(KeyError):
+            pw = pwd.getpwnam(f'fork-runner-{i}')
+            uids.add(pw.pw_uid)
+            gids.add(pw.pw_gid)
+    for path in dict.fromkeys((os.path.abspath(path), os.path.realpath(path))):
+        why = writable_by_job(path, uids, gids)
+        if why:
+            return why
+    return None
+
+
+def writable_by_job(path, uids, gids):
+    while True:
+        try:
+            st = os.stat(path)
+        except OSError as e:
+            return f'{path} cannot be read ({e.strerror})'
+        if st.st_uid in uids:
+            return f'{path} belongs to a runner user'
+        if (st.st_mode & 0o002 or st.st_mode & 0o020 and st.st_gid in gids) and not (
+                stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
+            return f'{path} can be written by other users'
+        if path == os.path.dirname(path):
+            return None
+        path = os.path.dirname(path)
+
+
+def machine_section():
+    here = os.path.dirname(os.path.realpath(__file__))
+    found = [c for c in (os.path.join(here, 'machine_file.py'), os.path.join(here, '..', '..', 'common',
+                                                                               'machine_file.py')) if os.path.isfile(c)]
+    spec = importlib.util.spec_from_file_location('machine_file', found[0])
+    mf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mf)
+
+    def shape(key):
+        return lambda v: None if re.fullmatch(SHAPES[key], v) else f'not a {key} ({SHAPES[key]})'
+
+    def within(lo, hi):
+        return lambda v: None if lo <= v <= hi else f'{lo} to {hi}'
+    try:
+        section = mf.read_section('desk', MACHINE, ROOT_UID)
+        return mf.fields(section, {'pool': (str, mf.REQUIRED, shape('pool')), 'host': (str, mf.REQUIRED, shape('host')),
+                                   'port': (int, 22, within(1, 65535)), 'user': (str, 'fleet-desk', shape('user')),
+                                   'hostKey': (str, mf.REQUIRED, shape('hostKey')), 'slots': (int, 1, within(1, 8)),
+                                   'reserveMb': (int, None, within(0, 1000000)),
+                                   'netBase': (str, None, shape('netBase')),
+                                   'freeCommand': (str, None, shape('freeCommand'))}, 'desk')
+    except mf.MachineFileError as e:
+        raise Refused(f'machine file: {e}') from None
+
+
+def read_state():
+    try:
+        with open(p(STATE), encoding='utf-8') as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise Refused(f'{STATE} cannot be read ({e}): fix or remove it and run again') from None
+    state = state if isinstance(state, dict) else {}
+    state.setdefault('createdDenyFiles', [])
+    state.setdefault('addedDenyLines', [])   # [deny file, user]: lines the kit added (also for users it did not make)
+    deny = '|'.join(map(re.escape, DENY))
+
+    def names(key, shape):
+        return isinstance(state.get(key), list) and all(isinstance(x, str) and re.fullmatch(shape, x)
+                                                        for x in state[key])
+    if not (state.get('version') == 1 and names('createdUsers', SHAPES['user'])
+            and names('createdDenyFiles', deny)
+            and isinstance(state['addedDenyLines'], list)
+            and all(isinstance(x, list) and len(x) == 2 and all(isinstance(y, str) for y in x)
+                    and re.fullmatch(deny, x[0]) and re.fullmatch(SHAPES['user'], x[1])
+                    for x in state['addedDenyLines'])
+            and isinstance(state.get('restartPending', False), bool)
+            and state.get('fleetConfig') in ('release', 'project')
+            and (state.get('sha') is None or SHA.fullmatch(str(state['sha'])))):
+        raise Refused(f'{STATE} is not an install record of this kit (version 1): fix or remove it and run again')
+    return state
+
+
+def write_file(path, text, mode=0o644):
+    """Atomic (a temp file in the same folder, renamed over the old one); unchanged text is not rewritten (a link, a
+    changed mode or an owner other than root is: the new file is root's)."""
+    real = p(path)
+    if same_file(real, text, mode):
+        return False
+    os.makedirs(os.path.dirname(real), mode=0o755, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix='.' + os.path.basename(real) + '.')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, real)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return True
+
+
+def save_state(state):
+    write_file(STATE, json.dumps(state, indent=2, sort_keys=True) + '\n', 0o600)
+
+
+def ours(path):
+    try:
+        if not stat.S_ISREG(os.stat(p(path)).st_mode):   # a FIFO (or a link to one) is not opened: it would hang
+            return False
+        with open(p(path), encoding='utf-8') as f:
+            return f.readline() == HEADER
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def drop_ins(unit):
+    """Drop-ins that change one of the kit's units: `UNIT.d/`, and the dash-prefix forms (`fork-fleet-.service.d/`)
+    in every unit folder, and whatever systemd itself lists. The type-wide `service.d/` (distribution defaults) is left
+    out: it is not aimed at the kit's units."""
+    stem, kind = unit.rsplit('.', 1)
+    names = [unit] + [stem[:i + 1] + '.' + kind for i, c in enumerate(stem) if c == '-']
+    found = set()
+    for root in DROPIN_ROOTS:
+        for n in names:
+            with contextlib.suppress(OSError):
+                found.update(f'{root}/{n}.d/{f}' for f in os.listdir(p(f'{root}/{n}.d')) if f.endswith('.conf'))
+    r = run('systemctl', 'show', '-p', 'DropInPaths', '--value', unit, check=False)
+    if r.returncode == 0:
+        found.update(x for x in r.stdout.split() if os.path.basename(os.path.dirname(x)) != kind + '.d')
+    return sorted(found)
+
+
+def stage(source, sha, fleet_config, pool):
+    """The release's files in /opt/fork-fleet/.kit-stage-*, checked; returns (folder, {path: sha256})."""
+    for name in os.listdir(p(OPT)):   # a run that stopped while staging
+        if name.startswith('.kit-stage-'):
+            shutil.rmtree(os.path.join(p(OPT), name), ignore_errors=True)
+    tmp = tempfile.mkdtemp(prefix='.kit-stage-', dir=p(OPT))
+    pairs = [(dst, os.path.join(source, src)) for dst, src in FILES.items()]
+    pairs += [(f'units/{u}', os.path.join(source, src)) for u, src in UNITS.items()]
+    pairs += [(f'fork-fleet-walls/{n}', os.path.join(source, WALLS, n)) for n in sorted(os.listdir(os.path.join(
+        source, WALLS)))]
+    manifest = {}
+    for rel, src in pairs:
+        src = fleet_config if rel == 'fork-fleet.json' and fleet_config else src
+        dst = os.path.join(tmp, rel)
+        os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
+        shutil.copyfile(src, dst)
+        os.chmod(dst, file_mode(rel))
+        manifest[rel] = sha256(dst)
+    for d, _, _ in os.walk(tmp):
+        os.chmod(d, 0o755)
+    problems = []
+    r = py(os.path.join(tmp, 'fork-fleet-walls.py'), 'os')
+    if r.returncode:
+        problems.append(f'fork-fleet-walls.py os: exit {r.returncode} {r.stderr.strip()[:200]}')
+    r = py(os.path.join(tmp, 'fork-fleet.py'), '--config', os.path.join(tmp, 'fork-fleet.json'), 'gate')
+    if 'no Runner.Worker above this hook' not in r.stdout + r.stderr:
+        problems.append(f'the gate does not load with this fleet config: {(r.stderr or r.stdout).strip()[:300]}')
+    try:
+        with open(os.path.join(tmp, 'fork-fleet.json'), encoding='utf-8') as f:
+            pools = json.load(f).get('pools')
+        if not isinstance(pools, list) or not all(isinstance(x, dict) for x in pools):
+            problems.append('the fleet config\'s "pools" is not a list of pools')
+        elif pool not in [x.get('name') for x in pools]:
+            problems.append(f'the fleet config has no pool {pool!r} (the machine file\'s desk.pool)')
+    except (OSError, ValueError, AttributeError) as e:
+        problems.append(f'the fleet config cannot be read: {e}')
+    for rel in ('fork-fleet-launch.sh', 'hook.sh'):
+        if run('bash', '-n', os.path.join(tmp, rel), check=False).returncode:
+            problems.append(f'{rel}: bash -n fails')
+    if py(os.path.join(tmp, 'fork-fleet-desk-agent.py'), '--help').returncode:
+        problems.append('fork-fleet-desk-agent.py --help fails')
+    if problems:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise Refused(f'the release failed its self-test ({OPT} is unchanged):\n  ' + '\n  '.join(problems))
+    return tmp, manifest
+
+
+def file_mode(rel):
+    """The mode of an installed file: programs 0755, the rest 0644."""
+    executable = rel in ('fork-fleet-launch.sh', 'hook.sh', 'desk-install', 'free-memory') or (
+        rel.startswith('fork-fleet-walls/') and not rel.endswith('.json'))
+    return 0o755 if executable else 0o644
+
+
+def read_manifest():
+    with contextlib.suppress(OSError):
+        with open(p(OPT + '/MANIFEST.sha256'), encoding='utf-8') as f:
+            return dict(reversed(line.rstrip('\n').split('  ', 1)) for line in f if '  ' in line)
+    return {}
+
+
+def swap(tmp, manifest, sha, before_change):
+    """Each changed file renamed into /opt/fork-fleet (the agent stopped meanwhile, so no verb runs from half-old,
+    half-new files, and the refresh timer and service stopped too: refresh runs the launcher); files of the old
+    release that are gone, removed. Unchanged files (same text, mode and owner root) are left as they are; one whose
+    mode or owner was changed is replaced by the staged copy. True when anything changed."""
+    def same(rel):
+        with contextlib.suppress(OSError):
+            st = os.lstat(p(f'{OPT}/{rel}'))
+            return (stat.S_ISREG(st.st_mode) and st.st_uid == ROOT_UID and stat.S_IMODE(st.st_mode) == file_mode(rel)
+                    and sha256(p(f'{OPT}/{rel}')) == manifest[rel])
+    changed = [rel for rel in sorted(manifest) if not same(rel)]
+    gone = sorted(set(read_manifest()) - set(manifest))
+    if changed or gone:
+        before_change()
+        run('systemctl', 'stop', TIMER, REFRESH, AGENT, check=False)
+    for d in sorted({os.path.dirname(rel) for rel in manifest} - {''}):
+        # closed before any file goes in: in a folder others can write, a user could swap a file in before the chmod
+        os.makedirs(p(f'{OPT}/{d}'), mode=0o755, exist_ok=True)
+        os.chmod(p(f'{OPT}/{d}'), 0o755)
+    for rel in changed:
+        os.replace(os.path.join(tmp, rel), p(f'{OPT}/{rel}'))
+    for rel in gone:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(p(f'{OPT}/{rel}'))
+    write_file(OPT + '/MANIFEST.sha256', ''.join(f'{d}  {r}\n' for r, d in sorted(manifest.items())))
+    write_file(OPT + '/SOURCE', sha + '\n')
+    shutil.rmtree(tmp, ignore_errors=True)
+    return bool(changed or gone)
+
+
+def lines_of(path):
+    with contextlib.suppress(FileNotFoundError), open(p(path), encoding='utf-8') as f:
+        return f.read().splitlines()
+    return []
+
+
+def make_users(users, state):
+    for u in users:
+        if user_exists(u):
+            continue
+        if u not in state['createdUsers']:   # recorded first: a run stopped here still removes it on uninstall
+            state['createdUsers'].append(u)
+            save_state(state)
+        run('useradd', '--no-create-home', '--home-dir', '/nonexistent', '--user-group', '--shell',
+            '/usr/sbin/nologin', u)
+        say(f'made runner user {u}')
+    for u in users:
+        run('loginctl', 'disable-linger', u, check=False)
+        for f in DENY:
+            if os.path.exists(p(f.replace('.deny', '.allow'))):
+                continue
+            # A deny file that was not there opens cron or at to every other user (with neither file, only root may
+            # use at): recorded first, so uninstall removes the file again.
+            if not os.path.lexists(p(f)) and f not in state['createdDenyFiles']:
+                state['createdDenyFiles'].append(f)
+                save_state(state)
+            lines = lines_of(f)
+            if u not in lines:
+                if [f, u] not in state['addedDenyLines']:   # recorded first: uninstall removes the line again
+                    state['addedDenyLines'].append([f, u])
+                    save_state(state)
+                write_file(f, '\n'.join(lines + [u]) + '\n')
+
+
+def settings(m, users):
+    known = (m['host'] if m['port'] == 22 else f'[{m["host"]}]:{m["port"]}') + ' ' + m['hostKey']
+    files = {ETC + '/launch.conf': (f'RUNNER_USERS={",".join(users)}\n'
+                                    + (f'RESERVE_MB={m["reserveMb"]}\n' if m['reserveMb'] is not None else '')
+                                    + (f'NET_BASE={m["netBase"]}\n' if m['netBase'] else '')
+                                    + (f'FREE_COMMAND={m["freeCommand"]}\n' if m['freeCommand'] else ''), 0o600),
+             ETC + '/desk.conf': (f'POOL={m["pool"]}\nHOST={m["host"]}\nPORT={m["port"]}\nUSER={m["user"]}\n', 0o600),
+             ETC + '/desk-known_hosts': (known + '\n', 0o644),
+             ETC + '/resolv.conf': ('nameserver 1.1.1.1\nnameserver 9.9.9.9\n', 0o644),
+             SYSCTL: ('net.ipv4.ip_forward = 1\n', 0o644)}
+    return {path: (HEADER + text, mode) for path, (text, mode) in files.items()}
+
+
+def make_key(pool, before_change):
+    """The desk key, once: made under a temp name, then renamed (the public half first)."""
+    if os.path.exists(p(KEY)) and os.path.exists(p(KEY + '.pub')):
+        return False
+    before_change()
+    new = p(ETC + '/.desk-key.new')
+    for f in (new, new + '.pub'):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f)
+    if os.path.exists(p(KEY)):
+        raise Refused(f'{KEY} is there without {KEY}.pub: remove both and run again (a new key)')
+    run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', f'desk-{pool}', '-f', new)
+    os.replace(new + '.pub', p(KEY + '.pub'))
+    os.replace(new, p(KEY))
+    return True
+
+
+def lock(stack):
+    """One install or uninstall at a time: a lock on the /etc/fork-fleet folder itself (0700, so only root can open it
+    and hold it; nothing to clean up), held until the run ends. A second run is refused, not queued: it would sweep the
+    first one's staging folder."""
+    try:
+        fd = os.open(p(ETC), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise Refused(f'{ETC} cannot be locked ({e.strerror}): it must be a folder, not a link') from None
+    stack.callback(os.close, fd)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Refused('another desk-install install or uninstall is running: wait for it and run again') from None
+
+
+def install(a, stop_after=None, stack=None):
+    def done(step):
+        if step == stop_after:
+            raise SystemExit(f'stopped after {step} (test)')
+
+    if os.geteuid() != ROOT_UID:
+        raise Refused('run this as root')
+    if a.fleet_config and a.release_fleet_config:
+        raise Refused('--fleet-config and --release-fleet-config: one or the other')
+    if not SHA.fullmatch(a.sha or ''):
+        raise Refused('--sha must be the full 40-character release commit')
+    missing = [s for s in [*FILES.values(), *UNITS.values(), WALLS] if not os.path.exists(os.path.join(a.source, s))]
+    if missing:
+        raise Refused(f'--source {a.source}: {missing[0]} is missing (point it at the release\'s top folder)')
+    if a.fleet_config and not os.path.isfile(a.fleet_config):
+        raise Refused(f'--fleet-config {a.fleet_config}: no such file')
+    if a.fleet_config and job_writable(a.fleet_config):   # the file it names and every folder above both
+        raise Refused(f'--fleet-config {a.fleet_config}: {job_writable(a.fleet_config)}; copy it to a folder only root '
+                      'can write (for example /root) and run again')
+    m = machine_section()
+    r = py(os.path.join(a.source, FILES['fork-fleet-walls.py']), 'os')
+    if r.returncode == 3:
+        raise Refused(f'this OS ({r.stdout.strip() or "unknown"}) is not supported yet: it has no walls file')
+    state = read_state()
+    if state is None:
+        there = [f for f in FOREIGN if os.path.lexists(p(f))]
+        if there:
+            raise Refused(f'{there[0]} is from an install this kit did not make: uninstall that first (README)')
+        state = {'version': 1, 'createdUsers': [], 'createdDenyFiles': [], 'addedDenyLines': [],
+                 'fleetConfig': 'release'}
+    for u in UNITS:
+        if os.path.lexists(p(f'{UNIT_DIR}/{u}')) and not ours(f'{UNIT_DIR}/{u}'):
+            raise Refused(f'{UNIT_DIR}/{u} was not written by this kit: remove it and run again')
+        if drop_ins(u):
+            raise Refused(f'{drop_ins(u)[0]} changes {u} and was not written by this kit: remove it and run again')
+    config = os.path.realpath(a.fleet_config) if a.fleet_config else None
+    if config is None and state['fleetConfig'] == 'project' and not a.release_fleet_config:
+        # the project's config from the last install (older records: the installed copy), checked again below
+        config = p(PROJECT) if os.path.isfile(p(PROJECT)) else p(OPT + '/fork-fleet.json')
+        if not os.path.isfile(config):
+            raise Refused(f'the install record says a project\'s fleet config, but neither {PROJECT} nor '
+                          f'{OPT}/fork-fleet.json is there: run again with --fleet-config FILE or '
+                          '--release-fleet-config')
+    subdirs = sorted({*SUBDIRS, *(os.path.dirname(r) for r in read_manifest() if os.path.dirname(r))})
+    for path, kind in ((OPT, stat.S_ISDIR), (OPT + '/template', stat.S_ISDIR),
+                       *((f'{OPT}/{d}', stat.S_ISDIR) for d in subdirs), (ETC, stat.S_ISDIR),
+                       (KEY, stat.S_ISREG), (KEY + '.pub', stat.S_ISREG)):
+        if not_root_owned(path, kind):   # a hand setup: the root-run launcher must not sit where a user can write
+            raise Refused(not_root_owned(path, kind))
+    users = [f'fork-runner-{i}' for i in range(1, m['slots'] + 1)]
+    for u in users:   # a runner user made by hand must be as locked as one the kit makes
+        if user_exists(u) and user_problem(u):
+            raise Refused(f'runner user {user_problem(u)}: fix it and run again')
+    done('check')
+    for d, mode in ((OPT, 0o755), (OPT + '/template', 0o755), (ETC, 0o700)):
+        os.makedirs(p(d), mode=mode, exist_ok=True)
+        os.chmod(p(d), mode)
+    lock(stack if stack is not None else contextlib.ExitStack())
+    save_state(state)
+    make_users(users, state)
+    done('users')
+    tmp, manifest = stage(a.source, a.sha, config, m['pool'])
+    done('stage')
+
+    def pending():
+        """Recorded before anything the agent reads changes: the agent reads its settings only when it starts, so a
+        run stopped after a write (and before the restart) still restarts it on the next run."""
+        if not state.get('restartPending'):
+            state['restartPending'] = True
+            save_state(state)
+
+    def put(path, text, mode=0o644):
+        if not same_text(path, text, mode):
+            pending()
+            write_file(path, text, mode)
+    # the fleet config choice before the swap: a run stopped after it keeps what was asked for. The restart mark goes
+    # first when the swap will change the installed config, so `check` fails until a run ends the swap.
+    if manifest['fork-fleet.json'] != read_manifest().get('fork-fleet.json'):
+        pending()
+    if config:
+        with open(os.path.join(tmp, 'fork-fleet.json'), encoding='utf-8') as f:
+            write_file(PROJECT, f.read())
+    state['fleetConfig'] = 'project' if config else 'release'
+    save_state(state)
+    if not config:
+        remove(PROJECT)
+    swap(tmp, manifest, a.sha, pending)
+    state['sha'] = a.sha
+    save_state(state)
+    done('files')
+    for path, (text, mode) in settings(m, users).items():
+        put(path, text, mode)
+    run('sysctl', '-q', '-p', p(SYSCTL))
+    make_key(m['pool'], pending)
+    os.chmod(p(KEY), 0o600)   # `check` wants it so; an older key made with another mode is set right
+    os.chmod(p(KEY + '.pub'), 0o644)
+    done('settings')
+    for u in UNITS:
+        with open(p(f'{OPT}/units/{u}'), encoding='utf-8') as f:
+            put(f'{UNIT_DIR}/{u}', HEADER + f.read())
+    r = py(p(OPT + '/fork-fleet-desk-agent.py'), 'check')
+    if r.returncode:
+        raise Refused(f'the desk agent refuses its settings (not started): {r.stderr.strip()[:300]}')
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'enable', '--now', TIMER)
+    if not os.path.exists(p(OPT + '/template/runner-template/.fork-fleet-version')):
+        run(p(OPT + '/fork-fleet-launch.sh'), 'prune', check=False)   # makes the launch lock refresh opens
+        run('systemctl', 'start', '--no-block', REFRESH)              # the first runner template, in the background
+    run('systemctl', 'enable', AGENT)
+    # restart only after a change (this run's or a stopped run's): a restart ends the agent's whole control group, a
+    # `start` it is running with it (the always-on host would see that job fail). Unchanged: start is a no-op.
+    run('systemctl', 'restart' if state.get('restartPending') else 'start', AGENT)
+    if state.pop('restartPending', None) is not None:
+        save_state(state)
+    done('units')
+    with open(p(KEY + '.pub'), encoding='utf-8') as f:
+        pub = f.read().strip()
+    say(f'installed release {a.sha} for pool {m["pool"]} ({len(users)} slot(s)); the agent dials {m["host"]}')
+    say(f'its public key, for the always-on host (fork-fleet-desk-key.py add {m["pool"]}):\n{pub}')
+    say('then: desk-install check (every line PASS)')
+    return 0
+
+
+def same_text(path, text, mode):
+    return same_file(p(path), text, mode)
+
+
+def check():
+    rows = []
+
+    def row(ok, name, what):
+        rows.append(ok)
+        print(f'{"PASS" if ok else "FAIL"}  {name}  {what}', flush=True)
+    problems = installed_problems()
+    for x in problems:
+        row(False, 'kit', x)
+    if not problems:
+        row(True, 'kit', f'the installed files are release {read_state()["sha"]}\'s')
+    walls = py(p(OPT + '/fork-fleet-walls.py'), 'describe')
+    lines = [x for x in walls.stdout.splitlines() if x.startswith(('PASS  ', 'FAIL  '))]
+    for line in lines:
+        print(line)
+        rows.append(line.startswith('PASS'))
+    if walls.returncode and not any(x.startswith('FAIL') for x in lines):
+        row(False, 'walls', f'exit {walls.returncode}: {walls.stderr.strip()[:200]}')
+    r = py(p(OPT + '/fork-fleet-desk-agent.py'), 'check')
+    row(r.returncode == 0, 'agent-settings', (r.stdout or r.stderr).strip()[:200])
+    for unit in (AGENT, TIMER):
+        on = run('systemctl', 'is-active', '--quiet', unit, check=False).returncode == 0
+        row(on and run('systemctl', 'is-enabled', '--quiet', unit, check=False).returncode == 0, 'unit',
+            f'{unit} enabled and active')
+    row(os.path.exists(p(OPT + '/template/runner-template/.fork-fleet-version')), 'template',
+        'the runner template is there (the refresh timer makes it)')
+    try:
+        m = machine_section()
+        users = [f'fork-runner-{i}' for i in range(1, m['slots'] + 1)]
+        row(True, 'machine-file', f'desk section: pool {m["pool"]}, {m["slots"]} slot(s), always-on host {m["host"]}')
+        if m['freeCommand']:   # busy is fine: the script answers by the contract (FREE.md)
+            r = py(p(OPT + '/free_contract.py'), 'ask', m['freeCommand'])
+            row(r.returncode in (0, 75), 'free-script', f'{m["freeCommand"]}: {(r.stdout or r.stderr).strip()[:200]}')
+        stale = [path for path, (text, mode) in settings(m, users).items() if not same_text(path, text, mode)]
+        row(not stale, 'settings', f'{stale[0]} differs from the machine file: install again' if stale else
+            'the written settings match the machine file')
+    except Refused as e:
+        users = []
+        row(False, 'machine-file', str(e)[:300])
+    for u in users:
+        why = f'{u} does not exist' if not user_exists(u) else user_problem(u)
+        row(not why, 'runner-user', why or f'{u} exists: no login shell, no password, uid not 0, only its own group '
+            f'({u}), no home, not in cron.allow/at.allow')
+    with contextlib.suppress(Refused):   # a smaller `slots` leaves the kit's extra users: named, not lost
+        for u in (read_state() or {}).get('createdUsers', []) if users else []:
+            if u not in users and user_exists(u):
+                row(True, 'runner-user', f'{u} is no longer a slot (no login, unused; uninstall removes it)')
+    try:
+        with open(p('/proc/sys/net/ipv4/ip_forward'), encoding='ascii') as f:
+            forward = f.read().strip() == '1'
+    except OSError:
+        forward = False
+    row(forward, 'ip-forward', 'IPv4 forwarding is on (the runners\' namespaces need it)')
+    fails = rows.count(False)
+    print('ALL PASS' if not fails else f'{fails} FAIL')
+    return 0 if not fails else 1
+
+
+def installed_problems():
+    """What differs from the install record: /opt/fork-fleet against its manifest, SOURCE, the units."""
+    try:
+        problems, state = [], read_state() or {}
+    except Refused as e:
+        return [str(e)]
+    manifest = read_manifest()
+    if not manifest or not state.get('sha'):
+        return [f'{OPT}/MANIFEST.sha256 or {STATE} is missing: not installed (or a first install stopped)']
+    for rel, digest in manifest.items():
+        try:
+            st = os.lstat(p(f'{OPT}/{rel}'))
+            ok = stat.S_ISREG(st.st_mode) and sha256(p(f'{OPT}/{rel}')) == digest and st.st_uid == ROOT_UID
+            mode_ok = stat.S_IMODE(st.st_mode) == file_mode(rel)
+        except OSError:
+            ok = mode_ok = False
+        if not ok:
+            problems.append(f'{OPT}/{rel}: differs from what was installed')
+        elif not mode_ok:
+            problems.append(f'{OPT}/{rel}: mode {stat.S_IMODE(st.st_mode):o}, not {file_mode(rel):o}: install again')
+    folders = {OPT: 0o755, OPT + '/template': 0o755, ETC: 0o700, KEY: 0o600, KEY + '.pub': 0o644}
+    folders.update({f'{OPT}/{os.path.dirname(rel)}': 0o755 for rel in manifest if os.path.dirname(rel)})
+    for path, mode in sorted(folders.items()):
+        try:
+            st = os.lstat(p(path))
+        except OSError:
+            continue   # a missing key or folder is named by its own check (agent settings, template)
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != ROOT_UID:
+            problems.append(f'{path}: a link or not owned by root: remove the link (or chown root), then install again')
+        elif stat.S_IMODE(st.st_mode) != mode:
+            problems.append(f'{path}: mode {stat.S_IMODE(st.st_mode):o}, not {mode:o}: install again')
+    if state.get('fleetConfig') == 'project':
+        try:
+            ok = sha256(p(PROJECT)) == manifest.get('fork-fleet.json')
+        except OSError:
+            ok = False
+        if not ok:
+            problems.append(f'{PROJECT} (the project\'s fleet config) is not the installed one: install again')
+    try:
+        with open(p(OPT + '/SOURCE'), encoding='utf-8') as f:
+            source = f.read().strip()
+    except OSError:
+        source = None
+    if source != state['sha']:
+        problems.append(f'{OPT}/SOURCE names {source}, the record {state["sha"]}: install again')
+    if state.get('restartPending'):
+        problems.append('a stopped install changed what the agent reads but did not restart it: install again')
+    for u in UNITS:
+        try:
+            with open(p(f'{OPT}/units/{u}'), encoding='utf-8') as f:
+                want = HEADER + f.read()
+        except OSError:
+            want = None
+        if not ours(f'{UNIT_DIR}/{u}'):
+            problems.append(f'{UNIT_DIR}/{u}: missing or not the kit\'s')
+        elif want is None or not same_text(f'{UNIT_DIR}/{u}', want, 0o644):
+            problems.append(f'{UNIT_DIR}/{u}: not the unit of release {state["sha"]} ({OPT}/units/{u}), or its mode or '
+                            'owner changed: install again')
+    problems += [f'{d}: a drop-in the kit did not write changes {u}' for u in UNITS for d in drop_ins(u)]
+    return problems
+
+
+def running():
+    """The launcher's runner units still running (or starting or stopping)."""
+    r = run('systemctl', 'list-units', '--plain', '--no-legend', '--type=service',
+            '--state=active,activating,deactivating,reloading', 'fork-fleet-*', check=False)
+    return [x.split()[0] for x in r.stdout.splitlines() if x.split() and RUNNER_UNIT.fullmatch(x.split()[0])]
+
+
+def remove(path):
+    """One path the kit made (a folder with all in it); absent is fine."""
+    real = p(path)
+    if os.path.isdir(real) and not os.path.islink(real):
+        shutil.rmtree(real)
+    else:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(real)
+
+
+def rmdir_left(path):
+    """The folder if empty; otherwise what is left in it (not the kit's, so kept)."""
+    try:
+        os.rmdir(p(path))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return [f'{path}/{n}' for n in sorted(os.listdir(p(path)))]
+    return []
+
+
+def uninstall(stack=None):
+    """Removes only what the kit made: its units, the files of its manifest, its settings, the runner copies and
+    template its programs made, the users and deny files it made. Every runner is stopped first; while one still runs,
+    the network table, users and record stay (run it again). The record goes last, so a stopped uninstall runs again."""
+    if os.geteuid() != ROOT_UID:
+        raise Refused('run this as root')
+    state = read_state()
+    if state is None:
+        say(f'no {STATE}: nothing here was installed by this kit (nothing changed)')
+        return 0
+    lock(stack if stack is not None else contextlib.ExitStack())   # the record is in /etc/fork-fleet: it is there
+    for unit in (AGENT, TIMER, REFRESH):
+        run('systemctl', 'disable', '--now', unit, check=False)
+    launcher = p(OPT + '/fork-fleet-launch.sh')
+    if os.path.exists(launcher):
+        for name in run(launcher, 'active', check=False).stdout.split():
+            run(launcher, 'stop', name, check=False)
+    for unit in running():   # what the launcher could not stop (or no launcher is left to ask)
+        run('systemctl', 'stop', unit, check=False)
+    left = running()
+    if left:
+        raise Refused(f'runner {left[0]} is still running: the network table, users and record stay (its namespace '
+                      'keeps routing through them). Stop it (systemctl stop) and run uninstall again')
+    if os.path.exists(launcher):
+        run(launcher, 'prune', check=False)
+    for ns in run('ip', 'netns', 'list', check=False).stdout.splitlines():
+        if ns.split() and ns.split()[0].startswith('fork-fleet-'):   # every runner's, made by the kit or by hand
+            run('ip', 'netns', 'delete', ns.split()[0], check=False)
+    for line in run('ip', '-o', 'link', 'show', check=False).stdout.splitlines():
+        link = re.match(r'[0-9]+: (ffh-[0-9]+)[@:]', line)
+        if link:
+            run('ip', 'link', 'delete', link.group(1), check=False)
+    run('nft', 'delete', 'table', 'inet', 'fork_fleet', check=False)
+    for u in UNITS:
+        if ours(f'{UNIT_DIR}/{u}'):
+            os.unlink(p(f'{UNIT_DIR}/{u}'))
+    run('systemctl', 'daemon-reload', check=False)
+    if ours(SYSCTL):
+        os.unlink(p(SYSCTL))
+    for rel in [*read_manifest(), 'MANIFEST.sha256', 'SOURCE', 'template',
+                *(n for n in os.listdir(p(OPT)) if n.startswith('.kit-stage-'))] if os.path.isdir(p(OPT)) else []:
+        remove(f'{OPT}/{rel}')
+    remove(WORK + '/runners')
+    for u in state['createdUsers']:
+        if user_exists(u):
+            run('userdel', u)
+    for f in DENY:
+        lines = lines_of(f)
+        # the lines the kit added (for every runner user, made by it or not; older records: the users it made)
+        added = set(state['createdUsers']) | {u for g, u in state['addedDenyLines'] if g == f}
+        if any(x in added for x in lines):
+            write_file(f, ''.join(x + '\n' for x in lines if x not in added))
+        if f in state['createdDenyFiles'] and not [x for x in lines_of(f) if x.strip()]:
+            remove(f)
+    for name in SETTINGS:
+        remove(f'{ETC}/{name}')
+    for name in os.listdir(p(ETC)) if os.path.isdir(p(ETC)) else []:
+        if name.startswith(('.desk-key.new', '.desk-kit.json.', *(f'.{n}.' for n in SETTINGS))):   # a stopped write or keygen
+            remove(f'{ETC}/{name}')
+    remove(STATE)   # the record last
+    left = []
+    for d in ([f'{OPT}/{x}' for x in SUBDIRS] + [OPT, WORK, ETC]):
+        left += rmdir_left(d)
+    left += [f'{d} (a drop-in, not the kit\'s)' for u in UNITS for d in drop_ins(u)]
+    for x in left:
+        say(f'left {x}: the kit did not make it')
+    say('uninstalled; on the always-on host remove its key: fork-fleet-desk-key.py remove POOL')
+    return 0
+
+
+def main(argv, stop_after=None):
+    ap = argparse.ArgumentParser(prog='desk-install', description=__doc__.split('\n\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    i = sub.add_parser('install')
+    i.add_argument('--source', required=True)
+    i.add_argument('--sha', required=True)
+    i.add_argument('--fleet-config')
+    i.add_argument('--release-fleet-config', action='store_true',
+                   help='back to the release\'s own fleet config after a project\'s was used')
+    for name in ('check', 'uninstall'):
+        sub.add_parser(name)
+    a = ap.parse_args(argv)
+    os.umask(0o022)
+    try:
+        with contextlib.ExitStack() as stack:
+            if a.cmd == 'install':
+                return install(a, stop_after, stack)
+            return check() if a.cmd == 'check' else uninstall(stack)
+    except Refused as e:
+        print(f'desk-install: {e}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

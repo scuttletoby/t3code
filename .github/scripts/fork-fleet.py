@@ -6,7 +6,8 @@ owner steps, the design and the failure table: .github/fork-fleet.md.
 
   python3 -I fork-fleet.py route     the last step of fork-tests.yml's `changes` job (GitHub-hosted). Writes to
                                      $GITHUB_OUTPUT: runners=<JSON {job key: runs-on}>, mode, attempt, watch,
-                                     fallback=<JSON runs-on for a job of another attempt (a re-run of failed jobs)>.
+                                     fallback=<JSON runs-on for a job of another attempt (a re-run of failed jobs)>,
+                                     rerun=<JSON where a trusted person's re-run may go instead; {} for none>.
                                      A job key is the job id, or <id>-<shard> for a sharded job.
   python3 -I fork-fleet.py watch     fork-tests.yml's `fleet_watch` job (GitHub-hosted, actions: write): a fleet job of
                                      its run that waits too long for a runner cancels the run with an error.
@@ -55,6 +56,7 @@ LABEL = re.compile(r'[a-z0-9][a-z0-9-]{0,62}')
 VARIABLE = re.compile(r'(?!GITHUB_)[A-Z][A-Z0-9_]{0,99}')
 JOB_ID = re.compile(r'[a-z0-9_]{1,40}')
 POOL = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
+SEED_MAX_MB = 16384   # a seed's largest max_mb: 16 GiB
 KINDS = ('push', 'draft', 'ready')   # a pool's `takes`: pushes, draft pull requests, pull requests ready for review
 # Events whose code and workflow are this repository's own (a pull request event: only when head and base are too).
 OWN_EVENTS = ('push', 'workflow_dispatch', 'schedule')
@@ -90,6 +92,9 @@ def load(path=CONFIG):
 
 def positive(x):
     return isinstance(x, int) and not isinstance(x, bool) and x > 0
+
+
+JOB_FIELDS = frozenset({'job', 'memory_mb', 'shards', 'gates', 'avoid'})
 
 
 def check_config(cfg):
@@ -131,6 +136,9 @@ def check_config(cfg):
     if not (isinstance(retired, list) and all(isinstance(x, str) and LABEL.fullmatch(x) and x not in GENERIC
                                               for x in retired)):
         out.append(f'retired_labels must be a list of labels, none of {sorted(GENERIC)}')
+    if 'reruns' in cfg and cfg['reruns'] not in [p.get('name') for p in launched]:
+        out.append(f'reruns is {cfg["reruns"]!r}: it must name a dispatcher pool (where a person\'s re-run of failed '
+                   'jobs may go)')
     for field, among in (('name', pools), ('label', launched), ('beacon', launched)):
         got = [p.get(field) for p in among]
         if len(set(map(str, got))) != len(got):
@@ -139,6 +147,15 @@ def check_config(cfg):
         who = f'pool {p.get("name")!r}'
         if not (isinstance(p.get('name'), str) and POOL.fullmatch(p['name'])):
             out.append(f'{who}: name must be a-z, 0-9, _ and - (it names the dispatcher\'s lock file)')
+        seeds = p.get('seeds', [])   # a desk pool's warm caches: fork-fleet-desk-seed.py
+        if not (isinstance(seeds, list) and all(
+                isinstance(x, dict) and isinstance(x.get('name'), str) and POOL.fullmatch(x['name'])
+                and all(positive(x.get(k)) for k in ('every_hours', 'max_age_hours', 'max_mb'))
+                and x['max_age_hours'] >= x['every_hours'] and x['max_mb'] <= SEED_MAX_MB for x in seeds)):
+            out.append(f'{who}: seeds must list {{"name" (a-z, 0-9, _, -), "every_hours", "max_age_hours" (at least '
+                       f'every_hours), "max_mb" (at most {SEED_MAX_MB})}}, each a positive whole number')
+        elif len({x['name'] for x in seeds}) != len(seeds):
+            out.append(f'{who}: two seeds with one name')
         if not positive(p.get('slots')):
             out.append(f'{who}: slots must be a positive whole number')
         if not isinstance(p.get('waits'), bool):
@@ -170,18 +187,50 @@ def check_config(cfg):
             out.append(f'with "hosted": false a static pool must take {kind} runs (where jobs that are not routed, '
                        're-runs of failed jobs and runs the dispatchers refuse go)')
     for j in cfg['jobs']:
+        unknown = sorted(set(j) - JOB_FIELDS) if isinstance(j, dict) else []
+        if unknown:
+            out.append(f'job {j.get("job")!r}: unknown key {", ".join(map(repr, unknown))} (a job takes only '
+                       f'{", ".join(sorted(JOB_FIELDS))}; a misspelled key would be ignored)')
         if not (isinstance(j.get('job'), str) and JOB_ID.fullmatch(j['job'])):
             out.append(f'job {j.get("job")!r}: the id must be a-z, 0-9 and _')
         if not positive(j.get('memory_mb')):
             out.append(f'job {j.get("job")!r}: memory_mb must be a positive number')
         if j.get('shards') is not None and not (positive(j['shards']) and j['shards'] < 1000):
             out.append(f'job {j.get("job")!r}: shards must be 1 to 999')
+        out += avoid_problems(pools, j)
     if out:
         return out
     keys = [k for k, _ in job_keys(cfg)]
     if len(set(keys)) != len(keys):
         out.append('a job key twice')
     return out
+
+
+def avoid_problems(pools, job):
+    """A job's `avoid` ({pool name: [kinds]}): the pools this job is never sent to for those kinds of run. Only a
+    dispatcher pool that does not wait may be avoided: the pool that waits and the static pools are where a job goes
+    when nothing else takes it (fleet mode, "hosted": false, re-runs), so avoiding one could leave it nowhere."""
+    if 'avoid' not in job:
+        return []
+    who, got = f'job {job.get("job")!r}: avoid', job['avoid']
+    if not (isinstance(got, dict) and got):
+        return [f'{who} must be an object {{"<pool name>": ["push", ...]}}']
+    out, named = [], {p.get('name'): p for p in pools}
+    for name, kinds in got.items():
+        pool = named.get(name)
+        if pool is None:
+            out.append(f'{who} names pool {name!r}, which the config does not have')
+        elif pool.get('static') or pool.get('waits') is not False:
+            out.append(f'{who} names pool {name!r}: only a dispatcher pool that does not wait may be avoided (the '
+                       'static pools and the pool that waits are where a job goes when nothing else takes it)')
+        if not (isinstance(kinds, list) and kinds and all(k in KINDS for k in kinds)):
+            out.append(f'{who}[{name!r}] must list some of {list(KINDS)}')
+    return out
+
+
+def avoids(job, pool, kind):
+    """Is this job never sent to this pool for this kind of run (its config `avoid`)?"""
+    return kind in ((job.get('avoid') or {}).get(pool['name']) or ())
 
 
 def dispatcher_or_retired(cfg, label):
@@ -539,14 +588,15 @@ def route(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt
     return route_all(cfg, env, event, mode_value, gates, now, nonce, attempt)[:2]
 
 
-def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt=None):
+def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, attempt=None, rerun=None):
     """(mode, {key: runs-on}, fallback). Raises for a broken setting or CONFIG, and with "hosted": false for a run that
     may hold another repository's code or that no static pool may take (red: nothing can run it). It calls no API (a
     push: one anonymous git ls-remote, made_by_the_sync). With `attempt`, a run label ends with -a<attempt> already.
     Every runs-on is the hosted label, a static pool's runs_on, or a dispatcher pool's label plus this run's own label:
     never a label that nothing serves. `fallback` is the runs-on for a job of another attempt (a re-run of failed jobs
     does not re-run route, and a run label serves one attempt only): the always-on pool for a trusted run, else where
-    this run's jobs went; never a dispatcher pool's label."""
+    this run's jobs went; never a dispatcher pool's label. A dict passed as `rerun` gets the `rerun` output
+    (rerun_labels): where a trusted person's re-run may go instead."""
     mode = mode_in(cfg, mode_value)
     hosted = hosted_of(cfg)
     keys = [key for key, _ in job_keys(cfg)]
@@ -590,7 +640,9 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
         if pool.get('static'):
             return list(pool['runs_on'])
         return [pool['label'], f'{pool["label"]}-{key}-{nonce}' + (f'-a{int(attempt)}' if attempt else '')]
-    todo, t = list(wanted), now()
+    todo, t, entry = list(wanted), now(), dict(job_keys(cfg))
+    if rerun is not None:
+        rerun.update(rerun_labels(cfg, env, kind, wanted, nonce, t))
     for pool in cfg['pools']:
         if kind not in takes_of(pool):
             say(f'pool {pool["name"]}: does not take {kind} runs')
@@ -607,10 +659,14 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
                     if why.startswith('its dispatcher says') else '::error::fork-fleet: ')
             say(f'{seen}pool {pool["name"]}: no free slot counted: {why}'
                 + (' (is its dispatcher running, with a valid token? .github/fork-fleet.md)' if 'error' in seen else ''))
+        kept = [key for key in todo if avoids(entry[key], pool, kind)]
+        if kept and free:
+            say(f'pool {pool["name"]}: not for {", ".join(kept)} in {kind} runs (the job\'s avoid)')
         for _ in range(min(free, pool.get('per_run', free))):
-            if not todo:
+            key = next((k for k in todo if k not in kept), None)
+            if key is None:
                 break
-            key = todo.pop(0)
+            todo.remove(key)
             out[key] = labels(pool, key)
             say(f'{key}: pool {pool["name"]} ' + ('(always there)' if pool.get('static') else
                                                   '(its dispatcher reports a free slot)'))
@@ -622,6 +678,26 @@ def route_all(cfg, env, event, mode_value, gates, now=time.time, nonce=None, att
     elif todo:
         say(f'{there}, no free fleet slot left: {", ".join(todo)}')
     return mode, out, fallback
+
+
+def rerun_labels(cfg, env, kind, keys, nonce, t):
+    """The `rerun` output, {"actors": [...], "pool": <label>, "labels": {key: <run label without -a<attempt>>}}, or {}.
+    A re-run of failed jobs does not re-run route, so its jobs take `fallback` (never a dispatcher pool). With the
+    config's `reruns` pool, a job that pool takes (its `takes`, the job's `avoid`) may instead ask for the pool's
+    label and its run label plus -a<the re-run's attempt> (the job's runs-on adds it), when a trusted actor started
+    the re-run: the dispatcher makes a runner only for a trusted attempt, and the gate checks the attempt. A re-run
+    that fleet-watch started is the bot's: `fallback`. Only when the pool's heartbeat was fresh now: a full pool is
+    waited for (the sweep bounds the wait), a dispatcher that is down, closed or never ran is not."""
+    pool = next((p for p in dispatched(cfg) if p['name'] == cfg.get('reruns')), None)
+    if pool is None or kind not in takes_of(pool):
+        return {}
+    _, why = beacon_free(cfg, pool, env, t)
+    if why:
+        say(f're-runs of failed jobs take the fallback, not pool {pool["name"]}: {why}')
+        return {}
+    entry = dict(job_keys(cfg))
+    labels = {key: f'{pool["label"]}-{key}-{nonce}' for key in keys if not avoids(entry[key], pool, kind)}
+    return {'actors': list(cfg['trusted']['actors']), 'pool': pool['label'], 'labels': labels} if labels else {}
 
 
 def with_vars(cfg, env):
@@ -657,10 +733,13 @@ def cmd_route(cfg, env, with_attempt=False):
     except ValueError:
         say('::warning::fork-fleet: the changes outputs cannot be read: every routed job counts as running')
     attempt = env.get('GITHUB_RUN_ATTEMPT') or '1'
-    mode, out, fallback = route_all(cfg, env, event, env.get('FLEET_MODE'), gates, attempt=with_attempt and int(attempt))
+    rerun = {}
+    mode, out, fallback = route_all(cfg, env, event, env.get('FLEET_MODE'), gates,
+                                    attempt=with_attempt and int(attempt), rerun=rerun)
     fleet = sum(1 for v in out.values() if not isinstance(v, str))
     lines = [f'runners={json.dumps(out, separators=(",", ":"))}', f'mode={mode}', f'attempt={attempt}',
-             f'watch={"true" if fleet else "false"}', f'fallback={json.dumps(fallback, separators=(",", ":"))}']
+             f'watch={"true" if fleet else "false"}', f'fallback={json.dumps(fallback, separators=(",", ":"))}',
+             f'rerun={json.dumps(rerun, separators=(",", ":"))}']
     with open(env['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
         f.write(''.join(f'{line}\n' for line in lines))
     where = {}
