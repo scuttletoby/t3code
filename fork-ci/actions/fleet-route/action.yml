@@ -43,6 +43,11 @@ outputs:
       runs-on (JSON) for a job of another attempt (a re-run of failed jobs does not re-run the route job); never a
       dispatcher pool's label: for a trusted run its kind's always-on static pool if any, else the hosted label.
     value: ${{ steps.route.outputs.fallback }}
+  rerun:
+    description: >-
+      With the config's "reruns": JSON {"actors", "pool", "labels"} for a re-run of failed jobs that a trusted person
+      starts (the job's runs-on adds -a<attempt> to its label); {} when re-runs take "fallback".
+    value: ${{ steps.route.outputs.rerun }}
   watch:
     description: true when a job went to a dispatcher or static pool (a job that bounds its wait can then start).
     value: ${{ steps.route.outputs.watch }}
