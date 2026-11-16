@@ -20,7 +20,8 @@
 #                TEMPLATE and swaps the two by one rename under the launch lock. Running jobs keep their copies; any
 #                failure leaves the old template. Below.
 #   active       the NAME of every fork-fleet-* unit that is loaded (starting, running or stopping).
-#   fits MB      exit 0 when MemAvailable minus RESERVE_MB leaves MB megabytes.
+#   fits MB      exit 0 when MemAvailable minus RESERVE_MB leaves MB megabytes and, with FREE_COMMAND set, that free
+#                script answers free (free/v1, fork-kit/common/FREE.md: run by FREE_CHECK, its reader).
 #   stop NAME    stops that unit (a job on it fails: its runner is gone).
 #   prune        removes the copies and environment files whose unit is gone.
 #   refresh-net  every dispatcher pass: looks this host's own public address up again and, when what is blocked would
@@ -61,7 +62,8 @@
 # fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only, comma-separated, say a
 # tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an https
 # URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
-# empty for none) have defaults below.
+# empty for none), FREE_COMMAND (a free/v1 script's absolute path, empty for none) and FREE_CHECK (its reader,
+# free_contract.py beside this launcher) have defaults below.
 # HOOK (and the two files beside it), WORK_ROOT and RESOLV_CONF are bound into every job too: never under a folder that
 # holds data (/home, /root, /mnt, /media, /srv), also through a symlink (no_data). A bind mount of a data folder at
 # one of them is not seen (it has no link to resolve): that is the operator's to avoid (.github/fork-fleet.md, step 4).
@@ -116,8 +118,8 @@ LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/pro
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
 SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com ALLOW_PATHS=''
 JOB_PATHS='' RUNNER_RELEASE=https://api.github.com/repos/actions/runner/releases/latest
-RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download RUNNER_MIN=''
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|JOB_PATHS|ALLOW_PATHS|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN)=([^[:space:]]*)$'
+RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download RUNNER_MIN='' FREE_COMMAND='' FREE_CHECK=''
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|JOB_PATHS|ALLOW_PATHS|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -135,6 +137,9 @@ PLAIN_PATH='(/[A-Za-z0-9._@+-]+)+'
 if [[ -n $JOB_PATHS ]]; then JOB_PATHS=$ROOT$JOB_PATHS; else
   JOB_PATHS=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fork-fleet-job-paths.txt
 fi
+[[ $FREE_COMMAND =~ ^($PLAIN_PATH)?$ && $FREE_CHECK =~ ^($PLAIN_PATH)?$ ]] ||
+  die "$conf: FREE_COMMAND and FREE_CHECK are plain absolute paths"
+[[ -n $FREE_CHECK ]] || FREE_CHECK=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/free_contract.py
 
 NAME='^[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}$'
 name_ok() { [[ $1 =~ $NAME ]] || die "not a runner name: $1"; }
@@ -682,7 +687,11 @@ fits() {
   [[ $1 =~ ^[0-9]{1,7}$ ]] || die "fits: not a number of megabytes: $1"
   kb=$(awk '$1 == "MemAvailable:" { print $2 }' "$MEMINFO")
   [[ $kb =~ ^[0-9]+$ ]] || die "no MemAvailable in $MEMINFO"
-  ((kb / 1024 - RESERVE_MB >= $1))
+  ((kb / 1024 - RESERVE_MB >= $1)) || return 1
+  [[ -n $FREE_COMMAND ]] || return 0
+  owned_safe "$FREE_CHECK"
+  # Its one line (free, busy: why, not available: why) for the dispatcher's log; any exit but 0 is not free.
+  /usr/bin/python3 -I "$FREE_CHECK" ask --need-mb "$1" "$FREE_COMMAND" >&2
 }
 
 # The ranges no job reaches: the host itself is refused on its own (the input chain), these on the way out: RFC 1918,
