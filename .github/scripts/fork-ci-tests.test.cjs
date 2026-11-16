@@ -280,3 +280,44 @@ test("a process a test leaves behind holding its output does not hang the run", 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// A pipe into a reader that stops early (`grep -q`, `grep -m`, `head`) kills the writer with SIGPIPE
+// whenever it has more to write; under `pipefail` that reads as a failed check, more often under load.
+const earlyExitPipe =
+  /(?<!\|)\|(?!\|)\s*!?\s*(?:grep\s+(?:-[A-Za-z]*[qm]|--quiet|--max-count)|head\b)/;
+const earlyExitPipes = (text) =>
+  text
+    .split("\n")
+    .map((line, index) => ({ line, number: index + 1 }))
+    .filter(({ line }) => !/^\s*#/.test(line) && earlyExitPipe.test(line));
+
+test("a pipe into grep -q, grep -m or head is found; reading the whole output first is not", () => {
+  const found = earlyExitPipes(
+    [
+      'sed -n "/a/,$p" f | grep -q x',
+      "! calls | grep -vqE y",
+      "git show c | grep -qx z",
+      "seq 9 | grep -m1 3",
+      'sed p <<< "$s" | head -n 1',
+      'grep -q x <<< "$(sed -n p f)"',
+      "a || grep -q x f",
+      "# a comment: `x | grep -q` stops early",
+      '[[ -z "$(grep -E a f | grep -vE b)" ]]',
+    ].join("\n"),
+  ).map(({ number }) => number);
+  assert.deepEqual(found, [1, 2, 3, 4, 5]);
+});
+
+test("no listed shell test pipes into a reader that stops early", () => {
+  const root = path.resolve(__dirname, "../..");
+  const shellTests = readList(fs.readFileSync(path.join(root, ".github/fork-ci-tests.txt"), "utf8"))
+    .map(({ file }) => file)
+    .filter((file) => file.endsWith(".sh") && fs.existsSync(path.join(root, file)));
+  assert.ok(shellTests.length > 0);
+  const found = shellTests.flatMap((file) =>
+    earlyExitPipes(fs.readFileSync(path.join(root, file), "utf8")).map(
+      ({ line, number }) => `${file}:${number}: ${line.trim()}`,
+    ),
+  );
+  assert.deepEqual(found, []);
+});
