@@ -220,6 +220,22 @@ class Host(Base):
         self.make('m2', {'a': b'x'})   # small enough for the pipe: offer() below has no reader until it returns
         self.assertEqual(self.offer('seed m2')[0], 0)   # the pool's lock was let go
 
+    def test_a_desktop_that_stops_reading_a_one_piece_seed_is_exit_1(self):
+        """lens236r3: the guard's `wrote == sent` half was untested. A seed of one piece (under PIECE) has
+        sent == size at the stall, so only that half refuses the cut stream."""
+        self.make('m2', {'a': os.urandom(512 << 10)})
+        r, w = os.pipe()   # nobody reads r
+        err = io.StringIO()
+        try:
+            with mock.patch.object(seed, 'STALL', 1):
+                code = seed.offer(POOL, 'seed m2', os.path.join(self.t, 'run'), out=w, err=err,
+                                  config=os.path.join(self.t, 'fork-fleet.json'), files=os.path.join(self.t, 'files'))
+        finally:
+            os.close(r)
+            os.close(w)
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertNotIn('seed m2 ', err.getvalue())   # no trailer for a cut stream
+
     def test_a_slow_desktop_meets_the_deadline(self):
         self.make('m2', {'a': os.urandom(1 << 20)})
         r, w = os.pipe()   # nobody reads r; the stall wait alone (100 s) would hold the lock much longer
