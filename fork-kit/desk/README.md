@@ -86,13 +86,15 @@ three quarters of the RAM, at most the RAM less 6 GB, never under 4 GB; one that
 refused), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (read and written as UTF-8 without a
 BOM; a dated copy of the old file is kept, other keys and sections stay; an old `networkingMode` or `dnsTunneling`
 line under `[experimental]`, the form before WSL 2.0 that can still win over `[wsl2]`, is removed, and the check
-FAILs while one is there); the distro's own settings the WSL2 walls
+FAILs while one is there; the question lists each change, old -> new, and the file is written only when it lists one,
+so "no change" means the file is left alone); the distro's own settings the WSL2 walls
 ask for (`/etc/wsl.conf`: systemd on, no Windows drives, programs or PATH; its own `/etc/resolv.conf`; WSL's binfmt
 handler masked); one `wsl --shutdown` when one of these changed or the running WSL does not have them yet (PID 1 not
-systemd, interop live, Windows drives mounted, `wsl.conf` newer than PID 1's start (read from `/proc/1/stat` and
-`btime`; unreadable means restart), `.wslconfig` newer than the running WSL, more memory than the cap, not NAT, or a
-`.wslconfig` change whose shutdown is still owed: one mark in `%LOCALAPPDATA%\fork-desk` for every distro, like
-`.wslconfig` itself, written before the change and removed after the shutdown, because WSL's uptime skips sleep),
+systemd, interop live, Windows drives mounted, `wsl.conf` changed after PID 1 started as far as the VM's clock tells
+(`/proc/1/stat` and `btime`; unreadable means restart; the clock skips the PC's sleep, so this alone can miss a change,
+hence the mark below), `.wslconfig` newer than the running WSL, more memory than the cap, not NAT, or a `.wslconfig`
+or `wsl.conf` change whose shutdown is still owed: one mark in `%LOCALAPPDATA%\fork-desk` for every distro, like
+`.wslconfig` itself, written before either change and removed after the shutdown, because WSL's uptime skips sleep),
 so a run stopped before its shutdown restarts next time (every WSL distro and Docker Desktop stop); the packages the fleet needs; the
 machine file and `-FleetConfig`, if given; this kit's bootstrap; a logon task that keeps the distro running while
 the owner is logged in. Last, `desk-install check` and the Windows side's own PASS/FAIL lines (the `[wsl2]` keys);
