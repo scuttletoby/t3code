@@ -149,8 +149,10 @@ Switch off in `settings.json`: `"headlessUsageRefreshInterval": 0`.
 
 Named MCP profiles. A profile says which outside MCP servers (`servers`) and which groups of T3's
 own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Two profiles are built in: `all`
-(everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool). Nothing applies
-a profile yet: the provider adapters and the T3 tool filter come in later pull requests.
+(everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool); a profile cannot
+take their names, and one written in by hand makes that built-in refuse threads until it is removed
+or renamed. Nothing applies a profile yet: the provider adapters and the T3 tool filter come in later
+pull requests.
 
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
@@ -171,8 +173,9 @@ its parent's profile. A child never gets more than its parent.
 
 ### `server.mcpThreadProfiles`
 
-The person's pick of profile per thread, by thread id. A pick wins over every default. The newest
-500 picks are kept; a thread whose pick was dropped falls back to its default.
+The person's pick of profile per thread, by thread id. A pick wins over every default. At most 500
+picks are kept: a save that would add more is refused until old picks are removed. No pick is ever
+dropped to make room.
 
 ### `projectOverride.waitChecks`
 

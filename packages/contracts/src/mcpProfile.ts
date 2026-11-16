@@ -191,10 +191,11 @@ export const McpThreadProfilesPatch = Schema.Record(
 );
 
 /**
- * The newest thread picks kept; a write that goes over drops the oldest, which then falls back to
- * its role default. Pruning deleted threads' picks comes later.
+ * The most thread picks the settings hold. A save that would go over is refused (remove old picks
+ * first); no pick is ever dropped to make room, since its thread would fall back to a wider role
+ * default. Pruning deleted threads' picks comes later.
  */
-export const MCP_THREAD_PROFILES_KEEP_NEWEST = 500;
+export const MCP_THREAD_PROFILES_MAX = 500;
 
 /**
  * The settings file's thread picks: thread id to profile name. Read leniently, like

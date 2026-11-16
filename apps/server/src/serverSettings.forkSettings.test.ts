@@ -4,7 +4,8 @@
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ServerSettingsPatch } from "@t3tools/contracts";
+import { ServerSettingsError, ServerSettingsPatch } from "@t3tools/contracts";
+import { ForkSettingsWriteError } from "@t3tools/shared/forkSettingsPatch";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -244,22 +245,33 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork MCP profile
     }).pipe(Effect.provide(layerServerSettings())),
   );
 
-  it.effect("refuses a save that names a profile that is not set up, saying how to fix it", () =>
-    Effect.gen(function* () {
-      const config = yield* ServerConfig.ServerConfig;
-      const fs = yield* FileSystem.FileSystem;
-      yield* fs.writeFileString(config.settingsPath, JSON.stringify(FULL_FILE));
-      const service = yield* ServerSettingsModule.ServerSettingsService;
-      const error = yield* service
-        .updateSettings(decodePatch({ mcpProfile: "lean" }))
-        .pipe(Effect.flip);
-      assert.strictEqual(
-        error.message,
-        'mcpProfile names MCP profile "lean", which is not set up: add that profile first, or pick "all" or "t3-only".',
-      );
-      // Nothing was written: the file still has no MCP keys.
-      const file = (yield* readFile) as Record<string, unknown>;
-      assert.isFalse("mcpProfile" in file);
-    }).pipe(Effect.provide(layerServerSettings())),
+  it.effect(
+    "refuses a save that names a profile that is not set up, with the fix as its cause",
+    () =>
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(config.settingsPath, JSON.stringify(FULL_FILE));
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const error = yield* service
+          .updateSettings(decodePatch({ mcpProfile: "lean" }))
+          .pipe(Effect.flip);
+        const reason =
+          'mcpProfile names MCP profile "lean", which is not set up: add that profile first, or pick "all" or "t3-only".';
+        // Upstream's error type, unchanged; the reason is its cause.
+        assert.strictEqual(error.operation, "normalize");
+        assert.instanceOf(error.cause, ForkSettingsWriteError);
+        assert.strictEqual((error.cause as Error).message, reason);
+        // The reason reaches a client: the error as the RPC sends it and decodes it.
+        const json = Schema.toCodecJson(ServerSettingsError);
+        const received = yield* Schema.decodeEffect(json)(yield* Schema.encodeEffect(json)(error));
+        assert.deepInclude(received.cause as object, {
+          name: "ForkSettingsWriteError",
+          message: reason,
+        });
+        // Nothing was written: the file still has no MCP keys.
+        const file = (yield* readFile) as Record<string, unknown>;
+        assert.isFalse("mcpProfile" in file);
+      }).pipe(Effect.provide(layerServerSettings())),
   );
 });

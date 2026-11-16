@@ -55,7 +55,10 @@ import {
   fallbackTextGenerationModelSelection,
   isModelSelectionProviderEnabled,
 } from "@t3tools/shared/serverSettings";
-import { forkSettingsWriteProblem } from "@t3tools/shared/forkSettingsPatch";
+import {
+  ForkSettingsWriteError,
+  forkSettingsWriteProblem,
+} from "@t3tools/shared/forkSettingsPatch";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
@@ -232,17 +235,21 @@ function ensureSecretProviderWritesAllowed(
   return Effect.void;
 }
 
-// Fork: refuses a fork setting's save that could not apply (forkSettingsPatch.ts says why).
+// Fork: refuses a fork setting's save that could not apply; the cause says why and how to fix it.
 function ensureForkSettingsWriteAllowed(
   current: ServerSettings,
   next: ServerSettings,
   settingsPath: string,
 ): Effect.Effect<void, ServerSettingsError> {
-  const detail = forkSettingsWriteProblem(current, next);
-  return detail === undefined
+  const problem = forkSettingsWriteProblem(current, next);
+  return problem === undefined
     ? Effect.void
     : Effect.fail(
-        new ServerSettingsError({ settingsPath, operation: "write-fork-setting", detail }),
+        new ServerSettingsError({
+          settingsPath,
+          operation: "normalize",
+          cause: new ForkSettingsWriteError(problem),
+        }),
       );
 }
 

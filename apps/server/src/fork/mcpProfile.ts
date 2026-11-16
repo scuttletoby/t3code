@@ -11,6 +11,7 @@ import {
   MCP_T3_UNGROUPED_TOOLS,
   type McpT3ToolGroup,
   type ServerSettings,
+  isBuiltInMcpProfileName,
   isDefinableMcpProfileName,
 } from "@t3tools/contracts";
 
@@ -57,7 +58,10 @@ export interface McpProfileResolved {
 export type McpProfileProblem =
   /** No profile has this name (or the name is not one a profile may have). */
   | "missing"
-  /** The profile is there, but this build cannot read it (a typo, or a newer build wrote it). */
+  /**
+   * The profile is there, but this build cannot read it (a typo, or a newer build wrote it), or a
+   * hand edit put an entry in `mcpProfiles` under a built-in's name.
+   */
   | "broken"
   /** The parent thread's own profile cannot be applied, so the child's cannot be cut down. */
   | "parent"
@@ -101,17 +105,39 @@ export const MCP_T3_TOOLKIT_GROUPS: Readonly<Record<string, McpT3ToolGroup | nul
 };
 
 /**
- * A T3 tool's group, or `"ungrouped"` for one every profile keeps; `undefined` when its toolkit
- * has no row in {@link MCP_T3_TOOLKIT_GROUPS} or it is an ungrouped toolkit's unlisted tool.
+ * The toolkit each of `MCP_T3_UNGROUPED_TOOLS` lives in. A tool of the same name in another toolkit
+ * is not ungrouped: it is in that toolkit's group. The test in personOnlySettings.test.ts checks
+ * each row against the toolkit files.
+ */
+export const MCP_T3_UNGROUPED_TOOL_KITS: Readonly<Record<string, string>> = {
+  request_secret: "orchestrator",
+  send_to_user: "message",
+  tool_search: "toolSearch",
+};
+
+/** {@link mcpT3ToolGroup}'s answer for a tool no profile may keep. */
+export const MCP_T3_TOOL_NOT_ALLOWED = "not-allowed";
+
+/**
+ * A T3 tool's group; `"ungrouped"` for one of `MCP_T3_UNGROUPED_TOOLS` in its own toolkit, which
+ * every profile keeps; {@link MCP_T3_TOOL_NOT_ALLOWED} for a tool this build does not know (its
+ * toolkit has no row in {@link MCP_T3_TOOLKIT_GROUPS}, or it is an ungrouped toolkit's other tool).
  */
 export function mcpT3ToolGroup(
   toolkit: string,
   tool: string,
-): McpT3ToolGroup | "ungrouped" | undefined {
-  if (MCP_T3_UNGROUPED_TOOLS.includes(tool)) return "ungrouped";
-  return Object.hasOwn(MCP_T3_TOOLKIT_GROUPS, toolkit)
-    ? (MCP_T3_TOOLKIT_GROUPS[toolkit] ?? undefined)
+): McpT3ToolGroup | "ungrouped" | typeof MCP_T3_TOOL_NOT_ALLOWED {
+  if (
+    MCP_T3_UNGROUPED_TOOLS.includes(tool) &&
+    Object.hasOwn(MCP_T3_UNGROUPED_TOOL_KITS, tool) &&
+    MCP_T3_UNGROUPED_TOOL_KITS[tool] === toolkit
+  ) {
+    return "ungrouped";
+  }
+  const group = Object.hasOwn(MCP_T3_TOOLKIT_GROUPS, toolkit)
+    ? MCP_T3_TOOLKIT_GROUPS[toolkit]
     : undefined;
+  return group ?? MCP_T3_TOOL_NOT_ALLOWED;
 }
 
 /** Longer lineages are refused; real delegation chains are a few threads deep. */
@@ -172,10 +198,20 @@ type Lookup =
 
 /** A named profile: a built-in, or an entry of `mcpProfiles` checked now. */
 function lookUp(settings: McpProfileSettings, name: string): Lookup {
-  const builtIn = Object.hasOwn(BUILT_IN_PROFILES, name) ? BUILT_IN_PROFILES[name] : undefined;
-  // Built-ins win over an entry of the same name, which a save never writes.
-  if (builtIn !== undefined) return { ok: true, profile: builtIn, unknown: [] };
   const profiles: unknown = settings.mcpProfiles;
+  const builtIn = Object.hasOwn(BUILT_IN_PROFILES, name) ? BUILT_IN_PROFILES[name] : undefined;
+  if (builtIn !== undefined) {
+    // A save never writes an entry under a built-in's name, so one is a hand edit. Which of the
+    // two the owner meant is unknown, so neither is used.
+    if (isRecord(profiles) && Object.hasOwn(profiles, name)) {
+      return {
+        ok: false,
+        problem: "broken",
+        issue: `mcpProfiles also has an entry named "${name}", a built-in profile's name`,
+      };
+    }
+    return { ok: true, profile: builtIn, unknown: [] };
+  }
   if (!isDefinableMcpProfileName(name) || !isRecord(profiles) || !Object.hasOwn(profiles, name)) {
     return { ok: false, problem: "missing", issue: "" };
   }
@@ -263,7 +299,12 @@ function cannotApply(
     problem === "missing"
       ? `MCP profile "${profileName}" is not set up, so this thread cannot start: ${FIX}.`
       : problem === "broken"
-        ? `MCP profile "${profileName}" cannot be read by this version (${issue}), so this thread cannot start: ${FIX}.`
+        ? `MCP profile "${profileName}" cannot be read by this version (${issue}), so this thread cannot start: ${
+            // Only an entry under its name breaks a built-in; picking it again would not help.
+            isBuiltInMcpProfileName(profileName)
+              ? `remove or rename that entry in the settings file`
+              : FIX
+          }.`
         : problem === "parent"
           ? `The parent thread's MCP profile "${profileName}" cannot be applied, so this thread cannot start: ${FIX}.`
           : `This thread's parent threads ${issue}, so its MCP profile cannot be worked out: ${FIX}.`;

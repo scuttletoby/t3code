@@ -76,10 +76,30 @@ describe("MCP profile resolver: old and empty state", () => {
     });
   });
 
-  it("ignores a profile in the file that redefines a built-in", () => {
-    const settings = fromFile({ mcpProfiles: { all: { servers: [], t3Tools: [] } } });
-    expect(isEveryMcpTool(resolved(resolveMcpProfile(settings, [top("t1")])).profile)).toBe(true);
-  });
+  it.each(["all", "t3-only"])(
+    "refuses %s when a hand edit put a profile of that name in the file",
+    (name) => {
+      const file = {
+        mcpProfiles: { [name]: { servers: [], t3Tools: [] }, lean: PROFILES.lean },
+        mcpProfile: name,
+      };
+      const settings = fromFile(file);
+      const result = refused(resolveMcpProfile(settings, [top("t1")]));
+      expect(result.problem).toBe("broken");
+      expect(result.profileName).toBe(name);
+      expect(result.message).toBe(
+        `MCP profile "${name}" cannot be read by this version (mcpProfiles also has an entry named "${name}", a built-in profile's name), so this thread cannot start: remove or rename that entry in the settings file.`,
+      );
+      // An owner's pick of the same built-in is refused too; another profile still works.
+      expect(
+        refused(
+          resolveMcpProfile(fromFile({ ...file, mcpThreadProfiles: { t2: name } }), [top("t2")]),
+        ).problem,
+      ).toBe("broken");
+      const lean = fromFile({ ...file, mcpThreadProfiles: { t3: "lean" } });
+      expect(resolved(resolveMcpProfile(lean, [top("t3")])).name).toBe("lean");
+    },
+  );
 });
 
 describe("MCP profile resolver: who decides", () => {

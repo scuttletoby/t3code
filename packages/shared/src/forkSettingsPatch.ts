@@ -53,11 +53,8 @@ function applyRule(rule: ForkPatchRule, stored: unknown, patch: unknown): unknow
       next.delete(id);
       if (entry !== null) next.set(id, entry);
     }
-    const { keepNewest } = rule.replaceEntries;
-    const ids = [...next.keys()];
-    if (keepNewest !== undefined && ids.length > keepNewest) {
-      for (const id of ids.slice(0, ids.length - keepNewest)) next.delete(id);
-    }
+    // Never trimmed to `maxEntries` here: dropping an entry would quietly change what it set (a
+    // thread pick's thread would fall back to a wider default). The save check refuses instead.
     return Object.fromEntries(next);
   }
   for (const [id, entry] of Object.entries(patch as Record<string, unknown>)) {
@@ -87,6 +84,36 @@ export function applyForkSettingsPatch(
     next[key] = applyRule(FORK_PATCH_RULES[key], current[key], value);
   }
   return next as Partial<Pick<ServerSettings, ForkServerSettingKey>>;
+}
+
+/**
+ * Fork: why the server refused a save of fork settings, with the fix. The server fails the save
+ * with upstream's `ServerSettingsError` (operation `normalize`, as for a patch that does not decode)
+ * and this as its `cause`, so upstream's error type stays as it is; the cause's name and message
+ * travel to the client with it.
+ */
+export class ForkSettingsWriteError extends Error {
+  override readonly name = "ForkSettingsWriteError";
+}
+
+/**
+ * A save that would leave a `replaceEntries` map with more than its `maxEntries`, and more than it
+ * had: refused, so no entry is ever dropped to make room. A map already over (a hand edit) still
+ * takes saves that do not grow it, so it never blocks an unrelated save.
+ */
+function maxEntriesProblem(current: ServerSettings, next: ServerSettings): string | undefined {
+  for (const key of FORK_PATCH_KEYS) {
+    const rule = FORK_PATCH_RULES[key];
+    if (typeof rule !== "object" || !("replaceEntries" in rule)) continue;
+    const max = rule.replaceEntries.maxEntries;
+    if (max === undefined) continue;
+    const count = (value: unknown) => (isRecord(value) ? Object.keys(value).length : 0);
+    const after = count(next[key]);
+    if (after > max && after > count(current[key])) {
+      return `${key} would hold ${after} entries, more than the ${max} allowed: remove old picks first, then save again.`;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -124,6 +151,7 @@ export function forkSettingsWriteProblem(
   next: ServerSettings,
 ): string | undefined {
   const problems: Array<string | undefined> = [
+    maxEntriesProblem(current, next),
     mcpProfileRefProblem(next, "mcpProfile", next.mcpProfile, current.mcpProfile, false),
     mcpProfileRefProblem(
       next,

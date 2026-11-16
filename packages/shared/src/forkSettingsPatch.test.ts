@@ -2,7 +2,7 @@
 
 import {
   DEFAULT_SERVER_SETTINGS,
-  MCP_THREAD_PROFILES_KEEP_NEWEST,
+  MCP_THREAD_PROFILES_MAX,
   ProjectId,
   ProviderInstanceId,
   type ServerSettings,
@@ -138,22 +138,66 @@ describe("fork settings patch", () => {
       ]);
     });
 
-    it(`keeps the ${MCP_THREAD_PROFILES_KEEP_NEWEST} newest picks`, () => {
-      const many = Object.fromEntries(
-        Array.from({ length: MCP_THREAD_PROFILES_KEEP_NEWEST }, (_, index) => [
-          `old-${index}`,
-          "lean",
-        ]),
-      );
-      const full: ServerSettings = { ...current, mcpThreadProfiles: many };
-      const next = applyForkSettingsPatch(full, {
-        mcpThreadProfiles: { [t("old-0")]: "all", [t("new")]: "lean" },
-      }).mcpThreadProfiles!;
-      expect(Object.keys(next)).toHaveLength(MCP_THREAD_PROFILES_KEEP_NEWEST);
-      // `old-0` was picked again, so `old-1` is now the oldest and goes.
-      expect(Object.keys(next).slice(0, 1)).toEqual(["old-2"]);
-      expect(Object.keys(next).slice(-2)).toEqual(["old-0", "new"]);
-      expect(next).not.toHaveProperty("old-1");
+    describe(`the ${MCP_THREAD_PROFILES_MAX}-pick cap`, () => {
+      const full: ServerSettings = {
+        ...current,
+        mcpThreadProfiles: Object.fromEntries(
+          Array.from({ length: MCP_THREAD_PROFILES_MAX }, (_, i) => [`old-${i}`, "t3-only"]),
+        ),
+      };
+      const after = (base: ServerSettings, patch: Parameters<typeof applyServerSettingsPatch>[1]) =>
+        applyServerSettingsPatch(base, patch);
+
+      it("never widens a live thread to make room", () => {
+        const next = applyForkSettingsPatch(full, {
+          mcpThreadProfiles: { [t("new")]: "t3-only" },
+        }).mcpThreadProfiles!;
+        expect(next["old-0"]).toBe("t3-only");
+        expect(Object.keys(next)).toHaveLength(MCP_THREAD_PROFILES_MAX + 1);
+      });
+
+      it("refuses the save that would go over, saying to remove old picks first", () => {
+        const patch = { mcpThreadProfiles: { [t("new")]: "t3-only" } };
+        expect(forkSettingsWriteProblem(full, after(full, patch))).toBe(
+          `mcpThreadProfiles would hold ${MCP_THREAD_PROFILES_MAX + 1} entries, more than the ${MCP_THREAD_PROFILES_MAX} allowed: remove old picks first, then save again.`,
+        );
+      });
+
+      it("takes a save at the cap that replaces or removes picks", () => {
+        // Replaces an existing pick: still 500.
+        expect(
+          forkSettingsWriteProblem(
+            full,
+            after(full, { mcpThreadProfiles: { [t("old-0")]: "all" } }),
+          ),
+        ).toBeUndefined();
+        // Removes one and adds one in the same save: still 500.
+        expect(
+          forkSettingsWriteProblem(
+            full,
+            after(full, { mcpThreadProfiles: { [t("old-1")]: null, [t("new")]: "all" } }),
+          ),
+        ).toBeUndefined();
+      });
+
+      it("lets a map already over the cap (a hand edit) take saves that do not grow it", () => {
+        const over: ServerSettings = {
+          ...full,
+          mcpThreadProfiles: { ...full.mcpThreadProfiles, extra: "t3-only" },
+        };
+        expect(
+          forkSettingsWriteProblem(over, after(over, { enableAgentBrowserAccess: false })),
+        ).toBeUndefined();
+        expect(
+          forkSettingsWriteProblem(
+            over,
+            after(over, { mcpThreadProfiles: { [t("old-0")]: null } }),
+          ),
+        ).toBeUndefined();
+        expect(
+          forkSettingsWriteProblem(over, after(over, { mcpThreadProfiles: { [t("new")]: "all" } })),
+        ).toMatch(/remove old picks first/);
+      });
     });
 
     it("replaces a profile whole, so a save repairs one this build cannot read", () => {

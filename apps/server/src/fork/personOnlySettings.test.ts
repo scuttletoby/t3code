@@ -18,7 +18,12 @@ import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 import { beforeAll, describe, expect, it } from "vite-plus/test";
 
-import { MCP_T3_TOOLKIT_GROUPS, mcpT3ToolGroup } from "./mcpProfile.ts";
+import {
+  MCP_T3_TOOLKIT_GROUPS,
+  MCP_T3_TOOL_NOT_ALLOWED,
+  MCP_T3_UNGROUPED_TOOL_KITS,
+  mcpT3ToolGroup,
+} from "./mcpProfile.ts";
 
 const TOOLKITS_DIR = NodePath.resolve(import.meta.dirname, "../mcp/toolkits");
 /** Every toolkit folder; each must define its tools in `tools.ts` and export its toolkits there. */
@@ -212,7 +217,7 @@ describe("person-only fork settings", () => {
 describe("MCP profile T3 tool groups", () => {
   it("maps every T3 tool to a group or to the ungrouped list", () => {
     const unmapped = [...toolsByFolder].flatMap(([folder, names]) =>
-      [...names].filter((name) => mcpT3ToolGroup(folder, name) === undefined),
+      [...names].filter((name) => mcpT3ToolGroup(folder, name) === MCP_T3_TOOL_NOT_ALLOWED),
     );
     expect(unmapped).toEqual([]);
   });
@@ -226,5 +231,29 @@ describe("MCP profile T3 tool groups", () => {
     );
     expect(MCP_T3_TOOL_GROUPS.filter((group) => !used.has(group))).toEqual([]);
     expect(MCP_T3_UNGROUPED_TOOLS.filter((name) => !tools.has(name))).toEqual([]);
+  });
+
+  it("pins each ungrouped tool to the toolkit that has it", () => {
+    expect(Object.keys(MCP_T3_UNGROUPED_TOOL_KITS).toSorted()).toEqual(
+      [...MCP_T3_UNGROUPED_TOOLS].toSorted(),
+    );
+    for (const [tool, toolkit] of Object.entries(MCP_T3_UNGROUPED_TOOL_KITS)) {
+      expect(toolsByFolder.get(toolkit)?.has(tool), `${toolkit} has ${tool}`).toBe(true);
+      expect(mcpT3ToolGroup(toolkit, tool)).toBe("ungrouped");
+    }
+  });
+
+  it("does not take an ungrouped tool's name in another toolkit as ungrouped", () => {
+    // Same name, other toolkit: that toolkit's group, or not allowed in a toolkit with no group.
+    expect(mcpT3ToolGroup("waits", "send_to_user")).toBe("waits");
+    expect(mcpT3ToolGroup("orchestrator", "tool_search")).toBe("orchestration");
+    expect(mcpT3ToolGroup("message", "request_secret")).toBe(MCP_T3_TOOL_NOT_ALLOWED);
+    expect(mcpT3ToolGroup("toolSearch", "send_to_user")).toBe(MCP_T3_TOOL_NOT_ALLOWED);
+  });
+
+  it("does not allow a tool this build does not know", () => {
+    expect(mcpT3ToolGroup("someNewToolkit", "anything")).toBe(MCP_T3_TOOL_NOT_ALLOWED);
+    expect(mcpT3ToolGroup("someNewToolkit", "send_to_user")).toBe(MCP_T3_TOOL_NOT_ALLOWED);
+    expect(mcpT3ToolGroup("message", "new_message_tool")).toBe(MCP_T3_TOOL_NOT_ALLOWED);
   });
 });

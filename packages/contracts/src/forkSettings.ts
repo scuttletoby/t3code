@@ -11,7 +11,7 @@ import { TrimmedString } from "./baseSchemas.ts";
 import {
   MCP_PROFILE_ALL,
   MCP_SUBAGENT_INHERIT,
-  MCP_THREAD_PROFILES_KEEP_NEWEST,
+  MCP_THREAD_PROFILES_MAX,
   McpProfileName,
   McpProfilePatch,
   McpProfileRef,
@@ -114,13 +114,14 @@ export const ForkServerSettingsPatchFields = {
 /**
  * How a patch field changes the stored value: `replace` whole; `merge-fields` only the named fields.
  * Per entry (`null` removes it): `mergeEntries` merges fields, a new entry starting from its
- * defaults; `replaceEntries` replaces the entry whole, makes it newest and keeps `keepNewest`.
+ * defaults; `replaceEntries` replaces the entry whole and makes it newest. A save that would leave
+ * more than `maxEntries` (and more than before) is refused; no entry is dropped to make room.
  */
 export type ForkPatchRule =
   | "replace"
   | "merge-fields"
   | { readonly mergeEntries: Readonly<Record<string, unknown>> }
-  | { readonly replaceEntries: { readonly keepNewest?: number } };
+  | { readonly replaceEntries: { readonly maxEntries?: number } };
 
 /** One rule per fork patch field. */
 export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatchRule } = {
@@ -139,8 +140,8 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   mcpProfiles: { replaceEntries: {} },
   mcpProfile: "replace",
   mcpSubagentProfile: "replace",
-  // One pick per thread, so two picks at once keep both; old picks go beyond the cap.
-  mcpThreadProfiles: { replaceEntries: { keepNewest: MCP_THREAD_PROFILES_KEEP_NEWEST } },
+  // One pick per thread, so two picks at once keep both; a save past the cap is refused.
+  mcpThreadProfiles: { replaceEntries: { maxEntries: MCP_THREAD_PROFILES_MAX } },
 };
 
 /** The client settings' fork fields (stored in the browser); none yet. */
