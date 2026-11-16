@@ -18,13 +18,14 @@ concurrency:
 
 jobs:
   soak:
-    name: Web soak ${{ matrix.rep }}
+    name: Web soak ${{ matrix.shard }}/3 rep ${{ matrix.rep }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        rep: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3]
+        rep: [1, 2, 3, 4]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -67,13 +68,14 @@ jobs:
         run: |
           nproc; free -m; df -BM / /tmp /dev/shm; ulimit -a
 
-      - name: Test (shard 1/2) with resource sampling
+      - name: Test (shard of 3) with resource sampling
         working-directory: apps/web
         env:
-          SHARD: 1/2
+          SHARD: ${{ matrix.shard }}/3
           DEBUG: vitest:browser:gc,pw:browser*
-          # Round 3: vitest's own Chromium GC after every test file (it runs only below this free /tmp).
-          VITEST_CHROMIUM_GC_DISK_THRESHOLD_GB: "1000000"
+          # Round 4: 3 shards; reps 1-3 with vitest's Chromium GC after every file (it runs only below
+          # this free /tmp), rep 4 without it.
+          VITEST_CHROMIUM_GC_DISK_THRESHOLD_GB: ${{ matrix.rep != 4 && '1000000' || '' }}
         run: |
           log="$RUNNER_TEMP/res.log"
           (
