@@ -711,8 +711,11 @@ class Queue:
         the PR OFF with a comment). Killed in a wait: STATE is still there, and the next run's recover() arms it."""
         wait = waited = 0
         while True:
+            # never --delete-branch: when GitHub can merge at once, gh merges and then deletes the branch with the
+            # token, and GitHub CLOSES every open PR stacked on it; the repository's own "Automatically delete head
+            # branches" setting retargets them to this PR's base first (README.md, "Config", delete_branch)
             r = self.gh('pr', 'merge', str(n), '--repo', self.repo, '--auto', f'--{self.cfg.merge_method}',
-                        *(['--delete-branch'] if self.cfg.delete_branch else []), '--match-head-commit', head)
+                        '--match-head-commit', head)
             wait += self.cfg.poll_seconds
             if r.returncode == 0 or not CHECK_NOT_DONE_RE.search(r.stderr or '') \
                     or waited + wait > self.cfg.wait_seconds:

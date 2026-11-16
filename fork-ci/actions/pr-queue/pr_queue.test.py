@@ -2474,12 +2474,108 @@ class Arm(unittest.TestCase):
         q.arm(7, H1)
         return calls[0]
 
-    def test_the_merge_method_and_branch_deletion_come_from_the_config(self):
-        self.assertEqual(self.armed_with(), ('pr', 'merge', '7', '--repo', REPO, '--auto', '--squash', '--delete-branch',
+    def test_the_merge_method_comes_from_the_config_and_the_queue_never_deletes_a_branch(self):
+        self.assertEqual(self.armed_with(), ('pr', 'merge', '7', '--repo', REPO, '--auto', '--squash',
                                              '--match-head-commit', H1))
         self.assertEqual(self.armed_with(merge_method='merge', delete_branch=False),
                          ('pr', 'merge', '7', '--repo', REPO, '--auto', '--merge', '--match-head-commit', H1))
         self.assertIn('--rebase', self.armed_with(merge_method='rebase'))
+        self.assertNotIn('--delete-branch', self.armed_with(delete_branch=True))
+
+
+class StackedGitHub:
+    """GitHub and gh for open PRs stacked on each other, as they treat a branch delete. `gh pr merge --auto` on a PR
+    GitHub can merge at once merges it directly, and with --delete-branch gh then deletes the head with the token: GitHub
+    CLOSES every open PR whose base it was (events base_ref_deleted, closed). The repository's own "Automatically delete
+    head branches" setting (`setting`) first retargets those PRs to the merged PR's base, then deletes. A PR that cannot
+    merge yet is only armed; GitHub merges it later (merge_armed) and only the setting deletes."""
+    def __init__(self, prs, setting=True):
+        self.prs = {n: dict(head=h, base=b, state='OPEN', armed=False) for n, (h, b) in prs.items()}
+        self.branches = {p['head'] for p in self.prs.values()} | {'main'}
+        self.setting, self.calls = setting, []
+
+    def delete(self, branch, by_setting):
+        for p in self.prs.values():
+            if p['state'] == 'OPEN' and p['base'] == branch:
+                if by_setting:
+                    p['base'] = self.merged_base
+                else:
+                    p['state'] = 'CLOSED'
+        self.branches.discard(branch)
+
+    def merge(self, n, token_delete):
+        p = self.prs[n]
+        p['state'], self.merged_base = 'MERGED', p['base']
+        if token_delete and p['head'] in self.branches:   # gh's own delete runs right after its merge call returns
+            self.delete(p['head'], by_setting=False)
+        if self.setting and p['head'] in self.branches:
+            self.delete(p['head'], by_setting=True)
+
+    def merge_armed(self):
+        for n, p in self.prs.items():
+            if p['state'] == 'OPEN' and p['armed']:
+                self.merge(n, token_delete=False)
+
+    def __call__(self, *a):
+        self.calls.append(a)
+        n = int(a[2])
+        if a[:2] == ('pr', 'merge') and '--auto' in a:
+            if self.prs[n]['base'] == 'main':   # up to date and green: gh merges now instead of arming
+                self.merge(n, token_delete='--delete-branch' in a)
+            else:
+                self.prs[n]['armed'] = True
+        return ok()
+
+
+class StackedPrsAreRetargetedNeverClosed(unittest.TestCase):
+    """A PR stacked on another (#2 on #1's branch, #3 on #2's) must survive #1's merge: GitHub's setting retargets it
+    to main. Before, the queue armed with --delete-branch; on a PR GitHub could merge at once gh merged it and deleted
+    the branch with the token, and GitHub closed the PR stacked on it."""
+    def queue(self, gh, delete_branch=True):
+        d = tempfile.mkdtemp(prefix='pr-queue-stack-')
+        self.addCleanup(shutil.rmtree, d, True)
+        q = make_queue(d, config.parse(json.dumps({**CFG_RAW, 'delete_branch': delete_branch})))
+        q.gh = gh
+        return q
+
+    def test_a_stacked_child_is_retargeted_by_githubs_setting_not_closed(self):
+        gh = StackedGitHub({1: ('work/a', 'main'), 2: ('work/b', 'work/a')})
+        self.queue(gh).arm(1, H1)
+        self.assertEqual(gh.prs[1]['state'], 'MERGED')
+        self.assertEqual((gh.prs[2]['state'], gh.prs[2]['base']), ('OPEN', 'main'), 'the stacked PR was closed')
+        self.assertNotIn('work/a', gh.branches, "GitHub's setting still deletes the merged branch")
+
+    def test_a_chain_of_three_survives_each_merge_in_turn(self):
+        gh = StackedGitHub({1: ('work/a', 'main'), 2: ('work/b', 'work/a'), 3: ('work/c', 'work/b')})
+        q = self.queue(gh)
+        q.arm(1, H1)
+        self.assertEqual([(gh.prs[n]['state'], gh.prs[n]['base']) for n in (2, 3)], [('OPEN', 'main'), ('OPEN', 'work/b')])
+        q.arm(2, H2)
+        self.assertEqual((gh.prs[3]['state'], gh.prs[3]['base']), ('OPEN', 'main'))
+        q.arm(3, H3)
+        self.assertEqual([gh.prs[n]['state'] for n in (1, 2, 3)], ['MERGED'] * 3)
+
+    def test_an_armed_parent_merged_later_by_github_leaves_the_child_open(self):
+        gh = StackedGitHub({1: ('work/a', 'release'), 2: ('work/b', 'work/a')})
+        gh.branches.add('release')
+        self.queue(gh).arm(1, H1)   # not mergeable at once: armed only
+        gh.merge_armed()
+        self.assertEqual((gh.prs[2]['state'], gh.prs[2]['base']), ('OPEN', 'release'))
+
+    def test_without_the_setting_the_branch_stays_and_the_child_stays_open(self):   # the queue deletes nothing itself
+        gh = StackedGitHub({1: ('work/a', 'main'), 2: ('work/b', 'work/a')}, setting=False)
+        self.queue(gh).arm(1, H1)
+        self.assertIn('work/a', gh.branches)
+        self.assertEqual((gh.prs[2]['state'], gh.prs[2]['base']), ('OPEN', 'work/a'))
+
+    def test_a_second_arm_after_the_branch_is_gone_changes_nothing(self):   # runs again: state already as wanted
+        gh = StackedGitHub({1: ('work/a', 'main'), 2: ('work/b', 'work/a')})
+        q = self.queue(gh)
+        q.arm(1, H1)
+        before = {n: dict(p) for n, p in gh.prs.items()}
+        gh.prs[1]['state'] = 'OPEN'   # a stale view: the queue arms PR 1 again
+        q.arm(1, H1)
+        self.assertEqual(gh.prs[2], before[2])
 
 
 class GitCalls(unittest.TestCase):
