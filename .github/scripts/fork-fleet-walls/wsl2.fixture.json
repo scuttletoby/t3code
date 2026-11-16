@@ -105,6 +105,32 @@
         "proc/self/mountinfo": null
       }
     ],
+    "job-units": [
+      {
+        "etc/systemd/system/service.d/10-x.conf": "[Service]\nPrivateDevices=no\n"
+      },
+      {
+        "run/systemd/system/fork-fleet-.service.d/10-gpu.conf": "[Service]\nBindReadOnlyPaths=/run/WSL:/run/WSL\n"
+      },
+      {
+        "usr/lib/systemd/system/fork-.service.d/x.conf": "[Service]\nSystemCallFilter=\n"
+      },
+      {
+        "etc/systemd/system/fork-fleet-ci-1.service.d/x.conf": "[Service]\nIPAddressDeny=\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "SYSTEMD_RUN=/usr/local/sbin/run-with-gpu\n"
+      },
+      {
+        "run/systemd/transient/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf": "# This is a drop-in unit file extension, created via \"systemctl set-property\"\n# or an equivalent operation. Do not edit.\n[Service]\nIPAddressDeny=\nIPAddressDeny=203.0.113.7/32\n"
+      },
+      {
+        "etc/systemd/system/system.slice.d/10-lan.conf": "[Slice]\nIPAddressAllow=any\n"
+      },
+      {
+        "etc/systemd/system/service.d/10-slow.conf": "[Service]\nTimeoutStopSec=infinity\n"
+      }
+    ],
     "etc-secrets": [
       {
         "etc/fstab": "UUID=0 / ext4 defaults 0 1\n//nas.example/share /srv/share cifs username=u,password=hunter2 0 0\n"
