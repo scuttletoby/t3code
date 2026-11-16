@@ -14,9 +14,11 @@ One small contract for every tool that asks whether a machine may take more work
   them (a sticky folder such as `/tmp` is fine). Otherwise it is not run. The path is followed one part at a
   time: the folders of the path as written are judged too, and every link on the way must belong to root or to
   that user (another user's link in `/tmp` is refused, as the kernel's `fs.protected_symlinks` would). The script
-  is judged and run by the file the path leads to, resolved once. Only the mode bits are read: an ACL that lets
-  others write is not seen, so do not set one. A script that could not be ended (a group the consumer may not
-  signal) is waited for at most one more second, then left to finish on its own.
+  is judged and run by the file the path leads to, resolved once. (A link whose target ends in `/` is accepted
+  by the reader where the kernel would refuse it; it names the same, fully checked file, so it does no harm.)
+  Only the mode bits are read: an ACL that lets others write is not seen, so do not set one. A script that could
+  not be ended (a group the consumer may not signal) is waited for at most one more second, then left to finish
+  on its own.
 - **The exit code is the verdict:** `0` free, `75` busy. Anything else, a timeout, output that is not one JSON
   object (`NaN` and `Infinity` are not JSON), a higher `v`, a `free` that disagrees with the exit code, or facts
   more than 60 seconds from now = **not available**. Busy and not available both count as **not free**.
@@ -66,6 +68,10 @@ size as busy. An answer without `memory.freeMb` makes no memory claim; the consu
     machine swaps hard; the swap rule is there for that.
   - [busy-while-running](free/busy-while-running): busy while a named program runs (a game, say). Copy it and put
     your programs in it. It sees the processes of its own system only: in WSL, Windows programs are not visible.
+    It matches the process name (`comm`), not the command line: a program started through an interpreter or a
+    wrapper (`python3 game.py`, `wine game.exe`, a shell script that runs the game) shows as `python3`, `wine` or
+    the program the wrapper starts, so name that. Naming an interpreter makes the machine busy whenever any script
+    of that interpreter runs.
 
 Several conditions in one script: call the others from it and answer busy when one is busy.
 
