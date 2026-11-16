@@ -36,6 +36,7 @@
     "memoryMax": "8G",
     "cpuQuota": "400%",
     "nameservers": ["1.1.1.1", "9.9.9.9"],
+    "peers": ["100.101.102.103/32"],
     "tailscaleTag": "tag:pc-agents"
   }
 }

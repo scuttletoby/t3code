@@ -29,7 +29,7 @@ printf '%s\n' "$sha" | grep -Eqx '[0-9a-f]{40}' || die "--sha must be the full 4
 work="$(mktemp -d /root/pc-agents-bootstrap.XXXXXXXX)"
 trap 'rm -rf "${work:?}"' EXIT
 trap 'exit 1' INT TERM HUP
-fetch() { curl -fsSL --proto '=https' --tlsv1.2 --max-redirs 0 -H 'Accept: application/vnd.github+json' -o "$2" "$1"; }
+fetch() { curl -fsSL --proto '=https' --tlsv1.2 --max-redirs 0 --connect-timeout 30 --max-time 900 -H 'Accept: application/vnd.github+json' -o "$2" "$1"; }
 
 fetch "$api/repos/$repo/branches/$branch" "$work/branch.json" || die "cannot read branch $branch of $repo"
 fetch "$api/repos/$repo/compare/$sha...$branch" "$work/compare.json" || die "cannot compare $sha with $branch"
