@@ -12,6 +12,7 @@ if ROOT and os.geteuid() == 0:
     raise SystemExit('pc-agents: PC_AGENTS_ROOT is for the tests only, never for root; unset it')
 OWNER = os.geteuid() if ROOT else 0   # who must own every file the kit writes
 HOME, USER = '/home/agent', 'agent'
+NOLOGIN = '/usr/sbin/nologin'   # the agent's login shell: no shell for `wsl -u agent` or su; T3 gets SHELL from its unit
 OPT, STATE = '/opt/pc-agents', '/etc/pc-agents'
 RECORD = STATE + '/installed.tsv'   # sha256 <TAB> path of every file this kit wrote (a path may have two mid-write)
 LOADED = '/run/pc-agents/firewall.loaded'   # sha256 of the firewall file and `nft list` of it, saved when loaded
@@ -78,7 +79,22 @@ SPEC = {
     'allow': (list, [], lambda v: is_ip_list(v, True)),
     'peers': (list, machine_file.REQUIRED, lambda v: is_ip_list(v, True, most=16) if v else '1 to 16 entries'),
     'tailscaleTag': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'tag:[a-z0-9-]{1,50}', v) else 'tag:name'),
+    'devPorts': (str, '4100-4199', lambda v: None if port_range(v) else 'LOW-HIGH, 1024 to 65535, like 4100-4199'),
 }
+
+
+def port_range(text):
+    """(low, high) of a 'LOW-HIGH' port range of 1024..65535, or None."""
+    m = re.fullmatch(r'([1-9]\d{3,4})-([1-9]\d{3,4})', text)
+    low, high = (int(m[1]), int(m[2])) if m else (0, 0)
+    return (low, high) if 1024 <= low <= high <= 65535 else None
+
+
+def loopback_ports(c):
+    """The TCP ports the agent may listen on and reach on localhost: T3's port and devPorts (nft and the unit's
+    SocketBindAllow=). Written apart unless the range holds T3's port (nft refuses overlapping set elements)."""
+    low, high = port_range(c['devPorts'])
+    return ([] if low <= c['port'] <= high else [str(c['port'])]) + [f'{low}-{high}']
 
 
 def locked_problem(path, value):
@@ -130,7 +146,8 @@ def render(c):
     allow6 = [a for a in c['allow'] if ':' in a]
     nft = HEAD + 'table inet pc_agents\ndelete table inet pc_agents\ntable inet pc_agents {\n\tchain agent_out {\n' + \
         '\t\ttype filter hook output priority filter; policy accept;\n' + \
-        f'\t\tmeta skuid != {c["agentUid"]} accept\n\t\tct state established,related accept\n\t\toifname "lo" accept\n' + \
+        f'\t\tmeta skuid != {c["agentUid"]} accept\n\t\tct state established,related accept\n' + \
+        f'\t\toifname "lo" tcp dport {{ {", ".join(loopback_ports(c))} }} accept\n\t\toifname "lo" drop\n' + \
         (f'\t\tip daddr {{ {", ".join(allow4)} }} accept\n' if allow4 else '') + \
         (f'\t\tip6 daddr {{ {", ".join(allow6)} }} accept\n' if allow6 else '') + \
         f'\t\tip daddr {{ {", ".join(BLOCKED4)} }} drop\n\t\tip6 daddr {{ {", ".join(BLOCKED6)} }} drop\n\t}}\n}}\n'
@@ -146,7 +163,7 @@ StartLimitBurst=5
 User={USER}
 Group={USER}
 Environment=HOME={HOME} T3CODE_HOME={HOME}/.t3 T3CODE_PORT={c["port"]} T3CODE_LAN=true
-Environment=PATH={HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH={HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin SHELL=/bin/bash
 ExecStartPre=+{CHECK} load-firewall
 ExecStartPre=+{CHECK} check
 ExecStart={runtime(c)}/t3 serve
@@ -166,6 +183,8 @@ ProtectProc=invisible
 InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale
 IPAddressDeny={" ".join(BLOCKED4 + BLOCKED6)}
 IPAddressAllow={" ".join(c["peers"] + c["allow"])}
+SocketBindDeny=any
+{chr(10).join("SocketBindAllow=tcp:" + p for p in loopback_ports(c))}
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS
 SystemCallArchitectures=native
@@ -193,8 +212,10 @@ WantedBy=multi-user.target
         STATE + '/firewall.nft': (nft, 0o644),
         sd + UNIT: (unit, 0o644),
         # A check that does not succeed, even one that cannot start or crashes before it can stop T3, stops T3.
-        sd + WALLS + '.service': (HEAD + f'[Unit]\nDescription=pc-agents walls check\n\n[Service]\nType=oneshot\n'
-                                  f'ExecStart={CHECK} check --enforce\n'
+        # After T3's unit: a check started while T3 is still starting (slow network at boot) waits for that start,
+        # instead of failing on a firewall not loaded yet and stopping T3 before it ran.
+        sd + WALLS + '.service': (HEAD + f'[Unit]\nDescription=pc-agents walls check\nAfter={UNIT}\n\n[Service]\n'
+                                  f'Type=oneshot\nTimeoutStartSec=5min\nExecStart={CHECK} check --enforce\n'
                                   'ExecStopPost=/bin/sh -c \'[ "$$SERVICE_RESULT" = success ] || '
                                   f'exec /usr/bin/systemctl stop {UNIT}\'\n', 0o644),
         sd + WALLS + '.timer': (HEAD + '[Unit]\nDescription=pc-agents walls check every 2 minutes\n\n[Timer]\n'
@@ -287,6 +308,40 @@ def users():
             return []
     return ({r[0]: (int(r[2]), int(r[3])) for r in rows('/etc/passwd') if r[2].isdigit() and r[3].isdigit()},
             {r[0]: [m for m in r[3].split(',') if m] for r in rows('/etc/group')})
+
+
+def login_shell(name):
+    """name's login shell in the passwd file, or None."""
+    try:
+        with open(ROOT + '/etc/passwd', encoding='utf-8') as f:
+            return next((r[6] for r in (line.rstrip('\n').split(':') for line in f) if r[0] == name and len(r) > 6),
+                        None)
+    except FileNotFoundError:
+        return None
+
+
+def sudo_problem(c):
+    """Why sudo could give the agent more (a sudoers line naming it, its group or uid, or every user), or None.
+    Harmless inside the unit (NoNewPrivileges), but a way out from anywhere else."""
+    who = re.compile(rf'(^|[\s,=:!(])(%?{USER}|%?#{c["agentUid"]}|ALL)($|[\s,=:)])')
+    found = []
+    names = ['/etc/sudoers'] + (['/etc/sudoers.d/' + n for n in sorted(os.listdir(ROOT + '/etc/sudoers.d'))]
+                                if os.path.isdir(ROOT + '/etc/sudoers.d') else [])
+    for path in names:
+        try:
+            with open(ROOT + path, encoding='utf-8', errors='replace') as f:
+                lines = f.read().replace('\\\n', ' ').splitlines()
+        except (FileNotFoundError, IsADirectoryError):
+            continue
+        for line in lines:
+            line = re.sub(r'#(?!include)(?!\d).*', '', line).strip()
+            if line.startswith('Defaults') or line.startswith(('@include', '#include')):
+                continue
+            first = line.split(None, 1)[0] if line else ''
+            # a user list (first field) or an alias naming the agent; `root ALL=(ALL) ALL` names root, not the agent
+            if line and (who.search(first) or re.match(r'User_Alias\b', line) and who.search(line.split('=', 1)[-1])):
+                found.append(f'{path}: {line[:80]}')
+    return found and 'sudo rules that cover the agent: ' + '; '.join(found[:3])
 
 
 def user_problem(c, need_agent):

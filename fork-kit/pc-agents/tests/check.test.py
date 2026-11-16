@@ -25,7 +25,7 @@ class Walls(Case):
         self.assertEqual(code, 0, out)
         walls = [line.split()[1] for line in out.splitlines()]
         for wall in ('wsl2:interop', 'wsl2:resolv', 'wsl2:windows-path', 'wsl2:networking', 'wsl2:os', 'masks',
-                     'record', 'linger', 'user-units', 'drop-ins', 'units', 'agent', 'kit-code', 'runtime',
+                     'record', 'linger', 'user-units', 'drop-ins', 'units', 'agent', 'sudoers', 'kit-code', 'runtime',
                      'automount', 'firewall', 'gateway', 'file:policy.json', 'file:t3code-agents.service',
                      'file:firewall.nft', 'file:wsl.conf', 'file:pc-agents-walls.timer'):
             self.assertIn(wall, walls)
@@ -71,6 +71,7 @@ class Walls(Case):
             'units': lambda: self.write('/log/units/t3code-agents.service.dropins', '/run/systemd/system/x.conf'),
             'runtime': lambda: os.chmod(self.path(k.runtime(CONFIG) + '/t3'), 0o777),
             'file:pc-agents-walls.timer': edit('/etc/systemd/system/pc-agents-walls.timer', '2min', '1d'),
+            'sudoers': lambda: self.write('/etc/sudoers.d/90-agent', 'agent ALL=(ALL) NOPASSWD: ALL\n'),
         }
         clean = {p: v[4] for p, v in self.snapshot().items()}
         for wall, change in cases.items():
@@ -86,6 +87,28 @@ class Walls(Case):
         self.machine({**CONFIG, **section})
         self.files()
         self.assertIsNone(k.load_firewall())
+
+    def test_agent_has_no_login_shell(self):
+        self.write('/etc/passwd', self.read('/etc/passwd').replace('/home/agent:/usr/sbin/nologin', '/home/agent:/bin/bash'))
+        self.fails('agent')
+
+    def test_sudo_rules_that_cover_the_agent(self):
+        base = 'Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n%sudo ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n'
+        self.write('/etc/sudoers', base + '# agent ALL=(ALL) ALL is only a comment\n')
+        self.write('/etc/sudoers.d/README', '# agent\n')
+        self.assertEqual(self.check()[0], 0)
+        for rule in ('agent ALL=(ALL) NOPASSWD: ALL', '%agent ALL=(ALL) ALL', '#1100 ALL=(ALL) ALL', 'ALL ALL=(ALL) ALL',
+                     'bob,agent ALL=(ALL) ALL', 'User_Alias AGENTS = bob, agent', 'agent \\\n  ALL=(ALL) ALL'):
+            with self.subTest(rule=rule):
+                self.write('/etc/sudoers.d/x', rule + '\n')
+                self.fails('sudoers')
+        os.unlink(self.path('/etc/sudoers.d/x'))
+        self.write('/etc/sudoers', base + 'agent ALL=(ALL) ALL\n')
+        self.fails('sudoers')
+
+    def test_timer_stopped_but_enabled(self):
+        os.unlink(self.path('/log/units/pc-agents-walls.timer.active'))
+        self.fails('units')
 
     def test_agent_user_manager_masked(self):
         os.unlink(self.path('/etc/systemd/system/user@1100.service'))
@@ -227,6 +250,46 @@ class Unit(Case):
         self.assertIn('\nStartLimitBurst=5\n', unit)
         self.assertIn('\n[user]\ndefault=root\n', files['/etc/wsl.conf'][0])
         self.assertIn('\nOnUnitActiveSec=2min\n', files['/etc/systemd/system/pc-agents-walls.timer'][0])
+        self.assertIn(' SHELL=/bin/bash\n', unit)   # the agent's login shell is nologin; T3's shells are bash
+        walls = files['/etc/systemd/system/pc-agents-walls.service'][0]
+        for line in ('After=t3code-agents.service', 'TimeoutStartSec=5min', 'Type=oneshot'):
+            self.assertIn('\n' + line + '\n', walls)
+
+    def test_loopback(self):
+        """The agent listens on and reaches over localhost only T3's port and devPorts: other distros' localhost
+        servers are out of reach, and what the agent serves is not forwarded to Windows' localhost on any port."""
+        files = k.render(k.config())
+        unit = files['/etc/systemd/system/t3code-agents.service'][0]
+        nft = files['/etc/pc-agents/firewall.nft'][0]
+        self.assertIn('\nSocketBindDeny=any\nSocketBindAllow=tcp:3800\nSocketBindAllow=tcp:4100-4199\n', unit)
+        self.assertIn('\t\toifname "lo" tcp dport { 3800, 4100-4199 } accept\n\t\toifname "lo" drop\n', nft)
+        self.assertNotIn('oifname "lo" accept', nft)
+        self.assertLess(nft.index('oifname "lo" drop'), nft.index('ip daddr {'))
+        self.machine({**CONFIG, 'devPorts': '3700-3899'})   # T3's port inside the range: written once (nft)
+        files = k.render(k.config())
+        self.assertIn('\nSocketBindDeny=any\nSocketBindAllow=tcp:3700-3899\nRestrict', files['/etc/systemd/system/t3code-agents.service'][0])
+        self.assertIn('tcp dport { 3700-3899 } accept', files['/etc/pc-agents/firewall.nft'][0])
+        for bad in ('80-90', '5000-4000', '4100', '4100-70000', ' 4100-4199', 4100):
+            with self.subTest(devPorts=bad):
+                self.machine({**CONFIG, 'devPorts': bad})
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn('devPorts', out)
+
+    def test_loopback_rules_are_checked(self):
+        self.walled()
+        for name, change in (('unit', lambda: self.write('/etc/systemd/system/t3code-agents.service', self.read(
+                                 '/etc/systemd/system/t3code-agents.service').replace('SocketBindDeny=any\n', ''))),
+                             ('loaded table', lambda: self.write('/log/nft-loaded', self.read('/log/nft-loaded').replace(
+                                 '\t\toifname "lo" drop\n', '')))):
+            with self.subTest(name):
+                shutil.rmtree(self.root)
+                self.setUp()
+                self.walled()
+                change()
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn('FAIL  ' + ('file:t3code-agents.service' if name == 'unit' else 'firewall'), out)
 
     def test_config(self):
         # The kit passes these; T3 itself tells a complete object from a partial one and does not start on a partial.

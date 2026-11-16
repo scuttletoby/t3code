@@ -13,8 +13,9 @@ CONFIG = {'organization': 'Example lab', 't3Version': '1.2.3', 't3ReleaseBaseUrl
           'memoryMax': '8G', 'cpuQuota': '400%', 'nameservers': ['1.1.1.1', '9.9.9.9'], 'peers': ['100.101.102.103/32'],
           'tailscaleTag': 'tag:pc-agents'}
 TOOLS = {  # fake programs, under the fake root; each finds the root from its own path
-    'usr/sbin/useradd': 'R="${0%/usr/sbin/useradd}"; uid=; prev=; for a; do [ "$prev" = --uid ] && uid=$a; prev=$a; '
-                        'done\necho "$a:x:$uid:$uid::/home/$a:/bin/bash" >>"$R/etc/passwd"\n'
+    'usr/sbin/useradd': 'R="${0%/usr/sbin/useradd}"; uid=; sh=/bin/sh; prev=; for a; do [ "$prev" = --uid ] && uid=$a; '
+                        '[ "$prev" = --shell ] && sh=$a; prev=$a; done\n'
+                        'echo "$a:x:$uid:$uid::/home/$a:$sh" >>"$R/etc/passwd"\n'
                         'echo "$a:x:$uid:" >>"$R/etc/group"\nmkdir -p "$R/home/$a"\n',
     # T3's installer, run by root through env -i (scripts/install.sh with T3CODE_HOME=/opt/pc-agents/t3)
     'usr/bin/env': 'R="${0%/usr/bin/env}"; echo "$*" >>"$R/log/install"\n[ -e "$R/log/install-fail" ] && exit 1\n'
@@ -38,7 +39,8 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  [ "$u" = pc-agents-walls.service ] && st=static\n'
                          '  echo "LoadState=${f:+loaded}"; echo "FragmentPath=$f"\n'
                          '  echo "DropInPaths=$(cat "$S/$u.dropins" 2>/dev/null)"; echo "UnitFileState=$st"\n'
-                         '  [ -e "$S/reload" ] && echo NeedDaemonReload=yes || echo NeedDaemonReload=no;;\n'
+                         '  [ -e "$S/reload" ] && echo NeedDaemonReload=yes || echo NeedDaemonReload=no\n'
+                         '  [ -e "$S/$u.active" ] && echo ActiveState=active || echo ActiveState=inactive;;\n'
                          'esac\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
@@ -160,7 +162,7 @@ class Case(unittest.TestCase):
             os.makedirs(os.path.dirname(self.path(p)), exist_ok=True)
             os.symlink('/dev/null', self.path(p))
         with open(self.path('/etc/passwd'), 'a') as f:
-            f.write('agent:x:1100:1100::/home/agent:/bin/bash\n')
+            f.write('agent:x:1100:1100::/home/agent:/usr/sbin/nologin\n')
         with open(self.path('/etc/group'), 'a') as f:
             f.write('agent:x:1100:\n')
         for src, (dst, mode) in k.CODE.items():
