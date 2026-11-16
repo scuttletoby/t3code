@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rep: [1, 2, 3, 4, 5, 6]
+        rep: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -72,6 +72,8 @@ jobs:
         env:
           SHARD: 1/2
           DEBUG: vitest:browser:gc,pw:browser*
+          # Round 3: vitest's own Chromium GC after every test file (it runs only below this free /tmp).
+          VITEST_CHROMIUM_GC_DISK_THRESHOLD_GB: "1000000"
         run: |
           log="$RUNNER_TEMP/res.log"
           (
