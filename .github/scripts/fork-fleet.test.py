@@ -3403,6 +3403,21 @@ class Wiring(unittest.TestCase):
                 shards = (spec.get('strategy') or {}).get('matrix', {}).get('shard')
                 self.assertEqual(len(shards) if shards else None, j.get('shards'))
 
+    def test_test_web_collects_chromium_garbage_after_every_file_and_checks_vitest_reads_it(self):
+        """Fork issue #245: without the setting, Test Web's Chromium pages grow until the browser connection closes.
+        Its name must be the one fork-vitest-gc-check.cjs looks for in the installed vitest, checked before Test."""
+        with open(os.path.join(ROOT, '.github/scripts/fork-vitest-gc-check.cjs')) as f:
+            name = re.search(r'^const VARIABLE = "(\w+)";$', f.read(), re.M).group(1)
+        steps = self.tests['jobs']['test_web']['steps']
+        names = [s.get('name') for s in steps]
+        test = steps[names.index('Test')]
+        self.assertGreaterEqual(float(test.get('env', {}).get(name, 0)), 1e6,
+                                f'{name}: a threshold no disk reaches, so vitest collects after every file')
+        check = [i for i, s in enumerate(steps) if 'fork-vitest-gc-check.cjs' in (s.get('run') or '')]
+        self.assertEqual(len(check), 1, 'one step runs fork-vitest-gc-check.cjs')
+        self.assertLess(check[0], names.index('Test'))
+        self.assertEqual(steps[check[0]].get('working-directory'), test.get('working-directory'))
+
     @staticmethod
     def evaluate(expr, variables, outputs, attempt, shard=None):
         """A runs-on expression in Python: GitHub's && and || return an operand, as Python's and/or do."""
