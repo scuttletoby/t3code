@@ -41,6 +41,7 @@ jobs:
       runners: ${{ steps.route.outputs.runners }}
       attempt: ${{ steps.route.outputs.attempt }}
       fallback: ${{ steps.route.outputs.fallback }}
+      rerun: ${{ steps.route.outputs.rerun }}
     steps:
       - uses: actions/checkout@<sha>
         with:
@@ -60,6 +61,10 @@ jobs:
     runs-on: >-
       ${{ needs.route.result == 'success'
           && (needs.route.outputs.attempt == github.run_attempt && fromJSON(needs.route.outputs.runners).plugins
+              || needs.route.outputs.rerun && contains(fromJSON(needs.route.outputs.rerun).actors, github.triggering_actor)
+                 && fromJSON(needs.route.outputs.rerun).labels.plugins
+                 && fromJSON(format('["{0}","{1}-a{2}"]', fromJSON(needs.route.outputs.rerun).pool,
+                                    fromJSON(needs.route.outputs.rerun).labels.plugins, github.run_attempt))
               || fromJSON(needs.route.outputs.fallback))
           || (github.event_name == 'push'
               || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
@@ -73,7 +78,10 @@ The `runs-on` reads, in order:
 2. the route's `fallback`, when it passed for an earlier attempt. A re-run of failed jobs does not re-run `route`,
    and a dispatcher's runner is made for one attempt only, so a job of attempt 2 must never wait on attempt 1's
    label. `fallback` never names a dispatcher pool: for a trusted run, the always-on static pool of its kind (if
-   there is one), else the `hosted` label; for any other run, where its jobs went;
+   there is one), else the `hosted` label; for any other run, where its jobs went. With the config's `reruns`, a
+   re-run that a trusted person started (`github.triggering_actor` in `rerun.actors`) goes to that dispatcher pool
+   first, as `<run label>-a<this attempt>` (the dispatcher makes a runner for that attempt only, and checks the
+   person again); a re-run that a bot started (fleet-watch) takes `fallback`;
 3. when the route job failed: the always-on pool (here `example-build`), but **only for a `push` event or a
    `pull_request` event whose head is this repository**. `pull_request_target`, `workflow_run` and every other
    event may run another repository's code, so they never get a self-hosted label here;
@@ -111,6 +119,7 @@ as well.
 | `mode`     | the mode applied: `fleet` whenever the config has `"hosted": false`                                     |
 | `attempt`  | the run attempt the labels were made for                                                                |
 | `fallback` | JSON runs-on for a job of another attempt (a re-run of failed jobs); never a dispatcher pool's label    |
+| `rerun`    | JSON, with `reruns`: `actors`, `pool` (label) and `labels` (job key -> run label without `-a<attempt>`) |
 | `watch`    | `true` when a job went to a fleet pool                                                                  |
 
 ## Modes
@@ -174,6 +183,7 @@ for pull requests ready for review.
     { "job": "plugins", "memory_mb": 6000 },
     { "job": "engine", "memory_mb": 4000, "gates": ["engine"] }
   ],
+  "reruns": "desktop",
   "stuck_seconds": 900,
   "fleet_stuck_seconds": 7200,
   "beacon_fresh_seconds": 180,
@@ -190,10 +200,11 @@ for pull requests ready for review.
 | `trusted`              | yes                    | `workflows` (paths), `actors` (logins) and `push_branches`: who may use the fleet                                                        |
 | `upstream_sync`        | no                     | `{"tag_prefix": "..."}`: a push commit tagged `<prefix><sha>` stays GitHub-hosted (the fork's upstream sync); not with `"hosted": false` |
 | `pools`                | yes                    | tried in order; see below                                                                                                                |
-| `jobs`                 | yes                    | routed jobs, heaviest first: `job` (id), `memory_mb`, optional `shards` (1-999) and `gates`                                              |
+| `jobs`                 | yes                    | routed jobs, heaviest first: `job` (id), `memory_mb`, optional `shards` (1-999), `gates` and `avoid` (below)                             |
+| `reruns`               | no                     | a dispatcher pool where a trusted person's re-run of failed jobs may go (below)                                                          |
 | `retired_labels`       | no                     | old pool labels (keep a label here for a week after changing it): never `hosted` or a static pool's label                                |
 | `stuck_seconds`        | yes                    | auto: how long a fleet job may wait before the watch cancels its run (the sweep re-runs it)                                              |
-| `fleet_stuck_seconds`  | yes                    | the same in fleet mode (cancelled with an error, not re-run)                                                                             |
+| `fleet_stuck_seconds`  | yes                    | the same in fleet mode (cancelled with an error; the sweep re-runs nothing, fleet-watch re-runs it once on `fallback`)                   |
 | `beacon_fresh_seconds` | with a dispatcher pool | a heartbeat older than this counts no free slot, with an `::error::`                                                                     |
 | `dispatch`             | with a dispatcher pool | the dispatcher's pace: `every_seconds`, `beacon_seconds`, `idle_passes`                                                                  |
 
@@ -212,6 +223,27 @@ A pool:
 | `static`  | static     | `true`: runners registered by hand and always there; no dispatcher, no heartbeat                                      |
 | `runs_on` | static     | its runners' labels, at least one not generic (`self-hosted`, `linux`, `x64`, ...); no dispatcher or retired label    |
 
+A job's `avoid` keeps it off a pool for some kinds of run: `{"job": "plugins", "memory_mb": 6000, "avoid": {"desktop":
+["push"]}}` never sends `plugins` of a push to `desktop` (say the jars a deploy ships are built on the always-on pool
+only), while drafts may still use it. The pool's slots then go to the next job in `jobs` order. Only a dispatcher pool
+that does not wait may be avoided: the pool that waits and the static pools are where a job goes when nothing else takes
+it. The pool must be in the config and the kinds from `push`, `draft` and `ready`. A job may have only the keys `job`,
+`memory_mb`, `shards`, `gates` and `avoid`; any other key (a misspelling such as `avoids`) is refused.
+
+`reruns` lets a person's re-run of failed jobs use a dispatcher pool (say the desktop) instead of `fallback`. A re-run
+does not re-run `route`, so `route` decides it ahead, for each job the pool takes on this kind of run (`takes`, the
+job's `avoid`): only when the pool's heartbeat is fresh and its dispatcher open now (a full pool is fine: the job waits
+for a slot like any other, and the fork's sweep cancels a run that waits too long). `per_run` does not apply to
+re-runs. The job's `runs-on` adds `-a${{ github.run_attempt }}`; the dispatcher's own checks (a trusted actor started
+this attempt, the label's attempt is the run's) and the job-started hook stay as they are.
+
+Because `route` decides at the first attempt, two things are fixed for that run's re-runs: a later change of mode or
+of `reruns` does not stop them going to the pool, and the heartbeat is the one seen then. A trusted re-run long after
+(say a day later, with the desktop switched off or the pool removed) asks for a label no dispatcher serves and waits
+until GitHub drops it (24 hours) or someone cancels it; the fork's sweep only looks at runs created in the last 24
+hours. Cancel it and start a new run (not a re-run) to route it again. `needs.route.outputs.rerun &&` keeps the
+expression working for a workflow that does not map the `rerun` output (its re-runs take `fallback`).
+
 A config that breaks any rule above fails the step with the list of problems and puts out nothing.
 
 ## Changing pools without stranding runs
@@ -222,8 +254,14 @@ that uses only the action has neither. So:
 
 - **Old runner labels:** keep the old label on its runners, and in `retired_labels`, for a week after a pool's label
   changes. Runs routed before the change queue on it and still find a runner.
+- **Removing a pool:** take it out of every job's `avoid` too (a config that still names it is refused, and the error
+  names the pool).
 - **Queued runs on a removed label** wait until GitHub drops them (24 hours). Cancel such a run by hand and re-run
   it; the re-run is routed by the new config.
+
+[fleet-watch](../fleet-watch/README.md) adds both for a project that uses this action: it cancels a run that waits
+too long and re-runs a cut-off run once, on `fallback`. A red-run report beside it must report each run id and attempt
+`(run_id, attempt)` once: one red re-run can come both from its `workflow_run` and from up to six sweeps (`reds`).
 
 ## Tests
 

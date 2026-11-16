@@ -870,15 +870,20 @@ resolv_target() {
   printf '%s\n' "$target"
 }
 
-# THE rule of a folder on the way to a bound path (a link's, and each one above the real path): only its owner may
-# write it, or it is sticky (then only an entry's owner may rename or remove it). A folder its group or all may write
-# lets each of them rename a link or a plain folder in it away and put their own link in its place, between the check
-# and the bind, so the bind comes from wherever they like. In a sticky one that others may write (/var/tmp), any of
-# them may have made the entry the path goes through ($3, when it is there): as its owner they may still rename it
-# away, so it must be root's or this user's, as a link must. Dies otherwise; $2: how the path goes through it.
+# THE rule of a folder on the way to a bound path (a link's, and each one above the real path, `/` too): it is root's
+# (or this user's, who runs the launcher), and only its owner may write it, or it is sticky (then only an entry's owner
+# may rename or remove it). Its owner, or its group or all when they may write it, could rename a link or a plain
+# folder in it away and put their own link in its place, between the check and the bind, so the bind comes from
+# wherever they like. In a sticky one that others may write (/var/tmp), any of them may have made the entry the path
+# goes through ($3, when it is there): as its owner they may still rename it away, so it must be root's or this
+# user's, as a link must. Dies otherwise; $2: how the path goes through it.
 closed_folder() {
   local mode uid
   mode=$(stat -c '0%a' -- "$ROOT${1:-/}") || die "$2: cannot read the folder ${1:-/}"
+  uid=$(stat -c %u -- "$ROOT${1:-/}") || die "$2: cannot read the folder ${1:-/}"
+  [[ $uid == 0 || $uid == "$EUID" ]] ||
+    die "$2, a folder of uid $uid: its owner could swap a link into it (only root's folders, or this user's:" \
+      "chown root: ${1:-/}, or move the path out of it)"
   ((mode & 01000 || !(mode & 022))) ||
     die "$2, which others may write (its group or all): they could swap a link into it" \
       "(chmod go-w ${1:-/}, or make it sticky: chmod +t ${1:-/})"
@@ -893,7 +898,7 @@ closed_folder() {
 # Every symlink on the way from $1 to its real path (on the fake machine: in it) is root's (or this user's, who runs
 # the launcher: root, but for the walls' tests), in a folder no other user may swap it in: one a user can repoint
 # leads a bind between the check and the job wherever that user likes, past every check. Dies otherwise. That
-# folder is root's too (its owner may remove any link in it, sticky or not), and closed (closed_folder).
+# folder is closed too (closed_folder: root's, as its owner may remove any link in it, sticky or not).
 links_owned() {
   local rest=${1#/} cur='' part target uid hops=0
   while [[ -n $rest ]]; do
@@ -908,9 +913,6 @@ links_owned() {
       uid=$(stat -c %u -- "$ROOT$cur/$part") || die "$1: cannot read the link $cur/$part"
       [[ $uid == 0 || $uid == "$EUID" ]] ||
         die "$1 goes through $cur/$part, a link of uid $uid: only root's links, or that user could repoint it"
-      uid=$(stat -c %u -- "$ROOT${cur:-/}") || die "$1: cannot read the folder ${cur:-/}"
-      [[ $uid == 0 || $uid == "$EUID" ]] ||
-        die "$1 goes through $cur/$part, in ${cur:-/}, a folder of uid $uid: only in root's, or that user could swap it"
       closed_folder "$cur" "$1 goes through $cur/$part, in ${cur:-/}"
       target=$(readlink -- "$ROOT$cur/$part") || die "$1: cannot read the link $cur/$part"
       [[ $target != /* ]] || cur=''
@@ -938,6 +940,7 @@ real_path() {
   while below=$d && d=${d%/*} && [[ -n $d ]]; do
     [[ ! -e $ROOT$d ]] || closed_folder "$d" "$1 leads to $real, under $d" "$below"
   done
+  closed_folder '' "$1 leads to $real, under /" "$below"
   printf '%s\n' "$real"
 }
 
