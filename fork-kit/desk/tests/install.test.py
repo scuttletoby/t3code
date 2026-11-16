@@ -1,0 +1,1103 @@
+"""desk-install on a fake host in a temporary folder: every fixed path under PREFIX, the current user as root, and
+every system command (useradd, systemctl, ssh-keygen, ...) a fake that records its arguments. A fake release folder
+holds stubs of the fleet files. No root, no systemd, no network, no real user.
+
+  python3 -I -B fork-kit/desk/tests/install.test.py
+"""
+import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess
+import sys, tempfile, types, unittest, unittest.mock
+
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(KIT))
+SHA1, SHA2 = 'a' * 40, 'b' * 40
+HOST_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI' + 'A' * 43
+MACHINE = {'version': 1, 'desk': {'pool': 'desktop', 'host': 'fleet-host.example', 'hostKey': HOST_KEY, 'slots': 2}}
+
+# One fake for every system command: argv[1] is the command's name. Its state lives in files beside it.
+FAKE = r'''
+import os, sys
+here = os.path.dirname(os.path.abspath(__file__))
+name, args = sys.argv[1], sys.argv[2:]
+with open(os.path.join(here, 'calls.log'), 'a') as f:
+    f.write(' '.join([name, *args]) + '\n')
+def lines(n):
+    try:
+        return open(os.path.join(here, n)).read().split()
+    except FileNotFoundError:
+        return []
+def put(n, items):
+    open(os.path.join(here, n), 'w').write('\n'.join(items) + '\n')
+fail = lines('fail')
+if name in fail:
+    put('fail', [x for x in fail if x != name])   # fails once
+    sys.exit(9)
+if name in lines('fail-after'):   # does its work, then dies (a run stopped right after it)
+    put('fail-after', [x for x in lines('fail-after') if x != name])
+    put('users', lines('users') + [args[-1]])
+    sys.exit(9)
+def one(n, default):   # a per-user setting: the file N-USER
+    try:
+        return open(os.path.join(here, n + '-' + args[-1])).read().strip()
+    except FileNotFoundError:
+        return default
+if name == 'id':   # its main group: gid-USER (1001, its own group's); its groups: groups-USER (its main group only)
+    if args[-1] not in lines('users'):
+        sys.exit(1)
+    print({'-u': one('uid', '1001'), '-g': one('gid', '1001'), '-G': one('groups', one('gid', '1001'))}.get(args[0], ''))
+if name == 'getent':   # login shell: shell-USER (nologin); password field: pw-USER (!); uid-USER; home-USER; gid-USER
+    u = args[-1]
+    if u not in lines('users'):
+        sys.exit(2)
+    if args[0] == 'passwd':
+        print(f'{u}:x:' + one('uid', '1001') + ':' + one('gid', '1001') + '::' + one('home', '/nonexistent') + ':'
+              + one('shell', '/usr/sbin/nologin'))
+    elif args[0] == 'group':   # the group named after the user: gid 1001
+        print(f'{u}:x:1001:')
+    else:
+        print(f'{u}:' + one('pw', '!') + ':19000:0:99999:7:::')
+if name == 'useradd':
+    put('users', lines('users') + [args[-1]])
+if name == 'userdel':
+    put('users', [u for u in lines('users') if u != args[-1]])
+if name == 'ssh-keygen':
+    key = args[args.index('-f') + 1]
+    open(key, 'w').write('PRIVATE\n'); os.chmod(key, 0o600)
+    open(key + '.pub', 'w').write('ssh-ed25519 AAAAfake desk-x\n')
+if name == 'systemctl' and args[0] in ('is-active', 'is-enabled'):
+    sys.exit(1 if args[-1] in lines('down') else 0)
+if name == 'systemctl' and args[0] == 'list-units':   # runner units: the file `units`; `stuck` ones never stop
+    print(''.join(f'{u} loaded active running runner\n' for u in lines('units')), end='')
+if name == 'systemctl' and args[0] == 'stop':
+    put('units', [u for u in lines('units') if u not in args[1:] or u in lines('stuck')])
+if name == 'ip' and args[:2] == ['netns', 'list']:
+    print(''.join(f'{n} (id: 0)\n' for n in lines('netns')), end='')
+if name == 'ip' and args[:2] == ['netns', 'delete']:
+    put('netns', [n for n in lines('netns') if n != args[2]])
+    put('links', [n for n in lines('links') if n != 'ffh-' + args[2].rsplit('-', 1)[-1]])
+if name == 'ip' and args[:2] == ['-o', 'link']:
+    print(''.join(f'{i}: {n}@if2: <BROADCAST> mtu 1500\n' for i, n in enumerate(lines('links'), 5)), end='')
+if name == 'ip' and args[:2] == ['link', 'delete']:
+    put('links', [n for n in lines('links') if n != args[2]])
+'''
+
+STUBS = {
+    '.github/scripts/fork-fleet-launch.sh': '#!/bin/bash\necho "launch $*" >> {log}\n'
+                                            '[ "$1" = active ] && cat {here}/active 2>/dev/null\n'
+                                            'if [ "$1" = stop ]; then grep -vx "$2" {here}/active > {here}/a.new;'
+                                            ' mv {here}/a.new {here}/active; fi\nexit 0\n',
+    '.github/scripts/fork-fleet-walls.py': '#!/usr/bin/python3 -I\nimport sys, os\n'
+                                           'v = sys.argv[1]\nif v == "os":\n'
+                                           '    print("linux"); sys.exit(int(open("{here}/os-exit").read()))\n'
+                                           'bad = os.path.exists("{here}/wall-fails")\n'
+                                           'print("PASS  os  linux")\nprint(("FAIL  vsock  closed: open" if bad else'
+                                           ' "PASS  vsock  closed"))\nsys.exit(1 if bad else 0)\n',
+    '.github/scripts/fork-fleet.py': 'import sys\nprint("::error::no Runner.Worker above this hook")\nsys.exit(1)\n',
+    '.github/scripts/fork-fleet-desk-agent.py': 'import os, sys\nif sys.argv[-1] == "check" and '
+                                                'os.path.exists("{here}/agent-bad"):\n'
+                                                '    print("bad settings", file=sys.stderr); sys.exit(2)\n'
+                                                'print("settings ok")\n',
+    '.github/scripts/fork-fleet-desk-wire.py': '# wire\n',
+    '.github/scripts/fork-fleet-hook.sh': '#!/bin/bash\nexit 0\n',
+    '.github/scripts/fork-fleet-job-paths.txt': '/usr\n',
+    '.github/fork-fleet.json': json.dumps({'pools': [{'name': 'desktop'}, {'name': 'vm'}]}),
+    '.github/scripts/fork-fleet-walls/linux': '#!/bin/sh\n',
+    '.github/scripts/fork-fleet-walls/linux.fixture.json': '{}\n',
+    '.github/scripts/fork-fleet-walls/wsl2': '#!/bin/sh\n',
+    '.github/scripts/fork-fleet-walls/wsl2.fixture.json': '{}\n',
+    '.github/scripts/fork-fleet-desk-agent.service': '# agent unit\n[Service]\n',
+    '.github/scripts/fork-fleet-refresh.service': '# refresh unit\n[Service]\n',
+    '.github/scripts/fork-fleet-refresh.timer': '# refresh timer\n[Timer]\n',
+}
+
+
+def slurp(path, mode='r'):
+    with open(path, mode) as f:
+        return f.read()
+
+
+def load():
+    path = os.path.join(KIT, 'sbin', 'desk-install')
+    loader = importlib.machinery.SourceFileLoader('desk_install', path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('desk_install', loader))
+    loader.exec_module(mod)
+    return mod
+
+
+class Desk(unittest.TestCase):
+    def setUp(self):
+        self.umask = os.umask(0o022)
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='desk-install-test-'))
+        self.addCleanup(self.close)
+        self.root, self.fakes = os.path.join(self.tmp, 'root'), os.path.join(self.tmp, 'fakes')
+        os.makedirs(self.fakes)
+        with open(os.path.join(self.fakes, 'fake.py'), 'w') as f:
+            f.write(FAKE)
+        self.write(os.path.join(self.fakes, 'os-exit'), '0')
+        self.source = self.release()
+        self.m = load()
+        self.m.PREFIX, self.m.ROOT_UID = self.root, os.geteuid()
+        self.m.MACHINE = os.path.join(self.tmp, 'machine', 'machine.json')
+        fake = os.path.join(self.fakes, 'fake.py')
+        self.m.CMD = {k: [sys.executable, '-I', fake, k] for k in self.m.CMD}
+        self.m.CMD.update(python3=[sys.executable, '-I', '-B'], bash=['bash'])
+        self.machine(MACHINE)
+        self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '1\n')
+
+    def close(self):
+        os.umask(self.umask)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, path, text, mode=0o644):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(text)
+        os.chmod(path, mode)
+
+    def release(self, name='release', extra=None):
+        top = os.path.join(self.tmp, name)
+        for rel, text in {**STUBS, **(extra or {})}.items():
+            if text is not None:
+                self.write(os.path.join(top, rel), text.replace('{log}', os.path.join(self.fakes, 'calls.log'))
+                           .replace('{here}', self.fakes), 0o755)
+        for rel in ('fork-kit/desk/sbin/desk-install', 'fork-kit/desk/README.md', 'fork-kit/common/machine_file.py',
+                    'fork-kit/common/free_contract.py', 'fork-kit/common/free/memory'):
+            self.write(os.path.join(top, rel), slurp(os.path.join(REPO, rel)), 0o755)
+        return top
+
+    def machine(self, data):
+        path = self.m.MACHINE
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        self.write(path, json.dumps(data) if not isinstance(data, str) else data)
+
+    def path(self, p):
+        return self.root + p
+
+    def calls(self):
+        with contextlib.suppress(FileNotFoundError):
+            with open(os.path.join(self.fakes, 'calls.log')) as f:
+                return f.read().splitlines()
+        return []
+
+    def clear_calls(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(os.path.join(self.fakes, 'calls.log'))
+
+    def run_main(self, *argv, stop_after=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = self.m.main(list(argv), stop_after=stop_after)
+            except SystemExit as e:
+                code = str(e)
+        return code, out.getvalue(), err.getvalue()
+
+    def install(self, *extra, sha=SHA1, stop_after=None, source=None):
+        return self.run_main('install', '--source', source or self.source, '--sha', sha, *extra,
+                             stop_after=stop_after)
+
+    def read(self, p):
+        with open(self.path(p)) as f:
+            return f.read()
+
+    def tree(self):
+        """Every path under the fake root with its kind, mode and contents (no times)."""
+        out = {}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            for name in dirnames + filenames:
+                full = os.path.join(dirpath, name)
+                st = os.lstat(full)
+                body = slurp(full, 'rb') if stat.S_ISREG(st.st_mode) else None
+                out[full[len(self.root):]] = (stat.S_IFMT(st.st_mode), st.st_mode & 0o777, body)
+        return out
+
+    def template(self):
+        self.write(self.path('/opt/fork-fleet/template/runner-template/.fork-fleet-version'), '2.330.0\n')
+
+    # ------------------------------------------------------------------------------------------------- install
+
+    def test_fresh_install_files_settings_users_key_units(self):
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read('/opt/fork-fleet/SOURCE'), SHA1 + '\n')
+        for rel in ('fork-fleet-launch.sh', 'hook.sh', 'fork-fleet.py', 'fork-fleet.json', 'fork-fleet-walls.py',
+                    'fork-fleet-walls/linux', 'fork-fleet-walls/wsl2.fixture.json', 'desk-install', 'machine_file.py'):
+            self.assertTrue(os.path.isfile(self.path(f'/opt/fork-fleet/{rel}')), rel)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/opt/fork-fleet/hook.sh')).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/opt/fork-fleet/fork-fleet.json')).st_mode), 0o644)
+        self.assertFalse([n for n in os.listdir(self.path('/opt/fork-fleet')) if n.startswith('.kit-stage')])
+        launch = self.read('/etc/fork-fleet/launch.conf')
+        self.assertTrue(launch.startswith(self.m.HEADER))
+        self.assertIn('RUNNER_USERS=fork-runner-1,fork-runner-2\n', launch)
+        self.assertNotIn('RESERVE_MB', launch)
+        self.assertIn('POOL=desktop\nHOST=fleet-host.example\nPORT=22\nUSER=fleet-desk\n',
+                      self.read('/etc/fork-fleet/desk.conf'))
+        self.assertTrue(self.read('/etc/fork-fleet/desk-known_hosts').endswith(f'fleet-host.example {HOST_KEY}\n'))
+        for f, mode in (('launch.conf', 0o600), ('desk.conf', 0o600), ('desk-key', 0o600), ('desk-kit.json', 0o600)):
+            self.assertEqual(stat.S_IMODE(os.stat(self.path(f'/etc/fork-fleet/{f}')).st_mode), mode, f)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/etc/fork-fleet')).st_mode), 0o700)
+        self.assertIn('ssh-ed25519 AAAAfake desk-x', out)
+        self.assertEqual(self.read('/etc/sysctl.d/60-fork-fleet.conf'), self.m.HEADER + 'net.ipv4.ip_forward = 1\n')
+        for u in self.m.UNITS:
+            self.assertTrue(self.read(f'/etc/systemd/system/{u}').startswith(self.m.HEADER), u)
+        calls = self.calls()
+        self.assertEqual([c for c in calls if c.startswith('useradd')], [
+            f'useradd --no-create-home --home-dir /nonexistent --user-group --shell /usr/sbin/nologin fork-runner-{i}'
+            for i in (1, 2)])
+        self.assertEqual(self.read('/etc/cron.deny'), 'fork-runner-1\nfork-runner-2\n')
+        self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['createdUsers'],
+                         ['fork-runner-1', 'fork-runner-2'])
+        order = [c for c in calls if c.startswith(('systemctl', 'launch')) and not c.startswith('systemctl show')]
+        self.assertEqual(order, ['systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service '
+                                 'fork-fleet-desk-agent.service', 'systemctl daemon-reload',
+                                 'systemctl enable --now t3code-fleet-refresh.timer', 'launch prune',
+                                 'systemctl start --no-block t3code-fleet-refresh.service',
+                                 'systemctl enable fork-fleet-desk-agent.service',
+                                 'systemctl restart fork-fleet-desk-agent.service'])
+        self.template()
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.endswith('ALL PASS\n'), out)
+        self.assertIn('PASS  vsock  closed', out)
+
+    def test_runs_again_and_changes_nothing(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        before = self.tree()
+        self.clear_calls()
+        code, _, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.tree(), before)
+        calls = self.calls()
+        self.assertFalse([c for c in calls if c.startswith(('useradd', 'ssh-keygen', 'systemctl stop',
+                                                            'systemctl restart'))], calls)
+        self.assertIn('systemctl start fork-fleet-desk-agent.service', calls)   # a no-op for a running agent
+        self.assertNotIn('systemctl start --no-block t3code-fleet-refresh.service', calls)   # the template is there
+
+    def test_a_changed_setting_restarts_the_agent(self):
+        self.assertEqual(self.install()[0], 0)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'reserveMb': 2048}})
+        self.clear_calls()
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
+
+    def test_a_change_written_by_a_killed_run_still_restarts_the_agent(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'host': 'new-host.example'}})
+        self.assertIn('stopped after', str(self.install(stop_after='settings')[0]))
+        code, out, _ = self.run_main('check')   # desk.conf is new, the running agent still has the old one
+        self.assertEqual(code, 1)
+        self.assertIn('did not restart it', out)
+        self.clear_calls()
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
+        self.assertNotIn('restartPending', self.read('/etc/fork-fleet/desk-kit.json'))
+        self.clear_calls()
+        self.assertEqual(self.install()[0], 0)   # and once restarted, not again
+        self.assertNotIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
+
+    def test_a_refused_agent_check_keeps_the_restart_for_the_next_run(self):
+        self.assertEqual(self.install()[0], 0)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'port': 2222}})
+        self.write(os.path.join(self.fakes, 'agent-bad'), '')
+        self.assertEqual(self.install()[0], 1)
+        os.unlink(os.path.join(self.fakes, 'agent-bad'))
+        self.clear_calls()
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('systemctl restart fork-fleet-desk-agent.service', self.calls())
+
+    def test_stopped_at_any_step_the_next_run_ends_it(self):
+        self.assertEqual(self.install()[0], 0)
+        want = self.tree()
+        for step in ('check', 'users', 'stage', 'files', 'settings', 'units'):
+            with self.subTest(step=step):
+                shutil.rmtree(self.root)
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(self.fakes, 'users'))
+                self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '1\n')
+                code, _, _ = self.install(stop_after=step)
+                self.assertIn('stopped after', str(code))
+                if step in ('stage', 'files', 'settings'):
+                    self.assertNotEqual(self.run_main('check')[0], 0)
+                code, _, err = self.install()
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.tree(), want)
+
+    def test_upgrade_replaces_changed_files_and_removes_gone_ones(self):
+        self.assertEqual(self.install()[0], 0)
+        launcher = os.stat(self.path('/opt/fork-fleet/fork-fleet-launch.sh')).st_ino
+        new = self.release('release2', {'.github/scripts/fork-fleet-walls/wsl2': None,
+                                        '.github/scripts/fork-fleet-walls/wsl2.fixture.json': None,
+                                        '.github/scripts/fork-fleet-hook.sh': '#!/bin/bash\nexit 0 # new\n'})
+        self.clear_calls()
+        code, _, err = self.install(sha=SHA2, source=new)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read('/opt/fork-fleet/SOURCE'), SHA2 + '\n')
+        self.assertFalse(os.path.exists(self.path('/opt/fork-fleet/fork-fleet-walls/wsl2')))
+        self.assertIn('# new', self.read('/opt/fork-fleet/hook.sh'))
+        self.assertEqual(os.stat(self.path('/opt/fork-fleet/fork-fleet-launch.sh')).st_ino, launcher)  # unchanged
+        calls = self.calls()
+        stop = 'systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service fork-fleet-desk-agent.service'
+        self.assertLess(calls.index(stop), calls.index('systemctl restart fork-fleet-desk-agent.service'))
+        self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['sha'], SHA2)
+
+    def test_project_fleet_config_is_used_and_kept(self):
+        project = os.path.join(self.tmp, 'project.json')
+        self.write(project, json.dumps({'pools': [{'name': 'desktop'}], 'project': True}))
+        code, _, err = self.install('--fleet-config', project)
+        self.assertEqual(code, 0, err)
+        self.assertIn('"project": true', self.read('/opt/fork-fleet/fork-fleet.json'))
+        code, _, err = self.install(sha=SHA2)   # no --fleet-config: the project's stays
+        self.assertEqual(code, 0, err)
+        self.assertIn('"project": true', self.read('/opt/fork-fleet/fork-fleet.json'))
+        code, _, err = self.install('--release-fleet-config', sha=SHA2)   # and back to the release's own
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('"project": true', self.read('/opt/fork-fleet/fork-fleet.json'))
+        self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['fleetConfig'], 'release')
+        code, _, err = self.install('--release-fleet-config', '--fleet-config', project)
+        self.assertEqual(code, 1)
+        self.assertIn('one or the other', err)
+
+    def test_the_fleet_config_choice_outlives_a_run_killed_after_the_swap(self):
+        project = os.path.join(self.tmp, 'project.json')
+        self.write(project, json.dumps({'pools': [{'name': 'desktop'}], 'project': True}))
+        newer = self.release('release3', {'.github/fork-fleet.json': json.dumps({'pools': [{'name': 'desktop'}],
+                                                                                 'release3': True})})
+        swap = self.m.swap
+
+        def killed(*args):
+            swap(*args)
+            raise SystemExit('killed right after the swap')
+        for first, then, want, other in ((['--fleet-config', project], ['--release-fleet-config'], '"release3"',
+                                          '"project"'),
+                                         ([], ['--fleet-config', project], '"project"', '"release3"')):
+            with self.subTest(then[0]):
+                shutil.rmtree(self.root)
+                self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '1\n')
+                self.assertEqual(self.install(*first)[0], 0)
+                self.m.swap = killed
+                try:
+                    self.assertIn('killed', str(self.install(*then, sha=SHA2)[0]))
+                finally:
+                    self.m.swap = swap
+                code, _, err = self.install(sha=SHA1, source=newer)   # a plain later install keeps the last choice
+                self.assertEqual(code, 0, err)
+                self.assertIn(want, self.read('/opt/fork-fleet/fork-fleet.json'))
+                self.assertNotIn(other, self.read('/opt/fork-fleet/fork-fleet.json'))
+
+    def test_a_run_killed_between_the_choice_and_the_swap_fails_check(self):
+        a, b = os.path.join(self.tmp, 'a.json'), os.path.join(self.tmp, 'b.json')
+        self.write(a, json.dumps({'pools': [{'name': 'desktop'}], 'which': 'a'}))
+        self.write(b, json.dumps({'pools': [{'name': 'desktop'}], 'which': 'b'}))
+        for first, then in ((['--fleet-config', a], ['--fleet-config', b]),
+                            (['--fleet-config', a], ['--release-fleet-config']),
+                            ([], ['--fleet-config', b])):
+            with self.subTest(then=then):
+                shutil.rmtree(self.root)
+                self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '1\n')
+                self.assertEqual(self.install(*first)[0], 0)
+                self.template()
+                self.assertEqual(self.run_main('check')[0], 0)
+                swap = self.m.swap
+
+                def killed(*args):
+                    raise SystemExit('killed before the swap')
+                self.m.swap = killed
+                try:
+                    self.assertIn('killed', str(self.install(*then)[0]))
+                finally:
+                    self.m.swap = swap
+                code, out, _ = self.run_main('check')   # the old config is still the installed one
+                self.assertEqual(code, 1, out)
+                self.assertEqual(self.install()[0], 0)
+                self.assertEqual(self.run_main('check')[0], 0)
+
+    def test_a_fleet_config_link_into_an_open_folder_is_refused(self):
+        open_dir, safe = os.path.join(self.tmp, 'open'), os.path.join(self.tmp, 'safe')
+        os.makedirs(open_dir)
+        os.chmod(open_dir, 0o777)
+        self.write(os.path.join(open_dir, 'f.json'), json.dumps({'pools': [{'name': 'desktop'}]}))
+        os.makedirs(safe)
+        os.symlink(os.path.join(open_dir, 'f.json'), os.path.join(safe, 'link.json'))
+        code, _, err = self.install('--fleet-config', os.path.join(safe, 'link.json'))
+        self.assertEqual(code, 1)
+        self.assertIn(f'{open_dir} can be written by other users', err)
+        self.assertFalse(os.path.exists(self.path('/opt')))
+
+    def test_a_fleet_config_a_runner_user_owns_or_its_group_may_write_is_refused(self):
+        folder = os.path.join(self.tmp, 'cfg')
+        os.makedirs(folder)
+        config = os.path.join(folder, 'f.json')
+        self.write(config, json.dumps({'pools': [{'name': 'desktop'}]}))
+        me, group, other = os.geteuid(), os.getegid(), 2 ** 31 - 7
+
+        def runner(uid, gid):
+            def getpwnam(name):
+                if name != 'fork-runner-3':
+                    raise KeyError(name)
+                return types.SimpleNamespace(pw_uid=uid, pw_gid=gid)
+            return types.SimpleNamespace(getpwnam=getpwnam)
+        real = self.m.pwd
+        try:
+            self.m.pwd = runner(me, other)   # the file belongs to a runner user
+            self.assertEqual(self.m.job_writable(config), f'{config} belongs to a runner user')
+            self.m.pwd = runner(other, group)   # its group is a runner user's, and the group may write it
+            os.chmod(config, 0o664)
+            self.assertEqual(self.m.job_writable(config), f'{config} can be written by other users')
+            os.chmod(config, 0o644)   # the group may only read it: the file passes (a folder above may not)
+            self.assertNotIn(config + ' ', self.m.job_writable(config) or '')
+        finally:
+            self.m.pwd = real
+
+    def test_install_sets_back_modes_check_names(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.assertEqual(self.run_main('check')[0], 0)
+        os.chmod(self.path('/opt/fork-fleet/fork-fleet-launch.sh'), 0o777)
+        os.chmod(self.path('/opt/fork-fleet/fork-fleet-walls'), 0o777)
+        os.chmod(self.path('/etc/fork-fleet/desk-key'), 0o644)
+        os.chmod(self.path('/etc/fork-fleet'), 0o755)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        for line in ('FAIL  kit  /opt/fork-fleet/fork-fleet-launch.sh: mode 777, not 755',
+                     'FAIL  kit  /opt/fork-fleet/fork-fleet-walls: mode 777, not 755',
+                     'FAIL  kit  /etc/fork-fleet/desk-key: mode 644, not 600',
+                     'FAIL  kit  /etc/fork-fleet: mode 755, not 700'):
+            self.assertIn(line, out)
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/opt/fork-fleet/fork-fleet-launch.sh')).st_mode), 0o755)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 0, out)
+
+    def test_a_second_install_or_uninstall_at_the_same_time_is_refused(self):
+        self.assertEqual(self.install()[0], 0)
+        fd = os.open(self.path('/etc/fork-fleet'), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            stage = os.path.join(self.path('/opt/fork-fleet'), '.kit-stage-other')
+            os.makedirs(stage)   # the other run's staging folder: not swept
+            for argv in (['install', '--source', self.source, '--sha', SHA2], ['uninstall']):
+                with self.subTest(argv[0]):
+                    code, _, err = self.run_main(*argv)
+                    self.assertEqual(code, 1)
+                    self.assertIn('another desk-install install or uninstall is running', err)
+                    self.assertTrue(os.path.isdir(stage))
+                    self.assertEqual(self.read('/opt/fork-fleet/SOURCE'), SHA1 + '\n')
+        finally:
+            os.close(fd)
+        self.assertEqual(self.install(sha=SHA2)[0], 0)
+
+    def test_the_lock_is_in_the_root_only_folder(self):
+        """lens225r3 nit 4: a lock on the world-readable /opt/fork-fleet could be held by any local user; the lock is
+        on /etc/fork-fleet (0700), which only root can open."""
+        self.assertEqual(self.install()[0], 0)
+        fd = os.open(self.path('/opt/fork-fleet'), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)   # what any local user could do: install is not blocked by it
+            self.assertEqual(self.install(sha=SHA2)[0], 0)
+            self.assertEqual(self.run_main('uninstall')[0], 0)
+        finally:
+            os.close(fd)
+
+    def test_a_linked_or_foreign_owned_folder_or_key_is_refused(self):
+        """lens225r3 nit 1 (probe): install neither followed nor fixed a linked or non-root /opt/fork-fleet,
+        /etc/fork-fleet or desk key, so `check` FAILed forever. Install now refuses before changing anything."""
+        other = os.path.join(self.tmp, 'elsewhere')
+        os.makedirs(other)
+        os.makedirs(os.path.dirname(self.path('/opt/fork-fleet')), exist_ok=True)
+        os.symlink(other, self.path('/opt/fork-fleet'))
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn('/opt/fork-fleet is a link', err)
+        self.assertEqual(os.listdir(other), [])
+        os.unlink(self.path('/opt/fork-fleet'))
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.assertEqual(self.run_main('check')[0], 0)
+        real_lstat, opt = os.lstat, self.path('/opt/fork-fleet')
+
+        def lstat(path, *a, **kw):   # /opt/fork-fleet owned by another user (a test cannot chown)
+            st = real_lstat(path, *a, **kw)
+            if os.fspath(path) != opt:
+                return st
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, *st[5:]))
+        before = self.tree()
+        with unittest.mock.patch.object(self.m.os, 'lstat', lstat):
+            code, _, err = self.install(sha=SHA2)
+            self.assertIn('FAIL  kit  /opt/fork-fleet: a link or not owned by root', self.run_main('check')[1])
+        self.assertEqual(code, 1)
+        self.assertIn('/opt/fork-fleet is not owned by root', err)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_linked_or_foreign_owned_subfolder_is_refused(self):
+        """lens225r4 finding 1 (probe): a link or foreign owner one level down (`units`, `fork-fleet-walls`) was
+        followed by install (the root-run walls and unit texts written into the link's target) and FAILed check
+        forever. Install now refuses it before changing anything, on a first install and on a later one."""
+        other = os.path.join(self.tmp, 'elsewhere')
+        os.makedirs(other)
+        for sub in ('units', 'fork-fleet-walls'):
+            with self.subTest(sub):
+                shutil.rmtree(self.root)
+                self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '1\n')
+                os.makedirs(self.path('/opt/fork-fleet'))
+                os.symlink(other, self.path(f'/opt/fork-fleet/{sub}'))
+                code, _, err = self.install()
+                self.assertEqual(code, 1, err)
+                self.assertIn(f'/opt/fork-fleet/{sub} is a link', err)
+                self.assertEqual(os.listdir(other), [])
+                os.unlink(self.path(f'/opt/fork-fleet/{sub}'))
+                self.assertEqual(self.install()[0], 0)
+                self.template()
+                self.assertNotIn('FAIL', self.run_main('check')[1])
+                real_lstat, folder = os.lstat, self.path(f'/opt/fork-fleet/{sub}')
+
+                def lstat(path, *a, **kw):   # the subfolder owned by another user (a test cannot chown)
+                    st = real_lstat(path, *a, **kw)
+                    if os.fspath(path) != folder:
+                        return st
+                    return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, *st[5:]))
+                before = self.tree()
+                with unittest.mock.patch.object(self.m.os, 'lstat', lstat):
+                    code, _, err = self.install(sha=SHA2)
+                self.assertEqual(code, 1)
+                self.assertIn(f'/opt/fork-fleet/{sub} is not owned by root', err)
+                self.assertEqual(self.tree(), before)
+
+    def test_check_names_a_linked_public_key(self):
+        """lens225r4 nit 3: install refuses a linked desk-key.pub, but check only looked at the private key."""
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        pub = self.path('/etc/fork-fleet/desk-key.pub')
+        self.write(os.path.join(self.tmp, 'pub-elsewhere'), slurp(pub))
+        os.unlink(pub)
+        os.symlink(os.path.join(self.tmp, 'pub-elsewhere'), pub)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL  kit  /etc/fork-fleet/desk-key.pub: a link or not owned by root', out)
+
+    def test_a_fifo_at_a_unit_or_setting_does_not_hang(self):
+        """lens225r4 nit 4: same_file (and ours) opened the path before testing it is a plain file; a FIFO hung
+        install and check. Now a FIFO is not the kit's file: check FAILs, install refuses (unit) or writes it (setting)."""
+        import signal
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+
+        def hung(*_):
+            raise AssertionError('hung on a FIFO')
+        old = signal.signal(signal.SIGALRM, hung)
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        self.addCleanup(signal.alarm, 0)
+        conf = self.path('/etc/fork-fleet/launch.conf')
+        os.unlink(conf)
+        os.mkfifo(conf, 0o600)
+        signal.alarm(20)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL  settings  /etc/fork-fleet/launch.conf differs', out)
+        self.assertEqual(self.install()[0], 0)   # the setting is written again, as a plain file
+        self.assertTrue(stat.S_ISREG(os.lstat(conf).st_mode))
+        unit = self.path('/etc/systemd/system/fork-fleet-desk-agent.service')
+        os.unlink(unit)
+        os.mkfifo(unit, 0o644)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1, out)
+        self.assertIn('fork-fleet-desk-agent.service: missing or not the kit\'s', out)
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn('fork-fleet-desk-agent.service was not written by this kit', err)
+        signal.alarm(0)
+
+    def test_a_unit_or_setting_with_another_owner_fails_check_and_install_puts_it_back(self):
+        """lens225r3 nit 5: units were checked for text and mode, not owner. A unit or setting that is a link or not
+        root's FAILs check and is written again (as root) by install."""
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        unit = self.path('/etc/systemd/system/fork-fleet-desk-agent.service')
+        text = slurp(unit)
+        real = os.path.join(self.tmp, 'unit-elsewhere')
+        self.write(real, text)
+        os.unlink(unit)
+        os.symlink(real, unit)   # same text through a link: not root's file
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        self.assertIn('fork-fleet-desk-agent.service: not the unit of release', out)
+        self.assertEqual(self.install()[0], 0)
+        self.assertFalse(os.path.islink(unit))
+        self.assertEqual(self.run_main('check')[0], 0)
+
+    def test_a_hand_made_user_in_other_groups_or_with_a_home_fails_check(self):
+        """lens225r3 nit 3: user_problem now matches the launcher's check_users (uid not 0, own group only) and wants
+        no home that is there."""
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        os.makedirs(self.path('/home/fork-runner-1'))
+        for name, text, want in (('groups-fork-runner-1', '1001 27', 'fork-runner-1 is in other groups (1001 27)'),
+                                 ('gid-fork-runner-1', '0', 'fork-runner-1 has the main group 0, not its own group'),
+                                 ('uid-fork-runner-2', '0', 'fork-runner-2 has uid 0'),
+                                 ('home-fork-runner-1', '/home/fork-runner-1', 'fork-runner-1 has the home')):
+            with self.subTest(name):
+                self.write(os.path.join(self.fakes, name), text + '\n')
+                code, out, _ = self.run_main('check')
+                self.assertEqual(code, 1)
+                self.assertIn('FAIL  runner-user  ' + want, out)
+                os.unlink(os.path.join(self.fakes, name))
+        self.assertEqual(self.run_main('check')[0], 0)
+
+    def test_check_fails_on_a_runner_user_that_can_log_in(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.assertEqual(self.run_main('check')[0], 0)
+        for name, text, want in (('shell-fork-runner-1', '/bin/bash', "fork-runner-1 has the login shell '/bin/bash'"),
+                                 ('pw-fork-runner-2', '', 'fork-runner-2 has a usable password or none')):
+            with self.subTest(name):
+                self.write(os.path.join(self.fakes, name), text + '\n')
+                code, out, _ = self.run_main('check')
+                self.assertEqual(code, 1)
+                self.assertIn('FAIL  runner-user  ' + want, out)
+                os.unlink(os.path.join(self.fakes, name))
+        self.write(self.path('/etc/at.allow'), 'fork-runner-2\n')
+        self.assertIn('FAIL  runner-user  fork-runner-2 is in /etc/at.allow', self.run_main('check')[1])
+
+    def test_a_subfolder_others_can_write_is_closed_before_files_go_in(self):
+        os.makedirs(self.path('/opt/fork-fleet/units'))
+        os.chmod(self.path('/opt/fork-fleet/units'), 0o777)
+        seen, real = [], os.replace
+        def spy(a, b, *k, **kw):
+            if '/opt/fork-fleet/units/' in b:
+                seen.append(stat.S_IMODE(os.stat(os.path.dirname(b)).st_mode))
+            return real(a, b, *k, **kw)
+        with unittest.mock.patch.object(self.m.os, 'replace', spy):
+            self.assertEqual(self.install()[0], 0)
+        self.assertTrue(seen)
+        self.assertEqual([x for x in seen if x & 0o022], [], 'unit files placed while units/ was writable by others')
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/opt/fork-fleet/units')).st_mode), 0o755)
+
+    def test_refusals_change_nothing(self):
+        cases = {
+            'not a release sha': (lambda: None, ['--sha', 'abc'], '--sha must be'),
+            'no machine file': (lambda: os.unlink(self.m.MACHINE), [], 'machine file'),
+            'no desk section': (lambda: self.machine({'version': 1}), [], 'no "desk" section'),
+            'bad host key': (lambda: self.machine({'version': 1, 'desk': {**MACHINE['desk'],
+                                                                          'hostKey': 'ssh-rsa AAAA'}}), [], 'hostKey'),
+            'too many slots': (lambda: self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'slots': 9}}), [],
+                               'slots'),
+            'bad net base': (lambda: self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'netBase': '10.256'}}),
+                             [], 'netBase'),
+            'unknown key': (lambda: self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'token': 'x'}}), [],
+                            'token'),
+            'os not supported': (lambda: self.write(os.path.join(self.fakes, 'os-exit'), '3'), [],
+                                 'not supported yet'),
+            'an install the kit did not make': (
+                lambda: self.write(self.path('/opt/fork-fleet/fork-fleet-launch.sh'), 'old'), [],
+                'this kit did not make'),
+            'a foreign unit': (lambda: self.write(self.path('/etc/systemd/system/fork-fleet-desk-agent.service'), 'x'),
+                               [], 'this kit did not make'),
+            'no such fleet config': (lambda: None, ['--fleet-config', '/nonexistent/x.json'], 'no such file'),
+            'a drop-in for the agent': (lambda: self.write(self.path(
+                '/etc/systemd/system/fork-fleet-desk-agent.service.d/override.conf'), '[Service]\nExecStart=\n'), [],
+                'override.conf changes fork-fleet-desk-agent.service'),
+            'a dash-prefix drop-in': (lambda: self.write(self.path(
+                '/run/systemd/system/t3code-fleet-.timer.d/x.conf'), '[Timer]\n'), [], 'changes t3code-fleet'),
+            'a record of another shape': (lambda: self.write(self.path('/etc/fork-fleet/desk-kit.json'),
+                                                             '{"version": 1}'), [], 'not an install record'),
+            'a hand-made runner user with a login shell': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
+                         self.write(os.path.join(self.fakes, 'shell-fork-runner-1'), '/bin/bash\n')), [],
+                "login shell '/bin/bash'"),
+            'a hand-made runner user with a password': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-2\n'),
+                         self.write(os.path.join(self.fakes, 'pw-fork-runner-2'), '$6$salt$hash\n')), [],
+                'usable password'),
+            'a hand-made runner user with uid 0': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
+                         self.write(os.path.join(self.fakes, 'uid-fork-runner-1'), '0\n')), [], 'has uid 0'),
+            'a hand-made runner user in group 0 only (useradd -g 0)': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
+                         self.write(os.path.join(self.fakes, 'gid-fork-runner-1'), '0\n')), [],
+                'has the main group 0, not its own group fork-runner-1'),
+            'a linked /opt/fork-fleet/units': (
+                lambda: (os.makedirs(os.path.join(self.tmp, 'elsewhere'), exist_ok=True),
+                         os.makedirs(self.path('/opt/fork-fleet')),
+                         os.symlink(os.path.join(self.tmp, 'elsewhere'), self.path('/opt/fork-fleet/units'))), [],
+                '/opt/fork-fleet/units is a link'),
+            'a linked /opt/fork-fleet/fork-fleet-walls': (
+                lambda: (os.makedirs(os.path.join(self.tmp, 'elsewhere'), exist_ok=True),
+                         os.makedirs(self.path('/opt/fork-fleet')),
+                         os.symlink(os.path.join(self.tmp, 'elsewhere'),
+                                    self.path('/opt/fork-fleet/fork-fleet-walls'))), [],
+                '/opt/fork-fleet/fork-fleet-walls is a link'),
+            'a hand-made runner user in other groups': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-2\n'),
+                         self.write(os.path.join(self.fakes, 'groups-fork-runner-2'), '1001 27\n')), [],
+                'is in other groups (1001 27)'),
+            'a hand-made runner user with a home': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
+                         os.makedirs(self.path('/home/fork-runner-1')),
+                         self.write(os.path.join(self.fakes, 'home-fork-runner-1'), '/home/fork-runner-1\n')), [],
+                'has the home /home/fork-runner-1'),
+            'a linked /opt/fork-fleet': (
+                lambda: (os.makedirs(os.path.join(self.tmp, 'elsewhere'), exist_ok=True),
+                         os.makedirs(self.path('/opt')),
+                         os.symlink(os.path.join(self.tmp, 'elsewhere'), self.path('/opt/fork-fleet'))), [],
+                '/opt/fork-fleet is a link'),
+            'a linked /etc/fork-fleet': (
+                lambda: (os.makedirs(os.path.join(self.tmp, 'elsewhere'), exist_ok=True),
+                         os.makedirs(self.path('/etc')),
+                         os.symlink(os.path.join(self.tmp, 'elsewhere'), self.path('/etc/fork-fleet'))), [],
+                '/etc/fork-fleet is a link'),
+            'a linked desk key': (
+                lambda: (self.write(self.path('/etc/fork-fleet/desk-kit.json'), json.dumps(
+                    {'version': 1, 'createdUsers': [], 'fleetConfig': 'release', 'sha': SHA1}), 0o600),
+                         self.write(os.path.join(self.tmp, 'elsewhere-key'), 'PRIVATE\n', 0o600),
+                         os.symlink(os.path.join(self.tmp, 'elsewhere-key'), self.path('/etc/fork-fleet/desk-key'))),
+                [], '/etc/fork-fleet/desk-key is a link'),
+            'a hand-made runner user in cron.allow': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
+                         self.write(self.path('/etc/cron.allow'), 'fork-runner-1\n')), [], 'is in /etc/cron.allow'),
+            'a record that names a project config that is gone': (
+                lambda: (self.write(self.path('/etc/fork-fleet/desk-kit.json'), json.dumps(
+                    {'version': 1, 'createdUsers': [], 'fleetConfig': 'project', 'sha': SHA1}), 0o600)), [],
+                'run again with --fleet-config FILE or --release-fleet-config'),
+            'a fleet config others may write': (lambda: (os.makedirs(os.path.join(self.tmp, 'open'), exist_ok=True),
+                                                         os.chmod(os.path.join(self.tmp, 'open'), 0o777),
+                                                         self.write(os.path.join(self.tmp, 'open', 'f.json'), '{}')),
+                                                ['--fleet-config', os.path.join(self.tmp, 'open', 'f.json')],
+                                                'can be written by other users'),
+        }
+        for name, (setup, args, msg) in cases.items():
+            with self.subTest(name):
+                shutil.rmtree(self.root, ignore_errors=True)
+                os.makedirs(self.root)
+                for n in os.listdir(self.fakes):   # the users of the case before
+                    if n == 'users' or n.startswith(('shell-', 'pw-', 'uid-', 'gid-', 'groups-', 'home-')):
+                        os.unlink(os.path.join(self.fakes, n))
+                self.machine(MACHINE)
+                self.write(os.path.join(self.fakes, 'os-exit'), '0')
+                setup()
+                before = self.tree()
+                self.clear_calls()
+                argv = ['install', '--source', self.source, '--sha', SHA1, *args]
+                if '--sha' in args:
+                    argv = ['install', '--source', self.source, *args]
+                code, _, err = self.run_main(*argv)
+                self.assertEqual(code, 1)
+                self.assertIn(msg, err)
+                self.assertEqual(self.tree(), before)
+                self.assertFalse([c for c in self.calls() if not c.startswith(('id ', 'getent ', 'systemctl show'))],
+                                 self.calls())
+
+    def test_bad_release_is_not_installed(self):
+        self.assertEqual(self.install()[0], 0)
+        before = {k: v for k, v in self.tree().items() if k != '/etc/fork-fleet/desk-kit.json'}
+        for name, extra, msg in (
+                ('no pool', {'.github/fork-fleet.json': json.dumps({'pools': [{'name': 'vm'}]})}, "no pool 'desktop'"),
+                ('gate does not load', {'.github/scripts/fork-fleet.py': 'raise SystemExit("bad config")\n'},
+                 'the gate does not load'),
+                ('launcher syntax', {'.github/scripts/fork-fleet-launch.sh': '#!/bin/bash\nif then\n'}, 'bash -n'),
+                ('pools not a list', {'.github/fork-fleet.json': json.dumps({'pools': {'desktop': {}}})},
+                 'not a list of pools')):
+            with self.subTest(name):
+                bad = self.release('bad-' + name.replace(' ', '-'), extra)
+                code, _, err = self.install(sha=SHA2, source=bad)
+                self.assertEqual(code, 1)
+                self.assertIn(msg, err)
+                after = {k: v for k, v in self.tree().items() if k != '/etc/fork-fleet/desk-kit.json'}
+                self.assertEqual(after, before)
+
+    def test_key_is_made_once_and_a_half_key_is_refused(self):
+        self.assertEqual(self.install()[0], 0)
+        os.unlink(self.path('/etc/fork-fleet/desk-key.pub'))
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn('without', err)
+        os.unlink(self.path('/etc/fork-fleet/desk-key'))
+        self.write(self.path('/etc/fork-fleet/.desk-key.new'), 'torn')   # a keygen that stopped
+        code, _, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read('/etc/fork-fleet/desk-key'), 'PRIVATE\n')
+        self.assertFalse(os.path.exists(self.path('/etc/fork-fleet/.desk-key.new')))
+
+    def test_reserve_and_port_reach_the_settings(self):
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'reserveMb': 4096, 'port': 2222, 'slots': 1,
+                                             'netBase': '10.77'}})
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('RUNNER_USERS=fork-runner-1\nRESERVE_MB=4096\nNET_BASE=10.77\n',
+                      self.read('/etc/fork-fleet/launch.conf'))
+        self.assertTrue(self.read('/etc/fork-fleet/desk-known_hosts').endswith(
+            f'[fleet-host.example]:2222 {HOST_KEY}\n'))
+
+    def test_a_free_script_reaches_the_settings_and_the_check(self):
+        script = os.path.join(self.tmp, 'free')
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'freeCommand': script}})
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn(f'FREE_COMMAND={script}\n', self.read('/etc/fork-fleet/launch.conf'))
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/opt/fork-fleet/free-memory')).st_mode), 0o755)
+        self.template()
+        now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        for code, body, want in ((0, '"free": true', 'PASS  free-script  ' + script + ': free\n'),
+                                 (75, '"free": false, "reason": "a game"', 'busy: a game'),
+                                 (75, '"free": true', 'FAIL  free-script')):
+            self.write(script, f"#!/bin/sh\necho '{{\"v\": 1, {body}, \"at\": \"{now}\"}}'\nexit {code}\n", 0o755)
+            out = self.run_main('check')[1]
+            self.assertIn(want, out)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'freeCommand': 'free'}})
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn('freeCommand', err)
+
+    def test_existing_user_is_used_not_recorded(self):
+        self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n')
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['createdUsers'], ['fork-runner-2'])
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertEqual(slurp(os.path.join(self.fakes, 'users')).split(), ['fork-runner-1'])
+
+    def test_a_user_made_by_a_run_that_died_is_removed_by_uninstall(self):
+        self.write(os.path.join(self.fakes, 'fail-after'), 'useradd\n')
+        code, _, _ = self.install()
+        self.assertEqual(code, 1)
+        self.assertEqual(slurp(os.path.join(self.fakes, 'users')).split(), ['fork-runner-1'])
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertEqual(slurp(os.path.join(self.fakes, 'users')).split(), [])
+
+    def test_agent_refusing_its_settings_starts_nothing(self):
+        self.write(os.path.join(self.fakes, 'agent-bad'), '')
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn('the desk agent refuses its settings', err)
+        self.assertFalse([c for c in self.calls() if c.startswith(('systemctl enable', 'systemctl restart'))])
+
+    # --------------------------------------------------------------------------------------------------- check
+
+    def test_check_names_each_failure(self):
+        self.assertEqual(self.install()[0], 0)
+        self.write(os.path.join(self.fakes, 'wall-fails'), '')
+        self.write(os.path.join(self.fakes, 'agent-bad'), '')
+        self.write(os.path.join(self.fakes, 'down'), 'fork-fleet-desk-agent.service\n')
+        self.write(self.path('/opt/fork-fleet/hook.sh'), '#!/bin/bash\nevil\n', 0o755)
+        self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '0\n')
+        os.unlink(os.path.join(self.fakes, 'users'))
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        for line in ('FAIL  kit  /opt/fork-fleet/hook.sh: differs', 'FAIL  vsock  closed: open',
+                     'FAIL  agent-settings  bad settings', 'FAIL  unit  fork-fleet-desk-agent.service',
+                     'PASS  unit  t3code-fleet-refresh.timer', 'FAIL  template', 'FAIL  runner-user  fork-runner-1',
+                     'FAIL  ip-forward'):
+            self.assertIn(line, out)
+        self.assertTrue(out.endswith('8 FAIL\n'), out)
+
+    def test_check_fails_on_a_drop_in_and_on_settings_the_machine_file_no_longer_gives(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.assertEqual(self.run_main('check')[0], 0)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'slots': 1}})
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  settings  /etc/fork-fleet/launch.conf differs from the machine file', out)
+        self.machine(MACHINE)
+        self.write(self.path('/etc/systemd/system/fork-fleet-desk-agent.service.d/override.conf'),
+                   '[Service]\nExecStart=\nExecStart=/bin/sh -c evil\n')
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        self.assertIn('override.conf: a drop-in the kit did not write changes fork-fleet-desk-agent.service', out)
+
+    def test_check_fails_when_a_unit_is_not_the_release_unit(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        new = self.release('release2', {'.github/scripts/fork-fleet-desk-agent.service': '# v2\n[Service]\n'})
+        self.assertIn('stopped after', str(self.install(sha=SHA2, source=new, stop_after='settings')[0]))
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        self.assertIn('fork-fleet-desk-agent.service: not the unit of release', out)
+        self.assertEqual(self.install(sha=SHA2, source=new)[0], 0)
+        self.assertEqual(self.run_main('check')[0], 0)
+
+    def test_check_names_a_runner_user_left_by_fewer_slots(self):
+        self.assertEqual(self.install()[0], 0)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'slots': 1}})
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('PASS  runner-user  fork-runner-2 is no longer a slot', self.run_main('check')[1])
+
+    def test_check_before_install_fails_without_writing(self):
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  kit', out)
+        self.assertFalse(os.path.exists(self.path('/opt')))
+
+    # ----------------------------------------------------------------------------------------------- uninstall
+
+    def test_uninstall_leaves_nothing_of_its_own(self):
+        self.write(self.path('/etc/cron.deny'), 'someone\n')
+        self.write(self.path('/etc/systemd/system/other.service'), 'x')
+        self.write(os.path.join(self.fakes, 'users'), 'someone\n')
+        self.assertEqual(self.install()[0], 0)
+        self.write(os.path.join(self.fakes, 'active'), 'desktop-1\n')
+        self.write(self.path('/var/lib/fork-fleet/runners/x'), '')
+        self.write(os.path.join(self.fakes, 'netns'), 'fork-fleet-fork-runner-1\n')   # the namespaces that are there
+        self.clear_calls()
+        code, out, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        calls = self.calls()
+        for c in ('systemctl disable --now fork-fleet-desk-agent.service', 'launch active', 'launch stop desktop-1',
+                  'launch prune', 'ip netns delete fork-fleet-fork-runner-1', 'nft delete table inet fork_fleet',
+                  'userdel fork-runner-1', 'userdel fork-runner-2'):
+            self.assertIn(c, calls)
+        self.assertLess(calls.index('launch stop desktop-1'), calls.index('userdel fork-runner-1'))
+        for path in ('/opt/fork-fleet', '/etc/fork-fleet', '/var/lib/fork-fleet', '/etc/sysctl.d/60-fork-fleet.conf',
+                     '/etc/systemd/system/fork-fleet-desk-agent.service'):
+            self.assertFalse(os.path.lexists(self.path(path)), path)
+        self.assertEqual(self.read('/etc/cron.deny'), 'someone\n')
+        self.assertTrue(os.path.exists(self.path('/etc/systemd/system/other.service')))
+        self.assertEqual(slurp(os.path.join(self.fakes, 'users')).split(), ['someone'])
+        code, out, _ = self.run_main('uninstall')   # again: nothing to do
+        self.assertEqual(code, 0)
+        self.assertIn('nothing here was installed by this kit', out)
+
+    def test_uninstall_keeps_what_the_kit_did_not_make(self):
+        self.assertEqual(self.install()[0], 0)
+        for path in ('/etc/fork-fleet/token', '/opt/fork-fleet/notes.txt', '/var/lib/fork-fleet/other/x'):
+            self.write(self.path(path), 'not the kit\'s\n')
+        self.write(self.path('/var/lib/fork-fleet/runners/desktop-1/x'), '')
+        code, out, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        left = {k for k in self.tree() if k.startswith(('/etc/fork-fleet', '/opt/fork-fleet', '/var/lib/fork-fleet'))}
+        self.assertEqual(left, {'/etc/fork-fleet', '/etc/fork-fleet/token', '/opt/fork-fleet',
+                                '/opt/fork-fleet/notes.txt', '/var/lib/fork-fleet', '/var/lib/fork-fleet/other',
+                                '/var/lib/fork-fleet/other/x'})
+        self.assertIn('left /etc/fork-fleet/token: the kit did not make it', out)
+
+    def test_uninstall_removes_the_deny_files_it_made(self):
+        self.write(self.path('/etc/cron.deny'), 'someone\n')   # there before: kept, without the kit's lines
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.read('/etc/at.deny'), 'fork-runner-1\nfork-runner-2\n')
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertFalse(os.path.lexists(self.path('/etc/at.deny')))   # with none, only root may use at again
+        self.assertEqual(self.read('/etc/cron.deny'), 'someone\n')
+
+    def test_uninstall_removes_the_deny_lines_it_added_for_users_that_were_there(self):
+        self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\nfork-runner-2\n')   # both made by hand
+        self.write(self.path('/etc/cron.deny'), 'someone\n')
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.read('/etc/at.deny'), 'fork-runner-1\nfork-runner-2\n')
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertFalse(os.path.lexists(self.path('/etc/at.deny')))   # with none, only root may use at again
+        self.assertEqual(self.read('/etc/cron.deny'), 'someone\n')
+
+    def test_uninstall_keeps_the_table_while_a_runner_still_runs(self):
+        self.assertEqual(self.install()[0], 0)
+        self.write(os.path.join(self.fakes, 'units'), 'fork-fleet-desktop-1.service\nfork-fleet-desktop-2.service\n')
+        self.write(os.path.join(self.fakes, 'stuck'), 'fork-fleet-desktop-2.service\n')
+        self.clear_calls()
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1)
+        self.assertIn('fork-fleet-desktop-2.service is still running', err)
+        calls = self.calls()
+        self.assertIn('systemctl stop fork-fleet-desktop-1.service', calls)   # what the launcher did not stop
+        self.assertFalse([c for c in calls if c.startswith(('nft', 'userdel', 'ip netns delete'))], calls)
+        self.assertTrue(os.path.exists(self.path('/etc/fork-fleet/desk-kit.json')))
+        os.unlink(os.path.join(self.fakes, 'stuck'))
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertIn('nft delete table inet fork_fleet', self.calls())
+
+    def test_uninstall_removes_every_runner_namespace(self):
+        self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n')   # made by hand, not by the kit
+        self.assertEqual(self.install()[0], 0)
+        self.write(os.path.join(self.fakes, 'netns'), 'fork-fleet-fork-runner-1\nfork-fleet-fork-runner-2\nother\n')
+        self.write(os.path.join(self.fakes, 'links'), 'ffh-1001\neth0\nffh-1009\n')
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertEqual(slurp(os.path.join(self.fakes, 'netns')).split(), ['other'])
+        self.assertEqual(slurp(os.path.join(self.fakes, 'links')).split(), ['eth0'])
+
+    def test_uninstall_removes_its_record_last(self):
+        self.assertEqual(self.install()[0], 0)
+        gone, unlink, scandir = [], os.unlink, os.scandir
+
+        def record(path, *a, **kw):
+            gone.append(os.path.basename(path))
+            return unlink(path, *a, **kw)
+
+        class Sorted:
+            """Folders listed by name, so the record (desk-kit.json sorts before desk.conf and launch.conf) comes
+            first: a whole-folder removal would take it before the rest, whatever order the file system gives."""
+            def __init__(self, *a, **kw):
+                self.it = scandir(*a, **kw)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.it.close()
+
+            def __iter__(self):
+                return iter(sorted(self.it, key=lambda e: e.name))
+
+            def close(self):
+                self.it.close()
+        os.unlink, os.scandir = record, Sorted
+        try:
+            self.assertEqual(self.run_main('uninstall')[0], 0)
+        finally:
+            os.unlink, os.scandir = unlink, scandir
+        self.assertEqual(gone[-1], 'desk-kit.json', gone)
+
+    def test_uninstall_refuses_a_record_of_another_shape(self):
+        self.assertEqual(self.install()[0], 0)
+        for bad in ('[]', '{"version": 1, "createdUsers": "fork-runner-1", "fleetConfig": "release"}',
+                    '{"version": 1, "createdUsers": ["root;x"], "fleetConfig": "release"}'):
+            with self.subTest(bad):
+                self.write(self.path('/etc/fork-fleet/desk-kit.json'), bad, 0o600)
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1)
+                self.assertIn('not an install record', err)
+
+    def test_uninstall_stopped_half_way_runs_again(self):
+        self.assertEqual(self.install()[0], 0)
+        self.write(os.path.join(self.fakes, 'fail'), 'userdel\n')
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1)
+        self.assertTrue(os.path.exists(self.path('/etc/fork-fleet/desk-kit.json')))   # the record stays
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.path('/etc/fork-fleet')))
+        self.assertEqual(slurp(os.path.join(self.fakes, 'users')).split(), [])
+
+    def test_uninstall_of_a_foreign_install_changes_nothing(self):
+        self.write(self.path('/opt/fork-fleet/fork-fleet-launch.sh'), 'old')
+        before = self.tree()
+        code, out, _ = self.run_main('uninstall')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(self.calls(), [])
+
+
+class Release(unittest.TestCase):
+    def test_every_file_the_kit_installs_is_in_this_repository(self):
+        m = load()
+        for src in [*m.FILES.values(), *m.UNITS.values(), m.WALLS]:
+            self.assertTrue(os.path.exists(os.path.join(REPO, src)), src)
+        self.assertTrue(os.listdir(os.path.join(REPO, m.WALLS)))
+
+    def test_bootstrap_checks_its_arguments_before_anything(self):
+        boot = os.path.join(KIT, 'bootstrap.sh')
+        self.assertEqual(subprocess.run(['sh', '-n', boot]).returncode, 0)
+        env = {'PATH': '/usr/bin:/bin'}
+        for args, msg in ((['--repo', 'x'], '--repo must be'), (['--repo', 'a/b', '--sha', 'x'], '--sha must be'),
+                          (['--nope'], 'unknown option'),
+                          # flags after --fleet-config are checked too: a later --sha cannot replace a good one
+                          (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config', boot, '--sha', 'x'], '--sha must be'),
+                          (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config', boot, '--repo', 'x'],
+                           '--repo must be'),
+                          (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config', '/nonexistent/f.json'],
+                           'no such file'),
+                          (['--repo', 'a/b', '--sha', 'a' * 40, '--fleet-config'], 'needs a value')):
+            r = subprocess.run(['sh', boot, *args], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn(msg, r.stderr)
+        if os.geteuid() != 0:
+            r = subprocess.run(['sh', boot, '--repo', 'a/b', '--sha', 'a' * 40], capture_output=True, text=True,
+                               env=env)
+            self.assertIn('run this as root', r.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
-import copy, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat, subprocess, sys
+import copy, datetime, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat, subprocess, sys
 import tempfile
 import unittest, urllib.error, urllib.parse
 from contextlib import redirect_stdout
@@ -704,6 +704,7 @@ class Route(unittest.TestCase):
         self.assertEqual(runners['lint'][0], POOLS[WAITING]['label'])
         lines, _ = self.outputs(**{POOLS[FIRST]['beacon']: beacon(1, at=int(ff.time.time()))})
         self.assertEqual(lines['watch'], 'true')
+        self.assertEqual(lines['rerun'], '{}')   # the fork's config has no reruns: always the line, {} for none
 
     def test_cmd_route_with_unreadable_outputs_counts_every_job(self):
         lines, log = self.outputs(FLEET_MODE='fleet', GATES='{')
@@ -1476,6 +1477,9 @@ class Launcher(unittest.TestCase):
             if subprocess.run(['id', '-G', user], capture_output=True, text=True).stdout.split() != \
                     [str(pwd.getpwnam(user).pw_gid)]:
                 self.skipTest(f'{user} is in other groups here')
+        # Folders as an install makes them, whatever this machine's umask: the launcher refuses a bound path under a
+        # folder its group may write (closed_folder), and a test's own folders must not trip it.
+        self.addCleanup(os.umask, os.umask(0o022))
         self.d = launcher_tmp()
         self.addCleanup(shutil.rmtree, self.d, True)
         self.rec = self.path('rec')
@@ -1747,6 +1751,97 @@ class Launcher(unittest.TestCase):
         self.refused(f'{self.path("open")} must be writable by its owner only')
         os.mkdir(self.path('open/own'), 0o755)
         self.conf(HOOK=self.write('open/own/hook.sh', '#!/bin/sh\n', 0o755))
+        # PR #213 re-check 2 (security N5): in a sticky folder others may write, the folder below it must be root's
+        # (here: this user's): another user who made it may rename it away and put a link in its place (a stat that
+        # says so: the tests cannot chown).
+        self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in */open/own) echo 4242; exit 0;; '
+                   'esac\nexec /usr/bin/stat "$@"\n', 0o755)
+        # #226 item 6: every folder on the way is checked for its owner now, sticky one above it or not.
+        self.refused(f'{self.path("open/own")}, a folder of uid 4242')
+        os.chmod(self.path('open'), 0o1775)   # its group, the same
+        self.refused(f'{self.path("open/own")}, a folder of uid 4242')
+        os.chmod(self.path('open'), 0o1777)
+        os.remove(self.path('bin/stat'))
+        self.start(self.NAME)
+
+    def test_the_folder_rule_says_the_fix(self):
+        """PR #213 re-check 2 (correctness observation): the refusal names the folder and the fix."""
+        os.makedirs(self.path('grp/own'))
+        os.chmod(self.path('grp/own'), 0o755)
+        os.chmod(self.path('grp'), 0o775)
+        self.conf(HOOK=self.write('grp/own/hook.sh', '#!/bin/sh\n', 0o755))
+        g = self.path('grp')
+        self.refused(f'which others may write (its group or all): they could swap a link into it (chmod go-w {g}, '
+                     f'or make it sticky: chmod +t {g})')
+
+    def test_a_path_through_a_link_another_user_may_repoint_is_refused(self):
+        """#211: a link on the way to a bound path (the hook's among them) is root's (or, in these tests, the user's
+        who runs the launcher), in a folder no other user may write: a link another user owns, or may swap, could
+        be repointed between start's check and the job. Each link on the way is checked, not only the real path."""
+        os.makedirs(self.path('real/hook'), 0o755)
+        os.chmod(self.path('real/hook'), 0o755)
+        self.write('real/hook/hook.sh', '#!/bin/sh\n', 0o755)
+        os.mkdir(self.path('pub'))
+        os.chmod(self.path('pub'), 0o777)   # not sticky: anyone may swap a link in it
+        os.symlink(self.path('real/hook'), self.path('pub/hl'))
+        self.conf(HOOK=self.path('pub/hl/hook.sh'))
+        self.refused(f'goes through {self.path("pub/hl")}, in {self.path("pub")}, which others may write')
+        os.symlink(self.path('pub/hl'), self.path('l2'))   # a link to a link: each one on the way is checked
+        self.conf(HOOK=self.path('l2/hook.sh'))
+        self.refused(f'goes through {self.path("pub/hl")}, in {self.path("pub")}')
+        os.chmod(self.path('pub'), 0o755)
+        # A link another user owns (a stat that says so: the tests cannot chown): that user could repoint it.
+        self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in */pub/hl) echo 4242; exit 0;; esac\n'
+                   'exec /usr/bin/stat "$@"\n', 0o755)
+        self.refused(f'goes through {self.path("pub/hl")}, a link of uid 4242')
+        os.remove(self.path('bin/stat'))
+        os.chmod(self.path('pub'), 0o1777)   # sticky: only a link's owner may swap it, and that is this user (root)
+        self.start(self.NAME)
+
+    def test_a_link_in_a_folder_another_user_owns_or_its_group_may_write_is_refused(self):
+        """Fix round 1 (#213 S7, C5): a root link is safe only in root's folder that only root may write (or a sticky
+        one): the folder's owner may remove any link in it, and a group-writable folder lets every member swap it.
+        Through start and through `paths`, as the doc says (step 1b: "in a folder only its owner may write")."""
+        os.makedirs(self.path('real/hook'), 0o755)
+        os.chmod(self.path('real/hook'), 0o755)
+        self.write('real/hook/hook.sh', '#!/bin/sh\n', 0o755)
+        os.mkdir(self.path('grp'))
+        os.symlink(self.path('real/hook'), self.path('grp/hl'))
+        self.conf(HOOK=self.path('grp/hl/hook.sh'))
+        for mode in (0o775, 0o2775, 0o770, 0o730):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path('grp'), mode)
+                self.refused(f'goes through {self.path("grp/hl")}, in {self.path("grp")}, which others may write')
+        os.chmod(self.path('grp'), 0o755)
+        # The folder another user owns (a stat that says so: the tests cannot chown), sticky or not: that user may
+        # remove the link and make another.
+        self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in */grp) echo 4242; exit 0;; esac\n'
+                   'exec /usr/bin/stat "$@"\n', 0o755)
+        for mode in (0o755, 0o1777):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path('grp'), mode)
+                self.refused(f'goes through {self.path("grp/hl")}, in {self.path("grp")}, a folder of uid 4242')
+        os.remove(self.path('bin/stat'))
+        for mode, name in ((0o755, 'fleet-vm-t3code-11'), (0o1775, 'fleet-vm-t3code-12')):   # its owner's, or sticky
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path('grp'), mode)
+                self.start(name)
+
+    def test_every_folder_above_a_bound_path_is_roots_or_this_users_and_slash_too(self):
+        """#226 item 6: a folder above the real path that another user owns, closed (0755) or not, is that user's to
+        rename entries in: they could move the hook's folder away and put a link in its place between the check and
+        the bind. Only root's folders (or, in these tests, this user's) pass, and `/` is one of them."""
+        os.makedirs(self.path('own/sub'))
+        for d in ('own', 'own/sub'):
+            os.chmod(self.path(d), 0o755)
+        self.conf(HOOK=self.write('own/sub/hook.sh', '#!/bin/sh\n', 0o755))
+        for folder, pattern in ((self.path('own'), '*/own'), ('/', '/')):
+            with self.subTest(folder):
+                self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in '
+                           f'{pattern}) echo 4242; exit 0;; esac\nexec /usr/bin/stat "$@"\n', 0o755)
+                self.refused(f', a folder of uid 4242: its owner could swap a link into it (only root\'s folders, or '
+                             f'this user\'s: chown root: {folder}, or move the path out of it)')   # PR #240 fix 1
+        os.remove(self.path('bin/stat'))
         self.start(self.NAME)
 
     def walls_root(self, conf, files=(), links=(), dirs=()):
@@ -1764,6 +1859,8 @@ class Launcher(unittest.TestCase):
         for link, to in links:
             os.makedirs(os.path.dirname(root + link), exist_ok=True)
             os.symlink(to, root + link)
+        for folder, _, _ in os.walk(root):   # as installed, any umask: a link's folder is its owner's alone
+            os.chmod(folder, 0o755)
         return root
 
     def paths(self, root, conf='/etc/fork-fleet/launch.conf'):
@@ -1808,6 +1905,35 @@ class Launcher(unittest.TestCase):
                 self.assertNotEqual(got.returncode, 0)
                 self.assertIn(word, got.stderr)
                 self.assertEqual(got.stdout, '')
+
+    def test_paths_refuses_a_link_in_a_folder_its_group_may_write(self):
+        """Fix round 1 (#213 S7): `paths` (what the walls read) refuses what start refuses: the hook through a root
+        link in a folder its group may write, which any member could swap between the check and the job."""
+        root = self.walls_root('HOOK=/opt/shared/hl/hook.sh\n', files=(('/opt/ff/hook.sh', ''),),
+                               links=(('/opt/shared/hl', '../ff'),))
+        self.assertEqual(self.paths(root).returncode, 0)
+        os.chmod(root + '/opt/shared', 0o775)
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('/opt/shared/hl, in /opt/shared, which others may write', got.stderr)
+
+    def test_paths_refuses_a_plain_folder_in_a_folder_its_group_may_write(self):
+        """PR #213 re-check RS N5: a plain folder on the way to a bound path, in a folder its group may write, is
+        refused as a link there is (closed_folder, one rule): a member could rename the folder away and put a link in
+        its place between the check and the bind. Sticky, or only its owner may write: passes."""
+        root = self.walls_root('HOOK=/opt/shared/ff/hook.sh\n', files=(('/opt/shared/ff/hook.sh', ''),))
+        self.assertEqual(self.paths(root).returncode, 0)
+        for mode in (0o775, 0o2775, 0o770, 0o757):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(root + '/opt/shared', mode)
+                got = self.paths(root)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn('/opt/shared/ff/hook.sh leads to /opt/shared/ff/hook.sh, under /opt/shared, which others '
+                              'may write (its group or all)', got.stderr)
+        for mode in (0o1775, 0o755):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(root + '/opt/shared', mode)
+                self.assertEqual(self.paths(root).returncode, 0, self.paths(root).stderr)
 
     def test_paths_refuses_a_bound_path_that_holds_data(self):
         """Fix round 3 (#191 re-check, correctness): the hook, its two files, WORK_ROOT and resolv.conf are bound into
@@ -1854,7 +1980,7 @@ class Launcher(unittest.TestCase):
         exist then), so the hook's folder must be writable by its owner only: in a shared folder (sticky, as /var/tmp
         is, or not) another user could make fork-fleet.py there in between, and every job would run it."""
         for mode, why in ((0o1777, f'{self.d} must be writable by its owner only'),
-                          (0o775, f'{self.d} must be writable by its owner only'),
+                          (0o775, f'under {self.d}, which others may write'),   # its group: the same rule
                           (0o777, f'under {self.d}, which others may write')):   # real_path's rule, first
             with self.subTest(oct(mode)):
                 os.chmod(self.d, mode)
@@ -2060,6 +2186,39 @@ class Launcher(unittest.TestCase):
         self.assertIn('not a number', self.launch('fits', '1e3').stderr)
         self.write('meminfo', 'MemTotal: 1 kB\n', 0o644)
         self.assertIn('no MemAvailable', self.launch('fits', '1').stderr)
+
+    def test_fits_asks_the_free_script_too(self):
+        """FREE_COMMAND (free/v1, fork-kit/common/FREE.md): after the memory rule, its answer through FREE_CHECK."""
+        with open(os.path.join(HERE, '..', '..', 'fork-kit', 'common', 'free_contract.py')) as f:
+            reader = self.write('free_contract.py', f.read(), 0o644)
+        script = self.path('free')
+        self.conf(FREE_COMMAND=script, FREE_CHECK=reader)
+        free = 8388608 // 1024 - 2048
+
+        def answer(code, **facts):
+            at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            body = json.dumps({'v': 1, 'free': code == 0, 'at': at, **facts})
+            self.write('free', f"#!/bin/sh\necho '{body}'\n: > {self.rec}/free-ran\nexit {code}\n", 0o755)
+        answer(0)
+        self.assertEqual(self.launch('fits', str(free)).returncode, 0)
+        answer(75, reason='a game is running')
+        got = self.launch('fits', '1')
+        self.assertEqual(got.returncode, 75)
+        self.assertIn('busy: a game is running', got.stderr)
+        answer(0, memory={'freeMb': 1000})
+        self.assertNotEqual(self.launch('fits', '1001').returncode, 0)
+        self.assertEqual(self.launch('fits', '1000').returncode, 0)
+        answer(3)
+        self.assertIn('not available: exit 3', self.launch('fits', '1').stderr)
+        answer(0)
+        os.remove(self.path('rec/free-ran'))
+        self.assertEqual(self.launch('fits', str(free + 1)).returncode, 1)
+        self.assertFalse(os.path.exists(self.path('rec/free-ran')), 'the memory rule says no first')
+        os.chmod(reader, 0o666)
+        self.assertIn('writable by its owner only', self.launch('fits', '1').stderr)
+        os.chmod(reader, 0o644)
+        self.conf(FREE_COMMAND='free')
+        self.assertIn('plain absolute paths', self.launch('fits', '1').stderr)
 
     def test_stop(self):
         self.assertEqual(self.launch('stop', self.NAME).returncode, 0)
@@ -3530,6 +3689,125 @@ class AnyRepository(unittest.TestCase):
         self.assertEqual(out, {'plugins': [GEN_PC[0], GEN_PC[1].format('plugins')],   # config order: heaviest first
                                'engine': ['self-hosted', 'proj-build'], 'docs': ['self-hosted', 'proj-build']})
         self.assertNotIn('::error::', log)
+
+    def test_a_job_that_avoids_a_pool_for_pushes_goes_to_the_next_one(self):
+        """Issue 224 item 3: a project builds what its deploy ships on its always-on pool only (push runs), while its
+        other heavy job may use the desktop. per_run then goes to the heaviest job that does not avoid the pool."""
+        cfg = copy.deepcopy(GEN)
+        cfg['jobs'][0]['avoid'] = {'pc': ['push']}
+        self.assertEqual(ff.check_config(cfg), [])
+        _, out, log = self.route(cfg, pc=beacon(2))
+        self.assertEqual(out, {'plugins': BUILD, 'engine': [GEN_PC[0], GEN_PC[1].format('engine')], 'docs': BUILD})
+        self.assertIn('pool pc: not for plugins in push runs', log)
+        _, out, _ = self.route(cfg, pc=beacon(2), e=env(**PR_ENV), event=draft(True))   # a draft: avoid says push only
+        self.assertEqual(out['plugins'], [GEN_PC[0], GEN_PC[1].format('plugins')])
+        for mode in ff.MODES:   # fleet mode queues it on the pool that waits, never on the avoided one
+            with self.subTest(mode=mode):
+                _, out, _ = self.route(cfg, mode=mode, pc=beacon(0))
+                self.assertEqual(out['plugins'], BUILD)
+        cfg['jobs'][1]['avoid'] = {'pc': ['push', 'draft']}
+        cfg['jobs'][2]['avoid'] = {'pc': ['push']}
+        _, out, log = self.route(cfg, pc=beacon(2))   # every job avoids it: the pool takes none, the slot stays free
+        self.assertEqual(set(map(tuple, out.values())), {tuple(BUILD)})
+
+    def test_a_broken_avoid_is_refused(self):
+        cases = {
+            'not an object': ([], 'avoid must be an object'),
+            'empty': ({}, 'avoid must be an object'),
+            'an unknown pool': ({'desk': ['push']}, "pool 'desk', which the config does not have"),
+            'a static pool': ({'build': ['push']}, 'only a dispatcher pool that does not wait'),
+            'the pool that waits': ({'ready': ['ready']}, 'only a dispatcher pool that does not wait'),
+            'an unknown kind': ({'pc': ['merged']}, "avoid['pc'] must list some of"),
+            'no kinds': ({'pc': []}, "avoid['pc'] must list some of"),
+            'kinds as a string': ({'pc': 'push'}, "avoid['pc'] must list some of"),
+        }
+        for name, (avoid, words) in cases.items():
+            with self.subTest(name):
+                bad = copy.deepcopy(GEN)
+                bad['jobs'][0]['avoid'] = avoid
+                problems = ff.check_config(bad)
+                self.assertTrue(any(words in p for p in problems), problems)
+        waiting = copy.deepcopy(CFG)   # the fork's own config: its pool that waits is a dispatcher pool
+        waiting['jobs'][0]['avoid'] = {WAITING: ['push']}
+        self.assertTrue(any('does not wait' in p for p in ff.check_config(waiting)), ff.check_config(waiting))
+
+    def test_an_unknown_job_key_is_refused(self):
+        # A misspelled `avoid` would otherwise be ignored and the job sent to the pool it meant to avoid.
+        bad = copy.deepcopy(GEN)
+        bad['jobs'][0]['avoids'] = {'pc': ['push']}
+        problems = ff.check_config(bad)
+        self.assertTrue(any("unknown key 'avoids'" in p for p in problems), problems)
+        self.assertEqual(ff.check_config(copy.deepcopy(GEN)), [])
+
+    def rerun(self, cfg, pc=None, e=None, event=PUSH, attempt=None, mode='', gates=None, own=True):
+        """(rerun output, log) of route_all for this run."""
+        e = dict(e or env())
+        if pc is not None:
+            e['PROJ_BEACON_PC'] = pc
+        got = {}
+        _, log = quiet(ff.route_all, cfg, e, private(event) if own else event, mode, gates, now=lambda: T0,
+                       nonce=NONCE, attempt=attempt, rerun=got)
+        return got, log
+
+    def test_a_trusted_persons_rerun_may_use_the_reruns_pool_for_its_own_attempt(self):
+        """Issue 224 item 4: a re-run of failed jobs does not re-run route; with `reruns`, route says ahead which run
+        label each job may ask for on that pool, and the job adds -a<its attempt>. The dispatcher (unchanged) accepts
+        exactly that pair for that attempt only."""
+        cfg = {**copy.deepcopy(GEN), 'reruns': 'pc'}
+        self.assertEqual(ff.check_config(cfg), [])
+        for attempt in (None, 1, 2, 3):   # a full re-run re-runs route too: the rerun labels never carry an attempt
+            with self.subTest(attempt=attempt):
+                got, _ = self.rerun(cfg, pc=beacon(2), attempt=attempt)
+                self.assertEqual(got, {'actors': list(GEN['trusted']['actors']), 'pool': 'proj-pc',
+                                       'labels': {k: GEN_PC[1].format(k) for k in ('plugins', 'engine', 'docs')}})
+        for attempt in (2, 3):   # what the README's runs-on asks for on attempt N
+            with self.subTest(attempt=attempt):
+                ask = [got['pool'], got['labels']['engine'] + f'-a{attempt}']
+                self.assertEqual(ff.fleet_job(cfg, ask)[1:], ('engine', attempt))
+        self.assertIsNone(ff.fleet_job(cfg, [got['pool'], got['labels']['engine']]))   # never without an attempt
+        got, _ = self.rerun(GEN, pc=beacon(2))   # no reruns: re-runs take fallback
+        self.assertEqual(got, {})
+
+    def test_a_full_pool_still_takes_reruns_a_missing_or_stale_heartbeat_does_not(self):
+        cfg = {**copy.deepcopy(GEN), 'reruns': 'pc'}
+        got, _ = self.rerun(cfg, pc=beacon(0))   # full now: the re-run waits for a slot (the sweep bounds the wait)
+        self.assertEqual(got['pool'], 'proj-pc')
+        cases = {'no heartbeat': None, 'a stale heartbeat': beacon(2, at=T0 - 3600), 'a garbled heartbeat': '{'}
+        for name, pc in cases.items():
+            with self.subTest(name):
+                got, log = self.rerun(cfg, pc=pc)
+                self.assertEqual(got, {})
+                self.assertIn('re-runs of failed jobs take the fallback, not pool pc', log)
+
+    def test_reruns_only_for_trusted_runs_kinds_the_pool_takes_and_jobs_that_do_not_avoid_it(self):
+        cfg = {**copy.deepcopy(GEN_HOSTED), 'reruns': 'pc'}
+        cases = {
+            'a pull request from another repository': dict(e=env(**PR_ENV), event=pr(head='someone/fork')),
+            'an untrusted actor': dict(e=env(GITHUB_ACTOR='someone', GITHUB_TRIGGERING_ACTOR='someone')),
+            'github mode': dict(mode='github'),
+            'a ready pull request (pc does not take ready)': dict(e=env(**PR_ENV), event=draft(False)),
+        }
+        for name, kw in cases.items():
+            with self.subTest(name):
+                got, _ = self.rerun(cfg, pc=beacon(2), **kw)
+                self.assertEqual(got, {})
+        got, _ = self.rerun(cfg, pc=beacon(2), gates={'docs': 'false'})   # a job this change skips gets none
+        self.assertEqual(sorted(got['labels']), ['engine', 'plugins'])
+        cfg['jobs'][0]['avoid'] = {'pc': ['push']}
+        got, _ = self.rerun(cfg, pc=beacon(2))
+        self.assertEqual(sorted(got['labels']), ['docs', 'engine'])
+        got, _ = self.rerun(cfg, pc=beacon(2), e=env(**PR_ENV), event=draft(True))   # avoid says push only
+        self.assertIn('plugins', got['labels'])
+        for job in cfg['jobs']:
+            job['avoid'] = {'pc': ['push']}
+        got, _ = self.rerun(cfg, pc=beacon(2))
+        self.assertEqual(got, {})
+
+    def test_reruns_must_name_a_dispatcher_pool(self):
+        for name in ('build', 'desk', '', None):
+            with self.subTest(name=name):
+                problems = ff.check_config({**GEN, 'reruns': name})
+                self.assertTrue(any('reruns' in p for p in problems), problems)
 
     def test_pool_by_draft_state(self):
         _, out, _ = self.route(pc=beacon(2), e=env(**PR_ENV), event=draft(True))

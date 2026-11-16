@@ -15,6 +15,7 @@ Every kit follows the same pattern:
 
 | Kit                              | What                                                                                                    |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| [desk](desk/README.md)           | A desktop's side of a fork fleet desk pool: runner users, walls, desk agent; one folder (Linux, WSL2)   |
 | [gh-apps](gh-apps/README.md)     | GitHub App tokens for agents through `gh-as`, without giving agents the keys (Linux)                    |
 | [golive](golive/README.md)       | Move a T3 boot service to a new build with a cold copy first; core and `check` so far (Linux)           |
 | [heavy](heavy/README.md)         | `heavy <command>`: run builds and tests in a capped slice, stop what they leave behind (Linux, systemd) |
