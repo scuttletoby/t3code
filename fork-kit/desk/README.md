@@ -41,17 +41,25 @@ sh bootstrap.sh --repo OWNER/REPO --sha RELEASE_SHA --release-fleet-config   # b
 ```
 
 `--fleet-config` is the project's fleet config (its pools); without it the release's own is used. It must be in a
-folder only root (or you) can write. The project's is kept in `/etc/fork-fleet/fleet-config.json` and the choice is
+folder only root (or you) can write; a link is followed, and the folders of both the link and the file it names are
+checked. The project's is kept in `/etc/fork-fleet/fleet-config.json` and the choice is
 recorded before any file is swapped, so a later install of a new release keeps it, even after a stopped run;
 `--release-fleet-config` goes back to the release's own. Install prints the desk key's public half: add it on
 the always-on host with `fork-fleet-desk-key.py add POOL`. The first runner template is made in the background by
 the refresh timer; `check` says FAIL for `template` until it is there.
 
-`check` only reads: the installed files against their manifest, each unit against the release's (header plus
+`check` only reads: the installed files against their manifest (text, root owner and mode), the folders' and the
+desk key's modes, the project's fleet config against the installed one, each unit against the release's (header plus
 `/opt/fork-fleet/units/UNIT`), a restart a stopped install still owes, systemd drop-ins that change the kit's units,
 every wall of this OS (`fork-fleet-walls.py describe`), the agent's settings, the units, the template, the settings
-files against the machine file, the runner users (and names a user the kit made that a smaller `slots` no longer
-uses) and IPv4 forwarding.
+files against the machine file, the runner users (each must exist, have no login shell, a locked password and no
+line in `cron.allow`/`at.allow`; and it names a user the kit made that a smaller `slots` no longer uses) and IPv4
+forwarding.
+
+A `fork-runner-N` user made by hand before the install is used, but only when it is as locked as one the kit makes
+(no login shell, locked password, not in an allow file): otherwise install refuses before changing anything and
+names the fix (`usermod -s /usr/sbin/nologin`, `passwd -l`). One install or uninstall runs at a time (a lock on
+`/opt/fork-fleet`); a second one is refused.
 
 ## Windows (WSL2)
 
@@ -86,16 +94,20 @@ stay (`wsl --unregister DISTRO` removes the distro).
 
 ## Runs again, stops half-way, old or empty state
 
-- **Again:** files, settings and units that did not change are not rewritten, and the agent is not stopped or
+- **Again:** files, settings and units that did not change are not rewritten (a file whose mode or owner was
+  changed is put back from the release), and the agent is not stopped or
   restarted (a restart would end a job it is starting). After a change it is restarted. The agent reads its settings
   only when it starts, so before the first change the record gets a restart-pending mark, cleared after the
-  restart: a run stopped in between restarts the agent on the next run.
+  restart: a run stopped in between restarts the agent on the next run. The mark is also set before a new fleet
+  config choice is saved, so a run stopped between saving the choice and the swap fails `check` until the next run.
 - **Stopped half-way:** the next install ends it. A new release is staged in `/opt/fork-fleet/.kit-stage-*` and
   checked first (gate loads with the fleet config, the pool is in it, `bash -n`, the walls know this OS); a release
   that fails is never installed. Files are renamed in one by one while the agent and the refresh timer are stopped;
   `SOURCE` is written
   last, so `check` reports a half-done swap. Users are recorded in `/etc/fork-fleet/desk-kit.json` before they are
   made, so uninstall removes them even after a stop.
+- **Old record:** a record that names a project's fleet config while neither `/etc/fork-fleet/fleet-config.json`
+  nor the installed copy is there is refused with the fix (`--fleet-config FILE` or `--release-fleet-config`).
 - **Old install:** a launcher, `launch.conf`, `desk.conf`, desk key, unit, or a systemd drop-in for one of the kit's
   units (`UNIT.d/*.conf`, also the dash-prefix forms) that this kit did not write is refused before anything changes.
   The type-wide `service.d/` and `timer.d/` folders are not checked: they hold the distribution's defaults for every
