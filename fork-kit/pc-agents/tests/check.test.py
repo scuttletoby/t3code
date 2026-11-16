@@ -6,7 +6,7 @@ on its own when its part of the wall is taken away; --enforce stops T3.
 import os, shutil, subprocess, sys, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fake_distro import CONFIG, Case, DRVFS, SHA1, k  # noqa: E402
+from fake_distro import CONFIG, Case, DRVFS, SHA1, cli, k  # noqa: E402
 
 
 class Walls(Case):
@@ -25,7 +25,8 @@ class Walls(Case):
         self.assertEqual(code, 0, out)
         walls = [line.split()[1] for line in out.splitlines()]
         for wall in ('wsl2:interop', 'wsl2:resolv', 'wsl2:windows-path', 'wsl2:networking', 'wsl2:os', 'masks',
-                     'record', 'linger', 'user-units', 'drop-ins', 'units', 'agent', 'sudoers', 'kit-code', 'runtime',
+                     'record', 'linger', 'user-units', 'drop-ins', 'units', 'agent', 'sudoers', 'restart', 'kit-code',
+                     'runtime',
                      'automount', 'firewall', 'gateway', 'file:policy.json', 'file:t3code-agents.service',
                      'file:firewall.nft', 'file:wsl.conf', 'file:pc-agents-walls.timer'):
             self.assertIn(wall, walls)
@@ -37,6 +38,7 @@ class Walls(Case):
         code, out = self.check('--enforce')
         self.assertEqual(code, 1, out)
         self.assertIn('stop t3code-agents.service', self.log())
+        self.assertIn('stop pc-agents-as-agent-*.service', self.log())   # and every `pc-agents as-agent` run
         self.assertFalse(os.path.exists(self.path('/log/units/t3code-agents.service.active')))
         self.assertIn('stopped t3code-agents.service', out)
 
@@ -229,12 +231,76 @@ class Crash(Case):
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn('stop t3code-agents.service', self.log())   # the check itself could not stop T3
         self.stop_post('exit-code')
-        self.assertIn('stop t3code-agents.service', self.log())
+        self.assertIn('stop t3code-agents.service pc-agents-as-agent-*.service', self.log())
         self.assertFalse(os.path.exists(self.path('/log/units/t3code-agents.service.active')))
 
     def test_success_does_not_stop_t3(self):
         self.stop_post('success')
         self.assertEqual(self.log(), [])
+
+
+class Restart(Case):
+    """The restart wall: while setup's marker is there, a T3 that started before it runs stale files."""
+    def setUp(self):
+        super().setUp()
+        self.walled()
+
+    def mark(self, text=None):
+        self.write(k.PENDING, k.marker() if text is None else text)
+
+    def restart_fails(self, why):
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertEqual({line.split()[1] for line in out.splitlines() if line.startswith('FAIL')}, {'restart'}, out)
+        self.assertIn(why, out)
+
+    def test_t3_started_before_the_marker_fails_and_enforce_stops_it(self):
+        self.mark()
+        self.restart_fails('T3 runs as started before setup\'s last change')
+        code, out = self.check('--enforce')
+        self.assertEqual(code, 1, out)
+        self.assertIn('stop t3code-agents.service', self.log())
+        self.assertIn('stop pc-agents-as-agent-*.service', self.log())
+        self.assertEqual(self.check()[0], 0)   # T3 stopped: nothing stale runs; the next setup starts it
+
+    def test_t3_started_after_the_marker_passes(self):   # setup's own restart, before it removes the marker
+        self.mark()
+        k.run(['/usr/bin/systemctl', 'restart', k.UNIT])
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+
+    def test_marker_of_an_earlier_boot_passes(self):   # every T3 now started after it
+        self.mark('boot_id=00000000-0000-0000-0000-000000000000 monotonic_us=999999999999999\n')
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+
+    def test_marker_of_an_older_kit_fails(self):   # it had no time in it
+        self.mark('setup changed what T3 runs with; the next good run restarts T3 and removes this\n')
+        self.restart_fails('cannot be read')
+
+    def test_no_start_time_fails(self):
+        self.mark()
+        os.unlink(self.path('/log/units/t3code-agents.service.start'))
+        self.restart_fails('cannot be read')
+
+    def test_unreadable_marker_fails(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads any file')
+        self.mark()
+        os.chmod(self.path(k.PENDING), 0)
+        self.restart_fails('cannot read')
+
+    def test_systemctl_show_fails(self):
+        self.mark()
+        self.write('/log/systemctl-fail', '')
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL  restart', out)
+
+    def test_skipped_before_the_first_enable(self):   # setup's own check, while its marker is there by design
+        self.mark()
+        code, out = self.call(cli.check, False, True)
+        self.assertNotIn('restart', [line.split()[1] for line in out.splitlines() if line.startswith(('PASS', 'FAIL'))])
 
 
 class Unit(Case):
