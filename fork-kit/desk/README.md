@@ -50,18 +50,22 @@ recorded before any file is swapped, so a later install of a new release keeps i
 the always-on host with `fork-fleet-desk-key.py add POOL`. The first runner template is made in the background by
 the refresh timer; `check` says FAIL for `template` until it is there.
 
-`check` only reads: the installed files against their manifest (text, root owner and mode), the folders' and the
-desk key's modes, the project's fleet config against the installed one, each unit against the release's (header plus
-`/opt/fork-fleet/units/UNIT`), a restart a stopped install still owes, systemd drop-ins that change the kit's units,
-every wall of this OS (`fork-fleet-walls.py describe`), the agent's settings, the units (and the seed service's
-last result), the template, the settings files against the machine file, the runner users (each must exist, have no
-login shell, a locked password and no line in `cron.allow`/`at.allow`; and it names a user the kit made that a
-smaller `slots` no longer uses) and IPv4 forwarding.
+`check` only reads: the installed files against their manifest (text, root owner and mode), the folders' and the desk
+key's modes and root owner (not a link), the project's fleet config against the installed one, each unit against the
+release's (header plus `/opt/fork-fleet/units/UNIT`, mode and root owner), a restart a stopped install still owes,
+systemd drop-ins that change the kit's units, every wall of this OS (`fork-fleet-walls.py describe`), the agent's
+settings, the units (and the seed service's last result), the template, the settings files against the machine file
+(text, mode and root owner), the runner users (each must exist, have no login shell, a locked password, a uid other
+than 0, its own group only, no home that is there (`/nonexistent`) and no line in `cron.allow`/`at.allow`; and it
+names a user the kit made that a smaller `slots` no longer uses) and IPv4 forwarding.
 
-A `fork-runner-N` user made by hand before the install is used, but only when it is as locked as one the kit makes
-(no login shell, locked password, not in an allow file): otherwise install refuses before changing anything and
-names the fix (`usermod -s /usr/sbin/nologin`, `passwd -l`). One install or uninstall runs at a time (a lock on
-`/opt/fork-fleet`); a second one is refused.
+A `fork-runner-N` user made by hand before the install is used, but only when it passes the same checks (no login
+shell, locked password, uid not 0, its own group only, no home that is there, not in an allow file; the launcher
+refuses the same uid and group cases at each job start): otherwise install refuses before changing anything and
+names the fix (`usermod -s /usr/sbin/nologin`, `passwd -l`, `gpasswd -d`, `usermod -d /nonexistent`). A
+`/opt/fork-fleet`, `/opt/fork-fleet/template`, `/etc/fork-fleet` or desk key that is a link or not owned by root (a
+hand setup) is refused the same way, not followed or fixed. One install or uninstall runs at a time (a lock on
+`/etc/fork-fleet`, which only root can open); a second one is refused.
 
 The seed timer (`t3code-fleet-seed.timer`) fetches the pool's warm caches, if its fleet config lists any, into
 `/var/lib/fork-fleet/seeds`, which jobs see read-only ([fork-fleet.md](../../.github/fork-fleet.md), "Seeds").
@@ -90,13 +94,15 @@ three quarters of the RAM, at most the RAM less 6 GB, never under 4 GB; one that
 refused), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (read and written as UTF-8 without a
 BOM; a dated copy of the old file is kept, other keys and sections stay; an old `networkingMode` or `dnsTunneling`
 line under `[experimental]`, the form before WSL 2.0 that can still win over `[wsl2]`, is removed, and the check
-FAILs while one is there); the distro's own settings the WSL2 walls
+FAILs while one is there; the question lists each change, old -> new, and the file is written only when it lists one,
+so "no change" means the file is left alone); the distro's own settings the WSL2 walls
 ask for (`/etc/wsl.conf`: systemd on, no Windows drives, programs or PATH; its own `/etc/resolv.conf`; WSL's binfmt
 handler masked); one `wsl --shutdown` when one of these changed or the running WSL does not have them yet (PID 1 not
-systemd, interop live, Windows drives mounted, `wsl.conf` newer than PID 1's start (read from `/proc/1/stat` and
-`btime`; unreadable means restart), `.wslconfig` newer than the running WSL, more memory than the cap, not NAT, or a
-`.wslconfig` change whose shutdown is still owed: one mark in `%LOCALAPPDATA%\fork-desk` for every distro, like
-`.wslconfig` itself, written before the change and removed after the shutdown, because WSL's uptime skips sleep),
+systemd, interop live, Windows drives mounted, `wsl.conf` changed after PID 1 started as far as the VM's clock tells
+(`/proc/1/stat` and `btime`; unreadable means restart; the clock skips the PC's sleep, so this alone can miss a change,
+hence the mark below), `.wslconfig` newer than the running WSL, more memory than the cap, not NAT, or a `.wslconfig`
+or `wsl.conf` change whose shutdown is still owed: one mark in `%LOCALAPPDATA%\fork-desk` for every distro, like
+`.wslconfig` itself, written before either change and removed after the shutdown, because WSL's uptime skips sleep),
 so a run stopped before its shutdown restarts next time (every WSL distro and Docker Desktop stop); the packages the fleet needs; the
 machine file and `-FleetConfig`, if given; this kit's bootstrap; a logon task that keeps the distro running while
 the owner is logged in. Last, `desk-install check` and the Windows side's own PASS/FAIL lines (the `[wsl2]` keys);
@@ -111,8 +117,9 @@ parts run in the tests on a fake root.
 
 ## Runs again, stops half-way, old or empty state
 
-- **Again:** files, settings and units that did not change are not rewritten (a file whose mode or owner was
-  changed is put back from the release), and the agent is not stopped or
+- **Again:** files, settings and units that did not change are not rewritten (a file in `/opt/fork-fleet`, a
+  setting or a unit whose mode or owner was changed, or that is a link, is written again as root's; the folders'
+  modes are set back; a linked or foreign-owned folder or key is refused, above), and the agent is not stopped or
   restarted (a restart would end a job it is starting). After a change it is restarted. The agent reads its settings
   only when it starts, so before the first change the record gets a restart-pending mark, cleared after the
   restart: a run stopped in between restarts the agent on the next run. The mark is also set before a new fleet
