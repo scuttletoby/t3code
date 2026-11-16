@@ -666,6 +666,20 @@ class Desk(unittest.TestCase):
         self.write(self.path('/etc/at.allow'), 'fork-runner-2\n')
         self.assertIn('FAIL  runner-user  fork-runner-2 is in /etc/at.allow', self.run_main('check')[1])
 
+    def test_a_subfolder_others_can_write_is_closed_before_files_go_in(self):
+        os.makedirs(self.path('/opt/fork-fleet/units'))
+        os.chmod(self.path('/opt/fork-fleet/units'), 0o777)
+        seen, real = [], os.replace
+        def spy(a, b, *k, **kw):
+            if '/opt/fork-fleet/units/' in b:
+                seen.append(stat.S_IMODE(os.stat(os.path.dirname(b)).st_mode))
+            return real(a, b, *k, **kw)
+        with unittest.mock.patch.object(self.m.os, 'replace', spy):
+            self.assertEqual(self.install()[0], 0)
+        self.assertTrue(seen)
+        self.assertEqual([x for x in seen if x & 0o022], [], 'unit files placed while units/ was writable by others')
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/opt/fork-fleet/units')).st_mode), 0o755)
+
     def test_refusals_change_nothing(self):
         cases = {
             'not a release sha': (lambda: None, ['--sha', 'abc'], '--sha must be'),

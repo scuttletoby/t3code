@@ -25,7 +25,7 @@ git config --global user.name test
 git config --global user.email test@example.invalid
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
-unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML OLD_HEADS PUSH_REF
 export CONFIG_BRANCH=main
 
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
@@ -42,16 +42,20 @@ else
 # a line starting [allowlist] allows every key, and one with `[extend]` and a `path =` line fails to load (FTL,
 # exit 1) unless the file is there; a .gitleaksignore (--gitleaks-ignore-path, default ".", and
 # SOURCE) line `<commit>:...` ignores the keys of that commit, a line `file:aws-access-token:line`
-# the key on that line of that file in any commit.
+# the key on that line of that file in any commit. `gitleaks stdin`: the same settings, a key id
+# on a line of the input fails, with each line in the --report-path JSON as "StartLine".
 set -uo pipefail
-opts="" config="" ignore_path="." source="."
+opts="" config="" ignore_path="." source="." mode=git report=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --log-opts=*) opts="${1#--log-opts=}" ;;
     --config) config="$2"; shift ;;
     --gitleaks-ignore-path) ignore_path="$2"; shift ;;
+    --report-path) report="$2"; shift ;;
+    --report-format) shift ;;
     -*) ;;
-    *) [[ "$1" == git ]] || source="$1" ;;
+    git | stdin) mode="$1" ;;
+    *) source="$1" ;;
   esac
   shift
 done
@@ -61,7 +65,7 @@ elif [[ -n "${GITLEAKS_CONFIG:-}" ]]; then settings="$(cat "$GITLEAKS_CONFIG")"
 elif [[ -n "${GITLEAKS_CONFIG_TOML:-}" ]]; then settings="$GITLEAKS_CONFIG_TOML"
 elif [[ -f "$source/.gitleaks.toml" ]]; then settings="$(cat "$source/.gitleaks.toml")"
 fi
-extend_path="$(sed -nE "s/^[[:space:]]*path[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'].*/\1/p" <<< "$settings" | head -n 1)"
+extend_path="$(sed -nE "s/^[[:space:]]*path[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'].*/\1/p" <<< "$settings" | sed -n 1p)"
 if [[ "$settings" == *"[extend]"* && -n "$extend_path" && ! -f "$extend_path" ]]; then
   echo "FTL Failed to load config error=\"failed to load extended config, err: open $extend_path: no such file or directory\""
   exit 1
@@ -70,6 +74,20 @@ ignored=" "
 for file in "$ignore_path" "$ignore_path/.gitleaksignore" "$source/.gitleaksignore"; do
   if [[ -f "$file" ]]; then ignored+="$(grep -vE '^[[:space:]]*(#|$)' "$file" | tr '\n' ' ')"; fi
 done
+if [[ "$mode" == stdin ]]; then
+  lines=""
+  if ! grep -qE '^[[:space:]]*\[allowlist\]' <<< "$settings"; then
+    lines="$(grep -nE 'AKIA[A-Z2-7]{16}' | cut -d: -f1)"
+  else
+    cat > /dev/null
+  fi
+  if [[ -n "$report" ]]; then
+    { echo "["; sed 's/.*/ {\n  "StartLine": &,\n  "RuleID": "aws-access-token"\n },/' <<< "$lines"; echo "]"; } > "$report"
+  fi
+  if [[ -n "$lines" ]]; then echo "leaks found: $(wc -l <<< "$lines")"; exit 1; fi
+  echo "no leaks found"
+  exit 0
+fi
 # Into a file first: `grep -q` stops reading early, and pipefail would read git's SIGPIPE as no match.
 # shellcheck disable=SC2086
 if ! git log -p -U0 $opts > "$TMPDIR/fake-gitleaks.log" 2> "$TMPDIR/fake-gitleaks.err"; then
@@ -264,8 +282,42 @@ BEFORE="0000000000000000000000000000000000000000" AFTER="$leaky" \
   check "push of a new branch: only its newest commit, with a warning" 0 "::warning.*new branch"
 BEFORE="1111111111111111111111111111111111111111" AFTER="$leaky" \
   check "push: an old tip that cannot be fetched warns" 0 "::warning.*cannot be fetched"
+# A push to any branch but the default one, or a tag (see the script's header): every commit its tip
+# has that the default branch has not, whatever the old tip.
+zeros="0000000000000000000000000000000000000000"
+PUSH_REF=refs/heads/leaky BEFORE="$zeros" AFTER="$leaky" \
+  check "push of a new branch: every commit not on the default branch, a key deleted again included" 1 \
+  "refs/heads/leaky has that main has not"
+PUSH_REF=refs/heads/leaky BEFORE="$(git rev-parse leaky~1)" AFTER="$leaky" \
+  check "push to another branch: the whole branch, not only the commits after the old tip" 1
+PUSH_REF=refs/heads/clean BEFORE="$zeros" AFTER="$clean" check "push of a new branch without a key passes" 0
+PUSH_REF=refs/heads/fresh BEFORE="$zeros" AFTER="$base" \
+  check "push of a new branch at the default branch's tip: nothing to scan, passes" 0 "the 0 commit"
+PUSH_REF=refs/tags/v9 BEFORE="$zeros" AFTER="$leaky" check "push of a tag: every commit not on the default branch" 1
+PUSH_REF=refs/heads/main BEFORE="$(git rev-parse leaky~1)" AFTER="$leaky" \
+  check "push to the default branch: only the commits after the old tip, as before" 0 "pushed after"
+PUSH_REF=refs/heads/leaky CONFIG_BRANCH="" BEFORE="$zeros" AFTER="$leaky" \
+  check "push to another branch without CONFIG_BRANCH fails" 2 "cannot fetch the default branch"
 
-EVENT_NAME=workflow_dispatch check "an unknown event fails" 2
+# A force push replaced a pull request's head (see the script's header). The check the ruleset
+# requires runs on the newest head only, so it also reads what the earlier heads had: BEFORE (the
+# synchronize event's old head) and OLD_HEADS (every tip of the PR's branch the workflow listed).
+export EVENT_NAME=pull_request AFTER=""
+BEFORE="$leaky" HEAD_SHA="$clean" \
+  check "pull request: a key only the head a force push replaced (BEFORE) had is found" 1 "1 earlier head"
+BEFORE="" OLD_HEADS="$leaky $clean" HEAD_SHA="$clean" \
+  check "pull request: a key only an earlier tip of the PR's branch (OLD_HEADS) had is found" 1 "1 earlier head"
+BEFORE="$leaky" OLD_HEADS="$evil $leaky" HEAD_SHA="$clean" \
+  check "pull request: each earlier head counts once" 1 "2 earlier head"
+BEFORE="$(git rev-parse clean~1)" OLD_HEADS="$base $fork_point $clean" HEAD_SHA="$clean" \
+  check "pull request: earlier heads the head or the default branch holds add nothing" 0 "" "earlier head"
+BEFORE="3333333333333333333333333333333333333333" OLD_HEADS="" HEAD_SHA="$clean" \
+  check "pull request: an earlier head that cannot be fetched warns" 0 "::warning.*cannot be fetched \\(333333333333\\)"
+BEFORE="" OLD_HEADS="--output=x" HEAD_SHA="$clean" check "pull request: an OLD_HEADS word that is not a commit id fails" 2 "not a commit id"
+BEFORE="" OLD_HEADS="" HEAD_SHA="$clean" check "pull request: the newest head alone passes (control)" 0
+export EVENT_NAME=push HEAD_SHA=""
+
+EVENT_NAME=issues check "an unknown event fails" 2
 
 export EVENT_NAME=pull_request BEFORE="" AFTER=""
 # The range does not depend on the PR's base (see the script's header).
@@ -398,6 +450,36 @@ UPSTREAM="" BEFORE="$old_series" AFTER="$rebased" \
   check "force push, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
 BEFORE="$old_series" AFTER="$rebased" \
   check "force push: upstream reachable again, the scan passes again" 0
+# A push to another branch leaves upstream's commits out too: the branch on upstream's stable tag
+# holds that tag's commit with a key, which the default branch has not.
+PUSH_REF=refs/heads/stable BEFORE="0000000000000000000000000000000000000000" AFTER="$stable" \
+  check "push to another branch on an upstream tag: the tag's commits are left out" 0 "upstream up/t3code already has"
+UPSTREAM="" PUSH_REF=refs/heads/stable BEFORE="0000000000000000000000000000000000000000" AFTER="$stable" \
+  check "push to another branch, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
+PUSH_REF=refs/heads/leaky BEFORE="$rebased" AFTER="$rebased_leaky" \
+  check "push to another branch: a key in the fork's own commit is found" 1
+# PR #214 (c3): a pull request's earlier head from before a fork-follow rebase, on an upstream tag
+# off upstream's default branch, holds that tag's commit with a key. It is upstream's: left out as
+# the push scans leave it out, so an honest rebase clears the PR. Without upstream, the full range.
+cd "$root/up"
+git checkout -q -b pr-new "$rebased"
+commit pr.txt "pr" "PR 1, rebased"
+pr_new=$(git rev-parse HEAD)
+git push -q "$root/fork.git" "$pr_new:refs/heads/pr"
+cd "$root"
+EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$stable" HEAD_SHA="$pr_new" \
+  check "pull request: an earlier head on an upstream tag (before a rebase): upstream's commits are left out" 0 \
+  "upstream up/t3code already has"
+EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$rebased_leaky" HEAD_SHA="$pr_new" \
+  check "pull request: an earlier head's own key is still found with upstream left out" 1
+UPSTREAM="" EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$stable" HEAD_SHA="$pr_new" \
+  check "pull request: an earlier head on an upstream tag, upstream unknown: the full range, with a warning" 1 \
+  "::warning.*not known"
+# The daily sweep (every branch and tag) leaves upstream's commits out too, and only then.
+git -C "$root/fork.git" update-ref -d refs/heads/leaky
+EVENT_NAME=schedule check "daily sweep: upstream's commits on the fork's branches are left out" 0 \
+  "every ref of origin but refs/pull.*upstream up/t3code already has"
+UPSTREAM="" EVENT_NAME=schedule check "daily sweep, upstream unknown: the full range, with a warning" 1 "::warning.*not known"
 unset UPSTREAM UPSTREAM_URL
 
 # New origins for the cases below: a bare origin that serves blob-less clones, and a work repo.
@@ -416,6 +498,114 @@ checkout() { # checkout ORIGIN BRANCH
   git clone -q --filter=blob:none --single-branch --branch "$2" "file://$root/$1.git" "$clone"
 }
 allow_all="paths = ['''.*''']"
+
+# PR #214 (s3): an earlier head origin still serves but whose fetch fails for another reason (a
+# network or server error) is tried again, and fails the job when every try fails; only origin
+# saying it no longer has the commit ("not our ref") is a warning (above).
+new_origin flaky
+commit app.txt "app" "main 1"
+git checkout -q -b pr
+commit leak.txt "aws_access_key_id=$key" "old head: a key"
+flaky_old=$(git rev-parse HEAD)
+git push -q origin main pr
+git reset -q --hard main
+commit c.txt "clean" "new head"
+flaky_new=$(git rev-parse HEAD)
+git push -q -f origin pr
+# origin's upload-pack, failing as a 502 would on the calls listed in flaky-fail: the scan's first
+# call fetches the default branch; the later ones are the earlier head's.
+cat > "$root/flaky-upload-pack" <<FLAKY
+#!/usr/bin/env bash
+n=\$(( \$(cat "$root/flaky-count" 2>/dev/null || echo 0) + 1 )); echo \$n > "$root/flaky-count"
+if grep -qx "\$n" "$root/flaky-fail"; then echo "fatal: unable to access origin: The requested URL returned error: 502" >&2; exit 128; fi
+exec git upload-pack "\$@"
+FLAKY
+chmod +x "$root/flaky-upload-pack"
+flaky() { # flaky NAME EXPECTED PATTERN FAILING_CALLS...
+  local name="$1" expected="$2" pattern="$3"
+  shift 3
+  checkout flaky pr
+  git -C "$clone" config remote.origin.uploadpack "$root/flaky-upload-pack"
+  printf '%s\n' "$@" > "$root/flaky-fail"
+  rm -f "$root/flaky-count"
+  FETCH_RETRY_DELAY=0 EVENT_NAME=pull_request BEFORE="" AFTER="" OLD_HEADS="$flaky_old" HEAD_SHA="$flaky_new" \
+    check "$name" "$expected" "$pattern"
+}
+flaky "pull request: an earlier head fetched at once: its key is found (control)" 1 ""
+flaky "pull request: an earlier head whose first fetches fail (502): tried again, its key is found" 1 "" 2 3
+flaky "pull request: an earlier head whose fetch fails every time (502): fails, asks for a re-run" 2 \
+  "cannot fetch the earlier head.*Re-run the job" $(seq 2 40)
+
+# PR #214 (s4): commit and tag messages are scanned too, with the same settings.
+new_origin msgs
+commit app.txt "app" "main 1"
+msgs_base=$(git rev-parse HEAD)
+git checkout -q -b pr
+commit x.txt "x" "debug: aws_access_key_id=$key"
+msgs_pr=$(git rev-parse HEAD)
+git checkout -q -b pr-clean "$msgs_base"
+commit y.txt "y" "a plain message"
+msgs_clean=$(git rev-parse HEAD)
+# PR #214 (r1s-1): the commit object as stored, so its author and committer lines too.
+git checkout -q -b pr-author "$msgs_base"
+GIT_AUTHOR_NAME="aws_access_key_id=$key" commit a.txt "a" "a plain message"
+msgs_author=$(git rev-parse HEAD)
+git checkout -q -b pr-committer "$msgs_base"
+GIT_COMMITTER_EMAIL="$key@example.invalid" commit c.txt "c" "a plain message"
+msgs_committer=$(git rev-parse HEAD)
+git checkout -q main
+GIT_COMMITTER_DATE="@$date" git tag -a v9 -m "release notes: token $key" "$msgs_base"
+GIT_COMMITTER_DATE="@$date" git tag -a v8 -m "release notes" "$msgs_base"
+git push -q origin main pr pr-clean pr-author pr-committer v9 v8
+checkout msgs pr
+EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_pr" \
+  check "pull request: a key in a commit message is found" 1 "message, author or committer of commit $msgs_pr"
+EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_clean" \
+  check "pull request: plain commit messages pass (control)" 0 "Scanning the commit objects.*1 in all"
+EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_author" \
+  check "pull request: a key in a commit's author name is found" 1 "author or committer of commit $msgs_author"
+EVENT_NAME=pull_request BEFORE="" AFTER="" HEAD_SHA="$msgs_committer" \
+  check "pull request: a key in a commit's committer email is found" 1 "author or committer of commit $msgs_committer"
+EVENT_NAME=push PUSH_REF=refs/tags/v9 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_base" \
+  check "push of an annotated tag: a key in its message is found" 1 "author or committer of tag object"
+EVENT_NAME=push PUSH_REF=refs/tags/v8 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_base" \
+  check "push of an annotated tag: a plain message passes (control)" 0 "1 tag object\\(s\\)"
+EVENT_NAME=push PUSH_REF=refs/tags/v8 BEFORE="0000000000000000000000000000000000000000" AFTER="$msgs_clean" \
+  check "push of a tag that moved since: its message is not read, with a warning" 0 "::warning.*cannot be fetched as pushed"
+
+# The daily sweep (schedule, or by hand): every branch and tag of origin, for what no push run
+# scanned ([skip ci], more than three tags at once, pushes by the workflow token, older branches).
+new_origin sweep
+commit app.txt "app" "main 1"
+git checkout -q -b side
+commit k.txt "aws_access_key_id=$key" "side: a key"
+git checkout -q main
+git push -q origin main side
+clone="$root/sweep-clone"
+git clone -q --filter=blob:none --no-checkout "file://$root/sweep.git" "$clone"
+EVENT_NAME=schedule check "daily sweep: a key on a branch no push run scanned is found" 1 "every ref of origin but refs/pull"
+git push -q origin :side
+EVENT_NAME=schedule check "daily sweep: the branch gone, the same clone passes (control)" 0 "every ref of origin but refs/pull/\\* \\(1 distinct"
+# PR #214 (r1s-1): refs outside branches and tags (notes, anything) are public too: any clone can
+# fetch them, and no push run scans them. Pull request heads are left out (see the script header).
+git push -q origin side:refs/notes/commits
+EVENT_NAME=schedule check "daily sweep: a key held only by refs/notes/commits is found" 1
+git push -q origin :refs/notes/commits side:refs/keep/x
+EVENT_NAME=schedule check "daily sweep: a key held only by refs/keep/x is found" 1
+git push -q origin :refs/keep/x side:refs/pull/1/head
+EVENT_NAME=schedule check "daily sweep: a pull request head is left out, as documented" 0 "\\(1 distinct"
+git push -q origin :refs/pull/1/head
+GIT_COMMITTER_DATE="@$date" git tag -a v2 -m "notes: $key" main
+git push -q origin v2
+EVENT_NAME=workflow_dispatch check "manual sweep: a key in a tag message is found" 1 "author or committer of tag object"
+git push -q origin :refs/tags/v2
+git tag tree-tag "main^{tree}"
+git push -q origin tree-tag
+EVENT_NAME=schedule check "daily sweep: a tag that names no commit warns" 0 "::warning.*name no commit \\(tags/tree-tag\\)"
+rm -rf "${root:?}/sweep.git"
+EVENT_NAME=schedule check "daily sweep: origin cannot be read: fails" 2
+cd "$root"
+
 export EVENT_NAME=pull_request BEFORE="" AFTER=""
 
 # gitleaks settings come from the default branch, never from the PR (see the script's header).
@@ -444,6 +634,20 @@ BASE_SHA="$settings_base" HEAD_SHA="$(git rev-parse own-ignore)" \
 printf '%s\n' '[extend]' 'useDefault = true' '[allowlist]' "$allow_all" > "$root/env.toml"
 GITLEAKS_CONFIG="$root/env.toml" BASE_SHA="$settings_base" HEAD_SHA="$(git rev-parse own-ignore)" \
   check "pull request: GITLEAKS_CONFIG does not reach gitleaks" 1
+# A push to another branch reads the default branch's settings, never what its own earlier push
+# set: the first push allows every path, the second adds a key.
+git checkout -q -b own-toml-2 "$settings_base"
+printf '%s\n' '[extend]' 'useDefault = true' '[allowlist]' "$allow_all" > .gitleaks.toml
+date=$((date + 60)); git add -A; GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "branch: allow every path"
+own_toml_1=$(git rev-parse HEAD)
+commit k2.txt "aws_access_key_id=$key" "branch: a key, after its own settings"
+git checkout -q main
+git push -q origin own-toml-2
+checkout settings own-toml-2
+EVENT_NAME=push PUSH_REF=refs/heads/own-toml-2 BEFORE="$own_toml_1" AFTER="$(git rev-parse own-toml-2)" \
+  check "push to another branch: settings its own earlier push added do not hide its key" 1 "::notice.*reads them from the default branch main.*once it is on the default branch"
+EVENT_NAME=push PUSH_REF=refs/heads/main BEFORE="$own_toml_1" AFTER="$(git rev-parse own-toml-2)" \
+  check "push to the default branch reads the tip before the push (control)" 0 "settings .* from the tip before the push"
 # The reviewed path: the ignore line lands on the default branch in a change of its own; the same
 # PR's scan, run again, then passes.
 git checkout -q main
@@ -655,13 +859,17 @@ else
 fi
 # Its shape (any gitleaks): no [extend] (useDefault brings back the default path skip list,
 # disabledRules drops rules) and no [allowlist] table (a second global allowlist); every
-# [[allowlists]] entry after the first names its rules and the values it allows (anchored, and
-# none allows a token-shaped value), and one with paths has condition = "AND", so it never skips a
-# whole file. Against the gitleaks binary (the real one only; its default config is built in): the
-# rules, from the first [[rules]] to the end, are its default rules byte for byte, and the first
-# entry is its global allowlist without the path skip list. Each rule is tried on broken copies too.
+# [[allowlists]] entry after the first names rules of the file and the values it allows, and one
+# with paths has condition = "AND", so it never skips a whole file. Each value regex of such an
+# entry is an exact value: ^, one fixed string with no regex syntax (escapes \<punctuation> and
+# \xHH only), $; anything else is a problem, whatever it would match (see literal_value for why).
+# Against the gitleaks binary (the real one only; its default config is built in): the rules, from
+# the first [[rules]] to the end, are its default rules byte for byte; the first entry is its global
+# allowlist without the path skip list; and the binary judges that entry (with its stop words) on
+# generated token shapes, each of which its rules alone find: one it hides is a problem. Each rule
+# is tried on broken copies too.
 cat > "$root/toml-check.py" <<'CHECK'
-import re, sys, tomllib
+import collections, hashlib, json, math, os, re, subprocess, sys, tempfile, tomllib
 path, binary_path = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
 raw = open(path, "rb").read()
 try:
@@ -676,14 +884,122 @@ entries = cfg.get("allowlists") or []
 if not entries:
     problems.append("no [[allowlists]] entries (the first is gitleaks' global value allowlist)")
 NARROW = {"description", "targetRules", "condition", "paths", "regexes", "regexTarget"}
-# Token-shaped values (and lines holding them) no entry may allow, put together at run time.
-fake = "Zx8Kq2Lm9" + "Vb4Nc7Rt5Wy3Hd6Jf1Gs0Pa"
-samples = [fake, "1.0.0-" + fake, "AK" + "IA" + "ZR4PLM7VNQWT2XJD", "api_" + "key = '" + fake + "'"]
+
+
+# Token shapes entry 1 may not allow, made at run time from a hash (this file holds none of them):
+# hex (32, 40, 64), letters and digits (16 to 64), base64, URL-safe, a token after a version
+# (1.0.0-<token>), each after 8 secret-like names in 4 ways of writing them; and AWS, GitHub, Slack
+# and Bedrock keys. Each line must be a finding of gitleaks' rules alone (the judge checks that).
+STOP = {w.lower() for part in [*entries[:1], *(a for r in cfg.get("rules") or [] for a in r.get("allowlists") or [])]
+        for w in part.get("stopwords") or []}
+
+
+def rand(seed, n, alphabet):
+    out, block = [], 0
+    while len(out) < n:
+        for b in hashlib.sha256(f"{seed}/{block}".encode()).digest():
+            if b < 256 - 256 % len(alphabet) and len(out) < n:
+                out.append(alphabet[b % len(alphabet)])
+        block += 1
+    return "".join(out)
+
+
+def tok(seed, n, alphabet):
+    # Like a real key: starts with a letter or digit, has both, and is random enough for gitleaks'
+    # entropy limits (3.5 for generic-api-key), and holds none of the rules' stop words (java, ...);
+    # else the next one.
+    for tries in range(1000):
+        v = rand(f"{seed}/{tries}", n, alphabet)
+        entropy = -sum(c / n * math.log2(c / n) for c in collections.Counter(v).values())
+        if (v[0].isalnum() and re.search("[0-9]", v) and re.search("[A-Za-z]", v)
+                and entropy >= min(3.7, math.log2(n) - 0.4) and not any(w in v.lower() for w in STOP)):
+            return v
+    raise SystemExit(f"no token for {seed}")
+
+
+HEX, UP = "0123456789abcdef", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+B62 = "0123456789" + UP + UP.lower()
+SHAPES = {"hex32": (32, HEX), "hex40": (40, HEX), "hex64": (64, HEX), "HEX40": (40, HEX.upper()),
+          "alnum16": (16, B62), "alnum20": (20, B62), "alnum24": (24, B62), "alnum32": (32, B62),
+          "alnum40": (40, B62), "alnum64": (64, B62), "base64-40": (40, B62 + "+/"),
+          "base64-pad": (43, B62 + "+/"), "url32": (32, B62 + "-_"), "version": (24, B62)}
+NAMES = ["api_key", "client_secret", "auth_token", "password", "aws_secret_access_key", "access_token",
+         "secret", "apiKey"]
+FORMATS = ['{n} = "{v}"', "{n}: {v}", "{N}={v}", '"{n}": "{v}",']
+fixture = []  # (line, value, what it is)
+for i, (shape, (n, alphabet)) in enumerate(SHAPES.items()):
+    for j, name in enumerate(NAMES):
+        v = tok(f"{shape}/{name}", n, alphabet)
+        v = {"base64-pad": v + "=", "version": "1.0.0-" + v}.get(shape, v)
+        fixture.append((FORMATS[(i + j) % len(FORMATS)].format(n=name, N=name.upper(), v=v), v, f"{name}, {shape}"))
+for line, v in [("aws_access_key_id = {v}", "AK" + "IA" + tok("aws", 16, UP + "234567")),
+                ("AWS_SESSION_KEY_ID={v}", "AS" + "IA" + tok("asia", 16, UP + "234567")),
+                ("GITHUB_TOKEN={v}", "gh" + "p_" + tok("ghp", 36, B62)),
+                ("token: {v}", "github" + "_pat_" + tok("pat", 82, B62 + "_")),
+                ("SLACK_BOT_TOKEN={v}", "xo" + "xb-" + rand("s1", 10, HEX[:10]) + "-" + rand("s2", 13, HEX[:10])
+                 + "-" + tok("s3", 24, B62)),
+                ("bedrock = {v}", "bedrock-api-key-" + __import__("base64").b64encode(b"bedrock.amazonaws.com").decode()
+                 + tok("bedrock", 40, B62 + "+/"))]:
+    fixture.append((line.format(v=v), v, line.split()[0].split("=")[0] + ", " + v[:4] + "..."))
+
+# Later entries allow exact values only (PR #214, round 2). Each earlier rule that judged a value
+# regex from its text (bounded repeats, letter-and-digit classes, alternations of fixed text) was
+# got round by a form it misread: (?m) anchors that match inside a multi-line key, POSIX classes
+# Python's re reads differently from gitleaks' Go RE2, nested repeats, an alternation of single
+# characters. This rule reads no regex syntax at all, so there is nothing to misread: ^, then only
+# characters that are not syntax in either engine (printable ASCII) or an escape that stands for
+# one character in both (a backslash before punctuation, or \xHH), then $. Such a regex matches
+# exactly one string, the one the reviewer reads in it. Nothing is guessed about which keys it
+# could match, so no sample of key shapes is needed for these entries.
+SYNTAX = set("\\.+*?()|[]{}^$")
+PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")  # what both engines accept after a backslash
+HEXDIGITS = set("0123456789abcdefABCDEF")
+
+
+def literal_value(r):
+    """(the one string r matches, None) when r is an exact value (see above), else (None, why)."""
+    if not (isinstance(r, str) and r.startswith("^") and r.endswith("$") and len(r) >= 3):
+        return None, "is not ^value$"
+    out, i, end = [], 1, len(r) - 1
+    while i < end:
+        c = r[i]
+        if c == "\\":
+            n = r[i + 1] if i + 1 < end else ""
+            if n and n in PUNCT:
+                out.append(n)
+                i += 2
+            elif n == "x" and i + 4 <= end and set(r[i + 2:i + 4]) <= HEXDIGITS:
+                out.append(chr(int(r[i + 2:i + 4], 16)))
+                i += 4
+            elif not n:
+                return None, "ends in a backslash, so its $ is a literal $ and the value is not anchored"
+            else:
+                return None, f"has the escape \\{n}, which is not one fixed character (only \\<punctuation> or \\xHH)"
+        elif c in SYNTAX:
+            return None, f"has the regex syntax {c!r} (escape it with a backslash to mean the character)"
+        elif not " " <= c <= "~":
+            return None, f"has the character {c!r}, which is not printable ASCII (write it as \\xHH)"
+        else:
+            out.append(c)
+            i += 1
+    value = "".join(out)
+    # Python's re must agree that r matches exactly this string (a check on this reader).
+    try:
+        if not re.fullmatch(r, value):
+            return None, "does not match its own value in Python's re (a bug in this check)"
+    except re.error as e:
+        return None, f"cannot be read by Python's re ({e})"
+    return value, None
+
+
+rule_ids = {rule.get("id") for rule in cfg.get("rules") or []}
 for i, e in enumerate(entries[1:], start=2):
     where = f"[[allowlists]] entry {i} ({e.get('description', 'no description')!r})"
     problems += [f"{where}: key {k!r} is not allowed (only {', '.join(sorted(NARROW))})" for k in sorted(set(e) - NARROW)]
     if not e.get("targetRules"):
         problems.append(f"{where}: no targetRules (it would apply to every rule)")
+    problems += [f"{where}: targetRules names {rule!r}, which is not a rule of this file"
+                 for rule in e.get("targetRules") or [] if rule not in rule_ids]
     if not e.get("regexes"):
         problems.append(f"{where}: no regexes (it would allow every value)")
     if e.get("paths") and e.get("condition") != "AND":
@@ -691,15 +1007,67 @@ for i, e in enumerate(entries[1:], start=2):
     if e.get("regexTarget", "secret") not in ("secret", "line"):
         problems.append(f"{where}: regexTarget {e.get('regexTarget')!r}")
     for r in e.get("regexes") or []:
-        if not (r.startswith("^") and r.endswith("$")):
-            problems.append(f"{where}: regex {r!r} is not anchored (^...$)")
-            continue
-        try:
-            wide = [v for v in samples if re.search(r, v)]
-        except re.error:
-            wide = []
-        if wide:
-            problems.append(f"{where}: regex {r!r} allows a token-shaped value")
+        _, why = literal_value(r)
+        if why:
+            problems.append(f"{where}: regex '{r}' {why}: a later entry allows exact values only (see the"
+                            " header of .gitleaks.toml)")
+
+
+def toml_value(v):
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    if "'''" not in v and not re.search(r"[\x00-\x08\x0a-\x1f\x7f]", v):
+        return f"'''{v}'''"
+    return json.dumps(v, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def entry_toml(e):
+    return "[[allowlists]]\n" + "".join(f"{k} = {toml_value(v)}\n" for k, v in e.items()) + "\n"
+
+
+def judge(rules):
+    """The real gitleaks judges gitleaks' global allowlist (entry 1, the only part that is not exact
+    values): the fixture is scanned with the rules alone, then with the rules and entry 1 (its stop
+    words too). Any finding entry 1 removes is a token shape it allows."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.mkdir(src)
+        # One file per line: gitleaks gives a line-target allowlist the whole line only when the
+        # line starts its file (or its hunk, in a git scan); after another line it starts with "\n".
+        for n, (line, _, _) in enumerate(fixture, start=1):
+            with open(os.path.join(src, f"{n:03}.txt"), "w") as f:
+                f.write(line + "\n")
+        env = {k: v for k, v in os.environ.items() if k not in ("GITLEAKS_CONFIG", "GITLEAKS_CONFIG_TOML")}
+
+        def scan(parts):
+            conf, report = os.path.join(tmp, "judge.toml"), os.path.join(tmp, "report.json")
+            with open(conf, "w") as f:
+                f.write("".join(entry_toml(p) for p in parts) + rules)
+            run = subprocess.run([os.path.abspath(binary_path), "dir", "--no-banner", "--no-color", "--exit-code", "0",
+                                  "--config", conf, "--report-format", "json", "--report-path", report, src],
+                                 cwd=tmp, env=env, capture_output=True, text=True)
+            if run.returncode != 0:
+                return None, (run.stdout + run.stderr).strip().splitlines()[-1:] or [f"exit {run.returncode}"]
+            return {(int(os.path.basename(x["File"])[:3]), x["RuleID"]) for x in json.load(open(report))}, None
+
+        base, err = scan([])
+        if base is None:
+            return [f"gitleaks cannot scan the judge's fixture with these rules: {err[0]}"]
+        out = [f"the judge's fixture line {n} ({what}) is not a finding of gitleaks' rules,"
+               " so it judges nothing: change its shape" for n, (_, _, what) in enumerate(fixture, start=1)
+               if not any(found == n for found, _ in base)]
+        parts = [("entry 1 (gitleaks' global allowlist)", [entries[0]])] if entries else []
+        for what, part in parts:
+            got, err = scan(part)
+            if got is None:
+                out.append(f"{what}: gitleaks cannot load it ({err[0]})")
+            elif base - got:
+                n, rule = min(base - got)
+                out.append(f"{what} allows a token-shaped value: gitleaks no longer finds fixture line {n}"
+                           f" ({fixture[n - 1][2]}; {rule}) and {len(base - got) - 1} more")
+        return out
+
+
 if binary_path:
     binary = open(binary_path, "rb").read()
     start = raw.find(b"\n[[rules]]\n")
@@ -719,6 +1087,8 @@ if binary_path:
                 differ = sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))
                 problems.append("[[allowlists]] entry 1 is not this gitleaks' global allowlist without its paths"
                                 f" (differs in {', '.join(differ)})")
+        if start >= 0:
+            problems += judge(raw[start + 1:].decode())
 print("\n".join(problems))
 sys.exit(1 if problems else 0)
 CHECK
@@ -755,8 +1125,107 @@ toml_mutant "an entry without regexes" "$(narrow_entry "targetRules = [\\\"gener
 toml_mutant "an entry that allows any value (^.*\$)" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"^.*\$\\\"]")"
 toml_mutant "an unanchored value" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"abc\\\"]")"
 toml_mutant "an entry with stopwords" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"^abc\$\\\"]\\nstopwords = [\\\"key\\\"]")"
-toml_mutant "the old pnpm-lock.yaml version shape (any 1.0.0-<token>)" \
-  "t.replace(\"(?:-(?:[a-z]{1,10}|[a-z]{0,2}\\\\d{1,14})(?:\\\\.(?:[a-z]{1,10}|[a-z]{0,2}\\\\d{1,14})){0,2})?\$\", \"(?:-[0-9A-Za-z.-]+)?(?:\\\\+[0-9A-Za-z.-]+)?\$\", 1)"
+toml_mutant "the pnpm-lock.yaml value widened back to a shape (any 14 digits)" \
+  "t.replace(\"^0\\\\.0\\\\.4-canary\\\\.v20260819050620\$\", \"^0\\\\.0\\\\.4-canary\\\\.v\\\\d{14}\$\", 1)"
+toml_mutant "a #91 value widened to any 16 hex characters" \
+  "t.replace(\"'''^0123456789abcdef\$'''\", \"'''^[0-9a-f]{16}\$'''\", 1)"
+# Later entries: each regex must be an exact value (^, one fixed string, $; see the header of
+# .gitleaks.toml). Every other form is refused, whatever it would match: a rule that read regex text
+# to judge "narrow" was got round each round (#212, #214) by a form it misread.
+toml_entry() { # toml_entry NAME pass|fail ENTRY_LINE... -> the repository's file with one more entry
+  [[ -f "$repo_toml" ]] || return 0
+  local name="$1" want="$2" got=fail verb=fails
+  shift 2
+  [[ "$want" == fail ]] || verb=passes
+  python3 -I -c 'import sys; t = open(sys.argv[1]).read(); e = "\n".join(sys.argv[3:])
+open(sys.argv[2], "w").write(t.replace("\n[[rules]]\n", "\n[[allowlists]]\n" + e + "\n\n[[rules]]\n", 1))' \
+    "$repo_toml" "$root/mutant.toml" "$@"
+  if toml_check "$root/mutant.toml" > "$root/mutant.out"; then got=pass; fi
+  if [[ "$got" == "$want" ]]; then
+    echo "ok   repository settings: an entry with $name $verb the check"
+  else
+    echo "FAIL repository settings: an entry with $name: the check gives $got, expected $want"
+    sed 's/^/    /' "$root/mutant.out"
+    failures=$((failures + 1))
+  fi
+}
+generic='targetRules = ["generic-api-key"]'
+toml_entry "a | outside a group (^abc|<40 hex>\$: any 40-hex value)" fail "$generic" 'condition = "AND"' \
+  "paths = ['''^test/fx\\.txt\$''']" "regexes = ['''^abc|[0-9a-f]{40}\$''']"
+toml_entry "an alternation inside a group that allows 40-hex values" fail "$generic" "regexes = ['''^(?:abc|[0-9a-f]{40})\$''']"
+toml_entry "a 40-character token class (^[A-Za-z0-9/+]{40}\$)" fail "$generic" "regexes = ['''^[A-Za-z0-9/+]{40}\$''']"
+toml_entry "Go-only syntax Python cannot read (\\pL\\pN)" fail "$generic" "regexes = ['''^[\\pL\\pN]{16,}\$''']"
+toml_entry "a whole-line pattern (regexTarget line, ^.*secret.*\$)" fail "$generic" 'regexTarget = "line"' \
+  "regexes = ['''^.*secret.*\$''']"
+toml_entry "a line pattern without .* for lines naming a secret" fail "$generic" 'regexTarget = "line"' \
+  "regexes = ['''^\\S*secret\\S* = \"\\w+\"\$''']"
+toml_entry "a UUID shape (32 hex characters in five groups)" fail "$generic" \
+  "regexes = ['''^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$''']"
+toml_entry "a 36-character class ({36})" fail "$generic" "regexes = ['''^[a-z0-9-]{36}\$''']"
+toml_entry "an open-ended word class (\\w+)" fail "$generic" "regexes = ['''^key_\\w+\$''']"
+# Forms that are close to an exact value, and still refused.
+toml_entry "an alternation of exact values inside a group" fail "$generic" "regexes = ['''^(?:abc|def)\$''']"
+toml_entry "a flag after ^ (^(?i)value\$)" fail "$generic" "regexes = ['''^(?i)abc123def456\$''']"
+toml_entry "a flag first ((?i)^value\$)" fail "$generic" "regexes = ['''(?i)^abc123def456\$''']"
+toml_entry "an unescaped dot (any character)" fail "$generic" "regexes = ['''^abc.def\$''']"
+toml_entry "an escaped last \$ (no end anchor: ^abc\\\$)" fail "$generic" "regexes = ['''^abc\\\$''']"
+toml_entry "a \\d escape (a class, not one character)" fail "$generic" "regexes = ['''^abc\\d\$''']"
+toml_entry "a \\n escape (only \\<punctuation> and \\xHH)" fail "$generic" "regexes = ['''^abc\\ndef\$''']"
+toml_entry "a broken \\x escape (\\xZ1)" fail "$generic" "regexes = ['''^abc\\xZ1\$''']"
+toml_entry "a character that is not printable ASCII" fail "$generic" "regexes = ['''^abc$(printf '\303\251')def\$''']"
+toml_entry "an empty value (^\$)" fail "$generic" "regexes = ['''^\$''']"
+toml_entry "targetRules naming a rule the file does not have" fail 'targetRules = ["no-such-rule"]' \
+  "regexes = ['''^abc\$''']"
+toml_entry "an exact value with regexTarget match" fail "$generic" 'regexTarget = "match"' "regexes = ['''^abc\$''']"
+# Exact values pass: written plainly, with \<punctuation> escapes, or one character as \xHH.
+toml_entry "an exact fake value in one file (reviewed)" pass 'targetRules = ["aws-access-token"]' 'condition = "AND"' \
+  "paths = ['''^test/fx\\.txt\$''']" "regexes = ['''^${key:0:4}\\x$(printf %02X "'${key:4:1}")${key:5}\$''']"
+ant="sk\\-ant\\-api03\\-$(printf 'q%.0s' {1..20})Fake" # an escaped fake, built at run time
+toml_entry "an exact escaped fake Anthropic-shaped value" pass "$generic" "regexes = ['''^$ant\$''']"
+toml_entry "an exact fake JWT" pass "$generic" "regexes = ['''^eyJhbGciOiJub25lIn0\\.eyJzdWIiOiJ0ZXN0In0\\.\$''']"
+toml_entry "an exact value with an escaped backslash last (^abc\\\\\\\\\$)" pass "$generic" "regexes = ['''^abc\\\\\$''']"
+# The reviewers' bypasses of #214 round 1: each entry hides a key in the real gitleaks (proved
+# first, when GITLEAKS_BIN is set), and the check refuses it. The keys are built at run time.
+rnd() { python3 -I -c 'import hashlib,sys; a=sys.argv[2]; out=""; i=0
+while len(out) < int(sys.argv[3]):
+    out += "".join(a[b % len(a)] for b in hashlib.sha256(f"{sys.argv[1]}/{i}".encode()).digest()); i += 1
+print(out[:int(sys.argv[3])])' "$@"; }
+toml_hides() { # toml_hides NAME RULE REGEX FILE_CONTENT
+  if [[ -n "${GITLEAKS_BIN:-}" && -f "$repo_toml" ]]; then
+    python3 -I -c 'import sys; t = open(sys.argv[1]).read()
+e = "[[allowlists]]\ntargetRules = [\"" + sys.argv[3] + "\"]\nregexes = [\x27\x27\x27" + sys.argv[4] + "\x27\x27\x27]\n"
+open(sys.argv[2], "w").write(t.replace("\n[[rules]]\n", "\n" + e + "\n[[rules]]\n", 1))' "$repo_toml" "$root/hide.toml" "$2" "$3"
+    rm -rf "${root:?}/hide-src"; mkdir "$root/hide-src"; printf '%s\n' "$4" > "$root/hide-src/f.txt"
+    local n=() c
+    for c in "$repo_toml" "$root/hide.toml"; do
+      "$gitleaks" dir --no-banner --exit-code 0 --config "$c" --report-format json --report-path "$root/hide.json" "$root/hide-src" 2> /dev/null
+      n+=("$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$root/hide.json")")
+    done
+    if [[ "${n[0]}" -gt 0 && "${n[1]}" -eq 0 ]]; then
+      echo "ok   repository settings: an entry with $1 hides a key in gitleaks (${n[0]} findings -> 0)"
+    else
+      echo "FAIL repository settings: an entry with $1 does not hide its key (${n[0]} -> ${n[1]}): the case proves nothing"
+      failures=$((failures + 1))
+    fi
+  fi
+  toml_entry "$1" fail "targetRules = [\"$2\"]" "regexes = ['''$3''']"
+}
+B62=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
+k36="$(rnd r1-36 "$B62" 36)"
+h="$(rnd r1-uuid 0123456789abcdef 32)"; uuid="${h:0:8}-${h:8:4}-4${h:13:3}-a${h:17:3}-${h:20:12}"
+h40="$(rnd r1-hex 0123456789abcdef 40)"
+b64="$(rnd r1-pem "$B62+/" 256)"
+pem="$(printf -- '-----BEGIN PRIV''ATE KEY-----\n%s\n%s\n%s\n%s\n-----END PRIV''ATE KEY-----' \
+  "${b64:0:64}" "${b64:64:64}" "${b64:128:64}" "${b64:192:64}")"
+xd='[[:xdigit:]]'
+alt="(?:$(printf '%s|' 0 1 2 3 4 5 6 7 8 9 a b c d e f)zz)"
+toml_hides "(?m) around an exact-looking value (every private key)" private-key '(?m)^-----BEGIN PRIVATE KEY-----$' "$pem"
+toml_hides "a POSIX class ([[:alnum:]]{36}, which Python misreads)" generic-api-key '^[[:alnum:]]{36}$' "api_key = \"$k36\""
+toml_hides "nested repeats of an alternation (36 letters or digits)" generic-api-key \
+  '^(?:(?:[A-Za-z]|[0-9]{1}){6}){6}$' "api_key = \"$k36\""
+toml_hides "a POSIX-class UUID shape" generic-api-key "^$xd{8}-$xd{4}-$xd{4}-$xd{4}-$xd{12}\$" "client_secret = \"$uuid\""
+toml_hides "40 groups of fixed alternatives (any 40-hex value)" generic-api-key \
+  "^$(for _ in $(seq 40); do printf '%s' "$alt"; done)\$" "auth_token = \"$h40\""
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   toml_mutant "one more global allowlist value" "t.replace('regexes = [', 'regexes = [\n    \'\'\'^x\$\'\'\',', 1)"
   toml_mutant "a global allowlist stopword dropped" "t.replace('stopwords = [\n', 'stopwords = [\n#', 1)"
@@ -928,7 +1397,7 @@ EVENT_NAME=push BEFORE="$pinned_main" AFTER="$squashed_pinned" \
 # merge. A different key on that line, or another key beside it, is still found. Real gitleaks only
 # (the stand-in reads no [[allowlists]]).
 if [[ -n "${GITLEAKS_BIN:-}" && -f "$repo_toml" ]]; then
-  key_toml="^${key:0:4}[${key:4:1}]${key:5}\$"
+  key_toml="^${key:0:4}\\x$(printf %02X "'${key:4:1}")${key:5}\$"
   new_origin values
   cp "$repo_toml" .gitleaks.toml
   commit app.txt "app" "main 1, with the repository's .gitleaks.toml"
