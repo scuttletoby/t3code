@@ -7,11 +7,6 @@ name: Fork checks
 # from the default branch, so a pull request cannot weaken, skip or delete the check that judges
 # it. The pull request's commits are only fetched as git objects and read as text; nothing from
 # them is checked out or run, so the base branch's permissions never reach pull request code.
-#
-# `edited` stays: retargeting a pull request to another base branch fires only `edited`, and the
-# checks compare the head with the base, so a stacked pull request moved to main is judged again.
-# Every edit runs the checks in full: a job skipped on an edit would count as passed and replace a
-# failed result for the same head.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
@@ -53,9 +48,7 @@ jobs:
             "$DEFAULT_SHA" "$BASE_SHA" "$HEAD_SHA"
           git checkout -q --detach "$DEFAULT_SHA"
 
-      # The tests read only the default branch, which an edit of the pull request does not change.
       - name: Test the check
-        if: github.event.action != 'edited'
         run: node --test .github/scripts/fork-schema-check.test.cjs .github/scripts/fork-upstream-files-check.test.cjs
 
       # T3 has no down-migrations, so a fork migration strands installs that return to upstream.
