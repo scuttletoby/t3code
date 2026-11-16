@@ -4,8 +4,8 @@ holds stubs of the fleet files. No root, no systemd, no network, no real user.
 
   python3 -I -B fork-kit/desk/tests/install.test.py
 """
-import contextlib, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess, sys, tempfile
-import types, unittest, unittest.mock
+import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess
+import sys, tempfile, types, unittest, unittest.mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(KIT))
@@ -159,7 +159,8 @@ class Desk(unittest.TestCase):
             if text is not None:
                 self.write(os.path.join(top, rel), text.replace('{log}', os.path.join(self.fakes, 'calls.log'))
                            .replace('{here}', self.fakes), 0o755)
-        for rel in ('fork-kit/desk/sbin/desk-install', 'fork-kit/desk/README.md', 'fork-kit/common/machine_file.py'):
+        for rel in ('fork-kit/desk/sbin/desk-install', 'fork-kit/desk/README.md', 'fork-kit/common/machine_file.py',
+                    'fork-kit/common/free_contract.py', 'fork-kit/common/free/memory'):
             self.write(os.path.join(top, rel), slurp(os.path.join(REPO, rel)), 0o755)
         return top
 
@@ -824,6 +825,25 @@ class Desk(unittest.TestCase):
                       self.read('/etc/fork-fleet/launch.conf'))
         self.assertTrue(self.read('/etc/fork-fleet/desk-known_hosts').endswith(
             f'[fleet-host.example]:2222 {HOST_KEY}\n'))
+
+    def test_a_free_script_reaches_the_settings_and_the_check(self):
+        script = os.path.join(self.tmp, 'free')
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'freeCommand': script}})
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn(f'FREE_COMMAND={script}\n', self.read('/etc/fork-fleet/launch.conf'))
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/opt/fork-fleet/free-memory')).st_mode), 0o755)
+        self.template()
+        now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        for code, body, want in ((0, '"free": true', 'PASS  free-script  ' + script + ': free\n'),
+                                 (75, '"free": false, "reason": "a game"', 'busy: a game'),
+                                 (75, '"free": true', 'FAIL  free-script')):
+            self.write(script, f"#!/bin/sh\necho '{{\"v\": 1, {body}, \"at\": \"{now}\"}}'\nexit {code}\n", 0o755)
+            out = self.run_main('check')[1]
+            self.assertIn(want, out)
+        self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'freeCommand': 'free'}})
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn('freeCommand', err)
 
     def test_existing_user_is_used_not_recorded(self):
         self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n')
