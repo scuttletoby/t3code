@@ -4,7 +4,7 @@ name: Fork tests
 # fork has none of upstream's runners and upstream's workflows are disabled here.
 # Commands follow ci.yml step for step. Only the runners, time limits, apt
 # setup and the task cache differ (kept with actions/cache instead of upstream's
-# private remote cache), and Test and Test Web split over two runners each.
+# private remote cache), Test splits over two runners and Test Web over three.
 # Upstream's composite actions and change detector (.github/actions,
 # .github/scripts/ci-changes.cjs) are used as they are, so a rebase brings their
 # changes. The `workflows` job lints the fork workflows (actionlint) and fails
@@ -690,7 +690,7 @@ jobs:
           exit "$status"
 
   # Upstream runs this on one large runner; on a 4-CPU runner the 548 files
-  # took 7.5 minutes, so two runners each take a vitest slice.
+  # took 7.5 minutes, so each of the shards below takes a vitest slice.
   test_web:
     name: Test Web ${{ matrix.shard }}
     needs: changes
@@ -744,6 +744,12 @@ jobs:
           if ldd "$browser" | grep '=> not found'; then
             node apps/web/node_modules/playwright/cli.js install-deps chromium
           fi
+
+      # The Test step's VITEST_CHROMIUM_GC_DISK_THRESHOLD_GB is not a documented vitest option: fail
+      # here, not with browser crashes later, when the installed vitest no longer reads it.
+      - name: Check vitest still reads the garbage collection setting
+        working-directory: apps/web
+        run: node ../../.github/scripts/fork-vitest-gc-check.cjs
 
       # Upstream: `vp run --filter @t3tools/web test --shard N/total`. The same
       # script, run in its directory with the slice, as on the Test shards.
