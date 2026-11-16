@@ -1,6 +1,7 @@
 // Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit is listed in .github/fork-ci-tests.txt and
 // runs here by extension (RUNNER), FORK_CI_TEST_JOBS at once (default: CPU count), or `run by <file>` (not an upstream
 // workflow; it names the test). Unlisted or runner-less tests fail; a listed one that is gone fails once history had it.
+// Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all); order() sets the start order.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -19,7 +20,7 @@ const RUNNER = {
 };
 const UPSTREAM_WORKFLOW = /^\.github\/workflows\/(?!fork-)[^/]+\.ya?ml$/;
 
-// `entries`: [{ file, runBy }]; `present`: test files in the tree;
+// `entries`: [{ file, runBy, weight }]; `present`: test files in the tree;
 // `ever(file)` says whether the file is in the tested commit's history;
 // `read(file)` returns a runner file's text, or null when it does not exist.
 function plan(entries, present, ever, read = () => null) {
@@ -64,13 +65,49 @@ function readList(text) {
     .map((line) => line.replace(/#.*/, "").trim())
     .filter(Boolean)
     .map((line) => {
-      const match = line.match(/^(\S+)(?:\s+run by\s+(\S+))?$/);
+      const match = line.match(/^(\S+)(?:\s+~([1-9]\d{0,4})s|\s+run by\s+(\S+))?$/);
       if (!match)
         throw new Error(
-          `${LIST}: cannot read "${line}" (expected "<test>" or "<test> run by <file>")`,
+          `${LIST}: cannot read "${line}" (expected "<test>", "<test> ~<seconds>s" or "<test> run by <file>")`,
         );
-      return { file: match[1], runBy: match[2] ?? null };
+      return {
+        file: match[1],
+        runBy: match[3] ?? null,
+        weight: match[2] ? Number(match[2]) : null,
+      };
     });
+}
+
+// The files to run in start order: those without a weight first (a new test may be long), in list order, then the
+// heaviest first (equal weights in list order). With every slot busy from the start, the longest test sets the time.
+function order(files, entries) {
+  const weight = new Map(entries.map((entry) => [entry.file, entry.weight]));
+  const position = new Map(entries.map((entry, index) => [entry.file, index]));
+  const rank = (file) => weight.get(file) ?? Infinity;
+  return files.toSorted((a, b) => rank(b) - rank(a) || position.get(a) - position.get(b));
+}
+
+// Whether `file` is in the part the arguments name: under one of the `<prefix>` ones (any, when there are none),
+// and under none of the `!<prefix>` ones.
+function inPart(file, parts) {
+  const want = parts.filter((part) => !part.startsWith("!"));
+  const skip = parts.filter((part) => part.startsWith("!")).map((part) => part.slice(1));
+  return (
+    (want.length === 0 || want.some((prefix) => file.startsWith(prefix))) &&
+    !skip.some((prefix) => file.startsWith(prefix))
+  );
+}
+
+// A note for the log when a test's weight is missing or far from its time: the order then needs a new weight.
+function weightNote(file, weight, seconds) {
+  if (weight === null)
+    return seconds > 30
+      ? `${file} took ${Math.round(seconds)} s and has no weight: add "~${Math.round(seconds)}s"`
+      : null;
+  // Off by more than half or double and by more than 30 s: load on the runner moves times less than that.
+  return Math.abs(seconds - weight) > 30 && (seconds > 2 * weight || seconds < weight / 2)
+    ? `${file} took ${Math.round(seconds)} s, its weight is ~${weight}s: update it`
+    : null;
 }
 
 function findTests(dir, root = ROOT) {
@@ -176,16 +213,22 @@ function runTest(file) {
   });
 }
 
-async function main() {
-  const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8"));
-  const result = plan(entries, presentTests(), everInHistory, readFile);
+async function main(parts = process.argv.slice(2)) {
+  const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8")).filter((entry) =>
+    inPart(entry.file, parts),
+  );
+  const present = presentTests().filter((file) => inPart(file, parts));
+  const result = plan(entries, present, everInHistory, readFile);
+  const weight = new Map(entries.map((entry) => [entry.file, entry.weight]));
   const rows = [];
   let failed =
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
-  for (const run of await runAll(result.run, jobCount(), runTest)) {
+  for (const run of await runAll(order(result.run, entries), jobCount(), runTest)) {
     if (run.status !== 0) failed += 1;
+    const note = weightNote(run.file, weight.get(run.file), Number(run.seconds));
+    if (note) console.log(`::notice file=${run.file}::${note}`);
     rows.push(
-      `| \`${run.file}\` | ${run.status === 0 ? "passed" : "**failed**"} | ${run.seconds} s |`,
+      `| \`${run.file}\` | ${run.status === 0 ? "passed" : "**failed**"} | ${run.seconds} s | ${weight.get(run.file) ? `~${weight.get(run.file)}s` : ""} |`,
     );
   }
   for (const file of result.unlisted)
@@ -199,25 +242,35 @@ async function main() {
     );
   for (const { file, why } of result.notRun)
     console.log(`::error file=${file}::${file} is not run: ${why}`);
+  // A part that runs nothing is a wrong argument (a typo, a renamed folder): its tests would never run.
+  const empty = parts.length > 0 && result.run.length === 0;
+  if (empty) {
+    failed += 1;
+    console.log(
+      `::error::the part ${parts.join(" ")} runs no test here: fix the argument of this ` +
+        `fork-ci-tests.cjs call (a typo or a renamed folder?), or its tests never run.`,
+    );
+  }
   for (const { file, runBy } of result.elsewhere)
-    rows.push(`| \`${file}\` | run by \`${runBy}\` | |`);
+    rows.push(`| \`${file}\` | run by \`${runBy}\` | | |`);
   for (const file of result.pending)
-    rows.push(`| \`${file}\` | not present: its PR has not merged | |`);
-  for (const file of result.unlisted) rows.push(`| \`${file}\` | **not in ${LIST}** | |`);
-  for (const file of result.deleted) rows.push(`| \`${file}\` | **deleted while listed** | |`);
+    rows.push(`| \`${file}\` | not present: its PR has not merged | | |`);
+  for (const file of result.unlisted) rows.push(`| \`${file}\` | **not in ${LIST}** | | |`);
+  for (const file of result.deleted) rows.push(`| \`${file}\` | **deleted while listed** | | |`);
   for (const file of result.noRunner)
-    rows.push(`| \`${file}\` | **no runner for its extension** | |`);
-  for (const { file, why } of result.notRun) rows.push(`| \`${file}\` | **not run: ${why}** | |`);
+    rows.push(`| \`${file}\` | **no runner for its extension** | | |`);
+  for (const { file, why } of result.notRun) rows.push(`| \`${file}\` | **not run: ${why}** | | |`);
 
   const summary = process.env.GITHUB_STEP_SUMMARY;
   if (summary)
     fs.appendFileSync(
       summary,
       [
-        "### Fork script tests",
+        `### Fork script tests${parts.length ? ` (${parts.join(" ")})` : ""}`,
         "",
-        "| Test | Result | Time |",
-        "| --- | --- | --- |",
+        ...(empty ? [`**No test runs in this part: check its argument.**`, ""] : []),
+        "| Test | Result | Time | Weight |",
+        "| --- | --- | --- | --- |",
         ...rows,
         "",
       ].join("\n") + "\n",
@@ -225,7 +278,17 @@ async function main() {
   if (failed) process.exitCode = 1;
 }
 
-module.exports = { plan, readList, findTests, presentTests, runAll, jobCount };
+module.exports = {
+  plan,
+  readList,
+  order,
+  inPart,
+  weightNote,
+  findTests,
+  presentTests,
+  runAll,
+  jobCount,
+};
 
 if (require.main === module)
   main().catch((error) => {
