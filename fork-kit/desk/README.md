@@ -69,9 +69,11 @@ hand setup) is refused the same way, not followed or fixed. One install or unins
 
 The seed timer (`t3code-fleet-seed.timer`) fetches the pool's warm caches, if its fleet config lists any, into
 `/var/lib/fork-fleet/seeds`, which jobs see read-only ([fork-fleet.md](../../.github/fork-fleet.md), "Seeds").
-A torn seed is tried again after 1, 2, 4, 8, 16, then 24 hours; one torn on every try for more than a day makes each
-run exit 1, so `check` shows the seed service's last run as failed. `/var/lib/fork-fleet/seeds/.torn.json` names it
-and the host's reason (jobs can read that file too).
+A torn seed is tried again after about 1, 2, 4, 8, 16, then 24 hours (up to an hour later: the timer's random delay),
+or at once when the host offers another copy; one torn on every try for more than a day makes each run that reads the
+host's list exit 1, so `check` shows the seed service's last run as failed (a run that cannot write the record, a full
+disk, exits 1 too). `/var/lib/fork-fleet/seeds/.torn.json` names it and the host's reason (jobs can read that file
+too); a run without the host's list leaves it as it is.
 
 ## Windows (WSL2)
 

@@ -795,8 +795,6 @@ class Desktop(Base):
                 self.assertTrue(any('m2' in x and why in x for x in self.said), self.said)
                 with contextlib.suppress(FileNotFoundError):   # each case tried at once, not after a wait
                     os.unlink(os.path.join(self.root, '.torn.json'))
-        for k in ('_proc_member', '_proc_sparse', '_proc_gnusparse_00', '_proc_gnusparse_01', '_proc_gnusparse_10'):
-            self.assertTrue(callable(getattr(tarfile.TarInfo, k, None)), f'tarfile.TarInfo.{k} is gone: see Info')
 
     def test_members_are_let_go_as_they_are_unpacked(self):
         self.make('m2', {f'd/{i}': b'x' for i in range(300)})
@@ -824,6 +822,150 @@ class Desktop(Base):
         self.run_seed(now=lambda: time.time() + 7 * 3600)
         self.assertEqual(self.files('m2'), {'a': b'one', 'b': b'one'})   # the old one stays
         self.assertTrue(any('hard link' in x for x in self.said), self.said)
+
+    def test_the_private_tarfile_parts_the_limits_rely_on_are_there(self):   # lens237sr3: fail loud, not silently
+        for k in ('_proc_member', '_proc_sparse', '_proc_gnusparse_00', '_proc_gnusparse_01', '_proc_gnusparse_10'):
+            self.assertTrue(callable(getattr(tarfile.TarInfo, k, None)), f'tarfile.TarInfo.{k} is gone: see Info')
+        self.assertTrue(callable(getattr(tarfile.TarFile, '_find_link_target', None)),
+                        'tarfile.TarFile._find_link_target is gone: see Tar')
+        self.assertIs(seed.Tar._find_link_target, seed.Tar.__dict__['_find_link_target'])
+
+    def forked(self):
+        """run_seed() in a child: 0 when it stayed under the unit's MemoryMax=512M, 1 when not (its peak RSS, or a
+        MemoryError: the child may map 1 GB at most, so the test never takes the machine's memory)."""
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            import resource
+            code = 2
+            try:
+                os.close(r)
+                resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+                self.run_seed()
+                os.write(w, json.dumps(self.said).encode())
+                code = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >= 512 << 10
+                           or any('MemoryError' in x for x in self.said))
+            finally:
+                os._exit(code)
+        os.close(w)
+        with os.fdopen(r) as f:
+            self.said = json.loads(f.read() or '[]')
+        return os.waitpid(pid, 0)[1] >> 8
+
+    def test_a_link_that_cannot_be_made_never_loads_the_stream(self):   # lens237sr3: the MUST
+        big = [{**SEEDS[0], 'max_mb': 128}, SEEDS[1]]
+        self.config(big)
+        self.own(big)
+        x = tarfile.TarInfo('pax')
+        x.type = tarfile.XHDTYPE
+        body = b''.join(b'15 a.%07d=x\n' % i for i in range(65_000))   # ~0.98 MB, under HEADER_MOST
+        rest = b''.join(self.block(x, body) + self.block(tarfile.TarInfo(f'f{i}')) for i in range(110))   # ~108 MB
+        del body
+        with open(os.path.join(self.t, 'rest'), 'wb') as f:   # kept on disk: the child must not inherit it
+            f.write(rest)
+        del rest
+
+        def rest():
+            with open(os.path.join(self.t, 'rest'), 'rb') as f:
+                return f.read()
+
+        def link(name, target, kind):
+            info = tarfile.TarInfo(name)
+            info.type, info.linkname = kind, target
+            return self.block(info)
+        cases = {   # a link whose path is there: os.link fails; os.unlink of a folder fails
+            'a hard link over a file': self.block(tarfile.TarInfo('a'), b'1') + self.block(tarfile.TarInfo('b'), b'2')
+            + link('b', 'a', tarfile.LNKTYPE),
+            'a symlink over a folder': self.block(tarfile.TarInfo('d/x'), b'1') + link('d', 'x', tarfile.SYMTYPE),
+        }
+        for i, (what, head) in enumerate(cases.items()):
+            with self.subTest(what):
+                self.raw('m2', head + rest())
+                self.assertEqual(self.forked(), 0, self.said[-3:])   # hard link: over 512 MB before round 4
+                self.assertIsNone(self.files('m2'))
+                self.assertTrue(any('m2' in x and 'already there' in x for x in self.said), self.said)
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(self.root, '.torn.json'))
+        self.raw('m2', self.block(tarfile.TarInfo('a'), b'1') + link('b', 'a', tarfile.LNKTYPE))
+        with mock.patch.object(os, 'link', side_effect=OSError(18, 'Invalid cross-device link')):   # any other
+            self.run_seed()                                                                         # link failure
+        self.assertIsNone(self.files('m2'))
+        self.assertTrue(any('m2' in x and 'cannot be made' in x for x in self.said), self.said)
+
+    def test_a_negative_size_never_lowers_the_disk_count(self):   # lens237sr3: the MUST
+        d = bytearray(tarfile.TarInfo('z').tobuf(format=tarfile.GNU_FORMAT))
+        d[156:157] = tarfile.DIRTYPE
+        d[124:136] = b'\xff' + b'\0' * 11                     # a base-256 size below zero
+        d[148:156] = b' ' * 8
+        d[148:156] = b'%06o\0 ' % sum(d[:512])
+        self.raw('m2', bytes(d) + b''.join(self.block(tarfile.TarInfo(f'e{i}')) for i in range(1500)))
+        self.run_seed()
+        self.assertIsNone(self.files('m2'))   # before round 4: 1,500 files (6 MB of entries) under max_mb 2
+        self.assertTrue(any('m2' in x and 'size' in x for x in self.said), self.said)
+        f = bytearray(tarfile.TarInfo('y').tobuf(format=tarfile.GNU_FORMAT))   # a folder with a size: refused too
+        f[156:157] = tarfile.DIRTYPE
+        f[124:136] = b'%011o\0' % 512
+        f[148:156] = b' ' * 8
+        f[148:156] = b'%06o\0 ' % sum(f[:512])
+        self.raw('m2', bytes(f) + b'\0' * 512 + self.block(tarfile.TarInfo('e'), b'x'))
+        self.run_seed(now=lambda: time.time() + 2 * 3600)
+        self.assertIsNone(self.files('m2'))
+        self.assertTrue(any('m2' in x and 'size' in x for x in self.said), self.said)
+
+    def test_one_lost_list_does_not_reset_the_torn_record(self):   # lens237cr3
+        self.make('m2', {'a': b'one'})
+        start, codes, real, tried = int(time.time()), {}, seed.listing, []
+
+        def torn(agent_, conf, item, root, now, **kw):
+            tried.append(round((now() - start) / 3600))
+            raise seed.Torn('cut off')
+
+        def lost(h):
+            def listing(a, c):
+                if h % 12 == 11:   # the 30 s list lost twice a day
+                    raise seed.Torn('no list in 30 s')
+                return real(a, c)
+            return listing
+        with mock.patch.object(seed, 'fetch', torn):
+            for h in range(49):
+                with mock.patch.object(seed, 'listing', lost(h)):
+                    codes[h] = self.run_seed(now=lambda h=h: start + h * 3600)
+        self.assertEqual(tried, [0, 1, 3, 7, 15, 31])   # the back-off goes on
+        self.assertEqual({h for h, c in codes.items() if c}, set(range(25, 49)) - {35, 47})   # late, list or not
+
+    def test_a_torn_record_that_cannot_be_saved_still_counts_and_fails_the_run(self):   # lens237cr3: disk full
+        self.make('m2', {'a': b'one'})
+        os.makedirs(os.path.join(self.root, '.torn.json.tmp'))   # the record cannot be written, as on a full disk
+        tried = []
+
+        def torn(agent_, conf, item, root, now, **kw):
+            tried.append(item['name'])
+            raise seed.Torn('No space left on device')
+        with mock.patch.object(seed, 'fetch', torn):
+            self.assertEqual(self.run_seed(), 1)
+        self.assertEqual(tried, ['m2'])   # tried, and the try counted in memory
+        self.assertTrue(any('.torn.json' in x and 'cannot be written' in x for x in self.said), self.said)
+        os.rmdir(os.path.join(self.root, '.torn.json.tmp'))
+        with mock.patch.object(seed, 'fetch', torn):
+            self.assertEqual(self.run_seed(now=lambda: time.time() + 3600), 0)
+        with open(os.path.join(self.root, '.torn.json')) as f:
+            self.assertEqual(json.load(f)['m2']['tries'], 1)   # the lost record starts again, no worse
+
+    def test_a_new_copy_on_the_host_is_tried_at_once_after_torn_tries(self):   # lens237cr3 nit
+        start, tried = int(time.time()), []
+        self.make('m2', {'a': b'one'}, mtime=start - 3600)
+
+        def torn(agent_, conf, item, root, now, **kw):
+            tried.append(round((now() - start) / 3600))
+            raise seed.Torn('cut off')
+        with mock.patch.object(seed, 'fetch', torn):
+            for h in (0, 1, 2):
+                self.run_seed(now=lambda h=h: start + h * 3600)
+            self.make('m2', {'a': b'two!'}, mtime=start - 60)   # the host made a fixed one
+            self.run_seed(now=lambda: start + 2 * 3600 + 120)
+            self.run_seed(now=lambda: start + 2 * 3600 + 180)
+        self.assertEqual(tried, [0, 1, 2])   # at once, then the back-off again (now 4 h)
+        self.assertTrue(any('torn 3 times' in x for x in self.said), self.said)
 
     def test_a_deeply_nested_list_means_no_list(self):   # lens237cr2
         self.make('m2', {'a': b'one'})
