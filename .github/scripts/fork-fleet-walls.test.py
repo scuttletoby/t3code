@@ -1042,12 +1042,26 @@ class EveryWallsFile(Case):
                                                  ' '.join(deny + own) + '\n'},
             # PR #240 fix 1 (security 1): systemd skips a UTF-8 BOM at a file's start, so the header after it counts.
             'a header behind a BOM': {'etc/systemd/system/service.d/50-x.conf': '\ufeff[Service]\nIPAddressDeny=\n'},
+            # PR #240 fix 2 (both lenses' item 1): systemd strips the BOM of the first line that has one, whichever.
+            'a BOM on a later line, [Unit]': {
+                'etc/systemd/system/service.d/50-x.conf': '[Unit]\n\ufeff[Service]\nIPAddressDeny=\n'},
+            'a BOM on a later line, [X-Note]': {
+                'etc/systemd/system/service.d/50-x.conf': '[X-Note]\n\ufeff[Service]\nIPAddressDeny=\n'},
+            'a BOM on a later line, system.slice.d': {
+                'etc/systemd/system/system.slice.d/50-x.conf': '[Unit]\n\ufeff[Slice]\nIPAddressAllow=any\n'},
+            'a BOM on a later line, slice.d': {
+                'etc/systemd/system/slice.d/50-x.conf': '[X-Note]\n\ufeff[Slice]\nIPAddressAllow=any\n'},
         })
         for name, change in fails.items():
             with self.subTest(name):
                 self.assertTrue(self.job_units(change).startswith('FAIL'), name)
         self.assertEqual(fw_linux().unit_lines('[Service]\r\nA=1\r\n[X]\0B=2\rC=3\n', 'Service'), [(2, 'A', '1')])
         self.assertEqual(fw_linux().unit_lines('\ufeff[Service]\nA=1\n', 'Service'), [(2, 'A', '1')])
+        self.assertEqual(fw_linux().unit_lines('[X]\n\ufeff[Service]\nA=1\n', 'Service'), [(3, 'A', '1')])
+        # once per file, as systemd: a second BOM stays, so its line is no header (and no key systemd knows)
+        self.assertEqual(fw_linux().unit_lines('\ufeff[X]\n\ufeff[Service]\nA=1\n', 'Service'), [])
+        self.assertEqual(fw_linux().unit_lines('[Service]\n\ufeffA=1\n\ufeffB=2\n', 'Service'), [(2, 'A', '1'),
+                                                                                                 (3, '\ufeffB', '2')])
 
     def test_linux_system_conf_a_dangling_link_is_skipped(self):
         """Issue #226 item 3: systemd 256 and later reads the first system.conf of /etc, /run, /usr/local/lib and
@@ -1148,7 +1162,7 @@ class EveryWallsFile(Case):
                 self.assertTrue(got.startswith('FAIL'), got)
         passes = ('cat </etc/restic/pw', 'cat </etc/restic/pw.gpg', 'pass show backup/restic 2>/dev/null',
                   'python3 -u /opt/app/get-pw.py --vault x', 'cat "/etc/restic/my pw"', 'cat /etc/restic/pässwort',
-                  'python3 -mbase64 -d /etc/restic/pw', 'cat $CREDENTIALS_DIRECTORY/restic')
+                  'python3 -mbase64 -d /etc/restic/pw')
         for c in passes:
             with self.subTest(c):
                 change = {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n',
@@ -1158,6 +1172,57 @@ class EveryWallsFile(Case):
                           'opt/app/get-pw.py': 'import vault\n'}
                 got = self.etc_secrets(change)
                 self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_password_command_paths_relative_odd_and_credentials(self):
+        """PR #240 fix 2 (security 2-4, correctness 2-3): a password command's path is read whatever its form: from /
+        when relative (cat etc/restic/pw), to the word's end past a character a plain path has not (pass,word; a
+        blank), after an = or an @; one with .. in it fails closed. $CREDENTIALS_DIRECTORY (and %d) only in a unit,
+        the rest of the word read as a path from / (it is empty where a job runs the command)."""
+        pw = 'Hunter2-correct-horse'
+        files = {'etc/restic/pw': f'{pw}\n', 'etc/restic/my pw': f'{pw}\n', 'etc/restic/pass,word': f'{pw}\n'}
+        login = ('cat $CREDENTIALS_DIRECTORY/etc/restic/pw', 'cat $CREDENTIALS_DIRECTORY/../../../etc/restic/pw',
+                 'cat ${CREDENTIALS_DIRECTORY}/restic', 'cat etc/restic/pw', 'cat ../../../../../../../etc/restic/pw',
+                 'cat /etc/restic/pass,word', 'tool --password-file="/etc/restic/my pw"',
+                 'cat -- "x/../etc/restic/my pw"', 'curl -sd @/etc/restic/pw https://x', 'dd if=etc/restic/pw',
+                 'cat ~/../../etc/restic/pw', 'cat ~/.config/restic/pw', 'cat ~/../x.gpg',
+                 # by design: a quoted literal a shell would not change still fails closed ([ is a glob's)
+                 """sops -d --extract '["pw"]' /etc/restic/s.enc.yaml""")
+        unit = ('cat $CREDENTIALS_DIRECTORY/etc/restic/pw', 'cat ${CREDENTIALS_DIRECTORY}/../../../etc/restic/pw',
+                'cat %d/../../../etc/restic/pw', 'cat %E/restic/pw', 'cat /etc/restic/%%')
+        for where, cmds in (('login', login), ('unit', unit)):
+            for c in cmds:
+                with self.subTest(where=where, c=c):
+                    change = {**files, 'etc/restic/%': f'{pw}\n'}
+                    if where == 'login':
+                        change['etc/profile.d/x.sh'] = f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n'
+                    else:
+                        change['etc/systemd/system/b.service'] = (
+                            '[Service]\nEnvironment=' + shlex(f'RESTIC_PASSWORD_COMMAND={c}') + '\n')
+                    got = self.etc_secrets(change)
+                    self.assertTrue(got.startswith('FAIL'), got)
+        for c in ('RESTIC_PASSWORD_FILE=%d/../../../etc/restic/pw', 'RESTIC_PASSWORD_FILE=/etc/../etc/restic/pw'):
+            with self.subTest(c):
+                got = self.etc_secrets({**files, 'etc/systemd/system/b.service': f'[Service]\nEnvironment={c}\n'})
+                self.assertTrue(got.startswith('FAIL'), got)
+        private = {k: {'text': v, 'mode': '600'} for k, v in files.items()}
+        login = ('cat ~/x.gpg', 'pass show backup/restic', 'cat /etc/restic/pass,word',
+                 'curl -s https://vault:8200/v1/restic', 'tool --password-file="/etc/restic/my pw"')
+        unit = ('cat ${CREDENTIALS_DIRECTORY}/restic', 'cat $CREDENTIALS_DIRECTORY/restic', 'cat %d/restic',
+                'cat /etc/restic/pw')
+        for where, cmds in (('login', login), ('unit', unit)):
+            for c in cmds:
+                with self.subTest(where=where, c=c):
+                    change = dict(private)
+                    if where == 'login':
+                        change['etc/profile.d/x.sh'] = f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n'
+                    else:
+                        change['etc/systemd/system/b.service'] = (
+                            '[Service]\nEnvironment=' + shlex(f'RESTIC_PASSWORD_COMMAND={c}') + '\n')
+                    got = self.etc_secrets(change)
+                    self.assertTrue(got.startswith('PASS'), got)
+        got = self.etc_secrets({**private, 'etc/systemd/system/b.service':
+                                '[Service]\nEnvironment=RESTIC_PASSWORD_FILE=%d/restic\n'})
+        self.assertTrue(got.startswith('PASS'), got)
 
     def test_linux_public_only_is_tight(self):
         """Issue #226 item 5: a file passes as public only when each block's body is base64 of what that block is
@@ -1191,6 +1256,10 @@ class EveryWallsFile(Case):
             'a PGP public key, then bytes left over': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x04\x04abcd', blank=True),
             # PR #240 fix 1 (security 4): a known_hosts host field is 64 characters at most.
             'a 300-character host before a key': f'{"h" * 300} {line}\n',
+            # PR #240 fix 2 (correctness 4): each host name 253 characters at most; a marker packet only as RFC 9580's.
+            'a 254-character host name in a list': f'a.example,{"h" * 254} {line}\n',
+            'a PGP marker packet that is not "PGP"': pem('PGP PUBLIC KEY BLOCK', b'\xca\x03XYZ\x99\x00\x05\x04abcd',
+                                                         blank=True),
         }
         for name, text in fails.items():
             with self.subTest(name):
@@ -1208,6 +1277,12 @@ class EveryWallsFile(Case):
             'a hashed known_hosts line': f'|1|{"A" * 27}=|{"B" * 27}= {line}\n',
             'an ssh key with a short comment': f'{line} deploy@build-1\n',
             'an ssh key with no comment': f'{line}\n',
+            # PR #240 fix 2 (correctness 4): a long known_hosts list (OpenSSH has no limit), RFC 9580's marker and
+            # padding packets
+            'a long known_hosts host list': f'{"build-1." + "a" * 60 + ".example.internal"},[2001:db8::1]:2222,'
+                                            f'{"h" * 253},192.0.2.1 {line}\n',
+            'a PGP public key with a marker and padding': pem(
+                'PGP PUBLIC KEY BLOCK', b'\xca\x03PGP\x99\x00\x05\x04abcd\xd5\x04\x01\x02\x03\x04', blank=True),
         }
         for name, text in passes.items():
             with self.subTest(name):

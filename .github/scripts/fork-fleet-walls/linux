@@ -76,7 +76,10 @@ PUBLIC_BLOCK = re.compile(r'-----BEGIN (CERTIFICATE|TRUSTED CERTIFICATE|X509 CRL
                           r'PGP PUBLIC KEY BLOCK)-----\n(.*?)-----END \1-----', re.S)
 BASE64 = re.compile(r'(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
 PGP_ARMOR = re.compile(r'((?:(?:Version|Comment|Hash|Charset): [ -~]{1,76}\n)*)\n(.*?)(?:=[A-Za-z0-9+/]{4}\n)?', re.S)
-SSH_HOSTS = r'(?:@(?:cert-authority|revoked)\s+)?[A-Za-z0-9.*?!\[\]:,|=+/_-]{1,64}\s+'   # 64 characters at most
+# A known_hosts host list: names (a host, [host]:port, a pattern, a hashed |1|salt|hash) split by commas, each 253
+# characters at most (the longest DNS name; OpenSSH sets no limit, a longer one is not read as public).
+_SSH_HOST = r'[A-Za-z0-9.*?!\[\]:|=+/_-]{1,253}'
+SSH_HOSTS = r'(?:@(?:cert-authority|revoked)\s+)?' + _SSH_HOST + r'(?:,' + _SSH_HOST + r')*\s+'
 SSH_PUBLIC = re.compile(r'(?:' + SSH_HOSTS + r')?((?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp(?:256|384|521)|'
                         r'sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)(?:-cert-v01@openssh\.com)?)\s+'
                         r'([A-Za-z0-9+/]+={0,2})((?:\s+[A-Za-z0-9._@+:-]+){0,4})')
@@ -94,16 +97,23 @@ INLINE = {'python': 'c', 'pypy': 'c', 'perl': 'eEM', 'ruby': 'e', 'node': 'ep', 
           'php': 'rRBEF', 'lua': 'e', 'Rscript': 'e', 'julia': 'e', 'expect': 'c'}
 INLINE_LONG = ('--eval', '--print', '--command', '--expression', '--source', '--exec')
 SCRIPTED = re.compile(r'g?awk|mawk|nawk|g?sed')
-# A path in a word of a command: not inside a relative one (backup/etc), after a short option's letter (-p/etc/pw);
-# its letters any (\w is Unicode's: /etc/restic/pässwort), or any non-ASCII character.
-PATH_IN = re.compile(r'(?<![\w.@+-])(/(?:[\w.@+-]|[^\x00-\x7f])+)+')
+# Where a path starts in a word of a command (word_paths): at a / that is not inside a relative path (backup/etc,
+# ../etc), so at the word's start, or after an option's letter (-p/etc/pw), an = (--file=/etc/pw), an @ (curl -d
+# @/etc/pw) or any other character a path has not. It ends at the word's end, or at any character of NOT_PLAIN_PATH
+# (\w is Unicode's: /etc/restic/pässwort), which a file's name may hold or not (/etc/restic/pass,word; /etc/pw,ro):
+# each end is read.
+PATH_START = re.compile(r'(?<![\w.+-])/')
+NOT_PLAIN_PATH = re.compile(r'[^\w.@+/-]')
 # What makes a word of a command not plain literal text: a variable or a command's output ($f, ${IFS}, $(...), `...`),
-# a glob (* ? [), a brace (a{b,c}), a tilde at a word's start or after = or : (~backup/pw), a backslash. Its file
-# is not known until a shell runs it: such a word fails closed (command_secret).
+# a glob (* ? [), a brace (a{b,c}), a tilde at a word's start or after = or : (~backup/pw, ~/pw: a service user's
+# home may be outside /home, where jobs see it), a backslash. Its file is not known until a shell runs it: such a word
+# fails closed (command_secret). But a LOCKED file in the home of who runs it (~/restic.gpg) needs a key all the same.
 NOT_PLAIN = re.compile(r'[$`*?\[{}\\]|(?:^|[=:])~')
-# But the one variable that names a folder no job sees: systemd's credentials of the unit that runs the command
-# (private to it; the advice's own form: cat ${CREDENTIALS_DIRECTORY}/restic).
-OWN_CREDENTIALS = re.compile(r'\$(?:CREDENTIALS_DIRECTORY(?!\w)|\{CREDENTIALS_DIRECTORY\})')
+# But in a unit's command (only there can it be set) the folder of the unit's own credentials, which no job sees:
+# $CREDENTIALS_DIRECTORY (the advice's own form: cat ${CREDENTIALS_DIRECTORY}/restic) and its specifier %d. It may be
+# empty (a unit with no credentials; a job that runs the command), so the rest of the word is read as a path from /
+# (cat $CREDENTIALS_DIRECTORY/etc/restic/pw reads /etc/restic/pw), and a .. in it fails closed (word_paths).
+OWN_CREDENTIALS = re.compile(r'\$(?:CREDENTIALS_DIRECTORY(?!\w)|\{CREDENTIALS_DIRECTORY\})|%[%d]')
 # A python run as `python -m module` (joined too: -mbase64) has no script: its first word is the module's input.
 PY_MODULE = re.compile(r'-[A-Za-z]*m.*')
 LOCKED = ('.gpg', '.age')
@@ -578,8 +588,11 @@ def secret_value(value, unit=False):
 
 def file_exposed(value, unit=False):
     """Whether a *_FILE value names a file (a folder: a file in it) that is here and others can read: in a unit, its
-    specifiers read as unit_paths reads them (%d, the unit's own credentials, is none of this host's files)."""
+    specifiers read as unit_paths reads them (%d, the unit's own credentials, is none of this host's files). One with
+    a .. in it may lead anywhere (%d/../../etc/pw): it fails closed."""
     value = unquote(value)
+    if '..' in value.split('/'):
+        return True
     if unit and '%' in value:
         return not value.startswith('%d/') and any(exposed(p) for p in unit_paths(value))
     return bool(A_PATH.fullmatch(value) and exposed(value))
@@ -597,10 +610,11 @@ def command_secret(value, unit=False, depth=0):
     NAME=value or --option=value (--password hunter2); an echo or printf of literal text, and a here-string of it
     (<<<text; a here-document, <<); a script in its words (INLINE, SCRIPTED); any file others can read that it names
     (an argument, an option's value or a redirect's: sed -n 1p /etc/pw, --password-file=/etc/pw, cat</etc/pw) but its
-    program (INTERPRETERS' script too; not python's -m module) and a LOCKED file, a word with a blank in it read as one
-    path too ("/etc/restic/my pw"); and what a shell runs (sh -c '...'), or any word with a blank in it (eval '...',
-    su -c '...'), read again. A word that is not plain literal text (NOT_PLAIN: $f, "$f", ${IFS}, a glob, ~user; not
-    OWN_CREDENTIALS), a value it cannot split, or one nested deeper than 4: a secret (it fails closed; PR #240)."""
+    program (INTERPRETERS' script too; not python's -m module) and a LOCKED file, each path in a word as word_paths
+    reads it ("/etc/restic/my pw", etc/restic/pw from /); and what a shell runs (sh -c '...'), or any word with a
+    blank in it (eval '...', su -c '...'), read again. A word that is not plain literal text (NOT_PLAIN: $f, "$f",
+    ${IFS}, a glob, ~user; in a unit, OWN_CREDENTIALS is none of it), a path with .. in it, a value it cannot split,
+    or one nested deeper than 4: a secret (it fails closed; PR #240)."""
     value = unquote(value)
     if depth > 4:
         return True
@@ -610,13 +624,15 @@ def command_secret(value, unit=False, depth=0):
         words = list(lex)
     except ValueError:
         return True
+    if unit:   # the unit's own credentials: empty, so the rest of the word is a path from / (word_paths)
+        words = [OWN_CREDENTIALS.sub(lambda m: '%%' if m[0] == '%%' else '', w) for w in words]
     commands = [[]]
     for w in words:
         if w and not w.strip(';&|()'):
             commands.append([])
         else:
             commands[-1].append(w)
-    return (any(NOT_PLAIN.search(OWN_CREDENTIALS.sub('', w)) for w in words)
+    return (any(NOT_PLAIN.search(w[1:] if w.startswith('~/') and w.endswith(LOCKED) else w) for w in words)
             or any(simple_secret(c, unit, depth) for c in commands if c))
 
 
@@ -654,9 +670,32 @@ def simple_secret(words, unit, depth):
         first = next((i for i, w in enumerate(args) if not w.startswith('-')), len(args))
         if not (prog.startswith('python') and any(PY_MODULE.fullmatch(w) for w in args[:first])):
             args = args[first + 1:]
-    paths = {m[0] for w in args for m in PATH_IN.finditer(re.sub(r'^-[A-Za-z]', '', w))}
-    paths |= {w for w in args if w.startswith('/') and re.search(r'\s', w)}   # a quoted path with a blank in it
-    return any(not p.endswith(LOCKED) and exposed(p) for p in paths)
+    for w in args:
+        paths = word_paths(w, unit)
+        if paths is None or any(not p.endswith(LOCKED) and exposed(p) for p in paths):
+            return True
+    return False
+
+
+def word_paths(word, unit=False):
+    """The files a word of a command may name (simple_secret): each path in it from where it starts (PATH_START) to
+    the word's end, and to each character of NOT_PLAIN_PATH before that; a relative one (the word, or what follows an
+    = in it, with a / not at its start) read from /, where a unit runs it (etc/restic/pw: /etc/restic/pw; pass show
+    backup/restic: /backup/restic, not there); in a unit, its specifiers as unit_paths reads them. None: a path with ..
+    in it, which leads anywhere from where it is run (../../etc/pw, x/../etc/pw): it fails closed."""
+    word = re.sub(r'^-[A-Za-z]', '', word)   # a short option's letter: -p/etc/pw
+    texts = [word[m.start():] for m in PATH_START.finditer(word)]
+    texts += ['/' + p for p in [word] + [word[i + 1:] for i, c in enumerate(word) if c == '=']
+              if '/' in p and not p.startswith('/')]
+    out = set()
+    for t in texts:
+        for end in [m.start() for m in NOT_PLAIN_PATH.finditer(t)] + [len(t)]:
+            p = t[:end]
+            if '..' in p.split('/'):
+                return None
+            if p.strip('/'):
+                out.update(unit_paths(p) if unit and '%' in p else [p])
+    return sorted(out)
 
 
 def inline_script(prog, args):
@@ -733,18 +772,20 @@ def unit_lines(text, section=None):
     """(line number, key, value) of each assignment in a systemd unit, drop-in or config file, as systemd reads it
     (systemd.syntax(7)): a line ends at \\n, \\r, \\r\\n or \\0 only (UNIT_LINE_END; not at a form feed or U+2028,
     as Python's splitlines() would), and only blanks, tabs and line ends (UNIT_BLANKS) are stripped; a comment line
-    (# or ;) skipped, and a UTF-8 BOM at its start; a line ending in a backslash continued on the next, the
+    (# or ;) skipped, and a UTF-8 BOM at the start of the first line that has one (systemd's conf-parser.c, bom_seen:
+    not only the file's first line); a line ending in a backslash continued on the next, the
     backslash a blank, a comment line inside it skipped; blanks around the key and the `=` dropped. section (Service,
     Slice, Manager): only the lines in that [section], as systemd takes a setting only in the section it belongs to; it
     drops one in any other section (an X- one, [Unit], [Install]) or before the first, and so does this."""
-    out, buf, start, at = [], None, 0, None
-    text = text.removeprefix('\ufeff')   # systemd skips a UTF-8 BOM at the start (conf-parser.c)
+    out, buf, start, at, bom_seen = [], None, 0, None, False
 
     def keep(buf):
         key, eq, value = buf.partition('=')
         if eq and (section is None or at == section):
             out.append((start, key.strip(UNIT_BLANKS), value.strip(UNIT_BLANKS)))
     for n, raw in enumerate(UNIT_LINE_END.split(text), 1):
+        if not bom_seen and raw.startswith('\ufeff'):   # once per file, before blanks are stripped (conf-parser.c)
+            raw, bom_seen = raw[1:], True
         line = raw.strip(UNIT_BLANKS)
         if buf is None:
             if line[:1] == '[':
@@ -802,8 +843,10 @@ DER_SHAPE = {'CERTIFICATE': (SEQUENCE, SEQUENCE, BIT_STRING), 'TRUSTED CERTIFICA
              'X509 CRL': (SEQUENCE, SEQUENCE, BIT_STRING), 'PUBLIC KEY': (SEQUENCE, BIT_STRING),
              'RSA PUBLIC KEY': (INTEGER, INTEGER)}
 # The OpenPGP packets a public key block may hold (RFC 9580 10.1): a public key and subkeys, user ids and
-# attributes, signatures, trust. Not a secret key or subkey (5, 7), nor any data.
+# attributes, signatures, trust. Not a secret key or subkey (5, 7), nor any data. Also, anywhere in it, the two that
+# say nothing (PGP_MARKER, PGP_PADDING): a marker (10, its body "PGP") and padding (21, random bytes; RFC 9580 5.14).
 PGP_PUBLIC_TAGS = {6, 14, 13, 17, 2, 12}
+PGP_MARKER, PGP_PADDING = 10, 21
 
 
 def der(raw):
@@ -829,7 +872,7 @@ def der(raw):
 
 
 def pgp_packets(raw):
-    """The tags of the OpenPGP packets of raw, all of it (RFC 9580 4.2: new and old format). A partial or
+    """The OpenPGP packets of raw, all of it, [(tag, body)] (RFC 9580 4.2: new and old format). A partial or
     indeterminate length (only data packets have one), or bytes left over: ValueError."""
     tags, at = [], 0
     while at < len(raw):
@@ -853,7 +896,7 @@ def pgp_packets(raw):
             size, at = int.from_bytes(raw[at:at + n], 'big'), at + n
         if at + size > len(raw):
             raise ValueError('not OpenPGP')
-        tags.append(tag)
+        tags.append((tag, raw[at:at + size]))
         at += size
     return tags
 
@@ -861,7 +904,8 @@ def pgp_packets(raw):
 def public_block(kind, body):
     """Whether a PUBLIC_BLOCK's body is base64 of what its markers (kind) say, and nothing else, read in full: DER,
     one SEQUENCE of DER_SHAPE (a TRUSTED CERTIFICATE: a certificate, then its trust), every element in it well formed;
-    an OpenPGP public key in PGP_ARMOR, every packet a public one (PGP_PUBLIC_TAGS), the first a public key (6)."""
+    an OpenPGP public key in PGP_ARMOR, every packet a public one (PGP_PUBLIC_TAGS), the first a public key (6); a
+    marker and padding packet skipped."""
     if kind == 'PGP PUBLIC KEY BLOCK':
         m = PGP_ARMOR.fullmatch(body)
         body = m[2] if m else '!'
@@ -871,7 +915,8 @@ def public_block(kind, body):
     raw = base64.b64decode(data)
     try:
         if kind == 'PGP PUBLIC KEY BLOCK':
-            tags = pgp_packets(raw)
+            tags = [t for t, body in pgp_packets(raw)
+                    if t != PGP_PADDING and not (t == PGP_MARKER and body == b'PGP')]
             return tags[:1] == [6] and set(tags) <= PGP_PUBLIC_TAGS
         top = der(raw)
     except (ValueError, RecursionError):   # too deep to be a key or certificate
