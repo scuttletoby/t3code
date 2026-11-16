@@ -29,6 +29,16 @@
         "} = upstreamPatch;",
         "...applyForkSettingsPatch(current, forkPatch),"
       ]
+    },
+    "apps/server/src/serverSettings.ts": {
+      "why": "Every settings write goes through upstream's patch and write paths here. The fork swaps in its patch (fork/serverSettingsPatch.ts, under upstream's name, so a project's MCP profile a client left out is kept) and calls its save check (fork/serverSettingsWriteCheck.ts) once in each write path.",
+      "added": [
+        "// Fork: upstream's patch keeping a project's MCP profile a client left out, and the save check.",
+        "import { applyServerSettingsPatchKeepingForkProjectKeys as applyServerSettingsPatch } from \"./fork/serverSettingsPatch.ts\";",
+        "import * as ForkSettingsWrite from \"./fork/serverSettingsWriteCheck.ts\";",
+        "Effect.flatMap(ForkSettingsWrite.withCheck(update, \"test settings\")), // Fork: save check",
+        "yield* ForkSettingsWrite.check(current, updated, settingsPath); // Fork: save check"
+      ]
     }
   }
 }

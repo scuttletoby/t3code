@@ -167,6 +167,10 @@
       "types": "./src/serverSettings.ts",
       "import": "./src/serverSettings.ts"
     },
+    "./forkSettingsPatch": {
+      "types": "./src/forkSettingsPatch.ts",
+      "import": "./src/forkSettingsPatch.ts"
+    },
     "./waitFor": {
       "types": "./src/waitFor.ts",
       "import": "./src/waitFor.ts"
