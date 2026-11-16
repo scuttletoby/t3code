@@ -64,6 +64,7 @@ fork-kit/heavy/tests/sweep.test.py
 # A real systemd user manager (the step starts one for the runner user).
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml
 fork-kit/pc-agents/tests/check.test.py
+fork-kit/pc-agents/tests/setup.test.py
 
 # Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
 .github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml
