@@ -2,7 +2,8 @@
 (tests/golive_fixture.py): the service manager is faked (stop kills a fake server, start spawns a new one), the T3
 home is a temp folder, hooks and the quiet command are stub scripts. Nothing here stops, starts or reads a real T3.
 python3 -I -B fork-kit/golive/tests/copy.test.py"""
-import errno, hashlib, io, json, os, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, unittest
+import errno, hashlib, io, itertools, json, os, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time
+import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -112,6 +113,14 @@ class CopyBase(unittest.TestCase):
 
     def calls(self):
         return [c[0] for c in self.m.calls('fake-adapter-calls.jsonl')]
+
+    def distinct_stamps(self):
+        """For the whole test: each _stamp() is a new second, so copies made in the same real second never share a
+        folder name (a copy correctly refuses a name that exists)."""
+        stamps = (f'20990101T{i // 3600:02d}{i // 60 % 60:02d}{i % 60:02d}Z' for i in itertools.count())
+        patcher = mock.patch.object(coldcopy, '_stamp', side_effect=lambda: next(stamps))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def last_run(self):
         return journal.read(self.m.state)[0][-1]
@@ -446,8 +455,61 @@ class Copy(CopyBase):
         paths = {e['path'] for e in coldcopy.read_manifest(dest)['files']}
         self.assertFalse(paths & set(kept), paths & set(kept))
 
+    def test_kept_files_are_named_and_counted(self):
+        # r2 nit: kept files (each as big as what it kept) piled up unnamed; a refusal for free disk now names them.
+        kept = ('statev2.sqlite.golive-aside-20260101T000000Z', 'settings.json.golive-aside-20260101T000000Z')
+        for n in kept:
+            self.m.write(f'home/userdata/{n}', b'old data ' * 1000)
+        self.m.write('home/userdata/.statev2.sqlite.golive-restore-20260101T000000Z-aside', b'a temp, not kept')
+        paths = [self.m.path(f'home/userdata/{n}') for n in sorted(kept)]
+        self.assertEqual(coldcopy.kept_files(self.m.home), [(p, 9000) for p in paths])
+        with mock.patch.object(coldcopy, '_free_bytes', return_value=0), self.assertRaises(journal.Refused) as e:
+            self.copy(owner_says_go=True)
+        self.assertIn('2 file(s) earlier restores kept', str(e.exception))
+        for path in paths:
+            self.assertIn(path, str(e.exception))
+        self.assertEqual(self.calls(), [], 'T3 was stopped')
+        result = self.copy(owner_says_go=True)
+        self.assertEqual(result['keptFiles'], paths)
+        self.assertTrue(any(paths[0] in line for line in self.said))
+
+    def test_a_linked_database_is_refused_before_t3_stops(self):
+        # r2 correctness nit 2: the copy took the link, stopped T3, then failed with KeyError 'sha256' every time.
+        db = self.m.path('home/userdata/statev2.sqlite')
+        os.rename(db, self.m.path('home/real.sqlite'))
+        os.symlink(self.m.path('home/real.sqlite'), db)
+        with self.assertRaises(journal.Refused) as e:
+            self.copy(owner_says_go=True)
+        self.assertIn('statev2.sqlite in', str(e.exception))
+        self.assertIn('is a link', str(e.exception))
+        self.assertEqual(self.calls(), [], 'T3 was stopped')
+        self.assertEqual(self.copies(), [])
+        self.assertIsNone(journal.unfinished(self.m.state))
+
+    def test_a_home_with_a_restore_stopped_half_way_is_never_copied(self):
+        self.m.write(f'home/userdata/{coldcopy.RESTORE_MARK}', json.dumps({'oldHome': []}))
+        with self.assertRaises(journal.Refused) as e:
+            self.copy(owner_says_go=True)
+        self.assertIn('a restore stopped half-way', str(e.exception))
+        self.assertEqual((self.calls(), self.copies()), ([], []))
+
+    def test_the_home_is_looked_at_again_just_before_the_stop(self):
+        # A restore (or a link) that appears during the wait or the pre hooks: refused, T3 never stopped.
+        real = coldcopy._hooks
+
+        def hooks(run, name, paths, home):
+            if name == 'pre-hooks':
+                self.m.write(f'home/userdata/{coldcopy.RESTORE_MARK}', json.dumps({'oldHome': []}))
+            return real(run, name, paths, home)
+        with mock.patch.object(coldcopy, '_hooks', hooks), self.assertRaises(journal.Refused) as e:
+            self.copy(owner_says_go=True)
+        self.assertIn('a restore stopped half-way', str(e.exception))
+        self.assertEqual(self.calls(), ['run_detached', 'pre', 'post'])
+
     def test_incomplete_copy_folders_are_named_and_counted(self):
         # r1 data-safety C: a copy killed or failed half-way left a folder that was never used, named or counted.
+        # r2: three copies, so each needs its own second (CI ran two in one second: "already exists").
+        self.distinct_stamps()
         real = coldcopy._copy_file
 
         def disk_full(src, dst, deadline, mode):
@@ -740,6 +802,56 @@ class Restore(CopyBase):
             coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
         self.assertIn('kept copy of each file it replaces', str(e.exception))
 
+    def test_a_restore_reads_its_temp_files_back_from_disk(self):
+        # r2 nit: the temps were hashed only as written, not read back from disk like the kept files.
+        real = coldcopy._hash
+        with mock.patch.object(coldcopy, '_hash', lambda path, *a, **kw: 'torn' if coldcopy.RESTORE_TEMP in path
+                               and not path.endswith('-aside') else real(path, *a, **kw)):
+            with self.assertRaises(coldcopy.Incomplete) as e:
+                self.restore()
+        self.assertIn('does not read back', str(e.exception))
+        self.assertEqual(self.all_hashes() - {sha(os.path.join(self.dest, 'userdata', n)) for n in
+                                              ('statev2.sqlite', 'statev2.sqlite-wal', 'settings.json')},
+                         set(self.newer.values()), 'the home was changed')
+        self.assertFalse([n for n in os.listdir(self.userdata) if coldcopy.ASIDE in n], 'kept before checked')
+
+    def test_a_finished_restore_leaves_no_record(self):
+        facts = self.restore()
+        self.assertFalse(os.path.lexists(os.path.join(self.userdata, coldcopy.RESTORE_MARK)))
+        self.assertEqual(facts['alsoKept'], [])
+        self.assertIsNone(coldcopy.stopped_restore(self.m.home))
+
+    def test_an_unreadable_record_of_a_stopped_restore_is_refused_before_any_change(self):
+        self.m.write(f'home/userdata/{coldcopy.RESTORE_MARK}', '{"oldHome": ')
+        for call in (lambda: coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE),
+                     self.restore):
+            with self.assertRaises(RuntimeError) as e:
+                call()
+            self.assertIn('which kept files are the old home is unknown', str(e.exception))
+        self.assertEqual(self.all_hashes() - {sha(os.path.join(self.userdata, coldcopy.RESTORE_MARK))},
+                         set(self.newer.values()))
+
+    def test_a_record_whose_kept_files_were_put_back_by_hand_keeps_the_home_as_the_old_home(self):
+        self.m.write(f'home/userdata/{coldcopy.RESTORE_MARK}',
+                     json.dumps({'oldHome': ['statev2.sqlite.golive-aside-20260101T000000Z']}))
+        facts = self.restore()
+        self.assertIn('staleRecord', facts)
+        self.assertEqual(sorted(n.split(coldcopy.ASIDE)[0] for n in facts['movedAside']),
+                         ['settings.json', 'statev2.sqlite', 'statev2.sqlite-shm', 'statev2.sqlite-wal'])
+        self.assertLessEqual(set(self.newer.values()), self.all_hashes())
+        self.assertFalse(os.path.lexists(os.path.join(self.userdata, coldcopy.RESTORE_MARK)))
+
+    def test_a_refusal_for_restore_disk_names_kept_files_but_not_the_old_home_of_a_stopped_restore(self):
+        old = 'statev2.sqlite.golive-aside-20260101T000000Z'
+        other = 'settings.json.golive-aside-20250101T000000Z'
+        for n in (old, other):
+            self.m.write(f'home/userdata/{n}', b'old')
+        self.m.write(f'home/userdata/{coldcopy.RESTORE_MARK}', json.dumps({'oldHome': [old]}))
+        with mock.patch.object(coldcopy, '_free_bytes', return_value=0), self.assertRaises(OSError) as e:
+            coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+        self.assertIn(os.path.join(self.userdata, other), str(e.exception))
+        self.assertNotIn(old, str(e.exception))
+
     def test_a_restore_stopped_at_any_point_loses_nothing_and_never_pairs_a_wal_wrongly(self):
         # Should fix 2: was "moved aside one by one", which could leave a -wal without its database.
         stops = kill_at_each_change(self, self.restore, self.assert_whole_home)
@@ -963,10 +1075,15 @@ class RealSqlite(CopyBase):
         self.write_rows(20, 'leave-in-wal')
         self.adapter.stop()
 
+        mark = os.path.join(self.userdata, coldcopy.RESTORE_MARK)
+        seen = {}
+
         def restore():
+            seen.clear()
+            seen['record'] = os.path.exists(mark)  # a restore before this one stopped after it named the old home
             try:
                 with journal.run(self.m.state, 'back') as r, r.step('restore'):
-                    coldcopy.restore(r, dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+                    seen['result'] = coldcopy.restore(r, dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
             except Exception:
                 journal.settle(self.m.state, 'test: looked at the home')
                 raise
@@ -979,24 +1096,80 @@ class RealSqlite(CopyBase):
                 c.close()
 
         def kept_files_are_the_old_home():
-            kept = {n.split(coldcopy.ASIDE)[0]: n for n in os.listdir(self.userdata)
-                    if coldcopy.ASIDE in n and coldcopy.ASIDE + '2099' not in n}  # the first restore's, not the rerun's
-            if 'statev2.sqlite-wal' not in kept:
-                return
-            self.assertIn('statev2.sqlite', kept, 'the WAL was kept before its database')
+            # The old home is what the record names after a stop, and the result's movedAside after a rerun (r2
+            # data N1: a rerun's newest kept set was the half-way home, and nothing said which set was the old one).
+            if 'result' not in seen:
+                if not os.path.exists(mark):  # stopped before anything left the home: the home is the old home
+                    self.assertEqual(self.open_rows(self.userdata)[1], 120)
+                    return
+                with open(mark) as f:
+                    old_home = json.load(f)['oldHome']
+                new_server_writes = 0
+            else:
+                old_home = seen['result']['movedAside']
+                # A rerun with no record found the home whole (the old home), so T3's writes there belong to it.
+                new_server_writes = None if not seen['record'] else 0
+            kept = {n.split(coldcopy.ASIDE)[0]: n for n in old_home}
+            # The home before the first restore had all four; a T3 that started on a whole home and closed cleanly
+            # checkpointed its WAL away, so then the home (the old home) has no WAL and no -shm.
+            whole = {'statev2.sqlite', 'settings.json'} | ({'statev2.sqlite-wal', 'statev2.sqlite-shm'}
+                                                           if new_server_writes is not None else set())
+            self.assertLessEqual(whole, set(kept), 'the old home is not named whole')
             scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
             for n in ('statev2.sqlite', 'statev2.sqlite-wal'):
-                shutil.copy2(os.path.join(self.userdata, kept[n]), os.path.join(scratch, n))
+                if n in kept:
+                    shutil.copy2(os.path.join(self.userdata, kept[n]), os.path.join(scratch, n))
             c = sqlite3.connect(os.path.join(scratch, 'statev2.sqlite'))
             try:
                 self.assertEqual(c.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
                 self.assertEqual(c.execute('SELECT count(*) FROM t').fetchone()[0], 120)
-                self.assertEqual(c.execute("SELECT count(*) FROM t WHERE body='NEW SERVER'").fetchone()[0], 0,
-                                 'a T3 started after the stop changed the kept old files')
+                if new_server_writes is not None:
+                    self.assertEqual(c.execute("SELECT count(*) FROM t WHERE body='NEW SERVER'").fetchone()[0], 0,
+                                     'a T3 started after the stop changed the kept old files')
             finally:
                 c.close()
+            if 'result' in seen and seen['record']:
+                # What a T3 started on the half-way home wrote is kept too (alsoKept), never lost.
+                also = {n.split(coldcopy.ASIDE)[0] for n in seen['result']['alsoKept']}
+                self.assertNotIn('settings.json', also, 'an unchanged file was kept again')
+                self.assertIn('statev2.sqlite', also, 'what T3 wrote on the half-way home was not kept')
         stops = kill_at_each_change(self, restore, kept_files_are_the_old_home, after_stop=t3_starts)
-        self.assertGreaterEqual(stops, 10)
+        self.assertGreaterEqual(stops, 12)
+
+    def test_newest_kept_set_after_a_rerun_is_the_old_home(self):
+        # r2 data N1 (the lens probe RerunAsideProbe, as written): stopped between the WAL unlink and the database
+        # rename, the rerun kept the half-way home (database and settings, no WAL) as the newest "old" set.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'checkpoint')
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+
+        def restore(stamp):
+            with mock.patch.object(coldcopy, '_stamp', return_value=stamp), \
+                    journal.run(self.m.state, 'back') as r, r.step('restore'):
+                return coldcopy.restore(r, dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+        real = os.rename
+
+        def rn(a, b, *k, **kw):
+            if b.endswith('statev2.sqlite'):
+                raise OSError(5, 'killed before the db rename')
+            return real(a, b, *k, **kw)
+        with mock.patch.object(coldcopy.os, 'rename', rn), self.assertRaises(OSError):
+            restore('20990101T000001Z')
+        journal.settle(self.m.state, 'probe')
+        self.assertFalse(os.path.exists(self.db + '-wal'), 'not stopped where the probe means')
+        result = restore('20990101T000002Z')
+        newest = {n.split(coldcopy.ASIDE)[0] for n in result['movedAside']}
+        self.assertIn('statev2.sqlite-wal', newest)
+        # Nothing new was in the half-way home, so nothing was kept again; the named set opens with every commit.
+        self.assertEqual(result['alsoKept'], [])
+        self.assertTrue(all('20990101T000001Z' in n for n in result['movedAside']), result['movedAside'])
+        scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+        for n in result['movedAside']:
+            if n.startswith('statev2.sqlite.') or n.startswith('statev2.sqlite-wal.'):
+                shutil.copy2(os.path.join(self.userdata, n), os.path.join(scratch, n.split(coldcopy.ASIDE)[0]))
+        self.assertEqual(self.open_rows(scratch), ('ok', 120))
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
 
 
 class CommandLine(CopyBase):

@@ -4,7 +4,7 @@ both sides back (SHA256 must match), writes the manifest LAST, starts the same b
 
 A copy folder without a finished manifest is incomplete and is never used (incomplete_copies lists them; the kit
 deletes no data). A copy never goes over an old one, and restore() keeps a copy of every file it replaces under a
-name with a time in it.
+name with a time in it (kept_files lists them), and records which kept files are the old home until it is done.
 
 Every change is made inside a journalled step (journal.py); the checks and the wait for a quiet point come first.
 A guard (a second detached unit, started before T3 stops) waits for the run to end however it ends and starts T3
@@ -21,9 +21,11 @@ OWNER_LOCK = 'server-owner.sqlite'  # upstream's ownership lock (serverOwnership
 # Not copied: logs, this server's runtime record and ownership lock, and SQLite's -shm: it is only a shared-memory
 # index that SQLite rebuilds from the WAL when the first connection opens the database, so a cold copy never needs it.
 # Also never copied: a restore's leftover temp files (.<name>.golive-restore-<time>, from a restore stopped half-way)
-# and the old files a restore kept (<name>.golive-aside-<time>): old data, not the home's, and as big as the database.
-SKIP = frozenset({'logs', 'server-runtime.json', OWNER_LOCK, OWNER_LOCK + '-journal'})
+# and the old files a restore kept (<name>.golive-aside-<time>): old data, not the home's, and as big as the database,
+# and the record of a restore stopped half-way (RESTORE_MARK; a copy refuses while it is there).
 RESTORE_TEMP, ASIDE = '.golive-restore-', '.golive-aside-'
+RESTORE_MARK = 'golive-restore-unfinished.json'  # in userdata/ from before a restore's first removal until it is done
+SKIP = frozenset({'logs', 'server-runtime.json', OWNER_LOCK, OWNER_LOCK + '-journal', RESTORE_MARK})
 QUIET_GAP, STOP_WAIT, START_WAIT, POLL = 60, 120, 180, 1.0  # seconds; tests make them small
 GUARD_WAIT = 30  # seconds for the guard to say it waits, before T3 may stop
 GUARD_LOG = 'guard.log'
@@ -237,6 +239,47 @@ def incomplete_copies(backup_dir):
     return found
 
 
+def kept_files(home):
+    """Read only: [(path, bytes)] of the files restores kept in userdata/ (<name>.golive-aside-<time>[-n]), each
+    as big as what it kept. Never copied and never removed by the kit: the owner removes them once sure, except
+    those a restore stopped half-way names in RESTORE_MARK (the old home until that restore is run again)."""
+    userdata = os.path.join(home, 'userdata')
+    try:
+        names = sorted(n for n in os.listdir(userdata) if ASIDE in n and not n.startswith('.'))
+    except FileNotFoundError:
+        return []
+    found = []
+    for n in names:
+        try:
+            found.append((os.path.join(userdata, n), os.lstat(os.path.join(userdata, n)).st_size))
+        except FileNotFoundError:
+            pass
+    return found
+
+
+def stopped_restore(home):
+    """Read only: the record (RESTORE_MARK) a restore stopped half-way left in userdata/, or None. Its 'oldHome'
+    names the kept files that are the home as it was before that restore. None as well when a file it names is
+    gone (put back by hand): the home is then the old home again. RuntimeError when the record cannot be read: which
+    kept files are the old home is then unknown, and the owner looks."""
+    path = os.path.join(home, 'userdata', RESTORE_MARK)
+    try:
+        with open(path, encoding='utf-8') as f:
+            mark = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        mark = e
+    if not (isinstance(mark, dict) and isinstance(mark.get('oldHome'), list)
+            and all(isinstance(n, str) and ASIDE in n and '/' not in n for n in mark['oldHome'])):
+        raise RuntimeError(f'{path} cannot be read ({mark if isinstance(mark, Exception) else "not a record"}): a '
+                           'restore stopped half-way and which kept files are the old home is unknown; look at the '
+                           f'*{ASIDE}* files, put the home right, then remove it')
+    if not all(os.path.lexists(os.path.join(home, 'userdata', n)) for n in mark['oldHome']):
+        return None
+    return mark
+
+
 def _free_name(folder, name):
     """name, or name-2, name-3 ... : the first that does not exist in folder (an aside never goes over another)."""
     candidate, n = name, 1
@@ -276,14 +319,17 @@ def plan_restore(copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     (the same home for `back`, the live home for a rehearsal) and `version` the T3 build that will start on the
     restored data: it must be the build the copy was taken under (WrongCopy otherwise). Returns
     ({path: manifest entry}, [files to put back]); raises Incomplete (no finished manifest, no database, a file
-    that differs from the manifest), ValueError (a name that is not a top-level userdata file) or OSError (not
-    enough free disk: the copy's files plus a kept copy of each home file they replace plus the floor; the temp
-    files of a restore stopped half-way count as free, since restore() removes them first). A caller runs it as a
+    that differs from the manifest), ValueError (a name that is not a top-level userdata file), RuntimeError (the
+    record of a restore stopped half-way cannot be read, see stopped_restore) or OSError (not enough free disk:
+    the copy's files plus a kept copy of each home file they replace plus the floor; the temp files of a restore
+    stopped half-way count as free, since restore() removes them first; the refusal names the files earlier
+    restores kept, except the old home of a restore stopped half-way). A caller runs it as a
     pre-check before its restore step, so a refusal changes nothing and needs no settling; restore() runs it
     again."""
     m = read_manifest(copy_dir, from_home, version)
     files = {e.get('path'): e for e in m['files'] if isinstance(e, dict) and e.get('kind') == 'file'}
     userdata = os.path.join(home, 'userdata')
+    prior = stopped_restore(home)
     want = []
     for name in names:
         if '/' in name or name in ('', '.', '..'):
@@ -299,8 +345,10 @@ def plan_restore(copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     leftover = sum(os.lstat(os.path.join(userdata, n)).st_size for n in _leftover_temps(userdata))
     need = sum(files[n]['bytes'] for n in want) + kept + floor_bytes
     if _free_bytes(userdata) + leftover < need:
+        old_home = {os.path.join(userdata, n) for n in (prior or {}).get('oldHome', ())}
         raise OSError(f'not enough free disk in {userdata} for the restore ({need // MB} MB needed: the copy, a '
-                      'kept copy of each file it replaces, the floor)')
+                      'kept copy of each file it replaces, the floor)'
+                      f'{_room_note((), [(p, b) for p, b in kept_files(home) if p not in old_home])}')
     return files, want
 
 
@@ -320,6 +368,37 @@ def _leftover_temps(userdata):
     home file it was being kept from is still there)."""
     return sorted(n for n in os.listdir(userdata) if n.startswith('.') and RESTORE_TEMP in n
                   and stat.S_ISREG(os.lstat(os.path.join(userdata, n)).st_mode))
+
+
+def _unchanged(userdata, n, kept_name, copied):
+    """True when home file n holds exactly the old home's kept file kept_name or the copy's file (manifest entry
+    `copied`): a rerun has nothing new to keep from it."""
+    path = os.path.join(userdata, n)
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    digest = None
+    if copied is not None and copied.get('bytes') == st.st_size:
+        digest = _hash(path, drop_cache=True)
+        if digest == copied.get('sha256'):
+            return True
+    if kept_name is not None:
+        kept = os.path.join(userdata, kept_name)
+        kst = os.lstat(kept)
+        if stat.S_ISREG(kst.st_mode) and kst.st_size == st.st_size:
+            return (digest or _hash(path, drop_cache=True)) == _hash(kept, drop_cache=True)
+    return False
+
+
+def _write_mark(userdata, record, stamp):
+    """Write RESTORE_MARK through a temp file (a restore temp: a rerun removes it if this stops) and a rename."""
+    tmp = os.path.join(userdata, _free_name(userdata, f'.{RESTORE_MARK}{RESTORE_TEMP}{stamp}'))
+    with open(tmp, 'x', encoding='utf-8') as f:
+        json.dump(record, f, indent=1, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, os.path.join(userdata, RESTORE_MARK))
+    _fsync_dir(userdata)
 
 
 def _keep(userdata, n, stamp):
@@ -348,36 +427,50 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     Order, so that a stop at any point loses nothing and never leaves a WAL without its database or a database
     with another database's WAL:
     0. temp files of an earlier restore stopped half-way are removed (see _leftover_temps);
-    1. the copy's files are copied in under temp names (.<name>.golive-restore-<time>) and checked;
+    1. the copy's files are copied in under temp names (.<name>.golive-restore-<time>), then read back from disk;
     2. every home file this replaces is kept first: an fsynced copy <name>.golive-aside-<time> (see _keep). From
        here on the old files are kept whatever happens, even if T3 starts on the home before the restore ends;
-    3. the database's -shm, -journal and -wal leave the home, then the files the copy does not hold. The home now
-       has its own database without its WAL: an older but whole database;
-    4. the copy's database renames over the home's (atomic), then its WAL and journal go in.
-    Running it again starts again from the untouched copy. The CALLER keeps T3 from starting until the step is
-    done (a T3 started after a stop in step 3 or 4 serves that older database or the copy's without its WAL; the
-    kept files stay the old home either way): settling such a stop means running the restore again, or putting
-    the kept files back, before T3 starts."""
+    3. RESTORE_MARK is written: it names the kept files that are the old home;
+    4. the database's -shm, -journal and -wal leave the home, then the files the copy does not hold. The home now
+       has its own database file without its WAL: older, and not a database to serve (the WAL may hold commits,
+       and after a crash in the middle of a checkpoint the file alone may be torn until the WAL is replayed);
+    5. the copy's database renames over the home's (atomic), then its WAL and journal go in;
+    6. RESTORE_MARK is removed: the restore is done.
+    Running it again starts again from the untouched copy. A rerun after a stop in steps 4-6 finds RESTORE_MARK:
+    the home is then half-way, not the old home, so its result names the old home from the record ('movedAside')
+    and it keeps only home files that hold anything new ('alsoKept': what a T3 started after the stop wrote).
+    The CALLER keeps T3 from starting until the step is done (a T3 started after a stop in steps 4-6 serves that
+    older database file or the copy's without its WAL; the kept files stay the old home either way): settling such
+    a stop means running the restore again, or putting the kept files RESTORE_MARK names back and removing it,
+    before T3 starts."""
     run.require_step('restore')
     files, want = plan_restore(copy_dir, home, from_home=from_home, version=version, names=names,
                                floor_bytes=floor_bytes)
     userdata = os.path.join(home, 'userdata')
+    mark_path = os.path.join(userdata, RESTORE_MARK)
     lock = hold_owner_lock(userdata, 0)
     try:
-        stamp, temps, aside = _stamp(), {}, []
+        prior = stopped_restore(home)
+        stale = prior is None and os.path.lexists(mark_path)
+        stamp, temps, kept = _stamp(), {}, []
         cleaned = _leftover_temps(userdata)
         for n in cleaned:
             os.unlink(os.path.join(userdata, n))
         for n in want:
             tmp = os.path.join(userdata, _free_name(userdata, f'.{n}{RESTORE_TEMP}{stamp}'))
             _, digest = _copy_file(os.path.join(copy_dir, 'userdata', n), tmp, None, files[n]['mode'])
-            if digest != files[n]['sha256']:
-                raise Incomplete(f'{tmp} does not match the manifest after copying')
+            if digest != files[n]['sha256'] or _hash(tmp, drop_cache=True) != digest:
+                raise Incomplete(f'{tmp} does not read back as the manifest says')
             temps[n] = tmp
         _fsync_dir(userdata)
+        old = {k.split(ASIDE)[0]: k for k in prior['oldHome']} if prior else {}
         for n in _replaced(userdata, names):
-            aside.append(_keep(userdata, n, stamp))
+            if prior is not None and _unchanged(userdata, n, old.get(n), files.get(n)):
+                continue  # the old home is kept already, or it is the copy's file: nothing new in it
+            kept.append(_keep(userdata, n, stamp))
             _fsync_dir(userdata)
+        if prior is None:
+            _write_mark(userdata, {'oldHome': kept, 'at': stamp, 'copy': copy_dir}, stamp)
         for name in names:
             for n in _companions(name) + ([name] if name not in temps else []):
                 if os.path.lexists(os.path.join(userdata, n)):
@@ -388,9 +481,16 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
                 if n in temps:
                     os.rename(temps[n], os.path.join(userdata, n))
                     _fsync_dir(userdata)
+        os.unlink(mark_path)
+        _fsync_dir(userdata)
     finally:
         lock.close()
-    return {'copy': copy_dir, 'restored': want, 'movedAside': aside, 'removedTemps': cleaned}
+    result = {'copy': copy_dir, 'restored': want, 'movedAside': prior['oldHome'] if prior else kept,
+              'alsoKept': kept if prior else [], 'removedTemps': cleaned}
+    if stale:
+        result['staleRecord'] = ('a file the record of a stopped restore named was gone (put back by hand): the home '
+                                 'was kept as the old home')
+    return result
 
 
 # --- the practice stop ---
@@ -485,10 +585,10 @@ def _free_bytes(path):
     return st.f_bavail * st.f_frsize
 
 
-def _free_check(cfg, total, incomplete=()):
+def _free_check(cfg, total, incomplete=(), kept=()):
     """Refused unless the backup disk holds the copy plus the floor and the stateDir disk (the journal, the guard
     log) keeps the floor free; a disk holding both needs the copy plus one floor. A refusal names the incomplete
-    copy folders (never used) the owner may remove to make room."""
+    copy folders (never used) and the files restores kept that the owner may remove to make room."""
     need = {}
     for folder, size in ((cfg.backup_dir, total), (cfg.state_dir, 0)):
         path = _existing(folder)
@@ -498,15 +598,35 @@ def _free_check(cfg, total, incomplete=()):
         if free < want:
             raise journal.Refused(f'{path}: {free // MB} MB free, needs {want // MB} MB (the copy {total // MB} MB '
                                   f'on the backup disk, floor {cfg.free_floor_mb} MB); nothing was changed'
-                                  f'{_incomplete_note(incomplete)}')
+                                  f'{_room_note(incomplete, kept)}')
 
 
-def _incomplete_note(incomplete):
-    if not incomplete:
-        return ''
-    return (f'; {len(incomplete)} incomplete copy folder(s), never used, hold '
-            f'{sum(b for _, b in incomplete) // MB} MB and may be removed by hand: '
-            f'{", ".join(f for f, _ in incomplete)}')
+def _room_note(incomplete, kept):
+    """'; <what the owner may remove by hand>' naming incomplete copy folders and kept files, or ''."""
+    note = ''
+    if incomplete:
+        note += (f'; {len(incomplete)} incomplete copy folder(s), never used, hold '
+                 f'{sum(b for _, b in incomplete) // MB} MB and may be removed by hand: '
+                 f'{", ".join(f for f, _ in incomplete)}')
+    if kept:
+        note += (f'; {len(kept)} file(s) earlier restores kept (old data) hold {sum(b for _, b in kept) // MB} MB '
+                 f'and may be removed by hand once no longer needed: {", ".join(f for f, _ in kept)}')
+    return note
+
+
+def _home_problem(cfg):
+    """Why this home cannot be copied as it is (None when it can): a database that is a link (a copy takes the
+    files of userdata/, so it would hold the link, not the database), or a restore stopped half-way (the home is
+    neither the old one nor the copy's)."""
+    userdata = os.path.join(cfg.home, 'userdata')
+    links = [n for n in _family(live.DATABASE) if os.path.islink(os.path.join(userdata, n))]
+    if links:
+        return (f'{", ".join(links)} in {userdata} is a link: the copy takes files only and would hold the link, '
+                'not the database')
+    if os.path.lexists(os.path.join(userdata, RESTORE_MARK)):
+        return (f'a restore stopped half-way ({os.path.join(userdata, RESTORE_MARK)} is there): run it again, or '
+                'put back the kept files it names and remove it, before a copy')
+    return None
 
 
 def _plan_total(cfg):
@@ -625,16 +745,19 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
         if code != 0 or result.get('nothing'):
             raise journal.Refused('; '.join(failed + result['info']) or 'check refused')
         server = result['live']
-        incomplete = incomplete_copies(cfg.backup_dir)
-        if incomplete:
-            say(_incomplete_note(incomplete)[2:])
-        _free_check(cfg, _plan_total(cfg), incomplete)  # before the wait: no use waiting hours for no room
+        why = _home_problem(cfg)
+        if why is not None:
+            raise journal.Refused(f'{why}; nothing was changed')
+        incomplete, kept = incomplete_copies(cfg.backup_dir), kept_files(cfg.home)
+        if incomplete or kept:
+            say(_room_note(incomplete, kept)[2:])
+        _free_check(cfg, _plan_total(cfg), incomplete, kept)  # before the wait: no use waiting hours for no room
         if cfg.quiet_command is None and not owner_says_go:
             raise journal.Refused('the machine file has no golive.quietCommand: set one, or pass --owner-says-go')
         if not owner_says_go:
             wait_quiet(cfg, server['version'], say)
-            _free_check(cfg, _plan_total(cfg), incomplete)  # and again after it: the wait may have taken hours
-        why = _server_changed(cfg, adapter, server)
+            _free_check(cfg, _plan_total(cfg), incomplete, kept)  # and again after it: the wait may have taken hours
+        why = _server_changed(cfg, adapter, server) or _home_problem(cfg)
         if why is not None:
             raise journal.Refused(f'{why}; nothing was changed')
         dest = os.path.join(cfg.backup_dir, f't3-copy-{_stamp()}-{server["version"]}')
@@ -656,7 +779,7 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
             ok, detail = quiet_now(cfg, server['version'])
             failed_hook = None if ok else f'not quiet any more: {detail}'
         if failed_hook is None:  # the last look before the stop
-            failed_hook = _server_changed(cfg, adapter, server)
+            failed_hook = _server_changed(cfg, adapter, server) or _home_problem(cfg)
         if failed_hook is None and not _guard_alive(adapter, unit):
             failed_hook = f'the guard {unit} is not running any more ({look})'
         if failed_hook is not None:
@@ -713,7 +836,7 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
                 first.add_note(f'then: {type(later).__name__}: {later}')
             raise first
         return {'copy': dest, 'bytes': total, 'liveVersion': server['version'], 'leftOut': left_out,
-                'incompleteCopies': [f for f, _ in incomplete]}
+                'incompleteCopies': [f for f, _ in incomplete], 'keptFiles': [f for f, _ in kept]}
 
 
 def guard(cfg, adapter, run_id):
