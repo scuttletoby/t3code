@@ -1,0 +1,62 @@
+# An example caller of fleet-watch (README.md). Copy it to .github/workflows/ on the project's default branch and fill
+# in the CAPITALS. A workflow_run and a schedule run from the default branch's copy, so a pull request cannot change it.
+name: Fleet watch
+
+on:
+  workflow_run:
+    workflows: [CI WORKFLOW NAME] # the `name:` of each workflow in the fleet config's trusted.workflows
+    types: [completed]
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions: {}
+
+concurrency:
+  # One watch per run; the sweeps queue behind each other. A second watch of one run would find the re-run going.
+  group: fleet-watch-${{ github.event.workflow_run.id || 'sweep' }}
+
+jobs:
+  watch:
+    # A run that passed has nothing to re-run.
+    if: github.event_name == 'schedule' || github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest # GitHub-hosted, or an always-on pool's labels: never a dispatcher pool's
+    timeout-minutes: 10
+    permissions:
+      actions: write # read runs, jobs and job logs; cancel and re-run runs
+      contents: read # the checkout of the config
+    steps:
+      - uses: actions/checkout@<sha> # pin by full SHA
+        with:
+          sparse-checkout: .github/fleet.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: watch
+        uses: scuttletoby/t3code/fork-ci/actions/fleet-watch@<release sha of ci/vN> # ci/vN
+        with:
+          config: .github/fleet.json
+          verb: ${{ github.event_name == 'schedule' && 'sweep' || 'watch' }}
+          run-id: ${{ github.event.workflow_run.id }}
+          vars: ${{ toJSON(vars) }}
+      # Optional: a red-run report (for example, one that files an issue when the default branch goes red). Asked
+      # after the watch step, so a re-run it started is there; a re-run it could not start is not pending.
+      - id: pending
+        if: always() && github.event_name == 'workflow_run'
+        uses: scuttletoby/t3code/fork-ci/actions/fleet-watch@<release sha of ci/vN> # ci/vN
+        continue-on-error: true # a failed step leaves pending empty: report the red
+        with:
+          config: .github/fleet.json
+          verb: pending
+          run-id: ${{ github.event.workflow_run.id }}
+          attempt: ${{ github.event.workflow_run.run_attempt }}
+      - if: always() && github.event_name == 'workflow_run' && steps.pending.outputs.pending != 'true'
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        # The report must do each (run_id, attempt) once: the sweeps below may list this attempt too.
+        run: REPORT RED COMMAND "$RUN_ID" "$ATTEMPT"
+      - if: always() && github.event_name == 'schedule' && steps.watch.outputs.reds != '' && steps.watch.outputs.reds != '[]'
+        env:
+          REDS: ${{ steps.watch.outputs.reds }} # [{"run_id": N, "attempt": A}, ...]
+        # The report must do each (run_id, attempt) once: every sweep of an hour lists it again, and a workflow_run
+        # of the re-run (if GitHub fires one) reports it above.
+        run: REPORT RED ATTEMPTS COMMAND "$REDS"
