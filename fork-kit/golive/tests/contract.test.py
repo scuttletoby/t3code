@@ -10,7 +10,7 @@ import os, re, sys, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golive_fixture  # noqa: E402,F401  (puts the kit on sys.path)
-from golive import live, osadapter  # noqa: E402
+from golive import coldcopy, live, osadapter  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(golive_fixture.KIT))
 
@@ -55,6 +55,11 @@ UPSTREAM = [
     ('apps/server/src/config.ts', 'join(stateDir, "server-runtime.json")', 'server runtime file'),
     ('apps/server/src/config.ts', f'join(stateDir, "{live.DATABASE}")', 'database file'),
     ('apps/server/src/config.ts', ': "userdata",', 'state folder userdata/'),
+    ('apps/server/src/serverOwnership.ts',
+     f'const ownershipLockPath = (stateDir: string) => NodePath.join(stateDir, "{coldcopy.OWNER_LOCK}");',
+     'coldcopy.OWNER_LOCK: the ownership lock copy and restore hold'),
+    ('apps/server/src/serverOwnership.ts', 'db.exec("PRAGMA busy_timeout = 250; BEGIN EXCLUSIVE;");',
+     'coldcopy.hold_owner_lock: an exclusive transaction'),
     ('packages/shared/src/cliRelease.ts', 'export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";', 'SHA256SUMS'),
     ('packages/shared/src/cliRelease.ts',
      'return `t3-${version}-${platformKey}.${platformKey.startsWith("win32") ? "zip" : "tar.gz"}`;',
