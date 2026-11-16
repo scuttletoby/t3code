@@ -5,7 +5,7 @@ walls, and a distro that is not fresh is refused with nothing changed.
 
   python3 -I -B fork-kit/pc-agents/tests/setup.test.py
 """
-import json, os, re, shutil, stat, sys, unittest
+import json, os, re, shutil, signal, stat, subprocess, sys, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_distro import CONFIG, KIT, REPO, SHA1, SHA2, Case, blob, cli, k  # noqa: E402
@@ -45,7 +45,7 @@ class Setup(Case):
             p = self.path(f'/opt/pc-agents/{SHA1}/{dst}')
             self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), mode, dst)
             self.assertEqual(blob(p), blob(os.path.join(REPO, src)), dst)
-        self.assertIn('agent:x:1100:1100::/home/agent:/bin/bash', self.read('/etc/passwd'))
+        self.assertIn('agent:x:1100:1100::/home/agent:/usr/sbin/nologin', self.read('/etc/passwd'))
         self.assertIn('/etc/systemd/system/user@1100.service', k.masks(c))
         t3 = self.path('/opt/pc-agents/t3/runtime/versions/1.2.3/t3')
         self.assertEqual(os.stat(t3).st_uid, os.geteuid())
@@ -137,7 +137,8 @@ class Setup(Case):
             with self.assertRaises(KeyboardInterrupt):
                 self.setup_run()
             cli.put = real_put
-            self.assertFalse([line for line in self.log() if line.startswith('enable')], f'stopped at write {stop}')
+            if stop < total:   # the last write is the marker right before the restart, after the enable
+                self.assertFalse([line for line in self.log() if line.startswith('enable')], f'stopped at write {stop}')
             code, out = self.setup_run()
             self.assertEqual(code, 0, f'stopped at write {stop} ({writes[stop - 1]}): {out}')
             self.assertEqual({p: v[4] for p, v in self.snapshot().items()}, whole, f'stopped at write {stop}')
@@ -242,6 +243,186 @@ class Setup(Case):
         self.assertFalse(os.path.lexists(self.path(k.PENDING)))
 
 
+    def test_t3_that_dies_a_moment_after_the_restart_is_reported(self):
+        self.ready()
+        self.write('/log/t3-dies', '')   # T3 starts, then exits on something it cannot apply
+        self.machine({**CONFIG, 'memoryMax': '4G'})
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('T3 did not start or stay up (T3 is inactive)', out)
+        self.assertNotIn('done:', out)
+        self.assertTrue(os.path.isfile(self.path(k.PENDING)))
+        os.unlink(self.path('/log/t3-dies'))
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.lexists(self.path(k.PENDING)))
+
+    def test_rerun_within_the_start_limit_still_restarts_t3(self):
+        self.ready()
+        self.write('/log/units/t3code-agents.service.limit', '')   # systemd: start request repeated too quickly
+        self.machine({**CONFIG, 'memoryMax': '4G'})
+        os.unlink(self.path('/log/systemctl'))
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        log = self.log()
+        self.assertLess(log.index('reset-failed t3code-agents.service'), log.index('restart t3code-agents.service'))
+
+    def test_agent_of_an_older_kit_gets_no_login_shell(self):
+        self.ready()
+        self.write('/etc/passwd', self.read('/etc/passwd').replace('/home/agent:/usr/sbin/nologin', '/home/agent:/bin/bash'))
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertIn('agent:x:1100:1100::/home/agent:/usr/sbin/nologin', self.read('/etc/passwd'))
+        self.assertEqual(self.log('usermod'), ['--shell /usr/sbin/nologin agent'])
+        os.unlink(self.path('/log/usermod'))
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertEqual(self.log('usermod'), [])   # once
+
+
+class RestartPending(Case):
+    """The restart wall with setup: a T3 that started before setup's last change fails `check`."""
+    stop_after = Setup.stop_after
+
+    def test_interrupted_upgrade_keeps_old_t3_and_check_fails(self):   # lenspcas1 #1
+        self.ready()
+        self.machine({**CONFIG, 't3Version': '1.2.4', 'maxRuntimeMode': 'approval-required'})
+        self.write('/log/install-fail', '')
+        self.assertEqual(self.setup_run()[0], 1)
+        running = self.read('/log/units/t3code-agents.service.active')
+        self.assertIn('versions/1.2.3/t3 serve', running)
+        self.assertIn('full-access', running)
+        code, out = self.call(cli.main, ['as-agent', '--', 'sh'])
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.log('systemd-run'), [])
+        os.unlink(self.path('/log/systemctl'))
+        code, out = self.check('--enforce')
+        self.assertNotEqual(code, 0, out)
+        self.assertIn('FAIL  restart', out)
+        self.assertIn('stop t3code-agents.service', self.log())
+        os.unlink(self.path('/log/install-fail'))
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertIn('versions/1.2.4/t3 serve', self.read('/log/units/t3code-agents.service.active'))
+        self.assertEqual(self.check('--enforce')[0], 0)
+
+    def test_killed_after_the_policy_is_written_check_fails(self):   # lenspcac1 #3
+        self.ready()
+        self.machine({**CONFIG, 'maxRuntimeMode': 'approval-required'})
+        self.stop_after('/etc/t3code/policy.json')
+        self.assertNotIn('approval-required', self.read('/log/units/t3code-agents.service.active'))
+        self.assertNotEqual(self.check('--enforce')[0], 0)
+
+    def test_upgrade_killed_at_any_write_fails_check_until_run_again(self):
+        def files():
+            return {p: v[4] for p, v in self.snapshot().items() if p not in (k.PENDING, k.RECORD)}
+        upgrade = {**CONFIG, 'memoryMax': '4G', 'maxRuntimeMode': 'approval-required'}
+        real_put, writes = cli.put, []
+        self.addCleanup(setattr, cli, 'put', real_put)
+        self.ready()
+        self.machine(upgrade)
+        cli.put = lambda *a, **kw: writes.append(a[0]) or real_put(*a, **kw)
+        self.assertEqual(self.setup_run(SHA2)[0], 0)
+        cli.put = real_put
+        self.assertGreater(len(writes), 10)
+        for stop in range(1, len(writes) + 1):
+            shutil.rmtree(self.root)
+            self.setUp()
+            self.ready()
+            self.machine(upgrade)
+            before = files()
+
+            def stopping(*a, n=[0], **kw):
+                n[0] += 1
+                if n[0] == stop:
+                    raise KeyboardInterrupt
+                return real_put(*a, **kw)
+            cli.put = stopping
+            with self.assertRaises(KeyboardInterrupt):
+                self.setup_run(SHA2)
+            cli.put = real_put
+            code, out = self.check()
+            if files() != before:   # something T3 runs with changed
+                self.assertIn('FAIL  restart', out, f'stopped at write {stop} ({writes[stop - 1]})')
+            code, out = self.setup_run(SHA2)
+            self.assertEqual(code, 0, f'stopped at write {stop}: {out}')
+            code, out = self.check()
+            self.assertEqual(code, 0, f'stopped at write {stop}: {out}')
+
+    def test_check_passes_on_its_own_restart_and_a_kill_while_watching_restarts_again(self):
+        self.ready()
+        self.machine({**CONFIG, 'memoryMax': '4G'})
+        real, seen = cli.stays_up, []
+
+        def watching():   # killed while setup watches the restarted T3
+            seen.append(self.check())
+            raise KeyboardInterrupt
+        cli.stays_up = watching
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.setup_run()
+        finally:
+            cli.stays_up = real
+        self.assertEqual(seen[0][0], 0, seen[0][1])   # the T3 setup just restarted is not stale
+        self.assertTrue(os.path.isfile(self.path(k.PENDING)))
+        self.assertEqual(self.check()[0], 0)
+        os.unlink(self.path('/log/systemctl'))
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertIn('restart t3code-agents.service', self.log())   # once more, then the marker goes
+        self.assertFalse(os.path.lexists(self.path(k.PENDING)))
+
+    def test_marker_of_an_older_kit_fails_until_setup_runs_again(self):
+        self.ready()
+        self.write(k.PENDING, 'setup changed what T3 runs with; the next good run restarts T3 and removes this\n')
+        self.assertIn('FAIL  restart', self.check()[1])
+        os.unlink(self.path('/log/systemctl'))
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertIn('restart t3code-agents.service', self.log())
+        self.assertFalse(os.path.lexists(self.path(k.PENDING)))
+        self.assertEqual(self.check()[0], 0)
+
+
+class Signals(Case):
+    def test_sigterm_or_sighup_kills_the_running_download_too(self):
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig.name):
+                self.write('/log/install-hang', '')
+                p = subprocess.Popen([sys.executable, '-I', os.path.join(KIT, 'sbin', 'pc-agents'), 'setup',
+                                      '--source', REPO, '--sha', SHA1], env={'PC_AGENTS_ROOT': self.root,
+                                      'PATH': '/usr/bin:/bin'}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                hang = self.path('/log/hang.pid')
+                try:
+                    end = time.monotonic() + 60
+                    while not os.path.exists(hang) and time.monotonic() < end and p.poll() is None:
+                        time.sleep(0.05)
+                    self.assertTrue(os.path.exists(hang), 'the fake download did not start')
+                    time.sleep(0.2)
+                    pid = int(self.read('/log/hang.pid'))
+                    p.send_signal(sig)
+                    self.assertEqual(p.wait(timeout=30), 128 + sig)
+                    end = time.monotonic() + 10
+                    while time.monotonic() < end and alive(pid):
+                        time.sleep(0.05)
+                    self.assertFalse(alive(pid), 'the download outlived pc-agents')
+                finally:
+                    if p.poll() is None:
+                        p.kill()
+                        p.wait()
+                    if os.path.exists(hang):
+                        try:
+                            os.kill(int(self.read('/log/hang.pid')), signal.SIGKILL)
+                        except (ProcessLookupError, ValueError):
+                            pass
+                        os.unlink(hang)
+
+
+def alive(pid):
+    """pid runs (a zombie, ended but not yet reaped, does not count)."""
+    try:
+        with open(f'/proc/{pid}/stat', encoding='ascii') as f:
+            return f.read().rsplit(')', 1)[1].split()[0] != 'Z'
+    except FileNotFoundError:
+        return False
+
+
 class StaleFirewall(Case):
     def test_tightened_allow_with_failed_install(self):
         self.machine({**CONFIG, 'allow': ['192.168.1.0/24']})
@@ -251,7 +432,10 @@ class StaleFirewall(Case):
         self.write('/log/install-fail', '')
         self.assertEqual(self.setup_run()[0], 1)
         self.assertNotIn('192.168.1.0/24', self.read('/log/nft-loaded'))   # new table already loaded
-        self.assertEqual(self.check('--enforce')[0], 0)                      # and check agrees with the file
+        status, out = self.check()
+        fails = [line for line in out.splitlines() if line.startswith('FAIL')]
+        self.assertEqual(status, 1)                      # the old T3 still runs: only the restart wall fails,
+        self.assertEqual([line.split()[1] for line in fails], ['restart'], out)   # the firewall agrees with the file
 
     def test_a_loaded_table_that_is_not_the_files_fails(self):
         self.ready()
@@ -266,15 +450,18 @@ class StaleFirewall(Case):
 class AsAgent(Case):
     def test_runs_as_the_agent_under_the_units_walls(self):
         self.ready()
-        code, out = self.call(cli.main, ['as-agent', '--', 'claude', 'login'])
+        tool = 'pc-agents-test-tool-only-in-the-agents-path'   # like claude in ~/.local/bin: not on root's PATH
+        code, out = self.call(cli.main, ['as-agent', '--', tool, 'login'])
         self.assertEqual(code, 0, out)
         argv = self.log('systemd-run')
-        for arg in ('--pty', '--uid=agent', '--gid=agent', '--setenv=HOME=/home/agent',
+        self.assertEqual(argv[-5:], ['--', '/usr/bin/env', '--', tool, 'login'])   # env looks it up in PATH below
+        self.assertTrue([a for a in argv if re.fullmatch(r'--unit=pc-agents-as-agent-\d+', a)], argv)
+        for arg in ('--pty', '--uid=agent', '--gid=agent', '--setenv=HOME=/home/agent', '--setenv=SHELL=/bin/bash',
+                    '--setenv=PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin',
                     '--property=InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale'):
             self.assertIn(arg, argv)
         for line in k.sandbox(k.config()):
             self.assertIn('--property=' + line, argv)
-        self.assertEqual(argv[-3:], ['--', 'claude', 'login'])
 
     def test_refused_when_a_wall_does_not_hold(self):
         self.ready()

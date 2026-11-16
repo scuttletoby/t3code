@@ -32,7 +32,11 @@ so the agent cannot undo it:
 - no Windows drive is mounted;
 - the loaded firewall table is the one from the kit's `firewall.nft`: `pc-agents load-firewall` saves the file's hash
   and what the kernel then lists, and any later change, or an older file left loaded, differs;
-- the default gateway (the Windows host) is in a blocked range, and no `allow` or `peers` entry lets it through.
+- the default gateway (the Windows host) is in a blocked range, and no `allow` or `peers` entry lets it through;
+- no T3 runs that started before setup's last change: while setup's marker `/etc/pc-agents/restart-pending` is there
+  (see "Runs again" below), a T3 process started before the time in it fails this wall, and so does a marker or a
+  start time it cannot read. So the 2-minute check stops a T3 that a stopped or failed setup left running with old
+  files, and `pc-agents as-agent` refuses meanwhile. Setup's own first check skips it.
 
 The fleet's `mounts`, `sockets` and `userns` walls are
 about the CI launcher's job units, so they are not reported here; the unit's own sandbox is checked instead (it must
@@ -89,11 +93,13 @@ refuses what is cheap to tell (a field of a provider instance, an object deeper 
 two settings, a blank `organization`); T3 refuses the rest, like a field inside a setting that can be empty (lock the
 whole setting), says why in its log (`journalctl -u t3code-agents`) and does not start. T3 exits 1 on a policy it
 cannot apply, the same code as any other failure, so the unit cannot tell it apart (`RestartPreventExitStatus=`);
-it gives up after 5 starts in 10 minutes instead (`StartLimitBurst=5`).
+it gives up after 5 starts in 10 minutes instead (`StartLimitBurst=5`). Setup clears that count
+(`systemctl reset-failed`) before it starts T3, so running it again within the 10 minutes still starts T3.
 
 A wall that fails stops T3, and nothing starts it again by itself: fix what `pc-agents check` names (or run
 `pc-agents setup` again), then start it as root: `systemctl start t3code-agents.service` (its own start runs the
-check first and refuses on a failed wall).
+check first and refuses on a failed wall). If it says `start request repeated too quickly`, run
+`systemctl reset-failed t3code-agents.service` first.
 
 ## Owner steps (once per PC)
 
@@ -117,19 +123,35 @@ Commands are for Windows PowerShell unless a step says otherwise. `<distro>` is 
 6. **Join Tailscale** with the tag (as root in the distro): install it
    (`curl -fsSL https://tailscale.com/install.sh | sh`), then `tailscale up --advertise-tags=<tag> --accept-dns=false`
    (keep the kit's public nameservers; MagicDNS is on the tailnet, which the agent cannot reach) and open the link it
-   prints in a browser on any machine. Put the linking T3's Tailscale address in `peers` (step 2's file) and run step 3
-   again. The ACL is below.
+   prints in a browser on any machine. The linking T3's Tailscale address is already in `peers` (step 2's file needs
+   it; setup refuses a file without it); if that address changes, edit the file and run step 3 again. The ACL is
+   below.
 7. **Log in to Claude as the agent:** never open a shell as `agent` (`wsl -u agent` would start the agent's own
    session, outside T3's walls). Run each command through the kit instead, which runs it as `agent` under the same
    walls as T3 (a transient system unit, `systemd-run`):
    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- sh -c '<the install command from Claude Code's docs>'`,
-   then the same with `-- claude`; open the link it prints in your browser. Codex: the same with `-- codex login`.
+   then the same with `-- claude`; open the link it prints in your browser. The kit runs the command through `env`
+   with the agent's `PATH` (`/home/agent/.local/bin` first), so a bare `claude` is found there, and with only
+   `HOME`, `T3CODE_HOME`, `PATH` and `SHELL` set. Codex: its browser login waits on `localhost` port 1455, outside
+   `devPorts`, so the walls refuse it: use its device-code login instead, the same with `-- codex login --device-auth`
+   (`codex login --help` names it).
 8. **Log in to GitHub as the agent:** install `gh` (as root, from GitHub CLI's docs), then
    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- gh auth login --with-token` and paste
    a fine-grained token for the agents' repos into that window only.
 9. **Link from the other T3:** on this PC's T3 (`http://<tailscale address>:<port>`), Settings → Sharing & access →
    make a pairing code. In the other T3: Settings → Environments → Linked environments → Link, the same address
    and the code, **Full access**.
+10. **Keep the distro running:** WSL stops a distro soon after its last window closes, and does not start one when
+    Windows starts. A logon task of your own (no administrator needed) keeps this one running while you are logged
+    in. In PowerShell, as yourself (the same task as the desk starter's, `fork-kit/desk/windows/start-desk.ps1`):
+    ```powershell
+    $a = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument '--headless wsl.exe -d <distro> -u root --exec sleep infinity'
+    Register-ScheduledTask -TaskName 'pc-agents <distro>' -Action $a -Trigger (New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)) -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) -Force
+    Start-ScheduledTask -TaskName 'pc-agents <distro>'
+    ```
+    `conhost.exe --headless` shows no window. Running it again replaces the task. A distro set up before this step
+    only needs these lines; nothing in the distro changes. To remove it:
+    `Unregister-ScheduledTask -TaskName 'pc-agents <distro>' -Confirm:$false`.
 
 Run step 3 again for a new release or a changed machine file (and steps 4 and 5 if it asks); T3 restarts only when
 something changed. To remove everything: `wsl --unregister <distro>`.
@@ -154,15 +176,26 @@ allowed (connection tracking).
 
 - **Again:** every file is compared before it is written; an unchanged file is not touched, and T3 restarts only
   when a file, the release or the T3 version changed. The tests run the setup twice and find no change.
-- **Stopped half-way:** each file is written whole (a new file, then one rename). Before the first change, setup
-  writes the root-owned marker `/etc/pc-agents/restart-pending`; it is removed only after T3 restarted and is
-  running. So a run stopped anywhere, or a failed T3 install, leaves the marker, and the next good run restarts T3
-  even when it has nothing left to write (an old T3 never keeps running under new files). The record
+- **Stopped half-way:** each file is written whole (a new file, then one rename). Before and after every change
+  (and after a T3 install, and once more right before its restart), setup writes the root-owned marker
+  `/etc/pc-agents/restart-pending` with this boot's id and the time (`CLOCK_MONOTONIC`, the clock of systemd's
+  `ExecMainStartTimestampMonotonic`, which no clock change moves). It is removed only after T3 restarted and stayed
+  up for 15 seconds (the same process, active, no automatic restart). So a run stopped anywhere, or a failed T3
+  install, leaves the marker, and the next good run restarts T3 even when it has nothing left to write. Meanwhile
+  the `restart` wall fails while the T3 that runs started before the marker's time, so the 2-minute check stops it
+  (an old T3 never keeps running under new files and a passing check). A run stopped during setup's own restart or
+  its 15 seconds leaves a T3 started after the marker: the wall passes, and the next run restarts it once more. A
+  marker of an earlier boot passes (every T3 now started after it); one an older kit wrote, with no time in it,
+  fails until setup runs again. A T3 that starts and then exits within the 15 seconds is reported (`T3 did not
+  start or stay up`), and the marker stays. The record
   (`/etc/pc-agents/installed.tsv`) holds a file's old and new hash while it is replaced, so a run stopped right after
   a write, followed by an edit of the machine file, is not mistaken for a hand edit. A new T3 version is installed by
   root after the new firewall is loaded, so a slow or failed download never leaves the old firewall in place.
-- **Timeouts:** every program setup runs has a time limit (30 minutes for T3's download, 15 for `apt-get`); past it
-  the whole process group is stopped and setup says so. Run it again.
+- **Timeouts and signals:** every program setup runs has a time limit (30 minutes for T3's download, 15 for
+  `apt-get`); past it the whole process group is stopped and setup says so. Run it again. Ctrl-C, `SIGTERM` or
+  `SIGHUP` (a closed window) stop setup the same way, the running download's whole group too.
+- **Start limit:** a rerun within 10 minutes of five failed starts still starts T3 (`systemctl reset-failed` first).
+- **An older kit's distro:** an `agent` made with a login shell gets `/usr/sbin/nologin` (`usermod`), once.
 - **A distro that is not fresh:** refused before anything is written, with the reasons: another login user, an
   `agent` with another uid or in another group, a file the kit would write that it did not write (or that was
   edited since, for example a hand-written `wsl.conf` or `policy.json`), a cron, at or ssh unit where the kit masks
@@ -206,7 +239,12 @@ allowed (connection tracking).
 - **DNS** goes to the public `nameservers` only. A `systemd-resolved` stub (`127.0.0.53`), which may resolve LAN
   names through Windows, is out of reach: the agent's localhost traffic outside T3's port and `devPorts` is dropped.
 - **Terminals:** what the agent prints in a terminal can use escape codes, such as OSC 52, which some terminals turn
-  into a write to the Windows clipboard. Do not paste from the clipboard blindly after watching agent output.
+  into a write to the Windows clipboard. `pc-agents as-agent` runs with `--pty`, so the owner steps' output reaches
+  your terminal that way too. Do not paste from the clipboard blindly after watching agent output.
+- **Runs only while you are logged in:** the logon task (step 10) keeps the distro running while you are logged in
+  and the PC is awake. Logging out, sleep, a Windows restart or `wsl --shutdown` stop T3 (the linking T3 sees this
+  PC offline); the task starts it again at your next logon. Without the task, T3 stops soon after the last WSL
+  window closes.
 - **No namespaces in the unit** (`RestrictNamespaces=yes`): provider sandboxes that need them (bubblewrap) do not
   run; the distro is the sandbox, so use full access.
 - **Tailscale, Claude Code and `gh` are yours to install** (steps 6 to 8): their installers and logins need you.
@@ -224,7 +262,10 @@ python3 -I -B fork-kit/pc-agents/tests/check.test.py
 ```
 
 A fake distro in a temporary folder (`PC_AGENTS_ROOT`, refused for root; `tests/fake_distro.py`), with fake
-`useradd`, T3's installer, `systemctl` (it keeps which units are enabled and running), `systemd-run` and `nft`: every
-file and mode, a second run changes nothing, a run stopped at every write finishes on the next and restarts T3, each
-kind of foreign distro is refused, and each wall fails on its own when its part is taken away.
+`useradd`, `usermod`, T3's installer, `systemctl` (it keeps which units are enabled and running, their main process
+and start time, a start limit, and a T3 that dies a moment after it starts), `systemd-run` (a bare command is looked
+up in the caller's `PATH`, as the real one does) and `nft`: every file and mode, a second run changes nothing, a run
+stopped at every write finishes on the next and restarts T3, an upgrade stopped at every write fails `check` until
+setup runs again, `SIGTERM` and `SIGHUP` end the download too, each kind of foreign distro is refused, and each wall
+fails on its own when its part is taken away.
 `apps/server/src/policy/managedSettings.forkKeys.test.ts` proves the managed policy locks the fork's settings.

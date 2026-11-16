@@ -3,12 +3,13 @@
 
   pc-agents setup --source DIR --sha SHA   as root, in a fresh distro: make or repair everything; safe to run again
   pc-agents check [--enforce]              every wall, PASS or FAIL; exit 0 only when all hold. --enforce also
-                                           stops T3 when one fails (the timer, every 2 minutes). T3's unit runs
-                                           it before every start, so T3 never starts on a failed wall.
+                                           stops T3 and every as-agent unit when one fails (the timer, every 2
+                                           minutes). T3's unit runs it before every start, so T3 never starts on
+                                           a failed wall.
   pc-agents load-firewall                  as root: load the agent firewall and note what the kernel lists
   pc-agents as-agent -- CMD...             as root: run CMD as the agent under T3's unit walls (the owner steps)
 Standard library only."""
-import os, re, stat, sys
+import os, re, stat, sys, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 LIB = os.path.join(HERE, 'lib')
@@ -36,10 +37,12 @@ def same(path, data, mode, link=False):
 
 def put(path, data, mode, link=False):
     """Write a file (or a link) whole: a new file beside it, then one rename. Returns True when it changed. Every
-    change but to the record marks T3 for a restart first, so a run stopped after it still restarts T3 next time."""
+    change but to the record marks T3 for a restart before and after it, so a run stopped after it still restarts T3
+    next time, and `check` fails on a T3 that started before it."""
     if same(path, data, mode, link):
         return False
-    if path not in (k.RECORD, k.PENDING):
+    marks = path not in (k.RECORD, k.PENDING)
+    if marks:
         mark()
     real = k.ROOT + path
     os.makedirs(os.path.dirname(real), mode=0o755, exist_ok=True)
@@ -57,13 +60,15 @@ def put(path, data, mode, link=False):
                 os.fchown(f.fileno(), 0, 0)
             os.fsync(f.fileno())
     os.replace(tmp, real)
+    if marks:
+        mark()
     return True
 
 
 def mark():
-    """Note that T3 must restart (root's marker, removed only once T3 restarted and runs)."""
-    if not k.lstat(k.PENDING):
-        put(k.PENDING, 'setup changed what T3 runs with; the next good run restarts T3 and removes this\n', 0o644)
+    """Note that T3 must restart, and when setup last changed something (root's marker, rewritten on every change and
+    removed only once T3 restarted and stayed up). A T3 started before that time is stale: `check` fails on it."""
+    put(k.PENDING, k.marker(), 0o644)
 
 
 def keep(done):
@@ -126,6 +131,7 @@ def install_t3(c, version, done):
                   timeout=1800)
         if r.returncode or k.lstat(folder + '/t3') is None:
             return f'T3 install failed: {(r.stderr or r.stdout).strip()[-400:]}'
+        mark()
     if not done.get(folder + '/t3'):   # a mismatch is left to the runtime wall; only a missing hash is added
         done[folder + '/t3'] = {k.file_sha(folder + '/t3')}
         keep(done)
@@ -147,10 +153,14 @@ def setup(source, sha):
     if bad:
         return say('refused, nothing changed:\n  ' + '\n  '.join(bad)) or 1
     if k.USER not in k.users()[0]:
-        r = k.run(['/usr/sbin/useradd', '--create-home', '--home-dir', k.HOME, '--shell', '/bin/bash',
+        r = k.run(['/usr/sbin/useradd', '--create-home', '--home-dir', k.HOME, '--shell', k.NOLOGIN,
                    '--uid', str(c['agentUid']), '--user-group', k.USER])
         if r.returncode:
             return say(f'useradd failed: {r.stderr.strip()[-300:]}') or 1
+    elif k.login_shell(k.USER) != k.NOLOGIN:   # an agent an older kit made with a login shell
+        r = k.run(['/usr/sbin/usermod', '--shell', k.NOLOGIN, k.USER])
+        if r.returncode:
+            return say(f'usermod failed: {r.stderr.strip()[-300:]}') or 1
     if k.lstat('/usr/sbin/nft') is None:
         for argv in (['/usr/bin/apt-get', 'update'], ['/usr/bin/apt-get', 'install', '-y', 'nftables']):
             r = k.run(argv, timeout=900)
@@ -189,19 +199,41 @@ def setup(source, sha):
         k.run(['/usr/bin/systemctl', 'disable', '--now'] + units)
         return say('a wall does not hold, so T3 is not enabled. After a first run: wsl --terminate <this distro> '
                    'from Windows, then run setup again') or 3
+    k.run(['/usr/bin/systemctl', 'reset-failed', k.UNIT])   # a rerun within the start limit's 10 minutes still starts
+    ran = k.run(['/usr/bin/systemctl', 'is-active', k.UNIT]).returncode == 0
     r = k.run(['/usr/bin/systemctl', 'enable', '--now'] + units)
     if r.returncode == 0 and k.lstat(k.PENDING):
+        mark()   # every change of this and earlier runs is before now; the T3 started next is after it
         r = k.run(['/usr/bin/systemctl', 'restart', k.UNIT])
     if r.returncode == 0:
         r = k.run(['/usr/bin/systemctl', 'is-active', k.UNIT])
-    if r.returncode:
-        return say(f'T3 did not start ({(r.stderr or r.stdout).strip()[-300:]}): see journalctl -u {k.UNIT}; '
-                   'run setup again once fixed') or 1
+    why = (r.stderr or r.stdout).strip()[-300:] if r.returncode else \
+        stays_up() if k.lstat(k.PENDING) or not ran else None
+    if why:
+        return say(f'T3 did not start or stay up ({why}): see journalctl -u {k.UNIT}; run setup again once fixed') or 1
     if k.lstat(k.PENDING):
         os.unlink(k.ROOT + k.PENDING)
     say(f'done: T3 serves on port {c["port"]}. Next: tailscale up --advertise-tags={c["tailscaleTag"]} '
         '--accept-dns=false')
     return 0
+
+
+def stays_up():
+    """Why T3 did not stay up for k.SETTLE seconds after a start (it can exit on a policy it cannot apply a moment
+    after it started), or None: active all along, the same main process, no automatic restart."""
+    first, end = None, time.monotonic() + k.SETTLE
+    while True:
+        r = k.run(['/usr/bin/systemctl', 'show', '-p', 'ActiveState,MainPID,NRestarts', k.UNIT])
+        got = k.props(r.stdout)
+        now = (got.get('ActiveState'), got.get('MainPID'), got.get('NRestarts'))
+        if r.returncode or now[0] != 'active' or now[1] in (None, '', '0'):
+            return f'T3 is {now[0] or "unknown"}'
+        if first and now != first:
+            return f'T3 restarted (main process {first[1]} then {now[1]}, restarts {first[2]} then {now[2]})'
+        first = first or now
+        if time.monotonic() >= end:
+            return None
+        time.sleep(k.SETTLE_STEP)
 
 
 def as_agent(cmd):
@@ -215,10 +247,12 @@ def as_agent(cmd):
         return say(str(e)) or 2
     if check(False) != 0:
         return say('a wall does not hold: not running anything as the agent') or 1
-    argv = [k.ROOT + '/usr/bin/systemd-run', '--quiet', '--collect', '--pty', f'--uid={k.USER}', f'--gid={k.USER}',
-            f'--working-directory={k.HOME}', f'--setenv=HOME={k.HOME}', f'--setenv=T3CODE_HOME={k.HOME}/.t3',
-            f'--setenv=PATH={k.HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin']
-    argv += [f'--property={line}' for line in k.sandbox(c)] + ['--'] + cmd
+    argv = [k.ROOT + '/usr/bin/systemd-run', '--quiet', '--collect', '--pty', f'--unit={k.AS_AGENT}-{os.getpid()}',
+            f'--uid={k.USER}', f'--gid={k.USER}', f'--working-directory={k.HOME}', f'--setenv=HOME={k.HOME}',
+            f'--setenv=T3CODE_HOME={k.HOME}/.t3', f'--setenv=PATH={k.HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin',
+            '--setenv=SHELL=/bin/bash']
+    # systemd-run looks a bare name up in root's PATH, not the unit's: env looks it up in the agent's (~/.local/bin)
+    argv += [f'--property={line}' for line in k.sandbox(c)] + ['--', '/usr/bin/env', '--'] + cmd
     return k.subprocess.call(argv)
 
 
@@ -280,6 +314,8 @@ def own_walls(c, before_enable=False):
                 k.user_problem(c, True) or (None if shell == k.NOLOGIN else
                                             f'{k.USER}\'s login shell is {shell}, not {k.NOLOGIN}')))
     out.append(('sudoers', f'no sudo rule covers {k.USER}', k.sudo_problem(c)))
+    if not before_enable:   # setup asks before its own restart, while the marker is there by design
+        out.append(('restart', 'no T3 runs that started before setup\'s last change', k.restart_problem()))
     current = k.lstat(k.OPT + '/current')
     target = os.readlink(k.ROOT + k.OPT + '/current') if current and stat.S_ISLNK(current.st_mode) else ''
     code = [] if current and current.st_uid == k.OWNER and re.fullmatch(r'[0-9a-f]{40}', target) else \
@@ -357,9 +393,10 @@ def check(enforce, before_enable=False):
         print(f'FAIL  {wall}  {what}: {why}'[:500] if why else f'PASS  {wall}  {what}', flush=True)
     failed = any(why for _, _, why in results)
     if failed and enforce:
-        r = k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
-        say(f'a wall does not hold: stopped {k.UNIT}' if r.returncode == 0 else
-            f'a wall does not hold, and stopping {k.UNIT} FAILED: {r.stderr.strip()[-300:]}')
+        for unit in (k.UNIT, f'{k.AS_AGENT}-*.service'):   # T3, then every running `pc-agents as-agent`
+            r = k.run(['/usr/bin/systemctl', 'stop', unit])
+            say(f'a wall does not hold: stopped {unit}' if r.returncode == 0 else
+                f'a wall does not hold, and stopping {unit} FAILED: {r.stderr.strip()[-300:]}')
     return 1 if failed else 0
 
 
@@ -378,4 +415,5 @@ def main(argv):
 
 
 if __name__ == '__main__':
+    k.stop_on_signals()
     sys.exit(main(sys.argv[1:]))
