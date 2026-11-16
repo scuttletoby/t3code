@@ -120,9 +120,46 @@ test("a part is the files under its prefixes and under none of its `!` prefixes"
   assert.deepEqual(pick("fork-kit/"), files.slice(0, 2));
   assert.deepEqual(pick("!fork-kit/"), files.slice(2));
   assert.deepEqual(pick("fork-kit/", "!fork-kit/x/"), files.slice(0, 1));
-  // Every file is in exactly one of the two parts the workflow runs.
-  for (const file of files)
-    assert.notEqual(inPart(file, ["fork-kit/"]), inPart(file, ["!fork-kit/"]));
+});
+
+// The arguments of each `node .github/scripts/fork-ci-tests.cjs ...` call in a workflow's text.
+const runnerCalls = (text) =>
+  text
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .flatMap((line) => [
+      ...line.matchAll(/\bnode\s+\.github\/scripts\/fork-ci-tests\.cjs((?:[ \t]+[^\s#;&|]+)*)/g),
+    ])
+    .map((match) =>
+      [...match[1].matchAll(/'([^']*)'|"([^"]*)"|(\S+)/g)].map((a) => a[1] ?? a[2] ?? a[3]),
+    );
+
+test("reads a workflow's runner calls, quotes removed, comment lines skipped", () => {
+  const text = [
+    "      # node .github/scripts/fork-ci-tests.cjs commented/",
+    "        run: node .github/scripts/fork-ci-tests.cjs fork-kit/",
+    "          node .github/scripts/fork-ci-tests.cjs '!fork-kit/' \"!x/\" # a note",
+    "          node .github/scripts/fork-ci-tests.cjs",
+  ].join("\n");
+  assert.deepEqual(runnerCalls(text), [["fork-kit/"], ["!fork-kit/", "!x/"], []]);
+});
+
+test("Fork tests' runner calls split every listed and present test into exactly one part", () => {
+  const root = path.resolve(__dirname, "../..");
+  const calls = runnerCalls(
+    fs.readFileSync(path.join(root, ".github/workflows/fork-tests.yml"), "utf8"),
+  );
+  assert.ok(calls.length > 0, "fork-tests.yml calls fork-ci-tests.cjs");
+  const listed = readList(fs.readFileSync(path.join(root, ".github/fork-ci-tests.txt"), "utf8"));
+  const files = [...new Set([...listed.map(({ file }) => file), ...presentTests(root)])];
+  const wrong = files
+    .map((file) => [file, calls.filter((parts) => inPart(file, parts))])
+    .filter(([, parts]) => parts.length !== 1)
+    .map(
+      ([file, parts]) =>
+        `${file}: in ${parts.length} parts (${parts.map((p) => p.join(" ") || "all").join("; ")})`,
+    );
+  assert.deepEqual(wrong, []);
 });
 
 test("a long test without a weight, or one far from its weight, gets a note", () => {
@@ -313,12 +350,37 @@ test("one part runs only its files, heaviest first; an unlisted file fails only 
     assert.equal(kit.run.status, 0, kit.run.stdout + kit.run.stderr);
     const groups = (out) => [...out.matchAll(/::group::(\S+)/g)].map((m) => m[1]);
     assert.deepEqual(groups(kit.run.stdout), ["fork-kit/heavy.test.sh", "fork-kit/light.test.sh"]);
+    // heavy.test.sh ends at once, far from its ~60s: the log asks for a new weight.
+    assert.match(
+      kit.run.stdout,
+      /::notice file=fork-kit\/heavy\.test\.sh::fork-kit\/heavy\.test\.sh took \d+ s, its weight is ~60s: update it/,
+    );
     assert.equal(rest.run.status, 1, rest.run.stdout + rest.run.stderr);
     assert.deepEqual(groups(rest.run.stdout), ["fork-ci/other.test.sh"]);
     assert.match(rest.run.stdout, /::error file=fork-ci\/unlisted\.test\.sh::.* is not in /);
   } finally {
     fs.rmSync(kit.root, { recursive: true, force: true });
     fs.rmSync(rest.root, { recursive: true, force: true });
+  }
+});
+
+test("a part that runs no test fails, so a wrong argument cannot skip its tests", () => {
+  const tests = { "fork-kit/a.test.sh": "echo a\n", "fork-ci/b.test.sh": "echo b\n" };
+  for (const args of [["fork-kits/"], ["fork-kit/", "!fork-kit/"]]) {
+    const { root, run } = runScript(tests, 1, args);
+    try {
+      assert.equal(run.status, 1, run.stdout + run.stderr);
+      assert.match(run.stdout, new RegExp(`::error::the part ${args.join(" ")} runs no test here`));
+      assert.doesNotMatch(run.stdout, /::group::/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const { root, run } = runScript(tests, 1, ["fork-kit/"]);
+  try {
+    assert.equal(run.status, 0, run.stdout + run.stderr);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

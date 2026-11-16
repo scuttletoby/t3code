@@ -242,6 +242,15 @@ async function main(parts = process.argv.slice(2)) {
     );
   for (const { file, why } of result.notRun)
     console.log(`::error file=${file}::${file} is not run: ${why}`);
+  // A part that runs nothing is a wrong argument (a typo, a renamed folder): its tests would never run.
+  const empty = parts.length > 0 && result.run.length === 0;
+  if (empty) {
+    failed += 1;
+    console.log(
+      `::error::the part ${parts.join(" ")} runs no test here: fix the argument of this ` +
+        `fork-ci-tests.cjs call (a typo or a renamed folder?), or its tests never run.`,
+    );
+  }
   for (const { file, runBy } of result.elsewhere)
     rows.push(`| \`${file}\` | run by \`${runBy}\` | | |`);
   for (const file of result.pending)
@@ -259,6 +268,7 @@ async function main(parts = process.argv.slice(2)) {
       [
         `### Fork script tests${parts.length ? ` (${parts.join(" ")})` : ""}`,
         "",
+        ...(empty ? [`**No test runs in this part: check its argument.**`, ""] : []),
         "| Test | Result | Time | Weight |",
         "| --- | --- | --- | --- |",
         ...rows,
