@@ -1,9 +1,7 @@
 // Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit is listed in .github/fork-ci-tests.txt and
 // runs here by extension (RUNNER), FORK_CI_TEST_JOBS at once (default: CPU count), or `run by <file>` (not an upstream
 // workflow; it names the test). Unlisted or runner-less tests fail; a listed one that is gone fails once history had it.
-// Order: tests without a weight (`~<seconds>s` in the list) first, in list order, then the longest first, so that a
-// long test does not start last. Arguments split the work over jobs by path: `fork-kit/` checks and runs only the
-// tests under fork-kit/, `!fork-kit/` all the others (no argument: all of them).
+// Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all); order() sets the start order.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
