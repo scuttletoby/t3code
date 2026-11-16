@@ -5,7 +5,14 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { plan, readList, findTests, presentTests } = require("./fork-ci-tests.cjs");
+const {
+  plan,
+  readList,
+  findTests,
+  presentTests,
+  runAll,
+  jobCount,
+} = require("./fork-ci-tests.cjs");
 
 const never = () => false;
 const here = (...files) => files.map((file) => ({ file, runBy: null }));
@@ -142,4 +149,175 @@ test("an unlisted test under .github/scripts or fork-ci fails the run", () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("runAll runs at most `jobs` at once, starts the next as soon as a slot frees, keeps the order", async () => {
+  const runs = new Map(); // item -> resolve of its run, in start order
+  const waiting = []; // [count, resolve]: resolved once that many runs started
+  const started = (count) =>
+    new Promise((resolve) => (runs.size >= count ? resolve() : waiting.push([count, resolve])));
+  let running = 0;
+  let most = 0;
+  const all = runAll(["a", "b", "c", "d"], 2, (item) => {
+    running += 1;
+    most = Math.max(most, running);
+    const done = new Promise((resolve) => runs.set(item, resolve)).then(() => {
+      running -= 1;
+      return item.toUpperCase();
+    });
+    for (const [count, resolve] of waiting) if (runs.size >= count) resolve();
+    return done;
+  });
+  await started(2);
+  assert.deepEqual([...runs.keys()], ["a", "b"]); // two at once, c waits for a free slot
+  runs.get("b")(); // the second ends first: its slot takes c
+  await started(3);
+  assert.deepEqual([...runs.keys()], ["a", "b", "c"]);
+  runs.get("a")();
+  await started(4);
+  runs.get("d")();
+  runs.get("c")();
+  assert.deepEqual(await all, ["A", "B", "C", "D"]);
+  assert.equal(most, 2);
+  assert.deepEqual(await runAll([], 4, async () => 1), []);
+});
+
+test("jobCount reads FORK_CI_TEST_JOBS, else the CPU count", () => {
+  assert.equal(jobCount({ FORK_CI_TEST_JOBS: "3" }), 3);
+  for (const bad of [undefined, "", "0", "-2", "1.5", "many"])
+    assert.equal(jobCount({ FORK_CI_TEST_JOBS: bad }), os.availableParallelism(), String(bad));
+});
+
+// Runs the real script in a scratch tree whose list names `tests` ({ file: shell text }).
+function runScript(tests, jobs) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-tests-"));
+  const write = (file, text) => {
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    fs.writeFileSync(path.join(root, file), text);
+  };
+  write(
+    ".github/scripts/fork-ci-tests.cjs",
+    fs.readFileSync(require.resolve("./fork-ci-tests.cjs")),
+  );
+  write(".github/fork-ci-tests.txt", Object.keys(tests).join("\n") + "\n");
+  for (const [file, text] of Object.entries(tests)) write(file, text);
+  const env = {
+    ...process.env,
+    FORK_CI_TEST_JOBS: String(jobs),
+    LEFT: path.join(root, "left.pid"),
+    MARKS: root,
+  };
+  delete env.GITHUB_STEP_SUMMARY;
+  const run = childProcess.spawnSync("node", [".github/scripts/fork-ci-tests.cjs"], {
+    cwd: root,
+    env,
+    encoding: "utf8",
+    timeout: 60000,
+  });
+  return { root, run };
+}
+
+// A test file that passes only when `other` starts while it runs (it waits up to 5 s for the other's mark).
+const meets = (name, other) =>
+  `echo ${name}-start; : > "$MARKS/${name}"\n` +
+  `for i in $(seq 50); do [ -e "$MARKS/${other}" ] && { echo ${name}-end; exit 0; }; sleep 0.1; done\n` +
+  `echo "${other} did not run beside ${name}"; exit 1\n`;
+
+test("test files run in parallel, each one's output in its own group, and a failure fails the run", () => {
+  const { root, run } = runScript(
+    {
+      "fork-ci/a.test.sh": meets("a", "b"),
+      "fork-ci/b.test.sh": meets("b", "a"),
+      "fork-ci/c.test.sh": "echo c-start; echo c-end; exit 3\n",
+    },
+    3,
+  );
+  try {
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    for (const name of ["a", "b", "c"])
+      assert.match(
+        run.stdout,
+        new RegExp(
+          `::group::fork-ci/${name}\\.test\\.sh \\([0-9.]+ s\\)\\n${name}-start\\n${name}-end\\n`,
+        ),
+      );
+    assert.doesNotMatch(run.stdout, /::error file=fork-ci\/[ab]\.test\.sh/);
+    assert.match(
+      run.stdout,
+      /::error file=fork-ci\/c\.test\.sh::fork-ci\/c\.test\.sh failed \(exit 3\)/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("FORK_CI_TEST_JOBS=1 runs one file at a time", () => {
+  const { root, run } = runScript(
+    { "fork-ci/a.test.sh": meets("a", "b"), "fork-ci/b.test.sh": meets("b", "a") },
+    1,
+  );
+  try {
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(run.stdout, /b did not run beside a/); // b started only after a ended
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a process a test leaves behind holding its output does not hang the run", () => {
+  const { root, run } = runScript(
+    { "fork-ci/left.test.sh": 'sleep 60 & echo $! > "$LEFT"; echo done\n' },
+    1,
+  );
+  try {
+    assert.equal(run.error, undefined, String(run.error)); // not killed at the 60 s limit: the run ended
+    assert.equal(run.status, 0, run.stdout + run.stderr);
+    assert.match(run.stdout, /::group::fork-ci\/left\.test\.sh[^\n]*\ndone\n/);
+  } finally {
+    try {
+      process.kill(Number(fs.readFileSync(path.join(root, "left.pid"), "utf8")));
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A pipe into a reader that stops early (`grep -q`, `grep -m`, `head`) kills the writer with SIGPIPE
+// whenever it has more to write; under `pipefail` that reads as a failed check, more often under load.
+const earlyExitPipe =
+  /(?<!\|)\|(?!\|)\s*!?\s*(?:grep\s+(?:-[A-Za-z]*[qm]|--quiet|--max-count)|head\b)/;
+const earlyExitPipes = (text) =>
+  text
+    .split("\n")
+    .map((line, index) => ({ line, number: index + 1 }))
+    .filter(({ line }) => !/^\s*#/.test(line) && earlyExitPipe.test(line));
+
+test("a pipe into grep -q, grep -m or head is found; reading the whole output first is not", () => {
+  const found = earlyExitPipes(
+    [
+      'sed -n "/a/,$p" f | grep -q x',
+      "! calls | grep -vqE y",
+      "git show c | grep -qx z",
+      "seq 9 | grep -m1 3",
+      'sed p <<< "$s" | head -n 1',
+      'grep -q x <<< "$(sed -n p f)"',
+      "a || grep -q x f",
+      "# a comment: `x | grep -q` stops early",
+      '[[ -z "$(grep -E a f | grep -vE b)" ]]',
+    ].join("\n"),
+  ).map(({ number }) => number);
+  assert.deepEqual(found, [1, 2, 3, 4, 5]);
+});
+
+test("no listed shell test pipes into a reader that stops early", () => {
+  const root = path.resolve(__dirname, "../..");
+  const shellTests = readList(fs.readFileSync(path.join(root, ".github/fork-ci-tests.txt"), "utf8"))
+    .map(({ file }) => file)
+    .filter((file) => file.endsWith(".sh") && fs.existsSync(path.join(root, file)));
+  assert.ok(shellTests.length > 0);
+  const found = shellTests.flatMap((file) =>
+    earlyExitPipes(fs.readFileSync(path.join(root, file), "utf8")).map(
+      ({ line, number }) => `${file}:${number}: ${line.trim()}`,
+    ),
+  );
+  assert.deepEqual(found, []);
 });
