@@ -150,24 +150,32 @@ def send(fd, out, size, stall=None):
     stall = STALL if stall is None else stall
     sha, sent = hashlib.sha256(), 0
     deadline = time.monotonic() + GRACE + size / MIN_RATE
+    wrote = 0
     old = signal.signal(signal.SIGALRM, stalled)
     try:
-        while sent < size and (data := os.read(fd, min(PIECE, size - sent))):
-            sha.update(data)
-            sent += len(data)
-            view = memoryview(data)
-            while view:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    raise Stalled
-                signal.alarm(max(1, min(stall, math.ceil(left))))   # each piece that moves starts the wait again
-                view = view[os.write(out, view[:WRITE]):]
+        try:
+            while sent < size and (data := os.read(fd, min(PIECE, size - sent))):
+                sha.update(data)
+                sent += len(data)
+                view = memoryview(data)
+                while view:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise Stalled
+                    signal.alarm(max(1, min(stall, math.ceil(left))))   # each piece that moves starts the wait again
+                    n = os.write(out, view[:WRITE])
+                    wrote += n
+                    view = view[n:]
+        finally:
+            signal.alarm(0)   # an alarm already on its way still arrives here, inside the `except Stalled` below
     except Stalled:
-        if time.monotonic() >= deadline:
+        if wrote == sent and not (sent < size and os.fstat(fd).st_size > sent):
+            pass   # the last alarm came after the last write: everything read was sent
+        elif time.monotonic() >= deadline:
             raise Refused(f'the desktop did not take {size} bytes within {GRACE + size / MIN_RATE:.0f} seconds '
                           f'(at least {MIN_RATE >> 10} KiB a second): stopped', 1) from None
-        raise Refused(f'the desktop took less than {WRITE >> 10} KiB in {stall} seconds: stopped', 1) from None
+        else:
+            raise Refused(f'the desktop took less than {WRITE >> 10} KiB in {stall} seconds: stopped', 1) from None
     finally:
-        signal.alarm(0)
         signal.signal(signal.SIGALRM, old)
     return sha.hexdigest(), sent

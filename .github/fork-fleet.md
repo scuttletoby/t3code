@@ -705,7 +705,12 @@ it is sent is fine (the old one is sent whole). A file dated more than five minu
 than `max_age_hours` or above `max_mb` is refused. Both folders and the files are
 root's (or the project's), readable by the desk-link user and writable by no one
 else (the owner itself is not checked, only that no one else may write); never
-put a secret in a seed: every job of the pool reads it.
+put a secret in a seed: every job of the pool reads it. **Make a seed only from
+trusted code (the default branch), never in a job that runs pull request code:**
+every later job of the pool starts from it, so a poisoned seed reaches them all.
+A file replaced by a rename while another hard link to the old one stays (a
+backup copy, say) is still "in place" for this check and is refused (exit 4):
+keep no second link to a seed file.
 
 The desktop asks for them with the desk link's key, in an ssh session of its
 own: the same forced command sends every command that starts with `seed` to
@@ -715,6 +720,14 @@ codes), never to a session. It answers `seeds` with the pool's list and
 size and SHA-256; anything else is refused. One stream per pool at a time; a
 desktop that takes less than 64 KiB in two minutes, or not the whole file within
 ten minutes plus one second per 256 KiB, is cut off and the next one may go.
+So a link must carry at least about 256 KiB a second (2 Mbit/s) for a large
+seed: at 100 KiB a second, a seed above about 96 MiB is always cut off. Size
+`max_mb` to the desktop's link. A desktop just fast enough not to stall can hold
+its pool's lock for a long time (16 GiB at 256 KiB a second is about 18 hours);
+only that pool's own seed streams wait, nothing else. The host does not limit
+how often a desktop asks: the key belongs to the pool's own desktop, one stream
+per pool runs at a time, and each is cut off at its deadline, so the most it
+costs is one file's reads and upload at a time.
 
 ## Owner steps on the repository
 
