@@ -74,6 +74,35 @@ class Lock(Base):
         with journal.lock(self.state, 'copy', exclusive=True):
             pass  # free: no stale lock to clear by hand
 
+    def test_a_killed_run_s_name_left_in_the_lock_is_not_named_as_the_holder(self):
+        # fork #187 nit: a killed run leaves its name in the lock file; while a check then holds the lock, a busy
+        # message must not name the dead process.
+        p = self.hold(kill=True)
+        p.wait()
+        with journal.lock(self.state, 'check', exclusive=False):
+            with self.assertRaises(journal.Busy) as e:
+                with journal.lock(self.state, 'copy', exclusive=True):
+                    pass
+        self.assertNotIn(str(p.pid), str(e.exception))
+        self.assertIn('a golive check is running', str(e.exception))
+
+    def test_wait_blocks_until_the_holder_ends(self):
+        p = self.hold(kill=False)
+        import threading
+        got = []
+
+        def guard():
+            with journal.lock(self.state, 'guard', True, wait=True):
+                got.append('held')
+        t = threading.Thread(target=guard)
+        t.daemon = True
+        t.start()
+        t.join(0.3)
+        self.assertTrue(t.is_alive(), 'did not wait')
+        fx.kill(p)
+        t.join(10)
+        self.assertEqual(len(got), 1)
+
     def test_the_state_folder_is_private(self):
         with journal.run(self.state, 'copy'):
             pass
@@ -124,6 +153,42 @@ class Journal(Base):
         self.assertIsNone(journal.unfinished(self.state))
         with journal.run(self.state, 'copy'):
             pass
+
+    def test_refused_after_every_step_is_done_needs_no_settling(self):
+        # fork #186: a command that stops on purpose after undoing its steps is "refused", not "failed".
+        with self.assertRaises(journal.Refused):
+            with journal.run(self.state, 'copy') as r:
+                with r.step('pre-hooks'):
+                    pass
+                with r.step('post-hooks'):
+                    pass
+                raise journal.Refused('not quiet')
+        run = journal.read(self.state)[0][-1]
+        self.assertEqual((run['end']['result'], run['end']['detail']), ('refused', 'Refused: not quiet'))
+        self.assertIsNone(journal.unfinished(self.state))
+
+    def test_refused_from_inside_a_step_is_a_failure(self):
+        with self.assertRaises(journal.Refused):
+            with journal.run(self.state, 'copy') as r:
+                with r.step('stop-service'):
+                    raise journal.Refused('half-way')
+        self.assertEqual(journal.read(self.state)[0][-1]['end']['result'], 'failed')
+        self.assertIsNotNone(journal.unfinished(self.state))
+
+    def test_a_change_outside_a_step_is_an_error(self):
+        # fork #186: the rule "changes only inside journalled steps" is enforced, not just written down.
+        with journal.run(self.state, 'switch') as r:
+            with self.assertRaises(RuntimeError) as e:
+                r.require_step('arm the rollback timer')
+            self.assertIn('outside a journalled step', str(e.exception))
+            self.assertIsNone(r.in_step)
+            with r.step('arm-timer'):
+                self.assertEqual(r.in_step, 'arm-timer')
+                r.require_step('arm the rollback timer')
+                with self.assertRaises(RuntimeError):
+                    with r.step('nested'):
+                        pass
+            self.assertIsNone(r.in_step)
 
     def test_run_ids_are_unique_within_a_second(self):
         for _ in range(3):
