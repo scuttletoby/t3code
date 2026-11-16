@@ -24,6 +24,19 @@
     "stageDir": "/srv/example/golive/stage",
     "backupDir": "/srv/example/golive/backups",
     "stateDir": "/srv/example/golive/state",
-    "freeFloorMb": 2048
+    "freeFloorMb": 2048,
+    "quietCommand": "/srv/example/golive/bin/quiet",
+    "preHooks": ["/srv/example/golive/bin/pause-jobs"],
+    "postHooks": ["/srv/example/golive/bin/resume-jobs"],
+    "quietWaitSeconds": 7200,
+    "stopLimitSeconds": 1800
+  },
+  "desk": {
+    "pool": "pc",
+    "host": "fleet-host.example",
+    "hostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "slots": 2,
+    "reserveMb": 4096,
+    "freeCommand": "/opt/fork-fleet/free-memory"
   }
 }
