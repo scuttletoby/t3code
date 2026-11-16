@@ -152,20 +152,33 @@ test("an unlisted test under .github/scripts or fork-ci fails the run", () => {
 });
 
 test("runAll runs at most `jobs` at once, starts the next as soon as a slot frees, keeps the order", async () => {
+  const runs = new Map(); // item -> resolve of its run, in start order
+  const waiting = []; // [count, resolve]: resolved once that many runs started
+  const started = (count) =>
+    new Promise((resolve) => (runs.size >= count ? resolve() : waiting.push([count, resolve])));
   let running = 0;
   let most = 0;
-  const started = [];
-  const results = await runAll([30, 5, 5, 5, 5], 2, async (ms) => {
-    started.push(ms);
+  const all = runAll(["a", "b", "c", "d"], 2, (item) => {
     running += 1;
     most = Math.max(most, running);
-    await new Promise((resolve) => setTimeout(resolve, ms));
-    running -= 1;
-    return ms * 2;
+    const done = new Promise((resolve) => runs.set(item, resolve)).then(() => {
+      running -= 1;
+      return item.toUpperCase();
+    });
+    for (const [count, resolve] of waiting) if (runs.size >= count) resolve();
+    return done;
   });
+  await started(2);
+  assert.deepEqual([...runs.keys()], ["a", "b"]); // two at once, c waits for a free slot
+  runs.get("b")(); // the second ends first: its slot takes c
+  await started(3);
+  assert.deepEqual([...runs.keys()], ["a", "b", "c"]);
+  runs.get("a")();
+  await started(4);
+  runs.get("d")();
+  runs.get("c")();
+  assert.deepEqual(await all, ["A", "B", "C", "D"]);
   assert.equal(most, 2);
-  assert.deepEqual(results, [60, 10, 10, 10, 10]);
-  assert.equal(started.length, 5);
   assert.deepEqual(await runAll([], 4, async () => 1), []);
 });
 
@@ -192,31 +205,35 @@ function runScript(tests, jobs) {
     ...process.env,
     FORK_CI_TEST_JOBS: String(jobs),
     LEFT: path.join(root, "left.pid"),
+    MARKS: root,
   };
   delete env.GITHUB_STEP_SUMMARY;
-  const started = Date.now();
   const run = childProcess.spawnSync("node", [".github/scripts/fork-ci-tests.cjs"], {
     cwd: root,
     env,
     encoding: "utf8",
     timeout: 60000,
   });
-  return { root, run, seconds: (Date.now() - started) / 1000 };
+  return { root, run };
 }
 
+// A test file that passes only when `other` starts while it runs (it waits up to 5 s for the other's mark).
+const meets = (name, other) =>
+  `echo ${name}-start; : > "$MARKS/${name}"\n` +
+  `for i in $(seq 50); do [ -e "$MARKS/${other}" ] && { echo ${name}-end; exit 0; }; sleep 0.1; done\n` +
+  `echo "${other} did not run beside ${name}"; exit 1\n`;
+
 test("test files run in parallel, each one's output in its own group, and a failure fails the run", () => {
-  const { root, run, seconds } = runScript(
+  const { root, run } = runScript(
     {
-      "fork-ci/a.test.sh": "echo a-start; sleep 2; echo a-end\n",
-      "fork-ci/b.test.sh": "echo b-start; sleep 2; echo b-end\n",
-      "fork-ci/c.test.sh": "echo c-start; sleep 2; echo c-end; exit 3\n",
+      "fork-ci/a.test.sh": meets("a", "b"),
+      "fork-ci/b.test.sh": meets("b", "a"),
+      "fork-ci/c.test.sh": "echo c-start; echo c-end; exit 3\n",
     },
     3,
   );
   try {
     assert.equal(run.status, 1, run.stdout + run.stderr);
-    // One after another they take 6 s.
-    assert.ok(seconds < 5, `took ${seconds} s`);
     for (const name of ["a", "b", "c"])
       assert.match(
         run.stdout,
@@ -224,6 +241,7 @@ test("test files run in parallel, each one's output in its own group, and a fail
           `::group::fork-ci/${name}\\.test\\.sh \\([0-9.]+ s\\)\\n${name}-start\\n${name}-end\\n`,
         ),
       );
+    assert.doesNotMatch(run.stdout, /::error file=fork-ci\/[ab]\.test\.sh/);
     assert.match(
       run.stdout,
       /::error file=fork-ci\/c\.test\.sh::fork-ci\/c\.test\.sh failed \(exit 3\)/,
@@ -233,15 +251,27 @@ test("test files run in parallel, each one's output in its own group, and a fail
   }
 });
 
+test("FORK_CI_TEST_JOBS=1 runs one file at a time", () => {
+  const { root, run } = runScript(
+    { "fork-ci/a.test.sh": meets("a", "b"), "fork-ci/b.test.sh": meets("b", "a") },
+    1,
+  );
+  try {
+    assert.equal(run.status, 1, run.stdout + run.stderr);
+    assert.match(run.stdout, /b did not run beside a/); // b started only after a ended
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a process a test leaves behind holding its output does not hang the run", () => {
-  const { root, run, seconds } = runScript(
+  const { root, run } = runScript(
     { "fork-ci/left.test.sh": 'sleep 60 & echo $! > "$LEFT"; echo done\n' },
     1,
   );
   try {
-    assert.equal(run.error, undefined, String(run.error));
+    assert.equal(run.error, undefined, String(run.error)); // not killed at the 60 s limit: the run ended
     assert.equal(run.status, 0, run.stdout + run.stderr);
-    assert.ok(seconds < 20, `took ${seconds} s`);
     assert.match(run.stdout, /::group::fork-ci\/left\.test\.sh[^\n]*\ndone\n/);
   } finally {
     try {
