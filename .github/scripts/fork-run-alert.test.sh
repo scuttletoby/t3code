@@ -83,8 +83,8 @@ expect() { # expect LABEL 'CONDITION' (shell, evaluated)
 }
 rc_is() { [[ "$rc" == "$1" ]]; }
 says() { grep -qF -- "$1" <<< "$out"; }
-called() { calls | grep -qF -- "$1"; }
-not_called() { ! calls | grep -qF -- "$1"; }
+called() { grep -qF -- "$1" <<< "$(calls)"; }
+not_called() { ! grep -qF -- "$1" <<< "$(calls)"; }
 issues() { jq length "$root/state/issues.json" 2> /dev/null || echo 0; }
 
 reset; run failure --message "The daily secret sweep failed"
