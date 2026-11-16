@@ -4,16 +4,19 @@
  */
 import {
   FORK_PATCH_RULES,
+  FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT,
   MCP_PROFILE_ALL,
   MCP_PROFILE_T3_ONLY,
   MCP_SUBAGENT_INHERIT,
   type ForkPatchRule,
   type ForkServerSettingKey,
+  type ProjectId,
   type ServerSettings,
   type ServerSettingsPatch,
   isBuiltInMcpProfileName,
   isDefinableMcpProfileName,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 const FORK_PATCH_KEYS = Object.keys(FORK_PATCH_RULES) as ReadonlyArray<ForkServerSettingKey>;
 
@@ -86,14 +89,53 @@ export function applyForkSettingsPatch(
   return next as Partial<Pick<ServerSettings, ForkServerSettingKey>>;
 }
 
+type ProjectOverrides = ServerSettings["projectSettingsOverrides"][ProjectId];
+
+/**
+ * `next` (the settings after `patch`) with each {@link FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT} key a
+ * project's entry in the patch leaves out kept as stored. Upstream replaces a project's entry whole,
+ * so without this an older client saving a project's scripts would drop its MCP profile and widen
+ * it to the server's. A removed project (`null`) keeps nothing; `""` in the entry clears the key.
+ */
+export function keepLeftOutForkProjectKeys(
+  current: ServerSettings,
+  patch: ServerSettingsPatch,
+  next: ServerSettings,
+): ServerSettings {
+  const storedProjects: Readonly<Record<string, ProjectOverrides>> =
+    current.projectSettingsOverrides;
+  let projects: Record<string, ProjectOverrides> | undefined;
+  for (const [projectId, entry] of Object.entries(patch.projectSettingsOverrides ?? {})) {
+    if (!isRecord(entry) || !Object.hasOwn(storedProjects, projectId)) continue;
+    const stored = storedProjects[projectId];
+    const kept: Record<string, string> = {};
+    for (const key of FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT) {
+      const value = stored?.[key];
+      if (value !== undefined && !Object.hasOwn(entry, key)) kept[key] = value;
+    }
+    if (Object.keys(kept).length === 0) continue;
+    projects ??= { ...next.projectSettingsOverrides };
+    // Upstream drops an entry left empty; a kept key brings it back.
+    projects[projectId] = { ...projects[projectId], ...kept };
+  }
+  return projects === undefined
+    ? next
+    : { ...next, projectSettingsOverrides: projects as ServerSettings["projectSettingsOverrides"] };
+}
+
 /**
  * Fork: why the server refused a save of fork settings, with the fix. The server fails the save
  * with upstream's `ServerSettingsError` (operation `normalize`, as for a patch that does not decode)
- * and this as its `cause`, so upstream's error type stays as it is; the cause's name and message
- * travel to the client with it.
+ * and this as its `cause`, so upstream's error type stays as it is; the cause's name
+ * (`ForkSettingsWriteError`) and message (`problem`) travel to the client with it.
  */
-export class ForkSettingsWriteError extends Error {
-  override readonly name = "ForkSettingsWriteError";
+export class ForkSettingsWriteError extends Schema.TaggedError<ForkSettingsWriteError>()(
+  "ForkSettingsWriteError",
+  { problem: Schema.String },
+) {
+  override get message(): string {
+    return this.problem;
+  }
 }
 
 /**

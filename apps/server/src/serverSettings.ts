@@ -50,15 +50,16 @@ import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { renameRetiredAutoUpdateKeys } from "./cloud/autoUpdateSettings.ts";
 import {
-  applyServerSettingsPatch,
   deriveLegacyProjectOverrides,
   fallbackTextGenerationModelSelection,
   isModelSelectionProviderEnabled,
 } from "@t3tools/shared/serverSettings";
+// Fork: the save check, and upstream's patch that keeps a project's MCP profile a client left out.
 import {
   ForkSettingsWriteError,
   forkSettingsWriteProblem,
 } from "@t3tools/shared/forkSettingsPatch";
+import { applyServerSettingsPatchKeepingForkProjectKeys as applyServerSettingsPatch } from "./fork/serverSettingsPatch.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
@@ -248,7 +249,7 @@ function ensureForkSettingsWriteAllowed(
         new ServerSettingsError({
           settingsPath,
           operation: "normalize",
-          cause: new ForkSettingsWriteError(problem),
+          cause: new ForkSettingsWriteError({ problem }),
         }),
       );
 }
@@ -335,6 +336,7 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
   ): Effect.Effect<ServerSettings, ServerSettingsError> =>
     writeSemaphore.withPermits(1)(
       Ref.get(currentSettingsRef).pipe(
+        // Fork: refuses a fork setting's save that could not apply, as the real layer does.
         Effect.flatMap((current) =>
           update(current).pipe(
             Effect.tap((next) => ensureForkSettingsWriteAllowed(current, next, "test settings")),
@@ -1252,7 +1254,7 @@ const make = Effect.gen(function* () {
         // An older client echoes a reference as the redacted marker; restore it before vetting so
         // a removed provider's reference is cleared below rather than restored by persistence.
         const updated = withEchoedSecretReferences(current, yield* update(current));
-        yield* ensureForkSettingsWriteAllowed(current, updated, settingsPath);
+        yield* ensureForkSettingsWriteAllowed(current, updated, settingsPath); // Fork: save check
         // Vet before secrets: a variable the policy hides from clients is not one they removed.
         const vetted = managed.vetWrite(current, yield* normalizeServerSettings(updated), patch);
         if (vetted._tag === "Locked") {

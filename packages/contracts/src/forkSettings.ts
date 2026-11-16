@@ -165,6 +165,17 @@ export const ForkProjectOverrideFields = {
   mcpSubagentProfile: Schema.optionalKey(McpProfileRef),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
+/**
+ * Fork project keys a project save keeps when the project's entry leaves them out: upstream replaces
+ * a project's entry whole, and a client that does not know a key (an older one) leaves it out, which
+ * would quietly widen that project to the server's profile. `""` clears one. (`waitChecks` keeps
+ * upstream's rule: left out is removed.)
+ */
+export const FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT = [
+  "mcpProfile",
+  "mcpSubagentProfile",
+] as const satisfies ReadonlyArray<keyof typeof ForkProjectOverrideFields>;
+
 /** A project's overrides of fork settings in a patch (each project's set is replaced whole). */
 export const ForkProjectOverridePatchFields = {
   /** A save refuses a bad check. */

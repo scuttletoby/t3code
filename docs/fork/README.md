@@ -151,8 +151,8 @@ Named MCP profiles. A profile says which outside MCP servers (`servers`) and whi
 own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Two profiles are built in: `all`
 (everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool); a profile cannot
 take their names, and one written in by hand makes that built-in refuse threads until it is removed
-or renamed. Nothing applies a profile yet: the provider adapters and the T3 tool filter come in later
-pull requests.
+(a save may send `null` under a built-in name to remove it) or renamed. Nothing applies a profile
+yet: the provider adapters and the T3 tool filter come in later pull requests.
 
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
@@ -186,7 +186,9 @@ Set: **Settings**, choose the project at the top, then **Wait checks**.
 
 ### `projectOverride.mcpProfile`
 
-A project's own default profile for its top-level threads. Not set: the server's `mcpProfile`.
+A project's own default profile for its top-level threads. Not set (absent or `""`): the server's
+`mcpProfile`. A project save that leaves this key out (an older client) keeps the stored value;
+only `""` clears it. The same holds for `mcpSubagentProfile`.
 
 ### `projectOverride.mcpSubagentProfile`
 

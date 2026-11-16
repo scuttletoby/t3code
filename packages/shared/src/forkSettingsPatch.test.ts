@@ -16,6 +16,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   applyForkSettingsPatch,
   forkSettingsWriteProblem,
+  keepLeftOutForkProjectKeys,
   splitForkSettingsPatch,
 } from "./forkSettingsPatch.ts";
 import { applyServerSettingsPatch } from "./serverSettings.ts";
@@ -328,5 +329,68 @@ describe("fork settings save check (MCP profile references)", () => {
     ],
   ] as const)("refuses %s, saying how to fix it", (_name, patch, message) => {
     expect(problemAfter(patch)).toMatch(message);
+  });
+});
+
+describe("a project save keeps the fork keys its entry leaves out", () => {
+  const project = ProjectId.make("project-1");
+  const other = ProjectId.make("project-2");
+  const base: ServerSettings = {
+    ...current,
+    mcpProfiles: { lean: { servers: [], t3Tools: [] } },
+    projectSettingsOverrides: {
+      [project]: { mcpProfile: "lean", mcpSubagentProfile: "t3-only", defaultProjectScripts: [] },
+      [other]: { defaultAutoPull: true },
+    },
+  };
+  type Patch = Parameters<typeof applyServerSettingsPatch>[1];
+  // What the server does: upstream's patch, then the kept keys (apps/server/src/fork).
+  const save = (settings: ServerSettings, patch: Patch) =>
+    keepLeftOutForkProjectKeys(settings, patch, applyServerSettingsPatch(settings, patch));
+
+  it("an older client's project save keeps the project's MCP profile", () => {
+    const patch = { projectSettingsOverrides: { [project]: { defaultProjectScripts: [] } } };
+    const next = save(base, patch);
+    expect(next.projectSettingsOverrides[project]).toEqual({
+      mcpProfile: "lean",
+      mcpSubagentProfile: "t3-only",
+      defaultProjectScripts: [],
+    });
+    expect(next.projectSettingsOverrides[other]).toEqual({ defaultAutoPull: true });
+    expect(forkSettingsWriteProblem(base, next)).toBeUndefined();
+    // Run again: the same result.
+    expect(save(next, patch)).toEqual(next);
+  });
+
+  it("keeps them when the entry comes back empty (upstream would drop the entry)", () => {
+    expect(
+      save(base, { projectSettingsOverrides: { [project]: {} } }).projectSettingsOverrides,
+    ).toEqual({
+      [project]: { mcpProfile: "lean", mcpSubagentProfile: "t3-only" },
+      [other]: { defaultAutoPull: true },
+    });
+  });
+
+  it("clears a key only on an explicit empty value, and changes one that is sent", () => {
+    const next = save(base, {
+      projectSettingsOverrides: { [project]: { mcpProfile: "", mcpSubagentProfile: "lean" } },
+    });
+    expect(next.projectSettingsOverrides[project]).toEqual({
+      mcpProfile: "",
+      mcpSubagentProfile: "lean",
+    });
+  });
+
+  it("keeps nothing for a removed project or one that had no keys", () => {
+    const next = save(base, {
+      projectSettingsOverrides: { [project]: null, [other]: { defaultAutoPull: false } },
+    });
+    expect(next.projectSettingsOverrides).toEqual({ [other]: { defaultAutoPull: false } });
+  });
+
+  it("returns the settings untouched when no project entry leaves a stored key out", () => {
+    const patch = { enableAgentBrowserAccess: false };
+    const next = applyServerSettingsPatch(base, patch);
+    expect(keepLeftOutForkProjectKeys(base, patch, next)).toBe(next);
   });
 });

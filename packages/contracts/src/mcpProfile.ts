@@ -116,18 +116,21 @@ const isSavableMcpProfile = (entry: unknown): boolean =>
   );
 
 /**
- * Profiles in a settings patch: each entry replaces the stored one whole; `null` removes it. Typed
- * as the settings file's map (each entry `unknown`), so a client may send back what it read; the
- * check refuses a bad name or entry. (Effect drops, rather than refuses, a record key its key
- * schema rejects, so names are checked on the whole map.)
+ * Profiles in a settings patch: each entry replaces the stored one whole; `null` removes it (also
+ * under a built-in name, to remove a hand-edited entry that breaks it). Entries are `unknown`, so a
+ * client may send back what it read. Names are checked on the whole map: Effect drops, rather than
+ * refuses, a record key its key schema rejects.
  */
 export const McpProfilesPatch = Schema.Record(Schema.String, Schema.Unknown)
   .check(
     Schema.makeFilter(
       (profiles: { readonly [name: string]: unknown }) =>
-        Object.keys(profiles).every(isDefinableMcpProfileName),
+        Object.entries(profiles).every(
+          ([name, entry]) =>
+            isDefinableMcpProfileName(name) || (entry === null && isBuiltInMcpProfileName(name)),
+        ),
       {
-        expected: `profile names of lower-case letters, digits and dashes (at most 40), other than ${MCP_BUILT_IN_PROFILE_NAMES.join(", ")} and ${MCP_SUBAGENT_INHERIT}`,
+        expected: `profile names of lower-case letters, digits and dashes (at most 40), other than ${MCP_BUILT_IN_PROFILE_NAMES.join(", ")} (null only, to remove one) and ${MCP_SUBAGENT_INHERIT}`,
       },
     ),
   )

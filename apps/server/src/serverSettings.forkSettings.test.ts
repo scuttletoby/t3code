@@ -258,9 +258,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork MCP profile
           .pipe(Effect.flip);
         const reason =
           'mcpProfile names MCP profile "lean", which is not set up: add that profile first, or pick "all" or "t3-only".';
-        // Upstream's error type, unchanged; the reason is its cause.
+        // Upstream's error type, unchanged; the reason is its cause, a tagged error.
         assert.strictEqual(error.operation, "normalize");
         assert.instanceOf(error.cause, ForkSettingsWriteError);
+        assert.strictEqual((error.cause as ForkSettingsWriteError)._tag, "ForkSettingsWriteError");
         assert.strictEqual((error.cause as Error).message, reason);
         // The reason reaches a client: the error as the RPC sends it and decodes it.
         const json = Schema.toCodecJson(ServerSettingsError);
@@ -273,5 +274,26 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork MCP profile
         const file = (yield* readFile) as Record<string, unknown>;
         assert.isFalse("mcpProfile" in file);
       }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("keeps a project's MCP profile when an older client saves the project without it", () =>
+    Effect.gen(function* () {
+      const start = {
+        ...FULL_FILE,
+        mcpProfiles: { lean: { servers: [], t3Tools: [] } },
+        projectSettingsOverrides: {
+          [PROJECT]: { mcpProfile: "lean", mcpSubagentProfile: "t3-only" },
+        },
+      };
+      // A client that does not know the MCP keys sends the project's entry without them.
+      const file = (yield* loadThenPatch(start, {
+        projectSettingsOverrides: { [PROJECT]: { enableAgentBrowserAccess: true } },
+      })) as { projectSettingsOverrides: Record<string, unknown> };
+      assert.deepStrictEqual(file.projectSettingsOverrides[PROJECT], {
+        enableAgentBrowserAccess: true,
+        mcpProfile: "lean",
+        mcpSubagentProfile: "t3-only",
+      });
+    }).pipe(Effect.provide(layerServerSettings())),
   );
 });

@@ -121,8 +121,17 @@ describe("MCP profile settings patch", () => {
     }
   });
 
+  it("takes null under a built-in name, so a hand-edited entry with that name can be removed", () => {
+    expect(decodePatch({ mcpProfiles: { all: null, "t3-only": null } }).mcpProfiles).toEqual({
+      all: null,
+      "t3-only": null,
+    });
+  });
+
   it.each([
     ["a built-in name", { mcpProfiles: { all: { servers: [], t3Tools: [] } } }],
+    ["a built-in name with a non-null value", { mcpProfiles: { "t3-only": "all" } }],
+    ["`inherit` with null", { mcpProfiles: { inherit: null } }],
     ["the name `inherit`", { mcpProfiles: { inherit: { servers: [], t3Tools: [] } } }],
     ["a bad name", { mcpProfiles: { "Bad Name": { servers: [], t3Tools: [] } } }],
     ["an unknown field", { mcpProfiles: { lean: { servers: [], t3Tools: [], extra: 1 } } }],
