@@ -2,7 +2,7 @@
 
 Every path is read and written under ROOT, which is '' (the real machine) except in the tests, where
 PC_AGENTS_ROOT names a fake one; root never gets a fake one. Standard library only."""
-import hashlib, ipaddress, json, os, pwd, re, subprocess
+import hashlib, ipaddress, json, os, re, signal, subprocess
 
 import machine_file
 
@@ -13,8 +13,11 @@ if ROOT and os.geteuid() == 0:
 OWNER = os.geteuid() if ROOT else 0   # who must own every file the kit writes
 HOME, USER = '/home/agent', 'agent'
 OPT, STATE = '/opt/pc-agents', '/etc/pc-agents'
-RECORD = STATE + '/installed.tsv'   # sha256 <TAB> path of every file this kit wrote
+RECORD = STATE + '/installed.tsv'   # sha256 <TAB> path of every file this kit wrote (a path may have two mid-write)
+LOADED = '/run/pc-agents/firewall.loaded'   # sha256 of the firewall file and `nft list` of it, saved when loaded
+T3 = OPT + '/t3'   # T3's runtime, installed by root (T3CODE_HOME of scripts/install.sh): the agent cannot change it
 UNIT, WALLS = 't3code-agents.service', 'pc-agents-walls'
+UNITS = (UNIT, WALLS + '.service', WALLS + '.timer')
 CHECK = OPT + '/current/sbin/pc-agents'
 WALLS_PY = OPT + '/current/walls/fork-fleet-walls.py'
 # Walls of fork-fleet-walls/wsl2 that are about the fleet launcher's job units. Here the job unit is T3's own unit,
@@ -22,8 +25,12 @@ WALLS_PY = OPT + '/current/walls/fork-fleet-walls.py'
 UNIT_WALLS = {'mounts', 'sockets', 'userns'}
 MASKS = ['/etc/binfmt.d/WSLInterop.conf'] + ['/etc/systemd/system/' + u for u in
                                             ('cron.service', 'atd.service', 'ssh.service', 'ssh.socket')]
-UNIT_DIRS = ('/etc/systemd/system', '/run/systemd/system', '/usr/local/lib/systemd/system', '/usr/lib/systemd/system',
-             '/lib/systemd/system', '/run/systemd/transient', '/run/systemd/generator.early')
+# Every folder systemd reads system units and drop-ins from (systemd.unit(5)); the kit's units live in the first.
+UNIT_DIRS = ('/etc/systemd/system', '/etc/systemd/system.control', '/run/systemd/system.control',
+             '/run/systemd/transient', '/run/systemd/generator.early', '/etc/systemd/system.attached',
+             '/run/systemd/system', '/run/systemd/system.attached', '/run/systemd/generator',
+             '/usr/local/lib/systemd/system', '/usr/lib/systemd/system', '/lib/systemd/system',
+             '/run/systemd/generator.late')
 BLOCKED4 = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16',
             '224.0.0.0/4', '240.0.0.0/4')
 BLOCKED6 = ('fc00::/7', 'fe80::/10', 'ff00::/8')
@@ -56,24 +63,37 @@ def is_ip_list(value, net, glob=False, most=64):
 
 
 SPEC = {
-    'organization': (str, machine_file.REQUIRED, lambda v: None if 0 < len(v) <= 80 else '1 to 80 characters'),
+    'organization': (str, machine_file.REQUIRED,
+                     lambda v: None if v.strip() and len(v) <= 80 else '1 to 80 characters, not blank'),
     't3Version': (str, machine_file.REQUIRED, lambda v: None if VERSION.fullmatch(v) else 'an exact version, no v'),
     't3ReleaseBaseUrl': (str, machine_file.REQUIRED,
                          lambda v: None if re.fullmatch(r'https://[A-Za-z0-9./_-]+', v) else 'an https URL'),
     'port': (int, machine_file.REQUIRED, lambda v: None if 1024 <= v <= 65535 else '1024 to 65535'),
     'agentUid': (int, 1100, lambda v: None if 1000 <= v < 60000 else '1000 to 59999'),
     'maxRuntimeMode': (str, machine_file.REQUIRED, lambda v: None if v in MODES else 'one of ' + ', '.join(MODES)),
-    'lockedSettings': (dict, {}, lambda v: next((f'{k}: set by the kit itself, or not a settings path' for k in v
-                                                 if k in KIT_SETTINGS or not re.fullmatch(r'[a-z]\w*(\.\w+)*', k)), None)
-                       or next((f'{k}: lock one field per dotted path ({k}.field), not an object (T3 takes an object '
-                                'only as the whole setting and does not start on a policy it cannot apply)'
-                                for k, x in v.items() if isinstance(x, dict)), None)),
+    'lockedSettings': (dict, {}, lambda v: next(filter(None, (locked_problem(p, x) for p, x in v.items())), None)),
     'memoryMax': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'[1-9]\d*[KMGT]', v) else 'like 8G'),
     'cpuQuota': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'[1-9]\d*%', v) else 'like 400%'),
     'nameservers': (list, machine_file.REQUIRED, lambda v: is_ip_list(v, False, True, 3)),
     'allow': (list, [], lambda v: is_ip_list(v, True)),
+    'peers': (list, machine_file.REQUIRED, lambda v: is_ip_list(v, True, most=16) if v else '1 to 16 entries'),
     'tailscaleTag': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'tag:[a-z0-9-]{1,50}', v) else 'tag:name'),
 }
+
+
+def locked_problem(path, value):
+    """Why T3 would refuse to lock path to value, where that is cheap to tell (T3 checks the rest and does not start
+    on a policy it cannot apply: managedSettings.ts), or None. An object is a complete value: a whole setting
+    (`agentSlots`) or one entry of a record (`providerInstances.codex-work`), never a part of one."""
+    segments = path.split('.')
+    if not re.fullmatch(r'[a-z]\w*(\.[A-Za-z0-9_-]+)*', path) or segments[0] in KIT_SETTINGS:
+        return f'{path}: set by the kit itself, or not a settings path'
+    if segments[0] == 'providerInstances' and len(segments) > 2:
+        return f'{path}: lock providerInstances.{segments[1]} as a whole (T3 refuses one field of a provider instance)'
+    if isinstance(value, dict) and len(segments) > 2:
+        return (f'{path}: an object only as a whole setting ({segments[0]}) or a record entry; lock one field per '
+                'dotted path instead (T3 does not start on a partial object)')
+    return None
 
 
 def config():
@@ -82,7 +102,21 @@ def config():
 
 
 def runtime(c):
-    return f'{HOME}/.t3/runtime/versions/{c["t3Version"]}/t3'
+    """T3's version folder (root's, from scripts/install.sh with T3CODE_HOME=T3); the unit runs its `t3`."""
+    return f'{T3}/runtime/versions/{c["t3Version"]}'
+
+
+def masks(c):
+    """Units the kit masks: WSL's binfmt handler, cron, at, ssh and the agent's systemd user manager (with it masked,
+    no login of the agent, no linger and no user unit runs anything outside T3's unit)."""
+    return MASKS + [f'/etc/systemd/system/user@{c["agentUid"]}.service']
+
+
+def dropin_dirs(unit):
+    """Every drop-in folder name systemd reads for unit: its own, its type's and each dash prefix's."""
+    name, kind = unit.rsplit('.', 1)
+    parts = name.split('-')
+    return [unit + '.d', kind + '.d'] + ['-'.join(parts[:i]) + f'-.{kind}.d' for i in range(1, len(parts))]
 
 
 def render(c):
@@ -104,15 +138,18 @@ def render(c):
 Description=T3 Code for agents, walled (pc-agents kit)
 Wants=network-online.target
 After=network-online.target
+# T3 exits 1 on a policy it cannot apply, like on any other failure: give up after 5 starts in 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 User={USER}
 Group={USER}
 Environment=HOME={HOME} T3CODE_HOME={HOME}/.t3 T3CODE_PORT={c["port"]} T3CODE_LAN=true
 Environment=PATH={HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStartPre=+/usr/sbin/nft -f {STATE}/firewall.nft
+ExecStartPre=+{CHECK} load-firewall
 ExecStartPre=+{CHECK} check
-ExecStart={runtime(c)} serve
+ExecStart={runtime(c)}/t3 serve
 Restart=on-failure
 RestartSec=30
 UMask=0077
@@ -126,7 +163,9 @@ PrivateTmp=yes
 PrivateDevices=yes
 PrivateIPC=yes
 ProtectProc=invisible
-InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl
+InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale
+IPAddressDeny={" ".join(BLOCKED4 + BLOCKED6)}
+IPAddressAllow={" ".join(c["peers"] + c["allow"])}
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS
 SystemCallArchitectures=native
@@ -145,7 +184,7 @@ ProtectHostname=yes
 WantedBy=multi-user.target
 '''
     wsl = HEAD + ('[boot]\nsystemd=true\n[automount]\nenabled=false\nmountFsTab=false\n[interop]\nenabled=false\n'
-                  f'appendWindowsPath=false\n[network]\ngenerateResolvConf=false\n[user]\ndefault={USER}\n')
+                  'appendWindowsPath=false\n[network]\ngenerateResolvConf=false\n[user]\ndefault=root\n')
     sd = '/etc/systemd/system/'
     return {
         '/etc/wsl.conf': (wsl, 0o644),
@@ -153,10 +192,14 @@ WantedBy=multi-user.target
         '/etc/t3code/policy.json': (json.dumps(policy, indent=2, sort_keys=True) + '\n', 0o644),
         STATE + '/firewall.nft': (nft, 0o644),
         sd + UNIT: (unit, 0o644),
-        sd + WALLS + '.service': (HEAD + f'[Unit]\nDescription=pc-agents daily walls check\n\n[Service]\nType=oneshot\n'
-                                  f'ExecStart={CHECK} check --enforce\n', 0o644),
-        sd + WALLS + '.timer': (HEAD + '[Unit]\nDescription=pc-agents daily walls check\n\n[Timer]\nOnCalendar=daily\n'
-                                'Persistent=true\n\n[Install]\nWantedBy=timers.target\n', 0o644),
+        # A check that does not succeed, even one that cannot start or crashes before it can stop T3, stops T3.
+        sd + WALLS + '.service': (HEAD + f'[Unit]\nDescription=pc-agents walls check\n\n[Service]\nType=oneshot\n'
+                                  f'ExecStart={CHECK} check --enforce\n'
+                                  'ExecStopPost=/bin/sh -c \'[ "$$SERVICE_RESULT" = success ] || '
+                                  f'exec /usr/bin/systemctl stop {UNIT}\'\n', 0o644),
+        sd + WALLS + '.timer': (HEAD + '[Unit]\nDescription=pc-agents walls check every 2 minutes\n\n[Timer]\n'
+                                'OnActiveSec=1min\nOnUnitActiveSec=2min\nAccuracySec=10s\n\n[Install]\n'
+                                'WantedBy=timers.target\n', 0o644),
     }
 
 
@@ -164,12 +207,58 @@ def sha(text):
     return hashlib.sha256(text.encode() if isinstance(text, str) else text).hexdigest()
 
 
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(ROOT + path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
 def record():
+    """{path: {sha256, ...}} of the record: one hash per path, two while setup replaces a file (old and new)."""
+    out = {}
     try:
         with open(ROOT + RECORD, encoding='utf-8') as f:
-            return dict(reversed(line.rstrip('\n').split('\t', 1)) for line in f if '\t' in line)
+            for line in f:
+                if '\t' in line:
+                    h, path = line.rstrip('\n').split('\t', 1)
+                    out.setdefault(path, set()).add(h)
     except FileNotFoundError:
-        return {}
+        pass
+    return out
+
+
+def save(path, text):
+    """Write a small state file whole (new file, one rename) unless it already says text."""
+    real = ROOT + path
+    try:
+        with open(real, encoding='utf-8') as f:
+            if f.read() == text:
+                return
+    except (FileNotFoundError, UnicodeDecodeError):
+        pass
+    os.makedirs(os.path.dirname(real), mode=0o755, exist_ok=True)
+    with open(real + '.new', 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.replace(real + '.new', real)
+
+
+def nft_listing():
+    r = run(['/usr/sbin/nft', 'list', 'table', 'inet', 'pc_agents'])
+    return r.stdout if r.returncode == 0 else None
+
+
+def load_firewall():
+    """Load firewall.nft and save its hash with what the kernel then lists, so the check can tell that the loaded
+    table is this file's (any change by anyone, or an older file left loaded, differs). Returns why not, or None."""
+    body = file_sha(STATE + '/firewall.nft')
+    r = run(['/usr/sbin/nft', '-f', STATE + '/firewall.nft'])
+    listing = nft_listing() if r.returncode == 0 else None
+    if listing is None:
+        return f'cannot load {STATE}/firewall.nft: {(r.stderr or r.stdout).strip()[-300:]}'
+    save(LOADED, f'{body}\n{listing}')
+    return None
 
 
 def lstat(path):
@@ -214,6 +303,23 @@ def user_problem(c, need_agent):
     return f'user {USER} is in other groups ({", ".join(extra)}): it must have none' if extra else None
 
 
-def run(argv, **kw):
-    return subprocess.run([ROOT + argv[0]] + argv[1:], stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                          timeout=120, **kw)
+def run(argv, timeout=120):
+    """Run argv (argv[0] under ROOT) in a process group of its own. Past timeout, or when this process stops, the
+    whole group is killed (a download's curl too); a timeout returns exit 124 and says so in stderr."""
+    p = subprocess.Popen([ROOT + argv[0]] + argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except BaseException as e:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:   # something left the group but holds the pipes: stop reading
+            out, err = '', ''
+        if not isinstance(e, subprocess.TimeoutExpired):
+            raise
+        return subprocess.CompletedProcess(argv, 124, out, f'{err}\n{argv[0]} took more than {timeout} s; stopped it')
+    return subprocess.CompletedProcess(argv, p.returncode, out, err)
