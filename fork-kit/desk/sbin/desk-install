@@ -371,11 +371,12 @@ def swap(tmp, manifest, sha, before_change):
     if changed or gone:
         before_change()
         run('systemctl', 'stop', TIMER, REFRESH, AGENT, check=False)
-    for rel in changed:
-        os.makedirs(os.path.dirname(p(f'{OPT}/{rel}')), mode=0o755, exist_ok=True)
-        os.replace(os.path.join(tmp, rel), p(f'{OPT}/{rel}'))
     for d in sorted({os.path.dirname(rel) for rel in manifest} - {''}):
+        # closed before any file goes in: in a folder others can write, a user could swap a file in before the chmod
+        os.makedirs(p(f'{OPT}/{d}'), mode=0o755, exist_ok=True)
         os.chmod(p(f'{OPT}/{d}'), 0o755)
+    for rel in changed:
+        os.replace(os.path.join(tmp, rel), p(f'{OPT}/{rel}'))
     for rel in gone:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(p(f'{OPT}/{rel}'))
