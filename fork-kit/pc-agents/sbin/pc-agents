@@ -264,15 +264,22 @@ def own_walls(c, before_enable=False):
     seen = []
     for u in k.UNITS:   # what systemd has loaded, not only what is on disk
         r = k.run(['/usr/bin/systemctl', 'show', '-p',
-                   'LoadState,FragmentPath,DropInPaths,UnitFileState,NeedDaemonReload', u])
+                   'LoadState,FragmentPath,DropInPaths,UnitFileState,NeedDaemonReload,ActiveState', u])
         got = dict(line.split('=', 1) for line in r.stdout.splitlines() if '=' in line)
         want = {'LoadState': 'loaded', 'FragmentPath': f'{k.UNIT_DIRS[0]}/{u}', 'DropInPaths': '',
                 'NeedDaemonReload': 'no'}
         if u != k.WALLS + '.service' and not before_enable:
             want['UnitFileState'] = 'enabled'
+        if u == k.WALLS + '.timer' and not before_enable:   # enabled is not enough: a stopped timer checks nothing
+            want['ActiveState'] = 'active'
         seen += [f'{u}: {key}={got.get(key)!r}' for key, v in want.items() if r.returncode or got.get(key) != v]
-    out.append(('units', 'systemd runs the kit\'s units as written, enabled', seen and '; '.join(seen[:3])))
-    out.append(('agent', f'one login user, {k.USER}, in no group but its own', k.user_problem(c, True)))
+    out.append(('units', 'systemd runs the kit\'s units as written, enabled, the timer running',
+                seen and '; '.join(seen[:3])))
+    shell = k.login_shell(k.USER)
+    out.append(('agent', f'one login user, {k.USER}, in no group but its own, with no login shell',
+                k.user_problem(c, True) or (None if shell == k.NOLOGIN else
+                                            f'{k.USER}\'s login shell is {shell}, not {k.NOLOGIN}')))
+    out.append(('sudoers', f'no sudo rule covers {k.USER}', k.sudo_problem(c)))
     current = k.lstat(k.OPT + '/current')
     target = os.readlink(k.ROOT + k.OPT + '/current') if current and stat.S_ISLNK(current.st_mode) else ''
     code = [] if current and current.st_uid == k.OWNER and re.fullmatch(r'[0-9a-f]{40}', target) else \
