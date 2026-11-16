@@ -1,13 +1,7 @@
-// Fork only: is this pull request fork-only? Every path it changes must be fork-owned
-// (.github/fork-owned-paths.txt). Run by fork-tests.yml's `changes` job after upstream's detector, from
-// the root of the pull request's merge commit (checked out with fetch-depth: 2):
-//   node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"
-// Prints `fork_only=true` and every gate of upstream's detector (.github/scripts/ci-changes.cjs) as
-// that detector decides for a change with no path left, all false; anything else prints
-// `fork_only=false` and the detector's own answer stands. It fails closed: not a pull_request run, no
-// merge commit, a git error, an empty change, an unreadable list, or one path the list does not own
-// (or NEVER names) all mean `fork_only=false`. It never exits non-zero for those. Tests:
-// fork-owned-paths.test.py.
+// Fork only: prints `fork_only=true` and upstream's gates for an empty change (all false) when every path
+// this pull request changes is fork-owned (.github/fork-owned-paths.txt); else `fork_only=false`. Fails
+// closed and never exits non-zero. Run by fork-tests.yml's `changes` job from the merge commit:
+//   node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"   (tests: fork-owned-paths.test.py)
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const { decide } = require("./ci-changes.cjs");
