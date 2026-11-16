@@ -188,7 +188,10 @@ Set: **Settings**, choose the project at the top, then **Wait checks**.
 
 A project's own default profile for its top-level threads. Not set (absent or `""`): the server's
 `mcpProfile`. A project save that leaves this key out (an older client) keeps the stored value;
-only `""` clears it. The same holds for `mcpSubagentProfile`.
+only `""` clears it (the server then stores nothing, so the project inherits again). Upstream's
+"reset to inherited" helper clears by leaving the key out, so it does not clear these two keys; a
+screen resets them with the fork's `clearProjectSettingsOverridesWithForkKeys`
+(`@t3tools/shared/forkSettingsPatch`), which sends `""`. The same holds for `mcpSubagentProfile`.
 
 ### `projectOverride.mcpSubagentProfile`
 

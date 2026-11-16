@@ -11,6 +11,8 @@ import {
   type ForkPatchRule,
   type ForkServerSettingKey,
   type ProjectId,
+  type ProjectScopedServerSettingKey,
+  type ProjectSettingsOverrides,
   type ServerSettings,
   type ServerSettingsPatch,
   isBuiltInMcpProfileName,
@@ -90,12 +92,12 @@ export function applyForkSettingsPatch(
 }
 
 type ProjectOverrides = ServerSettings["projectSettingsOverrides"][ProjectId];
+const KEPT_KEYS: ReadonlyArray<string> = FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT;
 
 /**
- * `next` (the settings after `patch`) with each {@link FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT} key a
- * project's entry in the patch leaves out kept as stored. Upstream replaces a project's entry whole,
- * so without this an older client saving a project's scripts would drop its MCP profile and widen
- * it to the server's. A removed project (`null`) keeps nothing; `""` in the entry clears the key.
+ * `next` with each {@link FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT} key a patched project entry leaves
+ * out kept as stored, so an older client's whole-entry save cannot widen the project. A removed
+ * project keeps nothing; `""` clears the key (not stored; an entry left empty is dropped).
  */
 export function keepLeftOutForkProjectKeys(
   current: ServerSettings,
@@ -106,21 +108,51 @@ export function keepLeftOutForkProjectKeys(
     current.projectSettingsOverrides;
   let projects: Record<string, ProjectOverrides> | undefined;
   for (const [projectId, entry] of Object.entries(patch.projectSettingsOverrides ?? {})) {
-    if (!isRecord(entry) || !Object.hasOwn(storedProjects, projectId)) continue;
-    const stored = storedProjects[projectId];
+    if (!isRecord(entry)) continue;
+    const stored = Object.hasOwn(storedProjects, projectId) ? storedProjects[projectId] : undefined;
     const kept: Record<string, string> = {};
+    const cleared: string[] = [];
     for (const key of FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT) {
       const value = stored?.[key];
-      if (value !== undefined && !Object.hasOwn(entry, key)) kept[key] = value;
+      if (!Object.hasOwn(entry, key)) {
+        if (value !== undefined) kept[key] = value;
+      } else if (entry[key] === "") {
+        cleared.push(key);
+      }
     }
-    if (Object.keys(kept).length === 0) continue;
+    if (Object.keys(kept).length === 0 && cleared.length === 0) continue;
     projects ??= { ...next.projectSettingsOverrides };
     // Upstream drops an entry left empty; a kept key brings it back.
-    projects[projectId] = { ...projects[projectId], ...kept };
+    const merged: Record<string, unknown> = { ...projects[projectId], ...kept };
+    for (const key of cleared) delete merged[key];
+    if (Object.keys(merged).length === 0) delete projects[projectId];
+    else projects[projectId] = merged as ProjectOverrides;
   }
   return projects === undefined
     ? next
     : { ...next, projectSettingsOverrides: projects as ServerSettings["projectSettingsOverrides"] };
+}
+
+/**
+ * Fork: drop-in for upstream's `clearProjectSettingsOverrides` that sends `""` for a cleared MCP
+ * profile key, since a key left out is kept (above). Any path that can reset an MCP profile key
+ * must use this; with no such key it returns what upstream's does.
+ */
+export function clearProjectSettingsOverridesWithForkKeys(
+  settings: Pick<ServerSettings, "projectSettingsOverrides">,
+  projectId: ProjectId,
+  keys: ReadonlyArray<ProjectScopedServerSettingKey>,
+): ProjectSettingsOverrides | null {
+  const current = settings.projectSettingsOverrides[projectId];
+  if (current === undefined) return null;
+  const next: Record<string, unknown> = { ...current };
+  for (const key of keys) delete next[key];
+  // Everything cleared: upstream removes the project's entry (`null`), which keeps nothing.
+  if (Object.keys(next).length === 0) return null;
+  for (const key of keys) {
+    if (KEPT_KEYS.includes(key) && current[key] !== undefined) next[key] = "";
+  }
+  return next as ProjectSettingsOverrides;
 }
 
 /**

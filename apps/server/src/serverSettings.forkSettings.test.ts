@@ -4,8 +4,11 @@
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ServerSettingsError, ServerSettingsPatch } from "@t3tools/contracts";
-import { ForkSettingsWriteError } from "@t3tools/shared/forkSettingsPatch";
+import { ProjectId, ServerSettingsError, ServerSettingsPatch } from "@t3tools/contracts";
+import {
+  clearProjectSettingsOverridesWithForkKeys,
+  ForkSettingsWriteError,
+} from "@t3tools/shared/forkSettingsPatch";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -294,6 +297,30 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork MCP profile
         mcpProfile: "lean",
         mcpSubagentProfile: "t3-only",
       });
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("clears a project's MCP profile when the screen resets it with the fork's helper", () =>
+    Effect.gen(function* () {
+      const start = {
+        ...FULL_FILE,
+        mcpProfile: "t3-only",
+        projectSettingsOverrides: { [PROJECT]: { mcpProfile: "all", defaultAutoPull: true } },
+      };
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(config.settingsPath, JSON.stringify(start));
+      const settings = yield* service.getSettings;
+      // What the client sends for "reset to inherited" on the project's MCP profile.
+      const entry = clearProjectSettingsOverridesWithForkKeys(settings, ProjectId.make(PROJECT), [
+        "mcpProfile",
+      ]);
+      yield* service.updateSettings(
+        decodePatch({ projectSettingsOverrides: { [PROJECT]: entry } }),
+      );
+      const file = (yield* readFile) as { projectSettingsOverrides: Record<string, unknown> };
+      assert.deepStrictEqual(file.projectSettingsOverrides[PROJECT], { defaultAutoPull: true });
     }).pipe(Effect.provide(layerServerSettings())),
   );
 });
