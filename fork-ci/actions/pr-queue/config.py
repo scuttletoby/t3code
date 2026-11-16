@@ -24,7 +24,6 @@ class ConfigError(Exception):
 class Config:
     required_checks: frozenset
     merge_method: str
-    delete_branch: bool
     bot_logins: tuple
     lens_author_associations: tuple
     override_prefix: str
@@ -38,6 +37,7 @@ class Config:
     list_limit: int = 50
     update_when_base_was_red: bool = False
     head_check_app: int = None
+    delete_branch: bool = False   # read and checked, never used: the queue deletes no branch (README.md, "Config")
 
     def ready(self, n):
         """The command that re-arms PR n after a lens read, as the project writes it."""
@@ -70,7 +70,8 @@ KEYS = {
     'required_checks': (True, lambda v: isinstance(v, list) and v != [] and all(map(_text, v)) and len(set(v)) == len(v),
                         'a non-empty list of distinct check names (exactly the branch ruleset\'s required checks)'),
     'merge_method': (True, lambda v: v in MERGE_METHODS, f'one of {", ".join(MERGE_METHODS)}'),
-    'delete_branch': (True, lambda v: isinstance(v, bool), 'true or false'),
+    'delete_branch': (False, lambda v: isinstance(v, bool), 'true or false (no longer used: the queue deletes no '
+                      'branch; the repository\'s "Automatically delete head branches" setting does)'),
     'bot_logins': (True, lambda v: isinstance(v, list) and all(map(_text, v)),
                    'a list of logins whose comments never count as a lens (may be empty; list every bot: gh drops `[bot]`)'),
     'lens_author_associations': (True, _associations, f'a non-empty list of distinct author associations from '
