@@ -106,7 +106,8 @@ Restore primitive (`coldcopy.restore(run, copy_dir, home, from_home=..., version
 and `back`; only inside a journalled step, with the home's server stopped): takes only a copy whose manifest
 names that home and live version (else `WrongCopy`), reads the copy back against its manifest first, refuses
 while any server holds the ownership lock, and needs free disk for the copy's files plus a kept copy of each
-home file they replace plus the floor. In order, each step fsynced:
+home file they replace plus the floor (all these checks run again under the ownership lock, just before the
+first change). In order, each step fsynced:
 
 1. temp files a restore stopped half-way left (`.<name>.golive-restore-<time>...`) are removed: a temp is only
    renamed to its real name once whole, and the copy folder still holds what it held;
@@ -127,22 +128,28 @@ WAL), not the old home, so the rerun names the old home from the record (`movedA
 again only home files that hold something new (`alsoKept`: what a T3 started after the stop wrote). The record
 is rewritten to name those too before anything leaves the home, so a third run still names them. Free disk for
 a rerun counts only the files it will keep. A record that cannot be read refuses the restore before any
-change. A record whose kept files were all put back by hand (moved back, or copied back so the home holds the
-same bytes; a kept `-shm` need not go back) is replaced, and the home is taken as the old home (`staleRecord` in
-the result). A record put back only in part (say the database moved back but not its `-wal`) refuses before
-any change: finish putting the kept files back, or remove the record once the home is right. A rerun after a
-stop between the record's removal and the end of the caller's step finds no record and a home that is exactly
-the copy's: it keeps nothing (`alreadyRestored`), so the restored data is never named as the old home. While
-the record is there, a copy refuses.
+change. A record whose kept files were all put back by hand (moved back, or copied back so the home holds the same
+bytes; a kept `-shm` need not go back) is replaced, and the home is taken as the old home (`staleRecord` in the
+result; `staleKept` names that record's kept files still on disk, such as what earlier reruns kept, which stay
+until the owner removes them). A record put back only in part (say the database moved back but not its `-wal`, or a
+kept file gone from both its kept name and the home) refuses before any change, and so does one put back in full
+while the home still holds a `-wal`, `-journal` or `-shm` the old home did not have (the copy's WAL, say, which
+next to the old database would serve or checkpoint another database's pages); the refusal names the files. Finish
+putting the kept files back and remove the named files, or remove the record once the home is right. A rerun after
+a stop between the record's removal and the end of the caller's step finds no record and a home that is exactly the
+copy's: it keeps nothing (`alreadyRestored`), so the restored data is never named as the old home. While the record
+is there, a copy refuses.
 
 **The caller must keep T3 from starting until the restore step is done** (the later `rehearse` and `back` will:
 the service stopped, and not started at boot before the step ends). If T3 does start after a stop in steps 5-7
 (a power loss, then the enabled service at boot), it opens the old database file without its WAL (missing the
 WAL's commits, and after a crash in the middle of a checkpoint the file alone may be torn), or the copy's
 without its WAL. The kept files are independent copies, so they stay exactly the old home. Settling that means
-running the restore again, or putting back the kept files the record names and removing the record, with T3
-stopped. The kit never removes kept files; `kept_files` lists them, and a restore's refusal for free disk names
-them, with the ones the record of a restore stopped half-way names listed apart as files that must stay.
+running the restore again, or, with T3 stopped, first removing the home's `-wal`, `-journal` and `-shm`, then
+putting back the kept files the record names and removing the record. Putting back drops the half-way home: if
+a T3 ran on it after the stop, run the restore again instead (it keeps what that T3 wrote). The kit never
+removes kept files; `kept_files` lists them, and a restore's refusal for free disk names them, with the ones the
+record of a restore stopped half-way names listed apart as files that must stay.
 
 ## Failure table
 
@@ -184,8 +191,9 @@ empty state?
 | ... and T3 starts before anyone looks                                               | The caller must prevent it (see above). If it happens anyway, T3 opens the old database file or the copy's without its WAL, and its writes change only the home: the kept files stay the old home (tested at every stop point)                                                                                                                                                                                                                                                                                                                                      |
 | ... and the restore runs again                                                      | Before anything leaves the home, the home is still the old home: the rerun keeps it again. After that, the record names the old home: the rerun reports that set as `movedAside`, keeps only changed home files (`alsoKept`, so a T3's writes are not lost; the record is rewritten to name them, so a third run still does), and never names the half-way home as the old one (tested at every stop point, and the stop between the WAL removal and the database rename). Free disk counts only the files the rerun keeps, so a rerun fits where the first run fit |
 | ... record of the stopped restore cannot be read                                    | The restore refuses before any change; the owner looks at the kept files, puts the home right and removes the record                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ... all kept files put back by hand, record left                                    | Moved back, or copied back so the home holds the same bytes (a kept `-shm` need not go back): the record is replaced; the home is kept as the old home (`staleRecord`)                                                                                                                                                                                                                                                                                                                                                                                              |
-| ... kept files put back only in part                                                | Refused before any change, by `plan_restore` too: the message names the kept files gone and those not back in the home. Finish putting them back, or remove the record once the home is right                                                                                                                                                                                                                                                                                                                                                                       |
+| ... all kept files put back by hand, record left                                    | Moved back, or copied back so the home holds the same bytes (a kept `-shm` need not go back): the record is replaced; the home is kept as the old home (`staleRecord`; `staleKept` names that record's kept files still on disk, such as what earlier reruns kept)                                                                                                                                                                                                                                                                                                  |
+| ... kept files put back only in part                                                | Refused before any change, by `plan_restore` too: the message names the kept files gone and those not back in the home, and a kept file gone from both its kept name and the home (deleted by mistake; a `-shm` may be). Finish putting them back, or remove the record once the home is right                                                                                                                                                                                                                                                                      |
+| ... put back in full, a half-way `-wal`/`-journal`/`-shm` left                      | All kept files back, but the home still holds a `-wal`, `-journal` or `-shm` the old home did not have (the copy's WAL left by a put-back after a stop in steps 5-7): refused before any change, by `plan_restore` too, naming the files. Remove them, then run the restore again (the record is then stale) or remove the record. Only if T3 ran on the put-back home with the record still there is such a file that T3's own: then remove the record instead                                                                                                     |
 | ... killed after the record is removed, before the step ends                        | No record, and the home is exactly the copy's: the rerun keeps nothing (`alreadyRestored`), so the restored data is never named as the old home. The old home is the first run's kept set (`kept_files` lists it)                                                                                                                                                                                                                                                                                                                                                   |
 | A copy while a restore record is there                                              | Refused before T3 stops: the home is half-way. Run the restore again (or put back the kept files and remove the record)                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Database is a link (upstream allows a linked database)                              | Refused before T3 stops: a copy takes files only and would hold the link, not the database                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |

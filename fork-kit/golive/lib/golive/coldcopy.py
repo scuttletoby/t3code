@@ -260,37 +260,70 @@ def kept_files(home):
 def stopped_restore(home):
     """Read only: the record (RESTORE_MARK) a restore stopped half-way left in userdata/, or None. Its 'oldHome'
     names the kept files that are the home as it was before that restore; its 'alsoKept' (when there) what reruns
-    kept from the half-way home. None as well when the old home was put back by hand: every file 'oldHome' names
-    is gone (moved back), or each one still there holds what the home's file of that name holds (copied back; a
-    kept -shm need not go back). RuntimeError when the record cannot be read (which kept files are the old home is
-    then unknown), or when the old home was put back only in part (a rerun would keep that mix as the old home and
-    name no more the kept files still out, such as the WAL with the commits): the owner looks."""
+    kept from the half-way home; its 'names' the files that restore put back. None as well when the old home was
+    put back by hand (see _read_record). RuntimeError when the record cannot be read (which kept files are the old
+    home is then unknown), or when the old home was put back only in part or with a file of the half-way home
+    left: the owner looks."""
+    record, stale = _read_record(home)
+    return None if stale else record
+
+
+def _read_record(home):
+    """(record, stale) of RESTORE_MARK: (None, False) when there is none. Stale when the old home was put back by
+    hand in full: every file 'oldHome' names is moved back (gone from its kept name and back in the home) or
+    copied back (still there, and the home's file of that name holds the same bytes); a kept -shm need not go
+    back. And the home then holds no -wal, -journal or -shm of a database the record names that the old home did
+    not have: such a file is the half-way home's (the copy's WAL, or what a T3 started after the stop wrote), and
+    next to the old database it would serve, or on the first checkpoint write, another database's pages.
+    RuntimeError, before any change, when the record cannot be read, or the old home is put back only in part (a
+    rerun would keep that mix as the old home and name no more the kept files still out, such as the WAL with the
+    commits), or a file of the half-way home is left beside it; the message names the files."""
     userdata = os.path.join(home, 'userdata')
     path = os.path.join(userdata, RESTORE_MARK)
     try:
         with open(path, encoding='utf-8') as f:
             mark = json.load(f)
     except FileNotFoundError:
-        return None
+        return None, False
     except (OSError, ValueError) as e:
         mark = e
-    def names_ok(v):
-        return isinstance(v, list) and all(isinstance(n, str) and ASIDE in n and '/' not in n for n in v)
-    if not (isinstance(mark, dict) and names_ok(mark.get('oldHome')) and names_ok(mark.get('alsoKept', []))):
+    def names_ok(v, aside=True):
+        return isinstance(v, list) and all(isinstance(n, str) and (ASIDE in n or not aside) and '/' not in n
+                                           and n not in ('', '.', '..') for n in v)
+    if not (isinstance(mark, dict) and names_ok(mark.get('oldHome')) and names_ok(mark.get('alsoKept', []))
+            and names_ok(mark.get('names', list(DEFAULT_RESTORE)), aside=False)):
         raise RuntimeError(f'{path} cannot be read ({mark if isinstance(mark, Exception) else "not a record"}): a '
                            'restore stopped half-way and which kept files are the old home is unknown; look at the '
                            f'*{ASIDE}* files, put the home right, then remove it')
     gone = [n for n in mark['oldHome'] if not os.path.lexists(os.path.join(userdata, n))]
     if not gone:
-        return mark
-    out = [n for n in mark['oldHome'] if n not in gone and not n.split(ASIDE)[0].endswith('-shm')
-           and not _same_file(os.path.join(userdata, n), os.path.join(userdata, n.split(ASIDE)[0]))]
-    if out:
+        return mark, False
+    def base(n):
+        return n.split(ASIDE)[0]
+    out = [n for n in mark['oldHome'] if n not in gone and not base(n).endswith('-shm')
+           and not _same_file(os.path.join(userdata, n), os.path.join(userdata, base(n)))]
+    lost = [n for n in gone if not base(n).endswith('-shm') and not os.path.lexists(os.path.join(userdata, base(n)))]
+    had = {base(n) for n in mark['oldHome']}
+    foreign = [c for name in mark.get('names', DEFAULT_RESTORE) for c in _companions(name)
+               if c not in had and os.path.lexists(os.path.join(userdata, c))]
+    if out or lost:
         raise RuntimeError(f'{path} names the kept files of the old home, but they are only partly put back '
-                           f'({", ".join(gone)} gone from the kept files; {", ".join(out)} not back in the home): '
-                           'finish putting the kept files back, or remove the record once the home is right; '
-                           'nothing was changed')
-    return None
+                           f'({", ".join(gone)} gone from the kept files; '
+                           + (f'{", ".join(out)} not back in the home' if out else '')
+                           + ('; ' if out and lost else '')
+                           + (f'{", ".join(lost)} gone from the home too' if lost else '') + '): '
+                           'finish putting the kept files back (a rerun then names any -wal, -journal or -shm left '
+                           'in the home that the old home did not have), or remove the record once the home is '
+                           'right; nothing was changed')
+    if foreign:
+        raise RuntimeError(f'{path} names the kept files of the old home and they are back, but the home also '
+                           f'holds {", ".join(foreign)}, which the old home did not have: the half-way home\'s (the '
+                           'copy\'s, or what a T3 started after the stop wrote), and beside the old database a WAL '
+                           f'of another database. Remove {"it" if len(foreign) == 1 else "them"}, then run the '
+                           'restore again (or remove the record) before T3 starts. Only if T3 ran on the put-back '
+                           'home since (with the record still there) is it that T3\'s own: then remove the record '
+                           'instead; nothing was changed')
+    return mark, True
 
 
 def _record_names(record):
@@ -356,7 +389,7 @@ def plan_restore(copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     them first; the refusal names the files earlier restores kept that may be removed, and apart from them the
     kept files the record of a restore stopped half-way names, which must stay). A caller runs it as a
     pre-check before its restore step, so a refusal changes nothing and needs no settling; restore() runs it
-    again."""
+    again under the ownership lock (so the disk check and the record check hold for the restore itself)."""
     m = read_manifest(copy_dir, from_home, version)
     files = {e.get('path'): e for e in m['files'] if isinstance(e, dict) and e.get('kind') == 'file'}
     userdata = os.path.join(home, 'userdata')
@@ -498,22 +531,26 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     the home is then half-way, not the old home, so its result names the old home from the record ('movedAside')
     and it keeps only home files that hold anything new ('alsoKept': what a T3 started after the stop wrote; the
     record is rewritten to name them before anything leaves the home, so a later rerun names them too). A record
-    put back only in part refuses before any change (see stopped_restore). A rerun after a stop between step 6 and
+    put back only in part, or with a -wal, -journal or -shm the old home did not have, refuses before any change
+    (see _read_record); one put back in full is stale: the home is the old home ('staleRecord', and 'staleKept'
+    names the record's kept files still there). A rerun after a stop between step 6 and
     the end of the caller's step finds no record and the home exactly the copy's: it keeps nothing
     ('alreadyRestored'), so the restored data is never named as the old home.
     The CALLER keeps T3 from starting until the step is done (a T3 started after a stop in steps 4-6 serves that
     older database file or the copy's without its WAL; the kept files stay the old home either way): settling such
-    a stop means running the restore again, or putting the kept files RESTORE_MARK names back and removing it,
-    before T3 starts."""
+    a stop means running the restore again, or, before T3 starts, removing the home's -wal, -journal and -shm,
+    then putting the kept files RESTORE_MARK names back and removing it (that drops the half-way home; if a T3 ran
+    on it after the stop, run the restore again instead: it keeps what that T3 wrote)."""
     run.require_step('restore')
-    files, want = plan_restore(copy_dir, home, from_home=from_home, version=version, names=names,
-                               floor_bytes=floor_bytes)
     userdata = os.path.join(home, 'userdata')
     mark_path = os.path.join(userdata, RESTORE_MARK)
     lock = hold_owner_lock(userdata, 0)
-    try:
-        prior = stopped_restore(home)
-        stale = prior is None and os.path.lexists(mark_path)
+    try:  # the checks (disk included) under the lock, so nothing changes between them and the restore
+        files, want = plan_restore(copy_dir, home, from_home=from_home, version=version, names=names,
+                                   floor_bytes=floor_bytes)
+        prior, stale = _read_record(home)
+        stale_kept = [n for n in _record_names(prior) if os.path.lexists(os.path.join(userdata, n))] if stale else []
+        prior = None if stale else prior
         stamp, temps, kept = _stamp(), {}, []
         cleaned = _leftover_temps(userdata)
         for n in cleaned:
@@ -530,7 +567,7 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
             kept.append(_keep(userdata, n, stamp))
             _fsync_dir(userdata)
         if prior is None:
-            _write_mark(userdata, {'oldHome': kept, 'at': stamp, 'copy': copy_dir}, stamp)
+            _write_mark(userdata, {'oldHome': kept, 'at': stamp, 'copy': copy_dir, 'names': list(names)}, stamp)
         elif kept:  # a rerun: the record names what it kept too, before anything leaves the home
             prior = {**prior, 'alsoKept': prior.get('alsoKept', []) + kept}
             _write_mark(userdata, prior, stamp)
@@ -555,7 +592,11 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
                                      'it was done): nothing was kept')
     if stale:
         result['staleRecord'] = ('the kept files the record of a stopped restore named were put back by hand: the '
-                                 'home was kept as the old home')
+                                 'home was kept as the old home'
+                                 + (f'; the kept files that record named and that are still there (copies of what '
+                                    f'was put back, and what earlier reruns kept from the half-way home) stay '
+                                    f'until the owner removes them: {", ".join(stale_kept)}' if stale_kept else ''))
+        result['staleKept'] = stale_kept
     return result
 
 
