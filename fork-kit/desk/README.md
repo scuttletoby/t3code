@@ -51,20 +51,25 @@ the always-on host with `fork-fleet-desk-key.py add POOL`. The first runner temp
 the refresh timer; `check` says FAIL for `template` until it is there.
 
 `check` only reads: the installed files against their manifest (text, root owner and mode), the folders' and the
-desk key's modes and root owner (not a link), the project's fleet config against the installed one, each unit against
+desk key's (both halves) modes and root owner (not a link), the project's fleet config against the installed one, each unit against
 the release's (header plus `/opt/fork-fleet/units/UNIT`, mode and root owner), a restart a stopped install still owes, systemd drop-ins that change the kit's units,
 every wall of this OS (`fork-fleet-walls.py describe`), the agent's settings, the units, the template, the settings
 files against the machine file (text, mode and root owner), the runner users (each must exist, have no login shell,
-a locked password, a uid other than 0, its own group only, no home that is there (`/nonexistent`) and no line in
+a locked password, a uid other than 0, its own group only (the main group is the group named after the user, and
+no other), no home that is there (`/nonexistent`) and no line in
 `cron.allow`/`at.allow`; and it names a user the kit made that a smaller `slots` no longer uses) and IPv4
 forwarding.
 
 A `fork-runner-N` user made by hand before the install is used, but only when it passes the same checks (no login
 shell, locked password, uid not 0, its own group only, no home that is there, not in an allow file; the launcher
-refuses the same uid and group cases at each job start): otherwise install refuses before changing anything and
+refuses uid 0 and more than one group at each job start, and install and `check` also refuse a main group that is
+not the user's own, such as gid 0 from `useradd -g 0`): otherwise install refuses before changing anything and
 names the fix (`usermod -s /usr/sbin/nologin`, `passwd -l`, `gpasswd -d`, `usermod -d /nonexistent`). A
-`/opt/fork-fleet`, `/opt/fork-fleet/template`, `/etc/fork-fleet` or desk key that is a link or not owned by root (a
-hand setup) is refused the same way, not followed or fixed. One install or uninstall runs at a time (a lock on
+`/opt/fork-fleet`, a folder in it (`template`, `units`, `fork-fleet-walls`, and any other the installed manifest
+names), `/etc/fork-fleet` or desk key (either half) that is a link or not owned by root (a hand setup) is refused the
+same way, not followed or fixed. The folders above them (`/opt`, `/etc`, `/etc/systemd/system`) are not checked:
+they are the system's, root-owned on a stock system, and a user who could write them could already change what root
+runs; keep them root's. One install or uninstall runs at a time (a lock on
 `/etc/fork-fleet`, which only root can open); a second one is refused.
 
 ## Windows (WSL2)
@@ -112,7 +117,8 @@ parts run in the tests on a fake root.
 ## Runs again, stops half-way, old or empty state
 
 - **Again:** files, settings and units that did not change are not rewritten (a file in `/opt/fork-fleet`, a
-  setting or a unit whose mode or owner was changed, or that is a link, is written again as root's; the folders'
+  setting or a unit whose mode or owner was changed, or that is a link or a FIFO, is written again as root's (a FIFO is never opened; one at a unit
+  path is refused as not the kit's); the folders'
   modes are set back; a linked or foreign-owned folder or key is refused, above), and the agent is not stopped or
   restarted (a restart would end a job it is starting). After a change it is restarted. The agent reads its settings
   only when it starts, so before the first change the record gets a restart-pending mark, cleared after the
