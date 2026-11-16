@@ -441,7 +441,7 @@ plan
 check "plan: upstream edits a deleted listed file -> the conflict is resolved by deleting it, rebase" \
   eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.11 ]] && ! in_candidate ci.yml && [[ ! -e "$root/report.md" ]]'
 check "plan: the resolved rebase keeps the fork's patches and its list" \
-  eval 'action_is rebase && git -C "$root/work" cat-file -e "$(out candidate):feature.txt" && git -C "$root/work" show "$(out candidate):.github/fork-removed-workflows.txt" | grep -qx .github/workflows/ci.yml'
+  eval 'action_is rebase && git -C "$root/work" cat-file -e "$(out candidate):feature.txt" && grep -qx .github/workflows/ci.yml <<< "$(git -C "$root/work" show "$(out candidate):.github/fork-removed-workflows.txt")"'
 # Re-run: an earlier run published this candidate, then stopped before the branch moved. The
 # next run rebuilds the same files and advances to that release instead of building again.
 released="$(out candidate)"
@@ -470,7 +470,7 @@ new_fork v0.1.11
 fork_commit "fork: list ci.yml" 'echo .github/workflows/ci.yml >> .github/fork-removed-workflows.txt'
 plan
 check "plan: upstream brings a listed file back -> deleted again on the candidate, rebase" \
-  eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.12 ]] && ! in_candidate ci.yml && git -C "$root/work" log -1 --format=%s "$(out candidate)" | grep -q "fork: delete upstream workflows listed"'
+  eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.12 ]] && ! in_candidate ci.yml && grep -q "fork: delete upstream workflows listed" <<< "$(git -C "$root/work" log -1 --format=%s "$(out candidate)")"'
 
 new_upstream
 new_fork v0.1.10
@@ -506,7 +506,7 @@ new_fork v0.1.10
 fork_commit "fork: delete ci.yml, CRLF list" "printf '# deleted\\r\\n.github/workflows/ci.yml\\r\\n' > .github/fork-removed-workflows.txt && rm .github/workflows/ci.yml"
 plan
 check "plan: a list with CRLF line ends is read like one with LF, the listed file stays deleted" \
-  eval 'action_is rebase && ! in_candidate ci.yml && git -C "$root/work" show "$(out candidate):.github/fork-removed-workflows.txt" | grep -q $'"'"'ci.yml\r$'"'"''
+  eval 'action_is rebase && ! in_candidate ci.yml && grep -q $'"'"'ci.yml\r$'"'"' <<< "$(git -C "$root/work" show "$(out candidate):.github/fork-removed-workflows.txt")"'
 
 # Upstream renames a listed file: git reports a rename/delete conflict on the new name, which the
 # list does not name, so the plan stops and names it rather than shipping it under that name.
@@ -1054,9 +1054,9 @@ check "workflow: advance's if: is a conjunction (no top-level ||) of the plan's 
 check "workflow: the move step runs only when the checks before it passed (no if:)" \
   eval 'awk "/- name: Move the series branch/ { s = 1; next } s && /^      - / { exit } s && /^        if:/ { bad = 1 } END { exit bad }" <<< "$advance_job"'
 check "workflow: action none deletes a leftover candidate branch" \
-  eval 'grep -B2 -A3 "action == .none." "$workflow" | grep -q "fork-follow-push.sh cleanup"'
+  eval 'grep -q "fork-follow-push.sh cleanup" <<< "$(grep -B2 -A3 "action == .none." "$workflow")"'
 check "workflow: the last sweep reports runs since the run began" \
-  eval 'sed -n "/^  report:/,\$p" "$workflow" | grep -q "SINCE: \${{ needs.guard.outputs.started }}"'
+  eval 'grep -q "SINCE: \${{ needs.guard.outputs.started }}" <<< "$(sed -n "/^  report:/,\$p" "$workflow")"'
 # Each job that reads FORK_PUSH_TOKEN runs in the Environment that holds it, named as in env.
 token_jobs="$(grep -vF "$presence" "$workflow" | awk '/^  [a-z_-]+:$/ { job = $1 } /secrets\.FORK_PUSH_TOKEN/ { print job }' | sort -u)"
 env_jobs="$(awk '/^  [a-z_-]+:$/ { job = $1 } /^    environment: fork-push$/ { print job }' "$workflow" | sort -u)"
@@ -1067,9 +1067,9 @@ check "workflow: the jobs that read FORK_PUSH_TOKEN, and only they, run in the E
 check "workflow: no job uses actions/checkout; four plain-git checkouts, none with a token" \
   eval '! grep -q "actions/checkout@" "$workflow" && [[ $(grep -c "^          git init -q$" "$workflow") == 4 ]]'
 check "workflow: every action is pinned by commit" \
-  eval '! grep -E "^\s*-?\s*uses: [^.][^@]*@" "$workflow" | grep -vqE "@[0-9a-f]{40}( |$)"'
+  eval '[[ -z "$(grep -E "^\s*-?\s*uses: [^.][^@]*@" "$workflow" | grep -vE "@[0-9a-f]{40}( |$)")" ]]'
 check "workflow: the report runs on every run (also action none)" \
-  eval 'sed -n "/^  report:/,\$p" "$workflow" | grep -q "^    if: always()$"'
+  eval 'grep -q "^    if: always()$" <<< "$(sed -n "/^  report:/,\$p" "$workflow")"'
 check "workflow: upstream workflows are swept after each push" \
   eval '[[ $(grep -c "fork-workflows.sh" "$workflow") -ge 3 ]]'
 

@@ -107,8 +107,8 @@ expect() { # expect LABEL 'CONDITION' (shell, evaluated)
 }
 rc_is() { [[ "$rc" == "$1" ]]; }
 says() { grep -qF -- "$1" <<< "$out"; }
-called() { calls | grep -qF -- "$1"; }
-not_called() { ! calls | grep -qF -- "$1"; }
+called() { grep -qF -- "$1" <<< "$(calls)"; }
+not_called() { ! grep -qF -- "$1" <<< "$(calls)"; }
 
 # --- check -------------------------------------------------------------------------------------
 reset; limit collaborators_only 180; run check
