@@ -25,7 +25,10 @@ TEMPLATE = '''{
     "stageDir": "/path/to/the/downloaded/release",
     "backupDir": "/path/to/the/backups",
     "stateDir": "/path/to/the/kit/state",
-    "freeFloorMb": 2048
+    "freeFloorMb": 2048,
+    "quietCommand": "/path/to/a/quiet/check",
+    "preHooks": ["/path/to/pause/background/jobs"],
+    "postHooks": ["/path/to/resume/background/jobs"]
   }
 }'''
 
@@ -42,6 +45,22 @@ def _not_negative(value):
     return None if value >= 0 else 'must be a whole number >= 0'
 
 
+MIN_QUIET_WAIT = 60  # a quiet point is two samples 60 s apart (coldcopy.QUIET_GAP); a shorter wait always refuses
+
+
+def _quiet_wait(value):
+    return None if value >= MIN_QUIET_WAIT else f'must be a whole number >= {MIN_QUIET_WAIT} (two samples, 60 s apart)'
+
+
+def _positive(value):
+    return None if value > 0 else 'must be a whole number > 0'
+
+
+def _absolute_list(value):
+    bad = [v for v in value if not (isinstance(v, str) and os.path.isabs(v))]
+    return f'every entry must be an absolute path (not {bad[0]!r})' if bad else None
+
+
 SPEC = {
     'home': (str, machine_file.REQUIRED, _absolute),
     'targetVersion': (str, machine_file.REQUIRED, _exact_version),
@@ -49,6 +68,13 @@ SPEC = {
     'backupDir': (str, machine_file.REQUIRED, _absolute),
     'stateDir': (str, machine_file.REQUIRED, _absolute),
     'freeFloorMb': (int, DEFAULT_FREE_FLOOR_MB, _not_negative),
+    # Same contract as the fork setting automaticUpdatesQuietCommand: absolute path, no arguments, exit 0 = quiet.
+    'quietCommand': (str, None, _absolute),
+    # Run in order, no arguments, before T3 stops (pre) and after it runs again (post); each must be safe twice.
+    'preHooks': (list, (), _absolute_list),
+    'postHooks': (list, (), _absolute_list),
+    'quietWaitSeconds': (int, 7200, _quiet_wait),    # how long to wait for a quiet point, then give up
+    'stopLimitSeconds': (int, 1800, _positive),      # longest T3 stays stopped for a copy; then it starts again
 }
 # The kit's own folders; none may be the T3 home or inside it (check promises to write nothing there).
 OWN_FOLDERS = ('stateDir', 'backupDir', 'stageDir')
@@ -68,6 +94,10 @@ class Config:
         self.backup_dir = os.path.normpath(values['backupDir'])
         self.state_dir = os.path.normpath(values['stateDir'])
         self.free_floor_mb = values['freeFloorMb']
+        self.quiet_command = values['quietCommand']
+        self.pre_hooks, self.post_hooks = tuple(values['preHooks']), tuple(values['postHooks'])
+        self.quiet_wait_seconds = values['quietWaitSeconds']
+        self.stop_limit_seconds = values['stopLimitSeconds']
         for key in OWN_FOLDERS:
             if _inside(values[key], self.home):
                 raise machine_file.MachineFileError(
