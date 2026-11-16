@@ -344,6 +344,8 @@ def sweep(cfg, gh, mode, now, notes, reds=None):
                             and watch(cfg, gh, run, mode, now, logs=False):
                         notes.append(f'run {run["id"]} re-run (its watch did not)')
                     continue
+                if now - (ff.stamp(run.get('created_at')) or 0) > WINDOW:
+                    continue   # its watch never re-runs a run this old (plan): a cancel would only turn a wait red
                 jobs = gh.pages(f'actions/runs/{int(run["id"])}/attempts/{int(run.get("run_attempt") or 1)}/jobs',
                                 'jobs', most=3)
                 late = [j for j in jobs if j.get('status') == 'queued' and not j.get('runner_name') and pool_of(cfg, j)

@@ -437,6 +437,15 @@ class Sweep(unittest.TestCase):
                 self.sweep(gh)
                 self.assertEqual(gh.writes(), [])
 
+    def test_a_run_created_too_long_ago_for_its_watch_is_not_cancelled(self):
+        # A person re-runs a 2-day-old run: its watch will not re-run it (created over 24 h ago), so a cancel would
+        # only turn a job that is waiting into a red.
+        gh = FakeGitHub(now=T0 + 600)
+        run = self.waiting(gh, attempt=2)
+        run['created_at'] = iso(T0 - 2 * 86400)
+        self.sweep(gh)
+        self.assertEqual(gh.writes(), [])
+
     def test_fleet_mode_waits_longer_on_the_pool_that_waits(self):
         gh = FakeGitHub(now=T0 + 7199)
         self.waiting(gh, labels=VM)

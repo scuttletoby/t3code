@@ -39,6 +39,11 @@ Known limits, each costing at most one re-run of a trusted run, onto `fallback`:
 - a late job a runner takes in the one call between the sweep's last read of the job and its cancel is cancelled while
   it runs (the sweep reads the run and the late job again just before the cancel, and cancels only while the job still
   waits with no runner); its watch then keeps that red (cancelled while it ran), never a false green.
+- a run created more than 24 hours ago is never cancelled by the sweep (its watch would not re-run it): a person's
+  late re-run of an old run waits for its pool;
+- a re-run that GitHub itself ends as `cancelled` (a self-hosted `fallback` job queued past GitHub's 24-hour limit;
+  not confirmed on a real run) is left out of `reds` like a person's cancel: with `"hosted": false`, watch the
+  fallback pool's runners.
 
 ## Guarantees
 
