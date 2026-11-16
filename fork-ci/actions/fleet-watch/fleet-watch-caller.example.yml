@@ -52,8 +52,11 @@ jobs:
         env:
           RUN_ID: ${{ github.event.workflow_run.id }}
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-        run: REPORT RED COMMAND "$RUN_ID" "$ATTEMPT" # once per run id and attempt
+        # The report must do each (run_id, attempt) once: the sweeps below may list this attempt too.
+        run: REPORT RED COMMAND "$RUN_ID" "$ATTEMPT"
       - if: always() && github.event_name == 'schedule' && steps.watch.outputs.reds != '' && steps.watch.outputs.reds != '[]'
         env:
           REDS: ${{ steps.watch.outputs.reds }} # [{"run_id": N, "attempt": A}, ...]
-        run: REPORT RED ATTEMPTS COMMAND "$REDS" # once per run id and attempt: the sweeps of an hour list it again
+        # The report must do each (run_id, attempt) once: every sweep of an hour lists it again, and a workflow_run
+        # of the re-run (if GitHub fires one) reports it above.
+        run: REPORT RED ATTEMPTS COMMAND "$REDS"

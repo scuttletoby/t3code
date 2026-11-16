@@ -29,10 +29,16 @@ replaces it.
 
 Known limits, each costing at most one re-run of a trusted run, onto `fallback`:
 
+- a job that hit its own `timeout-minutes` while the runner lived counts as its own failure only when GitHub records it
+  as `timed_out`; if GitHub records it like a lost runner instead (job `failure`, its step `cancelled`, no failed
+  step: not confirmed on a real run), it counts as cut off and is re-run once (likely timing out again);
 - a run a person cancelled after a job had waited past its bound counts as cut off (GitHub's record does not say who
   cancelled a run; fleet-route's `sweep` does the same);
 - a step that prints an error line matching `exit code 137` or `watch.errors` itself counts as killed: only runs of
-  trusted actors and workflows are read, so only their own code can do that.
+  trusted actors and workflows are read, so only their own code can do that;
+- a late job a runner takes in the one call between the sweep's last read of the job and its cancel is cancelled while
+  it runs (the sweep reads the run and the late job again just before the cancel, and cancels only while the job still
+  waits with no runner); its watch then keeps that red (cancelled while it ran), never a false green.
 
 ## Guarantees
 
@@ -48,15 +54,20 @@ Known limits, each costing at most one re-run of a trusted run, onto `fallback`:
 - **No state of its own.** GitHub's record of each run (its latest attempt, who started it, its jobs) is the only
   state, so it may run again, stop half-way, or start on an empty repository: a second watch of one run finds the
   re-run going (GitHub refuses a second one) and does nothing; a watch that never ran is done by the next sweep; a
-  run that ended more than 24 hours ago, or whose branch has a newer run of another commit, is never re-run.
+  run created or ended more than 24 hours ago, or whose branch has a newer run of another commit, is never re-run.
 - **Bounded.** At most 200 GitHub calls per step (the rest waits for the next sweep; each sweep starts at another
-  workflow, so one busy workflow cannot use them all every time), one page of runs per workflow and state, 300 jobs
+  workflow, so one busy workflow cannot use them all every time; a sweep that runs out fails with an `::error::`, as
+  its `reds` may then miss some), one page of queued and of running runs per workflow, completed runs back to 49 hours
+  (every run a re-run of fleet-watch can have ended red in the last hour: created at most 24 hours before the re-run,
+  which ran at most 24 hours; up to 1000, GitHub's limit; more, or a re-run of its own still running past that, is an
+  `::error::`), 300 jobs
   per attempt (a run with more is unsure: its red stands), and a job's log only when its red would otherwise stand,
   only in `watch` (the sweep's catch-up leaves a run whose logs would decide to its watch, so it reads no log).
 - **Unsure means red.** `pending` answers `true` only when GitHub shows a newer attempt; a re-run GitHub refused (or
   not started yet), an error or a missing token is `false` or an empty output. Test it with `== 'true'`.
 - **Settings are never guessed.** `watch` and `sweep` fail when `vars` is missing or is not a JSON object, or the
-  setting is not a mode; an unset setting is `auto`, as for fleet-route.
+  setting is not a string or not a mode; an unset setting is `auto`, as for fleet-route. A `FLEET_MODE` (or the
+  config's `variable`) in the calling job's `env` wins over `vars`, as for fleet-route.
 
 ## Usage
 
@@ -75,9 +86,12 @@ re-run with `GITHUB_TOKEN` fires `workflow_run` (events that `GITHUB_TOKEN` trig
 [triggering a workflow from a workflow](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/triggering-a-workflow#triggering-a-workflow-from-a-workflow);
 the only re-run note for `workflow_run` is that `requested` does not occur:
 [`workflow_run`](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run)).
-So the sweep lists those red attempts as `reds` for an hour, and the example reports them; when `workflow_run` does
-fire, both report one attempt: make the report do each run id and attempt once (for example, look for its earlier
-report first).
+So the sweep lists those red attempts as `reds` for an hour, and the example reports them.
+
+**The report must do each `(run_id, attempt)` once.** One red attempt of a re-run is listed by every sweep of that
+hour (up to six times), and also comes as a `workflow_run` when GitHub fires one; look for the report of that run id
+and attempt first (for example, an issue whose title holds both) and do nothing when it is there. A re-run attempt
+that ended `cancelled` (a person, or a newer push, cancelled it) is not listed: that is not the change's red.
 
 ## Config
 

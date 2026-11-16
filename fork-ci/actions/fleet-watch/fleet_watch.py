@@ -18,13 +18,16 @@ _spec.loader.exec_module(ff)
 say = ff.say
 
 MAX_CALLS = 200        # GitHub calls one run of this script makes at most; the next sweep goes on from GitHub's record
-WINDOW = 24 * 3600     # a run that ended longer ago is never re-run
+WINDOW = 24 * 3600     # a run created or ended longer ago is never re-run
 CATCH_UP = 3600        # the sweep re-runs (as `watch` would) red runs that ended this long ago at most
+LONGEST = 24 * 3600    # a re-run of this script's still running this long after WINDOW is an error: reds cannot reach it
+RUN_PAGES = 10         # pages of 100 completed runs a sweep reads per workflow (GitHub lists 1000 at most)
 MAX_ATTEMPT = 2        # attempts this script re-runs at most: 1 and 2 (a person's re-run); 3 and later by hand only
 LOG_MAX = 8 << 20      # bytes of a job's log read for its error lines
 JOB_PAGES = 3          # pages of 100 jobs read per attempt: a run with more is unsure, its red stands
 BOT = 'github-actions[bot]'   # the triggering actor of a re-run started with the job's GITHUB_TOKEN
 RED = ('failure', 'timed_out', 'cancelled', 'startup_failure')
+REPORT = ('failure', 'timed_out', 'startup_failure')   # a re-run's red to report: cancelled is a person's or a push's
 SET_UP = ('Set up job', 'Set up runner')   # the runner's own steps: its set-up, and the job-started hook (the gate)
 MACHINE = (re.compile(r'Process completed with exit code 137\b'),)   # a step killed (SIGKILL), most often for memory
 
@@ -85,6 +88,9 @@ def mode_from(cfg, env):
         got = None
     if not isinstance(got, dict):
         raise ValueError('the vars input is not a JSON object of repository variables (toJSON(vars))')
+    name = cfg.get('variable')
+    if name and got.get(name) is not None and not isinstance(got[name], str):
+        raise ValueError(f'the vars input\'s {name} is not a string, so not a mode (toJSON(vars) gives strings)')
     return ff.mode_in(cfg, ff.with_vars(cfg, env).get('FLEET_MODE'))
 
 
@@ -189,8 +195,8 @@ def plan(cfg, gh, run, mode, now, logs=True):
         return [], why
     if run.get('status') != 'completed':
         return [], f'it is {run.get("status")}'
-    if now - (ff.stamp(run.get('updated_at')) or 0) > WINDOW:
-        return [], 'it ended more than 24 hours ago'
+    if now - (ff.stamp(run.get('created_at')) or 0) > WINDOW or now - (ff.stamp(run.get('updated_at')) or 0) > WINDOW:
+        return [], 'it was created or ended more than 24 hours ago'
     followers, machine = settings(cfg)
     jobs = gh.pages(f'actions/runs/{int(run["id"])}/attempts/{int(run.get("run_attempt") or 1)}/jobs', 'jobs',
                     most=JOB_PAGES)
@@ -268,24 +274,40 @@ def watch(cfg, gh, run, mode, now, logs=True):
     return rerun(cfg, gh, run, cut)
 
 
-def bot_red(cfg, run, now):
-    """A red attempt that a GITHUB_TOKEN re-run (this script's) ended in, in the last CATCH_UP seconds, of a run that
-    is trusted otherwise: its report may get no workflow_run event, so the sweep lists it (reds=)."""
+def ours(cfg, run):
+    """Is this attempt a GITHUB_TOKEN re-run (this script's) of a run that is trusted otherwise?"""
     if (run.get('triggering_actor') or {}).get('login') != BOT or int(run.get('run_attempt') or 1) < 2:
         return False
-    if run.get('status') != 'completed' or run.get('conclusion') not in RED:
-        return False
-    if now - (ff.stamp(run.get('updated_at')) or 0) > CATCH_UP:
-        return False
     return untrusted(cfg, dict(run, triggering_actor=run.get('actor'), run_attempt=1)) is None
+
+
+def bot_red(cfg, run, now):
+    """A red attempt that a re-run of this script's ended in, in the last CATCH_UP seconds: its report may get no
+    workflow_run event, so the sweep lists it (reds=). One cancelled (by a person, or a newer push) is not listed."""
+    if run.get('status') != 'completed' or run.get('conclusion') not in REPORT:
+        return False
+    return now - (ff.stamp(run.get('updated_at')) or 0) <= CATCH_UP and ours(cfg, run)
+
+
+def still_queued(gh, late):
+    """The first late job that, read again just before the cancel, still waits with no runner, or None (a runner
+    took it since the jobs were listed: the run is not cancelled under it)."""
+    for j in late:
+        got = gh.call(f'actions/jobs/{int(j["id"])}')
+        if got.get('status') == 'queued' and not got.get('runner_name'):
+            return j
+    return None
 
 
 def sweep(cfg, gh, mode, now, notes, reds=None):
     """Cancels a run whose dispatcher job waits too long, and re-runs a red run no watch re-ran (when its jobs alone
     decide). Adds to reds the red attempts this script's re-runs ended in. Returns the number of troubles; what was not
     done is done by the next sweep, from GitHub's record. The workflows start at a different one each sweep (by the
-    millisecond it starts), so one busy workflow cannot use up the call budget every time."""
-    trouble, since = 0, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now - WINDOW))
+    millisecond it starts), so one busy workflow cannot use up the call budget every time. Completed runs are read
+    back to every run a re-run of this script's could have ended red in the last CATCH_UP seconds: one created at most
+    WINDOW before the re-run, which ran at most LONGEST (a longer one is reported as trouble while it runs)."""
+    reach = WINDOW + LONGEST + CATCH_UP
+    trouble, since = 0, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now - reach))
     paths = list(cfg['trusted']['workflows'])
     first = round(now * 1000) % len(paths) if paths else 0
     reds = [] if reds is None else reds
@@ -293,17 +315,27 @@ def sweep(cfg, gh, mode, now, notes, reds=None):
         base = f'actions/workflows/{urllib.parse.quote(os.path.basename(path))}/runs'
         try:
             busy = [r for s in ('queued', 'in_progress') for r in gh.pages(f'{base}?status={s}', 'workflow_runs', 1)]
-            done = gh.pages(f'{base}?status=completed&created=%3E%3D{since}', 'workflow_runs', 1)
+            done = gh.pages(f'{base}?status=completed&created=%3E%3D{since}', 'workflow_runs', RUN_PAGES)
         except Spent:
             raise
         except ff.TROUBLE as e:
             say(f'::warning::fleet-watch: the runs of {path} cannot be listed ({e.__class__.__name__}: {e})')
             trouble += 1
             continue
+        if len(done) >= RUN_PAGES * 100:
+            say(f'::error::fleet-watch: {path} has {len(done)} completed runs or more since {since}, not all read: '
+                f'reds may miss a red re-run of a run created before {done[-1].get("created_at")}')
+            trouble += 1
         for run in busy + done:
             try:
                 if bot_red(cfg, run, now):
                     reds.append({'run_id': int(run['id']), 'attempt': int(run['run_attempt'])})
+                    continue
+                if run.get('status') != 'completed' and ours(cfg, run) \
+                        and now - (ff.stamp(run.get('created_at')) or 0) > WINDOW + LONGEST:
+                    say(f'::error::fleet-watch: run {run["id"]} attempt {run["run_attempt"]} (a re-run of fleet-watch) '
+                        'still runs, too long for reds to list its end: report its red by hand')
+                    trouble += 1
                     continue
                 if untrusted(cfg, run):
                     continue
@@ -322,13 +354,16 @@ def sweep(cfg, gh, mode, now, notes, reds=None):
                 if changed:
                     say(f'run {run["id"]}: not cancelled: {changed}')
                     continue
+                j = still_queued(gh, late)
+                if j is None:
+                    say(f'run {run["id"]}: not cancelled: a runner took its late jobs since they were listed')
+                    continue
                 try:
                     gh.call(f'actions/runs/{int(run["id"])}/cancel', 'POST')
                 except urllib.error.HTTPError as e:
                     if e.code != 409:
                         raise
                     continue   # it ended since it was listed: its watch takes it
-                j = late[0]
                 why = f'{j["name"]} waited {waited(j, now) // 60} min for pool {pool_of(cfg, j)["name"]}'
                 say(f'::warning::fleet-watch: run {run["id"]}: {why}: cancelled; its watch re-runs it on the fallback')
                 notes.append(f'run {run["id"]} cancelled: {why}')
@@ -380,7 +415,7 @@ def main(argv=None, env=None, gh=None, now=None):
             say(f'run {args.run_id} attempt {args.attempt}: {"pending" if yes else "not pending"}: {why}')
             out.append(f'pending={"true" if yes else "false"}')
     except Spent as e:
-        say(f'::warning::fleet-watch: {e}')
+        say(f'::error::fleet-watch: {e}' + ('; reds may miss red re-runs not reached' if args.verb == 'sweep' else ''))
         code = 1
     if args.verb == 'sweep':   # what it found before a stop too; an exception leaves it empty (the next sweep lists)
         out.append(f'reds={json.dumps(reds, separators=(",", ":"))}')

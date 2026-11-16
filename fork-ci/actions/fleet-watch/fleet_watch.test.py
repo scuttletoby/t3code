@@ -100,6 +100,8 @@ class FakeGitHub:
                 raise error
         if m := re.fullmatch(r'actions/runs/(\d+)', path):
             return dict(self.runs[int(m[1])])
+        if m := re.fullmatch(r'actions/jobs/(\d+)', path):
+            return dict(next(j for js in self.jobs.values() for j in js if j['id'] == int(m[1])))
         if m := re.fullmatch(r'actions/runs/(\d+)/attempts/(\d+)/jobs\?per_page=100&page=(\d+)', path):
             page = int(m[3])
             return {'jobs': self.jobs.get((int(m[1]), int(m[2])), [])[(page - 1) * 100:page * 100]}
@@ -376,6 +378,18 @@ class Watch(unittest.TestCase):
         self.assertFalse(got)
         self.assertIn('not all read', out)
 
+    def test_a_run_created_more_than_a_day_ago_is_not_re_run(self):
+        # lens233cr1 N1: a person re-runs a 2-day-old run today and the desk runner stops. A re-run (attempt 3) would
+        # end red where the sweep's reds cannot see it; so it is not re-run, and attempt 2's red is reported.
+        gh = FakeGitHub()
+        run = cut_run(gh, attempt=2)
+        run['created_at'] = iso(T0 - 2 * 86400)
+        got, out = watch(gh)
+        self.assertFalse(got)
+        self.assertIn('created or ended more than 24 hours ago', out)
+        self.assertEqual(gh.writes(), [])
+        self.assertFalse(quiet(fw.pending, gh, 5, 2)[0][0])
+
     def test_a_stop_half_way_is_finished_by_the_next_watch(self):
         gh = FakeGitHub()
         cut_run(gh)
@@ -474,6 +488,19 @@ class Sweep(unittest.TestCase):
         self.assertNotIn(('GET', 'actions/jobs/51/logs'), gh.calls)
         self.assertIn('left to its watch', out)
 
+    def test_a_job_a_runner_took_since_it_was_listed_is_not_cancelled(self):
+        class Race(FakeGitHub):   # the pool's runner picks the late job up while the sweep reads the run again
+            def call(self, path, method='GET', data=None):
+                if method == 'GET' and path == 'actions/runs/5':
+                    self.jobs[(5, 1)][0].update(status='in_progress', runner_name='runner-1')
+                return super().call(path, method, data)
+        gh = Race(now=T0 + 600)
+        self.waiting(gh)
+        got, out, notes = self.sweep(gh)
+        self.assertEqual((got, notes, gh.writes()), (0, [], []))
+        self.assertIn('a runner took its late jobs', out)
+        self.assertIn(('GET', 'actions/jobs/51'), gh.calls)
+
     def test_a_run_that_changed_since_it_was_listed_is_not_cancelled(self):
         class Race(FakeGitHub):   # a person re-runs it while the sweep reads its jobs
             def call(self, path, method='GET', data=None):
@@ -499,6 +526,7 @@ class Sweep(unittest.TestCase):
             'an hour later': (dict(), gh.now + 3600),
             'passed': (dict(conclusion='success'), gh.now),
             'a person re-ran it': (dict(triggering_actor={'login': OWNER}), gh.now),
+            'cancelled (a person or a newer push)': (dict(conclusion='cancelled'), gh.now),
             'other branch': (dict(head_branch='topic'), gh.now),
         }
         for case, (change, now) in cases.items():
@@ -508,6 +536,47 @@ class Sweep(unittest.TestCase):
                 reds = []
                 quiet(fw.sweep, CONFIG, other, 'auto', now, [], reds)
                 self.assertEqual(reds, [])
+
+    def bot_red_run(self, gh, rid=5, created=T0, ended=None):
+        run = gh.add(a_run(rid, attempt=2, triggering=BOT, ended=ended or gh.now - 10))
+        run['created_at'] = iso(created)
+        return run
+
+    def test_reds_reaches_every_re_run_the_watch_could_have_made(self):
+        # lens233cr1 N1: page 1 of the runs created in the last 24 hours missed these.
+        cases = {
+            'behind 150 newer runs': (T0 + 1000, 150),
+            'created 25 hours ago, re-run 23 hours later': (T0 + 25 * 3600, 0),
+        }
+        for case, (now, newer) in cases.items():
+            with self.subTest(case):
+                gh = FakeGitHub(now=now)
+                self.bot_red_run(gh)
+                for i in range(newer):
+                    gh.add(a_run(100 + i, conclusion='success'))
+                reds = []
+                got, out = quiet(fw.sweep, CONFIG, gh, 'auto', gh.now, [], reds)
+                self.assertEqual((got, reds), (0, [{'run_id': 5, 'attempt': 2}]), out)
+                self.assertEqual(gh.writes(), [])
+
+    def test_runs_it_cannot_all_list_are_an_error(self):
+        gh = FakeGitHub()
+        for i in range(100):
+            gh.add(a_run(100 + i, conclusion='success'))
+        with mock.patch.object(fw, 'RUN_PAGES', 1):
+            got, out, _ = self.sweep(gh)
+        self.assertEqual(got, 1)
+        self.assertRegex(out, r'::error::fleet-watch: .*not all read: reds may miss')
+
+    def test_a_re_run_still_running_past_the_reach_of_reds_is_an_error(self):
+        gh = FakeGitHub(now=T0 + fw.WINDOW + fw.LONGEST + 1)
+        run = self.bot_red_run(gh)
+        run.update(status='in_progress', conclusion=None)
+        got, out, _ = self.sweep(gh)
+        self.assertEqual(got, 1)
+        self.assertIn('report its red by hand', out)
+        gh.now -= 2
+        self.assertEqual(self.sweep(gh)[0], 0)
 
     def test_each_sweep_starts_at_another_workflow(self):
         cfg = dict(CONFIG, trusted=dict(CONFIG['trusted'], workflows=[CI, '.github/workflows/other.yml']))
@@ -537,6 +606,24 @@ class Budget(unittest.TestCase):
             with self.assertRaises(fw.Spent):
                 quiet(fw.sweep, CONFIG, gh, 'auto', T0, [])
         self.assertEqual(len(calls), 20)
+
+    def test_a_sweep_out_of_calls_says_reds_may_miss_some(self):
+        class Spending(FakeGitHub):
+            def call(self, path, method='GET', data=None):
+                if len(self.calls) >= 2:
+                    raise fw.Spent('200 GitHub calls made')
+                return super().call(path, method, data)
+        with tempfile.TemporaryDirectory() as tmp:
+            config, output = os.path.join(tmp, 'fleet.json'), os.path.join(tmp, 'output')
+            with open(config, 'w') as f:
+                json.dump(CONFIG, f)
+            gh = Spending()
+            code, out = quiet(fw.main, ['--config', config, 'sweep'], {'GITHUB_OUTPUT': output, 'FLEET_VARS': '{}'},
+                              gh, gh.now)
+            self.assertEqual(code, 1)
+            self.assertIn('::error::fleet-watch: 200 GitHub calls made; reds may miss', out)
+            with open(output) as f:
+                self.assertEqual(f.read(), 'reds=[]\n')
 
     def test_a_logs_redirect_never_gets_the_token(self):
         sent = []
@@ -668,7 +755,8 @@ class Action(unittest.TestCase):
             self.assertEqual(f.read(), 'rerun=true\npending=true\nreds=[{"run_id":5,"attempt":2}]\n')
 
     def test_watch_and_sweep_refuse_missing_or_garbled_vars(self):
-        cases = {'missing': '', 'not json': '{x', 'not an object': '[]', 'not a mode': '{"PROJ_RUNNERS": "flet"}'}
+        cases = {'missing': '', 'not json': '{x', 'not an object': '[]', 'not a mode': '{"PROJ_RUNNERS": "flet"}',
+                 'not a string': '{"PROJ_RUNNERS": 1}'}
         for verb in ('watch', 'sweep'):
             for case, raw in cases.items():
                 with self.subTest(verb=verb, case=case):

@@ -259,6 +259,10 @@ that uses only the action has neither. So:
 - **Queued runs on a removed label** wait until GitHub drops them (24 hours). Cancel such a run by hand and re-run
   it; the re-run is routed by the new config.
 
+[fleet-watch](../fleet-watch/README.md) adds both for a project that uses this action: it cancels a run that waits
+too long and re-runs a cut-off run once, on `fallback`. A red-run report beside it must report each run id and attempt
+`(run_id, attempt)` once: one red re-run can come both from its `workflow_run` and from up to six sweeps (`reds`).
+
 ## Tests
 
 `fleet_route.test.py` runs the action's step as a runner does (no token, an empty `GH_CONFIG_DIR`), against the
