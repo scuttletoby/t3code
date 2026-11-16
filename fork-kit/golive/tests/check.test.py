@@ -145,6 +145,18 @@ class NothingToDoNeverHidesARefusal(CheckBase):
         self.assertIn('restore may have stopped half-way', failed['database'])
         self.assertIn('t3code.service is installed', failed['database'])
 
+    def test_a_database_moved_aside_with_no_service_is_not_nothing_to_protect(self):
+        # fork #187: a restore stopped half-way on a home whose unit was also removed must not say "use the normal
+        # installer" (it would install over the only copy of the data).
+        self.m.config()
+        self.m.write('home/userdata/statev2.sqlite.golive-aside-20261115T120000Z', b'SQLite format 3\0')
+        self.m.service(LoadState='not-found', ActiveState='inactive', UnitFileState='', FragmentPath='', MainPID=0)
+        code, result, _ = self.check_json()
+        self.assertEqual(code, 1, result)
+        self.assertNotIn('nothing', result)
+        self.assertIn('statev2.sqlite.golive-aside-20261115T120000Z', self.failed(result)['database'])
+        self.assertNotIn('use the normal installer', ' '.join(result['info']))
+
     def test_live_boot_service_with_no_database(self):
         self.m.standard()
         os.remove(self.m.path('home/userdata/statev2.sqlite'))
@@ -400,6 +412,16 @@ class Refusals(CheckBase):
         self.assertIn('no bus', self.failed(result)['boot service'])
 
 
+    def test_an_unexpected_error_still_prints_json(self):
+        # fork #187 nit: --json always prints JSON (never empty output), and it never reads as ok.
+        self.m.standard()
+        with mock.patch.object(check, '_checks', side_effect=KeyError('surprise')):
+            code, result, _ = self.check_json()
+        self.assertEqual(code, 1)
+        self.assertIs(result['ok'], False)
+        self.assertIn('surprise', self.failed(result)['check ran'])
+
+
 class CannotRun(CheckBase):
     def test_no_machine_file_prints_a_template(self):
         code, _, err = self.check()
@@ -613,20 +635,41 @@ class WithJournal(CheckBase):
         cfg = config.load()
         adapter = fx.osadapter.SystemdUser()
         with journal.run(self.m.state, 'switch') as r:
-            with r.step('check'):
-                code, result = check.run_check(cfg, adapter, own_run=r)
-                self.assertEqual(code, 0, self.failed(result))
-                # Without its run it is Busy like anyone else, and a run that does not hold the lock is refused.
-                code, result = check.run_check(cfg, adapter)
-                self.assertIn('one run at a time', self.failed(result))
-                with self.assertRaises(ValueError):
-                    check.run_check(cfg, adapter, own_run=journal.Run(self.m.state, 'switch'))
+            code, result = check.run_check(cfg, adapter, own_run=r)  # a pre-check: before the first step
+            self.assertEqual(code, 0, self.failed(result))
+            # Without its run it is Busy like anyone else, and a run that does not hold the lock is refused.
+            code, result = check.run_check(cfg, adapter)
+            self.assertIn('one run at a time', self.failed(result))
+            with self.assertRaises(ValueError):
+                check.run_check(cfg, adapter, own_run=journal.Run(self.m.state, 'switch'))
         with self.assertRaises(ValueError):
             check.run_check(cfg, adapter, own_run=r)  # the run has ended: it holds no lock now
         os.makedirs(self.m.path('other-state'))
         with journal.run(self.m.path('other-state'), 'switch') as other:
             with self.assertRaises(ValueError):
                 check.run_check(cfg, adapter, own_run=other)
+
+    def test_the_check_is_a_pre_check_never_a_step(self):
+        # fork #186: a check inside a step made every refused pre-check a run to settle. It runs before the first
+        # step; inside one it is refused, and a run refused by it ends "refused" with nothing to settle.
+        self.m.standard()
+        cfg, adapter = config.load(), fx.osadapter.SystemdUser()
+        with journal.run(self.m.state, 'switch') as r:
+            with self.assertRaises(ValueError) as e:
+                with r.step('check'):
+                    check.run_check(cfg, adapter, own_run=r)
+            self.assertIn('before the first step', str(e.exception))
+        journal.settle(self.m.state, 'test')
+        self.m.write('home/runtime/.restart-pending', '')
+        with self.assertRaises(journal.Refused):
+            with journal.run(self.m.state, 'switch') as r:
+                code, result = check.run_check(cfg, adapter, own_run=r)
+                self.assertEqual(code, 1)
+                raise journal.Refused('; '.join(self.failed(result)))
+        self.assertEqual(journal.read(self.m.state)[0][-1]['end']['result'], 'refused')
+        self.assertIsNone(journal.unfinished(self.m.state))
+        os.remove(self.m.path('home/runtime/.restart-pending'))
+        self.assertEqual(self.check()[0], 0)
 
     def test_own_run_still_sees_an_earlier_run_to_settle(self):
         self.m.standard()

@@ -2,7 +2,7 @@
 
 `t3-golive` moves a T3 home that runs as a boot service from its current build to a newer one (for example a
 fork build), with a cold copy of the data first and a way back. It is built in steps; this folder has the
-**core** so far:
+**core** and the **copy** so far:
 
 | Part              | File                      | What it does                                                 |
 | ----------------- | ------------------------- | ------------------------------------------------------------ |
@@ -11,8 +11,9 @@ fork build), with a cold copy of the data first and a way back. It is built in s
 | live T3           | `lib/golive/live.py`      | finds the running server from its own files and process      |
 | `check`, `settle` | `lib/golive/check.py`     | read only: may this home move to the target build now?       |
 | OS adapter        | `lib/golive/osadapter.py` | systemd user units only; other systems refuse until written  |
+| `copy`, restore   | `lib/golive/coldcopy.py`  | the practice stop: a cold copy; the restore primitive        |
 
-Later parts (copy, rehearse, switch, back) come in their own PRs. Install from `ci-release` comes with them.
+Later parts (rehearse, switch, back) come in their own PRs. Install from `ci-release` comes with them.
 
 ## `t3-golive check`
 
@@ -43,6 +44,174 @@ lock of its own (the run holds it exclusively, so there is no gap) and does not 
 A run that does not hold the lock on this `stateDir` is refused (`ValueError`), so this opens the lock to no one
 else.
 
+## `t3-golive copy [--owner-says-go]`: the practice stop
+
+The first change the kit makes, and a rehearsal of the stop the switch will need. It runs detached (a transient
+user unit, printed with how to follow it), because stopping T3 kills everything inside its service, a T3
+terminal included; `--here` runs it in the calling process and is refused inside the boot service. In order:
+
+1. **Checks** (no change yet): `check` must pass (or say nothing to do: then it refuses), the database must be
+   a file, not a link (a copy takes files and would hold only the link), no restore may have stopped half-way
+   (`userdata/golive-restore-unfinished.json`, see below), the backup disk must hold the copy plus the floor,
+   the `stateDir` disk must keep the floor (the journal and guard log live there), and a quiet command must be
+   set unless the owner says go.
+2. **Quiet point** (no change yet): `quietCommand` (the fork setting `automaticUpdatesQuietCommand`'s contract:
+   absolute path, no arguments, run in the home with both versions in its environment, exit 0 = quiet) must say
+   quiet twice, 60 s apart, within `quietWaitSeconds`; else it refuses. `--owner-says-go` skips the wait. Then
+   free space is checked again, and the live server is read again: if its pid, its version, the service
+   state's `activeVersion` or a pending update changed during the wait (the auto-updater keeps the same quiet
+   contract and may have moved T3 to a newer build), it refuses.
+3. **Guard**: a second detached unit (`t3-golive guard`) waits for this run to end however it ends; if the run
+   stopped T3 and left it stopped (killed, crashed), it starts T3 again, and it runs the post hooks if the run
+   ran the pre hooks but not the post hooks. If it cannot read the journal it fails open: it starts T3 if the
+   service is inactive and runs the post hooks, and logs why. It logs to `<stateDir>/guard.log` (first a
+   "waiting" line, then what it did) and writes no journal line. The run goes on only after it sees the
+   guard's "waiting" line (within 30 s); else it refuses and says where to look
+   (`journalctl --user -u <guard unit>` and `<stateDir>/guard.log`).
+4. **Pre hooks** (`preHooks`, in order), then one more quiet sample, the live server read again, and the guard
+   unit checked still active. Any failure runs the post hooks and refuses: T3 was never stopped. If a post
+   hook fails there, the run ends "failed" and needs `settle` (jobs may still be paused).
+5. **Stop** the boot service; wait until it is inactive and its server is gone; take upstream's ownership lock
+   of the home (`userdata/server-owner.sqlite`), so no server can start on it during the copy; the service
+   state must still name the same build, with no update pending. This state check is what keeps a copy from
+   carrying the wrong version: the auto-updater names a new build there (or marks the update pending) before it
+   starts it. If it changed, no copy is taken and T3 is started on whatever build the service now starts; the
+   run says which.
+6. **Cold copy** of `userdata/` into a new folder `<backupDir>/t3-copy-<time>-<live version>/` (mode 700; never
+   over an old one): the database with its WAL, settings, attachments and the other small files, with their
+   modes; links as links. Left out: `logs`, `server-runtime.json`, the ownership lock, SQLite's `-shm` (an index
+   SQLite rebuilds from the WAL on the first open), and a restore's temp files and kept old files
+   (`*.golive-restore-*`, `*.golive-aside-*`). Each file is hashed while it is copied and fsynced.
+7. **Read-back**: both the copy and the source are read from disk again; every SHA256 must match.
+8. **Manifest**, written LAST (temp file, fsync, rename): every entry with its size, mode and SHA256.
+9. **Start** the same build again, **verify** a new server of the same version runs for the home, then the
+   **post hooks**. These run however steps 5-8 ended. The start comes before its journal line, so a full disk
+   under the journal cannot keep T3 stopped. `stopLimitSeconds` bounds steps 6-7: past it the copy gives up and
+   T3 starts again. When the restart fails as well, the first error is raised and the later ones are kept as
+   notes (also in the journal's end line).
+
+**A copy folder without a finished manifest is incomplete and is never used** (`coldcopy.read_manifest`,
+`verify_copy`). The kit deletes no data: each copy names the incomplete copy folders it finds
+(`coldcopy.incomplete_copies`) and the files earlier restores kept (`coldcopy.kept_files`, each as big as what
+it kept), and a refusal for free disk counts and names both, so the owner can remove them. The database link
+and the restore record are looked at again after the quiet wait and at the last look before the stop. A
+refusal before T3 stopped (every started step done) ends the run
+"refused" and needs no settling; any failure after T3 stopped needs `settle`, after T3 was started again.
+
+Kills and stops: SIGTERM is handled like a kill (the guard puts T3 back). A kill during the quiet wait changed
+nothing and needs no settling. After a power loss no guard runs: the enabled service starts T3 at boot, the post
+hooks never run, and the journal asks for `settle`. More in the failure table below.
+
+Restore primitive (`coldcopy.restore(run, copy_dir, home, from_home=..., version=...)`, for the later `rehearse`
+and `back`; only inside a journalled step, with the home's server stopped): takes only a copy whose manifest
+names that home and live version (else `WrongCopy`), reads the copy back against its manifest first, refuses
+while any server holds the ownership lock, and needs free disk for the copy's files plus a kept copy of each
+home file they replace plus the floor (all these checks run again under the ownership lock, just before the
+first change). In order, each step fsynced:
+
+1. temp files a restore stopped half-way left (`.<name>.golive-restore-<time>...`) are removed: a temp is only
+   renamed to its real name once whole, and the copy folder still holds what it held;
+2. the database family and `settings.json` are copied in under temp names, then read back from disk against
+   the manifest;
+3. every home file it will replace (`-wal`, `-journal` and `-shm` included) is **kept**: copied (not hard-linked)
+   to `<name>.golive-aside-<time>`, read back, then renamed to that name;
+4. a record, `userdata/golive-restore-unfinished.json`, is written (temp file, fsync, rename): it names the kept
+   files that are the old home;
+5. the home's companions (`-shm`, `-journal`, `-wal`) are removed;
+6. the copies are renamed in, database first;
+7. the record is removed: the restore is done.
+
+A stop at any point leaves the old or the new database with no WAL or its own WAL, never a WAL without its
+database or with the other database, and every old file kept. Running it again finishes the job. A rerun after
+a stop in steps 5-7 finds the record: the home is then half-way (for example the old database file without its
+WAL), not the old home, so the rerun names the old home from the record (`movedAside` in its result) and keeps
+again only home files that hold something new (`alsoKept`: what a T3 started after the stop wrote). The record
+is rewritten to name those too before anything leaves the home, so a third run still names them. Free disk for
+a rerun counts only the files it will keep. A record that cannot be read refuses the restore before any
+data changes. A record whose kept files were all put back by hand (moved back, or copied back so the home holds the same
+bytes; a kept `-shm` need not go back) is replaced, and the home is taken as the old home (`staleRecord` in the
+result; `staleKept` names that record's kept files still on disk, such as what earlier reruns kept, which stay
+until the owner removes them). A record put back only in part (say the database moved back but not its `-wal`, or a
+kept file gone from both its kept name and the home, or gone while the home's file of that name holds the copy's
+bytes by the copy's manifest SHA256, so it was deleted) refuses before any data changes, and so does one put back
+in full while the home still holds a `-wal`, `-journal` or `-shm` the old home did not have. The refusal names
+each such file and whose it is, by the SHA256 in the copy's manifest:
+
+- **the copy's** `-wal`/`-journal` (same SHA256), left from the restore stopped half-way: remove it, and **do not
+  remove the record** (next to the old database it would serve or checkpoint another database's pages); then run
+  the restore again;
+- **T3's**, one that does not match the copy's: a T3 that ran on the put-back home with the record still there
+  wrote it, and it holds that T3's newest commits: **keep it and remove the record instead**;
+- a **`-shm` with no `-wal`** of the half-way home beside it: only SQLite's index of a WAL, always safe to remove.
+
+When the copy's manifest cannot be read, the refusal says it cannot tell whose the file is: remove neither it nor
+the record until it is compared with the copy's file. Finish putting the kept files back, or remove the record once
+the home is right. "Before any data changes": the restore takes the home's ownership lock first, which creates an
+empty `server-owner.sqlite` when the home has none (as T3 itself does); nothing else changes. A rerun after
+a stop between the record's removal and the end of the caller's step finds no record and a home that is exactly the
+copy's: it keeps nothing (`alreadyRestored`), so the restored data is never named as the old home. While the record
+is there, a copy refuses.
+
+**The caller must keep T3 from starting until the restore step is done** (the later `rehearse` and `back` will:
+the service stopped, and not started at boot before the step ends). If T3 does start after a stop in steps 5-7
+(a power loss, then the enabled service at boot), it opens the old database file without its WAL (missing the
+WAL's commits, and after a crash in the middle of a checkpoint the file alone may be torn), or the copy's
+without its WAL. The kept files are independent copies, so they stay exactly the old home. Settling that means
+running the restore again, or, with T3 stopped, first removing the home's `-wal`, `-journal` and `-shm`, then
+putting back the kept files the record names and removing the record. Putting back drops the half-way home: if
+a T3 ran on it after the stop, run the restore again instead (it keeps what that T3 wrote). The kit never
+removes kept files; `kept_files` lists them, and a restore's refusal for free disk names them, with the ones the
+record of a restore stopped half-way names listed apart as files that must stay.
+
+## Failure table
+
+The state question for every row: what happens when this runs again, stops half-way, or meets existing, old or
+empty state?
+
+| Situation                                                                           | What happens                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runs again while one runs                                                           | `journal.Busy` (flock); the running one is named only if its pid is alive                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Runs again after a good copy                                                        | A new folder `t3-copy-<time>-<version>`; never over an old one (refused before T3 stops if the name exists)                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Runs again after a failed or killed copy                                            | Refused (`Unfinished`) until `t3-golive settle`; `check` names where it stopped                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Killed during the quiet wait (before the first step)                                | Nothing changed; no settling needed; `check` only notes it and the next copy runs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Killed before T3 stops (guard up, hooks maybe run)                                  | No end in the journal. T3 was never stopped; the guard runs the post hooks if the pre hooks ran                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Killed while T3 is stopped (mid-copy, before the manifest)                          | The guard starts T3 again and runs the post hooks. The copy folder has no manifest, so it is never used; later copies name it. The next run asks for `settle`                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Killed during the restart                                                           | The copy is whole (manifest written). The guard starts T3 if it is not active and runs the post hooks. The next run asks for `settle`                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| SIGTERM (e.g. `systemctl stop` of the run's unit)                                   | Same as a kill: the guard puts T3 back                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Power loss                                                                          | No guard after boot. The enabled service starts T3 at boot; the post hooks never run (jobs stay paused until the owner looks); the journal asks for `settle`                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Guard does not come up (no "waiting" line within 30 s)                              | Refused before the pre hooks; T3 never stopped; nothing to settle. The message names `journalctl --user -u <guard unit>` and `<stateDir>/guard.log`                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Guard died before the last check                                                    | Post hooks run; refused; T3 never stopped; the message says where to look                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Guard dies after the last check (or during the copy)                                | A known gap, not closed: T3 stops without a guard. The run itself still starts T3 again; only if the run is killed too does T3 stay down until the next boot or a manual `systemctl --user start t3code.service`                                                                                                                                                                                                                                                                                                                                                    |
+| Auto-updater moved T3 during the wait or the pre hooks                              | Refused (post hooks run if the pre hooks ran); nothing copied, so no copy is labelled with the old version                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Update lands between the last look and the stop                                     | No copy taken. T3 is started again on the build the service now starts (no wait for the old one); the run says which build runs, ends "failed" and needs settling                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ... the update was in its trial when T3 stopped                                     | Stopping T3 interrupts upstream's update. A stop during its trial: the launcher starts the trial again on the next start. A stop during its rollback: the launcher records `rollback-interrupted` and deals with it on the next start. The copy refuses while an update is pending, so this needs the update to begin in that same gap                                                                                                                                                                                                                              |
+| A crash restarted T3 on the same build before the stop                              | The copy is taken: the build, and so the label, is the same                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Error during copy or read-back (disk full, hash differs, too long)                  | T3 is started again and verified, post hooks run, no manifest, the run ends "failed" and needs settling. If the restart fails too, the first error is raised and the later one is kept as a note (also in the journal end line)                                                                                                                                                                                                                                                                                                                                     |
+| Journal disk full at the restart                                                    | T3 is started before its journal line is written, so it still runs; the run ends with the error and needs settling. The `stateDir` disk must keep the floor free before the run starts                                                                                                                                                                                                                                                                                                                                                                              |
+| Disk filled during the quiet wait                                                   | Free space is checked again after the wait; refused, nothing changed. The refusal names incomplete copy folders and kept files that could be removed                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Not quiet within `quietWaitSeconds`                                                 | Refused, nothing changed, nothing to settle                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Pre hook fails, or busy again after the pre hooks                                   | Post hooks run; refused; T3 never stopped; nothing to settle                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ... and then a post hook fails                                                      | Ends "failed" and needs settling (jobs may still be paused)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| A server still owns the home after the stop                                         | Gives up after the stop wait, copies nothing, starts T3, ends "failed"                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| No quiet command set                                                                | Refused unless `--owner-says-go`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Empty home (no database, nothing ran)                                               | `check` says nothing to do, so copy refuses (nothing to protect)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| A folder in the home cannot be read                                                 | Refused before anything changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Old state: copy folder with no manifest, or files that differ from it               | `read_manifest`/`verify_copy`/`restore` raise `Incomplete`; never used, never deleted; each copy names those with no manifest                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Old state: a copy of another home or another live version                           | `read_manifest`/`plan_restore`/`restore` raise `WrongCopy`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Old state: stale `-shm`, logs, runtime record, a restore's temp files or kept files | Left out of the copy and of its free-space need                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Restore stops half-way (at any copy, link, unlink or rename)                        | The home holds the old or the new database, with its own WAL or none; never a WAL without its database or with the other database. Every old file is kept as an independent copy. The failed step needs `settle`; running it again removes the temp files and finishes from the untouched copy (tested at every stop point, also on a real WAL-mode SQLite database)                                                                                                                                                                                                |
+| ... and T3 starts before anyone looks                                               | The caller must prevent it (see above). If it happens anyway, T3 opens the old database file or the copy's without its WAL, and its writes change only the home: the kept files stay the old home (tested at every stop point)                                                                                                                                                                                                                                                                                                                                      |
+| ... and the restore runs again                                                      | Before anything leaves the home, the home is still the old home: the rerun keeps it again. After that, the record names the old home: the rerun reports that set as `movedAside`, keeps only changed home files (`alsoKept`, so a T3's writes are not lost; the record is rewritten to name them, so a third run still does), and never names the half-way home as the old one (tested at every stop point, and the stop between the WAL removal and the database rename). Free disk counts only the files the rerun keeps, so a rerun fits where the first run fit |
+| ... record of the stopped restore cannot be read                                    | The restore refuses before any data changes; the owner looks at the kept files, puts the home right and removes the record                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ... all kept files put back by hand, record left                                    | Moved back, or copied back so the home holds the same bytes (a kept `-shm` need not go back): the record is replaced; the home is kept as the old home (`staleRecord`; `staleKept` names that record's kept files still on disk, such as what earlier reruns kept)                                                                                                                                                                                                                                                                                                  |
+| ... kept files put back only in part                                                | Refused before any data changes, by `plan_restore` too: the message names the kept files gone and those not back in the home, and a kept file deleted by mistake: gone from both its kept name and the home, or gone while the home's file of that name holds the copy's bytes (a `-shm` may go). Finish putting them back, or remove the record once the home is right                                                                                                                                                                                             |
+| ... put back in full, a half-way `-wal`/`-journal`/`-shm` left                      | All kept files back, but the home still holds a `-wal`, `-journal` or `-shm` the old home did not have: refused before any data changes, by `plan_restore` too, naming each file and whose it is by the copy's manifest SHA256. The copy's (same SHA256): remove it, do NOT remove the record, run the restore again. Not the copy's (a T3 ran on the put-back home with the record still there): keep it, remove the record instead. A `-shm` with no `-wal` beside it: always safe to remove. Copy's manifest unreadable: remove neither until compared           |
+| ... killed after the record is removed, before the step ends                        | No record, and the home is exactly the copy's: the rerun keeps nothing (`alreadyRestored`), so the restored data is never named as the old home. The old home is the first run's kept set (`kept_files` lists it)                                                                                                                                                                                                                                                                                                                                                   |
+| A copy while a restore record is there                                              | Refused before T3 stops: the home is half-way. If the kept files are back, remove the record (first any `-wal`/`-journal` of the copy beside the old database: a restore run names them); otherwise run the restore again                                                                                                                                                                                                                                                                                                                                           |
+| Database is a link (upstream allows a linked database)                              | Refused before T3 stops: a copy takes files only and would hold the link, not the database                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Kept files pile up (one set per restore, each as big as the database)               | Never copied, never removed by the kit. Each copy names and counts them; a refusal for free disk names them (a restore's refusal lists the ones the record of a stopped restore names apart, as files that must stay)                                                                                                                                                                                                                                                                                                                                               |
+| `copy --here` from a T3 terminal                                                    | Refused: stopping T3 would kill it half-way                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+
 ## `t3-golive settle --reason "<what you did>"`
 
 After a run stopped half-way or ended with an error, look at the T3 home and put it right, then run this: it
@@ -66,7 +235,10 @@ There is no flag or environment variable to point elsewhere. Placeholder values:
     "stageDir": "/path/to/the/downloaded/release",
     "backupDir": "/path/to/the/backups",
     "stateDir": "/path/to/the/kit/state",
-    "freeFloorMb": 2048
+    "freeFloorMb": 2048,
+    "quietCommand": "/path/to/a/quiet/check",
+    "preHooks": ["/path/to/pause/background/jobs"],
+    "postHooks": ["/path/to/resume/background/jobs"]
   }
 }
 ```
@@ -75,7 +247,10 @@ There is no flag or environment variable to point elsewhere. Placeholder values:
 `<stageDir>/<version>/` (`tar -xzf <archive> -C <stageDir>/<version> --strip-components=1`). `stateDir` holds
 the lock and the journal; it is required, and no environment variable moves it, so a detached `switch` and a
 `check` from a shell always find the same lock and journal. `stateDir`, `backupDir` and `stageDir` must be
-outside the T3 home (check writes nothing there). `freeFloorMb` is optional (default 2048). An unknown key, a
+outside the T3 home (check writes nothing there). `freeFloorMb` is optional (default 2048). For `copy`:
+`quietCommand` (optional; without it `copy` needs `--owner-says-go`), `preHooks` and `postHooks` (optional
+lists of absolute paths, run with no arguments; each must be safe to run twice), `quietWaitSeconds` (default
+7200, at least 60: two samples 60 s apart) and `stopLimitSeconds` (default 1800). An unknown key, a
 missing key, a wrong type or a newer `version` is refused by name (the shared loader, `fork-kit/common`).
 
 ## Lock and journal
@@ -85,8 +260,12 @@ its pid and command into it, `check` holds it shared. `<stateDir>/journal.jsonl`
 fsynced before the step it names starts and carries the hash of the line before it. A run killed half-way
 leaves a run with no end; a run that ended with an error after its first step started may have left the home
 just as half-applied. Either needs settling: every later `check` refuses and says where it stopped, and a
-changing run refuses to start until the owner runs `settle`. (A run that failed before its first step changed
-nothing and is only a note.) A torn last line is reported and ignored; damage anywhere else refuses, naming the
+changing run refuses to start until the owner runs `settle`. (A run that failed or was killed before its first
+step changed nothing and is only a note.) The rule every changing command keeps: every change is made inside a journalled
+step (kit code calls `run.require_step()` first, so a change outside one is an error), and pre-checks, `check`
+included, run before the first step (`run_check` refuses inside a step). A command that stops on purpose after
+every step it started is done raises `journal.Refused`: the run ends "refused" and needs no settling. The guard
+takes the lock with `wait=True`: it blocks until the run it watches ends. A torn last line is reported and ignored; damage anywhere else refuses, naming the
 file and how to settle it; a line from a newer kit refuses with "update the kit".
 
 ## Tests
@@ -94,10 +273,11 @@ file and how to settle it; a line from a newer kit refuses with "update the kit"
 ```
 python3 -I -B fork-kit/golive/tests/check.test.py      # check on a fake machine
 python3 -I -B fork-kit/golive/tests/journal.test.py    # lock, journal, adapter, version order
+python3 -I -B fork-kit/golive/tests/copy.test.py       # copy, guard, restore on a fake machine
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
 python3 -I -B fork-kit/common/tests/machine_file.test.py
 ```
 
 The tests fake the service manager (stub `systemctl` and `systemd-run`) and the T3 home (a temporary folder,
-with a copy of `sleep` standing in for the server). They need no root and no systemd, and never touch a real
+with a copy of `sleep` standing in for the server; `copy.test.py` fakes stop and start on it too). They need no root and no systemd, and never touch a real
 T3 home, unit or `~/.t3`.
