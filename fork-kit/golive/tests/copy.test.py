@@ -304,18 +304,34 @@ class Copy(CopyBase):
         self.assertEqual(self.copies(), [])
         self.assertIsNone(journal.unfinished(self.m.state))
 
-    def test_an_update_at_the_stop_takes_no_copy(self):
+    def test_an_update_at_the_stop_takes_no_copy_and_says_which_build_runs_again(self):
         # Between the last look and the stop: the service state names another build once T3 is down.
+        # r1 correctness nit 2: the restart then waited START_WAIT for the old build and reported "T3 did not come
+        # back" while the new build ran.
         self.install()
         self.m.write('home/runtime/service-state.json', json.dumps({'protocol': 3, 'activeVersion': fx.LIVE}))
         self.adapter.on['stop'] = lambda: self.m.write('home/runtime/service-state.json',
                                                        json.dumps({'protocol': 3, 'activeVersion': NEWER}))
-        coldcopy.START_WAIT = 0.5
+        started = time.monotonic()
         with self.assertRaises(RuntimeError) as e:
             self.copy()
+        self.assertLess(time.monotonic() - started, coldcopy.START_WAIT, 'it waited for the old build')
         self.assertIn('service state changed at the stop', str(e.exception))
+        notes = ' '.join(getattr(e.exception, '__notes__', ()))
+        self.assertNotIn('did not come back', notes)
+        self.assertIn(f'T3 runs again, on t3 {NEWER}', notes)
+        self.assertIn(f't3 {NEWER} runs again', ' '.join(self.said))
+        [verify] = [s for s in self.last_run()['steps'] if s['step'] == 'verify' and s['phase'] == 'done']
+        self.assertEqual(verify['data']['version'], NEWER)
         self.assertEqual(self.copies(), [])
         self.assertEqual(self.last_run()['end']['result'], 'failed')
+
+    def test_a_runtime_record_of_another_server_of_the_same_build_does_not_stop_the_copy(self):
+        # r1 correctness nit 1: a pid check after the stop could only run after a crash (upstream removes the
+        # record on a clean stop), and there it refused a copy whose label was right: the state check is the guard.
+        self.adapter.on['stop'] = lambda: self.m.runtime_file(pid=os.getpid(), serverVersion=fx.LIVE)
+        result = self.copy(owner_says_go=True)
+        self.assertEqual(coldcopy.read_manifest(result['copy'])['liveVersion'], fx.LIVE)
 
     def test_free_space_is_checked_again_after_the_quiet_wait(self):
         with mock.patch.object(coldcopy, '_free_bytes', side_effect=[10 ** 15, 0]):
@@ -356,6 +372,8 @@ class Copy(CopyBase):
         with self.assertRaises(journal.Refused) as e:
             self.copy()
         self.assertIn('did not come up', str(e.exception))
+        self.assertIn('look at: journalctl --user -u t3-golive-guard-', str(e.exception))
+        self.assertIn(os.path.join(self.m.state, 'guard.log'), str(e.exception))
         self.assertEqual(self.calls(), ['quiet', 'quiet', 'run_detached'])
         self.assertIsNone(journal.unfinished(self.m.state))
 
@@ -364,6 +382,7 @@ class Copy(CopyBase):
         with self.assertRaises(journal.Refused) as e:
             self.copy()
         self.assertIn('is not running any more', str(e.exception))
+        self.assertIn('look at: journalctl --user -u t3-golive-guard-', str(e.exception))
         self.assertEqual(self.calls(), ['quiet', 'quiet', 'run_detached', 'pre', 'quiet', 'post'])
         self.assertIsNone(journal.unfinished(self.m.state))
 
@@ -414,6 +433,41 @@ class Copy(CopyBase):
         dest = self.copy(owner_says_go=True)['copy']
         self.assertNotIn('.statev2.sqlite.golive-restore-20260101T000000Z',
                          {e['path'] for e in coldcopy.read_manifest(dest)['files']})
+
+    def test_the_files_a_restore_kept_are_never_copied(self):
+        # r1 correctness nit 3: each restore's kept old files went into every later copy and its free-space need.
+        kept = ('statev2.sqlite.golive-aside-20260101T000000Z', 'statev2.sqlite-wal.golive-aside-20260101T000000Z',
+                'statev2.sqlite-shm.golive-aside-20260101T000000Z', 'settings.json.golive-aside-20260101T000000Z-2')
+        before = coldcopy.plan(self.m.path('home/userdata'))[1]
+        for n in kept:
+            self.m.write(f'home/userdata/{n}', b'old data ' * 1000)
+        self.assertEqual(coldcopy.plan(self.m.path('home/userdata'))[1], before, 'counted in the free-space need')
+        dest = self.copy(owner_says_go=True)['copy']
+        paths = {e['path'] for e in coldcopy.read_manifest(dest)['files']}
+        self.assertFalse(paths & set(kept), paths & set(kept))
+
+    def test_incomplete_copy_folders_are_named_and_counted(self):
+        # r1 data-safety C: a copy killed or failed half-way left a folder that was never used, named or counted.
+        real = coldcopy._copy_file
+
+        def disk_full(src, dst, deadline, mode):
+            if src.endswith('settings.json'):
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real(src, dst, deadline, mode)
+        with mock.patch.object(coldcopy, '_copy_file', disk_full), self.assertRaises(OSError):
+            self.copy(owner_says_go=True)
+        journal.settle(self.m.state, 'test: looked at the home')
+        [half] = [os.path.join(self.m.backups, n) for n in self.copies()]
+        self.assertEqual([f for f, _ in coldcopy.incomplete_copies(self.m.backups)], [half])
+        with mock.patch.object(coldcopy, '_free_bytes', return_value=0), self.assertRaises(journal.Refused) as e:
+            self.copy(owner_says_go=True)
+        self.assertIn(f'1 incomplete copy folder(s), never used', str(e.exception))
+        self.assertIn(half, str(e.exception))
+        result = self.copy(owner_says_go=True)
+        self.assertEqual(result['incompleteCopies'], [half])
+        self.assertTrue(any(half in line for line in self.said))
+        self.assertEqual(coldcopy.incomplete_copies(self.m.backups)[0][0], half, 'the finished copy is not listed')
+        self.assertEqual(len(coldcopy.incomplete_copies(self.m.backups)), 1)
 
     def test_a_copy_that_fails_half_way_has_no_manifest_and_t3_runs_again(self):
         real = coldcopy._copy_file
@@ -668,6 +722,24 @@ class Restore(CopyBase):
         coldcopy.verify_copy(self.dest)
         self.assertEqual(journal.read(self.m.state)[0][-1]['end']['result'], 'ok')
 
+    def test_a_stopped_restore_s_temp_files_are_removed_and_count_as_free(self):
+        # r1 correctness nit 5: they stayed forever and were not counted in the free-space check.
+        leftover = ('.statev2.sqlite.golive-restore-20260101T000000Z',
+                    '.statev2.sqlite-wal.golive-restore-20260101T000000Z-aside')
+        for n in leftover:
+            self.m.write(f'home/userdata/{n}', b't' * (3 * coldcopy.MB))
+        files, want = coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+        need = (sum(files[n]['bytes'] for n in want)
+                + sum(os.path.getsize(os.path.join(self.userdata, n)) for n in coldcopy._replaced(self.userdata,
+                                                                                               coldcopy.DEFAULT_RESTORE)))
+        with mock.patch.object(coldcopy, '_free_bytes', return_value=need - 5 * coldcopy.MB):
+            facts = self.restore()
+        self.assertEqual(facts['removedTemps'], sorted(leftover))
+        self.assertFalse([n for n in os.listdir(self.userdata) if coldcopy.RESTORE_TEMP in n])
+        with mock.patch.object(coldcopy, '_free_bytes', return_value=need - 1), self.assertRaises(OSError) as e:
+            coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+        self.assertIn('kept copy of each file it replaces', str(e.exception))
+
     def test_a_restore_stopped_at_any_point_loses_nothing_and_never_pairs_a_wal_wrongly(self):
         # Should fix 2: was "moved aside one by one", which could leave a -wal without its database.
         stops = kill_at_each_change(self, self.restore, self.assert_whole_home)
@@ -763,16 +835,18 @@ class Restore(CopyBase):
             self.restore()
 
 
-def kill_at_each_change(test, restore, check):
-    """Stop a restore at each change it makes to the home (a link, an unlink or a rename: the restore has no
-    clean-up, so stopping on an error there is a kill), call check() on what is left, then run the restore again
-    (it must finish) and check() again; the home is put back between tries. Returns how many stops were tried."""
+def kill_at_each_change(test, restore, check, after_stop=None):
+    """Stop a restore at each change it makes to the home (a file copy, a link, an unlink or a rename: the restore
+    has no clean-up, so stopping on an error there is a kill), call after_stop() (if given: what may happen before
+    anyone looks, such as T3 starting at boot) and check() on what is left, then run the restore again (it must
+    finish) and check() again; the home is put back between tries. Returns how many stops were tried."""
     userdata = test.userdata
     saved = tempfile.mkdtemp(prefix='golive-home-', dir=test.m.root)
     names = [n for n in os.listdir(userdata) if os.path.isfile(os.path.join(userdata, n))]
     for n in names:
         shutil.copy2(os.path.join(userdata, n), saved)
     real = {f: getattr(os, f) for f in ('link', 'unlink', 'rename')}
+    real_copy = coldcopy._copy_file
     stop = 0
     while True:
         count = [0]
@@ -782,15 +856,18 @@ def kill_at_each_change(test, restore, check):
                 count[0] += 1
                 if count[0] > stop:
                     raise OSError(errno.EIO, f'stopped before change {count[0]}')
-                return real[f](*args, **kw)
+                return (real_copy if f == 'copy' else real[f])(*args, **kw)
             return call
-        with mock.patch.multiple(coldcopy.os, **{f: counted(f) for f in real}):
+        with mock.patch.multiple(coldcopy.os, **{f: counted(f) for f in real}), \
+                mock.patch.object(coldcopy, '_copy_file', counted('copy')):
             try:
                 restore()
                 finished = True
             except OSError:
                 finished = False
         with test.subTest(stop=stop):
+            if not finished and after_stop is not None:
+                after_stop()
             check()
             if not finished:
                 with mock.patch.object(coldcopy, '_stamp', return_value=f'20990101T0000{stop:02d}Z'):
@@ -876,6 +953,50 @@ class RealSqlite(CopyBase):
                 raise
         kill_at_each_change(self, settled_restore, check_home)
         self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+
+    def test_t3_started_after_a_restore_stopped_anywhere_never_changes_the_kept_old_files(self):
+        # r1 data-safety A: the kept database was a hard link to the live one. Stopped between the companion
+        # unlinks and the database rename, then T3 started at boot: its writes went into the kept database too,
+        # and the kept pair mixed old and new pages (and passed integrity_check).
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'checkpoint')
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+
+        def restore():
+            try:
+                with journal.run(self.m.state, 'back') as r, r.step('restore'):
+                    coldcopy.restore(r, dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+            except Exception:
+                journal.settle(self.m.state, 'test: looked at the home')
+                raise
+
+        def t3_starts():  # the enabled service starts T3 at boot; it opens what the home holds and writes
+            if os.path.exists(self.db):
+                c = sqlite3.connect(self.db)
+                c.execute("UPDATE t SET body='NEW SERVER' WHERE id <= 3")
+                c.commit()
+                c.close()
+
+        def kept_files_are_the_old_home():
+            kept = {n.split(coldcopy.ASIDE)[0]: n for n in os.listdir(self.userdata)
+                    if coldcopy.ASIDE in n and coldcopy.ASIDE + '2099' not in n}  # the first restore's, not the rerun's
+            if 'statev2.sqlite-wal' not in kept:
+                return
+            self.assertIn('statev2.sqlite', kept, 'the WAL was kept before its database')
+            scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+            for n in ('statev2.sqlite', 'statev2.sqlite-wal'):
+                shutil.copy2(os.path.join(self.userdata, kept[n]), os.path.join(scratch, n))
+            c = sqlite3.connect(os.path.join(scratch, 'statev2.sqlite'))
+            try:
+                self.assertEqual(c.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+                self.assertEqual(c.execute('SELECT count(*) FROM t').fetchone()[0], 120)
+                self.assertEqual(c.execute("SELECT count(*) FROM t WHERE body='NEW SERVER'").fetchone()[0], 0,
+                                 'a T3 started after the stop changed the kept old files')
+            finally:
+                c.close()
+        stops = kill_at_each_change(self, restore, kept_files_are_the_old_home, after_stop=t3_starts)
+        self.assertGreaterEqual(stops, 10)
 
 
 class CommandLine(CopyBase):
