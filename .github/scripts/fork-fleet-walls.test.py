@@ -346,9 +346,17 @@ def fw_linux():
     return module
 
 
+def der(tag, content):
+    """One DER element: its tag, its length (< 65536) and content."""
+    n = len(content)
+    return bytes([tag]) + (bytes([n]) if n < 0x80 else bytes([0x82, n >> 8, n & 0xff])) + content
+
+
 def der_sequence(n):
-    """A DER SEQUENCE with n bytes in it (n < 65536), as a certificate or a public key is."""
-    return b'\x30' + (bytes([n]) if n < 0x80 else bytes([0x82, n >> 8, n & 0xff])) + bytes(i % 256 for i in range(n))
+    """A certificate's DER shape, n bytes of filler in it (n < 60000): a SEQUENCE of what is signed (a SEQUENCE), the
+    algorithm (a SEQUENCE) and the signature (a BIT STRING)."""
+    tbs = der(0x30, der(0x02, b'\x01') + der(0x04, bytes(i % 256 for i in range(n))))
+    return der(0x30, tbs + der(0x30, der(0x06, b'\x2a\x86\x48')) + der(0x03, b'\x00' + b'\x11' * 16))
 
 
 def pem(label, data, blank=False):
@@ -1032,11 +1040,14 @@ class EveryWallsFile(Case):
                                    '\x0c'.join(deny + own) + '\n'},
             'a key with a form feed before it': {**unit, dropin: '[Service]\nIPAddressDeny=\n\x0cIPAddressDeny=' +
                                                  ' '.join(deny + own) + '\n'},
+            # PR #240 fix 1 (security 1): systemd skips a UTF-8 BOM at a file's start, so the header after it counts.
+            'a header behind a BOM': {'etc/systemd/system/service.d/50-x.conf': '\ufeff[Service]\nIPAddressDeny=\n'},
         })
         for name, change in fails.items():
             with self.subTest(name):
                 self.assertTrue(self.job_units(change).startswith('FAIL'), name)
         self.assertEqual(fw_linux().unit_lines('[Service]\r\nA=1\r\n[X]\0B=2\rC=3\n', 'Service'), [(2, 'A', '1')])
+        self.assertEqual(fw_linux().unit_lines('\ufeff[Service]\nA=1\n', 'Service'), [(2, 'A', '1')])
 
     def test_linux_system_conf_a_dangling_link_is_skipped(self):
         """Issue #226 item 3: systemd 256 and later reads the first system.conf of /etc, /run, /usr/local/lib and
@@ -1048,18 +1059,30 @@ class EveryWallsFile(Case):
         self.assertIn('/usr/lib/systemd/system.conf', got)
         got = self.job_units(endless, [('etc/systemd/system.conf', '/dev/null')])
         self.assertTrue(got.startswith('PASS'), got)
+        # PR #240 fix 1 (security 6): a system.conf that is a folder must not end the search unseen: cannot tell.
+        for change in ({**endless, 'etc/systemd/system.conf/': ''}, {'etc/systemd/system.conf/': ''}):
+            with self.subTest(change):
+                got = self.job_units(change)
+                self.assertTrue(got.startswith('FAIL'), got)
+                self.assertIn('/etc/systemd/system.conf is there but is no file', got)
 
     def test_linux_same_named_dropins_only_the_one_systemd_applies(self):
         """Issue #226 item 7: of drop-ins with one name, systemd applies only the one in the first folder of its search
         path (and there the most specific): a safe one, or a link to /dev/null, in /etc masks one in /usr that would
         fail. It masks for every job unit only from a folder that applies to every job unit (service.d, fork-.service.d,
-        fork-fleet-.service.d): one in a single unit's folder leaves the others the one in /usr."""
+        fork-fleet-.service.d): one in a single unit's folder leaves the others the one in /usr. PR #240 fix 1
+        (correctness 1): systemd lists every dir's own and prefix folders before any dir's service.d
+        (src/shared/dropin.c, unit_file_find_dropin_paths), so service.d in /etc never shadows a same-named file in a
+        prefix or own folder in /run or /usr, and a prefix folder's file in /usr shadows service.d in /etc."""
         bad = {'usr/lib/systemd/system/service.d/10-x.conf': '[Service]\nPrivateDevices=no\n'}
         safe = '[Service]\nTimeoutStopFailureMode=abort\n'
         passes = {
             'a safe one in /etc, the same folder': ({**bad, 'etc/systemd/system/service.d/10-x.conf': safe}, ()),
-            'a safe one in /run, a folder for every job unit': (
+            'a safe one in /run, a folder for every job unit': (   # a prefix folder: before every service.d
                 {**bad, 'run/systemd/system/fork-fleet-.service.d/10-x.conf': safe}, ()),
+            'a safe one in /usr, a prefix folder, before service.d in /etc': (
+                {'etc/systemd/system/service.d/10-x.conf': '[Service]\nPrivateDevices=no\n',
+                 'usr/lib/systemd/system/fork-.service.d/10-x.conf': safe}, ()),
             'a link to /dev/null in /etc': (bad, [('etc/systemd/system/service.d/10-x.conf', '/dev/null')]),
         }
         fails = {
@@ -1070,6 +1093,10 @@ class EveryWallsFile(Case):
                                                 ()),
             'another name': ({**bad, 'etc/systemd/system/service.d/20-x.conf': safe}, ()),
         }
+        for d in ('usr/lib/systemd/system/fork-.service.d', 'run/systemd/system/fork-fleet-.service.d',
+                  'usr/lib/systemd/system/fork-fleet-ci-1.service.d'):   # the correctness lens's own test
+            fails[f'an unsafe one in {d}, a safe one in /etc service.d'] = (
+                {f'{d}/10-x.conf': '[Service]\nPrivateDevices=no\n', 'etc/systemd/system/service.d/10-x.conf': safe}, ())
         for name, (change, links) in passes.items():
             with self.subTest(name):
                 got = self.job_units(change, links)
@@ -1078,6 +1105,20 @@ class EveryWallsFile(Case):
             with self.subTest(name):
                 got = self.job_units(change, links)
                 self.assertTrue(got.startswith('FAIL'), got)
+
+    def test_linux_dropin_folder_that_cannot_be_listed(self):
+        """PR #240 fix 1 (correctness 3): a drop-in folder that is there but cannot be listed (mode 0311: it may be
+        entered, not read) may hold anything: cannot tell, not an empty folder."""
+        for folder in ('etc/systemd/system/service.d', 'run/systemd/system/fork-fleet-.service.d',
+                       'usr/lib/systemd/system/slice.d'):
+            with self.subTest(folder):
+                root = self.root(overlay(LINUX, {f'{folder}/10-x.conf': '[Service]\nPrivateDevices=no\n'}))
+                os.chmod(os.path.join(root, folder), 0o311)
+                self.addCleanup(os.chmod, os.path.join(root, folder), 0o755)
+                p = run([os.path.join(self.folder, 'linux'), 'describe'], root)
+                got = [x for x in p.stdout.splitlines() if x.split('  ')[1:2] == ['job-units']]
+                self.assertEqual(len(got), 1, p.stdout + p.stderr)
+                self.assertRegex(got[0], rf'^FAIL .*cannot tell .*cannot list /{folder}')
 
     def test_linux_password_commands_read_redirects_and_inline_scripts(self):
         """Issue #226 item 2 (a regression against main before #213, which failed every literal *_COMMAND): a
@@ -1090,19 +1131,30 @@ class EveryWallsFile(Case):
                 '''perl -e 'print <STDIN>' ''', '''perl -ne 'print' ''', '''awk 'BEGIN{getline p<"/etc/restic/pw"; print p}' ''',
                 '''sh -c 'read p </etc/restic/pw; echo "$p"' ''', '''ruby -e 'puts File.read(%q(/etc/restic/pw))' ''',
                 '''node -e 'x' ''', '''timeout 5 python3 -c 'x' ''', "sed '1r /etc/restic/pw' /dev/null",
-                '''sh -c "sh -c 'sh -c \\"sh -c \\\\\\"sh -c x\\\\\\"\\"'"''', "cat 'unbalanced")
+                '''sh -c "sh -c 'sh -c \\"sh -c \\\\\\"sh -c x\\\\\\"\\"'"''', "cat 'unbalanced",
+                # PR #240 fix 1 (correctness 2, security 2): a word whose file only a shell knows fails closed (a
+                # glob, a variable, ${IFS}, a brace, ~user); a quoted path with a blank, a non-ASCII one and python's
+                # joined -m module (no script: its words are its input) are read.
+                'cat /etc/restic/p*', 'cat /etc/restic/p?', 'cat /etc/restic/[p]w', 'p=/etc/restic; cat $p/pw',
+                'f=/etc/restic/pw; cat "$f"', 'cat${IFS}/etc/restic/pw', 'cat /etc/restic/{pw,x}', 'cat ~backup/pw',
+                'cat "/etc/restic/my pw"', 'cat /etc/restic/pässwort', 'python3 -mbase64 -d /etc/restic/pw.b64',
+                'python3 -Im base64 -d /etc/restic/pw.b64')
         for c in cmds:
             with self.subTest(c):
                 change = {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c.strip())}\n',
-                          'etc/restic/pw': f'{pw}\n'}
+                          'etc/restic/pw': f'{pw}\n', 'etc/restic/my pw': f'{pw}\n', 'etc/restic/pässwort': f'{pw}\n',
+                          'etc/restic/pw.b64': base64.b64encode(pw.encode()).decode() + '\n'}
                 got = self.etc_secrets(change)
                 self.assertTrue(got.startswith('FAIL'), got)
         passes = ('cat </etc/restic/pw', 'cat </etc/restic/pw.gpg', 'pass show backup/restic 2>/dev/null',
-                  'python3 -u /opt/app/get-pw.py --vault x')
+                  'python3 -u /opt/app/get-pw.py --vault x', 'cat "/etc/restic/my pw"', 'cat /etc/restic/pässwort',
+                  'python3 -mbase64 -d /etc/restic/pw', 'cat $CREDENTIALS_DIRECTORY/restic')
         for c in passes:
             with self.subTest(c):
                 change = {'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n',
                           'etc/restic/pw': {'text': f'{pw}\n', 'mode': '600'}, 'etc/restic/pw.gpg': 'x\n',
+                          'etc/restic/my pw': {'text': f'{pw}\n', 'mode': '600'},
+                          'etc/restic/pässwort': {'text': f'{pw}\n', 'mode': '600'},
                           'opt/app/get-pw.py': 'import vault\n'}
                 got = self.etc_secrets(change)
                 self.assertTrue(got.startswith('PASS'), got)
@@ -1125,6 +1177,20 @@ class EveryWallsFile(Case):
             'ssh options before the key': f'environment="GH_TOKEN={pw}" {line}\n',
             'a password as the key': f'ssh-ed25519 SHVudGVyMmNvcnJlY3Q= x\n',
             'a key of another type than it says': line.replace('ssh-ed25519', 'ssh-rsa', 1) + '\n',
+            # PR #240 fix 1 (security 3, correctness nit): each block read in full, its first inner element too.
+            'a PKCS#8 private key between PUBLIC KEY markers': pem(
+                'PUBLIC KEY', bytes.fromhex('30150201000410') + bytes(range(16))),
+            'an RSA private key between RSA PUBLIC KEY markers': pem(
+                'RSA PUBLIC KEY', der(0x30, b''.join(der(0x02, bytes([i + 1])) for i in range(9)))),
+            'an encrypted private key between PUBLIC KEY markers': pem(
+                'PUBLIC KEY', der(0x30, der(0x30, der(0x06, b'\x2a')) + der(0x04, bytes(range(16))))),
+            'a certificate whose inside is no DER': pem('CERTIFICATE', der(0x30, der(0x30, b'\x99' * 8) +
+                                                                         der(0x30, b'') + der(0x03, b'\x00'))),
+            'a PGP public key, then a secret key packet': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x05\x04abcd'
+                                                              b'\x95\x00\x05\x04abcd', blank=True),
+            'a PGP public key, then bytes left over': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x04\x04abcd', blank=True),
+            # PR #240 fix 1 (security 4): a known_hosts host field is 64 characters at most.
+            'a 300-character host before a key': f'{"h" * 300} {line}\n',
         }
         for name, text in fails.items():
             with self.subTest(name):
@@ -1132,7 +1198,14 @@ class EveryWallsFile(Case):
                 self.assertTrue(got.startswith('FAIL'), got)
         passes = {
             'certificates and a comment': '# the CA\n' + cert + cert,
-            'a PGP public key': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x04\x04abcd', blank=True),
+            'a PGP public key': pem('PGP PUBLIC KEY BLOCK', b'\x99\x00\x05\x04abcd', blank=True),
+            'a PGP public key, a user id and a signature': pem(
+                'PGP PUBLIC KEY BLOCK', b'\x99\x00\x05\x04abcd\xcd\x03a@b\xc2\x02\x04\x00', blank=True),
+            'a public key': pem('PUBLIC KEY', der(0x30, der(0x30, der(0x06, b'\x2b\x65\x70')) +
+                                                 der(0x03, b'\x00' + bytes(range(32))))),
+            'an RSA public key': pem('RSA PUBLIC KEY', der(0x30, der(0x02, b'\x00\xc1' + bytes(63)) +
+                                                           der(0x02, b'\x01\x00\x01'))),
+            'a hashed known_hosts line': f'|1|{"A" * 27}=|{"B" * 27}= {line}\n',
             'an ssh key with a short comment': f'{line} deploy@build-1\n',
             'an ssh key with no comment': f'{line}\n',
         }

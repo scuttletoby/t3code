@@ -873,7 +873,8 @@ closed_folder() {
   mode=$(stat -c '0%a' -- "$ROOT${1:-/}") || die "$2: cannot read the folder ${1:-/}"
   uid=$(stat -c %u -- "$ROOT${1:-/}") || die "$2: cannot read the folder ${1:-/}"
   [[ $uid == 0 || $uid == "$EUID" ]] ||
-    die "$2, a folder of uid $uid: its owner could swap a link into it (only root's folders, or this user's)"
+    die "$2, a folder of uid $uid: its owner could swap a link into it (only root's folders, or this user's:" \
+      "chown root: ${1:-/}, or move the path out of it)"
   ((mode & 01000 || !(mode & 022))) ||
     die "$2, which others may write (its group or all): they could swap a link into it" \
       "(chmod go-w ${1:-/}, or make it sticky: chmod +t ${1:-/})"

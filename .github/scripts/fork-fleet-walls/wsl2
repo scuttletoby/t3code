@@ -36,7 +36,7 @@ ROOT = os.environ.get('FORK_FLEET_WALLS_ROOT', '')
 ME = os.path.realpath(__file__)
 # The sha256 of the launcher (fork-fleet-launch.sh) whose job units unit_props reads as safe: the one this file ships
 # with. A changed launcher must be read again and this pin changed with it (fork-fleet-walls-wsl2.test.py checks it).
-LAUNCHER_SHA256 = '42fbd968288d6a7d27ec4ca3d36b158053a4bcb9ebb4d4271d7242320c2479d8'
+LAUNCHER_SHA256 = 'a37ea904f84656da1d3740929c4baed9bb39f376c813bfab35b9ea33caa5ca76'
 WSL_CONF = '/etc/wsl.conf'
 BINFMT = '/proc/sys/fs/binfmt_misc'
 MASK = '/etc/binfmt.d/WSLInterop.conf'   # same name as WSL's /usr/lib/binfmt.d file: systemd-binfmt reads this one

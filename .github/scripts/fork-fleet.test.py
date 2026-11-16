@@ -1839,7 +1839,8 @@ class Launcher(unittest.TestCase):
             with self.subTest(folder):
                 self.write('bin/stat', '#!/bin/sh\n[ "$1 $2 $3" = "-c %u --" ] && case $4 in '
                            f'{pattern}) echo 4242; exit 0;; esac\nexec /usr/bin/stat "$@"\n', 0o755)
-                self.refused(f', a folder of uid 4242: its owner could swap a link into it')
+                self.refused(f', a folder of uid 4242: its owner could swap a link into it (only root\'s folders, or '
+                             f'this user\'s: chown root: {folder}, or move the path out of it)')   # PR #240 fix 1
         os.remove(self.path('bin/stat'))
         self.start(self.NAME)
 

@@ -255,8 +255,11 @@ B_ANCHOR = '  b=$real\n  resolv_bind=$b:$resolv\n'
 TRAPS = ('trap rm -rf --one-file-system -- $(printf %q $tmp) EXIT', 'trap exit 129 HUP', 'trap exit 130 INT',
          'trap exit 143 TERM', 'trap rm -f -- $(printf %q $env_file) EXIT')
 # Ways bash runs code later, at a time of its own, or loads it (none in the launcher): mapfile's and readarray's -C
-# callback, a builtin from a file (enable -f), extdebug (shopt), a prompt, PS4 under set -x, BASH_ENV in a child bash.
-LATER = re.compile(r'(?<![\w$.-])(mapfile|readarray|enable|shopt)(?![\w-])|(?<![\w$])(PROMPT_COMMAND|PS[0-4]|BASH_ENV)(?!\w)')
+# callback, a builtin from a file (enable -f), extdebug (shopt), a prompt, PS4 under set -x, BASH_ENV in a child bash
+# (ENV in one started as sh), options a child bash takes from its environment (BASHOPTS, SHELLOPTS: xtrace with PS4),
+# and command_not_found_handle (run for a command bash cannot find).
+LATER = re.compile(r'(?<![\w$.-])(mapfile|readarray|enable|shopt|command_not_found_handle)(?![\w-])|'
+                   r'(?<![\w$])(PROMPT_COMMAND|PS[0-4]|BASH_ENV|ENV|BASHOPTS|SHELLOPTS)(?!\w)')
 
 
 def launcher_tripwires(text):
@@ -568,6 +571,12 @@ class Launcher(Case):
             'BASH_ENV': real.replace(RUN, '  export BASH_ENV=/etc/fork-fleet/more.sh\n' + RUN),
             'enable -f': real.replace(RUN, '  enable -f /etc/fork-fleet/more.so more\n' + RUN),
             'shopt -s extdebug': real.replace(RUN, '  shopt -s extdebug\n' + RUN),
+            # PR #240 fix 1 (correctness nit, security 5): a child sh's ENV, options a child bash takes, a handler.
+            'ENV': real.replace(RUN, '  export ENV=/etc/fork-fleet/more.sh\n' + RUN),
+            'BASHOPTS': real.replace(RUN, '  export BASHOPTS=extdebug\n' + RUN),
+            'SHELLOPTS': real.replace(RUN, '  export SHELLOPTS=xtrace\n' + RUN),
+            'command_not_found_handle': real.replace(
+                RUN, "  command_not_found_handle() { props+=(-p PrivateDevices=no); }\n  no-such-command\n" + RUN),
         })
         for name, text in edits.items():
             with self.subTest(name):

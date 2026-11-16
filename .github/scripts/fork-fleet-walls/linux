@@ -76,7 +76,7 @@ PUBLIC_BLOCK = re.compile(r'-----BEGIN (CERTIFICATE|TRUSTED CERTIFICATE|X509 CRL
                           r'PGP PUBLIC KEY BLOCK)-----\n(.*?)-----END \1-----', re.S)
 BASE64 = re.compile(r'(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
 PGP_ARMOR = re.compile(r'((?:(?:Version|Comment|Hash|Charset): [ -~]{1,76}\n)*)\n(.*?)(?:=[A-Za-z0-9+/]{4}\n)?', re.S)
-SSH_HOSTS = r'(?:@(?:cert-authority|revoked)\s+)?[A-Za-z0-9.*?!\[\]:,|=+/_-]+\s+'
+SSH_HOSTS = r'(?:@(?:cert-authority|revoked)\s+)?[A-Za-z0-9.*?!\[\]:,|=+/_-]{1,64}\s+'   # 64 characters at most
 SSH_PUBLIC = re.compile(r'(?:' + SSH_HOSTS + r')?((?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp(?:256|384|521)|'
                         r'sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)(?:-cert-v01@openssh\.com)?)\s+'
                         r'([A-Za-z0-9+/]+={0,2})((?:\s+[A-Za-z0-9._@+:-]+){0,4})')
@@ -94,8 +94,18 @@ INLINE = {'python': 'c', 'pypy': 'c', 'perl': 'eEM', 'ruby': 'e', 'node': 'ep', 
           'php': 'rRBEF', 'lua': 'e', 'Rscript': 'e', 'julia': 'e', 'expect': 'c'}
 INLINE_LONG = ('--eval', '--print', '--command', '--expression', '--source', '--exec')
 SCRIPTED = re.compile(r'g?awk|mawk|nawk|g?sed')
-# A path in a word of a command: not inside a relative one (backup/etc), after a short option's letter (-p/etc/pw).
-PATH_IN = re.compile(r'(?<![\w.@+-])(/[A-Za-z0-9._@+-]+)+')
+# A path in a word of a command: not inside a relative one (backup/etc), after a short option's letter (-p/etc/pw);
+# its letters any (\w is Unicode's: /etc/restic/pässwort), or any non-ASCII character.
+PATH_IN = re.compile(r'(?<![\w.@+-])(/(?:[\w.@+-]|[^\x00-\x7f])+)+')
+# What makes a word of a command not plain literal text: a variable or a command's output ($f, ${IFS}, $(...), `...`),
+# a glob (* ? [), a brace (a{b,c}), a tilde at a word's start or after = or : (~backup/pw), a backslash. Its file
+# is not known until a shell runs it: such a word fails closed (command_secret).
+NOT_PLAIN = re.compile(r'[$`*?\[{}\\]|(?:^|[=:])~')
+# But the one variable that names a folder no job sees: systemd's credentials of the unit that runs the command
+# (private to it; the advice's own form: cat ${CREDENTIALS_DIRECTORY}/restic).
+OWN_CREDENTIALS = re.compile(r'\$(?:CREDENTIALS_DIRECTORY(?!\w)|\{CREDENTIALS_DIRECTORY\})')
+# A python run as `python -m module` (joined too: -mbase64) has no script: its first word is the module's input.
+PY_MODULE = re.compile(r'-[A-Za-z]*m.*')
 LOCKED = ('.gpg', '.age')
 TOKEN_SHAPE = re.compile(r'(?<![A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|'
                          r'glpat-[A-Za-z0-9_-]{20,}|xox[abeprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|'
@@ -143,8 +153,10 @@ DROPIN_DIRS = ('/etc/systemd/system.control', '/run/systemd/system.control', '/r
                '/usr/local/lib/systemd/system', '/usr/lib/systemd/system', '/lib/systemd/system',
                '/run/systemd/generator.late')
 DROPIN_FOLDERS = ('service.d', 'fork-.service.d', 'fork-fleet-*.service.d')
-# Those that apply to every job unit, by their place among its folders in one dir (shadowed).
+# Those that apply to every job unit, by their place among its folders in one dir (shadowed), and the folders of a
+# unit type (every unit of it), which systemd searches after all others (shadowed).
 EVERY_JOB_UNIT = {'fork-fleet-.service.d': 1, 'fork-.service.d': 2, 'service.d': 3}
+TYPE_FOLDERS = ('service.d', 'slice.d')
 # What a drop-in for the job units may set: what turns no wall off. Distros ship one (Fedora's service.d/
 # 10-timeout-abort.conf: TimeoutStopFailureMode=abort). A stop timeout (STOP_TIMEOUTS) only up to STOP_MAX: at
 # RuntimeMaxSec systemd asks a job to stop and kills it when that runs out, so an endless one (infinity, or 0, which
@@ -341,11 +353,23 @@ def mounts_wall():
     return None
 
 
+def entries(folder):
+    """The names in a folder under ROOT, as systemd lists one (conf_files: not a hidden one): [] when it is not there
+    or is no folder (systemd skips it); one that is there but cannot be listed raises (cannot tell)."""
+    if not os.path.isdir(ROOT + folder):
+        return []
+    try:
+        return [n for n in os.listdir(ROOT + folder) if not n.startswith('.')]
+    except OSError as e:
+        raise ValueError(f'cannot list {folder} ({e.strerror})') from None
+
+
 def dropins(folders=DROPIN_FOLDERS, units=(), every=None):
     """Every drop-in file (*.conf, a link followed) in these drop-in folders that systemd applies (not shadowed), and
-    every unit file of these names, in DROPIN_DIRS: [path], sorted, each once."""
-    found = {p[len(ROOT):] for d in DROPIN_DIRS for f in folders
-             for p in glob.glob(glob.escape(ROOT + d) + '/' + f + '/*.conf')}
+    every unit file of these names, in DROPIN_DIRS: [path], sorted, each once. A folder that cannot be listed: cannot
+    tell."""
+    found = {f'{d}/{g}/{n}' for d in DROPIN_DIRS for f in folders for g in fnmatch.filter(entries(d), f)
+             for n in entries(f'{d}/{g}') if n.endswith('.conf')}
     found = {p for p in found if not shadowed(p, every or {})}
     found |= {d + '/' + u for d in DROPIN_DIRS for u in units}
     return sorted(p for p in found if os.path.isfile(ROOT + p))
@@ -353,15 +377,21 @@ def dropins(folders=DROPIN_FOLDERS, units=(), every=None):
 
 def shadowed(path, every):
     """Whether systemd applies another drop-in of path's name instead of it, to every unit path applies to. Of
-    drop-ins with one name it applies the first only: by DROPIN_DIRS, and in one of them the unit's own folder first,
-    then its prefixes' (longest first), then the type's (every: {folder that applies to every job unit: its place
-    there}). So one in the same folder of an earlier dir shadows it, and one in a folder of every that comes first. It
+    drop-ins with one name it applies the first only, in the order systemd lists their folders (src/shared/dropin.c,
+    unit_file_find_dropin_paths and unit_file_find_dirs, the same from v255 to v262.2): for each dir of DROPIN_DIRS
+    in turn, the unit's own folder, then its prefixes' (longest first); and only after all of those, for each dir
+    again, the type's (TYPE_FOLDERS: service.d). conf_files then takes a name from the first folder that has it. So
+    the key is (a type's folder, dir, place in the dir: every, {folder that applies to every job unit: its place}):
+    one in the same folder of an earlier dir shadows it, and one in a folder of every whose key comes first (a prefix
+    folder in /usr shadows service.d in /etc; service.d in /etc never shadows a prefix or own folder anywhere). It
     shadows as a file or a link to /dev/null (a mask); a dangling link may not: kept (it fails closed)."""
     d, f, name = path.rsplit('/', 2)
-    i = DROPIN_DIRS.index(d)
-    return any((j, every.get(g, 0)) < (i, every.get(f, 0)) and (
+
+    def key(e, g):
+        return g in TYPE_FOLDERS, DROPIN_DIRS.index(e), every.get(g, 0)
+    return any(key(e, g) < key(d, f) and (
                    os.path.isfile(ROOT + f'{e}/{g}/{name}') or os.path.realpath(ROOT + f'{e}/{g}/{name}') == '/dev/null')
-               for j, e in enumerate(DROPIN_DIRS[:i + 1]) for g in {f, *every})
+               for e in DROPIN_DIRS for g in {f, *every})
 
 
 def after_reset(values):
@@ -467,6 +497,9 @@ def job_units_wall():
         if keys:
             bad.append(f'{path} sets {", ".join(keys[:4])} for the slice the job units sit in')
     main = [p for p in MANAGER_MAIN if os.path.exists(ROOT + p)][:1]   # a link to /dev/null too; not a dangling one
+    for p in main:   # a link to /dev/null masks the others; a folder (or a socket, ...) is no config: cannot tell
+        if not os.path.isfile(ROOT + p) and os.path.realpath(ROOT + p) != '/dev/null':
+            raise ValueError(f'{p} is there but is no file: systemd reads no config from it (remove it)')
     for path in [p for p in main if os.path.isfile(ROOT + p)] + sorted(
             {p[len(ROOT):] for t in MANAGER_CONFS for p in glob.glob(glob.escape(ROOT) + t) if os.path.isfile(p)}):
         keys = endless(file_lines(path), MANAGER_STOP_TIMEOUTS)
@@ -564,8 +597,10 @@ def command_secret(value, unit=False, depth=0):
     NAME=value or --option=value (--password hunter2); an echo or printf of literal text, and a here-string of it
     (<<<text; a here-document, <<); a script in its words (INLINE, SCRIPTED); any file others can read that it names
     (an argument, an option's value or a redirect's: sed -n 1p /etc/pw, --password-file=/etc/pw, cat</etc/pw) but its
-    program (INTERPRETERS' script too) and a LOCKED file; and what a shell runs (sh -c '...'), or any word with a blank
-    in it (eval '...', su -c '...'), read again. A value it cannot split, or one nested deeper than 4: a secret."""
+    program (INTERPRETERS' script too; not python's -m module) and a LOCKED file, a word with a blank in it read as one
+    path too ("/etc/restic/my pw"); and what a shell runs (sh -c '...'), or any word with a blank in it (eval '...',
+    su -c '...'), read again. A word that is not plain literal text (NOT_PLAIN: $f, "$f", ${IFS}, a glob, ~user; not
+    OWN_CREDENTIALS), a value it cannot split, or one nested deeper than 4: a secret (it fails closed; PR #240)."""
     value = unquote(value)
     if depth > 4:
         return True
@@ -581,7 +616,8 @@ def command_secret(value, unit=False, depth=0):
             commands.append([])
         else:
             commands[-1].append(w)
-    return any(simple_secret(c, unit, depth) for c in commands if c)
+    return (any(NOT_PLAIN.search(OWN_CREDENTIALS.sub('', w)) for w in words)
+            or any(simple_secret(c, unit, depth) for c in commands if c))
 
 
 def simple_secret(words, unit, depth):
@@ -616,9 +652,11 @@ def simple_secret(words, unit, depth):
     prog, args = os.path.basename(words[0]), words[1:]
     if INTERPRETERS.fullmatch(prog):   # its script is its program: the words before it and it are not its input
         first = next((i for i, w in enumerate(args) if not w.startswith('-')), len(args))
-        args = args[first + 1:]
-    return any(not m[0].endswith(LOCKED) and exposed(m[0])
-               for w in args for m in PATH_IN.finditer(re.sub(r'^-[A-Za-z]', '', w)))
+        if not (prog.startswith('python') and any(PY_MODULE.fullmatch(w) for w in args[:first])):
+            args = args[first + 1:]
+    paths = {m[0] for w in args for m in PATH_IN.finditer(re.sub(r'^-[A-Za-z]', '', w))}
+    paths |= {w for w in args if w.startswith('/') and re.search(r'\s', w)}   # a quoted path with a blank in it
+    return any(not p.endswith(LOCKED) and exposed(p) for p in paths)
 
 
 def inline_script(prog, args):
@@ -695,11 +733,12 @@ def unit_lines(text, section=None):
     """(line number, key, value) of each assignment in a systemd unit, drop-in or config file, as systemd reads it
     (systemd.syntax(7)): a line ends at \\n, \\r, \\r\\n or \\0 only (UNIT_LINE_END; not at a form feed or U+2028,
     as Python's splitlines() would), and only blanks, tabs and line ends (UNIT_BLANKS) are stripped; a comment line
-    (# or ;) skipped; a line ending in a backslash continued on the next, the
+    (# or ;) skipped, and a UTF-8 BOM at its start; a line ending in a backslash continued on the next, the
     backslash a blank, a comment line inside it skipped; blanks around the key and the `=` dropped. section (Service,
     Slice, Manager): only the lines in that [section], as systemd takes a setting only in the section it belongs to; it
     drops one in any other section (an X- one, [Unit], [Install]) or before the first, and so does this."""
     out, buf, start, at = [], None, 0, None
+    text = text.removeprefix('\ufeff')   # systemd skips a UTF-8 BOM at the start (conf-parser.c)
 
     def keep(buf):
         key, eq, value = buf.partition('=')
@@ -755,10 +794,74 @@ def public_only(path):
             and all(ssh_public(line) for line in rest))
 
 
+# The DER shape of each block (public_block): the tags of the elements in its outer SEQUENCE, in order. A private key
+# between the markers has another: PKCS#8 and PKCS#1 start with INTEGER 0 (a version), an encrypted one ends in an
+# OCTET STRING. A TRUSTED CERTIFICATE is a certificate, then its trust (any SEQUENCE).
+SEQUENCE, INTEGER, BIT_STRING = 0x30, 0x02, 0x03
+DER_SHAPE = {'CERTIFICATE': (SEQUENCE, SEQUENCE, BIT_STRING), 'TRUSTED CERTIFICATE': (SEQUENCE, SEQUENCE, BIT_STRING),
+             'X509 CRL': (SEQUENCE, SEQUENCE, BIT_STRING), 'PUBLIC KEY': (SEQUENCE, BIT_STRING),
+             'RSA PUBLIC KEY': (INTEGER, INTEGER)}
+# The OpenPGP packets a public key block may hold (RFC 9580 10.1): a public key and subkeys, user ids and
+# attributes, signatures, trust. Not a secret key or subkey (5, 7), nor any data.
+PGP_PUBLIC_TAGS = {6, 14, 13, 17, 2, 12}
+
+
+def der(raw):
+    """The DER elements of raw, all of it: [(tag, contents)], each constructed one's contents parsed in full too. Not
+    DER (a cut-off or overlong length, bytes left over): ValueError."""
+    out, at = [], 0
+    while at < len(raw):
+        if at + 2 > len(raw) or raw[at] & 0x1f == 0x1f:   # a tag of more than one byte is in no key or certificate
+            raise ValueError('not DER')
+        tag, size, at = raw[at], raw[at + 1], at + 2
+        if size & 0x80:
+            n = size & 0x7f
+            if not 1 <= n <= 4 or at + n > len(raw):
+                raise ValueError('not DER')
+            size, at = int.from_bytes(raw[at:at + n], 'big'), at + n
+        if at + size > len(raw):
+            raise ValueError('not DER')
+        if tag & 0x20:
+            der(raw[at:at + size])
+        out.append((tag, raw[at:at + size]))
+        at += size
+    return out
+
+
+def pgp_packets(raw):
+    """The tags of the OpenPGP packets of raw, all of it (RFC 9580 4.2: new and old format). A partial or
+    indeterminate length (only data packets have one), or bytes left over: ValueError."""
+    tags, at = [], 0
+    while at < len(raw):
+        head = raw[at]
+        if not head & 0x80:
+            raise ValueError('not OpenPGP')
+        if head & 0x40:   # new format
+            tag, first, at = head & 0x3f, raw[at + 1] if at + 1 < len(raw) else 255, at + 2
+            if first < 192:
+                size = first
+            elif first < 224 and at < len(raw):
+                size, at = ((first - 192) << 8) + raw[at] + 192, at + 1
+            elif first == 255 and at + 4 <= len(raw):
+                size, at = int.from_bytes(raw[at:at + 4], 'big'), at + 4
+            else:
+                raise ValueError('not OpenPGP')
+        else:   # old format
+            tag, n, at = (head >> 2) & 0x0f, (1, 2, 4, 0)[head & 3], at + 1
+            if not n or at + n > len(raw):
+                raise ValueError('not OpenPGP')
+            size, at = int.from_bytes(raw[at:at + n], 'big'), at + n
+        if at + size > len(raw):
+            raise ValueError('not OpenPGP')
+        tags.append(tag)
+        at += size
+    return tags
+
+
 def public_block(kind, body):
-    """Whether a PUBLIC_BLOCK's body is base64 of what its markers (kind) say, and nothing else: DER, one SEQUENCE
-    whose length is all the rest (a TRUSTED CERTIFICATE: a certificate and its trust, two); an OpenPGP public key,
-    whose first packet is one (tag 6), in PGP_ARMOR."""
+    """Whether a PUBLIC_BLOCK's body is base64 of what its markers (kind) say, and nothing else, read in full: DER,
+    one SEQUENCE of DER_SHAPE (a TRUSTED CERTIFICATE: a certificate, then its trust), every element in it well formed;
+    an OpenPGP public key in PGP_ARMOR, every packet a public one (PGP_PUBLIC_TAGS), the first a public key (6)."""
     if kind == 'PGP PUBLIC KEY BLOCK':
         m = PGP_ARMOR.fullmatch(body)
         body = m[2] if m else '!'
@@ -766,19 +869,17 @@ def public_block(kind, body):
     if not data or not BASE64.fullmatch(data):
         return False
     raw = base64.b64decode(data)
-    if kind == 'PGP PUBLIC KEY BLOCK':
-        return raw[0] == 0xc6 or raw[0] & 0xfc == 0x98   # new format tag 6, or old format tag 6
-    at, seqs = 0, 0
-    while at < len(raw):
-        if at + 2 > len(raw) or raw[at] != 0x30:
-            return False
-        size, at = raw[at + 1], at + 2
-        if size & 0x80:
-            if not 1 <= size & 0x7f <= 4:
-                return False
-            size, at = int.from_bytes(raw[at:at + (size & 0x7f)], 'big'), at + (size & 0x7f)
-        at, seqs = at + size, seqs + 1
-    return at == len(raw) and seqs <= (2 if kind == 'TRUSTED CERTIFICATE' else 1)
+    try:
+        if kind == 'PGP PUBLIC KEY BLOCK':
+            tags = pgp_packets(raw)
+            return tags[:1] == [6] and set(tags) <= PGP_PUBLIC_TAGS
+        top = der(raw)
+    except (ValueError, RecursionError):   # too deep to be a key or certificate
+        return False
+    want = [SEQUENCE] * (2 if kind == 'TRUSTED CERTIFICATE' else 1)
+    if [t for t, _ in top] != want:
+        return False
+    return tuple(t for t, _ in der(top[0][1])) == DER_SHAPE[kind]
 
 
 def ssh_public(line):
