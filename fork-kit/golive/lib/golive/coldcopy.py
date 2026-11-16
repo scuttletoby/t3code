@@ -257,27 +257,66 @@ def kept_files(home):
     return found
 
 
-def stopped_restore(home):
+def stopped_restore(home, copy_dir=None):
     """Read only: the record (RESTORE_MARK) a restore stopped half-way left in userdata/, or None. Its 'oldHome'
     names the kept files that are the home as it was before that restore; its 'alsoKept' (when there) what reruns
-    kept from the half-way home; its 'names' the files that restore put back. None as well when the old home was
-    put back by hand (see _read_record). RuntimeError when the record cannot be read (which kept files are the old
-    home is then unknown), or when the old home was put back only in part or with a file of the half-way home
-    left: the owner looks."""
-    record, stale = _read_record(home)
+    kept from the half-way home; its 'names' the files that restore put back; its 'sums' the SHA256 of each kept
+    file; its 'copy' and 'alsoCopies' the copies it and its reruns restored from. None as well when the old home
+    was put back by hand (see _read_record; copy_dir, the copy about to be restored, counts as one of the record's
+    copies). RuntimeError when the record cannot be read (which kept files are the old home is then unknown), or
+    when the old home was put back only in part or with a file of the half-way home left: the owner looks."""
+    record, stale = _read_record(home, copy_dir)
     return None if stale else record
 
 
-def _read_record(home):
+def _file_sum(path):
+    """SHA256 of a regular file, None for anything else or nothing."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+    except FileNotFoundError:
+        return None
+    return _hash(path, drop_cache=True)
+
+
+def _copy_sums(mark, copy_dir=None):
+    """({name: {SHA256}} of the files the copies a restore record names (and copy_dir) hold, by their manifests;
+    [those copies whose manifest cannot be read, so what they hold is unknown])."""
+    copies = [mark.get('copy')] + list(mark.get('alsoCopies', [])) + ([copy_dir] if copy_dir else [])
+    sums, unread = {}, []
+    for c in dict.fromkeys(os.path.normpath(c) if isinstance(c, str) else c for c in copies):
+        try:
+            if not isinstance(c, str):
+                raise Incomplete('the record names no copy')
+            m = read_manifest(c)
+        except Incomplete:
+            unread.append(c if isinstance(c, str) else '(the record names no copy)')
+            continue
+        for e in m['files']:
+            if isinstance(e, dict) and e.get('kind') == 'file' and isinstance(e.get('path'), str):
+                sums.setdefault(e['path'], set()).add(e.get('sha256'))
+    return sums, unread
+
+
+def _them(names, one='it', more='them'):
+    return one if len(names) == 1 else more
+
+
+def _read_record(home, copy_dir=None):
     """(record, stale) of RESTORE_MARK: (None, False) when there is none. Stale when the old home was put back by
     hand in full: every file 'oldHome' names is moved back (gone from its kept name and back in the home) or
     copied back (still there, and the home's file of that name holds the same bytes); a kept -shm need not go
-    back. And the home then holds no -wal, -journal or -shm of a database the record names that the old home did
-    not have: such a file is the half-way home's (the copy's WAL, or what a T3 started after the stop wrote), and
-    next to the old database it would serve, or on the first checkpoint write, another database's pages.
-    RuntimeError, before any change, when the record cannot be read, or the old home is put back only in part (a
+    back. A kept file gone while the home's file of that name holds the bytes of a copy's file (by the copy's
+    manifest; one the record's copies restored, or copy_dir) and the kept file did not ('sums') is not moved back:
+    it was deleted, and the home holds the half-way home's file. And the home then holds no -wal, -journal or -shm
+    of a database the record names that the old home did not have: such a file is the half-way home's (the copy's
+    WAL, or what a T3 started after the stop wrote), and next to the old database it would serve, or on the first
+    checkpoint write, another database's pages.
+    RuntimeError, before any data changes, when the record cannot be read, or the old home is put back only in part (a
     rerun would keep that mix as the old home and name no more the kept files still out, such as the WAL with the
-    commits), or a file of the half-way home is left beside it; the message names the files."""
+    commits), or a file of the half-way home is left beside it; the message names the files and, by the copy's
+    SHA256, whose each is: the copy's (remove it, keep the record), a T3's that ran on the put-back home (keep it,
+    remove the record), or a stray -shm (always safe to remove)."""
     userdata = os.path.join(home, 'userdata')
     path = os.path.join(userdata, RESTORE_MARK)
     try:
@@ -291,7 +330,11 @@ def _read_record(home):
         return isinstance(v, list) and all(isinstance(n, str) and (ASIDE in n or not aside) and '/' not in n
                                            and n not in ('', '.', '..') for n in v)
     if not (isinstance(mark, dict) and names_ok(mark.get('oldHome')) and names_ok(mark.get('alsoKept', []))
-            and names_ok(mark.get('names', list(DEFAULT_RESTORE)), aside=False)):
+            and names_ok(mark.get('names', list(DEFAULT_RESTORE)), aside=False)
+            and isinstance(mark.get('sums', {}), dict)
+            and all(isinstance(v, str) for v in mark.get('sums', {}).values())
+            and isinstance(mark.get('alsoCopies', []), list)
+            and all(isinstance(c, str) for c in mark.get('alsoCopies', []))):
         raise RuntimeError(f'{path} cannot be read ({mark if isinstance(mark, Exception) else "not a record"}): a '
                            'restore stopped half-way and which kept files are the old home is unknown; look at the '
                            f'*{ASIDE}* files, put the home right, then remove it')
@@ -300,29 +343,76 @@ def _read_record(home):
         return mark, False
     def base(n):
         return n.split(ASIDE)[0]
+    sums, unread = _copy_sums(mark, copy_dir)
+    kept_sums = mark.get('sums', {})
+    def copys(name, digest):
+        return digest is not None and digest in sums.get(name, ())
     out = [n for n in mark['oldHome'] if n not in gone and not base(n).endswith('-shm')
            and not _same_file(os.path.join(userdata, n), os.path.join(userdata, base(n)))]
     lost = [n for n in gone if not base(n).endswith('-shm') and not os.path.lexists(os.path.join(userdata, base(n)))]
+    lost_copy = []  # deleted: the home's file of that name is the copy's, and the kept one was not
+    for n in gone:
+        if base(n).endswith('-shm') or n in lost:
+            continue
+        digest = _file_sum(os.path.join(userdata, base(n)))
+        if copys(base(n), digest) and kept_sums.get(n) != digest:
+            lost_copy.append(n)
     had = {base(n) for n in mark['oldHome']}
     foreign = [c for name in mark.get('names', DEFAULT_RESTORE) for c in _companions(name)
                if c not in had and os.path.lexists(os.path.join(userdata, c))]
-    if out or lost:
+    if out or lost or lost_copy:
+        said = ([f'{", ".join(out)} not back in the home'] if out else []) \
+            + ([f'{", ".join(lost)} gone from the home too'] if lost else []) \
+            + ([f'{", ".join(lost_copy)} not moved back: the home\'s '
+                f'{", ".join(base(n) for n in lost_copy)} {_them(lost_copy, "holds", "hold")} the bytes of the '
+                f'copy\'s file (its manifest SHA256), not the kept {_them(lost_copy, "one", "ones")}, so '
+                f'{_them(lost_copy)} was deleted'] if lost_copy else [])
         raise RuntimeError(f'{path} names the kept files of the old home, but they are only partly put back '
-                           f'({", ".join(gone)} gone from the kept files; '
-                           + (f'{", ".join(out)} not back in the home' if out else '')
-                           + ('; ' if out and lost else '')
-                           + (f'{", ".join(lost)} gone from the home too' if lost else '') + '): '
+                           f'({", ".join(gone)} gone from the kept files; ' + '; '.join(said) + '): '
                            'finish putting the kept files back (a rerun then names any -wal, -journal or -shm left '
                            'in the home that the old home did not have), or remove the record once the home is '
                            'right; nothing was changed')
     if foreign:
+        wals = [c for c in foreign if not c.endswith('-shm')]
+        theirs = [c for c in wals if copys(c, _file_sum(os.path.join(userdata, c)))]
+        others = [c for c in wals if c not in theirs]
+        t3s, unsure = ([], others) if unread else (others, [])
+        groups = {'copy': theirs, 't3': t3s, 'unsure': unsure, 'stray': []}
+        for c in foreign:
+            if c.endswith('-shm'):
+                wal = c[:-len('-shm')] + '-wal'
+                for key in ('t3', 'unsure', 'copy'):
+                    if wal in groups[key]:
+                        groups[key].append(c)
+                        break
+                else:
+                    groups['stray'].append(c)
+        said = []
+        if groups['copy']:
+            g = groups['copy']
+            said.append(f'{", ".join(g)} {_them(g, "is", "are")} the copy\'s (the same SHA256 as in its manifest; '
+                        f'a -shm goes with its -wal), left from the restore stopped half-way: remove {_them(g)}, '
+                        'and do NOT remove the record (beside the old database the copy\'s WAL would serve or '
+                        'checkpoint another database\'s pages); then run the restore again (the record is then '
+                        'stale)')
+        if groups['t3']:
+            g = groups['t3']
+            said.append(f'{", ".join(g)} {_them(g, "does", "do")} not match the copy\'s: a T3 that ran on the '
+                        f'put-back home (with the record still there) wrote {_them(g)}, and '
+                        f'{_them(g, "it holds", "they hold")} its newest commits: keep {_them(g)} and remove the '
+                        'record instead (the next restore then keeps the whole home)')
+        if groups['unsure']:
+            g = groups['unsure']
+            said.append(f'whose {", ".join(g)} {_them(g, "is", "are")} cannot be told (no readable manifest in '
+                        f'{", ".join(unread)}, so the copy\'s SHA256 is unknown): remove neither '
+                        f'{_them(g)} nor the record until you have compared {_them(g)} with the copy\'s file')
+        if groups['stray']:
+            g = groups['stray']
+            said.append(f'{", ".join(g)} {_them(g, "is a -shm", "are -shm files")} with no -wal of the half-way '
+                        'home beside it, only SQLite\'s index of a WAL, rebuilt when the database opens: always '
+                        'safe to remove' + ('' if len(said) else ' (then run the restore again)'))
         raise RuntimeError(f'{path} names the kept files of the old home and they are back, but the home also '
-                           f'holds {", ".join(foreign)}, which the old home did not have: the half-way home\'s (the '
-                           'copy\'s, or what a T3 started after the stop wrote), and beside the old database a WAL '
-                           f'of another database. Remove {"it" if len(foreign) == 1 else "them"}, then run the '
-                           'restore again (or remove the record) before T3 starts. Only if T3 ran on the put-back '
-                           'home since (with the record still there) is it that T3\'s own: then remove the record '
-                           'instead; nothing was changed')
+                           'holds files the old home did not have: ' + '; '.join(said) + '; nothing was changed')
     return mark, True
 
 
@@ -393,7 +483,7 @@ def plan_restore(copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     m = read_manifest(copy_dir, from_home, version)
     files = {e.get('path'): e for e in m['files'] if isinstance(e, dict) and e.get('kind') == 'file'}
     userdata = os.path.join(home, 'userdata')
-    prior = stopped_restore(home)
+    prior = stopped_restore(home, copy_dir)
     want = []
     for name in names:
         if '/' in name or name in ('', '.', '..'):
@@ -495,10 +585,12 @@ def _write_mark(userdata, record, stamp):
 def _keep(userdata, n, stamp):
     """Keep home file n as <n>.golive-aside-<time>: an independent copy, written under a temp name, fsynced and read
     back, then renamed (a link is kept as a link). Not a hard link: a T3 started on the home after a restore stopped
-    half-way writes to the home's files, and must not change the kept ones."""
+    half-way writes to the home's files, and must not change the kept ones. Returns (kept name, its SHA256 or None
+    for a link)."""
     src = os.path.join(userdata, n)
     st = os.lstat(src)
     tmp = os.path.join(userdata, _free_name(userdata, f'.{n}{RESTORE_TEMP}{stamp}-aside'))
+    digest = None
     if stat.S_ISLNK(st.st_mode):
         os.symlink(os.readlink(src), tmp)
     else:
@@ -507,7 +599,7 @@ def _keep(userdata, n, stamp):
             raise RuntimeError(f'{tmp} does not read back as {src}')
     name = _free_name(userdata, f'{n}{ASIDE}{stamp}')
     os.rename(tmp, os.path.join(userdata, name))
-    return name
+    return name, digest
 
 
 def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, floor_bytes=0):
@@ -530,10 +622,11 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     Running it again starts again from the untouched copy. A rerun after a stop in steps 4-6 finds RESTORE_MARK:
     the home is then half-way, not the old home, so its result names the old home from the record ('movedAside')
     and it keeps only home files that hold anything new ('alsoKept': what a T3 started after the stop wrote; the
-    record is rewritten to name them before anything leaves the home, so a later rerun names them too). A record
-    put back only in part, or with a -wal, -journal or -shm the old home did not have, refuses before any change
-    (see _read_record); one put back in full is stale: the home is the old home ('staleRecord', and 'staleKept'
-    names the record's kept files still there). A rerun after a stop between step 6 and
+    record is rewritten to name them, and a rerun's copy ('alsoCopies'), before anything leaves the home, so a
+    later rerun names them too). The record holds each kept file's SHA256 ('sums'). A record put back only in part,
+    or with a -wal, -journal or -shm the old home did not have, refuses before any data change (see _read_record);
+    one put back in full is stale: the home is the old home ('staleRecord', and 'staleKept' names the record's kept
+    files still there). A rerun after a stop between step 6 and
     the end of the caller's step finds no record and the home exactly the copy's: it keeps nothing
     ('alreadyRestored'), so the restored data is never named as the old home.
     The CALLER keeps T3 from starting until the step is done (a T3 started after a stop in steps 4-6 serves that
@@ -548,10 +641,10 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     try:  # the checks (disk included) under the lock, so nothing changes between them and the restore
         files, want = plan_restore(copy_dir, home, from_home=from_home, version=version, names=names,
                                    floor_bytes=floor_bytes)
-        prior, stale = _read_record(home)
+        prior, stale = _read_record(home, copy_dir)
         stale_kept = [n for n in _record_names(prior) if os.path.lexists(os.path.join(userdata, n))] if stale else []
         prior = None if stale else prior
-        stamp, temps, kept = _stamp(), {}, []
+        stamp, temps, kept, sums = _stamp(), {}, [], {}
         cleaned = _leftover_temps(userdata)
         for n in cleaned:
             os.unlink(os.path.join(userdata, n))
@@ -564,13 +657,22 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
         _fsync_dir(userdata)
         keep, already = _to_keep(userdata, names, prior, files, want)  # nothing new in the others
         for n in keep:
-            kept.append(_keep(userdata, n, stamp))
+            name, digest = _keep(userdata, n, stamp)
+            kept.append(name)
+            if digest:
+                sums[name] = digest
             _fsync_dir(userdata)
         if prior is None:
-            _write_mark(userdata, {'oldHome': kept, 'at': stamp, 'copy': copy_dir, 'names': list(names)}, stamp)
-        elif kept:  # a rerun: the record names what it kept too, before anything leaves the home
-            prior = {**prior, 'alsoKept': prior.get('alsoKept', []) + kept}
-            _write_mark(userdata, prior, stamp)
+            _write_mark(userdata, {'oldHome': kept, 'at': stamp, 'copy': copy_dir, 'names': list(names),
+                                   'sums': sums}, stamp)
+        else:  # a rerun: the record names what it kept and its copy too, before anything leaves the home
+            copies = [prior.get('copy')] + prior.get('alsoCopies', [])
+            new_copy = os.path.normpath(copy_dir) not in [os.path.normpath(c) for c in copies if isinstance(c, str)]
+            if kept or new_copy:
+                prior = {**prior, 'alsoKept': prior.get('alsoKept', []) + kept,
+                         'sums': {**prior.get('sums', {}), **sums},
+                         'alsoCopies': prior.get('alsoCopies', []) + ([copy_dir] if new_copy else [])}
+                _write_mark(userdata, prior, stamp)
         for name in names:
             for n in _companions(name) + ([name] if name not in temps else []):
                 if os.path.lexists(os.path.join(userdata, n)):
@@ -731,8 +833,9 @@ def _home_problem(cfg):
         return (f'{", ".join(links)} in {userdata} is a link: the copy takes files only and would hold the link, '
                 'not the database')
     if os.path.lexists(os.path.join(userdata, RESTORE_MARK)):
-        return (f'a restore stopped half-way ({os.path.join(userdata, RESTORE_MARK)} is there): run it again, or '
-                'put back the kept files it names and remove it, before a copy')
+        return (f'a restore stopped half-way ({os.path.join(userdata, RESTORE_MARK)} is there): if the kept files '
+                'it names are back in the home, remove it (first remove any -wal or -journal of the copy left beside '
+                'the old database: a restore run names them); otherwise run the restore again; then copy')
     return None
 
 
