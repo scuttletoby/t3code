@@ -559,9 +559,13 @@ class EveryWallsFile(Case):
                 root = self.root(overlay(LINUX, change))
                 self.assertNotIn('etc-secrets', self.walls('linux', 'describe', root)[1])
 
-    def etc_secrets(self, change):
-        """The linux etc-secrets line on the passing fixture with change, through describe."""
-        p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)))
+    def etc_secrets(self, change, then=None):
+        """The linux etc-secrets line on the passing fixture with change, through describe; then(root), if given,
+        changes the built root first (a link, a mode, raw bytes)."""
+        root = self.root(overlay(LINUX, change))
+        if then:
+            then(root)
+        p = run([os.path.join(self.folder, 'linux'), 'describe'], root)
         lines = [x for x in p.stdout.splitlines() if x.split('  ')[1:2] == ['etc-secrets']]
         self.assertEqual(len(lines), 1, p.stdout + p.stderr)
         return lines[0]
@@ -1062,6 +1066,121 @@ class EveryWallsFile(Case):
         self.assertEqual(fw_linux().unit_lines('\ufeff[X]\n\ufeff[Service]\nA=1\n', 'Service'), [])
         self.assertEqual(fw_linux().unit_lines('[Service]\n\ufeffA=1\n\ufeffB=2\n', 'Service'), [(2, 'A', '1'),
                                                                                                  (3, '\ufeffB', '2')])
+
+    def test_linux_unit_lines_continue_on_an_odd_run_of_backslashes(self):
+        """PR #240 fix 3 item 1 (correctness r2 finding 1): systemd continues a line only when the raw line ends in an
+        odd run of backslashes with nothing after it (conf-parser.c); `x\\\\` and `x\\ ` end the line. Joining them
+        would hide the next line's reset or allow: each FAILS job-units."""
+        fails = ({'etc/systemd/system/service.d/50-x.conf': '[Service]\nTimeoutStartSec=90\\\\\nIPAddressDeny=\n'},
+                 {'etc/systemd/system/service.d/50-x.conf': '[Service]\nTimeoutStartSec=90\\ \nIPAddressDeny=\n'},
+                 {'etc/systemd/system/system.slice.d/50-x.conf': '[Slice]\nDescription=x\\\\\nIPAddressAllow=any\n'})
+        for change in fails:
+            with self.subTest(change):
+                got = self.job_units(change)
+                self.assertTrue(got.startswith('FAIL'), got)
+        lines = fw_linux().unit_lines
+        self.assertEqual(lines('[Service]\nA=x\\\\\nB=2\n', 'Service'), [(2, 'A', 'x\\\\'), (3, 'B', '2')])
+        self.assertEqual(lines('[Service]\nA=x\\ \nB=2\n', 'Service'), [(2, 'A', 'x\\'), (3, 'B', '2')])
+        self.assertEqual(lines('[Service]\nA=x\\\nB=2\n', 'Service'), [(2, 'A', 'x B=2')])
+        self.assertEqual(lines('[Service]\nA=x\\\\\\\n# c\nB=2\n', 'Service'), [(2, 'A', 'x\\\\ B=2')])
+        # the same in a secret: the second line is its own Environment= and is read
+        got = self.etc_secrets({'etc/systemd/system/b.service':
+                                '[Service]\nDescription=x\\\\\nEnvironment=RESTIC_PASSWORD=hunter2\n'})
+        self.assertTrue(got.startswith('FAIL'), got)
+
+    def test_linux_unit_forms_the_walls_cannot_read_fail_closed(self):
+        """PR #240 fix 3 items 2-4 and 6 (security r2 findings 1-4, correctness r2 finding 2): a source path that
+        starts with a specifier is expanded (LoadCredential=x:%E/..., EnvironmentFile=%E/...); a specifier that is
+        many folders (%Y %y %S %C %L %V) is its real folder, one the walls cannot know (%h, %I) fails closed, as does
+        any other relative source; a bare word is read from WorkingDirectory=, and env -C, --chdir and cd fail closed;
+        any backslash (a systemd escape: p\\x77, \\s) in an Environment= item fails closed. Each FAILS etc-secrets,
+        naming the line; the plain forms of the same, with the file private, pass."""
+        pw = 'Hunter2-correct-horse\n'
+        env = 'RESTIC_PASSWORD=Hunter2-correct-horse\n'
+        cases = {'LoadCredential=restic:%E/restic/pw': {'etc/restic/pw': pw},
+                 'EnvironmentFile=%E/restic/env': {'etc/restic/env': env},
+                 'EnvironmentFile=-%E/restic/env': {'etc/restic/env': env},
+                 'Environment=RESTIC_PASSWORD_FILE=%Y/restic.pw': {'etc/systemd/system/restic.pw': pw},
+                 'Environment="RESTIC_PASSWORD_COMMAND=cat %Y/restic.pw"': {'etc/systemd/system/restic.pw': pw},
+                 'Environment=RESTIC_PASSWORD_FILE=%S/restic/pw': {'var/lib/restic/pw': pw},
+                 'Environment=RESTIC_PASSWORD_FILE=%L/restic/pw': {'var/log/restic/pw': pw},
+                 'Environment=RESTIC_PASSWORD_FILE=%h/restic/pw': {},
+                 'Environment=RESTIC_PASSWORD_FILE=/etc/%I/pw': {},
+                 'LoadCredential=restic:etc/restic/pw': {},
+                 'EnvironmentFile=restic.env': {},
+                 'WorkingDirectory=/etc/restic\nEnvironment="RESTIC_PASSWORD_COMMAND=cat pw"': {'etc/restic/pw': pw},
+                 'WorkingDirectory=~\nEnvironment="RESTIC_PASSWORD_COMMAND=cat pw"': {},
+                 'Environment="RESTIC_PASSWORD_COMMAND=env -C /etc/restic cat pw"': {'etc/restic/pw': pw},
+                 'Environment="RESTIC_PASSWORD_COMMAND=env --chdir=/etc/restic cat pw"': {'etc/restic/pw': pw},
+                 'Environment="RESTIC_PASSWORD_COMMAND=cd /etc/restic && cat pw"': {'etc/restic/pw': pw},
+                 'Environment=RESTIC_PASSWORD_FILE=/etc/restic/p\\x77': {'etc/restic/pw': pw},
+                 'Environment=RESTIC_PASSWORD_COMMAND=cat\\s/etc/restic/pw': {'etc/restic/pw': pw}}
+        for line, files in cases.items():
+            with self.subTest(line):
+                got = self.etc_secrets({**files, 'etc/systemd/system/b.service': f'[Service]\n{line}\n'})
+                self.assertTrue(got.startswith('FAIL'), got)
+        # a WorkingDirectory= in a drop-in counts for the unit's commands too
+        got = self.etc_secrets({'etc/restic/pw': pw,
+                                'etc/systemd/system/b.service.d/x.conf': '[Service]\nWorkingDirectory=/etc/restic\n',
+                                'etc/systemd/system/b.service':
+                                '[Service]\nEnvironment="RESTIC_PASSWORD_COMMAND=cat pw"\n'})
+        self.assertTrue(got.startswith('FAIL'), got)
+        got = self.etc_secrets({'etc/systemd/system/b.service': '[Service]\nEnvironment=RESTIC_PASSWORD_FILE=%h/pw\n'})
+        self.assertIn('line 2', got)
+        private = {'text': pw, 'mode': '600'}
+        passes = {'LoadCredential=restic:%E/restic/pw': {'etc/restic/pw': private},
+                  'EnvironmentFile=%E/restic/env': {'etc/restic/env': {'text': env, 'mode': '600'}},
+                  'Environment=RESTIC_PASSWORD_FILE=%Y/restic.pw': {'etc/systemd/system/restic.pw': private},
+                  'WorkingDirectory=/etc/restic\nEnvironment="RESTIC_PASSWORD_COMMAND=cat pw"':
+                  {'etc/restic/pw': private},
+                  'Environment="RESTIC_PASSWORD_COMMAND=cat /etc/restic/pw"': {'etc/restic/pw': private}}
+        for line, files in passes.items():
+            with self.subTest(line):
+                got = self.etc_secrets({**files, 'etc/systemd/system/b.service': f'[Service]\n{line}\n'})
+                self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_password_command_glued_paths_bytes_links_and_credentials(self):
+        """PR #240 fix 3 items 5, 7-9: a path glued to an option (curl -sK/etc/restic/pw) or relative after : or @
+        (-pass file:etc/restic/pw) is read; a word that is not valid UTF-8 fails closed; a link in a private folder to
+        a file others can reach FAILS (the folders above the real file count); and in a unit
+        ${CREDENTIALS_DIRECTORY}/name is the unit's own credential, not /name."""
+        pw = 'Hunter2-correct-horse\n'
+        for c in ('curl -sK/etc/restic/pw https://x', 'openssl enc -d -pass file:etc/restic/pw',
+                  'tool --key @etc/restic/pw'):
+            with self.subTest(c):
+                got = self.etc_secrets({'etc/restic/pw': pw,
+                                        'etc/profile.d/x.sh': f'export RESTIC_PASSWORD_COMMAND={shlex(c)}\n'})
+                self.assertTrue(got.startswith('FAIL'), got)
+
+        def raw_name(root):   # cat /etc/restic/p<0xff>w: python reads the byte as U+FFFD
+            with open(os.path.join(root, 'etc/profile.d/x.sh'), 'wb') as f:
+                f.write(b'export RESTIC_PASSWORD_COMMAND="cat /etc/restic/p\xffw"\n')
+            with open(os.path.join(root.encode(), b'etc/restic/p\xffw'), 'wb') as f:
+                f.write(pw.encode())
+            os.chmod(os.path.join(root.encode(), b'etc/restic/p\xffw'), 0o644)
+        with self.subTest('not UTF-8'):
+            got = self.etc_secrets({'etc/restic/': '', 'etc/profile.d/x.sh': '\n'}, raw_name)
+            self.assertTrue(got.startswith('FAIL'), got)
+
+        def link(folder_mode, target_mode):
+            def then(root):
+                os.symlink('../restic-real/pw', os.path.join(root, 'etc/restic/pw'))
+                os.chmod(os.path.join(root, 'etc/restic'), folder_mode)
+                os.chmod(os.path.join(root, 'etc/restic-real'), target_mode)
+            return then
+        change = {'etc/restic/': '', 'etc/restic-real/pw': pw,
+                  'etc/profile.d/x.sh': 'export RESTIC_PASSWORD_FILE=/etc/restic/pw\n'}
+        with self.subTest('a private link to a public file'):
+            got = self.etc_secrets(change, link(0o700, 0o755))
+            self.assertTrue(got.startswith('FAIL'), got)
+        with self.subTest('a public link to a private file'):
+            got = self.etc_secrets(change, link(0o755, 0o700))
+            self.assertTrue(got.startswith('PASS'), got)
+        for c in ('cat ${CREDENTIALS_DIRECTORY}/restic', 'cat $CREDENTIALS_DIRECTORY/restic', 'cat %d/restic'):
+            with self.subTest(c):   # a host with a readable /restic (a repository, say)
+                got = self.etc_secrets({'restic': pw, 'etc/systemd/system/b.service':
+                                        '[Service]\nEnvironment=' + shlex(f'RESTIC_PASSWORD_COMMAND={c}') + '\n'})
+                self.assertTrue(got.startswith('PASS'), got)
 
     def test_linux_system_conf_a_dangling_link_is_skipped(self):
         """Issue #226 item 3: systemd 256 and later reads the first system.conf of /etc, /run, /usr/local/lib and
