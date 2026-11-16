@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
-import copy, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat, subprocess, sys
+import copy, datetime, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat, subprocess, sys
 import tempfile
 import unittest, urllib.error, urllib.parse
 from contextlib import redirect_stdout
@@ -2186,6 +2186,39 @@ class Launcher(unittest.TestCase):
         self.assertIn('not a number', self.launch('fits', '1e3').stderr)
         self.write('meminfo', 'MemTotal: 1 kB\n', 0o644)
         self.assertIn('no MemAvailable', self.launch('fits', '1').stderr)
+
+    def test_fits_asks_the_free_script_too(self):
+        """FREE_COMMAND (free/v1, fork-kit/common/FREE.md): after the memory rule, its answer through FREE_CHECK."""
+        with open(os.path.join(HERE, '..', '..', 'fork-kit', 'common', 'free_contract.py')) as f:
+            reader = self.write('free_contract.py', f.read(), 0o644)
+        script = self.path('free')
+        self.conf(FREE_COMMAND=script, FREE_CHECK=reader)
+        free = 8388608 // 1024 - 2048
+
+        def answer(code, **facts):
+            at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            body = json.dumps({'v': 1, 'free': code == 0, 'at': at, **facts})
+            self.write('free', f"#!/bin/sh\necho '{body}'\n: > {self.rec}/free-ran\nexit {code}\n", 0o755)
+        answer(0)
+        self.assertEqual(self.launch('fits', str(free)).returncode, 0)
+        answer(75, reason='a game is running')
+        got = self.launch('fits', '1')
+        self.assertEqual(got.returncode, 75)
+        self.assertIn('busy: a game is running', got.stderr)
+        answer(0, memory={'freeMb': 1000})
+        self.assertNotEqual(self.launch('fits', '1001').returncode, 0)
+        self.assertEqual(self.launch('fits', '1000').returncode, 0)
+        answer(3)
+        self.assertIn('not available: exit 3', self.launch('fits', '1').stderr)
+        answer(0)
+        os.remove(self.path('rec/free-ran'))
+        self.assertEqual(self.launch('fits', str(free + 1)).returncode, 1)
+        self.assertFalse(os.path.exists(self.path('rec/free-ran')), 'the memory rule says no first')
+        os.chmod(reader, 0o666)
+        self.assertIn('writable by its owner only', self.launch('fits', '1').stderr)
+        os.chmod(reader, 0o644)
+        self.conf(FREE_COMMAND='free')
+        self.assertIn('plain absolute paths', self.launch('fits', '1').stderr)
 
     def test_stop(self):
         self.assertEqual(self.launch('stop', self.NAME).returncode, 0)

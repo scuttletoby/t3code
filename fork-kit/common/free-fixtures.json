@@ -1,0 +1,173 @@
+{
+  "about": "free/v1 (FREE.md): the cases every parser must agree on. exit null = no answer in time; with padTo, the PAD in stdout is filled with x until stdout is padTo bytes long; now is the reader's clock; needMb is the size the reader asks for.",
+  "now": "2026-11-15T05:00:30Z",
+  "cases": [
+    {
+      "name": "free",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "free"
+    },
+    {
+      "name": "busy with a reason",
+      "exit": 75,
+      "stdout": "{\"v\": 1, \"free\": false, \"reason\": \"memory pressure 62%\", \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "busy"
+    },
+    {
+      "name": "the full example",
+      "exit": 75,
+      "stdout": "{\"v\": 1, \"free\": false, \"reason\": \"memory pressure 62%\", \"at\": \"2026-11-15T05:00:00Z\", \"labels\": [\"ci-runner\"], \"memory\": {\"budgetMb\": 4608, \"reservedMb\": 3072, \"freeMb\": 1536, \"pressureFull10\": 62, \"swapUsedPercent\": 80}, \"queue\": {\"running\": 2, \"waiting\": 1}, \"leftovers\": [{\"comm\": \"python3\", \"count\": 73, \"cpuPercent\": 380}]}",
+      "verdict": "busy"
+    },
+    {
+      "name": "unknown fields are ignored",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"later\": {\"x\": 1}}",
+      "verdict": "free"
+    },
+    {
+      "name": "an offset instead of Z",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T06:00:00.250+01:00\"}",
+      "verdict": "free"
+    },
+    {
+      "name": "enough memory for the size asked",
+      "exit": 0,
+      "needMb": 2048,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"memory\": {\"freeMb\": 2048}}",
+      "verdict": "free"
+    },
+    {
+      "name": "too little memory for the size asked",
+      "exit": 0,
+      "needMb": 2049,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"memory\": {\"freeMb\": 2048}}",
+      "verdict": "busy"
+    },
+    {
+      "name": "no memory figure: a size asked is not judged",
+      "exit": 0,
+      "needMb": 99999,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "free"
+    },
+    {
+      "name": "NaN is not JSON",
+      "exit": 0,
+      "needMb": 100,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"memory\": {\"freeMb\": NaN}}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "Infinity is not JSON",
+      "exit": 0,
+      "needMb": 100,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"memory\": {\"freeMb\": -Infinity}}",
+      "verdict": "unavailable"
+    },
+    { "name": "no answer in time", "exit": null, "stdout": "", "verdict": "unavailable" },
+    {
+      "name": "another exit code",
+      "exit": 1,
+      "stdout": "{\"v\": 1, \"free\": false, \"reason\": \"x\", \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "exit 0 but free is false",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": false, \"reason\": \"x\", \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "exit 75 but free is true",
+      "exit": 75,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "free is a string",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": \"true\", \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "busy without a reason",
+      "exit": 75,
+      "stdout": "{\"v\": 1, \"free\": false, \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "busy with a blank reason",
+      "exit": 75,
+      "stdout": "{\"v\": 1, \"free\": false, \"reason\": \"  \", \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "a newer version",
+      "exit": 0,
+      "stdout": "{\"v\": 2, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "no version",
+      "exit": 0,
+      "stdout": "{\"free\": true, \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "version true",
+      "exit": 0,
+      "stdout": "{\"v\": true, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "no time",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "a time without a zone",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "facts older than 60 seconds",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T04:59:29Z\"}",
+      "verdict": "unavailable"
+    },
+    {
+      "name": "facts from 60 seconds ago",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T04:59:30Z\"}",
+      "verdict": "free"
+    },
+    {
+      "name": "facts from the future",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:01:31Z\"}",
+      "verdict": "unavailable"
+    },
+    { "name": "not JSON", "exit": 0, "stdout": "free", "verdict": "unavailable" },
+    { "name": "a JSON list", "exit": 0, "stdout": "[1]", "verdict": "unavailable" },
+    { "name": "nothing on stdout", "exit": 0, "stdout": "", "verdict": "unavailable" },
+    {
+      "name": "4096 bytes is the most",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"pad\": \"PAD\"}",
+      "padTo": 4096,
+      "verdict": "free"
+    },
+    {
+      "name": "4097 bytes is too many",
+      "exit": 0,
+      "stdout": "{\"v\": 1, \"free\": true, \"at\": \"2026-11-15T05:00:00Z\", \"pad\": \"PAD\"}",
+      "padTo": 4097,
+      "verdict": "unavailable"
+    }
+  ]
+}
