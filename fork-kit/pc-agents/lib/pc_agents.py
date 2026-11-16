@@ -2,7 +2,7 @@
 
 Every path is read and written under ROOT, which is '' (the real machine) except in the tests, where
 PC_AGENTS_ROOT names a fake one; root never gets a fake one. Standard library only."""
-import hashlib, ipaddress, json, os, re, signal, subprocess
+import hashlib, ipaddress, json, os, re, signal, subprocess, time
 
 import machine_file
 
@@ -15,6 +15,10 @@ HOME, USER = '/home/agent', 'agent'
 NOLOGIN = '/usr/sbin/nologin'   # the agent's login shell: no shell for `wsl -u agent` or su; T3 gets SHELL from its unit
 OPT, STATE = '/opt/pc-agents', '/etc/pc-agents'
 RECORD = STATE + '/installed.tsv'   # sha256 <TAB> path of every file this kit wrote (a path may have two mid-write)
+PENDING = STATE + '/restart-pending'   # setup changed something T3 runs with: restart T3 before removing this
+BOOT_ID = '/proc/sys/kernel/random/boot_id'   # the marker holds this boot's id and CLOCK_MONOTONIC, like systemd's
+AS_AGENT = 'pc-agents-as-agent'   # name prefix of `pc-agents as-agent`'s transient units (check --enforce stops them)
+SETTLE, SETTLE_STEP = 15, 1   # after a (re)start, setup watches T3 this many seconds, every SETTLE_STEP, before done
 LOADED = '/run/pc-agents/firewall.loaded'   # sha256 of the firewall file and `nft list` of it, saved when loaded
 T3 = OPT + '/t3'   # T3's runtime, installed by root (T3CODE_HOME of scripts/install.sh): the agent cannot change it
 UNIT, WALLS = 't3code-agents.service', 'pc-agents-walls'
@@ -135,6 +139,41 @@ def dropin_dirs(unit):
     return [unit + '.d', kind + '.d'] + ['-'.join(parts[:i]) + f'-.{kind}.d' for i in range(1, len(parts))]
 
 
+def sandbox(c):
+    """The unit's walls, one `Key=value` each: T3's unit runs under them, and so does `pc-agents as-agent`."""
+    return [
+        'UMask=0077',
+        f'MemoryMax={c["memoryMax"]}',
+        f'CPUQuota={c["cpuQuota"]}',
+        'NoNewPrivileges=yes',
+        'ProtectSystem=strict',
+        'ProtectHome=read-only',
+        f'ReadWritePaths={HOME}',
+        'PrivateTmp=yes',
+        'PrivateDevices=yes',
+        'PrivateIPC=yes',
+        'ProtectProc=invisible',
+        'InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale',
+        f'IPAddressDeny={" ".join(BLOCKED4 + BLOCKED6)}',
+        f'IPAddressAllow={" ".join(c["peers"] + c["allow"])}',
+        'SocketBindDeny=any',
+        *('SocketBindAllow=tcp:' + p for p in loopback_ports(c)),
+        'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK',
+        'SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS',
+        'SystemCallArchitectures=native',
+        'RestrictNamespaces=yes',
+        'RestrictSUIDSGID=yes',
+        'RestrictRealtime=yes',
+        'LockPersonality=yes',
+        'ProtectKernelTunables=yes',
+        'ProtectKernelModules=yes',
+        'ProtectKernelLogs=yes',
+        'ProtectControlGroups=yes',
+        'ProtectClock=yes',
+        'ProtectHostname=yes',
+    ]
+
+
 def render(c):
     """{path: (text, mode)} of every file the kit owns, from the config alone (the same every run)."""
     settings = {**KIT_SETTINGS, **c['lockedSettings']}
@@ -151,6 +190,7 @@ def render(c):
         (f'\t\tip daddr {{ {", ".join(allow4)} }} accept\n' if allow4 else '') + \
         (f'\t\tip6 daddr {{ {", ".join(allow6)} }} accept\n' if allow6 else '') + \
         f'\t\tip daddr {{ {", ".join(BLOCKED4)} }} drop\n\t\tip6 daddr {{ {", ".join(BLOCKED6)} }} drop\n\t}}\n}}\n'
+    walls = '\n'.join(sandbox(c))
     unit = HEAD + f'''[Unit]
 Description=T3 Code for agents, walled (pc-agents kit)
 Wants=network-online.target
@@ -169,35 +209,7 @@ ExecStartPre=+{CHECK} check
 ExecStart={runtime(c)}/t3 serve
 Restart=on-failure
 RestartSec=30
-UMask=0077
-MemoryMax={c["memoryMax"]}
-CPUQuota={c["cpuQuota"]}
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths={HOME}
-PrivateTmp=yes
-PrivateDevices=yes
-PrivateIPC=yes
-ProtectProc=invisible
-InaccessiblePaths=-/mnt -/run/WSL -/tmp/.X11-unix -/usr/lib/wsl -/run/tailscale
-IPAddressDeny={" ".join(BLOCKED4 + BLOCKED6)}
-IPAddressAllow={" ".join(c["peers"] + c["allow"])}
-SocketBindDeny=any
-{chr(10).join("SocketBindAllow=tcp:" + p for p in loopback_ports(c))}
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS
-SystemCallArchitectures=native
-RestrictNamespaces=yes
-RestrictSUIDSGID=yes
-RestrictRealtime=yes
-LockPersonality=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
+{walls}
 
 [Install]
 WantedBy=multi-user.target
@@ -217,7 +229,7 @@ WantedBy=multi-user.target
         sd + WALLS + '.service': (HEAD + f'[Unit]\nDescription=pc-agents walls check\nAfter={UNIT}\n\n[Service]\n'
                                   f'Type=oneshot\nTimeoutStartSec=5min\nExecStart={CHECK} check --enforce\n'
                                   'ExecStopPost=/bin/sh -c \'[ "$$SERVICE_RESULT" = success ] || '
-                                  f'exec /usr/bin/systemctl stop {UNIT}\'\n', 0o644),
+                                  f'exec /usr/bin/systemctl stop {UNIT} "{AS_AGENT}-*.service"\'\n', 0o644),
         sd + WALLS + '.timer': (HEAD + '[Unit]\nDescription=pc-agents walls check every 2 minutes\n\n[Timer]\n'
                                 'OnActiveSec=1min\nOnUnitActiveSec=2min\nAccuracySec=10s\n\n[Install]\n'
                                 'WantedBy=timers.target\n', 0o644),
@@ -320,6 +332,58 @@ def login_shell(name):
         return None
 
 
+def clock():
+    """(this boot's id, CLOCK_MONOTONIC in microseconds): systemd's *TimestampMonotonic clock, which no clock change
+    or WSL time sync moves."""
+    with open(ROOT + BOOT_ID, encoding='ascii') as f:
+        return f.read().strip(), time.monotonic_ns() // 1000
+
+
+def marker():
+    """The restart marker's text: when setup last changed something T3 runs with (boot id, monotonic microseconds)."""
+    boot, now = clock()
+    return f'boot_id={boot} monotonic_us={now}\nsetup changed what T3 runs with; the next good run restarts T3 and ' \
+        'removes this. Until then `pc-agents check` fails while a T3 started before this time runs.\n'
+
+
+def props(text):
+    """`systemctl show` output as a dict."""
+    return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+
+
+def restart_problem():
+    """Why a T3 runs that started before setup's last change (a restart is pending), or None. No marker, or no T3
+    process (stopped, or still in its ExecStartPre check): nothing stale runs. Anything unreadable fails."""
+    if lstat(PENDING) is None:
+        return None
+    r = run(['/usr/bin/systemctl', 'show', '-p', 'MainPID,ExecMainStartTimestampMonotonic', UNIT])
+    got = props(r.stdout)
+    if r.returncode or not re.fullmatch(r'\d+', got.get('MainPID', '')):
+        return f'cannot tell whether T3 runs ({(r.stderr or r.stdout).strip()[-200:]})'
+    if got['MainPID'] == '0':
+        return None
+    try:
+        with open(ROOT + PENDING, encoding='utf-8', errors='replace') as f:
+            m = re.match(r'boot_id=(\S+) monotonic_us=(\d+)\n', f.read())
+        boot = clock()[0]
+    except OSError as e:
+        return f'cannot read {PENDING} or the boot id ({e})'
+    started = got.get('ExecMainStartTimestampMonotonic', '')
+    if not m or not re.fullmatch(r'[1-9]\d*', started):
+        return f'a restart is pending ({PENDING}) and T3\'s start time or the marker\'s cannot be read'
+    if m[1] == boot and int(started) <= int(m[2]):   # a marker of an earlier boot is older than any T3 now
+        return f'T3 runs as started before setup\'s last change ({PENDING}): run pc-agents setup again'
+    return None
+
+
+def stop_on_signals():
+    """SIGTERM and SIGHUP end this process like Ctrl-C does, through run()'s clean-up (its child's group is killed)."""
+    def stop(signum, frame):
+        raise SystemExit(128 + signum)
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, stop)
+
+
 def sudo_problem(c):
     """Why sudo could give the agent more (a sudoers line naming it, its group or uid, or every user), or None.
     Harmless inside the unit (NoNewPrivileges), but a way out from anywhere else."""
@@ -359,8 +423,9 @@ def user_problem(c, need_agent):
 
 
 def run(argv, timeout=120):
-    """Run argv (argv[0] under ROOT) in a process group of its own. Past timeout, or when this process stops, the
-    whole group is killed (a download's curl too); a timeout returns exit 124 and says so in stderr."""
+    """Run argv (argv[0] under ROOT) in a process group of its own. Past timeout, or when this process stops (Ctrl-C,
+    or SIGTERM and SIGHUP once stop_on_signals() ran), the whole group is killed (a download's curl too); a timeout
+    returns exit 124 and says so in stderr."""
     p = subprocess.Popen([ROOT + argv[0]] + argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
