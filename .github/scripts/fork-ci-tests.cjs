@@ -1,9 +1,6 @@
-// Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit must be listed in .github/fork-ci-tests.txt.
-// A plain entry runs here by its extension (RUNNER); `<test> run by <file>` is run by that file,
-// which must name the test and cannot be a (disabled) upstream workflow. Unlisted or runner-less
-// tests fail; a listed test that is gone fails once the tested history had it, a note before.
-// Test files run in parallel, FORK_CI_TEST_JOBS at once (default: the CPU count); each one's output
-// is printed whole, in its own group, when it ends.
+// Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit is listed in .github/fork-ci-tests.txt and
+// runs here by extension (RUNNER), FORK_CI_TEST_JOBS at once (default: CPU count), or `run by <file>` (not an upstream
+// workflow; it names the test). Unlisted or runner-less tests fail; a listed one that is gone fails once history had it.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
