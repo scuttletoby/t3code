@@ -40,17 +40,19 @@ def one(n, default):   # a per-user setting: the file N-USER
         return open(os.path.join(here, n + '-' + args[-1])).read().strip()
     except FileNotFoundError:
         return default
-if name == 'id':   # its groups: the file groups-USER (its own group only)
+if name == 'id':   # its main group: gid-USER (1001, its own group's); its groups: groups-USER (its main group only)
     if args[-1] not in lines('users'):
         sys.exit(1)
-    print({'-u': one('uid', '1001'), '-g': '1001', '-G': one('groups', '1001')}.get(args[0], ''))
-if name == 'getent':   # login shell: shell-USER (nologin); password field: pw-USER (!); uid-USER; home-USER
+    print({'-u': one('uid', '1001'), '-g': one('gid', '1001'), '-G': one('groups', one('gid', '1001'))}.get(args[0], ''))
+if name == 'getent':   # login shell: shell-USER (nologin); password field: pw-USER (!); uid-USER; home-USER; gid-USER
     u = args[-1]
     if u not in lines('users'):
         sys.exit(2)
     if args[0] == 'passwd':
-        print(f'{u}:x:' + one('uid', '1001') + ':1001::' + one('home', '/nonexistent') + ':'
+        print(f'{u}:x:' + one('uid', '1001') + ':' + one('gid', '1001') + '::' + one('home', '/nonexistent') + ':'
               + one('shell', '/usr/sbin/nologin'))
+    elif args[0] == 'group':   # the group named after the user: gid 1001
+        print(f'{u}:x:1001:')
     else:
         print(f'{u}:' + one('pw', '!') + ':19000:0:99999:7:::')
 if name == 'useradd':
@@ -535,6 +537,84 @@ class Desk(unittest.TestCase):
         self.assertIn('/opt/fork-fleet is not owned by root', err)
         self.assertEqual(self.tree(), before)
 
+    def test_a_linked_or_foreign_owned_subfolder_is_refused(self):
+        """lens225r4 finding 1 (probe): a link or foreign owner one level down (`units`, `fork-fleet-walls`) was
+        followed by install (the root-run walls and unit texts written into the link's target) and FAILed check
+        forever. Install now refuses it before changing anything, on a first install and on a later one."""
+        other = os.path.join(self.tmp, 'elsewhere')
+        os.makedirs(other)
+        for sub in ('units', 'fork-fleet-walls'):
+            with self.subTest(sub):
+                shutil.rmtree(self.root)
+                self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '1\n')
+                os.makedirs(self.path('/opt/fork-fleet'))
+                os.symlink(other, self.path(f'/opt/fork-fleet/{sub}'))
+                code, _, err = self.install()
+                self.assertEqual(code, 1, err)
+                self.assertIn(f'/opt/fork-fleet/{sub} is a link', err)
+                self.assertEqual(os.listdir(other), [])
+                os.unlink(self.path(f'/opt/fork-fleet/{sub}'))
+                self.assertEqual(self.install()[0], 0)
+                self.template()
+                self.assertNotIn('FAIL', self.run_main('check')[1])
+                real_lstat, folder = os.lstat, self.path(f'/opt/fork-fleet/{sub}')
+
+                def lstat(path, *a, **kw):   # the subfolder owned by another user (a test cannot chown)
+                    st = real_lstat(path, *a, **kw)
+                    if os.fspath(path) != folder:
+                        return st
+                    return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, *st[5:]))
+                before = self.tree()
+                with unittest.mock.patch.object(self.m.os, 'lstat', lstat):
+                    code, _, err = self.install(sha=SHA2)
+                self.assertEqual(code, 1)
+                self.assertIn(f'/opt/fork-fleet/{sub} is not owned by root', err)
+                self.assertEqual(self.tree(), before)
+
+    def test_check_names_a_linked_public_key(self):
+        """lens225r4 nit 3: install refuses a linked desk-key.pub, but check only looked at the private key."""
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        pub = self.path('/etc/fork-fleet/desk-key.pub')
+        self.write(os.path.join(self.tmp, 'pub-elsewhere'), slurp(pub))
+        os.unlink(pub)
+        os.symlink(os.path.join(self.tmp, 'pub-elsewhere'), pub)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL  kit  /etc/fork-fleet/desk-key.pub: a link or not owned by root', out)
+
+    def test_a_fifo_at_a_unit_or_setting_does_not_hang(self):
+        """lens225r4 nit 4: same_file (and ours) opened the path before testing it is a plain file; a FIFO hung
+        install and check. Now a FIFO is not the kit's file: check FAILs, install refuses (unit) or writes it (setting)."""
+        import signal
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+
+        def hung(*_):
+            raise AssertionError('hung on a FIFO')
+        old = signal.signal(signal.SIGALRM, hung)
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        self.addCleanup(signal.alarm, 0)
+        conf = self.path('/etc/fork-fleet/launch.conf')
+        os.unlink(conf)
+        os.mkfifo(conf, 0o600)
+        signal.alarm(20)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL  settings  /etc/fork-fleet/launch.conf differs', out)
+        self.assertEqual(self.install()[0], 0)   # the setting is written again, as a plain file
+        self.assertTrue(stat.S_ISREG(os.lstat(conf).st_mode))
+        unit = self.path('/etc/systemd/system/fork-fleet-desk-agent.service')
+        os.unlink(unit)
+        os.mkfifo(unit, 0o644)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1, out)
+        self.assertIn('fork-fleet-desk-agent.service: missing or not the kit\'s', out)
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn('fork-fleet-desk-agent.service was not written by this kit', err)
+        signal.alarm(0)
+
     def test_a_unit_or_setting_with_another_owner_fails_check_and_install_puts_it_back(self):
         """lens225r3 nit 5: units were checked for text and mode, not owner. A unit or setting that is a link or not
         root's FAILs check and is written again (as root) by install."""
@@ -560,6 +640,7 @@ class Desk(unittest.TestCase):
         self.template()
         os.makedirs(self.path('/home/fork-runner-1'))
         for name, text, want in (('groups-fork-runner-1', '1001 27', 'fork-runner-1 is in other groups (1001 27)'),
+                                 ('gid-fork-runner-1', '0', 'fork-runner-1 has the main group 0, not its own group'),
                                  ('uid-fork-runner-2', '0', 'fork-runner-2 has uid 0'),
                                  ('home-fork-runner-1', '/home/fork-runner-1', 'fork-runner-1 has the home')):
             with self.subTest(name):
@@ -624,6 +705,21 @@ class Desk(unittest.TestCase):
             'a hand-made runner user with uid 0': (
                 lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
                          self.write(os.path.join(self.fakes, 'uid-fork-runner-1'), '0\n')), [], 'has uid 0'),
+            'a hand-made runner user in group 0 only (useradd -g 0)': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
+                         self.write(os.path.join(self.fakes, 'gid-fork-runner-1'), '0\n')), [],
+                'has the main group 0, not its own group fork-runner-1'),
+            'a linked /opt/fork-fleet/units': (
+                lambda: (os.makedirs(os.path.join(self.tmp, 'elsewhere'), exist_ok=True),
+                         os.makedirs(self.path('/opt/fork-fleet')),
+                         os.symlink(os.path.join(self.tmp, 'elsewhere'), self.path('/opt/fork-fleet/units'))), [],
+                '/opt/fork-fleet/units is a link'),
+            'a linked /opt/fork-fleet/fork-fleet-walls': (
+                lambda: (os.makedirs(os.path.join(self.tmp, 'elsewhere'), exist_ok=True),
+                         os.makedirs(self.path('/opt/fork-fleet')),
+                         os.symlink(os.path.join(self.tmp, 'elsewhere'),
+                                    self.path('/opt/fork-fleet/fork-fleet-walls'))), [],
+                '/opt/fork-fleet/fork-fleet-walls is a link'),
             'a hand-made runner user in other groups': (
                 lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-2\n'),
                          self.write(os.path.join(self.fakes, 'groups-fork-runner-2'), '1001 27\n')), [],
@@ -667,7 +763,7 @@ class Desk(unittest.TestCase):
                 shutil.rmtree(self.root, ignore_errors=True)
                 os.makedirs(self.root)
                 for n in os.listdir(self.fakes):   # the users of the case before
-                    if n == 'users' or n.startswith(('shell-', 'pw-', 'uid-', 'groups-', 'home-')):
+                    if n == 'users' or n.startswith(('shell-', 'pw-', 'uid-', 'gid-', 'groups-', 'home-')):
                         os.unlink(os.path.join(self.fakes, n))
                 self.machine(MACHINE)
                 self.write(os.path.join(self.fakes, 'os-exit'), '0')

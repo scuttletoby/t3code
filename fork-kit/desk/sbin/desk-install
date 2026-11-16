@@ -40,6 +40,7 @@ FILES = {'fork-fleet-launch.sh': '.github/scripts/fork-fleet-launch.sh',
          'machine_file.py': 'fork-kit/common/machine_file.py', 'README.md': 'fork-kit/desk/README.md',
          'free_contract.py': 'fork-kit/common/free_contract.py', 'free-memory': 'fork-kit/common/free/memory'}
 WALLS = '.github/scripts/fork-fleet-walls'   # copied whole: every OS's walls file and fixture
+SUBDIRS = ('units', 'fork-fleet-walls')   # the folders the manifest makes inside /opt/fork-fleet
 UNITS = {'fork-fleet-desk-agent.service': '.github/scripts/fork-fleet-desk-agent.service',
          't3code-fleet-refresh.service': '.github/scripts/fork-fleet-refresh.service',
          't3code-fleet-refresh.timer': '.github/scripts/fork-fleet-refresh.timer',
@@ -98,9 +99,10 @@ def user_exists(name):
 
 def user_problem(u):
     """Why runner user u (made by the kit or by hand) could be used for more than one-job runners: a login shell, a
-    usable password (or none), uid 0, a group besides its own, a home that is there, a line in cron.allow/at.allow;
-    None when it is fine. The launcher's check_users refuses the same users at each job start (uid, groups). Read
-    through getent and id (as root)."""
+    usable password (or none), uid 0, a main group that is not the group named after it (gid 0 from `useradd -g 0`),
+    another group besides it, a home that is there, a line in cron.allow/at.allow; None when it is fine. The
+    launcher's check_users refuses uid 0 and more than one group at each job start. Read through getent and id (as
+    root)."""
     r = run('getent', 'passwd', u, check=False)
     fields = r.stdout.strip().split(':')
     if r.returncode or len(fields) < 7:
@@ -109,6 +111,10 @@ def user_problem(u):
         return f'{u} has the login shell {fields[6]!r} (usermod -s /usr/sbin/nologin {u})'
     if fields[2] == '0' or not fields[2].isdigit():
         return f'{u} has uid {fields[2]}: a runner user is a user of its own, not root (userdel {u}; install makes it)'
+    own = run('getent', 'group', u, check=False).stdout.strip().split(':')
+    if len(own) < 3 or own[0] != u or own[2] != fields[3]:
+        return (f'{u} has the main group {fields[3]}, not its own group {u}: a runner user is in its own group only '
+                f'(userdel {u}; install makes it with its own group)')
     gid, groups = run('id', '-g', u, check=False), run('id', '-G', u, check=False)
     if gid.returncode or groups.returncode or groups.stdout.split() != gid.stdout.split():
         return f'{u} is in other groups ({groups.stdout.strip()}): a runner user is in its own group only (gpasswd -d)'
@@ -144,12 +150,14 @@ def not_root_owned(path, kind):
 
 
 def same_file(real, text, mode):
-    """The file (not a link) holds text, has mode and is owned by root."""
+    """The file (not a link) holds text, has mode and is owned by root. Not a plain file: not opened (a FIFO would
+    hang the run)."""
     try:
         st = os.lstat(real)
+        if not (stat.S_ISREG(st.st_mode) and st.st_uid == ROOT_UID and stat.S_IMODE(st.st_mode) == mode):
+            return False
         with open(real, encoding='utf-8') as f:
-            return (stat.S_ISREG(st.st_mode) and st.st_uid == ROOT_UID and stat.S_IMODE(st.st_mode) == mode
-                    and f.read() == text)
+            return f.read() == text
     except (OSError, UnicodeDecodeError):
         return False
 
@@ -270,6 +278,8 @@ def save_state(state):
 
 def ours(path):
     try:
+        if not stat.S_ISREG(os.stat(p(path)).st_mode):   # a FIFO (or a link to one) is not opened: it would hang
+            return False
         with open(p(path), encoding='utf-8') as f:
             return f.readline() == HEADER
     except (OSError, UnicodeDecodeError):
@@ -505,7 +515,9 @@ def install(a, stop_after=None, stack=None):
             raise Refused(f'the install record says a project\'s fleet config, but neither {PROJECT} nor '
                           f'{OPT}/fork-fleet.json is there: run again with --fleet-config FILE or '
                           '--release-fleet-config')
-    for path, kind in ((OPT, stat.S_ISDIR), (OPT + '/template', stat.S_ISDIR), (ETC, stat.S_ISDIR),
+    subdirs = sorted({*SUBDIRS, *(os.path.dirname(r) for r in read_manifest() if os.path.dirname(r))})
+    for path, kind in ((OPT, stat.S_ISDIR), (OPT + '/template', stat.S_ISDIR),
+                       *((f'{OPT}/{d}', stat.S_ISDIR) for d in subdirs), (ETC, stat.S_ISDIR),
                        (KEY, stat.S_ISREG), (KEY + '.pub', stat.S_ISREG)):
         if not_root_owned(path, kind):   # a hand setup: the root-run launcher must not sit where a user can write
             raise Refused(not_root_owned(path, kind))
@@ -555,6 +567,7 @@ def install(a, stop_after=None, stack=None):
     run('sysctl', '-q', '-p', p(SYSCTL))
     make_key(m['pool'], pending)
     os.chmod(p(KEY), 0o600)   # `check` wants it so; an older key made with another mode is set right
+    os.chmod(p(KEY + '.pub'), 0o644)
     done('settings')
     for u in UNITS:
         with open(p(f'{OPT}/units/{u}'), encoding='utf-8') as f:
@@ -630,8 +643,8 @@ def check():
         row(False, 'machine-file', str(e)[:300])
     for u in users:
         why = f'{u} does not exist' if not user_exists(u) else user_problem(u)
-        row(not why, 'runner-user', why or f'{u} exists: no login shell, no password, own group only, no home, '
-            'not in cron.allow/at.allow')
+        row(not why, 'runner-user', why or f'{u} exists: no login shell, no password, uid not 0, only its own group '
+            f'({u}), no home, not in cron.allow/at.allow')
     with contextlib.suppress(Refused):   # a smaller `slots` leaves the kit's extra users: named, not lost
         for u in (read_state() or {}).get('createdUsers', []) if users else []:
             if u not in users and user_exists(u):
@@ -667,7 +680,7 @@ def installed_problems():
             problems.append(f'{OPT}/{rel}: differs from what was installed')
         elif not mode_ok:
             problems.append(f'{OPT}/{rel}: mode {stat.S_IMODE(st.st_mode):o}, not {file_mode(rel):o}: install again')
-    folders = {OPT: 0o755, OPT + '/template': 0o755, ETC: 0o700, KEY: 0o600}
+    folders = {OPT: 0o755, OPT + '/template': 0o755, ETC: 0o700, KEY: 0o600, KEY + '.pub': 0o644}
     folders.update({f'{OPT}/{os.path.dirname(rel)}': 0o755 for rel in manifest if os.path.dirname(rel)})
     for path, mode in sorted(folders.items()):
         try:
@@ -799,7 +812,7 @@ def uninstall(stack=None):
             remove(f'{ETC}/{name}')
     remove(STATE)   # the record last
     left = []
-    for d in ([f'{OPT}/{x}' for x in ('units', 'fork-fleet-walls')] + [OPT, WORK, ETC]):
+    for d in ([f'{OPT}/{x}' for x in SUBDIRS] + [OPT, WORK, ETC]):
         left += rmdir_left(d)
     left += [f'{d} (a drop-in, not the kit\'s)' for u in UNITS for d in drop_ins(u)]
     for x in left:
