@@ -1,7 +1,8 @@
 """A fake WSL2 distro in a temporary folder for the pc-agents tests: every fixed path under PC_AGENTS_ROOT, the
-current user as root, fake useradd, env (T3's installer), systemctl, systemd-run and nft (each logs to /log in the
-fake root; systemctl keeps which units are enabled and which ExecStart runs in /log/units). No root, no systemd, no
-network, no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
+current user as root, fake useradd, usermod, env (T3's installer), apt-get, systemctl, systemd-run and nft (each logs
+to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and policy a started one runs
+with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units). No root, no systemd, no network,
+no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,31 +18,57 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                         '[ "$prev" = --shell ] && sh=$a; prev=$a; done\n'
                         'echo "$a:x:$uid:$uid::/home/$a:$sh" >>"$R/etc/passwd"\n'
                         'echo "$a:x:$uid:" >>"$R/etc/group"\nmkdir -p "$R/home/$a"\n',
+    'usr/sbin/usermod': 'R="${0%/usr/sbin/usermod}"; echo "$*" >>"$R/log/usermod"\n'
+                        '[ "$1" = --shell ] && sed -i "s#^$3:\\(\\([^:]*:\\)\\{5\\}\\)[^:]*\\$#$3:\\1$2#" "$R/etc/passwd"\n',
     # T3's installer, run by root through env -i (scripts/install.sh with T3CODE_HOME=/opt/pc-agents/t3)
     'usr/bin/env': 'R="${0%/usr/bin/env}"; echo "$*" >>"$R/log/install"\n[ -e "$R/log/install-fail" ] && exit 1\n'
+                   # install-hang: a download that never ends, its pid noted (the group kill must end it)
+                   '[ -e "$R/log/install-hang" ] && { sleep 60 & echo $! >"$R/log/hang.pid"; wait; }\n'
                    'for a; do case "$a" in T3CODE_VERSION=*) v=${a#*=};; esac; done\n'
                    'd="$R/opt/pc-agents/t3/runtime/versions/$v"; mkdir -p "$d"; printf "#!/bin/sh\\n# t3 $v\\n" >"$d/t3"\n'
                    'chmod 755 "$d/t3"\n',
-    'usr/bin/systemd-run': 'R="${0%/usr/bin/systemd-run}"; printf "%s\\n" "$@" >"$R/log/systemd-run"\n',
+    # systemd-run: like the real one, a bare command name is looked up in the CALLER's PATH, before anything runs
+    'usr/bin/systemd-run': 'R="${0%/usr/bin/systemd-run}"; printf "%s\\n" "$@" >"$R/log/systemd-run"\n'
+                           'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; cmd=$2\n'
+                           'case "$cmd" in */*) [ -x "$R$cmd" ] || [ -x "$cmd" ];; *) command -v "$cmd" >/dev/null;; esac'
+                           ' || { echo "Failed to find executable $cmd: No such file or directory" >&2; exit 1; }\n',
     'usr/bin/systemctl': 'R="${0%/usr/bin/systemctl}"; echo "$*" >>"$R/log/systemctl"; S="$R/log/units"; mkdir -p "$S"\n'
                          '[ -e "$R/log/systemctl-fail" ] && { echo "systemctl: failed (test)" >&2; exit 1; }\n'
-                         'run() { grep "^ExecStart=" "$R/etc/systemd/system/$1" >"$S/$1.active" 2>/dev/null || :; }\n'
+                         # what a started unit runs with: its ExecStart and T3's policy
+                         # a start: refused while the start limit is hit ($S/U.limit, until reset-failed); with
+                         # /log/t3-crash T3 exits at once, with /log/t3-dies after the first look (show) at it
+                         'run() { [ -e "$S/$1.limit" ] && { echo "$1: start request repeated too quickly" >&2; '
+                         'return 1; }\nrm -f "$S/$1.seen"\n'
+                         '[ "$1" = t3code-agents.service ] && [ -e "$R/log/t3-crash" ] && { rm -f "$S/$1.active"; return; }\n'
+                         '{ grep "^ExecStart=" "$R/etc/systemd/system/$1"; '
+                         'cat "$R/etc/t3code/policy.json"; } >"$S/$1.active" 2>/dev/null || :\n'
+                         'echo $$ >"$S/$1.pid"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
+                         '>"$S/$1.start"; }\n'
                          'case "$1" in\n'
                          'enable|disable) v=$1; shift; now=; [ "$1" = --now ] && { now=1; shift; }\n'
                          '  for u; do if [ $v = enable ]; then : >"$S/$u.enabled"; [ -n "$now" ] && '
-                         '{ [ -e "$S/$u.active" ] || run "$u"; }\n'
+                         '{ [ -e "$S/$u.active" ] || run "$u" || exit 1; }\n'
                          '  else rm -f "$S/$u.enabled"; [ -z "$now" ] || rm -f "$S/$u.active"; fi; done;;\n'
-                         'restart) shift; for u; do run "$u"; done;;\n'
+                         'restart) shift; for u; do run "$u" || exit 1; done;;\n'
+                         'reset-failed) shift; for u; do rm -f "$S/$u.limit"; done;;\n'
                          'stop) shift; for u; do rm -f "$S/$u.active"; done;;\n'
                          'is-active) [ -e "$S/$2.active" ] && echo active || { echo inactive; exit 3; };;\n'
                          'show) u=$4; f=; [ -e "$R/etc/systemd/system/$u" ] && f=/etc/systemd/system/$u\n'
+                         '  [ -e "$R/log/t3-dies" ] && [ -e "$S/$u.active" ] && { [ -e "$S/$u.seen" ] && '
+                         'rm -f "$S/$u.active"; : >"$S/$u.seen"; }\n'
                          '  st=disabled; [ -e "$S/$u.enabled" ] && st=enabled\n'
                          '  [ "$u" = pc-agents-walls.service ] && st=static\n'
                          '  echo "LoadState=${f:+loaded}"; echo "FragmentPath=$f"\n'
                          '  echo "DropInPaths=$(cat "$S/$u.dropins" 2>/dev/null)"; echo "UnitFileState=$st"\n'
                          '  [ -e "$S/reload" ] && echo NeedDaemonReload=yes || echo NeedDaemonReload=no\n'
-                         '  [ -e "$S/$u.active" ] && echo ActiveState=active || echo ActiveState=inactive;;\n'
+                         '  if [ -e "$S/$u.active" ]; then echo ActiveState=active; echo "MainPID=$(cat "$S/$u.pid")"\n'
+                         '  else echo ActiveState=inactive; echo MainPID=0; fi; echo NRestarts=0\n'
+                         '  echo "ExecMainStartTimestampMonotonic=$(cat "$S/$u.start" 2>/dev/null || echo 0)";;\n'
                          'esac\n',
+    # apt-get: update, or install nftables (the fake nft kept in /log/nft-package); /log/apt-fail makes it fail
+    'usr/bin/apt-get': 'R="${0%/usr/bin/apt-get}"; echo "$*" >>"$R/log/apt-get"\n'
+                       '[ -e "$R/log/apt-fail" ] && { echo "E: no network (test)" >&2; exit 100; }\n'
+                       '[ "$1" = install ] && cp "$R/log/nft-package" "$R/usr/sbin/nft"; exit 0\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
 }
@@ -67,6 +94,7 @@ k = cli.k
 
 class Case(unittest.TestCase):
     def setUp(self):
+        k.SETTLE, k.SETTLE_STEP = 0.3, 0.05   # setup watches T3 0.3 s here, not 15
         self.umask = os.umask(0o022)
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='pc-agents-test-'))
         os.chmod(self.root, 0o755)
@@ -79,8 +107,9 @@ class Case(unittest.TestCase):
         files['etc/wsl.conf'] = '[boot]\nsystemd=true\n'
         files['etc/passwd'] = 'root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n'
         files['etc/group'] = 'root:x:0:\nsudo:x:27:\nnogroup:x:65534:\n'
+        files['proc/sys/kernel/random/boot_id'] = '0f8e4f9c-1b6a-4d2e-9a57-3c1d2e4f5a6b\n'
         files['proc/net/route'] = 'Iface\tDestination\tGateway\tFlags\nboth\t00000000\t011014AC\t0003\n'
-        files['log/'] = ''
+        files['log/'] = files['opt/'] = files['etc/systemd/system/'] = ''   # as in a fresh Ubuntu
         files.update({rel: {'text': '#!/bin/sh\n' + text, 'mode': '755'} for rel, text in TOOLS.items()})
         for rel, value in files.items():
             self.write('/' + rel, value)
