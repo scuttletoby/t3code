@@ -43,17 +43,25 @@ sh bootstrap.sh --repo OWNER/REPO --sha RELEASE_SHA --release-fleet-config   # b
 ```
 
 `--fleet-config` is the project's fleet config (its pools); without it the release's own is used. It must be in a
-folder only root (or you) can write. The project's is kept in `/etc/fork-fleet/fleet-config.json` and the choice is
+folder only root (or you) can write; a link is followed, and the folders of both the link and the file it names are
+checked. The project's is kept in `/etc/fork-fleet/fleet-config.json` and the choice is
 recorded before any file is swapped, so a later install of a new release keeps it, even after a stopped run;
 `--release-fleet-config` goes back to the release's own. Install prints the desk key's public half: add it on
 the always-on host with `fork-fleet-desk-key.py add POOL`. The first runner template is made in the background by
 the refresh timer; `check` says FAIL for `template` until it is there.
 
-`check` only reads: the installed files against their manifest, each unit against the release's (header plus
+`check` only reads: the installed files against their manifest (text, root owner and mode), the folders' and the
+desk key's modes, the project's fleet config against the installed one, each unit against the release's (header plus
 `/opt/fork-fleet/units/UNIT`), a restart a stopped install still owes, systemd drop-ins that change the kit's units,
 every wall of this OS (`fork-fleet-walls.py describe`), the agent's settings, the units, the template, the settings
-files against the machine file, the runner users (and names a user the kit made that a smaller `slots` no longer
-uses) and IPv4 forwarding.
+files against the machine file, the runner users (each must exist, have no login shell, a locked password and no
+line in `cron.allow`/`at.allow`; and it names a user the kit made that a smaller `slots` no longer uses) and IPv4
+forwarding.
+
+A `fork-runner-N` user made by hand before the install is used, but only when it is as locked as one the kit makes
+(no login shell, locked password, not in an allow file): otherwise install refuses before changing anything and
+names the fix (`usermod -s /usr/sbin/nologin`, `passwd -l`). One install or uninstall runs at a time (a lock on
+`/opt/fork-fleet`); a second one is refused.
 
 ## Windows (WSL2)
 
@@ -64,7 +72,8 @@ Save the machine file on Windows, then in a normal (not administrator) Windows P
 powershell -ExecutionPolicy Bypass -File start-desk.ps1 -Repo OWNER/REPO -Sha RELEASE_SHA -MachineFile machine.json
 ```
 
-It prints the PC's facts and asks before it changes anything. Before the question it checks the machine file and
+It prints the PC's facts and asks before it changes anything; the question lists each `.wslconfig` key it will
+change, old value -> new. Before the question it checks the machine file and
 `-FleetConfig` exist and refuses a WSL 1 distro of that name (`wsl -l -v`; WSL 1 runs no systemd:
 `wsl --set-version DISTRO 2` first). A distro of that name that the script did not make
 is named in the question (its whole `/etc/wsl.conf` is replaced) and must be confirmed by typing its name. Then: the
@@ -73,31 +82,43 @@ leaves a mark in `%LOCALAPPDATA%\fork-desk`, so the next run asks no takeover qu
 `wsl --unregister DISTRO`); `.wslconfig`'s `[wsl2]` memory cap (`-MemoryGB`, default
 three quarters of the RAM, at most the RAM less 6 GB, never under 4 GB; one that leaves Windows under 2 GB is
 refused), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (read and written as UTF-8 without a
-BOM; a dated copy of the old file is kept, other keys and sections stay); the distro's own settings the WSL2 walls
+BOM; a dated copy of the old file is kept, other keys and sections stay; an old `networkingMode` or `dnsTunneling`
+line under `[experimental]`, the form before WSL 2.0 that can still win over `[wsl2]`, is removed, and the check
+FAILs while one is there); the distro's own settings the WSL2 walls
 ask for (`/etc/wsl.conf`: systemd on, no Windows drives, programs or PATH; its own `/etc/resolv.conf`; WSL's binfmt
 handler masked); one `wsl --shutdown` when one of these changed or the running WSL does not have them yet (PID 1 not
-systemd, interop live, Windows drives mounted, `wsl.conf` or `.wslconfig` newer than the running one, more memory
-than the cap, not NAT, or a `.wslconfig` change whose shutdown is still owed: a mark in `%LOCALAPPDATA%\fork-desk`,
-written before the change and removed after the shutdown, because WSL's uptime skips sleep),
+systemd, interop live, Windows drives mounted, `wsl.conf` newer than PID 1's start (read from `/proc/1/stat` and
+`btime`; unreadable means restart), `.wslconfig` newer than the running WSL, more memory than the cap, not NAT, or a
+`.wslconfig` change whose shutdown is still owed: one mark in `%LOCALAPPDATA%\fork-desk` for every distro, like
+`.wslconfig` itself, written before the change and removed after the shutdown, because WSL's uptime skips sleep),
 so a run stopped before its shutdown restarts next time (every WSL distro and Docker Desktop stop); the packages the fleet needs; the
 machine file and `-FleetConfig`, if given; this kit's bootstrap; a logon task that keeps the distro running while
 the owner is logged in. Last, `desk-install check` and the Windows side's own PASS/FAIL lines (the `[wsl2]` keys);
 any FAIL or error exits 1. Safe to run again. `-Uninstall` (needs no `-Repo` or `-Sha`) runs `desk-install uninstall` in the distro, stops and removes the logon
 task and names the first `.wslconfig.bak-*` (the file before the first run); the distro and `.wslconfig`
-stay (`wsl --unregister DISTRO` removes the distro).
+stay (`wsl --unregister DISTRO` removes the distro), and so does an owed shutdown's mark.
+
+Known limits: the `DISTRO.made` mark is per distro name; a run stopped inside `wsl --install`, then that distro
+removed by hand and a distro of the same name made by hand, would skip the takeover question once (the mark is gone
+after the next run's settings step). The PowerShell parts are tested only where `pwsh` is installed; the in-distro
+parts run in the tests on a fake root.
 
 ## Runs again, stops half-way, old or empty state
 
-- **Again:** files, settings and units that did not change are not rewritten, and the agent is not stopped or
+- **Again:** files, settings and units that did not change are not rewritten (a file whose mode or owner was
+  changed is put back from the release), and the agent is not stopped or
   restarted (a restart would end a job it is starting). After a change it is restarted. The agent reads its settings
   only when it starts, so before the first change the record gets a restart-pending mark, cleared after the
-  restart: a run stopped in between restarts the agent on the next run.
+  restart: a run stopped in between restarts the agent on the next run. The mark is also set before a new fleet
+  config choice is saved, so a run stopped between saving the choice and the swap fails `check` until the next run.
 - **Stopped half-way:** the next install ends it. A new release is staged in `/opt/fork-fleet/.kit-stage-*` and
   checked first (gate loads with the fleet config, the pool is in it, `bash -n`, the walls know this OS); a release
   that fails is never installed. Files are renamed in one by one while the agent and the refresh timer are stopped;
   `SOURCE` is written
   last, so `check` reports a half-done swap. Users are recorded in `/etc/fork-fleet/desk-kit.json` before they are
   made, so uninstall removes them even after a stop.
+- **Old record:** a record that names a project's fleet config while neither `/etc/fork-fleet/fleet-config.json`
+  nor the installed copy is there is refused with the fix (`--fleet-config FILE` or `--release-fleet-config`).
 - **Old install:** a launcher, `launch.conf`, `desk.conf`, desk key, unit, or a systemd drop-in for one of the kit's
   units (`UNIT.d/*.conf`, also the dash-prefix forms) that this kit did not write is refused before anything changes.
   The type-wide `service.d/` and `timer.d/` folders are not checked: they hold the distribution's defaults for every
