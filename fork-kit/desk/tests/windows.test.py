@@ -91,6 +91,19 @@ class Prepare(unittest.TestCase):
                 out[full] = os.readlink(full) if os.path.islink(full) else slurp(full)
         return out
 
+    def test_check_only_says_whether_wsl_conf_changes_and_writes_nothing(self):
+        def check_only():
+            r = subprocess.run(['bash', '-s'], input='CHECK_ONLY=1\n' + prepare() + '\n# end\r\n', text=True,
+                               capture_output=True, env={'PATH': '/usr/bin:/bin', 'ROOT': self.root})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+        before = self.etc()
+        self.assertEqual(check_only(), 'differs: /etc/wsl.conf\n')
+        self.assertEqual(self.etc(), before)
+        self.assertFalse(os.path.exists(self.root + '/etc/binfmt.d'))
+        self.run_prepare()
+        self.assertEqual(check_only(), '')
+
     def test_an_empty_distro(self):
         self.assertIn('changed: /etc/resolv.conf', self.run_prepare())
         self.assertFalse([n for n in os.listdir(self.root + '/etc') if '.bak-' in n])
@@ -261,9 +274,10 @@ class Script(unittest.TestCase):
     def test_old_experimental_networking_keys_are_removed_named_and_checked(self):
         part = wslconfig_part()
         self.assertIn("$Experimental = @('networkingMode', 'dnsTunneling')", part)
-        merge = part[part.index('function Merge-WslConfig'):part.index('function WslVersion')]
+        merge = part[part.index('function MergeLines'):part.index('function WslVersion')]
         self.assertIn("$sec -eq 'experimental'", merge)
-        self.assertIn('$Matches[1] -in $Experimental) { continue }', merge)
+        self.assertIn('$Matches[1] -in $Experimental) {', merge)
+        self.assertIn(': removed (the [wsl2] one is used)"); continue }', merge)
         src = text().decode('ascii')
         body = src[src.index('try {'):]
         ask = min(body.index("Read-Host 'Type yes"), body.index('Read-Host "Type the distro'))
@@ -271,6 +285,53 @@ class Script(unittest.TestCase):
         check = body[body.index("Head 'check'"):]
         self.assertIn("SectionKeys (Read-WslConfig $WslConfig) 'experimental'", check)
         self.assertIn('FAIL  wslconfig  [experimental] $k=', check)
+
+    def test_the_question_and_the_merge_decide_the_same_way(self):
+        """lens d8min r3 N2: the question compared trimmed values, the merge whole text, so "no change" could be shown
+        while the file was rewritten. Both now come from MergeLines: the file is written only when it has a note."""
+        part = wslconfig_part()
+        self.assertIn('function Changes([string[]]$lines, $want) { (MergeLines $lines $want).Notes }', part)
+        merge = part[part.index('function Merge-WslConfig'):part.index('function WslVersion')]
+        self.assertIn('$merged = MergeLines (Read-WslConfig $path) $want', merge)
+        self.assertIn('if ($merged.Notes.Count -eq 0) { return $false }', merge)
+        self.assertNotIn('-join', merge)   # no second, text-wide test
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_no_change_means_the_file_is_left_alone(self):
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, '.wslconfig')
+        for old, notes in (('[wsl2]\nmemory = 9GB\nNetworkingMode=NAT\n', []),
+                           ('[wsl2]\nmemory=9GB\nnetworkingMode=nat\nmemory=12GB\n',
+                            ['[wsl2] memory=12GB: a repeated line, removed'])):
+            with self.subTest(old):
+                with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(old)
+                script = os.path.join(d, 'merge.ps1')
+                with open(script, 'w', encoding='ascii') as f:
+                    f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = "9GB"; networkingMode = "nat" }\n'
+                            '"notes=$(@(Changes (Read-WslConfig $args[0]) $want) -join \'|\')"\n'
+                            '"changed=$(Merge-WslConfig $args[0] $want)"\n')
+                r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path],
+                                   capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f'changed={bool(notes)}', r.stdout)
+                for n in notes:
+                    self.assertIn(n, r.stdout)
+                if not notes:
+                    self.assertIn('notes=\n', r.stdout)
+                    self.assertEqual(slurp(path), old)
+                for n in os.listdir(d):
+                    if n.startswith('.wslconfig.bak-'):
+                        os.unlink(os.path.join(d, n))
+
+    def test_the_owed_mark_goes_before_wsl_conf_changes(self):
+        """lens d8min r3 N1: the start of PID 1 is read from the VM's clock, which skips the PC's sleep, so a run
+        stopped after writing wsl.conf could look restarted. The owed mark now goes first when wsl.conf will change."""
+        src = text().decode('ascii')
+        body = src[src.index("Head \"the distro's own settings\""):]
+        self.assertLess(body.index('if (InDistro \'reading /etc/wsl.conf\' ("CHECK_ONLY=1`n" + $Prepare)) { Mark $Owed }'),
+                        body.index("$changed = InDistro \"the distro's settings\" $Prepare"))
 
     def test_the_owed_shutdown_mark_is_shared_like_wslconfig(self):
         src = text().decode('ascii')

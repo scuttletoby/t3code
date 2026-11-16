@@ -69,9 +69,10 @@ size as busy. An answer without `memory.freeMb` makes no memory claim; the consu
   - [busy-while-running](free/busy-while-running): busy while a named program runs (a game, say). Copy it and put
     your programs in it. It sees the processes of its own system only: in WSL, Windows programs are not visible.
     It matches the process name (`comm`), not the command line: a program started through an interpreter or a
-    wrapper (`python3 game.py`, `wine game.exe`, a shell script that runs the game) shows as `python3`, `wine` or
-    the program the wrapper starts, so name that. Naming an interpreter makes the machine busy whenever any script
-    of that interpreter runs.
+    wrapper (`python3 game.py`, a shell script that runs the game) shows as `python3` or the program the wrapper
+    starts, so name that. Wine usually names its process after the `.exe` (`game.exe`, cut to 15 characters, as
+    `ps -e -o comm=` shows it), not `wine`. Naming an interpreter makes the machine busy whenever any script of
+    that interpreter runs.
 
 Several conditions in one script: call the others from it and answer busy when one is busy.
 
