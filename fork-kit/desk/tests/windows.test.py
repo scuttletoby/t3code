@@ -108,6 +108,15 @@ class Prepare(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
+    def started(self, at):
+        """PID 1 started at `at` (seconds since the epoch): /proc/stat's btime plus field 22 of /proc/1/stat."""
+        os.makedirs(self.root + '/proc/1', exist_ok=True)
+        tick, boot = os.sysconf('SC_CLK_TCK'), int(at) - 500
+        put(self.root + '/proc/stat', f'cpu  1 2 3 4\nbtime {boot}\nprocesses 9\n')
+        fields = ['1', '(sys temd)', 'S'] + ['0'] * 49   # a name with a space: the fields count from its ')'
+        fields[21] = str(500 * tick)
+        put(self.root + '/proc/1/stat', ' '.join(fields) + '\n')
+
     def test_the_restart_decision_reads_the_live_state(self):
         # a run stopped after it wrote wsl.conf, before its `wsl --shutdown`: the next run changes nothing, but the
         # running distro still has the old settings, so it restarts
@@ -116,7 +125,7 @@ class Prepare(unittest.TestCase):
         put(self.root + '/proc/meminfo', 'MemTotal:        8000000 kB\n')
         self.run_prepare()
         past = time.time() - 3600
-        os.utime(self.root + '/proc/1', (past, past))
+        self.started(past)
         self.assertIn('restart: /etc/wsl.conf is newer than the running distro', self.live())
         os.utime(self.root + '/etc/wsl.conf', (past - 60, past - 60))
         self.assertEqual(self.live({'WANT_KB': '8388608'}), '')
@@ -133,9 +142,25 @@ class Prepare(unittest.TestCase):
         os.chmod(fake + '/wslinfo', 0o755)
         self.assertIn('the networking mode is mirrored, not nat', self.live({'PATH': fake + ':/usr/bin:/bin'}))
 
+    def test_the_start_of_pid_1_is_read_from_proc_stat_not_the_mtime_of_proc_1(self):
+        os.makedirs(self.root + '/proc/1')
+        put(self.root + '/proc/1/comm', 'systemd\n')
+        self.run_prepare()
+        now = time.time()
+        os.utime(self.root + '/etc/wsl.conf', (now - 600, now - 600))
+        self.started(now - 300)                    # PID 1 started after the write ...
+        os.utime(self.root + '/proc/1', (now - 3600, now - 3600))   # ... whatever the mtime of /proc/1 says
+        self.assertEqual(self.live(), '')
+        self.started(now - 900)                    # PID 1 older than the write: it still runs the old settings
+        os.utime(self.root + '/proc/1', (now, now))
+        self.assertIn('restart: /etc/wsl.conf is newer than the running distro', self.live())
+        os.unlink(self.root + '/proc/stat')        # unreadable: restart, never a guess
+        self.assertIn('restart: the start time of PID 1 cannot be read', self.live())
+
     def test_a_mounted_windows_drive_restarts(self):
         os.makedirs(self.root + '/proc/1')
         put(self.root + '/proc/1/comm', 'systemd\n')
+        self.started(time.time())
         put(self.root + '/proc/mounts', 'none /usr/lib/wsl/drivers 9p ro 0 0\n/dev/sdc / ext4 rw 0 0\n')
         self.assertEqual(self.live(), '')   # WSL's own driver share is not a Windows drive
         put(self.root + '/proc/mounts', 'C:\\134 /mnt/c 9p rw 0 0\n')
@@ -232,6 +257,49 @@ class Script(unittest.TestCase):
                            text=True, timeout=120, stdin=subprocess.DEVNULL)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout.strip(), '1 2 0')
+
+    def test_old_experimental_networking_keys_are_removed_named_and_checked(self):
+        part = wslconfig_part()
+        self.assertIn("$Experimental = @('networkingMode', 'dnsTunneling')", part)
+        merge = part[part.index('function Merge-WslConfig'):part.index('function WslVersion')]
+        self.assertIn("$sec -eq 'experimental'", merge)
+        self.assertIn('$Matches[1] -in $Experimental) { continue }', merge)
+        src = text().decode('ascii')
+        body = src[src.index('try {'):]
+        ask = min(body.index("Read-Host 'Type yes"), body.index('Read-Host "Type the distro'))
+        self.assertLess(body.index('$changes = @(Changes (Read-WslConfig $WslConfig) $want)'), ask)
+        check = body[body.index("Head 'check'"):]
+        self.assertIn("SectionKeys (Read-WslConfig $WslConfig) 'experimental'", check)
+        self.assertIn('FAIL  wslconfig  [experimental] $k=', check)
+
+    def test_the_owed_shutdown_mark_is_shared_like_wslconfig(self):
+        src = text().decode('ascii')
+        self.assertIn("$Owed = Join-Path $Marks 'wslconfig.restart'", src)
+        uninstall = src[src.index('if ($Uninstall)'):src.index("if (-not $MachineFile)")]
+        self.assertNotIn('$Owed', uninstall)   # another distro's run still owes the shutdown
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_wslconfig_merge_removes_old_experimental_networking_keys(self):
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, '.wslconfig')
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('[wsl2]\nmemory=24GB\nguiApplications=true\n[experimental]\nnetworkingMode=mirrored\n'
+                    'sparseVhd=true\ndnsTunneling=false\n')
+        script = os.path.join(d, 'merge.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = "9GB"; networkingMode = "nat"; '
+                    'guiApplications = "false" }\nChanges (Read-WslConfig $args[0]) $want\n'
+                    '"changed=$(Merge-WslConfig $args[0] $want)"\n'
+                    '"left=$((SectionKeys (Read-WslConfig $args[0]) \'experimental\').Keys -join \',\')"\n'
+                    '"after=$(@(Changes (Read-WslConfig $args[0]) $want).Count)"\n')
+        r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path], capture_output=True,
+                           text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for line in ('[wsl2] memory: 24GB -> 9GB', '[wsl2] networkingMode: (not set) -> nat',
+                     '[wsl2] guiApplications: true -> false', '[experimental] networkingMode=mirrored: removed',
+                     '[experimental] dnsTunneling=false: removed', 'changed=True', 'left=sparseVhd', 'after=0'):
+            self.assertIn(line, r.stdout)
 
     def test_wslconfig_is_utf8_without_a_bom_never_ascii(self):
         src = text().decode('ascii')

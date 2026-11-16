@@ -20,10 +20,11 @@ $env:WSL_UTF8 = '1'                      # wsl.exe's own lines in UTF-8, not UTF
 $OutputEncoding = [Text.UTF8Encoding]::new($false)   # what is piped into wsl.exe: UTF-8, not ASCII
 $Task = "fork-desk-$Distro"
 $WslConfig = Join-Path $env:USERPROFILE '.wslconfig'
-# Marks on the Windows side, for a run that stops: `made` (this script is installing the distro: a later run asks no
-# takeover question), `restart` (.wslconfig changed and its `wsl --shutdown` is still owed: VM uptime skips sleep)
+# Marks on the Windows side, for a run that stops: `DISTRO.made` (this script is installing the distro: a later run
+# asks no takeover question), `wslconfig.restart` (.wslconfig changed and its `wsl --shutdown` is still owed: VM
+# uptime skips sleep). .wslconfig is shared by every distro, so its mark is too: a run for another -Distro still owes it.
 $Marks = Join-Path $env:LOCALAPPDATA 'fork-desk'
-$Made = Join-Path $Marks "$Distro.made"; $Owed = Join-Path $Marks "$Distro.restart"
+$Made = Join-Path $Marks "$Distro.made"; $Owed = Join-Path $Marks 'wslconfig.restart'
 function Mark([string]$path) { New-Item -ItemType Directory -Force -Path $Marks | Out-Null; Set-Content -LiteralPath $path 'start-desk.ps1' }
 
 function Head([string]$t) { Write-Host "==== $t" -ForegroundColor Cyan }
@@ -86,7 +87,15 @@ ROOT=${ROOT:-}
 for h in "$ROOT"/proc/sys/fs/binfmt_misc/WSLInterop*; do
   [ ! -e "$h" ] || { echo "restart: WSL interop is live (${h##*/})"; break; }
 done
-[ ! "$ROOT/etc/wsl.conf" -nt "$ROOT/proc/1" ] || echo 'restart: /etc/wsl.conf is newer than the running distro'
+# when PID 1 started (boot time + its start in clock ticks; the mtime of /proc/1 is only when that entry was made)
+tick=$(getconf CLK_TCK 2>/dev/null || echo 100)
+since=$(sed -n 's/.*\x29 //p' "$ROOT/proc/1/stat" 2>/dev/null | cut -d' ' -f20)   # after the name: field 22
+boot=$(sed -n 's/^btime \([0-9]*\)$/\1/p' "$ROOT/proc/stat" 2>/dev/null || true)
+conf=$(stat -c %Y "$ROOT/etc/wsl.conf" 2>/dev/null || echo 0)
+case "$since" in (''|*[!0-9]*) since= ;; esac
+case "$boot" in (''|*[!0-9]*) since= ;; esac
+if [ -z "$since" ]; then echo 'restart: the start time of PID 1 cannot be read'
+elif [ "$conf" -ge $((boot + since / tick)) ]; then echo 'restart: /etc/wsl.conf is newer than the running distro'; fi
 mem=$(sed -n 's/^MemTotal: *\([0-9]*\) kB$/\1/p' "$ROOT/proc/meminfo" 2>/dev/null || true)
 [ -z "${WANT_KB:-}" ] || [ -z "$mem" ] || [ "$mem" -le "$WANT_KB" ] || echo "restart: WSL has $mem kB, above the cap"
 mode=$(wslinfo --networking-mode 2>/dev/null || true)
@@ -104,13 +113,24 @@ function Read-WslConfig([string]$path) {
   if (-not (Test-Path -LiteralPath $path)) { return @() }
   @([IO.File]::ReadAllLines($path, [Text.UTF8Encoding]::new($false)))   # a BOM (UTF-8 or UTF-16) is still read
 }
-function Wsl2Keys([string[]]$lines) {   # the keys of the [wsl2] section only
+# networkingMode and dnsTunneling were [experimental] keys before WSL 2.0; an old line there can still win over
+# [wsl2], so Merge-WslConfig removes them there (the [wsl2] ones are what the desk needs) and the check FAILs on them.
+$Experimental = @('networkingMode', 'dnsTunneling')
+function SectionKeys([string[]]$lines, [string]$section) {   # the keys of one section only
   $keys = @{}; $sec = ''
   foreach ($l in $lines) {
     if ($l -match '^\s*\[(.+)\]\s*$') { $sec = $Matches[1].Trim().ToLower(); continue }
-    if ($sec -eq 'wsl2' -and $l -match '^\s*([^=#;\s]+)\s*=\s*(.*?)\s*$') { $keys[$Matches[1]] = $Matches[2] }
+    if ($sec -eq $section -and $l -match '^\s*([^=#;\s]+)\s*=\s*(.*?)\s*$') { $keys[$Matches[1]] = $Matches[2] }
   }
   $keys
+}
+function Wsl2Keys([string[]]$lines) { SectionKeys $lines 'wsl2' }
+function Changes([string[]]$lines, $want) {   # what Merge-WslConfig would change, one line each: old -> new
+  $now = Wsl2Keys $lines; $old = SectionKeys $lines 'experimental'
+  foreach ($k in $want.Keys) {
+    if ($now[$k] -ne $want[$k]) { "  [wsl2] ${k}: $(if ($null -ne $now[$k]) { $now[$k] } else { '(not set)' }) -> $($want[$k])" }
+  }
+  foreach ($k in $Experimental) { if ($old.ContainsKey($k)) { "  [experimental] $k=$($old[$k]): removed (the [wsl2] one is used)" } }
 }
 function Merge-WslConfig([string]$path, $want, [scriptblock]$before = {}) {   # True when it changed the file (a dated copy of the old one kept; $before runs first)
   $lines = Read-WslConfig $path
@@ -120,6 +140,7 @@ function Merge-WslConfig([string]$path, $want, [scriptblock]$before = {}) {   # 
     if ($l -match '^\s*\[(.+)\]\s*$') { if ($sec -eq 'wsl2') { AddMissing }; $sec = $Matches[1].Trim().ToLower(); $out.Add($l); continue }
     if ($sec -eq 'wsl2' -and $l -match '^\s*([^=#;\s]+)\s*=' -and $want.Contains($Matches[1])) {
       $k = $Matches[1]; if (-not $done[$k]) { $out.Add("$k=$($want[$k])"); $done[$k] = 1 }; continue }
+    if ($sec -eq 'experimental' -and $l -match '^\s*([^=#;\s]+)\s*=' -and $Matches[1] -in $Experimental) { continue }
     $out.Add($l)
   }
   if ($sec -eq 'wsl2') { AddMissing }
@@ -163,7 +184,7 @@ try {
     if ($have) { InDistro 'desk-install uninstall' '[ ! -x /opt/fork-fleet/desk-install ] || /opt/fork-fleet/desk-install uninstall' }
     Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue   # its `sleep infinity` too
     Unregister-ScheduledTask -TaskName $Task -Confirm:$false -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $Owed, $Made -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Made -ErrorAction SilentlyContinue   # an owed shutdown is kept: .wslconfig is shared
     $bak = @(Get-ChildItem -Path "$WslConfig.bak-*" -ErrorAction SilentlyContinue | Sort-Object Name)
     "Done. The distro and .wslconfig are kept; to remove the distro too: wsl --unregister $Distro"
     if ($bak) { ".wslconfig as it was before the first run: $($bak[0].FullName) (copy it back over .wslconfig to undo)" }
@@ -181,10 +202,12 @@ try {
   $ours = Test-Path -LiteralPath $Made
   if ($have -and -not $ours) { wsl.exe -d $Distro -u root --cd / -- test -e /etc/fork-kit/desk-distro; $ours = $LASTEXITCODE -eq 0 }
 
+  $want = [ordered]@{ memory = "${MemoryGB}GB"; swap = "${SwapGB}GB"; networkingMode = 'nat'; dnsTunneling = 'true'; guiApplications = 'false' }
+  $changes = @(Changes (Read-WslConfig $WslConfig) $want)
   Write-Host ''
-  Write-Host "Next: the distro $Distro; .wslconfig [wsl2] memory=${MemoryGB}GB swap=${SwapGB}GB networkingMode=nat" -ForegroundColor Yellow
-  Write-Host 'dnsTunneling=true guiApplications=false (for ALL your WSL distros; a dated copy is kept); then ONE' -ForegroundColor Yellow
-  Write-Host 'wsl --shutdown (every WSL distro and Docker Desktop stop), the desk kit, and a logon task.' -ForegroundColor Yellow
+  Write-Host "Next: the distro $Distro; .wslconfig (for ALL your WSL distros; a dated copy is kept):" -ForegroundColor Yellow
+  if ($changes) { $changes | ForEach-Object { Write-Host $_ -ForegroundColor Yellow } } else { Write-Host '  no change' -ForegroundColor Yellow }
+  Write-Host 'then ONE wsl --shutdown (every WSL distro and Docker Desktop stop), the desk kit, and a logon task.' -ForegroundColor Yellow
   if ($have -and -not $ours) {
     Write-Host "The distro $Distro is already there and this script did not make it. Its /etc/wsl.conf is REPLACED" -ForegroundColor Yellow
     Write-Host '(its [user] default= and every other line go; no /mnt/c, no Windows programs or PATH), and it runs fleet' -ForegroundColor Yellow
@@ -207,7 +230,6 @@ try {
   }
 
   Head '.wslconfig'
-  $want = [ordered]@{ memory = "${MemoryGB}GB"; swap = "${SwapGB}GB"; networkingMode = 'nat'; dnsTunneling = 'true'; guiApplications = 'false' }
   $restart = Merge-WslConfig $WslConfig $want { Mark $Owed }   # the mark first: a run stopped after the write still restarts
   if ($restart) { 'changed: .wslconfig' }
 
@@ -251,10 +273,11 @@ sh /root/desk-bootstrap.sh --repo $Repo --sha $Sha$extra
   $bad = 0
   wsl.exe -d $Distro -u root --cd / -- /opt/fork-fleet/desk-install check
   if ($LASTEXITCODE -ne 0) { $bad++ }
-  $cfg = Wsl2Keys (Read-WslConfig $WslConfig)
+  $cfg = Wsl2Keys (Read-WslConfig $WslConfig); $old = SectionKeys (Read-WslConfig $WslConfig) 'experimental'
   foreach ($k in $want.Keys) {
     if ($cfg[$k] -eq $want[$k]) { "PASS  wslconfig  [wsl2] $k=$($want[$k])" } else { "FAIL  wslconfig  [wsl2] no $k=$($want[$k])"; $bad++ }
   }
+  foreach ($k in $Experimental) { if ($old.ContainsKey($k)) { "FAIL  wslconfig  [experimental] $k=$($old[$k]) is still there"; $bad++ } }
   $t = Get-ScheduledTask $Task -ErrorAction SilentlyContinue
   if ($t -and $t.State -eq 'Running') { "PASS  logon-task  $Task running" } else { "FAIL  logon-task  $Task is $(if ($t) { $t.State } else { 'missing' })"; $bad++ }
   if ($bad -eq 0) { Write-Host 'ALL PASS: this PC takes fleet jobs while you are logged in.' -ForegroundColor Green }

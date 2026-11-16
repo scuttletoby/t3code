@@ -311,6 +311,33 @@ class Host(Base):
             th.join(60)
         self.assertEqual((code, bytes(got)), (0, data), err.getvalue())
 
+    def test_an_alarm_that_comes_after_the_last_write_is_not_a_stall(self):
+        data = self.make('m2', {'a': b'y' * 3000})
+        real = seed.signal
+        fired = []
+
+        def alarm(n):   # the last stall alarm goes off just as the stream ends: the race between the loop and alarm(0)
+            got = real.alarm(n)
+            if n == 0 and not fired:
+                fired.append(True)
+                os.kill(os.getpid(), real.SIGALRM)
+            return got
+        fake = type('signal', (), {'SIGALRM': real.SIGALRM, 'signal': staticmethod(real.signal),
+                                   'alarm': staticmethod(alarm)})
+        with mock.patch.object(seed, 'signal', fake):
+            code, out, err = self.offer('seed m2')
+        self.assertTrue(fired)
+        self.assertEqual((code, out), (0, data), err)
+
+    def test_a_pool_without_seeds_lists_nothing(self):
+        cfg = json.loads(json.dumps(CONFIG))
+        cfg['pools'][0].pop('seeds', None)
+        with open(os.path.join(self.t, 'fork-fleet.json'), 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        code, out, err = self.offer('seeds')
+        self.assertEqual((code, json.loads(out)), (0, {'v': 1, 'seeds': []}), err)
+        self.assertEqual(self.offer('seed m2')[:2], (2, b''))
+
     def test_pools_never_share_a_seed_file(self):
         cfg = json.loads(json.dumps(CONFIG))
         cfg['pools'][0]['seeds'] = SEEDS
