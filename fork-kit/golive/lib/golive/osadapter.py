@@ -10,6 +10,7 @@ UNIT = 't3code.service'
 SYSTEMCTL = 'systemctl'
 SYSTEMD_RUN = 'systemd-run'
 TIMEOUT = 30
+CGROUP_FILE = '/proc/self/cgroup'  # tests only change it
 _UNIT_NAME = re.compile(r'^[A-Za-z0-9_.@-]{1,200}$')
 
 
@@ -67,6 +68,22 @@ class SystemdUser:
         return {'loaded': props.get('LoadState') == 'loaded', 'active': props.get('ActiveState') == 'active',
                 'enabled': props.get('UnitFileState') == 'enabled', 'mainPid': main_pid or None,
                 'unitPath': unit_path, 'home': home}
+
+    def inside_service(self):
+        """True when this process runs inside the boot service (a T3 terminal or agent): stopping the service would
+        kill it half-way, so a command that stops T3 must run detached instead. Unreadable: True."""
+        try:
+            with open(CGROUP_FILE, encoding='utf-8') as f:
+                return any(UNIT in line.rstrip('\n').split(':', 2)[-1].split('/') for line in f)
+        except OSError:
+            return True  # cannot tell: treat it as inside (fail closed)
+
+    def unit_active(self, unit):
+        """True while a transient unit (the copy's guard) runs; read only."""
+        if not _UNIT_NAME.match(unit):
+            raise AdapterError(f'not a safe unit name: {unit!r}')
+        out = self._run([SYSTEMCTL, '--user', 'show', unit, '--property=ActiveState'])
+        return any(line.strip() in ('ActiveState=active', 'ActiveState=activating') for line in out.splitlines())
 
     def stop(self):
         self._run([SYSTEMCTL, '--user', 'stop', UNIT])

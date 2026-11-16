@@ -1,4 +1,4 @@
-"""The command line (`check`, `settle`) and `t3-golive check`: may this T3 home move to the target build now?
+"""The command line (`check`, `settle`, `copy`; coldcopy.py has the copy) and `t3-golive check`: may this T3 home move to the target build now?
 
 check is read only: it never stops, starts or writes to a T3 home, never opens its database (the target build's
 read-only report does that) and never runs a `t3` from PATH. It writes only the kit's own lock file.
@@ -49,6 +49,8 @@ def run_check(cfg, adapter, own_run=None):
             same = False
         if not (own_run.holds_lock and same):
             raise ValueError('own_run must be an open journal.run() on this stateDir')
+        if own_run.in_step is not None:  # fork #186: a refused pre-check must not leave a run to settle
+            raise ValueError(f'the check runs before the first step, not inside step "{own_run.in_step}"')
         return _checks(cfg, adapter, result, add, info, own_run.id)
     try:
         with journal.lock(cfg.state_dir, 'check', exclusive=False):
@@ -72,6 +74,9 @@ def _journal(cfg, add, info, own_id):
     if last is not None and last['end'] is not None and last['end']['result'] != 'ok' and not last['settled']:
         info.append(f'last run: {last["command"]} ended {last["end"]["result"]} before its first step: '
                     f'{last["end"]["detail"]}')
+    elif last is not None and last['end'] is None and not last['settled']:
+        info.append(f'last run: {last["command"]} (pid {last["pid"]}) stopped before its first step; it changed '
+                    'nothing')
     return add('journal', True, 'no run to settle')
 
 
@@ -94,7 +99,8 @@ def _checks(cfg, adapter, result, add, info, own_id):
     db_bytes = live.database_bytes(cfg.home)
     found = live.traces(cfg.home)
 
-    if db_bytes is None and not svc['loaded'] and not found:
+    aside = live.database_aside(cfg.home)
+    if db_bytes is None and not svc['loaded'] and not found and not aside:
         # Nothing ran here as a service: no database, no boot service, no runtime files, no markers.
         if not os.path.isdir(os.path.join(cfg.home, 'userdata')):
             add('T3 home', False, f'{cfg.home} holds no userdata folder: it is not a T3 home (is "home" right?)')
@@ -142,11 +148,9 @@ def _checks(cfg, adapter, result, add, info, own_id):
     add('no markers', not marks, ', '.join(marks) if marks else 'no restart, stop or restore marker')
 
     if db_bytes is None:
-        aside = live.database_aside(cfg.home)
-        has = ([f'{osadapter.UNIT} is installed'] if svc['loaded'] else []) + found
+        has = ([f'{osadapter.UNIT} is installed'] if svc['loaded'] else []) + found + [f'found {a}' for a in aside]
         add('database', False, f'no {live.DATABASE} in {os.path.join(cfg.home, "userdata")}, yet this home has: '
-                               f'{", ".join(has)}' + (f'; found {", ".join(aside)}' if aside else '')
-                               + ': a restore may have stopped half-way (database moved aside); do not install '
+                               f'{", ".join(has)}: a restore may have stopped half-way (database moved aside); do not install '
                                  'over it, put it back first')
         return 1, result
 
@@ -275,6 +279,16 @@ def main(argv, out=sys.stdout, err=sys.stderr):
                                    'ended with an error (or move a damaged journal aside), so runs may start '
                                    'again. Writes only the kit\'s journal.')
     p.add_argument('--reason', required=True, help='what you did to put the T3 home right')
+    p = sub.add_parser('copy', help='the practice stop: at a quiet point, stop T3, copy its data, start it again',
+                       description='At a quiet point: stop the boot service, copy the T3 home\'s userdata (database '
+                                   'with its WAL, settings, small files) to a new folder in backupDir, read both '
+                                   'sides back, write the manifest last, start the same build again and verify it. '
+                                   'Runs detached (a transient unit) unless --here.')
+    p.add_argument('--owner-says-go', action='store_true',
+                   help='do not wait for a quiet point (the owner says now is fine)')
+    p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p = sub.add_parser('guard', help=argparse.SUPPRESS)
+    p.add_argument('--run', required=True)
     args = parser.parse_args(argv)
     try:
         cfg = config_mod.load()
@@ -289,7 +303,17 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     except osadapter.Unsupported as e:
         print(f't3-golive: {e}', file=err)
         return 2
-    code, result = run_check(cfg, adapter)
+    if args.command in ('copy', 'guard'):
+        from golive import coldcopy  # it uses run_check from this module
+        if args.command == 'guard':
+            coldcopy.guard(cfg, adapter, args.run)
+            return 0
+        return coldcopy.main_copy(cfg, adapter, args.here, args.owner_says_go, out, err)
+    try:
+        code, result = run_check(cfg, adapter)
+    except Exception as e:  # fork #187: --json always prints JSON; never reads as ok
+        code, result = 1, {'ok': False, 'home': cfg.home, 'target': cfg.target_version, 'info': [],
+                           'checks': [{'name': 'check ran', 'ok': False, 'detail': f'{type(e).__name__}: {e}'}]}
     if args.json:
         print(json.dumps(result, indent=2), file=out)
     else:
