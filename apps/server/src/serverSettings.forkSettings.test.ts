@@ -4,7 +4,11 @@
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ServerSettingsPatch } from "@t3tools/contracts";
+import { ProjectId, ServerSettingsError, ServerSettingsPatch } from "@t3tools/contracts";
+import {
+  clearProjectSettingsOverridesWithForkKeys,
+  ForkSettingsWriteError,
+} from "@t3tools/shared/forkSettingsPatch";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -215,6 +219,108 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork settings ro
   it.effect.each(CASES)("writes the same file after $name", ({ start, patch, file }) =>
     Effect.gen(function* () {
       assert.deepStrictEqual(yield* loadThenPatch(start ?? FULL_FILE, patch), file);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+});
+
+it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork MCP profile keys", (it) => {
+  it.effect("keeps every other setting when an MCP key in the file holds a bad value", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(
+        config.settingsPath,
+        JSON.stringify({ ...FULL_FILE, mcpThreadProfiles: { t1: null }, mcpProfile: 5 }),
+      );
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const settings = yield* service.getSettings;
+      assert.strictEqual(settings.enableAgentBrowserAccess, false);
+      assert.strictEqual(settings.usagePacingGate, "advise");
+      assert.strictEqual(settings.agentSlots.maxPerMachine, 4);
+      assert.deepStrictEqual(Object.keys(settings.waitChecks).toSorted(), [
+        "build-done",
+        "ci-green",
+      ]);
+      // The unset pick is dropped; the bad default reads as a name no profile can have, so the
+      // resolver refuses it instead of widening it to "all".
+      assert.deepStrictEqual(settings.mcpThreadProfiles, {});
+      assert.strictEqual(settings.mcpProfile, "(unreadable number)");
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect(
+    "refuses a save that names a profile that is not set up, with the fix as its cause",
+    () =>
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(config.settingsPath, JSON.stringify(FULL_FILE));
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const error = yield* service
+          .updateSettings(decodePatch({ mcpProfile: "lean" }))
+          .pipe(Effect.flip);
+        const reason =
+          'mcpProfile names MCP profile "lean", which is not set up: add that profile first, or pick "all" or "t3-only".';
+        // Upstream's error type, unchanged; the reason is its cause, a tagged error.
+        assert.strictEqual(error.operation, "normalize");
+        assert.instanceOf(error.cause, ForkSettingsWriteError);
+        assert.strictEqual((error.cause as ForkSettingsWriteError)._tag, "ForkSettingsWriteError");
+        assert.strictEqual((error.cause as Error).message, reason);
+        // The reason reaches a client: the error as the RPC sends it and decodes it.
+        const json = Schema.toCodecJson(ServerSettingsError);
+        const received = yield* Schema.decodeEffect(json)(yield* Schema.encodeEffect(json)(error));
+        assert.deepInclude(received.cause as object, {
+          name: "ForkSettingsWriteError",
+          message: reason,
+        });
+        // Nothing was written: the file still has no MCP keys.
+        const file = (yield* readFile) as Record<string, unknown>;
+        assert.isFalse("mcpProfile" in file);
+      }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("keeps a project's MCP profile when an older client saves the project without it", () =>
+    Effect.gen(function* () {
+      const start = {
+        ...FULL_FILE,
+        mcpProfiles: { lean: { servers: [], t3Tools: [] } },
+        projectSettingsOverrides: {
+          [PROJECT]: { mcpProfile: "lean", mcpSubagentProfile: "t3-only" },
+        },
+      };
+      // A client that does not know the MCP keys sends the project's entry without them.
+      const file = (yield* loadThenPatch(start, {
+        projectSettingsOverrides: { [PROJECT]: { enableAgentBrowserAccess: true } },
+      })) as { projectSettingsOverrides: Record<string, unknown> };
+      assert.deepStrictEqual(file.projectSettingsOverrides[PROJECT], {
+        enableAgentBrowserAccess: true,
+        mcpProfile: "lean",
+        mcpSubagentProfile: "t3-only",
+      });
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("clears a project's MCP profile when the screen resets it with the fork's helper", () =>
+    Effect.gen(function* () {
+      const start = {
+        ...FULL_FILE,
+        mcpProfile: "t3-only",
+        projectSettingsOverrides: { [PROJECT]: { mcpProfile: "all", defaultAutoPull: true } },
+      };
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(config.settingsPath, JSON.stringify(start));
+      const settings = yield* service.getSettings;
+      // What the client sends for "reset to inherited" on the project's MCP profile.
+      const entry = clearProjectSettingsOverridesWithForkKeys(settings, ProjectId.make(PROJECT), [
+        "mcpProfile",
+      ]);
+      yield* service.updateSettings(
+        decodePatch({ projectSettingsOverrides: { [PROJECT]: entry } }),
+      );
+      const file = (yield* readFile) as { projectSettingsOverrides: Record<string, unknown> };
+      assert.deepStrictEqual(file.projectSettingsOverrides[PROJECT], { defaultAutoPull: true });
     }).pipe(Effect.provide(layerServerSettings())),
   );
 });
