@@ -40,6 +40,9 @@ copies that must fail (so a check that stops seeing its problem goes red too):
   removed      .github/fork-removed-workflows.txt (the upstream workflows the fork deletes, kept
                deleted by fork-follow.sh) is there, every line is an upstream workflow path, none of
                them is in the tree, and it names the files the owner decided to delete.
+  result       fork-tests.yml's fork_ci_result, the one check a ruleset requires, needs every other job
+               of that workflow except the ones in RESULT_OPTIONAL (none today), so no job's failure
+               can merge.
 
     python3 .github/scripts/fork-contracts.test.py
 
@@ -1422,6 +1425,43 @@ for label, (text, extra) in {
     "a path outside .github/workflows": (removed_text + ".github/workflows/../ci.yml\n", set()),
 }.items():
     check(f"removed: {label} fails", bool(removed_problems(text, tree | extra)))
+
+# --- result ------------------------------------------------------------------------------------
+# Jobs fork_ci_result may leave out of its needs, each with its reason. None today: every job's
+# failure must block a merge.
+RESULT_OPTIONAL = {}
+
+
+def result_problems(wf):
+    jobs = wf.get("jobs") or {}
+    if "fork_ci_result" not in jobs:
+        return ["fork-tests.yml has no fork_ci_result job"]
+    needs = jobs["fork_ci_result"].get("needs") or []
+    needs = [needs] if isinstance(needs, str) else needs
+    problems = [f"fork_ci_result does not need {job}" for job in jobs
+                if job != "fork_ci_result" and job not in RESULT_OPTIONAL and job not in needs]
+    problems += [f"RESULT_OPTIONAL names {job}, which is not a job" for job in RESULT_OPTIONAL if job not in jobs]
+    return problems
+
+
+fork_tests = load(workflows_dir / "fork-tests.yml")
+check("result: fork_ci_result needs every other job of fork-tests.yml",
+      not result_problems(fork_tests), "; ".join(result_problems(fork_tests)))
+
+
+def result_mutant(mutate):
+    wf = copy.deepcopy(fork_tests)
+    mutate(wf["jobs"])
+    return result_problems(wf)
+
+
+for label, mutate in {
+    "a job dropped from its needs": lambda jobs: jobs["fork_ci_result"]["needs"].remove("changes"),
+    "a new job left out of its needs": lambda jobs: jobs.update(extra={"runs-on": "ubuntu-24.04"}),
+    "needs only one job, as a string": lambda jobs: jobs["fork_ci_result"].update(needs="changes"),
+    "no fork_ci_result job": lambda jobs: jobs.pop("fork_ci_result"),
+}.items():
+    check(f"result: {label} fails", bool(result_mutant(mutate)))
 
 shutil.rmtree(work, ignore_errors=True)
 if failures:
