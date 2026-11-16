@@ -1,0 +1,105 @@
+name: Fork web soak (temporary)
+
+# TEMPORARY diagnostic for fork issue #245; removed before the pull request merges.
+# Runs Test Web shard 1 several times and samples free /tmp space, free memory
+# and Chromium memory, to find why Chromium dies late in that shard.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/fork-web-soak.yml
+      - apps/web/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-web-soak-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    name: Web soak ${{ matrix.rep }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3, 4]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          save-pnpm-store: false
+
+      - name: Resolve Playwright version
+        id: playwright_version
+        run: echo "version=$(node -p "require('./apps/web/node_modules/playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Chromium
+        id: chromium_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-shell-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright_version.outputs.version }}
+
+      - name: Install Chromium for web browser tests
+        if: steps.chromium_cache.outputs.cache-hit != 'true'
+        run: node apps/web/node_modules/playwright/cli.js install --only-shell chromium
+
+      - name: Install missing Chromium system dependencies
+        run: |
+          browser=$(find "$HOME/.cache/ms-playwright" -name chrome-headless-shell -type f -print -quit)
+          test -n "$browser"
+          if ldd "$browser" | grep '=> not found'; then
+            node apps/web/node_modules/playwright/cli.js install-deps chromium
+          fi
+
+      - name: Resources before
+        run: |
+          nproc; free -m; df -BM / /tmp /dev/shm; ulimit -a
+
+      - name: Test (shard 1/2) with resource sampling
+        working-directory: apps/web
+        env:
+          SHARD: 1/2
+          DEBUG: vitest:browser:gc
+        run: |
+          log="$RUNNER_TEMP/res.log"
+          (
+            while :; do
+              tmp=$(df -BM --output=avail /tmp | tail -1 | tr -dc 0-9)
+              shm=$(df -BM --output=used /dev/shm | tail -1 | tr -dc 0-9)
+              mem=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+              chrome=$(ps -eo rss=,args= | awk '/ms-playwrigh[t]/{s+=$1; if($1>m)m=$1; n++} END{printf "%d %d %d", s/1024, m/1024, n}')
+              node=$(ps -eo rss=,comm= | awk '$2=="node"{s+=$1} END{printf "%d", s/1024}')
+              echo "$(date +%T) tmpfree=$tmp shmused=$shm memavail=$mem chrome_sum_max_n=$chrome node=$node"
+              sleep 3
+            done
+          ) > "$log" 2>&1 &
+          sampler=$!
+          status=0
+          eval "$(jq -r .scripts.test package.json) --shard=$SHARD" > "$RUNNER_TEMP/test.log" 2>&1 || status=$?
+          kill "$sampler" || true
+          grep -v "vitest:browser:gc" "$RUNNER_TEMP/test.log" | tail -n 60
+          echo "::group::gc debug (first and last 5)"
+          grep "vitest:browser:gc" "$RUNNER_TEMP/test.log" | head -n 5
+          grep "vitest:browser:gc" "$RUNNER_TEMP/test.log" | tail -n 5
+          grep -c "Low disk space" "$RUNNER_TEMP/test.log" || true
+          echo "::endgroup::"
+          echo "::group::resource samples"
+          cat "$log"
+          echo "::endgroup::"
+          echo "min tmpfree MB: $(grep -o 'tmpfree=[0-9]*' "$log" | cut -d= -f2 | sort -n | head -1)"
+          echo "min memavail MB: $(grep -o 'memavail=[0-9]*' "$log" | cut -d= -f2 | sort -n | head -1)"
+          echo "max chrome sum MB: $(awk '{split($5,a,"="); print a[2]}' "$log" | sort -n | tail -1)"
+          sudo dmesg | grep -iE "oom|killed process|out of memory" | tail -n 10 || true
+          exit "$status"
