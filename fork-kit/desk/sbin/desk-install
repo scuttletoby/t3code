@@ -36,7 +36,8 @@ FILES = {'fork-fleet-launch.sh': '.github/scripts/fork-fleet-launch.sh',
          'fork-fleet-desk-wire.py': '.github/scripts/fork-fleet-desk-wire.py',
          'hook.sh': '.github/scripts/fork-fleet-hook.sh', 'fork-fleet.py': '.github/scripts/fork-fleet.py',
          'fork-fleet.json': '.github/fork-fleet.json', 'desk-install': 'fork-kit/desk/sbin/desk-install',
-         'machine_file.py': 'fork-kit/common/machine_file.py', 'README.md': 'fork-kit/desk/README.md'}
+         'machine_file.py': 'fork-kit/common/machine_file.py', 'README.md': 'fork-kit/desk/README.md',
+         'free_contract.py': 'fork-kit/common/free_contract.py', 'free-memory': 'fork-kit/common/free/memory'}
 WALLS = '.github/scripts/fork-fleet-walls'   # copied whole: every OS's walls file and fixture
 SUBDIRS = ('units', 'fork-fleet-walls')   # the folders the manifest makes inside /opt/fork-fleet
 UNITS = {'fork-fleet-desk-agent.service': '.github/scripts/fork-fleet-desk-agent.service',
@@ -53,6 +54,7 @@ ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C.UTF-8'}
 SHA = re.compile(r'[0-9a-f]{40}')
 SHAPES = {'pool': r'[a-z0-9][a-z0-9_-]{0,39}', 'host': r'[A-Za-z0-9][A-Za-z0-9.-]{0,252}',
           'user': r'[a-z_][a-z0-9_-]{0,31}', 'netBase': r'10\.(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])',
+          'freeCommand': r'(/[A-Za-z0-9._@+-]+)+',
           'hostKey': r'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}'}
 RUNNER_UNIT = re.compile(r'fork-fleet-[a-z0-9][a-z0-9-]{0,62}-[0-9]{1,20}\.service')   # the launcher's runner units
 
@@ -208,7 +210,8 @@ def machine_section():
                                    'port': (int, 22, within(1, 65535)), 'user': (str, 'fleet-desk', shape('user')),
                                    'hostKey': (str, mf.REQUIRED, shape('hostKey')), 'slots': (int, 1, within(1, 8)),
                                    'reserveMb': (int, None, within(0, 1000000)),
-                                   'netBase': (str, None, shape('netBase'))}, 'desk')
+                                   'netBase': (str, None, shape('netBase')),
+                                   'freeCommand': (str, None, shape('freeCommand'))}, 'desk')
     except mf.MachineFileError as e:
         raise Refused(f'machine file: {e}') from None
 
@@ -344,7 +347,7 @@ def stage(source, sha, fleet_config, pool):
 
 def file_mode(rel):
     """The mode of an installed file: programs 0755, the rest 0644."""
-    executable = rel in ('fork-fleet-launch.sh', 'hook.sh', 'desk-install') or (
+    executable = rel in ('fork-fleet-launch.sh', 'hook.sh', 'desk-install', 'free-memory') or (
         rel.startswith('fork-fleet-walls/') and not rel.endswith('.json'))
     return 0o755 if executable else 0o644
 
@@ -424,7 +427,8 @@ def settings(m, users):
     known = (m['host'] if m['port'] == 22 else f'[{m["host"]}]:{m["port"]}') + ' ' + m['hostKey']
     files = {ETC + '/launch.conf': (f'RUNNER_USERS={",".join(users)}\n'
                                     + (f'RESERVE_MB={m["reserveMb"]}\n' if m['reserveMb'] is not None else '')
-                                    + (f'NET_BASE={m["netBase"]}\n' if m['netBase'] else ''), 0o600),
+                                    + (f'NET_BASE={m["netBase"]}\n' if m['netBase'] else '')
+                                    + (f'FREE_COMMAND={m["freeCommand"]}\n' if m['freeCommand'] else ''), 0o600),
              ETC + '/desk.conf': (f'POOL={m["pool"]}\nHOST={m["host"]}\nPORT={m["port"]}\nUSER={m["user"]}\n', 0o600),
              ETC + '/desk-known_hosts': (known + '\n', 0o644),
              ETC + '/resolv.conf': ('nameserver 1.1.1.1\nnameserver 9.9.9.9\n', 0o644),
@@ -621,6 +625,9 @@ def check():
         m = machine_section()
         users = [f'fork-runner-{i}' for i in range(1, m['slots'] + 1)]
         row(True, 'machine-file', f'desk section: pool {m["pool"]}, {m["slots"]} slot(s), always-on host {m["host"]}')
+        if m['freeCommand']:   # busy is fine: the script answers by the contract (FREE.md)
+            r = py(p(OPT + '/free_contract.py'), 'ask', m['freeCommand'])
+            row(r.returncode in (0, 75), 'free-script', f'{m["freeCommand"]}: {(r.stdout or r.stderr).strip()[:200]}')
         stale = [path for path, (text, mode) in settings(m, users).items() if not same_text(path, text, mode)]
         row(not stale, 'settings', f'{stale[0]} differs from the machine file: install again' if stale else
             'the written settings match the machine file')

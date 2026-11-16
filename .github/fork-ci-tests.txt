@@ -43,6 +43,7 @@ fork-ci/actions/pinned/pinned.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
+fork-kit/common/tests/free_contract.test.py
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py
 fork-kit/desk/tests/windows.test.py
