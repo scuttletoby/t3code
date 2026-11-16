@@ -51,17 +51,26 @@ user unit, printed with how to follow it), because stopping T3 kills everything 
 terminal included; `--here` runs it in the calling process and is refused inside the boot service. In order:
 
 1. **Checks** (no change yet): `check` must pass (or say nothing to do: then it refuses), the backup disk must
-   hold the copy plus the floor, and a quiet command must be set unless the owner says go.
+   hold the copy plus the floor, the `stateDir` disk must keep the floor (the journal and guard log live there),
+   and a quiet command must be set unless the owner says go.
 2. **Quiet point** (no change yet): `quietCommand` (the fork setting `automaticUpdatesQuietCommand`'s contract:
    absolute path, no arguments, run in the home with both versions in its environment, exit 0 = quiet) must say
-   quiet twice, 60 s apart, within `quietWaitSeconds`; else it refuses. `--owner-says-go` skips the wait.
+   quiet twice, 60 s apart, within `quietWaitSeconds`; else it refuses. `--owner-says-go` skips the wait. Then
+   free space is checked again, and the live server is read again: if its pid, its version, the service
+   state's `activeVersion` or a pending update changed during the wait (the auto-updater keeps the same quiet
+   contract and may have moved T3 to a newer build), it refuses.
 3. **Guard**: a second detached unit (`t3-golive guard`) waits for this run to end however it ends; if the run
    stopped T3 and left it stopped (killed, crashed), it starts T3 again, and it runs the post hooks if the run
-   ran the pre hooks but not the post hooks. It logs to `<stateDir>/guard.log` and writes no journal line.
-4. **Pre hooks** (`preHooks`, in order), then one more quiet sample. A failure runs the post hooks and refuses:
-   T3 was never stopped.
+   ran the pre hooks but not the post hooks. If it cannot read the journal it fails open: it starts T3 if the
+   service is inactive and runs the post hooks, and logs why. It logs to `<stateDir>/guard.log` (first a
+   "waiting" line, then what it did) and writes no journal line. The run goes on only after it sees the
+   guard's "waiting" line (within 30 s); else it refuses.
+4. **Pre hooks** (`preHooks`, in order), then one more quiet sample, the live server read again, and the guard
+   unit checked still active. Any failure runs the post hooks and refuses: T3 was never stopped. If a post
+   hook fails there, the run ends "failed" and needs `settle` (jobs may still be paused).
 5. **Stop** the boot service; wait until it is inactive and its server is gone; take upstream's ownership lock
-   of the home (`userdata/server-owner.sqlite`), so no server can start on it during the copy.
+   of the home (`userdata/server-owner.sqlite`), so no server can start on it during the copy; the service
+   state must still name the same build, with no update pending.
 6. **Cold copy** of `userdata/` into a new folder `<backupDir>/t3-copy-<time>-<live version>/` (mode 700; never
    over an old one): the database with its WAL, settings, attachments and the other small files, with their
    modes; links as links. Left out: `logs`, `server-runtime.json`, the ownership lock and SQLite's `-shm` (an index
@@ -69,18 +78,28 @@ terminal included; `--here` runs it in the calling process and is refused inside
 7. **Read-back**: both the copy and the source are read from disk again; every SHA256 must match.
 8. **Manifest**, written LAST (temp file, fsync, rename): every entry with its size, mode and SHA256.
 9. **Start** the same build again, **verify** a new server of the same version runs for the home, then the
-   **post hooks**. These run however steps 5-8 ended. `stopLimitSeconds` bounds steps 6-7: past it the copy gives
-   up and T3 starts again.
+   **post hooks**. These run however steps 5-8 ended. The start comes before its journal line, so a full disk
+   under the journal cannot keep T3 stopped. `stopLimitSeconds` bounds steps 6-7: past it the copy gives up and
+   T3 starts again. When the restart fails as well, the first error is raised and the later ones are kept as
+   notes (also in the journal's end line).
 
 **A copy folder without a finished manifest is incomplete and is never used** (`coldcopy.read_manifest`,
 `verify_copy`). Nothing is ever deleted. A refusal before T3 stopped (every started step done) ends the run
 "refused" and needs no settling; any failure after T3 stopped needs `settle`, after T3 was started again.
 
-Restore primitive (`coldcopy.restore(run, copy_dir, home)`, for the later `rehearse` and `back`; only inside a
-journalled step, with the home's server stopped): reads the copy back against its manifest first, refuses while
-any server holds the ownership lock, copies the database family and `settings.json` in under temp names, moves
-the home's own files (`-wal`, `-journal` and `-shm` included) aside to `<name>.golive-aside-<time>`, then renames
-the copies into place. Running it again after a stop half-way starts again from the untouched copy.
+Kills and stops: SIGTERM is handled like a kill (the guard puts T3 back). A kill during the quiet wait changed
+nothing and needs no settling. After a power loss no guard runs: the enabled service starts T3 at boot, the post
+hooks never run, and the journal asks for `settle`.
+
+Restore primitive (`coldcopy.restore(run, copy_dir, home, from_home=..., version=...)`, for the later `rehearse`
+and `back`; only inside a journalled step, with the home's server stopped): takes only a copy whose manifest
+names that home and live version (else `WrongCopy`), reads the copy back against its manifest first, refuses
+while any server holds the ownership lock, and copies the database family and `settings.json` in under temp
+names (`.<name>.golive-restore-<time>`, never copied by `copy`). Then, each step fsynced: it hard-links every
+home file it will replace (`-wal`, `-journal` and `-shm` included) to `<name>.golive-aside-<time>`, removes the
+home's companions (`-shm`, `-journal`, `-wal`), and renames the copies in, database first. A stop at any point
+leaves the old or the new database with no WAL or its own WAL, never a WAL without its database or with the
+other database, and every old file still under its aside name. Running it again finishes the job.
 
 ## `t3-golive settle --reason "<what you did>"`
 
@@ -120,7 +139,7 @@ the lock and the journal; it is required, and no environment variable moves it, 
 outside the T3 home (check writes nothing there). `freeFloorMb` is optional (default 2048). For `copy`:
 `quietCommand` (optional; without it `copy` needs `--owner-says-go`), `preHooks` and `postHooks` (optional
 lists of absolute paths, run with no arguments; each must be safe to run twice), `quietWaitSeconds` (default
-7200) and `stopLimitSeconds` (default 1800). An unknown key, a
+7200, at least 60: two samples 60 s apart) and `stopLimitSeconds` (default 1800). An unknown key, a
 missing key, a wrong type or a newer `version` is refused by name (the shared loader, `fork-kit/common`).
 
 ## Lock and journal
@@ -130,8 +149,8 @@ its pid and command into it, `check` holds it shared. `<stateDir>/journal.jsonl`
 fsynced before the step it names starts and carries the hash of the line before it. A run killed half-way
 leaves a run with no end; a run that ended with an error after its first step started may have left the home
 just as half-applied. Either needs settling: every later `check` refuses and says where it stopped, and a
-changing run refuses to start until the owner runs `settle`. (A run that failed before its first step changed
-nothing and is only a note.) The rule every changing command keeps: every change is made inside a journalled
+changing run refuses to start until the owner runs `settle`. (A run that failed or was killed before its first
+step changed nothing and is only a note.) The rule every changing command keeps: every change is made inside a journalled
 step (kit code calls `run.require_step()` first, so a change outside one is an error), and pre-checks, `check`
 included, run before the first step (`run_check` refuses inside a step). A command that stops on purpose after
 every step it started is done raises `journal.Refused`: the run ends "refused" and needs no settling. The guard

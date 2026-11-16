@@ -8,10 +8,10 @@ The journal is <stateDir>/journal.jsonl, append-only, one JSON object per line, 
 the step it names starts. Each line carries the sha256 of the line before it, so an edited or lost line is found.
 A run is: begin, then per step "started" and "done" (with its facts, such as hashes), then end.
 
-A run needs settling when it has no end (killed, or the machine went down) or when it ended with an error after
-its first step started (an error can leave the same half-applied state as a kill). Every later run reports it,
-and a changing run refuses to start until the owner puts the home right and runs `t3-golive settle` (settle()).
-A run that failed before its first step changed nothing and needs no settling.
+A run needs settling when it stopped (killed, or the machine went down) or ended with an error after its first
+step started: either can leave a half-applied state. Every later run reports it, and a changing run refuses to
+start until the owner puts the home right and runs `t3-golive settle` (settle()). A run that failed or was
+killed before its first step changed nothing (every change is made inside a step) and needs no settling.
 
 The rule every changing command keeps (fork #186): every change is made inside `r.step()`, and pre-checks run
 before the first step. Kit code that changes something calls `r.require_step()` first, so a change outside a step
@@ -173,13 +173,11 @@ def read(state_dir):
 
 
 def needs_settling(run):
-    """True when the run stopped half-way, or ended with an error after its first step started, and the owner
-    has not settled it."""
-    if run['settled'] is not None:
+    """True when the run stopped half-way, or ended with an error, after its first step started, and the owner
+    has not settled it. Killed before its first step (a copy waiting for a quiet point), it changed nothing."""
+    if run['settled'] is not None or not run['steps']:
         return False
-    if run['end'] is None:
-        return True
-    return run['end']['result'] not in ('ok', 'refused') and bool(run['steps'])
+    return run['end'] is None or run['end']['result'] not in ('ok', 'refused')
 
 
 def unfinished(state_dir):
@@ -264,6 +262,12 @@ class Run:
         self._append('step', step=name, phase='done', data=done or None)
 
 
+def _detail(error):
+    """An error for the journal, with its notes (a later error while putting things right, for example)."""
+    notes = ''.join(f'; {n}' for n in getattr(error, '__notes__', ()))
+    return f'{type(error).__name__}: {error}{notes}'[:500]
+
+
 @contextlib.contextmanager
 def run(state_dir, command):
     """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished), journal begin
@@ -283,10 +287,10 @@ def run(state_dir, command):
             except Refused as e:
                 # Refused inside a step, or after a step that never reached "done", is a failure like any other.
                 result = 'failed' if r._broken else 'refused'
-                r._append('end', result=result, detail=f'{type(e).__name__}: {e}'[:500])
+                r._append('end', result=result, detail=_detail(e))
                 raise
             except BaseException as e:
-                r._append('end', result='failed', detail=f'{type(e).__name__}: {e}'[:500])
+                r._append('end', result='failed', detail=_detail(e))
                 raise
             r._append('end', result='ok', detail=None)
         finally:

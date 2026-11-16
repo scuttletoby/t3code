@@ -78,6 +78,13 @@ class SystemdUser:
         except OSError:
             return True  # cannot tell: treat it as inside (fail closed)
 
+    def unit_active(self, unit):
+        """True while a transient unit (the copy's guard) runs; read only."""
+        if not _UNIT_NAME.match(unit):
+            raise AdapterError(f'not a safe unit name: {unit!r}')
+        out = self._run([SYSTEMCTL, '--user', 'show', unit, '--property=ActiveState'])
+        return any(line.strip() in ('ActiveState=active', 'ActiveState=activating') for line in out.splitlines())
+
     def stop(self):
         self._run([SYSTEMCTL, '--user', 'stop', UNIT])
 

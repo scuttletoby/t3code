@@ -45,6 +45,13 @@ def _not_negative(value):
     return None if value >= 0 else 'must be a whole number >= 0'
 
 
+MIN_QUIET_WAIT = 60  # a quiet point is two samples 60 s apart (coldcopy.QUIET_GAP); a shorter wait always refuses
+
+
+def _quiet_wait(value):
+    return None if value >= MIN_QUIET_WAIT else f'must be a whole number >= {MIN_QUIET_WAIT} (two samples, 60 s apart)'
+
+
 def _positive(value):
     return None if value > 0 else 'must be a whole number > 0'
 
@@ -66,7 +73,7 @@ SPEC = {
     # Run in order, no arguments, before T3 stops (pre) and after it runs again (post); each must be safe twice.
     'preHooks': (list, (), _absolute_list),
     'postHooks': (list, (), _absolute_list),
-    'quietWaitSeconds': (int, 7200, _not_negative),  # how long to wait for a quiet point, then give up
+    'quietWaitSeconds': (int, 7200, _quiet_wait),    # how long to wait for a quiet point, then give up
     'stopLimitSeconds': (int, 1800, _positive),      # longest T3 stays stopped for a copy; then it starts again
 }
 # The kit's own folders; none may be the T3 home or inside it (check promises to write nothing there).

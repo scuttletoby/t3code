@@ -206,6 +206,7 @@ class FakeAdapter(osadapter.SystemdUser):
 
     def __init__(self, root, machine=None, on=None):
         self.root, self.machine, self.on = root, machine, on or {}
+        self.guard_up, self.guard_alive = True, True  # a detached guard logs that it waits, and keeps running
 
     def _svc(self, **props):
         path = os.path.join(self.root, 'service.json')
@@ -244,6 +245,12 @@ class FakeAdapter(osadapter.SystemdUser):
         if not osadapter._UNIT_NAME.match(unit):
             raise osadapter.AdapterError(f'not a safe unit name: {unit!r}')
         self._record('run_detached', unit, argv)
+        if self.guard_up and argv[1:3] == ['guard', '--run']:
+            from golive import coldcopy
+            coldcopy._guard_log(os.path.join(self.root, 'kit-state'), {'run': argv[3], 'waiting': True})
+
+    def unit_active(self, unit):
+        return self.guard_alive
 
 
 def kill(proc):

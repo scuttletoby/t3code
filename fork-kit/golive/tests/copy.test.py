@@ -2,7 +2,7 @@
 (tests/golive_fixture.py): the service manager is faked (stop kills a fake server, start spawns a new one), the T3
 home is a temp folder, hooks and the quiet command are stub scripts. Nothing here stops, starts or reads a real T3.
 python3 -I -B fork-kit/golive/tests/copy.test.py"""
-import errno, hashlib, io, json, os, signal, subprocess, sys, threading, time, unittest
+import errno, hashlib, io, json, os, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,6 +38,7 @@ print('ready', flush=True)
 time.sleep(60)
 '''
 
+# A copy run in its own process, SIGKILLed where `setup` says (it sets on[<adapter call>] = kill, or wraps a function).
 KILLED = '''import os, sys
 sys.path[:0] = {paths!r}
 import golive_fixture as fx
@@ -45,9 +46,33 @@ from golive import coldcopy, config, osadapter
 config.MACHINE_FILE, config.MACHINE_OWNER = {machine!r}, os.getuid()
 osadapter.SYSTEMCTL, osadapter.CGROUP_FILE = {systemctl!r}, {cgroup!r}
 coldcopy.QUIET_GAP, coldcopy.POLL = 0, 0.01
-adapter = fx.FakeAdapter({root!r}, None, on={{'stop': lambda: os.kill(os.getpid(), 9)}})
+
+
+def kill(*args):
+    os.kill(os.getpid(), 9)
+
+
+on = {{}}
+{setup}
+adapter = fx.FakeAdapter({root!r}, None, on=on)
 coldcopy.run_copy(config.load(), adapter, say=lambda line: None)
 '''
+
+# Commits rows into a WAL-mode database and exits without closing it: the commits stay in the -wal, not
+# checkpointed into the database file, as a server stopped without a checkpoint leaves them.
+WAL_WRITER = '''import os, sqlite3, sys
+c = sqlite3.connect(sys.argv[1], isolation_level=None)
+c.execute('PRAGMA journal_mode=WAL')
+c.execute('PRAGMA wal_autocheckpoint=0')
+c.execute('CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, body TEXT)')
+for i in range(int(sys.argv[2])):
+    c.execute('INSERT INTO t (body) VALUES (?)', ('row %d ' % i * 40,))
+if sys.argv[3] == 'checkpoint':
+    c.close()
+else:
+    os._exit(0)
+'''
+NEWER = '0.1.10'
 
 
 def sha(path):
@@ -69,7 +94,7 @@ class CopyBase(unittest.TestCase):
         self.m.write('home/userdata/attachments/a1/photo.png', b'\x89PNG' + b'p' * 300, mode=0o600)
         os.symlink('a1/photo.png', self.m.path('home/userdata/attachments/latest'))
         self.adapter = fx.FakeAdapter(self.m.root, self.m)
-        patcher = mock.patch.multiple(coldcopy, QUIET_GAP=0, POLL=0.01, STOP_WAIT=3, START_WAIT=5)
+        patcher = mock.patch.multiple(coldcopy, QUIET_GAP=0, POLL=0.01, STOP_WAIT=3, START_WAIT=5, GUARD_WAIT=0.3)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.said = []
@@ -96,6 +121,28 @@ class CopyBase(unittest.TestCase):
 
     def copies(self):
         return sorted(os.listdir(self.m.backups))
+
+    def updater(self, version=NEWER):
+        """What the auto-updater does: installs a newer build, names it in the service state, restarts T3 on it."""
+        self.install(version)
+        self.m.spawn_server(version)
+
+    def install(self, version=NEWER):
+        with open(shutil.which('sleep', path='/usr/bin:/bin'), 'rb') as f:
+            self.m.write(f'home/runtime/versions/{version}/t3', f.read(), mode=0o755)
+        self.m.write('home/runtime/service-state.json', json.dumps({'protocol': 3, 'activeVersion': version}))
+
+    def killed(self, setup):
+        """Run a copy in its own process, SIGKILLed where setup says; returns its run from the journal."""
+        code = KILLED.format(paths=[os.path.join(fx.KIT, 'lib'), fx.COMMON, os.path.dirname(os.path.abspath(__file__))],
+                             machine=config.MACHINE_FILE, systemctl=osadapter.SYSTEMCTL,
+                             cgroup=osadapter.CGROUP_FILE, root=self.m.root, setup=setup)
+        p = subprocess.run([sys.executable, '-I', '-B', '-c', code], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=60)
+        self.assertEqual(p.returncode, -signal.SIGKILL, p.stderr)
+        run = self.last_run()
+        self.assertIsNone(run['end'])
+        return run
 
     def assert_t3_runs_again(self, old_pid):
         svc = self.adapter.service()
@@ -167,7 +214,7 @@ class Copy(CopyBase):
     def test_no_quiet_point_is_refused_and_nothing_is_changed(self):
         self.configure(quietWaitSeconds=0)
         self.codes('quiet', 1)
-        with self.assertRaises(journal.Refused) as e:
+        with mock.patch.object(config, 'MIN_QUIET_WAIT', 0), self.assertRaises(journal.Refused) as e:
             self.copy()
         self.assertIn('no quiet point within 0 s', str(e.exception))
         self.assertIn('quiet says 1', str(e.exception))
@@ -214,6 +261,159 @@ class Copy(CopyBase):
         self.assertIn('not quiet any more', str(e.exception))
         self.assertEqual(self.calls(), ['quiet', 'quiet', 'run_detached', 'pre', 'quiet', 'post'])
         self.assertIsNone(journal.unfinished(self.m.state))
+
+    def test_quiet_wait_seconds_is_at_least_the_gap_of_two_samples(self):
+        # nit: 0 was accepted, yet two quiet samples 60 s apart can never fit in it, so every copy refused.
+        self.configure(quietWaitSeconds=59)
+        with self.assertRaises(config.machine_file.MachineFileError) as e:
+            config.load()
+        self.assertIn('quietWaitSeconds', str(e.exception))
+        self.configure(quietWaitSeconds=60)
+        self.assertEqual(config.load().quiet_wait_seconds, 60)
+
+    def test_an_update_during_the_quiet_wait_is_refused_before_anything_changes(self):
+        # Must fix 1: the auto-updater keeps the same quiet contract and may restart T3 on a newer build (and
+        # migrate the database) while the copy waits; a copy labelled with the old version must never be made.
+        real = coldcopy.wait_quiet
+
+        def wait_then_update(*args):
+            real(*args)
+            self.updater()
+        with mock.patch.object(coldcopy, 'wait_quiet', wait_then_update):
+            with self.assertRaises(journal.Refused) as e:
+                self.copy()
+        self.assertIn(f'the live server changed (t3 {fx.LIVE}', str(e.exception))
+        self.assertIn(f'-> t3 {NEWER}', str(e.exception))
+        self.assertEqual(self.copies(), [])
+        self.assertEqual(self.calls(), ['quiet', 'quiet'], 'T3 was stopped, or the guard armed, for a stale check')
+        self.assertIsNone(journal.unfinished(self.m.state))
+
+    def test_an_update_during_the_pre_hooks_is_refused_before_the_stop(self):
+        real = coldcopy._hooks
+
+        def hooks(run, name, *args):
+            out = real(run, name, *args)
+            if name == 'pre-hooks':
+                self.updater()
+            return out
+        with mock.patch.object(coldcopy, '_hooks', hooks):
+            with self.assertRaises(journal.Refused) as e:
+                self.copy()
+        self.assertIn('the live server changed', str(e.exception))
+        self.assertEqual(self.calls(), ['quiet', 'quiet', 'run_detached', 'pre', 'quiet', 'post'])
+        self.assertEqual(self.copies(), [])
+        self.assertIsNone(journal.unfinished(self.m.state))
+
+    def test_an_update_at_the_stop_takes_no_copy(self):
+        # Between the last look and the stop: the service state names another build once T3 is down.
+        self.install()
+        self.m.write('home/runtime/service-state.json', json.dumps({'protocol': 3, 'activeVersion': fx.LIVE}))
+        self.adapter.on['stop'] = lambda: self.m.write('home/runtime/service-state.json',
+                                                       json.dumps({'protocol': 3, 'activeVersion': NEWER}))
+        coldcopy.START_WAIT = 0.5
+        with self.assertRaises(RuntimeError) as e:
+            self.copy()
+        self.assertIn('service state changed at the stop', str(e.exception))
+        self.assertEqual(self.copies(), [])
+        self.assertEqual(self.last_run()['end']['result'], 'failed')
+
+    def test_free_space_is_checked_again_after_the_quiet_wait(self):
+        with mock.patch.object(coldcopy, '_free_bytes', side_effect=[10 ** 15, 0]):
+            with self.assertRaises(journal.Refused) as e:
+                self.copy()
+        self.assertIn('MB free', str(e.exception))
+        self.assertEqual(self.calls(), ['quiet', 'quiet'])
+        self.assertIsNone(journal.unfinished(self.m.state))
+
+    def test_the_state_dir_disk_must_keep_the_floor_too(self):
+        # The journal and the guard log live in stateDir; a full disk there would stop a restart (see below).
+        with mock.patch.object(coldcopy, '_device', lambda path: path), \
+                mock.patch.object(coldcopy, '_free_bytes', lambda path: 0 if path == self.m.state else 10 ** 15):
+            with self.assertRaises(journal.Refused) as e:
+                self.copy(owner_says_go=True)
+        self.assertIn(f'{self.m.state}: 0 MB free', str(e.exception))
+        self.assertEqual(self.calls(), [])
+
+    def test_t3_starts_first_and_is_journalled_after(self):
+        # A full disk under the journal must not keep T3 stopped: start, then write the line.
+        real = journal.Run._append
+
+        def append(run, event, **fields):
+            if event == 'step' and fields.get('step') == 'start-service':
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real(run, event, **fields)
+        old_pid = self.m.server.pid
+        with mock.patch.object(journal.Run, '_append', append):
+            with self.assertRaises(OSError) as e:
+                self.copy(owner_says_go=True)
+        self.assertEqual(e.exception.errno, errno.ENOSPC)
+        self.assertEqual(self.calls()[-3:], ['stop', 'start', 'post'])
+        self.assert_t3_runs_again(old_pid)
+        self.assertEqual(self.last_run()['end']['result'], 'failed')
+
+    def test_the_guard_must_say_it_waits_before_t3_stops(self):
+        self.adapter.guard_up = False
+        with self.assertRaises(journal.Refused) as e:
+            self.copy()
+        self.assertIn('did not come up', str(e.exception))
+        self.assertEqual(self.calls(), ['quiet', 'quiet', 'run_detached'])
+        self.assertIsNone(journal.unfinished(self.m.state))
+
+    def test_a_guard_that_died_stops_the_run_before_the_stop(self):
+        self.adapter.guard_alive = False
+        with self.assertRaises(journal.Refused) as e:
+            self.copy()
+        self.assertIn('is not running any more', str(e.exception))
+        self.assertEqual(self.calls(), ['quiet', 'quiet', 'run_detached', 'pre', 'quiet', 'post'])
+        self.assertIsNone(journal.unfinished(self.m.state))
+
+    def test_a_failing_post_hook_on_a_refusal_needs_settling(self):
+        # Jobs may stay paused: that is no clean refusal.
+        self.codes('pre', 3)
+        self.codes('post', 4)
+        with self.assertRaises(RuntimeError) as e:
+            self.copy()
+        self.assertIn('post exited 4', str(e.exception))
+        self.assertEqual(self.last_run()['end']['result'], 'failed')
+        self.assertIsNotNone(journal.unfinished(self.m.state))
+
+    def test_the_first_error_is_kept_when_the_restart_fails_too(self):
+        real = coldcopy._copy_file
+
+        def disk_full(src, dst, deadline, mode):
+            if src.endswith('settings.json'):
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real(src, dst, deadline, mode)
+
+        def start_fails():
+            raise osadapter.AdapterError('systemctl --user start exited 1')
+        self.adapter.on['start'] = start_fails
+        with mock.patch.object(coldcopy, '_copy_file', disk_full):
+            with self.assertRaises(OSError) as e:
+                self.copy(owner_says_go=True)
+        self.assertEqual(e.exception.errno, errno.ENOSPC)
+        self.assertIn('then: AdapterError: systemctl --user start exited 1', ' '.join(e.exception.__notes__))
+        detail = self.last_run()['end']['detail']
+        self.assertIn('No space left', detail)
+        self.assertIn('AdapterError', detail)
+
+    def test_a_folder_that_cannot_be_read_is_refused_not_skipped(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads every folder')
+        folder = self.m.path('home/userdata/attachments/a1')
+        os.chmod(folder, 0)
+        self.addCleanup(os.chmod, folder, 0o755)
+        with self.assertRaises(journal.Refused) as e:
+            self.copy(owner_says_go=True)
+        self.assertIn('cannot be read in full', str(e.exception))
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.copies(), [])
+
+    def test_a_restore_s_leftover_temp_files_are_never_copied(self):
+        self.m.write('home/userdata/.statev2.sqlite.golive-restore-20260101T000000Z', b'half a restore')
+        dest = self.copy(owner_says_go=True)['copy']
+        self.assertNotIn('.statev2.sqlite.golive-restore-20260101T000000Z',
+                         {e['path'] for e in coldcopy.read_manifest(dest)['files']})
 
     def test_a_copy_that_fails_half_way_has_no_manifest_and_t3_runs_again(self):
         real = coldcopy._copy_file
@@ -315,14 +515,7 @@ class Copy(CopyBase):
 
 class Guard(CopyBase):
     def test_a_copy_killed_while_t3_is_stopped_is_put_right_by_the_guard_and_reported(self):
-        code = KILLED.format(paths=[os.path.join(fx.KIT, 'lib'), fx.COMMON, os.path.dirname(os.path.abspath(__file__))],
-                             machine=config.MACHINE_FILE, systemctl=osadapter.SYSTEMCTL,
-                             cgroup=osadapter.CGROUP_FILE, root=self.m.root)
-        p = subprocess.run([sys.executable, '-I', '-B', '-c', code], stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, timeout=60)
-        self.assertEqual(p.returncode, -signal.SIGKILL, p.stderr)
-        run = self.last_run()
-        self.assertIsNone(run['end'])
+        run = self.killed("on['stop'] = kill")
         self.assertEqual(self.steps(run)[-1], ('stop-service', 'started'))
         self.assertFalse(self.adapter.service()['active'], 'the fake stop ran')
 
@@ -339,13 +532,14 @@ class Guard(CopyBase):
         with self.assertRaises(journal.Unfinished):
             self.copy()
 
-    def test_the_guard_waits_for_the_run_and_leaves_a_finished_one_alone(self):
+    def test_the_guard_says_it_waits_then_waits_for_the_run_and_leaves_a_finished_one_alone(self):
         done = []
         with journal.run(self.m.state, 'copy') as r:
             with r.step('stop-service'):
                 pass
             t = threading.Thread(target=lambda: done.append(coldcopy.guard(config.load(), self.adapter, r.id)))
             t.start()
+            self.assertTrue(coldcopy._guard_waiting(self.m.state, r.id), 'the run cannot see the guard waiting')
             time.sleep(0.3)
             self.assertTrue(t.is_alive(), 'the guard did not wait for the run to end')
         t.join(10)
@@ -359,6 +553,68 @@ class Guard(CopyBase):
                     self.adapter.stop()
                     raise OSError('the start failed too')
         self.assertEqual(coldcopy.guard(config.load(), self.adapter, r.id), ['started t3code.service'])
+
+    def test_a_journal_the_guard_cannot_read_fails_open(self):
+        # Should fix 4: unreadable, the guard cannot tell whether the run stopped T3: it puts T3 back anyway.
+        os.makedirs(self.m.state, exist_ok=True)
+        with open(os.path.join(self.m.state, 'journal.jsonl'), 'w') as f:
+            f.write('not json\nnot json either\n')
+        self.adapter.stop()
+        did = coldcopy.guard(config.load(), self.adapter, 'some-run')
+        self.assertIn('journal unreadable', did[0])
+        self.assertEqual(did[1], 'started t3code.service')
+        self.assertIn('post says 0', did[2])
+        self.assertTrue(self.adapter.service()['active'])
+
+    def test_a_copy_killed_while_waiting_for_a_quiet_point_needs_no_settling(self):
+        # Nothing changed before the first step; the next copy runs and check only notes it.
+        self.killed('coldcopy.wait_quiet = kill')
+        self.assertIsNone(journal.unfinished(self.m.state))
+        code, result = check.run_check(config.load(), self.adapter)
+        self.assertEqual(code, 0, result)
+        self.assertIn('stopped before its first step; it changed nothing', ' '.join(result['info']))
+        self.copy(owner_says_go=True)
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+
+    def test_a_copy_killed_mid_copy_has_no_manifest_and_the_guard_starts_t3(self):
+        run = self.killed('''
+real = coldcopy._copy_file
+def copy_file(src, dst, deadline, mode):
+    if src.endswith('settings.json'):
+        kill()
+    return real(src, dst, deadline, mode)
+coldcopy._copy_file = copy_file''')
+        self.assertEqual(self.steps(run)[-1], ('cold-copy', 'started'))
+        [name] = self.copies()
+        with self.assertRaises(coldcopy.Incomplete):
+            coldcopy.read_manifest(os.path.join(self.m.backups, name))
+        did = coldcopy.guard(config.load(), self.adapter, run['id'])
+        self.assertEqual(did[0], 'started t3code.service')
+        self.assertTrue(self.adapter.service()['active'])
+        with self.assertRaises(journal.Unfinished):
+            self.copy()
+
+    def test_a_copy_killed_just_before_its_manifest_is_never_used(self):
+        run = self.killed('''
+real_rename = os.rename
+os.rename = lambda src, dst: kill() if dst.endswith('manifest.json') else real_rename(src, dst)''')
+        self.assertEqual(self.steps(run)[-1], ('manifest', 'started'))
+        dest = os.path.join(self.m.backups, self.copies()[0])
+        self.assertTrue(os.path.exists(os.path.join(dest, '.manifest.json.tmp')))
+        with self.assertRaises(coldcopy.Incomplete):
+            coldcopy.verify_copy(dest)
+        self.assertEqual(coldcopy.guard(config.load(), self.adapter, run['id'])[0], 'started t3code.service')
+
+    def test_a_copy_killed_during_the_restart_is_whole_and_the_guard_runs_the_post_hooks(self):
+        run = self.killed("on['start'] = kill")
+        self.assertEqual(self.steps(run)[-1], ('manifest', 'done'))
+        dest = os.path.join(self.m.backups, self.copies()[0])
+        self.assertEqual(coldcopy.verify_copy(dest)['liveVersion'], fx.LIVE)
+        did = coldcopy.guard(config.load(), self.adapter, run['id'])
+        self.assertEqual(len(did), 1)  # the service already runs; only the post hooks
+        self.assertIn('post says 0', did[0])
+        with self.assertRaises(journal.Unfinished):
+            self.copy()
 
     def test_an_unknown_run_or_one_that_never_stopped_t3_is_left_alone(self):
         self.adapter.stop()
@@ -384,7 +640,8 @@ class Restore(CopyBase):
         try:
             with journal.run(self.m.state, 'back') as r:
                 with r.step('restore') as facts:
-                    facts.update(coldcopy.restore(r, kw.pop('dest', self.dest), self.m.home, **kw))
+                    facts.update(coldcopy.restore(r, kw.pop('dest', self.dest), self.m.home,
+                                                  **{'from_home': self.m.home, 'version': fx.LIVE, **kw}))
         except Exception:
             journal.settle(self.m.state, 'test: looked at the home')
             raise
@@ -411,22 +668,34 @@ class Restore(CopyBase):
         coldcopy.verify_copy(self.dest)
         self.assertEqual(journal.read(self.m.state)[0][-1]['end']['result'], 'ok')
 
-    def test_a_restore_that_stopped_half_way_runs_again_from_the_untouched_copy(self):
-        real, renames = os.rename, []
+    def test_a_restore_stopped_at_any_point_loses_nothing_and_never_pairs_a_wal_wrongly(self):
+        # Should fix 2: was "moved aside one by one", which could leave a -wal without its database.
+        stops = kill_at_each_change(self, self.restore, self.assert_whole_home)
+        self.assertGreaterEqual(stops, 8)
 
-        def fail_on_the_first_put_back(src, dst):
-            if '.golive-restore-' in src:
-                raise OSError(errno.EIO, 'killed here')
-            renames.append(dst)
-            return real(src, dst)
-        with mock.patch.object(coldcopy.os, 'rename', fail_on_the_first_put_back):
-            with self.assertRaises(OSError):
-                self.restore()
-        self.assertFalse(os.path.exists(os.path.join(self.userdata, 'statev2.sqlite')), 'the half state')
-        with mock.patch.object(coldcopy, '_stamp', return_value='20990101T000000Z'):
-            self.restore()
-        self.assertEqual(sha(os.path.join(self.userdata, 'statev2.sqlite')), self.copied)
-        self.assertLessEqual(set(self.newer.values()), self.all_hashes(), 'the first try lost a file')
+    def assert_whole_home(self):
+        """After a stop anywhere: no -wal without its database, the database paired only with its own WAL (or
+        none), and every file the home had still there under some name."""
+        def h(n):
+            p = os.path.join(self.userdata, n)
+            return sha(p) if os.path.exists(p) else None
+        db, wal = h('statev2.sqlite'), h('statev2.sqlite-wal')
+        new_db, new_wal = (sha(os.path.join(self.dest, 'userdata', n)) for n in ('statev2.sqlite', 'statev2.sqlite-wal'))
+        self.assertIsNotNone(db, 'the home has no database')
+        self.assertIn((db, wal), {(self.newer['statev2.sqlite'], self.newer['statev2.sqlite-wal']),
+                                  (self.newer['statev2.sqlite'], None), (new_db, None), (new_db, new_wal)})
+        if h('statev2.sqlite-shm') is not None:
+            self.assertEqual((db, wal), (self.newer['statev2.sqlite'], self.newer['statev2.sqlite-wal']))
+        self.assertLessEqual(set(self.newer.values()), self.all_hashes(), 'a file of the home was lost')
+
+    def test_restore_takes_only_a_copy_of_that_home_under_that_build(self):
+        for kw in ({'version': '0.1.8'}, {'from_home': self.m.path('another-home')}):
+            with self.subTest(**kw):
+                with self.assertRaises(coldcopy.WrongCopy):
+                    self.restore(**kw)
+                with self.assertRaises(coldcopy.WrongCopy):
+                    coldcopy.read_manifest(self.dest, kw.get('from_home', self.m.home), kw.get('version', fx.LIVE))
+        self.assertEqual(self.all_hashes(), set(self.newer.values()))
 
     def test_a_copy_without_a_finished_manifest_is_never_used(self):
         os.rename(os.path.join(self.dest, 'manifest.json'), os.path.join(self.dest, 'manifest.json.x'))
@@ -460,12 +729,12 @@ class Restore(CopyBase):
     def test_restore_is_a_change_and_runs_only_inside_a_step(self):
         with journal.run(self.m.state, 'back') as r:
             with self.assertRaises(RuntimeError) as e:
-                coldcopy.restore(r, self.dest, self.m.home)
+                coldcopy.restore(r, self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
         self.assertIn('outside a journalled step', str(e.exception))
         self.assertEqual(self.all_hashes(), set(self.newer.values()))
 
     def test_plan_restore_is_the_read_only_pre_check(self):
-        files, want = coldcopy.plan_restore(self.dest, self.m.home)
+        files, want = coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
         self.assertEqual(sorted(want), ['settings.json', 'statev2.sqlite', 'statev2.sqlite-wal'])
         self.assertEqual(self.all_hashes(), set(self.newer.values()))
         with open(os.path.join(self.dest, 'userdata/settings.json'), 'a') as f:
@@ -473,7 +742,7 @@ class Restore(CopyBase):
         with self.assertRaises(journal.Refused):
             with journal.run(self.m.state, 'back') as r:
                 try:
-                    coldcopy.plan_restore(self.dest, self.m.home)
+                    coldcopy.plan_restore(self.dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
                 except coldcopy.Incomplete as e:
                     raise journal.Refused(str(e)) from None
         self.assertIsNone(journal.unfinished(self.m.state), 'a refused pre-check needs no settling')
@@ -492,6 +761,121 @@ class Restore(CopyBase):
         self.m.write(os.path.relpath(os.path.join(self.dest, 'manifest.json'), self.m.root), json.dumps(m))
         with self.assertRaises(coldcopy.Incomplete):
             self.restore()
+
+
+def kill_at_each_change(test, restore, check):
+    """Stop a restore at each change it makes to the home (a link, an unlink or a rename: the restore has no
+    clean-up, so stopping on an error there is a kill), call check() on what is left, then run the restore again
+    (it must finish) and check() again; the home is put back between tries. Returns how many stops were tried."""
+    userdata = test.userdata
+    saved = tempfile.mkdtemp(prefix='golive-home-', dir=test.m.root)
+    names = [n for n in os.listdir(userdata) if os.path.isfile(os.path.join(userdata, n))]
+    for n in names:
+        shutil.copy2(os.path.join(userdata, n), saved)
+    real = {f: getattr(os, f) for f in ('link', 'unlink', 'rename')}
+    stop = 0
+    while True:
+        count = [0]
+
+        def counted(f):
+            def call(*args, **kw):
+                count[0] += 1
+                if count[0] > stop:
+                    raise OSError(errno.EIO, f'stopped before change {count[0]}')
+                return real[f](*args, **kw)
+            return call
+        with mock.patch.multiple(coldcopy.os, **{f: counted(f) for f in real}):
+            try:
+                restore()
+                finished = True
+            except OSError:
+                finished = False
+        with test.subTest(stop=stop):
+            check()
+            if not finished:
+                with mock.patch.object(coldcopy, '_stamp', return_value=f'20990101T0000{stop:02d}Z'):
+                    restore()
+                check()
+        if finished:
+            return stop
+        for n in os.listdir(userdata):  # put the home back for the next try (test files only)
+            if os.path.isfile(os.path.join(userdata, n)) and not n.startswith('server-owner.sqlite'):
+                os.unlink(os.path.join(userdata, n))
+        for n in names:
+            shutil.copy2(os.path.join(saved, n), userdata)
+        stop += 1
+
+
+class RealSqlite(CopyBase):
+    """A real WAL-mode SQLite database with commits only in its -wal (and a -shm that is not copied)."""
+
+    def setUp(self):
+        super().setUp()
+        self.userdata = self.m.path('home/userdata')
+        self.db = os.path.join(self.userdata, 'statev2.sqlite')
+        for n in ('statev2.sqlite', 'statev2.sqlite-wal', 'statev2.sqlite-shm'):
+            os.remove(os.path.join(self.userdata, n))
+        self.write_rows(50, 'checkpoint')
+        self.write_rows(30, 'leave-in-wal')
+
+    def write_rows(self, n, how):
+        subprocess.run([sys.executable, '-I', '-c', WAL_WRITER, self.db, str(n), how], check=True, timeout=60,
+                       stdin=subprocess.DEVNULL)
+
+    def open_rows(self, folder, with_wal=True):
+        """(integrity_check, rows) of the database in folder, opened from a scratch copy of the database and its
+        -wal only (no -shm: SQLite rebuilds it), so opening it changes nothing here."""
+        scratch = tempfile.mkdtemp(prefix='golive-open-', dir=self.m.root)
+        for n in ('statev2.sqlite',) + (('statev2.sqlite-wal',) if with_wal else ()):
+            if os.path.exists(os.path.join(folder, n)):
+                shutil.copy2(os.path.join(folder, n), scratch)
+        c = sqlite3.connect(os.path.join(scratch, 'statev2.sqlite'))
+        try:
+            return c.execute('PRAGMA integrity_check').fetchone()[0], c.execute('SELECT count(*) FROM t').fetchone()[0]
+        finally:
+            c.close()
+
+    def test_a_cold_copy_of_a_wal_mode_database_opens_whole_with_every_commit(self):
+        self.assertTrue(os.path.exists(self.db + '-shm'))
+        self.assertGreater(os.path.getsize(self.db + '-wal'), 0)
+        self.assertEqual(self.open_rows(self.userdata, with_wal=False), ('ok', 50), '30 commits are only in the WAL')
+        dest = self.copy(owner_says_go=True)['copy']
+        copied = os.path.join(dest, 'userdata')
+        self.assertFalse(os.path.exists(os.path.join(copied, 'statev2.sqlite-shm')))
+        self.assertEqual(self.open_rows(copied), ('ok', 80))
+
+    def test_a_restore_of_a_wal_mode_database_stopped_anywhere_opens_whole(self):
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'checkpoint')    # life goes on: the database file changes,
+        self.write_rows(20, 'leave-in-wal')  # and a new WAL holds more
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 120))
+        self.adapter.stop()
+        old = {n: sha(os.path.join(self.userdata, n)) for n in ('statev2.sqlite', 'statev2.sqlite-wal',
+                                                                 'statev2.sqlite-shm', 'settings.json')}
+
+        def restore():
+            with journal.run(self.m.state, 'back') as r:
+                with r.step('restore'):
+                    coldcopy.restore(r, dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+
+        def check_home():
+            integrity, rows = self.open_rows(self.userdata)
+            self.assertEqual(integrity, 'ok')
+            self.assertIn(rows, (120, 100, 50, 80), 'neither the old nor the copied database')
+            have = {sha(os.path.join(self.userdata, n)) for n in os.listdir(self.userdata)
+                    if os.path.isfile(os.path.join(self.userdata, n)) and not n.startswith('server-owner')}
+            self.assertLessEqual(set(old.values()), have, 'a file of the home was lost')
+            if os.path.exists(self.db + '-wal'):
+                self.assertTrue(os.path.exists(self.db))
+
+        def settled_restore():
+            try:
+                restore()
+            except Exception:
+                journal.settle(self.m.state, 'test: looked at the home')
+                raise
+        kill_at_each_change(self, settled_restore, check_home)
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
 
 
 class CommandLine(CopyBase):

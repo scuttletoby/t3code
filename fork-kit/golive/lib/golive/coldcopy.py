@@ -19,8 +19,12 @@ MANIFEST, MANIFEST_VERSION = 'manifest.json', 1
 OWNER_LOCK = 'server-owner.sqlite'  # upstream's ownership lock (serverOwnership.ts); never copied, never deleted
 # Not copied: logs, this server's runtime record and ownership lock, and SQLite's -shm: it is only a shared-memory
 # index that SQLite rebuilds from the WAL when the first connection opens the database, so a cold copy never needs it.
+# Also never copied: a restore's leftover temp files (.<name>.golive-restore-<time>, from a restore stopped half-way).
 SKIP = frozenset({'logs', 'server-runtime.json', OWNER_LOCK, OWNER_LOCK + '-journal'})
+RESTORE_TEMP, ASIDE = '.golive-restore-', '.golive-aside-'
 QUIET_GAP, STOP_WAIT, START_WAIT, POLL = 60, 120, 180, 1.0  # seconds; tests make them small
+GUARD_WAIT = 30  # seconds for the guard to say it waits, before T3 may stop
+GUARD_LOG = 'guard.log'
 HOOK_TIMEOUT, QUIET_TIMEOUT, CHUNK = 120, 30, 8 << 20
 DEFAULT_RESTORE = (live.DATABASE, 'settings.json')
 MB = 1024 * 1024
@@ -29,6 +33,10 @@ _clock = time.monotonic  # the stop limit's clock; tests change it
 
 class Incomplete(Exception):
     """A copy that must not be used: no finished manifest, or files that do not match it."""
+
+
+class WrongCopy(Exception):
+    """A finished copy, but of another home or another T3 version than the caller names."""
 
 
 def _stamp():
@@ -80,15 +88,20 @@ def _copy_file(src, dst, deadline, mode):
     return size, h.hexdigest()
 
 
+def _raise(error):
+    raise error  # os.walk's onerror: an unreadable folder stops the copy instead of being skipped in silence
+
+
 def plan(userdata):
     """What a copy takes from userdata/: [{'path', 'kind', 'bytes', 'mode'[, 'target']}] top-down, and the total
-    bytes. Plain files, folders and links; anything else (a socket, a fifo) is left out and named."""
+    bytes. Plain files, folders and links; anything else (a socket, a fifo) is left out and named. A folder that
+    cannot be read raises OSError (a copy that says complete must hold everything)."""
     entries, total, left_out = [], 0, []
-    for d, dirs, names in os.walk(userdata):
+    for d, dirs, names in os.walk(userdata, onerror=_raise):
         rel_d = os.path.relpath(d, userdata)
         for n in sorted(dirs + names):
             rel = n if rel_d == '.' else f'{rel_d}/{n}'
-            if rel_d == '.' and (n in SKIP or n.endswith('-shm')):
+            if rel_d == '.' and (n in SKIP or n.endswith('-shm') or (n.startswith('.') and RESTORE_TEMP in n)):
                 if n in dirs:
                     dirs.remove(n)
                 continue
@@ -125,7 +138,7 @@ def copy_userdata(run, home, dest, deadline):
             size, e['sha256'] = _copy_file(src, dst, deadline, e['mode'])
             if size != e['bytes']:
                 raise RuntimeError(f'{src} changed size while T3 was stopped ({e["bytes"]} -> {size} bytes)')
-    for d, dirs, _ in os.walk(os.path.join(dest, 'userdata')):
+    for d, dirs, _ in os.walk(os.path.join(dest, 'userdata'), onerror=_raise):
         _fsync_dir(d)
     _fsync_dir(dest)
     _fsync_dir(os.path.dirname(dest))
@@ -155,8 +168,9 @@ def write_manifest(run, dest, manifest):
     _fsync_dir(dest)
 
 
-def read_manifest(copy_dir):
-    """The manifest of a finished copy; Incomplete when it has none, or one this kit cannot read."""
+def read_manifest(copy_dir, home=None, live_version=None):
+    """The manifest of a finished copy; Incomplete when it has none, or one this kit cannot read. With home and
+    live_version, WrongCopy unless the copy was taken of that home while that T3 version served it."""
     path = os.path.join(copy_dir, MANIFEST)
     try:
         with open(path, encoding='utf-8') as f:
@@ -168,6 +182,11 @@ def read_manifest(copy_dir):
     if not (isinstance(m, dict) and m.get('manifestVersion') == MANIFEST_VERSION and m.get('complete') is True
             and isinstance(m.get('files'), list)):
         raise Incomplete(f'{path} is not a finished manifest of version {MANIFEST_VERSION}: the copy is not used')
+    if home is not None and m.get('home') != os.path.normpath(home):
+        raise WrongCopy(f'{copy_dir} is a copy of {m.get("home")}, not of {os.path.normpath(home)}')
+    if live_version is not None and m.get('liveVersion') != live_version:
+        raise WrongCopy(f'{copy_dir} was taken under t3 {m.get("liveVersion")}, not {live_version}: the data may '
+                        'not match that build')
     return m
 
 
@@ -220,12 +239,15 @@ def hold_owner_lock(userdata, wait_seconds):
             time.sleep(POLL)
 
 
-def plan_restore(copy_dir, home, names=DEFAULT_RESTORE, floor_bytes=0):
-    """Read only: may this copy be restored into `home`? Returns ({path: manifest entry}, [files to put back]);
-    raises Incomplete (no finished manifest, no database, a file that differs from the manifest), ValueError (a
-    name that is not a top-level userdata file) or OSError (not enough free disk). A caller runs it as a pre-check
-    before its restore step, so a refusal changes nothing and needs no settling; restore() runs it again."""
-    m = read_manifest(copy_dir)
+def plan_restore(copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, floor_bytes=0):
+    """Read only: may this copy be restored into `home`? `from_home` is the home the copy must have been taken of
+    (the same home for `back`, the live home for a rehearsal) and `version` the T3 build that will start on the
+    restored data: it must be the build the copy was taken under (WrongCopy otherwise). Returns
+    ({path: manifest entry}, [files to put back]); raises Incomplete (no finished manifest, no database, a file
+    that differs from the manifest), ValueError (a name that is not a top-level userdata file) or OSError (not
+    enough free disk). A caller runs it as a pre-check before its restore step, so a refusal changes nothing and
+    needs no settling; restore() runs it again."""
+    m = read_manifest(copy_dir, from_home, version)
     files = {e.get('path'): e for e in m['files'] if isinstance(e, dict) and e.get('kind') == 'file'}
     userdata = os.path.join(home, 'userdata')
     want = []
@@ -246,37 +268,59 @@ def plan_restore(copy_dir, home, names=DEFAULT_RESTORE, floor_bytes=0):
     return files, want
 
 
-def restore(run, copy_dir, home, names=DEFAULT_RESTORE, floor_bytes=0):
+def _companions(name):
+    """A database's files that only mean something next to it: -shm, -journal, -wal (empty for other files)."""
+    return [f'{name}-shm', f'{name}-journal', f'{name}-wal'] if name.endswith('.sqlite') else []
+
+
+def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, floor_bytes=0):
     """The restore primitive (used by `rehearse` and `back`), in a step, with the home's server stopped: puts
-    userdata/<name> from a finished copy back into `home`. The copy is read back against its manifest first
-    (plan_restore); the home's files are moved aside with a time in their name (never deleted), and the copy's
-    files go in through temp names and a rename. Running it again starts again from the untouched copy.
-    Refused (TimeoutError) while any server holds the home's ownership lock. Returns the step's facts."""
+    userdata/<name> from a finished copy back into `home` (see plan_restore for from_home and version). Refused
+    (TimeoutError) while any server holds the home's ownership lock. Returns the step's facts.
+
+    Order, so that a stop at any point loses nothing and never leaves a WAL without its database or a database
+    with another database's WAL:
+    1. the copy's files are copied in under temp names (.<name>.golive-restore-<time>) and checked;
+    2. every home file this replaces gets a second name first, a hard link <name>.golive-aside-<time> (fsynced):
+       from here on each one is kept whatever happens;
+    3. the database's -shm, -journal and -wal leave the home (their aside names keep them), then the files the
+       copy does not hold. The home now has its own database without its WAL: an older but whole database;
+    4. the copy's database renames over the home's (atomic), then its WAL and journal go in.
+    Running it again starts again from the untouched copy; a stop half-way leaves temp files, which a copy skips."""
     run.require_step('restore')
-    files, want = plan_restore(copy_dir, home, names, floor_bytes)
+    files, want = plan_restore(copy_dir, home, from_home=from_home, version=version, names=names,
+                               floor_bytes=floor_bytes)
     userdata = os.path.join(home, 'userdata')
     lock = hold_owner_lock(userdata, 0)
     try:
-        stamp, moved = _stamp(), []
-        temps = {}
+        stamp, temps, aside = _stamp(), {}, []
         for n in want:
-            tmp = os.path.join(userdata, f'.{n}.golive-restore-{stamp}')
+            tmp = os.path.join(userdata, _free_name(userdata, f'.{n}{RESTORE_TEMP}{stamp}'))
             _, digest = _copy_file(os.path.join(copy_dir, 'userdata', n), tmp, None, files[n]['mode'])
             if digest != files[n]['sha256']:
                 raise Incomplete(f'{tmp} does not match the manifest after copying')
             temps[n] = tmp
-        for name in names:
-            for n in _family(name) + ([f'{name}-shm'] if name.endswith('.sqlite') else []):
-                if os.path.lexists(os.path.join(userdata, n)):
-                    aside = _free_name(userdata, f'{n}.golive-aside-{stamp}')
-                    os.rename(os.path.join(userdata, n), os.path.join(userdata, aside))
-                    moved.append(aside)
-        for n, tmp in temps.items():
-            os.rename(tmp, os.path.join(userdata, n))
         _fsync_dir(userdata)
+        replaced = [n for name in names for n in [name] + _companions(name)
+                    if os.path.lexists(os.path.join(userdata, n))]
+        for n in replaced:
+            a = _free_name(userdata, f'{n}{ASIDE}{stamp}')
+            os.link(os.path.join(userdata, n), os.path.join(userdata, a), follow_symlinks=False)
+            aside.append(a)
+        _fsync_dir(userdata)
+        for name in names:
+            for n in _companions(name) + ([name] if name not in temps else []):
+                if os.path.lexists(os.path.join(userdata, n)):
+                    os.unlink(os.path.join(userdata, n))  # its aside name keeps it
+        _fsync_dir(userdata)
+        for name in names:
+            for n in _family(name):  # the database first, then its WAL and journal
+                if n in temps:
+                    os.rename(temps[n], os.path.join(userdata, n))
+                    _fsync_dir(userdata)
     finally:
         lock.close()
-    return {'copy': copy_dir, 'restored': want, 'movedAside': moved}
+    return {'copy': copy_dir, 'restored': want, 'movedAside': aside}
 
 
 # --- the practice stop ---
@@ -355,40 +399,184 @@ def _wait_stopped(adapter, old_pid):
     raise RuntimeError(f'{osadapter.UNIT} did not stop within {STOP_WAIT} s')
 
 
+def _existing(path):
+    while not os.path.isdir(path):
+        path = os.path.dirname(path)
+    return path
+
+
+def _device(path):
+    return os.stat(path).st_dev
+
+
+def _free_bytes(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def _free_check(cfg, total):
+    """Refused unless the backup disk holds the copy plus the floor and the stateDir disk (the journal, the guard
+    log) keeps the floor free; a disk holding both needs the copy plus one floor."""
+    need = {}
+    for folder, size in ((cfg.backup_dir, total), (cfg.state_dir, 0)):
+        path = _existing(folder)
+        need.setdefault(_device(path), [path, cfg.free_floor_mb * MB])[1] += size
+    for path, want in need.values():
+        free = _free_bytes(path)
+        if free < want:
+            raise journal.Refused(f'{path}: {free // MB} MB free, needs {want // MB} MB (the copy {total // MB} MB '
+                                  f'on the backup disk, floor {cfg.free_floor_mb} MB); nothing was changed')
+
+
+def _plan_total(cfg):
+    try:
+        return plan(os.path.join(cfg.home, 'userdata'))[1]
+    except OSError as e:
+        raise journal.Refused(f'the T3 home cannot be read in full ({e}); nothing was changed') from None
+
+
+def _server_changed(cfg, adapter, server):
+    """Why the live server is not the one the checks passed (None when it still is). The auto-updater keeps the
+    same quiet contract, so it may restart T3 on a newer build (and migrate its database) while a copy waits."""
+    try:
+        svc = adapter.service()
+        now = live.live_server(cfg.home, svc['mainPid']) if svc['active'] else None
+        active, pending = live.service_state(cfg.home)
+    except (live.NotLive, osadapter.AdapterError) as e:
+        return f'the live server cannot be read again: {e}'
+    if now is None:
+        return f'{osadapter.UNIT} is not active any more'
+    if (now['pid'], now['version']) != (server['pid'], server['version']):
+        return (f'the live server changed (t3 {server["version"]} pid {server["pid"]} -> t3 {now["version"]} pid '
+                f'{now["pid"]})')
+    if active != server['version']:
+        return f'the service state now names t3 {active}, not the live {server["version"]}'
+    if pending:
+        return f'an update to {pending.get("targetVersion")} is pending'
+    found = live.markers(cfg.home)
+    return f'markers appeared: {", ".join(found)}' if found else None
+
+
+def _same_after_stop(cfg, server):
+    """In the stop step, once no server can start: the T3 that stopped was the one the run checked, and the one
+    that will start again is too. RuntimeError otherwise (an update slipped in between the last look and the stop)."""
+    active, pending = live.service_state(cfg.home)
+    if active != server['version'] or pending:
+        raise RuntimeError(f'the service state changed at the stop (now t3 {active}'
+                           f'{", an update pending" if pending else ""}); the copy is not taken')
+    try:
+        with open(os.path.join(cfg.home, 'userdata', 'server-runtime.json'), encoding='utf-8') as f:
+            pid = json.load(f).get('pid')
+    except (OSError, ValueError, AttributeError):
+        return
+    if pid != server['pid']:
+        raise RuntimeError(f'another server (pid {pid}) ran on the home before the stop; the copy is not taken')
+
+
+def _guard_log(state_dir, record):
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    with open(os.path.join(state_dir, GUARD_LOG), 'a', encoding='utf-8') as f:
+        f.write(json.dumps({'at': _stamp(), **record}) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _guard_waiting(state_dir, run_id):
+    """True once the guard of this run logged that it waits (within GUARD_WAIT seconds)."""
+    end = time.monotonic() + GUARD_WAIT
+    while True:
+        try:
+            with open(os.path.join(state_dir, GUARD_LOG), encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and rec.get('run') == run_id and rec.get('waiting') is True:
+                        return True
+        except FileNotFoundError:
+            pass
+        if time.monotonic() >= end:
+            return False
+        time.sleep(POLL)
+
+
+def _guard_alive(adapter, unit):
+    try:
+        return adapter.unit_active(unit)
+    except osadapter.AdapterError:
+        return False
+
+
+def _restart(run, cfg, adapter, server, say):
+    """Start T3 again FIRST and journal it after (a full disk must not keep T3 down), then verify it. Returns the
+    error, or None."""
+    try:
+        adapter.start()
+        start_error = None
+    except BaseException as e:
+        start_error = e
+    try:
+        with run.step('start-service', startedBeforeThisLine=True) as facts:
+            if start_error is not None:
+                facts['error'] = str(start_error)
+                raise start_error
+        with run.step('verify') as facts:
+            again = _wait_started(cfg, adapter, server['version'], server['pid'])
+            facts.update(pid=again['pid'], version=again['version'])
+        say(f't3 {again["version"]} runs again (pid {again["pid"]})')
+    except BaseException as e:
+        if start_error is not None and e is not start_error:  # the journal failed too: keep why the start failed
+            e.add_note(f'and the start had failed: {type(start_error).__name__}: {start_error}')
+        return e
+    return None
+
+
 def run_copy(cfg, adapter, owner_says_go=False, say=print):
     """The practice stop, in this process. Returns the result dict; raises journal.Refused (nothing changed or
-    all undone), journal.Busy / Unfinished, or the error that ended a run (it then needs settling)."""
+    all undone), journal.Busy / Unfinished, or the error that ended a run (it then needs settling). When more
+    than one thing failed, the first error is raised with the others as notes."""
     with journal.run(cfg.state_dir, 'copy') as run:
         code, result = check_mod.run_check(cfg, adapter, own_run=run)
         failed = [f'{c["name"]}: {c["detail"]}' for c in result['checks'] if not c['ok']]
         if code != 0 or result.get('nothing'):
             raise journal.Refused('; '.join(failed + result['info']) or 'check refused')
         server = result['live']
-        _, total, left_out = plan(os.path.join(cfg.home, 'userdata'))
-        parent = cfg.backup_dir
-        while not os.path.isdir(parent):
-            parent = os.path.dirname(parent)
-        st = os.statvfs(parent)
-        if st.f_bavail * st.f_frsize < total + cfg.free_floor_mb * MB:
-            raise journal.Refused(f'{parent}: {st.f_bavail * st.f_frsize // MB} MB free, the copy needs '
-                                  f'{total // MB} MB + floor {cfg.free_floor_mb} MB')
+        _free_check(cfg, _plan_total(cfg))  # before the wait: no use waiting hours for a copy that cannot fit
         if cfg.quiet_command is None and not owner_says_go:
             raise journal.Refused('the machine file has no golive.quietCommand: set one, or pass --owner-says-go')
         if not owner_says_go:
             wait_quiet(cfg, server['version'], say)
+            _free_check(cfg, _plan_total(cfg))  # and again after it: the wait may have taken hours
+        why = _server_changed(cfg, adapter, server)
+        if why is not None:
+            raise journal.Refused(f'{why}; nothing was changed')
         dest = os.path.join(cfg.backup_dir, f't3-copy-{_stamp()}-{server["version"]}')
         if os.path.lexists(dest):
             raise journal.Refused(f'{dest} already exists; a copy never goes over another: try again in a second')
         with run.step('guard') as facts:
-            facts['unit'] = f't3-golive-guard-{os.getpid()}-{os.urandom(3).hex()}'
-            adapter.run_detached(facts['unit'], [KIT_BIN, 'guard', '--run', run.id])
+            unit = facts['unit'] = f't3-golive-guard-{os.getpid()}-{os.urandom(3).hex()}'
+            try:
+                adapter.run_detached(unit, [KIT_BIN, 'guard', '--run', run.id])
+                facts['waiting'] = _guard_waiting(cfg.state_dir, run.id)
+            except osadapter.AdapterError as e:
+                facts.update(waiting=False, error=str(e))
+        if not facts['waiting']:
+            raise journal.Refused(f'the guard {unit} did not come up within {GUARD_WAIT} s'
+                                  f'{": " + facts["error"] if "error" in facts else ""}; T3 was not stopped')
         failed_hook = _hooks(run, 'pre-hooks', cfg.pre_hooks, cfg.home)
         if failed_hook is None and not owner_says_go:
             ok, detail = quiet_now(cfg, server['version'])
             failed_hook = None if ok else f'not quiet any more: {detail}'
+        if failed_hook is None:  # the last look before the stop
+            failed_hook = _server_changed(cfg, adapter, server)
+        if failed_hook is None and not _guard_alive(adapter, unit):
+            failed_hook = f'the guard {unit} is not running any more'
         if failed_hook is not None:
             again = _hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
-            raise journal.Refused(f'{failed_hook}; T3 was not stopped' + (f'; post hook: {again}' if again else ''))
+            if again:  # jobs may stay paused: not a clean refusal, the owner must look (settle)
+                raise RuntimeError(f'{failed_hook}; T3 was not stopped; then a post hook failed: {again}')
+            raise journal.Refused(f'{failed_hook}; T3 was not stopped')
         say(f'stopping {osadapter.UNIT} (t3 {server["version"]}, pid {server["pid"]}) for the copy')
         error, lock, stopping = None, None, False
         try:
@@ -397,6 +585,7 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
                 adapter.stop()
                 _wait_stopped(adapter, server['pid'])
                 lock = hold_owner_lock(os.path.join(cfg.home, 'userdata'), STOP_WAIT)
+                _same_after_stop(cfg, server)
             deadline = _clock() + cfg.stop_limit_seconds
             with run.step('cold-copy', dest=dest) as facts:
                 entries, total, left_out = copy_userdata(run, cfg.home, dest, deadline)
@@ -415,49 +604,60 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
         finally:
             if lock is not None:
                 lock.close()
-        try:
-            if stopping:
-                with run.step('start-service'):
-                    adapter.start()
-                with run.step('verify') as facts:
-                    again = _wait_started(cfg, adapter, server['version'], server['pid'])
-                    facts.update(pid=again['pid'], version=again['version'])
-                say(f't3 {again["version"]} runs again (pid {again["pid"]})')
-        finally:
+        errors = [error] if error is not None else []
+        if stopping:
+            restart_error = _restart(run, cfg, adapter, server, say)
+            if restart_error is not None:
+                errors.append(restart_error)
+        try:  # a journal that cannot be written stops this too: the guard then runs the post hooks
             failed_hook = _hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
-        if error is not None:
-            raise error
-        if failed_hook:
-            raise RuntimeError(f'post hook failed: {failed_hook}')
+            if failed_hook:
+                errors.append(RuntimeError(f'post hook failed: {failed_hook}'))
+        except BaseException as e:
+            errors.append(e)
+        if errors:
+            first = errors[0]
+            for later in errors[1:]:
+                first.add_note(f'then: {type(later).__name__}: {later}')
+            raise first
         return {'copy': dest, 'bytes': total, 'liveVersion': server['version'], 'leftOut': left_out}
 
 
 def guard(cfg, adapter, run_id):
-    """Started detached by a copy run before T3 stops. Waits for that run to end however it ends (the lock frees
-    when its holder dies), then starts T3 if the run had stopped it and left it stopped, and runs the post hooks
-    if the run ran the pre hooks but not the post hooks. It changes nothing else and writes no journal line (the
-    run, ended or killed, stays as it is for the owner). Logs to <stateDir>/guard.log. Returns what it did."""
+    """Started detached by a copy run before T3 stops. Logs that it waits (the run stops T3 only after this line),
+    then waits for that run to end however it ends (the lock frees when its holder dies), then starts T3 if the
+    run had stopped it and left it stopped, and runs the post hooks if the run ran the pre hooks but not the post
+    hooks. A journal it cannot read fails open: T3 is started if it is not active and the post hooks run (each is
+    safe twice). It changes nothing else and writes no journal line (the run, ended or killed, stays as it is for
+    the owner). Logs to <stateDir>/guard.log. Returns what it did."""
+    try:
+        _guard_log(cfg.state_dir, {'run': run_id, 'waiting': True})
+    except OSError:
+        pass  # the run then does not see this guard and refuses before T3 stops
     with journal.lock(cfg.state_dir, 'guard', exclusive=True, wait=True):
         did = []
         try:
             runs, _ = journal.read(cfg.state_dir)
-        except journal.Damaged as e:
-            runs = []
-            did.append(f'journal unreadable, did nothing: {e}')
-        mine = [r for r in runs if r['id'] == run_id]
-        steps = {(s['step'], s['phase']) for s in mine[0]['steps']} if mine else set()
-        if ('stop-service', 'started') in steps:
+            mine = [r for r in runs if r['id'] == run_id]
+            steps = {(s['step'], s['phase']) for s in mine[0]['steps']} if mine else set()
+            stopped = ('stop-service', 'started') in steps
+            paused = ('pre-hooks', 'started') in steps and ('post-hooks', 'done') not in steps
+        except (journal.Damaged, OSError) as e:  # Newer included
+            mine, stopped, paused = [], True, True
+            did.append(f'journal unreadable, so T3 is put back as if the run had stopped it: {e}')
+        if stopped:
             try:
                 if not adapter.service()['active']:
                     adapter.start()
                     did.append(f'started {osadapter.UNIT}')
             except osadapter.AdapterError as e:
                 did.append(f'could not start {osadapter.UNIT}: {e}')
-        if ('pre-hooks', 'started') in steps and ('post-hooks', 'done') not in steps:
+        if paused:
             did += [_run_command(p, cfg.home, HOOK_TIMEOUT)[1] for p in cfg.post_hooks]
-        line = json.dumps({'at': _stamp(), 'run': run_id, 'found': bool(mine), 'did': did}) + '\n'
-        with open(os.path.join(cfg.state_dir, 'guard.log'), 'a', encoding='utf-8') as f:
-            f.write(line)
+        try:
+            _guard_log(cfg.state_dir, {'run': run_id, 'found': bool(mine), 'did': did})
+        except OSError:
+            pass
         return did
 
 
@@ -487,7 +687,8 @@ def main_copy(cfg, adapter, here, owner_says_go, out=sys.stdout, err=sys.stderr)
         print(f't3-golive: {e}', file=err)
         return 1
     except Exception as e:
-        print(f't3-golive: the copy failed: {type(e).__name__}: {e}\nT3 was started again if the run got that '
+        notes = ''.join(f'\n{n}' for n in getattr(e, '__notes__', ()))
+        print(f't3-golive: the copy failed: {type(e).__name__}: {e}{notes}\nT3 was started again if the run got that '
               f'far; the copy folder (if any) has no manifest and is never used. {journal.SETTLE_HINT}', file=err)
         return 1
     print(f'copy done: {result["copy"]} ({result["bytes"] // MB} MB, t3 {result["liveVersion"]}); read back, '

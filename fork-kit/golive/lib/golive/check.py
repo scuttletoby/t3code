@@ -74,6 +74,9 @@ def _journal(cfg, add, info, own_id):
     if last is not None and last['end'] is not None and last['end']['result'] != 'ok' and not last['settled']:
         info.append(f'last run: {last["command"]} ended {last["end"]["result"]} before its first step: '
                     f'{last["end"]["detail"]}')
+    elif last is not None and last['end'] is None and not last['settled']:
+        info.append(f'last run: {last["command"]} (pid {last["pid"]}) stopped before its first step; it changed '
+                    'nothing')
     return add('journal', True, 'no run to settle')
 
 
