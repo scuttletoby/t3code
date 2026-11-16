@@ -1,9 +1,9 @@
-// Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit must be listed in .github/fork-ci-tests.txt.
-// A plain entry runs here by its extension (RUNNER); `<test> run by <file>` is run by that file,
-// which must name the test and cannot be a (disabled) upstream workflow. Unlisted or runner-less
-// tests fail; a listed test that is gone fails once the tested history had it, a note before.
+// Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit is listed in .github/fork-ci-tests.txt and
+// runs here by extension (RUNNER), FORK_CI_TEST_JOBS at once (default: CPU count), or `run by <file>` (not an upstream
+// workflow; it names the test). Unlisted or runner-less tests fail; a listed one that is gone fails once history had it.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "../..");
@@ -119,24 +119,74 @@ function readFile(file) {
   }
 }
 
-function main() {
+// Calls start(item) for every item, at most `jobs` at once, each as soon as a slot is free.
+// start returns a promise; the results come back in the items' order.
+async function runAll(items, jobs, start) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await start(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(jobs, items.length)) }, worker));
+  return results;
+}
+
+function jobCount(env = process.env) {
+  const jobs = Number(env.FORK_CI_TEST_JOBS);
+  return Number.isInteger(jobs) && jobs > 0 ? jobs : os.availableParallelism();
+}
+
+// Runs one test file, its stdout and stderr kept together, and prints them as one group when it ends.
+function runTest(file) {
+  const [command, ...args] = RUNNER[file.match(TEST_FILE)[1]];
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const child = childProcess.spawn(command, [...args, file], {
+      cwd: ROOT,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const output = [];
+    child.stdout.on("data", (chunk) => output.push(chunk));
+    child.stderr.on("data", (chunk) => output.push(chunk));
+    let ended = false;
+    const done = (status, signal) => {
+      if (ended) return;
+      ended = true;
+      // Stop reading pipes a left-behind process still holds, so they do not keep this script alive.
+      child.stdout.destroy();
+      child.stderr.destroy();
+      const seconds = ((Date.now() - started) / 1000).toFixed(1);
+      process.stdout.write(`::group::${file} (${seconds} s)\n`);
+      process.stdout.write(Buffer.concat(output));
+      process.stdout.write("\n::endgroup::\n");
+      if (status !== 0)
+        console.log(`::error file=${file}::${file} failed (exit ${status ?? signal})`);
+      resolve({ file, status, seconds });
+    };
+    child.on("error", (error) => {
+      output.push(Buffer.from(`cannot start ${command}: ${error.message}\n`));
+      done(null, "spawn error");
+    });
+    child.on("close", done);
+    // A process the test left behind may hold the pipes open: the test is done when it exits.
+    child.on("exit", (status, signal) => setTimeout(() => done(status, signal), 5000).unref());
+  });
+}
+
+async function main() {
   const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8"));
   const result = plan(entries, presentTests(), everInHistory, readFile);
   const rows = [];
   let failed =
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
-  for (const file of result.run) {
-    const [command, ...args] = RUNNER[file.match(TEST_FILE)[1]];
-    const started = Date.now();
-    console.log(`::group::${file}`);
-    const run = childProcess.spawnSync(command, [...args, file], { cwd: ROOT, stdio: "inherit" });
-    console.log("::endgroup::");
-    const seconds = ((Date.now() - started) / 1000).toFixed(1);
-    if (run.status !== 0) {
-      failed += 1;
-      console.log(`::error file=${file}::${file} failed (exit ${run.status ?? run.signal})`);
-    }
-    rows.push(`| \`${file}\` | ${run.status === 0 ? "passed" : "**failed**"} | ${seconds} s |`);
+  for (const run of await runAll(result.run, jobCount(), runTest)) {
+    if (run.status !== 0) failed += 1;
+    rows.push(
+      `| \`${run.file}\` | ${run.status === 0 ? "passed" : "**failed**"} | ${run.seconds} s |`,
+    );
   }
   for (const file of result.unlisted)
     console.log(`::error file=${file}::${file} is not in ${LIST}; add it there`);
@@ -175,6 +225,10 @@ function main() {
   if (failed) process.exitCode = 1;
 }
 
-module.exports = { plan, readList, findTests, presentTests };
+module.exports = { plan, readList, findTests, presentTests, runAll, jobCount };
 
-if (require.main === module) main();
+if (require.main === module)
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
