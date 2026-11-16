@@ -912,6 +912,60 @@ class Desktop(Base):
         self.assertIsNone(self.files('m2'))
         self.assertTrue(any('m2' in x and 'size' in x for x in self.said), self.said)
 
+    def test_a_negative_extended_header_never_lowers_the_header_count(self):   # lens237sr4: the MUST
+        def hdr(name, typ, size):
+            d = bytearray(tarfile.TarInfo(name).tobuf(format=tarfile.GNU_FORMAT))
+            d[156:157], d[124:136] = typ, size
+            d[148:156] = b' ' * 8
+            d[148:156] = b'%06o\0 ' % sum(d[:512])
+            return bytes(d)
+        neg = b'\xff' + ((1 << 88) - (1 << 20)).to_bytes(11, 'big')   # -1 MB, base-256
+        body = b'A' * ((2 << 20) - 1) + b'\0'                         # a 2 MB long name, over HEADER_MOST
+        blob = hdr('n', tarfile.GNUTYPE_LONGNAME, neg) + hdr('b', tarfile.GNUTYPE_LONGNAME, b'%011o\0' % len(body)) \
+            + body + tarfile.TarInfo('f').tobuf(format=tarfile.GNU_FORMAT) + b'\0' * 1024
+        old_block = lambda self_, n: -(-n // 512) * 512   # tarfile before the CVE-2025-8194 fix: no size check
+        with mock.patch.object(tarfile.TarInfo, '_block', old_block), self.assertRaisesRegex(seed.Torn, 'below 0'):
+            with seed.Tar.open(fileobj=io.BytesIO(blob), mode='r|', tarinfo=seed.Info) as t:
+                t.next()   # before round 5: the 2 MB name read whole, the count at [0, 0]
+
+    def test_a_link_named_with_a_slash_over_a_file_is_refused(self):   # lens237sr4 nit
+        link = tarfile.TarInfo('a/')
+        link.type, link.linkname = tarfile.SYMTYPE, 'x'
+        self.raw('m2', self.block(tarfile.TarInfo('a'), b'1') + self.block(tarfile.TarInfo('x'), b'2')
+                 + self.block(link))
+        self.run_seed()
+        self.assertIsNone(self.files('m2'))   # before round 5: the symlink replaced the file a
+        self.assertTrue(any('m2' in x and 'already there' in x for x in self.said), self.said)
+
+    def test_a_python_without_the_private_tarfile_parts_fetches_nothing(self):   # lens237sr4 nit: exit 2
+        self.make('m2', {'a': b'one'})
+        for owner, k in ((tarfile.TarInfo, '_proc_member'), (tarfile.TarInfo, '_proc_gnusparse_01'),
+                         (tarfile.TarFile, '_find_link_target')):
+            with self.subTest(k), mock.patch.object(owner, k, None):
+                with self.assertRaisesRegex(agent.Bad, k):
+                    self.run_seed()
+                self.assertEqual(self.fetches(), [])
+        self.assertEqual(self.run_seed(), 0)
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+
+    def test_a_host_that_remakes_each_hour_never_meets_the_back_off(self):   # lens237cr4 + sr4: the MUST
+        start, tried = int(time.time()) - 13 * 3600, []
+
+        def torn(agent_, conf, item, root, now, **kw):
+            tried.append(round((now() - start) / 3600))
+            raise seed.Torn('cut off (slow link)')
+        said = []
+        with mock.patch.object(seed, 'fetch', torn):
+            for h in range(12):
+                self.make('m2', {'a': b'%d' % h}, mtime=start + h * 3600 - 60)
+                self.run_seed(now=lambda h=h: start + h * 3600)
+                said += self.said
+        self.assertEqual(tried, [0, 1, 2, 6, 7])   # a new copy skips a wait once per step; before round 5: 0..11
+        fails = [x for x in said if 'keeps' in x]
+        self.assertEqual(len(fails), 5, said)
+        self.assertTrue(all('tried again in about' in x for x in fails), fails)
+        self.assertEqual(['at once if' in x for x in fails], [True, True, False, True, False])
+
     def test_one_lost_list_does_not_reset_the_torn_record(self):   # lens237cr3
         self.make('m2', {'a': b'one'})
         start, codes, real, tried = int(time.time()), {}, seed.listing, []

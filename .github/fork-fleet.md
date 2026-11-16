@@ -755,16 +755,19 @@ in all (the unit allows three), each seed at most 30 minutes. A seed torn again
 and again is tried again after about 1, 2, 4, 8, 16 and then every 24 hours (a
 link too slow for it does not spend every hour on it; a fetch that kills the
 run counts as torn; the times are approximate: the timer's 10 minute random
-delay and a 5 minute margin can make a wait up to an hour longer), and at once
-when the host offers another copy of it. One torn on every try for more than a
-day makes the run exit 1, so `desk-install check` shows FAIL until it is
+delay and a 5 minute margin can make a wait up to an hour longer); another
+copy on the host is tried at once, but only once per wait (the try counts, so a
+host that remakes the seed every hour still meets the back-off). One torn on
+every try for more than a day makes the run exit 1, so `desk-install check` shows FAIL until it is
 fetched (`/var/lib/fork-fleet/seeds/.torn.json` names it and why); so does a
 run that cannot write that file (a full disk). A host that gives no list (down,
 an older kit, a half-done install) means no new seeds: each one here stays until
-its age drops it, and the torn record is left as it is. A desktop whose own fleet config is broken or lacks its pool fetches
-nothing and exits 2 (`desk-install check` shows the seed service's last
-result), but still drops each seed past the `max_age_hours` it was fetched
-with. Jobs see
+its age drops it, the torn record is left as it is, and the run exits 0 (a host
+down for good shows in `desk-install check` only as seeds that age out). A
+desktop whose own fleet config is broken or lacks its pool, or whose Python's
+tarfile lacks the private parts the limits above rely on, fetches nothing and
+exits 2 (`desk-install check` shows the seed service's last result), but still
+drops each seed past the `max_age_hours` it was fetched with. Jobs see
 `/var/lib/fork-fleet/seeds/NAME` read-only (the launcher's `ALLOW_PATHS`;
 the unpacking and old copies beside it, `.new` and `.v`, are visible too and
 hold the same data), copy what they need from it when it is there, and run

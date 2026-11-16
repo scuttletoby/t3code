@@ -36,8 +36,10 @@ Each run (one at a time: a lock) meets this state:
                                                the copy is removed, the old seed stays, the other seeds go on, old
                                                versions are still pruned; tried again after about 1, 2, 4, 8, 16, then
                                                24 hours (TornLog; the hourly timer's RandomizedDelaySec and a 5 min
-                                               margin make each wait up to an hour longer), at once when the host
-                                               offers another copy; torn on every try for over TORN_DAY: exit 1
+                                               margin make each wait up to an hour longer); another copy on the host
+                                               skips the wait once per back-off step (the try still counts, so a
+                                               host that remakes it hourly still backs off); torn on every try for
+                                               over TORN_DAY: exit 1
   .torn.json cannot be written (a full disk)   the run goes on, counts its tries in memory, and exits 1
   a fetch that kills the run (MemoryMax, TimeoutStartSec)
                                                counted as torn before it began; the next run prunes first
@@ -45,7 +47,8 @@ Each run (one at a time: a lock) meets this state:
   no seed (never fetched, the host down)       jobs run cold
   no list (the host down, an older kit that answers with a session or not JSON, exit 1 of a half-done install)
                                                nothing fetched, exit 0; each seed stays until its age drops it; the
-                                               torn record (.torn.json) is left as it is
+                                               torn record (.torn.json) is left as it is (a host down for good shows
+                                               in check only as seeds that age out)
   its own fleet config broken or without POOL  nothing fetched, exit 2; a seed older than its label's maxAgeHours
                                                (its own max_age_hours when it was fetched) is still dropped
   older than max_age_hours, made over SKEW in the future (the clocks disagree), or no longer in the pool's list
@@ -339,6 +342,10 @@ EXTENDED = (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE, tarfile.G
             tarfile.GNUTYPE_LONGLINK)
 
 
+PRIVATE = ('_proc_member', '_proc_sparse', '_proc_gnusparse_00', '_proc_gnusparse_01', '_proc_gnusparse_10',
+           '_find_link_target')   # the private tarfile parts Info's and Tar's limits rely on: without one, no fetch
+
+
 class Info(tarfile.TarInfo):
     """A tar header read with limits tarfile has not: it reads an extended header (pax, or a GNU long name) into
     memory whole and its parsed form takes many times its size, and a sparse member's map can grow without end. So the
@@ -346,6 +353,8 @@ class Info(tarfile.TarInfo):
     whole tar too, and a sparse member is refused (make a seed without --sparse). Torn before tarfile reads one."""
 
     def _proc_member(self, tarfile_):
+        if self.size < 0:   # tarfile refuses it only from the CVE-2025-8194 fix on; here it would lower `used`
+            raise Torn(f'{self.name[:80]!r} has a size below 0')
         used = tarfile_.__dict__.setdefault('fork_headers', [0, 0])   # [before this member, global in all]
         if self.type in EXTENDED:
             used[0] += self.size
@@ -381,7 +390,8 @@ def unpack(t, data, most):
 
     def linked(member, path):
         got = check(member, path)
-        if got is not None and (got.islnk() or got.issym()) and os.path.lexists(os.path.join(path, got.name)):
+        if got is not None and (got.islnk() or got.issym()) and os.path.lexists(
+                os.path.join(path, got.name.rstrip('/'))):   # 'a/' names the path 'a' too
             raise Torn(f'{got.name[:80]!r} is a link to {got.linkname[:80]!r} where a member is already there')
         if got is not None and got.islnk():
             try:
@@ -580,12 +590,15 @@ def own_seeds(conf, config):
 
 def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
     """One run (the module's docstring). A seed that fails in any way, a deep tree included, is said and the run
-    goes on with the next; old versions are pruned in every run. When it may fetch nothing (no data filter, its own
-    fleet config broken or without its pool) it still drops each seed past its age, by its label's max_age_hours,
-    and then says why (agent.Bad: exit 2, the unit's last result shows it)."""
+    goes on with the next; old versions are pruned in every run. When it may fetch nothing (no data filter or no
+    private tarfile part in PRIVATE, its own fleet config broken or without its pool) it still drops each seed past
+    its age, by its label's max_age_hours, and then says why (agent.Bad: exit 2, the unit's last result shows it)."""
     cannot, own = None, None
     if not hasattr(tarfile, 'data_filter'):   # releases with known filter bypasses pass this: settle() checks again
         cannot = 'this Python has no tarfile data filter (3.12, or 3.8.17 and later)'
+    elif gone := [k for k in PRIVATE if not callable(getattr(tarfile.TarFile if k == '_find_link_target'
+                                                             else tarfile.TarInfo, k, None))]:
+        cannot = f'this Python\'s tarfile has no {", ".join(gone)} (the limits of Info and Tar need them)'
     try:
         own = own_seeds(conf, config)
     except Torn as e:
@@ -636,14 +649,15 @@ def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
 
 
 class TornLog:
-    """SEEDS/.torn.json, {name: {"first", "last", "tries", "why", "copy"}}: the seeds whose last fetch was torn,
-    written before each fetch (so a fetch that kills the run, by its memory or time limit, counts as torn too) and
-    cleared when the seed is fetched or the same as the host's. A seed torn TRIES times in a row is tried again only
-    min(2 ** (TRIES - 1), 24) hours after the last try (a link too slow for it, a host that cuts it: not every
-    hour), or at once when the host offers another copy (`copy`: its [bytes, made] when last tried); one torn on
-    every try since more than TORN_DAY is `late`. Only seeds in the host's list are kept, and only in a run that
-    read the list. A missing or unreadable file is an empty record; one that cannot be written (a full disk) is
-    kept in memory for this run and said in `unsaved`."""
+    """SEEDS/.torn.json, {name: {"first", "last", "tries", "why", "copy", "early"}}: the seeds whose last fetch was
+    torn, written before each fetch (so a fetch that kills the run, by its memory or time limit, counts as torn too)
+    and cleared when the seed is fetched or the same as the host's. A seed torn TRIES times in a row is tried again
+    only min(2 ** (TRIES - 1), 24) hours after the last try (a link too slow for it, a host that cuts it: not every
+    hour), or at once when the host offers another copy (`copy`: its [bytes, made] when last tried), but that only
+    once per back-off step (`early`: the last try was such a one); one torn on every try since more than TORN_DAY
+    is `late`. Only seeds in the host's list are kept, and only in a run that read the list. A missing or unreadable
+    file is an empty record; one that cannot be written (a full disk) is kept in memory for this run and said in
+    `unsaved`."""
 
     def __init__(self, root, now):
         self.path, self.now, self.seeds = root and os.path.join(root, '.torn.json'), now, {}
@@ -659,20 +673,30 @@ class TornLog:
     def keep(self, items):
         self.seeds = {n: r for n, r in self.seeds.items() if n in items}
 
-    def due(self, name, item=None):
-        """None when the seed may be tried now (ITEM, the host's offer, another copy than the one last tried
-        included), else the hours until it may."""
+    def left(self, name):
+        """The seconds until the seed's back-off is over, None when it is (or it has no record)."""
         r = self.seeds.get(name)
-        if not r or item and r.get('copy') not in (None, [item['bytes'], item['made']]):
+        if not r:
             return None
         wait = min(2 ** (min(r['tries'], 6) - 1), 24) * 3600 - 300   # 5 min early: the hourly timer drifts
         left = r['last'] + wait - self.now()
-        return math.ceil(left / 3600) if 0 < left <= wait else None   # a date ahead of the clock: try now
+        return left if 0 < left <= wait else None   # a date ahead of the clock: try now
+
+    def due(self, name, item=None):
+        """None when the seed may be tried now, else the hours until it may. ITEM, the host's offer, may skip the
+        wait when it is another copy than the one last tried, but only once per back-off step (`early`: the last
+        try skipped it), so a host that remakes the seed every hour still meets the back-off."""
+        r, left = self.seeds.get(name), self.left(name)
+        if left is None or item and not r.get('early') and r.get('copy') not in (None, [item['bytes'], item['made']]):
+            return None
+        return math.ceil(left / 3600)
 
     def trying(self, name, item=None):
-        """Counted as torn before the fetch, saved: `why` says so until the fetch ends."""
+        """Counted as torn before the fetch, saved: `why` says so until the fetch ends; `early` when it is tried
+        before its back-off is over (a new copy)."""
+        early = self.left(name) is not None
         r = self.seeds.get(name) or {'first': int(self.now()), 'tries': 0}
-        self.seeds[name] = {**r, 'last': int(self.now()), 'tries': r['tries'] + 1,
+        self.seeds[name] = {**r, 'last': int(self.now()), 'tries': r['tries'] + 1, 'early': early,
                             'why': 'the run stopped during the fetch (its memory or time limit?)'}
         if item:
             self.seeds[name]['copy'] = [item['bytes'], item['made']]
@@ -769,8 +793,10 @@ def take(agent, conf, item, root, now, say, torn=None, end=None):
     except Exception as e:   # any: a torn stream, a full disk, a tar this Python cannot unpack
         why = f'{e.__class__.__name__}: {str(e)[:300]}'
         torn.torn(name, why)
-        hours = min(2 ** (min(torn.seeds[name]['tries'], 6) - 1), 24)
-        say(f'seed {name}: keeps {"the old one" if label else "none"}: {why}; tried again in {hours} h')
+        r = torn.seeds[name]
+        hours = min(2 ** (min(r['tries'], 6) - 1), 24)
+        say(f'seed {name}: keeps {"the old one" if label else "none"}: {why}; tried again in about {hours} h'
+            + ('' if r['early'] else ' (at once if the host makes another copy before then)'))
         return False
     torn.fine(name)
     say(f'seed {name}: {got["bytes"] >> 20} MB, sha256 checked, swapped in')
