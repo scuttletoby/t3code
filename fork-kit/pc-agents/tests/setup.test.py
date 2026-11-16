@@ -107,6 +107,7 @@ class Setup(Case):
         self.assertIn('restart t3code-agents.service', self.log())
 
     def test_stopped_half_way_then_run_again(self):
+        self.no_watch()
         self.terminate()
         self.assertEqual(self.setup_run()[0], 0)
         whole = {p: v[4] for p, v in self.snapshot().items()}
@@ -317,17 +318,16 @@ class RestartPending(Case):
         upgrade = {**CONFIG, 'memoryMax': '4G', 'maxRuntimeMode': 'approval-required'}
         real_put, writes = cli.put, []
         self.addCleanup(setattr, cli, 'put', real_put)
+        self.no_watch()
         self.ready()
         self.machine(upgrade)
+        upgradable = self.keep()   # a machine set up all the way, its config just changed
         cli.put = lambda *a, **kw: writes.append(a[0]) or real_put(*a, **kw)
         self.assertEqual(self.setup_run(SHA2)[0], 0)
         cli.put = real_put
         self.assertGreater(len(writes), 10)
         for stop in range(1, len(writes) + 1):
-            shutil.rmtree(self.root)
-            self.setUp()
-            self.ready()
-            self.machine(upgrade)
+            self.restore(upgradable)
             before = files()
 
             def stopping(*a, n=[0], **kw):

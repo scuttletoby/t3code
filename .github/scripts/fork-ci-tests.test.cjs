@@ -8,6 +8,9 @@ const test = require("node:test");
 const {
   plan,
   readList,
+  order,
+  inPart,
+  weightNote,
   findTests,
   presentTests,
   runAll,
@@ -80,12 +83,94 @@ test("a test run elsewhere must be named by its runner, which is not an upstream
   assert.match(result.notRun[1].why, /upstream workflow/);
 });
 
-test("the list ignores comments and blank lines and reads `run by`", () => {
-  assert.deepEqual(readList("# head\n\na.test.sh  # from #2\n  b.test.py run by c.yml\n"), [
-    { file: "a.test.sh", runBy: null },
-    { file: "b.test.py", runBy: "c.yml" },
-  ]);
-  assert.throws(() => readList("a.test.sh run c.yml\n"), /cannot read/);
+test("the list ignores comments and blank lines and reads `run by` and weights", () => {
+  assert.deepEqual(
+    readList("# head\n\na.test.sh  # from #2\n  b.test.py run by c.yml\nd.test.cjs ~120s\n"),
+    [
+      { file: "a.test.sh", runBy: null, weight: null },
+      { file: "b.test.py", runBy: "c.yml", weight: null },
+      { file: "d.test.cjs", runBy: null, weight: 120 },
+    ],
+  );
+  for (const bad of [
+    "a.test.sh run c.yml",
+    "a.test.sh ~0s",
+    "a.test.sh ~12",
+    "a.test.sh ~1.5s",
+    "a.test.sh ~12s run by c.yml",
+  ])
+    assert.throws(() => readList(`${bad}\n`), /cannot read/, bad);
+});
+
+test("the heaviest tests start first, tests without a weight before them, ties in list order", () => {
+  const entries = readList(
+    "a.test.sh ~10s\nb.test.sh\nc.test.sh ~90s\nd.test.sh ~10s\ne.test.sh\n",
+  );
+  assert.deepEqual(
+    order(["a.test.sh", "b.test.sh", "c.test.sh", "d.test.sh", "e.test.sh"], entries),
+    ["b.test.sh", "e.test.sh", "c.test.sh", "a.test.sh", "d.test.sh"],
+  );
+  assert.deepEqual(order(["d.test.sh", "a.test.sh"], entries), ["a.test.sh", "d.test.sh"]);
+});
+
+test("a part is the files under its prefixes and under none of its `!` prefixes", () => {
+  const files = ["fork-kit/a.test.py", "fork-kit/x/b.test.sh", ".github/scripts/c.test.cjs"];
+  const pick = (...parts) => files.filter((file) => inPart(file, parts));
+  assert.deepEqual(pick(), files);
+  assert.deepEqual(pick("fork-kit/"), files.slice(0, 2));
+  assert.deepEqual(pick("!fork-kit/"), files.slice(2));
+  assert.deepEqual(pick("fork-kit/", "!fork-kit/x/"), files.slice(0, 1));
+});
+
+// The arguments of each `node .github/scripts/fork-ci-tests.cjs ...` call in a workflow's text.
+const runnerCalls = (text) =>
+  text
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .flatMap((line) => [
+      ...line.matchAll(/\bnode\s+\.github\/scripts\/fork-ci-tests\.cjs((?:[ \t]+[^\s#;&|]+)*)/g),
+    ])
+    .map((match) =>
+      [...match[1].matchAll(/'([^']*)'|"([^"]*)"|(\S+)/g)].map((a) => a[1] ?? a[2] ?? a[3]),
+    );
+
+test("reads a workflow's runner calls, quotes removed, comment lines skipped", () => {
+  const text = [
+    "      # node .github/scripts/fork-ci-tests.cjs commented/",
+    "        run: node .github/scripts/fork-ci-tests.cjs fork-kit/",
+    "          node .github/scripts/fork-ci-tests.cjs '!fork-kit/' \"!x/\" # a note",
+    "          node .github/scripts/fork-ci-tests.cjs",
+  ].join("\n");
+  assert.deepEqual(runnerCalls(text), [["fork-kit/"], ["!fork-kit/", "!x/"], []]);
+});
+
+test("Fork tests' runner calls split every listed and present test into exactly one part", () => {
+  const root = path.resolve(__dirname, "../..");
+  const calls = runnerCalls(
+    fs.readFileSync(path.join(root, ".github/workflows/fork-tests.yml"), "utf8"),
+  );
+  assert.ok(calls.length > 0, "fork-tests.yml calls fork-ci-tests.cjs");
+  const listed = readList(fs.readFileSync(path.join(root, ".github/fork-ci-tests.txt"), "utf8"));
+  const files = [...new Set([...listed.map(({ file }) => file), ...presentTests(root)])];
+  const wrong = files
+    .map((file) => [file, calls.filter((parts) => inPart(file, parts))])
+    .filter(([, parts]) => parts.length !== 1)
+    .map(
+      ([file, parts]) =>
+        `${file}: in ${parts.length} parts (${parts.map((p) => p.join(" ") || "all").join("; ")})`,
+    );
+  assert.deepEqual(wrong, []);
+});
+
+test("a long test without a weight, or one far from its weight, gets a note", () => {
+  assert.equal(weightNote("a.test.sh", null, 20), null);
+  assert.match(weightNote("a.test.sh", null, 45), /no weight: add "~45s"/);
+  assert.equal(weightNote("a.test.sh", 100, 180), null); // load moves times this much
+  assert.equal(weightNote("a.test.sh", 100, 60), null);
+  assert.match(weightNote("a.test.sh", 100, 230), /weight is ~100s: update it/);
+  assert.equal(weightNote("a.test.sh", 10, 35), null);
+  assert.match(weightNote("a.test.sh", 10, 45), /update it/);
+  assert.match(weightNote("a.test.sh", 200, 20), /update it/);
 });
 
 test("finds every *.test.* file, subdirectories included", () => {
@@ -189,7 +274,7 @@ test("jobCount reads FORK_CI_TEST_JOBS, else the CPU count", () => {
 });
 
 // Runs the real script in a scratch tree whose list names `tests` ({ file: shell text }).
-function runScript(tests, jobs) {
+function runScript(tests, jobs, args = [], list = Object.keys(tests).join("\n")) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-tests-"));
   const write = (file, text) => {
     fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
@@ -199,7 +284,7 @@ function runScript(tests, jobs) {
     ".github/scripts/fork-ci-tests.cjs",
     fs.readFileSync(require.resolve("./fork-ci-tests.cjs")),
   );
-  write(".github/fork-ci-tests.txt", Object.keys(tests).join("\n") + "\n");
+  write(".github/fork-ci-tests.txt", list + "\n");
   for (const [file, text] of Object.entries(tests)) write(file, text);
   const env = {
     ...process.env,
@@ -208,7 +293,7 @@ function runScript(tests, jobs) {
     MARKS: root,
   };
   delete env.GITHUB_STEP_SUMMARY;
-  const run = childProcess.spawnSync("node", [".github/scripts/fork-ci-tests.cjs"], {
+  const run = childProcess.spawnSync("node", [".github/scripts/fork-ci-tests.cjs", ...args], {
     cwd: root,
     env,
     encoding: "utf8",
@@ -246,6 +331,54 @@ test("test files run in parallel, each one's output in its own group, and a fail
       run.stdout,
       /::error file=fork-ci\/c\.test\.sh::fork-ci\/c\.test\.sh failed \(exit 3\)/,
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one part runs only its files, heaviest first; an unlisted file fails only its own part", () => {
+  const tests = {
+    "fork-kit/light.test.sh": "echo light\n",
+    "fork-kit/heavy.test.sh": "echo heavy\n",
+    "fork-ci/other.test.sh": "echo other\n",
+    "fork-ci/unlisted.test.sh": "echo unlisted\n",
+  };
+  const list = "fork-kit/light.test.sh ~5s\nfork-kit/heavy.test.sh ~60s\nfork-ci/other.test.sh\n";
+  const kit = runScript(tests, 1, ["fork-kit/"], list);
+  const rest = runScript(tests, 1, ["!fork-kit/"], list);
+  try {
+    assert.equal(kit.run.status, 0, kit.run.stdout + kit.run.stderr);
+    const groups = (out) => [...out.matchAll(/::group::(\S+)/g)].map((m) => m[1]);
+    assert.deepEqual(groups(kit.run.stdout), ["fork-kit/heavy.test.sh", "fork-kit/light.test.sh"]);
+    // heavy.test.sh ends at once, far from its ~60s: the log asks for a new weight.
+    assert.match(
+      kit.run.stdout,
+      /::notice file=fork-kit\/heavy\.test\.sh::fork-kit\/heavy\.test\.sh took \d+ s, its weight is ~60s: update it/,
+    );
+    assert.equal(rest.run.status, 1, rest.run.stdout + rest.run.stderr);
+    assert.deepEqual(groups(rest.run.stdout), ["fork-ci/other.test.sh"]);
+    assert.match(rest.run.stdout, /::error file=fork-ci\/unlisted\.test\.sh::.* is not in /);
+  } finally {
+    fs.rmSync(kit.root, { recursive: true, force: true });
+    fs.rmSync(rest.root, { recursive: true, force: true });
+  }
+});
+
+test("a part that runs no test fails, so a wrong argument cannot skip its tests", () => {
+  const tests = { "fork-kit/a.test.sh": "echo a\n", "fork-ci/b.test.sh": "echo b\n" };
+  for (const args of [["fork-kits/"], ["fork-kit/", "!fork-kit/"]]) {
+    const { root, run } = runScript(tests, 1, args);
+    try {
+      assert.equal(run.status, 1, run.stdout + run.stderr);
+      assert.match(run.stdout, new RegExp(`::error::the part ${args.join(" ")} runs no test here`));
+      assert.doesNotMatch(run.stdout, /::group::/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const { root, run } = runScript(tests, 1, ["fork-kit/"]);
+  try {
+    assert.equal(run.status, 0, run.stdout + run.stderr);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
