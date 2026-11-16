@@ -4,7 +4,8 @@ holds stubs of the fleet files. No root, no systemd, no network, no real user.
 
   python3 -I -B fork-kit/desk/tests/install.test.py
 """
-import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess, sys, tempfile, unittest
+import contextlib, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess, sys, tempfile
+import types, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(KIT))
@@ -36,6 +37,19 @@ if name in lines('fail-after'):   # does its work, then dies (a run stopped righ
     sys.exit(9)
 if name == 'id':
     sys.exit(0 if args[-1] in lines('users') else 1)
+if name == 'getent':   # a user's login shell: the file shell-USER (nologin); its password field: pw-USER (!)
+    u = args[-1]
+    if u not in lines('users'):
+        sys.exit(2)
+    def one(n, default):
+        try:
+            return open(os.path.join(here, n + '-' + u)).read().strip()
+        except FileNotFoundError:
+            return default
+    if args[0] == 'passwd':
+        print(f'{u}:x:1001:1001::/nonexistent:' + one('shell', '/usr/sbin/nologin'))
+    else:
+        print(f'{u}:' + one('pw', '!') + ':19000:0:99999:7:::')
 if name == 'useradd':
     put('users', lines('users') + [args[-1]])
 if name == 'userdel':
@@ -365,6 +379,123 @@ class Desk(unittest.TestCase):
                 self.assertIn(want, self.read('/opt/fork-fleet/fork-fleet.json'))
                 self.assertNotIn(other, self.read('/opt/fork-fleet/fork-fleet.json'))
 
+    def test_a_run_killed_between_the_choice_and_the_swap_fails_check(self):
+        a, b = os.path.join(self.tmp, 'a.json'), os.path.join(self.tmp, 'b.json')
+        self.write(a, json.dumps({'pools': [{'name': 'desktop'}], 'which': 'a'}))
+        self.write(b, json.dumps({'pools': [{'name': 'desktop'}], 'which': 'b'}))
+        for first, then in ((['--fleet-config', a], ['--fleet-config', b]),
+                            (['--fleet-config', a], ['--release-fleet-config']),
+                            ([], ['--fleet-config', b])):
+            with self.subTest(then=then):
+                shutil.rmtree(self.root)
+                self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '1\n')
+                self.assertEqual(self.install(*first)[0], 0)
+                self.template()
+                self.assertEqual(self.run_main('check')[0], 0)
+                swap = self.m.swap
+
+                def killed(*args):
+                    raise SystemExit('killed before the swap')
+                self.m.swap = killed
+                try:
+                    self.assertIn('killed', str(self.install(*then)[0]))
+                finally:
+                    self.m.swap = swap
+                code, out, _ = self.run_main('check')   # the old config is still the installed one
+                self.assertEqual(code, 1, out)
+                self.assertEqual(self.install()[0], 0)
+                self.assertEqual(self.run_main('check')[0], 0)
+
+    def test_a_fleet_config_link_into_an_open_folder_is_refused(self):
+        open_dir, safe = os.path.join(self.tmp, 'open'), os.path.join(self.tmp, 'safe')
+        os.makedirs(open_dir)
+        os.chmod(open_dir, 0o777)
+        self.write(os.path.join(open_dir, 'f.json'), json.dumps({'pools': [{'name': 'desktop'}]}))
+        os.makedirs(safe)
+        os.symlink(os.path.join(open_dir, 'f.json'), os.path.join(safe, 'link.json'))
+        code, _, err = self.install('--fleet-config', os.path.join(safe, 'link.json'))
+        self.assertEqual(code, 1)
+        self.assertIn(f'{open_dir} can be written by other users', err)
+        self.assertFalse(os.path.exists(self.path('/opt')))
+
+    def test_a_fleet_config_a_runner_user_owns_or_its_group_may_write_is_refused(self):
+        folder = os.path.join(self.tmp, 'cfg')
+        os.makedirs(folder)
+        config = os.path.join(folder, 'f.json')
+        self.write(config, json.dumps({'pools': [{'name': 'desktop'}]}))
+        me, group, other = os.geteuid(), os.getegid(), 2 ** 31 - 7
+
+        def runner(uid, gid):
+            def getpwnam(name):
+                if name != 'fork-runner-3':
+                    raise KeyError(name)
+                return types.SimpleNamespace(pw_uid=uid, pw_gid=gid)
+            return types.SimpleNamespace(getpwnam=getpwnam)
+        real = self.m.pwd
+        try:
+            self.m.pwd = runner(me, other)   # the file belongs to a runner user
+            self.assertEqual(self.m.job_writable(config), f'{config} belongs to a runner user')
+            self.m.pwd = runner(other, group)   # its group is a runner user's, and the group may write it
+            os.chmod(config, 0o664)
+            self.assertEqual(self.m.job_writable(config), f'{config} can be written by other users')
+            os.chmod(config, 0o644)   # the group may only read it: the file passes (a folder above may not)
+            self.assertNotIn(config + ' ', self.m.job_writable(config) or '')
+        finally:
+            self.m.pwd = real
+
+    def test_install_sets_back_modes_check_names(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.assertEqual(self.run_main('check')[0], 0)
+        os.chmod(self.path('/opt/fork-fleet/fork-fleet-launch.sh'), 0o777)
+        os.chmod(self.path('/opt/fork-fleet/fork-fleet-walls'), 0o777)
+        os.chmod(self.path('/etc/fork-fleet/desk-key'), 0o644)
+        os.chmod(self.path('/etc/fork-fleet'), 0o755)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 1)
+        for line in ('FAIL  kit  /opt/fork-fleet/fork-fleet-launch.sh: mode 777, not 755',
+                     'FAIL  kit  /opt/fork-fleet/fork-fleet-walls: not root-owned with mode 755',
+                     'FAIL  kit  /etc/fork-fleet/desk-key: not root-owned with mode 600',
+                     'FAIL  kit  /etc/fork-fleet: not root-owned with mode 700'):
+            self.assertIn(line, out)
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/opt/fork-fleet/fork-fleet-launch.sh')).st_mode), 0o755)
+        code, out, _ = self.run_main('check')
+        self.assertEqual(code, 0, out)
+
+    def test_a_second_install_or_uninstall_at_the_same_time_is_refused(self):
+        self.assertEqual(self.install()[0], 0)
+        fd = os.open(self.path('/opt/fork-fleet'), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            stage = os.path.join(self.path('/opt/fork-fleet'), '.kit-stage-other')
+            os.makedirs(stage)   # the other run's staging folder: not swept
+            for argv in (['install', '--source', self.source, '--sha', SHA2], ['uninstall']):
+                with self.subTest(argv[0]):
+                    code, _, err = self.run_main(*argv)
+                    self.assertEqual(code, 1)
+                    self.assertIn('another desk-install install or uninstall is running', err)
+                    self.assertTrue(os.path.isdir(stage))
+                    self.assertEqual(self.read('/opt/fork-fleet/SOURCE'), SHA1 + '\n')
+        finally:
+            os.close(fd)
+        self.assertEqual(self.install(sha=SHA2)[0], 0)
+
+    def test_check_fails_on_a_runner_user_that_can_log_in(self):
+        self.assertEqual(self.install()[0], 0)
+        self.template()
+        self.assertEqual(self.run_main('check')[0], 0)
+        for name, text, want in (('shell-fork-runner-1', '/bin/bash', "fork-runner-1 has the login shell '/bin/bash'"),
+                                 ('pw-fork-runner-2', '', 'fork-runner-2 has a usable password or none')):
+            with self.subTest(name):
+                self.write(os.path.join(self.fakes, name), text + '\n')
+                code, out, _ = self.run_main('check')
+                self.assertEqual(code, 1)
+                self.assertIn('FAIL  runner-user  ' + want, out)
+                os.unlink(os.path.join(self.fakes, name))
+        self.write(self.path('/etc/at.allow'), 'fork-runner-2\n')
+        self.assertIn('FAIL  runner-user  fork-runner-2 is in /etc/at.allow', self.run_main('check')[1])
+
     def test_refusals_change_nothing(self):
         cases = {
             'not a release sha': (lambda: None, ['--sha', 'abc'], '--sha must be'),
@@ -393,6 +524,21 @@ class Desk(unittest.TestCase):
                 '/run/systemd/system/t3code-fleet-.timer.d/x.conf'), '[Timer]\n'), [], 'changes t3code-fleet'),
             'a record of another shape': (lambda: self.write(self.path('/etc/fork-fleet/desk-kit.json'),
                                                              '{"version": 1}'), [], 'not an install record'),
+            'a hand-made runner user with a login shell': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
+                         self.write(os.path.join(self.fakes, 'shell-fork-runner-1'), '/bin/bash\n')), [],
+                "login shell '/bin/bash'"),
+            'a hand-made runner user with a password': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-2\n'),
+                         self.write(os.path.join(self.fakes, 'pw-fork-runner-2'), '$6$salt$hash\n')), [],
+                'usable password'),
+            'a hand-made runner user in cron.allow': (
+                lambda: (self.write(os.path.join(self.fakes, 'users'), 'fork-runner-1\n'),
+                         self.write(self.path('/etc/cron.allow'), 'fork-runner-1\n')), [], 'is in /etc/cron.allow'),
+            'a record that names a project config that is gone': (
+                lambda: (self.write(self.path('/etc/fork-fleet/desk-kit.json'), json.dumps(
+                    {'version': 1, 'createdUsers': [], 'fleetConfig': 'project', 'sha': SHA1}), 0o600)), [],
+                'run again with --fleet-config FILE or --release-fleet-config'),
             'a fleet config others may write': (lambda: (os.makedirs(os.path.join(self.tmp, 'open'), exist_ok=True),
                                                          os.chmod(os.path.join(self.tmp, 'open'), 0o777),
                                                          self.write(os.path.join(self.tmp, 'open', 'f.json'), '{}')),
@@ -403,6 +549,9 @@ class Desk(unittest.TestCase):
             with self.subTest(name):
                 shutil.rmtree(self.root, ignore_errors=True)
                 os.makedirs(self.root)
+                for n in os.listdir(self.fakes):   # the users of the case before
+                    if n == 'users' or n.startswith(('shell-', 'pw-')):
+                        os.unlink(os.path.join(self.fakes, n))
                 self.machine(MACHINE)
                 self.write(os.path.join(self.fakes, 'os-exit'), '0')
                 setup()
@@ -415,7 +564,7 @@ class Desk(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn(msg, err)
                 self.assertEqual(self.tree(), before)
-                self.assertFalse([c for c in self.calls() if not c.startswith(('id ', 'systemctl show'))],
+                self.assertFalse([c for c in self.calls() if not c.startswith(('id ', 'getent ', 'systemctl show'))],
                                  self.calls())
 
     def test_bad_release_is_not_installed(self):
