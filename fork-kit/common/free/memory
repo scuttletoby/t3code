@@ -1,0 +1,40 @@
+#!/usr/bin/python3 -I
+"""A free/v1 script (FREE.md): free while memory is not under pressure and swap is not nearly full.
+
+Busy when, over the last 10 seconds, all tasks waited on memory more than PRESSURE_FULL10 percent of the time
+(/proc/pressure/memory, "full avg10"), or when more than SWAP_USED_PERCENT of swap is in use. Change the two
+numbers in a copy of this file; the desk kit installs this one as /opt/fork-fleet/free-memory.
+"""
+import datetime, json, sys
+
+PRESSURE_FULL10, SWAP_USED_PERCENT = 10, 50
+
+
+def meminfo():
+    with open('/proc/meminfo', encoding='ascii') as f:
+        return {k: int(v.split()[0]) for k, v in (line.split(':', 1) for line in f)}
+
+
+def pressure_full10():
+    try:
+        with open('/proc/pressure/memory', encoding='ascii') as f:
+            for line in f:
+                if line.startswith('full '):
+                    return float(dict(x.split('=') for x in line.split()[1:])['avg10'])
+    except OSError:   # a kernel without PSI: no pressure figure, the swap rule alone
+        return None
+    return None
+
+
+m, full10 = meminfo(), pressure_full10()
+swap = round(100 * (m['SwapTotal'] - m['SwapFree']) / m['SwapTotal']) if m.get('SwapTotal') else 0
+reason = (f'memory pressure {full10:g}%' if full10 is not None and full10 > PRESSURE_FULL10 else
+          f'swap {swap}% used' if swap > SWAP_USED_PERCENT else '')
+memory = {'freeMb': m['MemAvailable'] // 1024, 'swapUsedPercent': swap}
+if full10 is not None:
+    memory['pressureFull10'] = full10
+answer = {'v': 1, 'free': not reason, 'at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'memory': memory}
+if reason:
+    answer['reason'] = reason
+print(json.dumps(answer))
+sys.exit(75 if reason else 0)
