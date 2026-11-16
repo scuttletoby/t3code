@@ -4,6 +4,7 @@ to /log in the fake root; systemctl keeps which units are enabled, and the ExecS
 with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units). No root, no systemd, no network,
 no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest
+from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(KIT))
@@ -93,8 +94,16 @@ k = cli.k
 
 
 class Case(unittest.TestCase):
+    # How long setup watches T3 after a start here (15 s on a machine). 0: one look, for a test about the writes
+    # and not the watch (no_watch()).
+    settle = 0.3
+
     def setUp(self):
-        k.SETTLE, k.SETTLE_STEP = 0.3, 0.05   # setup watches T3 0.3 s here, not 15
+        k.SETTLE, k.SETTLE_STEP = self.settle, 0.05
+        # No power cut in a fake root, so when a write reaches the disk is not tested here: fsync only costs time.
+        fsync = mock.patch.object(os, 'fsync', lambda fd: None)
+        fsync.start()
+        self.addCleanup(fsync.stop)
         self.umask = os.umask(0o022)
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='pc-agents-test-'))
         os.chmod(self.root, 0o755)
@@ -119,6 +128,24 @@ class Case(unittest.TestCase):
     def close(self):
         os.umask(self.umask)
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def no_watch(self):
+        """Setup looks at T3 once after a start, for this test and every setUp() it calls: a test that runs setup
+        hundreds of times for its writes, not its watch (the watch has tests of its own)."""
+        self.settle = k.SETTLE = 0
+
+    def keep(self):
+        """A copy of the fake root as it is now, for restore(): the same machine again, without the setup runs that
+        made it."""
+        copy = tempfile.mkdtemp(prefix='pc-agents-kept-')
+        self.addCleanup(shutil.rmtree, copy, ignore_errors=True)
+        shutil.copytree(self.root, copy, symlinks=True, dirs_exist_ok=True)
+        return copy
+
+    def restore(self, copy):
+        """The fake root as keep() copied it, at the same path (the fake tools find the root from their own path)."""
+        shutil.rmtree(self.root)
+        shutil.copytree(copy, self.root, symlinks=True)
 
     def path(self, p):
         return self.root + p
