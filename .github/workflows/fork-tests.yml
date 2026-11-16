@@ -245,7 +245,6 @@ jobs:
       # docs/fork/: the fork's pages whose commands and links a test runs (fork-gate-trust-docs.test.py).
       # apps/, packages/: only the T3 source files the go-live kit's contract test pins
       # (fork-kit/golive/tests/contract.test.py); keep the two lists in step.
-      # .gitleaks.toml: fork-secret-scan.test.sh checks the repository's gitleaks rules.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -258,7 +257,6 @@ jobs:
             /fork-ci/
             /fork-kit/
             /scripts/
-            /.gitleaks.toml
             /apps/server/src/cli/forkReport.ts
             /apps/server/src/cloud/bootService.ts
             /apps/server/src/cloud/serviceProtocol.ts
@@ -284,16 +282,17 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
 
-      # Every test under .github/scripts, fork-ci and fork-kit, checked against .github/fork-ci-tests.txt:
-      # the fork's tests run here, the others must be named by the job or script
-      # that runs them. An unlisted test, or a listed one deleted from history,
-      # fails; a listed one whose pull request has not merged yet is a note.
+      # The tests under .github/scripts and fork-ci, checked against .github/fork-ci-tests.txt
+      # (the fork-kit/ ones run in kit_tests, beside this job): the fork's tests run here, longest
+      # first by their weight in the list; the others must be named by the job or script that runs
+      # them. An unlisted test, or a listed one deleted from history, fails; a listed one whose pull
+      # request has not merged yet is a note.
       - name: Fork script tests
         run: |
           if compgen -G '.github/scripts/fork-*.test.py' >/dev/null && ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
-          node .github/scripts/fork-ci-tests.cjs
+          node .github/scripts/fork-ci-tests.cjs '!fork-kit/'
 
       # The fleet launcher with real runner users (created and deleted by the test):
       # one slot's user cannot read another's copy, nothing a job leaves (files in
@@ -305,6 +304,51 @@ jobs:
 
       - name: Fleet launcher as root
         run: sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot
+
+      - name: Compare upstream's test jobs with the recorded copy
+        run: node .github/scripts/fork-tests-drift.cjs
+
+      # Fork lines in upstream files stay the seam lines pinned in .github/fork-seams.json (a fork
+      # setting goes in forkSettings.ts, not upstream's settings.ts). A pull request's run checks out
+      # its merge commit, whose first parent is the base: the lines the pull request adds.
+      - name: Fork lines in upstream files
+        if: ${{ github.event_name == 'pull_request' }}
+        run: node .github/scripts/fork-seam-check.cjs HEAD^1 HEAD
+
+  # The host kits' tests (fork-kit/), split from `workflows` so the two halves of the fork's
+  # script tests run side by side: one job of all of them was the longest in the run.
+  kit_tests:
+    name: Fork kit tests
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # The same files as in `workflows` (its comment says why each); the kits' tests read some.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.changes.outputs.sha }}
+          sparse-checkout: |
+            /.github/
+            /docs/fork/
+            /fork-ci/
+            /fork-kit/
+            /scripts/
+            /apps/server/src/cli/forkReport.ts
+            /apps/server/src/cloud/bootService.ts
+            /apps/server/src/cloud/serviceProtocol.ts
+            /apps/server/src/config.ts
+            /apps/server/src/golive/forkReport.ts
+            /apps/server/src/serverOwnership.ts
+            /apps/server/src/serverRuntimeState.ts
+            /apps/server/src/serviceLauncher.ts
+            /packages/shared/src/cliRelease.ts
+          sparse-checkout-cone-mode: false
+
+      # The tests under fork-kit, checked against .github/fork-ci-tests.txt as in `workflows`.
+      - name: Fork kit tests
+        run: node .github/scripts/fork-ci-tests.cjs fork-kit/
 
       # The gh-apps host kit installed for real (fork-kit/gh-apps/README.md): real service
       # users, the real sudoers file and sudo, an agent user that tries to reach the keys,
@@ -329,16 +373,6 @@ jobs:
           systemctl --user daemon-reload
           systemctl --user show heavy.slice -p LoadState,FragmentPath,MemoryMax
           HEAVY_REAL_TESTS=1 python3 -I -B fork-kit/heavy/tests/heavy.test.py
-
-      - name: Compare upstream's test jobs with the recorded copy
-        run: node .github/scripts/fork-tests-drift.cjs
-
-      # Fork lines in upstream files stay the seam lines pinned in .github/fork-seams.json (a fork
-      # setting goes in forkSettings.ts, not upstream's settings.ts). A pull request's run checks out
-      # its merge commit, whose first parent is the base: the lines the pull request adds.
-      - name: Fork lines in upstream files
-        if: ${{ github.event_name == 'pull_request' }}
-        run: node .github/scripts/fork-seam-check.cjs HEAD^1 HEAD
 
   # Every commit a pull request or a push to main adds, history included: a
   # secret committed and then deleted is still public. Release runs test a
@@ -1025,6 +1059,7 @@ jobs:
         changes,
         fleet_watch,
         workflows,
+        kit_tests,
         secrets,
         lint,
         build,
