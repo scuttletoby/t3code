@@ -187,7 +187,9 @@ async function main() {
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
   for (const run of await runAll(result.run, jobCount(), runTest)) {
     if (run.status !== 0) failed += 1;
-    rows.push(`| \`${run.file}\` | ${run.status === 0 ? "passed" : "**failed**"} | ${run.seconds} s |`);
+    rows.push(
+      `| \`${run.file}\` | ${run.status === 0 ? "passed" : "**failed**"} | ${run.seconds} s |`,
+    );
   }
   for (const file of result.unlisted)
     console.log(`::error file=${file}::${file} is not in ${LIST}; add it there`);

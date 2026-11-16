@@ -5,7 +5,14 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { plan, readList, findTests, presentTests, runAll, jobCount } = require("./fork-ci-tests.cjs");
+const {
+  plan,
+  readList,
+  findTests,
+  presentTests,
+  runAll,
+  jobCount,
+} = require("./fork-ci-tests.cjs");
 
 const never = () => false;
 const here = (...files) => files.map((file) => ({ file, runBy: null }));
@@ -175,10 +182,17 @@ function runScript(tests, jobs) {
     fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
     fs.writeFileSync(path.join(root, file), text);
   };
-  write(".github/scripts/fork-ci-tests.cjs", fs.readFileSync(require.resolve("./fork-ci-tests.cjs")));
+  write(
+    ".github/scripts/fork-ci-tests.cjs",
+    fs.readFileSync(require.resolve("./fork-ci-tests.cjs")),
+  );
   write(".github/fork-ci-tests.txt", Object.keys(tests).join("\n") + "\n");
   for (const [file, text] of Object.entries(tests)) write(file, text);
-  const env = { ...process.env, FORK_CI_TEST_JOBS: String(jobs), LEFT: path.join(root, "left.pid") };
+  const env = {
+    ...process.env,
+    FORK_CI_TEST_JOBS: String(jobs),
+    LEFT: path.join(root, "left.pid"),
+  };
   delete env.GITHUB_STEP_SUMMARY;
   const started = Date.now();
   const run = childProcess.spawnSync("node", [".github/scripts/fork-ci-tests.cjs"], {
@@ -206,9 +220,14 @@ test("test files run in parallel, each one's output in its own group, and a fail
     for (const name of ["a", "b", "c"])
       assert.match(
         run.stdout,
-        new RegExp(`::group::fork-ci/${name}\\.test\\.sh \\([0-9.]+ s\\)\\n${name}-start\\n${name}-end\\n`),
+        new RegExp(
+          `::group::fork-ci/${name}\\.test\\.sh \\([0-9.]+ s\\)\\n${name}-start\\n${name}-end\\n`,
+        ),
       );
-    assert.match(run.stdout, /::error file=fork-ci\/c\.test\.sh::fork-ci\/c\.test\.sh failed \(exit 3\)/);
+    assert.match(
+      run.stdout,
+      /::error file=fork-ci\/c\.test\.sh::fork-ci\/c\.test\.sh failed \(exit 3\)/,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
