@@ -70,6 +70,48 @@ they are the system's, root-owned on a stock system, and a user who could write 
 runs; keep them root's. One install or uninstall runs at a time (a lock on
 `/etc/fork-fleet`, which only root can open); a second one is refused.
 
+## Windows (WSL2)
+
+[windows/start-desk.ps1](windows/start-desk.ps1) does the Windows side and then this kit inside one WSL2 distro.
+Save the machine file on Windows, then in a normal (not administrator) Windows PowerShell window:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File start-desk.ps1 -Repo OWNER/REPO -Sha RELEASE_SHA -MachineFile machine.json
+```
+
+It prints the PC's facts and asks before it changes anything; the question lists each `.wslconfig` key it will
+change, old value -> new. Before the question it checks the machine file and
+`-FleetConfig` exist and refuses a WSL 1 distro of that name (`wsl -l -v`; WSL 1 runs no systemd:
+`wsl --set-version DISTRO 2` first). A distro of that name that the script did not make
+is named in the question (its whole `/etc/wsl.conf` is replaced) and must be confirmed by typing its name. Then: the
+distro (`-Distro`, default `fork-desk`, Ubuntu 24.04, installed with `--version 2`; a run stopped while installing it
+leaves a mark in `%LOCALAPPDATA%\fork-desk`, so the next run asks no takeover question, and a broken one names
+`wsl --unregister DISTRO`); `.wslconfig`'s `[wsl2]` memory cap (`-MemoryGB`, default
+three quarters of the RAM, at most the RAM less 6 GB, never under 4 GB; one that leaves Windows under 2 GB is
+refused), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (read and written as UTF-8 without a
+BOM; a dated copy of the old file is kept, other keys and sections stay; an old `networkingMode` or `dnsTunneling`
+line under `[experimental]`, the form before WSL 2.0 that can still win over `[wsl2]`, is removed, and the check
+FAILs while one is there; the question lists each change, old -> new, and the file is written only when it lists one,
+so "no change" means the file is left alone); the distro's own settings the WSL2 walls
+ask for (`/etc/wsl.conf`: systemd on, no Windows drives, programs or PATH; its own `/etc/resolv.conf`; WSL's binfmt
+handler masked); one `wsl --shutdown` when one of these changed or the running WSL does not have them yet (PID 1 not
+systemd, interop live, Windows drives mounted, `wsl.conf` changed after PID 1 started as far as the VM's clock tells
+(`/proc/1/stat` and `btime`; unreadable means restart; the clock skips the PC's sleep, so this alone can miss a change,
+hence the mark below), `.wslconfig` newer than the running WSL, more memory than the cap, not NAT, or a `.wslconfig`
+or `wsl.conf` change whose shutdown is still owed: one mark in `%LOCALAPPDATA%\fork-desk` for every distro, like
+`.wslconfig` itself, written before either change and removed after the shutdown, because WSL's uptime skips sleep),
+so a run stopped before its shutdown restarts next time (every WSL distro and Docker Desktop stop); the packages the fleet needs; the
+machine file and `-FleetConfig`, if given; this kit's bootstrap; a logon task that keeps the distro running while
+the owner is logged in. Last, `desk-install check` and the Windows side's own PASS/FAIL lines (the `[wsl2]` keys);
+any FAIL or error exits 1. Safe to run again. `-Uninstall` (needs no `-Repo` or `-Sha`) runs `desk-install uninstall` in the distro, stops and removes the logon
+task and names the first `.wslconfig.bak-*` (the file before the first run); the distro and `.wslconfig`
+stay (`wsl --unregister DISTRO` removes the distro), and so does an owed shutdown's mark.
+
+Known limits: the `DISTRO.made` mark is per distro name; a run stopped inside `wsl --install`, then that distro
+removed by hand and a distro of the same name made by hand, would skip the takeover question once (the mark is gone
+after the next run's settings step). The PowerShell parts are tested only where `pwsh` is installed; the in-distro
+parts run in the tests on a fake root.
+
 ## Runs again, stops half-way, old or empty state
 
 - **Again:** files, settings and units that did not change are not rewritten (a file in `/opt/fork-fleet`, a
