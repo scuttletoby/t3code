@@ -32,6 +32,12 @@ watches; it changes nothing on the machine, and `0` turns it off.
   field reaches upstream's structs unchanged (an upstream key of the same name would hide it), that
   every fork setting has a patch field and a patch rule, and pins the count of fork lines in
   `settings.ts`; `forkSettingsPatch.test.ts` pins them in `packages/shared/src/serverSettings.ts`.
+- [`serverSettings.forkIntervals.test.ts`](../../apps/server/src/serverSettings.forkIntervals.test.ts)
+  finds every interval (Duration) setting by walking the settings schema, the fork's and upstream's,
+  and fails when one does not survive a patch or a save and load: upstream's patch merge and its
+  `ATOMIC_SETTINGS_KEYS` list each interval by hand, and a missed one is saved as a broken object.
+  The same schema walk ([`forkSettingsIntervals.ts`](../../packages/shared/src/forkSettingsIntervals.ts))
+  makes a save refuse an interval no run could use and a load read one as its default.
 - The seam check ([`fork-seam-check.cjs`](../../.github/scripts/fork-seam-check.cjs)) refuses any
   line the fork adds to an upstream file beyond the seam lines pinned in
   [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment. It runs on
@@ -91,7 +97,7 @@ change, or a fork line beyond the seams, it stops and opens one issue. Then:
    fork's own file (a setting into `forkSettings.ts`); a changed seam line is fixed in
    `.github/fork-seams.json`.
 3. Run the pin tests before pushing:
-   `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
+   `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
 4. Push with `--force-with-lease` and start fork-follow once, as its report says.
 
 ### The sync that brings upstream's updater
