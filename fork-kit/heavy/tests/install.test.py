@@ -285,6 +285,19 @@ class Install(unittest.TestCase):
         self.assertEqual(self.install(sha=SHA2)[0], 0)
         self.assertFalse(any(os.path.exists(u) for u in units))
         self.assertNotIn('sweep_timer', self.config())
+        # an older config, one unit ours and one someone else's: refused, and the refusal names the way out
+        self.assertEqual(self.install('--sweep-timer', sha=SHA2)[0], 0)
+        self.old_installer_config()
+        with open(units[1], 'w') as f:
+            f.write('[Timer]\nOnCalendar=daily\n')
+        code, _, err = self.install(sha=SHA2)
+        self.assertEqual(code, 1)
+        self.assertIn('heavy-sweep.timer exists and was not written by this kit', err)
+        self.assertIn('--no-sweep-timer', err)
+        self.assertEqual(self.install('--no-sweep-timer', sha=SHA2)[0], 0)
+        self.assertFalse(os.path.exists(units[0]))
+        with open(units[1]) as f:
+            self.assertEqual(f.read(), '[Timer]\nOnCalendar=daily\n')
 
     def test_sweep_units_someone_else_wrote_are_refused_and_kept(self):
         os.makedirs(self.path('/etc/systemd/user'))

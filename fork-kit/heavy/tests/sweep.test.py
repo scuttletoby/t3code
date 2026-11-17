@@ -398,6 +398,20 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(own(['bash', '-c', 'admin:pw'], shown=True), ['bash', '-c', '[8 chars]'])
         self.assertEqual(own(['python3', '-m', 'pytest'], shown=True), ['python3', '-m', 'pytest'])
         self.assertEqual(own(['java', '-jar', 'server.jar'], shown=True), ['java', '-jar', 'server.jar'])
+        self.assertEqual(own(['sh', '-c', ''], shown=True), ['sh', '-c', '[0 chars]'])
+        # a short-option cluster: -o/-O in it take the next word; one that holds the code letter is the inline option
+        self.assertEqual(own(['bash', '-euo', 'pipefail', '-c', 'pytest', 'x']), ['bash', '-c', 'pytest'])
+        self.assertEqual(own(['bash', '-eo', 'pipefail', 'run.test.sh', 'x']), ['bash', 'run.test.sh'])
+        self.assertEqual(own(['bash', '-lc', 'pytest -q', 'x']), ['bash', '-lc', 'pytest -q'])
+        self.assertEqual(own(['bash', '-lc', 'pytest -q'], shown=True), ['bash', '-lc', '[pytest ... 9 chars]'])
+        self.assertEqual(own(['dash', '-ce', 'x'], shown=True), ['dash', '-ce', 'x'])
+        self.assertEqual(own(['python3', '-um', 'pytest', '-x']), ['python3', '-um', 'pytest'])
+        self.assertEqual(own(['python3', '-uW', 'error', 'a.test.py']), ['python3', 'a.test.py'])
+        self.assertEqual(own(['python3', '-OO', 'a.test.py']), ['python3', 'a.test.py'])
+        self.assertEqual(own(['node', '-pe', 'f()', 'x']), ['node', '-pe', 'f()'])
+        self.assertEqual(own(['perl', '-lne', 'print', 'f']), ['perl', '-lne', 'print'])
+        self.assertEqual(own(['java', '-ea', 'Main']), ['java', 'Main'])
+        self.assertEqual(own(['perl', '-Mre', '-e', 'x']), ['perl', '-e', 'x'])        # -M takes the rest of its word
 
     def test_a_tree_stops_only_its_own_unit_and_never_a_session_or_a_live_heavy_below_it(self):
         h, svc = self.host, f'{CG}/app.slice/t3code.service'
@@ -465,6 +479,57 @@ class SweepTests(unittest.TestCase):
         self.assertIn('unit t3code.service): python3 -c [import ... 39 chars] (+1 args)', out)
         self.assertIn('unit t3code.service): sh -c [9 chars]', out)
         self.assertEqual(self.signalled(), [5101, 5102, 5103], out)     # matching still reads the whole text
+
+    def test_short_option_clusters_and_other_interpreters_never_show_their_inline_code(self):
+        # bash -lc is how agent CLIs run each shell command: -lc is the -c option, so its text is code as well
+        self.cfg.update(testPatterns=['(^|[ /])pytest( |$)'])
+        self.write_machine()
+        rows = [
+            (['bash', '-lc', 'mysql -phunter2 db && pytest'], 'bash -lc [mysql ... 28 chars]'),
+            (['sh', '-ec', 'lftp -u admin:hunter3 h'], 'sh -ec [lftp ... 23 chars]'),
+            (['sh', '-xc', 'PASS=hunter4 pytest'], 'sh -xc [19 chars]'),
+            (['dash', '-ce', 'mysql -phunter5'], 'dash -ce [mysql ... 15 chars]'),
+            (['python3', '-uc', 'x.run(pw="hunter6")'], 'python3 -uc [19 chars]'),
+            (['python3', '-Bc', 'import x; x.run("hunter7")'], 'python3 -Bc [import ... 26 chars]'),
+            (['python3', '-Sc', 'p="hunter8"'], 'python3 -Sc [11 chars]'),
+            (['node', '-pe', 'f("hunter9")'], 'node -pe [12 chars]'),
+            (['perl', '-le', 'print "hunter10"'], 'perl -le [print ... 16 chars]'),
+            (['perl', '-ne', 'x("hunter11")'], 'perl -ne [13 chars]'),
+            (['perl', '-we', 'system("x -phunter12")'], 'perl -we [22 chars]'),
+            (['ruby', '-we', 'x("hunter13")'], 'ruby -we [13 chars]'),
+            (['perl', '-e', 'x("hunter14")'], 'perl -e [13 chars]'),
+            (['ruby', '-e', 'system "mysql -phunter15"'], 'ruby -e [system ... 25 chars]'),
+            (['php', '-r', 'f("hunter16");'], 'php -r [14 chars]'),
+            (['timeout', '60', 'bash', '-lc', 'mysql -phunter17'], 'timeout bash -lc [mysql ... 16 chars]'),
+            (['stdbuf', '-oL', 'bash', '-lc', 'mysql -phunter18'], 'stdbuf bash -lc [mysql ... 16 chars]'),
+            (['timeout', '60', 'python3', '-uc', 'p="hunter19"'], 'timeout python3 -uc [12 chars]'),
+        ]
+        for n, (argv, _) in enumerate(rows):
+            self.orphan(5201 + n, argv + ['arg0'], cpu=90)
+        code, out, _ = self.run_sweep()
+        with open(os.path.join(self.report, 'sweep.log')) as f:
+            text = f.read() + out
+        with open(os.path.join(self.report, 'last-report.txt')) as f:
+            text += f.read()
+        self.assertNotIn('hunter', text)
+        self.assertNotIn('admin:', text)
+        for argv, shown in rows:
+            extra = 2 if argv[0] in ('timeout', 'stdbuf') else 1         # the wrapper's own value is not shown either
+            self.assertIn(f'unit t3code.service): {shown} (+{extra} args)', out)
+        self.assertEqual(self.signalled(), [5201, 5203], out)     # matching still reads the whole code text
+
+    def test_inline_code_through_a_wrapper_is_still_matched(self):
+        # the cut is for showing only: what is test-shaped is read from the whole text, through wrappers too
+        self.cfg.update(testPatterns=['(^|[ /])pytest( |$)'])
+        self.write_machine()
+        self.orphan(5301, ['timeout', '60', 'sh', '-c', 'PASS=hunter2 pytest'], cpu=90)
+        self.orphan(5302, ['stdbuf', '-oL', 'bash', '-lc', 'pytest -q'], cpu=90)
+        code, out, _ = self.run_sweep()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.signalled(), [5301, 5302], out)
+        self.assertIn('stopped: pid 5301 timeout', out)
+        self.assertIn('timeout sh -c [19 chars]', out)
+        self.assertNotIn('hunter2', out)
 
     def test_redact(self):
         r = self.mod.redact
@@ -807,6 +872,12 @@ class SweepTests(unittest.TestCase):
         cid = self.host.container('a', 'db1', 3 * 86400, owner=f'uid={UID},scope={kept}')
         self.host.container('b', 'db2', 3 * 86400, running=False, owner=f'uid={UID},scope={kept}')
         young = self.host.container('c', 'db3', 60, owner=f'uid={UID},scope={kept}')
+        # a kept scope that is still there: its container is in use, so not reported at all
+        live = 'heavy-keep-server-0a1b2c3d.scope'
+        self.orphan(3002, 'sleep 1000', unit=self.scope(live))
+        self.host.load()['units'][live] = {'ActiveState': 'active'}
+        self.host.save()
+        in_use = self.host.container('d', 'db4', 3 * 86400, owner=f'uid={UID},scope={live}')
         code, out, _ = self.run_sweep()
         self.assertEqual(code, 0, out)
         self.nothing_stopped()
@@ -814,7 +885,8 @@ class SweepTests(unittest.TestCase):
         self.assertIn(f'owner {kept} was kept on purpose (HEAVY_KEEP=1)', out)
         self.assertIn('report only: container ' + 'b' * 12 + ' db2', out)
         self.assertNotIn(young, out)
-        self.assertIn('0 containers removed, 2 reported', out)
+        self.assertNotIn(in_use, out)
+        self.assertIn('0 containers removed, 3 reported', out)            # the live scope's process is the 3rd
 
     def test_young_container_whose_owner_is_gone_waits(self):
         self.host.container('a', 'db1', 60, owner=f'uid={UID},pid=4242,start=77')
@@ -1072,6 +1144,26 @@ MUTATIONS = {
                                        'test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal'),
     'kept-scope container only reported': ("if gone and is_kept_scope(owner['scope']):", 'if False:',
                                            'test_container_labelled_in_a_kept_scope_is_only_reported'),
+    'kept-scope rule only once the scope is gone': ("if gone and is_kept_scope(owner['scope']):",
+                                                    "if is_kept_scope(owner['scope']):",
+                                                    'test_container_labelled_in_a_kept_scope_is_only_reported'),
+    'bundled code option cut when shown': ('return argv[:1] + [a, code_text(argv[j])]',
+                                           'return argv[:1] + [a] + argv[j:j + 1]',
+                                           'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'c anywhere in a shell bundle is -c': ("return ('-c' if 'c' in a else None), a.count('o') + a.count('O')",
+                                           "return None, a.count('o') + a.count('O')",
+                                           'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    '-o/-O in a shell bundle take a word': ("return ('-c' if 'c' in a else None), a.count('o') + a.count('O')",
+                                            "return ('-c' if 'c' in a else None), 0", 'test_own_command'),
+    'last letter of a bundle is the inline option': ('if last in INLINE[kind]:', 'if False:',
+                                                     'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'attached-value words are one option': ('or a[1] in BUNDLED[kind]:', ':', 'test_own_command'),
+    'perl/ruby/php code is code': ("'shell': {'-c'}, 'other': {'-e', '-E', '-r'}}\n# Short",
+                                   "'shell': {'-c'}, 'other': set()}\n# Short",
+                                   'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'matching reads the whole text through a wrapper': ('rest = own_command(argv[i:], shown)',
+                                                        'rest = own_command(argv[i:], True)',
+                                                        'test_inline_code_through_a_wrapper_is_still_matched'),
 }
 
 

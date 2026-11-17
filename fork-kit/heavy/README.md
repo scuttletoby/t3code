@@ -101,9 +101,10 @@ Each sweep appends to `<report>/sweep.log` (rotated at 1 MiB) and writes a short
 The report folder must be a folder of the sweep's user that no group or other user can write (not a link); else
 the sweep refuses. The log, the report and the journal show only a process's own command (above), with the
 number of other arguments, and mask anything that looks like a secret (`--token=***`, `PASSWORD=***`, a URL's
-password, `ghp_...`-shaped words). Inline code (`sh -c`, `python3 -c`, `node -e`) shows only its first word, when
-that looks like a program name, and its length (`sh -c [mysql ... 35 chars]`): a short password in it
-(`-phunter2`, `-u admin:hunter2`) is never shown. Container names, images and bad labels are cut to 60 characters and masked
+password, `ghp_...`-shaped words). Inline code (`sh -c`, `python3 -c`, `node -e`, `perl`/`ruby -e`, `php -r`, and
+bundled forms such as `bash -lc`, `sh -ec`, `python3 -uc`, `node -pe`, `perl -lne`, also behind `timeout` or
+`stdbuf`) shows only its first word, when that looks like a program name, and its length
+(`bash -lc [mysql ... 35 chars]`): a short password in it (`-phunter2`, `-u admin:hunter2`) is never shown. Container names, images and bad labels are cut to 60 characters and masked
 the same way:
 
 ```
@@ -250,7 +251,8 @@ removes them again). Upgrade: the same line again. Remove:
   back to a release without the sweep, run the newer installer with `--no-sweep-timer`; if you did not, the
   timer just does nothing (users run `systemctl --user disable --now heavy-sweep.timer` to clear it). The older
   installer drops the setting from `config.json` but keeps the units; rolling forward again with the usual line
-  (without `--sweep-timer`) keeps them and says so.
+  (without `--sweep-timer`) keeps them and says so. If one of the two units there is not the kit's, that line
+  refuses and names the file; remove it, or run with `--no-sweep-timer`.
 - **Old state:** a plain-file `/usr/local/bin/heavy` (the one-line wrapper from before) is kept and put back by
   uninstall. A link there that points elsewhere, a folder where the kit expects its own, or a slice unit in
   `/etc/systemd/user/` the kit did not write is refused with a message, never overwritten. Config values stay

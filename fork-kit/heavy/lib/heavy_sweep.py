@@ -54,6 +54,10 @@ INLINE = {'python': {'-c', '-m'}, 'node': {'-e', '-p', '--eval', '--print'}, 'ja
           'shell': {'-c'}, 'other': {'-e', '-E', '-r'}}
 # of those, the ones whose next word is code text, which can hold a short password (`sh -c 'mysql -phunter2'`)
 CODE = {'python': {'-c'}, 'node': {'-e', '-p', '--eval', '--print'}, 'shell': {'-c'}, 'other': {'-e', '-E', '-r'}}
+# Short options bundled in one word (`bash -lc`, `bash -euo pipefail`, `python3 -uc`, `node -pe`, `perl -lne`). For a
+# shell, c anywhere in it is -c, and each o/O in it takes a word first. For the others, the last letter acts as if it
+# stood alone. A word that starts with a letter whose value is attached (`-Wignore`, `-Mre`, `-rjson`) is one option.
+BUNDLED = {'shell': '', 'python': 'WXQ', 'node': '', 'other': 'MmIixdDr'}
 INTERPRETERS = {'node': 'node', 'nodejs': 'node', 'bun': 'node', 'deno': 'node', 'java': 'java', 'ruby': 'other',
                 'perl': 'other', 'php': 'other', 'Rscript': 'other', 'lua': 'other', 'tclsh': 'other'}
 # Wrappers that run one command for as long as they live: their own command is the wrapper plus that command's
@@ -213,6 +217,16 @@ def own_command(argv, shown=False):
             if shown and a in CODE.get(kind, ()) and i + 1 < len(argv):
                 return argv[:1] + [a, code_text(argv[i + 1])]
             return argv[:1] + argv[i:i + 2]
+        bundled = bundled_option(kind, a)
+        if bundled:
+            opt, values = bundled
+            j = i + 1 + values
+            if opt is None:
+                i = j
+                continue
+            if shown and opt in CODE[kind] and j < len(argv):
+                return argv[:1] + [a, code_text(argv[j])]
+            return argv[:1] + [a] + argv[j:j + 1]
         if a in takes:
             i += 2
         elif a.startswith(('-', '@')) or (kind == 'shell' and a.startswith('+')):
@@ -220,6 +234,19 @@ def own_command(argv, shown=False):
         else:
             return argv[:1] + [a]
     return argv[:1]
+
+
+def bundled_option(kind, a):
+    """For a word of bundled short options (see BUNDLED): (the inline option it acts as, or None; how many of the
+    words after it are option values). None when the word is not bundled short options."""
+    if kind not in BUNDLED or not re.fullmatch(r'-[A-Za-z]{2,}', a) or a[1] in BUNDLED[kind]:
+        return None
+    if kind == 'shell':
+        return ('-c' if 'c' in a else None), a.count('o') + a.count('O')
+    last = '-' + a[-1]
+    if last in INLINE[kind]:
+        return last, 0
+    return None, (1 if last in OPTION_VALUES.get(kind, ()) else 0)
 
 
 def code_text(code):
