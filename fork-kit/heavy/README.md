@@ -102,11 +102,12 @@ The report folder must be a folder of the sweep's user that no group or other us
 the sweep refuses. The log, the report and the journal show only a process's own command (above), with the
 number of other arguments, and mask anything that looks like a secret (`--token=***`, `PASSWORD=***`, a URL's
 password, `ghp_...`-shaped words). Inline code (`sh -c`, `fish --command`, `python3 -c`, `node -e`, `perl`/`ruby -e`,
-`php -r`, and bundled forms such as `bash -lc`, `sh -ec`, `python3 -uc`, `node -pe`, `perl -lne`, `perl -Fx -lane`,
+`php -r`/`-B`/`-R`, and bundled forms such as `bash -lc`, `sh -ec`, `python3 -uc`, `node -pe`, `perl -lne`, `perl -Fx -lane`,
 `perl -0777ne`, also behind `timeout`, `stdbuf` or `env -S`) shows only its length (`python3 -c [39 chars]`). For a
 shell, whose first word is a program, it also shows that word when it looks like a program name and the code has more
 than one word (`bash -lc [mysql ... 35 chars]`). A short password in it (`-phunter2`, `-u admin:hunter2`, code that
-is one word) is never shown, and fish's `-C` code is left out with the other arguments. Container names, images and
+is one word) is never shown, and fish's `-C` code is left out with the other arguments. A command line that nests
+wrappers or `env -S` more than 8 deep is not read: it shows only its program and is only reported. Container names, images and
 bad labels are cut to 60 characters and masked the same way:
 
 ```
