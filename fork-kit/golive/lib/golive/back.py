@@ -6,16 +6,18 @@ runtimes, so the switch keeps one first), the pre hooks run, the boot service is
 half-restored home) and stopped, the newest finished copy of this home is restored (coldcopy.restore: the migrated
 database and settings.json are kept aside, never deleted; the copy stays where it is), then that t3 runs
 `update <old> --allow-downgrade --yes` (it enables and starts the service), that build is verified, and the post
-hooks run (after a failure too, as in the copy run). A W1 that is stopped or fails after the stop leaves T3 stopped
-and not started at boot, on purpose, until a back ends ok. By hand it needs `--lose-work-since <the copy's time>`;
-the switch calls restore_and_downgrade(automatic=True) inside its own run.
+hooks run. A W1 that is stopped or fails after the stop leaves T3 stopped and not started at boot, and runs no post
+hook (background jobs stay paused), on purpose, until a back ends ok. By hand it needs `--lose-work-since <the
+copy's time>`; the switch calls restore_and_downgrade(automatic=True) inside its own run.
 W2 (loses nothing): the fork adds no migrations, so the upstream nightly a fork build is cut from (its version
 without `.fork.N`) runs the migrated database as it is. Read from the code, untried on a live home.
 W3: an upstream stable newer than that base, once one is installed or staged. W2 and W3 run that build's
 `update <version> --allow-downgrade --yes` on the data as it is, between the pre and the post hooks.
 
 A back may follow a back or switch that stopped half-way (journal.run may_follow): it finishes that back's plan
-(journalled in its "plan" step); the restore, the put-back and the update are safe to run again. A back after a good
+(journalled in its "plan" step); the restore, the put-back and the update are safe to run again. A W1 that got past
+its update (or its verify) is not redone: while the service state names its build, the rerun only verifies (or
+finds it verified) and runs the post hooks, so what T3 served since is never restored over. A back after a good
 back of the same way, with nothing unfinished since, finds the build that back verified running and does nothing.
 """
 import functools, http.client, json, os, re, subprocess, sys, urllib.error, urllib.request
@@ -216,10 +218,14 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
     with run.step('runtime', version=old) as facts:
         facts.update(keptruntime.put_back(run, cfg, old))
 
+    stopped, verified = [], []
+
     def stop_restore_update():
         server = _server(cfg, adapter)
-        say('stopping T3 for W1: until this back ends ok, T3 stays stopped and is not started at boot (on purpose: '
-            'the home may be half-restored); if it stops or fails, run the same back again')
+        say('stopping T3 for W1: until this back ends ok, T3 stays stopped and is not started at boot, and background '
+            'jobs stay paused (on purpose: the home may be half-restored); if it stops or fails, run the same back '
+            'again')
+        stopped.append(True)
         with run.step('stop-service', pid=server and server['pid']):
             adapter.disable()  # first: from here T3 must not start at boot until the update enables it again
             adapter.stop()
@@ -227,16 +233,32 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
         with run.step('restore', copy=copy_dir) as facts:
             facts.update(coldcopy.restore(run, copy_dir, cfg.home, from_home=cfg.home, version=old,
                                           floor_bytes=cfg.free_floor_mb * MB))
-        return _update(run, cfg, adapter, t3, old, say)
-    return _hooked(run, cfg, hooks, stop_restore_update)
+        verified.append(_update(run, cfg, adapter, t3, old, say))
+        return verified[0]
+    try:
+        return _hooked(run, cfg, hooks, stop_restore_update, post_on_failure=lambda: not stopped, rerun=W1_RERUN)
+    except Exception as e:
+        if verified:  # only a post hook failed: T3 runs (said in the error)
+            pass
+        elif stopped and run._broken == 'verify':
+            e.add_note(f'its update to t3 {old} ran, but T3 is not verified (`t3-golive status` says whether it '
+                       'runs); the same `t3-golive back --way w1` verifies it again, with no second restore')
+        elif stopped:
+            e.add_note('T3 was stopped for this W1: T3 stays stopped and is not started at boot (on purpose: the '
+                       'home may be half-restored) until the same `t3-golive back --way w1` ends ok')
+        raise
 
 
-def _hooked(run, cfg, hooks, body):
+W1_RERUN = '; run the same `t3-golive back --way w1` again: it runs only the post hooks (no second stop or restore)'
+
+
+def _hooked(run, cfg, hooks, body, *, pre=True, post_on_failure=lambda: True, rerun=''):
     """body (it stops or restarts T3) between the machine's pre hooks and post hooks, as the copy run runs them
     (coldcopy.run_copy): a failed pre hook runs the post hooks and refuses before T3 is touched; the post hooks run
-    after body however it ends, a failure included. A kill runs no post hook: the next back runs both again (each
-    hook must be safe twice, config.py)."""
-    if hooks:
+    after body, and after a failure only while post_on_failure() (W1: T3 was never stopped; once W1 stopped T3, the
+    background jobs stay paused until a back ends ok, as after a kill). A kill runs no post hook: the next back runs
+    them (each hook must be safe twice, config.py). pre=False: a rerun that only finishes a stopped W1."""
+    if hooks and pre:
         failed = coldcopy._hooks(run, 'pre-hooks', cfg.pre_hooks, cfg.home)
         if failed is not None:
             again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
@@ -246,7 +268,9 @@ def _hooked(run, cfg, hooks, body):
     try:
         result = body()
     except BaseException as e:
-        if hooks:
+        if hooks and not post_on_failure():
+            e.add_note('no post hook ran: background jobs stay paused until the same back ends ok')
+        elif hooks:
             try:
                 again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
                 if again:
@@ -257,7 +281,8 @@ def _hooked(run, cfg, hooks, body):
     if hooks:
         again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
         if again:
-            raise RuntimeError(f't3 {result["version"]} runs, verified, but a post hook failed: {again}')
+            raise RuntimeError(f't3 {result["version"]} runs, verified, and starts at boot, but a post hook failed: '
+                               f'{again}{rerun}')
     return result
 
 
@@ -276,6 +301,11 @@ def _update(run, cfg, adapter, t3, version, say):
         facts['exit'] = p.returncode
         if p.returncode != 0:
             raise RuntimeError(f'{t3} update {version} exited {p.returncode}: {(p.stderr or p.stdout).strip()[-300:]}')
+    return _verify(run, cfg, adapter, version, old_pid, say)
+
+
+def _verify(run, cfg, adapter, version, old_pid, say):
+    """That version runs (a server other than old_pid), the service state names it, the service is enabled."""
     with run.step('verify') as facts:
         again = coldcopy._wait_started(cfg, adapter, version, old_pid)
         if live.service_state(cfg.home)[0] != version or not adapter.service()['enabled']:
@@ -295,6 +325,64 @@ def _steady_on(cfg, adapter, version):
     return bool(server) and server['version'] == active == version and not pending and not live.markers(cfg.home)
 
 
+def _names(cfg, version):
+    """The service state names `version`, with no update pending."""
+    try:
+        active, pending = live.service_state(cfg.home)
+    except live.NotLive:
+        return False
+    return active == version and not pending
+
+
+def _chain(runs):
+    """The back and switch runs left half-way at the end of `runs`, oldest first (each follows the one before)."""
+    chain = []
+    for r in reversed(runs):
+        if not (journal.needs_settling(r) and r['command'] in FOLLOWS):
+            break
+        chain.insert(0, r)
+    return chain
+
+
+def _w1_got(chain, version):
+    """How far the stopped W1 to `version` in `chain` got since its plan: None (it never stopped T3), 'stopped',
+    'updated' (its `t3 update` exited 0) or 'verified'. A later stop (a whole rerun) starts it over."""
+    steps = [s for r in chain for s in r['steps']]
+    plans = [i for i, s in enumerate(steps) if s['step'] == 'plan' and s['phase'] == 'started'
+             and _d(s['data']).get('way') == 'w1' and _d(s['data']).get('version') == version]
+    got, to_version = None, False
+    for s in steps[plans[-1]:] if plans else ():
+        step, done, data = s['step'], s['phase'] == 'done', _d(s['data'])
+        if step == 'stop-service':
+            got = 'stopped'
+        elif step == 'update' and not done:
+            to_version = data.get('version') == version
+        elif step == 'update' and got == 'stopped' and to_version:
+            got = 'updated'
+        elif step == 'verify' and done and got in ('updated', 'verified') and data.get('version') == version:
+            got = 'verified'
+    return got
+
+
+def _resume_w1(run, cfg, adapter, plan, got, say):
+    """A stopped W1 that got past its update ('updated') or its verify ('verified'), whose build the service state
+    still names: no second stop or restore (T3 may have served new work since). It verifies, unless that build is
+    verified and runs steadily, then runs the post hooks. A failure here runs no post hook (that W1 stopped T3)."""
+    version = plan['version']
+    with run.step('resume', way='w1', version=version, t3=plan['t3'], copy=plan['copy'], got=got):
+        pass
+
+    def finish():
+        server = _server(cfg, adapter)
+        if got == 'verified' and server and _steady_on(cfg, adapter, version) and adapter.service()['enabled']:
+            say(f'the stopped W1 got past its verify: t3 {version} runs (pid {server["pid"]}); only the post hooks '
+                'are left')
+            return {'version': version, 'pid': server['pid']}
+        say(f'the stopped W1 got past its update: verifying t3 {version} (the copy is not restored again)')
+        return _verify(run, cfg, adapter, version, 0, say)
+    return _hooked(run, cfg, True, finish, pre=False, post_on_failure=lambda: False, rerun=W1_RERUN)
+
+
 def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=print):
     """Take the way back `way` ('w1', 'w2', 'w3') in this process. Returns {'version', 'nothing'?}; raises
     journal.Refused (nothing changed), Busy (another run holds the lock: a guard timer firing during a manual back
@@ -310,14 +398,16 @@ def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=pr
             say(f'already back: t3 {_facts(last, "version")} runs, verified by the {way} back of {last["began"]}; '
                 'nothing to do')
             return {'version': _facts(last, 'version'), 'nothing': True}
-        plan = None
-        for r in reversed(runs):  # the back (or its followers) that stopped half-way: finish its plan
-            if not (journal.needs_settling(r) and r['command'] in FOLLOWS):
-                break
+        chain, plan = _chain(runs), None
+        for r in reversed(chain):  # the back (or its followers) that stopped half-way: finish its plan
             plan = plan or (_facts(r, 'way') and {k: _facts(r, k) for k in ('way', 'version', 't3', 'copy')})
         if plan and plan['way'] != way:
             raise journal.Refused(f'the last back ({plan["way"]}) stopped half-way: run `t3-golive back --way '
                                   f'{plan["way"]}` again to finish it')
+        if plan and way == 'w1':
+            got = _w1_got(chain, plan['version'])
+            if got in ('updated', 'verified') and _names(cfg, plan['version']):
+                return _resume_w1(run, cfg, adapter, plan, got, say)
         if plan and way != 'w1':  # its t3 may be gone since (unstaged, pruned): look again
             t3, where = _upstream_t3(cfg, plan['version'])
             if t3 is None:
@@ -404,6 +494,31 @@ def _report(cfg, adapter, add, notes, runs):
                                            or 'none'))
 
 
+def _rerun_hint(runs):
+    """What status says about a back or switch left half-way: what it left and what the next back does."""
+    chain = _chain(runs)
+    named = [r for r in chain if _facts(r, 'way')]
+    if not named:
+        return ('no way back was begun: take a way back (`t3-golive back` lists the possible ones), or put the home '
+                f'right and settle: {journal.SETTLE_HINT}')
+    way, version = _facts(named[-1], 'way'), _facts(named[-1], 'version')
+    again = f'`t3-golive back --way {way}`'
+    if way != 'w1':
+        return f'run {again} again: it runs the update to t3 {version} again'
+    got = _w1_got(chain, version)
+    if got == 'verified':
+        return (f'W1 got past its verify (t3 {version} runs and starts at boot); only its post hooks are left: '
+                f'background jobs may stay paused until {again} runs them (no second stop or restore while the '
+                'service state names that build)')
+    if got == 'updated':
+        return (f'W1 got past its update to t3 {version}; background jobs stay paused until {again} verifies it and '
+                'runs the post hooks (no second restore while the service state names that build)')
+    if got == 'stopped':
+        return (f'W1 stopped T3: T3 stays stopped and is not started at boot, and background jobs stay paused, until '
+                f'{again} ends ok (it finishes the restore and the downgrade)')
+    return f'W1 did not stop T3; run {again} again to finish it'
+
+
 def _status(cfg, adapter, add, notes, seen):
     """The checks; returns 'up', 'restarting', 'down' or 'unknown' (the live server goes in seen['server'])."""
     try:
@@ -423,9 +538,7 @@ def _status(cfg, adapter, add, notes, seen):
         if open_run is None:
             add('journal', True, 'no golive run was left half-way')
         elif open_run['command'] in FOLLOWS:
-            add('journal', False, f'{journal.describe(open_run)}; run the same `t3-golive back` again: it finishes '
-                'where that run stopped (a W1 stopped after its stop leaves T3 stopped and not started at boot until '
-                'then)')
+            add('journal', False, f'{journal.describe(open_run)}; {_rerun_hint(runs)}')
         else:
             add('journal', False, f'{journal.describe(open_run)}; {journal.SETTLE_HINT}')
     expected = next((_facts(r, 'version') for r in reversed(runs) if any(
@@ -482,8 +595,11 @@ def status(cfg, adapter):
         notes += [f'incomplete copy (never used) {f}: {b / MB:.1f} MB' for f, b in
                   coldcopy.incomplete_copies(cfg.backup_dir)]
         notes += [f'kept by a restore {f}: {b / MB:.1f} MB' for f, b in coldcopy.kept_files(cfg.home)]
-        notes += [f'kept runtime of t3 {v} (for W1) {f}: {b / MB:.1f} MB' + (f'; NOT usable: {why}' if why else '')
-                  for v, f, b, why in keptruntime.listing(cfg)]
+        for v, f, b, why in keptruntime.listing(cfg):
+            notes.append(f'kept runtime of t3 {v} (for W1) {f}: {b / MB:.1f} MB' + (f'; NOT usable: {why}' if why
+                                                                                     else ''))
+            if why and EXACT_VERSION.match(v):  # present but damaged: W1's safety net is gone
+                add('way back W1', False, f'not available: the kept runtime of t3 {v} is damaged: {why}')
     except Exception as e:  # a hand-edited manifest included: a note, never a crash
         notes.append(f'the copies cannot be listed: {type(e).__name__}: {e}')
     ok = verdict == 'up' and all(c[0] for c in checks)
@@ -518,8 +634,9 @@ def main(args, cfg, adapter, out=sys.stdout, err=sys.stderr):
             print(f't3-golive: {e}', file=err)
             return 1
         print(f'started detached as {unit}. Follow it with: journalctl --user -u {unit} -f; then t3-golive status'
-              + ('. If it is stopped or fails after it stopped T3, T3 stays stopped and is not started at boot until '
-                 'the same back is run again and ends ok' if args.way == 'w1' else ''), file=out)
+              + ('. If it is stopped or fails after it stopped T3, T3 stays stopped and is not started at boot, and '
+                 'background jobs stay paused, until the same back is run again and ends ok' if args.way == 'w1'
+                 else ''), file=out)
         return 0
     if adapter.inside_service():
         print(f't3-golive: this runs inside {osadapter.UNIT}; stopping it would kill this back half-way. Run '
@@ -536,10 +653,8 @@ def main(args, cfg, adapter, out=sys.stdout, err=sys.stderr):
         return 1
     except Exception as e:
         notes = ''.join(f'\n{n}' for n in getattr(e, '__notes__', ()))
-        down = ('\nIf it got past the stop, T3 stays stopped and is not started at boot (on purpose: the home may be '
-                'half-restored) until a `t3-golive back --way w1` ends ok.' if args.way == 'w1' else '')
-        print(f't3-golive: back failed: {type(e).__name__}: {e}{notes}{down}\nRun the same `t3-golive back` again: '
-              'it finishes where this one stopped. `t3-golive status` says where T3 is.', file=err)
+        print(f't3-golive: back failed: {type(e).__name__}: {e}{notes}\nRun the same `t3-golive back` again: it '
+              'finishes where this one stopped. `t3-golive status` says where T3 is.', file=err)
         return 1
     print('nothing to do' if result.get('nothing') else f'back on t3 {result["version"]}, verified', file=out)
     return 0

@@ -328,9 +328,15 @@ it runs detached (a transient unit; stopping or restarting T3 kills a T3 termina
   build, named by the service state, the service enabled; the **post hooks**. `restore_and_downgrade(run, ...,
   automatic=True)` is the same function for the switch's own way back, inside the switch's run, with no time typed
   (`hooks=False` when the switch's run runs the hooks itself).
-- **A W1 that is killed or fails after its stop leaves T3 stopped and disabled** (not started at boot), on purpose:
-  the home may be half-restored. `status` says DOWN and names the run; nothing starts T3 again until a
-  `t3-golive back --way w1` ends ok. Run the same back again: it finishes where the stopped one got to.
+- **A W1 that is killed or fails after its stop leaves T3 stopped and disabled** (not started at boot), and runs
+  no post hook (background jobs stay paused), on purpose: the home may be half-restored. `status` says DOWN and
+  names the run; nothing starts T3 again until a `t3-golive back --way w1` ends ok (a copy run's guard starts only
+  an enabled service). Run the same back again: stopped before its update ended ok, it restores and downgrades
+  again (the restore is safe to run again; what was moved aside stays kept); past its update, while the service
+  state names the old build, it does not stop T3 or restore again: it verifies (or, verified and running steadily,
+  skips that) and runs the post hooks, so work T3 served in between is never restored over. A post hook that fails
+  after the verify leaves T3 running and enabled: the rerun runs only the post hooks. If the service state names
+  another build by then, the rerun is a whole W1 again.
 - **W2, the same-base upstream nightly** (loses nothing): the fork adds no migrations, so the upstream nightly the
   fork build is cut from runs the migrated database as it is: between the pre and the post hooks,
   `<that t3> update <base> --allow-downgrade --yes`, then the same verify. **Read from the code, untried on a live
@@ -341,8 +347,10 @@ it runs detached (a transient unit; stopping or restarting T3 kills a T3 termina
 
 **The pre and post hooks** (`preHooks`, `postHooks` of the machine file) run around stopping and starting T3 as in
 the copy run: a failed pre hook runs the post hooks and refuses before T3 is touched; the post hooks run after the
-verify, and after a failure too. A killed back runs no post hook (back has no guard): background jobs stay paused
-until a back runs again (it runs both again; each hook must be safe twice).
+verify. After a failure they run for W2 and W3 (T3 was never stopped) and for a W1 that never stopped T3; once a W1
+stopped T3, they do not run until a back ends ok (background jobs stay paused while T3 is down on a half-restored
+home; the error and `status` say so). A killed back runs no post hook (back has no guard): background jobs stay
+paused until a back runs again (each hook must be safe twice).
 
 ### The kept runtime (`lib/golive/keptruntime.py`)
 
@@ -353,8 +361,9 @@ switch. The switch therefore keeps a copy first: `keptruntime.keep(run, cfg, <ol
 steps before its update (`keptruntime.plan_keep(cfg, <old>, floor_bytes)` is the read-only check before its first
 step), copies `<home>/runtime/versions/<old>/` to `<stateDir>/kept-runtimes/<old>/runtime/` with `kept.json` (every
 entry's kind, size, mode, SHA256, link target) written last and the folder renamed into place whole. W1 checks it
-entry by entry (`keptruntime.check`) and only then copies it back into `runtime/versions/<old>/` (a fresh
-`.install-complete`, so upstream's 1 h grace covers it, and upstream uses it as installed instead of downloading).
+entry by entry (`keptruntime.check`; a linked kept folder is never followed) and only then copies it back into
+`runtime/versions/<old>/`, hashing each file as it copies it against the entries it checked (a kept file changed
+since the check is refused, nothing put back) (a fresh `.install-complete`, so upstream's 1 h grace covers it, and upstream uses it as installed instead of downloading).
 Upstream never looks in `stateDir`, so no update removes it, and the kit deletes none.
 
 | Situation                                                                            | What happens                                                                                                                                                                                                                                                                                                                                                                                              |
@@ -370,13 +379,16 @@ Upstream never looks in `stateDir`, so no update removes it, and the kit deletes
 | The kept runtime is missing, unfinished (no `kept.json`) or damaged (a file differs) | Never used: W1 not possible, named, refused before any change. `keep` run again sets a damaged one aside (`<version>.bad-<time>`) and keeps anew; a stopped keep leaves only `.partial-<version>`, redone by the next keep                                                                                                                                                                                |
 | W2 with no base nightly installed or staged                                          | Refused before any change, naming what is missing                                                                                                                                                                                                                                                                                                                                                         |
 | The guard timer (switch) fires `back` during a manual back                           | Refused by the kit's lock (`journal.Busy`): one back at a time                                                                                                                                                                                                                                                                                                                                            |
+| W1 after W2 or W3 when the old build is the nightly the fork is cut from             | Refused ("not older than the t3 now"): W2 then runs that very build, and upstream's `t3 update <the version it runs>` may answer "already on" and not start the service W1 stopped (update.ts), which would leave T3 down. Take the copy's data back by hand, or stay on W2's build                                                                                                                       |
 | A journal from before this kit (no `way` in a back's plan)                           | No "nothing to do" from it; the way is taken afresh from what is on disk                                                                                                                                                                                                                                                                                                                                  |
 
 ## `t3-golive status`
 
 Read only: it holds the kit's lock shared like `check` but makes no lock file or state folder when there is none
 (no golive run ever took the lock then). It checks: the boot service (active, enabled, serves this home); the
-journal (no run left half-way: a back or switch that stopped or failed is named, with "run the same back again");
+journal (no run left half-way: a back or switch that stopped or failed is named, with what it left and what the
+next back does: a W1 past its verify has only its post hooks left; one past its stop keeps T3 stopped and the jobs
+paused; a switch with no way back begun says to take one);
 the service state (the version the last golive run verified, no update pending); no marker; the live server
 (`server-runtime.json`, a live pid of that version, started by the service); HTTP answers on `127.0.0.1` at the port
 the server recorded (never another host its `origin` may name); the t3 launcher links upstream recorded
@@ -384,7 +396,8 @@ the server recorded (never another host its `origin` may name); the t3 launcher 
 migration, project and thread counts not below the newest `reportCounts` in the journal (the newest run that
 journalled any: a copy after the switch replaces the switch's). It lists the fork features that are on, the provider
 instances, the copies on disk with their sizes (complete, incomplete, kept files) and the kept runtimes (and whether
-each is usable): the kit deletes none. The first line is one of **T3 is up:**, **T3 is up but not right**, **T3 is
+each is usable): the kit deletes none. A kept runtime that is there but damaged is a failed check ("way back W1: not
+available"), so T3 reads up but not right. The first line is one of **T3 is up:**, **T3 is up but not right**, **T3 is
 restarting or starting** (a golive run holds the lock, a marker, the service activating or stopping, or no server
 yet), **T3 is DOWN**, or **T3 state unknown** (the service manager did not answer, or status itself failed); exit 0
 only for `T3 is up:` (every check passed). An error inside it is a failed check, never a crash or an OK. No report
