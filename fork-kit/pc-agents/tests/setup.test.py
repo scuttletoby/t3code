@@ -548,5 +548,20 @@ class Refused(Case):
         self.assertFalse(os.path.lexists(self.path('/etc/t3code/policy.json')))
 
 
+class ReleaseHolds(unittest.TestCase):
+    """Setup copies k.CODE out of the release commit the bootstrap downloads, and a release commit holds only the
+    paths of .github/fork-ci-release.json: every source must be in one of them (setup crashed on a real distro
+    with FileNotFoundError for fork-fleet-walls.py, since the tests run from a full checkout)."""
+
+    def test_every_code_source_is_in_a_release(self):
+        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
+        with open(os.path.join(root, '.github', 'fork-ci-release.json')) as f:
+            paths = json.load(f)['paths']
+        missing = [src for src in k.CODE if not any(src == p or src.startswith(p.rstrip('/') + '/') for p in paths)]
+        self.assertEqual(missing, [], 'add these to .github/fork-ci-release.json paths')
+        for src in k.CODE:
+            self.assertTrue(os.path.isfile(os.path.join(root, src)), src)
+
+
 if __name__ == '__main__':
     unittest.main()
