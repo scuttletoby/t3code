@@ -26,12 +26,18 @@ again later; the session's end is not complete until `release` exits 0.
 
 ## How a step runs
 
-- The program is given by its **absolute path** (`/…`, `C:\…`, `\\server\…`). A relative program or
-  a bare name is refused when the settings are saved: it would run from the session's worktree or
-  the `PATH`, and the agent can change both. Use installed programs that do not run files from the
-  repository for any step that guards something; put a guard step first in `push`.
+- The program is given by its **full path on the server's OS**: `/…` on Linux and macOS; `C:\…`,
+  `C:/…` or `\\server\…` on Windows (there `/…` and `\…` are relative to the current drive). A
+  relative program or a bare name is refused when the settings are saved: it would run from the
+  session's worktree or the `PATH`, and the agent can change both.
 - No shell. The arguments are the ones in the settings; T3 and the agent add none.
 - Working folder: the session's worktree. Environment: the server's, plus the session's facts.
+- **The working folder is the agent's.** A full path does not make a step safe when the program
+  reads its scripts or config from the current folder: `git` (hooks, repository config), `make`,
+  `npm`, `python -m …`, or a shell running a script from the repository all run files the agent
+  wrote. Every step, and above all a guard, must be an installed script that does not run code from
+  the worktree; read the worktree only as data (`T3_PLAYTEST_WORKTREE`). Put a guard step first in
+  `push`.
 
 | Variable               | Value                                                                       |
 | ---------------------- | --------------------------------------------------------------------------- |
@@ -90,7 +96,8 @@ why it ended and its last round. A thread has at most one session that is not en
 
 ## Limits
 
-- At most 10 push steps; each step's arguments at most 50; `timeoutSeconds` 1 to 3600 (default 120).
+- At most 10 push steps, none named `claim`, `renew` or `release`; each step's argument list at most
+  50 items, the program included; no empty argument; `timeoutSeconds` 1 to 3600 (default 120).
 - `renewMinutes` 1 to 60 (default 10), `idleMinutes` 5 to 1440 (default 90), `maxHours` 1 to 48
   (default 6).
 - The settings are person-only, like every fork setting: no agent tool can change them, and a

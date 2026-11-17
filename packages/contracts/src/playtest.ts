@@ -22,14 +22,30 @@ const PLAYTEST_STEP_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/u;
 export const PLAYTEST_PUSH_STEPS_MAX = 10;
 
 /**
- * An absolute path on any OS: `/…`, `C:\…` or `C:/…`, or `\\server\…`. A relative program would
- * resolve against the session's worktree, which the agent edits, so a step could run the agent's
- * own copy of a guard. A bare name (a `PATH` lookup) is refused for the same reason.
+ * Whether `program` is a full path on the server's OS (Node's `process.platform` name). Anything else
+ * (on Windows also `/…` and `\…`, relative to the drive) resolves against the agent's worktree or
+ * `PATH`. The server checks it when a save sets a program; the step runner checks it before a run.
  */
-const isAbsoluteProgram = (program: string): boolean =>
-  program.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(program) || program.startsWith("\\\\");
+export const isPlaytestProgramFullyQualified = (program: string, platform: string): boolean =>
+  platform === "win32"
+    ? /^[A-Za-z]:[\\/]/u.test(program) || /^[\\/]{2}/u.test(program)
+    : program.startsWith("/");
 
-export const PlaytestStepName = Schema.String.check(Schema.isPattern(PLAYTEST_STEP_NAME_PATTERN));
+/** A full path on some OS. The settings do not know the server's OS; the server's save checks it. */
+const isAbsoluteProgram = (program: string): boolean =>
+  isPlaytestProgramFullyQualified(program, "linux") ||
+  isPlaytestProgramFullyQualified(program, "win32");
+
+/** What `T3_PLAYTEST_STEP` says for the three fixed steps, so no push step may take these names. */
+const PLAYTEST_FIXED_STEPS: ReadonlyArray<string> = ["claim", "renew", "release"];
+
+/** A push step's name; not `claim`, `renew` or `release`, which name the fixed steps. */
+export const PlaytestStepName = Schema.String.check(
+  Schema.isPattern(PLAYTEST_STEP_NAME_PATTERN),
+  Schema.makeFilter((name: string) => !PLAYTEST_FIXED_STEPS.includes(name), {
+    expected: "a push step name other than claim, renew or release",
+  }),
+);
 export type PlaytestStepName = typeof PlaytestStepName.Type;
 
 /**
@@ -38,7 +54,7 @@ export type PlaytestStepName = typeof PlaytestStepName.Type;
  * an agent adds none. Only settings can add or change one.
  */
 export const PlaytestStep = Schema.Struct({
-  /** Program (an absolute path) and fixed arguments. */
+  /** Program (an absolute path) and fixed arguments: at most 50 items, the program included. */
   argv: Schema.Array(TrimmedNonEmptyString).check(
     Schema.isMinLength(1),
     Schema.isMaxLength(50),
