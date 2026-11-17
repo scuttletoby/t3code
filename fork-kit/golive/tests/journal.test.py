@@ -314,7 +314,7 @@ class Adapter(Base):
         self.m.unit(home='/srv/t3 home/%%x')
         svc = osadapter.SystemdUser().service()
         self.assertEqual(svc, {'loaded': True, 'active': True, 'enabled': True, 'mainPid': os.getpid(),
-                               'unitPath': self.m.path('units/t3code.service'), 'home': '/srv/t3 home/%x'})
+                               'state': 'active', 'unitPath': self.m.path('units/t3code.service'), 'home': '/srv/t3 home/%x'})
         self.assertEqual(self.m.calls('systemctl-calls.jsonl'),
                          [['--user', 'show', 't3code.service',
                            '--property=LoadState,ActiveState,UnitFileState,FragmentPath,MainPID']])
