@@ -64,6 +64,25 @@ UPSTREAM = [
     ('packages/shared/src/cliRelease.ts',
      'return `t3-${version}-${platformKey}.${platformKey.startsWith("win32") ? "zip" : "tar.gz"}`;',
      'archive name t3-<version>-<platform>.tar.gz'),
+    # back and status (back.py)
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'sentinelPath: path.join(versionDir, ".install-complete"),',
+     'back.installed_t3: a whole runtime has runtime/versions/<v>/.install-complete'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'const PINNED_RUNTIME_LAUNCHERS_FILE = "launchers";',
+     'status: the launcher links upstream recorded in runtime/launchers'),
+    ('apps/server/src/cli/update.ts', 'allowDowngrade: Flag.Boolean("allow-downgrade")',
+     'back: update --allow-downgrade'),
+    ('apps/server/src/cli/update.ts', 'yes: Flag.Boolean("yes")', 'back: update --yes restarts the service'),
+    ('apps/server/src/cli/config.ts', 'export const baseDirFlag = Flag.String("base-dir")', 'back: update --base-dir'),
+    # keptruntime.py: upstream prunes old runtimes at the end of every update, so W1 keeps its own copy
+    ('apps/server/src/cli/update.ts', '      keep: [currentVersion, targetVersion],',
+     'keptruntime: every update prunes the runtimes it does not keep (the old build after the switch, W2, W3)'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'const PINNED_RUNTIME_PRUNE_GRACE = Duration.hours(1);',
+     'keptruntime.put_back: a fresh .install-complete is spared by a prune for 1 h'),
+    ('apps/server/src/cloud/pinnedRuntime.ts',
+     'entryExists && Option.isSome(sentinel) && sentinel.value.trim() === input.version;',
+     'keptruntime.put_back: a whole runtime put back is used as it is, not downloaded again'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', '    if (!isExactServiceVersion(version)) continue;',
+     'keptruntime: its .golive-* folders in runtime/versions are no version, never pruned'),
     ('apps/server/src/cloud/serviceProtocol.ts', 'const SEMVER_NUMBER = "(?:0|[1-9]\\\\d*)";',
      'config.EXACT_VERSION'),
     ('apps/server/src/cloud/serviceProtocol.ts',
@@ -97,13 +116,14 @@ REHEARSE_UPSTREAM = [
 
 REPORT_FILE = 'apps/server/src/golive/forkReport.ts'
 REPORT_CLI = 'apps/server/src/cli/forkReport.ts'
-# Every key path check.py and live.py read from the report, with where it sits.
+# Every key path check.py, live.py and back.py read from the report, with where it sits.
 REPORT_PATHS = ['reportVersion', 'version', 'ok', 'problems', 'problems.code', 'problems.message',
                 'database.pendingMigrations', 'database.counts', 'database.counts.threads',
                 'database.counts.projects', 'database.counts.threadsArchived', 'database.counts.projectsArchived',
-                'fork.featuresOn', 'database.appliedMigrations', 'database.appliedMigrations.id',
+                'fork.featuresOn', 'fork.features', 'database.appliedMigrations', 'database.appliedMigrations.id',
                 'database.unknownMigrations', 'settings.parseWarning', 'settings.providerInstances',
-                'settings.providerInstances.id']
+                'settings.providerInstances.id', 'settings.providerInstances.driver',
+                'settings.providerInstances.enabled']
 # What live.compare_counts relies on (fork #181): both reports count the same rows, every project and every thread
 # not deleted (sub-agent and archived threads included), so one report is compared with another, never with
 # `t3 thread list` (one project, no sub-agents).
