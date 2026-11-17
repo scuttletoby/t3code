@@ -236,8 +236,10 @@ allowed (connection tracking).
 - **Packages:** setup installs `nftables`, `libatomic1` and `unzip` when `dpkg` does not list one as installed (held
   counts as installed; a distro set up by an older kit gets the two new ones at its next run; no T3 restart for
   them). It installs them after it writes its files, so `apt-get` resolves through the machine file's `nameservers`
-  as they are now, and before it loads the firewall. A package install stopped half-way (`dpkg --audit` names it) is
-  finished first (`dpkg --configure -a`, run only then). Nothing asks a question: a changed config file is kept and
+  as they are now, and before it loads the firewall. A package install stopped half-way (`dpkg --audit` names it, or
+  `/var/lib/dpkg/updates` holds a file named all digits, which `apt-get install` refuses on as well) is finished first
+  (`dpkg --configure -a`, run only then). `apt-get` and `dpkg` run under `LC_ALL=C`, so a lock reads the same in
+  every language. Nothing asks a question: a changed config file is kept and
   debconf takes its defaults. A lock another `apt-get` or `dpkg` holds (apt-daily on a new distro) is waited for, up
   to 5 minutes a step: `apt-get` waits for dpkg's lock itself, and setup runs `dpkg`, `apt-get update` and
   `apt-get install` again while they fail on the locks they take without a wait. A failed step stops setup, naming
