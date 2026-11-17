@@ -480,3 +480,64 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork playtest se
       }).pipe(Effect.provide(layerServerSettings())),
   );
 });
+
+it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork handoff settings", (it) => {
+  const ON = { mode: "handoff", threads: { "thread-1": "compact" }, sizeTokens: 120_000 };
+
+  it.effect("saves a value, and the same save again leaves the same file", () =>
+    Effect.gen(function* () {
+      const once = yield* loadThenPatch(FULL_FILE, { handoff: ON });
+      assert.deepStrictEqual((once as { handoff?: unknown }).handoff, ON);
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* service.updateSettings(decodePatch({ handoff: ON }));
+      assert.deepStrictEqual(yield* readFile, once);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("reads a hand-edited or newer value as off, keeps the rest, and a save drops it", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(
+        config.settingsPath,
+        JSON.stringify({
+          ...FULL_FILE,
+          handoff: { ...ON, fromANewerBuild: true },
+          projectSettingsOverrides: { [PROJECT]: { handoff: { mode: "always" } } },
+        }),
+      );
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const settings = yield* service.getSettings;
+      assert.strictEqual(settings.handoff.mode, "off");
+      assert.strictEqual(
+        settings.projectSettingsOverrides[ProjectId.make(PROJECT)]?.handoff?.mode,
+        "off",
+      );
+      assert.strictEqual(settings.waitFor.maxPerThread, 7);
+      yield* service.updateSettings(decodePatch({ enableAgentBrowserAccess: true }));
+      assert.isFalse("handoff" in ((yield* readFile) as Record<string, unknown>));
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("keeps a project's value when a client that does not know the key saves", () =>
+    Effect.gen(function* () {
+      const file = yield* loadThenPatch(
+        { ...FULL_FILE, projectSettingsOverrides: { [PROJECT]: { handoff: ON } } },
+        { projectSettingsOverrides: { [PROJECT]: { defaultAutoPull: true } } },
+      );
+      const project = (file as { projectSettingsOverrides: Record<string, unknown> })
+        .projectSettingsOverrides[PROJECT];
+      // Kept whole; a project's entry is written with its defaults filled in.
+      assert.deepInclude((project as { handoff?: object }).handoff, ON);
+      // `null` clears it: the project then uses the server's.
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* service.updateSettings(
+        decodePatch({
+          projectSettingsOverrides: { [PROJECT]: { defaultAutoPull: true, handoff: null } },
+        }),
+      );
+      const read = (yield* service.getSettings).projectSettingsOverrides[ProjectId.make(PROJECT)];
+      assert.isUndefined(read?.handoff);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+});
