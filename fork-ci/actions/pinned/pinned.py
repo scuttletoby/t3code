@@ -16,7 +16,7 @@ and no good copy: FetchError, and the caller fails or falls back to its full ans
 also removes .part- files older than PART_AGE (a killed fetch), and the folders of other shas that nothing used for
 CACHE_DAYS and the run folders a killed run left that long ago. load() and run run the bytes that were checked, never
 a second read of the cache file, and refuse a file that would load its neighbours (neighbour_loads): those would be
-cache files nothing checked.
+cache files nothing checked. run also refuses a cache under a folder someone else could write (shared_above).
 
   python3 -I pinned.py --config .github/fork-ci.json [--cache DIR] run <action> <file> [args...]
 runs that pinned script (python3 -I) with the arguments after its name, from a private copy of the checked bytes.
@@ -25,18 +25,30 @@ prints the "files" map at the config's sha (fetched, not checked): for a pin bum
 README.md next to this file: the Python API and the bootstrap a project copies to load this module.
 """
 import argparse, ast, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, types, urllib.request
+try:
+    import grp, pwd
+except ImportError:   # no owners (Windows): shared_above checks nothing there
+    grp = pwd = None
 
 NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._-]*\Z')   # \Z: no trailing newline
 SHA = re.compile(r'[0-9a-f]{40}')
 PART_AGE = 3600     # seconds: an older .part- file is a killed fetch (a live one takes seconds)
 CACHE_DAYS = 14     # another sha's folder that nothing used for this long goes (a rerun of an old run fetches again)
-# modules that load code from a path (site: a .pth file runs code; builtins: its __import__ and exec)
-BY_PATH = ('importlib', 'runpy', 'imp', 'zipimport', 'pkgutil', 'site', 'pkg_resources', 'ctypes', 'builtins')
+# modules that load code from a path (site: a .pth file runs code; builtins: its __import__ and exec; the private
+# twins of importlib, imp and ctypes; pydoc.importfile; unittest's discover)
+BY_PATH = ('importlib', 'runpy', 'imp', 'zipimport', 'pkgutil', 'site', 'pkg_resources', 'ctypes', 'builtins',
+           '_frozen_importlib', '_frozen_importlib_external', '_imp', '_ctypes', 'pydoc', 'unittest')
 SYS_IMPORT = ('path', 'meta_path', 'path_hooks', 'path_importer_cache', 'modules')   # the sys names imports go by
-SYS_FRAME = ('_getframe', '_current_frames')   # sys names whose frames give the file's own path (f_code.co_filename)
+# sys names that give the file's own path: frames (f_code.co_filename), tracebacks (tb_frame), the command line
+SYS_FRAME = ('_getframe', '_current_frames', '_getframemodulename', 'exc_info', 'exception', 'last_traceback',
+             'last_value', 'last_exc', 'settrace', 'setprofile', 'orig_argv')
+SYS_FROM = ('argv', 'exit', 'stdin', 'stdout', 'stderr', 'executable', 'platform', 'version', 'version_info',
+            'maxsize')   # the only names `from sys import` may take (argv: only as argv[k] or argv[k:], k >= 1)
 # where a neighbour's path starts: the file's own path, or the importer (__builtins__ holds __import__)
-OWN_PATH = ('__file__', '__spec__', '__loader__', '__cached__', '__import__', '__builtins__')
-OWN_MODULE = ('__main__', 'inspect')   # modules that give the running file's own path (__main__.__file__, getfile)
+OWN_PATH = ('__file__', '__spec__', '__loader__', '__cached__', '__import__', '__builtins__', 'globals', 'locals')
+OWN_MODULE = ('__main__', 'inspect', 'traceback')   # modules that give the running file's own path
+OWN_ATTR = ('co_filename', 'f_code', 'f_globals', 'f_back', 'tb_frame', 'gi_frame', 'cr_frame', 'ag_frame',
+            '__code__', '__globals__', '__traceback__')   # a function's or an exception's way to its frame or file
 RUN = '.run-'   # a run's private folder in the cache (a killed run leaves it; prune removes it after CACHE_DAYS)
 
 
@@ -86,6 +98,15 @@ def private(cache):
     another user's, or one the group or others can write is refused, never chmodded: someone else could already have
     put a symlink, a FIFO or a file in it that prune or a read would act on. (The bytes run are checked either way.)"""
     if not os.path.lexists(cache):
+        missing, up = [], os.path.dirname(os.path.abspath(cache))
+        while not os.path.lexists(up):
+            missing.append(up)
+            up = os.path.dirname(up)
+        for up in reversed(missing):   # 0700 like the cache, whatever the umask: run checks the folders above it
+            try:
+                os.mkdir(up, 0o700)
+            except FileExistsError:
+                pass
         try:
             os.makedirs(cache, mode=0o700)
         except FileExistsError:   # another run made it first (two first runs at once): the check below decides
@@ -94,6 +115,80 @@ def private(cache):
     if not stat.S_ISDIR(st.st_mode) or hasattr(os, 'getuid') and (st.st_uid != os.getuid() or st.st_mode & 0o022):
         raise FetchError(f'cache folder {cache} is not a folder of your own that only you can write (a symlink, '
                          "another user's, or group- or world-writable): remove it or pass --cache with another")
+
+
+def own_group(gid):
+    """Whether gid is your own private group: your primary group, named as you, with no listed member and no other
+    user's primary group. Debian and Ubuntu give each user one (and umask 002, so ~/.cache is often 0775); Debian's
+    OpenSSH trusts a group-writable folder of yours in such a group (StrictModes) for the same reason. None (falsy:
+    not one) when any lookup fails, whatever it raises."""
+    try:
+        me, group, users = pwd.getpwuid(os.getuid()), grp.getgrgid(gid), pwd.getpwall()
+    except Exception:   # KeyError, OSError, or whatever an NSS module raises: cannot tell, so not private
+        return None
+    return (me.pw_gid == gid and group.gr_name == me.pw_name and not group.gr_mem
+            and all(u.pw_uid == me.pw_uid for u in users if u.pw_gid == gid))
+
+
+ACLS = ('system.posix_acl_access', 'system.nfs4_acl')
+
+
+def acl(folder):
+    """Whether folder has an ACL (True), none (False), or None when we cannot tell: no listxattr here (not Linux),
+    or it fails (a file system without xattrs, an unreadable folder). With an ACL, a folder's group bits are the ACL
+    mask, not its group's: a 0775 folder of yours can be writable by a user or group the ACL names."""
+    listxattr = getattr(os, 'listxattr', None)
+    if listxattr is None:
+        return None
+    try:
+        return not set(ACLS).isdisjoint(listxattr(folder))
+    except OSError:
+        return None
+
+
+def shared_above(cache):
+    """The folders above the cache (by the path given and by its real path) that someone else could write: not ours
+    or root's, world-writable (a sticky /tmp too), or group-writable unless it is ours, has no ACL (acl: the group
+    bits may be its mask) and its group is our own private group (own_group). run's copy is
+    <cache>/.run-X/<action>/<file>, so a script's `../../..` is the folder above the cache, where such a someone could
+    plant a neighbour. A missing folder is skipped: private() makes it 0700 below a folder checked here. [] where there
+    are no owners (Windows)."""
+    if not hasattr(os, 'getuid'):
+        return []
+    bad, seen = [], set()
+    for p in (os.path.abspath(cache), os.path.realpath(cache)):
+        up = os.path.dirname(p)
+        while up not in seen:
+            seen.add(up)
+            try:
+                st = os.stat(up)   # a symlink is judged by its target; its own folder is judged as an ancestor
+            except FileNotFoundError:
+                up = os.path.dirname(up)
+                continue
+            if (st.st_uid not in (0, os.getuid()) or st.st_mode & 0o002
+                    or st.st_mode & 0o020
+                    and not (st.st_uid == os.getuid() and acl(up) is False and own_group(st.st_gid))):
+                bad.append(up)
+            up = os.path.dirname(up)
+    return bad
+
+
+def fix_above(up):
+    """How to fix a folder shared_above found: chmod a folder of yours, use another cache under anyone else's."""
+    st = os.stat(up)
+    if st.st_uid != os.getuid():
+        return 'pass --cache with a folder whose every parent only you or root can write'
+    if st.st_mode & 0o002:
+        return f'chmod go-w {up}'
+    has = acl(up)
+    if has:
+        return (f'{up} has an ACL, so its group bits are the ACL mask, not its group: remove the ACL '
+                f'(setfacl -b {up}) or chmod g-w {up}')
+    if has is None:
+        return f'cannot tell if {up} has an ACL: chmod g-w {up}'
+    if own_group(st.st_gid) is None:
+        return f'cannot tell if the group of {up} is private: chmod g-w {up}'
+    return f'chmod g-w {up}'
 
 
 def read_regular(path):
@@ -196,18 +291,20 @@ def neighbour_loads(data):
         puts its folder first, then imports config and lens), or used as anything but `sys.<other name>` (an alias's
         .path, getattr, vars, `s = sys`);
       - a module that loads code from a path or swaps the import (BY_PATH), or a relative import;
-      - the file's own path (OWN_PATH: __file__, __spec__, __loader__, __cached__; argv[0]; sys._getframe; __main__,
-        inspect) or the importer (__import__, __builtins__): every way to name a neighbour (exec(open(...)), a
-        subprocess, os.chdir, site.addsitedir, a data file) starts from it.
+      - the file's own path (OWN_PATH: __file__, __spec__, __loader__, __cached__, globals, locals; sys.argv except
+        argv[k] or argv[k:] with k >= 1; SYS_FRAME; OWN_ATTR; vars(); __main__, inspect, traceback) or the importer
+        (__import__, __builtins__): every way to name a neighbour (exec(open(...)), a subprocess, os.chdir,
+        site.addsitedir, a data file) starts from it. `from sys import` takes only SYS_FROM.
     Other imports come from the caller's own path (the standard library, an installed PyYAML), as any import of the
-    caller's does. A static check of the usual spellings, never complete (globals()['__file__'], traceback, an
-    absolute path pass it), so run also puts its copy in a private folder inside the checked cache: every `..` of it
-    is ours (README: the folders above the cache must be)."""
+    caller's does. A static check of the usual spellings, never complete (exec, eval or getattr of a built string, an
+    absolute path such as /proc/self/cmdline pass it), so run also puts its copy in a private folder inside the
+    checked cache and refuses a cache with a folder above it that someone else could write (shared_above): every `..`
+    of the copy is ours or root's."""
     try:
         tree = ast.parse(data)
     except (SyntaxError, ValueError):
         return ['(does not parse)']
-    found, sys_names = set(), {'sys'}
+    found, sys_names, argv_names = set(), {'sys'}, set()
     for node in ast.walk(tree):
         names = []
         if isinstance(node, ast.Import):
@@ -216,17 +313,48 @@ def neighbour_loads(data):
         elif isinstance(node, ast.ImportFrom):
             names = ['.' * node.level + (node.module or '')]
             sys_names.update(a.asname or a.name for a in node.names if a.name == 'sys')   # from os import sys
-            if node.module == 'sys' and any(a.name in (*SYS_IMPORT, '*') for a in node.names):
-                found.add('sys.path')
+            if node.module == 'sys':
+                for a in node.names:
+                    if a.name in (*SYS_IMPORT, '*'):
+                        found.add('sys.path')
+                    elif a.name not in SYS_FROM:
+                        found.add(f'sys.{a.name}')
+                    elif a.name == 'argv':
+                        argv_names.add(a.asname or a.name)
         found.update(n for n in names if n.startswith('.') or n.split('.')[0] in (*BY_PATH, *OWN_MODULE))
     parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def index(node):
+        return node.slice.value if isinstance(node.slice, getattr(ast, 'Index', ())) else node.slice
+
+    def past_0(i):   # a constant k >= 1, or a slice [k:] that starts there
+        i = i.lower if isinstance(i, ast.Slice) else i
+        return isinstance(i, ast.Constant) and type(i.value) is int and i.value >= 1
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript):   # argv[0], sys.argv[0]: the script's own path
-            index = node.slice.value if isinstance(node.slice, getattr(ast, 'Index', ())) else node.slice
             argv = (isinstance(node.value, ast.Attribute) and node.value.attr == 'argv'
-                    or isinstance(node.value, ast.Name) and node.value.id == 'argv')
-            if argv and isinstance(index, ast.Constant) and index.value == 0:
+                    or isinstance(node.value, ast.Name) and node.value.id in ('argv', *argv_names))
+            if argv and isinstance(index(node), ast.Constant) and index(node).value == 0:
                 found.add('argv[0]')
+            if isinstance(index(node), ast.Constant) and index(node).value == 'sys':   # os.__dict__['sys']
+                found.add('sys.path')
+        if (isinstance(node, ast.Name) and node.id in argv_names
+                or isinstance(node, ast.Attribute) and node.attr == 'argv'
+                and (isinstance(node.value, ast.Name) and node.value.id in sys_names
+                     or isinstance(node.value, ast.Attribute) and node.value.attr == 'sys')):
+            p = parent.get(node)   # sys's argv: only argv[k], argv[k:] (k >= 1) or len(argv)
+            if not (isinstance(p, ast.Subscript) and p.value is node and past_0(index(p))
+                    or isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == 'len'):
+                found.add('sys.argv')
+        if isinstance(node, ast.Attribute) and node.attr in OWN_ATTR:
+            found.add(node.attr)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == 'vars' and not node.args:   # vars() is locals()
+                found.add('vars()')
+            if (node.func.id == 'getattr' and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == 'sys'):
+                found.add('sys.path')
         if isinstance(node, ast.Name) and node.id in OWN_PATH:
             found.add(node.id)
         elif (isinstance(node, ast.Name) and node.id in sys_names
@@ -267,10 +395,18 @@ def load(config, action, module, cache=None):
 def run(config, action, name, args=(), cache=None, runner=None):
     """Run the pinned script with python3 -I and args, from a private copy (<cache>/.run-X/<action>/<name>) of the
     bytes that were checked; its exit code. The copy goes after the run (a killed run's goes after CACHE_DAYS)."""
-    cache = cache or default_cache()
-    _, data = self_contained(config, action, name, cache)   # checks the cache folder first (private)
+    cache = cache or default_cache()   # never None: mkdtemp(dir=None) is the shared temp folder
+    shared = shared_above(cache)   # before private() makes any folder: a refused cache leaves nothing behind
+    if shared:
+        raise FetchError(f'{", ".join(shared)} above the cache {cache} can be written by someone else (not yours or '
+                         "root's, world-writable, a sticky temp folder too, or group-writable by a group that is not "
+                         "your own private one, or through an ACL): a script's `..` reaches it, so run refuses this "
+                         "cache. Fix: "
+                         + '; '.join(dict.fromkeys(fix_above(up) for up in shared)))
+    private(cache)
+    _, data = self_contained(config, action, name, cache)
     # 0700, ours alone: the bytes checked are the bytes run. In the checked cache, never the shared temp folder: the
-    # script's `..` is this folder, `../..` the 0700 cache, and above it folders the README requires to be ours.
+    # script's `..` is this folder, `../..` the 0700 cache, and above it the folders shared_above found ours or root's.
     run_dir = tempfile.mkdtemp(prefix=RUN, dir=cache)
     try:
         folder = os.path.join(run_dir, action)
