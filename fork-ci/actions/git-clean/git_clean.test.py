@@ -252,6 +252,36 @@ class Planted(Base):
                 self.assertFalse(os.path.lexists(dot))
                 self.assertTrue(os.path.isdir(os.path.join(elsewhere, '.git')))   # the target is outside: kept
 
+    def test_files_that_change_history_or_objects_are_refused(self):
+        """grafts change a commit's parents (--no-replace-objects does not turn them off), alternates add another
+        repository's objects, info/attributes changes how a file merges or diffs. actions/checkout writes none."""
+        repo = self.checkout()
+        git(repo, 'commit', '-q', '--allow-empty', '-m', 'b')
+        os.makedirs(os.path.join(repo, '.git', 'info'), exist_ok=True)
+        with open(os.path.join(repo, '.git', 'info', 'grafts'), 'w') as f:
+            f.write(git(repo, 'rev-parse', 'HEAD') + '\n')
+        self.assertEqual(git(repo, *G.GIT_SAFE, 'rev-list', '--count', 'HEAD'), '1', 'the planted graft did nothing')
+        self.assert_refused_then_wiped(repo, 'info/grafts')
+        for name, text in (('info/attributes', '* merge=union\n'), ('objects/info/alternates', self.outside + '\n'),
+                           ('objects/info/http-alternates', 'https://example.com/objects\n')):
+            with self.subTest(name=name):
+                self.rm(self.ws)
+                os.makedirs(self.ws)
+                repo = self.checkout()
+                path = os.path.join(repo, '.git', *name.split('/'))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'w') as f:
+                    f.write(text)
+                self.assert_refused_then_wiped(repo, name)
+
+    def test_the_refusal_says_what_to_do_either_way(self):   # an earlier job's key, or one checkout itself wrote
+        repo = self.checkout()
+        self.plant(repo, ('core.sshCommand', 'ssh -i key'))
+        code, out = self.run_cli('check', '--path', '.', env=self.env('github-hosted'))
+        self.assertEqual(code, 2, out)
+        self.assertIn('run fork-ci/actions/git-clean before actions/checkout', out)
+        self.assertIn('Written by actions/checkout itself', out)
+
     def test_unreadable_config_is_refused(self):
         repo = self.checkout()
         with open(os.path.join(repo, '.git', 'config'), 'a') as f:
@@ -271,6 +301,7 @@ class Allowed(Base):
                    ('filter.lfs.process', 'git-lfs filter-process'), ('filter.lfs.required', 'true'),
                    ('http.https://github.com/.extraheader', 'AUTHORIZATION: basic eDp5'),
                    ('submodule.lib.url', 'https://github.com/owner/lib'), ('submodule.lib.active', 'true'),
+                   ('submodule.ssh.url', 'git@github.com:owner/lib.git'),
                    ('user.name', 'ci'), ('user.email', 'ci@example.com'))
         git(repo, 'config', '--worktree', 'core.sparseCheckout', 'true')
         self.assertEqual(G.problems(repo, self.env()), [])
@@ -282,13 +313,105 @@ class Allowed(Base):
                            ('filter.lfs.smudge', 'sh -c x'), ('branch.main.remote', '.'),
                            ('core.bare', 'true'), ('user.name', 'a\nb'),
                            (f'includeIf.gitdir:{self.ws}/.git.path', f'{self.temp}/git-credentials-x.config'),
-                           (f'includeIf.gitdir:{self.ws}/.git.path', f'{self.outside}/git-credentials-{UUID}.config')):
+                           (f'includeIf.gitdir:{self.ws}/.git.path', f'{self.outside}/git-credentials-{UUID}.config'),
+                           (f'includeIf.gitdir:{self.ws}/.git.path', f'{self.temp}/git-credentials-{UUID[:-1]}.config'),
+                           ('include.path', self.creds), ('includeIf.onbranch:main.path', self.creds),
+                           ('http.https://github.com/.extraheader', 'AUTHORIZATION: bearer eDp5'),
+                           ('http.https://github.com/.extraheader', 'AUTHORIZATION: basic eDp5 x'),
+                           ('submodule.lib.url', 'ext::sh -c touch% /tmp/x'), ('submodule.lib.url', 'file:///tmp/x'),
+                           ('submodule.lib.url', 'https://user@example.com/x'),
+                           ('submodule.lib.url', 'git@-oProxyCommand:y')):
             with self.subTest(key=key, value=value):
                 self.rm(self.ws)
                 os.makedirs(self.ws)
                 repo = self.checkout()
+                if 'git-credentials' in value and os.path.dirname(value) == self.temp:
+                    self.header_only(value)
                 self.plant(repo, (key, value))
                 self.assertTrue(G.problems(repo, self.env()), (key, value))
+
+    @property
+    def creds(self):
+        return os.path.join(self.temp, f'git-credentials-{UUID}.config')
+
+    def header_only(self, path):
+        if os.path.exists(path):
+            os.remove(path)
+        git(self.d, 'config', '--file', path, 'http.https://github.com/.extraheader', 'AUTHORIZATION: basic eDp5')
+
+    def test_the_token_file_holds_only_the_token_header_value(self):
+        repo = self.checkout()
+        os.remove(self.creds)
+        git(self.d, 'config', '--file', self.creds, 'http.https://github.com/.extraheader', 'AUTHORIZATION: bearer x')
+        self.assertTrue(G.problems(repo, self.env()))
+
+    def shallow_checkout(self, detached):
+        """What actions/checkout does with fetch-depth 1, its default: init, fetch one ref with --depth=1, check it out
+        (detached on pull_request, on a branch on push)."""
+        src = os.path.join(self.d, 'src')
+        git(self.d, 'init', '-q', '-b', 'main', src)
+        for n in ('a', 'b', 'c'):
+            git(src, 'commit', '-q', '--allow-empty', '-m', n)
+        repo = self.ws
+        git(repo, 'init', '-q')
+        git(repo, 'remote', 'add', 'origin', 'https://github.com/owner/repo')
+        git(repo, 'fetch', '-q', '--no-tags', '--depth=1', f'file://{src}', '+refs/heads/main:refs/remotes/origin/main')
+        if detached:
+            git(repo, 'checkout', '-q', '--detach', 'refs/remotes/origin/main')
+        else:
+            git(repo, 'checkout', '-q', '-B', 'main', 'refs/remotes/origin/main')
+        return repo, src
+
+    def test_a_fetch_depth_1_checkout_passes(self):
+        for detached in (True, False):
+            with self.subTest(detached=detached):
+                self.rm(self.ws)
+                self.rm(os.path.join(self.d, 'src'))
+                os.makedirs(self.ws)
+                repo, _ = self.shallow_checkout(detached)
+                with open(os.path.join(repo, '.git', 'shallow')) as f:
+                    self.assertEqual(f.read(), git(repo, 'rev-parse', 'HEAD') + '\n')   # what checkout leaves
+                code, out = self.run_cli('check', '--path', '.', '--require', env=self.env('github-hosted'))
+                self.assertEqual(code, 0, out)
+
+    def test_any_other_shallow_file_is_refused(self):
+        """shallow cuts history at the commits it names: only the one commit of a depth-1 checkout (HEAD) passes."""
+        def deeper(repo, src):   # a depth-2 fetch: the boundary is HEAD's parent
+            git(repo, 'fetch', '-q', '--no-tags', '--depth=2', f'file://{src}', '+refs/heads/main:refs/remotes/origin/main')
+
+        def parent(repo, src):   # the history cut below HEAD, in a full clone
+            self.rm(os.path.join(repo, '.git'))
+            git(repo, 'init', '-q')
+            git(repo, 'fetch', '-q', '--no-tags', f'file://{src}', '+refs/heads/main:refs/remotes/origin/main')
+            git(repo, 'checkout', '-q', '--detach', 'refs/remotes/origin/main')
+            self.write_shallow(repo, git(src, 'rev-parse', 'HEAD~1') + '\n')
+
+        cases = (('depth 2', deeper), ('parent', parent),
+                 ('two lines', lambda repo, src: self.write_shallow(repo, git(repo, 'rev-parse', 'HEAD') + '\n' +
+                                                                     git(src, 'rev-parse', 'HEAD~1') + '\n')),
+                 ('empty', lambda repo, src: self.write_shallow(repo, '')),
+                 ('no newline', lambda repo, src: self.write_shallow(repo, git(repo, 'rev-parse', 'HEAD'))),
+                 ('symlink', lambda repo, src: self.link_shallow(repo)))
+        for name, make in cases:
+            with self.subTest(case=name):
+                self.rm(self.ws)
+                self.rm(os.path.join(self.d, 'src'))
+                os.makedirs(self.ws)
+                repo, src = self.shallow_checkout(True)
+                make(repo, src)
+                code, out = self.run_cli('check', '--path', '.', '--require', env=self.env('github-hosted'))
+                self.assertEqual(code, 2, out)
+                self.assertIn('shallow', out)
+
+    def write_shallow(self, repo, text):
+        with open(os.path.join(repo, '.git', 'shallow'), 'w') as f:
+            f.write(text)
+
+    def link_shallow(self, repo):
+        path = os.path.join(repo, '.git', 'shallow')
+        real = os.path.join(self.d, 'shallow')
+        os.rename(path, real)
+        os.symlink(real, path)
 
     def test_no_checkout_yet(self):
         """GitHub-hosted, before actions/checkout: an empty workspace has nothing to check; --require wants a .git."""
@@ -356,12 +479,65 @@ class Wipe(Base):
                     {'GITHUB_WORKSPACE': self.outside},                    # not inside RUNNER_WORKSPACE
                     {'GITHUB_WORKSPACE': self.runner},                     # RUNNER_WORKSPACE itself
                     {'GITHUB_WORKSPACE': os.path.join(self.ws, 'nope')},   # missing
-                    {'GITHUB_WORKSPACE': os.path.join(self.d, '_work'), 'RUNNER_WORKSPACE': None}):   # holds RUNNER_TEMP
+                    {'GITHUB_WORKSPACE': os.path.join(self.d, '_work'), 'RUNNER_WORKSPACE': None},
+                    {'RUNNER_WORKSPACE': None},                            # self-hosted: the runner always sets it
+                    {'RUNNER_WORKSPACE': 'proj'},
+                    {'HOME': os.path.join(self.ws, 'sub')},
+                    {'RUNNER_TEMP': os.path.join(self.ws, 'sub')},
+                    {'RUNNER_TOOL_CACHE': os.path.join(self.ws, 'sub')}):
             with self.subTest(bad=bad):
                 code, out = self.run_cli('prepare', '--path', '.', env=self.env(**bad))
                 self.assertEqual(code, 2, out)
                 self.assertIn('refused', out)
+                for name in ('HOME', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE'):
+                    if name in bad:
+                        self.assertIn(f'holds {name}', out)
+                if bad.get('GITHUB_WORKSPACE') in (self.outside, self.runner):
+                    self.assertIn('is not inside RUNNER_WORKSPACE', out)
                 self.assertEqual(sorted(os.listdir(self.ws)), before)
+        self.assert_outside_kept()
+
+    def test_a_symlinked_runner_workspace_is_refused(self):
+        """An earlier job swapped RUNNER_WORKSPACE (_work/<repo>) for a symlink: realpath follows it on both sides, so
+        only the real path of the runner's work folder tells."""
+        elsewhere = os.path.join(self.d, 'elsewhere')
+        os.makedirs(os.path.join(elsewhere, 'proj'))
+        with open(os.path.join(elsewhere, 'proj', 'f'), 'w') as f:
+            f.write('x')
+        self.rm(self.runner)
+        os.symlink(elsewhere, self.runner)
+        code, out = self.run_cli('prepare', '--path', '.')
+        self.assertEqual(code, 2, out)
+        self.assertIn('a symlink below RUNNER_WORKSPACE', out)
+        self.assertEqual(os.listdir(os.path.join(elsewhere, 'proj')), ['f'])
+
+    def test_a_symlink_between_the_runner_workspace_and_the_workspace_is_refused(self):
+        other = os.path.join(self.runner, 'other', 'proj')
+        os.makedirs(other)
+        with open(os.path.join(other, 'f'), 'w') as f:
+            f.write('x')
+        os.symlink(os.path.join(self.runner, 'other'), os.path.join(self.runner, 'via'))
+        code, out = self.run_cli('prepare', '--path', '.',
+                                 env=self.env(GITHUB_WORKSPACE=os.path.join(self.runner, 'via', 'proj')))
+        self.assertEqual(code, 2, out)
+        self.assertEqual(os.listdir(other), ['f'])
+
+    def test_a_very_deep_tree_is_removed(self):
+        """Deeper than Python's recursion limit and longer than PATH_MAX: the next job is not stuck behind it."""
+        fd = os.open(self.ws, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for _ in range(2500):
+                os.mkdir('d', dir_fd=fd)
+                down = os.open('d', os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+                os.close(fd)
+                fd = down
+            os.close(os.open('f', os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd))
+            os.symlink(self.outside, 'out', dir_fd=fd)
+        finally:
+            os.close(fd)
+        code, out = self.run_cli('prepare', '--path', '.')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(os.listdir(self.ws), [])
         self.assert_outside_kept()
 
     def test_symlinked_workspace_is_refused(self):
@@ -482,6 +658,30 @@ class FixedGitConfig(Base):
                 with self.subTest(module=name):
                     self.assertTrue(call('rev-parse', 'HEAD'), f'{name}: git read the global or system config')
 
+    def test_helpers_ignore_the_home_attributes_file(self):
+        """GIT_CONFIG_GLOBAL does not stop git reading ~/.config/git/attributes ($XDG_CONFIG_HOME/git/attributes)."""
+        home, xdg = os.path.join(self.d, 'home'), os.path.join(self.d, 'xdg')
+        for d in (os.path.join(home, '.config', 'git'), os.path.join(xdg, 'git')):
+            os.makedirs(d)
+            with open(os.path.join(d, 'attributes'), 'w') as f:
+                f.write('a.txt evil=planted\n')
+        rest = {k: v for k, v in os.environ.items() if k != 'XDG_CONFIG_HOME'}
+        for extra in ({'HOME': home}, {'HOME': home, 'XDG_CONFIG_HOME': xdg}):
+            with unittest.mock.patch.dict(os.environ, {**rest, **extra}, clear=True):
+                plain = subprocess.run(['git', 'check-attr', 'evil', '--', 'a.txt'], cwd=self.repo, text=True,
+                                       capture_output=True, env={**os.environ, 'GIT_CONFIG_GLOBAL': os.devnull,
+                                                                 'GIT_CONFIG_NOSYSTEM': '1'}).stdout
+                self.assertIn('planted', plain, 'the planted attributes file is not read: the test plants nothing')
+                for name, call in self.helpers():
+                    with self.subTest(module=name, **extra):
+                        out = call('--work-tree', self.repo, 'check-attr', 'evil', '--', 'a.txt')
+                        out = out.decode() if isinstance(out, bytes) else out
+                        self.assertIn('unspecified', out or '', f'{name}: git read the home attributes file')
+
+    def test_no_system_attributes_either(self):   # $(prefix)/etc/gitattributes cannot be planted in a test
+        self.assertEqual(G.GIT_ENV.get('GIT_ATTR_NOSYSTEM'), '1')
+        self.assertEqual(G.GIT_SAFE[G.GIT_SAFE.index('core.attributesFile=/dev/null') - 1], '-c')
+
     def test_helpers_run_no_planted_fsmonitor(self):
         for name, call in self.helpers():
             if name == 'head_check':
@@ -515,6 +715,7 @@ class FixedGitConfig(Base):
         import pr_queue
         self.assertEqual(pr_queue.GIT_ENV, G.GIT_ENV)
         self.assertEqual(pr_queue.GIT_SAFE, G.GIT_SAFE)
+        self.assertEqual(set(pr_queue.UNTRUSTED_FILES), {*G.UNTRUSTED_FILES, 'shallow'})   # git_clean: shallow apart
         for folder, name in (('job-changed', 'job_changed'), ('docs-scope', 'docs_scope'),
                              ('test-select', 'test_select'), ('pr-queue/tested-base', 'tested_base'),
                              ('weakened-tests', 'weakened_tests')):

@@ -167,7 +167,7 @@ default branch and posted by an App that only the default branch can use.
 | `config`          | (required)                         | the queue's JSON config, a path in the repository, read from the base commit                        |
 | `required-lenses` | (empty)                            | lens names, one per line, that must be among the reads; matched as lens keys (case, `r2`)           |
 | `pass-drafts`     | `false`                            | `true` passes a draft without reading its review; add `ready_for_review` to the workflow's triggers |
-| `path`            | `.`                                | where the merge commit is checked out                                                               |
+| `path`            | `.`                                | where the merge commit is checked out, relative to the workspace (an absolute path is refused)      |
 | `pr`              | `github.event.pull_request.number` | the pull request                                                                                    |
 | `repo`            | `github.repository`                | owner/name                                                                                          |
 | `token`           | `github.token`                     | reads the pull request's comments and reviews (`pull-requests: read`)                               |
@@ -290,7 +290,15 @@ Setup (the repository owner's steps; nothing here creates them):
    config's `review` block is in `enforce`: then the path rules name them and
    the input may be empty), and pin the release. Copy
    [`review-trigger.example.yml`](review-trigger.example.yml) next to it,
-   unchanged (the caller names it by its `name`).
+   unchanged (the caller names it by its `name`). In a public repository,
+   GitHub blocks `pull_request_target` (from 2026-12-02) unless a repository
+   Actions policy allows that event for exactly the caller's file (Settings →
+   Actions → Policies, rule "Restrict events", or
+   `POST /repos/{owner}/{repo}/actions/policies`). A renamed caller is then
+   blocked again, and a blocked run is only a failed run that nothing
+   requires; this fork lists its allowed files in
+   `.github/fork-actions-policies.json` and fails its required check when
+   `fork-checks.yml` did not run (`fork-checks-ran.py`, issue 401).
 5. Dispatch it once without a number (the backfill), so open pull requests get
    the check under its name.
 6. Bind the required check to the App: in a ruleset, the required status
