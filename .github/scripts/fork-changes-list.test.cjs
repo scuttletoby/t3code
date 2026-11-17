@@ -59,10 +59,57 @@ test("pinnedIds fails closed: no table, an empty one, a row it cannot read, an u
   assert.throws(
     () =>
       pinnedIds(TABLE(ROW("server", "waitFor") + `  {\n    scope: SCOPE,\n    key: "x",\n  },\n`)),
-    /2 "scope:" .* but 1 read/u,
+    /line \d+: 1 "scope:" but 0 read/u,
   );
   assert.throws(() => pinnedIds(TABLE(ROW("machine", "x"))), /unknown scope machine/u);
   assert.throws(() => pinnedIds("export const FORK_SETTING_DEFAULTS = [\n"), /no closing/u);
+});
+
+test("pinnedIds fails closed on a table entry that is not a `{ ... }` object literal (#396)", () => {
+  const first = ROW("server", "waitFor");
+  // Each shape is skipped by a parse that only looks for `scope:` text, so its setting would go unchecked.
+  // TABLE puts the first row on line 6, so the entry after it starts on line 12.
+  const shapes = {
+    spread: ["  ...EXTRA_ROWS,\n", /line 12: `\.\.\.EXTRA_ROWS,` is not a `\{ \.\.\. \}` row/u],
+    "helper call": ['  row("server", "x"),\n', /line 12: `row\("server", "x"\),` is not a/u],
+    "shorthand on one line": ['  { scope, key: "x" },\n', /line 12: 0 "scope:" but 0 read/u],
+    "shorthand over several lines": [
+      '  {\n    scope,\n    key: "x",\n    off: true,\n  },\n',
+      /line 12: 0 "scope:" but 0 read/u,
+    ],
+  };
+  for (const [shape, [entry, error]] of Object.entries(shapes)) {
+    assert.throws(() => pinnedIds(TABLE(first + entry + ROW("client", "after"))), error, shape);
+  }
+  // An entry on the table's own first line, and a one-line empty table followed by another array.
+  assert.throws(
+    () => pinnedIds(`export const FORK_SETTING_DEFAULTS = [...EXTRA_ROWS,\n${first}];\n`),
+    /line 1: `\.\.\.EXTRA_ROWS,` after the table's "\["/u,
+  );
+  assert.throws(
+    () => pinnedIds(`export const FORK_SETTING_DEFAULTS = [];\nconst after = [\n${first}];\n`),
+    /line 1: `\];` after the table's "\["/u,
+  );
+  // A `];` at column 0 inside a row ends the text table early: the rows after it would go unread.
+  const cut =
+    '  {\n    scope: "server",\n    key: "cut",\n    default: [\n];\n    off: true,\n  },\n';
+  assert.throws(
+    () => pinnedIds(TABLE(first + cut + ROW("client", "after"))),
+    /FORK_SETTING_DEFAULTS line \d+: a row is still open at the table's "\];"/u,
+  );
+});
+
+test("pinnedIds reads a one-line row and passes a comment between rows", () => {
+  assert.deepEqual(
+    pinnedIds(
+      TABLE(
+        ROW("server", "waitFor") +
+          "  // a note between rows\n\n" +
+          '  { scope: "client", key: "theme", default: "dark", off: "light" },\n',
+      ),
+    ),
+    ["client.theme", "server.waitFor"],
+  );
 });
 
 test("namedIds takes only `scope.key` in backticks; compare finds missing and unknown settings", () => {
