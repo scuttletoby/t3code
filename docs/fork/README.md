@@ -383,9 +383,10 @@ A build made this way does not know it is the fork: its `t3 update` and `t3 serv
 fetch upstream's releases. Do not use them on it; update it with `git pull` and a rebuild.
 
 **A machine that already runs T3 as a boot service.** Do not switch it by hand. The go-live kit
-([fork-kit/golive](../../fork-kit/golive/README.md)) is for this: today it has only its read-only
-`check`. Its copy, rehearsal on the copy, switch and way back are not written yet, and the kits are
-not yet installable from the release branch. Until then, try a build on a copy with
+([fork-kit/golive](../../fork-kit/golive/README.md)) is for this, step by step in
+[go-live.md](go-live.md): today it has `check`, the practice `copy`, the way `back` and `status`. Its
+rehearsal on the copy and its switch are not written yet, and the kits are not yet installable from
+the release branch. Until then, try a build on a copy with
 `t3 serve --hold-work --base-dir <copy>` ([updates.md](updates.md#trying-a-build-on-a-copy-serve---hold-work)).
 
 Not there yet: a fork installer URL, a macOS CLI archive, signed desktop apps, and the go-live
@@ -393,6 +394,8 @@ switch.
 
 ## Other fork pages
 
+- [go-live.md](go-live.md): the runbook for moving a boot-service machine to the fork, the way back,
+  and switching features on one at a time.
 - [updates.md](updates.md): update defaults, how a test pins them, the nightly sync runbook,
   `serve --hold-work`.
 - [anchor-machine.md](anchor-machine.md): one machine for new work, with upstream load balancing.
