@@ -13,7 +13,7 @@ so the agent cannot undo it:
 | A sandboxed unit        | `t3code-agents.service` (system unit, `User=agent`): `ProtectSystem=strict`, only `/home/agent` writable, no `AF_VSOCK` (Hyper-V sockets to Windows), io_uring off, no namespaces, `PrivateDevices`, `MemoryMax`, `CPUQuota`                                                                                                                       |
 | No LAN, no Windows host | twice, nftables for the agent's uid and the unit's `IPAddressDeny=`: private, link-local, CGNAT and multicast ranges blocked but for `allow` and the linking `peers`, so the private addresses of the Windows host, the home network and the tailnet are out of reach; public addresses go through (the home's own public address too: see Limits) |
 | Localhost only for T3   | the unit's `SocketBindDeny=any` with `SocketBindAllow=` T3's port and `devPorts`, and nftables dropping the agent's other localhost traffic: the agent listens on, and reaches on `localhost`, only T3's port and `devPorts`, so servers of other distros on `localhost` are out of reach                                                          |
-| Locked T3 settings      | `/etc/t3code/policy.json` (managed policy): linked environments on, automatic updates off, Connect, webhook tasks and browser cookie import off, `maxRuntimeMode` and your `lockedSettings` locked; T3 itself is root's (under `/opt/pc-agents/t3`)                                                                                                |
+| Locked T3 settings      | `/etc/t3code/policy.json` (managed policy): linked environments on, updates off (`limits.updates`), Connect, webhook tasks and browser cookie import off, `maxRuntimeMode` and your `lockedSettings` locked; T3 itself is root's (under `/opt/pc-agents/t3`)                                                                                       |
 | Checked, not trusted    | `pc-agents check` runs before every start of T3 (the unit refuses to start on a failed wall) and every 2 minutes (a failed wall stops T3; a check that cannot run or crashes stops it too)                                                                                                                                                         |
 
 `pc-agents check` is the fleet's WSL2 walls check (`.github/scripts/fork-fleet-walls.py` with
@@ -59,7 +59,7 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
     "t3ReleaseBaseUrl": "https://github.com/example/t3code/releases/download",
     "port": 3773,
     "maxRuntimeMode": "full-access",
-    "lockedSettings": { "agentSlots.enabled": true, "agentSlots.maxPerMachine": 2 },
+    "lockedSettings": {},
     "memoryMax": "8G",
     "cpuQuota": "400%",
     "nameservers": ["1.1.1.1", "9.9.9.9"],
@@ -77,7 +77,7 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 | `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                      |
 | `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                 |
 | `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                |
-| `lockedSettings`        | more T3 settings to lock, `{path: value}`: the child ceiling (`agentSlots.…`), see below                          |
+| `lockedSettings`        | more T3 settings to lock, `{path: value}`: the child ceiling (`agentSlots.…`, fork builds), see below             |
 | `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                             |
 | `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                   |
 | `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host        |
@@ -91,10 +91,13 @@ Every T3 setting can be locked through `lockedSettings`, the fork's own settings
 path (`agentSlots.maxPerMachine`), or give a whole setting (`agentSlots`) or one record entry
 (`providerInstances.codex-work`) as an object holding every field: T3 takes an object only as a complete value. The kit
 refuses what is cheap to tell (a field of a provider instance, an object deeper than a record entry, the kit's own
-two settings, a blank `organization`); T3 refuses the rest, like a field inside a setting that can be empty (lock the
-whole setting), says why in its log (`journalctl -u t3code-agents`) and does not start. T3 exits 1 on a policy it
-cannot apply, the same code as any other failure, so the unit cannot tell it apart (`RestartPreventExitStatus=`);
-it gives up after 5 starts in 10 minutes instead (`StartLimitBurst=5`). Setup clears that count
+setting, a blank `organization`); T3 refuses the rest, like a field inside a setting that can be empty (lock the
+whole setting), says why in its log (`journalctl -u t3code-agents`) and does not start; setup shows that line. A
+policy may name only settings the installed `t3Version` knows: T3 does not start on a setting it lacks, so the fork's own
+settings (`agentSlots`, ...) need a fork build, and `automaticUpdates` a version that has it (the kit turns updates
+off through `limits.updates` on every version). Releases that exit 77 on a policy they cannot apply are not restarted
+(`RestartPreventExitStatus=77`); on any other exit the unit gives up after 5 starts in 10 minutes
+(`StartLimitBurst=5`). Setup clears that count
 (`systemctl reset-failed`) before it starts T3, so running it again within the 10 minutes still starts T3.
 
 A wall that fails stops T3, and nothing starts it again by itself: fix what `pc-agents check` names (or run
