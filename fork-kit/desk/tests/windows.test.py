@@ -362,6 +362,47 @@ class Script(unittest.TestCase):
                      '[experimental] dnsTunneling=false: removed', 'changed=True', 'left=sparseVhd', 'after=0'):
             self.assertIn(line, r.stdout)
 
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_a_memory_cap_at_or_above_the_minimum_is_kept(self):
+        """-MemoryGB is the least cap: one a person raised (more agents or jobs in WSL) is neither lowered nor a FAIL,
+        nor a `wsl --shutdown` on every run (the live check's cap is the one kept)."""
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, '.wslconfig')
+        script = os.path.join(d, 'memory.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = (WantMemory $args[0] 8); swap = "4GB" }\n'
+                    '"want=$($want.memory) kb=$(CapKb $want.memory)"\n'
+                    '"notes=$(@(Changes (Read-WslConfig $args[0]) $want) -join \'|\')"\n'
+                    '$null = Merge-WslConfig $args[0] $want\n$cfg = Wsl2Keys (Read-WslConfig $args[0])\n'
+                    '"check=$(@($want.Keys | Where-Object { $cfg[$_] -ne $want[$_] }).Count)"\n')
+        for old, want, kb, note in (('memory=26GB', '26GB', 27262976, ''),   # raised: kept, no change, no FAIL
+                                    ('memory = 30720mb', '30720mb', 31457280, ''),
+                                    ('memory=8GB', '8GB', 8388608, ''),
+                                    ('memory=9G', '9G', 9437184, ''),
+                                    ('memory=4GB', '8GB', 8388608, '[wsl2] memory: 4GB -> 8GB'),   # below: raised
+                                    ('memory=8191MB', '8GB', 8388608, '[wsl2] memory: 8191MB -> 8GB'),
+                                    ('memory=lots', '8GB', 8388608, '[wsl2] memory: lots -> 8GB'),
+                                    ('', '8GB', 8388608, '[wsl2] memory: (not set) -> 8GB')):
+            with self.subTest(old):
+                with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(f'[wsl2]\n{old}\nswap=4GB\n')
+                r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path],
+                                   capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f'want={want} kb={kb}\n', r.stdout)
+                self.assertIn(f'notes={note and "  " + note}\n', r.stdout)   # a note is indented
+                self.assertIn('check=0\n', r.stdout)
+                if not note:
+                    self.assertEqual(slurp(path), f'[wsl2]\n{old}\nswap=4GB\n')   # left alone
+
+    def test_the_minimum_memory_cap_decides_through_wantmemory(self):
+        src = text().decode('ascii')
+        body = src[src.index('try {'):]
+        self.assertIn('$want = [ordered]@{ memory = (WantMemory $WslConfig $MemoryGB);', body)
+        self.assertIn('("WANT_KB=$(CapKb $want.memory)`n" + $Live)', body)   # the cap kept, not -MemoryGB
+        self.assertNotIn('$MemoryGB * 1048576', body)
+
     def test_wslconfig_is_utf8_without_a_bom_never_ascii(self):
         src = text().decode('ascii')
         self.assertNotRegex(src, r'(?i)-Encoding\s+ascii')
