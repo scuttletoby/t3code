@@ -2,7 +2,9 @@
 /// <reference types="vite-plus/client" />
 
 // Fork: the fork's settings docs follow the one pin table (forkDefaults.ts), so a new fork setting
-// without a docs row, or a docs row for a setting that does not exist, fails here.
+// without a docs row, or a docs row for a setting that does not exist, fails here. The fork's changes
+// list is checked by .github/scripts/fork-changes-list.test.cjs (Fork tests' `workflows` job), so a pull
+// request that changes only fork-owned files skips this app job.
 import { FORK_SETTING_DEFAULTS, type ForkSettingDefault } from "@t3tools/contracts/forkDefaults";
 import * as NodeFS from "node:fs";
 import { describe, expect, it } from "vite-plus/test";
@@ -11,7 +13,6 @@ const repoFile = (path: string) =>
   NodeFS.readFileSync(new URL(`../../../${path}`, import.meta.url), "utf8");
 
 const README = repoFile("docs/fork/README.md");
-const CHANGES = repoFile("FORK_CHANGES.md");
 
 const rowId = (row: ForkSettingDefault) => `${row.scope}.${row.key}`;
 const pinned = FORK_SETTING_DEFAULTS.map(rowId).toSorted();
@@ -85,17 +86,5 @@ describe("fork settings docs (docs/fork/README.md)", () => {
       .map((line) => /^### `([^`]+)`$/u.exec(line)?.[1])
       .filter((id) => id !== undefined);
     expect(headings.toSorted()).toEqual(pinned);
-  });
-});
-
-describe("fork changes list (FORK_CHANGES.md)", () => {
-  const named = new Set([...CHANGES.matchAll(SETTING_ID)].map((match) => match[1]!));
-
-  it("names every fork setting", () => {
-    expect(pinned.filter((id) => !named.has(id))).toEqual([]);
-  });
-
-  it("names no setting that does not exist", () => {
-    expect([...named].filter((id) => !byId.has(id))).toEqual([]);
   });
 });
