@@ -117,6 +117,7 @@ class Numbers(Case):
         self.assertEqual(d1['never_started_jobs'], 1)
         self.assertIsNone(doc['incomplete'])
         self.assertIsNone(doc['cache_write_failed'])
+        self.assertIsNone(doc['cache_cleanup_failed'])
 
     def test_text_output(self):
         code, out = self.run_main()
@@ -342,6 +343,24 @@ class State(Case):
             ('jobs total_count negative', 'jobs', lambda b: b.update(total_count=-1)),
             ('job started_at in the basic format', 'jobs',
              lambda b: [j.update(started_at='20261101T100100Z') for j in b['jobs']]),
+            ('run created_at with an offset', 'workflow_runs',   # its day is not its first 10 characters
+             lambda b: [r.update(created_at='2026-11-01T12:00:00+05:00') for r in b['workflow_runs']]),
+            ('run created_at a day only', 'workflow_runs',
+             lambda b: [r.update(created_at='2026-11-01') for r in b['workflow_runs']]),
+            ('job started_at with an offset', 'jobs',
+             lambda b: [j.update(started_at='2026-11-01T10:01:00+05:00') for j in b['jobs']]),
+            ('job completed_at a day only', 'jobs', lambda b: [j.update(completed_at='2026-11-01') for j in b['jobs']]),
+            # An item without a field the counting reads (only a hand-edited file): was counted as 0 seconds, a run
+            # not completed, or a skipped job as one that never reached a runner.
+            ('job without started_at', 'jobs', lambda b: [j.pop('started_at') for j in b['jobs']]),
+            ('job without completed_at', 'jobs', lambda b: [j.pop('completed_at') for j in b['jobs']]),
+            ('job completed_at empty', 'jobs', lambda b: [j.update(completed_at=None) for j in b['jobs']]),
+            ('job without runner_name', 'jobs', lambda b: [j.pop('runner_name') for j in b['jobs']]),
+            ('job without status', 'jobs', lambda b: [j.pop('status') for j in b['jobs']]),
+            ('job not completed', 'jobs', lambda b: [j.update(status='in_progress') for j in b['jobs']]),
+            ('job without conclusion', 'jobs', lambda b: [j.pop('conclusion') for j in b['jobs']]),
+            ('run without status', 'workflow_runs', lambda b: [r.pop('status') for r in b['workflow_runs']]),
+            ('run without conclusion', 'workflow_runs', lambda b: [r.pop('conclusion') for r in b['workflow_runs']]),
         ]
         self.assertEqual(self.numbers()[0], 0)
         for what, kind, change in damage:
@@ -377,6 +396,7 @@ class State(Case):
         code, doc = self.numbers()
         self.assertEqual((code, doc['requests'], doc['cached']), (0, 0, 6), self.err)
         self.assertIsNone(doc['cache_write_failed'])   # nothing had to be saved
+        self.assertIn('Permission denied', doc['cache_cleanup_failed'])   # in --json too, not only on stderr
         self.assertEqual(self.err.count('old .part- file not removed'), 1, self.err)
         self.assertIn('Permission denied', self.err)
         self.assertNotIn('cache not written', self.err)
@@ -399,12 +419,17 @@ class State(Case):
         code, doc = self.numbers('--max-requests', '4')
         self.assertEqual(code, 3)
         self.assertIsNone(doc['cache_write_failed'], self.err)
+        self.assertTrue(doc['cache_cleanup_failed'], self.err)
         self.assertEqual(self.err.count('old .part- file not removed'), 1, self.err)
         self.assertNotIn('cache not written', self.err)
         code, out = self.run_main('--max-requests', '1')
         self.assertIn('run again with the same --cache', out)
         code, doc = self.numbers()   # 4 + 1 pages saved by the two stopped runs: one page left of 6
         self.assertEqual((code, doc['requests'], doc['days']['total']['ci_hours']), (0, 1, 3.25), self.err)
+        self.assertTrue(doc['cache_cleanup_failed'], self.err)   # still there: said again on every run
+        os.rmdir(os.path.join(self.cache, '.part-9-dir'))
+        code, doc = self.numbers()   # gone: nothing to report any more
+        self.assertEqual((code, doc['cache_cleanup_failed']), (0, None), self.err)
 
     def test_an_old_part_file_another_run_removed_first_is_ignored(self):
         os.makedirs(self.cache)
