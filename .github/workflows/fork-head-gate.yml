@@ -29,7 +29,7 @@ on:
         type: string
         required: true
       required-lenses:
-        description: Lens names, one per line, that must have read the head (the caller's; never from the pull request). None = refused.
+        description: Lens names, one per line, that must have read the head (the caller's; never from the pull request). None = refused, unless the config at the base tip has a review block in mode enforce (its path rules then name the lenses).
         type: string
         required: true
       environment:
