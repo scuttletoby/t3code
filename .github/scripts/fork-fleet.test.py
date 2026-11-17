@@ -1594,7 +1594,7 @@ class Launcher(unittest.TestCase):
                         RESERVE_MB='2048', MAX_SECONDS='3600', NET_BASE='10.204', RESOLV_CONF=self.path('resolv.conf'),
                         IP_FORWARD=self.path('ip_forward'), OWN_ADDRESS_URLS=self.OWN_URLS, OWN_ADDRESS_SECONDS='0',
                         MEMINFO=self.path('meminfo'), SYSTEMD_RUN=self.path('bin/systemd-run'),
-                        SYSTEMCTL=self.path('bin/systemctl'), JOB_PATHS=self.job_paths)
+                        SYSTEMCTL=self.path('bin/systemctl'), JOB_PATHS=self.job_paths, CANARY_DIR=self.d)
         settings.update(over)
         self.write('launch.conf', '# fleet\n\n' + ''.join(f'{k}={v}\n' for k, v in settings.items()) + extra, 0o600)
 
@@ -1636,6 +1636,13 @@ class Launcher(unittest.TestCase):
     def seen(self, rw=''):
         """The mount points check-net's probe is told to allow."""
         return ' '.join(['/', *self.allowed(), *([rw] if rw else []), os.path.realpath('/etc/resolv.conf')])
+
+    def links(self):
+        """The links check-net's probe is told the unit's root has (job_fs): the list's links, and /etc/resolv.conf
+        when the jobs' resolv.conf is bound elsewhere (systemd-resolved's link: issue #243, no longer in a whole /etc)."""
+        resolv = os.path.realpath('/etc/resolv.conf')
+        return ' '.join([p for p in job_paths() if os.path.islink(p)] +
+                        (['/etc/resolv.conf'] if resolv != '/etc/resolv.conf' else []))
 
     def sources(self):
         """Where check-net's probe is told each bound point comes from: POINT=DEVICE:INODE of the real path job_fs
@@ -1749,7 +1756,9 @@ class Launcher(unittest.TestCase):
                       '/var/tmp:size=1G,mode=1777', props)
         links = {os.path.join('/', os.path.relpath(os.path.join(d, x), root)): os.readlink(os.path.join(d, x))
                  for d, dirs, files in os.walk(root) for x in dirs + files if os.path.islink(os.path.join(d, x))}
-        self.assertEqual(links, {p: os.readlink(p) for p in job_paths() if os.path.islink(p)})
+        resolv = os.path.realpath('/etc/resolv.conf')   # issue #243: no whole /etc, so its link is the launcher's
+        self.assertEqual(links, {p: os.readlink(p) for p in job_paths() if os.path.islink(p)} |
+                         ({'/etc/resolv.conf': resolv} if resolv != '/etc/resolv.conf' else {}))
         for d, dirs, files in os.walk(root):
             for x in files:
                 self.assertTrue(os.path.islink(os.path.join(d, x)), os.path.join(d, x))
@@ -2034,6 +2043,43 @@ class Launcher(unittest.TestCase):
                 self.assertIn(word, got.stderr)
                 self.assertIn('it holds data', got.stderr)
                 self.assertEqual(got.stdout, '')
+
+    def test_paths_shows_jobs_an_allow_list_of_etc_not_all_of_it(self):
+        """Issue #243 item 1: the list names the few /etc entries builds need, never /etc itself. On a fake machine
+        with a shadow-like file, a made-up secret, a private key folder and a backup tool's folder in /etc, `paths`
+        (what job_fs binds) has the listed entries that are there and nothing else of /etc."""
+        self.assertNotIn('/etc', job_paths())
+        files = (('/etc/passwd', 'root:x:0:0::/root:/bin/sh\n'), ('/etc/group', 'root:x:0:\n'), ('/etc/hosts', ''),
+                 ('/etc/nsswitch.conf', ''), ('/etc/ssl/certs/ca-certificates.crt', ''),
+                 ('/etc/ssl/private/host.key', 'k'), ('/etc/shadow', 'root:$6$x:1::::::\n'),
+                 ('/etc/fork-fleet-test-secret', 'hunter2\n'), ('/etc/restic/pw', 'hunter2\n'),
+                 ('/etc/default/backup', 'RESTIC_PASSWORD=hunter2\n'), ('/usr/share/zoneinfo/UTC', ''))
+        root = self.walls_root('', files=files, links=(('/etc/localtime', '../usr/share/zoneinfo/UTC'),))
+        got = self.paths(root)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        etc = sorted(x for x in got.stdout.splitlines() if x.startswith('/etc/') and 'resolv.conf' not in x)
+        self.assertEqual(etc, ['/etc/group /etc/group', '/etc/hosts /etc/hosts', '/etc/nsswitch.conf /etc/nsswitch.conf',
+                               '/etc/passwd /etc/passwd', '/etc/ssl/certs /etc/ssl/certs'])
+        for hidden in ('/etc ', 'shadow', 'secret', 'private', 'restic', 'default'):
+            self.assertNotIn(hidden, got.stdout)
+
+    def test_paths_refuses_all_of_etc_as_an_older_kit_lists_it(self):
+        """Issue #243 item 4: an older kit's list (or a JOB_PATHS of one's own, or ALLOW_PATHS) that still names /etc
+        whole is refused, by `paths` (the walls) and by start (no runner with the old view): re-run the installer."""
+        root = self.walls_root('JOB_PATHS=/etc/fork-fleet/job-paths\n',
+                               files=(('/etc/fork-fleet/job-paths', '/usr\n/etc\n'), ('/etc/passwd', '')))
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('/etc: all of /etc is never in a job\'s view (an older kit\'s list?): re-run the installer',
+                      got.stderr)
+        self.assertEqual(got.stdout, '')
+        with open(root + '/etc/fork-fleet/launch.conf', 'w') as f:
+            f.write('ALLOW_PATHS=/etc\n')
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('all of /etc is never in a job\'s view', got.stderr)
+        self.write('job-paths.txt', '/usr\n/etc\n', 0o644)
+        self.refused('all of /etc is never in a job\'s view')
 
     def test_start_refuses_a_work_root_that_holds_data_and_an_open_file_beside_the_hook(self):
         """Fix round 3 (#191 re-check nits): start, not only `paths`: WORK_ROOT under /srv is refused before anything
@@ -2769,7 +2815,8 @@ class Launcher(unittest.TestCase):
                                        '--uid', 'nobody', *self.sandbox('nobody', self.path('run/check-net.root')),
                                        '-p', 'RuntimeMaxSec=60'])
         self.assertEqual(args[dash + 1:dash + 4], ['/usr/bin/python3', '-I', '-c'])
-        self.assertEqual(args[dash + 5:], ['job', self.seen(), self.sources()])
+        self.assertEqual(args[dash + 5:], ['job', self.seen(), self.sources(), self.links(),
+                                           f'{self.d}/fork-fleet-canary {self.d}/fork-fleet-canary-group'])
         self.assertEqual(self.rec_text('ip').splitlines(), self.ip_calls('nobody', self.NOBODY_NET))
         self.write('rec/probe-exit', '1', 0o644)
         got = self.check_net(f'127.0.0.1:{port}')
@@ -2823,7 +2870,7 @@ class Launcher(unittest.TestCase):
         resolv = os.path.realpath('/etc/resolv.conf')
         self.assertIn(f'FAIL  mount sources: not what job_fs checked: {resolv}\n', got.stdout)
         args = self.waited('fork-fleet-check-walls')
-        code, job, seen, sources = args[args.index('--') + 4:]
+        code, job, seen, sources, links, canaries = args[args.index('--') + 4:]
         sources = ' '.join(x for x in sources.split() if not x.startswith(resolv + '='))
 
         def probe(sources):
@@ -2835,6 +2882,63 @@ class Launcher(unittest.TestCase):
         self.assertNotEqual(swapped, sources)
         self.assertIn('FAIL  mount sources: not what job_fs checked: /usr\n', probe(swapped))
         self.assertIn('FAIL  mount sources: none given\n', probe(''))
+        # Issue #243 item 2: here, outside the unit, the host's whole /etc is there, and the canaries are on disk.
+        self.assertIn('FAIL  /etc: holds ', got.stdout)
+        self.assertIn('FAIL  canaries: ', got.stdout)
+
+    def etc_probe(self, etc, seen, links='', canaries=''):
+        """The walls' probe (job) with its /etc at the folder etc: the lines on /etc and the canaries."""
+        code = walls_probe()
+        self.assertIn("ETC = '/etc'\n", code)
+        code = code.replace("ETC = '/etc'\n", f'ETC = {etc!r}\n')
+        out = subprocess.run(['python3', '-I', '-c', code, 'job', seen, '', links, canaries], capture_output=True,
+                             text=True, timeout=60).stdout
+        return [x for x in out.splitlines() if x[6:].startswith(('/etc:', 'canaries:'))]
+
+    def test_check_nets_probe_lists_the_jobs_etc_and_reads_the_canaries(self):
+        """Issue #243 item 2, check by looking: the probe lists the job's /etc and fails on any entry that no list
+        line, link or the jobs' resolv.conf put there (a shadow-like file, a made-up secret, a private key folder
+        beside an allowed one); and it fails when a canary (a file check-net keeps outside the list, one others may
+        read and one only the runner's group may) is there or can be read. A /etc it cannot list fails too."""
+        etc = os.path.join(self.d, 'job-etc')
+        for f in ('passwd', 'group', 'resolv.conf', 'ssl/certs/ca.pem'):
+            os.makedirs(os.path.dirname(os.path.join(etc, f)), exist_ok=True)
+            with open(os.path.join(etc, f), 'w') as fh:
+                fh.write('x\n')
+        os.symlink('../usr/share/zoneinfo/UTC', os.path.join(etc, 'localtime'))
+        seen = '/ /usr /etc/passwd /etc/group /etc/ssl/certs /etc/resolv.conf'
+        canary = self.write('canary', 'fork-fleet canary\n', 0o644)
+        gone = self.path('canary-gone')
+        self.assertEqual(self.etc_probe(etc, seen, '/etc/localtime', gone),
+                         ['ok    /etc: only the listed entries', 'ok    canaries: 1 not there inside'])
+        for planted in ('shadow', 'fork-fleet-test-secret', 'ssl/private/host.key', 'default/backup'):
+            os.makedirs(os.path.dirname(os.path.join(etc, planted)), exist_ok=True)
+            with open(os.path.join(etc, planted), 'w') as fh:
+                fh.write('hunter2\n')
+        self.assertEqual(self.etc_probe(etc, seen, '/etc/localtime', f'{gone} {canary}'),
+                         ['FAIL  /etc: holds default, fork-fleet-test-secret, shadow, ssl/private, which no list line '
+                          'puts there', f'FAIL  canaries: {canary} there inside'])
+        self.assertRegex(self.etc_probe(etc, seen, '', gone)[0], r'^FAIL  /etc: holds .*, localtime, ')   # no link
+        self.assertEqual(self.etc_probe(os.path.join(etc, 'nope'), seen, '', '')[0][:21], 'FAIL  /etc: cannot li')
+        self.assertEqual(self.etc_probe(etc, seen, '/etc/localtime', '')[1], 'FAIL  canaries: none given')
+
+    def test_check_net_keeps_two_canaries_outside_the_list_while_it_runs(self):
+        """Issue #243 item 2: check-net writes its two canaries in CANARY_DIR (/etc: no list line has them), one others
+        may read and one only the runner user's group may, hands their paths to the walls' probe, and removes them
+        when done. Again: the same two, made fresh."""
+        port = self.server()
+        self.write('rec/probe-exit', '0', 0o644)
+        canaries = [self.path('etc/fork-fleet-canary'), self.path('etc/fork-fleet-canary-group')]
+        os.mkdir(self.path('etc'), 0o755)
+        self.conf(CANARY_DIR=self.path('etc'))
+        for _ in range(2):
+            got = self.check_net(f'127.0.0.1:{port}')
+            self.assertEqual(got.returncode, 0, got.stderr)
+            args = self.waited('fork-fleet-check-walls')
+            self.assertEqual(args[args.index('--') + 9:], [' '.join(canaries)])
+            self.assertIn(f'-- :{pwd.getpwnam("nobody").pw_gid} {canaries[1]}\n', self.rec_text('chown'))
+            for c in canaries:
+                self.assertFalse(os.path.lexists(c), c)
 
     def test_the_walls_hold_in_a_real_systemd_unit(self):
         """The walls' probe in a real unit of this user's systemd, with the walls check-net gives it: AF_VSOCK,
@@ -2871,6 +2975,12 @@ def real_walls(test, args, systemd_run, *more, full=False):
         walls = [p for p in props if p.split('=')[0] not in ('NetworkNamespacePath', 'IPAddressDeny', 'IPAddressAllow')]
     unit = [*systemd_run, '--wait', '--pipe', '--quiet', '--collect', *more, *(a for w in walls for a in ('-p', w))]
     probe = args[dash + 1:]
+    if full:   # issue #243: check-net's canaries, outside the list, on disk while the probe looks for them
+        for c in probe[-1].split():
+            with open(c, 'w') as f:
+                f.write('fork-fleet canary\n')
+            os.chmod(c, 0o644)
+            test.addCleanup(os.remove, c)
     got = subprocess.run([*unit, '--', *probe], capture_output=True, text=True, timeout=120)
     test.assertRegex(got.stdout, r'ok    AF_VSOCK is refused')
     test.assertIn('ok    io_uring is refused (ENOSYS)', got.stdout)
@@ -2884,7 +2994,8 @@ def real_walls(test, args, systemd_run, *more, full=False):
         for want in ('ok    devices: only the pseudo ones', 'ok    mounts: only the allowed ones',
                      "ok    later mounts: no mount inside receives the host's", 'ok    /mnt and /media: nothing inside',
                      'ok    sockets: none in /tmp, /var/tmp, /run, /dev/shm',
-                     'ok    mount sources: each the host path job_fs checked'):
+                     'ok    mount sources: each the host path job_fs checked',
+                     'ok    /etc: only the listed entries', 'ok    canaries: 2 not there inside'):
             test.assertIn(want, got.stdout)
         tools = [t for t in (['git', '--version'], ['node', '--version'], ['java', '-version'], ['docker', '--version'])
                  if shutil.which(t[0]) and os.path.realpath(shutil.which(t[0])).startswith(('/usr/', '/etc/'))]

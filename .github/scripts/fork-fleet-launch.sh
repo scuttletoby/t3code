@@ -62,7 +62,8 @@
 # address they give is blocked, at least one must answer), OWN_ADDRESS_SECONDS (how long refresh-net keeps using its
 # last answer, at most 3600; 0: it looks up on every pass; start always looks up), JOB_PATHS (the system paths every
 # job sees: fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only, comma-separated, say a
-# tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an https
+# tool cache: empty by default), CANARY_DIR (where check-net keeps its two canary files while it runs: /etc, which no
+# job sees whole), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an https
 # URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
 # empty for none), FREE_COMMAND (a free/v1 script's absolute path, empty for none) and FREE_CHECK (its reader,
 # free_contract.py beside this launcher) have defaults below.
@@ -119,10 +120,10 @@ RUNNER_USERS='' TEMPLATE=/opt/fork-fleet/template/runner-template WORK_ROOT=/var
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
 SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com OWN_ADDRESS_SECONDS=120
-ALLOW_PATHS=''
+ALLOW_PATHS='' CANARY_DIR=/etc
 JOB_PATHS='' RUNNER_RELEASE=https://api.github.com/repos/actions/runner/releases/latest
 RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download RUNNER_MIN='' FREE_COMMAND='' FREE_CHECK=''
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|OWN_ADDRESS_SECONDS|JOB_PATHS|ALLOW_PATHS|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK)=([^[:space:]]*)$'
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|OWN_ADDRESS_SECONDS|JOB_PATHS|ALLOW_PATHS|CANARY_DIR|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -142,6 +143,7 @@ PLAIN_PATH='(/[A-Za-z0-9._@+-]+)+'
 if [[ -n $JOB_PATHS ]]; then JOB_PATHS=$ROOT$JOB_PATHS; else
   JOB_PATHS=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fork-fleet-job-paths.txt
 fi
+[[ $CANARY_DIR =~ ^$PLAIN_PATH$ ]] || die "$conf: CANARY_DIR is a plain absolute path"
 [[ $FREE_COMMAND =~ ^($PLAIN_PATH)?$ && $FREE_CHECK =~ ^($PLAIN_PATH)?$ ]] ||
   die "$conf: FREE_COMMAND and FREE_CHECK are plain absolute paths"
 [[ -n $FREE_CHECK ]] || FREE_CHECK=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/free_contract.py
@@ -972,12 +974,15 @@ real_path() {
   printf '%s\n' "$real"
 }
 
-# A path no job ever sees of this host's: its own of these or none (/proc, /sys, /dev, /run, /tmp, /var/tmp), or one
-# that holds data (no_data). The rule of the list's and ALLOW_PATHS' lines.
+# A path no job ever sees of this host's: its own of these or none (/proc, /sys, /dev, /run, /tmp, /var/tmp), all of
+# /etc, or one that holds data (no_data). The rule of the list's and ALLOW_PATHS' lines.
 never() {
   case $1/ in /proc/* | /sys/* | /dev/* | /run/* | /tmp/* | /var/tmp/*)
     die "$2: a job never sees it from this host (its own, none, or data): not a path to allow" ;;
   esac
+  # All of /etc (issue #243): only the entries a build needs (the list's /etc lines), never the logins, units, cron,
+  # /etc/default and backup tools' folders beside them. An older kit's list still names it: refused, no runner starts.
+  [[ $1 != /etc ]] || die "$2: all of /etc is never in a job's view (an older kit's list?): re-run the installer"
   no_data "$1" "$2"
 }
 
@@ -1051,18 +1056,29 @@ job_view() {
 
 # job_view for a unit: its root ($1, root's), its copy ($2, read-write; already a real path, in WORK_ROOT's), and
 # the jobs' resolv.conf at $3. Sets props_fs and resolv_bind; seen, the mount points check-net's probe allows (its
-# own /proc, /sys, /dev and memory file systems are allowed there); and from, each of them with the device and inode
-# its source has here, which the probe compares with what the unit has there (a link swapped in after job_view shows).
+# own /proc, /sys, /dev and memory file systems are allowed there); from, each of them with the device and inode
+# its source has here, which the probe compares with what the unit has there (a link swapped in after job_view shows);
+# and linked, the links its root has (the list's, and /etc/resolv.conf when $3 is elsewhere: the probe allows them).
 job_fs() {
   local root=$1 rw=$2 resolv=$3 i b real
   local -a ro=() view_ro view_links
   job_view
   rm -rf --one-file-system -- "$root"
   mkdir -m 0755 -- "$root"
+  linked=''
   for ((i = 0; i < ${#view_links[@]}; i += 2)); do
     mkdir -p -m 0755 -- "$root${view_links[i]%/*}"
     ln -s -- "${view_links[i + 1]}" "$root${view_links[i]}"
+    linked+=" ${view_links[i]}"
   done
+  # A host whose /etc/resolv.conf is a link (systemd-resolved's, into /run) has the jobs' file bound at its target:
+  # the job's /etc/resolv.conf is then that same link, as no whole /etc brings it any more (issue #243).
+  if [[ $resolv != /etc/resolv.conf && ! -e $root/etc/resolv.conf && ! -L $root/etc/resolv.conf ]]; then
+    mkdir -p -m 0755 -- "$root/etc"
+    ln -s -- "$resolv" "$root/etc/resolv.conf"
+    linked+=' /etc/resolv.conf'
+  fi
+  linked=${linked# }
   seen='/' from=''
   for b in "${view_ro[@]}"; do
     ro+=("$b:norbind") seen+=" ${b#*:}" from+=" ${b#*:}=$(stat -L -c '%d:%i' -- "${b%%:*}")"
@@ -1122,7 +1138,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv bad own blocked seen from f real
+  local name=$1 dir env_file line key value user resolv bad own blocked seen from linked f real
   local -a props
   local -A got=()
   name_ok "$name"
@@ -1238,7 +1254,8 @@ exit "$bad"
 EOF
 
 # The walls' probe (python3 -I -c, arguments job or host, the mount points job_fs allows, then each bound one's
-# POINT=DEVICE:INODE: its source as job_fs checked it, seen from outside). job: in the sandbox,
+# POINT=DEVICE:INODE: its source as job_fs checked it, seen from outside, the links its root has, and the canaries'
+# paths). job: in the sandbox,
 # as the runner user; a line per wall, exit 1 when one is open or could not be tried. host: as root, outside, the
 # control: whether this host has what the walls close (where it has not, the refusal inside shows nothing; the walls
 # are still set). Each 32-bit call is made in a child that may not dump core: the filter ends it with SIGSYS; another
@@ -1248,7 +1265,10 @@ EOF
 # mounts (mountinfo's master: or shared: tag: a disk mounted after the job started would show up in it); whether each
 # bound point is the very file or folder job_fs checked (a link swapped in before systemd bound it would show);
 # entries in /mnt or /media; and sockets in the places a desktop keeps them (WSLg's X11 and PulseAudio). Other mount
-# points are read from mountinfo, never looked at: a share that hangs cannot stop the probe.
+# points are read from mountinfo, never looked at: a share that hangs cannot stop the probe. Then /etc (issue #243),
+# checked by looking: every entry of the job's /etc is one the list (a mount point), a link of job_fs's (its fourth
+# argument) or the jobs' resolv.conf put there, and check-net's canaries (its fifth: files outside the list, one
+# others may read, one only the runner's group may) are not there nor readable.
 read -r -d '' WALLS <<'EOF' || true
 import ctypes, errno, mmap, os, re, signal, socket, stat, sys
 libc = ctypes.CDLL(None, use_errno=True)
@@ -1346,6 +1366,37 @@ socks = [p for d in ('/tmp', '/var/tmp', '/run', '/dev/shm') for p in walk(d, st
 whole = budget[0] >= 0
 def few(xs):
     return ', '.join(sorted(xs)[:8]) + (' ...' if len(xs) > 8 else '')
+ETC = '/etc'
+links = set(sys.argv[4].split()) if len(sys.argv) > 4 else set()
+listed = {p[5:] for p in allowed | links if p.startswith('/etc/')}
+def etc_extra():
+    """What /etc holds beyond the entries job_fs put there (names under /etc), or None when it cannot be listed."""
+    extra, todo = [], ['']
+    try:
+        while todo:
+            d = todo.pop()
+            for x in os.listdir(os.path.join(ETC, d)):
+                rel = os.path.join(d, x)
+                p = os.path.join(ETC, rel)
+                if rel in listed:
+                    continue
+                if any(a.startswith(rel + '/') for a in listed) and os.path.isdir(p) and not os.path.islink(p):
+                    todo.append(rel)
+                else:
+                    extra.append(rel)
+    except OSError:
+        return None
+    return extra
+etc = etc_extra()
+canaries = sys.argv[5].split() if len(sys.argv) > 5 else []
+def there(p):
+    try:
+        with open(p, 'rb') as f:
+            f.read(1)
+        return True
+    except OSError:
+        return os.path.lexists(p)
+seen_canaries = [c for c in canaries if there(c)]
 if sys.argv[1] == 'host':
     print('host: AF_VSOCK ' + ('opens here: the wall matters' if vsock == 'open' else
                                f'does not open here either ({vsock}): the refusal inside shows nothing on this host'))
@@ -1357,6 +1408,11 @@ if sys.argv[1] == 'host':
                      ('mounts that receive later mounts', receive), ('entries in /mnt and /media', mnt),
                      ('sockets', socks)):
         print(f'host: {what}: ' + (few(xs) if xs else 'none here either: the refusal inside shows nothing'))
+    print('host: /etc: ' + ('cannot be listed' if etc is None else
+                            f'{len(etc)} entries no list line puts in a job\'s: the wall matters' if etc else
+                            'nothing beyond the list here either: the refusal inside shows nothing'))
+    print(f'host: canaries: {len(seen_canaries)} of {len(canaries)} there' + (': the wall matters' if seen_canaries else
+                                                                              ''))
     sys.exit(0)
 bad = 0
 def line(ok, text):
@@ -1380,13 +1436,33 @@ line(bool(sources) and not swapped, 'mount sources: ' + (
 line(not receive, 'later mounts: ' + (f'the host\'s reach {few(receive)}' if receive else
                                       'no mount inside receives the host\'s'))
 line(not mnt, '/mnt and /media: ' + (f'hold {few(mnt)} inside' if mnt else 'nothing inside'))
+line(etc == [], '/etc: ' + ('cannot list it' if etc is None else
+                            f'holds {few(etc)}, which no list line puts there' if etc else 'only the listed entries'))
+line(bool(canaries) and not seen_canaries, 'canaries: ' + (
+    f'{few(seen_canaries)} there inside' if seen_canaries else f'{len(canaries)} not there inside' if canaries else
+    'none given'))
 line(whole and not socks, 'sockets: ' + (f'{few(socks)} inside' if socks else 'none in /tmp, /var/tmp, /run, /dev/shm'
                                          if whole else 'too many files to look through'))
 sys.exit(bad)
 EOF
 
+# check-net's canaries (issue #243): two files in CANARY_DIR (/etc, root's: no list line names them), one others may
+# read and one only the runner user's group ($1's) may, so a job that saw them would read both. Made fresh each time
+# (a file left by a check-net that was cut off is replaced) and removed when check-net ends (its trap).
+make_canaries() {
+  local c=$CANARY_DIR/fork-fleet-canary gid
+  owned_safe "$CANARY_DIR"
+  gid=$(id -g -- "$1") || die "check-net: no group of $1"
+  rm -f -- "$c" "$c-group"
+  printf 'fork-fleet canary: no job may see this file\n' >"$c"
+  printf 'fork-fleet canary: no job may see this file\n' >"$c-group"
+  chmod 0644 -- "$c"
+  chmod 0640 -- "$c-group"
+  chown -- ":$gid" "$c-group"
+}
+
 check_net() {
-  local url=$1 target host port user resolv own blocked seen from rc=0
+  local url=$1 target host port user resolv own blocked seen from linked canaries rc=0
   local -a pairs=() props
   shift
   [[ $url =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] || die "check-net: not a plain http(s) URL: $url"
@@ -1410,14 +1486,19 @@ check_net() {
   merge_own "$own"
   net_up "$user"
   sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/check-net.root" ''
+  canaries="$CANARY_DIR/fork-fleet-canary $CANARY_DIR/fork-fleet-canary-group"
+  # Expanded now, as start's env file: removed however check-net ends (one a kill left is replaced next time).
+  # shellcheck disable=SC2064
+  trap "rm -f -- $(printf '%q' "$CANARY_DIR/fork-fleet-canary") $(printf '%q' "$CANARY_DIR/fork-fleet-canary-group")" EXIT
+  make_canaries "$user"
   # Every probe's words (the names of files any local user may make among them) reach the terminal through shown().
-  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from" 2>&1 | shown_lines
+  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from" "$linked" "$canaries" 2>&1 | shown_lines
   echo "check-net: as $user, in its namespace fork-fleet-$user"
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-net --uid "$user" "${props[@]}" \
     -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null 2>&1 |
     shown_lines || rc=$?
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-walls --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" </dev/null 2>&1 |
+    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" "$linked" "$canaries" </dev/null 2>&1 |
     shown_lines || rc=$((rc | 2))
   ((rc == 0)) || die "check-net: the runners' network or walls are NOT as they must be (see above): do not use this pool"
   echo "check-net: the runners reach $url and none of the $((${#pairs[@]} / 2)) services named nor this host's own" \
