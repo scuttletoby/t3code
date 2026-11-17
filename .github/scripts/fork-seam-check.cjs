@@ -267,15 +267,9 @@ function findUnlistedChanges(
 }
 
 /**
- * Upstream lines a seam or "pending" file no longer has, two counts: `lines`, those the head does not
- * keep in order and indentation (deleted, moved, changed or re-indented: a dropped or moved guard
- * adds no line), and `gone`, those whose text the head no longer has at all (deleted or changed).
- * A count is not a set of lines, so `gone` keeps a line already lost to a move or re-indent from
- * being deleted later for free. From upstream (the base has no fork line, and fork lines only add)
- * both are held exactly to the file's "lost" entry (0 when unlisted), like a pending ceiling. A
- * pull request's base is main: in a seam file it may drop only listed seam lines (a moved copy of
- * one, say `}`, looks the same as upstream's line); in a pending file it cannot tell upstream's
- * lines from the fork's, so only the run from upstream counts them.
+ * Upstream lines a seam or pending file lost: `lines` not kept in order and indentation, `gone`
+ * whose text is gone (so a line already moved or re-indented cannot be deleted later for free).
+ * From upstream both are held exactly to its "lost" entry (0 when unlisted), like a ceiling.
  */
 function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }) {
   const reasons = [];
@@ -299,6 +293,8 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }
     const lines = lostLines(orderedLines(base), orderedLines(head));
     const gone = addedLines(head, base); // [line, copies the head has fewer of]
     if (!upstream) {
+      // Main's pending lines mix with upstream's, so only seam files: their listed lines may go,
+      // not move (a moved `}` looks like upstream's).
       const dropped = gone.reduce(
         (sum, [line, copies]) => sum + Math.min(copies, listed.get(line) ?? 0),
         0,
