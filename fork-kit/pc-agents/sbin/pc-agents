@@ -192,6 +192,26 @@ def install_t3(c, version, done):
     return None
 
 
+def install_packages():
+    """Install the k.PACKAGES that are not (fully) installed. A dpkg run stopped half-way is finished first (apt-get
+    refuses until it is). Returns why not, or None."""
+    r = k.run(['/usr/bin/dpkg-query', '-W', '-f=${Package}\t${Status}\n', *k.PACKAGES])
+    have = {p for p, _, status in (line.partition('\t') for line in r.stdout.splitlines())
+            if status == 'install ok installed'}
+    missing = [p for p in k.PACKAGES if p not in have]
+    if not missing:
+        return None
+    say('installing ' + ' '.join(missing))
+    for argv in (['/usr/bin/dpkg', '--configure', '-a'], ['/usr/bin/apt-get', 'update'],
+                 ['/usr/bin/apt-get', 'install', '-y', *missing]):
+        r = k.run(argv, timeout=900)
+        if r.returncode:
+            return (f'cannot install {" ".join(missing)}: {" ".join(argv)} failed ({r.stderr.strip()[-300:]}). Fix '
+                    'the distro\'s network or package sources, run `apt-get update && apt-get install -y '
+                    f'{" ".join(missing)}` as root, then setup again')
+    return None
+
+
 def setup(source, sha):
     if not re.fullmatch(r'[0-9a-f]{40}', sha) or not os.path.isdir(source):
         return say('usage: pc-agents setup --source DIR --sha 40-HEX-SHA') or 2
@@ -215,13 +235,8 @@ def setup(source, sha):
         r = k.run(['/usr/sbin/usermod', '--shell', k.NOLOGIN, k.USER])
         if r.returncode:
             return say(f'usermod failed: {r.stderr.strip()[-300:]}') or 1
-    if k.lstat('/usr/sbin/nft') is None:
-        for argv in (['/usr/bin/apt-get', 'update'], ['/usr/bin/apt-get', 'install', '-y', 'nftables']):
-            r = k.run(argv, timeout=900)
-            if r.returncode:
-                return say(f'cannot install nftables: {" ".join(argv)} failed ({r.stderr.strip()[-300:]}). Fix the '
-                           'distro\'s network or package sources, run `apt-get update && apt-get install -y '
-                           'nftables` as root, then setup again') or 1
+    if why := install_packages():
+        return say(why) or 1
     version = f'{k.OPT}/{sha}'
     for src, (dst, mode) in k.CODE.items():
         with open(os.path.join(source, src), 'rb') as f:
@@ -319,15 +334,19 @@ def stays_up():
 
 
 def pair(args):
-    """T3's own `t3 pair` for the T3 the unit runs (this t3Version's, not a glob over the versions folder, where an
-    older version stays), as the agent with the unit's T3 home, so it finds that running server."""
+    """T3's own `t3 pair` of the machine file's t3Version, the one the unit starts (not a glob over the versions
+    folder, where an older version stays), as the agent with the unit's T3 home, so it finds that running server.
+    An upgrade stopped half-way (the new t3Version written, its download failed) has no such t3 yet: said so."""
     if not k.ROOT and os.geteuid() != 0:
         return say('run this as root') or 2
     try:
         c = k.config()
     except machine_file.MachineFileError as e:
         return say(str(e)) or 2
-    return as_agent([k.runtime(c) + '/t3', 'pair'] + args)
+    t3 = k.runtime(c) + '/t3'
+    if k.lstat(t3) is None:
+        return say(f'T3 {c["t3Version"]} is not installed yet: run pc-agents setup again (README step 3)') or 1
+    return as_agent([t3, 'pair'] + args)
 
 
 def as_agent(cmd):
