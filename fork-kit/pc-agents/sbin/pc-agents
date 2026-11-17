@@ -8,6 +8,9 @@
                                            a failed wall.
   pc-agents load-firewall                  as root: load the agent firewall and note what the kernel lists
   pc-agents as-agent -- CMD...             as root: run CMD as the agent under T3's unit walls (the owner steps)
+  pc-agents pair [ARGS...]                 as root: a pairing code for the running T3 (its `t3 pair ARGS`, as the
+                                           agent): the kit's T3 is walled from Windows, so no Windows browser can
+                                           open it to make one
 Standard library only."""
 import os, re, shutil, stat, sys, time
 
@@ -262,8 +265,9 @@ def setup(source, sha):
     why = (r.stderr or r.stdout).strip()[-300:] if r.returncode else \
         stays_up() if k.lstat(k.PENDING) or not ran else None
     if why:
-        said = t3_said(since)
-        return say(f'T3 did not start or stay up ({why}){"; its log: " + said if said else ""}: see journalctl -u '
+        said, ended = t3_said(since), t3_ended(c)
+        return say(f'T3 did not start or stay up ({why}{"; " + ended if ended else ""})'
+                   f'{"; its log: " + said if said else ""}: see journalctl -u '
                    f'{k.UNIT}; run setup again once fixed') or 1
     if k.lstat(k.PENDING):
         os.unlink(k.ROOT + k.PENDING)
@@ -285,6 +289,17 @@ def t3_said(since):
     return re.sub(r'[^\x20-\x7e]', '?', lines[-1][:400]) if lines else ''
 
 
+def t3_ended(c):
+    """How T3's last main process ended, when not cleanly (its exit status, or the signal that killed it), or ''."""
+    got = k.props(k.run(['/usr/bin/systemctl', 'show', '-p', 'ExecMainCode,ExecMainStatus', k.UNIT]).stdout)
+    how, status = got.get('ExecMainCode'), got.get('ExecMainStatus') or '0'
+    if how == '1' and status != '0':   # CLD_EXITED
+        return f'exit status {status}' + (f': T3 cannot apply the managed policy /etc/t3code/policy.json (a '
+                                          f'lockedSettings entry T3 {c["t3Version"]} does not know?)'
+                                          if status == '77' else '')
+    return f'killed by signal {status}' if how in ('2', '3') else ''   # CLD_KILLED, CLD_DUMPED
+
+
 def stays_up():
     """Why T3 did not stay up for k.SETTLE seconds after a start (it can exit on a policy it cannot apply a moment
     after it started), or None: active all along, the same main process, no automatic restart."""
@@ -301,6 +316,18 @@ def stays_up():
         if time.monotonic() >= end:
             return None
         time.sleep(k.SETTLE_STEP)
+
+
+def pair(args):
+    """T3's own `t3 pair` for the T3 the unit runs (this t3Version's, not a glob over the versions folder, where an
+    older version stays), as the agent with the unit's T3 home, so it finds that running server."""
+    if not k.ROOT and os.geteuid() != 0:
+        return say('run this as root') or 2
+    try:
+        c = k.config()
+    except machine_file.MachineFileError as e:
+        return say(str(e)) or 2
+    return as_agent([k.runtime(c) + '/t3', 'pair'] + args)
 
 
 def as_agent(cmd):
@@ -479,6 +506,8 @@ def main(argv):
         return say(why) or 1 if why else 0
     if argv[:2] == ['as-agent', '--'] and len(argv) > 2:
         return as_agent(argv[2:])
+    if argv[:1] == ['pair']:
+        return pair(argv[1:])
     print(__doc__, file=sys.stderr)
     return 2
 
