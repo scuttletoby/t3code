@@ -913,6 +913,8 @@ class FakeLauncher:
             self.started.append((args[0], input))
             self.units.add(args[0])
         elif verb == 'stop':
+            if args[0] not in self.units:   # systemctl stop: "Unit ... not loaded.", exit 5
+                return subprocess.CompletedProcess(cmd, 5, '', 'fork-fleet-launch: systemctl failed\n')
             self.stopped.append(args[0])
             self.units.discard(args[0])
         elif verb == 'prune':
@@ -1115,6 +1117,50 @@ class Dispatch(unittest.TestCase):
         self.gh.add(a_run(6, actor='someone'), a_job(41, [POOLS[WAITING]['label']]))
         self.dispatch()
         self.assertEqual(self.fake[WAITING].stopped, [self.name(40)])
+
+    def test_a_failed_stop_keeps_the_idle_count_and_the_next_pass_stops_it(self):
+        """#342: the stop fails (systemd trouble): the pool is down for that pass and the runner's count is kept, so
+        the next pass that answers stops it at once, not idle_passes passes later."""
+        self.registration(40)
+        self.fake[WAITING].units.add(self.name(40))
+        self.fake[WAITING].fail = 'stop'
+        for _ in range(CFG['dispatch']['idle_passes']):
+            self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, [])
+        self.assertEqual(self.state['idle'], {self.name(40): CFG['dispatch']['idle_passes']})
+        self.assertIn(WAITING, self.state['down'])
+        self.fake[WAITING].fail = None
+        self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, [self.name(40)])
+        self.assertEqual(self.state['idle'], {})
+
+    def test_a_runner_busy_or_whose_own_job_is_queued_again_counts_its_idle_passes_from_zero(self):
+        """#342: idle for idle_passes - 1 passes, then busy (or its own job queued) for one: the count starts again,
+        so it is stopped only after idle_passes more idle passes."""
+        for why in ('busy', 'own job queued'):
+            with self.subTest(why):
+                self.setUp()
+                self.registration(40)
+                self.fake[WAITING].units.add(self.name(40))
+                passes = CFG['dispatch']['idle_passes']
+                for _ in range(passes - 1):
+                    self.dispatch()
+                if why == 'busy':
+                    self.gh.runners[0]['busy'] = True
+                else:
+                    job = a_job(40, job_labels(WAITING, 'lint'))
+                    self.gh.add(a_run(), job)
+                self.dispatch()
+                self.assertEqual(self.state['idle'], {})
+                if why == 'busy':
+                    self.gh.runners[0]['busy'] = False
+                else:
+                    job['status'] = 'completed'   # cancelled before its runner took it
+                for _ in range(passes - 1):
+                    self.dispatch()
+                self.assertEqual(self.fake[WAITING].stopped, [])
+                self.dispatch()
+                self.assertEqual(self.fake[WAITING].stopped, [self.name(40)])
 
     def test_a_runner_still_coming_up_for_its_queued_job_is_not_idle(self):
         self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
@@ -4501,6 +4547,21 @@ class RetiredLabels(unittest.TestCase):
         self.assertEqual(sorted(self.fake[WAITING].stopped), old)
         self.dispatch()
         self.assertEqual([n for n, _ in self.fake[WAITING].started], [f'{RET_POOLS[WAITING]["label"]}-11'])
+
+    def test_an_idle_runner_under_a_retired_label_whose_unit_is_on_another_host_is_left_alone(self):
+        """#342: a pool's label changed and its launch moved to another host in the same change (or `retired` lists a
+        label a removed pool used): the online runner under the old label runs on another host, holds no slot here, and
+        `stop` fails here (systemd has no such unit). It is never stopped, so the pool is never left down for it and
+        its own job starts."""
+        self.reg(43, 'fleet-old-a-43', status='online')    # its unit runs on another host
+        self.dispatch(passes=CFG['dispatch']['idle_passes'])
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+        self.dispatch(passes=3)
+        self.assertEqual(self.fake[WAITING].stopped, [])
+        self.assertEqual(self.states[WAITING]['down'], {})
+        self.assertEqual(self.states[WAITING]['idle'], {})
+        self.assertEqual([n for n, _ in self.fake[WAITING].started], [f'{RET_POOLS[WAITING]["label"]}-11'])
+        self.assertEqual(self.left(), ['fleet-old-a-43', f'{RET_POOLS[WAITING]["label"]}-11'])
 
     def test_an_idle_runner_under_a_retired_label_another_job_could_take_is_stopped_at_once(self):
         self.reg(43, 'fleet-old-a-43', status='online')
