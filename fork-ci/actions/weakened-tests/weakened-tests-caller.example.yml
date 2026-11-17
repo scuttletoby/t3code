@@ -1,0 +1,32 @@
+# An example caller of weakened-tests (README.md). Copy it to .github/workflows/ in the project and pin the release.
+# Report only: do not make this job a required check; it never fails.
+name: Weakened tests
+
+on:
+  pull_request:
+    # edited: a body edit that adds a "why" line updates the comment.
+    types: [opened, synchronize, reopened, edited]
+
+permissions: {}
+
+concurrency:
+  # One report per pull request at a time, never cancelled half-way: two runs at once could each find no comment
+  # and each post one.
+  group: weakened-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # the checkout
+      pull-requests: write # read the pull request body, post and edit the report comment
+    steps:
+      - uses: actions/checkout@<sha> # pin by full SHA
+        with:
+          fetch-depth: 0 # the base, the head and their merge base
+          persist-credentials: false
+      - uses: scuttletoby/t3code/fork-ci/actions/weakened-tests@<release sha of ci/vN> # ci/vN
+        with:
+          config: .github/weakened-tests.json # optional: the defaults apply without it
