@@ -58,11 +58,21 @@ class Judgement:
                f'{protected})'
 
 
+def shown(path):
+    """A changed path as text that can be written anywhere: a file name that is not UTF-8 reaches the judge with its
+    bytes kept as lone surrogates (head_check.changed_paths decodes git with surrogateescape), and those are written as
+    \\xNN here. Matching uses the path itself, never this."""
+    try:
+        return path.encode('utf-8', 'surrogateescape').decode('utf-8', 'backslashreplace')
+    except UnicodeEncodeError:
+        return path.encode('utf-8', 'backslashreplace').decode('utf-8')
+
+
 def _some(paths):
     if not paths:
         return 'no changed path'
-    shown = ', '.join(paths[:SHOW_PATHS])
-    return shown + (f' and {len(paths) - SHOW_PATHS} more' if len(paths) > SHOW_PATHS else '')
+    shown_ = ', '.join(shown(p) for p in paths[:SHOW_PATHS])
+    return shown_ + (f' and {len(paths) - SHOW_PATHS} more' if len(paths) > SHOW_PATHS else '')
 
 
 def parse_name_status(text):
@@ -91,9 +101,15 @@ def parse_name_status(text):
 
 
 def protected_paths(review, config_path):
-    """The exact paths that always count as critical: the config file and every lens prompt file."""
-    config_path = config_path[2:] if config_path.startswith('./') else config_path
-    return {config_path, *(x.prompt for x in review.lenses)}
+    """The exact paths that always count as critical: the config file and every lens prompt file. The config path is
+    written as git names a changed file (one leading ./ aside), by the rule the lens prompt paths follow: git also reads
+    `././x` or `a//b`, but no changed path is ever spelled so, and the config would not be protected: JudgeError."""
+    rel = config_path[2:] if config_path.startswith('./') else config_path
+    why = review_config.prompt_problem(rel)
+    if why:
+        raise JudgeError(f'the config path {config_path!r} {why}: write it as git names the file (such as '
+                         '.github/pr-queue.json), or a change to it would not count as protected')
+    return {rel, *(x.prompt for x in review.lenses)}
 
 
 def is_protected(path, exact):
