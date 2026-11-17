@@ -1,11 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { describe, expect, it } from "vite-plus/test";
+import { afterEach, vi } from "vite-plus/test"; // Fork
 
-import {
-  cliArchiveTarCommand,
-  newestCliReleaseVersion,
-  parseChecksums,
-  resolveCliReleaseRepository,
-} from "./cliRelease.ts";
+import { cliArchiveTarCommand, newestCliReleaseVersion, parseChecksums } from "./cliRelease.ts";
+import { resolveCliReleaseRepository } from "./cliRelease.ts"; // Fork
 
 describe("cliRelease", () => {
   it("parses sha256sum output including binary-mode markers", () => {

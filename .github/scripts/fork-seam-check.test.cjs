@@ -345,6 +345,10 @@ test("a malformed config throws instead of guarding nothing", () => {
     { files: SEAM, lost: { "a.ts": { lines: 2, gone: 3 } } },
     { files: SEAM, lost: { "a.ts": { lines: 2, gone: 1, why: "x" } } },
     { files: SEAM, lost: { "b.ts": { lines: 1, gone: 0 } } },
+    // Unknown kinds: a misspelt block or seam key would silently guard nothing.
+    { files: SEAM, lsot: {} },
+    { files: SEAM, Pending: { "p.ts": 1 } },
+    { files: { "a.ts": { ...SEAM["a.ts"], add: ["x"] } } },
     ...["/abs", "../up", "**", "*", "!", "a/../b"].map((pattern) => ({
       files: {},
       forkFiles: [pattern],
@@ -352,6 +356,16 @@ test("a malformed config throws instead of guarding nothing", () => {
   ]) {
     assert.throws(() => parseConfig(JSON.stringify(bad)), JSON.stringify(bad));
   }
+  // Keys that start with "//" are comments, at the top and in an entry.
+  assert.doesNotThrow(() =>
+    parseConfig(
+      JSON.stringify({
+        "//": "c",
+        "//pending": "c",
+        files: { "a.ts": { ...SEAM["a.ts"], "//": "c" } },
+      }),
+    ),
+  );
   assert.deepEqual(parseConfig(JSON.stringify({ files: SEAM })), {
     files: SEAM,
     pending: {},
@@ -500,6 +514,50 @@ test("a pull request that widens or drops its own list is judged by main's list"
     git("rm", "-rfq", ".");
     const bare = commit({ "x.txt": "x\n" }, "no list");
     assert.equal(run("--config-ref", bare, main, widened).status, 3);
+  });
+});
+
+// A pull request is judged by main's list, so its own list was never parsed before merge: a
+// malformed one (bad JSON, the old plain-number "lost", an unknown kind, or none) then made every
+// later pull request and fork-follow run crash (exit 3), the pull request that fixes it included.
+test("a pull request's own list is parsed for its format (never its rules) and refused when malformed", () => {
+  withRepo(({ git, commit, run, fromUpstream }) => {
+    const main = commit({ ...seams({ files: SEAM }), ...BASE }, "main");
+    const heads = {
+      'old plain-number "lost"': [
+        seams({ files: SEAM, lost: { "a.ts": 3 } }),
+        /"lost": a\.ts needs/,
+      ],
+      "bad JSON": [{ [CONFIG]: '{"files": {' }, /JSON/],
+      "an unknown kind": [seams({ files: SEAM, lsot: {} }), /unknown key "lsot"/],
+      "no list": [{ [CONFIG]: null }, /this change deletes it/],
+    };
+    for (const [what, [files, message]] of Object.entries(heads)) {
+      git("checkout", "-q", "-f", "-B", "pr", main);
+      const pr = commit(files, what);
+      for (const args of [
+        [main, pr],
+        ["--config-ref", main, main, pr],
+      ]) {
+        const result = run(...args);
+        assert.equal(result.status, 1, `${what}: ${result.stdout}${result.stderr}`);
+        assert.match(result.stderr, /this change's own \.github\/fork-seams\.json/, what);
+        assert.match(result.stderr, message, what);
+        assert.match(result.stderr, /Fix the list in this change/, what);
+        assert.doesNotMatch(result.stderr, /a file of the fork's own/, what);
+      }
+    }
+    // A well-formed list passes, whatever its rules (main's list judges the change).
+    git("checkout", "-q", "-f", "-B", "pr", main);
+    const wide = {
+      files: { "a.ts": { why: "mine", added: ["anything: 1,"] } },
+      pending: { "z.ts": 9 },
+    };
+    const fine = commit(seams(wide), "a wider list");
+    assert.equal(run(main, fine).status, 0);
+    // From upstream the head's list is the one in force: malformed, it is still a crash.
+    const broken = commit(seams({ files: SEAM, lost: { "a.ts": 3 } }), "broken");
+    assert.equal(fromUpstream(main, broken).status, 3);
   });
 });
 
