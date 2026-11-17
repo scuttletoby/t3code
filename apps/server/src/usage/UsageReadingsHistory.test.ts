@@ -19,6 +19,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
@@ -1106,7 +1107,7 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
   );
 
   it.effect(
-    "the server layer records the start snapshot and later changes, past a failed append",
+    "the server layer records the start snapshot, an update published while it reads (once), and later changes, past a failed append",
     () =>
       TestClock.withLive(
         Effect.gen(function* () {
@@ -1115,9 +1116,11 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
           const baseDir = yield* fs.realPath(
             yield* fs.makeTempDirectoryScoped({ prefix: "usage-readings-layer-" }),
           );
-          const changes = yield* Queue.unbounded<ReadonlyArray<ServerProvider>>();
+          const changes = yield* PubSub.unbounded<ReadonlyArray<ServerProvider>>();
           // Milestones: every successful append, and the one append that fails as on a full disk.
           const appended = yield* Queue.unbounded<string>();
+          const start = [provider(limits(at(0), 40))];
+          const update = [provider(limits(at(MINUTE), 45))];
           const appendFailed = yield* Deferred.make<void>();
           let failNextAppend = false;
           const faultyFs: FileSystem.FileSystem = {
@@ -1149,8 +1152,13 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
           };
           const dependencies = Layer.mergeAll(
             Layer.mock(ProviderRegistry)({
-              getProviders: Effect.succeed([provider(limits(at(0), 40))]),
-              streamChanges: Stream.fromQueue(changes),
+              // Right after the start-up read, the registry publishes that same snapshot, then an
+              // update twice: the update lands between the read and a subscription made after it.
+              getProviders: Effect.succeed(start).pipe(
+                Effect.tap(() => PubSub.publishAll(changes, [start, update, update])),
+              ),
+              streamChanges: Stream.fromPubSub(changes),
+              subscribeChanges: PubSub.subscribe(changes).pipe(Effect.map(Stream.fromSubscription)),
             }),
             Layer.succeed(FileSystem.FileSystem, faultyFs),
           );
@@ -1159,13 +1167,15 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
 
           yield* Effect.gen(function* () {
             yield* UsageReadingsHistory.UsageReadingsHistory;
-            // Start-up records the providers it finds.
+            // Start-up records the providers it finds, then the update published while it read.
             yield* milestone(Queue.take(appended));
-            // A failed append is logged; the subscription keeps running.
+            yield* milestone(Queue.take(appended));
+            // A failed append is logged; the subscription keeps running. The repeats seen before
+            // this update appended nothing, so this is the append that fails.
             failNextAppend = true;
-            yield* Queue.offer(changes, [provider(limits(at(MINUTE), 45))]);
+            yield* PubSub.publish(changes, [provider(limits(at(2 * MINUTE), 50))]);
             yield* milestone(Deferred.await(appendFailed));
-            yield* Queue.offer(changes, [provider(limits(at(2 * MINUTE), 50))]);
+            yield* PubSub.publish(changes, [provider(limits(at(3 * MINUTE), 55))]);
             yield* milestone(Queue.take(appended));
           }).pipe(
             Effect.provide(
@@ -1183,7 +1193,7 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
           const recorded = (yield* fileLines(path.join(directory, `${INSTANCE}.jsonl`))).map(
             (line) => JSON.parse(line) as UsageReading,
           );
-          assert.deepStrictEqual(percents(recorded), [40, 50]);
+          assert.deepStrictEqual(percents(recorded), [40, 45, 55]);
         }),
       ),
   );
