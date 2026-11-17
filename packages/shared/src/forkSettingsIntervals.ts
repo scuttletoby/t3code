@@ -50,9 +50,10 @@ export function findDurationPaths(schema: Schema.Top): {
         for (const index of ast.indexSignatures) walk(index.type, [...path, "*"], false);
         return;
       case "Union": {
-        // `undefined` (an `optional` key) never sits in a file. With two other members, a key path
-        // to an interval can also hold a value that is not one (`null` or "off" for "never", or
-        // another member's field), which a load must not drop: out of reach.
+        // `undefined` (an `optional` key) never sits in a file. With two other members, the key
+        // path can also hold a non-interval (`null` or "off", another member's field): out of reach.
+        // Stricter than needed (`NullOr(Struct)` or variants sharing the key were safe); widen
+        // this walk only when the `outOfReach` test fails for such a setting.
         const members = ast.types.filter((member) => SchemaAST.toType(member)._tag !== "Undefined");
         for (const member of members) walk(member, path, reachable && members.length === 1);
         return;
@@ -77,7 +78,11 @@ export function findDurationPaths(schema: Schema.Top): {
   return { paths, outOfReach };
 }
 
-/** Every interval setting's path, from the server settings schema. */
+/**
+ * Every interval setting's path, from the server settings schema. Never widen one (to `NullOr` or
+ * "off" for "never"); give the new encoding a new key: an older build drops a value it cannot read
+ * and its next save deletes it, so a rollback loses it (docs/fork/updates.md).
+ */
 export const SETTINGS_INTERVAL_PATHS = findDurationPaths(ServerSettings).paths;
 
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
