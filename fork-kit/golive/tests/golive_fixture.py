@@ -244,10 +244,11 @@ class FakeAdapter(osadapter.SystemdUser):
     def run_detached(self, unit, argv, guard_after_seconds=None, guard_argv=None):
         if not osadapter._UNIT_NAME.match(unit):
             raise osadapter.AdapterError(f'not a safe unit name: {unit!r}')
-        self._record('run_detached', unit, argv)
-        if self.guard_up and argv[1:3] == ['guard', '--run']:
+        self._record('run_detached', unit, argv, *([guard_after_seconds, guard_argv] if guard_argv else []))
+        if self.guard_up and argv[1:3] in (['guard', '--run'], ['back', '--auto']):  # copy's guard; switch's
             from golive import coldcopy
-            coldcopy._guard_log(os.path.join(self.root, 'kit-state'), {'run': argv[3], 'waiting': True})
+            run_id = argv[argv.index('--run') + 1]
+            coldcopy._guard_log(os.path.join(self.root, 'kit-state'), {'run': run_id, 'waiting': True})
 
     def unit_active(self, unit):
         return self.guard_alive

@@ -9,7 +9,7 @@ Exit 2: the kit cannot run here (no config, no adapter for this OS).
 settle records that the owner put the home right after a run that stopped half-way or ended with an error (or
 moves a damaged journal aside), so changing runs may start again. It writes only the kit's own journal.
 """
-import argparse, json, os, sys
+import argparse, hashlib, json, os, sys
 
 import machine_file
 from golive import config as config_mod, journal, live, osadapter
@@ -266,6 +266,14 @@ def _report(cfg, report, result, add):
     db = report.get('database') if isinstance(report.get('database'), dict) else {}
     result['counts'] = db.get('counts')
     result['pendingMigrations'] = db.get('pendingMigrations')
+    result['providers'] = providers_sum(report)  # switch's verify: the same after as before
+
+
+def providers_sum(report):
+    """SHA256 of the report's provider instances (only the sum: the journal and --json never hold settings)."""
+    settings = report.get('settings') if isinstance(report.get('settings'), dict) else {}
+    text = json.dumps(settings.get('providerInstances'), sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _plan(cfg, live_version, db_bytes, counts):
@@ -330,6 +338,23 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
     p = sub.add_parser('guard', help=argparse.SUPPRESS)
     p.add_argument('--run', required=True)
+    p = sub.add_parser('switch', help='move the live T3 to the target build, verify it, go back on its own if not',
+                       description='Needs a passed, fresh rehearsal of this target from the live build. At a quiet '
+                                   'point: stop the boot service, cold copy its userdata, runtime and unit to a new '
+                                   'folder in backupDir, check the old build can start on the copy, update to the '
+                                   'target with the staged build and verify. A failed or late verify goes back on '
+                                   'its own; a guard unit goes back if the run dies. Runs detached unless --here.')
+    p.add_argument('--owner-says-go', action='store_true',
+                   help='do not wait for a quiet point (the owner says now is fine)')
+    p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p = sub.add_parser('back', help='after a switch run that died: put T3 back as its journal says',
+                       description='--auto: what the switch guard runs. Goes back only if the given switch run is '
+                                   'the last run and its journal says neither "verified" nor "rolled back"; '
+                                   'does nothing while another run holds the lock. (Going back by hand after a '
+                                   'verified switch comes with go-live PR 7.)')
+    p.add_argument('--auto', action='store_true', required=True)
+    p.add_argument('--run', required=True, help='the switch run id (in the journal)')
+    p.add_argument('--wait', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         cfg = config_mod.load()
@@ -344,6 +369,12 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     except osadapter.Unsupported as e:
         print(f't3-golive: {e}', file=err)
         return 2
+    if args.command in ('switch', 'back'):
+        from golive import switch
+        if args.command == 'back':
+            switch.back_auto(cfg, adapter, args.run, args.wait, say=lambda line: print(line, file=out, flush=True))
+            return 0
+        return switch.main_switch(cfg, adapter, args.here, args.owner_says_go, out, err)
     if args.command in ('copy', 'guard'):
         from golive import coldcopy  # it uses run_check from this module
         if args.command == 'guard':
