@@ -21,7 +21,8 @@ const isDuration = (ast: SchemaAST.AST): boolean =>
 
 /**
  * Every Duration in `schema`'s decoded type: `paths` by key from the top, and `outOfReach` for one
- * inside a record, an array or a declaration, where no fixed key path leads (written with `*`).
+ * inside a record, an array or a declaration, where no fixed key path leads (written with `*`), or
+ * inside a union, where the same path may hold a value that is not an interval.
  */
 export function findDurationPaths(schema: Schema.Top): {
   readonly paths: ReadonlyArray<ReadonlyArray<string>>;
@@ -48,10 +49,14 @@ export function findDurationPaths(schema: Schema.Top): {
         }
         for (const index of ast.indexSignatures) walk(index.type, [...path, "*"], false);
         return;
-      case "Union":
-        // A member that is an object still has keys: an interval in it has the same path.
-        for (const member of ast.types) walk(member, path, reachable);
+      case "Union": {
+        // `undefined` (an `optional` key) never sits in a file. With two other members, a key path
+        // to an interval can also hold a value that is not one (`null` or "off" for "never", or
+        // another member's field), which a load must not drop: out of reach.
+        const members = ast.types.filter((member) => SchemaAST.toType(member)._tag !== "Undefined");
+        for (const member of members) walk(member, path, reachable && members.length === 1);
         return;
+      }
       case "Arrays":
         for (const element of [...ast.elements, ...ast.rest]) walk(element, [...path, "*"], false);
         return;
