@@ -11,7 +11,8 @@
 #   BEFORE       push: the branch tip before the push (all zeros when the branch is new);
 #                pull_request: the head before this push of it (synchronize), else empty
 #   OLD_HEADS    pull_request: every tip the PR's branch has had, as far as the workflow could list
-#                them (whitespace-separated commit ids; may be empty)
+#                them; schedule / workflow_dispatch (the sweep): every tip any ref has had, as
+#                GitHub's activity record lists them (whitespace-separated commit ids; may be empty)
 #   AFTER        push: the branch tip after the push
 #   PUSH_REF     push: the ref pushed (refs/heads/<name> or refs/tags/<name>); empty is read as the
 #                default branch
@@ -77,6 +78,12 @@
 #                  is not a branch or tag (notes), and branches older than this scan were never
 #                  read. A finding is old by then: rotate it. A failed sweep opens (or comments on)
 #                  an issue (fork-secret-sweep.yml), as a schedule run alerts no one otherwise.
+#   sweep, vanished tips  a [skip ci] push to a branch that is deleted or force-pushed away before
+#                  the sweep runs is held by no ref, but GitHub still serves its commits by id. So
+#                  the sweep also reads every tip OLD_HEADS lists (the workflow lists GitHub's
+#                  activity record: each push, force push and deletion with the tips before and
+#                  after), fetched by id, all at once and then one by one: one origin no longer
+#                  has ("not our ref") gets a warning, any other fetch failure fails the job.
 #
 # Commit objects: each commit of the range as git stores it (`git cat-file`: its message, author
 # and committer names and emails, signature and other headers), and on a tag push the pushed tag's
@@ -119,6 +126,9 @@
 # commit id change), and a value entry does not depend on either, so the PR scan does not scan the
 # squash result as one more diff.
 #
+# Shallow checkout: a range in a shallow clone stops at its graft, so the scan would pass on commits
+# it never read; the job fails (exit 2) before anything else. The workflow checks out fetch-depth: 0.
+#
 # Not covered (the job summary lists these too): a `gitleaks:allow` comment on the line itself
 # (visible in the diff); ref names (branch, tag and note names); the pull request's title, body and
 # comments (GitHub data, not git); commits only an outside pull request (refs/pull/N/head) holds, as
@@ -127,7 +137,11 @@
 # that edits the workflow (pull_request runs take it from the pull request; the workflow runs this
 # script from the default branch's tip, so an edit of the script alone changes nothing); text
 # in another encoding than UTF-8 or UTF-16 with a byte-order mark (UTF-16 without one, UTF-32);
-# compressed or packed contents (zip, gzip, images' compressed data); a key split across lines.
+# compressed or packed contents (zip, gzip, images' compressed data); a key split across lines;
+# a vanished tip (see "sweep, vanished tips") GitHub's activity record does not list (it records
+# branches: a deleted tag or notes ref is not in it; an entry older than what GitHub keeps of the
+# record (the workflow reads all of it, with no time window)) or that origin will not send by id any more although
+# GitHub's web pages may still show it (a warning).
 #
 # Contents: git log runs with --text, so a file git takes for binary (a NUL byte in it) still shows
 # its lines. A path whose contents in the range start with a UTF-16 byte-order mark goes through a
@@ -165,7 +179,9 @@
 # fetches there and a content still missing is a fatal git error, which fails the scan.
 set -euo pipefail
 
-have() { git cat-file -e "$1^{commit}" 2>/dev/null; }
+# GIT_NO_LAZY_FETCH: in a blob-less clone a missing commit would otherwise be fetched here, one by
+# one with no timeout, behind fetch_earlier's back.
+have() { GIT_NO_LAZY_FETCH=1 git cat-file -e "$1^{commit}" 2>/dev/null; }
 # Commits only, file contents on demand: the checkout is a blob-less clone.
 fetch() {
   have "$1" || git fetch --no-tags --quiet --filter=blob:none origin "$1" 2>/dev/null || true
@@ -188,6 +204,41 @@ fetch_earlier() {
   return 2
 }
 zero() { [[ -z "$1" || "$1" =~ ^0+$ ]]; }
+# earlier WHAT ID...: the earlier tips a pull request's branch (BEFORE, OLD_HEADS) or, in the sweep,
+# any ref (OLD_HEADS) has had. Each id once, all zeros skipped; a word that is not a commit id fails
+# the job. Sets listed (fetched, so readable) and gone (origin says it no longer has them); a fetch
+# that fails for any other reason fails the job (see fetch_earlier).
+earlier() {
+  local label="$1" old got ids=() missing=()
+  shift
+  listed=()
+  gone=()
+  for old in "$@"; do
+    zero "$old" && continue
+    if ! [[ "$old" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+      echo "::error::Secret scan: '$old' in BEFORE or OLD_HEADS is not a commit id" >&2
+      exit 2
+    fi
+    [[ " ${ids[*]} " != *" $old "* ]] || continue
+    ids+=("$old")
+    have "$old" || missing+=("$old")
+  done
+  # One fetch for all of them first (the sweep may list hundreds); one by one, with retries, only
+  # when it fails (any of them gone fails the whole fetch).
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    timeout 600 git fetch --no-tags --quiet --filter=blob:none origin "${missing[@]}" 2> /dev/null || true
+  fi
+  for old in "${ids[@]}"; do
+    got=0
+    fetch_earlier "$old" || got=$?
+    if [[ $got -eq 1 ]]; then gone+=("$old"); continue; fi
+    if [[ $got -ne 0 ]]; then
+      echo "::error::Secret scan: cannot fetch $label $old, and origin did not say it no longer has it (a network or server failure?), so what it had cannot be scanned. Re-run the job." >&2
+      exit 2
+    fi
+    listed+=("$old")
+  done
+}
 short() { printf '%s ' "$@" | sed -E 's/([0-9a-f]{12})[0-9a-f]+/\1/g; s/ $//'; }
 # Upstream's default branch and v* tags (the same tags fork-follow.sh reads), commits only, into
 # refs/scan-upstream/*. Refs from an earlier run go first, so a tag upstream has deleted since is
@@ -238,6 +289,14 @@ fetch_config_branch() {
   git rev-parse --quiet --verify 'refs/scan-config/head^{commit}'
 }
 
+# A shallow checkout (fetch-depth other than 0) ends the history at its graft: a range then holds
+# fewer commits than it should and the scan passes on what it never read (#239). Refused.
+if [[ "$(git rev-parse --is-shallow-repository 2> /dev/null)" != false ]]; then
+  echo "::error::Secret scan: the checkout is shallow (or not a git repository), so the range would miss commits and the scan would pass on what it never read. Check out with fetch-depth: 0." >&2
+  summary "### Secret scan" "" "Failed: the checkout is shallow, so nothing was scanned. Check out with fetch-depth: 0."
+  exit 2
+fi
+
 warning=""
 other_ref=""
 tag_objects=()
@@ -259,22 +318,10 @@ case "$EVENT_NAME" in
     what="the pull request's $(git rev-list --count "$range") commit(s) not on $CONFIG_BRANCH, merges included"
     # Earlier heads a force push replaced (see the header): what they had that neither the head nor
     # the default branch has is scanned too.
+    earlier "the earlier head" ${BEFORE:-} ${OLD_HEADS:-}
     tips=()
-    gone=()
-    for old in ${BEFORE:-} ${OLD_HEADS:-}; do
-      zero "$old" && continue
-      if ! [[ "$old" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
-        echo "::error::Secret scan: '$old' in BEFORE or OLD_HEADS is not a commit id" >&2
-        exit 2
-      fi
-      [[ " $HEAD_SHA ${tips[*]} ${gone[*]} " != *" $old "* ]] || continue
-      got=0
-      fetch_earlier "$old" || got=$?
-      if [[ $got -eq 1 ]]; then gone+=("$old"); continue; fi
-      if [[ $got -ne 0 ]]; then
-        echo "::error::Secret scan: cannot fetch the earlier head $old of this pull request, and origin did not say it no longer has it (a network or server failure?), so what it had cannot be scanned. Re-run the job." >&2
-        exit 2
-      fi
+    for old in "${listed[@]}"; do
+      [[ "$old" != "$HEAD_SHA" ]] || continue
       if git merge-base --is-ancestor "$old" "$HEAD_SHA" || git merge-base --is-ancestor "$old" "$settings"; then
         continue
       fi
@@ -385,8 +432,22 @@ case "$EVENT_NAME" in
       warning="${#odd[@]} ref(s) name no commit (${odd[*]:0:5}), so their contents are not scanned, only their tag messages"
     fi
     mapfile -t tips < <(printf '%s\n' "${tips[@]}" | sort -u)
-    range="${tips[*]}"
     what="every ref of origin but refs/pull/* (${#tips[@]} distinct tip(s))"
+    # Tips no ref holds any more (a branch deleted or force-pushed after a push no run scanned):
+    # every tip GitHub's activity record lists (OLD_HEADS; see "sweep" in the header).
+    earlier "the listed tip" ${OLD_HEADS:-}
+    vanished=()
+    for old in "${listed[@]}"; do
+      [[ " ${tips[*]} " == *" $old "* ]] || vanished+=("$old")
+    done
+    if [[ ${#vanished[@]} -gt 0 ]]; then
+      tips+=("${vanished[@]}")
+      what="$what, and ${#vanished[@]} tip(s) no ref holds that GitHub's activity record lists"
+    fi
+    if [[ ${#gone[@]} -gt 0 ]]; then
+      warning="${warning:+$warning; }${#gone[@]} tip(s) GitHub's activity record lists cannot be fetched: origin no longer serves them ($(short "${gone[@]:0:5}")), so they are not scanned"
+    fi
+    range="${tips[*]}"
     without_upstream
     # shellcheck disable=SC2086
     what="$what: $(git rev-list --count $range) commit(s)"
@@ -667,7 +728,7 @@ if [[ $status -eq 0 && $mstatus -eq 0 ]]; then
 else
   summary "gitleaks found possible secrets in $what (values redacted; see the job log). Rotate any real secret: it is already public."
 fi
-summary "" "Not covered: ref names; pull request titles, bodies and comments; commits only an outside pull request's head (refs/pull/*) holds; refs that name a tree or blob; a \`gitleaks:allow\` line; text in other encodings; packed or compressed contents; a key split across lines (see the header of fork-secret-scan.sh)."
+summary "" "Not covered: ref names; pull request titles, bodies and comments; commits only an outside pull request's head (refs/pull/*) holds; refs that name a tree or blob; a vanished tip GitHub's activity record does not list or origin no longer sends; a \`gitleaks:allow\` line; text in other encodings; packed or compressed contents; a key split across lines (see the header of fork-secret-scan.sh)."
 
 if [[ $status -ne 0 ]]; then exit "$status"; fi
 exit "$mstatus"
