@@ -37,7 +37,7 @@ ROOT = os.environ.get('FORK_FLEET_WALLS_ROOT', '')
 ME = os.path.realpath(__file__)
 # The sha256 of the launcher (fork-fleet-launch.sh) whose job units unit_props reads as safe: the one this file ships
 # with. A changed launcher must be read again and this pin changed with it (fork-fleet-walls-wsl2.test.py checks it).
-LAUNCHER_SHA256 = '8eb71a5a4cbe4a41312b2bb2499b494f7bc34f9b7d28040f71f0e87f1a5f651f'
+LAUNCHER_SHA256 = '402f3d41a0ed1064fdf1a138caf489402157bb45e44464d9ab3b88330a35354b'
 WSL_CONF = '/etc/wsl.conf'
 BINFMT = '/proc/sys/fs/binfmt_misc'
 MASK = '/etc/binfmt.d/WSLInterop.conf'   # same name as WSL's /usr/lib/binfmt.d file: systemd-binfmt reads this one
@@ -60,11 +60,12 @@ RUN_OPTIONS = ('--unit', '--uid', '--working-directory')
 # shows (binds only from BINDS, EnvironmentFile= only its own file, RootDirectory= only the unit's own root), and any
 # property that only takes away (RESTRICTS). Any other one (DeviceAllow=, LoadCredential=, MountImages=,
 # SupplementaryGroups=, ...) cannot be told: the walls must learn it first.
-RUN_PROPS = {'Type', 'KillMode', 'EnvironmentFile', 'ReadWritePaths', 'RuntimeMaxSec', 'NetworkNamespacePath',
-             'IPAddressDeny', 'IPAddressAllow', 'RootDirectory', 'MountAPIVFS', 'MountFlags', 'BindReadOnlyPaths',
-             'BindPaths', 'TemporaryFileSystem', 'NoNewPrivileges', 'RemoveIPC', 'PrivateDevices', 'PrivateIPC',
-             'PrivateTmp', 'PrivateNetwork', 'PrivateUsers', 'PrivateMounts', 'SystemCallFilter',
-             'SystemCallArchitectures', 'SystemCallErrorNumber', 'LockPersonality', 'CapabilityBoundingSet', 'UMask'}
+RUN_PROPS = {'Type', 'KillMode', 'EnvironmentFile', 'ReadWritePaths', 'RuntimeMaxSec', 'TimeoutStopSec',
+             'TimeoutAbortSec', 'NetworkNamespacePath', 'IPAddressDeny', 'IPAddressAllow', 'RootDirectory',
+             'MountAPIVFS', 'MountFlags', 'BindReadOnlyPaths', 'BindPaths', 'TemporaryFileSystem', 'NoNewPrivileges',
+             'RemoveIPC', 'PrivateDevices', 'PrivateIPC', 'PrivateTmp', 'PrivateNetwork', 'PrivateUsers',
+             'PrivateMounts', 'SystemCallFilter', 'SystemCallArchitectures', 'SystemCallErrorNumber', 'LockPersonality',
+             'CapabilityBoundingSet', 'UMask'}
 RESTRICTS = re.compile(r'(Protect|Restrict|Memory|CPU|Tasks|IO|Limit)[A-Za-z]*')
 READ_LITERAL = {'TemporaryFileSystem', 'RestrictAddressFamilies', 'SystemCallFilter', 'SystemCallArchitectures',
                 'RestrictNamespaces', 'PrivateDevices'}   # read by the walls: must be written out, no $
