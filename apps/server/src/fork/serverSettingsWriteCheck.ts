@@ -12,7 +12,7 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { Effect } from "effect";
 
-/** Fails when saving `next` over `current` would bring in a fork setting that cannot apply. */
+/** Fails when saving `next` over `current` would bring in a fork setting or interval that cannot apply. */
 export function check(
   current: ServerSettings,
   next: ServerSettings,
