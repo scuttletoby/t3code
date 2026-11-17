@@ -41,13 +41,15 @@ const LINKED_SECRETS: Record<string, string> = {
   }),
 };
 
-type Run = "unlink" | "logout" | "link" | "login" | "up";
+type Run = "unlink" | "logout" | "link" | "login" | "publish" | "up" | "up-off";
 
-const ARGS: Record<Exclude<Run, "up">, ReadonlyArray<string>> = {
+const ARGS: Record<Exclude<Run, "up" | "up-off">, ReadonlyArray<string>> = {
   unlink: ["connect", "unlink"],
   logout: ["connect", "logout"],
   link: ["connect", "link", "--publish-only", "--headless"],
   login: ["connect", "login", "--headless"],
+  // Turning publishing on writes `cloud-publish-agent-activity`, which the copy has not set.
+  publish: ["connect", "publish"],
 };
 
 const runOnHome = (run: Run, options: { readonly marked: boolean }) =>
@@ -104,14 +106,16 @@ const runOnHome = (run: Run, options: { readonly marked: boolean }) =>
         }),
       ),
     );
-    if (run === "up") yield* fs.writeFileString(`${baseDir}/service.env`, "T3CODE_LAN=false\n");
+    if (run === "up" || run === "up-off") {
+      yield* fs.writeFileString(`${baseDir}/service.env`, "T3CODE_LAN=false\n");
+    }
 
     const command =
-      run === "up"
+      run === "up" || run === "up-off"
         ? Command.runWith(upCommand, { version: packageJson.version })([
             "--base-dir",
             baseDir,
-            "--connect",
+            run === "up" ? "--connect" : "--no-connect",
           ])
         : Command.runWith(makeCli({ cloudEnabled: true }), { version: "0.0.0" })([
             ...ARGS[run],
@@ -167,7 +171,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer, NetService.layer))
       { run: "logout" as const },
       { run: "link" as const },
       { run: "login" as const },
+      { run: "publish" as const },
       { run: "up" as const },
+      // `t3 up` turning Connect off: its unlink ends in the relay delete.
+      { run: "up-off" as const },
     ])("$run on a marked home is refused before any request or change", ({ run }) =>
       Effect.gen(function* () {
         const result = yield* runOnHome(run, { marked: true });

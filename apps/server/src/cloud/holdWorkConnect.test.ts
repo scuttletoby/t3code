@@ -30,7 +30,11 @@ const recordingCloudLink = () => {
   return { calls, service };
 };
 
-const cloudLinkFor = (heldFromBoot: boolean) =>
+/** A temp home, or `baseDir` when given (a marked copy's home, say). */
+const homeConfig = (baseDir?: string) =>
+  ServerConfig.layerTest(process.cwd(), baseDir ?? { prefix: "t3-hold-work-link-" });
+
+const cloudLinkFor = (heldFromBoot: boolean, baseDir?: string) =>
   Effect.gen(function* () {
     const recording = recordingCloudLink();
     const gate = yield* WorkAdmission.makeWorkAdmissionGate({ heldFromBoot });
@@ -38,7 +42,7 @@ const cloudLinkFor = (heldFromBoot: boolean) =>
       Effect.provide(
         HoldWorkConnect.layer(Layer.succeed(CloudLink.CloudLink, recording.service)).pipe(
           Layer.provide(Layer.succeed(WorkAdmission.WorkAdmission, gate)),
-          Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-hold-work-link-" })),
+          Layer.provide(homeConfig(baseDir)),
           Layer.provide(NodeServices.layer),
         ),
       ),
@@ -94,7 +98,7 @@ describe("holdWorkConnect", () => {
 });
 
 /** An agent activity publisher whose every method records its call. */
-const relayFor = (heldFromBoot: boolean) =>
+const relayFor = (heldFromBoot: boolean, baseDir?: string) =>
   Effect.gen(function* () {
     const calls: Array<string> = [];
     const record = (name: string) => () => Effect.sync(() => void calls.push(name));
@@ -111,7 +115,11 @@ const relayFor = (heldFromBoot: boolean) =>
               start: record("start"),
             }),
           ),
-        ).pipe(Layer.provide(Layer.succeed(WorkAdmission.WorkAdmission, gate))),
+        ).pipe(
+          Layer.provide(Layer.succeed(WorkAdmission.WorkAdmission, gate)),
+          Layer.provide(homeConfig(baseDir)),
+          Layer.provide(NodeServices.layer),
+        ),
       ),
     );
     return { calls, relay };
@@ -145,11 +153,10 @@ describe("holdWorkConnect agent activity", () => {
 
 describe("holdWorkConnect held-copy marker", () => {
   /** Builds the held or normal CloudLink layer on `baseDir`; the fake CloudLink notes whether the marker was there when it was built. */
-  const buildOn = (baseDir: string, heldFromBoot: boolean) =>
+  const buildOn = (baseDir: string, heldFromBoot: boolean, markerAtBuild: Array<boolean> = []) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const marker = `${baseDir}/${HoldWorkConnect.HELD_COPY_MARKER_FILE}`;
-      const markerAtBuild: Array<boolean> = [];
       const gate = yield* WorkAdmission.makeWorkAdmissionGate({ heldFromBoot });
       const fake = Layer.effect(
         CloudLink.CloudLink,
@@ -189,6 +196,25 @@ describe("holdWorkConnect held-copy marker", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("a held boot that cannot write its marker fails before CloudLink is built", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-hold-work-mark-" });
+      // A normal boot first lays out the home, so only the marker write meets the read-only home.
+      yield* buildOn(baseDir, false);
+      yield* fs.chmod(baseDir, 0o500);
+      const built: Array<boolean> = [];
+      const exit = yield* buildOn(baseDir, true, built).pipe(Effect.exit);
+      yield* fs.chmod(baseDir, 0o700);
+      // A held copy that booted unmarked would be unguarded once it stops.
+      expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : null).toMatchObject({
+        reason: { _tag: "PermissionDenied" },
+      });
+      expect(built).toEqual([]);
+      expect(yield* fs.exists(`${baseDir}/${HoldWorkConnect.HELD_COPY_MARKER_FILE}`)).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect(
     "a second held start keeps the marker as it is, even one cut off empty or unreadable",
     () =>
@@ -209,10 +235,47 @@ describe("holdWorkConnect held-copy marker", () => {
   );
 });
 
+describe("holdWorkConnect normal boot of a marked copy", () => {
+  it.effect.each([
+    { label: "a marker", marker: "file" as const },
+    { label: "a marker a start cut off empty", marker: "empty" as const },
+    { label: "a dangling symlink in the marker's place", marker: "dangling" as const },
+  ])("holds Connect and agent activity on $label, as a held boot does", ({ marker }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-hold-work-marked-" });
+      const markerPath = `${baseDir}/${HoldWorkConnect.HELD_COPY_MARKER_FILE}`;
+      if (marker === "dangling") yield* fs.symlink(`${baseDir}/gone`, markerPath);
+      else yield* fs.writeFileString(markerPath, marker === "empty" ? "" : "marked");
+
+      const { calls, cloudLink } = yield* cloudLinkFor(false, baseDir);
+      expect(yield* cloudLink.reconcileDesiredLinkIfStillDesired(ORIGIN)).toBeNull();
+      expect(yield* cloudLink.registerManagedTunnelRecovery(ORIGIN)).toEqual({
+        status: "not_linked",
+      });
+      expect(yield* cloudLink.startManagedTunnelIfOriginConfirmed(ORIGIN)).toBe(false);
+      // The shutdown release would delete the running server's tunnel under the shared id.
+      expect(yield* cloudLink.releaseManagedTunnelOnShutdown()).toBe(false);
+      const refused = yield* Effect.flip(cloudLink.unlink());
+      expect(refused).toEqual(HoldWorkConnect.heldConnectRefusal(markerPath));
+      expect(refused.message).toContain(markerPath);
+      expect(calls).toEqual([]);
+
+      const activity = yield* relayFor(false, baseDir);
+      yield* useRelay(activity.relay);
+      expect(activity.calls).toEqual([]);
+      // Nothing touched the marker.
+      if (marker !== "dangling") {
+        expect(yield* fs.readFileString(markerPath)).toBe(marker === "empty" ? "" : "marked");
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
 describe("holdWorkConnect CLI refusal on a held copy's home", () => {
   const refusalFor = (home: {
     readonly state?: Record<string, unknown>;
-    readonly marker?: "file" | "empty" | "unreadable" | "directory";
+    readonly marker?: "file" | "empty" | "unreadable" | "directory" | "dangling";
     readonly secrets?: boolean;
     readonly missing?: boolean;
     readonly unsearchable?: boolean;
@@ -234,6 +297,7 @@ describe("holdWorkConnect CLI refusal on a held copy's home", () => {
         );
       }
       if (home.marker === "directory") yield* fs.makeDirectory(marker);
+      else if (home.marker === "dangling") yield* fs.symlink(`${baseDir}/gone`, marker);
       else if (home.marker !== undefined) {
         yield* fs.writeFileString(marker, home.marker === "empty" ? "" : "{not json");
         if (home.marker === "unreadable") yield* fs.chmod(marker, 0o000);
@@ -270,6 +334,8 @@ describe("holdWorkConnect CLI refusal on a held copy's home", () => {
     { label: "a marker a start cut off empty", marker: "empty" as const },
     { label: "an unreadable marker", marker: "unreadable" as const },
     { label: "a directory in the marker's place", marker: "directory" as const },
+    // The held boot's exclusive create sees it as there and keeps it, so the CLI must too.
+    { label: "a dangling symlink in the marker's place", marker: "dangling" as const },
     // Checking fails (no search permission on the home): counted as there.
     { label: "a marker that cannot be checked", marker: "file" as const, unsearchable: true },
   ])("refuses on $label, and says how to clear it", ({ marker, unsearchable }) =>
