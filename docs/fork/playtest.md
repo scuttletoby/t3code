@@ -6,8 +6,9 @@ request per round. T3 runs the session; the project's **adapter** does everythin
 target. This page is what an adapter must do. The settings are
 [`server.playtest` and `projectOverride.playtest`](README.md#serverplaytest).
 
-Status: the settings, this contract and the session store exist. The `playtest` tool, the renew
-worker and the thread controls come in later pull requests and follow this page.
+Status: the settings, this contract, the session store and the worker (renew, the limits, ends
+for gone threads) exist. The `playtest` tool and the thread controls come in later pull requests and
+follow this page.
 
 ## The steps
 
@@ -98,15 +99,52 @@ why it ended and its last round. A thread has at most one session that is not en
   `release`. Two ends at once share one `release`.
 - **A claim that fails** (any exit but 0 and 10, or a timeout) is followed by `release`, as the claim
   may be half taken. A claim that exits 10 ends the session with nothing to release.
-- **After a restart** a round that was running reads `stopped`; a claim or release that was running
-  leaves the session busy until it is ended, and `end` runs `release` again. If T3 crashed rather
-  than stopped, the old step may still be running on the machine while that `release` runs: an
-  adapter that cannot take two steps at once guards itself (a lock file).
+- **After a restart** a round that was running reads `stopped`. The worker then finishes what the
+  restart cut: a claim that was running ends the session as `claim-failed` and runs `release`; a
+  release that was running runs again. If T3 crashed rather than stopped, the old step may still be
+  running on the machine while that `release` runs: an adapter that cannot take two steps at once
+  guards itself (a lock file).
 - **A bad file** (torn, empty, not valid) is copied aside as `playtest.json.corrupt-<time>` and
   replaced by the sessions that still read; the lost ones are named in the server log, and their
   claims expire on the target by themselves. A file with no version or an older one is handled the
   same way: copied aside, its sessions kept, written again as the current version. A file from a
   newer T3 is not read or written: every playtest call is refused until that T3 runs again.
+
+## The worker
+
+A sweep on T3's scheduler (every few seconds; it reads the file only when something is due, and
+not at all while the scheduler is held) does the rest:
+
+- **Renew.** Once at once after T3 starts, then every `renewMinutes` after the last one. A claim
+  that just worked counts as a renew. Renew runs beside a round, so a long build does not let the
+  claim expire. A renew that fails (not 0, not 10) is kept as the session's problem and tried again
+  after a minute (at most `renewMinutes`); a renew that exits 10 ends the session as `claim-gone`.
+  A renew that has failed for 3 × `renewMinutes` in a row (since the last good claim or renew, or
+  since its first failure after a restart) also ends it as `claim-gone`: the claim has expired on
+  the target by then, and the notice says so. An end while renew runs stops it (its process is
+  killed) before `release`. Renew, release and notice times run on the monotonic clock, so a wall
+  clock set back does not hold them up.
+- **Idle.** No round and no message from the person for `idleMinutes` ends the session as `idle`. A
+  round that runs counts as activity; an agent's message does not.
+- **Time limit.** `maxHours` after the start the session ends as `time-limit`, even while a round
+  runs (the round is stopped).
+- **Thread gone.** A thread that is archived or deleted ends its session as `thread-gone`. The
+  sweep never waits for a thread read: each runs in the background (one per thread at a time,
+  60 seconds at most), and the sweep after a "gone" answer ends the session. A read that is late or
+  cannot answer counts as "not known", never as gone; it is logged and read again later, and the
+  other sessions go on.
+- **Release again.** A session left `ending` (its release failed, or a restart cut it) runs
+  `release` again every `renewMinutes` until it exits 0.
+- **One notice for the person.** When T3 ends a session itself (idle, time limit, claim gone, a
+  claim a restart cut), it shows one notice in the thread, "Playtest ended": why, whether the target
+  is back, that the worktree and its changes are kept, and to start a new session when the person
+  is back. It is a system notice item (as T3's own "Branch not renamed"), not a message: it starts
+  no agent turn and no agent reads it, so nothing claims the target again while nobody is there. It
+  is written once its `release` worked, or once a `release` failed (it says so). It has a fixed id,
+  so it shows once, also across restarts and retries. A write that fails or takes more than 60
+  seconds is tried again a minute later. A thread that is gone does not get it (the server log says
+  so); the session's status still says why it ended. Ends the agent or the person asked for, and
+  `thread-gone`, show no notice.
 
 ## Limits
 
