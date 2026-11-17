@@ -25,13 +25,16 @@ permissions: {}
 jobs:
   gate:
     # A comment on an issue that is no pull request starts nothing, nor does a review trigger run that did not finish
-    # (a newer one on the same pull request replaced it).
+    # (a newer one on the same pull request replaced it) or that no review started (a workflow of the same name run by
+    # a push or a pull request's own event: skipped here, before a guard job starts).
     if: >-
       (github.event_name != 'issue_comment' || github.event.issue.pull_request) &&
-      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+      (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' &&
+      contains(fromJSON('["pull_request_review","pull_request_review_comment"]'), github.event.workflow_run.event)))
     # Review trigger runs of one head (a burst of reviews or line comments): one judges, the newest waits, the ones in
     # between are dropped while they wait. Never cancelled half-way (that would post a failure). Every other event has
-    # a group of its own, so it is never dropped.
+    # a group of its own here, so a review run never drops it in this group. (The gate job's own group, per head, is
+    # shared by all events: a newer job there replaces a waiting one and reads the newest state of the same head.)
     concurrency:
       group: ${{ github.event_name == 'workflow_run' && format('head-gate-review-{0}-{1}', github.workflow_ref, github.event.workflow_run.head_sha) || format('head-gate-run-{0}', github.run_id) }}
       cancel-in-progress: false
