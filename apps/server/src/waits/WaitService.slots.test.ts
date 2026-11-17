@@ -578,6 +578,24 @@ describe("WaitService slot waits", () => {
     }),
   );
 
+  it.effect("wait_list shows the capacity rule in observe mode only (#353)", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      for (const mode of ["observe", "fixed"] as const) {
+        const world = newWorld();
+        const store = disk();
+        const send = fakeDelivery();
+        const listed = yield* Effect.gen(function* () {
+          const { delegate, service } = yield* startService(store.fs, send.delivery);
+          assert.strictEqual(yield* delegate(T1), "allow");
+          return yield* service.list({ threadId: T1, projectId: PROJECT });
+        }).pipe(Effect.provide(serverLayer(world, slotsOn(2, { agentSlots: { mode } }))));
+        if (mode === "observe") assert.deepInclude(listed.slotRule, { mode: "observe" });
+        else assert.isUndefined(listed.slotRule);
+      }
+    }),
+  );
+
   it.effect(
     "one thread holds at most one slot: repeated met slot waits do not hoard every free slot",
     () =>
