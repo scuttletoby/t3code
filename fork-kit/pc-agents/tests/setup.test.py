@@ -61,7 +61,6 @@ class Setup(Case):
         self.ready()
         policy = json.loads(self.read('/etc/t3code/policy.json'))
         self.assertEqual(policy['settings'], {'agentSlots.maxPerMachine': {'value': 2, 'locked': True},
-                                              'automaticUpdates': {'value': False, 'locked': True},
                                               'linkedEnvironmentsEnabled': {'value': True, 'locked': True}})
         self.assertEqual(policy['limits']['maxRuntimeMode'], 'full-access')
         self.assertEqual((policy['limits']['connect'], policy['limits']['webhookTasks']), (False, False))
@@ -326,7 +325,15 @@ class Setup(Case):
         code, out = self.setup_run()
         self.assertEqual(code, 1, out)
         self.assertIn('journalctl -u t3code-agents.service', out)
+        self.assertNotIn('T3 said', out)   # an empty journal: the message still comes
         self.assertTrue(os.path.isfile(self.path(k.PENDING)))
+        # T3's own error comes with it, from the unit's journal
+        self.write('/log/journal', 'starting\n[ERROR] ManagedPolicyFileError: "x" is not a setting this version can '
+                                   'manage\nMain process exited, code=exited, status=77/NOPERM\n')
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('T3 said: [ERROR] ManagedPolicyFileError: "x" is not a setting', out)
+        self.assertEqual(self.log('journalctl')[-1], '-u t3code-agents.service -n 80 -o cat --no-pager')
         os.unlink(self.path('/log/t3-crash'))
         self.assertEqual(self.setup_run()[0], 0)
         self.assertFalse(os.path.lexists(self.path(k.PENDING)))

@@ -261,12 +261,24 @@ def setup(source, sha):
     why = (r.stderr or r.stdout).strip()[-300:] if r.returncode else \
         stays_up() if k.lstat(k.PENDING) or not ran else None
     if why:
-        return say(f'T3 did not start or stay up ({why}): see journalctl -u {k.UNIT}; run setup again once fixed') or 1
+        said = t3_said()
+        return say(f'T3 did not start or stay up ({why}){"; T3 said: " + said if said else ""}: see journalctl -u '
+                   f'{k.UNIT}; run setup again once fixed') or 1
     if k.lstat(k.PENDING):
         os.unlink(k.ROOT + k.PENDING)
     say(f'done: T3 serves on port {c["port"]}. Next: tailscale up --advertise-tags={c["tailscaleTag"]} '
         '--accept-dns=false')
     return 0
+
+
+def t3_said():
+    """T3's last error line in its unit's journal (a policy it cannot apply, a port in use), or ''."""
+    try:
+        r = k.run(['/usr/bin/journalctl', '-u', k.UNIT, '-n', '80', '-o', 'cat', '--no-pager'], timeout=30)
+    except OSError:
+        return ''
+    lines = [x.strip() for x in r.stdout.splitlines() if re.search(r'\bERROR\b|Error\b', x)]
+    return lines[-1][:400] if lines else ''
 
 
 def stays_up():

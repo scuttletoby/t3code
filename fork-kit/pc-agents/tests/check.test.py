@@ -360,9 +360,9 @@ class Unit(Case):
     def test_config(self):
         # The kit passes these; T3 itself tells a complete object from a partial one and does not start on a partial.
         ok = {'agentSlots': {'maxPerMachine': 2}, 'providerInstances.codex-work': {'driver': 'codex'},
-              'agentSlots.maxPerMachine': 2, 'providerInstances': {}}
+              'agentSlots.maxPerMachine': 2, 'providerInstances': {}, 'automaticUpdates': False}
         self.assertEqual([p for p, v in ok.items() if k.locked_problem(p, v)], [])
-        bad = {'providerInstances.codex-work.enabled': True, 'agentSlots.a.b': {'x': 1}, 'automaticUpdates': True,
+        bad = {'providerInstances.codex-work.enabled': True, 'agentSlots.a.b': {'x': 1}, 'linkedEnvironmentsEnabled': False,
                'linkedEnvironmentsEnabled.x': 1, 'Agent': 1, 'a..b': 1}
         self.assertEqual([p for p, v in bad.items() if not k.locked_problem(p, v)], [])
         for section in ({**CONFIG, 'organization': '   '}, {**CONFIG, 'peers': []},

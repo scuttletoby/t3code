@@ -40,7 +40,9 @@ BLOCKED4 = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '169.254.0.0/16', '172.1
             '224.0.0.0/4', '240.0.0.0/4')
 BLOCKED6 = ('fc00::/7', 'fe80::/10', 'ff00::/8')
 MODES = ('approval-required', 'auto-accept-edits', 'auto', 'full-access')
-KIT_SETTINGS = {'linkedEnvironmentsEnabled': True, 'automaticUpdates': False}
+# Only settings every T3 the kit can run knows (T3 does not start on a policy naming a setting it lacks). Updates are
+# off through limits.updates (all versions; the server's self-update refuses), not the newer automaticUpdates.
+KIT_SETTINGS = {'linkedEnvironmentsEnabled': True}
 VERSION = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)?')
 HEAD = '# pc-agents kit: written by `pc-agents setup`; an edit is refused at its next run and fails the walls check\n'
 
@@ -209,6 +211,8 @@ ExecStartPre=+{CHECK} check
 ExecStart={runtime(c)}/t3 serve
 Restart=on-failure
 RestartSec=30
+# 77: T3 cannot apply the managed policy; a restart cannot fix that
+RestartPreventExitStatus=77
 {walls}
 
 [Install]
