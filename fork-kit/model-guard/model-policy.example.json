@@ -1,0 +1,26 @@
+{
+  "mode": "advise",
+  "allow": [
+    {
+      "driver": "claudeAgent",
+      "model": "example-large-1-0",
+      "efforts": ["medium", "high", "xhigh"],
+      "defaultEffort": "high",
+      "aliases": ["large"],
+      "useFor": "most work: building, reviewing, relays"
+    },
+    {
+      "driver": "claudeAgent",
+      "model": "example-deep-2-0",
+      "efforts": ["medium", "high", "xhigh"],
+      "defaultEffort": "high",
+      "aliases": ["deep"],
+      "useFor": "design options and root causes others missed; it costs more, so not routine work"
+    },
+    {
+      "driver": "exampleDriver",
+      "model": "example-plain-1",
+      "useFor": "a model with no effort control"
+    }
+  ]
+}
