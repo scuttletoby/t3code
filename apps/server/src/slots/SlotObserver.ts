@@ -63,8 +63,10 @@ export interface SlotObserveInput {
   readonly atMs: number;
   readonly starting: ReadonlyArray<StartingEntry>;
   /**
-   * The live held slots as the gate counts them (memory and wait store), as of the decision. Read
-   * in the observer's fiber, so a slow wait store never delays the decision.
+   * The live held slots as the gate counts them: memory as of the decision, the wait store as of
+   * when the observation runs (read in the observer's fiber, so a slow store never delays the
+   * decision). An observation that waits behind others can miss a hold a later decision used up
+   * meanwhile, or count one granted after its decision: one agent off, for a few seconds.
    */
   readonly held: Effect.Effect<ReadonlyArray<SlotReservation>>;
   /** `acquire`'s caller: its own held slot is used up by the start it asks for (counted once). */
@@ -84,6 +86,9 @@ export function slicePath(slice: string): string {
   const parts = slice.replace(/\.slice$/, "").split("-");
   return parts.map((_, index) => `/${parts.slice(0, index + 1).join("-")}.slice`).join("");
 }
+
+/** One of the rule's own starts, and the thread that asked for it (its holds are used up). */
+type OwnStart = StartingEntry & { readonly threadId?: string | undefined };
 
 interface OwnPiece {
   readonly scope: { readonly unit: string; readonly slice: string } | undefined;
@@ -121,7 +126,14 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
    * its child shows a run (then it counts as that run, once). A dispatch that ends with no child
    * stops counting at once.
    */
-  let ownStarts: ReadonlyArray<StartingEntry> = [];
+  let ownStarts: ReadonlyArray<OwnStart> = [];
+  /**
+   * While the gate keeps no records: held slots of the threads those starts were for, by key, until
+   * they end. A start uses its thread's hold up, as the gate's `useUp` does with slots on (with slots
+   * off the gate leaves it in the store), so the start and the hold never both count, not even once
+   * the start stops counting (its child shows its run, or its dispatch ends).
+   */
+  const usedHolds = new Map<string, number>();
 
   const readFacts = async (pieces: ReadonlyArray<OwnPiece>): Promise<CapacityFacts> => {
     const machine = await readMachine(host);
@@ -198,9 +210,23 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
         input.atMs,
         input.startGraceMs,
       );
+      const live = liveReservations(heldRead.value, input.atMs);
+      if (!input.gateRecords) {
+        // Also the starts this decision counts (a skipped or slow observation of a start's own
+        // decision leaves its hold to the next one).
+        const startedThreads = new Set(own.map((entry) => entry.threadId));
+        if (input.ownStart !== undefined) startedThreads.add(input.callerThreadId);
+        for (const reservation of live) {
+          if (startedThreads.has(reservation.threadId)) {
+            usedHolds.set(reservation.key, reservation.untilMs);
+          }
+        }
+      }
       const held = onePerThread(
-        liveReservations(heldRead.value, input.atMs).filter(
-          (reservation) => reservation.threadId !== input.callerThreadId,
+        live.filter(
+          (reservation) =>
+            reservation.threadId !== input.callerThreadId &&
+            (input.gateRecords || !usedHolds.has(reservation.key)),
         ),
       );
       const scopes = yield* Effect.forEach([...running.visible], (threadId) =>
@@ -256,9 +282,12 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
       ownStarts = input.gateRecords
         ? []
         : liveStarting(ownStarts, new Set(), input.atMs, input.startGraceMs);
+      for (const [key, untilMs] of usedHolds) {
+        if (input.gateRecords || untilMs <= input.atMs) usedHolds.delete(key);
+      }
       const ownBefore = ownStarts;
       if (!input.gateRecords && input.ownStart !== undefined) {
-        ownStarts = [...ownStarts, input.ownStart];
+        ownStarts = [...ownStarts, { ...input.ownStart, threadId: input.callerThreadId }];
       }
       if (waiting >= OBSERVE_MAX_WAITING) {
         return Ref.update(status, (current) => ({ ...current, skipped: current.skipped + 1 }));
@@ -302,5 +331,7 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
         );
       }),
     status: Ref.get(status),
+    /** What the rule keeps in memory (for tests: nothing past the point it stops counting). */
+    kept: Effect.sync(() => ({ starts: ownStarts.length, usedHolds: usedHolds.size })),
   };
 });
