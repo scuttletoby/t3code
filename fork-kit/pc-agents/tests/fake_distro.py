@@ -27,7 +27,14 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                    '[ -e "$R/log/install-hang" ] && { sleep 60 & echo $! >"$R/log/hang.pid"; wait; }\n'
                    'for a; do case "$a" in T3CODE_VERSION=*) v=${a#*=};; esac; done\n'
                    'd="$R/opt/pc-agents/t3/runtime/versions/$v"; mkdir -p "$d"; printf "#!/bin/sh\\n# t3 $v\\n" >"$d/t3"\n'
-                   'chmod 755 "$d/t3"\n',
+                   'chmod 755 "$d/t3"\n'
+                   # install-loose: as upstream's tar leaves it (a mktemp -d top, the archive's group-writable modes)
+                   '[ -e "$R/log/install-loose" ] && { mkdir -p "$d/lib/x"; echo x >"$d/lib/x/m.js"; chmod 775 "$d/lib" '
+                   '"$d/lib/x"; chmod 664 "$d/lib/x/m.js"; ln -s x "$d/lib/y"; echo s >"$d/lib/s"; chmod 4775 "$d/lib/s"; '
+                   'chmod 700 "$d"; }\n'
+                   # install-link-out: a link from the runtime to a file outside it
+                   '[ -e "$R/log/install-link-out" ] && { echo o >"$R/log/outside"; chmod 664 "$R/log/outside"; '
+                   'ln -s "$R/log/outside" "$d/out"; }; exit 0\n',
     # systemd-run: like the real one, a bare command name is looked up in the CALLER's PATH, before anything runs
     'usr/bin/systemd-run': 'R="${0%/usr/bin/systemd-run}"; printf "%s\\n" "$@" >"$R/log/systemd-run"\n'
                            'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; cmd=$2\n'
