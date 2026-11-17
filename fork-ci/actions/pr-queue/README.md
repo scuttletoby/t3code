@@ -538,7 +538,8 @@ checkout of its config, in a job with the read permissions above:
 
 With `update_when_base_was_red`, the job of every required check runs
 `tested-base` right after its checkout of the merge commit (`path` is the
-checkout's path, default `.`):
+checkout's path relative to the workspace, default `.`; an absolute path or a
+`.git` that fork-ci git-clean refuses writes no note):
 
 ```yaml
 - uses: actions/checkout@<sha>
