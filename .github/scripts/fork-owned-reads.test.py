@@ -57,6 +57,9 @@ def owned(paths):
 LIST_LINES = [l.strip() for l in LIST.read_text().splitlines() if l.strip() and not l.startswith("#")]
 ROOTS = sorted({l.lstrip("!").split("/")[0] for l in LIST_LINES})
 PATH_RE = re.compile(r"(?<![\w.-])(" + "|".join(map(re.escape, ROOTS)) + r")(/[\w.*/-]*)?")
+# A doc the list owns by its own line (FORK_CHANGES.md): naming it is a read, unlike a runbook a message points to
+# (a `.md` matched by a wider line such as `.github/fork-*`).
+OWNED_DOCS = {l for l in LIST_LINES if l.endswith(".md") and not l.startswith("!") and "*" not in l}
 # A fork-owned folder named alone, as in `path.join(root, "fork-ci", name)`: counts as a path inside it.
 FOLDERS = {l.rstrip("/") for l in LIST_LINES if l.endswith("/") and l.count("/") == 1}
 # A path built from quoted parts: `".github", "fork-x"` (path.join), `Path(".github") / "fork-x"`, `".github/" + "x"`.
@@ -114,7 +117,7 @@ def reads(files, tracked_files):
             name = (m.group(1) + (m.group(2) or "")).rstrip(".")
             if not m.group(2) and m.group(1) in FOLDERS and not re.match(r"[\w.-]", t[m.end():m.end() + 1]):
                 name += "/"
-            if not name.endswith(".md"):   # a runbook a message points to is not read
+            if not name.endswith(".md") or name in OWNED_DOCS:   # a runbook a message points to is not read
                 found.add((path, name.rstrip("/") + ("/x" if name.endswith("/") else "")))
         for m in SIBLING_RE.finditer(text):
             name = m.group(1) or m.group(2) + ".py"
@@ -171,6 +174,7 @@ PLANTED = {
     "native/f.py": 'kit = Path("fork-kit") / "heavy"\n',
     "evals/g.ts": 'const a = join(root, "fork-ci", name);\nconst b = ".github/" + "fork-ci-tests.txt";\n',
     ".github/scripts/h.py": 'm = importlib.import_module("fork_workflow_expr")\n',
+    "packages/shared/src/i.test.ts": 'const changes = repoFile("FORK_CHANGES.md");\n',
 }
 got = reads({**PLANTED, "apps/web/src/d.ts": "// reads .github/fork-ci-tests.txt and fork-ci/x\n"
              "  * fork-kit/heavy, see .github/fork-fleet.md\nconst p = '.github/pull_request_template.md';\n"
@@ -184,7 +188,8 @@ check("reads: a planted read is found in app code, a root script and a `!` file;
               (".github/scripts/fork-test-shards.cjs", ".github/scripts/fork-seam-check.cjs"),
               ("infra/e.ts", ".github/fork-ci-tests.txt"), ("native/f.py", "fork-kit/heavy"),
               ("native/f.py", "fork-kit/x"), ("evals/g.ts", "fork-ci/x"), ("evals/g.ts", ".github/fork-ci-tests.txt"),
-              (".github/scripts/h.py", ".github/scripts/fork_workflow_expr.py")}, str(sorted(got)))
+              (".github/scripts/h.py", ".github/scripts/fork_workflow_expr.py"),
+              ("packages/shared/src/i.test.ts", "FORK_CHANGES.md")}, str(sorted(got)))
 
 print(f"\n{len(failures)} failed" if failures else "\nall passed")
 sys.exit(1 if failures else 0)
