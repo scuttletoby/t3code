@@ -81,6 +81,46 @@ clock means no step down; a clock that went back restarts the wait.
 | `boxPsi`                             | the same for the box (cgroup, slice) the asked piece goes into; absent or `null`: no box | `"unreadable"`: elevated                       |
 | `osLevel`                            | `ok`, `elevated`, `severe`; `null`: none                                                 | anything else: elevated                        |
 
+## Readings (where the facts come from)
+
+[../capacityReadings.ts](../capacityReadings.ts) reads the machine through a small host (files,
+commands, Node's numbers) that tests replace with the fixtures in
+[capacity-readings.json](capacity-readings.json); the kit's Python reader runs the same cases later. It
+keeps nothing: no timer, no cache, no file written. `readMachine` gives `totalMb`, `availableMb`,
+`cpuCores`, `swap`, `psi`, `osLevel` (total and available from one read, total never kept);
+`readBoxPsi` a box's PSI; `readPieceDemand` one piece's demand (`gone` when its cgroup ended between
+the list and the read: drop it). `capacityFactsOf` joins them with what the caller knows (pieces,
+`pieceCaps`); `capacityLevel` gives the level alone, with the caller's `{level, calmSinceMs}`.
+
+A missing, unreadable, empty, cut-short, impossible (available above total, swap free above swap total,
+PSI above 100) or wrongly-unitted value is `null` (total, available, cores, demand) or `"unreadable"`
+(swap, PSI, OS level): the rule then admits nothing or brakes, never more. Only a file that does not
+exist where the OS simply has no such signal means "none": `/proc/pressure/memory` (kernel without PSI;
+also when it exists but PSI is turned off, EOPNOTSUPP) and a v1 box's PSI. A failed read is never
+"missing": the real host sorts only ENOENT/ENOTDIR as missing and EOPNOTSUPP as turned off; EACCES,
+EIO and the rest are unreadable. When `cgroup.controllers` or the v1 root `memory.stat` (how the
+cgroup version is found) cannot be read, `cgroup` is `"unreadable"`: a container cap is unknown, so
+available and cores are `null`. Fixture cases marked `failed` must never give more room than their
+healthy host.
+
+| Reading           | Linux, cgroup v2                                                                                                                                  | Linux, cgroup v1                                                               | macOS                                                                                                         | Windows (and the rest)                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| total, available  | `/proc/meminfo` MemTotal, MemAvailable (kB); in a container capped by the root's `memory.max` and `memory.max - (memory.current - inactive_file)` | same; capped by the root `memory.limit_in_bytes` when below the total          | Node's total; `vm_stat` free + inactive + speculative pages. If that fails: Node's free pages (an under-read) | Node's `totalmem`, `freemem` (with standby)           |
+| cores             | Node's, capped by the root's `cpu.max`                                                                                                            | Node's (`cpu.cfs_quota_us` not read)                                           | Node's                                                                                                        | Node's                                                |
+| swap              | SwapTotal, SwapFree; total 0 = none                                                                                                               | same                                                                           | none: swap files grow on demand (wider margin; the OS level covers it)                                        | none: Node does not give the page file (wider margin) |
+| PSI               | `/proc/pressure/memory`; missing = none (margin only)                                                                                             | same                                                                           | none: the OS level `kern.memorystatus_vm_pressure_level` (1 ok, 2 elevated, 4 severe; else unreadable)        | none, no OS level: available against the margin only  |
+| box PSI           | `<box>/memory.pressure`; missing = unreadable                                                                                                     | none                                                                           | none                                                                                                          | none                                                  |
+| demand of a piece | `memory.stat` anon + shmem + `memory.swap.current` (missing swap part = 0: owes more); `current`, `peak` kept for cost learning                   | `total_rss + total_shmem + total_swap`; `usage_in_bytes`, `max_usage_in_bytes` | `null`: owes its full cost                                                                                    | `null`: owes its full cost                            |
+
+The cgroup v2 root's `memory.max` and `cpu.max` are read whenever they exist: a real host's root has
+none (the kernel gives the root no limit files), so a host service's own unit limit is never taken,
+and a container's namespace root has them wherever this process sits inside it (systemd inside the
+container puts it in `/init.scope`, not at `0::/`); `/proc/self/cgroup` is not read.
+
+Not read yet (stated limits): a cgroup v1 container's CPU quota and a container's `memory.swap.max`; a
+cgroup v2 box with PSI turned off by `cgroup.pressure` reads as unreadable (elevated). Process-tree
+demand for macOS and Windows comes with the basic tier.
+
 ## Vector file
 
 ```json

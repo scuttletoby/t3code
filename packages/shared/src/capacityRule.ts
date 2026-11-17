@@ -292,6 +292,52 @@ function marginOf(rule: CapacityRule, readings: Readings, pieceCaps: boolean): n
     : ceilDiv(base100, 100);
 }
 
+/** Unreadable readings: at least "elevated" ("severe" stays). */
+function unreadableLevel(previous: PressureState | null | undefined): {
+  readonly level: CapacityLevel;
+  readonly pressure: PressureState;
+} {
+  const level: CapacityLevel = previous?.level === "severe" ? "severe" : "elevated";
+  return { level, pressure: { level, calmSinceMs: null } };
+}
+
+function pressureOf(
+  rule: CapacityRule,
+  readings: Readings,
+  marginMb: number,
+  input: { readonly previous?: PressureState | null; readonly nowMs?: number },
+): PressureState {
+  return nextPressure(
+    rule.pressure,
+    rawLevel(rule.pressure, readings, marginMb),
+    input.previous,
+    input.nowMs,
+  );
+}
+
+/**
+ * The pressure level alone, exactly as `capacityDecision` gives it (a status line, the brake).
+ * The caller keeps `pressure` for the next read and passes the clock; nothing is kept here.
+ */
+export function capacityLevel(
+  rule: CapacityRule,
+  input: {
+    readonly facts: CapacityFacts;
+    readonly previous?: PressureState | null;
+    readonly nowMs?: number;
+  },
+): {
+  readonly level: CapacityLevel;
+  readonly pressure: PressureState;
+  readonly marginMb: number | null;
+} {
+  const readings = readFacts(rule, input.facts);
+  if (readings === null) return { ...unreadableLevel(input.previous), marginMb: null };
+  const marginMb = marginOf(rule, readings, input.facts.pieceCaps === true);
+  const pressure = pressureOf(rule, readings, marginMb, input);
+  return { level: pressure.level, pressure, marginMb };
+}
+
 export interface CapacityInput {
   readonly facts: CapacityFacts;
   readonly ask: { readonly kind: string; readonly declaredMb?: number };
@@ -328,13 +374,13 @@ export function capacityDecision(rule: CapacityRule, input: CapacityInput): Capa
   const cost = costOf(rule, kind, input.learned, input.ask.declaredMb);
   const readings = readFacts(rule, input.facts);
   if (readings === null) {
-    const level: CapacityLevel = input.previous?.level === "severe" ? "severe" : "elevated";
+    const { level, pressure } = unreadableLevel(input.previous);
     return {
       admit: false,
       reason: "unreadable",
       kind,
       level,
-      pressure: { level, calmSinceMs: null },
+      pressure,
       freeMb: null,
       marginMb: null,
       owedMb: null,
@@ -355,12 +401,7 @@ export function capacityDecision(rule: CapacityRule, input: CapacityInput): Capa
   });
   const owedMb = live.reduce((sum, piece) => sum + Math.max(0, piece.cost.mb - piece.demandMb), 0);
   const freeMb = readings.availableMb - marginMb - owedMb - readings.reservedMb;
-  const pressure = nextPressure(
-    rule.pressure,
-    rawLevel(rule.pressure, readings, marginMb),
-    input.previous,
-    input.nowMs,
-  );
+  const pressure = pressureOf(rule, readings, marginMb, input);
   const result = (admit: boolean, reason: CapacityReason): CapacityDecision => ({
     admit,
     reason,
