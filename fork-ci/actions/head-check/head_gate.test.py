@@ -685,6 +685,24 @@ class Judge(Files, unittest.TestCase):
                    required_lenses='')
         self.assertEqual(self.verdict()['conclusion'], 'success', self.verdict()['summary'])
 
+    def test_an_empty_lens_list_never_stands_on_a_config_that_cannot_be_read(self):   # #348 item 5: this step alone
+        bare = self.w.commit({'other.py': 'o\n'}, [])
+        bad = self.w.commit(T.base_files(cfg_raw={**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': 'loud'}},
+                                         **T.PROMPTS), [self.m0])
+        good = self.review_base('enforce')
+        for base, says in ((bare, 'has no config'), (bad, 'mode'), (good, None)):
+            with self.subTest(says=says):
+                path, why = G.bare_repository(self.work, 'gate')
+                self.assertIsNone(why)
+                checkout = H.Checkout(path, bare=(base, self.read), remote=self.w.remote)
+                self.assertIsNone(G.fetch(checkout, base, self.read))
+                problem = G.empty_lenses_problem(checkout, T.CONFIG_PATH)
+                if says is None:
+                    self.assertIsNone(problem)
+                else:
+                    self.assertIsNotNone(problem)
+                    self.assertIn(says, problem)
+
     def test_a_review_block_the_base_tip_cannot_parse_is_a_failure(self):   # fail closed, whatever the input says
         cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': 'loud'}}
         base = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS), [self.m0])
