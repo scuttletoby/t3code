@@ -15,6 +15,7 @@ import * as HeadlessUsageRefresher from "../usage/HeadlessUsageRefresher.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
+import * as HandoffService from "./handoff/HandoffService.ts";
 
 /** Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. */
 export const holdWorkAgentActivity = HoldWorkConnect.agentActivityLayer;
@@ -28,11 +29,17 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
   reachabilityLayer: Layer.Layer<ROut2, E2, R2>,
 ) => HoldWorkConnect.layer(cloudLinkLayer).pipe(Layer.provideMerge(reachabilityLayer));
 
-/** In the runtime's core dependencies: usage pacer (and its history), slot gate, usage refresher. */
+/**
+ * In the runtime's core dependencies (server.ts's `layerRuntimeCoreDependenciesBase`, not its local
+ * `layerRuntimeServices`): usage pacer (and its history), slot gate, usage refresher, and the
+ * handoff service (fork/handoff), which upstream's own `mergeAll` builds concurrently beside its
+ * idle compaction worker.
+ */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
   SlotGate.layer,
   HeadlessUsageRefresher.layer,
+  HandoffService.layer,
 );
 
 /** In the routes, after upstream's follower of tasks in linked environments. */
