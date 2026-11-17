@@ -16,8 +16,9 @@ import {
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
 import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
+// Fork: a reset sends the clear value for a kept fork key, which the server keeps when left out.
+import { clearProjectSettingsOverridesWithForkKeys } from "@t3tools/shared/forkSettingsPatch";
 import {
-  clearProjectSettingsOverrides,
   resolveProjectSettings,
   resolveWorktreeCleanup,
   type ProjectSettingSource,
@@ -342,8 +343,8 @@ export function planScopedSettingsPatch(
                   delete next[key];
                   continue;
                 }
-                // Fork: a project's check map replaces the environment's whole, so a removed check stays removed.
-                if (key === "waitChecks") {
+                // Fork: a project's check map and review rules replace the environment's whole.
+                if (key === "waitChecks" || key === "reviewRules") {
                   next[key] = value;
                   continue;
                 }
@@ -431,7 +432,7 @@ export function planScopedSettingsClear(
   const serverWrites =
     scope.kind === "project" || scope.kind === "checkout"
       ? projectOverrideWrites(scope, environments, (_current, settings, projectId) =>
-          clearProjectSettingsOverrides(settings, projectId, keys),
+          clearProjectSettingsOverridesWithForkKeys(settings, projectId, keys),
         )
       : [];
   return {
@@ -490,7 +491,7 @@ export function planProjectOverridesClear(
       patch: {
         projectSettingsOverrides: {
           ...existing?.patch.projectSettingsOverrides,
-          [projectId]: clearProjectSettingsOverrides(settings, projectId, keys),
+          [projectId]: clearProjectSettingsOverridesWithForkKeys(settings, projectId, keys),
         },
       },
     });
