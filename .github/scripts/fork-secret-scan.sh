@@ -156,8 +156,10 @@
 # it; a warning).
 #
 # Credentials: the script sends whatever the checkout's git config holds. actions/checkout keeps the
-# job's token there (persist-credentials, on), so origin fetches here carry it, and the workflow's
-# "never the scan script" overstates (#317). gitleaks reads a view without that config (below).
+# job's token there (persist-credentials, on); the workflow's step right after the checkout takes it
+# out and fails if any extraheader is left (#317), so origin fetches here carry none. That works for a
+# public repository; a private one would need its own token for these fetches (they fail without
+# one, and so does the scan). gitleaks reads a view without that config (below).
 #
 # Contents: git log runs with --text, so a file git takes for binary (a NUL byte in it) still shows
 # its lines. A path whose contents in the range start with a UTF-16 byte-order mark goes through a
