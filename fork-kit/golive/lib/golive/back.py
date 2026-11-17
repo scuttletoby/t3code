@@ -359,8 +359,8 @@ def _report(cfg, adapter, add, notes, runs):
                                            or 'none'))
 
 
-def _status(cfg, adapter, add, notes):
-    """The checks; returns 'up', 'restarting', 'down' or 'unknown'."""
+def _status(cfg, adapter, add, notes, seen):
+    """The checks; returns 'up', 'restarting', 'down' or 'unknown' (the live server goes in seen['server'])."""
     try:
         svc = adapter.service()
     except osadapter.AdapterError as e:
@@ -390,6 +390,7 @@ def _status(cfg, adapter, add, notes):
     except live.NotLive as e:
         add('live server', False, str(e))
         return 'restarting'
+    seen['server'] = server
     add('live server', server['version'] == expected, f't3 {server["version"]}, pid {server["pid"]}, port '
         f'{server["port"]}' + (f'; expected t3 {expected}' if server['version'] != expected else ''))
     add('http', *_http(cfg, server))
@@ -402,14 +403,14 @@ def status(cfg, adapter):
     """Read only (it holds the kit's lock shared, like check): (exit code, lines). Exit 0 only when T3 is up and
     every check passed; a golive run holding the lock, a marker or a service starting or stopping read as
     restarting; anything that goes wrong in here is a failed check, never a crash or an OK."""
-    checks, notes, verdict = [], [], 'unknown'
+    checks, notes, verdict, seen = [], [], 'unknown', {}
 
     def add(name, ok, detail):
         checks.append((bool(ok), name, detail))
 
     try:
         with journal.lock(cfg.state_dir, 'status', exclusive=False):
-            verdict = _status(cfg, adapter, add, notes)
+            verdict = _status(cfg, adapter, add, notes, seen)
     except journal.Busy as e:
         add('no golive run', False, f'{e}: T3 may be stopping or restarting')
         verdict = 'restarting'
@@ -426,7 +427,9 @@ def status(cfg, adapter):
         notes.append(f'the copies cannot be listed: {e}')
     ok = verdict == 'up' and all(c[0] for c in checks)
     failed = ', '.join(name for good, name, _ in checks if not good)
-    head = {'up': 'T3 is up' + ('' if ok else f' but not right ({failed})'),
+    server = seen.get('server') or {}
+    on = f': t3 {server.get("version")} (pid {server.get("pid")}, port {server.get("port")})'
+    head = {'up': 'T3 is up' + (on if ok else f' but not right ({failed}){on}'),
             'restarting': f'T3 is restarting or starting ({failed})', 'down': f'T3 is DOWN ({failed or "stopped"})',
             'unknown': f'T3 state unknown ({failed})'}[verdict]
     lines = [head] + [f'{"ok  " if good else "FAIL"}  {name}: {detail}' for good, name, detail in checks]

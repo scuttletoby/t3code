@@ -61,7 +61,7 @@ fork-kit/common/tests/free_contract.test.py ~5s
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py ~65s
 fork-kit/desk/tests/windows.test.py ~8s
-fork-kit/golive/tests/back.test.py ~50s
+fork-kit/golive/tests/back.test.py ~20s
 fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
 fork-kit/golive/tests/copy.test.py ~26s
