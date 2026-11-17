@@ -104,7 +104,13 @@ KEYS = {
 
 
 def parse(text, where='config'):
-    """A Config from the JSON text, or ConfigError naming every problem at once."""
+    """A Config from the JSON text (str, or bytes that must be UTF-8), or ConfigError naming every problem at once."""
+    if isinstance(text, bytes):
+        try:
+            text = text.decode('utf-8')
+        except UnicodeDecodeError as e:   # a ValueError, but not JSON's: say what it is, never crash on it
+            raise ConfigError(f'{where}: not UTF-8 text ({e.reason} at byte {e.start}): commit the config as UTF-8 '
+                              'JSON') from None
     try:
         raw = json.loads(text, object_pairs_hook=_no_duplicates)
     except ConfigError as e:
@@ -140,11 +146,3 @@ def parse(text, where='config'):
                   lens_author_associations=tuple(raw.pop('lens_author_associations')),
                   override_prefix=override['prefix'], override_association=override['author_association'], **raw)
 
-
-def load(path):
-    try:
-        with open(path, encoding='utf-8') as f:
-            text = f.read()
-    except OSError as e:
-        raise ConfigError(f'{path}: cannot read it: {e}') from None
-    return parse(text, path)
