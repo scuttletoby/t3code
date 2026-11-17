@@ -389,6 +389,12 @@ class Script(unittest.TestCase):
                 ('memory=16777216TB', 30, '8GB', 8388608, '[wsl2] memory: 16777216TB -> 8GB'),   # WSL: 0, its default
                 ('memory=26 GB', 30, '8GB', 8388608, '[wsl2] memory: 26 GB -> 8GB'),   # WSL rejects these two
                 ('memory=30720mb', 30, '8GB', 8388608, '[wsl2] memory: 30720mb -> 8GB'),
+                ('memory=26Gb', 30, '8GB', 8388608, '[wsl2] memory: 26Gb -> 8GB'),   # the unit is case-sensitive
+                # WSL trims only space and tab: a non-breaking space (pasted from a web page) or a form feed after
+                # the unit stays in its value, and it rejects that (#321)
+                ('memory=26GB\u00a0', 30, '8GB', 8388608, '[wsl2] memory: 26GB\u00a0 -> 8GB'),
+                ('memory=26GB\f', 30, '8GB', 8388608, '[wsl2] memory: 26GB\f -> 8GB'),
+                ('memory=\u00a026GB', 30, '8GB', 8388608, '[wsl2] memory: \u00a026GB -> 8GB'),
                 ('memory=4GB', 30, '8GB', 8388608, '[wsl2] memory: 4GB -> 8GB'),   # below: raised
                 ('memory=8191MB', 30, '8GB', 8388608, '[wsl2] memory: 8191MB -> 8GB'),
                 ('memory=lots', 30, '8GB', 8388608, '[wsl2] memory: lots -> 8GB'),
