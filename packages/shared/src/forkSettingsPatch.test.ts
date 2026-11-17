@@ -86,6 +86,16 @@ describe("fork settings patch", () => {
     });
   });
 
+  it("replaces the handoff value whole, so a stored command source never outlives a save", () => {
+    const stored = decodePatch({
+      handoff: { source: "command", command: ["/usr/local/bin/state"] },
+    }).handoff;
+    const saved = decodePatch({ handoff: { mode: "handoff" } }).handoff;
+    const next = applyForkSettingsPatch({ ...current, handoff: stored! }, { handoff: saved! });
+    expect(next.handoff).toEqual(saved);
+    expect(next.handoff).not.toHaveProperty("command");
+  });
+
   it("merges a `merge-fields` field: a field left out keeps its stored value", () => {
     const next = applyForkSettingsPatch(current, {
       waitFor: { maxPerThread: 9 },
