@@ -151,8 +151,9 @@ merge() {
 }
 
 failures=0
-check() { # check NAME EXPECTED_STATUS [GREP_PATTERN [ABSENT_PATTERN]] -- runs the scan in $clone with the env given
-  local name="$1" expected="$2" pattern="${3:-}" absent="${4:-}" out status
+check() { # check NAME EXPECTED_STATUS [GREP_PATTERN [ABSENT_PATTERN [ALSO_PATTERN]]] -- runs the scan in $clone
+  # with the env given; exact=TEXT (in that env) wants the whole output to be TEXT, nothing more
+  local name="$1" expected="$2" pattern="${3:-}" absent="${4:-}" also="${5:-}" out status
   set +e
   out="$(cd "$clone" && GITLEAKS="$gitleaks" GITHUB_STEP_SUMMARY="$root/summary" "$script" 2>&1)"
   status=$?
@@ -161,8 +162,16 @@ check() { # check NAME EXPECTED_STATUS [GREP_PATTERN [ABSENT_PATTERN]] -- runs t
     echo "FAIL $name: exit $status, expected $expected"
     printf '%s\n' "$out" | sed 's/^/    /'
     failures=$((failures + 1))
+  elif [[ -n "${exact:-}" && "$out" != "$exact" ]]; then
+    echo "FAIL $name: output is not exactly: $exact"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    failures=$((failures + 1))
   elif [[ -n "$pattern" ]] && ! grep -qE "$pattern" <<< "$out"; then
     echo "FAIL $name: output lacks /$pattern/"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    failures=$((failures + 1))
+  elif [[ -n "$also" ]] && ! grep -qE "$also" <<< "$out"; then
+    echo "FAIL $name: output lacks /$also/"
     printf '%s\n' "$out" | sed 's/^/    /'
     failures=$((failures + 1))
   elif [[ -n "$absent" ]] && grep -qE "$absent" <<< "$out"; then
@@ -320,12 +329,17 @@ export EVENT_NAME=push HEAD_SHA=""
 EVENT_NAME=issues check "an unknown event fails" 2
 # #239: a shallow checkout lacks the history the range needs, so git log would read less than the
 # range and the scan would pass on what it never saw. Refused for every event, before any fetch.
+# #317: the refusal itself exits 2, with its own message and nothing after it (without its `exit 2`
+# the scan went on and failed later for another reason, with the message still shown).
 shallow="$root/shallow-clone"
 git clone -q --depth 1 --filter=blob:none --no-checkout --branch leaky "file://$root/origin.git" "$shallow"
-clone="$shallow" HEAD_SHA="$leaky" EVENT_NAME=pull_request BEFORE="" \
-  check "a shallow checkout fails (pull request)" 2 "shallow"
-clone="$shallow" EVENT_NAME=push BEFORE="$fork_point" AFTER="$leaky" check "a shallow checkout fails (push)" 2 "shallow"
-clone="$shallow" EVENT_NAME=schedule check "a shallow checkout fails (sweep)" 2 "shallow"
+shallow_refusal="::error::Secret scan: the checkout is shallow (or not a git repository), so the range would miss commits and the scan would pass on what it never read. Check out with fetch-depth: 0."
+clone="$shallow" exact="$shallow_refusal" HEAD_SHA="$leaky" EVENT_NAME=pull_request BEFORE="" \
+  check "a shallow checkout fails (pull request): the refusal and nothing after it" 2
+clone="$shallow" exact="$shallow_refusal" EVENT_NAME=push BEFORE="$fork_point" AFTER="$leaky" \
+  check "a shallow checkout fails (push): the refusal and nothing after it" 2
+clone="$shallow" exact="$shallow_refusal" EVENT_NAME=schedule \
+  check "a shallow checkout fails (sweep): the refusal and nothing after it" 2
 
 export EVENT_NAME=pull_request BEFORE="" AFTER=""
 # The range does not depend on the PR's base (see the script's header).
@@ -626,11 +640,135 @@ git clone -q --filter=blob:none --no-checkout "file://$root/sweep.git" "$clone"
 OLD_HEADS="" EVENT_NAME=schedule check "daily sweep: a deleted branch's tip, not listed: not read (control)" 0
 OLD_HEADS="$zeros $vanished $(git rev-parse main)" EVENT_NAME=schedule \
   check "daily sweep: a key only a deleted branch's tip (activity record) held is found" 1 "1 tip\\(s\\) no ref holds"
-OLD_HEADS="3333333333333333333333333333333333333333" EVENT_NAME=schedule \
-  check "daily sweep: a listed tip origin no longer serves warns" 0 "::warning.*no longer serves.*333333333333"
-OLD_HEADS="3333333333333333333333333333333333333333 $vanished" EVENT_NAME=schedule \
-  check "daily sweep: one listed tip gone fails the batch fetch; the others are still fetched one by one" 1 \
+# #317: a tip the record lists that origin no longer serves ("not our ref") is one no run scanned
+# (a [skip ci] push, then the branch deleted). The sweep scans everything else and then fails (exit
+# 2), unless the reviewed list of tips known gone names it. The list is read from the default
+# branch's tip only, never from the checkout or another branch.
+gone_list=.github/fork-secret-sweep-gone-tips.txt
+gone3=3333333333333333333333333333333333333333
+gone4=4444444444444444444444444444444444444444
+gone_error="::error::Secret scan: 1 tip\\(s\\) GitHub's activity record lists cannot be fetched"
+set_gone_list() { # set_gone_list CONTENT: the list on origin's default branch, as one commit
+  git checkout -q main
+  commit_bytes "$gone_list" "the list of tips known gone" <<< "$1"
+  git push -q origin main
+}
+fresh_sweep() { # a new blob-less clone of the sweep origin, holding nothing a run fetched
+  clone="$root/sweep-fresh"
+  rm -rf "${clone:?}"
+  git clone -q --filter=blob:none --no-checkout "file://$root/sweep.git" "$clone"
+}
+fresh_sweep
+OLD_HEADS="$gone3 $vanished" EVENT_NAME=schedule \
+  check "daily sweep, no list of tips known gone: a listed tip origin no longer serves fails, after the rest is scanned" 2 \
+  "$gone_error: origin no longer has them \\($gone3\\).*$gone_list" "" "leaks found: [1-9]"
+# The state question: a run again (the same clone, the tip still gone) fails the same way; nothing a
+# run leaves behind lets the next pass.
+OLD_HEADS="$gone3 $vanished" EVENT_NAME=schedule \
+  check "daily sweep: the same run again fails the same way" 2 "$gone_error.*$gone3"
+set_gone_list "# Tips known gone: none yet."
+OLD_HEADS="$gone3" EVENT_NAME=schedule \
+  check "daily sweep: an empty list of tips known gone: a gone tip fails" 2 "$gone_error.*$gone3"
+set_gone_list "$gone3 checked by hand: GitHub serves it nowhere (test)"
+OLD_HEADS="$gone3" EVENT_NAME=schedule \
+  check "daily sweep: a gone tip on the list of tips known gone warns, and passes" 0 \
+  "::warning.*1 tip\\(s\\) on the list of tips known gone.*333333333333" "::error"
+OLD_HEADS="$gone3 $gone4" EVENT_NAME=schedule \
+  check "daily sweep: a gone tip on the list and one not on it: fails, naming only the unlisted one" 2 \
+  "$gone_error: origin no longer has them \\($gone4\\)" "::error.*$gone3"
+OLD_HEADS="" EVENT_NAME=schedule \
+  check "daily sweep: an old entry the record no longer lists changes nothing" 0 "" "::error|tips known gone"
+
+# #317 item 2: "one batch fetch first, then one by one" from a fresh blob-less clone, which holds
+# none of the listed tips, so the batch (failed by the gone tip) is all that could have fetched
+# them. The packet trace shows the requests: the first that wants $vanished wants the gone tip too
+# (the batch), and a later one wants $vanished alone. That needs git to honour GIT_NO_LAZY_FETCH
+# (git 2.44, or a release with the May 2024 security fixes: 2.39.4 to 2.43.4, Ubuntu 24.04's
+# 2.43.0-1ubuntu7.x): otherwise `have` fetches each missing tip lazily, one by one, and the batch
+# never holds it. The probe tries it rather than reading the version. On CI (CI=true) a git that
+# ignores it fails here; elsewhere it skips the trace check.
+probe="$root/lazy-probe"
+git clone -q --filter=blob:none --no-checkout "file://$root/sweep.git" "$probe"
+if GIT_NO_LAZY_FETCH=1 git -C "$probe" cat-file -e "$vanished^{commit}" 2> /dev/null; then lazy_off=""; else lazy_off=1; fi
+echo "note $(git --version): GIT_NO_LAZY_FETCH $([[ -n "$lazy_off" ]] && echo "takes effect" || echo "does not take effect (git 2.44, or 2.39.4 to 2.43.4, needed)")"
+if [[ -z "$lazy_off" && "${CI:-}" == true ]]; then
+  echo "FAIL git on CI does not honour GIT_NO_LAZY_FETCH, so the one-by-one sweep test below proves nothing"
+  failures=$((failures + 1))
+fi
+fresh_sweep
+rm -f "$root/sweep-trace"
+GIT_TRACE_PACKET="$root/sweep-trace" OLD_HEADS="$gone3 $vanished" EVENT_NAME=schedule \
+  check "daily sweep, fresh blob-less clone: one listed tip gone fails the batch fetch; the others are fetched one by one" 1 \
   "1 tip\\(s\\) no ref holds"
+# One line per fetch request: its wants.
+wants="$(awk '/fetch> command=fetch/ { if (w != "") print w; w = "-" } / fetch> want / { w = w " " $NF }
+  END { if (w != "") print w }' "$root/sweep-trace")"
+batch="$(grep -m 1 " $vanished" <<< "$wants" || true)"
+alone="$(grep " $vanished" <<< "$wants" | grep -v " $gone3" || true)"
+if [[ -z "$lazy_off" ]]; then
+  echo "skip daily sweep, fresh clone: the batch fetch and the one-by-one fetch seen in the packet trace (git too old)"
+elif [[ "$batch" == *" $gone3"* && -n "$alone" ]]; then
+  echo "ok   daily sweep, fresh clone: the packet trace shows the batch fetch (both tips) and then $vanished fetched alone"
+else
+  echo "FAIL daily sweep, fresh clone: the packet trace lacks the batch fetch of both tips or the one-by-one fetch of $vanished"
+  printf '%s\n' "$wants" | sed 's/^/    /'
+  failures=$((failures + 1))
+fi
+
+# A tip that comes back: on the list, but origin serves it (again): it is scanned, and the warning
+# asks for the entry to go.
+set_gone_list "$vanished thought gone (test)"
+fresh_sweep
+OLD_HEADS="$vanished" EVENT_NAME=schedule \
+  check "daily sweep: a tip on the list of tips known gone that origin serves is scanned, with a warning" 1 \
+  "::warning.*1 tip\\(s\\) on the list of tips known gone are served.*${vanished:0:12}" "" "1 tip\\(s\\) no ref holds"
+# The list counts only on the default branch: an entry a branch (or the checkout) adds is not read.
+git checkout -q -b list-pr main
+commit_bytes "$gone_list" "a branch puts a tip on the list" <<< "$gone4 not reviewed"
+git push -q origin list-pr
+git checkout -q main
+checkout sweep list-pr
+OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: an entry only another branch's list (the checkout) has does not count" 2 "$gone_error.*$gone4"
+git push -q origin :list-pr
+# A list the scan cannot trust fails the sweep, gone tips or not.
+upper=ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD
+for bad in "$gone4" "$gone4"$'\r' "$upper reason" "${gone4:0:12} reason" "$zeros reason" "--all reason" "$gone4# reason"; do
+  set_gone_list "$gone3 checked by hand (test)
+$bad"
+  OLD_HEADS="" EVENT_NAME=schedule \
+    check "daily sweep: a list of tips known gone with a bad entry fails ($(printf '%q' "$bad"))" 2 \
+    "::error::Secret scan: line 2 of $gone_list on the default branch .* is not"
+done
+git rm -q "$gone_list"
+mkdir -p .github
+ln -s ../app.txt "$gone_list"
+git add -A
+GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "the list as a symbolic link"
+git push -q origin main
+OLD_HEADS="" EVENT_NAME=schedule \
+  check "daily sweep: a list of tips known gone that is a symbolic link fails" 2 "::error::Secret scan: $gone_list .* is not a plain file"
+git rm -q "$gone_list"
+mkdir -p "$gone_list"
+echo "$gone3 checked by hand (test)" > "$gone_list/x"
+git add -A
+GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "the list as a folder"
+git push -q origin main
+OLD_HEADS="$gone3" EVENT_NAME=schedule \
+  check "daily sweep: a list of tips known gone that is a folder fails" 2 "::error::Secret scan: $gone_list .* is not a plain file"
+git rm -q -r "$gone_list"
+set_gone_list "$gone3 checked by hand (test)"
+# Its contents cannot be fetched (origin fails that one call, a 502): fails, never read as empty.
+fresh_sweep
+git -C "$clone" config remote.origin.uploadpack "$root/flaky-upload-pack"
+printf '%s\n' 2 > "$root/flaky-fail"
+rm -f "$root/flaky-count"
+OLD_HEADS="$gone3" EVENT_NAME=schedule \
+  check "daily sweep: a list of tips known gone that cannot be read fails" 2 "::error::Secret scan: cannot read $gone_list"
+git rm -q "$gone_list"
+GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "no list"
+git push -q origin main
+clone="$root/sweep-clone-2"
 OLD_HEADS="--all" EVENT_NAME=schedule check "daily sweep: an OLD_HEADS word that is not a commit id fails" 2 "not a commit id"
 rm -rf "${root:?}/sweep.git"
 EVENT_NAME=schedule check "daily sweep: origin cannot be read: fails" 2

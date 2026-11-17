@@ -82,8 +82,19 @@
 #                  the sweep runs is held by no ref, but GitHub still serves its commits by id. So
 #                  the sweep also reads every tip OLD_HEADS lists (the workflow lists GitHub's
 #                  activity record: each push, force push and deletion with the tips before and
-#                  after), fetched by id, all at once and then one by one: one origin no longer
-#                  has ("not our ref") gets a warning, any other fetch failure fails the job.
+#                  after), fetched by id, all at once and then one by one; any fetch failure but
+#                  "not our ref" fails the job.
+#   sweep, gone tips  a listed tip origin says it no longer has ("not our ref") is one no run read
+#                  (that is why the sweep lists it), so it fails the sweep (exit 2), after the rest
+#                  is scanned, naming each id: GitHub may still show it on the web. The way out is
+#                  the reviewed list of tips known gone, .github/fork-secret-sweep-gone-tips.txt, read
+#                  from the default branch's tip (CONFIG_BRANCH) only, never from the checkout or
+#                  another branch: one line per tip, `<full commit id> <why it is known gone>`, plus
+#                  # comments and blank lines. A listed tip origin no longer serves gets a warning; one
+#                  it serves (it came back) is scanned, with a warning to drop its line. No file is an
+#                  empty list; a file that is not a plain file, cannot be read, or has any other line
+#                  fails the job (exit 2), whether or not a tip is gone. Entries the record no longer
+#                  lists change nothing.
 #
 # Commit objects: each commit of the range as git stores it (`git cat-file`: its message, author
 # and committer names and emails, signature and other headers), and on a tag push the pushed tag's
@@ -140,8 +151,13 @@
 # compressed or packed contents (zip, gzip, images' compressed data); a key split across lines;
 # a vanished tip (see "sweep, vanished tips") GitHub's activity record does not list (it records
 # branches: a deleted tag or notes ref is not in it; an entry older than what GitHub keeps of the
-# record (the workflow reads all of it, with no time window)) or that origin will not send by id any more although
-# GitHub's web pages may still show it (a warning).
+# record (the workflow reads all of it, with no time window)) or that is on the reviewed list of
+# tips known gone (origin will not send it by id any more, although GitHub's web pages may still show
+# it; a warning).
+#
+# Credentials: the script sends whatever the checkout's git config holds. actions/checkout keeps the
+# job's token there (persist-credentials, on), so origin fetches here carry it, and the workflow's
+# "never the scan script" overstates (#317). gitleaks reads a view without that config (below).
 #
 # Contents: git log runs with --text, so a file git takes for binary (a NUL byte in it) still shows
 # its lines. A path whose contents in the range start with a UTF-16 byte-order mark goes through a
@@ -288,6 +304,39 @@ fetch_config_branch() {
     "+refs/heads/$CONFIG_BRANCH:refs/scan-config/head" >&2 || return 1
   git rev-parse --quiet --verify 'refs/scan-config/head^{commit}'
 }
+# The reviewed list of tips known gone (see "sweep, gone tips") on commit $1, the default branch's
+# tip: sets known_gone to " <id> <id> ... ". No file is an empty list; a list the scan cannot trust
+# (not a plain file, unreadable, a line that is not `<full commit id> <why>`) fails the job (exit 2).
+gone_list=.github/fork-secret-sweep-gone-tips.txt
+read_gone_list() {
+  local entry mode type oid text line id n=0 where="on the default branch ${CONFIG_BRANCH:-} (${1:0:12})"
+  known_gone=" "
+  if ! entry="$(git ls-tree "$1" -- "$gone_list")"; then
+    echo "::error::Secret scan: cannot read $gone_list $where (the reviewed list of tips known gone)" >&2
+    exit 2
+  fi
+  [[ -n "$entry" ]] || return 0
+  read -r mode type oid _ <<< "$entry"
+  if [[ "$type" != blob || ( "$mode" != 100644 && "$mode" != 100755 ) ]]; then
+    echo "::error::Secret scan: $gone_list $where is not a plain file ($mode $type), so the list of tips known gone cannot be read" >&2
+    exit 2
+  fi
+  if ! text="$(git cat-file blob "$oid")"; then
+    echo "::error::Secret scan: cannot read $gone_list $where (the reviewed list of tips known gone; see the messages above)" >&2
+    exit 2
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ ! "$line" =~ ^[[:space:]]*(#|$) ]] || continue
+    id=""
+    if [[ "$line" =~ ^([0-9a-f]{40}([0-9a-f]{24})?)[[:space:]]+[^[:space:]] ]]; then id="${BASH_REMATCH[1]}"; fi
+    if [[ -z "$id" ]] || zero "$id"; then
+      echo "::error::Secret scan: line $n of $gone_list $where is not '<full commit id> <why it is known gone>', so the list of tips known gone cannot be trusted. Fix it on the default branch (a reviewed pull request)." >&2
+      exit 2
+    fi
+    known_gone+="$id "
+  done <<< "$text"
+}
 
 # A shallow checkout (fetch-depth other than 0) ends the history at its graft: a range then holds
 # fewer commits than it should and the scan passes on what it never read (#239). Refused.
@@ -298,6 +347,7 @@ if [[ "$(git rev-parse --is-shallow-repository 2> /dev/null)" != false ]]; then
 fi
 
 warning=""
+gone_failure=""
 other_ref=""
 tag_objects=()
 upstream_used=""
@@ -407,6 +457,7 @@ case "$EVENT_NAME" in
       exit 2
     fi
     settings_what="the default branch $CONFIG_BRANCH (${settings:0:12})"
+    read_gone_list "$settings"
     changes=()
     if ! git for-each-ref --format='delete %(refname)' refs/scan-sweep/ | git update-ref --stdin ||
       ! timeout 900 git fetch --quiet --no-tags --filter=blob:none origin \
@@ -444,8 +495,26 @@ case "$EVENT_NAME" in
       tips+=("${vanished[@]}")
       what="$what, and ${#vanished[@]} tip(s) no ref holds that GitHub's activity record lists"
     fi
-    if [[ ${#gone[@]} -gt 0 ]]; then
-      warning="${warning:+$warning; }${#gone[@]} tip(s) GitHub's activity record lists cannot be fetched: origin no longer serves them ($(short "${gone[@]:0:5}")), so they are not scanned"
+    # Gone tips (see "sweep, gone tips"): on the reviewed list, a warning; any other fails the sweep
+    # once the rest is scanned. A tip on the list origin serves (it came back) is scanned above.
+    gone_known=()
+    gone_new=()
+    back=()
+    for old in "${gone[@]}"; do
+      if [[ "$known_gone" == *" $old "* ]]; then gone_known+=("$old"); else gone_new+=("$old"); fi
+    done
+    for old in "${listed[@]}"; do
+      [[ "$known_gone" != *" $old "* ]] || back+=("$old")
+    done
+    if [[ ${#gone_known[@]} -gt 0 ]]; then
+      warning="${warning:+$warning; }${#gone_known[@]} tip(s) on the list of tips known gone ($gone_list) cannot be fetched, so they are not scanned ($(short "${gone_known[@]:0:5}"))"
+    fi
+    if [[ ${#back[@]} -gt 0 ]]; then
+      warning="${warning:+$warning; }${#back[@]} tip(s) on the list of tips known gone are served by origin, so they are scanned ($(short "${back[@]:0:5}")): remove their lines from $gone_list"
+    fi
+    if [[ ${#gone_new[@]} -gt 0 ]]; then
+      gone_failure="${#gone_new[@]} tip(s) GitHub's activity record lists cannot be fetched: origin no longer has them (${gone_new[*]}), and no run scanned them (a [skip ci] push whose branch is gone?), although GitHub may still show them. Look at each by hand; once one is known gone, add a line '<id> <why>' for it to $gone_list on the default branch (a reviewed pull request)"
+      echo "::error::Secret scan: $gone_failure" >&2
     fi
     range="${tips[*]}"
     without_upstream
@@ -728,7 +797,13 @@ if [[ $status -eq 0 && $mstatus -eq 0 ]]; then
 else
   summary "gitleaks found possible secrets in $what (values redacted; see the job log). Rotate any real secret: it is already public."
 fi
-summary "" "Not covered: ref names; pull request titles, bodies and comments; commits only an outside pull request's head (refs/pull/*) holds; refs that name a tree or blob; a vanished tip GitHub's activity record does not list or origin no longer sends; a \`gitleaks:allow\` line; text in other encodings; packed or compressed contents; a key split across lines (see the header of fork-secret-scan.sh)."
+summary "" "Not covered: ref names; pull request titles, bodies and comments; commits only an outside pull request's head (refs/pull/*) holds; refs that name a tree or blob; a vanished tip GitHub's activity record does not list or that is on the reviewed list of tips known gone; a \`gitleaks:allow\` line; text in other encodings; packed or compressed contents; a key split across lines (see the header of fork-secret-scan.sh)."
 
+# A tip no run read and origin no longer serves fails the sweep (see "sweep, gone tips"), after the
+# scan above, so its findings are still reported.
+if [[ -n "$gone_failure" ]]; then
+  summary "" "Failed: $gone_failure."
+  exit 2
+fi
 if [[ $status -ne 0 ]]; then exit "$status"; fi
 exit "$mstatus"
