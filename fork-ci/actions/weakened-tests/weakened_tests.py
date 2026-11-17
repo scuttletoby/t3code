@@ -45,10 +45,15 @@ KIND_TEXT = {'deleted': 'deleted', 'skipped': 'skipped or disabled', 'focused': 
              'stop running)', 'assertion': 'assertion removed or changed', 'unreadable': 'could not read this file'}
 PLAIN_MODES = ('100644', '100755')
 NODE_EXT = ('js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts')
+# The default test patterns must not backtrack on a PR's own file (a stalled step writes no report): each repeated
+# part can match a character one way only, and the annotations between @Test and the method are at most 20.
+# A Java annotation's arguments: strings (a parenthesis inside one is text) and one level of nested parentheses.
+JAVA_STR = r'"(?:[^"\\\n]|\\.)*"'
+JAVA_ARGS = rf'\((?:{JAVA_STR}|[^()"]|\((?:{JAVA_STR}|[^()"])*\))*\)'
 DEFAULT_LANGUAGES = {
     'java': {
         'files': ['**/src/test/**/*.java', '**/*Test.java', '**/*Tests.java', '**/*IT.java'],
-        'test': [r'@(?:Test|ParameterizedTest|RepeatedTest)\b(?:\([^)]*\))?(?:\s+@\w+(?:\([^)]*\))?)*\s+'
+        'test': [rf'@(?:Test|ParameterizedTest|RepeatedTest)\b(?:{JAVA_ARGS})?(?:\s+@\w+(?:{JAVA_ARGS})?){{0,20}}\s+'
                  r'(?:(?:public|protected|private|static|final)\s+)*void\s+(?P<name>\w+)\s*\('],
         'before': [r'^\s*@'],
         'skip': [r'@Disabled\w*\b', r'@Enabled\w+\b', r'@Ignore\b', r'\bassume[A-Z]\w*\s*\('],
@@ -66,7 +71,7 @@ DEFAULT_LANGUAGES = {
     'node': {
         'files': [f'**/{p}.{e}' for e in NODE_EXT for p in ('*.test', '*.spec', '__tests__/**/*')],
         'test': [r'(?<![\w.$])[xf]?(?:it|test)(?:\.\w+)*(?:\([^()]*\))?\s*\(\s*(?P<q>[\'"`])'
-                 r'(?P<name>(?:\\.|(?!(?P=q)).)*)(?P=q)'],
+                 r'(?P<name>(?:\\.|(?!(?P=q))[^\\\n])*)(?P=q)'],
         'before': [],
         'skip': [r'\.(?:skip\w*|todo)\b', r'(?<![\w.$])x(?:it|test|describe)\b'],
         'focus': [r'\.only\b', r'(?<![\w.$])f(?:it|test|describe)\b'],
@@ -159,8 +164,10 @@ def parse(text, lang):
     first test are the file's own."""
     lines, found = text.split('\n'), {}
     for p in lang['test']:
+        line, at = 0, 0   # matches come in order: count the newlines since the last one, not from the top each time
         for m in p.finditer(text):
-            found.setdefault(text.count('\n', 0, m.start()), m.group('name'))
+            line, at = line + text.count('\n', at, m.start()), m.start()
+            found.setdefault(line, m.group('name'))
     heads, last = [], -1
     for line in sorted(found):
         top = line

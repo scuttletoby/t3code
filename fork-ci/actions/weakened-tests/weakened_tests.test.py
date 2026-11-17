@@ -351,6 +351,38 @@ class NotListed(unittest.TestCase):
         self.assertEqual(r.find(head, base), [])
 
 
+class Parsing(unittest.TestCase):
+    def test_java_annotation_arguments_with_parentheses_still_mark_the_test(self):
+        java = wt.load_config(None)[0]['java']
+        text = ('class T {{\n    @Test\n    {}\n    void adds() {{\n        assertEquals(2, add(1, 1));\n    }}\n\n'
+                '    @Test\n    void subs() {{\n        assertEquals(0, sub(1, 1));\n    }}\n}}\n')
+        for ann in ('@DisplayName("adds (fast)")', '@CsvSource({"a (x), 1"})', '@EnabledIf("cond()")',
+                    '@CsvSource({\n        "a, 1",\n        "b, 2",\n    })', '@Timeout(value = (5))'):
+            with self.subTest(ann=ann):
+                self.assertEqual([t.name for t in wt.parse(text.format(ann), java)[0]], ['adds', 'subs'])
+
+    def test_a_hostile_test_file_parses_in_well_under_a_second(self):
+        """Every line shape that made a test pattern backtrack: in a child, so a regression fails instead of hanging
+        (the regex engine cannot be interrupted)."""
+        child = r"""import sys, time
+sys.path.insert(0, sys.argv[1])
+import weakened_tests as wt
+langs = wt.load_config(None)[0]
+texts = [('node', "it('" + '\\' * 64 + '\n'), ('node', ('it("' + '\\' * 64 + '\n') * 2000),
+         ('node', 'it(\n' * 100000), ('java', '@Test(\n' * 100000), ('java', '@Test ' * 20000),
+         ('java', '@Test @A("x\n' * 100000), ('java', '@Test @A(' + 'x' * 100000),
+         ('node', "it('a', f); " * 100000), ('python', 'def test_a(): pass\n' * 100000)]
+t = time.monotonic()
+for lang, text in texts:
+    wt.parse(text, langs[lang])
+print(time.monotonic() - t)
+"""
+        r = subprocess.run([sys.executable, '-I', '-B', '-c', child, HERE], capture_output=True, text=True,
+                           timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(float(r.stdout), 1.0)
+
+
 class Config(unittest.TestCase):
     def test_a_project_adds_patterns_read_from_the_base(self):
         cfg = {'languages': {'java': {'skip': ['@Flaky\\b']}, 'kotlin': {'files': ['**/*Test.kt'],
@@ -427,6 +459,16 @@ class CouldNotRead(unittest.TestCase):
         self.assertIn('Could not read', gh.ours()[0]['body'])
         self.assertIn('Could not read', c.summary)
         self.assertNotIn('None of the existing tests', c.summary)
+
+    def test_an_unforeseen_error_is_could_not_read(self):
+        """git cannot even start (the folder is gone): an error find() does not foresee is reported, not raised."""
+        r = Repo(self)
+        gh = FakeGh()
+        c = Cli(self, r)
+        out = c.run(r.base, gh, extra=('--path', os.path.join(r.d, 'gone')))
+        self.assertEqual(out['status'], 'could-not-read')
+        self.assertIn('unexpected error', c.summary)
+        self.assertIn('Could not read', gh.ours()[0]['body'])
 
 
 class Comment(unittest.TestCase):
@@ -551,6 +593,34 @@ class Comment(unittest.TestCase):
         body = gh.ours()[0]['body']
         self.assertLess(len(body), 65536)
         self.assertIn('more', body)
+
+
+    def test_a_report_over_max_text_is_cut(self):
+        """MAX_ROWS rows of the widest cells is over MAX_TEXT: the report is cut at a line, under the limit."""
+        wide = 'x' * 500
+        items = [wt.Item(f'{i}{wide}', f'{i}{wide}', 'assertion', wide) for i in range(wt.MAX_ROWS)]
+        text = wt.render(items, '', [False] * len(items), '0' * 40, '1' * 40)
+        self.assertLessEqual(len(text), wt.MAX_TEXT + 40)
+        self.assertTrue(text.endswith('… cut to fit a comment.\n'), text[-80:])
+
+
+class Guards(unittest.TestCase):
+    def test_code_keeps_html_and_backticks_out_of_the_span(self):
+        for name in ('a <b>x</b> c', 'a ` b', 'a`` @team ``b'):
+            with self.subTest(name=name):
+                cell = wt.code(name)
+                self.assertNotIn('<', cell)
+                self.assertNotIn('>', cell)
+                self.assertEqual(cell.count('`'), 2, cell)
+                self.assertTrue(cell.startswith('`') and cell.endswith('`'))
+
+    def test_code_caps_a_cell(self):
+        cell = wt.code('y' * 1000)
+        self.assertEqual(len(cell), wt.CELL + 2)
+        self.assertTrue(cell.endswith('…`'))
+
+    def test_escape_keeps_a_name_on_one_log_line(self):
+        self.assertEqual(wt.escape('tests/test_x\n::error::y\r%.py'), 'tests/test_x%0A::error::y%0D%25.py')
 
 
 class Action(unittest.TestCase):

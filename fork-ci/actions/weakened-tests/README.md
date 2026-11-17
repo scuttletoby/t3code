@@ -128,6 +128,15 @@ continuation line of a multi-line assertion is not seen), a decorator between tw
 counted for the test above it, and a test named in a way the patterns do not match is not seen on either side. Add
 patterns in the config for a project's own spellings.
 
+Assertions in the lines above a file's first test (a helper such as `def check(x): assert x`) are not compared, so
+weakening such a helper is not listed; the same helper below a test is compared as part of that test.
+
+A decorator that spans several lines (`@pytest.mark.skipif(` with its arguments on the next lines) is counted for the
+test above it, so its skip is listed under the wrong test name.
+
+A Java test is found through at most 20 annotations between `@Test` and the method, with string arguments on one line
+and one level of nested parentheses, so a PR's own file cannot make the patterns backtrack for minutes.
+
 ## Tests
 
 `weakened_tests.test.py` builds real git repositories and runs against a fake `gh`. It runs in the fork's CI
