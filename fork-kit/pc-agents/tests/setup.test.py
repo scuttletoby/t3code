@@ -11,6 +11,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_distro import CONFIG, KIT, REPO, SHA1, SHA2, Case, blob, cli, k  # noqa: E402
 
+DPKG = '--force-confdef --force-confold --configure -a'   # how setup runs dpkg: no config-file question
+
 
 class Setup(Case):
     def test_fresh_distro_serves_only_after_the_walls_hold(self):
@@ -336,9 +338,62 @@ class Setup(Case):
         self.write('/log/packages/unzip', 'install ok unpacked')   # an apt-get stopped half-way
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.log('dpkg'), ['--configure -a'])   # first: apt-get refuses while dpkg was interrupted
+        self.assertEqual(self.log('dpkg'), [DPKG])   # first: apt-get refuses while dpkg was interrupted
         self.assertEqual(self.log('apt-get'), ['update', 'install -y unzip'])
         self.assertFalse([line for line in self.log() if line.startswith('restart')])   # no T3 restart for a package
+
+    def test_a_held_package_counts_as_installed(self):
+        """`apt-mark hold` makes the status `hold ok installed`: installed, so no apt-get on every run (#296)."""
+        self.ready()
+        for log in ('apt-get', 'dpkg'):
+            os.unlink(self.path('/log/' + log))
+        self.write('/log/packages/unzip', 'hold ok installed')
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.log('apt-get'), [])
+        self.assertEqual(self.log('dpkg'), [])
+
+    def test_packages_are_installed_after_the_kits_own_resolv_conf(self):
+        """A distro of an older kit (no libatomic1) whose machine file's nameservers broke DNS: the corrected
+        nameservers reach resolv.conf before apt-get needs them, and a run stopped at apt-get goes on (#296)."""
+        self.ready()
+        os.unlink(self.path('/log/packages/libatomic1'))
+        self.write('/log/dns', 'nameserver 8.8.8.8')   # the mirror resolves only through the corrected nameserver
+        self.machine({**CONFIG, 'nameservers': ['8.8.8.8']})
+        self.write('/log/apt-fail', '')   # and the network is down for this run
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('nameserver 8.8.8.8\n', self.read('/etc/resolv.conf'))   # written before apt-get
+        os.unlink(self.path('/log/apt-fail'))
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.read('/log/packages/libatomic1'), 'install ok installed\n')
+        self.assertEqual(self.check()[0], 0)
+
+    def test_dpkg_and_apt_get_ask_nothing(self):
+        """stdin is /dev/null: a config-file question (an upgrade stopped half-way over an edited file) or a debconf
+        one takes its default instead of failing at end of file (#296)."""
+        self.write('/log/questions', '')
+        self.ready()
+        self.assertEqual(self.read('/log/packages/unzip'), 'install ok installed\n')
+        self.write('/log/packages/unzip', 'install ok unpacked')
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.read('/log/packages/unzip'), 'install ok installed\n')
+
+    def test_a_dpkg_that_fails_is_named_with_its_own_fix(self):
+        """apt-daily holding dpkg's lock on a new distro: the advice is dpkg's, not an apt-get that fails too."""
+        self.ready()
+        self.write('/log/packages/unzip', 'install ok unpacked')
+        self.write('/log/dpkg-fail', '')
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('dpkg --configure -a failed', out)
+        self.assertIn('another apt-get or dpkg', out)
+        self.assertNotIn('apt-get update && apt-get install', out)
+        os.unlink(self.path('/log/dpkg-fail'))
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
 
     def test_t3_that_does_not_start_is_reported(self):
         self.ready()
@@ -723,12 +778,21 @@ class Refused(Case):
                             ({'t3Version': 'latest'}, 'an exact version'),
                             ({'t3Version': '0.1.6'}, '0.1.7 or newer'),   # no managed policy: no locks at all
                             ({'t3Version': '0.0.30-fork.1'}, '0.1.7 or newer'),
+                            # built before 0.1.7 had the managed policy: a pre-release is older than its release
+                            ({'t3Version': '0.1.7-nightly.20261031.3991'}, '0.1.7 or newer'),
                             ({'maxRuntimeMode': 'root'}, 'one of')):
             self.machine({**CONFIG, **change})
             code, out = self.setup_run()
             self.assertEqual(code, 2, out)
             self.assertIn(why, out)
         self.assertFalse(os.path.lexists(self.path('/etc/t3code/policy.json')))
+
+
+    def test_versions_from_0_1_7_on_are_accepted(self):
+        """Compared as numbers, the release itself included: a string compare would refuse 0.1.10 (#296)."""
+        for v in ('0.1.7', '0.1.8-rc.1', '0.1.10', '0.1.10-nightly.20261114.4682.fork.1', '0.2.0', '1.0.0'):
+            self.machine({**CONFIG, 't3Version': v})
+            self.assertEqual(k.config()['t3Version'], v)
 
 
 class Readme(unittest.TestCase):
@@ -740,11 +804,13 @@ class Readme(unittest.TestCase):
         spans = re.findall(r'`([^`]*pc-agents (?:pair|as-agent)\b[^`]*)`', steps)
         self.assertGreaterEqual(len(spans), 5, spans)
         for span in spans:
-            self.assertTrue(span.startswith('wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents '), span)
+            self.assertRegex(span, r'^wsl -d <distro> -u root (--|-e) /opt/pc-agents/current/sbin/pc-agents ')
         self.assertIn('pc-agents pair --ttl 15m`', steps)
         for key in ('user.name', 'user.email'):   # the agent's git identity: placeholders the owner fills in
             line = next(s for s in spans if f'git config --global {key} ' in s)
             self.assertRegex(line, rf"git config --global {key} '<[^>]+>'$")
+            # -e: wsl runs it without root's shell, so a name with an apostrophe (O'Brien) reaches git as typed
+            self.assertTrue(line.startswith('wsl -d <distro> -u root -e '), line)
 
 
 class ReleaseHolds(unittest.TestCase):
