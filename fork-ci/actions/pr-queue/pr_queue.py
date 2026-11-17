@@ -104,6 +104,10 @@ REVIEW_PAGES = 50   # pages of 100 reviews or 100 inline comments: a PR with mor
 # "build" is queued` (also "in progress", "expected", "pending"; within one sentence). That one refusal is a race, not
 # a verdict (arm). Every other refusal (the head moved, a conflict, a failing check, no permission) is final.
 # A quoted check name may hold dots (`"test (3.12)"`); outside quotes a dot ends the sentence.
+# The repository setting "Automatically delete head branches" (cli reads it once per run): the queue never deletes a
+# branch itself (arm), so with the setting off merged branches stay. GraphQL, not REST: GET /repos leaves the setting
+# out for a token without push access, and the run's GITHUB_TOKEN reads only.
+DELETE_ON_MERGE_QUERY = 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){deleteBranchOnMerge}}'
 CHECK_NOT_DONE_RE = re.compile(r'required status checks?\b(?:"[^"\n]*"|[^."\n])*\b(?:is|are) '
                                r'(?:queued|in progress|expected|pending)\b', re.I)
 
@@ -327,6 +331,35 @@ class Queue:
                                    f"({' '.join(a[:2])}): it needs contents, pull requests and issues: write, and "
                                    'workflows: write when the base brings changes to workflow files')
         return r
+
+    def warn_if_branches_stay(self):
+        """Read the repository setting "Automatically delete head branches" once, with the run's read token, and warn
+        when it is off or cannot be read. Never fails the run and decides nothing: the queue works the same either way,
+        only merged branches pile up (README.md, "Config", delete_branch). run_gh, not gh: a refused read here must not
+        print gh()'s ::error:: (or use up its say_once). Returns the setting, or None when unknown."""
+        owner, name = self.repo.split('/', 1)
+        why = ''
+        try:
+            r = self.run_gh(self.read_token, ('api', 'graphql', '-f', f'query={DELETE_ON_MERGE_QUERY}',
+                                              '-f', f'owner={owner}', '-f', f'name={name}'), 'read')
+            if r.returncode != 0:
+                why = (r.stderr or r.stdout or '').strip()[:200] or f'gh exited {r.returncode}'
+            else:
+                answer = json.loads(r.stdout)
+                on = answer['data']['repository']['deleteBranchOnMerge']
+                if not isinstance(on, bool):
+                    raise TypeError
+                if not on:
+                    print('::warning::pr-queue: the repository setting "Automatically delete head branches" '
+                          '(delete_branch_on_merge) is off, so merged branches stay: the queue never deletes a branch '
+                          'itself. Turn it on (Settings, General, Pull Requests); GitHub then retargets pull requests '
+                          'stacked on a merged branch to its base before it deletes the branch')
+                return on
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            why = why or f'GitHub gave no answer of that shape ({type(e).__name__})'
+        print('::warning::pr-queue: could not read whether the repository setting "Automatically delete head branches" '
+              f'is on ({why}). The queue never deletes a branch itself: if the setting is off, merged branches stay')
+        return None
 
     def say_once(self, key, text):
         if key not in self.said:
@@ -1108,8 +1141,9 @@ def cli(argv=None, env=None):
     if problems:
         print('pr_queue refused to start and touched nothing:\n  ' + '\n  '.join(problems))
         return REFUSED
-    return Queue(a.repo, cfg, a.state_file, a.cache, lock, read_token=read,
-                 write_token=None if a.dry_run else write).main(a.dry_run)
+    q = Queue(a.repo, cfg, a.state_file, a.cache, lock, read_token=read, write_token=None if a.dry_run else write)
+    q.warn_if_branches_stay()   # once per run; a warning at most, never the run's result
+    return q.main(a.dry_run)
 
 
 if __name__ == '__main__':
