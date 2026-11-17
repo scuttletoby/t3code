@@ -2,7 +2,7 @@
 
 `t3-golive` moves a T3 home that runs as a boot service from its current build to a newer one (for example a
 fork build), with a cold copy of the data first and a way back. It is built in steps; this folder has the
-**core** and the **copy** so far:
+**core**, the **copy** and the **rehearsal** so far:
 
 | Part              | File                      | What it does                                                 |
 | ----------------- | ------------------------- | ------------------------------------------------------------ |
@@ -12,8 +12,9 @@ fork build), with a cold copy of the data first and a way back. It is built in s
 | `check`, `settle` | `lib/golive/check.py`     | read only: may this home move to the target build now?       |
 | OS adapter        | `lib/golive/osadapter.py` | systemd user units only; other systems refuse until written  |
 | `copy`, restore   | `lib/golive/coldcopy.py`  | the practice stop: a cold copy; the restore primitive        |
+| `rehearse`        | `lib/golive/rehearse.py`  | the target build tried on a clone of a copy (R0-R5)          |
 
-Later parts (rehearse, switch, back) come in their own PRs. Install from `ci-release` comes with them.
+Later parts (switch, back) come in their own PRs. Install from `ci-release` comes with them.
 
 ## `t3-golive check`
 
@@ -237,6 +238,73 @@ empty state?
 | Kept files pile up (one set per restore, each as big as the database)               | Never copied, never removed by the kit. Each copy names and counts them; a refusal for free disk names them (a restore's refusal lists the ones the record of a stopped restore names apart, as files that must stay)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `copy --here` from a T3 terminal                                                    | Refused: stopping T3 would kill it half-way                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
+## `t3-golive rehearse [--copy <folder>] [--port <p>] [--json]`
+
+Tries the target build on a **clone** of a finished copy (the newest `t3-copy-*` in `backupDir`, or `--copy`), in
+its own T3 home (`<backupDir>/t3-rehearsal/home`) and port. It never stops, starts or writes the live home and
+needs no boot service; it runs in the calling process. Every `t3` it runs gets an empty `HOME`, `PATH=/usr/bin:/bin`
+and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`).
+
+- **R0, before any step** (refused, nothing changed): the copy has a finished manifest, reads back against it, is
+  of this home, and was taken under the build the live service state names now (else "take a new copy"); the target
+  is newer; the old build (`<home>/runtime/versions/<copy's version>/t3`) is there; the staged release checks out
+  and its `serve --help` has `--hold-work`; the rehearsal folder is apart from the live home (real paths and file
+  ids, both ways, so a link or a bind path is caught); an old one is a real folder (no link) that bears the kit's
+  mark `.golive-rehearsal` (or is empty), with no folder in it that is the live home or on another device, no mount
+  point at or under it in the system's mount list (`/proc/self/mountinfo`: a bind mount of the same filesystem keeps
+  its device id), and no link to another home's ownership lock; no server holds it; the copy is not inside it (nor
+  a link into it); the port is free and is neither the live port nor 3773; `backupDir` holds 3 x the copy plus the
+  floor. Where the mount list cannot be read (any OS but Linux, no `/proc`), an old rehearsal folder is never
+  removed: the run is refused and the owner removes it by hand. **R0 on the clone**: the clone leaves out
+  `secrets/` and the live machine's process records (`device/`, `relay-clients/`), with what a copy never holds
+  (`server-runtime.json`, the ownership lock); it reads back against the manifest and is checked to hold none of
+  those: a runtime record would point the CLI at the LIVE server.
+- **The clone step** runs the old-folder guard again right before it removes anything (a mount or a swap since R0
+  is caught), then removes the old folder with its mark last.
+- **R1**: `__service-preflight` of the old build and of the fork build on the clone: both `ready`. The fork build's
+  read-only report of the clone is the "before" report.
+- **R2**: `<fork t3> auth session list --json --base-dir <clone>`, with no server: a read-only command whose
+  database layer migrates under the ownership lock. Timed: seconds, database growth, the migrations (the before
+  report's `pendingMigrations`). A report after it must show exactly those applied and none pending (or it says no
+  migrations were pending), so R3's server never migrates unmeasured.
+- **R3**: `<fork t3> serve --hold-work --host 127.0.0.1 --port <p> --no-browser --base-dir <clone>`; ready when
+  the clone's `server-runtime.json` names this server's pid, port `<p>` and `workHeld: true`.
+- **R4**, report against report (fork #181): the version is the target; applied = before's applied + before's
+  pending, none pending or unknown; `live.compare_counts` finds no difference; no fork feature on; no settings
+  parse warning; the same provider instances, at least one; the server still runs after the report.
+- **R5**: the server is stopped (always, also after a failure); `settings.json` is byte-identical; the old build's
+  preflight on the migrated clone says `blocked` (`ready` when there were no migrations; its reason is journalled);
+  `coldcopy.restore` puts the copy back into the clone and the old build's preflight says `ready`.
+
+The clone keeps `settings.json` as it is (R5 checks it is unchanged), so the R3 server reads the live provider
+settings: the provider program paths and homes (`binaryPath`, `homePath`) and any trace address. Its provider status
+checks may start those provider programs against the live provider homes (a login refresh, for example) and send
+traces to the same collector. No T3 data of the live home is reached.
+
+The result (from and target version, copy, SHA256 of its manifest, migrations, seconds, growth, port) is the
+journal's last step, `result`, of a run that ended `ok`. A rehearsal is a **scratch run**
+(`journal.run(..., scratch=True)`): its steps change only `<backupDir>/t3-rehearsal/`, so a run that fails or is
+stopped needs no `settle` (`check` notes it); the next run throws the old clone away and makes a new one, never
+reusing one half-migrated. A run that needs settling still blocks it.
+
+| Situation                                               | What happens                                                                  |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Runs again after a good or failed rehearsal             | The old clone (it bears the mark) is removed and redone from the copy         |
+| Killed at any step (R0-R5, mid-restore)                 | The server dies with the run; nothing to settle; the next run redoes it       |
+| Killed while it removes the old folder                  | The mark goes last: the folder still bears it (or is empty); next run ends it |
+| A mount (or a swap to a link) after R0, before removal  | The guard runs again in the clone step: the run fails, nothing is removed     |
+| A mount point at or under the folder; no mount list     | Refused; never removed (other OSes: remove an old folder by hand)             |
+| `--copy` inside the rehearsal folder, or a link into it | Refused before any step: the clone step would remove it                       |
+| R2 left migrations pending                              | The run fails before R3: the server would migrate unmeasured                  |
+| A server still holds an old rehearsal home              | Refused before any step; stop it (its pid is in that home's runtime record)   |
+| `t3-rehearsal` without the mark, or a link              | Refused; never removed                                                        |
+| Live home by a link or bind path, or bound in a clone   | Refused (real path; file ids both ways and inside) before any removal         |
+| Copy with no manifest, not matching it, of another home | Refused (`--copy` or `t3-golive copy`)                                        |
+| Copy from another build than the live one               | Refused: take a new copy                                                      |
+| Port taken between the check and the start              | The server exits; R3 fails, the rerun passes once the port is free            |
+| Server never ready, or not saying work is held          | Stopped; the run fails                                                        |
+| Server dies during R4, or any R4 check fails            | The run fails naming every problem; the server is stopped                     |
+
 ## `t3-golive settle --reason "<what you did>"`
 
 After a run stopped half-way or ended with an error, look at the T3 home and put it right, then run this: it
@@ -299,6 +367,7 @@ file and how to settle it; a line from a newer kit refuses with "update the kit"
 python3 -I -B fork-kit/golive/tests/check.test.py      # check on a fake machine
 python3 -I -B fork-kit/golive/tests/journal.test.py    # lock, journal, adapter, version order
 python3 -I -B fork-kit/golive/tests/copy.test.py       # copy, guard, restore on a fake machine
+python3 -I -B fork-kit/golive/tests/rehearse.test.py   # rehearse R0-R5 with a stub t3 (old and fork build)
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
 python3 -I -B fork-kit/common/tests/machine_file.test.py
 ```
