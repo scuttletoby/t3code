@@ -70,12 +70,13 @@ class Checkout:
         # Bare, git logs in the way the queue does (gh's login, GH_TOKEN), never with a helper of the machine's config.
         self.auth = pr_queue.GIT_AUTH if self.bare else ()
 
-    def git(self, *a):
+    def git(self, *a, errors='strict'):
+        """errors: how git's output is decoded; 'surrogateescape' for file names, which need not be UTF-8."""
         if self.run:
             return self.run(*a)
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
-                                  capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
+                                  errors=errors, capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
                                                             'GIT_ATTR_NOSYSTEM': '1', **pr_queue.GIT_ENV})
 
     def problem(self):
@@ -181,8 +182,9 @@ def same_change(checkout, head, read):
     return False, f'{head[:12]} is not the change read at {read[:12]}, nor that change merged with the base'
 
 
-def verdict(pr, review, checkout, required=None, pass_drafts=False):
-    """(ok, reason, rows): rows is [(lens, ok, short reason)] per lens, required ones first."""
+def verdict(pr, review, checkout, required=None, pass_drafts=False, rules_name_lenses=False):
+    """(ok, reason, rows): rows is [(lens, ok, short reason)] per lens, required ones first. rules_name_lenses: the
+    config's review rules (enforce) added required lenses, so a missing one may come from there too."""
     required = required or {}
     head = str(pr.get('headRefOid') or '').lower()
     if not SHA.fullmatch(head):
@@ -207,9 +209,9 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False):
             text = f'{"override " if override else "read "}{sha[:12]}: {how}'
         rows.append(((f'{key} (required)' if key in required else key), bool(sha and read and ok), text))
     if missing:
+        where = ' or the review rules of the config' if rules_name_lenses else ''
         return False, (f'required lens without a read: {", ".join(missing)}. No counted lens comment has that name: '
-                       f'check it in required-lenses (one name per line) or the review rules of the config; lenses '
-                       f'found: {found}'), rows
+                       f'check it in required-lenses (one name per line){where}; lenses found: {found}'), rows
     if not read:
         return False, why, rows
     return ok, how, rows
@@ -261,8 +263,10 @@ def changed_paths(checkout, base, head):
                       f'or the histories are unrelated){": " + said if said else ""}')
     changes = []
     for b in bases:
+        # A file name need not be UTF-8: its bytes stay as lone surrogates, so the path is judged by its folder like any
+        # other (review_judge.shown writes them as \xNN), never a UnicodeDecodeError that fails the head unexplained.
         d = checkout.git('diff', '--no-ext-diff', '--no-textconv', '--no-relative', '--ignore-submodules=none',
-                         '--no-color', '--name-status', '-z', '-M', b, head, '--')
+                         '--no-color', '--name-status', '-z', '-M', b, head, '--', errors='surrogateescape')
         if d.returncode != 0:
             return None, f'git diff {b[:12]} {head[:12]} failed: {(d.stderr or "").strip()[:200]}'
         try:
@@ -286,14 +290,16 @@ def path_judgement(checkout, rules, config_path):
         return None, str(e)
 
 
-def path_row(mode, judgement):
-    """The summary row of the path rules: what they decide (enforce) or would have said (shadow). Never a verdict of its
-    own: the required lens rows and the reason carry that."""
+def path_row(mode, judgement, warnings=()):
+    """The summary row of the path rules: what they decide (enforce) or would have said (shadow), and the config check's
+    warnings (shadow only: enforce refuses them). Never a verdict of its own: the required lens rows and the reason
+    carry that."""
+    said = ''.join(f'; config warning: {w}' for w in warnings)
     if mode == 'enforce':
         return ('path rules (enforce)', True, f'the path rules decide: {judgement.text()}; the required-lenses input '
-                'is required as well')
+                f'is required as well{said}')
     return ('path rules (shadow)', True, f'the path rules would have said: {judgement.text()}; the required-lenses '
-            'input decides (mode shadow)')
+            f'input decides (mode shadow){said}')
 
 
 def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out, problems):
@@ -311,10 +317,14 @@ def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out
     if problems:
         out('::error::head check refused to start: ' + escape('; '.join(problems)))
         return REFUSED, False, '; '.join(problems), []
+    enforced = False
     if paths is not None:
-        row = path_row(cfg.review.mode, paths)
+        row = path_row(cfg.review.mode, paths, cfg.review.warnings)
+        for w in cfg.review.warnings:
+            out('::warning::the review rules of the config: ' + escape(w))
         out(f'{row[0]}: {escape(row[2])}')
         if cfg.review.mode == 'enforce':
+            enforced = True
             required = dict(required or {})
             for name in paths.lenses:
                 required.setdefault(lens.lens_key(name), name)
@@ -323,7 +333,7 @@ def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out
         return 1, False, f'could not read the pull request from GitHub after {ATTEMPTS} tries: {why}', []
     review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association, cfg.lens_author_associations,
                          log=lambda text: out(escape(text)))
-    ok, reason, rows = verdict(pr, review, checkout, required, pass_drafts)
+    ok, reason, rows = verdict(pr, review, checkout, required, pass_drafts, enforced)
     if paths is not None:
         rows = [row] + rows
     return (0 if ok else 1), ok, reason, rows

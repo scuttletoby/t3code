@@ -42,9 +42,9 @@
 .github/scripts/fork-workflow-triggers.test.cjs
 fork-ci/actions/ci-demand/ci_demand.test.py ~13s
 fork-ci/actions/docs-scope/docs-scope.test.py ~16s
-fork-ci/actions/git-clean/git_clean.test.py
 fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/fleet-watch/fleet_watch.test.py
+fork-ci/actions/git-clean/git_clean.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/head-check/head_check.test.py ~12s
 fork-ci/actions/head-check/head_gate.test.py
@@ -74,7 +74,7 @@ fork-kit/gh-apps/tests/wrapper.test.py
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
 fork-kit/heavy/tests/install.test.py
-fork-kit/heavy/tests/sweep.test.py ~15s
+fork-kit/heavy/tests/sweep.test.py ~25s
 # A real systemd user manager (the step starts one for the runner user).
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml
 fork-kit/model-guard/tests/guard.test.py

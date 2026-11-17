@@ -158,9 +158,10 @@ class World:
             if name != '.git':
                 p = os.path.join(self.work, name)
                 shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
-        for path, text in files.items():
-            os.makedirs(os.path.dirname(os.path.join(self.work, path)) or self.work, exist_ok=True)
-            with open(os.path.join(self.work, path), 'w') as f:
+        for path, text in files.items():   # a bytes path: a file name that need not be UTF-8
+            where = os.path.join(os.fsencode(self.work) if isinstance(path, bytes) else self.work, path)
+            os.makedirs(os.path.dirname(where), exist_ok=True)
+            with open(where, 'w') as f:
                 f.write(text)
         self.git(self.work, 'add', '-A')
         tree = self.git(self.work, 'write-tree')
@@ -769,6 +770,93 @@ class PathRules(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn('critical, lenses data-1, data-2 (3501 changed paths', out)
 
+    def test_a_file_name_that_is_not_utf8_is_judged_by_its_folder(self):   # #348 item 1: no UnicodeDecodeError
+        for mode in ('enforce', 'shadow'):
+            with self.subTest(mode=mode):
+                base = self.base(mode)
+                tree = base_files(cfg_raw=review_cfg(mode), **{**PROMPTS, **self.STORE})
+                tree[b'src/storage/bad\xff.py'] = 'b\n'
+                tree[b'docs/bad\xfe.md'] = 'd\n'
+                head = self.w.commit(tree, [base])
+                code, out = self.check(base, head, ['code'])
+                self.assertIn('critical, lenses data-1, data-2 (2 changed paths', out)
+                self.assertIn('src/storage/bad\\xff.py', out)
+                if mode == 'enforce':
+                    self.assertEqual(code, 1, out)
+                    self.assertEqual(self.check(base, head, ['data-1', 'data-2'])[0], 0)
+                else:   # shadow: what main says (every lens read the head), the row only reports
+                    self.assertEqual(code, 0, out)
+                light = dict(base_files(cfg_raw=review_cfg(mode), **{**PROMPTS, **self.STORE}))
+                light[b'docs/bad\xfe.md'] = 'd\n'
+                code, out = self.check(base, self.w.commit(light, [base]), comments=[])
+                self.assertEqual(code, 0, out)
+                self.assertIn('light, lenses none (1 changed path; docs (light): docs/bad\\xfe.md', out)
+
+    def test_a_lens_name_with_capitals_is_required_by_its_key(self):   # #348 item 5: reads are keyed by lens_key
+        block = json.loads(json.dumps(REVIEW_BLOCK))
+        block['lenses'] = {('Data-One' if n == 'data-1' else 'Data-Two' if n == 'data-2' else n): x
+                           for n, x in block['lenses'].items()}
+        block['rules'][0]['lenses'] = ['Data-One', 'Data-Two']
+        cfg = {**CFG_RAW, 'review': block}
+        base = self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE}), [self.m0])
+        head = self.head(base, cfg=cfg, **{'src/storage/s.py': lines(40, ['x'], 3)})
+        code, out = self.check(base, head, ['code'])
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: Data-One, Data-Two', out)
+        for names in (['Data-One', 'Data-Two'], ['data-one', 'DATA-TWO']):
+            with self.subTest(names=names):
+                code, out = self.check(base, head, names)
+                self.assertEqual(code, 0, out)
+
+    def test_the_summary_row_says_what_the_path_rules_decide(self):   # #348 item 5: the row itself, in the table
+        for mode, says in (('enforce', '| path rules (enforce) | ok | the path rules decide: critical, lenses '
+                                       'data-1, data-2 (1 changed path'),
+                           ('shadow', '| path rules (shadow) | ok | the path rules would have said: critical, lenses '
+                                      'data-1, data-2 (1 changed path')):
+            with self.subTest(mode=mode):
+                base = self.base(mode)
+                head = self.head(base, mode, **{'src/storage/s.py': lines(40, ['x'], 3)})
+                path = self.w.checkout(base, head)
+                summary = os.path.join(self.w.dir, f'summary-{mode}.md')
+                gh = fake_gh((0, json.dumps(pr([self.p.lens(n, head) for n in ('data-1', 'data-2')], head=head))))
+                code, out = run_cli(path, gh, env={'GITHUB_STEP_SUMMARY': summary})
+                self.assertEqual(code, 0, out)
+                with open(summary, encoding='utf-8') as f:
+                    table = f.read().splitlines()
+                rows = [x for x in table if x.startswith('| ') and not x.startswith(('| lens ', '| --- '))]
+                self.assertTrue(rows[0].startswith(says), rows)
+
+    def test_a_rule_order_warning_of_a_shadow_config_is_in_the_row(self):   # #348 item 3: enforce refuses it instead
+        rules = [dict(REVIEW_BLOCK['rules'][1], paths=['**/*.md']), REVIEW_BLOCK['rules'][0], REVIEW_BLOCK['rules'][2]]
+        for mode in ('shadow', 'enforce'):
+            with self.subTest(mode=mode):
+                cfg = review_cfg(mode, rules=rules)
+                base = self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE}), [self.m0])
+                head = self.head(base, cfg=cfg, **{'src/storage/notes.md': 'n\n'})
+                code, out = self.check(base, head, ['code'])
+                if mode == 'shadow':
+                    self.assertEqual(code, 0, out)
+                    self.assertIn("::warning::the review rules of the config: rule 'docs' (light) comes before the "
+                                  "heavier rule 'data' (critical)", out)
+                    self.assertIn("would have said: light, lenses none", out)
+                    self.assertIn("config warning: rule 'docs' (light) comes before", out)
+                else:
+                    self.assertEqual(code, H.REFUSED, out)
+                    self.assertIn("rule 'docs' (light) comes before the heavier rule 'data' (critical)", out)
+
+    def test_without_a_review_block_a_missing_lens_reads_as_before(self):   # #348 item 6: byte for byte
+        base = self.base(mode=None)
+        head = self.head(base, mode=None, **{'src/app.py': 'a\n'})
+        code, out = self.check(base, head, ['correctness'], required='design')
+        self.assertEqual(code, 1, out)
+        self.assertIn('head check failed: required lens without a read: design. No counted lens comment has that '
+                      'name: check it in required-lenses (one name per line); lenses found: correctness', out)
+        self.assertNotIn('review rules', out)
+        base = self.base('enforce')   # the path rules can name a missing lens: the reason says where to look
+        head = self.head(base, **{'src/app.py': 'a\n'})
+        code, out = self.check(base, head, ['correctness'])
+        self.assertIn('check it in required-lenses (one name per line) or the review rules of the config;', out)
+
     def test_a_rerun_gives_the_same_answer(self):   # runs again: nothing stored between runs
         base = self.base()
         head = self.head(base, **{'src/storage/s.py': lines(40, ['x'], 3)})
@@ -788,7 +876,7 @@ class ChangedPaths(unittest.TestCase):
         answers = list(answers)
 
         class Checkout:
-            def git(self, *a):
+            def git(self, *a, **kw):
                 code, out = answers.pop(0)
                 return types.SimpleNamespace(returncode=code, stdout=out, stderr='boom' if code else '')
 
