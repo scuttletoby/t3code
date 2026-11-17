@@ -6,6 +6,7 @@ walls, and a distro that is not fresh is refused with nothing changed.
   python3 -I -B fork-kit/pc-agents/tests/setup.test.py
 """
 import json, os, re, shutil, signal, stat, subprocess, sys, time, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_distro import CONFIG, KIT, REPO, SHA1, SHA2, Case, blob, cli, k  # noqa: E402
@@ -309,15 +310,35 @@ class Setup(Case):
 
     def test_nftables_installed_after_a_package_list_update(self):
         os.replace(self.path('/usr/sbin/nft'), self.path('/log/nft-package'))
+        os.unlink(self.path('/log/packages/nftables'))
         self.terminate()
         self.write('/log/apt-fail', '')
         code, out = self.setup_run()
         self.assertEqual(code, 1, out)
-        self.assertIn('apt-get update && apt-get install -y nftables', out)
+        self.assertIn('apt-get update && apt-get install -y nftables libatomic1 unzip', out)
         os.unlink(self.path('/log/apt-fail'))
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.log('apt-get'), ['update', 'update', 'install -y nftables'])
+        self.assertEqual(self.log('apt-get'), ['update', 'update', 'install -y nftables libatomic1 unzip'])
+
+    def test_libatomic1_and_unzip_are_installed_once(self):
+        """Node (the agents' tool) does not start without libatomic.so.1 and the agent has no sudo; unzip is for
+        postinstall steps. A fresh Ubuntu has neither (#269)."""
+        self.ready()
+        self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+        for p in ('libatomic1', 'unzip'):
+            self.assertEqual(self.read('/log/packages/' + p), 'install ok installed\n')
+        for log in ('apt-get', 'dpkg', 'systemctl'):
+            os.unlink(self.path('/log/' + log))
+        self.assertEqual(self.setup_run()[0], 0)   # runs again: nothing to install
+        self.assertEqual(self.log('apt-get'), [])
+        self.assertEqual(self.log('dpkg'), [])
+        self.write('/log/packages/unzip', 'install ok unpacked')   # an apt-get stopped half-way
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.log('dpkg'), ['--configure -a'])   # first: apt-get refuses while dpkg was interrupted
+        self.assertEqual(self.log('apt-get'), ['update', 'install -y unzip'])
+        self.assertFalse([line for line in self.log() if line.startswith('restart')])   # no T3 restart for a package
 
     def test_t3_that_does_not_start_is_reported(self):
         self.ready()
@@ -348,6 +369,20 @@ class Setup(Case):
         self.assertEqual(self.setup_run()[0], 0)
         self.assertFalse(os.path.lexists(self.path(k.PENDING)))
 
+
+    def test_how_t3_ended_is_said_only_when_not_cleanly(self):
+        self.ready()
+        self.machine({**CONFIG, 'memoryMax': '4G'})
+        for crash, said in (('2 9', 'killed by signal 9'), ('3 6', 'killed by signal 6'), ('1 0', None)):
+            self.write('/log/t3-crash', crash)   # ExecMainCode ExecMainStatus: CLD_KILLED, CLD_DUMPED, a clean exit
+            code, out = self.setup_run()
+            self.assertEqual(code, 1, out)
+            self.assertIn('T3 did not start or stay up', out)
+            if said:
+                self.assertIn(said, out)
+            else:
+                self.assertNotIn('exit status', out)
+                self.assertNotIn('killed', out)
 
     def test_t3_that_dies_a_moment_after_the_restart_is_reported(self):
         self.ready()
@@ -576,6 +611,29 @@ class AsAgent(Case):
         self.assertIn('not running anything as the agent', out)
         self.assertEqual(self.log('systemd-run'), [])
 
+    def test_pair_before_its_t3_is_installed_says_so(self):
+        """An upgrade stopped half-way (the new t3Version written, its download failed): no env error, the cause."""
+        self.ready()
+        self.machine({**CONFIG, 't3Version': '1.2.4'})
+        self.write('/log/install-fail', '')
+        self.assertEqual(self.setup_run()[0], 1)
+        for stopped in (False, True):   # the old T3 still runs, or the 2-minute check stopped it (a restart is due)
+            if stopped:
+                k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
+            code, out = self.call(cli.main, ['pair'])
+            self.assertEqual(code, 1, out)
+            self.assertIn('T3 1.2.4 is not installed yet: run pc-agents setup again (README step 3)', out)
+            self.assertEqual(self.log('systemd-run'), [])
+
+    def test_pair_and_as_agent_are_for_root_only(self):
+        for argv in (['pair'], ['pair', '--ttl', '1m'], ['as-agent', '--', 'claude']):
+            with mock.patch.object(k, 'ROOT', ''), mock.patch.object(os, 'geteuid', lambda: 1100), \
+                    mock.patch.object(k, 'config', mock.Mock(side_effect=AssertionError('read the machine file'))):
+                code, out = self.call(cli.main, argv)
+            self.assertEqual(code, 2, out)
+            self.assertIn('run this as root', out)
+        self.assertEqual(self.log('systemd-run'), [])
+
     def test_pair_runs_the_installed_t3_pair_as_the_agent(self):
         self.ready()
         self.machine({**CONFIG, 't3Version': '1.2.4'})
@@ -663,12 +721,30 @@ class Refused(Case):
                             ({'lockedSettings': {'agentSlots.maxPerMachine.x': {'y': 2}}}, 'one field per dotted path'),
                             ({'nameservers': ['192.168.1.1']}, 'only public addresses'),
                             ({'t3Version': 'latest'}, 'an exact version'),
+                            ({'t3Version': '0.1.6'}, '0.1.7 or newer'),   # no managed policy: no locks at all
+                            ({'t3Version': '0.0.30-fork.1'}, '0.1.7 or newer'),
                             ({'maxRuntimeMode': 'root'}, 'one of')):
             self.machine({**CONFIG, **change})
             code, out = self.setup_run()
             self.assertEqual(code, 2, out)
             self.assertIn(why, out)
         self.assertFalse(os.path.lexists(self.path('/etc/t3code/policy.json')))
+
+
+class Readme(unittest.TestCase):
+    def test_owner_steps_run_as_written_in_powershell(self):
+        """Every kit command of the owner steps is a whole PowerShell line: `pc-agents ...` alone is not found there."""
+        with open(os.path.join(KIT, 'README.md'), encoding='utf-8') as f:
+            readme = f.read()
+        steps = readme[readme.index('## Owner steps'):readme.index('## Tailscale tag')]
+        spans = re.findall(r'`([^`]*pc-agents (?:pair|as-agent)\b[^`]*)`', steps)
+        self.assertGreaterEqual(len(spans), 5, spans)
+        for span in spans:
+            self.assertTrue(span.startswith('wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents '), span)
+        self.assertIn('pc-agents pair --ttl 15m`', steps)
+        for key in ('user.name', 'user.email'):   # the agent's git identity: placeholders the owner fills in
+            line = next(s for s in spans if f'git config --global {key} ' in s)
+            self.assertRegex(line, rf"git config --global {key} '<[^>]+>'$")
 
 
 class ReleaseHolds(unittest.TestCase):
