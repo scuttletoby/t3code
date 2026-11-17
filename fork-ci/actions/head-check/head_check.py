@@ -38,7 +38,7 @@ for a check that runs where nothing of the pull request is ever checked out (for
 head come from differs (Checkout).
 `--required-lenses` takes one lens name per line (a name may hold a comma: `data-integrity (DI-1, DI-2)`).
 """
-import argparse, json, os, re, subprocess, sys, tempfile, time
+import argparse, json, os, re, subprocess, sys, tempfile, time, unicodedata
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'pr-queue'))
@@ -81,7 +81,7 @@ class Checkout:
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
                                   errors=errors, capture_output=True, timeout=timeout,
-                                  env={**os.environ, 'GIT_TERMINAL_PROMPT': '0', **pr_queue.GIT_ENV})
+                                  env=pr_queue.git_env(os.environ))
 
     def problem(self):
         """Why the repository cannot be read as git made it, or None: not a git folder, shallow (the base's history is
@@ -422,12 +422,12 @@ def base_config(checkout, path, problems):
         return None
     # Bare, the base is the tip the gate read from GitHub's API, fetched by sha: what the pull request's branch says
     # about its own config is never read.
-    r = checkout.git('show', f'{parents[0]}:{repo_path(path)}')
+    r = checkout.git('show', f'{parents[0]}:{repo_path(path)}', errors='surrogateescape')
     if r.returncode != 0:
         problems.append(f'the base commit {parents[0][:12]} has no config {path}')
         return None
-    try:
-        return config.parse(r.stdout, f'{path} at the base {parents[0][:12]}')
+    try:   # as bytes: config.parse refuses one that is not UTF-8, as the queue does
+        return config.parse(r.stdout.encode('utf-8', 'surrogateescape'), f'{path} at the base {parents[0][:12]}')
     except config.ConfigError as e:
         problems.append(str(e))
         return None
@@ -470,12 +470,17 @@ def tree_entry(checkout, tree, rel):
     return tuple(fields)
 
 
+def folded(name):
+    """`name` as a case-insensitive file system compares it: case folded, NFC and NFD as one (APFS, HFS+)."""
+    return unicodedata.normalize('NFD', unicodedata.normalize('NFD', name).casefold())
+
+
 def case_matches(checkout, tree, rel):
-    """The paths in `tree` that name `rel` ignoring case, `rel` itself too: at each level the entries whose name
-    casefolds to the same as `rel`'s, the last of any type (a folder there collides too). Raises ValueError when git
-    fails (the caller refuses)."""
-    parts = rel.casefold().split('/')
-    level = [('', tree)]
+    """The paths in `tree` that name `rel` or one of its folders ignoring case (folded), `rel` itself too: at each level
+    the entries of any type whose name folds to the same as `rel`'s there (a file, a symlink or a submodule next to the
+    folder collides with it too); only folders are read on. Raises ValueError when git fails (the caller refuses)."""
+    parts = [folded(p) for p in rel.split('/')]
+    level, matches = [('', tree)], set()
     for i, want in enumerate(parts):
         found = []
         for prefix, oid in level:
@@ -486,10 +491,13 @@ def case_matches(checkout, tree, rel):
             for record in filter(None, (r.stdout or '').split('\0')):
                 meta, _, name = record.partition('\t')
                 fields = meta.split(' ')
-                if name.casefold() == want and (i == len(parts) - 1 or fields[1:2] == ['tree']):
-                    found.append((prefix + name, fields[-1]))
-        level = [(p + '/', oid) for p, oid in found] if i < len(parts) - 1 else found
-    return {p for p, _ in level}
+                if folded(name) == want:
+                    if i < len(parts) - 1 and fields[1:2] == ['tree']:
+                        found.append((prefix + name + '/', fields[-1]))
+                    else:
+                        matches.add(prefix + name)
+        level = found
+    return matches
 
 
 def _merged_config_problem(checkout, path, base, head):
