@@ -429,6 +429,10 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(own(['timeout', '5', 'env', '-S', 'CI=1 pytest -x']), ['timeout', 'env', 'pytest'])
         self.assertEqual(own(['timeout', '5', 'env', '-S', '-i -u A -- bash -c pytest']),
                          ['timeout', 'env', 'bash', '-c', 'pytest'])
+        # after env's --, NAME=value is still env's assignment (GNU env), not the program
+        self.assertEqual(own(['timeout', '5', 'env', '-S', '-- CI=1 pytest']), ['timeout', 'env', 'pytest'])
+        self.assertEqual(own(['timeout', '5', 'env', '--', 'CI=1', 'LANG=C', 'pytest', '-x']),
+                         ['timeout', 'env', 'pytest'])
         self.assertEqual(own(['python3', '-um', 'pytest', '-x']), ['python3', '-um', 'pytest'])
         self.assertEqual(own(['python3', '-uW', 'error', 'a.test.py']), ['python3', 'a.test.py'])
         self.assertEqual(own(['python3', '-Wignore', '-c', 'p="x"'], shown=True), ['python3', '-c', '[5 chars]'])
@@ -570,6 +574,10 @@ class SweepTests(unittest.TestCase):
             # perl reads the word after -Fxe or -pie as a script (and stops at once); shown, it is cut like code
             (['perl', '-Fxe', 'print "hunter38"'], 'perl -Fxe [16 chars]'),
             (['perl', '-pie', 's/OLDPW/hunter39/', 'f'], 'perl -pie [17 chars]', 2),
+            # #328 lens round 2: after env's --, NAME=value is still env's assignment (GNU env), not the program
+            (['timeout', '60', 'env', '-S', '-- DB_PASS=hunter40 ./server'], 'timeout env ./server', 3),
+            (['timeout', '60', 'env', '--', 'X=hunter41', './server'], 'timeout env ./server', 4),
+            (['timeout', '60', 'env', '--', 'A=hunter42', 'B=hunter43', './server'], 'timeout env ./server', 5),
         ]
         for n, (argv, *_) in enumerate(rows):
             self.orphan(5201 + n, argv + ['arg0'], cpu=90)
@@ -593,9 +601,10 @@ class SweepTests(unittest.TestCase):
         self.orphan(5301, ['timeout', '60', 'sh', '-c', 'PASS=hunter2 pytest'], cpu=90)
         self.orphan(5302, ['stdbuf', '-oL', 'bash', '-lc', 'pytest -q'], cpu=90)   # a parser row: stdbuf execs
         self.orphan(5303, ['timeout', '600', 'env', '-S', 'CI=1 pytest -x'], cpu=90)  # env's assignment is skipped
+        self.orphan(5304, ['timeout', '600', 'env', '-S', '-- CI=1 pytest'], cpu=90)  # after its -- too
         code, out, _ = self.run_sweep()
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.signalled(), [5301, 5302, 5303], out)
+        self.assertEqual(self.signalled(), [5301, 5302, 5303, 5304], out)
         self.assertIn('timeout env pytest (+2 args)', out)
         self.assertIn('stopped: pid 5301 timeout', out)
         self.assertIn('timeout sh -c [19 chars]', out)
@@ -1268,6 +1277,17 @@ MUTATIONS = {
                                                    'and j < len(argv):', 'test_own_command'),
     "perl's -F takes the rest of its word": ("'other': 'MmIixdDrFC'}", "'other': 'MmIixdDrC'}", 'test_own_command'),
     "perl's -C takes the rest of its word": ("'other': 'MmIixdDrFC'}", "'other': 'MmIixdDrF'}", 'test_own_command'),
+    # #328 lens round 2
+    "after env's --, NAME=value is still env's": (
+        "while name == 'env' and i < len(argv) and '=' in argv[i] and not argv[i].startswith('='):\n            i += 1",
+        'pass', 'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    "every assignment after env's -- is skipped": (
+        "while name == 'env' and i < len(argv) and '=' in argv[i]",
+        "if name == 'env' and i < len(argv) and '=' in argv[i]",
+        'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    "after env -S's --, NAME=value is not the program when matching": (
+        "while name == 'env' and i < len(argv) and '=' in argv[i] and not argv[i].startswith('='):\n            i += 1",
+        'pass', 'test_inline_code_through_a_wrapper_is_still_matched'),
 }
 
 

@@ -211,6 +211,8 @@ def own_command(argv, shown=False):
                 i += 1
             else:
                 break
+        while name == 'env' and i < len(argv) and '=' in argv[i] and not argv[i].startswith('='):
+            i += 1                                  # env -- NAME=value cmd: still env's assignment (GNU env)
         rest = own_command(argv[i:], shown)
         return argv[:1] + rest
     kind = interpreter_kind(name)
