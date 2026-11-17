@@ -4,7 +4,7 @@ check run of the gate's own GitHub App (fork-head-gate.yml; README.md, "The gate
 
 A pull request can change the workflow its own head check runs in, and that job reports as GitHub Actions, which any
 workflow file of the pull request can also report as. The gate runs from the default branch's workflow
-(pull_request_target, issue_comment, workflow_dispatch), with code from the fork's pinned release, reads the pull
+(pull_request_target, issue_comment, workflow_dispatch, and workflow_run of the review trigger), with code from the fork's pinned release, reads the pull
 request only as data, and posts with a key that lives only in an Environment that only the default branch may use. A
 ruleset that binds the required check to the gate App's id then counts this check run and nothing else.
 
@@ -21,8 +21,8 @@ failure. A run posts nothing only when it cannot post at all (README.md, "Stops 
 GitHub does not take the first write (start), no token can be made (no key, no App, no Environment), the guard job
 cannot read the Environment (it may not exist; when REST says 5xx or a rate limit every try, GraphQL, with its own
 rate limit, may still show it exists), the head is unknown (on an event that does not carry it, the pull
-request read fails every try and so does git's refs/pull/N/head), the backfill cannot list the open pull requests, a
-step before start fails, or the run never reaches start.
+request read fails every try and so does git's refs/pull/N/head), the backfill or a review run's lookup cannot list
+the open pull requests, a step before start fails, or the run never reaches start.
   guard   GITHUB_OUTPUT guard=ok when the key can only be the Environment's: no repository or organisation secret of
           its name (REPO_SECRET_PRESENT=true|false: the workflow passes only whether one is set), the Environment
           exists, and its deployment branches are exactly one rule, the default branch. Else exit 1 and guard=fail
@@ -35,7 +35,11 @@ step before start fails, or the run never reaches start.
           failure, so a pass it had cannot survive to a later ready, retarget or reopen), or, for a dispatch without
           one, the head of every open pull request (the backfill, paged, one entry per head). When the read fails
           every try: the head the event carries (--event-sha), else refs/pull/N/head by git (not the REST API, so
-          not its rate limit).
+          not its rate limit). On a workflow_run (the review trigger's run finished, README.md "Run again after a
+          review"): no number is taken; the open pull requests whose head is the run's head sha from the run's
+          head repository and branch (--run-*, GitHub's fields of the run), read from the API. More than one (one
+          branch into two bases): the lowest number judges the head once, the log names the others. None, or a run
+          of another event: nothing to judge (a log line says why).
   target  before any token: post=false only for bad arguments. Else post=true: the head gets a failure (judge writes
           it) when the guard did not pass, on a re-run (run attempt 2 or later), for a caller that is not the default
           branch's current one or does not pin this gate release, for a lens list with a name that names no lens, for
@@ -61,7 +65,8 @@ sys.path.insert(0, HERE)
 import head_check  # noqa: E402
 import pr_queue  # noqa: E402  (../pr-queue, put on the path by head_check)
 
-EVENTS = ('pull_request_target', 'issue_comment', 'workflow_dispatch')
+EVENTS = ('pull_request_target', 'issue_comment', 'workflow_dispatch', 'workflow_run')
+REVIEW_EVENTS = ('pull_request_review', 'pull_request_review_comment')   # what starts the review trigger (#88)
 MAX_PRS = 256   # a matrix runs at most 256 jobs
 MAX_SAME_HEAD = 20   # open, ready pull requests one head may have; each is judged
 RETRY_SECONDS = head_check.RETRY_SECONDS   # between two tries of a write
@@ -75,6 +80,8 @@ CALLER_PATH = re.compile(r'\.github/workflows/[A-Za-z0-9._-]+\.ya?ml')
 GATE_WORKFLOW = 'fork-head-gate.yml'
 GATE_FILES = ('.github/workflows/' + GATE_WORKFLOW, 'fork-ci/actions/head-check', 'fork-ci/actions/pr-queue')
 LIST_JQ = '.[] | [.number, .draft, .head.sha, .base.ref] | @json'
+HEAD_JQ = '.[] | [.number, .head.sha, .head.repo.full_name] | @json'   # head.repo is null for a deleted fork
+BRANCH_MAX = 255
 SERVER = 'https://github.com'
 
 
@@ -301,15 +308,76 @@ def pull_head_by_git(repo, number, env):
     return None, why
 
 
-def prs(repo, event, pr_text, gh, out, env, event_sha='', git_head=None):
+def review_run_pr(repo, run, gh, out):
+    """([{pr, sha}] or [], None) or (None, why) for a workflow_run of the review trigger. `run`: {event, sha, repo,
+    branch}, GitHub's fields of the finished run (github.event.workflow_run: event, head_sha,
+    head_repository.full_name, head_branch). The number is read from the API: the open pull requests whose head
+    branch is that branch of that repository, kept when their head is the run's sha. Never from the run's outputs,
+    artifacts or names: whatever the run did (a pull request can change its own copy of the trigger), it only says
+    "look at this head again", as an issue comment can."""
+    event, sha = str(run.get('event') or ''), str(run.get('sha') or '').strip().lower()
+    head_repo, branch = str(run.get('repo') or ''), str(run.get('branch') or '')
+    if event not in REVIEW_EVENTS:
+        out(f'nothing to judge: the run that finished was started by {event or "no event"!r}, not by a review or an '
+            f'inline review comment ({", ".join(REVIEW_EVENTS)})')
+        return [], None
+    if not (pr_queue.SHA.fullmatch(sha) and pr_queue.REPO_RE.fullmatch(head_repo) and 0 < len(branch) <= BRANCH_MAX
+            and branch.isprintable()):
+        out("nothing to judge: the run does not name a head (head sha, head repository, head branch); dispatch the "
+            'gate with the pull request number')
+        return [], None
+    owner = urllib.parse.quote(head_repo.split('/')[0], safe='')
+    query = (f'repos/{repo}/pulls?state=open&per_page=100&head={owner}:'
+             + urllib.parse.quote(branch, safe='/'))
+    r = read(gh, '--paginate', query, '--jq', HEAD_JQ)
+    if r.returncode != 0:
+        return None, f'could not list the open pull requests with the head of the review run: {said(r)}'
+    matches = []
+    for line in r.stdout.splitlines():
+        try:
+            n, head, from_repo = json.loads(line)
+        except (ValueError, TypeError):
+            return None, 'GitHub listed something that is not a pull request'
+        if not (type(n) is int and n > 0 and isinstance(head, str)
+                and pr_queue.SHA.fullmatch(head.lower()) and (from_repo is None or isinstance(from_repo, str))):
+            return None, 'GitHub listed something that is not a pull request'
+        if head.lower() == sha and isinstance(from_repo, str) and from_repo.lower() == head_repo.lower():
+            matches.append(n)
+    where = f'{sha} of {head_repo} branch {branch!r}'
+    if not matches:
+        out(f'nothing to judge: no open pull request has the head {head_check.escape(where)} (closed or merged since, '
+            'or the head moved on: its push ran the gate)')
+        return [], None
+    # One branch into two bases: every match has this head, and the gate judges a head, not a pull request (preflight
+    # lists every open pull request with it again; the number only names the job). So it is judged once.
+    first, others = min(matches), sorted(set(matches) - {min(matches)})
+    also = f'; #{first} judges it for {", ".join(f"#{n}" for n in others)} too' if others else ''
+    out(f'review run: #{first} has the head {head_check.escape(where)}{also}')
+    return [{'pr': first, 'sha': sha}], None
+
+
+def prs(repo, event, pr_text, gh, out, env, event_sha='', git_head=None, run=None):
     """The heads to judge, [{pr, sha}] (see the module's doc). target and judge judge a head as a whole; the pr only
     names the job. When the pull request read fails every try: `event_sha`, the head the event carries
-    (pull_request_target), else `git_head(repo, number, env)` (the CLI's: pull_head_by_git)."""
+    (pull_request_target), else `git_head(repo, number, env)` (the CLI's: pull_head_by_git). On a workflow_run: `run`,
+    see review_run_pr."""
     pr_text, event_sha = (pr_text or '').strip(), (event_sha or '').strip().lower()
     if event not in EVENTS:
         return refuse(out, env, f'refused on a {event or "unnamed"} event: the gate runs only on {", ".join(EVENTS)}')
     if pr_text and not NUMBER.fullmatch(pr_text):
         return refuse(out, env, f'{pr_text!r} is not a pull request number')
+    if event == 'workflow_run':
+        if pr_text:
+            return refuse(out, env, f'a workflow_run that names #{pr_text}: on a workflow_run the pull request comes '
+                          "only from the API, by the run's head")
+        if not pr_queue.REPO_RE.fullmatch(repo):
+            return refuse(out, env, f'--repo {repo!r} is not owner/name')
+        found, why = review_run_pr(repo, run or {}, gh, out)
+        if found is None:
+            return refuse(out, env, why, 'Nothing was posted: an older check run on the head stays until the next '
+                          'event on the pull request, or a dispatch with its number.')
+        set_output(env, prs=json.dumps(found, separators=(',', ':')))
+        return 0
     if not pr_text and event != 'workflow_dispatch':
         return refuse(out, env, f'a {event} event that names no pull request')
     if not pr_queue.REPO_RE.fullmatch(repo):
@@ -577,7 +645,7 @@ def bare_repository(work, name):
     except OSError as e:
         return None, f'could not make a folder in {work}: {e}'
     r = subprocess.run(['git', *pr_queue.GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
-                       capture_output=True)
+                       capture_output=True, env={**os.environ, **pr_queue.GIT_ENV})
     if r.returncode != 0:
         return None, f'git init failed: {r.stderr.strip()[:300]}'
     with open(os.path.join(path, 'config'), 'w', encoding='utf-8') as f:
@@ -730,6 +798,10 @@ def cli(argv=None, env=None, gh=gh_run, out=print, decide=head_check.decide, sle
     s.add_argument('--event', required=True)
     s.add_argument('--pr', default='')
     s.add_argument('--event-sha', default='', help='the head the event carries, used when the pull request read fails')
+    s.add_argument('--run-event', default='', help='workflow_run: the event that started the finished run')
+    s.add_argument('--run-sha', default='', help="workflow_run: the run's head sha")
+    s.add_argument('--run-repo', default='', help="workflow_run: the run's head repository, owner/name")
+    s.add_argument('--run-branch', default='', help="workflow_run: the run's head branch (give it as --run-branch=X)")
     run_arguments(sub.add_parser('target'))
     j = sub.add_parser('judge')
     run_arguments(j)
@@ -756,7 +828,8 @@ def cli(argv=None, env=None, gh=gh_run, out=print, decide=head_check.decide, sle
         return guard(a.repo, a.environment, a.secret_name, env.get('REPO_SECRET_PRESENT', ''), a.environment_only, gh,
                      out, env)
     if a.cmd == 'prs':
-        return prs(a.repo, a.event, a.pr, gh, out, env, a.event_sha, git_head)
+        return prs(a.repo, a.event, a.pr, gh, out, env, a.event_sha, git_head,
+                   run={'event': a.run_event, 'sha': a.run_sha, 'repo': a.run_repo, 'branch': a.run_branch})
     if a.cmd == 'target':
         return target(a, gh, out, env)
     if a.cmd == 'judge':

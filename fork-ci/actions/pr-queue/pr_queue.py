@@ -74,6 +74,9 @@ GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
 # commit-graph (a planted objects/info/commit-graph(s) could change the parents git reports; git rebuilds nothing from it).
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
             '--no-replace-objects')
+# ... and no global or system config: on a self-hosted runner an earlier job may have written ~/.gitconfig. The same
+# two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
@@ -117,7 +120,22 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     parent P of `head` is on `base` and head's tree is `git merge-tree --write-tree P X` byte for byte, where X is
     `read` or head's other parent when that one holds this itself (an earlier queue update: GitHub merges the new base
     into the head the queue already proved, which can be clean where a direct merge of `read` conflicts). A tree is
-    the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same."""
+    the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same.
+
+    git's output is decoded strictly by the callers. A conflict lists the conflicted files by name, and a name need
+    not be UTF-8: that is no same change (a clean merge prints only the tree id), said once, never a crash."""
+    if head == read:
+        return True
+    try:
+        return _holds(git, head, read, depth, base)
+    except UnicodeDecodeError as e:
+        print(f'::warning::pr-queue: git printed bytes that are not UTF-8 while checking {head[:12]} against the read '
+              f'{read[:12]} (a conflict naming a file whose name is not UTF-8: {e.reason}, byte {e.start}): the head '
+              'is not taken as the change read')
+        return False
+
+
+def _holds(git, head, read, depth, base):
     if head == read:
         return True
     tree = git('rev-parse', '--verify', '-q', head + '^{tree}').stdout.strip()
@@ -125,7 +143,7 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     for p in parents:
         if git('merge-base', '--is-ancestor', p, base).returncode != 0:
             continue
-        sides = [read] + [h for h in parents if h != p and depth > 1 and holds(git, h, read, depth - 1, base)]
+        sides = [read] + [h for h in parents if h != p and depth > 1 and _holds(git, h, read, depth - 1, base)]
         for side in dict.fromkeys(sides):
             m = git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', p, side)
             if m.returncode == 0 and tree and m.stdout.split()[:1] == [tree]:
@@ -372,7 +390,7 @@ class Queue:
         token = self.read_token
         env = self.gh_env(token) if token else {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
         return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0'})
+                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0', **GIT_ENV})
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
@@ -428,7 +446,7 @@ class Queue:
             print(f'could not make {new}: {e}')
             return False
         r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True, env=no_token_env())
+                           capture_output=True, env={**no_token_env(), **GIT_ENV})
         if r.returncode != 0:
             print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
             return False

@@ -12,7 +12,9 @@ queue's own rules, imported, never copied:
     reads the inline review comments (on a line of the diff), which count like any other comment.
   - pr_queue.holds: the head is that commit, or a clean merge of the base into it, byte for byte (a queue update).
 The config is the queue's own JSON file (config.py), read from the base commit, so the check and the queue read the
-same people and override, and a pull request cannot change them for its own check.
+same people and override, and a pull request cannot change them for its own check. The config the merge would leave is
+read for one thing only: it must parse, under size caps, or the head is refused (merged_config_problem), since merged
+it would refuse every head after it.
 `--required-lenses` (the project's, per pull request if it likes) adds lenses that must be among the reads.
 The config's optional `review` block (../pr-queue/README.md, "Review rules") names lenses by changed path: the paths
 are `git diff --name-status -M` from the merge base to the head (changed_paths), judged by review_judge.judge. In
@@ -43,6 +45,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import config  # noqa: E402
 import lens  # noqa: E402
 import pr_queue  # noqa: E402
+import review_config  # noqa: E402
 import review_judge  # noqa: E402
 
 ATTEMPTS, RETRY_SECONDS = 3, 10
@@ -77,7 +80,7 @@ class Checkout:
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
                                   errors=errors, capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-                                                            'GIT_ATTR_NOSYSTEM': '1'})
+                                                            'GIT_ATTR_NOSYSTEM': '1', **pr_queue.GIT_ENV})
 
     def problem(self):
         """Why the repository cannot be read as git made it, or None: not a git folder, shallow (the base's history is
@@ -267,8 +270,8 @@ def changed_paths(checkout, base, head):
         # other (review_judge.shown writes them as \xNN), never a UnicodeDecodeError that fails the head unexplained.
         d = checkout.git('diff', '--no-ext-diff', '--no-textconv', '--no-relative', '--ignore-submodules=none',
                          '--no-color', '--name-status', '-z', '-M', b, head, '--', errors='surrogateescape')
-        if d.returncode != 0:
-            return None, f'git diff {b[:12]} {head[:12]} failed: {(d.stderr or "").strip()[:200]}'
+        if d.returncode != 0:   # stderr as \xNN too (backslashreplace): a lone surrogate cannot be printed as UTF-8
+            return None, f'git diff {b[:12]} {head[:12]} failed: {review_judge.shown((d.stderr or "").strip()[:200])}'
         try:
             changes += review_judge.parse_name_status(d.stdout)
         except review_judge.JudgeError as e:
@@ -310,6 +313,10 @@ def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out
     cfg, paths = None, None
     if not problems:
         cfg = base_config(checkout, config_path, problems)
+    if cfg is not None:
+        why = merged_config_problem(checkout, config_path)
+        if why:
+            problems.append(why)
     if cfg is not None and cfg.review is not None:
         paths, why = path_judgement(checkout, cfg.review, config_path)
         if paths is None:
@@ -383,6 +390,24 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
     return code
 
 
+# Caps on a config a pull request writes, checked before it is parsed: the rule order check searches every pair of
+# globs (review_config._shadowed), so its work grows with the square of the glob characters. Measured: a 20 KB config
+# of two long globs took 2.9 GB, 100 rules took 15.6 s. Under these caps the worst shapes take about a second
+# (head_check.test.py, HostileConfig). The base's own config is never capped: a pull request that leaves it as it is
+# is not read again (merged_config_problem).
+MAX_CONFIG_BYTES = 32 * 1024
+MAX_GLOB_LENGTH = 128   # characters of one glob in review.rules[].paths
+MAX_GLOB_TOTAL = 2048   # characters of all of them together
+LOCKS = ('the base config would refuse every pull request after it, the one that fixes it too, and the queue would '
+         'stop')
+
+
+def repo_path(path):
+    """The config's path in a tree: `git show rev:./x` resolves against the work tree, and a bare repository has
+    none."""
+    return path[2:] if path.startswith('./') else path
+
+
 def base_config(checkout, path, problems):
     """The queue's config as the base commit holds it (the merge commit's first parent), never the pull request's own
     copy: a pull request cannot widen whose comments count for its own check. None with a problem added."""
@@ -392,8 +417,7 @@ def base_config(checkout, path, problems):
         return None
     # Bare, the base is the tip the gate read from GitHub's API, fetched by sha: what the pull request's branch says
     # about its own config is never read.
-    rel = path[2:] if path.startswith('./') else path
-    r = checkout.git('show', f'{parents[0]}:{rel}')
+    r = checkout.git('show', f'{parents[0]}:{repo_path(path)}')
     if r.returncode != 0:
         problems.append(f'the base commit {parents[0][:12]} has no config {path}')
         return None
@@ -402,6 +426,121 @@ def base_config(checkout, path, problems):
     except config.ConfigError as e:
         problems.append(str(e))
         return None
+
+
+def merged_config_problem(checkout, path):
+    """Why the config this pull request would merge must not merge, or None. The config that judges a head is the
+    base's, so a head is judged by the old config and could merge a new one that does not parse (or is in enforce with
+    a rule order enforce refuses, or is deleted); after it, the base config refuses every head, the one that fixes it
+    too, and the queue stops. So the config the merge leaves must parse (config.parse), under the caps above. It is
+    the merge's, never the head's own copy: two pull requests that each leave a good config can merge into a bad one,
+    and an older head's stale copy says nothing once an owner fixed the base. Checkout mode reads GitHub's merge commit
+    (HEAD), bare mode `git merge-tree` of the base and the head (a head that does not merge cleanly is refused: the
+    merged config is unknown, and GitHub cannot merge it either). The merged config is never used for anything else:
+    the rules that judge the head stay the base's. Any exception is a refusal that says why, never a crash or a pass."""
+    parents = checkout.merge_parents()
+    if not parents:
+        return None   # base_config refused it already
+    try:
+        return _merged_config_problem(checkout, path, *parents)
+    except Exception as e:   # unknown never passes
+        return (f'the config {path} this pull request would merge could not be checked, so it is not passed: '
+                f'{type(e).__name__}: {review_judge.shown(str(e))[:300]}')
+
+
+def _merged_config_problem(checkout, path, base, head):
+    rel = repo_path(path)
+    merged = 'HEAD'
+    if checkout.bare:
+        m = checkout.git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', base, head,
+                         errors='surrogateescape')
+        tree = (m.stdout or '').split()[:1]
+        if m.returncode == 1:
+            return (f'the head {head[:12]} does not merge cleanly into the base {base[:12]}, so the config it would '
+                    'merge is unknown: merge the base into the branch and resolve the conflict')
+        if m.returncode != 0 or not tree or not SHA.fullmatch(tree[0]):
+            said = review_judge.shown((m.stderr or m.stdout or '').strip()[:200])
+            return f'git merge-tree of the base {base[:12]} and the head {head[:12]} failed: {said}'
+        merged = tree[0]
+    new = checkout.git('rev-parse', '--verify', '-q', f'{merged}:{rel}')
+    if new.returncode != 0:
+        return (f'merged, this pull request deletes {path}: {LOCKS}. To stop using the queue, take its checks out of '
+                'the branch ruleset first')
+    old = checkout.git('rev-parse', '--verify', '-q', f'{base}:{rel}')
+    if old.returncode == 0 and old.stdout.strip() == new.stdout.strip():
+        return None   # the merge leaves the base's own config, which base_config parsed
+    oid = new.stdout.strip()
+    kind = checkout.git('cat-file', '-t', oid).stdout.strip()
+    if kind != 'blob':
+        what = review_judge.shown(kind[:20]) or 'thing'
+        return f'merged, this pull request leaves {path} as a {what}, not a file: {LOCKS}'
+    size = checkout.git('cat-file', '-s', oid).stdout.strip()
+    if not size.isdigit() or int(size) > MAX_CONFIG_BYTES:
+        return config_size_problem(path, size)
+    r = checkout.git('cat-file', 'blob', oid)
+    if r.returncode != 0:
+        said = review_judge.shown(r.stderr or '')[:200]
+        return f'the config {path} this pull request would merge could not be read: {said}'
+    return config_text_problem(r.stdout, path)
+
+
+def config_size_problem(path, size):
+    return (f'merged, this pull request leaves {path} at {size} bytes, over the {MAX_CONFIG_BYTES} bytes the check '
+            'reads of a config a pull request writes: keep it smaller')
+
+
+def glob_cap_problem(raw):
+    """Why the raw config's review globs are over the caps, or None. Only what config.parse would search is counted;
+    anything of another shape is left to config.parse, which refuses it without a search."""
+    block = raw.get('review') if isinstance(raw, dict) else None
+    rules = block.get('rules') if isinstance(block, dict) else None
+    if not isinstance(rules, list):
+        return None
+    total = 0
+    for i, rule in enumerate(rules):
+        globs = rule.get('paths') if isinstance(rule, dict) else None
+        for g in globs if isinstance(globs, list) else ():
+            if isinstance(g, str):
+                if len(g) > MAX_GLOB_LENGTH:
+                    return (f'rules[{i}].paths has a glob of {len(g)} characters, over the {MAX_GLOB_LENGTH} the check '
+                            'reads in a config a pull request writes')
+                total += len(g)
+    if total > MAX_GLOB_TOTAL:
+        return (f'globs of {total} characters in all, over the {MAX_GLOB_TOTAL} the check reads in a config a pull '
+                'request writes')
+    return None
+
+
+def config_text_problem(text, path):
+    """Why the config text a merge would leave must not merge, or None: over the caps, or it does not parse
+    (config.parse: an enforce block with a rule order enforce refuses is one such). Any exception is a refusal."""
+    try:
+        size = len(text.encode('utf-8', 'surrogateescape'))
+        if size > MAX_CONFIG_BYTES:
+            return config_size_problem(path, size)
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            raw = None   # config.parse names it
+        why = glob_cap_problem(raw)
+        if why:
+            return f'merged, this pull request leaves {path} with {why}: keep the rules shorter'
+        try:
+            config.parse(text, f'{path} after the merge')
+        except config.ConfigError as e:
+            block = raw.get('review') if isinstance(raw, dict) else None
+            order = (review_config.enforce_order_problems(block)
+                     if isinstance(block, dict) and block.get('mode') == 'enforce' else [])
+            if order:
+                return (f'merged, this pull request leaves {path} in mode enforce with a rule order enforce refuses: '
+                        f'{"; ".join(order)}. {LOCKS[0].upper()}{LOCKS[1:]}: fix the rule order first (or keep mode '
+                        'shadow until it is fixed)')
+            return (f'merged, this pull request leaves {path} a config that does not parse: {e}. Then {LOCKS}: fix '
+                    'it first')
+        return None
+    except Exception as e:   # RecursionError, MemoryError, ...: unknown never passes
+        return (f'the config {path} this pull request would merge could not be checked, so it is not passed: '
+                f'{type(e).__name__}: {review_judge.shown(str(e))[:300]}')
 
 
 if __name__ == '__main__':

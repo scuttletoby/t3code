@@ -44,7 +44,12 @@ check runs (`head_check_app`, [pr-queue](../../fork-ci/actions/pr-queue/README.m
 - **Lens comments.** A lens comment is only as good as the people allowed to post it (the config's
   `lens_author_associations`). Who may post them once agents use App tokens is open (lens identity).
 - **Stale answers.** The gate judges the comments that exist when it runs. Reviews and inline diff
-  comments do not start it (see the README's "Run again after a review").
+  comments start it through the review trigger, except when that does not run (see the README's "Run
+  again after a review"). The trigger is a convenience, not a guard: withdrawing a lens read (deleting
+  an inline lens comment, editing a review) runs the gate again only through the pull request's own
+  copy of the trigger, and another pull request may be able to cancel those runs through the shared
+  concurrency group name (not tested live). A stale answer, which can be a pass, then stays. To
+  withdraw a lens read, post an issue comment on the pull request or dispatch the gate.
 - **Ordinary CI jobs.** A pull request can still weaken an ordinary job of its own workflow. The gate
   catches that only through review: the reviewers read the exact head, and the gate cannot be
   rewritten.

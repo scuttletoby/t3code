@@ -95,8 +95,9 @@ watches; it changes nothing on the machine, and `0` turns it off.
 4. An agent tool may not write it: `FORK_AGENT_WRITABLE_KEYS` stays empty unless a pull request gives
    the reason.
 5. Add its row and section to [README.md](README.md) and name it in
-   [FORK_CHANGES.md](../../FORK_CHANGES.md); `packages/shared/src/forkDocs.test.ts` fails until both
-   match the row in `forkDefaults.ts`.
+   [FORK_CHANGES.md](../../FORK_CHANGES.md); `packages/shared/src/forkDocs.test.ts` (the README) and
+   `.github/scripts/fork-changes-list.test.cjs` (FORK_CHANGES.md) fail until both match the row in
+   `forkDefaults.ts`.
 
 A key written straight into `settings.ts` is refused by the seam check, whatever its comment says.
 
@@ -125,7 +126,8 @@ change, or a fork line beyond the seams, it stops and opens one issue. Then:
    default: keep the fork's value (and the `Fork:` comment of the inline `automaticUpdates`).
 2. Check that the fork's lines in upstream files are only the seams:
    `node .github/scripts/fork-seam-check.cjs --from-upstream <upstream tag> HEAD`. A refused line moves into the
-   fork's own file (a setting into `forkSettings.ts`); a changed seam line is fixed in
+   fork's own file (a setting into `forkSettings.ts`, a server layer into
+   `apps/server/src/fork/forkLayers.ts`); a changed seam line is fixed in
    `.github/fork-seams.json`.
 3. Run the pin tests before pushing:
    `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.

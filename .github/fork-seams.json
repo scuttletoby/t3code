@@ -69,6 +69,27 @@
         "continueThreadsAfterServerUpdate: false,",
         "automaticUpdates: false,"
       ]
+    },
+    "packages/shared/src/AgentScope.ts": {
+      "why": "The slot observer (apps/server/src/slots/SlotObserver.ts) reads an agent's memory from its own systemd scope; one optional method on upstream's interface asks for it.",
+      "added": [
+        "/** Fork: the thread's own systemd scope and slice, for reading its memory; none when shared. */",
+        "readonly ownScope?: (",
+        "threadId: string,",
+        ") => Effect.Effect<{ unit: string; slice: string } | undefined>;"
+      ]
+    },
+    "apps/server/src/process/agentScope.ts": {
+      "why": "The scope map is private to upstream's make(); the fork's ownScope (see packages/shared/src/AgentScope.ts) is a 7-line lookup in it.",
+      "added": [
+        "ownScope: (threadId) =>",
+        "Effect.sync(() => {",
+        "const tracked = scopeByThread.get(threadId);",
+        "return tracked === undefined || tracked.shared",
+        "? undefined",
+        ": { unit: tracked.unit, slice: ownedSlice };",
+        "}),"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -105,7 +126,7 @@
     "apps/server/src/scheduling/DueHint.ts": 5,
     "apps/server/src/scheduling/Scheduler.test.ts": 24,
     "apps/server/src/scheduling/Scheduler.ts": 13,
-    "apps/server/src/server.ts": 39,
+    "apps/server/src/server.ts": 10,
     "apps/server/src/serverRuntimeStartup.ts": 54,
     "apps/server/src/serverRuntimeState.test.ts": 21,
     "apps/server/src/serverRuntimeState.ts": 4,
@@ -173,6 +194,8 @@
     "apps/web/src/components/settings/WaitsAndSlotsSettings*",
     "apps/web/src/components/settings/waitsAndSlotsSettings*",
     "packages/contracts/src/editor.test.ts",
+    "packages/contracts/src/handoff.test.ts",
+    "packages/contracts/src/handoff.ts",
     "packages/contracts/src/mcpProfile*",
     "packages/contracts/src/playtest*",
     "packages/contracts/src/usagePacing.ts",

@@ -201,7 +201,8 @@ trusted, not only helpful ([issue 34](https://github.com/scuttletoby/t3code/issu
 How it works:
 
 - A caller on the default branch ([`gate-caller.example.yml`](gate-caller.example.yml))
-  runs on `pull_request_target`, `issue_comment` and `workflow_dispatch`.
+  runs on `pull_request_target`, `issue_comment`, `workflow_dispatch` and
+  `workflow_run` of the review trigger (see "Run again after a review").
   For a pull request into the default branch GitHub takes that file from the
   default branch, so a pull request that edits it changes nothing for its own
   run. The caller passes `secrets: inherit` (see "What it does not stop").
@@ -279,7 +280,9 @@ Setup (the repository owner's steps; nothing here creates them):
 4. Copy the example caller to `.github/workflows/` on the default branch, fill
    in the check name, config path and required lenses (at least one, unless the
    config's `review` block is in `enforce`: then the path rules name them and
-   the input may be empty), and pin the release.
+   the input may be empty), and pin the release. Copy
+   [`review-trigger.example.yml`](review-trigger.example.yml) next to it,
+   unchanged (the caller names it by its `name`).
 5. Dispatch it once without a number (the backfill), so open pull requests get
    the check under its name.
 6. Bind the required check to the App: in a ruleset, the required status
@@ -299,17 +302,68 @@ request. The same holds for the `review` block's path rules and for switching
 its `mode` from `shadow` to `enforce`: each open pull request is judged by the
 new rules at its next run, so dispatch the backfill right after the change.
 
-**Run again after a review.** Reviews and inline diff comments
-(`pull_request_review`, `pull_request_review_comment`) do not start the gate,
-though the rules count them (a lens may post as a review or on a line). GitHub
-runs those two events from the pull request's own merge commit, not from the
-default branch: the pull request's copy of the caller runs, the Environment
-(default branch only) refuses it, and it could never post. After a lens posts
-as a review or on a line of the diff, or deletes one, post an issue comment on
-the pull request or dispatch the gate with its number. A new push, ready or
-draft, a base change and any issue comment start it anyway. A trusted way to
-run on reviews is open:
-[issue 88](https://github.com/scuttletoby/t3code/issues/88).
+**Run again after a review.** The rules count reviews and inline diff
+comments (a lens may post as a review or on a line), so a review submitted,
+edited or dismissed and an inline comment written, edited or deleted run the
+gate again, through two workflows
+([issue 88](https://github.com/scuttletoby/t3code/issues/88)):
+
+- GitHub runs `pull_request_review` and `pull_request_review_comment` from
+  the pull request's own merge commit, not from the default branch, so the
+  caller cannot listen to them itself: the pull request's copy would run, and
+  the Environment (default branch only) would refuse it. The review trigger
+  ([`review-trigger.example.yml`](review-trigger.example.yml)) listens to them
+  instead. It does nothing but finish: no token, no secrets, nothing checked
+  out. Of a burst on one pull request only the newest run finishes (the older
+  ones are cancelled).
+- The caller runs on `workflow_run` of it (`completed`, and only a run that
+  succeeded). `workflow_run` runs from the default branch, so the Environment
+  allows it. The gate takes no number from that run: it reads the open pull
+  requests whose head branch is the run's head branch in the run's head
+  repository and keeps the one whose head is the run's head sha (all three
+  are GitHub's fields of the run, never its outputs, artifacts or names). A
+  match is judged like an issue comment on it. More than one (one branch into
+  two bases, so every match has the same head): the gate judges a head, not a
+  pull request, so the lowest number judges it once for all of them, and the
+  log names the others. None (closed or merged since, or the head moved on:
+  the push ran the gate already): nothing is judged and the log says why.
+- Review trigger runs on one head wait in one group per caller: one judges,
+  the newest waits, the ones in between are dropped while they wait. A run is
+  never cancelled half-way (that would post a failure on the head). In the
+  caller, every other event has a group of its own, so a review run never
+  drops it there. The gate job's own group (per head and check name) is
+  shared by all events, so a later review run's gate job can replace a
+  comment's or a push's gate job still waiting on the same head. That is
+  harmless: the newer job reads the newest state of the same head.
+
+Why a pull request gains nothing from this: it can change its own copy of
+the trigger (that copy is the one that runs), or add any workflow of the same
+name, but the caller only learns "look at this head again", which any issue
+comment on the pull request can already say. A run from a fork carries the
+fork as its head repository, so a fork that copies another pull request's
+head sha finds only its own pull request, and the head is judged as a whole
+anyway. A pull request that removes or breaks its copy only stops runs on
+itself.
+
+The trigger is a convenience, not a guard. Withdrawing a lens read (deleting
+an inline lens comment, editing a review) runs the gate again only through
+the pull request's own copy of the trigger, which the pull request controls.
+Concurrency groups are shared across the repository, so another pull
+request's workflow may be able to cancel those runs through the same group
+name (not tested live). Until a push, an issue comment or a dispatch, the old
+answer, which can be a pass, stays. To withdraw a lens read, post an issue
+comment on the pull request or dispatch the gate: the review trigger may not
+run.
+
+Fallback: when the trigger does not run (a fork's run waiting for approval,
+a review posted with a workflow's `GITHUB_TOKEN`, which starts no workflow,
+a pull request with a merge conflict, on which GitHub runs no
+`pull_request*` workflow, or a project that has not copied it yet), post an
+issue comment on the pull request or dispatch the gate with its number. A new
+push, ready or draft, a base change and any issue comment start the gate
+anyway. Copy the new caller
+only together with a gate release that knows `workflow_run`: an older gate
+refuses that event (its guard job fails, nothing is posted).
 
 **Runs again, stops half-way, old state.** Every way a run can end leaves the
 head "not passed" unless it judged the head and the head passed.
@@ -344,6 +398,10 @@ head "not passed" unless it judged the head and the head passed.
     gate.
   - The head is unknown: on an issue comment or a dispatch with a number, the
     pull request read and git's `refs/pull/N/head` both fail every try.
+  - A review trigger's run whose pull request cannot be found: the list of
+    open pull requests with its head fails every try (the guard job fails), or
+    no open pull request has its head (nothing to judge, the log says why).
+    More than one is no such case: the lowest number judges the head once.
   - The backfill cannot list the open pull requests after its tries, or finds
     more than 256 heads. Dispatch again (or once per pull request).
   - A step before start fails for a reason of GitHub or the runner, never
