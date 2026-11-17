@@ -333,10 +333,18 @@ test("a malformed config throws instead of guarding nothing", () => {
     // "lost": a count of 1 or more for a listed seam or pending file.
     { files: SEAM, lost: [] },
     { files: SEAM, lost: "a.ts" },
-    { files: SEAM, lost: { "a.ts": 0 } },
-    { files: SEAM, lost: { "a.ts": 1.5 } },
-    { files: SEAM, lost: { "a.ts": "2" } },
-    { files: SEAM, lost: { "b.ts": 1 } },
+    { files: SEAM, lost: { "a.ts": 2 } },
+    { files: SEAM, lost: { "a.ts": null } },
+    { files: SEAM, lost: { "a.ts": [2, 1] } },
+    { files: SEAM, lost: { "a.ts": { lines: 0, gone: 0 } } },
+    { files: SEAM, lost: { "a.ts": { lines: 1.5, gone: 0 } } },
+    { files: SEAM, lost: { "a.ts": { lines: "2", gone: 0 } } },
+    { files: SEAM, lost: { "a.ts": { lines: 2 } } },
+    { files: SEAM, lost: { "a.ts": { lines: 2, gone: -1 } } },
+    { files: SEAM, lost: { "a.ts": { lines: 2, gone: 0.5 } } },
+    { files: SEAM, lost: { "a.ts": { lines: 2, gone: 3 } } },
+    { files: SEAM, lost: { "a.ts": { lines: 2, gone: 1, why: "x" } } },
+    { files: SEAM, lost: { "b.ts": { lines: 1, gone: 0 } } },
     ...["/abs", "../up", "**", "*", "!", "a/../b"].map((pattern) => ({
       files: {},
       forkFiles: [pattern],
@@ -350,7 +358,7 @@ test("a malformed config throws instead of guarding nothing", () => {
     forkFiles: [],
     lost: {},
   });
-  const lost = { "a.ts": 2, "p.ts": 1 };
+  const lost = { "a.ts": { lines: 2, gone: 0 }, "p.ts": { lines: 1, gone: 1 } };
   assert.deepEqual(
     parseConfig(JSON.stringify({ files: SEAM, pending: { "p.ts": 1 }, lost })).lost,
     lost,
@@ -749,15 +757,16 @@ test("a seam file keeps upstream's lines in order: deleting, moving or re-indent
       [{ "a.ts": GUARD_BASE }, true],
     ]) {
       const { reasons } = lostIn(config, base, { "a.ts": head }, upstream);
-      assert.equal(reasons.length, 1, `${upstream} ${head}`);
+      // From upstream a deleted line also counts as one whose text is gone.
+      const deleted = upstream && !head.includes("authorized");
+      assert.equal(reasons.length, deleted ? 2 : 1, `${upstream} ${head}`);
       assert.match(reasons[0], /^a\.ts: 1 upstream line deleted, moved or re-indented/);
     }
   }
-  // Its own seam lines may move or go, and lines may be added around upstream's.
+  // Its own seam lines may go, and lines may be added around upstream's.
   for (const head of [
-    "forkHook();\nimport { x } from './x';\nif (!authorized) return;\ndoSensitive();\n",
     GUARD_BASE,
-    `import { x } from './x';\n\nif (!authorized) return;\n...fork,\ndoSensitive();\n`,
+    `import { x } from './x';\n\nif (!authorized) return;\n...fork,\ndoSensitive();\nforkHook();\n`,
   ]) {
     assert.deepEqual(lostIn(config, main, { "a.ts": head }, false), {
       reasons: [],
@@ -765,61 +774,143 @@ test("a seam file keeps upstream's lines in order: deleting, moving or re-indent
       notes: [],
     });
   }
+  // A moved seam line is refused on a pull request: a moved copy of a listed line looks the same
+  // as upstream's line with that text (`}`). Moving one takes two pull requests (drop, then add).
+  const moved = "forkHook();\nimport { x } from './x';\nif (!authorized) return;\ndoSensitive();\n";
+  assert.match(
+    lostIn(config, main, { "a.ts": moved }, false).reasons[0],
+    /^a\.ts: 1 upstream line deleted, moved or re-indented by this change/,
+  );
 });
 
-test('from upstream, a seam or pending file\'s lost upstream lines are held to its "lost" count', () => {
+test('from upstream, a seam or pending file\'s lost upstream lines are held to its "lost" counts', () => {
   const pendingConfig = (lost) => ({ pending: { "p.ts": 1 }, lost });
   const base = { "p.ts": GUARD_BASE };
   const dropGuard = { "p.ts": "import { x } from './x';\ndoSensitive();\nforkA();\n" };
   const moveGuard = {
     "p.ts": "import { x } from './x';\ndoSensitive();\nif (!authorized) return;\nforkA();\n",
   };
-  for (const head of [dropGuard, moveGuard]) {
+  for (const [head, gone] of [
+    [dropGuard, 1],
+    [moveGuard, 0],
+  ]) {
     assert.deepEqual(lostIn(pendingConfig({}), base, head, true).reasons, [
-      "p.ts: 1 upstream line deleted, moved or re-indented, more than its \"lost\" count of 0 (keep upstream's lines; a fork change goes in a file of the fork's own).",
+      "p.ts: 1 upstream line deleted, moved or re-indented, more than its \"lost\" lines count of 0 (keep upstream's lines; a fork change goes in a file of the fork's own).",
+      ...(gone
+        ? [
+            "p.ts: 1 upstream line deleted or changed (its text is gone), more than its \"lost\" gone count of 0 (keep upstream's lines; a fork change goes in a file of the fork's own).",
+          ]
+        : []),
     ]);
-    // Exactly the count passes.
-    assert.deepEqual(lostIn(pendingConfig({ "p.ts": 1 }), base, head, true), {
+    // Exactly the counts pass.
+    assert.deepEqual(lostIn(pendingConfig({ "p.ts": { lines: 1, gone } }), base, head, true), {
       reasons: [],
       ceilings: [],
       notes: [],
     });
   }
-  // One over the count is refused.
+  // One over a count is refused.
   const both = { "p.ts": "doSensitive();\nforkA();\n" };
-  assert.equal(lostIn(pendingConfig({ "p.ts": 1 }), base, both, true).reasons.length, 1);
+  assert.equal(
+    lostIn(pendingConfig({ "p.ts": { lines: 1, gone: 1 } }), base, both, true).reasons.length,
+    2,
+  );
   // A count above the lines lost is a ceiling to lower (a note right after a rebase).
   const kept = { "p.ts": `${GUARD_BASE}forkA();\n` };
-  assert.deepEqual(lostIn(pendingConfig({ "p.ts": 1 }), base, kept, true), {
+  assert.deepEqual(lostIn(pendingConfig({ "p.ts": { lines: 1, gone: 1 } }), base, kept, true), {
     reasons: [],
     ceilings: [
-      'p.ts: no upstream lines deleted, moved or re-indented, below its "lost" count of 1; remove it from "lost".',
+      'p.ts: no upstream lines deleted, moved or re-indented, below its "lost" entry; remove it from "lost".',
     ],
     notes: [],
   });
-  assert.deepEqual(lostIn(pendingConfig({ "p.ts": 2 }), base, dropGuard, true, true), {
-    reasons: [],
-    ceilings: [],
-    notes: [
-      'p.ts: 1 upstream line deleted, moved or re-indented, below its "lost" count of 2; lower it to 1.',
-    ],
-  });
+  assert.deepEqual(
+    lostIn(pendingConfig({ "p.ts": { lines: 2, gone: 1 } }), base, dropGuard, true, true),
+    {
+      reasons: [],
+      ceilings: [],
+      notes: [
+        'p.ts: 1 upstream line deleted, moved or re-indented, below its "lost" lines count of 2; lower it to 1.',
+      ],
+    },
+  );
   // On a pull request a pending file's own lines cannot be told from upstream's: the PR may move a
   // fork line out, so only the run from upstream counts them.
   assert.deepEqual(lostIn(pendingConfig({}), kept, dropGuard, false).reasons, []);
-  // A seam file from upstream: the same count.
+  // A seam file from upstream: the same counts.
   const seamConfig = (lost) => ({ files: GUARD_SEAM, lost });
   const seamHead = { "a.ts": "import { x } from './x';\ndoSensitive();\nforkHook();\n" };
-  assert.equal(lostIn(seamConfig({}), { "a.ts": GUARD_BASE }, seamHead, true).reasons.length, 1);
+  assert.equal(lostIn(seamConfig({}), { "a.ts": GUARD_BASE }, seamHead, true).reasons.length, 2);
+  const held = { "a.ts": { lines: 1, gone: 1 } };
+  assert.deepEqual(lostIn(seamConfig(held), { "a.ts": GUARD_BASE }, seamHead, true).reasons, []);
+  // On a pull request the count does not widen a seam file: no upstream line may go.
+  assert.equal(lostIn(seamConfig(held), { "a.ts": GUARD_BASE }, seamHead, false).reasons.length, 1);
+});
+
+// Right after a rebase only a count left too high is a note; one exceeded still stops the run.
+test("after a rebase, a lost count exceeded is still refused", () => {
+  const config = { pending: { "p.ts": 1 }, lost: { "p.ts": { lines: 1, gone: 1 } } };
+  const base = { "p.ts": GUARD_BASE };
+  const head = { "p.ts": "doSensitive();\nforkA();\n" };
+  const { reasons, notes } = lostIn(config, base, head, true, true);
+  assert.equal(reasons.length, 2, reasons.join("\n"));
+  assert.match(reasons[0], /^p\.ts: 2 upstream lines deleted, moved or re-indented, more than/);
+  assert.deepEqual(notes, []);
+});
+
+// Main's list pins generic seam lines (`}`, `/**`) in serverSettings.ts. Filtering every copy of
+// them out let an upstream line move past an upstream `}` unseen, in both runs.
+const BRACE_UP = [
+  "for (const key of keys) {",
+  "  if (!Equal.equals(currentRecord[key], defaultsRecord[key])) {",
+  "    next[key] = currentRecord[key];",
+  "  }",
+  "}",
+  "",
+].join("\n");
+const BRACE_MOVED = BRACE_UP.replace(
+  "    next[key] = currentRecord[key];\n  }\n",
+  "  }\n    next[key] = currentRecord[key];\n",
+);
+const BRACE_SEAM = { "s.ts": { why: "test", added: ["}", "/**", "forkHook();"] } };
+test("a line moved past an upstream copy of a listed seam line is refused on a pull request", () => {
+  // Main: upstream's text plus the fork's listed `}` and hook.
+  const main = { "s.ts": `${BRACE_UP}forkHook();\n}\n` };
+  const head = { "s.ts": `${BRACE_MOVED}forkHook();\n}\n` };
+  assert.match(
+    lostIn({ files: BRACE_SEAM }, main, head, false).reasons[0] ?? "",
+    /^s\.ts: 1 upstream line deleted, moved or re-indented by this change/,
+  );
+  // Dropping the fork's own `}` (a copy main has beyond upstream's) still passes ...
   assert.deepEqual(
-    lostIn(seamConfig({ "a.ts": 1 }), { "a.ts": GUARD_BASE }, seamHead, true).reasons,
+    lostIn({ files: BRACE_SEAM }, main, { "s.ts": `${BRACE_UP}forkHook();\n` }, false).reasons,
     [],
   );
-  // On a pull request the count does not widen a seam file: no upstream line may go.
-  assert.equal(
-    lostIn(seamConfig({ "a.ts": 1 }), { "a.ts": GUARD_BASE }, seamHead, false).reasons.length,
-    1,
+  // ... but only as many copies as the list names: dropping upstream's `}` too is refused.
+  const both = { "s.ts": `${BRACE_UP.replace(/\}\n$/, "")}forkHook();\n` };
+  assert.match(
+    lostIn({ files: BRACE_SEAM }, main, both, false).reasons[0] ?? "",
+    /^s\.ts: 1 upstream line deleted, moved or re-indented by this change/,
   );
+});
+
+test("from upstream, a line moved past a listed seam line is counted", () => {
+  const up = { "s.ts": BRACE_UP };
+  assert.match(
+    lostIn({ files: BRACE_SEAM }, up, { "s.ts": BRACE_MOVED }, true).reasons[0] ?? "",
+    /^s\.ts: 1 upstream line deleted, moved or re-indented, more than its "lost" lines count of 0/,
+  );
+  // The fork's added seam lines (another `}`) lose no upstream line.
+  assert.deepEqual(
+    lostIn({ files: BRACE_SEAM }, up, { "s.ts": `${BRACE_UP}forkHook();\n}\n` }, true).reasons,
+    [],
+  );
+});
+
+// A seam line the file indents still matches its listed (trimmed) text when a pull request drops it.
+test("a pull request may drop an indented seam line", () => {
+  const main = { "a.ts": `${GUARD_BASE}    forkHook();\n` };
+  assert.deepEqual(lostIn({ files: GUARD_SEAM }, main, { "a.ts": GUARD_BASE }, false).reasons, []);
 });
 
 test("lostLines counts the base lines not kept in order (longest common subsequence)", () => {
@@ -1005,7 +1096,10 @@ test('from upstream, a list with no "lost" counts refuses a seam file that lost 
     const result = fromUpstream(upstream, series);
     assert.equal(result.status, 1);
     assert.match(result.stderr, /- a\.ts: 1 upstream line deleted, moved or re-indented/);
-    const recorded = commit(seams({ files: GUARD_SEAM, lost: { "a.ts": 1 } }), "record it");
+    const recorded = commit(
+      seams({ files: GUARD_SEAM, lost: { "a.ts": { lines: 1, gone: 1 } } }),
+      "record it",
+    );
     assert.equal(fromUpstream(upstream, recorded).status, 0);
     // On a pull request to that main, moving an upstream line adds none, and is still refused.
     const pr = commit({ "a.ts": "doSensitive();\nimport { x } from './x';\nforkHook();\n" }, "PR");
@@ -1016,5 +1110,56 @@ test('from upstream, a list with no "lost" counts refuses a seam file that lost 
       /- a\.ts: 1 upstream line deleted, moved or re-indented by this change/,
     );
     assert.doesNotMatch(moved.stderr, /adds/);
+  });
+});
+
+// A count is a number, not a set of lines: an upstream line the fork re-indented already counts
+// as lost, so deleting it later left the ordered count the same, and both runs passed.
+test("from upstream, deleting an upstream line already counted as re-indented is refused", () => {
+  withRepo(({ git, commit, run, fromUpstream }) => {
+    const guard = "if (!req.authorized) {\n  return deny();\n}\nserve();\n";
+    const upstream = commit({ "p.ts": guard }, "upstream");
+    const reindented = "  if (!req.authorized) {\n    return deny();\n  }\nserve();\nforkA();\n";
+    const config = { files: {}, pending: { "p.ts": 1 }, lost: { "p.ts": { lines: 3, gone: 0 } } };
+    const main = commit({ ...seams(config), "p.ts": reindented }, "fork re-indents the guard");
+    const first = fromUpstream(upstream, main);
+    assert.equal(first.status, 0, first.stderr);
+    git("checkout", "-q", "-b", "pr", main);
+    const pr = commit({ "p.ts": reindented.replace("    return deny();\n", "") }, "delete it");
+    // The pull request's run cannot tell upstream's lines from the fork's in a pending file ...
+    assert.equal(run(main, pr).status, 0);
+    // ... and the run from upstream refuses it: the line's text is gone.
+    const result = fromUpstream(upstream, pr);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(
+      result.stderr,
+      /- p\.ts: 1 upstream line deleted or changed \(its text is gone\), more than its "lost" gone count of 0/,
+    );
+  });
+});
+
+// The "lost" ceilings used to be dropped in main() with every test still passing.
+test("from upstream, a lost count left too high is refused, naming the count; after a rebase it is a note", () => {
+  withRepo(({ commit, fromUpstream }) => {
+    const upstream = commit({ "p.ts": GUARD_BASE }, "upstream");
+    const config = { files: {}, pending: { "p.ts": 1 }, lost: { "p.ts": { lines: 3, gone: 2 } } };
+    const series = commit(
+      { ...seams(config), "p.ts": "import { x } from './x';\nforkA();\n" },
+      "fork series drops two lines",
+    );
+    const result = fromUpstream(upstream, series);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(
+      result.stderr,
+      /- p\.ts: 2 upstream lines deleted, moved or re-indented, below its "lost" lines count of 3; lower it to 2\./,
+    );
+    assert.match(result.stderr, /Lower each "pending" ceiling and "lost" count/);
+    assert.doesNotMatch(result.stderr, /a file of the fork's own/);
+    const after = fromUpstream("--after-rebase", upstream, series);
+    assert.equal(after.status, 0, after.stderr);
+    assert.match(
+      after.stdout,
+      /^Note: p\.ts: 2 upstream lines .* below its "lost" lines count of 3; lower it to 2\.$/m,
+    );
   });
 });

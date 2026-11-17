@@ -51,12 +51,16 @@ watches; it changes nothing on the machine, and `0` turns it off.
   note in the run log and the run's summary: when upstream takes a fork line word for word, the
   rebase drops it, and the ceiling could not have been lowered first. The next run, from the new
   base, fails until a pull request lowers it. A pull request may change a pending file but not grow
-  it. Upstream lines a seam or pending file no longer has in order (deleted, moved below the code
-  they guard, or re-indented) add no line, so they are counted too: `lost` maps such a file to how
-  many upstream lines it loses, counted from upstream (none when unlisted) and held exactly like a
-  `pending` ceiling. A pull request may lose no line of a seam file but its listed seam lines; in a
-  pending file it cannot tell upstream's lines from the fork's (moving a fork line out loses one),
-  so there fork-follow counts them. A listed path that neither the base nor the head has (upstream
+  it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
+  guard, or re-indented) add no line, so they are counted too, two ways: `lines`, the upstream lines
+  it does not keep in order and indentation, and `gone`, those whose text it no longer has at all,
+  so a line already counted as moved or re-indented cannot later be deleted unseen. `lost` maps such
+  a file to both (`{"lines": N, "gone": M}`), counted from upstream (none when unlisted) and held
+  exactly like a `pending` ceiling. A pull request may drop a seam file's listed seam lines (no more
+  copies than listed) but lose no other line, and may not move a seam line: a moved copy of `}`
+  looks the same as upstream's (move one with two pull requests). In a pending file it cannot tell
+  upstream's lines from the fork's (moving a fork line out loses one), so there fork-follow counts
+  them. A listed path that neither the base nor the head has (upstream
   renamed it) is a note: list both names until the old one is gone from the base. An upstream file
   in no list may gain no line, lose no line and keep its lines in order and indentation (trailing
   blanks and blank lines aside), and no upstream file may be deleted or renamed, except the workflows

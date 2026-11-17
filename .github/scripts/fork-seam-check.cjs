@@ -267,10 +267,15 @@ function findUnlistedChanges(
 }
 
 /**
- * Upstream lines a seam or "pending" file no longer has in order (a dropped or moved guard adds no
- * line). A seam file's lines but its seam lines are upstream's: a pull request loses none. In a
- * pending file a pull request cannot tell them from fork lines, so only a run from upstream counts
- * them, held exactly to the file's "lost" count (0 if unlisted), like a pending ceiling.
+ * Upstream lines a seam or "pending" file no longer has, two counts: `lines`, those the head does not
+ * keep in order and indentation (deleted, moved, changed or re-indented: a dropped or moved guard
+ * adds no line), and `gone`, those whose text the head no longer has at all (deleted or changed).
+ * A count is not a set of lines, so `gone` keeps a line already lost to a move or re-indent from
+ * being deleted later for free. From upstream (the base has no fork line, and fork lines only add)
+ * both are held exactly to the file's "lost" entry (0 when unlisted), like a pending ceiling. A
+ * pull request's base is main: in a seam file it may drop only listed seam lines (a moved copy of
+ * one, say `}`, looks the same as upstream's line); in a pending file it cannot tell upstream's
+ * lines from the fork's, so only the run from upstream counts them.
  */
 function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }) {
   const reasons = [];
@@ -279,35 +284,55 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }
   const lost = config.lost ?? {};
   const files = Object.entries(config.files).map(([file, seam]) => [
     file,
-    new Set(seam.added.map((line) => line.trim())),
+    lineCounts(seam.added.join("\n")),
   ]);
-  if (upstream) for (const file of Object.keys(config.pending ?? {})) files.push([file, new Set()]);
-  for (const [file, seamLines] of files) {
+  if (upstream) for (const file of Object.keys(config.pending ?? {})) files.push([file, new Map()]);
+  const say = (count, what) => `${count} upstream line${count === 1 ? "" : "s"} ${what}`;
+  const what = {
+    lines: "deleted, moved or re-indented",
+    gone: "deleted or changed (its text is gone)",
+  };
+  for (const [file, listed] of files) {
     const base = atBase(file);
     const head = atHead(file);
     if (base === undefined || head === undefined) continue; // Refused (or noted) elsewhere.
-    const upstreamLines = (text) =>
-      orderedLines(text).filter((line) => !seamLines.has(line.trim()));
-    const count = lostLines(upstreamLines(base), upstreamLines(head));
-    const lines = `${count} upstream line${count === 1 ? "" : "s"} deleted, moved or re-indented`;
+    const lines = lostLines(orderedLines(base), orderedLines(head));
+    const gone = addedLines(head, base); // [line, copies the head has fewer of]
     if (!upstream) {
+      const dropped = gone.reduce(
+        (sum, [line, copies]) => sum + Math.min(copies, listed.get(line) ?? 0),
+        0,
+      );
+      const count = lines - dropped;
       if (count > 0) {
         reasons.push(
-          `${file}: ${lines} by this change (only its listed seam lines may move or go).`,
+          `${file}: ${say(count, what.lines)} by this change (only its listed seam lines may go, and none may move: a moved copy looks like upstream's line).`,
         );
       }
       continue;
     }
-    const allowed = lost[file] ?? 0;
-    if (count > allowed) {
-      reasons.push(
-        `${file}: ${lines}, more than its "lost" count of ${allowed} (keep upstream's lines; a fork change goes in a file of the fork's own).`,
-      );
-    } else if (count < allowed) {
+    const counts = { lines, gone: total(gone) };
+    const held = lost[file] ?? { lines: 0, gone: 0 };
+    const below = [];
+    for (const key of ["lines", "gone"]) {
+      const text = say(counts[key], what[key]);
+      if (counts[key] > held[key]) {
+        reasons.push(
+          `${file}: ${text}, more than its "lost" ${key} count of ${held[key]} (keep upstream's lines; a fork change goes in a file of the fork's own).`,
+        );
+      } else if (counts[key] < held[key]) {
+        below.push(
+          `${file}: ${text}, below its "lost" ${key} count of ${held[key]}; lower it to ${counts[key]}.`,
+        );
+      }
+    }
+    if (below.length > 0) {
       (afterRebase ? notes : ceilings).push(
-        count === 0
-          ? `${file}: no upstream lines deleted, moved or re-indented, below its "lost" count of ${allowed}; remove it from "lost".`
-          : `${file}: ${lines}, below its "lost" count of ${allowed}; lower it to ${count}.`,
+        ...(lines === 0
+          ? [
+              `${file}: no upstream lines ${what.lines}, below its "lost" entry; remove it from "lost".`,
+            ]
+          : below),
       );
     }
   }
@@ -377,12 +402,23 @@ function parseConfig(text) {
   if (typeof lost !== "object" || lost === null || Array.isArray(lost)) {
     throw new Error(`${CONFIG}: "lost" must map each path to its count of upstream lines lost`);
   }
-  for (const [file, count] of Object.entries(lost)) {
+  for (const [file, entry] of Object.entries(lost)) {
     if (!Object.hasOwn(files, file) && !Object.hasOwn(pending, file)) {
       throw new Error(`${CONFIG}: "lost": ${file} is not in "files" or "pending"`);
     }
-    if (!Number.isSafeInteger(count) || count < 1) {
-      throw new Error(`${CONFIG}: "lost": ${file} needs a count of 1 or more lines`);
+    // `gone` (text gone) is at most `lines` (not kept in order) for any file, so more never matches.
+    const { lines, gone, ...other } = entry ?? {};
+    if (
+      Object.keys(other).length > 0 ||
+      !Number.isSafeInteger(lines) ||
+      lines < 1 ||
+      !Number.isSafeInteger(gone) ||
+      gone < 0 ||
+      gone > lines
+    ) {
+      throw new Error(
+        `${CONFIG}: "lost": ${file} needs {"lines": N, "gone": M}, with N at least 1 and M from 0 to N`,
+      );
     }
   }
   for (const pattern of config.forkFiles ?? []) {
