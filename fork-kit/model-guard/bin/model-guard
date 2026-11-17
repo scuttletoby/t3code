@@ -1,0 +1,31 @@
+#!/usr/bin/python3 -IB
+"""model-guard: Claude Code PreToolUse hook that keeps agents' model picks inside a policy (README.md).
+
+  model-guard                 the hook: reads the hook input on stdin, prints its answer on stdout
+  model-guard --self-check    the kit's files, the policy, and the hook in every listed settings file
+"""
+import os, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+
+
+def main(argv):
+    if argv in (['-h'], ['--help']):
+        print(__doc__.strip())
+        return 0
+    import model_guard
+    if argv == ['--self-check']:
+        return model_guard.self_check()
+    if argv:
+        print(f'model-guard: unknown arguments {argv!r}', file=sys.stderr)
+        return 2
+    return model_guard.run_hook(sys.stdin, sys.stdout)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception as e:  # noqa: BLE001 - exit 2 blocks the tool call: a broken guard refuses, never passes
+        print(f'model-guard refused: the guard failed ({type(e).__name__}: {e}); tell the machine owner',
+              file=sys.stderr)
+        sys.exit(2)

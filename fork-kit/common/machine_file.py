@@ -105,6 +105,18 @@ def _check_no_secrets(value, where):
             _check_no_secrets(v, f'{where}[{i}]')
 
 
+def read_protected_text(path, owner_uid=0):
+    """The text of another root-owned file that a kit trusts (for example a policy file the machine file names),
+    under the same rules as the machine file itself: owner, mode, no link, a plain file of at most 1 MiB, UTF-8.
+    Raises MachineFileError naming the file and the reason. `owner_uid` is for tests."""
+    try:
+        return _read(path, owner_uid)
+    except FileNotFoundError:
+        raise MachineFileError(f'{path}: not there') from None
+    except OSError as e:
+        raise MachineFileError(f'{path}: cannot be read ({e.strerror or e})') from None
+
+
 def read_section(kit, path=None, owner_uid=0):
     """The kit's section (a dict). Raises MachineFileError for every rule above. `path` and `owner_uid` are for
     tests; shipped commands use the default path and root."""

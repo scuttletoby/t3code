@@ -62,8 +62,10 @@ sweep = machine_file.fields(section, {'sweep': (dict, machine_file.REQUIRED, Non
 ```
 
 `read_section(kit, path=None, owner_uid=0)` returns the kit's section; `path` and `owner_uid` are for tests only.
+`read_protected_text(path, owner_uid=0)` reads another file a kit trusts (a policy file the machine file names)
+under the same file-safety rules (root owner, no link, plain file, 1 MiB, UTF-8).
 `fields(obj, spec, where)` checks one object against `{key: (types, default or REQUIRED, check or None)}` and fills
-in the defaults. Both raise `MachineFileError` with a message that names the file and the key. Plain Python 3
+in the defaults. All three raise `MachineFileError` with a message that names the file and the key. Plain Python 3
 standard library.
 
 ## Tests
