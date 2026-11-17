@@ -1,7 +1,7 @@
-// Fork (`serve --hold-work`): a held copy shares the live server's Connect link and environment id,
-// so it starts, registers and releases no tunnel, publishes no agent activity, and refuses to
-// link, change or unlink (an unlink is followed by a relay delete of that id). It only reads.
-// Every method is listed by name, never spread: a new upstream method is a type error here.
+// Fork (`serve --hold-work`, or any boot of a home a held boot marked): a copy shares the live
+// server's Connect environment id, so it starts, registers and releases no tunnel, publishes no
+// agent activity, and refuses to link, change or unlink (an unlink ends in a relay delete of that
+// id). Every method is listed by name, never spread: a new upstream method is a type error here.
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -17,22 +17,42 @@ import { readLiveServerRuntimeState } from "../serverRuntimeState.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as CloudLink from "./CloudLink.ts";
 
-const HOLD_CONNECT_LOG =
-  "T3 Connect held (--hold-work): the stored link is kept as it is; no tunnel starts, registers or is released";
+/** Why Connect is held: `--hold-work` (`markerPath` null), or the held-copy marker in this home. */
+interface ConnectHold {
+  readonly markerPath: string | null;
+}
 
-/** What a client sees when it asks a held server to link or change its link. */
-export const heldConnectRefusal = () =>
-  new ManagedLimits.ManagedPolicyRefusedError({
-    organization: "This held server",
-    action: "T3 Connect",
-    detail: "while it runs with --hold-work; restart it without the flag to link it",
-  });
+const markedCopy = (markerPath: string) =>
+  `${markerPath} marks this home as a copy that shares another server's T3 Connect link`;
 
-const refuse = () => Effect.fail(heldConnectRefusal());
+const holdLog = (hold: ConnectHold, part: string, effect: string) =>
+  hold.markerPath === null
+    ? `${part} held (--hold-work): ${effect}`
+    : `${part} held: ${markedCopy(hold.markerPath)}, so ${effect}. Delete it only if this home is not a copy`;
+
+/** What a client sees when it asks a held server, or one on a marked copy, to link or change its link. */
+export const heldConnectRefusal = (markerPath?: string) =>
+  new ManagedLimits.ManagedPolicyRefusedError(
+    markerPath === undefined
+      ? {
+          organization: "This held server",
+          action: "T3 Connect",
+          detail: "while it runs with --hold-work; restart it without the flag to link it",
+        }
+      : {
+          organization: "This copy",
+          action: "T3 Connect",
+          detail: `as ${markedCopy(markerPath)}; if it is not a copy, delete that file and restart`,
+        },
+  );
 
 /** The CloudLink a held server uses: it reads the link state, and starts or releases nothing. */
-const holdConnect = (cloudLink: CloudLink.CloudLink["Service"]): CloudLink.CloudLink["Service"] =>
-  CloudLink.CloudLink.of({
+const holdConnect = (
+  cloudLink: CloudLink.CloudLink["Service"],
+  hold: ConnectHold,
+): CloudLink.CloudLink["Service"] => {
+  const refuse = () => Effect.fail(heldConnectRefusal(hold.markerPath ?? undefined));
+  return CloudLink.CloudLink.of({
     linkState: cloudLink.linkState,
     // The web Unlink sends a relay delete for this environment id once the server agrees, and a
     // copy shares the live server's id: refusing here stops it before that delete.
@@ -58,6 +78,16 @@ const holdConnect = (cloudLink: CloudLink.CloudLink["Service"]): CloudLink.Cloud
       Effect.succeed(false),
     ),
   });
+};
+
+/** Held from boot, or a normal boot of a home a held boot marked; read once, as the layer builds. */
+const connectHold = Effect.gen(function* () {
+  if ((yield* WorkAdmission.WorkAdmission).heldFromBoot) {
+    return Option.some<ConnectHold>({ markerPath: null });
+  }
+  const marker = yield* heldCopyMarker((yield* ServerConfig.ServerConfig).baseDir);
+  return Option.map(marker, (markerPath): ConnectHold => ({ markerPath }));
+});
 
 /**
  * A held boot marks its home as a copy before the real CloudLink is built, so the CLI refusals
@@ -86,35 +116,45 @@ const markHeldCopy = Layer.effectDiscard(
   }),
 );
 
-/** `layer` as is, or held when the shared work gate is held from boot. */
+/** `layer` as is, or held when the server is held from boot or its home is a marked copy. */
 export const layer = <E, R>(cloudLinkLayer: Layer.Layer<CloudLink.CloudLink, E, R>) =>
   Layer.effect(
     CloudLink.CloudLink,
     Effect.gen(function* () {
       const cloudLink = yield* CloudLink.CloudLink;
-      if (!(yield* WorkAdmission.WorkAdmission).heldFromBoot) return cloudLink;
-      yield* Effect.logInfo(HOLD_CONNECT_LOG);
-      return holdConnect(cloudLink);
+      const hold = yield* connectHold;
+      if (Option.isNone(hold)) return cloudLink;
+      yield* Effect.logInfo(
+        holdLog(
+          hold.value,
+          "T3 Connect",
+          "the stored link is kept as it is; no tunnel starts, registers or is released",
+        ),
+      );
+      return holdConnect(cloudLink, hold.value);
     }),
   ).pipe(Layer.provide(cloudLinkLayer), Layer.provide(markHeldCopy));
 
-const HOLD_AGENT_ACTIVITY_LOG =
-  "Agent activity publishing held (--hold-work): no thread state is sent to the T3 Connect relay";
-
 /** The publisher a held server uses: it logs that it is held and sends nothing. */
-const holdAgentActivity = (): AgentAwarenessRelay.AgentAwarenessRelay["Service"] =>
+const holdAgentActivity = (hold: ConnectHold): AgentAwarenessRelay.AgentAwarenessRelay["Service"] =>
   AgentAwarenessRelay.AgentAwarenessRelay.of({
     publishThread: Effect.fn("HoldWorkConnect.publishThread")(() => Effect.void),
     drain: Effect.void,
     requestCatchUp: Effect.fn("HoldWorkConnect.requestCatchUp")(() => Effect.void),
     start: Effect.fn("HoldWorkConnect.startAgentActivity")(() =>
-      Effect.logInfo(HOLD_AGENT_ACTIVITY_LOG),
+      Effect.logInfo(
+        holdLog(
+          hold,
+          "Agent activity publishing",
+          "no thread state is sent to the T3 Connect relay",
+        ),
+      ),
     ),
   });
 
 /**
- * `layer` as is, or held when the shared work gate is held from boot. The publisher reads the
- * copied relay address, credential and signing key itself, not through CloudLink.
+ * `layer` as is, or held like `layer`. The publisher reads the copied relay address, credential
+ * and signing key itself, not through CloudLink.
  */
 export const agentActivityLayer = <E, R>(
   relayLayer: Layer.Layer<AgentAwarenessRelay.AgentAwarenessRelay, E, R>,
@@ -123,12 +163,37 @@ export const agentActivityLayer = <E, R>(
     AgentAwarenessRelay.AgentAwarenessRelay,
     Effect.gen(function* () {
       const relay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
-      return (yield* WorkAdmission.WorkAdmission).heldFromBoot ? holdAgentActivity() : relay;
+      const hold = yield* connectHold;
+      return Option.isSome(hold) ? holdAgentActivity(hold.value) : relay;
     }),
   ).pipe(Layer.provide(relayLayer));
 
-/** Written in a home by a held boot. The `t3 connect` refusals read it; nothing removes it. */
+/** Written in a home by a held boot. Every boot and the `t3 connect` refusals read it; nothing removes it. */
 export const HELD_COPY_MARKER_FILE = "hold-work-copy.txt";
+
+/**
+ * The marker's path when `baseDir` is marked. Anything at the path counts, a dangling symlink too
+ * (the held boot's exclusive create keeps one), and so does a check that fails.
+ */
+const heldCopyMarker = Effect.fn("HoldWorkConnect.heldCopyMarker")(function* (baseDir: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const markerPath = (yield* Path.Path).join(baseDir, HELD_COPY_MARKER_FILE);
+  const marked = yield* fs.exists(markerPath).pipe(
+    Effect.flatMap((exists) =>
+      exists
+        ? Effect.succeed(true)
+        : fs.readLink(markerPath).pipe(
+            Effect.as(true),
+            Effect.catchIf(
+              (error) => error.reason._tag === "NotFound",
+              () => Effect.succeed(false),
+            ),
+          ),
+    ),
+    Effect.orElseSucceed(() => true),
+  );
+  return marked ? Option.some(markerPath) : Option.none();
+});
 
 /**
  * `t3 connect` sign-in, link, unlink and logout, and `t3 up` turning Connect on or off: refused on
@@ -137,11 +202,9 @@ export const HELD_COPY_MARKER_FILE = "hold-work-copy.txt";
 export const refuseCliOnHeldCopy = Effect.fn("HoldWorkConnect.refuseCliOnHeldCopy")(function* (
   config: Pick<ServerConfig.ServerConfig["Service"], "baseDir" | "serverRuntimeStatePath">,
 ) {
-  const fs = yield* FileSystem.FileSystem;
-  const markerPath = (yield* Path.Path).join(config.baseDir, HELD_COPY_MARKER_FILE);
-  // Only whether it is there counts. A marker that cannot be checked counts as there.
-  if (yield* fs.exists(markerPath).pipe(Effect.orElseSucceed(() => true))) {
-    return yield* new HeldCopyRefusedError({ markerPath });
+  const marker = yield* heldCopyMarker(config.baseDir);
+  if (Option.isSome(marker)) {
+    return yield* new HeldCopyRefusedError({ markerPath: marker.value });
   }
   const running = yield* readLiveServerRuntimeState(config.serverRuntimeStatePath).pipe(
     Effect.orElseSucceed(() => Option.none()),
@@ -162,7 +225,7 @@ export class HeldCopyRefusedError extends Schema.TaggedError<HeldCopyRefusedErro
         : `${this.markerPath} marks this home as a copy that ran with --hold-work. A copy`;
     return [
       `Refused: ${why} that shares the live server's T3 Connect environment id and sign-in.`,
-      "Signing in, linking, unlinking or signing out here would act on the live server's link too. Nothing was changed.",
+      "Signing in, linking, unlinking or signing out here would act on the live server's link too. Nothing was sent, and the link and sign-in are as they were.",
       ...(this.markerPath === null
         ? []
         : [`If this home is not a copy, delete ${this.markerPath} and run the command again.`]),

@@ -155,7 +155,7 @@ settings files may still exist; it moves with the add-ons.
 threads, settings and migrations before it replaces a running T3. It is refused for the background
 service.
 
-Held (nothing of it starts until the server restarts without the flag):
+Held (nothing of it starts until the server restarts without the flag, except T3 Connect: see below):
 
 - agent turns, steers and rollbacks (outbox effects stay pending, unclaimed);
 - thread launches and worktree preparation;
@@ -176,14 +176,27 @@ Held (nothing of it starts until the server restarts without the flag):
   on that machine already.
 
   The first held boot writes `hold-work-copy.txt` in the copy's home, and nothing removes it, not
-  a normal boot either. While it is there, running or not, `t3 connect login`, `link`, `unlink` and
-  `logout`, `t3 connect publish` turning publishing on, and `t3 up` turning T3 Connect on or off are
-  refused on that home with nothing changed. Unlinking ends in a relay delete of the shared
-  environment id, which would remove the running server's link too, and signing in can refresh the
-  copied sign-in, which the running server shares. If the home is not a copy, delete the file and
-  run the command again. A copy that has never booted held has no marker, and the CLI cannot tell it
-  from the running server's home: never run those commands against it. Delete the copy's home
-  instead.
+  a normal boot either. While it is there:
+  - Every boot of that home holds T3 Connect and agent activity publishing as above, with or without
+    `--hold-work`, and logs the marker's path. A copy started normally (`t3 serve` or `t3 up` on its
+    home) runs its work but never registers or releases the tunnel under the shared environment id.
+    The server reads the marker once as it starts: one added while it runs counts from its next
+    start.
+  - `t3 connect login`, `link`, `unlink` and `logout`, `t3 connect publish` turning publishing on,
+    and `t3 up` turning T3 Connect on or off are refused on that home, running or not, before they
+    send anything or change the link or sign-in (the CLI may still create the home's folders and
+    signing key, as any command there does). Unlinking ends in a relay delete of the shared
+    environment id, which would remove the running server's link too, and signing in can refresh
+    the copied sign-in, which the running server shares.
+
+  Anything at that path counts, even an empty file or a dangling symlink, and so does a path that
+  cannot be checked. If the home is not a copy, delete the file and run the command or start the
+  server again.
+
+  A copy with no marker is not protected: one that has never booted held, or one held-booted only by
+  a build from before the marker (its first held boot on a newer build marks it). Neither the CLI
+  nor the server can tell it from the running server's home: never run those commands against it or
+  start it normally. Delete the copy's home instead.
 
 Still runs:
 

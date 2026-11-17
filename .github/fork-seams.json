@@ -212,8 +212,8 @@
     "packages/contracts/src/usagePacing.ts",
     "packages/contracts/src/waitFor*",
     "packages/shared/src/agentSlots*",
-    "packages/shared/src/capacity*",
     "packages/shared/src/capacity/",
+    "packages/shared/src/capacity*",
     "packages/shared/src/waitFor*",
     "scripts/lib/release-repository.ts",
     "scripts/release-repository.test.ts"
