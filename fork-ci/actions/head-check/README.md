@@ -321,15 +321,21 @@ gate again, through two workflows
   allows it. The gate takes no number from that run: it reads the open pull
   requests whose head branch is the run's head branch in the run's head
   repository and keeps the one whose head is the run's head sha (all three
-  are GitHub's fields of the run, never its outputs, artifacts or names). One
-  match is judged like an issue comment on it. None (closed or merged since,
-  or the head moved on: the push ran the gate already) or more than one (one
-  branch into two bases): nothing is judged and the log says why; dispatch
-  the gate with each number.
+  are GitHub's fields of the run, never its outputs, artifacts or names). A
+  match is judged like an issue comment on it. More than one (one branch into
+  two bases, so every match has the same head): the gate judges a head, not a
+  pull request, so it judges the head once, in the job for the lowest number.
+  The log lists them all; the target step names the ones it judges (ready,
+  into the default branch). None (closed or merged since, or the head moved on:
+  the push ran the gate already): nothing is judged and the log says why.
 - Review trigger runs on one head wait in one group per caller: one judges,
   the newest waits, the ones in between are dropped while they wait. A run is
-  never cancelled half-way (that would post a failure on the head). Other
-  events are never dropped by them.
+  never cancelled half-way (that would post a failure on the head). In the
+  caller, every other event has a group of its own, so a review run never
+  drops it there. The gate job's own group (per head and check name) is
+  shared by all events, so a later review run's gate job can replace a
+  comment's or a push's gate job still waiting on the same head. That is
+  harmless: the newer job reads the newest state of the same head.
 
 Why a pull request gains nothing from this: it can change its own copy of
 the trigger (that copy is the one that runs), or add any workflow of the same
@@ -337,14 +343,28 @@ name, but the caller only learns "look at this head again", which any issue
 comment on the pull request can already say. A run from a fork carries the
 fork as its head repository, so a fork that copies another pull request's
 head sha finds only its own pull request, and the head is judged as a whole
-anyway. A pull request that removes or breaks its copy only stops runs on
-itself.
+anyway. A pull request that removes or breaks its own copy of the trigger
+stops only its own review runs; whether another pull request can cancel them
+is the next paragraph.
+
+The trigger is a convenience, not a guard. Withdrawing a lens read (deleting
+an inline lens comment, editing a review) runs the gate again only through
+the pull request's own copy of the trigger, which the pull request controls.
+Concurrency groups are shared across the repository, so another pull
+request's workflow may be able to cancel those runs through the same group
+name (not tested live). Until a push, an issue comment or a dispatch, the old
+answer, which can be a pass, stays. To withdraw a lens read, post an issue
+comment on the pull request or dispatch the gate: the review trigger may not
+run.
 
 Fallback: when the trigger does not run (a fork's run waiting for approval,
 a review posted with a workflow's `GITHUB_TOKEN`, which starts no workflow,
-or a project that has not copied it yet), post an issue comment on the pull
-request or dispatch the gate with its number. A new push, ready or draft, a
-base change and any issue comment start the gate anyway. Copy the new caller
+a pull request with a merge conflict, on which GitHub runs no
+`pull_request`, `pull_request_review` or `pull_request_review_comment`
+workflow, or a project that has not copied it yet), post an
+issue comment on the pull request or dispatch the gate with its number. A new
+push, ready or draft, a base change and any issue comment start the gate
+anyway. Copy the new caller
 only together with a gate release that knows `workflow_run`: an older gate
 refuses that event (its guard job fails, nothing is posted).
 
@@ -383,8 +403,9 @@ head "not passed" unless it judged the head and the head passed.
     pull request read and git's `refs/pull/N/head` both fail every try.
   - A review trigger's run whose pull request cannot be found: the list of
     open pull requests with its head fails every try (the guard job fails), or
-    no open pull request, or more than one, has its head (nothing to judge,
-    the log says which).
+    no open pull request has its head (nothing to judge, the log says why).
+    More than one is no such case: the head is judged once, in the job for
+    the lowest number.
   - The backfill cannot list the open pull requests after its tries, or finds
     more than 256 heads. Dispatch again (or once per pull request).
   - A step before start fails for a reason of GitHub or the runner, never

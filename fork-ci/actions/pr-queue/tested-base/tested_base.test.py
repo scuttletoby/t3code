@@ -124,16 +124,32 @@ class TestedBase(unittest.TestCase):
             with open(os.devnull, 'w') as null, unittest.mock.patch('sys.stdout', null):
                 self.assertEqual(q.tested_base(job), want)
 
-    def test_the_action_runs_the_script_on_its_path_input(self):
+    def action_run(self, path='repo', **env):
+        """The action's one step, run as the runner runs it (bash -e, in the workspace)."""
+        import yaml
         with open(os.path.join(HERE, 'action.yml')) as f:
-            text = f.read()
-        self.assertIn('CHECKOUT_PATH: ${{ inputs.path }}', text)
-        run = 'python3 -I "$GITHUB_ACTION_PATH/tested_base.py" --path "$CHECKOUT_PATH"'
-        self.assertIn(f'run: {run}\n', text)
-        r = subprocess.run(['bash', '-c', run], text=True, capture_output=True,
-                           env={**GIT_ENV, 'GITHUB_ACTION_PATH': HERE, 'CHECKOUT_PATH': self.repo,
-                                'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_EVENT_PATH': self.event, 'GITHUB_SHA': self.M})
+            steps = yaml.safe_load(f)['runs']['steps']
+        self.assertEqual(len(steps), 1)   # one step, so the action still always passes
+        self.assertEqual(steps[0]['env'], {'CHECKOUT_PATH': '${{ inputs.path }}'})
+        return subprocess.run(['bash', '--noprofile', '--norc', '-e', '-c', steps[0]['run']], text=True,
+                              capture_output=True, cwd=self.d,
+                              env={**GIT_ENV, 'GITHUB_ACTION_PATH': HERE, 'CHECKOUT_PATH': path,
+                                   'GITHUB_WORKSPACE': self.d, 'GITHUB_EVENT_NAME': 'pull_request',
+                                   'GITHUB_EVENT_PATH': self.event, 'GITHUB_SHA': self.M, **env})
+
+    def test_the_action_runs_the_script_on_its_path_input(self):
+        r = self.action_run()
         self.assertEqual((r.returncode, r.stdout), (0, f'::notice title={T.TITLE}::{self.B1}\n'), r.stderr)
+
+    def test_the_action_writes_no_note_and_passes_when_git_clean_refuses(self):   # fork-ci git-clean
+        marker = os.path.join(self.d, 'ran')
+        git(self.repo, 'config', 'core.fsmonitor', f'touch {marker}; false')
+        r = self.action_run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('::error::git-clean: ', r.stdout)
+        self.assertIn('::warning::pr_queue tested base: no note', r.stdout)
+        self.assertNotIn('::notice', r.stdout)
+        self.assertFalse(os.path.exists(marker))
 
 
 if __name__ == '__main__':

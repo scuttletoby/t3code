@@ -459,7 +459,7 @@ class ReviewRun(Files, unittest.TestCase):
     def test_the_one_open_pull_request_with_the_runs_head_is_judged(self):
         for event in G.REVIEW_EVENTS:
             with self.subTest(event=event):
-                rows = [(12, False, self.H.upper(), REPO), (13, False, self.OTHER, REPO)]
+                rows = [(12, self.H.upper(), REPO), (13, self.OTHER, REPO)]
                 code, out, gh = self.review(rows, {'event': event})
                 self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
                 self.assertEqual([c[0][2] for c in gh.calls], [self.query(REPO.split('/')[0], 'feature/x')],
@@ -467,30 +467,84 @@ class ReviewRun(Files, unittest.TestCase):
 
     def test_no_open_pull_request_with_the_head_judges_nothing(self):
         # Empty: none open (closed or merged meanwhile), or the head moved on (the push ran the gate already).
-        for rows in ([], [(12, False, self.OTHER, REPO)], [(12, False, self.H, None)]):
+        for rows in ([], [(12, self.OTHER, REPO)], [(12, self.H, None)]):
             with self.subTest(rows=rows):
                 code, out, _ = self.review(rows)
                 self.assertEqual((code, self.found()), (0, []), out)
                 self.assertIn('nothing to judge', out)
                 self.assertIn('no open pull request', out)
 
-    def test_two_open_pull_requests_with_the_head_judge_nothing(self):   # same branch into two bases: ask for a number
-        code, out, _ = self.review([(12, False, self.H, REPO), (14, True, self.H, REPO)])
-        self.assertEqual((code, self.found()), (0, []), out)
-        self.assertIn('nothing to judge', out)
-        self.assertIn('#12, #14', out)
+    def test_two_open_pull_requests_with_the_head_judge_it_once(self):   # #379: same branch into two bases
+        # The gate judges a head, not a pull request (preflight lists every open pull request with it again), so the
+        # head is judged once, in the job for the lowest number; the log lists them all. Nothing is skipped: a lens
+        # read withdrawn on one of them leaves no stale pass. Order of the listing, a third one: the same answer.
+        for rows in ([(12, self.H, REPO), (14, self.H, REPO)], [(14, self.H, REPO), (12, self.H.upper(), REPO)],
+                     [(15, self.H, REPO), (14, self.H, REPO), (12, self.H, REPO), (13, self.OTHER, REPO)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+                self.assertNotIn('nothing to judge', out)
+                self.assertNotIn('each number', out)
+                listed = ', '.join(f'#{n}' for n, h, _ in sorted(rows) if h.lower() == self.H)
+                self.assertIn(f'review run: open pull requests {listed} have the head ', out)
+                self.assertIn('judged once, in the job for #12 (the lowest number)', out)
+
+    def test_the_lowest_is_the_lowest_number_not_the_first_text(self):   # #400: 9 < 10 < 100, though '10' < '9'
+        for rows in ([(10, self.H, REPO), (9, self.H, REPO)],
+                     [(100, self.H, REPO), (9, self.H, REPO), (10, self.H, REPO)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, [{'pr': 9, 'sha': self.H}]), out)
+                self.assertIn('open pull requests #9, #10' + (', #100' if len(rows) == 3 else '') + ' have', out)
+
+    def test_the_log_names_no_pull_request_as_judged(self):   # #400: the lowest may be a draft or into another base
+        # The listing has no draft or base (HEAD_JQ), so this line cannot know which of them are judged: it names
+        # them as the open ones with the head, and target's "judging" line names the ones judged.
+        code, out, _ = self.review([(12, self.H, REPO), (14, self.H, REPO)])
+        self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+        self.assertNotRegex(out, r'#\d+ judges')
+        self.assertIn('the target step names the ones it judges (ready, into the default branch)', out)
+        code, out, _ = self.review([(12, self.H, REPO)])   # one: unchanged
+        self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+        self.assertIn('review run: #12 has the head ', out)
+        self.assertNotIn('judged once', out)
+
+    def test_a_number_listed_twice_is_named_once(self):   # #400: pages that overlap while the list changes
+        for rows in ([(12, self.H, REPO), (14, self.H, REPO), (14, self.H, REPO)],
+                     [(14, self.H, REPO), (12, self.H, REPO), (12, self.H, REPO), (14, self.H, REPO)],
+                     [(12, self.H, REPO), (12, self.H, REPO)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+                line = next(l for l in out.splitlines() if l.startswith('review run:'))
+                want = 'open pull requests #12, #14 have' if 14 in (r[0] for r in rows) else '#12 has'
+                self.assertTrue(line.startswith(f'review run: {want} the head '), line)
+                self.assertEqual(line.count('#14'), int(14 in (r[0] for r in rows)), line)
+
+    def test_one_of_two_closed_half_way_judges_the_one_left(self):   # stops half-way: the listing has the one left
+        for rows in ([(14, self.H, REPO)], [(12, self.H, REPO)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, [{'pr': rows[0][0], 'sha': self.H}]), out)
+
+    def test_the_head_repository_is_compared_without_case(self):   # GitHub names are case-insensitive
+        for run_repo, row_repo in ((REPO.upper(), REPO), (REPO, REPO.upper()),
+                                   ('Someone/T3code-Fork', 'someone/t3code-fork')):
+            with self.subTest(run=run_repo, row=row_repo):
+                code, out, _ = self.review([(31, self.H, row_repo)], {'repo': run_repo})
+                self.assertEqual((code, self.found()), (0, [{'pr': 31, 'sha': self.H}]), out)
 
     def test_a_fork_head_is_looked_up_in_the_fork_and_a_forged_sha_elsewhere_never_matches(self):
         fork = {'repo': 'someone/t3code-fork', 'branch': 'main'}
-        rows = [(30, False, self.H, REPO), (31, False, self.H, 'someone/t3code-fork')]   # 30: same sha, base repo
+        rows = [(30, self.H, REPO), (31, self.H, 'someone/t3code-fork')]   # 30: same sha, base repo
         code, out, gh = self.review(rows, fork)
         self.assertEqual((code, self.found()), (0, [{'pr': 31, 'sha': self.H}]), out)
         self.assertEqual(gh.calls[0][0][2], self.query('someone', 'main'))
-        code, out, _ = self.review([(30, False, self.H, REPO)], fork)   # only another repository's head has the sha
+        code, out, _ = self.review([(30, self.H, REPO)], fork)   # only another repository's head has the sha
         self.assertEqual((code, self.found()), (0, []), out)
 
     def test_the_branch_is_one_query_value(self):   # a branch name is the pusher's text
-        code, out, gh = self.review([(12, False, self.H, REPO)], {'branch': 'a&b=c#d+e%f'},
+        code, out, gh = self.review([(12, self.H, REPO)], {'branch': 'a&b=c#d+e%f'},
                                     query=self.query(REPO.split('/')[0], 'a%26b%3Dc%23d%2Be%25f'))
         self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
 
@@ -502,20 +556,27 @@ class ReviewRun(Files, unittest.TestCase):
                 self.assertEqual((code, self.found(), gh.calls), (0, [], []), out)
                 self.assertIn('nothing to judge', out)
 
+    def test_the_listing_reads_only_the_fields_it_uses(self):   # #379: no draft (preflight fails a draft's head)
+        self.assertEqual(G.HEAD_JQ, '.[] | [.number, .head.sha, .head.repo.full_name] | @json')
+
     def test_a_number_on_a_workflow_run_is_refused(self):   # the number comes only from the API
         code, out, gh = self.review(pr='7')
         self.assertEqual((code, self.file('output'), gh.calls), (1, None, []), out)
 
     def test_an_unreadable_or_odd_listing_is_refused_and_posts_nothing(self):   # stops half-way: an older check stays
-        for rows in (answer(1, '', 'gh: Server Error (HTTP 502)'), answer(0, 'x\n'), answer(0, '[12, false, "x", null]\n'),
-                     answer(0, '[true, false, "' + self.H + '", null]\n'), answer(0, '[12, "no", "' + self.H + '", null]\n')):
+        for rows in (answer(1, '', 'gh: Server Error (HTTP 502)'), answer(0, 'x\n'), answer(0, '[12, "x", null]\n'),
+                     answer(0, '[true, "' + self.H + '", null]\n'), answer(0, '[12, "' + self.H + '", 5]\n'),
+                     answer(0, '["12", "' + self.H + '", "' + REPO + '"]\n'),   # #400: a number as a string
+                     answer(0, '[12.0, "' + self.H + '", "' + REPO + '"]\n'),
+                     answer(0, '[12, false, "' + self.H + '", null]\n'),   # the old four-field row
+                     answer(0, '[12, "' + self.H + '", "' + REPO + '", false]\n')):
             with self.subTest(rows=rows.stdout[:20]):
                 code, out, gh = self.review(rows)
                 self.assertEqual((code, self.file('output')), (1, None), out)
                 self.assertIn('could not list', out) if rows.returncode else self.assertIn('not a pull request', out)
 
     def test_a_burst_of_runs_reads_the_same_answer_each_time(self):   # runs again: reads only, the same answer
-        rows = [(12, False, self.H, REPO)]
+        rows = [(12, self.H, REPO)]
         answers = []
         for _ in range(3):
             code, out, _ = self.review(rows)
