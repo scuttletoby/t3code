@@ -357,6 +357,50 @@ describe("HeadlessUsageRefresher", () => {
     }),
   );
 
+  it.effect("a healthy skip ends a failure streak: the next outage is logged, short retry", () =>
+    Effect.gen(function* () {
+      yield* startAt(NOW_MS);
+      const opencode = { driver: ProviderDriverKind.make("opencode") };
+      let healthy = false;
+      const fake = fakeTarget(provider(NOW_MS - HOUR, opencode), {
+        checksOnInterval: () => !healthy,
+      });
+      fake.setOutcome("noReading");
+      const log = logCollector();
+      const { sweep } = yield* make(deps([fake.target]));
+      const tick = (ms: number) =>
+        TestClock.adjust(ms).pipe(Effect.andThen(sweep), Effect.provide(log.layer));
+      // Three failures in a row: one warning.
+      yield* tick(0);
+      yield* tick(2 * INTERVAL);
+      yield* tick(4 * INTERVAL);
+      assert.equal(fake.calls(), 3);
+      assert.equal(log.warnings.length, 1);
+      // A client recovers usage; the instance is healthy, so it is skipped for days.
+      healthy = true;
+      const recoveredAt = NOW_MS + 6 * INTERVAL + MINUTE;
+      yield* TestClock.setTime(recoveredAt);
+      fake.setSnapshot(provider(recoveredAt, opencode));
+      yield* tick(0);
+      assert.equal(fake.calls(), 3);
+      assert.deepEqual(log.infos, ["headless usage refresh works again"]);
+      yield* tick(3 * 24 * HOUR);
+      assert.equal(fake.calls(), 3);
+      // A new outage: retried at once, logged as a new streak, retried after 2 intervals.
+      healthy = false;
+      yield* tick(0);
+      assert.equal(fake.calls(), 4);
+      assert.equal(log.warnings.length, 2);
+      yield* tick(2 * INTERVAL);
+      assert.equal(fake.calls(), 5);
+      // Skipped again while healthy: the logged end is not repeated.
+      healthy = true;
+      yield* tick(0);
+      yield* tick(0);
+      assert.equal(log.infos.length, 2);
+    }),
+  );
+
   it.effect(
     "leaves the refresh to upstream while a client lease holds, and pauses on a constrained host",
     () =>
@@ -381,6 +425,28 @@ describe("HeadlessUsageRefresher", () => {
         yield* sweep;
         assert.equal(fake.calls(), 1);
       }),
+  );
+
+  it.effect("a host that locks during a sweep stops the rest of that sweep", () =>
+    Effect.gen(function* () {
+      yield* startAt(NOW_MS);
+      const first = fakeTarget(provider(NOW_MS - HOUR));
+      const second = fakeTarget(provider(NOW_MS - HOUR, {}, SECOND));
+      // The host locks while the first refresh runs, and unlocks later.
+      let locked = () => first.calls() > 0;
+      const { sweep } = yield* make(
+        deps([first.target, second.target], {
+          hostConstrained: () => Effect.sync(() => locked()),
+        }),
+      );
+      yield* sweep;
+      assert.equal(first.calls(), 1);
+      assert.equal(second.calls(), 0);
+      locked = () => false;
+      yield* sweep;
+      assert.equal(first.calls(), 1);
+      assert.equal(second.calls(), 1);
+    }),
   );
 
   it.effect("off switch: interval 0 refreshes nothing", () =>
