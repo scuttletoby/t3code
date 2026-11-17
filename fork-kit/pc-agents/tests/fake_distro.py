@@ -79,10 +79,20 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  [ -e "$S/$u.status" ] && { echo "ExecMainCode=$(cat "$S/$u.code")"; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
                          '  echo "ExecMainStartTimestampMonotonic=$(cat "$S/$u.start" 2>/dev/null || echo 0)";;\n'
                          'esac\n',
-    # apt-get: update, or install packages (each then installed in /log/packages; nftables brings the fake nft kept
-    # in /log/nft-package); /log/apt-fail makes it fail
-    'usr/bin/apt-get': 'R="${0%/usr/bin/apt-get}"; echo "$*" >>"$R/log/apt-get"\n'
+    # apt-get [-o OPTION]... update|install -y PKG...: logs the rest; installs each package in /log/packages (nftables
+    # brings the fake nft kept in /log/nft-package). As real apt-get: refuses while a package is unpacked (dpkg was
+    # interrupted). /log/apt-fail makes it fail; /log/dns holds the resolv.conf line `update` needs to reach the
+    # mirror; with /log/questions it fails unless noninteractive and keeping changed config files.
+    'usr/bin/apt-get': 'R="${0%/usr/bin/apt-get}"; o=; while [ "$1" = -o ]; do o="$o $2"; shift 2; done\n'
+                       'echo "$*" >>"$R/log/apt-get"\n'
                        '[ -e "$R/log/apt-fail" ] && { echo "E: no network (test)" >&2; exit 100; }\n'
+                       'grep -qs unpacked "$R"/log/packages/* && { echo "E: dpkg was interrupted, you must manually '
+                       'run \'dpkg --configure -a\' to correct the problem." >&2; exit 100; }\n'
+                       '[ ! -e "$R/log/questions" ] || { [ "$DEBIAN_FRONTEND" = noninteractive ] && case "$o" in '
+                       '*Dpkg::Options::=--force-confold*) :;; *) false;; esac; } || '
+                       '{ echo "E: end of file on stdin at conffile prompt (test)" >&2; exit 100; }\n'
+                       '[ "$1" != update ] || [ ! -e "$R/log/dns" ] || grep -qxF "$(cat "$R/log/dns")" "$R/etc/resolv.conf" '
+                       '|| { echo "E: Temporary failure resolving the mirror (test)" >&2; exit 100; }\n'
                        '[ "$1" = install ] || exit 0; shift 2\n'
                        'for p; do echo "install ok installed" >"$R/log/packages/$p"\n'
                        '  [ "$p" != nftables ] || cp "$R/log/nft-package" "$R/usr/sbin/nft"; done\n',
@@ -90,8 +100,14 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
     'usr/bin/dpkg-query': 'R="${0%/usr/bin/dpkg-query}"; echo "$*" >>"$R/log/dpkg-query"; shift 2; rc=0\n'
                           'for p; do if [ -e "$R/log/packages/$p" ]; then printf "%s\\t%s\\n" "$p" "$(cat "$R/log/packages/$p")"\n'
                           '  else echo "dpkg-query: no packages found matching $p" >&2; rc=1; fi; done; exit $rc\n',
-    # dpkg --configure -a: finishes what an apt-get stopped half-way left unpacked
+    # dpkg [--force-...]... --configure -a: finishes what an apt-get stopped half-way left unpacked. /log/dpkg-fail
+    # makes it fail as with apt-daily holding the lock; /log/questions as for apt-get.
     'usr/bin/dpkg': 'R="${0%/usr/bin/dpkg}"; echo "$*" >>"$R/log/dpkg"\n'
+                    '[ -e "$R/log/dpkg-fail" ] && { echo "dpkg: error: dpkg frontend lock was locked by another process '
+                    '(test)" >&2; exit 2; }\n'
+                    '[ ! -e "$R/log/questions" ] || { [ "$DEBIAN_FRONTEND" = noninteractive ] && case "$*" in '
+                    '*--force-confold*) :;; *) false;; esac; } || '
+                    '{ echo "dpkg: error: end of file on stdin at conffile prompt (test)" >&2; exit 1; }\n'
                     'for f in "$R"/log/packages/*; do [ ! -e "$f" ] || sed -i "s/unpacked/installed/" "$f"; done\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
