@@ -67,7 +67,7 @@ class Corpus(unittest.TestCase):
                'override_sha': SOURCE.override_sha, 'lens_header': lens.lens_header, 'no_lens_text': lens.no_lens_text,
                'latest_checks': lens.latest_checks, 'check_state': lens.check_state, 'lens_key': lens.lens_key}
         self.assertEqual({c['fn'] for c in cases}, set(fns) | {'full_sha'})
-        wrong, changed = [], 0
+        wrong, changed, opt_out = [], 0, 0
         for c in (c for c in cases if c['fn'] in fns):
             got = json.loads(json.dumps(fns[c['fn']](*c['args'])))
             if got == c['out']:
@@ -78,9 +78,13 @@ class Corpus(unittest.TestCase):
             if cause and got[:2] == [True, None] and any(w in got[2] for w in CHANGED):
                 changed += 1
                 continue
+            if c['fn'] == 'lens_problem' and c['out'] is None and (got or '').startswith(lens.OPT_OUT_READ):
+                opt_out += 1   # issue #77: a hex `read at` below `not a lens:` blocks now
+                continue
             wrong.append(f'{c["fn"]}{json.dumps(c["args"])[:160]}: got {got!r}, source {c["out"]!r}')
         self.assertEqual(wrong, [], f'{len(wrong)} of {len(cases)} differ; first: {wrong[:3]}')
         self.assertEqual(changed, 54, 'answers changed on purpose (a short read or an edited lens comment)')
+        self.assertEqual(opt_out, 2, 'answers changed on purpose (a hex read at below not a lens:, issue #77)')
 
 
 class Gaps(unittest.TestCase):
@@ -93,6 +97,66 @@ class Gaps(unittest.TestCase):
     def test_a_hex_word_without_a_digit_is_no_sha(self):
         self.assertIsNone(SOURCE.lens_problem(post('Notes\n```\nlens: effaced\n```')))
         self.assertIn(lens.EMBEDDED, SOURCE.lens_problem(post('Notes\n```\nlens: effaced1\n```')))
+
+
+class NotALens(unittest.TestCase):
+    """Issue #77: below a `not a lens:` first line, a lens read written another way (no colon after `lens`, another
+    field spelling) blocks too; only a `>` quote keeps such a line from counting."""
+    HEX = '7838aaec7c3cb4b6deaafa3d8cd701dd6f737f9a'
+
+    def problem(self, body):
+        return SOURCE.lens_problem(post(body))
+
+    def test_a_lens_line_without_the_colon_below_the_opt_out_blocks(self):
+        for read in (self.HEX, self.HEX[:10], 'abc1234'):
+            for line in (f'lens correctness, read at {read}', f'Lens — correctness · read at: {read}',
+                         f'lens=correctness read at {read}', f'read at: {read}', f'the round the lens read at {read}'):
+                for body in (f'not a lens: round 2 fixes\n{line}', f'not a lens: notes\n\n```\n{line}\n```',
+                             f'not a lens: notes\n    {line}', f'not a lens: {line}'):
+                    with self.subTest(body=body):
+                        self.assertIsNotNone(self.problem(body))
+
+    def test_another_field_spelling_with_a_sha_blocks_with_or_without_the_opt_out(self):
+        for line in (f'Lens — correctness ({self.HEX[:10]})', f'lens= correctness {self.HEX}',
+                     f'lens – correctness at {self.HEX[:7]}'):
+            for body in (f'not a lens: notes\n{line}', f'Notes\n{line}'):
+                with self.subTest(body=body):
+                    self.assertIn(lens.EMBEDDED, self.problem(body))
+
+    def test_a_quoted_read_or_one_without_a_sha_stays_clear(self):
+        for body in (f'not a lens: round 2 fixes\n> lens correctness, read at {self.HEX}',
+                     f'not a lens: notes\n>> correctness, read at: {self.HEX}',
+                     'not a lens: notes\nthe correctness lens read at the old head; read at: <sha> is the format',
+                     'not a lens: fix round for the lens findings\nLens — correctness, see above',
+                     f'not a lens: fixed in {self.HEX}\nlens-check passed'):
+            with self.subTest(body=body):
+                self.assertIsNone(self.problem(body))
+
+    def test_a_quoted_lens_field_with_a_sha_blocks_in_any_spelling(self):   # as `lens:` did before: EMBEDDED
+        for field in ('lens:', 'Lens —', 'lens='):
+            with self.subTest(field=field):
+                self.assertIn(lens.EMBEDDED, self.problem(f'not a lens: notes\n> {field} correctness at {self.HEX}'))
+
+    def test_a_quote_marker_inside_a_fence_is_code_not_a_quote(self):
+        self.assertIsNotNone(self.problem(f'not a lens: notes\n```\n> read at {self.HEX}\n```'))
+
+    def test_a_read_in_inline_code_below_the_opt_out_blocks(self):   # the line is read cleaned, not raw
+        self.assertIsNotNone(self.problem(f'not a lens: notes\nread at: `{self.HEX}`'))
+
+    def test_a_quote_marker_indented_four_spaces_is_code_not_a_quote(self):
+        self.assertIsNotNone(self.problem(f'not a lens: notes\n\n    > read at {self.HEX}'))
+
+    def test_the_queues_quote_of_any_lens_field_never_reads_as_a_lens_line(self):   # l283-state: leave_off quotes it
+        for line in (f'Lens — security ({self.HEX[:10]}) NOT SAFE', f'lens= security {self.HEX}',
+                     f'lens – security at {self.HEX[:7]}', f'lens: security read at: {self.HEX}'):
+            with self.subTest(line=line):
+                quoted = lens.no_lens_text(line)
+                self.assertFalse(lens.loose_header(lens.norm_line(quoted)), quoted)
+                self.assertIsNone(self.problem(f'Auto-merge OFF: {quoted}'), quoted)
+
+    def test_the_way_out_names_the_quote_and_never_reads_as_a_report(self):
+        self.assertIn('`>`', lens.NO_HEADER_WAY_OUT)
+        self.assertEqual(lens.no_lens_text(lens.NO_HEADER_WAY_OUT, keep_markdown=True), lens.NO_HEADER_WAY_OUT)
 
 
 class Markdown(unittest.TestCase):
@@ -278,6 +342,34 @@ class WhoCounts(unittest.TestCase):
             start = time.monotonic()
             self.head(post(body))
             self.assertLess(time.monotonic() - start, 5, body[:20])
+
+    def test_a_trusted_authors_runs_of_leading_markers_cost_no_time(self):   # issue #72: 0.3-0.7 s each before
+        import time
+        shapes = ('> ' * 32768, '>' * 65536, '- ' * 32768, '+ ' * 32768, '1. ' * 21845, '[x] ' * 16384, '# ' * 32768,
+                  '~~~ ' * 16384, '> - 1. # [x] ' * 5000 + f'lens: a · read at: {SHA_A}')
+        for body in shapes:   # end to end: generous, the rest is unchanged code and a busy host is slow
+            start = time.monotonic()
+            self.head(post(body))
+            self.assertLess(time.monotonic() - start, 5, body[:20])
+        start = time.monotonic()   # norm_line alone: 5-13 ms per shape; the old loop took 0.3-0.7 s each
+        for body in shapes:
+            lens.norm_line(body)
+        self.assertLess(time.monotonic() - start, 0.5)
+
+    def test_one_pass_strips_the_markers_the_old_loop_stripped(self):   # issue #72: same answers, one pass
+        def loop(line):   # the source's norm_line: one leading marker per pass
+            s, prev = lens.clean_inline(line), None
+            while s != prev:
+                prev = s
+                s = re.sub(r'^\s*(?:>|[-+•](?=\s|$)|\d{1,9}[.)](?=\s|$)|#{1,6}(?=\s|$)|~{3,}|\[[ xX]\](?=\s|$))\s*', '', s)
+            return s.strip()
+        import random
+        rnd = random.Random(72)
+        parts = ('>', '> ', '-', '- ', '+ ', '• ', '1.', '1. ', '12) ', '1234567890. ', '#', '# ', '####### ', '~~', '~~~',
+                 '~~~~ ', '[x] ', '[ ]', '[X]x', ' ', '\t', 'lens: a', 'read at ', 'x', '-x', '#x', '*', '`')
+        lines = [''.join(rnd.choice(parts) for _ in range(rnd.randint(0, 12))) for _ in range(3000)]
+        lines += ['~' * 65536 + 'x', '> ' * 1000 + '1.x', '#' * 7 + ' lens: a']
+        self.assertEqual([lens.norm_line(x) for x in lines], [loop(x) for x in lines])
 
     def test_many_capped_stranger_posts_cost_no_time(self):   # r4 sec: 0.76 s per 4096-char post before
         import time
