@@ -30,7 +30,7 @@ Listen to `edited` too (the example does), so a body edit that adds a "why" upda
 | ---------------- | --------------------------------------------- | ------------------------------------------------------------------ |
 | `config`         | `.github/weakened-tests.json`                 | the project's config, read at the base commit; optional file       |
 | `base`, `head`   | the event's `pull_request.base/head.sha`      | the change is `merge-base(base, head)..head`                       |
-| `path`           | `.`                                           | where the repository is checked out                                |
+| `path`           | `.`                                           | where the repository is checked out, relative to the workspace     |
 | `pr`, `repo`     | the event's pull request, `github.repository` | where the comment goes                                             |
 | `token`          | `github.token`                                | reads the pull request, posts and edits its comments               |
 | `comment`        | `true`                                        | `false`: only the job summary and the outputs                      |
@@ -38,7 +38,7 @@ Listen to `edited` too (the example does), so a body edit that adds a "why" upda
 
 | Output        | Value                                                                                       |
 | ------------- | ------------------------------------------------------------------------------------------- |
-| `status`      | `ok` or `could-not-read`                                                                    |
+| `status`      | `ok`, `could-not-read`, or `refused` (git-clean refused the checkout: nothing was checked)  |
 | `count`       | items listed; empty when the change could not be read                                       |
 | `missing_why` | listed items the body gives no why for; empty when the change or the body could not be read |
 
@@ -113,6 +113,10 @@ for js, jsx, ts, tsx, mjs, cjs, mts, cts; `it(` and `test(` with a string name).
 - **Could not read** (a commit missing from the checkout, no merge base, a git error, a bad config, test files over
   `max_bytes`, an unexpected error) is said in the comment and the summary, never shown as an empty list. A failure to
   read the body, list the comments or post is a warning; the step still passes.
+- **Refused:** the first thing the step runs is fork-ci git-clean's check of the checkout (`../git-clean/README.md`).
+  When it refuses (a `.git` an earlier job left, an absolute `path`), no git runs, `status` is `refused`, and an
+  existing report comment is replaced by a note that this head was not checked (no comment is posted when there is
+  none). The step still passes.
 
 ## Why a pull request cannot loosen it
 
