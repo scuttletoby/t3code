@@ -158,9 +158,13 @@ a check posted before stays as it was until then.
 Fix every config warning before switching to `enforce`: the gate reads the
 config from the base tip, so a base config that does not parse refuses every
 head, the one that fixes it too, and the queue stops (an owner then has to push
-the fix by hand). The gate therefore refuses a pull request whose own new config
-is in `enforce` with a rule order `enforce` refuses (the order checks above);
-that one check reads the pull request's config, everything else the base's.
+the fix by hand). The gate therefore refuses a pull request whose merged config
+(GitHub's merge commit, or `git merge-tree` of base and head in the gate's bare
+mode) does not parse, is deleted, or is in `enforce` with a rule order `enforce`
+refuses (the order checks above), and caps what it reads of a config a pull
+request changes (32 KiB, 128 characters per glob, 2,048 in all). That one check
+reads the merged config; everything else, the rules that judge the head too, the
+base's.
 
 **The empty input.** The gate refuses an empty `required-lenses` input (a head
 with no lens comment would pass), except when the config at the base tip has a
