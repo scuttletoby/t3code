@@ -72,8 +72,8 @@ UPSTREAM = [
     ('apps/server/src/config.ts', 'secretsDir: join(stateDir, "secrets"),', 'rehearse.NOT_CLONED: secrets/'),
 ]
 
-# The commands and flags `rehearse` runs (R1-R5). These files are not in the kit_tests job's sparse checkout yet
-# (.github/workflows/fork-tests.yml): there each one is skipped by name until the workflow lists it.
+# The commands and flags `rehearse` runs (R1-R5). Each file is in the kit_tests and workflows jobs' sparse checkouts
+# (.github/workflows/fork-tests.yml); a missing one fails, never skips.
 REHEARSE_UPSTREAM = [
     ('apps/server/src/cli/servicePreflight.ts', 'Command.make("__service-preflight", {', 'R1/R5 preflight'),
     ('apps/server/src/cli/servicePreflight.ts', 'databasePath: Flag.String("database-path"),', 'preflight flag'),
@@ -141,8 +141,6 @@ class Upstream(unittest.TestCase):
     def test_the_commands_rehearse_runs_are_still_there(self):
         for rel, text, why in REHEARSE_UPSTREAM:
             with self.subTest(why, file=rel):
-                if not os.path.exists(os.path.join(REPO, rel)):
-                    self.skipTest(f'{rel} is not in this checkout (a sparse one)')
                 self.assertIn(text, source(rel), f'{rel} changed: update rehearse ({why})')
 
     def test_platform_keys(self):
