@@ -104,8 +104,9 @@ def _path_problem(p):
 
 
 def _matches_any_segment(seg):
-    """`seg` (no `**`) matches every path segment: segments are never empty, so `*`, `?`, `*?*` do; `??` does not."""
-    return set(seg) <= {'*', '?'} and seg.count('?') <= 1
+    """`seg` (no `**`) matches every path segment: segments are never empty, so `*`, `*?`, `*?*` do; `?` and `??`
+    (exactly one or two characters) do not."""
+    return set(seg) <= {'*', '?'} and '*' in seg and seg.count('?') <= 1
 
 
 def matches_every_path(g):
@@ -233,7 +234,7 @@ def _rules(raw, declared, mins, problems):
                     problems.append(f'{where}.paths has a glob written twice')
                 if catch_all is not None:
                     problems.append(f'{where} comes after the catch-all rule {catch_all} and can never match: '
-                                    f'move it above')
+                                    f'move it above (or drop it, if it matches every path too)')
                 elif any(isinstance(g, str) and not glob_problem(g) and matches_every_path(g) for g in paths):
                     catch_all = where
                     if weight == 'light':

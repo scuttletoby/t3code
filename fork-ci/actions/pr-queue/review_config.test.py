@@ -242,12 +242,12 @@ class Refusals(unittest.TestCase):
             self.assertEqual(rc.parse_review(block).rules[2].paths, (g,), g)
 
     def test_globs_that_miss_some_path_are_no_catch_all(self):
-        for g in ('*', '*/*/**', '**/??', '**/*.md', 'src/**', '**/a*', '?'):
+        for g in ('*', '*/*/**', '**/??', '**/*.md', 'src/**', '**/a*', '?', '**/?', '?/**', '**/?/**', '**/??*'):
             self.assertFalse(rc.matches_every_path(g), g)
             block = recommended()
             block['rules'][2]['paths'] = [g]
             self.assertIn("no rule has the catch-all path '**'", refusal(block), g)
-        for g in ('**', '**/*', '*/**', '**/*/**', '**/?', '**/*?', '**/**/*'):
+        for g in ('**', '**/*', '*/**', '**/*/**', '**/*?', '**/?*', '**/*?*', '**/**/*'):
             self.assertTrue(rc.matches_every_path(g), g)
 
     def test_lens_name_the_gate_reads_as_another(self):
