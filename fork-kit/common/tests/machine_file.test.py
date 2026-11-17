@@ -196,7 +196,10 @@ class MachineFile(unittest.TestCase):
     def test_default_paths(self):
         self.assertEqual(mf.default_path('linux'), '/etc/fork-kit/machine.json')
         self.assertEqual(mf.default_path('darwin'), '/Library/Application Support/fork-kit/machine.json')
-        self.assertTrue(mf.default_path('win32').endswith(os.path.join('fork-kit', 'machine.json')))
+        # the fixed folder, never %ProgramData% from the environment, which any caller can point elsewhere
+        from unittest import mock
+        with mock.patch.dict(os.environ, {'ProgramData': self.dir}):
+            self.assertEqual(mf.default_path('win32'), r'C:\ProgramData\fork-kit\machine.json')
         with self.assertRaises(mf.MachineFileError):
             mf.default_path('plan9')
 
