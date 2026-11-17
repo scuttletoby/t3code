@@ -1077,7 +1077,8 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
         except HostError as e:
             closed[p['name']] = str(e)
             once(state, ('ready', p['name'], str(e)), f'::warning::fork-fleet: {e}')
-        # This host's own public address, again every pass: it may change while a job runs. The launcher re-applies
+        # This host's own public address, again every pass (the launcher asks its lookups at most every
+        # OWN_ADDRESS_SECONDS): it may change while a job runs. The launcher re-applies
         # the block for the running jobs too; when no lookup answers, the last block stays and no runner starts.
         try:
             hosts[p['name']].refresh_net()

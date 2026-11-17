@@ -2,7 +2,7 @@
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
 import copy, datetime, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat, subprocess, sys
-import tempfile
+import tempfile, time
 import unittest, urllib.error, urllib.parse
 from contextlib import redirect_stdout
 from functools import partial
@@ -1519,7 +1519,7 @@ class Launcher(unittest.TestCase):
         settings = dict(RUNNER_USERS=','.join(self.USERS), TEMPLATE=self.template, WORK_ROOT=self.path('var/runners'),
                         RUN_DIR=self.path('run'), HOOK=self.hook, LINGER_DIR=self.path('linger'),
                         RESERVE_MB='2048', MAX_SECONDS='3600', NET_BASE='10.204', RESOLV_CONF=self.path('resolv.conf'),
-                        IP_FORWARD=self.path('ip_forward'), OWN_ADDRESS_URLS=self.OWN_URLS,
+                        IP_FORWARD=self.path('ip_forward'), OWN_ADDRESS_URLS=self.OWN_URLS, OWN_ADDRESS_SECONDS='0',
                         MEMINFO=self.path('meminfo'), SYSTEMD_RUN=self.path('bin/systemd-run'),
                         SYSTEMCTL=self.path('bin/systemctl'), JOB_PATHS=self.job_paths)
         settings.update(over)
@@ -1583,7 +1583,8 @@ class Launcher(unittest.TestCase):
                                 '--working-directory', dest, '-p', 'Type=exec', '-p', 'KillMode=control-group',
                                 '-p', f'EnvironmentFile={run_dir}/{self.NAME}.env',
                                 *self.sandbox('nobody', f'{run_dir}/{self.NAME}.root', dest),
-                                '-p', f'ReadWritePaths={dest}', '-p', 'RuntimeMaxSec=3600', '--', f'{dest}/run.sh'])
+                                '-p', f'ReadWritePaths={dest}', '-p', 'RuntimeMaxSec=3600', '-p', 'TimeoutStopSec=90',
+                                '-p', 'TimeoutAbortSec=90', '--', f'{dest}/run.sh'])
         # HOME and TMPDIR inside the copy, which goes once its unit is gone: nothing of a job reaches the next one.
         self.assertEqual(self.rec_text('env'), self.INPUT + f'HOME={dest}/home\nTMPDIR={dest}/tmp\n'
                                                             f'ACTIONS_RUNNER_HOOK_JOB_STARTED={self.hook}\n')
@@ -2441,6 +2442,61 @@ class Launcher(unittest.TestCase):
         self.assertEqual(self.launch('refresh-net').returncode, 0)
         self.assertEqual(self.rec_text('nft-args'), 'list table inet fork_fleet\n')
         self.assertEqual(self.rec_text('set-property'), want * 2)
+
+    def test_refresh_net_reuses_a_fresh_lookup_for_own_address_seconds(self):
+        """Issue #204 item 2: refresh-net runs every dispatcher pass (20 s); it looks the address up again only once
+        its last answer (RUN_DIR/own-lookup) is OWN_ADDRESS_SECONDS old (120 by default; 0: every pass), so a pool
+        asks each lookup service 720 times a day, not 4320. A fresh answer is not enough when the table went or a
+        unit still waits for its IPAddressDeny: looked up and done now. State: no answer yet (a reboot empties /run),
+        a garbled one or one from the future (the clock set back): looked up; a failed lookup is not remembered."""
+        self.conf(OWN_ADDRESS_SECONDS='120')
+        self.start(self.NAME)
+        stamp = self.path('run/own-lookup')
+
+        def looked_up():   # with every lookup down, a pass that looks up fails; the answers come back after
+            for x in 'ab':
+                os.rename(self.path(f'rec/own-{x}'), self.path(f'rec/down-{x}'))
+            try:
+                got = self.launch('refresh-net')
+            finally:
+                for x in 'ab':
+                    os.rename(self.path(f'rec/down-{x}'), self.path(f'rec/own-{x}'))
+            if got.returncode == 0:
+                return False
+            self.assertIn('no lookup', got.stderr)
+            return True
+        self.assertFalse(os.path.exists(stamp))
+        self.assertTrue(looked_up())   # none yet; and a failed one leaves none
+        self.assertFalse(os.path.exists(stamp))
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        self.assertFalse(looked_up())
+        now = int(time.time())
+        for name, text in (('a stale answer', f'{now - 121}\n'), ('one from the future', f'{now + 600}\n'),
+                           ('a garbled one', 'x\n'), ('an empty one', '')):
+            with self.subTest(name):
+                self.write('run/own-lookup', text, 0o600)
+                self.assertTrue(looked_up())
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        os.remove(os.path.join(self.rec, 'nft'))   # the table went: looked up and made again
+        self.assertTrue(looked_up())
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        self.assertIn(f'ip daddr {self.OWN} counter reject', self.rec_text('nft'))
+        self.assertFalse(looked_up())
+        for x in 'ab':   # a new address whose set-property fails: tried again next pass, so looked up again
+            self.write(f'rec/own-{x}', '203.0.113.77\n', 0o644)
+        self.write('run/own-lookup', f'{now - 121}\n', 0o600)
+        self.write('rec/set-property-fails', '', 0o644)
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        self.assertTrue(looked_up())
+        os.remove(self.path('rec/set-property-fails'))
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        self.assertFalse(looked_up())
+        self.conf(OWN_ADDRESS_SECONDS='0')
+        self.assertTrue(looked_up())
+        for bad in ('-1', '1e3', '999999'):
+            with self.subTest(bad):
+                self.conf(OWN_ADDRESS_SECONDS=bad)
+                self.assertIn('OWN_ADDRESS_SECONDS', self.launch('refresh-net').stderr)
 
     def test_a_lookups_answer_never_reaches_the_terminal_raw(self):
         """Fix round 3 (#191 re-check S1): a lookup service's answer, curl's words and a caller's argument reach the
@@ -3363,6 +3419,90 @@ class LauncherAsRoot(unittest.TestCase):
         real_walls(self, Launcher.waited(self, 'fork-fleet-check-walls'), ['systemd-run'], '--uid', self.USERS[0],
                    full=True)
 
+
+    def test_the_real_job_unit_writes_its_copy_and_nothing_else(self):
+        """Issue #204 item 1: start's own unit, in the system's systemd (CI: the hosted runner's) as a real runner
+        user, with every property start gives it but its network (a namespace: test_check_net_proves_a_runners_network):
+        a trivial job writes its copy, HOME, TMPDIR and its own memory file systems; not the template's files its copy
+        links, nor anything else (every other mount it sees is read-only). Issue #217: the unit has the launcher's own
+        stop timeouts, so systemd's defaults decide nothing for it, and `stop` ends it. The red check: without
+        ProtectSystem=strict its root is writable."""
+        if subprocess.run(['systemd-run', '--wait', '--quiet', '--collect', '--', '/bin/true'], capture_output=True,
+                          timeout=60).returncode != 0:
+            self.skipTest('no system systemd to run a unit with')
+        Launcher.write(self, 'bin/systemd-run', REAL_SYSTEMD_RUN.replace('$REC', self.rec), 0o755)
+        self.conf(SYSTEMCTL=shutil.which('systemctl', path='/usr/bin:/bin'))
+        Launcher.write(self, 'template/run.sh', JOB_WRITES, 0o755)
+
+        def run(name, drop=''):
+            Launcher.write(self, 'rec/drop', drop, 0o644)
+            self.addCleanup(subprocess.run, ['systemctl', 'stop', f'fork-fleet-{name}.service'], capture_output=True)
+            got = self.launch('start', name, stdin=self.INPUT)
+            self.assertEqual(got.returncode, 0, got.stderr)
+            dest = os.path.realpath(self.path(f'var/runners/{name}'))
+            said = subprocess.run(['cat', '--', f'{dest}/out'], capture_output=True, text=True, timeout=120).stdout
+            return dest, said.splitlines()
+        name = 'fleet-vm-t3code-31'
+        dest, said = run(name)
+        own = [dest + '/written', dest + '/home/written', dest + '/tmp/written', '/tmp/written', '/var/tmp/written',
+               '/dev/shm/written']
+        self.assertEqual([x for x in said if x.startswith('wrote ')], [f'wrote {p}' for p in own], said)
+        self.assertEqual([x for x in said if x.startswith('refused ')],
+                         [f'refused {p}' for p in (dest + '/run.sh', os.path.dirname(dest) + '/written', '/written',
+                                                   '/etc/written', '/usr/written', '/var/lib/written')], said)
+        rw = {x[3:] for x in said if x.startswith('rw ')}
+        self.assertIn(dest, rw)
+        own_fs = {dest, '/tmp', '/var/tmp', '/run'}   # its copy and its own memory file systems; and the kernel's
+        self.assertEqual({m for m in rw - own_fs if not re.match(r'/(proc|sys|dev)(/|$)', m)}, set(), said)
+        with open(f'{dest}/written') as f:
+            self.assertEqual(f.read(), 'x\n')
+        with open(f'{self.template}/run.sh') as f:
+            self.assertEqual(f.read(), JOB_WRITES)
+        unit = f'fork-fleet-{name}.service'
+        shown = subprocess.run(['systemctl', 'show', '-p', 'TimeoutStopUSec', '-p', 'TimeoutAbortUSec', unit],
+                               capture_output=True, text=True, timeout=60).stdout.split()
+        self.assertEqual(sorted(shown), ['TimeoutAbortUSec=1min 30s', 'TimeoutStopUSec=1min 30s'])
+        import importlib.machinery
+        loader = importlib.machinery.SourceFileLoader('walls_linux', os.path.join(HERE, 'fork-fleet-walls', 'linux'))
+        walls = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(walls)
+        self.assertEqual(walls.stop_defaults_used(), set())   # the walls read systemd's own file for the unit
+        got = self.launch('stop', name)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertNotEqual(subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=60).returncode, 0)
+        _, said = run('fleet-vm-t3code-32', drop='ProtectSystem=strict')
+        self.assertIn('rw /', said)
+        self.launch('stop', 'fleet-vm-t3code-32')
+
+
+# LauncherAsRoot's systemd-run for the real job unit: the real one, with start's arguments but its network and the
+# property in $REC/drop, and a FIFO in the copy that the job tells the test through.
+REAL_SYSTEMD_RUN = """#!/usr/bin/env bash
+drop=$(cat -- "$REC/drop") dir='' args=()
+while (($#)); do
+  if [[ $1 == -p ]]; then
+    case $2 in NetworkNamespacePath=* | IPAddressDeny=* | IPAddressAllow=* | "$drop") ;; *) args+=(-p "$2") ;; esac
+    shift 2
+    continue
+  fi
+  [[ $1 != --working-directory ]] || dir=$2
+  args+=("$1")
+  shift
+done
+mkfifo -m 0600 -- "$dir/out" && chown --reference="$dir" -- "$dir/out" || exit 99
+exec /usr/bin/systemd-run "${args[@]}"
+"""
+# The trivial job: tries to write each path, says which mounts it sees read-write, then waits for its stop.
+JOB_WRITES = """#!/bin/bash
+exec >"$PWD/out" 2>&1
+for p in "$PWD/written" "$HOME/written" "$TMPDIR/written" /tmp/written /var/tmp/written /dev/shm/written \
+  "$PWD/run.sh" "${PWD%/*}/written" /written /etc/written /usr/written /var/lib/written; do
+  if (echo x >"$p") 2>/dev/null; then echo "wrote $p"; else echo "refused $p"; fi
+done
+while read -r _ _ _ _ point opts _; do [[ ,$opts, != *,rw,* ]] || echo "rw $point"; done </proc/self/mountinfo
+exec >/dev/null 2>&1
+exec sleep 600
+"""
 
 class Wiring(unittest.TestCase):
     """fork-tests.yml, fork-fleet.yml, fork-release.yml and the hook against the config."""
