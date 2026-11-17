@@ -44,6 +44,9 @@
     "peers": ["100.101.102.103/32"],
     "tailscaleTag": "tag:pc-agents"
   },
+  "model-guard": {
+    "policyFile": "/etc/fork-kit/model-policy.json"
+  },
   "desk": {
     "pool": "pc",
     "host": "fleet-host.example",

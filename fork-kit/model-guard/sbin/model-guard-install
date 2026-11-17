@@ -1,0 +1,353 @@
+#!/usr/bin/python3 -IB
+"""model-guard-install: install, uninstall or check the model-guard kit, as root (fork-kit/model-guard/README.md).
+
+  model-guard-install install --source KIT_FOLDER --sha RELEASE_SHA
+  model-guard-install uninstall
+  model-guard-install self-check
+
+install copies bin/model-guard, sbin/model-guard-install, lib/model_guard.py, README.md, model-policy.example.json
+and fork-kit/common/machine_file.py of one release into /usr/local/libexec/model-guard/versions/<sha>/ (with
+MANIFEST.sha256), checks the copy, switches the link `current` to it, links /usr/local/bin/model-guard and
+/usr/local/sbin/model-guard-install to it, writes the hook's own Claude Code managed settings file
+(managed-settings.d/model-guard.json; /etc/claude-code on Linux) and records every path in
+/etc/model-guard/installed.tsv. It never writes the policy file, the machine file or any other settings file. Safe
+to run again, and to stop at any step; a second installer started meanwhile is refused (a lock).
+"""
+import argparse, contextlib, fcntl, hashlib, importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile
+
+sys.dont_write_bytecode = True   # also when run without -B: a __pycache__ in a version folder is not in its manifest
+
+PREFIX = ''          # tests only: every fixed path below is read under this folder
+ROOT_UID = 0         # tests only: who must run the installer and own the installed files
+
+ETC = '/etc/model-guard'
+INSTALLED = ETC + '/installed.tsv'
+LOCK = ETC + '/install.lock'
+LIBEXEC = '/usr/local/libexec/model-guard'
+VERSIONS = LIBEXEC + '/versions'
+CURRENT = LIBEXEC + '/current'
+HOOK = '/usr/local/bin/model-guard'
+INSTALLER = '/usr/local/sbin/model-guard-install'
+LINKS = {HOOK: CURRENT + '/bin/model-guard', INSTALLER: CURRENT + '/sbin/model-guard-install'}
+SOURCE_FILES = ('bin/model-guard', 'sbin/model-guard-install', 'lib/model_guard.py', 'README.md',
+                'model-policy.example.json', 'common/machine_file.py')
+EXECUTABLE = {'bin/model-guard', 'sbin/model-guard-install'}
+SHA_RE = re.compile(r'^[0-9a-f]{40}\Z')
+STEPS = ('check', 'folders', 'copy', 'self-test', 'switch', 'links', 'settings', 'record')
+
+
+class Refused(Exception):
+    pass
+
+
+def p(path):
+    return PREFIX + path
+
+
+def say(msg):
+    print(f'model-guard-install: {msg}', flush=True)
+
+
+def source_file(source, rel):
+    """common/ sits next to the kits (fork-kit/common); a source folder with its own common/ (a copy) uses that."""
+    if rel.startswith('common/') and not os.path.isfile(os.path.join(source, rel)):
+        return os.path.join(os.path.dirname(os.path.normpath(source)), rel)
+    return os.path.join(source, rel)
+
+
+def sha256_file(path):
+    with open(path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def ensure_dir(path):
+    real = p(path)
+    if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)):
+        raise Refused(f'{path} exists and is not a folder: remove it by hand and run again')
+    os.makedirs(real, mode=0o755, exist_ok=True)
+    os.chmod(real, 0o755)
+
+
+def write_file(path, text):
+    """Atomic: a temporary file in the same folder, renamed over the old one. Unchanged text is not rewritten."""
+    real = p(path)
+    with contextlib.suppress(OSError):
+        with open(real, encoding='utf-8') as f:
+            if f.read() == text and stat.S_IMODE(os.stat(real).st_mode) == 0o644:
+                return
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix='.' + os.path.basename(real) + '.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, real)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def switch_link(path, target):
+    """Point path at target in one step (a new link, named for this process, renamed over the old one)."""
+    real = p(path)
+    if os.path.islink(real) and os.readlink(real) == target:
+        return
+    folder, name = os.path.split(real)
+    os.makedirs(folder, mode=0o755, exist_ok=True)
+    for old in os.listdir(folder):   # left by a run that stopped here (the lock keeps out a running one)
+        if old.startswith(name + '.new-link-') and os.path.islink(os.path.join(folder, old)):
+            os.unlink(os.path.join(folder, old))
+    tmp = f'{real}.new-link-{os.getpid()}'
+    os.symlink(target, tmp)
+    os.replace(tmp, real)
+
+
+def managed_paths(guard):
+    """(Claude Code's managed settings folder, its drop-in folder, the hook's drop-in file), as `guard`
+    (a model_guard module) names them."""
+    folder = guard.managed_dir()
+    return folder, folder + '/managed-settings.d', folder + '/managed-settings.d/' + guard.DROP_IN_NAME
+
+
+def load_guard(lib):
+    spec = importlib.util.spec_from_file_location('model_guard', os.path.join(lib, 'model_guard.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+OWN_LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib')
+
+
+@contextlib.contextmanager
+def install_lock():
+    """One installer at a time: a second one is refused while the first runs (it never waits)."""
+    ensure_dir(ETC)
+    fd = os.open(p(LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused('another model-guard-install is running: wait for it to finish and run again') from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def ours(path, target):
+    return os.path.islink(p(path)) and os.readlink(p(path)) == target
+
+
+def read_manifest(folder):
+    out = {}
+    with open(os.path.join(folder, 'MANIFEST.sha256'), encoding='utf-8') as f:
+        for line in f:
+            digest, _, rel = line.rstrip('\n').partition('  ')
+            out[rel] = digest
+    return out
+
+
+def tree_problems(folder):
+    """What differs between a version folder and its manifest, or is not root-owned, or others may write."""
+    try:
+        want = read_manifest(folder)
+    except OSError as e:
+        return [f'{folder}: no readable MANIFEST.sha256 ({e.strerror})']
+    problems, seen = [], set()
+    for dirpath, dirnames, filenames in os.walk(folder):
+        for name in dirnames + filenames + ([] if dirpath != folder else ['.']):
+            path = os.path.normpath(os.path.join(dirpath, name))
+            st = os.lstat(path)
+            if st.st_uid != ROOT_UID or st.st_mode & 0o022 or stat.S_ISLNK(st.st_mode):
+                problems.append(f'{path}: not root-owned, writable by others, or a link')
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), folder)
+            if rel == 'MANIFEST.sha256':
+                continue
+            seen.add(rel)
+            if rel not in want:
+                problems.append(f'{rel}: not in the manifest')
+            elif sha256_file(os.path.join(dirpath, name)) != want[rel]:
+                problems.append(f'{rel}: changed since install')
+    problems += [f'{rel}: missing' for rel in sorted(set(want) - seen)]
+    return problems
+
+
+def copy_tool(source, sha):
+    versions = p(VERSIONS)
+    dest = os.path.join(versions, sha)
+    if os.path.lexists(dest):
+        if os.path.isdir(dest) and not os.path.islink(dest) and not tree_problems(dest) \
+                and set(read_manifest(dest)) == set(SOURCE_FILES):
+            return dest
+        say(f'versions/{sha} is incomplete or changed: made again')
+        shutil.rmtree(dest) if not os.path.islink(dest) else os.unlink(dest)
+    for name in os.listdir(versions):   # a run that stopped while copying
+        if name.startswith('.tmp-'):
+            shutil.rmtree(os.path.join(versions, name), ignore_errors=True)
+    tmp = tempfile.mkdtemp(prefix=f'.tmp-{sha[:12]}-', dir=versions)
+    lines = []
+    for rel in sorted(SOURCE_FILES):
+        dst = os.path.join(tmp, rel)
+        os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
+        with open(source_file(source, rel), 'rb') as f:
+            data = f.read()
+        with open(dst, 'wb') as f:
+            f.write(data)
+        os.chmod(dst, 0o755 if rel in EXECUTABLE else 0o644)
+        lines.append(f'{hashlib.sha256(data).hexdigest()}  {rel}')
+    with open(os.path.join(tmp, 'MANIFEST.sha256'), 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.chmod(os.path.join(tmp, 'MANIFEST.sha256'), 0o644)
+    for dirpath, dirnames, _ in os.walk(tmp):
+        for name in dirnames:
+            os.chmod(os.path.join(dirpath, name), 0o755)
+    os.chmod(tmp, 0o755)
+    os.rename(tmp, dest)
+    return dest
+
+
+def check_old_state(guard):
+    """Refuse, before writing anything, what the installer must not overwrite."""
+    folder, drop_ins, drop_in = managed_paths(guard)
+    for path in (folder, drop_ins):
+        real = p(path)
+        if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)
+                                      or os.lstat(real).st_uid != ROOT_UID):
+            raise Refused(f'{path} exists and is not a root-owned folder: fix it by hand and run again')
+    if os.path.lexists(p(drop_in)) and not stat.S_ISREG(os.lstat(p(drop_in)).st_mode):
+        raise Refused(f'{drop_in} exists and is not a plain file: remove it by hand and run again')
+    for path, target in LINKS.items():
+        if os.path.lexists(p(path)) and not ours(path, target):
+            raise Refused(f'{path} exists and is not the kit\'s link: remove it by hand and run again')
+    for path in (ETC, LIBEXEC, VERSIONS):
+        real = p(path)
+        if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)):
+            raise Refused(f'{path} exists and is not a folder: remove it by hand and run again')
+    if os.path.lexists(p(CURRENT)) and not os.path.islink(p(CURRENT)):
+        raise Refused(f'{CURRENT} exists and is not a link: remove it by hand and run again')
+
+
+def self_test(dest):
+    """The new copy answers a checked call with no policy reachable by refusing it (fail closed)."""
+    problems = tree_problems(dest)
+    hook = os.path.join(dest, 'bin', 'model-guard')
+    r = subprocess.run([sys.executable, '-I', '-B', hook, '--help'], capture_output=True, text=True, timeout=60,
+                       stdin=subprocess.DEVNULL)
+    if r.returncode != 0 or 'model-guard' not in r.stdout:
+        problems.append(f'bin/model-guard --help failed: {(r.stderr or r.stdout).strip()[:200]}')
+    probe = ('import sys; sys.path.insert(0, sys.argv[1]); import io, json, model_guard as m; '
+             'out = io.StringIO(); m.run_hook(io.StringIO(sys.argv[2]), out, machine_path=sys.argv[3]); '
+             'print(json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"])')
+    with tempfile.TemporaryDirectory() as empty:
+        r = subprocess.run([sys.executable, '-I', '-B', '-c', probe, os.path.join(dest, 'lib'),
+                            json.dumps({'tool_name': 'Agent', 'tool_input': {}}),
+                            os.path.join(empty, 'machine.json')],
+                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    if r.returncode != 0 or r.stdout.strip() != 'deny':
+        problems.append(f'the hook did not refuse a call with no policy: {(r.stderr or r.stdout).strip()[:200]}')
+    return problems
+
+
+def install(a, stop_after=None):
+    def done(step):
+        if step == stop_after:
+            raise SystemExit(f'stopped after {step} (test)')
+
+    if os.geteuid() != ROOT_UID:
+        raise Refused('run this as root')
+    if not SHA_RE.match(a.sha or ''):
+        raise Refused('--sha must be the full 40-character release commit')
+    for rel in SOURCE_FILES:
+        if not os.path.isfile(source_file(a.source or '', rel)):
+            raise Refused(f'--source {a.source}: {rel} is missing (point it at the fork-kit/model-guard folder)')
+    check_old_state(load_guard(OWN_LIB))
+    with install_lock():
+        return _install(a, done)
+
+
+def _install(a, done):
+    check_old_state(load_guard(OWN_LIB))   # again, now that no other installer runs
+    done('check')
+    for path in (ETC, LIBEXEC, VERSIONS):
+        ensure_dir(path)
+    done('folders')
+    dest = copy_tool(os.path.realpath(a.source), a.sha)
+    done('copy')
+    problems = self_test(dest)
+    if problems:
+        raise Refused('the new copy failed its self-test (the version in use is unchanged):\n  '
+                      + '\n  '.join(problems))
+    done('self-test')
+    switch_link(CURRENT, f'{VERSIONS}/{a.sha}')
+    done('switch')
+    for path, target in LINKS.items():
+        switch_link(path, target)
+    done('links')
+    guard = load_guard(os.path.join(dest, 'lib'))
+    folder, drop_ins, drop_in = managed_paths(guard)
+    check_old_state(guard)
+    for path in (folder, drop_ins):
+        ensure_dir(path)
+    write_file(drop_in, guard.drop_in_text())
+    done('settings')
+    rows = [(path, 'link', target) for path, target in sorted(LINKS.items())]
+    rows.append((CURRENT, 'link', f'{VERSIONS}/{a.sha}'))
+    rows.append((drop_in, 'file', hashlib.sha256(guard.drop_in_text().encode('utf-8')).hexdigest()))
+    rows += [(f'{VERSIONS}/{a.sha}/{rel}', 'file', digest) for rel, digest in sorted(read_manifest(dest).items())]
+    write_file(INSTALLED, '# path\tkind\twant (written by model-guard-install; read by model-guard --self-check)\n'
+               + ''.join('\t'.join(r) + '\n' for r in rows))
+    done('record')
+    say(f'installed release {a.sha}')
+    for path, kind, want in rows:
+        say(f'  {path}  {kind}  {want}')
+    say(f'the hook now runs in every Claude Code session on this machine ({drop_in}), and refuses every checked '
+        'call until the machine file names a valid policy: see README.md, "Turn it on"; then run '
+        'model-guard --self-check')
+    return 0
+
+
+def uninstall():
+    if os.geteuid() != ROOT_UID:
+        raise Refused('run this as root')
+    _, _, drop_in = managed_paths(load_guard(OWN_LIB))
+    with install_lock():
+        if os.path.lexists(p(drop_in)) and stat.S_ISREG(os.lstat(p(drop_in)).st_mode):
+            os.unlink(p(drop_in))   # first: from here on no session runs the hook
+        for path, target in LINKS.items():
+            if ours(path, target):
+                os.unlink(p(path))
+        shutil.rmtree(p(LIBEXEC), ignore_errors=True)
+        shutil.rmtree(p(ETC), ignore_errors=True)
+    say('uninstalled. Another settings file that still runs "/usr/local/bin/model-guard || exit 2" now refuses '
+        'every checked call: remove that PreToolUse entry too')
+    return 0
+
+
+def main(argv, stop_after=None):
+    ap = argparse.ArgumentParser(prog='model-guard-install', description=__doc__.split('\n\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    i = sub.add_parser('install')
+    i.add_argument('--source', required=True)
+    i.add_argument('--sha', required=True)
+    sub.add_parser('uninstall')
+    sub.add_parser('self-check')
+    a = ap.parse_args(argv)
+    os.umask(0o022)
+    try:
+        if a.cmd == 'install':
+            return install(a, stop_after)
+        if a.cmd == 'uninstall':
+            return uninstall()
+        model_guard = load_guard(OWN_LIB)
+        machine = PREFIX + '/etc/fork-kit/machine.json' if PREFIX else None
+        return model_guard.self_check(machine_path=machine, owner_uid=ROOT_UID, prefix=PREFIX)
+    except Refused as e:
+        print(f'model-guard-install: {e}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
