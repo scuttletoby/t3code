@@ -27,10 +27,17 @@ on neither. For the PR it updates (head H1):
 A PR already up to date never reaches these steps: the project's head_check (required) covers its head.
 Stopped half-way, the next run finishes that PR first from STATE (recover), against the review and the base as GitHub
 shows them then, and touches no other PR until it has re-armed it or said on it why not: a PR is never OFF and silent.
+Two tokens (cli): every read (the PR list with its checks, check runs, workflow runs, reviews, git fetch) uses the
+run's GITHUB_TOKEN (PR_QUEUE_READ_TOKEN), read-only by the job's permissions (README.md, "Use it"); a personal access
+token cannot read check runs at all. The caller's token (PR_QUEUE_WRITE_TOKEN) is used only where it must be (gh_write):
+the branch update (one by GITHUB_TOKEN starts no workflow), auto-merge on (the merge it makes must start the base's
+push workflows) and off, the queue's comments, and the one read that asks whether the queue already said something
+(viewerDidAuthor means the token's own login).
 Files the queue trusts are this user's alone: STATE is written 0600 and read only if no one else could have written it;
 the cache is used only as the queue made it (own_cache), and git runs there with no hooks and no replace refs.
 Exit codes: 0 done; 1 a step failed, the next run tries again; 2 refused to start, nothing touched; 3 a PR may be OFF
 and no comment says so yet (STATE stays, the next run finishes it).
+    PR_QUEUE_READ_TOKEN=... PR_QUEUE_WRITE_TOKEN=... \
     pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 """
 import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, time, urllib.parse
@@ -53,7 +60,14 @@ BASE_RED = ('FAILURE', 'ERROR')   # "the base was red": a real failure. CANCELLE
 UPDATES = 3   # holds() follows at most this many queue updates in a row
 GIT_MIN = (2, 38)   # git merge-tree --write-tree
 REFUSED, SILENT = 2, 3
-# git gets the login from gh (GH_TOKEN, or gh's own login), never from a credential helper of the machine's git config.
+READ_TOKEN, WRITE_TOKEN = 'PR_QUEUE_READ_TOKEN', 'PR_QUEUE_WRITE_TOKEN'
+# Never passed on: each gh and git gets exactly one token, as GH_TOKEN (gh_env).
+TOKEN_VARS = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', READ_TOKEN, WRITE_TOKEN)
+READ_PERMISSIONS = 'actions, checks, contents, issues, pull-requests and statuses: read'
+# GitHub's answer to a token without the permission: "Resource not accessible by integration" (GITHUB_TOKEN, an App)
+# or "... by personal access token".
+NO_PERMISSION_RE = re.compile(r'Resource not accessible by', re.I)
+# git gets the login from gh (GH_TOKEN: the run's read token), never from a credential helper of the machine's git config.
 GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
             '-c', 'credential.https://github.com.helper=!gh auth git-credential')
 # Every git call, whatever the repository's files say: no hooks, no fsmonitor command, no replace refs, and no
@@ -255,10 +269,15 @@ def sync_dir(path):
         os.close(fd)
 
 
+def no_token_env():
+    """This process's environment without any token: for a local git that needs no login."""
+    return {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
+
+
 def git_problem(run=subprocess.run):
     """Why this git cannot run the queue (merge-tree --write-tree needs GIT_MIN), or None."""
     try:
-        r = run(['git', 'version'], text=True, capture_output=True)
+        r = run(['git', 'version'], text=True, capture_output=True, env=no_token_env())
         out = r.stdout.strip()
     except OSError as e:
         out = str(e)
@@ -269,20 +288,58 @@ def git_problem(run=subprocess.run):
 
 
 class Queue:
-    """One repository's queue. gh, git and sleep are attributes, so tests replace them."""
+    """One repository's queue. gh (reads), gh_write (writes), git and sleep are attributes, so tests replace them."""
 
-    def __init__(self, repo, cfg, state, cache, lock, sleep=time.sleep):
+    def __init__(self, repo, cfg, state, cache, lock, sleep=time.sleep, read_token=None, write_token=None):
         self.repo, self.cfg, self.state, self.cache, self.lock, self.sleep = repo, cfg, state, cache, lock, sleep
+        self.read_token, self.write_token, self.said = read_token, write_token, set()
         self.remote = f'https://github.com/{repo}.git'
         self.review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association,
                                   cfg.lens_author_associations)
 
+    @staticmethod
+    def gh_env(token):
+        """The environment for one gh or git: this process's, with no token but `token` as GH_TOKEN."""
+        return {**no_token_env(), 'GH_TOKEN': token}
+
+    @staticmethod
+    def run_gh(token, a, which):
+        """gh with exactly `token`; without one gh is not started (never the machine's own login)."""
+        if not token:
+            return subprocess.CompletedProcess(['gh', *a], 1, '', f'pr_queue: no {which} token, so gh was not started')
+        return subprocess.run(['gh', *a], text=True, capture_output=True, env=Queue.gh_env(token))
+
     def gh(self, *a):
-        return subprocess.run(['gh', *a], text=True, capture_output=True)
+        """A read, with the run's token (read-only: it can change nothing)."""
+        r = self.run_gh(self.read_token, a, 'read')
+        if r.returncode != 0 and NO_PERMISSION_RE.search(r.stderr or ''):
+            self.say_once('read', f"::error::pr-queue: the run's GITHUB_TOKEN may not read this ({' '.join(a[:2])}): "
+                                  f'the queue job needs {READ_PERMISSIONS}, and the calling workflow\'s job must grant '
+                                  'them too (a reusable workflow gets no more than its caller gives). The queue '
+                                  'decides nothing on a read that failed')
+        return r
+
+    def gh_write(self, *a):
+        """A write, or the one read that must be the poster's (tell), with the caller's token."""
+        r = self.run_gh(self.write_token, a, 'write')
+        if r.returncode != 0 and NO_PERMISSION_RE.search(r.stderr or ''):
+            self.say_once('write', f"::error::pr-queue: the queue's token (the `token` secret) may not do this "
+                                   f"({' '.join(a[:2])}): it needs contents, pull requests and issues: write, and "
+                                   'workflows: write when the base brings changes to workflow files')
+        return r
+
+    def say_once(self, key, text):
+        if key not in self.said:
+            self.said.add(key)
+            print(text)
 
     def git(self, *a):
-        return subprocess.run(['git', *GIT_SAFE, *GIT_AUTH, '--git-dir', self.cache, *a], text=True, capture_output=True,
-                              env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+        """git in the cache. It only fetches: with the run's read token, and with no token at all when there is none
+        (never gh's own login of the machine)."""
+        token = self.read_token
+        env = self.gh_env(token) if token else {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
+        return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
+                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0'})
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
@@ -338,7 +395,7 @@ class Queue:
             print(f'could not make {new}: {e}')
             return False
         r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True)
+                           capture_output=True, env=no_token_env())
         if r.returncode != 0:
             print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
             return False
@@ -515,7 +572,7 @@ class Queue:
         anyone can post a copy of it on a public repository. `head` is the head the reason was found on (the list):
         after a push the reason is not known for the new head, and a mark for it would silence its real notice.
         `still`: what the PR must still show when it is read for this (the list is older), else nothing is said."""
-        pr = self.view(n)
+        pr = self.view(n, gh=self.gh_write)   # viewerDidAuthor: the login that posts the queue's comments
         if not pr:
             print(f'#{n}: could not read it to say why it waits')
             return
@@ -529,8 +586,8 @@ class Queue:
         if any(c.get('viewerDidAuthor') is True and (c.get('body') or '').startswith(told)
                for c in pr.get('comments') or []):
             return
-        r = self.gh('pr', 'comment', str(n), '--repo', self.repo, '--body',
-                    f'{told} so this armed PR waits and the queue passes over it. {way_out}')
+        r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
+                          f'{told} so this armed PR waits and the queue passes over it. {way_out}')
         if r.returncode != 0:
             print(f'#{n}: could not comment: {r.stderr.strip()[:300]}')
 
@@ -647,12 +704,13 @@ class Queue:
         return waits or (None, None, False)
 
     # --- steps 2-4 --------------------------------------------------------------------------------------------------
-    def view(self, n, reviews=False):
+    def view(self, n, reviews=False, gh=None):
         """PR n as gh shows it, or None. reviews: also its reviews' own flags and its inline review comments
         (review_flags, under lens.REVIEW_FLAGS and lens.REVIEW_COMMENTS), for the review rules; None when they cannot
         be read, so nothing is decided on a review or an inline comment nobody could check. Read for every PR, also
-        one gh pr view lists no review for: an inline comment shows only in that read."""
-        r = self.gh('pr', 'view', str(n), '--repo', self.repo, '--json', VIEW)
+        one gh pr view lists no review for: an inline comment shows only in that read. gh: the call to read with
+        (default the read token's)."""
+        r = (gh or self.gh)('pr', 'view', str(n), '--repo', self.repo, '--json', VIEW)
         try:
             pr = json.loads(r.stdout) if r.returncode == 0 else None
         except ValueError:
@@ -680,9 +738,9 @@ class Queue:
         the comment failed (the caller keeps STATE, so the next run says it)."""
         why = lens.no_lens_text(why) + (' ' + lens.no_lens_text(advice, keep_markdown=True) if advice else '')
         print(f'#{n}: auto-merge left OFF: {why}')
-        r = self.gh('pr', 'comment', str(n), '--repo', self.repo, '--body',
-                    f'pr_queue turned auto-merge OFF: {why}\nNeeds a lens read of any new commits, then '
-                    f'`{self.cfg.ready(n)}`.')
+        r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
+                          f'pr_queue turned auto-merge OFF: {why}\nNeeds a lens read of any new commits, then '
+                          f'`{self.cfg.ready(n)}`.')
         if r.returncode != 0:
             print(f'#{n}: could not comment either: {r.stderr.strip()[:300]}')
             return SILENT
@@ -714,8 +772,8 @@ class Queue:
             # never --delete-branch: when GitHub can merge at once, gh merges and then deletes the branch with the
             # token, and GitHub CLOSES every open PR stacked on it; the repository's own "Automatically delete head
             # branches" setting retargets them to this PR's base first (README.md, "Config", delete_branch)
-            r = self.gh('pr', 'merge', str(n), '--repo', self.repo, '--auto', f'--{self.cfg.merge_method}',
-                        '--match-head-commit', head)
+            r = self.gh_write('pr', 'merge', str(n), '--repo', self.repo, '--auto', f'--{self.cfg.merge_method}',
+                              '--match-head-commit', head)
             wait += self.cfg.poll_seconds
             if r.returncode == 0 or not CHECK_NOT_DONE_RE.search(r.stderr or '') \
                     or waited + wait > self.cfg.wait_seconds:
@@ -761,7 +819,7 @@ class Queue:
         return code
 
     def update_off(self, n, old, base, read, fetched, why):
-        r = self.gh('pr', 'merge', str(n), '--repo', self.repo, '--disable-auto')
+        r = self.gh_write('pr', 'merge', str(n), '--repo', self.repo, '--disable-auto')
         if r.returncode != 0:
             print(f'#{n}: could not turn auto-merge off, so not updating: {r.stderr.strip()[:300]}')
             cur = self.view(n)   # gh may report an error for a change GitHub applied
@@ -776,7 +834,7 @@ class Queue:
             return self.leave_off(n, f'GitHub does not have the commit read at {read[:12]} (any more), so it was not '
                                      f'updated. Merge {base} into it yourself and push',
                                   f'(`{self.cfg.push_command}`).')
-        u = self.gh('pr', 'update-branch', str(n), '--repo', self.repo)
+        u = self.gh_write('pr', 'update-branch', str(n), '--repo', self.repo)
         print(u.stdout.strip() or u.stderr.strip()[:300])
         if u.returncode != 0:
             return self.leave_off(n, f'gh pr update-branch failed: {u.stderr.strip()[:200]}')
@@ -814,9 +872,9 @@ class Queue:
         """recover() cannot finish PR n yet: say so once on the PR (STATE `told`; the next runs only retry). 1: STATE
         stays and no other PR this run."""
         if not st.get('told'):
-            r = self.gh('pr', 'comment', str(n), '--repo', self.repo, '--body',
-                        f'pr_queue was stopped half-way and may have left auto-merge OFF here; {what}. The queue '
-                        'retries every run and touches no other PR until it has re-armed this one or said why not.')
+            r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
+                              f'pr_queue was stopped half-way and may have left auto-merge OFF here; {what}. The queue '
+                              'retries every run and touches no other PR until it has re-armed this one or said why not.')
             if r.returncode == 0:
                 self.write_state(dict(st, told=True))
         return 1
@@ -1039,11 +1097,19 @@ def cli(argv=None, env=None):
         cfg = config.load(a.config)
     except config.ConfigError as e:
         problems.append(str(e))
+    read, write = env.get(READ_TOKEN) or '', env.get(WRITE_TOKEN) or ''
+    if not read:
+        problems.append(f"{READ_TOKEN} is empty: every read uses the run's GITHUB_TOKEN (the action sets it)")
+    if not a.dry_run and not write:
+        problems.append(f"{WRITE_TOKEN} is empty: the branch update, auto-merge and comments use the caller's token")
+    elif not a.dry_run and write == read:
+        problems.append(f"{WRITE_TOKEN} is the run's GITHUB_TOKEN, whose branch updates start no workflow")
     problems += filter(None, [git_problem()])
     if problems:
         print('pr_queue refused to start and touched nothing:\n  ' + '\n  '.join(problems))
         return REFUSED
-    return Queue(a.repo, cfg, a.state_file, a.cache, lock).main(a.dry_run)
+    return Queue(a.repo, cfg, a.state_file, a.cache, lock, read_token=read,
+                 write_token=None if a.dry_run else write).main(a.dry_run)
 
 
 if __name__ == '__main__':
