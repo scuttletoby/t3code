@@ -50,6 +50,15 @@ def build(root, files):
     return root
 
 
+# Issue #217: a job unit an older launcher started (no stop timeout of its own: systemd's defaults decide it), and one
+# today's start() made, as systemd writes their transient unit files (a time span as systemd formats it).
+TRANSIENT = '# This is a transient unit file, created programmatically via the systemd API. Do not edit.\n'
+OLD_JOB = {'run/systemd/transient/fork-fleet-ci-0.service': TRANSIENT + '[Service]\nRuntimeMaxSec=1h\n'}
+NEW_JOB = {'run/systemd/transient/fork-fleet-ci-2.service': TRANSIENT + '[Service]\nRuntimeMaxSec=1h\n'
+           'TimeoutStopSec=1min 30s\nTimeoutAbortSec=1min 30s\n'}
+SLOW_DEFAULTS = '[Manager]\nDefaultTimeoutStopSec=1h\nDefaultTimeoutAbortSec=1h\n'
+
+
 def overlay(files, change):
     out = dict(files)
     for path, value in change.items():
@@ -891,6 +900,22 @@ class EveryWallsFile(WallsRunner):
         m = re.search(r'^JOB_DENY = (\(.*?\))$', slurp(os.path.join(FOLDER, 'linux')), re.M | re.S)
         self.assertEqual(sorted(ast.literal_eval(m.group(1))), sorted(self.launchers_deny()))
 
+    def test_linux_job_units_stop_timeouts_are_the_launchers(self):
+        """Issue #217: start() gives each job unit its own stop timeouts (JOB_STOP_TIMEOUTS), each at most STOP_MAX,
+        so systemd's defaults (DefaultTimeoutStopSec=, DefaultTimeoutAbortSec=) decide nothing for the units it
+        starts now."""
+        linux = slurp(os.path.join(FOLDER, 'linux'))
+        keys = ast.literal_eval(re.search(r'^JOB_STOP_TIMEOUTS = (\{.*?\})$', linux, re.M | re.S).group(1))
+        stop_max = int(re.search(r'^STOP_MAX = (\d+)', linux, re.M).group(1))
+        text = slurp(LAUNCHER)
+        start = text[text.index('\nstart() {\n'):]
+        got = dict(re.findall(r' -p (Timeout[A-Za-z]*)=(\S+)', start[:start.index('\n}\n')]))
+        self.assertEqual(set(got), set(keys.values()))
+        self.assertEqual(set(keys), {'DefaultTimeoutStopSec', 'DefaultTimeoutAbortSec'})
+        for k, v in got.items():
+            self.assertRegex(v, r'^[1-9][0-9]*$', k)
+            self.assertLessEqual(int(v), stop_max, k)
+
     def test_linux_job_units_reads_resets_slices_and_stop_timeouts(self):
         """PR #213 re-checks (correctness N1; security N2, N3). systemd's own set-property drop-in (refresh-net's, in
         /run/systemd/transient for a transient unit) starts with an empty IPAddressDeny= and then lists the merged
@@ -940,10 +965,18 @@ class EveryWallsFile(WallsRunner):
                                         '[Service]\nTimeoutStopSec=infinity\n'},
             'a stop timeout of 0': {'run/systemd/system/fork-fleet-.service.d/x.conf': '[Service]\nTimeoutSec=0\n'},
             'a stop timeout of a day': {'etc/systemd/system/service.d/x.conf': '[Service]\nTimeoutAbortSec=1d\n'},
-            "systemd's default stop timeout endless": {'etc/systemd/system.conf.d/x.conf':
+            "systemd's default stop timeout endless": {**OLD_JOB, 'etc/systemd/system.conf.d/x.conf':
                                                        '[Manager]\nDefaultTimeoutStopSec=infinity\n'},
-            "systemd's default, in system.conf, only root reads": {
+            "systemd's default, in system.conf, only root reads": {**OLD_JOB,
                 'etc/systemd/system.conf': {'text': '[Manager]\nDefaultTimeoutStopSec=2h\n', 'mode': '600'}},
+            # issue #217: a job unit's own stop timeout (start() sets one) beats systemd's default, not a drop-in's
+            "a drop-in's 1h beats the job unit's own": {**NEW_JOB, 'etc/systemd/system/fork-fleet-.service.d/x.conf':
+                                                         '[Service]\nTimeoutStopSec=1h\n'},
+            "systemd's default abort endless, an older job unit": {**OLD_JOB, 'etc/systemd/system.conf':
+                                                                   '[Manager]\nDefaultTimeoutAbortSec=infinity\n'},
+            'a job unit with its own stop timeout but no abort one': {
+                'run/systemd/transient/fork-fleet-ci-3.service': '[Service]\nTimeoutStopSec=1min 30s\n',
+                'etc/systemd/system.conf': '[Manager]\nDefaultTimeoutAbortSec=1h\n'},
             # re-check 2: lists by section
             'a reset whose list sits in [X-Note]': {'etc/systemd/system/service.d/50-deny.conf':
                                                     '[Service]\nIPAddressDeny=\n[X-Note]\n' + listed},
@@ -959,7 +992,7 @@ class EveryWallsFile(WallsRunner):
                                                    '50-IPAddressDeny.conf': as_systemd_writes(deny + own)},
             'a reset for a unit that is not there': {dropin: as_systemd_writes(deny + own)},
             # re-check 2: the main system.conf systemd reads
-            **{f'an endless default in {p}': {p: '[Manager]\nDefaultTimeoutStopSec=infinity\n'}
+            **{f'an endless default in {p}': {**OLD_JOB, p: '[Manager]\nDefaultTimeoutStopSec=infinity\n'}
                for p in ('run/systemd/system.conf', 'usr/local/lib/systemd/system.conf', 'usr/lib/systemd/system.conf')},
         }
         passes = {
@@ -984,6 +1017,14 @@ class EveryWallsFile(WallsRunner):
                                       '[Service]\nTimeoutStopSec=90s\nTimeoutAbortSec=3min\n'},
             "systemd's stock system.conf": {'etc/systemd/system.conf':
                                             '[Manager]\n#DefaultTimeoutStopSec=90s\nDefaultTimeoutStopSec=10s\n'},
+            # issue #217: the launcher gives each job unit its own stop timeouts, so systemd's defaults decide nothing
+            "systemd's defaults 1h, no job unit running": {'etc/systemd/system.conf': SLOW_DEFAULTS},
+            "systemd's defaults 1h, a job unit with its own": {**NEW_JOB, 'etc/systemd/system.conf': SLOW_DEFAULTS},
+            "systemd's defaults endless in a drop-in, a job unit with its own": {
+                **NEW_JOB, 'etc/systemd/system.conf.d/x.conf': SLOW_DEFAULTS.replace('1h', 'infinity')},
+            "set-property's drop-in folder beside a job unit": {
+                **NEW_JOB,
+                'run/systemd/transient/fork-fleet-ci-2.service.d/50-x.conf': '[Service]\nTimeoutStopSec=90\n'},
         }
         for name, change in fails.items():
             with self.subTest(name):
@@ -1183,7 +1224,7 @@ class EveryWallsFile(WallsRunner):
         """Issue #226 item 3: systemd 256 and later reads the first system.conf of /etc, /run, /usr/local/lib and
         /usr/lib that is there; a dangling link is not, so it reads the next one (an endless default there FAILS),
         while a link to /dev/null masks all after it (passes)."""
-        endless = {'usr/lib/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'}
+        endless = {**OLD_JOB, 'usr/lib/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'}
         got = self.job_units(endless, [('etc/systemd/system.conf', '/nonexistent/system.conf')])
         self.assertTrue(got.startswith('FAIL'), got)
         self.assertIn('/usr/lib/systemd/system.conf', got)
