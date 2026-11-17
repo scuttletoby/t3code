@@ -44,7 +44,8 @@ check runs (`head_check_app`, [pr-queue](../../fork-ci/actions/pr-queue/README.m
 - **Lens comments.** A lens comment is only as good as the people allowed to post it (the config's
   `lens_author_associations`). Who may post them once agents use App tokens is open (lens identity).
 - **Stale answers.** The gate judges the comments that exist when it runs. Reviews and inline diff
-  comments do not start it (see the README's "Run again after a review").
+  comments start it through the review trigger, except when that does not run (see the README's "Run
+  again after a review").
 - **Ordinary CI jobs.** A pull request can still weaken an ordinary job of its own workflow. The gate
   catches that only through review: the reviewers read the exact head, and the gate cannot be
   rewritten.
