@@ -2102,6 +2102,42 @@ class ArmWaitsOutTheQueuedCheckRace(Base):
         self.assertEqual((code, len(f.comments)), (0, 1))
 
 
+class HoldsReadsAnyFileName(unittest.TestCase):   # #374 item 5: merge-tree names a conflicted file as git stores it
+    """A conflict lists file names in merge-tree's output, and a name need not be UTF-8: a strict decode raised
+    UnicodeDecodeError out of holds. Not the same change (a conflict never gives the head's tree), said clearly."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix='pr-queue-holds-')
+        self.addCleanup(shutil.rmtree, self.d, True)
+        World.git(self.d, 'init', '-q', '-b', 'main')
+
+    def commit(self, text, parents=()):
+        with open(os.path.join(os.fsencode(self.d), b'bad\xff.txt'), 'w') as f:
+            f.write(text)
+        World.git(self.d, 'add', '-A')
+        tree = World.git(self.d, 'write-tree')
+        return World.git(self.d, 'commit-tree', tree, *sum((['-p', p] for p in parents), []), '-m', 'c')
+
+    def git(self, *a):   # as Queue.git and head_check's Checkout.git decode: strictly
+        return subprocess.run(['git', *a], cwd=self.d, text=True, encoding='utf-8', errors='strict',
+                              capture_output=True, env={**os.environ, **GIT_ENV})
+
+    def test_a_conflict_on_a_file_name_that_is_not_utf8_is_no_same_change(self):
+        m0 = self.commit('a\n')
+        read, m1 = self.commit('read\n', [m0]), self.commit('base\n', [m0])
+        World.git(self.d, 'update-ref', 'refs/queue/base', m1)
+        head = self.commit('resolved\n', [m1, read])   # a conflict resolution: never the read change alone
+        real = subprocess.run(['git', 'merge-tree', '--write-tree', m1, read], cwd=self.d, capture_output=True)
+        self.assertEqual(real.returncode, 1)   # a real conflict, naming the file as git stores it
+        self.assertIn(b'bad\xff.txt', real.stdout)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIs(Q.holds(self.git, head, read), False)
+        said = out.getvalue()
+        self.assertIn('git printed bytes that are not UTF-8', said)
+        self.assertIn('not taken as the change read', said)
+        self.assertIs(Q.holds(self.git, read, read), True)   # the read itself: no git at all
+
+
 class Conflict(unittest.TestCase):
     """An armed PR that conflicts with its base (merge state DIRTY) cannot merge, the queue cannot update it, and
     GitHub leaves auto-merge on without a word. It is told once per head and passed over; before, only the run log

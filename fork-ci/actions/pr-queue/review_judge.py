@@ -102,10 +102,11 @@ def parse_name_status(text):
 
 def protected_paths(review, config_path):
     """The exact paths that always count as critical: the config file and every lens prompt file. The config path is
-    written as git names a changed file (one leading ./ aside), by the rule the lens prompt paths follow: git also reads
-    `././x` or `a//b`, but no changed path is ever spelled so, and the config would not be protected: JudgeError."""
+    written as git names a changed file (one leading ./ aside): git also reads `././x` or `a//b`, but no changed path is
+    ever spelled so, and the config would not be protected: JudgeError. Glob characters are part of the name
+    (`queue[main].json`): the set is compared exactly, never matched."""
     rel = config_path[2:] if config_path.startswith('./') else config_path
-    why = review_config.prompt_problem(rel)
+    why = review_config.exact_path_problem(rel)
     if why:
         raise JudgeError(f'the config path {config_path!r} {why}: write it as git names the file (such as '
                          '.github/pr-queue.json), or a change to it would not count as protected')
