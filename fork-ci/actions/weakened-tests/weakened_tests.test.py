@@ -3,7 +3,7 @@ failure). Every case builds a real git repository with a base and a pull request
 a fake `gh` that records each call.
 Run: python3 fork-ci/actions/weakened-tests/weakened_tests.test.py
 """
-import json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+import json, os, re, shutil, stat, subprocess, sys, tempfile, unittest, unittest.mock
 
 import yaml
 
@@ -471,6 +471,36 @@ class CouldNotRead(unittest.TestCase):
         self.assertIn('Could not read', gh.ours()[0]['body'])
 
 
+class Refused(unittest.TestCase):
+    """git-clean refused the checkout (the action passes --refused): no git runs, status is refused, and the report
+    comment of an earlier head is replaced, so it is not read as this head's."""
+
+    def run_refused(self, gh):
+        r = Repo(self)
+        c = Cli(self, r)
+        with unittest.mock.patch.object(wt, 'Git', side_effect=AssertionError('git ran')):
+            out = c.run(r.base, gh, extra=('--refused',))
+        return c, out
+
+    def test_status_refused_and_the_old_report_is_replaced(self):
+        gh = FakeGh(comments=[{'id': 3, 'login': BOT, 'body': MARK + '\nold list of an earlier head'}])
+        c, out = self.run_refused(gh)
+        self.assertEqual((out['status'], out['count'], out['missing_why']), ('refused', '', ''))
+        self.assertEqual(gh.writes(), [('PATCH', 'repos/o/r/issues/comments/3')])
+        self.assertIn('git-clean refused', gh.ours()[0]['body'])
+        self.assertNotIn('old list', gh.ours()[0]['body'])
+        self.assertIn('git-clean refused', c.summary)
+
+    def test_no_comment_yet_posts_none_and_again_edits_nothing(self):
+        gh = FakeGh()
+        self.run_refused(gh)
+        self.assertEqual(gh.writes(), [])   # nothing stale to replace
+        gh = FakeGh(comments=[{'id': 3, 'login': BOT, 'body': MARK + '\nold'}])
+        self.run_refused(gh)
+        self.run_refused(gh)   # runs again: the same text, so no second edit
+        self.assertEqual(gh.writes(), [('PATCH', 'repos/o/r/issues/comments/3')])
+
+
 class Comment(unittest.TestCase):
     def weakened(self, r):
         r.branch()
@@ -668,6 +698,11 @@ class Action(unittest.TestCase):
         self.addCleanup(shutil.rmtree, files, True)
         marker = os.path.join(files, 'ran')
         r.git('config', 'core.fsmonitor', f'touch {marker}; false')
+        gh = os.path.join(files, 'gh')   # the comment list holds the report of an earlier head
+        with open(gh, 'w') as f:
+            f.write('#!/bin/sh\necho "$*" >> "$GH_LOG"\ncase "$*" in *--paginate*) printf \'%s\\n\' '
+                    f"'{json.dumps({'id': 3, 'login': BOT, 'body': MARK + ' old'})}';; *PATCH*) cat >> \"$GH_LOG\";; esac\n")
+        os.chmod(gh, 0o755)
         given = {'config': CONFIG, 'repo': 'o/r', 'pr': '7', 'base': r.base, 'head': head, 'path': '.',
                  'token': 'x', 'comment': 'true', 'comment-author': BOT}
         values = {k: given[re.fullmatch(r'\$\{\{ inputs\.([\w-]+) \}\}', v)[1]] for k, v in step['env'].items()}
@@ -676,13 +711,18 @@ class Action(unittest.TestCase):
         p = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', step['run']], text=True,
                            capture_output=True, cwd=r.d,
                            env={**os.environ, **values, 'GITHUB_OUTPUT': out, 'GITHUB_ACTION_PATH': HERE,
-                                'GITHUB_WORKSPACE': r.d, 'PATH': files + os.pathsep + os.environ['PATH']})
+                                'GITHUB_WORKSPACE': r.d, 'GH_LOG': os.path.join(files, 'gh.log'),
+                                'PATH': files + os.pathsep + os.environ['PATH']})
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn('::error::git-clean: ', p.stdout)
         self.assertIn('::warning::weakened-tests: no report', p.stdout)
         self.assertFalse(os.path.exists(marker))
         with open(out) as f:
-            self.assertEqual(f.read(), '')
+            self.assertEqual(f.read(), 'status=refused\ncount=\nmissing_why=\n')
+        with open(os.path.join(files, 'gh.log')) as f:
+            log = f.read()
+        self.assertIn('PATCH repos/o/r/issues/comments/3', log)   # the earlier head's report is replaced
+        self.assertIn('git-clean refused', log)
 
     def test_the_example_caller_runs_it_one_at_a_time_with_full_history(self):
         with open(os.path.join(HERE, 'weakened-tests-caller.example.yml')) as f:
