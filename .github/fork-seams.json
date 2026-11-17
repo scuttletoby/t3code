@@ -41,6 +41,28 @@
         "Effect.flatMap(ForkSettingsWrite.withCheck(update, \"test settings\")), // Fork: save check",
         "yield* ForkSettingsWrite.check(current, updated, settingsPath); // Fork: save check"
       ]
+    },
+    "packages/shared/src/AgentScope.ts": {
+      "why": "The slot observer (apps/server/src/slots/SlotObserver.ts) reads an agent's memory from its own systemd scope; one optional method on upstream's interface asks for it.",
+      "added": [
+        "/** Fork: the thread's own systemd scope and slice, for reading its memory; none when shared. */",
+        "readonly ownScope?: (",
+        "threadId: string,",
+        ") => Effect.Effect<{ unit: string; slice: string } | undefined>;"
+      ]
+    },
+    "apps/server/src/process/agentScope.ts": {
+      "why": "The scope map is private to upstream's make(); the fork's ownScope (see packages/shared/src/AgentScope.ts) is a 7-line lookup in it.",
+      "added": [
+        "// Fork: the thread's own scope, for the slot observer (slots/SlotObserver.ts).",
+        "ownScope: (threadId) =>",
+        "Effect.sync(() => {",
+        "const tracked = scopeByThread.get(threadId);",
+        "return tracked === undefined || tracked.shared",
+        "? undefined",
+        ": { unit: tracked.unit, slice: ownedSlice };",
+        "}),"
+      ]
     }
   }
 }

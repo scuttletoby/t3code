@@ -431,6 +431,7 @@ export const make = Effect.gen(function* () {
     stop,
     kill,
     clear,
+    // Fork: the thread's own scope, for the slot observer (slots/SlotObserver.ts).
     ownScope: (threadId) =>
       Effect.sync(() => {
         const tracked = scopeByThread.get(threadId);
