@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_distro import CONFIG, KIT, REPO, SHA1, SHA2, Case, blob, cli, k  # noqa: E402
 
 DPKG = '--force-confdef --force-confold --configure -a'   # how setup runs dpkg: no config-file question
+# apt-get's options: no config-file question, and a wait for dpkg's lock (apt-get's own locks are retried by setup)
+APT = 'Dpkg::Options::=--force-confdef Dpkg::Options::=--force-confold DPkg::Lock::Timeout=300'
 
 
 class Setup(Case):
@@ -338,7 +340,7 @@ class Setup(Case):
         self.write('/log/packages/unzip', 'install ok unpacked')   # an apt-get stopped half-way
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.log('dpkg'), [DPKG])   # first: apt-get refuses while dpkg was interrupted
+        self.assertEqual(self.log('dpkg'), ['--audit', DPKG])   # first: apt-get refuses while dpkg was interrupted
         self.assertEqual(self.log('apt-get'), ['update', 'install -y unzip'])
         self.assertFalse([line for line in self.log() if line.startswith('restart')])   # no T3 restart for a package
 
@@ -364,6 +366,7 @@ class Setup(Case):
         code, out = self.setup_run()
         self.assertEqual(code, 1, out)
         self.assertIn('nameserver 8.8.8.8\n', self.read('/etc/resolv.conf'))   # written before apt-get
+        self.assertEqual(self.check()[0], 1)   # between the two runs: the files changed, T3 did not restart (#321)
         os.unlink(self.path('/log/apt-fail'))
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)
@@ -380,20 +383,51 @@ class Setup(Case):
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)
         self.assertEqual(self.read('/log/packages/unzip'), 'install ok installed\n')
+        self.assertEqual(set(self.log('apt-get-options')), {APT})   # every apt-get run, every option (#321)
 
-    def test_a_dpkg_that_fails_is_named_with_its_own_fix(self):
-        """apt-daily holding dpkg's lock on a new distro: the advice is dpkg's, not an apt-get that fails too."""
+    def test_dpkg_configure_runs_only_when_something_is_half_installed(self):
+        """`dpkg --configure -a` takes dpkg's lock without waiting: on a fresh distro with nothing half-installed
+        it is not run, so unattended-upgrades holding that lock is left to apt-get's own wait (#321)."""
         self.ready()
-        self.write('/log/packages/unzip', 'install ok unpacked')
-        self.write('/log/dpkg-fail', '')
-        code, out = self.setup_run()
-        self.assertEqual(code, 1, out)
-        self.assertIn('dpkg --configure -a failed', out)
-        self.assertIn('another apt-get or dpkg', out)
-        self.assertNotIn('apt-get update && apt-get install', out)
-        os.unlink(self.path('/log/dpkg-fail'))
-        code, out = self.setup_run()
-        self.assertEqual(code, 0, out)
+        self.assertEqual(self.log('dpkg'), ['--audit'])
+        self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+
+    def test_a_lock_apt_daily_holds_is_waited_for(self):
+        """A new distro where apt-daily runs: apt-get update's lists lock, install's archives lock and dpkg's own
+        lock are taken without a wait (only DPkg::Lock::Timeout's frontend lock waits), so setup tries again (#321)."""
+        self.write('/log/packages/unzip', 'install ok unpacked')   # an upgrade stopped half-way
+        for name in ('dpkg-locked', 'apt-locked-update', 'apt-locked-install'):
+            self.write('/log/' + name, '2')
+        self.ready()
+        self.assertEqual(self.log('dpkg'), ['--audit'] + [DPKG] * 3)
+        self.assertEqual(self.log('apt-get'), ['update'] * 3 + ['install -y libatomic1 unzip'] * 3)
+        self.assertEqual(self.read('/log/packages/libatomic1'), 'install ok installed\n')
+        self.assertEqual(self.check()[0], 0)
+
+    def test_a_lock_held_past_the_wait_is_named_with_its_own_fix(self):
+        """A lock still held after the wait (5 minutes on a machine): the advice is to wait for the other apt-get or
+        dpkg, not to fix the network; nothing is installed, and the next run goes on."""
+        for name, failed in (('dpkg-locked', 'dpkg --configure -a failed'),
+                             ('apt-locked-update', 'apt-get update failed'),
+                             ('apt-locked-install', 'apt-get install failed')):
+            with self.subTest(lock=name):
+                self.ready()
+                os.unlink(self.path('/log/packages/libatomic1'))
+                self.write('/log/packages/unzip', 'install ok unpacked')
+                self.write('/log/' + name, '1000000')
+                code, out = self.setup_run()
+                self.assertEqual(code, 1, out)
+                self.assertIn(failed, out)
+                self.assertIn('Could not get lock' if 'apt' in name else 'locked by another process', out)
+                self.assertIn('Another apt-get or dpkg still runs', out)
+                self.assertNotIn('network', out)
+                self.assertFalse(os.path.exists(self.path('/log/packages/libatomic1')))
+                os.unlink(self.path('/log/' + name))
+                code, out = self.setup_run()
+                self.assertEqual(code, 0, out)
+                self.assertEqual(self.read('/log/packages/libatomic1'), 'install ok installed\n')
+                shutil.rmtree(self.root)
+                self.setUp()
 
     def test_t3_that_does_not_start_is_reported(self):
         self.ready()
@@ -780,6 +814,8 @@ class Refused(Case):
                             ({'t3Version': '0.0.30-fork.1'}, '0.1.7 or newer'),
                             # built before 0.1.7 had the managed policy: a pre-release is older than its release
                             ({'t3Version': '0.1.7-nightly.20261031.3991'}, '0.1.7 or newer'),
+                            ({'t3Version': '0.1.7-nightly.20261031.3991.fork.1'}, '0.1.7 or newer'),   # the fork's
+                            ({'t3Version': '0.1.7-fork.1.rc.1'}, '0.1.7 or newer'),
                             ({'maxRuntimeMode': 'root'}, 'one of')):
             self.machine({**CONFIG, **change})
             code, out = self.setup_run()
@@ -789,8 +825,10 @@ class Refused(Case):
 
 
     def test_versions_from_0_1_7_on_are_accepted(self):
-        """Compared as numbers, the release itself included: a string compare would refuse 0.1.10 (#296)."""
-        for v in ('0.1.7', '0.1.8-rc.1', '0.1.10', '0.1.10-nightly.20261114.4682.fork.1', '0.2.0', '1.0.0'):
+        """Compared as numbers, the release itself included: a string compare would refuse 0.1.10 (#296). The fork's
+        stable build of a release (`v<upstream>-fork.<n>`, fork-release.yml) is that release (#321)."""
+        for v in ('0.1.7', '0.1.7-fork.1', '0.1.7-fork.12', '0.1.8-rc.1', '0.1.10',
+                  '0.1.10-nightly.20261114.4682.fork.1', '0.2.0', '1.0.0'):
             self.machine({**CONFIG, 't3Version': v})
             self.assertEqual(k.config()['t3Version'], v)
 
