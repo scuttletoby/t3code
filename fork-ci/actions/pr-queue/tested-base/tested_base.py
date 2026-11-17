@@ -18,8 +18,17 @@ TITLE = 'pr_queue tested base'   # pr_queue.TESTED_BASE (tested_base.test.py pin
 SHA = re.compile(r'[0-9a-f]{40}')
 
 
+# Every git call: no global or system config (on a self-hosted runner an earlier job may have written ~/.gitconfig), and
+# no hooks, fsmonitor command, commit-graph or replace refs from the repository. The same as
+# ../../git-clean/git_clean.py's (git_clean.test.py pins them); the action's first step refused any other .git config.
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
+            '--no-replace-objects')
+
+
 def git(path, *a):
-    r = subprocess.run(['git', '-C', path, *a], text=True, capture_output=True)
+    r = subprocess.run(['git', *GIT_SAFE, '-C', path, *a], text=True, capture_output=True,
+                       env={**os.environ, **GIT_ENV})
     return r.stdout.strip() if r.returncode == 0 else None
 
 
