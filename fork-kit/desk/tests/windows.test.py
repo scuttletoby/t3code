@@ -391,6 +391,18 @@ class Script(unittest.TestCase):
             # ... and from [boot] (also 4 letters) into wsl2
             ('[boot]\nsystemd=true\n[wsl2] old\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '',
              None),
+            # ... and from a longer one into 'wsl2' padded past its length, which is no section (lens re-check: a NUL
+            # pad compared equal to 'wsl2' in PowerShell). WSL takes no comment but '#' on a header.
+            ('[experimental]\nautoMemoryReclaim=gradual\n[wsl2] ; set by hand\nmemory=20GB\n', '', 'autoMemoryReclaim',
+             '[experimental]\nautoMemoryReclaim=gradual\n[wsl2] ; set by hand\nmemory=20GB\n' + want),
+            # only space or tab after ']': a form feed rejects the header after its name
+            ('[experimental]\nautoProxy=true\n[wsl2]\f\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '',
+             'autoProxy', '[experimental]\nautoProxy=true\n[wsl2]\f\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n'
+             + want),
+            # a name starts with a letter: none read, so the keys stay in [wsl2]
+            ('[wsl2]\nmemory=9GB\n[1x]\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '', None),
+            # names are ASCII any case (strcasecmp): under a Turkish culture .ToLower() makes this 'experımental'
+            (want + '[EXPERIMENTAL]\nnetworkingMode=mirrored\n', '9GB', 'networkingMode', want + '[EXPERIMENTAL]\n'),
         )
         script = os.path.join(d, 'merge.ps1')
         with open(script, 'w', encoding='ascii') as f:
@@ -401,12 +413,13 @@ class Script(unittest.TestCase):
                     '"changed=$(Merge-WslConfig $args[0] $want)"\n'
                     '"after=$(@(Changes (Read-WslConfig $args[0]) $want).Count)"\n'
                     '"now=$((Wsl2Keys (Read-WslConfig $args[0]))[\'memory\'])"\n')
-        for old, memory, experimental, new in rows:
-            with self.subTest(old):
+        for (old, memory, experimental, new), culture in ((row, c) for c in ('C', 'tr_TR.UTF-8') for row in rows):
+            with self.subTest(old, culture=culture):   # .NET takes its culture from LC_ALL (tr: I lowers to dotless ı)
                 with open(path, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(old)
                 r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path],
-                                   capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                                   capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+                                   env={**os.environ, 'LC_ALL': culture})
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 out = r.stdout.splitlines()
                 self.assertIn(f'memory={memory}', out)   # what the check at the end reads

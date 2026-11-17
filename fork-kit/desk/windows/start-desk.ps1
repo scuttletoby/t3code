@@ -122,12 +122,13 @@ function Read-WslConfig([string]$path) {
 # [wsl2], so Merge-WslConfig removes them there (the [wsl2] ones are what the desk needs) and the check FAILs on them.
 $Experimental = @('networkingMode', 'dnsTunneling')
 # The section after line $l, as WSL's ParseSection reads a header: space or tab, an open bracket, a letter then letters
-# or digits, a close bracket, space or tab, then the end or a # comment; any case. A bracket line it rejects keeps the
-# length of $sec of the letters read (none: $sec as it was; fewer pad with NUL and match no section). $null: no bracket.
+# or digits, a close bracket, space or tab, then the end or a # comment; any ASCII case. A bracket line it rejects keeps
+# the length of $sec of the letters read (none: $sec as it was; fewer pad with '*' and match no section; WSL pads with
+# NUL, but PowerShell's -eq ignores NUL, so 'wsl2' and NULs would equal 'wsl2'). $null: no bracket.
 function NextSection([string]$l, [string]$sec) {
   if ($l -cnotmatch '^[ \t]*\[(([A-Za-z][A-Za-z0-9]*)(\][ \t]*(#.*)?$)?)?') { return $null }
-  if ($Matches[3]) { return $Matches[2].ToLower() }
-  if ($Matches[2]) { return $Matches[2].ToLower().PadRight($sec.Length, [char]0).Substring(0, $sec.Length) }
+  if ($Matches[3]) { return $Matches[2].ToLowerInvariant() }
+  if ($Matches[2]) { return $Matches[2].ToLowerInvariant().PadRight($sec.Length, '*').Substring(0, $sec.Length) }
   $sec
 }
 # A key=value line, trimmed of space and tab only, as WSL's config parser does: a non-breaking space or a form feed
