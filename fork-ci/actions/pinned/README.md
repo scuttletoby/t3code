@@ -56,6 +56,9 @@ paste what `files` prints.
   never the shared temp folder. One group-writable folder is accepted, as Debian's OpenSSH does for `StrictModes`: one
   of yours whose group is your own private group (your primary group, named as you, with no listed member and no other
   user's primary group). Debian and Ubuntu give each user such a group and umask 002, so `~/.cache` is often 0775.
+  Not when the folder has an ACL (POSIX or NFSv4), or when it cannot tell (`listxattr` fails or is missing, as on
+  macOS): with an ACL the group bits are the ACL mask, so `setfacl -m u:<user>:rwx` on a 0755 folder shows 0775. The
+  fix is `setfacl -b <folder>` or `chmod g-w <folder>`.
   Before #305 a copy sat directly in the system temp folder, so `head_check.py`'s
   `../pr-queue` (or `test_select.py`'s `../docs-scope`) was `$TMPDIR/pr-queue`, which any local user can make when
   `$TMPDIR` is `/tmp`; until #331 the run folder was in the system temp folder too, so `../..` reached it; until #339

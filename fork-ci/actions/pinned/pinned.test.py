@@ -3,7 +3,7 @@ and no good copy is an error; a killed fetch's .part- file and an old pin's fold
 were checked. The README's bootstrap is run as written. No test reaches the network: every fetch is served here.
 Run: python3 fork-ci/actions/pinned/pinned.test.py
 """
-import contextlib, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, time, unittest
+import contextlib, importlib.util, io, json, os, re, shutil, stat, struct, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 try:
     import grp, pwd
@@ -598,9 +598,10 @@ class Above(Case):
         self.assertEqual(os.listdir(default), [SHA])
 
 
-    def lookups(self, gid, name='me', primary=None, members=(), other_primary=None, no_group=False):
+    def lookups(self, gid, name='me', primary=None, members=(), other_primary=None, no_group=False, fails=None):
         """Fakes the user and group lookups (no real user or group is made): you are `me` with primary gid `primary`
-        (default `gid`); group `gid` is `name` with `members`; one other user has primary gid `other_primary`."""
+        (default `gid`); group `gid` is `name` with `members`; one other user has primary gid `other_primary`.
+        fails=(lookup name, exception): that lookup raises it."""
         uid = os.getuid()
         me = pwd.struct_passwd(('me', 'x', uid, gid if primary is None else primary, '', '/home/me', '/bin/sh'))
         other = pwd.struct_passwd(('other', 'x', uid + 1, gid + 1 if other_primary is None else other_primary, '',
@@ -615,10 +616,15 @@ class Above(Case):
             if u != uid:
                 raise KeyError(f'getpwuid(): uid not found: {u}')
             return me
+        fakes = {'getgrgid': getgrgid, 'getpwuid': getpwuid, 'getpwall': lambda: [me, other]}
+        if fails:
+            def raises(*a):
+                raise fails[1]
+            fakes[fails[0]] = raises
         stack = contextlib.ExitStack()
-        stack.enter_context(mock.patch.object(grp, 'getgrgid', getgrgid))
-        stack.enter_context(mock.patch.object(pwd, 'getpwuid', getpwuid))
-        stack.enter_context(mock.patch.object(pwd, 'getpwall', lambda: [me, other]))
+        stack.enter_context(mock.patch.object(grp, 'getgrgid', fakes['getgrgid']))
+        stack.enter_context(mock.patch.object(pwd, 'getpwuid', fakes['getpwuid']))
+        stack.enter_context(mock.patch.object(pwd, 'getpwall', fakes['getpwall']))
         return stack
 
     def as_roots(self, folder):
@@ -668,6 +674,93 @@ class Above(Case):
         self.assertEqual(len(self.runs), 2, 'nothing refused ran')
         self.assertEqual(self.urls, [f'{RAW}/fleet-watch/fleet_watch.py'], 'fetched once, by the first run')
         self.assertEqual(os.getuid(), uid)
+
+    def private_group_folder(self):
+        """A 0700 home with a .cache in it (made 0700, one by one: makedirs makes the middle one with the umask)."""
+        parent = os.path.join(self.root, 'home', '.cache')
+        os.mkdir(os.path.dirname(parent), 0o700)
+        os.mkdir(parent, 0o700)
+        return parent, os.path.join(parent, 'fci')
+
+    @staticmethod
+    def posix_acl(*entries):
+        """The system.posix_acl_access value (Linux's xattr format, version 2) of (tag, perm, id) entries."""
+        return struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *e) for e in entries)
+
+    @unittest.skipUnless(hasattr(os, 'setxattr'), 'POSIX ACLs (Linux)')
+    def test_a_folder_whose_acl_gives_another_user_write_is_refused(self):   # #345 re-check: the ACL mask
+        # A 0755 folder of yours plus `setfacl -m u:<another user>:rwx` shows 0775: the group bits are the ACL mask,
+        # not the group's. Its group is your private one, so the group bits alone said "only you".
+        parent, cache = self.private_group_folder()
+        os.chmod(parent, 0o755)
+        undefined, other = 0xFFFFFFFF, os.getuid() + 1
+        acl = self.posix_acl((0x01, 7, undefined), (0x02, 7, other), (0x04, 5, undefined), (0x10, 7, undefined),
+                             (0x20, 5, undefined))
+        try:
+            os.setxattr(parent, 'system.posix_acl_access', acl)
+        except OSError as e:
+            self.skipTest(f'this file system refuses POSIX ACLs ({e}); test_an_acl_faked covers it')
+        self.assertEqual(os.stat(parent).st_mode & 0o7777, 0o775, 'the mask shows as the group bits')
+        gid = os.stat(parent).st_gid
+        for _ in range(2):   # and on the next run
+            with self.private_above(), self.lookups(gid):
+                self.assertEqual(pinned.shared_above(cache), [parent])
+                with self.assertRaises(pinned.FetchError) as e:
+                    self.run_it(cache)
+                self.assertIn(f'setfacl -b {parent}', str(e.exception), 'the fix, for that folder')
+                self.assertIn(f'chmod g-w {parent}', str(e.exception))
+        os.removexattr(parent, 'system.posix_acl_access')   # setfacl -b
+        with self.private_above(), self.lookups(gid):
+            self.assertEqual(pinned.shared_above(cache), [], 'without the ACL, your private group is yours')
+        self.assertEqual((self.runs, self.urls), ([], []), 'nothing refused was fetched or ran')
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_an_acl_faked(self):   # #345 re-check: CI covers the ACL rule even where the file system has no ACLs
+        parent, cache = self.private_group_folder()
+        os.chmod(parent, 0o775)
+        gid = os.stat(parent).st_gid
+
+        def listing(names=(), error=None):
+            def listxattr(p, *a, **k):
+                if error:
+                    raise error
+                return list(names) if os.fspath(p) == parent else []
+            return mock.patch.object(os, 'listxattr', listxattr, create=True)
+        rows = (('a POSIX ACL', listing(['user.x', 'system.posix_acl_access']), 'setfacl -b'),
+                ('an NFSv4 ACL', listing(['system.nfs4_acl']), 'setfacl -b'),
+                ('listxattr fails', listing(error=OSError(95, 'Operation not supported')), 'cannot tell'),
+                ('listxattr cannot read it', listing(error=PermissionError(13, 'Permission denied')), 'cannot tell'),
+                ('no listxattr here', mock.patch.object(os, 'listxattr', None, create=True), 'cannot tell'))
+        for what, xattrs, why in rows:
+            with self.subTest(what), self.private_above(), self.lookups(gid), xattrs:
+                self.assertEqual(pinned.shared_above(cache), [parent])
+                with self.assertRaises(pinned.FetchError) as e:
+                    self.run_it(cache)
+                self.assertIn(why, str(e.exception))
+                self.assertIn(f'chmod g-w {parent}', str(e.exception), 'the fix, for that folder')
+        with self.subTest('other xattrs, no ACL'), self.private_above(), self.lookups(gid), listing(['user.x']):
+            self.assertEqual(pinned.shared_above(cache), [])
+        os.chmod(parent, 0o755)
+        with self.subTest('an ACL on a folder the group bits (the mask) keep unwritable'), self.private_above(), \
+                self.lookups(gid), listing(['system.posix_acl_access']):
+            self.assertEqual(pinned.shared_above(cache), [], 'the mask caps every named entry')
+        self.assertEqual((self.runs, self.urls), ([], []))
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_any_failed_group_lookup_is_a_clean_refusal(self):   # #345 re-check: a RuntimeError was a traceback
+        parent, cache = self.private_group_folder()
+        os.chmod(parent, 0o775)
+        gid = os.stat(parent).st_gid
+        for lookup in ('getgrgid', 'getpwuid', 'getpwall'):
+            for error in (RuntimeError('nss'), KeyError(gid), OSError(5, 'I/O error')):
+                with self.subTest(lookup=lookup, error=type(error).__name__), self.private_above(), \
+                        self.lookups(gid, fails=(lookup, error)), mock.patch.object(os, 'listxattr', lambda p: []):
+                    self.assertEqual(pinned.shared_above(cache), [parent])
+                    with self.assertRaises(pinned.FetchError) as e:
+                        self.run_it(cache)
+                    self.assertIn(f'cannot tell if the group of {parent} is private', str(e.exception))
+                    self.assertIn(f'chmod g-w {parent}', str(e.exception))
+        self.assertEqual((self.runs, self.urls), ([], []))
 
     @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
     def test_a_refused_cache_leaves_no_folders_behind(self):   # #345 minor 4: checked before private() makes any

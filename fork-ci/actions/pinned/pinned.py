@@ -120,22 +120,39 @@ def private(cache):
 def own_group(gid):
     """Whether gid is your own private group: your primary group, named as you, with no listed member and no other
     user's primary group. Debian and Ubuntu give each user one (and umask 002, so ~/.cache is often 0775); Debian's
-    OpenSSH trusts a group-writable folder of yours in such a group (StrictModes) for the same reason. A failed lookup
-    is not one."""
+    OpenSSH trusts a group-writable folder of yours in such a group (StrictModes) for the same reason. None (falsy:
+    not one) when any lookup fails, whatever it raises."""
     try:
         me, group, users = pwd.getpwuid(os.getuid()), grp.getgrgid(gid), pwd.getpwall()
-    except (KeyError, OSError):
-        return False
+    except Exception:   # KeyError, OSError, or whatever an NSS module raises: cannot tell, so not private
+        return None
     return (me.pw_gid == gid and group.gr_name == me.pw_name and not group.gr_mem
             and all(u.pw_uid == me.pw_uid for u in users if u.pw_gid == gid))
 
 
+ACLS = ('system.posix_acl_access', 'system.nfs4_acl')
+
+
+def acl(folder):
+    """Whether folder has an ACL (True), none (False), or None when we cannot tell: no listxattr here (not Linux),
+    or it fails (a file system without xattrs, an unreadable folder). With an ACL, a folder's group bits are the ACL
+    mask, not its group's: a 0775 folder of yours can be writable by a user or group the ACL names."""
+    listxattr = getattr(os, 'listxattr', None)
+    if listxattr is None:
+        return None
+    try:
+        return not set(ACLS).isdisjoint(listxattr(folder))
+    except OSError:
+        return None
+
+
 def shared_above(cache):
     """The folders above the cache (by the path given and by its real path) that someone else could write: not ours
-    or root's, world-writable (a sticky /tmp too), or group-writable unless it is ours and its group our own private
-    group (own_group). run's copy is <cache>/.run-X/<action>/<file>, so a script's `../../..` is the folder above the
-    cache, where such a someone could plant a neighbour. A missing folder is skipped: private() makes it 0700 below a
-    folder checked here. [] where there are no owners (Windows)."""
+    or root's, world-writable (a sticky /tmp too), or group-writable unless it is ours, has no ACL (acl: the group
+    bits may be its mask) and its group is our own private group (own_group). run's copy is
+    <cache>/.run-X/<action>/<file>, so a script's `../../..` is the folder above the cache, where such a someone could
+    plant a neighbour. A missing folder is skipped: private() makes it 0700 below a folder checked here. [] where there
+    are no owners (Windows)."""
     if not hasattr(os, 'getuid'):
         return []
     bad, seen = [], set()
@@ -149,7 +166,8 @@ def shared_above(cache):
                 up = os.path.dirname(up)
                 continue
             if (st.st_uid not in (0, os.getuid()) or st.st_mode & 0o002
-                    or st.st_mode & 0o020 and not (st.st_uid == os.getuid() and own_group(st.st_gid))):
+                    or st.st_mode & 0o020
+                    and not (st.st_uid == os.getuid() and acl(up) is False and own_group(st.st_gid))):
                 bad.append(up)
             up = os.path.dirname(up)
     return bad
@@ -158,9 +176,19 @@ def shared_above(cache):
 def fix_above(up):
     """How to fix a folder shared_above found: chmod a folder of yours, use another cache under anyone else's."""
     st = os.stat(up)
-    if st.st_uid == os.getuid():
-        return f'chmod {"go" if st.st_mode & 0o002 else "g"}-w {up}'
-    return 'pass --cache with a folder whose every parent only you or root can write'
+    if st.st_uid != os.getuid():
+        return 'pass --cache with a folder whose every parent only you or root can write'
+    if st.st_mode & 0o002:
+        return f'chmod go-w {up}'
+    has = acl(up)
+    if has:
+        return (f'{up} has an ACL, so its group bits are the ACL mask, not its group: remove the ACL '
+                f'(setfacl -b {up}) or chmod g-w {up}')
+    if has is None:
+        return f'cannot tell if {up} has an ACL: chmod g-w {up}'
+    if own_group(st.st_gid) is None:
+        return f'cannot tell if the group of {up} is private: chmod g-w {up}'
+    return f'chmod g-w {up}'
 
 
 def read_regular(path):
@@ -372,7 +400,8 @@ def run(config, action, name, args=(), cache=None, runner=None):
     if shared:
         raise FetchError(f'{", ".join(shared)} above the cache {cache} can be written by someone else (not yours or '
                          "root's, world-writable, a sticky temp folder too, or group-writable by a group that is not "
-                         "your own private one): a script's `..` reaches it, so run refuses this cache. Fix: "
+                         "your own private one, or through an ACL): a script's `..` reaches it, so run refuses this "
+                         "cache. Fix: "
                          + '; '.join(dict.fromkeys(fix_above(up) for up in shared)))
     private(cache)
     _, data = self_contained(config, action, name, cache)
