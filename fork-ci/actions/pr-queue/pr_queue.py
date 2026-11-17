@@ -73,10 +73,11 @@ GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
 # Every git call, whatever the repository's files say: no hooks, no fsmonitor command, no replace refs, and no
 # commit-graph (a planted objects/info/commit-graph(s) could change the parents git reports; git rebuilds nothing from it).
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
-            '--no-replace-objects')
-# ... and no global or system config: on a self-hosted runner an earlier job may have written ~/.gitconfig. The same
+            '-c', 'core.attributesFile=/dev/null', '--no-replace-objects')
+# ... and no global or system config or attributes: on a self-hosted runner an earlier job may have written
+# ~/.gitconfig or ~/.config/git/attributes. The same
 # two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
-GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
