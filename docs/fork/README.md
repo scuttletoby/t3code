@@ -45,13 +45,15 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`         | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`    | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set             | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set             | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 
-For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned; their other fields
-are tuning that does nothing while the switch is off.
+For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
+only `mode`; their other fields are tuning that does nothing while the switch is off.
 
 ## Each setting
 
@@ -220,6 +222,28 @@ The person's pick of profile per thread, by thread id. A pick wins over every de
 picks are kept: a save that would add more is refused until old picks are removed. No pick is ever
 dropped to make room.
 
+### `server.handoff`
+
+Handoff instead of compaction: when a long thread gets big, or sits idle while its prompt cache is
+about to run out, T3 starts a fresh session in the same thread with a written handoff, so the
+thread's children, watched pull requests and waits keep working. This pull request adds only the
+setting and the decision ("should this thread hand off now?"); nothing acts on it yet.
+
+Only the person can change it; agents cannot. `mode` is `off` (the default: upstream's compaction
+settings apply as they are), `handoff`, or `compact` (the same as `off`, so one thread can opt out
+of its project's `handoff`). `threads` maps a thread id to a mode and wins over `mode` (at most
+500). `source` says who writes the handoff: `agent` (the old session, in one turn; `instructions`
+replaces the built-in text) or `command` (a program given as `command`, run without a shell; it
+must only read). `sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
+smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
+model (not set: the thread's current one). A save with a bad value, or `source: command` without a
+command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
+server log), never as `handoff`.
+
+```json
+{ "handoff": { "mode": "handoff", "threads": { "<thread id>": "compact" } } }
+```
+
 ### `projectOverride.waitChecks`
 
 A project's own list of wait checks. It replaces the server's list for that project as a whole (a
@@ -250,6 +274,13 @@ screen resets them with the fork's `clearProjectSettingsOverridesWithForkKeys`
 
 A project's own profile rule for delegated children (`inherit` or a profile name). Not set: the
 server's `mcpSubagentProfile`.
+
+### `projectOverride.handoff`
+
+A project's own handoff settings. It replaces the server's `handoff` for that project as a whole.
+Not set: the project uses the server's. A project value that is not valid reads as off for that
+project; it never falls back to the server's value. A project save that leaves this key out (an
+older client) keeps the stored value; only `null` clears it.
 
 ### A setting the fork removed
 
