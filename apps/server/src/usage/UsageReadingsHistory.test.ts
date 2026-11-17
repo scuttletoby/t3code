@@ -310,6 +310,249 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
     }),
   );
 
+  it.effect("an older update replayed after a newer read at start is never a full read", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const directory = yield* historyDirectory;
+      const checked = (providerAt: string, usage: ServerProviderUsageLimits): ServerProvider => ({
+        ...provider(usage),
+        checkedAt: providerAt,
+      });
+      const before = yield* make({ directory });
+      yield* before.record([checked(at(0), limits(at(0), 40))]);
+
+      // After a restart a streamed update (45%) and then a provider check (40%) are published
+      // between subscribe and read. The read returns the check: nothing new over the 40% on disk.
+      const after = yield* make({ directory });
+      yield* after.record([checked(at(3 * MINUTE), limits(at(3 * MINUTE), 40))]);
+      // The drain replays the older streamed update: history, but not a full read.
+      yield* after.record([checked(at(0), limits(at(2 * MINUTE), 45))]);
+      // A streamed update after the check is not full either: the replay did not take the stamps back.
+      yield* after.record([checked(at(3 * MINUTE), limits(at(4 * MINUTE), 46))]);
+      // The next provider check is full.
+      yield* after.record([checked(at(5 * MINUTE), limits(at(5 * MINUTE), 46))]);
+      // The clock steps back a day: the stamps seen before are now ahead of it, so they cannot
+      // mark what follows as a replay. A check after the step is a full read, as before.
+      yield* TestClock.setTime(NOW_MS - DAY);
+      yield* after.record([checked(at(-DAY), limits(at(-DAY), 46))]);
+      yield* after.record([checked(at(-DAY), limits(at(-DAY + MINUTE), 47))]);
+      yield* after.record([checked(at(-DAY + 2 * MINUTE), limits(at(-DAY + 2 * MINUTE), 47))]);
+
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const served = yield* after.readings(INSTANCE);
+      assert.deepStrictEqual(
+        served.map((entry) => [entry.checkedAt, entry.full === true]),
+        [
+          [at(0), false],
+          [at(2 * MINUTE), false],
+          [at(4 * MINUTE), false],
+          [at(5 * MINUTE), true],
+          [at(-DAY), true],
+          [at(-DAY + MINUTE), false],
+          [at(-DAY + 2 * MINUTE), true],
+        ],
+      );
+    }),
+  );
+
+  it.effect("a check with a newer provider stamp but an older usage stamp keeps both newest", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const directory = yield* historyDirectory;
+      const history = yield* make({ directory });
+      const checked = (providerAt: string, usage: ServerProviderUsageLimits): ServerProvider => ({
+        ...provider(usage),
+        checkedAt: providerAt,
+      });
+      const failed = { unavailable: { reason: "probeFailed" as const } };
+
+      // A failed probe at 12:00.
+      yield* history.record([checked(at(0), limits(at(0), 40, failed))]);
+      // A check starts at 12:01; while its probe runs, a streamed update at 12:02 merges into the
+      // failed limits (they stay failed, the provider stamp stays 12:00).
+      yield* history.record([checked(at(0), limits(at(2 * MINUTE), 45, failed))]);
+      // The check returns with the probe it took at 12:01: provider stamp newer, usage stamp older.
+      yield* history.record([checked(at(MINUTE), limits(at(MINUTE), 50))]);
+      // The next streamed update moves only the usage stamp: not a full read.
+      yield* history.record([checked(at(MINUTE), limits(at(3 * MINUTE), 55))]);
+      // A provider check after it is full.
+      yield* history.record([checked(at(4 * MINUTE), limits(at(4 * MINUTE), 56))]);
+
+      const served = yield* history.readings(INSTANCE);
+      assert.deepStrictEqual(
+        served.map((entry) => [entry.checkedAt, entry.full === true]),
+        [
+          [at(0), false],
+          [at(2 * MINUTE), false],
+          [at(3 * MINUTE), false],
+          [at(4 * MINUTE), true],
+        ],
+      );
+    }),
+  );
+
+  it.effect("a replay with only an older usage stamp keeps the newest usage stamp", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const directory = yield* historyDirectory;
+      const checked = (providerAt: string, usage: ServerProviderUsageLimits): ServerProvider => ({
+        ...provider(usage),
+        checkedAt: providerAt,
+      });
+      const before = yield* make({ directory });
+      yield* before.record([checked(at(0), limits(at(0), 40))]);
+
+      // Check S1 (12:01, 45%), then a streamed update S2 (12:01/12:02, 40%). After a restart the
+      // read returns S2 (nothing new over the 40% on disk) and the drain replays S1.
+      const after = yield* make({ directory });
+      yield* after.record([checked(at(MINUTE), limits(at(2 * MINUTE), 40))]);
+      yield* after.record([checked(at(MINUTE), limits(at(MINUTE), 45))]);
+      // A check that kept the published limits (S2's): only the provider stamp moved, not full.
+      yield* after.record([checked(at(3 * MINUTE), limits(at(2 * MINUTE), 40))]);
+
+      const served = yield* after.readings(INSTANCE);
+      assert.deepStrictEqual(
+        served.map((entry) => [entry.checkedAt, entry.full === true]),
+        [
+          [at(0), false],
+          [at(MINUTE), false],
+          [at(2 * MINUTE), false],
+        ],
+      );
+    }),
+  );
+
+  it.effect("a replay with only an older provider stamp keeps the newest provider stamp", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const directory = yield* historyDirectory;
+      const checked = (providerAt: string, usage: ServerProviderUsageLimits): ServerProvider => ({
+        ...provider(usage),
+        checkedAt: providerAt,
+      });
+      const before = yield* make({ directory });
+      yield* before.record([checked(at(0), limits(at(0), 40))]);
+
+      // Check S1 (12:01, 45%), then a check S2 at 12:02 that kept S1's limits. After a restart the
+      // read returns S2 and the drain replays S1.
+      const after = yield* make({ directory });
+      yield* after.record([checked(at(2 * MINUTE), limits(at(MINUTE), 45))]);
+      yield* after.record([checked(at(MINUTE), limits(at(MINUTE), 45))]);
+      // A streamed update: only the usage stamp moved, not full.
+      yield* after.record([checked(at(2 * MINUTE), limits(at(3 * MINUTE), 46))]);
+
+      const served = yield* after.readings(INSTANCE);
+      assert.deepStrictEqual(
+        served.map((entry) => [entry.checkedAt, entry.full === true]),
+        [
+          [at(0), false],
+          [at(MINUTE), false],
+          [at(3 * MINUTE), false],
+        ],
+      );
+    }),
+  );
+
+  it.effect("a check whose usage stamp is older than one seen is never a full read", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const directory = yield* historyDirectory;
+      const checked = (providerAt: string, usage: ServerProviderUsageLimits): ServerProvider => ({
+        ...provider(usage),
+        checkedAt: providerAt,
+      });
+      const before = yield* make({ directory });
+      yield* before.record([checked(at(0), limits(at(0), 40))]);
+
+      // After a restart the read returns a streamed update (12:02, nothing new over the 40% on
+      // disk). Then a check started at 12:01 returns the probe it took then: a newer provider
+      // stamp, an older usage stamp. Its limits are older than ones already seen: not full.
+      const after = yield* make({ directory });
+      yield* after.record([checked(at(0), limits(at(2 * MINUTE), 40))]);
+      yield* after.record([checked(at(MINUTE), limits(at(MINUTE), 50))]);
+
+      const served = yield* after.readings(INSTANCE);
+      assert.deepStrictEqual(
+        served.map((entry) => [entry.checkedAt, entry.full === true]),
+        [
+          [at(0), false],
+          [at(MINUTE), false],
+        ],
+      );
+    }),
+  );
+
+  it.effect("an update whose provider stamp is older than one seen is never a full read", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const directory = yield* historyDirectory;
+      const checked = (providerAt: string, usage: ServerProviderUsageLimits): ServerProvider => ({
+        ...provider(usage),
+        checkedAt: providerAt,
+      });
+      const before = yield* make({ directory });
+      yield* before.record([checked(at(0), limits(at(0), 40))]);
+
+      // A check starts at 12:01 and probes at 12:02; a streamed update at 12:03 still carries the
+      // 12:00 check's provider stamp. After a restart the read returns the check (nothing new over
+      // disk) and the drain replays the streamed update: a newer usage stamp, an older provider
+      // stamp. It is history, but not a full read.
+      const after = yield* make({ directory });
+      yield* after.record([checked(at(MINUTE), limits(at(2 * MINUTE), 40))]);
+      yield* after.record([checked(at(0), limits(at(3 * MINUTE), 45))]);
+
+      const served = yield* after.readings(INSTANCE);
+      assert.deepStrictEqual(
+        served.map((entry) => [entry.checkedAt, entry.full === true]),
+        [
+          [at(0), false],
+          [at(3 * MINUTE), false],
+        ],
+      );
+    }),
+  );
+
+  it.effect("a last-seen stamp up to 5 minutes ahead of the clock still orders updates", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const directory = yield* historyDirectory;
+      const history = yield* make({ directory });
+      const checked = (
+        instanceId: ProviderInstanceId,
+        providerAt: string,
+        usage: ServerProviderUsageLimits,
+      ): ServerProvider => ({ ...provider(usage, instanceId), checkedAt: providerAt });
+      const inside = 5 * MINUTE - 1000;
+      const outside = 5 * MINUTE + 1000;
+
+      // Just inside the tolerance: a check stamped 4:59 ahead of the clock is still the newest.
+      // An older update after it is a replay, so the streamed update after that is not full.
+      yield* history.record([checked(INSTANCE, at(inside), limits(at(inside), 40))]);
+      yield* history.record([checked(INSTANCE, at(0), limits(at(0), 45))]);
+      yield* history.record([checked(INSTANCE, at(inside), limits(at(6 * MINUTE), 46))]);
+      // Just outside: a check stamped 5:01 ahead says nothing about order (the clock stepped
+      // back), so the check after it is a full read.
+      yield* history.record([checked(SECOND, at(outside), limits(at(outside), 40))]);
+      yield* history.record([checked(SECOND, at(0), limits(at(0), 45))]);
+
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const servedOf = (instanceId: ProviderInstanceId) =>
+        history
+          .readings(instanceId)
+          .pipe(
+            Effect.map((served) => served.map((entry) => [entry.checkedAt, entry.full === true])),
+          );
+      assert.deepStrictEqual(yield* servedOf(INSTANCE), [
+        [at(inside), false],
+        [at(6 * MINUTE), false],
+      ]);
+      assert.deepStrictEqual(yield* servedOf(SECOND), [
+        [at(outside), false],
+        [at(0), true],
+      ]);
+    }),
+  );
+
   it.effect("a restart continues the history without repeating its last reading", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(NOW_MS);
