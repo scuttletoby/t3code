@@ -201,6 +201,10 @@ valid (an unknown preset or key from a newer build, a bad runner) reads as off, 
 a warning in the server log; it is kept as written, and saves of other settings write it back
 unchanged until the person saves this setting.
 
+In the app: Settings, Threads, Review rules shows whether the rules are on and the values a lens
+would run with (each marked as the preset's or set by hand), with "Use recommended review rules"
+and "Turn off" buttons; it asks first before a button drops hand-set fields or an unreadable value.
+
 ```json
 {
   "reviewRules": { "preset": "recommended" }
