@@ -85,11 +85,16 @@ The config is refused when:
   catch-all rule (it could never match): a new folder must never fall to no rule
   or to no lens;
 - there is no `critical` rule (the built-in protected paths below take its lenses);
-- in `enforce`, a lighter rule comes before a heavier rule and some path matches
-  a glob of both (`**/*.md` light above `src/**` critical: `src/notes.md` would
-  belong to the light rule and need no lens). Put heavier rules first. The
-  catch-all rule is exempt: a lighter rule above it is the normal case. In
-  `shadow` the same order is a warning in the gate's summary row, not a refusal;
+- in `enforce`, a rule comes before another rule, some path matches a glob of
+  both, and the first rule is lighter (`**/*.md` light above `src/**` critical:
+  `src/notes.md` would belong to the light rule and need no lens) or of the same
+  weight without one of the other rule's lenses (`**/*.py` critical `[a]` above
+  `src/**/*` critical `[a, b]`: `src/x.py` would need no `b`). Put heavier rules
+  first, and of one weight the rule with more lenses. Only the match-every globs
+  of the catch-all rule (`**`) are exempt: a lighter rule above it is the normal
+  case, but an explicit glob it also names (`["src/**", "**"]`) is compared like
+  any other. In `shadow` the same order is a warning in the gate's summary row,
+  not a refusal, and the warning says that enforce refuses it;
 - a glob is not in the dialect below, or a rule name or glob is written twice.
 
 **Globs.** Paths are repo-relative and use `/`. `*` is any characters inside one
@@ -104,7 +109,10 @@ means the same thing on both sides.
 `.github/workflows/**` always count as critical, whatever the rules say, with the
 lenses of the first critical rule. So a pull request that weakens the rules needs
 the critical lenses, and it is judged by the old rules: the gate reads the config
-from the base tip only.
+from the base tip only. The config file is named as git names a changed file
+(one leading `./` aside; no empty, `.` or `..` segment): any other character is
+part of its name, glob characters too (`queue[main].json`), as the protected
+paths are compared exactly, never matched as globs.
 
 **How the gate judges.** The gate fetches the base tip and the head by sha and
 reads the changed paths with `git diff --name-status -z -M <merge base> <head>`:
@@ -128,6 +136,16 @@ whole). Then (`review_judge.py`, `review_glob.py`):
 their status, and the expected weight and lenses); the Python tests read it, and
 T3 tests its own matcher on the same file.
 
+Notes for T3's matcher and its GitHub reader (no change in the gate):
+
+- add a glob vector with a non-ASCII name (an emoji, which is two UTF-16 units):
+  `?` is one character of the path, so a TypeScript matcher must count code
+  points as Python does, never UTF-16 units;
+- GitHub's changed-files API stops at 3,000 files and gives text, not git's
+  bytes (no `-z`, and a name that is not UTF-8 is changed). A reader on that API
+  must map its names to git's, and when the list is cut, judge the change by the
+  heaviest weight of the rules (unknown never judges lighter).
+
 **Shadow and enforce.** In `shadow` the gate judges as before, by its
 `required-lenses` input, and its check summary adds a row "the path rules would
 have said: <weight>, lenses <...>" with the rules and paths behind it. In
@@ -136,6 +154,13 @@ have said: <weight>, lenses <...>" with the rules and paths behind it. In
 never remove them). Switching `shadow` to `enforce` takes effect on each pull
 request at its next gate run (a push, a base change, or the backfill dispatch);
 a check posted before stays as it was until then.
+
+Fix every config warning before switching to `enforce`: the gate reads the
+config from the base tip, so a base config that does not parse refuses every
+head, the one that fixes it too, and the queue stops (an owner then has to push
+the fix by hand). The gate therefore refuses a pull request whose own new config
+is in `enforce` with a rule order `enforce` refuses (the order checks above);
+that one check reads the pull request's config, everything else the base's.
 
 **The empty input.** The gate refuses an empty `required-lenses` input (a head
 with no lens comment would pass), except when the config at the base tip has a
