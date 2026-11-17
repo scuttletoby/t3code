@@ -2,15 +2,19 @@
 (R0-R5, README.md). It never stops, starts or writes the live T3 home. R2 migrates with `auth session list`: a
 read-only command whose database layer (layerCliConfig) migrates under the ownership lock (there is no
 `t3 project list`). A run is a scratch run (journal.run(scratch=True)): it changes only <backupDir>/t3-rehearsal/,
-which the next run throws away and redoes, so a stop needs no settling.
+which the next run throws away and redoes, so a stop needs no settling. The old folder is removed only under
+_guard_old (in R0 and again right before the removal), its mark last, so a run killed half-way leaves a folder the
+next run still knows as its own.
 """
-import ctypes, json, os, shutil, signal, socket, subprocess, tempfile, time
+import ctypes, json, os, shutil, signal, socket, stat, subprocess, tempfile, time
 
-from golive import coldcopy, journal, live
+from golive import coldcopy, journal, live, osadapter
 
 REHEARSAL, MARK = 't3-rehearsal', '.golive-rehearsal'
-NOT_CLONED = frozenset({'secrets'})  # left out of the clone, on top of what a copy never holds (coldcopy.SKIP)
-NEVER_IN_CLONE = ('server-runtime.json', coldcopy.OWNER_LOCK, 'secrets')  # R0 looks for each after the clone
+# Left out of the clone, on top of what a copy never holds (coldcopy.SKIP): secrets, and the live machine's process
+# records (device hub/daemon and relay clients), which a rehearsal server could act on (a daemon stop, a reap).
+NOT_CLONED = frozenset({'secrets', 'device', 'relay-clients'})
+NEVER_IN_CLONE = ('server-runtime.json', coldcopy.OWNER_LOCK, 'secrets', 'device', 'relay-clients')  # R0 checks
 LIVE_DEFAULT_PORT = 3773
 POLL, READY_WAIT, STOP_WAIT, T3_TIMEOUT, MIGRATE_TIMEOUT, MB = 0.5, 300, 60, 120, 3600, 1024 * 1024
 MIGRATE = ('auth', 'session', 'list', '--json')  # R2: read-only, offline, migrates (tests/contract.test.py)
@@ -67,16 +71,21 @@ def _ids(path):
         path = os.path.dirname(path)
 
 
-def _not_live(path, home):
-    """Refused unless `path` and the live home are apart: neither inside the other, by real path and by file id."""
-    real, live_real = os.path.realpath(path), os.path.realpath(home)
-    st = os.stat(home)
+def _overlap(path, other):
+    """True unless `path` and `other` (which exists) are apart: neither inside the other, by real path and file id."""
+    real, other_real = os.path.realpath(path), os.path.realpath(other)
+    st = os.stat(other)
     try:
         mine = os.stat(path)
     except FileNotFoundError:
         mine = None
-    if (os.path.commonpath([real, live_real]) in (real, live_real) or (st.st_dev, st.st_ino) in _ids(path)
-            or (mine is not None and (mine.st_dev, mine.st_ino) in _ids(home))):
+    return (os.path.commonpath([real, other_real]) in (real, other_real) or (st.st_dev, st.st_ino) in _ids(path)
+            or (mine is not None and (mine.st_dev, mine.st_ino) in _ids(other)))
+
+
+def _not_live(path, home):
+    """Refused unless `path` and the live home are apart: neither inside the other, by real path and by file id."""
+    if _overlap(path, home):
         raise journal.Refused(f'{path} is the live T3 home {home}, or inside it or around it; a rehearsal runs only '
                               'on a clone apart from it; nothing was changed')
 
@@ -119,7 +128,7 @@ def _newest_copy(cfg):
 
 def _prechecks(cfg, copy_dir, port):
     """R0 before any step (journal.Refused, nothing changed): the copy, the builds, the rehearsal home, the port."""
-    copy_dir = os.path.normpath(copy_dir or _newest_copy(cfg))
+    copy_dir, root = os.path.normpath(copy_dir or _newest_copy(cfg)), os.path.join(cfg.backup_dir, REHEARSAL)
     try:
         m = coldcopy.read_manifest(copy_dir, cfg.home)
         coldcopy.verify_copy(copy_dir)
@@ -149,25 +158,10 @@ def _prechecks(cfg, copy_dir, port):
     if '--hold-work' not in helped.stdout + helped.stderr:
         raise journal.Refused(f'{fork} has no `serve --hold-work`: R3 would start work on the clone; nothing was '
                               'changed')
-    root = os.path.join(cfg.backup_dir, REHEARSAL)
-    _not_live(root, cfg.home)
-    if os.path.lexists(root):
-        if os.path.islink(root) or not os.path.isfile(os.path.join(root, MARK)):
-            raise journal.Refused(f'{root} was not made by a rehearsal (no {MARK} in it): move it away; nothing was '
-                                  'changed')
-        live_ids = {(st.st_dev, st.st_ino) for st in (os.stat(cfg.home), os.stat(os.path.join(cfg.home, 'userdata')))}
-        for d, _, _ in os.walk(root):  # rmtree goes into a mount (a bind of the live home in an old clone): refuse
-            st = os.lstat(d)
-            if (st.st_dev, st.st_ino) in live_ids or st.st_dev != os.lstat(root).st_dev:
-                raise journal.Refused(f'{d} in the old rehearsal folder is the live T3 home or a mount point: unmount '
-                                      'it; nothing was changed')
-        old_userdata = os.path.join(root, 'home', 'userdata')
-        if os.path.isdir(old_userdata):
-            try:
-                coldcopy.hold_owner_lock(old_userdata, 0).close()
-            except TimeoutError:
-                raise journal.Refused(f'a T3 server still holds the old rehearsal home {old_userdata} (see its '
-                                      'server-runtime.json): stop it; nothing was changed') from None
+    _guard_old(cfg, root)
+    if _overlap(root, copy_dir):  # the clone step would remove the copy (or write into it)
+        raise journal.Refused(f'the copy {copy_dir} is inside the rehearsal folder {root} (or around it, or a link '
+                              'into it): the clone step would remove it; move the copy out; nothing was changed')
     files = [e for e in m['files'] if isinstance(e, dict) and e.get('kind') == 'file']
     need = 3 * sum(e.get('bytes', 0) for e in files) + cfg.free_floor_mb * MB  # clone, growth, restore's kept files
     if coldcopy._free_bytes(coldcopy._existing(cfg.backup_dir)) < need:
@@ -176,10 +170,79 @@ def _prechecks(cfg, copy_dir, port):
             'root': root, 'home': os.path.join(root, 'home'), 'port': _choose_port(cfg, port)}
 
 
+def _guard_old(cfg, root):
+    """Refused unless the rehearsal folder is apart from the live home and an old one may be removed: a real folder
+    (no link) that bears the kit's mark (or is empty: a removal killed after the mark), with no folder in it that is
+    the live home or on another device, no mount point at or under it in the system's mount list (a bind mount of
+    the same filesystem keeps st_dev; rmtree would go into it), no link to another home's lock, and no server on it.
+    Where the mount list cannot be read (another OS, no /proc) an old folder is never removed."""
+    _not_live(root, cfg.home)
+    if not os.path.lexists(root):
+        return
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise journal.Refused(f'{root} is a link or not a folder: move it away; nothing was changed')
+    try:
+        marked = stat.S_ISREG(os.lstat(os.path.join(root, MARK)).st_mode)
+    except FileNotFoundError:
+        marked = False
+    if not marked and os.listdir(root):
+        raise journal.Refused(f'{root} was not made by a rehearsal (no {MARK} in it): move it away; nothing was '
+                              'changed')
+    live_ids = {(st.st_dev, st.st_ino) for st in (os.stat(cfg.home), os.stat(os.path.join(cfg.home, 'userdata')))}
+    for d, _, _ in os.walk(root):
+        st = os.lstat(d)
+        if (st.st_dev, st.st_ino) in live_ids or st.st_dev != os.lstat(root).st_dev:
+            raise journal.Refused(f'{d} in the old rehearsal folder is the live T3 home or a mount point: unmount '
+                                  'it; nothing was changed')
+    try:
+        points = osadapter.mount_points()
+    except osadapter.Unsupported as e:
+        raise journal.Refused(f'{e}: the old rehearsal folder {root} is removed only when no mount can be in it; '
+                              'remove it by hand; nothing was changed') from None
+    real = os.path.realpath(root)
+    inside = [m for m in points if os.path.commonpath([real, os.path.normpath(m)]) == real]
+    if inside:
+        raise journal.Refused(f'{", ".join(inside)} in the old rehearsal folder is a mount point: unmount it; '
+                              'nothing was changed')
+    old_userdata = os.path.join(root, 'home', 'userdata')
+    if os.path.isdir(old_userdata):
+        if os.path.realpath(os.path.join(old_userdata, coldcopy.OWNER_LOCK)) != os.path.join(
+                real, 'home', 'userdata', coldcopy.OWNER_LOCK):
+            raise journal.Refused(f'{old_userdata} or its {coldcopy.OWNER_LOCK} is a link (it would lead to another '
+                                  'home\'s lock): move the old rehearsal folder away; nothing was changed')
+        try:
+            coldcopy.hold_owner_lock(old_userdata, 0).close()
+        except TimeoutError:
+            raise journal.Refused(f'a T3 server still holds the old rehearsal home {old_userdata} (see its '
+                                  'server-runtime.json): stop it; nothing was changed') from None
+
+
+def _remove(root):
+    """Remove the old rehearsal folder, its mark last: a run killed half-way leaves a folder that still bears the
+    mark (or an empty one), which the next run removes under the same guard."""
+    if os.path.islink(root):
+        raise Failed(f'{root} became a link: nothing was removed')
+    for name in os.listdir(root):
+        if name != MARK:
+            path = os.path.join(root, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+    if os.path.lexists(os.path.join(root, MARK)):
+        os.unlink(os.path.join(root, MARK))
+    os.rmdir(root)
+
+
 def _clone(run, cfg, p):
-    """The clone step: the old rehearsal folder (it bears MARK) goes, a new one is made; read back vs the manifest."""
+    """The clone step: the old rehearsal folder (it bears MARK) goes, a new one is made; read back vs the manifest.
+    The guard runs again right before the removal: a mount or a swap since R0 is caught."""
+    try:
+        _guard_old(cfg, p['root'])
+    except journal.Refused as e:
+        raise Failed(f'the clone step: {e}') from None
     if os.path.lexists(p['root']):
-        shutil.rmtree(p['root'])
+        _remove(p['root'])
     os.makedirs(p['root'], mode=0o700)
     with open(os.path.join(p['root'], MARK), 'w', encoding='utf-8') as f:
         json.dump({'run': run.id, 'copy': p['copy']}, f)
@@ -210,6 +273,10 @@ def _db(report):
     return report.get('database') if isinstance(report.get('database'), dict) else {}
 
 
+def _applied(database):
+    return [m.get('id') for m in database.get('appliedMigrations') or [] if isinstance(m, dict)]
+
+
 def _instances(report):
     s = report.get('settings') if isinstance(report.get('settings'), dict) else {}
     return sorted(str(i.get('id')) for i in s.get('providerInstances') or [] if isinstance(i, dict))
@@ -220,8 +287,7 @@ def _r4(cfg, before, after):
     said = []
     if after.get('version') != cfg.target_version:
         said.append(f'version: the server reports {after.get("version")}, not {cfg.target_version}')
-    applied = [m.get('id') for m in _db(before).get('appliedMigrations') or [] if isinstance(m, dict)]
-    now = [m.get('id') for m in _db(after).get('appliedMigrations') or [] if isinstance(m, dict)]
+    applied, now = _applied(_db(before)), _applied(_db(after))
     expected = applied + list(_db(before).get('pendingMigrations') or [])
     if now != expected or _db(after).get('pendingMigrations') or _db(after).get('unknownMigrations'):
         said.append(f'migrations: applied {now[len(applied):]}, expected {expected[len(applied):]}, still pending '
@@ -306,7 +372,16 @@ def run_rehearse(cfg, copy_dir=None, port=None, say=print):
             facts.update(seconds=result['migrateSeconds'], bytesGrown=result['bytesGrown'], exit=done.returncode)
             if done.returncode != 0:
                 raise Failed(f'R2: {" ".join(MIGRATE)} exited {done.returncode}: {done.stderr.strip()[-300:]}')
-        say(f'R2: migrated {result["migrations"]} in {result["migrateSeconds"]} s')
+            migrated = _db(_report(p))  # R2 must have migrated: R3's server would else migrate unmeasured
+            facts['pendingAfter'] = migrated.get('pendingMigrations')
+            if (_applied(migrated) != _applied(_db(before)) + result['migrations']
+                    or migrated.get('pendingMigrations') != [] or migrated.get('unknownMigrations')):
+                raise Failed(f'R2: {" ".join(MIGRATE)} left the clone with applied {_applied(migrated)[-5:]} (last '
+                             f'5), pending {migrated.get("pendingMigrations")}, unknown '
+                             f'{migrated.get("unknownMigrations")}; expected {result["migrations"]} applied: the '
+                             'server would migrate unmeasured')
+        say(f'R2: migrated {result["migrations"]} in {result["migrateSeconds"]} s' if result['migrations'] else
+            'R2: no migrations were pending')
         server, problems = None, []
         with tempfile.TemporaryDirectory(prefix='golive-rehearse-home-') as empty:
             try:
@@ -329,10 +404,11 @@ def run_rehearse(cfg, copy_dir=None, port=None, say=print):
         with run.step('old-build-blocked') as facts:
             if coldcopy._file_sum(os.path.join(p['home'], 'userdata', 'settings.json')) != settings:
                 raise Failed('R5: settings.json changed during the rehearsal')
-            facts['old'], _ = _preflight(p['old'], p['home'], p['protocol'], p['from'])
-            if facts['old'] != ('blocked' if result['migrations'] else 'ready'):
+            facts['old'], facts['reason'] = _preflight(p['old'], p['home'], p['protocol'], p['from'])
+            want = 'blocked' if result['migrations'] else 'ready'
+            if facts['old'] != want:
                 raise Failed(f'R5: the old build\'s preflight on the migrated clone says {facts["old"]}; it should be '
-                             f'blocked{" (no migrations)" if not result["migrations"] else ""}')
+                             f'{want}{"" if result["migrations"] else " (no migrations)"} (reason: {facts["reason"]})')
             result['oldBuildOnMigrated'] = facts['old']
         with run.step('restore') as facts:
             facts.update(coldcopy.restore(run, p['copy'], p['home'], from_home=cfg.home, version=p['from']))

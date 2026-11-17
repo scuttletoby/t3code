@@ -2,7 +2,7 @@
 build (the live home's runtime) and the fork build (the staged release) are one stub `t3` that keeps its migrations
 in a real SQLite file. Nothing here starts, stops or reads a real T3 or ~/.t3; every stub run is checked to stay in
 the rehearsal home.  python3 -I -B fork-kit/golive/tests/rehearse.test.py"""
-import hashlib, json, os, socket, sqlite3, subprocess, sys, time, unittest
+import hashlib, json, os, socket, sqlite3, subprocess, sys, time, types, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -14,7 +14,8 @@ OLD_HEAD, NEW_HEAD = 81, 83
 # The stub t3. Its version and migration head are fixed per copy; <root>/stub-mode.json (keyed by version) makes it
 # misbehave: "noHoldWork" (help without the flag), "neverReady", "dieInReport" (the report kills the server: dying
 # mid-R4), "touchSettings" (the server rewrites settings.json), "report" (keys laid over the report while a server
-# runs, that is in R4).
+# runs, that is in R4), "migrateNothing" (R2's command exits 0 and migrates nothing), "serveMigrates" (the server
+# migrates at start, as upstream's does when R2 left migrations pending).
 STUB = r'''#!{python} -I
 import json, os, signal, socket, sqlite3, sys, time
 VERSION, HEAD, ROOT = {version!r}, {head!r}, {root!r}
@@ -44,6 +45,9 @@ elif a[:3] == ['auth', 'session', 'list']:
     ud = os.path.join(arg('--base-dir'), 'userdata')
     if os.path.exists(os.path.join(ud, 'server-runtime.json')):
         sys.exit('a server runs: live mode')
+    if M.get('migrateNothing'):
+        print(json.dumps([]))
+        sys.exit(0)
     c = sqlite3.connect(os.path.join(ud, 'statev2.sqlite'))
     for i in range(max(ids(os.path.join(ud, 'statev2.sqlite'))) + 1, HEAD + 1):
         c.execute('INSERT INTO migrations VALUES (?)', (i,))
@@ -88,6 +92,12 @@ elif a[0] == 'serve':
     s.listen()
     owner = sqlite3.connect(os.path.join(ud, 'server-owner.sqlite'), isolation_level=None)
     owner.execute('BEGIN EXCLUSIVE')
+    if M.get('serveMigrates'):
+        c = sqlite3.connect(os.path.join(ud, 'statev2.sqlite'))
+        for i in range(max(ids(os.path.join(ud, 'statev2.sqlite'))) + 1, HEAD + 1):
+            c.execute('INSERT INTO migrations VALUES (?)', (i,))
+        c.commit()
+        c.close()
     rt = os.path.join(ud, 'server-runtime.json')
     def stop(*_):
         os.unlink(rt)
@@ -131,6 +141,38 @@ coldcopy._keep = killing_keep
 rehearse.run_rehearse(config.load(), say=lambda line: None)
 '''
 
+# A rehearsal in its own process, SIGKILLed while it removes the old rehearsal folder: `mid-tree` inside the old
+# clone's files, `last` at the removal of the (by then empty) folder itself.
+KILLED_DELETE = '''import os, sys
+sys.path[:0] = {paths!r}
+from golive import config, osadapter, rehearse
+config.MACHINE_FILE, config.MACHINE_OWNER = {machine!r}, os.getuid()
+osadapter.MOUNTINFO = {mountinfo!r}
+at = {at!r}
+unlink, rmdir, listdir = os.unlink, os.rmdir, os.listdir
+os.listdir = lambda p='.': sorted(listdir(p))  # the mark ('.golive-rehearsal') first: the worst order for it
+def killing_unlink(p, *a, **kw):
+    if at == 'mid-tree' and os.path.basename(os.fspath(p)) == 'statev2.sqlite':
+        os.kill(os.getpid(), 9)
+    return unlink(p, *a, **kw)
+def killing_rmdir(p, *a, **kw):
+    if at == 'last' and os.path.basename(os.fspath(p)) == rehearse.REHEARSAL:
+        os.kill(os.getpid(), 9)
+    return rmdir(p, *a, **kw)
+os.unlink, os.rmdir = killing_unlink, killing_rmdir
+rehearse.run_rehearse(config.load(), say=lambda line: None)
+'''
+
+MOUNTS = (  # a fake /proc/self/mountinfo: no mount near the machine's folders unless a test adds one
+    '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro\n'
+    '23 22 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n'
+    '24 22 0:31 / /mnt/with\\040space rw,relatime shared:13 - tmpfs tmpfs rw\n')
+
+
+def escaped(path):
+    """A path as mountinfo writes it: space, tab, newline and backslash as octal escapes."""
+    return ''.join('\\%03o' % ord(ch) if ch in ' \t\n\\' else ch for ch in path)
+
 
 def sha(path):
     with open(path, 'rb') as f:
@@ -167,7 +209,16 @@ class Base(unittest.TestCase):
         patcher = mock.patch.multiple(rehearse, POLL=0.02, READY_WAIT=5, STOP_WAIT=5)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.mountinfo = m.write('mountinfo', MOUNTS)
+        patcher = mock.patch.object(fx.osadapter, 'MOUNTINFO', self.mountinfo, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.said = []
+
+    def mount(self, path):
+        """A mount point at `path` in the fake mount list (no root here to mount one)."""
+        with open(self.mountinfo, 'a') as f:
+            f.write('90 22 0:44 /x %s rw,relatime - tmpfs tmpfs rw\n' % escaped(path))
 
     def stub(self, version, head):
         return STUB.format(python=sys.executable, version=version, head=head, root=self.m.root)
@@ -303,6 +354,8 @@ class Rehearse(Base):
         pre = [(c['version'], c['argv'][2]) for c in calls if c['argv'][0] == '__service-preflight']
         self.assertEqual([v for v, _ in pre], [fx.LIVE, fx.TARGET, fx.LIVE, fx.LIVE])
         self.assertEqual(result['oldBuildOnMigrated'], 'blocked')
+        r5 = [s['data'] for s in self.runs()[-1]['steps'] if s['step'] == 'old-build-blocked' and s['phase'] == 'done']
+        self.assertIn('unknown migrations', r5[0]['reason'], 'why the old build is blocked stays in the journal')
         # The clone holds no secrets, no runtime record and no ownership lock of the live home.
         self.assertNotIn('secrets', os.listdir(os.path.join(home, 'userdata')))
         self.assertFalse(self.server_left())
@@ -425,6 +478,52 @@ class Rehearse(Base):
         self.make_copy(name=f't3-copy-20990105T000000Z-{fx.LIVE}')
         self.failed('R1: the preflight of t3 ' + fx.LIVE)
 
+    def test_with_no_migrations_the_old_build_stays_ready_and_the_rehearsal_passes(self):
+        self.m.stage_release(fx.TARGET, files={'t3': self.stub(fx.TARGET, OLD_HEAD), 'lib/runtime.txt': 'runtime'})
+        result = self.rehearse()
+        self.assertEqual(result['migrations'], [])
+        self.assertEqual(result['oldBuildOnMigrated'], 'ready')
+        self.assertIn('R2: no migrations were pending', self.said)
+
+    def test_with_no_migrations_an_old_build_saying_blocked_fails_and_says_it_should_be_ready(self):
+        self.m.stage_release(fx.TARGET, files={'t3': self.stub(fx.TARGET, OLD_HEAD), 'lib/runtime.txt': 'runtime'})
+        real, seen = rehearse._preflight, []
+
+        def blocked_in_r5(binary, home, protocol, version):
+            seen.append(version)
+            got = real(binary, home, protocol, version)
+            return ('blocked', 'something else') if len(seen) == 3 else got
+        with mock.patch.object(rehearse, '_preflight', side_effect=blocked_in_r5):
+            text = self.failed('says blocked; it should be ready (no migrations)')
+        self.assertNotIn('should be blocked', text)
+        self.assertIn('something else', text, 'the preflight\'s reason is named')
+
+    def test_a_restore_that_leaves_the_clone_migrated_fails(self):
+        with mock.patch.object(coldcopy, 'restore', return_value={}):  # the copy never put back
+            self.failed('on the restored clone says blocked')
+
+    def test_r2_that_migrates_nothing_fails_before_any_server_migrates_unmeasured(self):
+        self.mode(fx.TARGET, migrateNothing=True, serveMigrates=True)
+        self.failed('R2:')
+        self.assertFalse([c for c in self.stub_calls() if c['argv'][0] == 'serve' and '--help' not in c['argv']],
+                         'R3 never starts on a clone R2 did not migrate')
+
+    def test_r4_migration_checks_each_fail_alone(self):
+        counts = {'projects': 3, 'projectsArchived': 0, 'threads': 40, 'threadsArchived': 0}
+        cases = [({'appliedMigrations': [{'id': i} for i in range(1, 84)], 'pendingMigrations': [84],
+                   'unknownMigrations': [], 'counts': counts}, 'still pending [84]'),
+                 ({'appliedMigrations': [{'id': i} for i in range(1, 83)], 'pendingMigrations': [],
+                   'unknownMigrations': [], 'counts': counts}, 'applied [82], expected [82, 83]')]
+        for over, needle in cases:
+            with self.subTest(needle):
+                self.mode(fx.TARGET, report={'database': over})
+                self.failed(needle)
+
+    def test_a_copy_with_no_provider_instance_fails(self):
+        self.m.write('home/userdata/settings.json', json.dumps({}))
+        self.make_copy(name=f't3-copy-20990106T000000Z-{fx.LIVE}')
+        self.failed('provider instances')
+
 
 class Guards(Base):
     def test_the_live_home_by_a_symlink_is_refused_and_never_removed(self):
@@ -475,6 +574,130 @@ class Guards(Base):
         self.assertTrue(os.path.isdir(inside))
         self.assertEqual(self.steps(), [])
 
+    def test_the_live_port_named_by_the_live_runtime_record_is_refused(self):
+        port = free_port()
+        self.m.write('home/userdata/server-runtime.json', json.dumps({'version': 1, 'pid': 1, 'port': port}))
+        self.refused('the live port', port=port)
+
+    def test_a_rehearsal_folder_that_is_a_link_is_refused_and_never_followed(self):
+        self.m.write('backups/elsewhere/.golive-rehearsal', '{}')
+        self.m.write('backups/elsewhere/keep.txt', 'x')
+        os.symlink(self.m.path('backups/elsewhere'), self.root())
+        self.refused('a link')
+        self.assertEqual(sorted(os.listdir(self.m.path('backups/elsewhere'))), ['.golive-rehearsal', 'keep.txt'])
+
+    def test_a_mount_point_in_an_old_rehearsal_folder_is_refused_and_nothing_removed(self):
+        self.rehearse()
+        home = os.path.join(self.root(), 'home')
+        spaced = os.path.join(home, 'userdata', 'with space')
+        os.makedirs(spaced)
+        for where in (os.path.join(home, 'userdata', 'attachments'), spaced, home, self.root()):
+            with self.subTest(where):
+                with open(self.mountinfo, 'w') as f:
+                    f.write(MOUNTS)
+                self.mount(where)  # the same filesystem bound there: st_dev cannot tell
+                self.refused('mount point')
+                self.assertTrue(os.path.isfile(os.path.join(home, 'userdata', 'statev2.sqlite')))
+
+    def test_a_mount_beside_the_rehearsal_folder_is_not_inside_it(self):
+        self.rehearse()
+        self.mount(self.root() + '-other')
+        self.mount(os.path.dirname(self.root()))
+        self.rehearse()
+
+    def test_a_mount_list_that_cannot_be_read_refuses_the_removal(self):
+        self.rehearse()
+        for case in ('missing', 'empty', 'other-os'):
+            with self.subTest(case):
+                self.m.write('mountinfo', MOUNTS)
+                if case == 'missing':
+                    os.unlink(self.mountinfo)
+                elif case == 'empty':
+                    self.m.write('mountinfo', '')
+                other_os = types.SimpleNamespace(platform='darwin' if case == 'other-os' else sys.platform)
+                with mock.patch.object(fx.osadapter, 'sys', other_os):
+                    self.refused('mount list')
+                self.assertTrue(os.path.isfile(os.path.join(self.root(), 'home', 'userdata', 'statev2.sqlite')))
+        self.m.write('mountinfo', MOUNTS)
+        self.rehearse()
+
+    def test_the_real_mount_list_reads(self):
+        if not os.path.exists('/proc/self/mountinfo'):
+            self.skipTest('no /proc here')
+        with mock.patch.object(fx.osadapter, 'MOUNTINFO', '/proc/self/mountinfo'):
+            self.assertIn('/', fx.osadapter.mount_points())
+        self.assertIn('/mnt/with space', fx.osadapter.mount_points())
+
+    def test_another_device_in_an_old_rehearsal_folder_is_refused(self):
+        self.rehearse()
+        inside = os.path.join(self.root(), 'home', 'userdata')
+        st, real = os.lstat(inside), os.lstat
+        other = os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, st.st_nlink, st.st_uid, st.st_gid,
+                                st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+        with mock.patch.object(rehearse.os, 'lstat', lambda p, *a, **kw: other if os.fspath(p) == inside
+                               else real(p, *a, **kw)):
+            self.refused('mount point')
+        self.assertTrue(os.path.isfile(os.path.join(inside, 'statev2.sqlite')))
+
+    def test_a_mount_or_a_swap_between_the_check_and_the_removal_is_caught(self):
+        self.rehearse()
+        home = os.path.join(self.root(), 'home')
+        append = journal.Run._append
+
+        def swap(how):
+            def at_clone(run, event, **fields):
+                append(run, event, **fields)
+                if fields.get('step') == 'clone' and fields.get('phase') == 'started':
+                    if how == 'mount':
+                        self.mount(os.path.join(home, 'userdata'))
+                    else:
+                        os.rename(self.root(), self.root() + '.moved')
+                        os.symlink(self.m.home, self.root())
+            return mock.patch.object(journal.Run, '_append', at_clone)
+        live = self.m.snapshot()
+        with swap('mount'):
+            self.failed('mount point')
+        self.assertTrue(os.path.isfile(os.path.join(home, 'userdata', 'statev2.sqlite')))
+        with open(self.mountinfo, 'w') as f:
+            f.write(MOUNTS)
+        with swap('link'):
+            self.failed('live T3 home')
+        self.assertEqual(self.m.snapshot(), live)
+        self.assertTrue(os.path.islink(self.root()))
+
+    def test_a_link_in_an_old_clone_never_takes_another_homes_lock(self):
+        self.rehearse()
+        elsewhere = self.m.path('elsewhere-userdata')
+        os.makedirs(elsewhere)
+        open(os.path.join(elsewhere, coldcopy.OWNER_LOCK), 'w').close()
+        ud = os.path.join(self.root(), 'home', 'userdata')
+        os.rename(ud, ud + '.old')
+        os.symlink(elsewhere, ud)
+        with mock.patch.object(coldcopy, 'hold_owner_lock', side_effect=AssertionError('lock taken')) as held:
+            self.refused('a link')
+        held.assert_not_called()
+
+    def test_a_copy_inside_the_rehearsal_folder_is_refused(self):
+        self.rehearse()
+        inside = os.path.join(self.root(), os.path.basename(self.copy_dir))
+        os.rename(self.copy_dir, inside)
+        self.refused('inside the rehearsal folder', copy_dir=inside)
+        self.assertTrue(os.path.isfile(os.path.join(inside, coldcopy.MANIFEST)))
+        linked = self.m.path(f'backups/t3-copy-20990109T000000Z-{fx.LIVE}')
+        os.symlink(inside, linked)  # newest by name: picked by default, a link into the rehearsal folder
+        self.refused('inside the rehearsal folder')
+        self.refused('inside the rehearsal folder', copy_dir=linked)
+        self.assertTrue(os.path.isfile(os.path.join(inside, coldcopy.MANIFEST)))
+
+    def test_device_and_relay_records_are_never_cloned(self):
+        self.m.write('home/userdata/device/agent-device/daemon.json', '{"pid": 1}')
+        self.m.write('home/userdata/device/agent-device/hub.json', '{"pid": 1}')
+        self.m.write('home/userdata/relay-clients/1.json', '{"pid": 1}')
+        self.make_copy(name=f't3-copy-20990107T000000Z-{fx.LIVE}')
+        self.rehearse()
+        names = os.listdir(os.path.join(self.root(), 'home', 'userdata'))
+        self.assertFalse({'device', 'relay-clients'} & set(names))
+
     def test_a_folder_without_the_kit_mark_is_never_removed(self):
         self.m.write(f'backups/{rehearse.REHEARSAL}/someone-else.txt', 'x')
         self.refused('not made by a rehearsal')
@@ -501,6 +724,8 @@ class Guards(Base):
     def test_the_r0_guard_refuses_a_clone_holding_them(self):
         """With the clone's own leaving-out broken, R0 still finds each one before anything runs on the clone."""
         self.m.write('home/userdata/server-runtime.json', '{"version": 1, "pid": 1, "port": 3773}')
+        self.m.write('home/userdata/device/agent-device/daemon.json', '{"pid": 1}')
+        self.m.write('home/userdata/relay-clients/1.json', '{"pid": 1}')
         copy = self.make_copy(name=f't3-copy-20990103T000000Z-{fx.LIVE}', extra=[
             {'path': 'server-runtime.json', 'kind': 'file', 'bytes': 39, 'mode': 0o644},
             {'path': coldcopy.OWNER_LOCK, 'kind': 'file', 'bytes': 0, 'mode': 0o644}])
@@ -546,6 +771,21 @@ class StoppedHalfWay(Base):
                 self.assertNotIn('journal', [c['name'] for c in result['checks'] if not c['ok']])
                 self.assertIn(f'(rehearse, pid {last["pid"]}', ' '.join(result['info']))
                 self.assertIn('nothing to settle', ' '.join(result['info']))
+                self.assertEqual(self.rehearse()['migrations'], [82, 83])
+
+    def test_a_rehearsal_killed_while_it_removes_the_old_folder_runs_again(self):
+        self.rehearse()
+        for at in ('mid-tree', 'last'):
+            with self.subTest(at):
+                code = KILLED_DELETE.format(paths=[os.path.join(fx.KIT, 'lib'), fx.COMMON],
+                                            machine=config.MACHINE_FILE, mountinfo=self.mountinfo, at=at)
+                p = subprocess.run([sys.executable, '-I', '-B', '-c', code], stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(p.returncode, -9, p.stderr)
+                self.assertTrue(os.path.isdir(self.root()), 'killed half-way: the folder is still there')
+                if at == 'mid-tree':
+                    self.assertTrue(os.path.isfile(os.path.join(self.root(), rehearse.MARK)), 'the mark goes last')
+                self.assertFalse(journal.needs_settling(self.runs()[-1]))
                 self.assertEqual(self.rehearse()['migrations'], [82, 83])
 
 
