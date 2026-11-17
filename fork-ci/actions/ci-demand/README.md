@@ -25,7 +25,8 @@ For each day (a run belongs to the UTC day it was created), then a `total` row:
 | runs without jobs        | runs whose jobs were not read because the run stopped early (see below)                                      |
 
 Skipped jobs count nowhere; skipped runs count as runs but cost no request. `--json` prints the same numbers as one
-object (`days.<day>`, `days.total`), plus `incomplete`, `run_list_complete` and `cache_write_failed` (see below).
+object (`days.<day>`, `days.total`), plus `incomplete`, `run_list_complete`, `cache_write_failed` and
+`cache_cleanup_failed` (see below).
 
 Two choices to keep in mind when comparing before and after:
 
@@ -64,12 +65,14 @@ Two choices to keep in mind when comparing before and after:
   over an hour ago, and is reused for 12 hours (a later re-run changes it). Writes are a `.part-` file then a rename,
   so a run killed mid-write leaves no half page under a name that is read. A file that is broken (bad JSON, nested
   too deep, a bad date, a body that is not an object, or a field missing or of the wrong type, such as
-  `total_count` as text or a page without its runs or jobs), saved for another page or in another cache format (an
-  older or newer version of this tool) is fetched again: never a crash, and never counted as no runs or no jobs. A
+  `total_count` as text or a page without its runs or jobs; or a run or job in it that is not completed or lacks a
+  field the counting reads, such as a job without `started_at`, `completed_at` or `runner_name`), saved for another
+  page or in another cache format (an older or newer version of this tool) is fetched again: never a crash, and never
+  counted as no runs, no jobs or 0 seconds. A
   date must be in the form GitHub writes, such as `2026-11-01T12:00:00Z`. A write that fails (a full disk, a
   read-only folder) is reported once and the run goes on with the pages it can read (see above). `.part-` files
   older than an hour are removed; one that cannot be removed (a read-only folder, a directory of that name) is
-  reported on its own line and the run goes on.
+  reported on its own line (and as `cache_cleanup_failed` in `--json`) and the run goes on.
 - **Any OS.** It needs Python 3 and `gh`. Where the OS has user ids (Linux, macOS), a cache folder another user owns
   is refused and the folder is made 0700, also when it existed before; on Windows these checks are skipped. So on
   Linux or macOS the cache folder must allow private permissions: one on a filesystem where chmod has no effect (FAT
