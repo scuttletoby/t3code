@@ -82,8 +82,9 @@ watches; it changes nothing on the machine, and `0` turns it off.
 4. An agent tool may not write it: `FORK_AGENT_WRITABLE_KEYS` stays empty unless a pull request gives
    the reason.
 5. Add its row and section to [README.md](README.md) and name it in
-   [FORK_CHANGES.md](../../FORK_CHANGES.md); `packages/shared/src/forkDocs.test.ts` fails until both
-   match the row in `forkDefaults.ts`.
+   [FORK_CHANGES.md](../../FORK_CHANGES.md); `packages/shared/src/forkDocs.test.ts` (the README) and
+   `.github/scripts/fork-changes-list.test.cjs` (FORK_CHANGES.md) fail until both match the row in
+   `forkDefaults.ts`.
 
 A key written straight into `settings.ts` is refused by the seam check, whatever its comment says.
 
