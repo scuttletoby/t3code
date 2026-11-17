@@ -475,12 +475,19 @@ class Target(Files, unittest.TestCase):
                 self.assertEqual((code, gh.calls), (0, []), out)
                 self.failed(out, 'dispatch the gate with the pull request number')
 
-    def test_no_required_lens_gets_a_failure_before_github_is_read(self):   # lens minor: none would pass a bare head
-        for lenses in ('', '\n \n', '<LENS_NAME>', 'r4'):
+    def test_a_name_that_names_no_lens_gets_a_failure_before_github_is_read(self):   # lens minor
+        for lenses in ('<LENS_NAME>', 'r4', 'code\n<LENS_NAME>'):
             with self.subTest(lenses=lenses):
                 code, out, gh = self.target(required_lenses=lenses)
                 self.assertEqual((code, gh.calls), (0, []), out)
                 self.failed(out, 'required-lenses names no lens')
+
+    def test_an_empty_lens_list_is_left_to_judge(self):   # PK10 C2: only the base tip's config says enforce
+        for lenses in ('', '\n \n'):
+            with self.subTest(lenses=lenses):
+                code, out, _ = self.target(required_lenses=lenses)
+                self.assertEqual((code, self.outputs()), (0, {'post': 'true', 'base': 'main'}), out)
+                os.remove(self.env['GITHUB_OUTPUT'])
 
     def test_bad_arguments_post_nothing(self):   # no head to post on
         for sha, kw in (('ab', {}), (self.H, {'repo': 'not a repo'})):
@@ -641,9 +648,54 @@ class Judge(Files, unittest.TestCase):
         head = self.w.commit(T.base_files(**{'x.py': T.lines(extra=['unread'], at=20)}), [self.m1])
         for lenses in ('', '\n'):
             with self.subTest(lenses=lenses):
-                code, out, _ = self.judge(self.routes(head), T.pr([], head=head), required_lenses=lenses)
+                code, out, gh = self.judge(self.routes(head), T.pr([], head=head), required_lenses=lenses)
                 self.assertEqual((code, self.verdict()['conclusion']), (0, 'failure'), out)
                 self.assertIn('required-lenses names no lens', self.verdict()['title'])
+                self.assertFalse([a for a, _ in gh.calls if a[:2] == ('pr', 'view')], 'refused before the PR is read')
+
+    def review_base(self, mode, **files):
+        """A base tip whose config has the shared vectors' `basic` review block in `mode`, child of m0."""
+        cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': mode}}
+        return self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS, **files), [self.m0])
+
+    def test_an_empty_lens_list_stands_only_when_the_base_tips_review_rules_enforce(self):   # correction 12
+        for mode in ('enforce', 'shadow'):
+            with self.subTest(mode=mode):
+                base = self.review_base(mode)
+                cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': mode}}
+                head = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS, **{'docs/a.md': 'a\n'}), [base])
+                code, out, _ = self.judge(self.routes(head, base=base), T.pr([], head=head), required_lenses='')
+                v = self.verdict()
+                if mode == 'enforce':   # a light-only change: the path rules need no lens
+                    self.assertEqual((code, v['conclusion']), (0, 'success'), out)
+                    self.assertIn('the path rules decide: light, lenses none', v['summary'])
+                else:
+                    self.assertEqual((code, v['conclusion']), (0, 'failure'), out)
+                    self.assertIn('required-lenses names no lens', v['title'])
+
+    def test_an_empty_lens_list_under_enforce_still_needs_the_path_rules_lenses(self):
+        base = self.review_base('enforce')
+        cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': 'enforce'}}
+        head = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS, **{'src/storage/a.py': 'a\n'}), [base])
+        self.judge(self.routes(head, base=base), T.pr([self.p.lens('code', head)], head=head), required_lenses='')
+        v = self.verdict()
+        self.assertEqual(v['conclusion'], 'failure')
+        self.assertIn('required lens without a read: data-1, data-2', v['title'])
+        self.judge(self.routes(head, base=base), T.pr([self.p.lens(n, head) for n in ('data-1', 'data-2')], head=head),
+                   required_lenses='')
+        self.assertEqual(self.verdict()['conclusion'], 'success', self.verdict()['summary'])
+
+    def test_a_review_block_the_base_tip_cannot_parse_is_a_failure(self):   # fail closed, whatever the input says
+        cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': 'loud'}}
+        base = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS), [self.m0])
+        head = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS, **{'docs/a.md': 'a\n'}), [base])
+        for lenses in ('', 'correctness'):
+            with self.subTest(lenses=lenses):
+                self.judge(self.routes(head, base=base), T.pr([self.p.lens('correctness', head)], head=head),
+                           required_lenses=lenses)
+                v = self.verdict()
+                self.assertEqual(v['conclusion'], 'failure', v['summary'])
+                self.assertIn('mode', v['title'])
 
     def test_a_draft_never_gets_a_green_check_on_a_head_it_shares(self):   # lens finding 1 (corr85, sec85 F1a)
         # PR #7 (ready, into main) got 'failure': no lens read the head. Its author opens draft #8 at the same head.
