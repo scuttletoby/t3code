@@ -312,4 +312,13 @@ describe("playtest session records", () => {
     // A stored note is read back with only its length checked, so an older file still loads.
     expect(decodeRecord({ ...record, note: "old\u0000note" }).note).toBe("old\u0000note");
   });
+
+  it("keeps whether the thread still has to hear about an end T3 made itself", () => {
+    // A record from before the worker has none; only due and sent are read.
+    expect(decodeRecord(record)).not.toHaveProperty("notice");
+    const ended = { ...record, state: "ended", endReason: "idle", endedAt: record.startedAt };
+    expect(decodeRecord({ ...ended, notice: "due" }).notice).toBe("due");
+    expect(decodeRecord({ ...ended, notice: "sent" }).notice).toBe("sent");
+    expect(() => decodeRecord({ ...ended, notice: "maybe" })).toThrow();
+  });
 });

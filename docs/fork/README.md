@@ -136,8 +136,8 @@ T3 runs the project's adapter, four kinds of step only the person sets: `claim` 
 `renew` keeps the claim alive, `push` (one or more named steps) sends a round to the target, and
 `release` puts the target back. Each step is a program given by its absolute path with fixed
 arguments, run without a shell; T3 passes the session's facts as environment variables. Nothing
-starts a session yet: the session store is there, and the tool and the thread controls come in
-later pull requests. The steps' contract is in [playtest.md](playtest.md).
+starts a session yet: the session store and the worker (renew, the idle and time limits, ends for
+gone threads) are there, and the tool and the thread controls come in later pull requests. The steps' contract is in [playtest.md](playtest.md).
 
 Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
 push step's name (or names one `claim`, `renew` or `release`), or names a program by anything but
