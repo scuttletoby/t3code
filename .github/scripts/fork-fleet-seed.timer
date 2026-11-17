@@ -1,0 +1,13 @@
+# Fork only: runs t3code-fleet-seed.service every hour, at a random minute in its first 10, and after a wake or a
+# boot when a run was missed (a desktop that slept). A run with nothing new asks the always-on host for one short
+# list and fetches nothing; each seed's every_hours (fork-fleet.json) paces the downloads.
+[Unit]
+Description=t3code fork fleet: hourly warm caches for a desk pool
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
