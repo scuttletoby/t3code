@@ -22,7 +22,7 @@ import {
   McpThreadProfiles,
   McpThreadProfilesPatch,
 } from "./mcpProfile.ts";
-import { ModelPolicy, ModelPolicyFromSettingsFile } from "./modelPolicy.ts";
+import { ModelPolicyFromSettingsFile, ModelPolicyPatch } from "./modelPolicy.ts";
 import { PlaytestSettings, PlaytestSettingsFromSettingsFile } from "./playtest.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
@@ -135,8 +135,11 @@ export const ForkServerSettingsPatchFields = {
   handoff: Schema.optionalKey(HandoffSettingsPatch),
   /** Strict: a save refuses a bad field, an unknown key, or a value without `preset`. */
   reviewRules: Schema.optionalKey(ReviewRulesPatch),
-  /** Strict: a save refuses a bad row, or a `defaultEffort` not in its row's `efforts`. */
-  modelPolicy: Schema.optionalKey(ModelPolicy),
+  /**
+   * Strict: a save refuses a bad row, a `defaultEffort` not in its row's `efforts`, an unknown key,
+   * or a value without both `mode` and `allow` (it replaces the stored value whole).
+   */
+  modelPolicy: Schema.optionalKey(ModelPolicyPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -176,7 +179,8 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   handoff: "replace",
   // Whole, so the strict check sees the value that is saved; two saves at once, the last one wins.
   reviewRules: "replace",
-  // Whole: two saves at once, the last one wins.
+  // Whole, as playtest, so the strict check sees the value that is saved; two saves at once, the last
+  // one wins. The patch has no defaults, so a save that leaves out `mode` or `allow` is refused.
   modelPolicy: "replace",
 };
 
