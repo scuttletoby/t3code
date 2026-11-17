@@ -54,8 +54,10 @@ describe("fork setting defaults", () => {
     },
   );
 
-  it("keeps every fork switch off by default but the read-only usage refresh", () => {
+  it("keeps every fork switch off by default but the read-only ones", () => {
+    // Usage refresh reads usage; agent slots only observe by default (read only, never decide).
     expect(FORK_SETTING_DEFAULTS.filter((row) => !row.off).map(rowId)).toEqual([
+      "server.agentSlots",
       "server.headlessUsageRefreshInterval",
     ]);
   });

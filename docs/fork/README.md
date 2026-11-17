@@ -40,7 +40,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}` | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`  | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
-| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
 | [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
@@ -201,6 +201,10 @@ valid (an unknown preset or key from a newer build, a bad runner) reads as off, 
 a warning in the server log; it is kept as written, and saves of other settings write it back
 unchanged until the person saves this setting.
 
+In the app: Settings, Threads, Review rules shows whether the rules are on and the values a lens
+would run with (each marked as the preset's or set by hand), with "Use recommended review rules"
+and "Turn off" buttons; it asks first before a button drops hand-set fields or an unreadable value.
+
 ```json
 {
   "reviewRules": { "preset": "recommended" }
@@ -217,6 +221,18 @@ instead of retrying.
 Switch on: **Settings → Threads**, section Agent slots, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is
 refused.
+
+`mode` says how the gate decides. `"fixed"`: by the numbers above, nothing else. `"observe"`: by the
+same numbers, and a capacity rule (`packages/shared/src/capacity/`) runs beside each decision on live
+memory readings and only records what it would have answered: one log line per decision, and the
+last result with counts under `slotRule` in `wait_list`. It never changes or delays a decision; a
+reading that fails or takes over 2 seconds counts as "unreadable". While switched off the gate keeps
+no records of new agents, so the rule counts each agent allowed in the last `startGraceSeconds` as
+starting. Without `mode`, a switched-on
+gate is `"fixed"` (a file from an older build decides exactly as before) and a switched-off one is
+`"observe"`; a mode this build does not know (from a newer build) is `"fixed"`. Not "off" for that
+reason: with the default the server reads memory files at each `delegate_task`; `"mode": "fixed"`
+stops it.
 
 ### `server.headlessUsageRefreshInterval`
 

@@ -202,7 +202,7 @@ for pull requests ready for review.
 | `pools`                | yes                    | tried in order; see below                                                                                                                |
 | `jobs`                 | yes                    | routed jobs, heaviest first: `job` (id), `memory_mb`, optional `shards` (1-999), `gates` and `avoid` (below)                             |
 | `reruns`               | no                     | a dispatcher pool where a trusted person's re-run of failed jobs may go (below)                                                          |
-| `retired_labels`       | no                     | old pool labels (keep a label here for a week after changing it): never `hosted` or a static pool's label                                |
+| `retired_labels`       | no                     | old pool labels (keep a label here for a week after changing it): never `hosted` or a pool's label now (below)                           |
 | `stuck_seconds`        | yes                    | auto: how long a fleet job may wait before the watch cancels its run (the sweep re-runs it)                                              |
 | `fleet_stuck_seconds`  | yes                    | the same in fleet mode (cancelled with an error; the sweep re-runs nothing, fleet-watch re-runs it once on `fallback`)                   |
 | `beacon_fresh_seconds` | with a dispatcher pool | a heartbeat older than this counts no free slot, with an `::error::`                                                                     |
@@ -256,8 +256,19 @@ that uses only the action has neither. So:
 - **Old runner labels:** keep the old label on its runners, and in `retired_labels`, for a week after a pool's label
   changes. Runs routed before the change queue on it and still find a runner.
 - **Old registrations:** list the old label in that pool's `retired` too. Its dispatcher then deletes the offline
-  registrations it made under the old label (`<old label>-<job id>`), as it does under the new one. It never touches
-  an online one, nor one under another pool's label. Without `retired`, delete them by hand.
+  registrations it made under the old label (`<old label>-<job id>`), as it does under the new one, and stops an idle
+  runner there after `idle_passes` (it holds one of the pool's `slots`) when that runner's unit is on its own host. It
+  never deletes an online one, nor stops one running on another host (say the pool's `launch` moved with the label),
+  nor touches one under another pool's label. Without `retired`, delete them by hand. To move a pool's `launch` to
+  another host, do it in a change of its own, not with the label change (or stop the old host's dispatcher before the
+  new one starts): a host still on the older config makes runners under the old label, and the new host deletes their
+  registrations before they connect. Such a job is retried a few times, then left to the sweep.
+- **Reusing a label:** a pool's label may not be in `retired_labels` (the config is refused). To give a retired label
+  to a pool again, first take it out of `retired_labels` and every `retired`, and wait until every host runs that
+  config: a host still on the older one deletes the new pool's registrations under it before their runners connect.
+- **Upgrading from an older version:** a pool's label in `retired_labels` was accepted before and is refused now:
+  `route` fails, and a dispatcher refuses to start on it (exit 1, with an `::error::`). Take the label out of
+  `retired_labels` (and any `retired`) before you upgrade.
 - **Removing a pool:** take it out of every job's `avoid` too (a config that still names it is refused, and the error
   names the pool).
 - **Queued runs on a removed label** wait until GitHub drops them (24 hours). Cancel such a run by hand and re-run

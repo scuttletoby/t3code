@@ -401,6 +401,109 @@ describe("HeadlessUsageRefresher", () => {
     }),
   );
 
+  it.effect("a skip that is not healthy keeps the failure streak (no false works again)", () =>
+    Effect.gen(function* () {
+      const opencode = { driver: ProviderDriverKind.make("opencode") };
+      const nowMs = NOW_MS + 6 * INTERVAL + MINUTE;
+      // Upstream's loop also skips these, but no reading can be taken in any of them.
+      const notHealthy: ReadonlyArray<readonly [string, Partial<ServerProvider>]> = [
+        ["signed out (server answers 401)", { auth: { status: "unauthenticated" } }],
+        ["CLI gone", { installed: false }],
+        // Re-enabled in settings while the snapshot still says disabled.
+        ["snapshot still disabled", { enabled: false }],
+        ["provider unavailable", { availability: "unavailable" }],
+        ["no usage limits", { usageLimits: undefined }],
+        [
+          "usage unsupported",
+          {
+            usageLimits: {
+              checkedAt: iso(nowMs),
+              windows: [],
+              unavailable: { reason: "unsupported" },
+            },
+          },
+        ],
+        [
+          "reading unavailable",
+          {
+            usageLimits: {
+              checkedAt: iso(nowMs),
+              windows: [],
+              unavailable: { reason: "probeFailed" },
+            },
+          },
+        ],
+      ];
+      for (const [label, extra] of notHealthy) {
+        yield* startAt(NOW_MS);
+        let skipped = false;
+        const fake = fakeTarget(provider(NOW_MS - HOUR, opencode), {
+          checksOnInterval: () => !skipped,
+        });
+        fake.setOutcome("noReading");
+        const log = logCollector();
+        const { sweep } = yield* make(deps([fake.target]));
+        const tick = (ms: number) =>
+          TestClock.adjust(ms).pipe(Effect.andThen(sweep), Effect.provide(log.layer));
+        yield* tick(0);
+        yield* tick(2 * INTERVAL);
+        yield* tick(4 * INTERVAL);
+        assert.equal(log.warnings.length, 1, label);
+        skipped = true;
+        yield* TestClock.setTime(nowMs);
+        fake.setSnapshot(provider(nowMs, { ...opencode, ...extra }));
+        yield* tick(0);
+        yield* tick(0);
+        assert.deepEqual(log.infos, [], label);
+        // A usable reading later ends the streak, logged once.
+        fake.setSnapshot(provider(nowMs, opencode));
+        yield* tick(0);
+        yield* tick(0);
+        assert.deepEqual(log.infos, ["headless usage refresh works again"], label);
+      }
+    }),
+  );
+
+  it.effect(
+    "a comeback after a skip in a bad state keeps the streak's retry delay (same outage)",
+    () =>
+      Effect.gen(function* () {
+        yield* startAt(NOW_MS);
+        let skipped = false;
+        const fake = fakeTarget(provider(NOW_MS - HOUR), { checksOnInterval: () => !skipped });
+        fake.setOutcome("noReading");
+        const log = logCollector();
+        const { sweep } = yield* make(deps([fake.target]));
+        const at = (ms: number) =>
+          TestClock.setTime(NOW_MS + ms).pipe(Effect.andThen(sweep), Effect.provide(log.layer));
+        // One failure at T: one warning, retry at T+20.
+        yield* at(0);
+        assert.equal(fake.calls(), 1);
+        assert.equal(log.warnings.length, 1);
+        // T+1: the re-enable race; upstream skips it while the snapshot still says disabled.
+        skipped = true;
+        fake.setSnapshot(provider(NOW_MS + MINUTE, { enabled: false }));
+        yield* at(MINUTE);
+        // Re-enabled and checked at T+1: due by interval at T+11, but held by the retry at T+20.
+        skipped = false;
+        fake.setSnapshot(provider(NOW_MS + MINUTE));
+        yield* at(INTERVAL + MINUTE);
+        yield* at(2 * INTERVAL - 1000);
+        assert.equal(fake.calls(), 1);
+        yield* at(2 * INTERVAL);
+        assert.equal(fake.calls(), 2);
+        // That refresh fails too: failure 2 of the same streak, no new warning, retry 4 intervals on.
+        assert.equal(log.warnings.length, 1);
+        assert.deepEqual(log.infos, []);
+        yield* at(6 * INTERVAL - 1000);
+        assert.equal(fake.calls(), 2);
+        fake.setOutcome("ok");
+        yield* at(6 * INTERVAL);
+        assert.equal(fake.calls(), 3);
+        assert.deepEqual(log.infos, ["headless usage refresh works again"]);
+      }),
+  );
+
   it.effect(
     "leaves the refresh to upstream while a client lease holds, and pauses on a constrained host",
     () =>

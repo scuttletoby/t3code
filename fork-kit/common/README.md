@@ -12,7 +12,7 @@ They live in one private file per machine, which the owner writes by hand and no
 | ------- | ---------------------------------------------------- |
 | Linux   | `/etc/fork-kit/machine.json`                         |
 | macOS   | `/Library/Application Support/fork-kit/machine.json` |
-| Windows | `%ProgramData%\fork-kit\machine.json`                |
+| Windows | `C:\ProgramData\fork-kit\machine.json`               |
 
 The path is fixed: shipped commands have no option or environment variable that names another file.
 
@@ -28,8 +28,10 @@ The path is fixed: shipped commands have no option or environment variable that 
 Rules (all checked by [machine_file.py](machine_file.py); a kit that finds one broken refuses, names the file and
 the reason, and changes nothing):
 
-- **Owned by root**, and neither the file nor its folder writable by group or others. These checks exist only
-  on Linux and macOS: on Windows the loader refuses the file until they do (no kit reads it there yet).
+- **Owned by root**, and neither the file nor its folder writable by group or others. Every folder above it, up
+  to `/`, is root-owned and not writable by group or others (a sticky folder such as `/tmp` is allowed), and none
+  of them is a link, so nobody but root can swap a folder on the way. These checks exist only on Linux and macOS:
+  on Windows the loader refuses the file until they do (no kit reads it there yet).
 - **A plain file of at most 1 MiB, not a symbolic link, in a folder that is not one either.** The loader opens the
   file without following a link and checks the file it opened (owner, mode, kind), not the path, so a file
   swapped in between is caught.
@@ -62,8 +64,10 @@ sweep = machine_file.fields(section, {'sweep': (dict, machine_file.REQUIRED, Non
 ```
 
 `read_section(kit, path=None, owner_uid=0)` returns the kit's section; `path` and `owner_uid` are for tests only.
+`read_protected_text(path, owner_uid=0)` reads another file a kit trusts (a policy file the machine file names)
+under the same file-safety rules (root owner, no link, plain file, 1 MiB, UTF-8).
 `fields(obj, spec, where)` checks one object against `{key: (types, default or REQUIRED, check or None)}` and fills
-in the defaults. Both raise `MachineFileError` with a message that names the file and the key. Plain Python 3
+in the defaults. All three raise `MachineFileError` with a message that names the file and the key. Plain Python 3
 standard library.
 
 ## Tests

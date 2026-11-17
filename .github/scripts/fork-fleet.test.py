@@ -913,6 +913,8 @@ class FakeLauncher:
             self.started.append((args[0], input))
             self.units.add(args[0])
         elif verb == 'stop':
+            if args[0] not in self.units:   # systemctl stop: "Unit ... not loaded.", exit 5
+                return subprocess.CompletedProcess(cmd, 5, '', 'fork-fleet-launch: systemctl failed\n')
             self.stopped.append(args[0])
             self.units.discard(args[0])
         elif verb == 'prune':
@@ -1115,6 +1117,77 @@ class Dispatch(unittest.TestCase):
         self.gh.add(a_run(6, actor='someone'), a_job(41, [POOLS[WAITING]['label']]))
         self.dispatch()
         self.assertEqual(self.fake[WAITING].stopped, [self.name(40)])
+
+    def test_an_idle_runner_under_the_pools_label_with_no_unit_here_is_left_alone(self):
+        """#356: GitHub still lists the runner online but its unit is not on this host (gone after a reboot or a
+        crash, or the pool's launch moved to another host without a label change). `stop` could only fail, so it is
+        never tried: the pool is never down for it, the same pass runs again without a stop, and a queued job starts.
+        Once GitHub marks the runner offline, its registration is deleted."""
+        for why in ('idle passes', 'another job could take it'):
+            with self.subTest(why):
+                self.setUp()
+                self.registration(40)
+                if why == 'another job could take it':
+                    self.gh.add(a_run(6, actor='someone'), a_job(41, [POOLS[WAITING]['label']]))
+                for _ in range(CFG['dispatch']['idle_passes']):
+                    self.dispatch()
+                self.assertEqual(self.fake[WAITING].stopped, [])
+                self.assertEqual(self.state['down'], {})
+                self.assertEqual(self.state['idle'], {})
+                if why == 'another job could take it':   # cancelled: it would hold back job 11 as a rival
+                    self.gh.jobs[6] = [a_job(41, [POOLS[WAITING]['label']], status='completed', conclusion='cancelled')]
+                self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+                for _ in range(4):
+                    self.dispatch()
+                self.assertEqual((self.fake[WAITING].stopped, self.started()), ([], [self.name(11)]))
+                self.assertEqual(self.state['down'], {})
+                self.gh.runners[0]['status'] = 'offline'
+                self.dispatch()
+                self.assertNotIn(self.name(40), [r['name'] for r in self.gh.runners])
+
+    def test_a_failed_stop_keeps_the_idle_count_and_the_next_pass_stops_it(self):
+        """#342: the stop fails (systemd trouble): the pool is down for that pass and the runner's count is kept, so
+        the next pass that answers stops it at once, not idle_passes passes later."""
+        self.registration(40)
+        self.fake[WAITING].units.add(self.name(40))
+        self.fake[WAITING].fail = 'stop'
+        for _ in range(CFG['dispatch']['idle_passes']):
+            self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, [])
+        self.assertEqual(self.state['idle'], {self.name(40): CFG['dispatch']['idle_passes']})
+        self.assertIn(WAITING, self.state['down'])
+        self.fake[WAITING].fail = None
+        self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, [self.name(40)])
+        self.assertEqual(self.state['idle'], {})
+
+    def test_a_runner_busy_or_whose_own_job_is_queued_again_counts_its_idle_passes_from_zero(self):
+        """#342: idle for idle_passes - 1 passes, then busy (or its own job queued) for one: the count starts again,
+        so it is stopped only after idle_passes more idle passes."""
+        for why in ('busy', 'own job queued'):
+            with self.subTest(why):
+                self.setUp()
+                self.registration(40)
+                self.fake[WAITING].units.add(self.name(40))
+                passes = CFG['dispatch']['idle_passes']
+                for _ in range(passes - 1):
+                    self.dispatch()
+                if why == 'busy':
+                    self.gh.runners[0]['busy'] = True
+                else:
+                    job = a_job(40, job_labels(WAITING, 'lint'))
+                    self.gh.add(a_run(), job)
+                self.dispatch()
+                self.assertEqual(self.state['idle'], {})
+                if why == 'busy':
+                    self.gh.runners[0]['busy'] = False
+                else:
+                    job['status'] = 'completed'   # cancelled before its runner took it
+                for _ in range(passes - 1):
+                    self.dispatch()
+                self.assertEqual(self.fake[WAITING].stopped, [])
+                self.dispatch()
+                self.assertEqual(self.fake[WAITING].stopped, [self.name(40)])
 
     def test_a_runner_still_coming_up_for_its_queued_job_is_not_idle(self):
         self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
@@ -4476,15 +4549,66 @@ class RetiredLabels(unittest.TestCase):
         self.dispatch()
         self.assertEqual(self.left(), ['fleet-old-b-50'])
 
-    def test_an_online_registration_under_a_retired_label_is_never_touched(self):
+    def test_an_online_registration_under_a_retired_label_is_never_deleted(self):
         self.reg(40, 'fleet-old-a-40')
         self.reg(42, 'fleet-old-a-42', status='online', busy=True)
-        self.reg(43, 'fleet-old-a-43', status='online')    # idle, its job gone: still left alone (not stopped)
+        self.reg(43, 'fleet-old-a-43', status='online')    # idle, its own job still queued: it is about to take it
         self.fake[WAITING].units |= {'fleet-old-a-42', 'fleet-old-a-43'}
-        self.gh.add(a_run(6, actor='someone'), a_job(61, ['fleet-old-a']))   # a queued job that could take 43
+        self.gh.add(a_run(6, actor='someone'), a_job(43, ['fleet-old-a']))
         self.dispatch(passes=CFG['dispatch']['idle_passes'] + 1)
         self.assertEqual(self.left(), ['fleet-old-a-42', 'fleet-old-a-43'])
         self.assertEqual(self.fake[WAITING].stopped, [])
+
+    def test_an_idle_runner_under_a_retired_label_is_stopped_and_frees_its_slot(self):
+        """#319: idle runners under the old label count toward the pool's slots, so they are stopped like any other
+        (after idle_passes) and a queued job for the pool starts then, not when their units time out."""
+        slots, passes = RET_POOLS[WAITING]['slots'], CFG['dispatch']['idle_passes']
+        old = [f'fleet-old-a-{40 + i}' for i in range(slots)]
+        for i, name in enumerate(old):
+            self.reg(40 + i, name, status='online')        # its job went away (cancelled): idle
+        self.fake[WAITING].units |= set(old)
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))   # no runner of the old label could take it
+        self.dispatch(passes=passes - 1)
+        self.assertEqual((self.fake[WAITING].stopped, self.fake[WAITING].started), ([], []))
+        self.dispatch()
+        self.assertEqual(sorted(self.fake[WAITING].stopped), old)
+        self.dispatch()
+        self.assertEqual([n for n, _ in self.fake[WAITING].started], [f'{RET_POOLS[WAITING]["label"]}-11'])
+
+    def test_an_idle_runner_under_a_retired_label_whose_unit_is_on_another_host_is_left_alone(self):
+        """#342: a pool's label changed and its launch moved to another host in the same change (or `retired` lists a
+        label a removed pool used): the online runner under the old label runs on another host, holds no slot here, and
+        `stop` fails here (systemd has no such unit). It is never stopped, so the pool is never left down for it and
+        its own job starts."""
+        self.reg(43, 'fleet-old-a-43', status='online')    # its unit runs on another host
+        self.dispatch(passes=CFG['dispatch']['idle_passes'])
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+        self.dispatch(passes=3)
+        self.assertEqual(self.fake[WAITING].stopped, [])
+        self.assertEqual(self.states[WAITING]['down'], {})
+        self.assertEqual(self.states[WAITING]['idle'], {})
+        self.assertEqual([n for n, _ in self.fake[WAITING].started], [f'{RET_POOLS[WAITING]["label"]}-11'])
+        self.assertEqual(self.left(), ['fleet-old-a-43', f'{RET_POOLS[WAITING]["label"]}-11'])
+
+    def test_an_idle_runner_under_a_retired_label_another_job_could_take_is_stopped_at_once(self):
+        self.reg(43, 'fleet-old-a-43', status='online')
+        self.fake[WAITING].units.add('fleet-old-a-43')
+        self.gh.add(a_run(6, actor='someone'), a_job(61, ['fleet-old-a']))   # the hook would refuse it on 43
+        self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, ['fleet-old-a-43'])
+
+    def test_only_a_job_id_after_the_label_matches(self):
+        """#319: near-miss names under the pool's labels (now and retired) are no runner it made: never deleted."""
+        a = RET_POOLS[WAITING]['label']
+        near = [f'{x}{tail}' for x in ('fleet-old-a', a)
+                for tail in ('-40-1', '-abc', '-40\n', '-40 ', '-\u0664\u0660', '-', '--40', '-' + '9' * 21)]
+        near += ['fleet-old-a2-40', 'fleet-old-ab-40', 'xfleet-old-a-40', 'FLEET-OLD-A-40', f'{a}2-40', f'x{a}-40']
+        for i, name in enumerate(near):
+            self.reg(100 + i, name)
+        self.reg(40, 'fleet-old-a-40')                     # the one name it made: deleted
+        self.dispatch()
+        self.assertEqual(self.deletes(), ['actions/runners/40'])
+        self.assertEqual(self.left(), sorted(near))
 
     def test_two_dispatchers_with_different_pools_side_by_side(self):
         a, b = RET_POOLS[WAITING]['label'], RET_POOLS[OTHER]['label']
@@ -4530,6 +4654,10 @@ class RetiredLabels(unittest.TestCase):
             'two pools claim one': lambda c: c['pools'][self.at(OTHER)].update(retired=['fleet-old-a']),
             'not in retired_labels': lambda c: c['pools'][self.at(WAITING)].update(retired=['fleet-old-z']),
             'not a list': lambda c: c['pools'][self.at(WAITING)].update(retired='fleet-old-a'),
+            # #319: a label reused while it is still retired; a host on the older config still deletes its
+            # registrations as that pool's leftovers
+            'a pool\'s label still in retired_labels': lambda c: c.update(
+                retired_labels=['fleet-old-a', 'fleet-old-b', b]),
         }
         for name, change in cases.items():
             with self.subTest(name):

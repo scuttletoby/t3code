@@ -79,12 +79,19 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  [ -e "$S/$u.status" ] && { echo "ExecMainCode=$(cat "$S/$u.code")"; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
                          '  echo "ExecMainStartTimestampMonotonic=$(cat "$S/$u.start" 2>/dev/null || echo 0)";;\n'
                          'esac\n',
-    # apt-get [-o OPTION]... update|install -y PKG...: logs the rest; installs each package in /log/packages (nftables
-    # brings the fake nft kept in /log/nft-package). As real apt-get: refuses while a package is unpacked (dpkg was
-    # interrupted). /log/apt-fail makes it fail; /log/dns holds the resolv.conf line `update` needs to reach the
-    # mirror; with /log/questions it fails unless noninteractive and keeping changed config files.
+    # apt-get [-o OPTION]... update|install -y PKG...: logs the rest (and the options, in /log/apt-get-options);
+    # installs each package in /log/packages (nftables brings the fake nft kept in /log/nft-package). As real apt-get:
+    # refuses while a package is unpacked (dpkg was interrupted). /log/apt-locked-update (or -install) holds how many
+    # more runs find the lists (or archives) lock held, as while apt-daily runs: real apt-get does not wait for those.
+    # /log/apt-fail makes it fail; /log/dns holds the resolv.conf line `update` needs to reach the mirror; with
+    # /log/questions it fails unless noninteractive and keeping changed config files.
     'usr/bin/apt-get': 'R="${0%/usr/bin/apt-get}"; o=; while [ "$1" = -o ]; do o="$o $2"; shift 2; done\n'
-                       'echo "$*" >>"$R/log/apt-get"\n'
+                       'echo "$*" >>"$R/log/apt-get"; echo "${o# }" >>"$R/log/apt-get-options"\n'
+                       'n=$(cat "$R/log/apt-locked-$1" 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then\n'
+                       '  echo $((n - 1)) >"$R/log/apt-locked-$1"; [ "$1" = update ] && d=/var/lib/apt/lists || '
+                       'd=/var/cache/apt/archives\n'
+                       '  echo "E: Could not get lock $d/lock. It is held by process 4242 (apt-get) (test)" >&2\n'
+                       '  echo "E: Unable to lock directory $d/" >&2; exit 100; fi\n'
                        '[ -e "$R/log/apt-fail" ] && { echo "E: no network (test)" >&2; exit 100; }\n'
                        'grep -qs unpacked "$R"/log/packages/* && { echo "E: dpkg was interrupted, you must manually '
                        'run \'dpkg --configure -a\' to correct the problem." >&2; exit 100; }\n'
@@ -100,11 +107,19 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
     'usr/bin/dpkg-query': 'R="${0%/usr/bin/dpkg-query}"; echo "$*" >>"$R/log/dpkg-query"; shift 2; rc=0\n'
                           'for p; do if [ -e "$R/log/packages/$p" ]; then printf "%s\\t%s\\n" "$p" "$(cat "$R/log/packages/$p")"\n'
                           '  else echo "dpkg-query: no packages found matching $p" >&2; rc=1; fi; done; exit $rc\n',
-    # dpkg [--force-...]... --configure -a: finishes what an apt-get stopped half-way left unpacked. /log/dpkg-fail
-    # makes it fail as with apt-daily holding the lock; /log/questions as for apt-get.
+    # dpkg --audit: names each package an apt-get stopped half-way left unpacked (no lock: it only reads).
+    # dpkg [--force-...]... --configure -a: finishes them. /log/dpkg-locked holds how many more runs find the lock
+    # held (real dpkg does not wait); /log/questions as for apt-get.
     'usr/bin/dpkg': 'R="${0%/usr/bin/dpkg}"; echo "$*" >>"$R/log/dpkg"\n'
-                    '[ -e "$R/log/dpkg-fail" ] && { echo "dpkg: error: dpkg frontend lock was locked by another process '
-                    '(test)" >&2; exit 2; }\n'
+                    'if [ "$1" = --audit ]; then rc=0; for f in "$R"/log/packages/*; do grep -qs unpacked "$f" || '
+                    'continue\n'
+                    '  [ $rc = 1 ] || echo "The following packages have been unpacked but not yet configured:"\n'
+                    '  echo " ${f##*/}"; rc=1; done; exit $rc; fi\n'
+                    'n=$(cat "$R/log/dpkg-locked" 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then\n'
+                    '  echo $((n - 1)) >"$R/log/dpkg-locked"\n'
+                    '  echo "dpkg: error: dpkg frontend lock was locked by another process with pid 4242 (test)" >&2\n'
+                    '  exit 2; fi\n'
+
                     '[ ! -e "$R/log/questions" ] || { [ "$DEBIAN_FRONTEND" = noninteractive ] && case "$*" in '
                     '*--force-confold*) :;; *) false;; esac; } || '
                     '{ echo "dpkg: error: end of file on stdin at conffile prompt (test)" >&2; exit 1; }\n'
@@ -139,6 +154,7 @@ class Case(unittest.TestCase):
 
     def setUp(self):
         k.SETTLE, k.SETTLE_STEP = self.settle, 0.05
+        k.LOCK_WAIT, k.LOCK_STEP = 0.3, 0.01   # 300 s and 5 s on a machine
         # No power cut in a fake root, so when a write reaches the disk is not tested here: fsync only costs time.
         fsync = mock.patch.object(os, 'fsync', lambda fd: None)
         fsync.start()

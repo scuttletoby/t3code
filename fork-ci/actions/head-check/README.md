@@ -42,6 +42,14 @@ All of them are the queue's, imported from `../pr-queue`, never copied:
   the base commit that the run's merge commit tests, never from the pull
   request's copy, so a pull request cannot change whose comments count for its
   own check.
+- **Lenses by changed path** (`review_judge.py`, the pr-queue README, "Review
+  rules"): when the base's config has a `review` block, the paths the head
+  changes against its merge base (`git diff --name-status -M`, renames under
+  both paths, no cap) are judged by its rules. In `enforce` the lenses of the
+  heaviest weight hit are required on top of `required-lenses`; in `shadow` the
+  summary only adds a row "the path rules would have said: ...". A change the
+  rules cannot judge (no merge base, a failed diff) refuses, in either mode.
+  Without the block, nothing of this runs.
 
 It passes when:
 
@@ -60,7 +68,8 @@ no longer has it, or the checkout kept no credentials: see Usage).
 It refuses to start (exit 2, before it reads GitHub, every reason at once) on
 a config error (also a base commit without the config), a missing pull
 request number (not a `pull_request` event), a lens name in `required-lenses`
-that names no lens, a git older than 2.38, a checkout that is not GitHub's
+that names no lens, a `review` block whose path rules cannot judge the head
+(above), a git older than 2.38, a checkout that is not GitHub's
 two-parent merge commit, a checkout that is shallow, or a checkout holding a
 file that changes what git's objects or merges say (`info/grafts`, `shallow`,
 alternates, `info/attributes`). A refusal is a red required check too. git
@@ -268,8 +277,9 @@ Setup (the repository owner's steps; nothing here creates them):
    the secret `HEAD_GATE_APP_KEY`. Keep no repository or organisation secret of
    that name: the guard refuses one.
 4. Copy the example caller to `.github/workflows/` on the default branch, fill
-   in the check name, config path and required lenses (at least one), and pin
-   the release.
+   in the check name, config path and required lenses (at least one, unless the
+   config's `review` block is in `enforce`: then the path rules name them and
+   the input may be empty), and pin the release.
 5. Dispatch it once without a number (the backfill), so open pull requests get
    the check under its name.
 6. Bind the required check to the App: in a ruleset, the required status
@@ -285,7 +295,9 @@ the lens rules on the default branch, dispatch the backfill again: it judges
 every open pull request again. A run that started before a caller or pin
 change posts a failure, and a config change judges nothing by itself, so a
 pass judged under the old config stays until the next event on that pull
-request.
+request. The same holds for the `review` block's path rules and for switching
+its `mode` from `shadow` to `enforce`: each open pull request is judged by the
+new rules at its next run, so dispatch the backfill right after the change.
 
 **Run again after a review.** Reviews and inline diff comments
 (`pull_request_review`, `pull_request_review_comment`) do not start the gate,

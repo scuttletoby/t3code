@@ -205,18 +205,19 @@ Two more things limit what a job can do:
   minutes (a job that ignores SIGTERM would run on past its limit), in a
   drop-in, or as systemd's own default (`system.conf`: the first of `/etc`,
   `/run`, `/usr/local/lib` and `/usr/lib`, and every `system.conf.d`) while a
-  job unit an older launcher started is still loaded, or while the installed
-  launcher is such an older one (the walls read its `start()`: the launcher
-  gives each job unit its own stop timeouts, 90 s, so the default decides
-  nothing for the units it starts now; an endless one of a unit's own fails
-  too); and a
+  job unit an older launcher started is still loaded (an endless one of a
+  unit's own fails too); and a
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
-  drops it anywhere else. On WSL2 they also read every property the launcher gives a job's unit
-  (each way `systemd-run` takes one), of the launcher they ship with only:
-  its sha256 is pinned in the `wsl2` walls file, and any other launcher
-  cannot be told and fails (no reading of bash can follow every way a changed
-  one could hand a unit more). A launcher change moves the pin in the same
+  drops it anywhere else. The walls know the launcher they ship with: its
+  sha256 is pinned in the `linux` and the `wsl2` walls files, and any other
+  launcher (one of another release too: install the kit whole) cannot be told
+  and fails `job-units` (no reading of bash can follow every way a changed one
+  could hand a unit more, or less). The pinned launcher's `start()` gives each
+  job unit its own stop timeouts, 90 s, so systemd's default decides nothing
+  for the units it starts. On WSL2 they also read every property that launcher
+  gives a job's unit (each way `systemd-run` takes one), and any other launcher
+  fails `sockets` too. A launcher change moves both pins in the same
   pull request: it needs the security lens, and the pin test also runs cheap
   tripwires on the launcher's text (a second `systemd-run`, `eval` or
   `source` even spelt with quotes or backslashes, a command word built from
@@ -975,7 +976,8 @@ dispatcher keeps only pacing in memory, so a restart starts over cleanly.
 | Dispatcher  | Crash after `generate-jitconfig`, before `start`                                                                              | An offline registration with no unit. The next pass deletes it, and the pass after starts the job's runner again (at most 3 tries per job, then it is left to the watch and the sweep).                                                                                                                   |
 | Dispatcher  | Crash after `start`                                                                                                           | The unit is there. The next pass sees it and starts nothing twice.                                                                                                                                                                                                                                        |
 | Dispatcher  | Launcher killed half-way through copying the template                                                                         | No unit. The next pass deletes the registration, `prune` removes the half copy and any environment file, and the job's runner is started again.                                                                                                                                                           |
-| Dispatcher  | A pool's label changed: offline registrations under its old label                                                             | Deleted when the pool lists the old label in `retired` (and `retired_labels`); never online ones or another pool's. A label two pools retire, or a pool's label now, is refused. Without `retired` they stay (delete them by hand).                                                                       |
+| Dispatcher  | A pool's label changed: offline registrations under its old label                                                             | Deleted when the pool lists the old label in `retired` (and `retired_labels`); never online ones or another pool's. An idle runner there is stopped like any other. A label two pools retire, or a pool's label in either list, is refused. Without `retired` they stay (delete them by hand).            |
+| Dispatcher  | An online runner under a pool's label (now or old) with no unit on this host                                                  | Never stopped: its unit is gone (a reboot, a crash) or on another host, it holds no slot here, and `stop` would fail on every pass (#342, #356). Once it is offline, its registration is deleted.                                                                                                         |
 | Dispatcher  | Restart, or a host reboot                                                                                                     | It reads everything again from GitHub and systemd. The lock directory under `/run` is made again after a boot. After a reboot, a job that was running fails as a lost runner (`auto`: the sweep re-runs it GitHub-hosted). A job still queued has its offline registration deleted and gets a new runner. |
 | Dispatcher  | Two dispatchers for one pool                                                                                                  | The second one fails on that pool's lock (`dispatch-<pool>.lock`). Two dispatchers for different pools both run.                                                                                                                                                                                          |
 | Dispatcher  | The job went away before its runner took it (cancelled)                                                                       | The idle runner is stopped after 3 passes, or at once if another queued job asks for all of its labels. A re-run's job never can: its label names its own attempt.                                                                                                                                        |

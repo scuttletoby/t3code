@@ -52,6 +52,8 @@ fork-ci/actions/pinned/pinned.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py ~23s
 fork-ci/actions/pr-queue/review_config.test.py
+fork-ci/actions/pr-queue/review_glob.test.py
+fork-ci/actions/pr-queue/review_judge.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 fork-ci/actions/test-select/test-select.test.py ~15s
 fork-ci/actions/test-select/trace-check.test.py
@@ -71,9 +73,11 @@ fork-kit/gh-apps/tests/wrapper.test.py
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
 fork-kit/heavy/tests/install.test.py
-fork-kit/heavy/tests/sweep.test.py ~15s
+fork-kit/heavy/tests/sweep.test.py ~25s
 # A real systemd user manager (the step starts one for the runner user).
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml
+fork-kit/model-guard/tests/guard.test.py
+fork-kit/model-guard/tests/install.test.py
 fork-kit/pc-agents/tests/check.test.py ~22s
 fork-kit/pc-agents/tests/setup.test.py ~110s
 

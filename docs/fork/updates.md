@@ -162,7 +162,19 @@ Held (nothing of it starts until the server restarts without the flag):
 - work an automatic update held (its marker stays);
 - automatic project pull;
 - following and stopping delegated tasks in linked environments (owed stops stay owed);
-- the startup analytics heartbeat.
+- the startup analytics heartbeat;
+- T3 Connect. A full copy carries the running server's Connect link (its environment id, relay link
+  and tunnel). The held server starts no tunnel, registers none with the relay and releases none when
+  it stops, so remote access stays with the running server. It publishes no agent activity (thread
+  state) to the relay under that id. A client's request to link, change the link, unlink or answer
+  the relay is refused with the reason, and so is every CLI unlink on that home (`t3 connect unlink`,
+  `t3 connect logout`, `t3 up` turning Connect off) while the held server runs: unlinking ends in a
+  relay delete of the shared environment id, which would remove the running server's link too.
+  The stored link files are kept as they are (`apps/server/src/cloud/holdWorkConnect.ts`).
+
+  The CLI can only tell a copy is held while its server runs. Never run `t3 connect unlink` or
+  `t3 connect logout` against a stopped copy's home: it removes the running server's link. Delete
+  the copy's home instead.
 
 Still runs:
 
@@ -173,7 +185,10 @@ Still runs:
   turn. Run the copy with an empty `HOME` and a bare `PATH` if they must not start;
 - the UI, WebSocket and HTTP API, and timers that only change thread state (pull request watch and
   sync, auto-settle);
-- anything a user asks for directly, such as a commit message or a pull request guide.
+- anything a user asks for directly, such as a commit message or a pull request guide;
+- reading the copy's Connect status;
+- the periodic Connect reachability check: read-only requests to the stored public address and the
+  tunnel network. It restarts only a tunnel this server started, and a held server starts none.
 
 Startup refuses to serve when the gate is not held or a part that starts work (outbox, thread launch,
 recovery, scheduler) does not use it. The check runs before activation, so nothing parked has run.
