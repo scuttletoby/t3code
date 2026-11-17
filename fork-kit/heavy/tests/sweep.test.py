@@ -461,9 +461,24 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(own(['timeout', '5', 'env', '-S', 'CI=1 #note', 'pytest', '-x']),
                          ['timeout', 'env', 'pytest'])
         self.assertEqual(own(['timeout', '5', 'env', '-S', 'pytest "#x" #y z']), ['timeout', 'env', 'pytest'])
+        # #352 lens: as GNU env reads it, a # starts a comment only at the start of a word (a#b is one word), and the
+        # comment runs to the end of the whole string, past a newline; a # in quotes is part of its word
+        self.assertEqual(own(['timeout', '5', 'env', '-S', 'sh -c a#b', 'x']), ['timeout', 'env', 'sh', '-c', 'a#b'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', 'sh -c "a #b" #c', 'x']),
+                         ['timeout', 'env', 'sh', '-c', 'a #b'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', "sh -c 'a #b'", 'x']), ['timeout', 'env', 'sh', '-c', 'a #b'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', 'CI=1 #note\npytest', './server']),
+                         ['timeout', 'env', './server'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', 'CI=1\t#note pytest', './server']),
+                         ['timeout', 'env', './server'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', '#c pytest', './server']), ['timeout', 'env', './server'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', '#', './server']), ['timeout', 'env', './server'])
         self.assertEqual(own(['bash', '-c', '--', 'pytest -q', 'x']), ['bash', '-c', 'pytest -q'])
         self.assertEqual(own(['bash', '-lc', '--', 'pytest -q', 'x']), ['bash', '-lc', 'pytest -q'])
         self.assertEqual(own(['bash', '-c', '--'], shown=True), ['bash', '-c'])    # no code word: nothing to cut
+        # only a shell's -c: python and node read the next word as the code, -- too
+        self.assertEqual(own(['python3', '-c', '--', 'x']), ['python3', '-c', '--'])
+        self.assertEqual(own(['python3', '-uc', '--', 'x']), ['python3', '-uc', '--'])
         self.assertEqual(own(['php', '-d', 'x=1', 'a.test.php']), ['php', 'a.test.php'])
         self.assertEqual(own(['php', '-c', 'php.ini', '-z', 'ext.so', 'a.test.php']), ['php', 'a.test.php'])
         self.assertEqual(own(['perl', '-d', 't/a.t']), ['perl', 't/a.t'])     # perl's -d (the debugger) takes none
@@ -604,6 +619,9 @@ class SweepTests(unittest.TestCase):
             (['ruby', '-Fxr', 'hunter48'], 'ruby -Fxr [8 chars]'),
             # a # word in env -S starts a comment to the end of the string; the command can follow the string
             (['timeout', '60', 'env', '-S', 'A=x #hunter49', './server'], 'timeout env ./server', 4),
+            # #352 lens: the comment runs past a newline to the end of the string; a # inside a word is part of it
+            (['timeout', '600', 'env', '-S', 'A=x #c\nhunter59', './server'], 'timeout env ./server', 4),
+            (['timeout', '600', 'env', '-S', 'DB_PASS=hunter60#cd ./client', 'hunter61'], 'timeout env ./client', 4),
             # php's -d, -c and -z take a separate value; -B and -R take code like -r and -E
             (['php', '-d', 'mysqli.default_pw=hunter50', '-r', 'f();'], 'php -r [4 chars]', 3),
             (['php', '-c', 'hunter51.ini', '-B', '$p="hunter52";', '-R', 'x();'], 'php -B [14 chars]', 5),
@@ -633,7 +651,7 @@ class SweepTests(unittest.TestCase):
 
     def test_inline_code_through_a_wrapper_is_still_matched(self):
         # the cut is for showing only: what is test-shaped is read from the whole text, through wrappers too
-        self.cfg.update(testPatterns=['(^|[ /])pytest( |$)'])
+        self.cfg.update(testPatterns=['(^|[ /])pytest( |$)', '(^|[ /])tests/'])
         self.write_machine()
         self.orphan(5301, ['timeout', '60', 'sh', '-c', 'PASS=hunter2 pytest'], cpu=90)
         self.orphan(5302, ['stdbuf', '-oL', 'bash', '-lc', 'pytest -q'], cpu=90)   # a parser row: stdbuf execs
@@ -641,6 +659,9 @@ class SweepTests(unittest.TestCase):
         self.orphan(5304, ['timeout', '600', 'env', '-S', '-- CI=1 pytest'], cpu=90)  # after its -- too
         self.orphan(5305, ['timeout', '600', 'bash', '-c', '--', 'pytest -q'], cpu=90)  # #352: -c's code after --
         self.orphan(5306, ['timeout', '600', 'env', '-S', 'CI=1 #note', 'pytest'], cpu=90)  # a comment in -S
+        # #352 lens: env runs ./server in both (the comment runs to the end of the string; ab#cd is one word)
+        self.orphan(5307, ['timeout', '600', 'env', '-S', 'CI=1 #note\npytest', './server'], cpu=90)
+        self.orphan(5308, ['timeout', '600', 'env', '-S', 'DB_PASS=ab#cd ./server', 'tests/fixtures.json'], cpu=90)
         code, out, _ = self.run_sweep()
         self.assertEqual(code, 0, out)
         self.assertEqual(self.signalled(), [5301, 5302, 5303, 5304, 5305, 5306], out)
@@ -658,10 +679,11 @@ class SweepTests(unittest.TestCase):
         self.orphan(6002, ['timeout', '60', 'env', '-S' * 1200 + ' pytest'], cpu=90)    # env -S-S-S...
         self.orphan(6003, ['timeout', '60', 'env', '-S', 'nice nohup env -S "A=1 pytest"'], cpu=90)   # 6 deep
         self.orphan(6004, ['timeout', '60'] + ['nice'] * 8 + ['pytest'], cpu=90)                    # 9 deep
+        self.orphan(6005, ['timeout', '60'] + ['nice'] * 7 + ['pytest'], cpu=90)                    # 8 deep: read
         for run in (1, 2):
             code, out, _ = self.run_sweep()
             self.assertEqual(code, 0, out)
-            self.assertEqual(self.signalled(), [6003], out)
+            self.assertEqual(self.signalled(), [6003, 6005], out)
             for pid, shown in ((6001, 'env (+2000 args)'), (6002, 'timeout (+3 args)'), (6004, 'timeout (+10 args)')):
                 line = next(t for t in out.splitlines() if t.startswith(f'  report only: pid {pid} '))
                 self.assertIn(f'): {shown}; ', line)
@@ -1364,6 +1386,8 @@ MUTATIONS = {
         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     'nesting is capped': ('if depth >= MAX_NESTING:', 'if False:',
                           'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
+    'the cap is MAX_NESTING deep, not one less': ('if depth >= MAX_NESTING:', 'if depth >= MAX_NESTING - 1:',
+                                                  'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
     'an env -S string counts as a level': (
         'return own_command(argv[:1] + split, shown, depth + 1)', 'return own_command(argv[:1] + split, shown, depth)',
         'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
@@ -1377,10 +1401,22 @@ MUTATIONS = {
                                                         'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
     'the cut rule covers -E and -r': ("and '-' + a[-1] in CODE[kind] and", "and a[-1] == 'e' and",
                                       'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
-    'a # word in env -S is a comment': ('shlex.split(text, comments=True)', 'shlex.split(text)',
+    'a # word in env -S is a comment': ('text = text[:comment.start()]', 'pass',
                                         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
-    'a # word in env -S is a comment when matching': ('shlex.split(text, comments=True)', 'shlex.split(text)',
+    'a # word in env -S is a comment when matching': ('text = text[:comment.start()]', 'pass',
                                                       'test_inline_code_through_a_wrapper_is_still_matched'),
+    # #352 lens: GNU env's rule, not shlex's
+    'an env -S comment runs to the end of the string': (
+        'text = text[:comment.start()]', "text = text[:comment.start()] + text[comment.start():].partition('\\n')[2]",
+        'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'an env -S comment runs to the end of the string when matching': (
+        'text = text[:comment.start()]', "text = text[:comment.start()] + text[comment.start():].partition('\\n')[2]",
+        'test_inline_code_through_a_wrapper_is_still_matched'),
+    'only a # that starts a word is a comment': (r'(?P<comment>\s#)', r'(?P<comment>[\s\S]#)', 'test_own_command'),
+    'only a # that starts a word is a comment when matching': (r'(?P<comment>\s#)', r'(?P<comment>[\s\S]#)',
+                                                               'test_inline_code_through_a_wrapper_is_still_matched'),
+    'a # in quotes is not a comment': (r'''(?P<comment>\s#)|'[^']*'?|"(?:\\[\s\S]|[^"\\])*"?|''', r'(?P<comment>\s#)|',
+                                       'test_own_command'),
     "php's -d, -c and -z take a word": ("'php': {'-d', '-c', '-z'}", "'php': set()",
                                         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     "php's -B and -R are code options": ("'other': {'-e', '-E', '-r', '-B', '-R'}}\n# of those",
@@ -1391,6 +1427,12 @@ MUTATIONS = {
     "a shell's -c reads its code after -- when matching": (
         "i += 1 + (kind == 'shell' and argv[i + 1:i + 2] == ['--'])", 'i += 1',
         'test_inline_code_through_a_wrapper_is_still_matched'),
+    "only a shell's -c reads -- as the end of options": (
+        "i += 1 + (kind == 'shell' and argv[i + 1:i + 2] == ['--'])", "i += 1 + (argv[i + 1:i + 2] == ['--'])",
+        'test_own_command'),
+    "only a shell bundle's c reads -- as the end of options": (
+        "j += opt is not None and kind == 'shell' and argv[j:j + 1] == ['--']",
+        "j += opt is not None and argv[j:j + 1] == ['--']", 'test_own_command'),
     "a shell bundle's c reads its code after --": (
         "j += opt is not None and kind == 'shell' and argv[j:j + 1] == ['--']", 'pass',
         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),

@@ -302,11 +302,15 @@ def code_text(code, kind):
     return f'[{words[0]} ... {len(code)} chars]'
 
 
+# a word of an env -S string, read left to right: an unquoted # after a space (one that starts a word) is a comment
+ENV_SPLIT_PART = re.compile(r'''(?P<comment>\s#)|'[^']*'?|"(?:\\[\s\S]|[^"\\])*"?|\\[\s\S]?''')
+
+
 def env_split(argv, i):
     """For env at argv[i]: the command `-S STRING`, `-SSTRING` (also after env's flags: `-iS`) or
     `--split-string=STRING` names, with the words after it, or None for another word. STRING is split like a shell
-    would (quotes; an unclosed quote splits at spaces); a # word starts a comment to the end of STRING, as in GNU env
-    (shlex also ends a word at a # inside it, which GNU env keeps: that only shows less)."""
+    would (quotes; an unclosed quote splits at spaces). As in GNU env, an unquoted # that starts a word starts a
+    comment to the end of STRING (past a newline too); a # inside a word (ab#cd) is part of it."""
     a = argv[i]
     short = re.match(r'-[i0v]*S', a)
     if a == '--split-string' or (short and short.end() == len(a)):
@@ -317,8 +321,11 @@ def env_split(argv, i):
         text, rest = a[short.end():], argv[i + 1:]
     else:
         return None
+    comment = next((m for m in ENV_SPLIT_PART.finditer(' ' + text) if m.group('comment')), None)
+    if comment:
+        text = text[:comment.start()]
     try:
-        words = shlex.split(text, comments=True)
+        words = shlex.split(text)
     except ValueError:
         words = text.split()
     return words + rest
