@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
+import { keepLeftOutForkProjectKeys } from "@t3tools/shared/forkSettingsPatch";
 import * as Cause from "effect/Cause";
 import { resolveWorktreeCleanup } from "@t3tools/shared/projectSettings";
 
@@ -1049,5 +1050,107 @@ describe("wait checks at project scope", () => {
         "This setting is environment-wide and cannot be overridden by a project.",
       );
     }
+  });
+});
+
+// Fork: review rules. A project's value replaces the environment's whole, as the server reads it.
+describe("review rules at project scope", () => {
+  const environmentId = EnvironmentId.make("laptop");
+  const projectId = ProjectId.make("fleet");
+  const scope = {
+    kind: "project" as const,
+    group: {} as never,
+    environmentId: null,
+    label: "fleet",
+    members: [{ id: projectId, environmentId } as never],
+    environmentIds: [environmentId],
+  };
+  const withSettings = (settings: Partial<ServerSettings>) => [
+    {
+      environmentId,
+      label: "Laptop",
+      connection: { phase: "connected" as const },
+      serverConfig: { settings: { ...DEFAULT_SERVER_SETTINGS, ...settings } },
+    },
+  ];
+  const handSet = {
+    preset: "recommended" as const,
+    minors: "free" as const,
+    configPath: "ci/queue.json",
+  };
+
+  it("stores the button's value whole, not merged with the environment's fields", () => {
+    const environments = withSettings({ reviewRules: handSet });
+    const plan = planScopedSettingsPatch(scope, environments, { reviewRules: { preset: "off" } });
+    expect(plan.serverWrites[0]?.patch).toEqual({
+      projectSettingsOverrides: { [projectId]: { reviewRules: { preset: "off" } } },
+    });
+  });
+
+  it("does not carry an unreadable environment value into the project's override", () => {
+    const environments = withSettings({
+      reviewRules: { preset: "off", unreadable: { preset: "strict" } },
+    });
+    const plan = planScopedSettingsPatch(scope, environments, {
+      reviewRules: { preset: "recommended" },
+    });
+    expect(plan.serverWrites[0]?.patch).toEqual({
+      projectSettingsOverrides: { [projectId]: { reviewRules: { preset: "recommended" } } },
+    });
+  });
+
+  // The server keeps a fork project key an entry leaves out, so a reset must send its clear value.
+  const serverSave = (settings: ServerSettings, patch: ServerSettingsPatch) =>
+    keepLeftOutForkProjectKeys(settings, patch, applyServerSettingsPatch(settings, patch));
+  const unreadable = { preset: "off" as const, unreadable: { preset: "strict" } };
+
+  it("resetting a project's review rules removes them while the project keeps another override", () => {
+    for (const reviewRules of [unreadable, handSet]) {
+      const settings = {
+        ...DEFAULT_SERVER_SETTINGS,
+        projectSettingsOverrides: {
+          [projectId]: { reviewRules, pullRequestMergeMethod: "squash" as const },
+        },
+      } as ServerSettings;
+      const plan = planScopedSettingsClear(scope, withSettings(settings), ["reviewRules"]);
+      const patch = plan.serverWrites[0]!.patch;
+      const saved = serverSave(settings, patch);
+      expect(saved.projectSettingsOverrides[projectId]).toEqual({
+        pullRequestMergeMethod: "squash",
+      });
+      // Run again: nothing left to clear, and the other override stays.
+      const again = planScopedSettingsClear(scope, withSettings(saved), ["reviewRules"]);
+      expect(serverSave(saved, again.serverWrites[0]!.patch)).toEqual(saved);
+    }
+  });
+
+  it("resetting another kept fork key (MCP profile) removes it and keeps the other override", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      projectSettingsOverrides: {
+        [projectId]: { mcpProfile: "all", pullRequestMergeMethod: "squash" as const },
+      },
+    } as ServerSettings;
+    const plan = planScopedSettingsClear(scope, withSettings(settings), ["mcpProfile"]);
+    expect(serverSave(settings, plan.serverWrites[0]!.patch).projectSettingsOverrides).toEqual({
+      [projectId]: { pullRequestMergeMethod: "squash" },
+    });
+  });
+
+  it("the bulk reset of listed overrides also removes a kept fork key", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      projectSettingsOverrides: {
+        [projectId]: { reviewRules: handSet, pullRequestMergeMethod: "squash" as const },
+      },
+    } as ServerSettings;
+    const plan = planProjectOverridesClear(
+      withSettings(settings),
+      [{ environmentId, projectId }],
+      ["reviewRules"],
+    );
+    expect(serverSave(settings, plan.serverWrites[0]!.patch).projectSettingsOverrides).toEqual({
+      [projectId]: { pullRequestMergeMethod: "squash" },
+    });
   });
 });
