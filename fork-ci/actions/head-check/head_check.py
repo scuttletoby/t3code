@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import config  # noqa: E402
 import lens  # noqa: E402
 import pr_queue  # noqa: E402
+import review_config  # noqa: E402
 import review_judge  # noqa: E402
 
 ATTEMPTS, RETRY_SECONDS = 3, 10
@@ -267,8 +268,8 @@ def changed_paths(checkout, base, head):
         # other (review_judge.shown writes them as \xNN), never a UnicodeDecodeError that fails the head unexplained.
         d = checkout.git('diff', '--no-ext-diff', '--no-textconv', '--no-relative', '--ignore-submodules=none',
                          '--no-color', '--name-status', '-z', '-M', b, head, '--', errors='surrogateescape')
-        if d.returncode != 0:
-            return None, f'git diff {b[:12]} {head[:12]} failed: {(d.stderr or "").strip()[:200]}'
+        if d.returncode != 0:   # stderr as \xNN too (backslashreplace): a lone surrogate cannot be printed as UTF-8
+            return None, f'git diff {b[:12]} {head[:12]} failed: {review_judge.shown((d.stderr or "").strip()[:200])}'
         try:
             changes += review_judge.parse_name_status(d.stdout)
         except review_judge.JudgeError as e:
@@ -310,6 +311,10 @@ def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out
     cfg, paths = None, None
     if not problems:
         cfg = base_config(checkout, config_path, problems)
+    if cfg is not None:
+        why = head_order_problem(checkout, config_path)
+        if why:
+            problems.append(why)
     if cfg is not None and cfg.review is not None:
         paths, why = path_judgement(checkout, cfg.review, config_path)
         if paths is None:
@@ -402,6 +407,37 @@ def base_config(checkout, path, problems):
     except config.ConfigError as e:
         problems.append(str(e))
         return None
+
+
+def head_order_problem(checkout, path):
+    """Why the head's own config must not merge, or None: its `review` block is in enforce with a rule order enforce
+    refuses (review_config.enforce_order_problems). The config that judges a head is always the base's, so such a
+    head is judged by the old block and could merge; after it, the base config refuses every head, the one that fixes
+    the order too, and the queue stops. The only thing read from the head's config: it is never parsed for anything
+    else, and a head config that is unreadable, not JSON, without a `review` block or with another problem is left to
+    the rules of the base (that last one also stops every head once merged: a check of its own, not this one)."""
+    parents = checkout.merge_parents()
+    if not parents:
+        return None   # base_config refused it already
+    rel = path[2:] if path.startswith('./') else path
+    # errors='replace': only the rule order is read, and a name with a broken byte is still a name. A head that leaves
+    # the config as the base has it gets nothing new here: base_config already refused an enforce block with this order.
+    r = checkout.git('show', f'{parents[1]}:{rel}', errors='replace')
+    if r.returncode != 0:
+        return None   # the head deletes the config: judged by the base's rules, as every change to it
+    try:
+        raw = json.loads(r.stdout)
+    except ValueError:
+        return None
+    block = raw.get('review') if isinstance(raw, dict) else None
+    if not isinstance(block, dict) or block.get('mode') != 'enforce':
+        return None
+    order = review_config.enforce_order_problems(block)
+    if not order:
+        return None
+    return (f'this pull request leaves {path} in mode enforce with a rule order enforce refuses: {"; ".join(order)}. '
+            'Merged, the base config would refuse every pull request after it, the one that fixes the order too: fix '
+            'the rule order first (or keep mode shadow until it is fixed)')
 
 
 if __name__ == '__main__':
