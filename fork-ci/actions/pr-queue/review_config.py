@@ -1,9 +1,9 @@
 """The `review` block of the queue's config: which paths need which lens reads, and the round cap (README.md, "Review
 rules").
 
-Only parsed and checked here; nothing judges a pull request by it yet. Strict like config.py: every key is required,
-an unknown key or a wrong value is an error, and every problem is named at once. A rule set that could leave a changed
-path without the lenses its weight needs is refused, never repaired: no hidden defaults in the merge path.
+Parsed and checked here; review_judge.py judges a change by it (the head gate). Strict like config.py: every key is
+required, an unknown key or a wrong value is an error, and every problem is named at once. A rule set that could leave
+a changed path without the lenses its weight needs is refused, never repaired: no hidden defaults in the merge path.
 
 Globs use one small dialect, so the Python gate and T3 match a path the same way: `*` any characters inside one path
 segment, `**` any number of whole segments (only as a segment of its own), `?` one character inside a segment. Paths

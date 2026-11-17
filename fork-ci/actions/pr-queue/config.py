@@ -38,7 +38,7 @@ class Config:
     update_when_base_was_red: bool = False
     head_check_app: int = None
     delete_branch: bool = False   # read and checked, never used: the queue deletes no branch (README.md, "Config")
-    review: object = None         # review_config.ReviewRules, or None without the key: nothing reads it yet
+    review: object = None         # review_config.ReviewRules, or None without the key (head_check judges by it)
 
     def ready(self, n):
         """The command that re-arms PR n after a lens read, as the project writes it."""
