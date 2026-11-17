@@ -131,12 +131,12 @@ const run = <A, E>(
 
 describe("SlotGate", () => {
   it.effect(
-    "off (the default) or with no limit: allows and reads neither projection nor memory",
+    "off or with no limit: allows and reads neither projection nor memory (fixed mode; observe in SlotObserver.test.ts)",
     () =>
       Effect.gen(function* () {
         for (const settings of [
-          {},
-          { agentSlots: { maxPerMachine: 1, minFreeMemoryMb: 100_000 } },
+          { agentSlots: { mode: "fixed" } },
+          { agentSlots: { mode: "fixed", maxPerMachine: 1, minFreeMemoryMb: 100_000 } },
           on({}),
           "unreadable" as const,
         ]) {

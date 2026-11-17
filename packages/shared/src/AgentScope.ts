@@ -34,6 +34,10 @@ export interface AgentScopeShape {
    * it, even when the next session runs without one (Cursor, OpenCode).
    */
   readonly clear: (threadId: string) => Effect.Effect<void>;
+  /** Fork: the thread's own systemd scope and slice, for reading its memory; none when shared. */
+  readonly ownScope?: (
+    threadId: string,
+  ) => Effect.Effect<{ unit: string; slice: string } | undefined>;
 }
 
 export interface AgentScopeCommand {

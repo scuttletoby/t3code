@@ -966,7 +966,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     // Outside the lock (the gate reads the store's held slots under it); only while slots are on.
     const usage =
       input.slots === undefined || !settings.agentSlots.enabled ? null : yield* input.slots.usage;
-    const slots = usage === null ? {} : { slots: usage };
+    const slotRule = input.slots === undefined ? null : yield* input.slots.observed;
+    const slots = {
+      ...(usage === null ? {} : { slots: usage }),
+      ...(slotRule === null ? {} : { slotRule }),
+    };
     if (!loaded.ok) {
       return {
         enabled: settings.waitFor.enabled,

@@ -3,6 +3,7 @@ import type { AgentSlotsSettings } from "@t3tools/contracts/waitFor";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  agentSlotsMode,
   DISPATCH_SAFETY_MS,
   effectiveSlotLimits,
   limitsCount,
@@ -337,5 +338,19 @@ describe("slotRefusalText", () => {
     expect(slotRefusalText(refusal("machine", 2, 2), true)).toContain(
       'Call wait_for {"kind":"slot","slot":{}} and end your turn',
     );
+  });
+});
+
+describe("agentSlotsMode", () => {
+  it("maps old settings files exactly and reads an unknown mode as fixed", () => {
+    // Before `mode`: switched on = today's fixed limits; off = the rule only observes.
+    expect(agentSlotsMode({ enabled: true })).toBe("fixed");
+    expect(agentSlotsMode({ enabled: false })).toBe("observe");
+    expect(agentSlotsMode({ enabled: false, mode: "fixed" })).toBe("fixed");
+    expect(agentSlotsMode({ enabled: true, mode: "observe" })).toBe("observe");
+    // A newer build's mode never runs here, and never makes this build read more.
+    expect(agentSlotsMode({ enabled: false, mode: "dynamic" })).toBe("fixed");
+    expect(agentSlotsMode({ enabled: true, mode: "" })).toBe("fixed");
+    expect(agentSlotsMode(DEFAULT_SERVER_SETTINGS.agentSlots)).toBe("observe");
   });
 });

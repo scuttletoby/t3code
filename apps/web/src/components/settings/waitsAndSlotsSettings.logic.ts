@@ -15,7 +15,7 @@ import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
-type NumberKey<T> = { [K in keyof T]: T[K] extends number ? K : never }[keyof T];
+type NumberKey<T> = { [K in keyof T]-?: T[K] extends number ? K : never }[keyof T];
 
 export interface NumberFieldSpec<K extends string> {
   readonly key: K;
