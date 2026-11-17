@@ -26,9 +26,11 @@ body is read for a "why" per listed test: a body line that names the test (or, f
 Every error, including one this script did not foresee, is a ::warning:: and exit 0.
 
   python3 -I weakened_tests.py --config .github/weakened-tests.json --repo OWNER/NAME --pr N --base SHA --head SHA
-      [--path DIR] [--comment-author LOGIN] [--no-comment]
-Writes status=ok|could-not-read, count=<items> and missing_why=<items without a why> to $GITHUB_OUTPUT (count and
-missing_why are empty when the change could not be read; missing_why is empty when the PR body could not be read).
+      [--path DIR] [--comment-author LOGIN] [--no-comment] [--refused]
+Writes status=ok|could-not-read|refused, count=<items> and missing_why=<items without a why> to $GITHUB_OUTPUT (count
+and missing_why are empty when the change could not be read; missing_why is empty when the PR body could not be read).
+--refused: git-clean refused the checkout, so no git runs; status is refused, and a report comment of an earlier head
+is replaced by a note (none is posted when there is none).
 """
 import argparse, collections, copy, json, os, re, subprocess, sys
 
@@ -88,6 +90,13 @@ class Unclear(Exception):
     """The change or the config could not be read: the report says so instead of listing nothing."""
 
 
+# No global or system config or attributes, no hooks, fsmonitor command, commit-graph or replace refs from the
+# repository: the same two as ../git-clean/git_clean.py's (git_clean.test.py pins them to its; this file stays self-contained).
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
+GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
+            '-c', 'core.attributesFile=/dev/null', '--no-replace-objects')
+
+
 class Git:
     """git in one folder: stdout as bytes, or None when git fails."""
 
@@ -95,7 +104,8 @@ class Git:
         self.cwd = cwd
 
     def __call__(self, *args, input=None):
-        r = subprocess.run(['git', *args], cwd=self.cwd, input=input, capture_output=True)
+        r = subprocess.run(['git', *GIT_SAFE, *args], cwd=self.cwd, input=input, capture_output=True,
+                           env={**os.environ, **GIT_ENV})
         return r.stdout if r.returncode == 0 else None
 
 
@@ -312,8 +322,15 @@ def code(text):
     return f'`{text.strip() or " "}`'
 
 
-def render(items, reason, why, merge_base, head):
+REFUSED_TEXT = ('**No report for head {head}:** git-clean refused the checkout\'s git config (the job log says why), '
+                'so nothing was checked. An earlier report here was for another head.')
+
+
+def render(items, reason, why, merge_base, head, refused=False):
     lines = [MARKER, '### Existing tests this pull request deletes, skips or weakens', '']
+    if refused:
+        lines += [REFUSED_TEXT.format(head=code(head[:12])), '', 'Report only: this never fails the pull request.']
+        return '\n'.join(lines) + '\n'
     if items is None:
         lines += [f'**Could not read the change:** {code(reason)}. This is not an empty list: nothing was checked.',
                   '', 'Report only: this never fails the pull request.']
@@ -392,11 +409,14 @@ def cli(argv=None, env=None, gh=None, out=print):
     p.add_argument('--path', default='.')
     p.add_argument('--comment-author', default='github-actions[bot]')
     p.add_argument('--no-comment', action='store_true')
+    p.add_argument('--refused', action='store_true')
     try:
         a = p.parse_args(argv)
     except SystemExit:
         out('::warning::weakened-tests: bad arguments; nothing was checked (this never fails the pull request)')
         return 0
+    if a.refused:
+        return refused(a, env, gh, out)
     items, reason, mb = None, '', ''
     try:
         items, mb = find(a.base, a.head, a.config, Git(a.path))
@@ -428,6 +448,22 @@ def cli(argv=None, env=None, gh=None, out=print):
     if not a.no_comment:
         try:
             out(f'weakened-tests: comment {publish(gh, a.repo, a.pr, text, a.comment_author, items == [])}')
+        except Exception as e:   # noqa: BLE001
+            out(f'::warning::weakened-tests: {escape(e)}')
+    return 0
+
+
+def refused(a, env, gh, out):
+    """git-clean refused the checkout: no git, status refused, and an earlier head's report comment replaced."""
+    text = render(None, '', [], '', a.head, refused=True)
+    try:
+        append(env.get('GITHUB_STEP_SUMMARY'), text)
+        append(env.get('GITHUB_OUTPUT'), 'status=refused\ncount=\nmissing_why=\n')
+    except OSError as e:
+        out(f'::warning::weakened-tests: could not write the outputs: {escape(e)}')
+    if not a.no_comment:
+        try:
+            out(f'weakened-tests: comment {publish(gh, a.repo, a.pr, text, a.comment_author, True)}')
         except Exception as e:   # noqa: BLE001
             out(f'::warning::weakened-tests: {escape(e)}')
     return 0

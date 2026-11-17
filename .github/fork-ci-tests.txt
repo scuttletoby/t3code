@@ -10,6 +10,7 @@
 # A present test that is not listed fails. A listed file that is not present yet
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs ~10s
+.github/scripts/fork-checks-ran.test.py
 .github/scripts/fork-contracts.test.py
 .github/scripts/fork-fleet-desk-agent.test.py ~23s
 .github/scripts/fork-fleet-desk-key.test.py ~10s
@@ -45,6 +46,7 @@ fork-ci/actions/ci-demand/ci_demand.test.py ~13s
 fork-ci/actions/docs-scope/docs-scope.test.py ~16s
 fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/fleet-watch/fleet_watch.test.py
+fork-ci/actions/git-clean/git_clean.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/head-check/head_check.test.py ~12s
 fork-ci/actions/head-check/head_gate.test.py
@@ -67,6 +69,7 @@ fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
 fork-kit/golive/tests/copy.test.py ~26s
 fork-kit/golive/tests/journal.test.py
+fork-kit/golive/tests/rehearse.test.py ~22s
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py
 fork-kit/gh-apps/tests/policy.test.py

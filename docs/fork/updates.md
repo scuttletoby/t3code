@@ -38,6 +38,14 @@ watches; it changes nothing on the machine, and `0` turns it off.
   `ATOMIC_SETTINGS_KEYS` list each interval by hand, and a missed one is saved as a broken object.
   The same schema walk ([`forkSettingsIntervals.ts`](../../packages/shared/src/forkSettingsIntervals.ts))
   makes a save refuse an interval no run could use and a load read one as its default.
+  **Never widen an existing interval setting** (to `null` or "off" for "never"); give the new
+  encoding a new key. A build from before the widening still follows the old key, reads the value
+  as its default, and its next save deletes it, so a rollback and roll forward turn "never" into
+  the default. That build cannot tell a newer build's `null` from the `null` older builds wrote
+  for an infinite interval. Keeping the stored value on a save that leaves the setting alone is
+  not done: it needs a line in upstream's write path, and it would keep a bad value (`-5`, a
+  string) in the file for good, where today the next save cleans it. A widened interval turns the
+  `outOfReach` check in `serverSettings.forkIntervals.test.ts` red in the build that widens it.
 - The seam check ([`fork-seam-check.cjs`](../../.github/scripts/fork-seam-check.cjs)) refuses any
   line the fork adds to an upstream file beyond the seam lines pinned in
   [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment, in every
@@ -48,11 +56,22 @@ watches; it changes nothing on the machine, and `0` turns it off.
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
   also lowers the ceiling in the same change). Right after a rebase, below the ceiling is only a
-  note in the run log: when upstream takes a fork line word for word, the rebase drops it, and the
-  ceiling could not have been lowered first. The next run, from the new base, fails until a pull
-  request lowers it. A pull request may change a pending file but not grow it. An upstream file in no list may gain no
-  line, lose no line and keep its lines in order (whitespace and blank lines aside), and no
-  upstream file may be deleted or renamed, except the workflows
+  note in the run log and the run's summary: when upstream takes a fork line word for word, the
+  rebase drops it, and the ceiling could not have been lowered first. The next run, from the new
+  base, fails until a pull request lowers it. A pull request may change a pending file but not grow
+  it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
+  guard, or re-indented) add no line, so they are counted too, two ways: `lines`, the upstream lines
+  it does not keep in order and indentation, and `gone`, those whose text it no longer has at all,
+  so a line already counted as moved or re-indented cannot later be deleted unseen. `lost` maps such
+  a file to both (`{"lines": N, "gone": M}`), counted from upstream (none when unlisted) and held
+  exactly like a `pending` ceiling. A pull request may drop a seam file's listed seam lines (no more
+  copies than listed) but lose no other line, and may not move a seam line: a moved copy of `}`
+  looks the same as upstream's (move one with two pull requests). In a pending file it cannot tell
+  upstream's lines from the fork's (moving a fork line out loses one), so there fork-follow counts
+  them. A listed path that neither the base nor the head has (upstream
+  renamed it) is a note: list both names until the old one is gone from the base. An upstream file
+  in no list may gain no line, lose no line and keep its lines in order and indentation (trailing
+  blanks and blank lines aside), and no upstream file may be deleted or renamed, except the workflows
   [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
   `fork-*.yml`. A submodule pointer counts as a line. A pull request's run has no upstream commit,
   so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
@@ -60,7 +79,9 @@ watches; it changes nothing on the machine, and `0` turns it off.
   reason a pull request's run counts upstream's copies of a seam line against its allowance: a
   seam line upstream also has (`}`, `/**`) cannot be added by a pull request, only checked by
   fork-follow, so keep seam lines specific. A branch made before fork-follow last rebased main
-  is refused with one "update the branch" error.
+  is refused with one "update the branch" error. Only `--from-upstream` (which fork-follow passes)
+  runs it from an upstream commit and reads the head's list; without it a base with no list is
+  refused, and an upstream that is itself a fork with a list is still judged by this fork's list.
 - [`serverSettings.forkDefaults.test.ts`](../../apps/server/src/serverSettings.forkDefaults.test.ts)
   loads the settings the way a server does and checks every fork setting is at its row's default
   with no file, `{}`, a file an upstream build wrote, a file cut off half-way and a file with a bad
@@ -112,8 +133,9 @@ change, or a fork line beyond the seams, it stops and opens one issue. Then:
 1. Rebase by hand as the workflow's report says. Never take upstream's side of a fork setting's
    default: keep the fork's value (and the `Fork:` comment of the inline `automaticUpdates`).
 2. Check that the fork's lines in upstream files are only the seams:
-   `node .github/scripts/fork-seam-check.cjs <upstream tag> HEAD`. A refused line moves into the
-   fork's own file (a setting into `forkSettings.ts`); a changed seam line is fixed in
+   `node .github/scripts/fork-seam-check.cjs --from-upstream <upstream tag> HEAD`. A refused line moves into the
+   fork's own file (a setting into `forkSettings.ts`, a server layer into
+   `apps/server/src/fork/forkLayers.ts`); a changed seam line is fixed in
    `.github/fork-seams.json`.
 3. Run the pin tests before pushing:
    `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.

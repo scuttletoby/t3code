@@ -63,6 +63,7 @@ Each action's README has a full example, every input and output, and what happen
 | [gradle-cache](actions/gradle-cache/README.md)     | stages the Maven files a lock lists, sha256-checked, from release assets          | `lock`, `out`, `token`                   | `maven-repo-local`                                | the lock file                                            |
 | [fleet-route](actions/fleet-route/README.md)       | which runner each job of a run gets: the project's self-hosted pools or hosted    | `config`, `vars`, `mode`, `gates`        | `runners`, `mode`, `attempt`, `fallback`, `watch` | the fleet config (e.g. `.github/fleet.json`)             |
 | [fleet-watch](actions/fleet-watch/README.md)       | re-runs, once, a run that a dispatcher pool's runner cut off                      | `config`, `verb`, `run-id`, `attempt`    | `rerun`, `pending`                                | the fleet config (its `watch` section)                   |
+| [git-clean](actions/git-clean/README.md)           | empties a reused self-hosted workspace, refuses a .git config it does not know    | `path`                                   | none                                              | none                                                     |
 | [head-check](actions/head-check/README.md)         | fails a pull request head that is not the change its review read                  | `config`, `required-lenses`, `token`     | `result`                                          | the pr-queue config                                      |
 | [pr-queue](actions/pr-queue/README.md)             | a merge queue for an up-to-date-required repository (also a reusable workflow)    | `config`, `state-file`, `cache`, `token` | none                                              | the pr-queue config                                      |
 | [weakened-tests](actions/weakened-tests/README.md) | reports (never fails) the existing tests a pull request deletes, skips or weakens | `config`, `token`                        | `status`, `count`, `missing_why`                  | `.github/weakened-tests.json` (optional: added patterns) |
@@ -74,7 +75,8 @@ Two habits every action expects:
 - **A job that others `need` must not skip them on failure:** GitHub counts a skipped required job as passing. Give
   the dependent job `if: ${{ !cancelled() }}` and a fallback for an empty output (fleet-route's README shows one).
 
-To move to a new release, change the SHA and the comment together; read the new tag's release notes first.
+To move to a new release, change the SHA and the comment together; read the new tag's release notes first
+([RELEASE-NOTES.md](RELEASE-NOTES.md): what changed, and what to do before or after the move).
 
 ### Outside a workflow
 
