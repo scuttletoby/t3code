@@ -173,8 +173,12 @@ Two more things limit what a job can do:
   network and the walls from inside a runner.
 - **Files and devices (every pool), one rule:** a job's unit has a root
   folder of its own, empty but for symlinks. Of the host's files it sees only
-  the paths in `fork-fleet-job-paths.txt` (`/usr`, `/etc`, the `/bin` and `/lib`
-  links), each read-only and one mount (nothing mounted under it), the
+  the paths in `fork-fleet-job-paths.txt` (`/usr`, the `/bin` and `/lib`
+  links, and an allow list of `/etc`: `passwd`, `group`, `hosts`, the TLS
+  certificates, `alternatives`, the `ld.so` files, the time zone and a few
+  more a build needs; never `/etc` whole, so no login file, unit, cron entry,
+  `/etc/default` or backup tool's folder is there: issue #243), each
+  read-only and one mount (nothing mounted under it), the
   launcher's `ALLOW_PATHS`, the hook and its own copy. So a share or drive
   mounted anywhere else (`/mnt`, `/media`, `/srv`, `/data`, a Windows drive at
   `/c`) is not there. `MountFlags=private`: a mount the host makes after the job
@@ -188,7 +192,14 @@ Two more things limit what a job can do:
   `/dev/dxg`), disk, `kvm`, `fuse` or `tun`. Git, Node, Java and the Docker
   client need none of these; a job never gets the Docker daemon (its socket is
   root on the host). Step 6 proves each of these from inside a runner, and
-  that each bound path is the one the launcher checked. The per-OS walls ask
+  that each bound path is the one the launcher checked; it lists the job's
+  `/etc` (any entry the list did not put there fails) and tries two canary
+  files it keeps in `/etc` meanwhile (one others may read, one only the
+  runner's group may; another `CANARY_DIR` must be root's, only root may
+  write it or any folder above it, and no link may lead to it, or check-net
+  refuses). An older kit whose list still names `/etc` whole is
+  refused by the launcher and fails `mounts`: re-run the installer. A
+  project that needs another `/etc` entry adds it to `ALLOW_PATHS`. The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`, and `tools` for the
   `systemd-run` and `systemctl` it runs) instead of keeping a list of their
   own. A systemd drop-in that changes the job units (`service.d`,
@@ -240,7 +251,9 @@ Two more things limit what a job can do:
   not.
 
 Fleet jobs read no secrets (a test checks this). The fleet's GitHub token lives
-only on the fleet host, readable by root.
+only on the fleet host, readable by root. A host's own secrets stay out of jobs
+because a job's `/etc` is an allow list (above); the walls' `etc-secrets` is a
+lint for the common places, not a proof.
 
 ### Why the gate kills the worker (actions/runner, `main`, read 2026-11-12)
 

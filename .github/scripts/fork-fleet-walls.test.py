@@ -1729,14 +1729,32 @@ class EveryWallsFile(WallsRunner):
         def a_link(): os.rename(allow, allow + '.real'); os.symlink(allow + '.real', allow)
         def lists_home(): write(allow, '/usr\n/home\n')
         def lists_dots(): write(allow, '/usr/../home\n')
+        def lists_etc(): write(allow, '/usr\n/etc\n')   # an older kit's list (issue #243 item 4)
         def none(): pass   # in place: a desktop with shares and data disks mounted outside the list holds
-        for change in (none, gone, open_list, a_link, lists_home, lists_dots):
+        for change in (none, gone, open_list, a_link, lists_home, lists_dots, lists_etc):
             with self.subTest(change.__name__):
                 self.folder = os.path.join(os.path.dirname(self.install()), 'fork-fleet-walls')
                 allow = os.path.join(os.path.dirname(self.folder), JOB_PATHS)
                 change()
                 fails = self.walls('linux', 'check', self.root(LINUX))[1]
                 (self.assertNotIn if change is none else self.assertIn)('mounts', fails)
+
+    def test_linux_mounts_fails_on_all_of_etc_from_an_older_launcher(self):
+        """Issue #243 items 3 and 4: jobs see an allow list of /etc, never all of it. A launcher whose `paths` still
+        binds /etc whole (an older kit: today's launcher refuses that list itself) fails `mounts`, before every start
+        (fork-fleet-walls.py check), with what to do: re-run the installer. Its listed entries pass."""
+        launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
+        for lines, bad in (('/usr /usr\\n/etc /etc\\n', True), ('/usr /usr\\n/etc/x /etc\\n', True),
+                           ('/usr /usr\\n/etc/passwd /etc/passwd\\n/etc/ssl/certs /etc/ssl/certs\\n', False)):
+            with self.subTest(lines):
+                write(launcher, f'#!/bin/sh\ncase $1 in paths) printf "{lines}" ;; *) exit 1 ;; esac\n')
+                os.chmod(launcher, 0o755)
+                p = run([os.path.join(self.folder, 'linux'), 'check'], self.root(LINUX))
+                if bad:
+                    self.assertRegex(p.stdout, r'FAIL  mounts  .*jobs see all of /etc \(.*\): an older kit\'s list; '
+                                               r're-run the installer')
+                else:
+                    self.assertNotIn('FAIL  mounts', p.stdout)
 
     def test_linux_mounts_asks_the_launcher_and_its_conf(self):
         """One rule and one conf lookup (fix round 2): the walls hold what jobs see to `fork-fleet-launch.sh paths`,
