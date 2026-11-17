@@ -1448,17 +1448,28 @@ EOF
 
 # check-net's canaries (issue #243): two files in CANARY_DIR (/etc, root's: no list line names them), one others may
 # read and one only the runner user's group ($1's) may, so a job that saw them would read both. Made fresh each time
-# (a file left by a check-net that was cut off is replaced) and removed when check-net ends (its trap).
+# (a file left by a check-net that was cut off is removed first) and removed when check-net ends (its trap). Root
+# writes them, so their folder is checked as a bound path is: CANARY_DIR is its own real path (no link on the way),
+# each folder above it is closed (closed_folder, through real_path), and CANARY_DIR itself is root's and only root may
+# write it (owned_safe); then no one else can put a link where a canary goes. Still, each is a new file (noclobber:
+# O_EXCL, which a link fails too) made with its mode (umask, no chmod that follows a link), and chown -h.
 make_canaries() {
-  local c=$CANARY_DIR/fork-fleet-canary gid
+  local c=$CANARY_DIR/fork-fleet-canary gid real
+  real=$(real_path "$CANARY_DIR")
+  [[ $real == "$CANARY_DIR" ]] ||
+    die "check-net: CANARY_DIR $CANARY_DIR leads to $real: name the folder itself, with no link on the way"
   owned_safe "$CANARY_DIR"
+  [[ -d $CANARY_DIR ]] || die "check-net: CANARY_DIR $CANARY_DIR is not a folder"
   gid=$(id -g -- "$1") || die "check-net: no group of $1"
   rm -f -- "$c" "$c-group"
-  printf 'fork-fleet canary: no job may see this file\n' >"$c"
-  printf 'fork-fleet canary: no job may see this file\n' >"$c-group"
-  chmod 0644 -- "$c"
-  chmod 0640 -- "$c-group"
-  chown -- ":$gid" "$c-group"
+  (
+    set -o noclobber
+    umask 022
+    printf 'fork-fleet canary: no job may see this file\n' >"$c"
+    umask 027
+    printf 'fork-fleet canary: no job may see this file\n' >"$c-group"
+  ) 2>/dev/null || die "check-net: could not make the canaries in $CANARY_DIR as new files: refused"
+  chown -h -- ":$gid" "$c-group"
 }
 
 check_net() {

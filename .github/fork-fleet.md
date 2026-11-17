@@ -195,7 +195,9 @@ Two more things limit what a job can do:
   that each bound path is the one the launcher checked; it lists the job's
   `/etc` (any entry the list did not put there fails) and tries two canary
   files it keeps in `/etc` meanwhile (one others may read, one only the
-  runner's group may). An older kit whose list still names `/etc` whole is
+  runner's group may; another `CANARY_DIR` must be root's, only root may
+  write it or any folder above it, and no link may lead to it, or check-net
+  refuses). An older kit whose list still names `/etc` whole is
   refused by the launcher and fails `mounts`: re-run the installer. A
   project that needs another `/etc` entry adds it to `ALLOW_PATHS`. The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`, and `tools` for the

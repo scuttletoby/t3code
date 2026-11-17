@@ -219,7 +219,7 @@ JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutA
 # The sha256 of the launcher (fork-fleet-launch.sh) these walls ship with, whose start() gives every job unit its own
 # stop timeouts (launcher_shipped). A changed launcher must change this pin and fork-fleet-walls/wsl2's with it
 # (fork-fleet-walls.test.py and fork-fleet-walls-wsl2.test.py check both against the launcher in the repo).
-LAUNCHER_SHA256 = 'f99b2a66480d1ce8c53a0f2240bed02cca11c686d726c10b986950248fbfd066'
+LAUNCHER_SHA256 = '0b4b4c10cca7f04cde8bcb732fba5dbd2dddc2b42b3535e37e92140c98598bc4'
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
 UNIT_BLANKS = ' \t\n\r'
