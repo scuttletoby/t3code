@@ -38,6 +38,14 @@ watches; it changes nothing on the machine, and `0` turns it off.
   `ATOMIC_SETTINGS_KEYS` list each interval by hand, and a missed one is saved as a broken object.
   The same schema walk ([`forkSettingsIntervals.ts`](../../packages/shared/src/forkSettingsIntervals.ts))
   makes a save refuse an interval no run could use and a load read one as its default.
+  **Never widen an existing interval setting** (to `null` or "off" for "never"); give the new
+  encoding a new key. A build from before the widening still follows the old key, reads the value
+  as its default, and its next save deletes it, so a rollback and roll forward turn "never" into
+  the default. That build cannot tell a newer build's `null` from the `null` older builds wrote
+  for an infinite interval. Keeping the stored value on a save that leaves the setting alone is
+  not done: it needs a line in upstream's write path, and it would keep a bad value (`-5`, a
+  string) in the file for good, where today the next save cleans it. A widened interval turns the
+  `outOfReach` check in `serverSettings.forkIntervals.test.ts` red in the build that widens it.
 - The seam check ([`fork-seam-check.cjs`](../../.github/scripts/fork-seam-check.cjs)) refuses any
   line the fork adds to an upstream file beyond the seam lines pinned in
   [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment. It runs on
