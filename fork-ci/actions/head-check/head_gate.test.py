@@ -66,8 +66,9 @@ class Api:
             if isinstance(v, Seq):
                 v = v.pop(0) if len(v) > 1 else v[0]
             return v if isinstance(v, types.SimpleNamespace) else answer(0, json.dumps(v))
-        if a[:2] == ('api', '--paginate') and a[3:] == ('--jq', G.LIST_JQ) and a[2] in self.lists:
-            v = self.lists[a[2]]   # the open pull requests: (number, draft, head sha, base ref), one JSON line each
+        if a[:2] == ('api', '--paginate') and a[3:] in (('--jq', G.LIST_JQ), ('--jq', getattr(G, 'HEAD_JQ', None))) \
+                and a[2] in self.lists:
+            v = self.lists[a[2]]   # the open pull requests, one JSON line each: LIST_JQ's or HEAD_JQ's fields
             return v if isinstance(v, types.SimpleNamespace) else answer(0, ''.join(json.dumps(x) + '\n' for x in v))
         if self.rest:
             return self.rest(*a)
@@ -331,7 +332,7 @@ class Prs(Files, unittest.TestCase):
         return found
 
     def test_the_events_one_open_ready_pull_request_into_the_default_branch(self):
-        for event in G.EVENTS:
+        for event in ('pull_request_target', 'issue_comment', 'workflow_dispatch'):   # workflow_run: ReviewRun
             with self.subTest(event=event):
                 code, out, _ = self.prs(event, '7', self.pull())
                 self.assertEqual((code, self.found()), (0, [{'pr': 7, 'sha': self.H}]), out)
@@ -428,6 +429,107 @@ class Prs(Files, unittest.TestCase):
             with self.subTest(listing=listing.stdout[:20]):
                 code, out, _ = self.prs('workflow_dispatch', '', listing=listing)
                 self.assertEqual((code, self.file('output')), (1, None), out)
+
+
+# --- prs on a workflow_run: the review trigger's run (issue #88) -----------------------------------------------------
+class ReviewRun(Files, unittest.TestCase):
+    """A review or an inline review comment starts the review trigger (review-trigger.example.yml); its finished run
+    starts the caller on workflow_run, from the default branch. The pull request comes from the API, by the run's head
+    sha, head repository and head branch (all GitHub's), never from the run's outputs, artifacts or names."""
+    H, OTHER = 'a1' * 20, 'b2' * 20
+    RUN = {'event': 'pull_request_review', 'sha': 'a1' * 20, 'repo': REPO, 'branch': 'feature/x'}
+
+    def query(self, owner, branch):
+        return f'repos/{REPO}/pulls?state=open&per_page=100&head={owner}:{branch}'
+
+    def review(self, rows=(), run=None, pr='', query=None):
+        run = {**self.RUN, **(run or {})}
+        query = query or self.query(run['repo'].split('/')[0], run['branch'])
+        lists = {query: rows if isinstance(rows, types.SimpleNamespace) else list(rows),
+                 f'repos/{REPO}/pulls?state=open&per_page=100': [(1, False, self.H, 'main')]}   # never the backfill
+        gh, out = Api(lists=lists), []
+        code = G.prs(REPO, 'workflow_run', pr, gh, out.append, self.env, run=run)
+        return code, '\n'.join(out), gh
+
+    def found(self):
+        found = json.loads(self.outputs().get('prs', 'null'))
+        os.remove(self.env['GITHUB_OUTPUT'])
+        return found
+
+    def test_the_one_open_pull_request_with_the_runs_head_is_judged(self):
+        for event in G.REVIEW_EVENTS:
+            with self.subTest(event=event):
+                rows = [(12, False, self.H.upper(), REPO), (13, False, self.OTHER, REPO)]
+                code, out, gh = self.review(rows, {'event': event})
+                self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+                self.assertEqual([c[0][2] for c in gh.calls], [self.query(REPO.split('/')[0], 'feature/x')],
+                                 'one paged read, by head: never the backfill')
+
+    def test_no_open_pull_request_with_the_head_judges_nothing(self):
+        # Empty: none open (closed or merged meanwhile), or the head moved on (the push ran the gate already).
+        for rows in ([], [(12, False, self.OTHER, REPO)], [(12, False, self.H, None)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, []), out)
+                self.assertIn('nothing to judge', out)
+                self.assertIn('no open pull request', out)
+
+    def test_two_open_pull_requests_with_the_head_judge_nothing(self):   # same branch into two bases: ask for a number
+        code, out, _ = self.review([(12, False, self.H, REPO), (14, True, self.H, REPO)])
+        self.assertEqual((code, self.found()), (0, []), out)
+        self.assertIn('nothing to judge', out)
+        self.assertIn('#12, #14', out)
+
+    def test_a_fork_head_is_looked_up_in_the_fork_and_a_forged_sha_elsewhere_never_matches(self):
+        fork = {'repo': 'someone/t3code-fork', 'branch': 'main'}
+        rows = [(30, False, self.H, REPO), (31, False, self.H, 'someone/t3code-fork')]   # 30: same sha, base repo
+        code, out, gh = self.review(rows, fork)
+        self.assertEqual((code, self.found()), (0, [{'pr': 31, 'sha': self.H}]), out)
+        self.assertEqual(gh.calls[0][0][2], self.query('someone', 'main'))
+        code, out, _ = self.review([(30, False, self.H, REPO)], fork)   # only another repository's head has the sha
+        self.assertEqual((code, self.found()), (0, []), out)
+
+    def test_the_branch_is_one_query_value(self):   # a branch name is the pusher's text
+        code, out, gh = self.review([(12, False, self.H, REPO)], {'branch': 'a&b=c#d+e%f'},
+                                    query=self.query(REPO.split('/')[0], 'a%26b%3Dc%23d%2Be%25f'))
+        self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+
+    def test_a_run_of_another_event_or_with_odd_fields_judges_nothing_and_reads_nothing(self):
+        for run in ({'event': 'pull_request'}, {'event': 'push'}, {'event': ''}, {'sha': 'abc'}, {'sha': ''},
+                    {'repo': ''}, {'repo': 'no-slash'}, {'branch': ''}, {'branch': 'a\nb'}, {'branch': 'x' * 256}):
+            with self.subTest(run=run):
+                code, out, gh = self.review(run=run)
+                self.assertEqual((code, self.found(), gh.calls), (0, [], []), out)
+                self.assertIn('nothing to judge', out)
+
+    def test_a_number_on_a_workflow_run_is_refused(self):   # the number comes only from the API
+        code, out, gh = self.review(pr='7')
+        self.assertEqual((code, self.file('output'), gh.calls), (1, None, []), out)
+
+    def test_an_unreadable_or_odd_listing_is_refused_and_posts_nothing(self):   # stops half-way: an older check stays
+        for rows in (answer(1, '', 'gh: Server Error (HTTP 502)'), answer(0, 'x\n'), answer(0, '[12, false, "x", null]\n'),
+                     answer(0, '[true, false, "' + self.H + '", null]\n'), answer(0, '[12, "no", "' + self.H + '", null]\n')):
+            with self.subTest(rows=rows.stdout[:20]):
+                code, out, gh = self.review(rows)
+                self.assertEqual((code, self.file('output')), (1, None), out)
+                self.assertIn('could not list', out) if rows.returncode else self.assertIn('not a pull request', out)
+
+    def test_a_burst_of_runs_reads_the_same_answer_each_time(self):   # runs again: reads only, the same answer
+        rows = [(12, False, self.H, REPO)]
+        answers = []
+        for _ in range(3):
+            code, out, _ = self.review(rows)
+            answers.append((code, self.found()))
+        self.assertEqual(answers, [(0, [{'pr': 12, 'sha': self.H}])] * 3)
+
+    def test_the_cli_takes_the_run_fields_and_a_branch_that_starts_with_a_dash(self):
+        seen = []
+        with unittest.mock.patch.object(G, 'prs', lambda *a, **k: seen.append((a, k)) or 0):
+            self.assertEqual(G.cli(['prs', '--repo', REPO, '--event', 'workflow_run', '--pr', '', '--event-sha', '',
+                                    '--run-event', 'pull_request_review_comment', '--run-sha', self.H,
+                                    '--run-repo', REPO, '--run-branch=-x'], env=self.env), 0)
+        self.assertEqual(seen[0][1]['run'], {'event': 'pull_request_review_comment', 'sha': self.H, 'repo': REPO,
+                                             'branch': '-x'})
 
 
 # --- target ---------------------------------------------------------------------------------------------------------
