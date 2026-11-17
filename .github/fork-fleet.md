@@ -439,7 +439,8 @@ done
 #    that folder. /opt and /var/lib must be on one filesystem: each copy hard-links the template (the launcher checks it).
 
 # 3. The fleet files, from one pinned main commit. All of them are fetched first and installed only when each came;
-#    SOURCE is written last, so it never names a commit whose files are not all in place.
+#    SOURCE is written last, so it never names a commit whose files are not all in place. Another project that
+#    carries these files: point `base` below at that project's repository and use a commit of its main.
 (
   set -euo pipefail
   sha=FULL_MAIN_SHA
@@ -450,6 +451,7 @@ done
          scripts/fork-fleet-hook.sh:hook.sh:755 scripts/fork-fleet-launch.sh:fork-fleet-launch.sh:755
          scripts/fork-fleet-desk.py:fork-fleet-desk.py:644 scripts/fork-fleet-desk-wire.py:fork-fleet-desk-wire.py:644
          scripts/fork-fleet-desk-seed.py:fork-fleet-desk-seed.py:644
+         scripts/fork-fleet-desk-key.py:fork-fleet-desk-key.py:644
          scripts/fork-fleet-refresh.service:fork-fleet-refresh.service:644
          scripts/fork-fleet-refresh.timer:fork-fleet-refresh.timer:644
          scripts/fork-fleet-job-paths.txt:fork-fleet-job-paths.txt:644"
@@ -574,10 +576,15 @@ Do not name the dispatcher's unit `fork-fleet-*`: that prefix is for runner
 units. Runner units are separate transient units, so restarting the dispatcher
 leaves running jobs alone.
 
-**The `pc` pool** stays off until `/opt/fork-fleet/launch-pc` exists: a wrapper
-that runs `fork-fleet-launch.sh` on the PC over ssh. Run the dispatcher with
-`--pool vm` until then. Without its dispatcher, `pc` has no heartbeat, and
-`route` never counts it. Whether and how the PC joins is an owner decision.
+**The `pc` pool** is a desk pool: the owner's PC, through the desk link below.
+It stays off until its own dispatcher unit runs (`t3code-fleet-dispatcher-pc`,
+"One dispatcher per desk pool") and the PC's desk key is added: without its
+dispatcher, `pc` has no heartbeat and `route` never counts it. While the PC
+sleeps or is off, `launch` exits 3 at once and its jobs go elsewhere. A host
+that ran an older `pc` dispatcher on `/opt/fork-fleet/launch-pc` first stops
+that dispatcher and lets its runners finish (this config's cleanup skips a pool
+that is down, so it never stops or prunes them); then it may delete the
+wrapper: nothing reads it.
 
 ### The desk link (a desktop pool)
 
@@ -587,7 +594,7 @@ out to the always-on host over ssh, as a dedicated unprivileged user (default
 pool. The pool's dispatcher on the always-on host sends the launcher's verbs
 through that one session (`fork-fleet-desk.py`, its wire format
 `fork-fleet-desk-wire.py`). Once per always-on host, as root (step 3 installs
-both files):
+these files and the key tool `fork-fleet-desk-key.py`):
 
 ```sh
 # The desk-link user: a real shell (sshd runs the forced command through it, so nologin would close the link) and no
@@ -598,7 +605,7 @@ usermod -p '*' fleet-desk
 echo 'd /run/fork-fleet-desk 0710 fleet-desk fleet-desk -' > /etc/tmpfiles.d/fork-fleet-desk.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/fork-fleet-desk.conf
 # Per desk pool: the desktop's public key, as the desk-link user, with the key tool fork-fleet-desk-key.py
-# (row D4 of the desktop-pool design; install it beside the others).
+# (step 3 installs it).
 sudo -u fleet-desk -H /usr/bin/python3 -I /opt/fork-fleet/fork-fleet-desk-key.py --config /opt/fork-fleet/fork-fleet.json add POOL < desk-POOL.pub
 ```
 
@@ -612,12 +619,31 @@ Another user name: use it in all three places above, and give the dispatcher
 tmpfiles line; the desk-link user must be in it, and so must the dispatcher's
 user when that is not root.
 
+A desk pool's entry in a project's fleet config (made-up names; `seeds` is
+optional, see "Seeds" below):
+
+```json
+{
+  "name": "desktop",
+  "label": "fleet-desktop-example",
+  "slots": 2,
+  "beacon": "FLEET_BEACON_DESKTOP",
+  "launch": ["python3", "-I", "/opt/fork-fleet/fork-fleet-desk.py", "launch", "desktop"],
+  "waits": false
+}
+```
+
+`waits: false`: a desktop may sleep, so a job never waits for it. `slots` at
+most the desktop's own `slots` (its machine file). The pool's name is the one in
+the desktop's machine file and in the key line.
+
 `serve` keeps one session per pool (a lock), listens on a 0660 socket in
 `/run/fork-fleet-desk` (it lets in only root, its own user and the socket
 group), and pings the agent; `launch` fails at once (exit 3) when no session is
 live, so a sleeping desktop's pool is down for the pass and `route` sends its
 jobs elsewhere. The dispatcher says so once, then every 10 minutes with a count,
-and once more when the desktop answers again. A verb with no answer in its time
+and once more when the desktop answers again after more than one pass (a single
+missed pass logs nothing when it answers). A verb with no answer in its time
 exits 75: it may or may not have run, and the next pass's `active` tells.
 
 **One dispatcher per desk pool.** Run each desk pool's dispatcher as its own
@@ -647,10 +673,11 @@ to run (exit 2) until the line is gone. The agent fixes the kit when it starts,
 in its real path: a link above it that an upgrade repoints changes nothing
 until the agent restarts, so restart it after an upgrade. The desk kit
 ([fork-kit/desk](../fork-kit/desk/README.md)) does all of this, with a PASS/FAIL
-check and an uninstall; by hand, once per desktop:
+check and an uninstall; by hand, once per desktop (`/etc/fork-fleet` root's and
+0700, not a link: the kit's `check` and install hold it to that):
 
 ```sh
-install -d -m 755 /etc/fork-fleet
+install -d -m 700 /etc/fork-fleet
 ssh-keygen -t ed25519 -N '' -C desk-POOL -f /etc/fork-fleet/desk-key   # desk-key.pub goes to the always-on host
 # The always-on host's own key, from that host (`cat /etc/ssh/ssh_host_ed25519_key.pub`), as one line;
 # with another PORT the name is [HOST]:PORT. Nothing else is ever trusted.
