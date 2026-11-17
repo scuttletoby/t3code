@@ -38,7 +38,7 @@ NO_HEADER = 'comment without a first-line lens header'
 # leaves the old one; hiding the old one is not enough either.
 # The queue posts this text, so it never holds the lens marker with its colon (no_lens_text).
 NO_HEADER_WAY_OUT = ('delete that comment (hiding it is not enough), or edit it to start with `not a lens` and a colon '
-                     'and hold no lens header line, or')
+                     'and hold no lens header line, with any line that names the sha a lens read quoted with `>`, or')
 EDITED = 'edited after posting: post a new comment instead'
 # A review's edit and hidden flags, by review node id, as the caller read them with a query of its own (pr_queue
 # review_flags). gh pr view never fetches them for reviews but prints `includesCreatedEdit: false` anyway, so a review
@@ -53,13 +53,16 @@ UNREAD = '_flagsUnread'   # the mark review_post puts on such a review
 HIDDEN = 'hidden: post a new comment instead'
 SHORT = 'not a full 40-hex sha'
 EMBEDDED = 'holds a lens header line'   # lens_problem: `not a lens:` cannot clear it
+# lens_problem: below a `not a lens:` first line, a hex `read at` outside a `>` quote (issue #77)
+OPT_OUT_READ = 'says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote'
 # What a lens report looks like (ONE rule on normalised lines): on a plain line (outside code blocks and quotes) a
 # `lens:`, a `read at:` or `read at <hex>`, `safe to merge`, or in its first TOP_LINES plain lines a Markdown heading
 # naming a lens (LOOKS_HEADING_RE reads the raw line: normalising drops `#`), or two `covered:`/`checks:` field lines;
 # on ANY line, fenced, indented or quoted too, a `read at` with a hex sha, a header line or a `lens:` field with any hex
 # sha (loose_header). Such a comment without a valid first-line header is a lens that read nothing. So is a comment
 # with two or more header lines (one comment per lens). A round, fix or note comment says so on its first line,
-# `not a lens: ...`; that clears it only when none of its lines is a header line or a `lens:` field with a sha.
+# `not a lens: ...`; that clears it only when none of its lines is a header line or a lens field with a sha, and no line
+# outside a `>` quote (a fence or an indented block is no quote) holds a hex `read at` (unquoted_lines, issue #77).
 LOOKS_RE = re.compile(r'\blens\s*:|\bread[\s-]*at\b\s*(?::|[0-9a-f]{7})|\bsafe\s+to\s+merge\b', re.I)
 NOT_A_LENS_RE = re.compile(r'not\s+a\s+lens\s*:', re.I)
 FIELD_LINE_RE = re.compile(r'(?:covered|checks)\s*:', re.I)
@@ -134,11 +137,13 @@ def clean_inline(text, narrow=False):
 def norm_line(line, narrow=False):
     """One line as lens_problem and lens_header read it: clean_inline, then any leading quote markers, list markers (`-`
     `+` `•` `1.` `1)`, a task box `[x]`; `*` is gone already), heading marks and `~~~` fences stripped."""
-    s, prev = clean_inline(line, narrow), None
-    while s != prev:
-        prev = s
-        s = re.sub(r'^\s*(?:>|[-+•](?=\s|$)|\d{1,9}[.)](?=\s|$)|#{1,6}(?=\s|$)|~{3,}|\[[ xX]\](?=\s|$))\s*', '', s)
-    return s.strip()
+    return LEADING_MARKERS_RE.sub('', clean_inline(line, narrow), count=1).strip()
+
+
+# Every leading marker in one match (issue #72: one re.sub per marker took 0.3-0.7 s for a 64 KB line of them). The same
+# answer as stripping `^\s*<marker>\s*` until nothing changes: after one, the next starts at a non-blank.
+LEADING_MARKERS_RE = re.compile(
+    r'^\s*(?:(?:>|[-+•](?=\s|$)|\d{1,9}[.)](?=\s|$)|#{1,6}(?=\s|$)|~{3,}|\[[ xX]\](?=\s|$))\s*)*')
 
 
 def opens_plain(line):
@@ -216,16 +221,34 @@ def plain_lines(body):
     return out
 
 
+def unquoted_lines(body):
+    """The comment's lines except those of a `>` quote (at most 3 leading spaces) outside a fence: a `>` in a fenced or
+    indented block is code, and the line stays."""
+    out, fence = [], None
+    for line in (body or '').splitlines():
+        m = re.match(r' {0,3}(`{3,}|~{3,})', line)
+        if fence:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+                fence = None
+        elif m:
+            fence = m.group(1)
+        elif re.match(r' {0,3}>', line):
+            continue
+        out.append(line)
+    return out
+
+
 def header_line(line):
     """A normalised line that is a lens header with a hex `read at`. A `<sha>` template line is none."""
     return bool(LENS_RE.match(line) and READ_AT_RE.search(line))
 
 
 def loose_header(line):
-    """A normalised line with a `lens:` field (at its start or after other text) naming any hex sha after it, however
-    the read is written (`read at commit X`, `reviewed at: X`, `read_at: X`, a commit URL, `(X)`). Never a valid
-    read; lens_problem flags it."""
-    m = re.search(r'\blens\s*:(.*)', re.sub(r'\bnot\s+a\s+lens\s*:', ' ', line, flags=re.I), re.I)   # opt-out: no field
+    """A normalised line with a lens field (at its start or after other text) naming any hex sha after it, however
+    the read is written (`read at commit X`, `reviewed at: X`, `read_at: X`, a commit URL, `(X)`). The field is
+    `lens` and a colon, or an `=`, `—` or `–` (issue #77; never `-`: no_lens_text writes `lens -`). Never a valid read;
+    lens_problem flags it."""
+    m = re.search(r'\blens\s*[:=—–](.*)', re.sub(r'\bnot\s+a\s+lens\s*:', ' ', line, flags=re.I), re.I)   # opt-out: no field
     return bool(m and HEX_RE.search(m.group(1)))
 
 
@@ -346,6 +369,8 @@ class Review:
         if any(loose_header(line) for line in normed):
             return f'{EMBEDDED} (a lens line with a sha not written `read at: <sha>`), {start}'
         if opens_plain(first) and NOT_A_LENS_RE.match(norm(first)):
+            if any(READ_AT_RE.search(norm(line)) for line in unquoted_lines(body)):
+                return f'{OPT_OUT_READ}, {start}'
             return None
         plain = plain_lines(body)
         if sum(bool(FIELD_LINE_RE.match(norm(line))) for line in plain) >= 2:   # fields of a headerless report
