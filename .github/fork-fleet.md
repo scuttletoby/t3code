@@ -205,18 +205,19 @@ Two more things limit what a job can do:
   minutes (a job that ignores SIGTERM would run on past its limit), in a
   drop-in, or as systemd's own default (`system.conf`: the first of `/etc`,
   `/run`, `/usr/local/lib` and `/usr/lib`, and every `system.conf.d`) while a
-  job unit an older launcher started is still loaded, or while the installed
-  launcher is such an older one (the walls read its `start()`: the launcher
-  gives each job unit its own stop timeouts, 90 s, so the default decides
-  nothing for the units it starts now; an endless one of a unit's own fails
-  too); and a
+  job unit an older launcher started is still loaded (an endless one of a
+  unit's own fails too); and a
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
-  drops it anywhere else. On WSL2 they also read every property the launcher gives a job's unit
-  (each way `systemd-run` takes one), of the launcher they ship with only:
-  its sha256 is pinned in the `wsl2` walls file, and any other launcher
-  cannot be told and fails (no reading of bash can follow every way a changed
-  one could hand a unit more). A launcher change moves the pin in the same
+  drops it anywhere else. The walls know the launcher they ship with: its
+  sha256 is pinned in the `linux` and the `wsl2` walls files, and any other
+  launcher (one of another release too: install the kit whole) cannot be told
+  and fails `job-units` (no reading of bash can follow every way a changed one
+  could hand a unit more, or less). The pinned launcher's `start()` gives each
+  job unit its own stop timeouts, 90 s, so systemd's default decides nothing
+  for the units it starts. On WSL2 they also read every property that launcher
+  gives a job's unit (each way `systemd-run` takes one), and any other launcher
+  fails `sockets` too. A launcher change moves both pins in the same
   pull request: it needs the security lens, and the pin test also runs cheap
   tripwires on the launcher's text (a second `systemd-run`, `eval` or
   `source` even spelt with quotes or backslashes, a command word built from
