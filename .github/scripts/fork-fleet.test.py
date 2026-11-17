@@ -4476,15 +4476,51 @@ class RetiredLabels(unittest.TestCase):
         self.dispatch()
         self.assertEqual(self.left(), ['fleet-old-b-50'])
 
-    def test_an_online_registration_under_a_retired_label_is_never_touched(self):
+    def test_an_online_registration_under_a_retired_label_is_never_deleted(self):
         self.reg(40, 'fleet-old-a-40')
         self.reg(42, 'fleet-old-a-42', status='online', busy=True)
-        self.reg(43, 'fleet-old-a-43', status='online')    # idle, its job gone: still left alone (not stopped)
+        self.reg(43, 'fleet-old-a-43', status='online')    # idle, its own job still queued: it is about to take it
         self.fake[WAITING].units |= {'fleet-old-a-42', 'fleet-old-a-43'}
-        self.gh.add(a_run(6, actor='someone'), a_job(61, ['fleet-old-a']))   # a queued job that could take 43
+        self.gh.add(a_run(6, actor='someone'), a_job(43, ['fleet-old-a']))
         self.dispatch(passes=CFG['dispatch']['idle_passes'] + 1)
         self.assertEqual(self.left(), ['fleet-old-a-42', 'fleet-old-a-43'])
         self.assertEqual(self.fake[WAITING].stopped, [])
+
+    def test_an_idle_runner_under_a_retired_label_is_stopped_and_frees_its_slot(self):
+        """#319: idle runners under the old label count toward the pool's slots, so they are stopped like any other
+        (after idle_passes) and a queued job for the pool starts then, not when their units time out."""
+        slots, passes = RET_POOLS[WAITING]['slots'], CFG['dispatch']['idle_passes']
+        old = [f'fleet-old-a-{40 + i}' for i in range(slots)]
+        for i, name in enumerate(old):
+            self.reg(40 + i, name, status='online')        # its job went away (cancelled): idle
+        self.fake[WAITING].units |= set(old)
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))   # no runner of the old label could take it
+        self.dispatch(passes=passes - 1)
+        self.assertEqual((self.fake[WAITING].stopped, self.fake[WAITING].started), ([], []))
+        self.dispatch()
+        self.assertEqual(sorted(self.fake[WAITING].stopped), old)
+        self.dispatch()
+        self.assertEqual([n for n, _ in self.fake[WAITING].started], [f'{RET_POOLS[WAITING]["label"]}-11'])
+
+    def test_an_idle_runner_under_a_retired_label_another_job_could_take_is_stopped_at_once(self):
+        self.reg(43, 'fleet-old-a-43', status='online')
+        self.fake[WAITING].units.add('fleet-old-a-43')
+        self.gh.add(a_run(6, actor='someone'), a_job(61, ['fleet-old-a']))   # the hook would refuse it on 43
+        self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, ['fleet-old-a-43'])
+
+    def test_only_a_job_id_after_the_label_matches(self):
+        """#319: near-miss names under the pool's labels (now and retired) are no runner it made: never deleted."""
+        a = RET_POOLS[WAITING]['label']
+        near = [f'{x}{tail}' for x in ('fleet-old-a', a)
+                for tail in ('-40-1', '-abc', '-40\n', '-40 ', '-\u0664\u0660', '-', '--40', '-' + '9' * 21)]
+        near += ['fleet-old-a2-40', 'fleet-old-ab-40', 'xfleet-old-a-40', 'FLEET-OLD-A-40', f'{a}2-40', f'x{a}-40']
+        for i, name in enumerate(near):
+            self.reg(100 + i, name)
+        self.reg(40, 'fleet-old-a-40')                     # the one name it made: deleted
+        self.dispatch()
+        self.assertEqual(self.deletes(), ['actions/runners/40'])
+        self.assertEqual(self.left(), sorted(near))
 
     def test_two_dispatchers_with_different_pools_side_by_side(self):
         a, b = RET_POOLS[WAITING]['label'], RET_POOLS[OTHER]['label']
@@ -4530,6 +4566,10 @@ class RetiredLabels(unittest.TestCase):
             'two pools claim one': lambda c: c['pools'][self.at(OTHER)].update(retired=['fleet-old-a']),
             'not in retired_labels': lambda c: c['pools'][self.at(WAITING)].update(retired=['fleet-old-z']),
             'not a list': lambda c: c['pools'][self.at(WAITING)].update(retired='fleet-old-a'),
+            # #319: a label reused while it is still retired; a host on the older config still deletes its
+            # registrations as that pool's leftovers
+            'a pool\'s label still in retired_labels': lambda c: c.update(
+                retired_labels=['fleet-old-a', 'fleet-old-b', b]),
         }
         for name, change in cases.items():
             with self.subTest(name):
