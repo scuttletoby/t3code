@@ -206,7 +206,8 @@ STOP_TIMEOUTS = ('TimeoutSec', 'TimeoutStopSec', 'TimeoutAbortSec')
 STOP_MAX = 300   # seconds
 # The same from systemd's own config: its defaults for every unit that sets none of its own. The launcher's start()
 # gives each job unit its own (JOB_STOP_TIMEOUTS: default -> its own; a test keeps them the launcher's), so they count
-# only while a unit an older launcher started is loaded (stop_defaults_used). The main file is the first of
+# only while a unit an older launcher started is loaded (stop_defaults_used), or while the installed launcher is such
+# an older one (launcher_stops). The main file is the first of
 # MANAGER_MAIN there is (systemd 256 and later; before, /etc's only: reading the others too can only report more), and
 # every drop-in of MANAGER_CONFS is read.
 MANAGER_MAIN = ('/etc/systemd/system.conf', '/run/systemd/system.conf', '/usr/local/lib/systemd/system.conf',
@@ -343,13 +344,17 @@ def container_wall():
     return None
 
 
+def launcher_safe(st):
+    """Raises unless st (the launcher's lstat or fstat) is a plain file owned by this uid and writable by it alone."""
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        raise ValueError(f'{LAUNCHER} is a link, or not owned by uid {os.geteuid()} and writable by it alone')
+
+
 def ask(verb, what):
     """The lines of a read-only verb of the launcher (`paths`, `tools`), run as the pool runs it: with its conf lookup
     (FORK_FLEET_LAUNCH_CONF too: the one place of it). A launcher not safe as owned_safe wants it, or one that refuses
     (what), raises."""
-    st = os.lstat(LAUNCHER)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
-        raise ValueError(f'{LAUNCHER} is a link, or not owned by uid {os.geteuid()} and writable by it alone')
+    launcher_safe(os.lstat(LAUNCHER))
     env = {'PATH': os.environ.get('PATH', '/usr/sbin:/usr/bin:/sbin:/bin'), 'LC_ALL': 'C'}
     env.update({k: os.environ[k] for k in ('FORK_FLEET_WALLS_ROOT', 'FORK_FLEET_LAUNCH_CONF') if os.environ.get(k)})
     p = subprocess.run([LAUNCHER, verb], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -506,17 +511,55 @@ def reset_left(path, deny):
     return f'IPAddressDeny= (an empty one, then a list without {left[0]})' if left else None
 
 
+def own_stops(lines):
+    """The stop timeouts these lines give a unit of its own, as systemd reads them: {key: value} for each key's last
+    assignment, unless that is empty (a reset to the default)."""
+    last = {k: v for _, k, v in lines if k in STOP_TIMEOUTS}
+    return {k: v for k, v in last.items() if v}
+
+
 def stop_defaults_used():
     """The defaults of JOB_STOP_TIMEOUTS some loaded fork-fleet-* unit leaves to systemd: those its transient unit
-    file (systemd writes one from systemd-run's properties, /run/systemd/transient) does not set, as in a job unit an
-    older launcher started, or a check-net probe's. A file that cannot be read: cannot tell."""
-    used = set()
+    file (systemd writes one from systemd-run's properties, /run/systemd/transient) does not set (own_stops), as in a
+    job unit an older launcher started, or a check-net probe's; and ['<file> sets Key=value'] for each such unit that
+    sets an endless one of its own. A unit that ends while this reads it (its file gone: --collect) leaves nothing to
+    judge (issue #297). A file that cannot be read otherwise: cannot tell."""
+    used, bad = set(), []
     for n in entries('/run/systemd/transient'):
         path = f'/run/systemd/transient/{n}'
         if fnmatch.fnmatch(n, 'fork-fleet-*.service') and os.path.isfile(ROOT + path):
-            own = {k for _, k, v in file_lines(path, 'Service') if v}
+            try:
+                own = own_stops(file_lines(path, 'Service'))
+            except FileNotFoundError:
+                continue
             used |= {d for d, k in JOB_STOP_TIMEOUTS.items() if k not in own}
-    return used
+            keys = endless([(0, k, v) for k, v in own.items()], STOP_TIMEOUTS)
+            if keys:
+                bad.append(f'{path} sets {", ".join(keys[:2])} for its job unit')
+    return used, bad
+
+
+def launcher_stops():
+    """The stop timeouts (own_stops) the installed launcher's start() gives every job unit it starts, as its
+    systemd-run command writes them (-p Key=value, quoted or not; not in a comment). The walls may sit beside an older
+    launcher (a kit not installed whole) whose start() gave none: systemd's defaults then decide the next job unit's
+    (issue #297). This guards against such an old launcher, not a hostile one (only root writes it, and launcher_safe
+    holds): a property in another form is not seen, so its default counts. A launcher not safe, no start(), or a value
+    written with an expansion: cannot tell."""
+    fd = os.open(LAUNCHER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+    with os.fdopen(fd, 'rb') as f:
+        launcher_safe(os.fstat(f.fileno()))
+        text = f.read().decode('utf-8', 'replace')
+    start = re.search(r'^start\(\) \{\n(.*?)^\}$', text, re.M | re.S)
+    if not start:
+        raise ValueError(f'{LAUNCHER} has no start()')
+    code = '\n'.join(line for line in start.group(1).split('\n') if not line.lstrip().startswith('#'))
+    lines = []
+    for _, key, value in re.findall(r'(?<!\S)-p[ \t]+(["\']?)(Timeout[A-Za-z]*)=([^\s"\']*)\1(?!\S)', code):
+        if re.search(r'[$`\\]', value):
+            raise ValueError(f'{LAUNCHER}: start() gives its job units {key}={value}, which is not written out')
+        lines.append((0, key, value))
+    return own_stops(lines)
 
 
 def job_units_wall():
@@ -526,7 +569,8 @@ def job_units_wall():
     SystemCallFilter=, ...), an endless stop timeout, or a reset of IPAddressDeny= (reset_left), turns a wall off
     where the launcher cannot see it; so does a slice above them (SLICE_UNITS, SLICE_FOLDERS) that allows more than
     localhost, or sets another firewall of its own (SLICE_OPENS), and systemd's default stop timeout (MANAGER_MAIN,
-    MANAGER_CONFS) when endless and a loaded job unit sets none of its own (stop_defaults_used). A list counts only
+    MANAGER_CONFS) when endless and a loaded job unit, or the installed launcher's start(), sets none of its own
+    (stop_defaults_used, launcher_stops); an endless one of a loaded unit's own or start()'s too. A list counts only
     in the section systemd reads it in ([Service], [Slice]). A SYSTEMD_RUN or SYSTEMCTL (the launcher's `tools`, as
     its settings set them) that is not systemd's own (LAUNCH_TOOLS) starts the units with a program that may drop any
     property. A file that cannot be read, or a value that cannot be read (an address, a time span): cannot tell."""
@@ -550,7 +594,14 @@ def job_units_wall():
             keys.append(f'IPAddressAllow={allow[0]}')
         if keys:
             bad.append(f'{path} sets {", ".join(keys[:4])} for the slice the job units sit in')
-    used = stop_defaults_used()
+    used, units = stop_defaults_used()
+    bad += units
+    start = launcher_stops()
+    old = {d for d, k in JOB_STOP_TIMEOUTS.items() if k not in start}
+    used |= old
+    keys = endless([(0, k, v) for k, v in start.items()], STOP_TIMEOUTS)
+    if keys:
+        bad.append(f'the launcher\'s start() ({LAUNCHER}) sets {", ".join(keys[:2])} for every job unit')
     main = [p for p in MANAGER_MAIN if os.path.exists(ROOT + p)][:1]   # a link to /dev/null too; not a dangling one
     for p in main:   # a link to /dev/null masks the others; a folder (or a socket, ...) is no config: cannot tell
         if not os.path.isfile(ROOT + p) and os.path.realpath(ROOT + p) != '/dev/null':
@@ -559,7 +610,9 @@ def job_units_wall():
             {p[len(ROOT):] for t in MANAGER_CONFS for p in glob.glob(glob.escape(ROOT) + t) if os.path.isfile(p)}):
         keys = endless(file_lines(path), used)
         if keys:
-            bad.append(f'{path} sets {", ".join(keys[:2])} for every unit, the job units among them')
+            why = (f' (the launcher\'s start() gives none of its own: {LAUNCHER} is older than these walls? install '
+                   'the kit whole)') if any(k.split('=', 1)[0] in old for k in keys) else ''
+            bad.append(f'{path} sets {", ".join(keys[:2])} for every unit, the job units among them{why}')
     tools = [line.split(' ', 1) for line in ask('tools', 'to say what it starts job units with')]
     if sorted(t[0] for t in tools) != sorted(LAUNCH_TOOLS) or any(len(t) != 2 for t in tools):
         raise ValueError('the launcher\'s `tools` printed no SYSTEMD_RUN and SYSTEMCTL lines')
