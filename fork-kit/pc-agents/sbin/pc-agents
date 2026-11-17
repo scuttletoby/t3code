@@ -192,8 +192,23 @@ def install_t3(c, version, done):
     return None
 
 
-# What dpkg and apt-get say when another one (apt-daily, unattended-upgrades) holds a lock they take without a wait
-LOCKED = re.compile(r'could not get lock|unable to lock|(is|was) locked by another process', re.I)
+# What dpkg and apt-get say (under LC_ALL=C) when another one (apt-daily, unattended-upgrades) holds a lock they take
+# without a wait. Not apt's `Unable to lock directory` or dpkg's `unable to lock`: those follow any lock failure (a
+# lock file that cannot be opened too), which waiting does not cure.
+LOCKED = re.compile(r'could not get lock|(is|was) locked by another process', re.I)
+
+
+def dpkg_interrupted():
+    """True when a dpkg run stopped before it saved its status: /var/lib/dpkg/updates holds a file named all digits
+    (apt-get install then refuses: "dpkg was interrupted"). `dpkg --audit` does not name the packages of such a
+    journal when their last state is installed. A folder that cannot be read counts as interrupted."""
+    try:
+        names = os.listdir(k.ROOT + '/var/lib/dpkg/updates')
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return any(re.fullmatch(r'[0-9]+', n) for n in names)
 
 
 def run_locked(argv, env):
@@ -210,9 +225,10 @@ def run_locked(argv, env):
 
 def install_packages():
     """Install the k.PACKAGES that are not (fully) installed; held counts as installed. A dpkg run stopped half-way
-    (`dpkg --audit` names a package) is finished first (apt-get refuses until it is). Nothing asks a question (stdin
-    is /dev/null): a changed config file is kept, debconf takes its defaults, and a lock apt-daily holds is waited
-    for (run_locked). Returns why not, or None."""
+    (`dpkg --audit` names a package, or dpkg_interrupted()) is finished first (apt-get refuses until it is). Nothing
+    asks a question (stdin is /dev/null): a changed config file is kept, debconf takes its defaults, and a lock
+    apt-daily holds is waited for (run_locked). apt and dpkg run under LC_ALL=C: LOCKED reads their English (sudo
+    keeps the caller's LANG). Returns why not, or None."""
     r = k.run(['/usr/bin/dpkg-query', '-W', '-f=${Package}\t${Status}\n', *k.PACKAGES])
     have = {p for p, _, status in (line.partition('\t') for line in r.stdout.splitlines())
             if status.endswith(' ok installed')}
@@ -220,11 +236,11 @@ def install_packages():
     if not missing:
         return None
     say('installing ' + ' '.join(missing))
-    quiet = {'DEBIAN_FRONTEND': 'noninteractive'}
+    quiet = {'DEBIAN_FRONTEND': 'noninteractive', 'LC_ALL': 'C'}
     busy = (' Another apt-get or dpkg still runs (apt-daily, on a new distro) after 5 minutes: '
             'wait for it to end, then run setup again')
-    r = k.run(['/usr/bin/dpkg', '--audit'])   # reads only: no lock
-    if r.returncode or r.stdout.strip():
+    r = k.run(['/usr/bin/dpkg', '--audit'], env={'LC_ALL': 'C'})   # reads only: no lock; exits 0 when it names one
+    if r.returncode or r.stdout.strip() or dpkg_interrupted():
         r = run_locked(['/usr/bin/dpkg', '--force-confdef', '--force-confold', '--configure', '-a'], quiet)
         if r.returncode:
             return (f'cannot install {" ".join(missing)}: dpkg --configure -a failed ({r.stderr.strip()[-300:]}).'
