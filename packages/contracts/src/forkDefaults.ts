@@ -123,8 +123,9 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     key: "agentSlots",
     default: { enabled: false },
     fields: true,
-    off: true,
-    reason: "delegate_task is never refused for slots until switched on.",
+    off: false,
+    reason:
+      'delegate_task is never refused for slots until switched on. Without `mode` while off, the mode is `observe`: at each slot decision the capacity rule reads live memory (read only, off the decision path) and records what it would have answered, in the log and in wait_list. It never changes or delays an answer. `mode: "fixed"` reads nothing.',
     decidedIn: "#84",
   },
   {
