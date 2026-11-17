@@ -1,0 +1,32 @@
+# Fork only: THE list of fork-owned paths, one pattern per line. A pull request whose every changed path is
+# fork-owned skips Fork tests' app jobs (Build, Test, Test Web, Test Server, Rust, Release Smoke, macOS lint):
+# none of them reads these files. Read by .github/scripts/fork-owned-paths.cjs (the `changes` job) and its test.
+#
+#   folder/       everything under the folder
+#   a/fork-*.py   one file; `*` matches any characters but `/`
+#   !pattern      never fork-owned, even when a line above matches it (a file an app job reads)
+#
+# Fail closed: a path no line matches is not fork-owned, and the pull request runs every job. Never fork-owned,
+# whatever this list says: this list, its script, every workflow and composite action, upstream's change detector,
+# package and lock files and shared build config (fork-owned-paths.cjs, NEVER). A file an app job of fork-tests.yml
+# names must be excluded here with `!` (fork-owned-paths.test.py checks the workflow). Pushes to main and release
+# runs always run every job.
+
+# The fork's composite actions and host kits: only the `workflows` and `kit_tests` jobs read them.
+fork-ci/
+fork-kit/
+
+# The fork's scripts and settings under .github; the `workflows` job tests them.
+.github/scripts/fork-*
+.github/scripts/fork_*
+.github/scripts/fork-fleet-walls/
+.github/fork-*
+# Read by app jobs or the runner routing every app job uses.
+!.github/scripts/fork-fleet.py
+!.github/scripts/fork-test-shards.cjs
+!.github/scripts/fork-vitest-gc-check.cjs
+!.github/fork-fleet.json
+
+# The secret scan's settings; the `secrets` job runs on every pull request.
+.gitleaks.toml
+.gitleaksignore
