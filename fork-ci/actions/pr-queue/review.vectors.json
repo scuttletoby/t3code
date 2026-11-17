@@ -84,7 +84,7 @@
         {
           "name": "auth",
           "weight": "critical",
-          "paths": ["src/auth/**"],
+          "paths": ["src/auth/**/*.py"],
           "lenses": ["security-1", "security-2"]
         },
         {
