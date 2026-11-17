@@ -170,9 +170,10 @@ new_fork() {
 work() { (cd "$root/work" && "$@" > /dev/null 2>&1); }
 fork_tag() { work git tag -f "$1" "${2:-HEAD}" && work git push -q --force origin "refs/tags/$1"; }
 
-plan() { # runs the plan in $root/work; output in $root/plan.out, report in $root/report.md
-  rm -f "$root/report.md" "$root/plan.out"
-  (cd "$root/work" && REPORT="$root/report.md" GITHUB_OUTPUT="$root/plan.out" bash "$dir/fork-follow.sh") > "$root/out" 2>&1
+plan() { # runs the plan in $root/work; output in $root/plan.out, report in $root/report.md, step summary in $root/summary.md
+  rm -f "$root/report.md" "$root/plan.out" "$root/summary.md"
+  (cd "$root/work" && REPORT="$root/report.md" GITHUB_OUTPUT="$root/plan.out" GITHUB_STEP_SUMMARY="$root/summary.md" \
+    bash "$dir/fork-follow.sh") > "$root/out" 2>&1
 }
 out() { sed -n "s/^$1=//p" "$root/plan.out" 2> /dev/null | tail -n1; }
 action_is() { [[ "$(out action)" == "$1" ]]; }
@@ -442,6 +443,9 @@ up_release v0.1.11 'echo "fork pending line" >> u2.txt'
 plan
 check "plan: upstream taking a pending fork line rebases, noting the ceiling" \
   eval 'action_is rebase && grep -q "Note: u2.txt: \"pending\" with no fork lines left" "$root/out"'
+# The plan log is seen only on a failure; the note also goes to the run's summary.
+check "plan: the after-rebase note is also in the step summary" \
+  eval 'has "u2.txt: \"pending\" with no fork lines left" "$root/summary.md" && has "lower it with a pull request to main" "$root/summary.md"'
 work git reset -q --hard "$(out candidate)"
 work git push -q --force origin HEAD:main
 plan
