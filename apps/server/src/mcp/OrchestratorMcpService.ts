@@ -2826,6 +2826,7 @@ const make = Effect.gen(function* () {
         },
       };
     }),
+    // Fork: `Effect.scoped` closes the hold of a call that stops half-way (fork/delegateChecks.ts).
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
       const environmentId =
         input.target === undefined
@@ -2874,7 +2875,7 @@ const make = Effect.gen(function* () {
         operation: "delegate-task",
       });
       const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
-      const requestedTarget = yield* resolveTargetRechecking({
+      const target = yield* resolveTargetRechecking({
         parent,
         target: input.target,
         providers,
@@ -2884,20 +2885,20 @@ const make = Effect.gen(function* () {
       const runtimeMode = yield* resolveRuntimeMode(
         parent.thread.runtimeMode,
         input.runtimeMode,
-        requestedTarget,
+        target,
       );
       const interactionMode = yield* resolveInteractionMode(
         parent.thread.interactionMode,
         input.interactionMode,
       );
       // Fork: seat 1 of the fork's delegation checks (fork/delegateChecks.ts), before the workspace.
-      const { target, note: usagePacingNote } = yield* delegateChecks.beforeWorkspace({
+      const { target: pacedTarget, note: usagePacingNote } = yield* delegateChecks.beforeWorkspace({
         isRetry: isRetryOfAcceptedDelegation,
         parent,
         requested: input.target,
         runtimeMode: input.runtimeMode,
         providers,
-        target: requestedTarget,
+        target,
       });
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
@@ -2935,7 +2936,7 @@ const make = Effect.gen(function* () {
       const forkHold = yield* delegateChecks.afterWorkspace({
         isRetry: isRetryOfAcceptedDelegation,
         callerThreadId: scope.thread.threadId,
-        target,
+        target: pacedTarget,
       });
       // The command commits the child's preparing run, which only this call
       // prepares, so a caller that goes away must not stop it in between.
@@ -2955,7 +2956,7 @@ const make = Effect.gen(function* () {
               parentNodeId,
               task: taskPrompt(input),
               ...(input.title === undefined ? {} : { title: input.title }),
-              modelSelection: target.modelSelection,
+              modelSelection: pacedTarget.modelSelection,
               runtimeMode,
               interactionMode,
               ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
@@ -3011,7 +3012,7 @@ const make = Effect.gen(function* () {
           return usagePacingNote === undefined ? task : { ...task, usagePacingNote };
         }),
       );
-    }, Effect.scoped), // Fork: closes the hold of a call that stops half-way (fork/delegateChecks.ts).
+    }, Effect.scoped),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");
       return yield* readTask(scope, taskId, false, true);
