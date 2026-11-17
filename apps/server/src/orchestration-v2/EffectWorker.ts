@@ -1071,21 +1071,18 @@ const runRegisteredDaemon = (options: OrchestrationEffectDaemonOptions) =>
           // The slot wait starts once the gate admits the claim: a held gate keeps one waiting
           // claim per slot, not one more per wait.
           const admitted = yield* Deferred.make<void>();
-          const attempt = yield* admission
-            .admit(
-              Deferred.succeed(admitted, undefined).pipe(
-                Effect.andThen(worker.runOnce(claimLimits)),
+          const admittedRunOnce = admission.admit(
+            Deferred.succeed(admitted, undefined).pipe(Effect.andThen(worker.runOnce(claimLimits))),
+          );
+          const attempt = yield* admittedRunOnce.pipe(
+            Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Orchestration effect worker failed", cause).pipe(
+                Effect.as("failed" as const),
               ),
-            )
-            .pipe(
-              Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
-              Effect.catchCause((cause) =>
-                Effect.logWarning("Orchestration effect worker failed", cause).pipe(
-                  Effect.as("failed" as const),
-                ),
-              ),
-              Effect.forkIn(scope),
-            );
+            ),
+            Effect.forkIn(scope),
+          );
           yield* Effect.raceFirst(
             Deferred.await(admitted),
             Fiber.await(attempt).pipe(Effect.asVoid),
