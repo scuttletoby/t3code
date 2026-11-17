@@ -1009,7 +1009,7 @@ class PathRules(unittest.TestCase):
                 code, out = self.check(base, self.entry(docs, '100755', oid, base), EVERY_LENS)
                 self.assertEqual(code, 0, out)
 
-    def test_a_base_that_holds_a_symlink_config_refuses_heads_until_one_makes_it_a_file(self):   # old state: no lock
+    def test_a_base_that_holds_a_symlink_config_refuses_heads_until_one_makes_it_a_file(self):   # old state
         m = self.base(mode=None)
         oid = self.w.git(self.w.work, 'rev-parse', f'{m}:{CONFIG_PATH}')
         base = self.entry(m, '120000', oid, m)   # the gate reads the link's text; the queue's open() cannot
@@ -1022,6 +1022,14 @@ class PathRules(unittest.TestCase):
                 fix = self.w.commit(base_files(cfg_raw=cfg, **PROMPTS, **self.STORE), [base])
                 code, out = self.check(base, fix, EVERY_LENS)
                 self.assertEqual(code, 0, out)
+        for name, text in (('a link to a path', 'pr-queue.real.json'), ('a submodule', m)):   # #424 item 2: a lock
+            with self.subTest('the fix is refused too when the base holds ' + name):
+                mode = '160000' if text == m else '120000'
+                locked = self.entry(m, mode, text if text == m else self.blob(text), m)
+                fix = self.w.commit(base_files(**PROMPTS, **self.STORE), [locked])
+                code, out = self.check(locked, fix, EVERY_LENS)
+                self.assertEqual(code, H.REFUSED, out)   # only an owner's push makes it a file again
+                self.assertIn(f'{CONFIG_PATH} at the base {locked[:12]}: not JSON', out)
         big = json.dumps({**CFG_RAW, 'lens_format_doc': 'd' * H.MAX_CONFIG_BYTES})   # the gate reads it, uncapped
         base = self.entry(m, '120000', self.blob(big), m)
         fix = self.w.commit(base_files(cfg_raw=json.loads(big), **PROMPTS, **self.STORE), [base])
@@ -1029,6 +1037,30 @@ class PathRules(unittest.TestCase):
         code, out = self.check(base, fix, EVERY_LENS)   # the same text, now a file: a new entry, read under the caps
         self.assertEqual(code, H.REFUSED, out)
         self.assertIn('bytes the check reads', out)
+
+    def test_a_name_that_differs_from_the_config_only_in_case_is_refused(self):   # #424 item 3
+        # A case-insensitive checkout (a macOS or Windows runner) keeps one of the two, and which one is up to git.
+        base = self.base(mode=None)
+        for twin in ('.github/PR-QUEUE.json', '.GitHub/pr-queue.json', '.GITHUB/Pr-Queue.JSON/x.json'):
+            with self.subTest(twin):
+                code, out = self.check(base, self.head(base, mode=None, **{twin: 'not json\n'}), EVERY_LENS)
+                self.assertEqual(code, H.REFUSED, out)
+                self.assertIn(f'merged, this pull request adds {twin.split("/x.json")[0]}, which differs from '
+                              f'{CONFIG_PATH} only in case', out)
+        for name in ('.github/pr-queue.json.bak', '.github/other.json', 'pr-queue.json', '.GITHUB'):   # others pass
+            with self.subTest(name):
+                self.assertEqual(self.check(base, self.head(base, mode=None, **{name: 'x\n'}), EVERY_LENS)[0], 0)
+        old = self.base(mode=None, **{'.github/PR-QUEUE.json': 'x\n'})   # old state: a base that holds one already
+        for name, files, drop in (('a head that leaves it', {'docs/a.md': 'a\n'}, ()),
+                                  ('a head that deletes it', {}, ('.github/PR-QUEUE.json',))):
+            with self.subTest(name):
+                head = self.head(old, mode=None, drop=drop, **{'.github/PR-QUEUE.json': 'x\n', **files})
+                code, out = self.check(old, head, EVERY_LENS)
+                self.assertEqual(code, 0, out)
+        code, out = self.check(old, self.head(old, mode=None, **{'.github/PR-QUEUE.json': 'x\n',
+                                                                    '.github/pr-QUEUE.json': 'y\n'}), EVERY_LENS)
+        self.assertEqual(code, H.REFUSED, out)   # a second one is still new
+        self.assertIn('adds .github/pr-QUEUE.json, which differs', out)
 
     def test_the_caps_hold_at_their_edge(self):   # #413 item 4: the documented values, exactly at and one over
         base = self.base('shadow')

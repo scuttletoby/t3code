@@ -400,8 +400,8 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
 MAX_CONFIG_BYTES = 32 * 1024
 MAX_GLOB_LENGTH = 128   # characters of one glob in review.rules[].paths
 MAX_GLOB_TOTAL = 2048   # characters of all of them together
-# The queue opens the config from a checkout (config.load): only a regular file is one there. git keeps a symlink
-# (120000) as a blob of its target text, and a submodule (160000) can name any object, so the object alone says nothing.
+# The queue reads the config only from a regular file's blob (pr_queue.committed_config). git keeps a symlink (120000)
+# as a blob of its target text, and a submodule (160000) can name any object, so the object alone says nothing.
 FILE_MODES = ('100644', '100755')
 MERGE_TREE_SECONDS = 300   # a merge that takes longer is refused; the gate's job has 15 minutes in all
 LOCKS = ('the base config would refuse every pull request after it, the one that fixes it too, and the queue would '
@@ -439,7 +439,7 @@ def merged_config_problem(checkout, path):
     base's, so a head is judged by the old config and could merge a new one that does not parse (or is in enforce with
     a rule order enforce refuses, or is deleted); after it, the base config refuses every head, the one that fixes it
     too, and the queue stops. So the config the merge leaves must parse (config.parse), under the caps above, and stay
-    a regular file (FILE_MODES: the queue opens it from a checkout). It is the merge's, never the head's own copy: two
+    a regular file (FILE_MODES: the queue reads no other). It is the merge's, never the head's own copy: two
     pull requests that each leave a good config can merge into a bad one, and an older head's stale copy says nothing
     once an owner fixed the base. Checkout mode reads GitHub's merge commit
     (HEAD), bare mode `git merge-tree` of the base and the head (a head that does not merge cleanly is refused: the
@@ -471,6 +471,28 @@ def tree_entry(checkout, tree, rel):
     return tuple(fields)
 
 
+def case_matches(checkout, tree, rel):
+    """The paths in `tree` that name `rel` ignoring case, `rel` itself too: at each level the entries whose name
+    casefolds to the same as `rel`'s, the last of any type (a folder there collides too). Raises ValueError when git
+    fails (the caller refuses)."""
+    parts = rel.casefold().split('/')
+    level = [('', tree)]
+    for i, want in enumerate(parts):
+        found = []
+        for prefix, oid in level:
+            r = checkout.git('ls-tree', '-z', oid, errors='surrogateescape')
+            if r.returncode != 0:
+                said = review_judge.shown((r.stderr or '').strip()[:200])
+                raise ValueError(f'git ls-tree {oid[:12]} failed: {said}')
+            for record in filter(None, (r.stdout or '').split('\0')):
+                meta, _, name = record.partition('\t')
+                fields = meta.split(' ')
+                if name.casefold() == want and (i == len(parts) - 1 or fields[1:2] == ['tree']):
+                    found.append((prefix + name, fields[-1]))
+        level = [(p + '/', oid) for p, oid in found] if i < len(parts) - 1 else found
+    return {p for p, _ in level}
+
+
 def _merged_config_problem(checkout, path, base, head):
     rel = repo_path(path)
     merged = 'HEAD'
@@ -499,8 +521,12 @@ def _merged_config_problem(checkout, path, base, head):
     if mode not in FILE_MODES or kind != 'blob':   # even when the base holds the same: unknown never passes
         what = {'120000': 'symlink', '160000': 'submodule'}.get(mode) or review_judge.shown(kind[:20])
         return (f'merged, this pull request leaves {path} as a {what} (mode {mode}), not a file (mode 100644 or '
-                '100755): the queue reads the config from a checkout, where it is no file, and would stop. Make it a '
-                'file again')
+                '100755): the queue reads only a regular file\'s config and would stop. Make it a file again')
+    added = sorted(case_matches(checkout, merged, rel) - case_matches(checkout, base, rel))
+    if added:   # checked before the skip below: a twin leaves the config's own entry as it was
+        return (f'merged, this pull request adds {review_judge.shown(added[0])[:200]}, which differs from {path} only '
+                'in case: a checkout on a case-insensitive file system (macOS, Windows) keeps one of the two, and '
+                'which one is up to git. Rename or delete it')
     if tree_entry(checkout, base, rel) == new:
         return None   # the merge leaves the base's own config, mode and text, which base_config parsed
     size = checkout.git('cat-file', '-s', oid).stdout.strip()
