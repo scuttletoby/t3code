@@ -274,7 +274,11 @@ describe("holdWorkConnect CLI refusal on a held copy's home", () => {
     { label: "a marker that cannot be checked", marker: "file" as const, unsearchable: true },
   ])("refuses on $label, and says how to clear it", ({ marker, unsearchable }) =>
     Effect.gen(function* () {
-      const result = yield* refusalFor({ marker, unsearchable, state: running });
+      const result = yield* refusalFor({
+        marker,
+        unsearchable: unsearchable === true,
+        state: running,
+      });
       const error = refusal(result.exit);
       expect(error).toBeInstanceOf(HoldWorkConnect.HeldCopyRefusedError);
       const message = String((error as Error).message);

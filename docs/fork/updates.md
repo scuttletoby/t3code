@@ -174,7 +174,7 @@ Held (nothing of it starts until the server restarts without the flag):
   copy's own link files and sends nothing to the relay; the policy has unlinked the running server
   on that machine already.
 
-  The first held boot writes `hold-work-copy.json` in the copy's home, and nothing removes it, not
+  The first held boot writes `hold-work-copy.txt` in the copy's home, and nothing removes it, not
   a normal boot either. While it is there, running or not, `t3 connect login`, `link`, `unlink` and
   `logout`, `t3 connect publish` turning publishing on, and `t3 up` turning T3 Connect on or off are
   refused on that home with nothing changed. Unlinking ends in a relay delete of the shared

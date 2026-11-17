@@ -70,19 +70,19 @@ const markHeldCopy = Layer.effectDiscard(
       (yield* ServerConfig.ServerConfig).baseDir,
       HELD_COPY_MARKER_FILE,
     );
-    const note = {
-      heldCopy: true,
-      markedAt: DateTime.formatIso(yield* DateTime.now),
-      why: "A server ran on this home with --hold-work, so it is taken to be a copy that shares the live server's T3 Connect link. `t3 connect` and `t3 up` refuse to sign in, link, unlink or sign out here while this file exists. Delete it only if this home is not a copy.",
-    };
-    yield* (yield* FileSystem.FileSystem)
-      .writeFileString(markerPath, `${JSON.stringify(note, null, 2)}\n`, { flag: "wx" })
-      .pipe(
-        Effect.catchIf(
-          (error) => error.reason._tag === "AlreadyExists",
-          () => Effect.void,
-        ),
-      );
+    const note = [
+      `A server ran on this T3 home with --hold-work (first at ${DateTime.formatIso(yield* DateTime.now)}),`,
+      "so it is taken to be a copy that shares the live server's T3 Connect link. While this file",
+      "exists, `t3 connect` and `t3 up` refuse to sign in, link, unlink or sign out here.",
+      "Delete it only if this home is not a copy.",
+      "",
+    ].join("\n");
+    yield* (yield* FileSystem.FileSystem).writeFileString(markerPath, note, { flag: "wx" }).pipe(
+      Effect.catchIf(
+        (error) => error.reason._tag === "AlreadyExists",
+        () => Effect.void,
+      ),
+    );
   }),
 );
 
@@ -128,7 +128,7 @@ export const agentActivityLayer = <E, R>(
   ).pipe(Layer.provide(relayLayer));
 
 /** Written in a home by a held boot. The `t3 connect` refusals read it; nothing removes it. */
-export const HELD_COPY_MARKER_FILE = "hold-work-copy.json";
+export const HELD_COPY_MARKER_FILE = "hold-work-copy.txt";
 
 /**
  * `t3 connect` sign-in, link, unlink and logout, and `t3 up` turning Connect on or off: refused on
