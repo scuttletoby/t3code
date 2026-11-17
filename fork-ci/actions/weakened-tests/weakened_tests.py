@@ -88,6 +88,13 @@ class Unclear(Exception):
     """The change or the config could not be read: the report says so instead of listing nothing."""
 
 
+# No global or system config, no hooks, fsmonitor command, commit-graph or replace refs from the repository: the same
+# two as ../git-clean/git_clean.py's (git_clean.test.py pins them to its; this file stays self-contained).
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
+            '--no-replace-objects')
+
+
 class Git:
     """git in one folder: stdout as bytes, or None when git fails."""
 
@@ -95,7 +102,8 @@ class Git:
         self.cwd = cwd
 
     def __call__(self, *args, input=None):
-        r = subprocess.run(['git', *args], cwd=self.cwd, input=input, capture_output=True)
+        r = subprocess.run(['git', *GIT_SAFE, *args], cwd=self.cwd, input=input, capture_output=True,
+                           env={**os.environ, **GIT_ENV})
         return r.stdout if r.returncode == 0 else None
 
 
