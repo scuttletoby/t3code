@@ -844,6 +844,47 @@ class PathRules(unittest.TestCase):
                     self.assertEqual(code, H.REFUSED, out)
                     self.assertIn("rule 'docs' (light) comes before the heavier rule 'data' (critical)", out)
 
+    def test_a_head_that_leaves_the_config_in_enforce_with_an_order_enforce_refuses_is_refused(self):   # #374 item 3
+        # Merged, the base config would refuse every head after it, the one that fixes the order too: the config that
+        # judges a head is the base's. So the head's own new config is read for this one check.
+        bad = [dict(REVIEW_BLOCK['rules'][1], paths=['**/*.md']), REVIEW_BLOCK['rules'][0], REVIEW_BLOCK['rules'][2]]
+        every = ['data-1', 'data-2', 'code', 'correctness']
+        for name, base_cfg in (('shadow to enforce', review_cfg('shadow', rules=bad)), ('a new block', CFG_RAW),
+                               ('reordered in enforce', review_cfg('enforce'))):
+            with self.subTest(name):
+                base = self.w.commit(base_files(cfg_raw=base_cfg, **{**PROMPTS, **self.STORE}), [self.m0])
+                head = self.head(base, cfg=review_cfg('enforce', rules=bad), **{'docs/a.md': 'a\n'})
+                code, out = self.check(base, head, every)
+                self.assertEqual(code, H.REFUSED, out)
+                self.assertIn(f'this pull request leaves {CONFIG_PATH} in mode enforce with a rule order enforce '
+                              "refuses: rule 'docs' (light) comes before the heavier rule 'data' (critical)", out)
+                self.assertIn('fix the rule order first', out)
+                self.assertEqual(self.check(base, head, every), (code, out))   # runs again: the same answer
+        # the head that fixes the order, the head that stays in shadow, and a base config the head leaves alone pass
+        base = self.w.commit(base_files(cfg_raw=review_cfg('shadow', rules=bad), **{**PROMPTS, **self.STORE}),
+                             [self.m0])
+        for name, cfg in (('fixed and switched', review_cfg('enforce')),
+                          ('stays shadow', review_cfg('shadow', rules=bad, findings=False)),   # not the base's text
+                          ('order fixed in shadow', review_cfg('shadow'))):
+            with self.subTest(name):
+                code, out = self.check(base, self.head(base, cfg=cfg, **{'docs/a.md': 'a\n'}), every)
+                self.assertEqual(code, 0, out)
+                self.assertNotIn('this pull request leaves', out)
+
+    def test_the_head_config_is_read_only_for_the_enforce_order(self):   # #374 item 3: old and odd head configs
+        base = self.base('shadow')
+        for name, text in (('not JSON', '{'), ('no review block', json.dumps(CFG_RAW)),
+                           ('another bad review block', json.dumps(review_cfg('enforce', rules=[])))):
+            with self.subTest(name):
+                tree = base_files(**{**PROMPTS, **self.STORE, 'docs/a.md': 'a\n'})
+                tree[CONFIG_PATH] = text
+                code, out = self.check(base, self.w.commit(tree, [base]), ['data-1', 'data-2', 'correctness'])
+                self.assertEqual(code, 0, out)   # judged by the base's shadow block, as before
+                self.assertNotIn('this pull request leaves', out)
+        head = self.head(base, drop=[CONFIG_PATH], **{'docs/a.md': 'a\n'})   # the head deletes the config
+        code, out = self.check(base, head, ['data-1', 'data-2', 'correctness'])
+        self.assertEqual(code, 0, out)
+
     def test_without_a_review_block_a_missing_lens_reads_as_before(self):   # #348 item 6: byte for byte
         base = self.base(mode=None)
         head = self.head(base, mode=None, **{'src/app.py': 'a\n'})
@@ -896,6 +937,18 @@ class ChangedPaths(unittest.TestCase):
                 changes, why = H.changed_paths(self.fake(*answers), C, A)
                 self.assertIsNone(changes)
                 self.assertIn(says, why)
+
+    def test_git_stderr_that_is_not_utf8_is_written_escaped(self):   # #374 item 5: no UnicodeEncodeError on print
+        class Checkout:
+            def git(self, *a, **kw):
+                if a[0] == 'merge-base':
+                    return types.SimpleNamespace(returncode=0, stdout=B + '\n', stderr='')
+                bad = b"fatal: bad \xff name".decode('utf-8', 'surrogateescape')   # surrogateescape keeps the byte
+                return types.SimpleNamespace(returncode=128, stdout='', stderr=bad)
+        changes, why = H.changed_paths(Checkout(), C, A)
+        self.assertIsNone(changes)
+        self.assertIn('fatal: bad \\xff name', why)
+        why.encode('utf-8')   # printed and written as UTF-8: no lone surrogate may reach it
 
     def test_every_merge_base_adds_its_paths(self):   # criss-cross: more paths, never fewer
         changes, why = H.changed_paths(self.fake((0, f'{B}\n{C}\n'), (0, 'M\0a\0'), (0, 'M\0b\0')), C, A)
