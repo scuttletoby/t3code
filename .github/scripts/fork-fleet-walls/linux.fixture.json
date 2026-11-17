@@ -147,6 +147,9 @@
         "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/srv/share\n"
       },
       {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/etc\n"
+      },
+      {
         "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/c\n",
         "c/": ""
       },
