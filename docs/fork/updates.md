@@ -40,9 +40,27 @@ watches; it changes nothing on the machine, and `0` turns it off.
   makes a save refuse an interval no run could use and a load read one as its default.
 - The seam check ([`fork-seam-check.cjs`](../../.github/scripts/fork-seam-check.cjs)) refuses any
   line the fork adds to an upstream file beyond the seam lines pinned in
-  [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment. It runs on
-  every pull request (Fork tests, "Workflow lint and upstream drift") and in fork-follow before and
-  after each rebase, against the upstream commit the series sits on.
+  [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment, in every
+  upstream file, listed or not. It runs on every pull request (Fork tests, "Workflow lint and
+  upstream drift") and in fork-follow before and after each rebase, against the upstream commit
+  the series sits on. A pull request is judged by its base's list, never by its own: a new seam,
+  `pending` or `forkFiles` entry counts once the owner merges it. `pending` maps upstream files
+  whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
+  upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
+  also lowers the ceiling in the same change). Right after a rebase, below the ceiling is only a
+  note in the run log: when upstream takes a fork line word for word, the rebase drops it, and the
+  ceiling could not have been lowered first. The next run, from the new base, fails until a pull
+  request lowers it. A pull request may change a pending file but not grow it. An upstream file in no list may gain no
+  line, lose no line and keep its lines in order (whitespace and blank lines aside), and no
+  upstream file may be deleted or renamed, except the workflows
+  [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
+  `fork-*.yml`. A submodule pointer counts as a line. A pull request's run has no upstream commit,
+  so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
+  for the fork's own; from upstream, a pattern that matches an upstream file fails. For the same
+  reason a pull request's run counts upstream's copies of a seam line against its allowance: a
+  seam line upstream also has (`}`, `/**`) cannot be added by a pull request, only checked by
+  fork-follow, so keep seam lines specific. A branch made before fork-follow last rebased main
+  is refused with one "update the branch" error.
 - [`serverSettings.forkDefaults.test.ts`](../../apps/server/src/serverSettings.forkDefaults.test.ts)
   loads the settings the way a server does and checks every fork setting is at its row's default
   with no file, `{}`, a file an upstream build wrote, a file cut off half-way and a file with a bad

@@ -488,9 +488,10 @@ function prCodeProblems(workflow) {
     checkouts.length === 1 && checkouts[0] === 'git checkout -q --detach "$DEFAULT_SHA"',
     `checks out ${checkouts.join(", ")}`,
   );
+  const defaultShas = code.match(/DEFAULT_SHA:.*/g) ?? [];
   expect(
-    JSON.stringify(code.match(/DEFAULT_SHA:.*/g)) ===
-      JSON.stringify(["DEFAULT_SHA: ${{ github.sha }}"]),
+    defaultShas.length > 0 &&
+      defaultShas.every((line) => line === "DEFAULT_SHA: ${{ github.sha }}"),
     "DEFAULT_SHA is not github.sha",
   );
   // Event values reach the shell only through env, never pasted into a script.
