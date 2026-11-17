@@ -130,9 +130,9 @@ module's. `pinned.test.py` runs this exact block.
 The bootstrap does **not** check the folders above the cache as `run` and `load()` do: that check (owners, modes, your
 private group, ACLs, the real path, folders you cannot enter) is too long to copy, and a shorter one would either refuse
 Ubuntu's usual 0775 `~/.cache` or drift from this module's rule. So keep `CACHE` under your home, as the adapter
-below does, never under `/tmp`. There the bootstrap makes the cache (0700) and writes `pinned.py` (the checked bytes,
-which load nothing next to them), then `P.load` and `P.main([... 'run' ...])` refuse the cache before they fetch or
-run anything else.
+below does, never under `/tmp`. Under `/tmp`, the bootstrap still makes the cache (0700) and writes `pinned.py` (the
+checked bytes, which load nothing next to them), then `P.load` and `P.main([... 'run' ...])` refuse the cache before
+they fetch or run anything else.
 
 <!-- bootstrap:start -->
 
