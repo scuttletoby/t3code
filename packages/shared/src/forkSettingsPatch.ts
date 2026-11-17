@@ -9,14 +9,15 @@ import {
   MCP_PROFILE_T3_ONLY,
   MCP_SUBAGENT_INHERIT,
   type ForkPatchRule,
+  type PlaytestSettings,
   type ForkServerSettingKey,
   type ProjectId,
   type ProjectScopedServerSettingKey,
-  type ProjectSettingsOverrides,
   type ServerSettings,
   type ServerSettingsPatch,
   isBuiltInMcpProfileName,
   isDefinableMcpProfileName,
+  isPlaytestProgramFullyQualified,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -92,13 +93,22 @@ export function applyForkSettingsPatch(
 }
 
 type ProjectOverrides = ServerSettings["projectSettingsOverrides"][ProjectId];
-const KEPT_KEYS: ReadonlyArray<string> = FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT;
+type ProjectOverridesPatch = NonNullable<
+  ServerSettingsPatch["projectSettingsOverrides"]
+>[ProjectId];
+/** Each kept key and the value that clears it. */
+const CLEAR_VALUES: Readonly<Record<string, "" | null>> = FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT;
+const KEPT_KEYS = Object.keys(CLEAR_VALUES);
+
+/** A stored value worth keeping: a blank text (a hand edit's `""`) or `null` means not set. */
+const isSet = (value: unknown): boolean =>
+  typeof value === "string" ? value.trim() !== "" : value !== undefined && value !== null;
 
 /**
  * `next` with each {@link FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT} key a patched project entry leaves
  * out kept as stored, so an older client's whole-entry save cannot widen the project. A removed
- * project keeps nothing, nor does a stored blank value; `""` clears the key (not stored; an entry
- * left empty is dropped).
+ * project keeps nothing, nor does a stored blank value; the key's clear value (`""`, or `null` for
+ * `playtest`) clears it (not stored; an entry left empty is dropped).
  */
 export function keepLeftOutForkProjectKeys(
   current: ServerSettings,
@@ -111,14 +121,13 @@ export function keepLeftOutForkProjectKeys(
   for (const [projectId, entry] of Object.entries(patch.projectSettingsOverrides ?? {})) {
     if (!isRecord(entry)) continue;
     const stored = Object.hasOwn(storedProjects, projectId) ? storedProjects[projectId] : undefined;
-    const kept: Record<string, string> = {};
+    const kept: Record<string, unknown> = {};
     const cleared: string[] = [];
-    for (const key of FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT) {
-      const value = stored?.[key];
+    for (const key of KEPT_KEYS) {
+      const value = (stored as Readonly<Record<string, unknown>> | undefined)?.[key];
       if (!Object.hasOwn(entry, key)) {
-        // A blank value (a hand edit's `""` or `null`) means not set: nothing to keep.
-        if (value !== undefined && value.trim() !== "") kept[key] = value;
-      } else if (entry[key] === "") {
+        if (isSet(value)) kept[key] = value;
+      } else if ((entry as Readonly<Record<string, unknown>>)[key] === CLEAR_VALUES[key]) {
         cleared.push(key);
       }
     }
@@ -136,15 +145,16 @@ export function keepLeftOutForkProjectKeys(
 }
 
 /**
- * Fork: drop-in for upstream's `clearProjectSettingsOverrides` that sends `""` for a cleared MCP
- * profile key, since a key left out is kept (above). Any path that can reset an MCP profile key
- * must use this; with no such key it returns what upstream's does.
+ * Fork: drop-in for upstream's `clearProjectSettingsOverrides` that sends the clear value (`""` for
+ * an MCP profile key, `null` for `playtest`) for a cleared kept key, since a key left out is kept
+ * (above). Any path that can reset a kept key must use this; with no such key it returns what
+ * upstream's does.
  */
 export function clearProjectSettingsOverridesWithForkKeys(
   settings: Pick<ServerSettings, "projectSettingsOverrides">,
   projectId: ProjectId,
   keys: ReadonlyArray<ProjectScopedServerSettingKey>,
-): ProjectSettingsOverrides | null {
+): ProjectOverridesPatch {
   const current = settings.projectSettingsOverrides[projectId];
   if (current === undefined) return null;
   const next: Record<string, unknown> = { ...current };
@@ -152,12 +162,45 @@ export function clearProjectSettingsOverridesWithForkKeys(
   // Everything cleared: upstream removes the project's entry (`null`), which keeps nothing.
   if (Object.keys(next).length === 0) return null;
   for (const key of keys) {
-    const stored = current[key];
-    if (KEPT_KEYS.includes(key) && typeof stored === "string" && stored.trim() !== "") {
-      next[key] = "";
-    }
+    if (KEPT_KEYS.includes(key) && isSet(current[key])) next[key] = CLEAR_VALUES[key];
   }
-  return next as ProjectSettingsOverrides;
+  return next as ProjectOverridesPatch;
+}
+
+/** Every playtest step program in the settings, with where it is set. */
+function playtestPrograms(settings: ServerSettings): Array<{ where: string; program: string }> {
+  const values: Array<readonly [string, PlaytestSettings | null | undefined]> = [
+    ["playtest", settings.playtest],
+    ...Object.entries(settings.projectSettingsOverrides).map(
+      ([projectId, entry]) => [`Project ${projectId}'s playtest`, entry.playtest] as const,
+    ),
+  ];
+  return values.flatMap(([where, value]) =>
+    value === undefined || value === null
+      ? []
+      : [value.claim, value.renew, ...value.push, value.release].flatMap((step) =>
+          step?.argv[0] === undefined ? [] : [{ where, program: step.argv[0] }],
+        ),
+  );
+}
+
+/**
+ * A playtest program a save sets that is not a full path on the server's OS (`platform`); the
+ * settings cannot know which OS runs them. A program already stored is never refused, so a hand edit
+ * blocks no other save (the step runner refuses to run it).
+ */
+export function playtestProgramProblem(
+  current: ServerSettings,
+  next: ServerSettings,
+  platform: string,
+): string | undefined {
+  const stored = new Set(playtestPrograms(current).map(({ program }) => program));
+  const bad = playtestPrograms(next).find(
+    ({ program }) => !stored.has(program) && !isPlaytestProgramFullyQualified(program, platform),
+  );
+  return bad === undefined
+    ? undefined
+    : `${bad.where} runs "${bad.program}", which is not a full path on this server's OS: give the program's full path (${platform === "win32" ? "C:\\… or \\\\server\\…" : "/…"}).`;
 }
 
 /**
