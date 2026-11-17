@@ -82,7 +82,6 @@
     "apps/server/src/process/agentScope.ts": {
       "why": "The scope map is private to upstream's make(); the fork's ownScope (see packages/shared/src/AgentScope.ts) is a 7-line lookup in it.",
       "added": [
-        "// Fork: the thread's own scope, for the slot observer (slots/SlotObserver.ts).",
         "ownScope: (threadId) =>",
         "Effect.sync(() => {",
         "const tracked = scopeByThread.get(threadId);",
