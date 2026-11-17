@@ -91,6 +91,16 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
   },
   {
     scope: "server",
+    key: "playtest",
+    default: { enabled: false },
+    fields: true,
+    off: true,
+    reason:
+      "No playtest sessions and no adapter steps until a person sets them and switches it on.",
+    decidedIn: "#260",
+  },
+  {
+    scope: "server",
     key: "agentSlots",
     default: { enabled: false },
     fields: true,
@@ -162,6 +172,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     off: true,
     reason: "A project without its own list uses the server's checks.",
     decidedIn: "#84",
+  },
+  {
+    scope: "projectOverride",
+    key: "playtest",
+    default: undefined,
+    off: true,
+    reason: "A project without its own adapter uses the server's playtest settings.",
+    decidedIn: "#260",
   },
 ];
 
