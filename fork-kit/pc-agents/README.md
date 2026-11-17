@@ -28,7 +28,8 @@ so the agent cannot undo it:
 - `agent` is the only login user, its login shell is `/usr/sbin/nologin`, and no sudo rule (`/etc/sudoers`,
   `/etc/sudoers.d`) names it, its group or uid, or every user;
 - the kit's code (`/opt/pc-agents`, the release folder it runs) and T3's runtime are root's, and T3's `t3` is the one
-  setup installed (its hash is in the record);
+  setup installed (its hash is in the record). Setup makes the runtime root's alone after `scripts/install.sh` (its
+  `tar` keeps the archive's owners and modes), and installs again a runtime an older setup left otherwise;
 - no Windows drive is mounted;
 - the loaded firewall table is the one from the kit's `firewall.nft`: `pc-agents load-firewall` saves the file's hash
   and what the kernel then lists, and any later change, or an older file left loaded, differs;
