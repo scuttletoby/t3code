@@ -49,7 +49,7 @@ jobs:
           git checkout -q --detach "$DEFAULT_SHA"
 
       - name: Test the check
-        run: node --test .github/scripts/fork-schema-check.test.cjs .github/scripts/fork-upstream-files-check.test.cjs
+        run: node --test .github/scripts/fork-schema-check.test.cjs .github/scripts/fork-upstream-files-check.test.cjs .github/scripts/fork-seam-check.test.cjs
 
       # T3 has no down-migrations, so a fork migration strands installs that return to upstream.
       - name: Refuse schema and migration changes
@@ -69,6 +69,14 @@ jobs:
           # The list, separated by spaces. To guard one more file, add its path here.
           UPSTREAM_FILES: apps/server/src/orchestration-v2/Orchestrator.ts apps/server/src/provider/agentContextBudget.json
         run: node .github/scripts/fork-upstream-files-check.cjs "$BASE_SHA" "$HEAD_SHA" "$UPSTREAM_FILES"
+
+      - name: Fork lines in upstream files
+        if: ${{ !cancelled() }}
+        env:
+          DEFAULT_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node .github/scripts/fork-seam-check.cjs --config-ref "$DEFAULT_SHA" "$BASE_SHA" "$HEAD_SHA"
 
   outside_pr:
     name: Outside pull request
