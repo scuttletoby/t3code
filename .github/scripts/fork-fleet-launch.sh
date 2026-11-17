@@ -843,11 +843,11 @@ docker_rules() {
 # refresh-net (each dispatcher pass): the address may change while a job runs (a new lease, a VPN that went down).
 # The table covers every runner's link, so re-applying it covers running jobs; their units get the new addresses too.
 # The same addresses in another order change nothing. A unit whose set-property failed is tried again next pass.
-# A pass within OWN_ADDRESS_SECONDS of the last answer (RUN_DIR/own-lookup, written once a pass is done) changes
-# nothing and asks no lookup service (each may throttle a host that asks every 20 s), unless the table is gone or a
-# unit waits for its retry.
+# A pass within OWN_ADDRESS_SECONDS of the last answer (RUN_DIR/own-lookup: when it was asked, written once a pass
+# is done; not when the pass ended, which may wait up to 100 s for the launch lock) changes nothing and asks no lookup
+# service (each may throttle a host that asks every 20 s), unless the table is gone or a unit waits for its retry.
 refresh_net() {
-  local own name blocked old='' retry=$RUN_DIR/deny-retry
+  local own name blocked old='' retry=$RUN_DIR/deny-retry asked=${EPOCHSECONDS-}
   if lookup_fresh && [[ ! -e $retry ]] && nft list table inet fork_fleet >/dev/null 2>&1; then return 0; fi
   own=$(own_address)
   setup
@@ -855,7 +855,7 @@ refresh_net() {
   merge_own "$own"
   if [[ $(addr_set "$blocked") == "$(addr_set "$old")" && ! -e $retry ]] &&
     nft list table inet fork_fleet >/dev/null 2>&1; then
-    lookup_done
+    lookup_done "$asked"
     return 0
   fi
   local failed=''
@@ -867,7 +867,7 @@ refresh_net() {
   if [[ -n $failed ]]; then
     warn "refresh-net: IPAddressDeny not changed for$failed (the table blocks $blocked); tried again next pass"
   else rm -f -- "$retry"; fi
-  lookup_done
+  lookup_done "$asked"
 }
 
 # Whether refresh-net's last answer is younger than OWN_ADDRESS_SECONDS: RUN_DIR/own-lookup (root's, as RUN_DIR is)
@@ -879,8 +879,9 @@ lookup_fresh() {
   [[ $last =~ ^[1-9][0-9]{0,11}$ ]] && ((last <= now && now - last < 10#$OWN_ADDRESS_SECONDS))
 }
 
+# $1: when the lookup was asked (empty without EPOCHSECONDS: never fresh, so every pass looks up).
 lookup_done() {
-  printf '%s\n' "${EPOCHSECONDS-}" >"$RUN_DIR/own-lookup.new"
+  printf '%s\n' "$1" >"$RUN_DIR/own-lookup.new"
   mv -f -- "$RUN_DIR/own-lookup.new" "$RUN_DIR/own-lookup"
 }
 
