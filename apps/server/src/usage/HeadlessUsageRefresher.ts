@@ -115,6 +115,18 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
   const failing = new Map<ProviderInstanceId, FailureState>();
   const permit = yield* Semaphore.make(1);
 
+  const endStreak = Effect.fn("HeadlessUsageRefresher.endStreak")(function* (
+    instanceId: ProviderInstanceId,
+  ) {
+    const previous = failing.get(instanceId);
+    if (previous === undefined) return;
+    failing.delete(instanceId);
+    yield* Effect.logInfo("headless usage refresh works again", {
+      instanceId,
+      failures: previous.failures,
+    });
+  });
+
   const refreshOne = Effect.fn("HeadlessUsageRefresher.refreshOne")(function* (
     target: RefreshTarget,
     refreshUsage: NonNullable<RefreshTarget["snapshot"]["refreshUsage"]>,
@@ -131,13 +143,7 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
     const ok = Exit.isSuccess(exit) && !timedOut && gotNewReading(before, after);
     const previous = failing.get(target.instanceId);
     if (ok) {
-      if (previous !== undefined) {
-        failing.delete(target.instanceId);
-        yield* Effect.logInfo("headless usage refresh works again", {
-          instanceId: target.instanceId,
-          failures: previous.failures,
-        });
-      }
+      yield* endStreak(target.instanceId);
       return;
     }
     const failures = (previous?.failures ?? 0) + 1;
@@ -162,7 +168,6 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
     if (Option.isNone(settings)) return;
     const intervalMs = effectiveIntervalMs(settings.value);
     if (intervalMs === null) return;
-    if (yield* deps.hostConstrained(settings.value)) return;
     const targets = yield* deps.listTargets;
     const live = new Set(targets.map((target) => target.instanceId));
     for (const id of failing.keys()) if (!live.has(id)) failing.delete(id);
@@ -173,8 +178,10 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
         continue;
       }
       // Upstream's loop skips some healthy instances: a check of a healthy OpenCode one
-      // starts an OpenCode server. Skip them too.
+      // starts an OpenCode server. Skip them too; healthy also ends a failure streak, so the
+      // next outage is logged and retried as a new one.
       if (target.snapshot.checksOnInterval && !(yield* target.snapshot.checksOnInterval)) {
+        yield* endStreak(target.instanceId);
         continue;
       }
       const before = yield* target.snapshot.getSnapshot;
@@ -190,6 +197,8 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
       ) {
         continue;
       }
+      // Read per refresh: the host may lock while an earlier refresh of this sweep runs.
+      if (yield* deps.hostConstrained(settings.value)) return;
       if (yield* deps.clientRefreshes(target.instanceId)) continue;
       yield* refreshOne(target, refreshUsage, before, intervalMs, nowMs);
     }
