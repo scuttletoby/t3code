@@ -64,6 +64,16 @@ UPSTREAM = [
     ('packages/shared/src/cliRelease.ts',
      'return `t3-${version}-${platformKey}.${platformKey.startsWith("win32") ? "zip" : "tar.gz"}`;',
      'archive name t3-<version>-<platform>.tar.gz'),
+    # back and status (back.py)
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'sentinelPath: path.join(versionDir, ".install-complete"),',
+     'back.installed_t3: a whole runtime has runtime/versions/<v>/.install-complete'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'const PINNED_RUNTIME_LAUNCHERS_FILE = "launchers";',
+     'status: the launcher links upstream recorded in runtime/launchers'),
+    ('apps/server/src/cli/update.ts', 'allowDowngrade: Flag.Boolean("allow-downgrade")',
+     'back: update --allow-downgrade'),
+    ('apps/server/src/cli/update.ts', 'yes: Flag.Boolean("yes")', 'back: update --yes restarts the service'),
+    ('apps/server/src/cli/config.ts', 'export const baseDirFlag = Flag.String("base-dir")', 'back: update --base-dir'),
+    ('apps/server/src/serverRuntimeState.ts', 'return `http://${hostname}:${port}`;', 'status: origin is http'),
     ('apps/server/src/cloud/serviceProtocol.ts', 'const SEMVER_NUMBER = "(?:0|[1-9]\\\\d*)";',
      'config.EXACT_VERSION'),
     ('apps/server/src/cloud/serviceProtocol.ts',
@@ -72,11 +82,13 @@ UPSTREAM = [
 
 REPORT_FILE = 'apps/server/src/golive/forkReport.ts'
 REPORT_CLI = 'apps/server/src/cli/forkReport.ts'
-# Every key path check.py and live.py read from the report, with where it sits.
+# Every key path check.py, live.py and back.py read from the report, with where it sits.
 REPORT_PATHS = ['reportVersion', 'version', 'ok', 'problems', 'problems.code', 'problems.message',
                 'database.pendingMigrations', 'database.counts', 'database.counts.threads',
                 'database.counts.projects', 'database.counts.threadsArchived', 'database.counts.projectsArchived',
-                'fork.featuresOn']
+                'fork.featuresOn', 'fork.features', 'database.unknownMigrations', 'database.appliedMigrations',
+                'settings.providerInstances', 'settings.providerInstances.id', 'settings.providerInstances.driver',
+                'settings.providerInstances.enabled']
 # What live.compare_counts relies on (fork #181): both reports count the same rows, every project and every thread
 # not deleted (sub-agent and archived threads included), so one report is compared with another, never with
 # `t3 thread list` (one project, no sub-agents).

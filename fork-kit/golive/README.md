@@ -2,7 +2,7 @@
 
 `t3-golive` moves a T3 home that runs as a boot service from its current build to a newer one (for example a
 fork build), with a cold copy of the data first and a way back. It is built in steps; this folder has the
-**core** and the **copy** so far:
+**core**, the **copy**, the way **back** and **status** so far:
 
 | Part              | File                      | What it does                                                 |
 | ----------------- | ------------------------- | ------------------------------------------------------------ |
@@ -12,8 +12,9 @@ fork build), with a cold copy of the data first and a way back. It is built in s
 | `check`, `settle` | `lib/golive/check.py`     | read only: may this home move to the target build now?       |
 | OS adapter        | `lib/golive/osadapter.py` | systemd user units only; other systems refuse until written  |
 | `copy`, restore   | `lib/golive/coldcopy.py`  | the practice stop: a cold copy; the restore primitive        |
+| `back`, `status`  | `lib/golive/back.py`      | the way back (W1-W3); read only: is T3 up and right?         |
 
-Later parts (rehearse, switch, back) come in their own PRs. Install from `ci-release` comes with them.
+Later parts (rehearse, switch) come in their own PRs. The owner's runbook is `docs/fork/go-live.md`. Install from `ci-release` comes with them.
 
 ## `t3-golive check`
 
@@ -237,6 +238,55 @@ empty state?
 | Kept files pile up (one set per restore, each as big as the database)               | Never copied, never removed by the kit. Each copy names and counts them; a refusal for free disk names them (a restore's refusal lists the ones the record of a stopped restore names apart, as files that must stay)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `copy --here` from a T3 terminal                                                    | Refused: stopping T3 would kill it half-way                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
+## `t3-golive back [--way w1|w2|w3] [--lose-work-since <time>] [--here]`
+
+Without `--way` it is read only and says which way back is possible now, and why: W1 needs a finished copy of this
+home (`manifest.json`; incomplete copies are named, never used) taken under an older build whose t3 upstream still
+keeps whole in `runtime/versions/<v>/` (`.install-complete`); W2 needs a fork build live (`.fork.N`) and its base
+nightly (the version without `.fork.N`) installed in the home or staged in `stageDir` like the target (checksums
+checked); W3 needs an upstream stable newer than that base, installed or staged. With `--way` it runs detached (a
+transient unit; stopping or restarting T3 kills a T3 terminal), `--here` in the calling process (refused inside the
+boot service).
+
+- **W1, restore and downgrade** (loses everything since the copy): by hand it is refused unless
+  `--lose-work-since` names the copy's time exactly as `back` prints it (`createdAt` of the manifest), and it first
+  prints the project and thread counts at the copy (journalled by `copy`) against the live build's report now
+  (threads that only got new messages are not in the counts). Then, each a journalled step: the plan; **disable** and
+  stop the boot service (no start at boot on a half-restored home); the restore primitive (the migrated database
+  and `settings.json` are kept aside, never deleted; the copy stays); `<home>/runtime/versions/<old>/t3 update <old>
+  --allow-downgrade --yes --base-dir <home>` (it enables and starts the service); verify: a new server of the old
+  build, named by the service state, the service enabled. `restore_and_downgrade(run, ..., automatic=True)` is the
+  same function for the switch's own way back, inside the switch's run, with no time typed.
+- **W2, the same-base upstream nightly** (loses nothing): the fork adds no migrations, so the upstream nightly the
+  fork build is cut from runs the migrated database as it is: `<that t3> update <base> --allow-downgrade --yes`,
+  then the same verify. **Read from the code, untried on a live home**: the tests use a stub t3.
+- **W3, an upstream stable newer than the base**: the same, with that stable.
+
+| Situation                                                                          | What happens                                                                                                                                                                                                                                                                           |
+| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Run twice                                                                          | The second finds the build the first back verified live (service state names it, no update or marker): "nothing to do", no stop, no update                                                                                                                                             |
+| Stopped half-way (killed, failed, power loss)                                      | Another `back` may follow it (`journal.run(may_follow=('back', 'switch'))`); it finishes the stopped back's journalled plan: the restore and the update are safe to run again (tested after the stop, the move-aside, mid-copy, mid-update). Any other command still asks for `settle` |
+| ... and the follow-up is refused (a wrong time, another way)                       | It ends "failed", not "refused", so the half-way home still needs settling; another way than the stopped one is refused, naming the way to run again                                                                                                                                   |
+| ... and the machine boots meanwhile                                                | W1 disabled the service before the stop, so T3 does not start on a half-restored home                                                                                                                                                                                                  |
+| No copy, an incomplete one, one of another home                                    | W1 not possible (named); a copy of another home is never listed                                                                                                                                                                                                                        |
+| The newest copy was taken under the build running now, or its t3 is no longer kept | W1 not possible, named. Older copies are not used in its place (they lose more)                                                                                                                                                                                                        |
+| W2 with no base nightly installed or staged                                        | Refused before any change, naming what is missing                                                                                                                                                                                                                                      |
+| The guard timer (switch) fires `back` during a manual back                         | Refused by the kit's lock (`journal.Busy`): one back at a time                                                                                                                                                                                                                         |
+
+## `t3-golive status`
+
+Read only, holding the kit's lock shared like `check`: the boot service (active, enabled, serves this home), the
+service state (the version the last golive run verified, no update pending), no marker, the live server
+(`server-runtime.json`, a live pid of that version, started by the service), HTTP answers on its `origin`, the t3
+launcher links upstream recorded (`runtime/launchers`) lead to that version, and the live fork build's report:
+read cleanly, no pending or unknown migration, project and thread counts not below the newest `reportCounts` in the
+journal (the switch's, else the last copy's). It lists the fork features that are on, the provider instances, and
+the copies on disk with their sizes (complete, incomplete, kept files: the kit deletes none). The first line says
+**up**, **up but not right**, **restarting** (a golive run holds the lock, a marker, the service activating or
+stopping, or no server yet) or **DOWN**; exit 0 only when up and every check passed. An error inside it is a failed
+check, never a crash or an OK. No report runs unless T3 runs steadily, and none for a build that is not a fork
+build (an upstream build after W2 or W3).
+
 ## `t3-golive settle --reason "<what you did>"`
 
 After a run stopped half-way or ended with an error, look at the T3 home and put it right, then run this: it
@@ -299,6 +349,7 @@ file and how to settle it; a line from a newer kit refuses with "update the kit"
 python3 -I -B fork-kit/golive/tests/check.test.py      # check on a fake machine
 python3 -I -B fork-kit/golive/tests/journal.test.py    # lock, journal, adapter, version order
 python3 -I -B fork-kit/golive/tests/copy.test.py       # copy, guard, restore on a fake machine
+python3 -I -B fork-kit/golive/tests/back.test.py       # back W1-W3 and status, a stub t3 for every build
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
 python3 -I -B fork-kit/common/tests/machine_file.test.py
 ```

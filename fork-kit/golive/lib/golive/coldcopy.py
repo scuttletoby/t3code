@@ -1070,6 +1070,7 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
                     'home': cfg.home, 'liveVersion': server['version'], 'bytes': total, 'files': entries,
                     'leftOut': left_out})
                 facts['manifest'] = os.path.join(dest, MANIFEST)
+                facts['reportCounts'] = result.get('counts')  # read by check before the wait; `back` compares
         except BaseException as e:
             error = e
         finally:

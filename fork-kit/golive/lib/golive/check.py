@@ -328,6 +328,16 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     p.add_argument('--owner-says-go', action='store_true',
                    help='do not wait for a quiet point (the owner says now is fine)')
     p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p = sub.add_parser('back', help='the way back from a fork build: say which of W1-W3 is possible, or take one',
+                       description='Without --way: read only, says which way back is possible now and why. W1 '
+                                   'restores the newest copy and goes back to the build it was taken under (loses '
+                                   'everything since the copy); W2 goes to the upstream nightly the fork build is cut '
+                                   'from; W3 to a newer upstream stable. Runs detached unless --here.')
+    p.add_argument('--way', choices=('w1', 'w2', 'w3'))
+    p.add_argument('--lose-work-since', metavar='TIME', help="W1 by hand: the copy's time, as `back` prints it")
+    p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    sub.add_parser('status', help='read only: is T3 up and right?', description='Read only: the light checks of '
+                   'verify, the fork features that are on, and the copies on disk. Exit 0 only when all pass.')
     p = sub.add_parser('guard', help=argparse.SUPPRESS)
     p.add_argument('--run', required=True)
     args = parser.parse_args(argv)
@@ -344,6 +354,9 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     except osadapter.Unsupported as e:
         print(f't3-golive: {e}', file=err)
         return 2
+    if args.command in ('back', 'status'):
+        from golive import back  # it uses this module
+        return back.main(args, cfg, adapter, out, err)
     if args.command in ('copy', 'guard'):
         from golive import coldcopy  # it uses run_check from this module
         if args.command == 'guard':

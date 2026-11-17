@@ -67,6 +67,7 @@ class SystemdUser:
             main_pid = 0
         return {'loaded': props.get('LoadState') == 'loaded', 'active': props.get('ActiveState') == 'active',
                 'enabled': props.get('UnitFileState') == 'enabled', 'mainPid': main_pid or None,
+                'state': props.get('ActiveState'),
                 'unitPath': unit_path, 'home': home}
 
     def inside_service(self):
@@ -90,6 +91,10 @@ class SystemdUser:
 
     def start(self):
         self._run([SYSTEMCTL, '--user', 'start', UNIT])
+
+    def disable(self):
+        """Not started at boot (`back` keeps T3 off a half-restored home; upstream's update enables it again)."""
+        self._run([SYSTEMCTL, '--user', 'disable', UNIT])
 
     def run_detached(self, unit, argv, guard_after_seconds=None, guard_argv=None):
         """Run argv as a transient user unit that outlives its caller (a restart of T3 kills anything inside it).

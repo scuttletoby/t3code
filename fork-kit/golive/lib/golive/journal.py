@@ -269,24 +269,27 @@ def _detail(error):
 
 
 @contextlib.contextmanager
-def run(state_dir, command):
-    """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished), journal begin
-    and end. An exception ends the run "failed" and goes on (after a started step it then needs settling); Refused
+def run(state_dir, command, may_follow=()):
+    """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished) unless its command
+    is in may_follow (`back` finishes a back or switch stopped half-way), journal begin and end. An exception ends the run "failed" and goes on (after a started step it then needs settling); Refused
     after every started step is done ends it "refused" (no settling); a kill leaves it with no end for the next run
     to report."""
     with lock(state_dir, command, exclusive=True):
         last = unfinished(state_dir)
-        if last is not None:
+        if last is not None and last['command'] not in may_follow:
             raise Unfinished(last)
         r = Run(state_dir, command)
         r._append('begin', command=command, pid=os.getpid())
         r._holds_lock = True
         try:
             try:
+                if last is not None:  # until this run ends ok, the home still needs settling (a refusal too)
+                    with r.step('follows', run=last['id']):
+                        pass
                 yield r
             except Refused as e:
                 # Refused inside a step, or after a step that never reached "done", is a failure like any other.
-                result = 'failed' if r._broken else 'refused'
+                result = 'failed' if r._broken or last is not None else 'refused'
                 r._append('end', result=result, detail=_detail(e))
                 raise
             except BaseException as e:
