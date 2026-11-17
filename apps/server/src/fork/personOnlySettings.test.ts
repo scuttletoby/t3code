@@ -141,6 +141,7 @@ describe("person-only fork settings", () => {
         "automaticUpdates",
         "waitFor",
         "waitChecks",
+        "playtest",
         "agentSlots",
         "mcpProfiles",
         "mcpProfile",
