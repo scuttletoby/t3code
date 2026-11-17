@@ -308,7 +308,9 @@ jobs:
             /apps/server/src/cli/forkReport.ts
             /apps/server/src/cli/server.ts
             /apps/server/src/cli/servicePreflight.ts
+            /apps/server/src/cli/update.ts
             /apps/server/src/cloud/bootService.ts
+            /apps/server/src/cloud/pinnedRuntime.ts
             /apps/server/src/cloud/servicePreflight.ts
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
@@ -447,7 +449,9 @@ jobs:
             /apps/server/src/cli/forkReport.ts
             /apps/server/src/cli/server.ts
             /apps/server/src/cli/servicePreflight.ts
+            /apps/server/src/cli/update.ts
             /apps/server/src/cloud/bootService.ts
+            /apps/server/src/cloud/pinnedRuntime.ts
             /apps/server/src/cloud/servicePreflight.ts
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
