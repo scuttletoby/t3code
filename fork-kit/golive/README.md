@@ -249,18 +249,23 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   of this home, and was taken under the build the live service state names now (else "take a new copy"); the target
   is newer; the old build (`<home>/runtime/versions/<copy's version>/t3`) is there; the staged release checks out
   and its `serve --help` has `--hold-work`; the rehearsal folder is apart from the live home (real paths and file
-  ids, both ways, so a link or a bind path is caught); an old one is a real folder (no link) that bears the kit's
+  ids of the home and of its `userdata`, both ways, so a link or a bind path is caught; and by the mount list: a
+  bind mount of any folder inside the live home, at the backups folder say, keeps the device and gives no id the
+  kit compares, but its mountinfo line names the folder it came from, so the folder each of the two is on its
+  filesystem must be apart; a mount list that cannot tell refuses); an old one is a real folder (no link) that bears the kit's
   mark `.golive-rehearsal` (or is empty), with no folder in it that is the live home or on another device, no mount
   point at or under it in the system's mount list (`/proc/self/mountinfo`: a bind mount of the same filesystem keeps
   its device id), and no link to another home's ownership lock; no server holds it; the copy is not inside it (nor
   a link into it); the port is free and is neither the live port nor 3773; `backupDir` holds 3 x the copy plus the
-  floor. Where the mount list cannot be read (any OS but Linux, no `/proc`), an old rehearsal folder is never
-  removed: the run is refused and the owner removes it by hand. **R0 on the clone**: the clone leaves out
+  floor. Where the mount list cannot be read (any OS but Linux, no `/proc`), the run is refused (it cannot tell a
+  bind mount), so an old rehearsal folder is never removed: the owner removes it by hand. **R0 on the clone**: the clone leaves out
   `secrets/` and the live machine's process records (`device/`, `relay-clients/`), with what a copy never holds
   (`server-runtime.json`, the ownership lock); it reads back against the manifest and is checked to hold none of
   those: a runtime record would point the CLI at the LIVE server.
 - **The clone step** runs the old-folder guard again right before it removes anything (a mount or a swap since R0
-  is caught), then removes the old folder with its mark last.
+  is caught), then removes the old folder with its mark last: it opens the folder without following a link, checks
+  it is the one the guard checked (device and inode), and removes its contents through that handle, so a swap of the
+  path after the check removes nothing of what is there now.
 - **R1**: `__service-preflight` of the old build and of the fork build on the clone: both `ready`. The fork build's
   read-only report of the clone is the "before" report.
 - **R2**: `<fork t3> auth session list --json --base-dir <clone>`, with no server: a read-only command whose
@@ -293,12 +298,14 @@ reusing one half-migrated. A run that needs settling still blocks it.
 | Killed at any step (R0-R5, mid-restore)                 | The server dies with the run; nothing to settle; the next run redoes it       |
 | Killed while it removes the old folder                  | The mark goes last: the folder still bears it (or is empty); next run ends it |
 | A mount (or a swap to a link) after R0, before removal  | The guard runs again in the clone step: the run fails, nothing is removed     |
+| A swap (link, other folder) after that check            | The run fails; what is at the path now is never removed                       |
 | A mount point at or under the folder; no mount list     | Refused; never removed (other OSes: remove an old folder by hand)             |
 | `--copy` inside the rehearsal folder, or a link into it | Refused before any step: the clone step would remove it                       |
 | R2 left migrations pending                              | The run fails before R3: the server would migrate unmeasured                  |
 | A server still holds an old rehearsal home              | Refused before any step; stop it (its pid is in that home's runtime record)   |
 | `t3-rehearsal` without the mark, or a link              | Refused; never removed                                                        |
 | Live home by a link or bind path, or bound in a clone   | Refused (real path; file ids both ways and inside) before any removal         |
+| `backupDir` a bind of a folder inside the live home     | Refused before any step (mount list: the folder each is on its filesystem)    |
 | Copy with no manifest, not matching it, of another home | Refused (`--copy` or `t3-golive copy`)                                        |
 | Copy from another build than the live one               | Refused: take a new copy                                                      |
 | Port taken between the check and the start              | The server exits; R3 fails, the rerun passes once the port is free            |

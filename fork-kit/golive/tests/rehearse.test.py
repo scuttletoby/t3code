@@ -2,7 +2,7 @@
 build (the live home's runtime) and the fork build (the staged release) are one stub `t3` that keeps its migrations
 in a real SQLite file. Nothing here starts, stops or reads a real T3 or ~/.t3; every stub run is checked to stay in
 the rehearsal home.  python3 -I -B fork-kit/golive/tests/rehearse.test.py"""
-import hashlib, json, os, socket, sqlite3, subprocess, sys, time, types, unittest
+import hashlib, json, os, shutil, socket, sqlite3, subprocess, sys, time, types, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -508,6 +508,37 @@ class Rehearse(Base):
         self.assertFalse([c for c in self.stub_calls() if c['argv'][0] == 'serve' and '--help' not in c['argv']],
                          'R3 never starts on a clone R2 did not migrate')
 
+    def test_each_r2_check_fails_on_its_own(self):
+        """R2's report must show every migration applied, none pending, none unknown: each alone stops before R3."""
+        def pending(d):
+            d['pendingMigrations'] = [84]
+
+        def applied(d):  # 82 left out, nothing pending: only the applied list is wrong
+            d['appliedMigrations'] = [m for m in d['appliedMigrations'] if m['id'] != 82]
+
+        def unknown(d):
+            d['unknownMigrations'] = [99]
+
+        def no_pending_key(d):
+            del d['pendingMigrations']
+        real = rehearse._report
+        for change, needle in ((pending, 'pending [84]'), (applied, 'applied [78, 79, 80, 81, 83]'),
+                               (unknown, 'unknown [99]'), (no_pending_key, 'pending None')):
+            with self.subTest(change.__name__):
+                calls = []
+
+                def after_r2(p):
+                    got = real(p)
+                    calls.append(got)
+                    if len(calls) == 2:  # R1's report, then R2's
+                        self.assertEqual(got['database']['pendingMigrations'], [], 'the stub migrated')
+                        change(got['database'])
+                    return got
+                with mock.patch.object(rehearse, '_report', after_r2):
+                    text = self.failed('R2: ' + ' '.join(rehearse.MIGRATE) + ' left the clone')
+                self.assertIn(needle, text)
+                self.assertNotIn('serve', [s for s, _ in self.steps()], 'R3 never starts')
+
     def test_r4_migration_checks_each_fail_alone(self):
         counts = {'projects': 3, 'projectsArchived': 0, 'threads': 40, 'threadsArchived': 0}
         cases = [({'appliedMigrations': [{'id': i} for i in range(1, 84)], 'pendingMigrations': [84],
@@ -547,13 +578,47 @@ class Guards(Base):
         return mock.patch.multiple(rehearse.os, stat=fake(0), lstat=fake(1))
 
     def test_the_rehearsal_home_inside_the_live_home_by_a_bind_path_is_refused_by_file_id(self):
-        cfg = config.load()
-        cfg.backup_dir = self.m.path('bound')  # the live home, bound here
-        os.makedirs(cfg.backup_dir)
-        with self.bind(cfg.backup_dir, self.m.home), self.assertRaises(journal.Refused) as e:
-            rehearse.run_rehearse(cfg, copy_dir=self.copy_dir, say=self.said.append)
-        self.assertIn('is the live T3 home', str(e.exception))
-        self.assertEqual(os.listdir(cfg.backup_dir), [])
+        for source in ('home', 'home/userdata'):  # the live home or its userdata, bound at the backups folder
+            with self.subTest(source):
+                cfg = config.load()
+                cfg.backup_dir = self.m.path(f'bound-{source.replace("/", "-")}')
+                os.makedirs(cfg.backup_dir)
+                with self.bind(cfg.backup_dir, self.m.path(source)), self.assertRaises(journal.Refused) as e:
+                    rehearse.run_rehearse(cfg, copy_dir=self.copy_dir, say=self.said.append)
+                self.assertIn('is the live T3 home', str(e.exception))
+                self.assertEqual(os.listdir(cfg.backup_dir), [])
+
+    def test_a_backups_folder_bound_from_inside_the_live_home_is_refused_by_the_mount_list(self):
+        """A bind of a folder inside the live home keeps the device (and gives no id the kit compares): the mount
+        list names the folder it came from (field 4)."""
+        def bound(source, at, dev='8:1'):  # '/' is 8:1 in MOUNTS
+            with open(self.mountinfo, 'w') as f:
+                f.write(MOUNTS + '91 22 %s %s %s rw,relatime shared:1 - ext4 /dev/sda1 rw\n' % (
+                    dev, escaped(source), escaped(at)))
+        home, root = self.m.home, self.root()
+        for source, at in ((home + '/userdata/attachments', self.m.backups), (home + '/userdata', self.m.backups),
+                           (home + '/userdata/x y', root), (root + '/x', home)):
+            with self.subTest(source=source, at=at):
+                bound(source, at)
+                self.refused('bind mount')
+                self.assertFalse(os.path.lexists(root))
+        bound(self.m.path('elsewhere'), self.m.backups)  # a bind of a folder apart from the live home: fine
+        self.rehearse()
+        bound(home + '/userdata', self.m.backups, dev='8:2')  # the same path on another filesystem: fine
+        self.rehearse()
+        bound(home + '/userdata', self.m.backups)  # covered by a later mount on the same point: that one counts
+        with open(self.mountinfo, 'a') as f:
+            f.write('92 91 0:50 / %s rw,relatime - tmpfs tmpfs rw\n' % escaped(self.m.backups))
+        self.rehearse()
+        os.rename(root, root + '.done')
+        for case in ('missing', 'no root mount'):  # the mount list cannot tell: refused, even with no old folder
+            with self.subTest(case):
+                if case == 'missing':
+                    os.unlink(self.mountinfo)
+                else:
+                    self.m.write('mountinfo', MOUNTS.split('\n', 1)[1])
+                self.refused('mount list')
+                self.assertFalse(os.path.lexists(root))
 
     def test_the_live_home_inside_the_rehearsal_home_by_a_bind_path_is_refused_by_file_id(self):
         root = self.root()
@@ -626,6 +691,7 @@ class Guards(Base):
             self.skipTest('no /proc here')
         with mock.patch.object(fx.osadapter, 'MOUNTINFO', '/proc/self/mountinfo'):
             self.assertIn('/', fx.osadapter.mount_points())
+            self.assertIsNotNone(fx.osadapter.source(self.m.home, fx.osadapter.mounts()))
         self.assertIn('/mnt/with space', fx.osadapter.mount_points())
 
     def test_another_device_in_an_old_rehearsal_folder_is_refused(self):
@@ -664,6 +730,50 @@ class Guards(Base):
             self.failed('live T3 home')
         self.assertEqual(self.m.snapshot(), live)
         self.assertTrue(os.path.islink(self.root()))
+
+    def test_a_swap_after_the_last_check_never_redirects_the_removal(self):
+        """The removal works on the folder the guard checked, opened without following links and emptied through
+        that handle: a swap after the check (to a link, or to another folder, also mid-removal) fails the clone
+        step and removes nothing of what is at that path now."""
+        root, victim, guard, listdir = self.root(), self.m.path('victim'), rehearse._guard_old, os.listdir
+        for how in ('link', 'folder', 'link-mid-removal'):
+            with self.subTest(how):
+                self.rehearse()
+                self.m.write('victim/home/keep.txt', 'x')
+                self.m.write('victim/.golive-rehearsal', '{}')
+                guarded = []
+
+                def swap():
+                    os.rename(root, root + '.moved')
+                    if how == 'folder':
+                        os.rename(victim, root)
+                    else:
+                        os.symlink(victim, root)
+
+                def swap_after_guard(cfg, path):
+                    got = guard(cfg, path)
+                    guarded.append(path)
+                    if len(guarded) == 2 and how != 'link-mid-removal':  # R0's guard, then the clone step's
+                        swap()
+                    return got
+
+                def swap_at_listing(path='.'):
+                    if len(guarded) == 2 and how == 'link-mid-removal' and not os.path.lexists(root + '.moved'):
+                        swap()
+                    return listdir(path)
+                try:
+                    with mock.patch.object(rehearse, '_guard_old', swap_after_guard), \
+                            mock.patch.object(rehearse.os, 'listdir', swap_at_listing):
+                        self.failed({'link': 'a link now', 'folder': 'another folder now',
+                                 'link-mid-removal': 'changed during the removal'}[how])
+                    kept = os.path.join(root if how == 'folder' else victim, 'home', 'keep.txt')
+                    self.assertTrue(os.path.isfile(kept), 'what is at the path now is never removed')
+                finally:  # put the machine back for the next case
+                    if os.path.lexists(root + '.moved'):
+                        os.unlink(root) if os.path.islink(root) else shutil.rmtree(root, ignore_errors=True)
+                        os.rename(root + '.moved', root)
+                    shutil.rmtree(victim, ignore_errors=True)
+        self.rehearse()
 
     def test_a_link_in_an_old_clone_never_takes_another_homes_lock(self):
         self.rehearse()
