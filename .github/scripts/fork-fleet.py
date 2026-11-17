@@ -143,6 +143,7 @@ def check_config(cfg):
         got = [p.get(field) for p in among]
         if len(set(map(str, got))) != len(got):
             out.append(f'two pools with one {field}')
+    out += check_retired(cfg, launched)
     for p in pools:
         who = f'pool {p.get("name")!r}'
         if not (isinstance(p.get('name'), str) and POOL.fullmatch(p['name'])):
@@ -225,6 +226,35 @@ def avoid_problems(pools, job):
                        'static pools and the pool that waits are where a job goes when nothing else takes it)')
         if not (isinstance(kinds, list) and kinds and all(k in KINDS for k in kinds)):
             out.append(f'{who}[{name!r}] must list some of {list(KINDS)}')
+    return out
+
+
+def check_retired(cfg, launched):
+    """A dispatcher pool's `retired`: the labels it had before. Its dispatcher deletes the offline registrations it
+    made under them, so each must be this pool's alone: in retired_labels, no pool's label now, in no other pool's."""
+    out, seen = [], set()
+    listed, current = cfg.get('retired_labels', []), {p.get('label') for p in launched}
+    for p in cfg.get('pools') or []:
+        if 'retired' not in p:
+            continue
+        who = f'pool {p.get("name")!r}'
+        got = p['retired']
+        if p.get('static'):
+            out.append(f'{who}: retired is for a dispatcher pool (a static pool\'s runners are registered by hand)')
+            continue
+        if not (isinstance(got, list) and all(isinstance(x, str) for x in got)):
+            out.append(f'{who}: retired must be a list of the labels it had before')
+            continue
+        unlisted = [x for x in got if not isinstance(listed, list) or x not in listed]
+        now = [x for x in got if x in current]
+        shared = [x for x in got if x in seen]
+        if unlisted:
+            out.append(f'{who}: retired {unlisted} must also be in retired_labels')
+        if now:
+            out.append(f'{who}: retired {now} is a dispatcher pool\'s label now: its registrations are that pool\'s')
+        if shared:
+            out.append(f'{who}: retired {shared} is another pool\'s too: whose registrations they are is unknown')
+        seen.update(got)
     return out
 
 
@@ -907,6 +937,12 @@ class Host:
     def __init__(self, pool, run=subprocess.run):
         self.pool, self.run = pool, run
         self.mine = re.compile(rf'{re.escape(pool["label"])}-[0-9]{{1,20}}')
+        old = '|'.join(map(re.escape, pool.get('retired', [])))   # labels it had before (check_retired: its alone)
+        self.old = re.compile(rf'(?:{old})-[0-9]{{1,20}}') if old else None
+
+    def made(self, name):
+        """Is this a runner name this pool's dispatcher made, under its label now or one it had before?"""
+        return bool(self.mine.fullmatch(name) or self.old and self.old.fullmatch(name))
 
     def _do(self, *args, stdin=None):
         try:
@@ -924,8 +960,9 @@ class Host:
         return got.stdout
 
     def units(self):
-        """Names of this pool's runners whose unit is still there (starting, running or stopping)."""
-        return {n for n in self._must('active').split() if self.mine.fullmatch(n)}
+        """Names of this pool's runners whose unit is still there (starting, running or stopping), under its label
+        now or one it had before (a runner started just before the label changed)."""
+        return {n for n in self._must('active').split() if self.made(n)}
 
     def fits(self, mb):
         return self._do('fits', str(int(mb))).returncode == 0
@@ -1087,18 +1124,20 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
             closed[p['name']] = str(e)
             once(state, ('net', p['name'], str(e)), f'::warning::fork-fleet: {e}; no runner starts on pool '
                                                     f'{p["name"]} until it answers (the last block stays)')
-    ours = {}
+    ours, old = {}, {}   # registrations under a pool's label now; under one it had before (offline ones are deleted)
     for r in gh.pages('actions/runners', 'runners'):
         for p in pools:
             if hosts[p['name']].mine.fullmatch(r.get('name') or ''):
                 ours[r['name']] = (p, r)
+            elif hosts[p['name']].made(r.get('name') or ''):
+                old[r['name']] = (p, r)
     state['idle'] = {k: v for k, v in state['idle'].items() if k in ours}
 
     # Leftovers: a registration with no runner behind it, and a runner whose job went away before it started. Such a
     # runner is stopped at once when a queued job of another run could be given it (the hook would refuse that job),
     # else after idle_passes passes (a runner that is just taking its own job is not busy yet). A runner's labels name
     # the run attempt it was made for, so no job of another attempt can be given it.
-    for name, (p, r) in ours.items():
+    for name, (p, r) in [*ours.items(), *old.items()]:
         if p['name'] in down:
             continue
         if r.get('status') == 'offline' and name not in units[p['name']]:
@@ -1108,6 +1147,8 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
                 if e.code != 404:
                     raise
             say(f'{name}: deleted a registration with no runner behind it')
+        elif name in old:
+            continue   # online under a label the pool had before: left to finish (or to be stopped by hand)
         elif r.get('status') == 'online' and not r.get('busy') and int(name.rsplit('-', 1)[1]) not in queued_ids:
             state['idle'][name] = state['idle'].get(name, 0) + 1
             labels = [x.get('name') for x in r.get('labels') or [] if isinstance(x, dict)]
