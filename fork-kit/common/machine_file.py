@@ -9,8 +9,8 @@ contain. There is one per machine, at a fixed path per OS:
 
 Shape: {"version": 1, "<kit folder name>": {...}, ...}, camelCase keys. Rules, all checked here:
 
-- root-owned and not writable by group or others (the file and its folder; not checked on Windows); neither may
-  be a symbolic link, and the file must be a plain file of at most 1 MiB;
+- root-owned and not writable by group or others (the file and its folder); neither may be a symbolic link, and
+  the file must be a plain file of at most 1 MiB. These checks are POSIX only: on Windows the file is refused;
 - a JSON object with no key given twice whose "version" is a whole number this loader knows (1);
 - no secrets: a key whose name says secret, token, password or private key holds only "file:<path>";
 - a kit reads "version" and its own section only; a missing section, an unknown key in it or a value of the
@@ -53,11 +53,7 @@ def _read(path, owner_uid):
     """The file's text. The folder is checked without following a link; the file is opened without following one,
     and the opened file itself (not the path, which could be swapped in between) is checked."""
     if os.name == 'nt':
-        with open(path, encoding='utf-8') as f:
-            text = f.read(MAX_BYTES + 1)
-        if len(text) > MAX_BYTES:
-            raise MachineFileError(f'{path}: larger than {MAX_BYTES} bytes')
-        return text
+        raise MachineFileError(f'{path}: not read on Windows, where its owner and permission checks do not exist yet')
     folder = os.path.dirname(path) or '.'
     st = os.lstat(folder)
     if stat.S_ISLNK(st.st_mode):

@@ -243,11 +243,61 @@ class Install(unittest.TestCase):
         self.assertTrue(all(os.path.isfile(u) for u in units))
         self.assertEqual(self.install('--no-sweep-timer', sha=SHA2)[0], 0)
         self.assertFalse(any(os.path.exists(u) for u in units))
-        self.assertNotIn('sweep_timer', self.config())
+        self.assertFalse(self.config().get('sweep_timer'))
         self.assertEqual(self.run_main('self-check')[0], 0)
+        self.assertEqual(self.install(sha=SHA2)[0], 0)              # again, without the option: still off
+        self.assertFalse(any(os.path.exists(u) for u in units))
         self.assertEqual(self.install('--sweep-timer', sha=SHA2)[0], 0)
         self.assertEqual(self.run_main('uninstall')[0], 0)
         self.assertFalse(any(os.path.exists(u) for u in units))
+
+    def old_installer_config(self):
+        """What an installer from before the sweep writes on a rollback: config.json without the sweep_timer key
+        (it keeps the units it does not know)."""
+        cfg = {k: v for k, v in self.config().items() if k != 'sweep_timer'}
+        with open(self.path('/etc/heavy/config.json'), 'w') as f:
+            json.dump(cfg, f)
+
+    def test_roll_forward_after_a_rollback_keeps_the_sweep_timer(self):
+        # #193: rollback with the old installer, then the usual install line (without --sweep-timer)
+        units = [self.path('/etc/systemd/user/heavy-sweep.service'), self.path('/etc/systemd/user/heavy-sweep.timer')]
+        self.assertEqual(self.install('--sweep-timer')[0], 0)
+        self.old_installer_config()
+        code, out, err = self.install(sha=SHA2)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(all(os.path.isfile(u) for u in units), out)
+        self.assertTrue(self.config()['sweep_timer'])
+        self.assertIn('kept the sweep timer units', out)
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        # an older config and only one unit left (a stop half-way): kept, and made whole again
+        self.old_installer_config()
+        os.unlink(units[1])
+        self.assertEqual(self.install(sha=SHA2)[0], 0)
+        self.assertTrue(all(os.path.isfile(u) for u in units))
+        # --no-sweep-timer stopped after its config step, then the usual line again: still off
+        code, _, _ = self.install('--no-sweep-timer', sha=SHA2, stop_after='config')
+        self.assertEqual(code, 'stopped after config (test)')
+        self.assertTrue(all(os.path.isfile(u) for u in units))
+        self.assertEqual(self.install(sha=SHA2)[0], 0)
+        self.assertFalse(any(os.path.exists(u) for u in units))
+        # an older config and no units: nothing written
+        self.old_installer_config()
+        self.assertEqual(self.install(sha=SHA2)[0], 0)
+        self.assertFalse(any(os.path.exists(u) for u in units))
+        self.assertNotIn('sweep_timer', self.config())
+        # an older config, one unit ours and one someone else's: refused, and the refusal names the way out
+        self.assertEqual(self.install('--sweep-timer', sha=SHA2)[0], 0)
+        self.old_installer_config()
+        with open(units[1], 'w') as f:
+            f.write('[Timer]\nOnCalendar=daily\n')
+        code, _, err = self.install(sha=SHA2)
+        self.assertEqual(code, 1)
+        self.assertIn('heavy-sweep.timer exists and was not written by this kit', err)
+        self.assertIn('--no-sweep-timer', err)
+        self.assertEqual(self.install('--no-sweep-timer', sha=SHA2)[0], 0)
+        self.assertFalse(os.path.exists(units[0]))
+        with open(units[1]) as f:
+            self.assertEqual(f.read(), '[Timer]\nOnCalendar=daily\n')
 
     def test_sweep_units_someone_else_wrote_are_refused_and_kept(self):
         os.makedirs(self.path('/etc/systemd/user'))

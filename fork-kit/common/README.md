@@ -28,7 +28,8 @@ The path is fixed: shipped commands have no option or environment variable that 
 Rules (all checked by [machine_file.py](machine_file.py); a kit that finds one broken refuses, names the file and
 the reason, and changes nothing):
 
-- **Owned by root**, and neither the file nor its folder writable by group or others (not checked on Windows).
+- **Owned by root**, and neither the file nor its folder writable by group or others. These checks exist only
+  on Linux and macOS: on Windows the loader refuses the file until they do (no kit reads it there yet).
 - **A plain file of at most 1 MiB, not a symbolic link, in a folder that is not one either.** The loader opens the
   file without following a link and checks the file it opened (owner, mode, kind), not the path, so a file
   swapped in between is caught.
