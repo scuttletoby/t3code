@@ -425,6 +425,10 @@ class SweepTests(unittest.TestCase):
                          ['timeout', 'env', 'bash', '-c', 'pytest -q'])
         self.assertEqual(own(['timeout', '5', 'env', '-S', 'bash -c "unclosed']),        # env refuses it; no crash
                          ['timeout', 'env', 'bash', '-c', '"unclosed'])
+        # env reads its split string itself: its own assignments and options there are not the program
+        self.assertEqual(own(['timeout', '5', 'env', '-S', 'CI=1 pytest -x']), ['timeout', 'env', 'pytest'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', '-i -u A -- bash -c pytest']),
+                         ['timeout', 'env', 'bash', '-c', 'pytest'])
         self.assertEqual(own(['python3', '-um', 'pytest', '-x']), ['python3', '-um', 'pytest'])
         self.assertEqual(own(['python3', '-uW', 'error', 'a.test.py']), ['python3', 'a.test.py'])
         self.assertEqual(own(['python3', '-Wignore', '-c', 'p="x"'], shown=True), ['python3', '-c', '[5 chars]'])
@@ -441,6 +445,11 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(own(['perl', '-lI', 'lib', 't/a.t']), ['perl', 't/a.t'])     # -I with its value as a word
         # as perl reads it: e is -i's backup suffix and the next word a script (perl stops at once: no such file)
         self.assertEqual(own(['perl', '-pie', 's/a/b/', 'f']), ['perl', 's/a/b/'])
+        # -F and -C take the rest of their word too (-Fe: the pattern is e; -CE: the flags are E)
+        self.assertEqual(own(['perl', '-Fe', '-lane', 'x', 'f']), ['perl', '-lane', 'x'])
+        self.assertEqual(own(['perl', '-CE', '-e', 'x']), ['perl', '-e', 'x'])
+        # shown, a script word after a bundle that ends in e is cut like code (-pie, -Fxe); an option word is not one
+        self.assertEqual(own(['perl', '-Mre', '-e', 'x'], shown=True), ['perl', '-e', '[1 chars]'])
 
     def test_a_tree_stops_only_its_own_unit_and_never_a_session_or_a_live_heavy_below_it(self):
         h, svc = self.host, f'{CG}/app.slice/t3code.service'
@@ -550,6 +559,17 @@ class SweepTests(unittest.TestCase):
             (['timeout', '60', 'env', '-S', 'bash -c "mysql -phunter30"'],
              'timeout env bash -c [mysql ... 16 chars]', 1),
             (['zsh', '-oerrexit', '-c', 'mysql -phunter31'], 'zsh -c [mysql ... 16 chars]', 2),
+            # #328 lens: env reads its split string itself, so an assignment there (a password) is env's, not shown
+            (['timeout', '60', 'env', '-S', 'DB_PASS=hunter32 ./server'], 'timeout env ./server', 3),
+            (['timeout', '60', 'env', '-SPGPASS=hunter33 psql'], 'timeout env psql', 2),
+            (['timeout', '60', 'env', '--split-string=X=hunter34 ./server --port 1'], 'timeout env ./server', 2),
+            (['timeout', '60', 'env', '-S', '-i X=hunter35 sh -c "mysql -phunter36"'],
+             'timeout env sh -c [mysql ... 16 chars]', 1),
+            (['timeout', '60', 'env', '-S', '-- bash -c "mysql -phunter37"'],
+             'timeout env bash -c [mysql ... 16 chars]', 1),
+            # perl reads the word after -Fxe or -pie as a script (and stops at once); shown, it is cut like code
+            (['perl', '-Fxe', 'print "hunter38"'], 'perl -Fxe [16 chars]'),
+            (['perl', '-pie', 's/OLDPW/hunter39/', 'f'], 'perl -pie [17 chars]', 2),
         ]
         for n, (argv, *_) in enumerate(rows):
             self.orphan(5201 + n, argv + ['arg0'], cpu=90)
@@ -572,9 +592,11 @@ class SweepTests(unittest.TestCase):
         self.write_machine()
         self.orphan(5301, ['timeout', '60', 'sh', '-c', 'PASS=hunter2 pytest'], cpu=90)
         self.orphan(5302, ['stdbuf', '-oL', 'bash', '-lc', 'pytest -q'], cpu=90)   # a parser row: stdbuf execs
+        self.orphan(5303, ['timeout', '600', 'env', '-S', 'CI=1 pytest -x'], cpu=90)  # env's assignment is skipped
         code, out, _ = self.run_sweep()
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.signalled(), [5301, 5302], out)
+        self.assertEqual(self.signalled(), [5301, 5302, 5303], out)
+        self.assertIn('timeout env pytest (+2 args)', out)
         self.assertIn('stopped: pid 5301 timeout', out)
         self.assertIn('timeout sh -c [19 chars]', out)
         self.assertNotIn('hunter2', out)
@@ -1203,8 +1225,8 @@ MUTATIONS = {
                                            'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     '-o/-O in a shell bundle take a word': ("return ('-c' if 'c' in a else None), a.count('o') + a.count('O')",
                                             "return ('-c' if 'c' in a else None), 0", 'test_own_command'),
-    'last letter of a bundle is the inline option': ('if last in INLINE[kind]:', 'if False:',
-                                                     'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    # the display rows stay cut without it (a bundle ending in e or c is cut when shown); the own command is wrong
+    'last letter of a bundle is the inline option': ('if last in INLINE[kind]:', 'if False:', 'test_own_command'),
     'attached-value words are one option': ('if attached is not None and attached < len(a) - 1:', 'if False:',
                                             'test_own_command'),
     'perl/ruby/php code is code': ("'other': {'-e', '-E', '-r'}}\n# Short", "'other': set()}\n# Short",
@@ -1231,6 +1253,21 @@ MUTATIONS = {
     "an option's value never starts with '-'": ("j += j < len(argv) and not argv[j].startswith('-')",
                                                 'j += j < len(argv)',
                                                 'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    # #328 lens
+    'env reads its split string itself': ('return own_command(argv[:1] + split, shown)',
+                                          'return argv[:1] + own_command(split, shown)',
+                                          'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'env -S assignments are not the program when matching': ('return own_command(argv[:1] + split, shown)',
+                                                             'return argv[:1] + own_command(split, shown)',
+                                                             'test_inline_code_through_a_wrapper_is_still_matched'),
+    'a script word after a bundle ending in e is cut': (
+        "if opt is None and shown and '-' + a[-1] in CODE[kind] and j < len(argv) and not argv[j].startswith('-'):",
+        'if False:',
+        'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'an option word after it is not that script': ("and j < len(argv) and not argv[j].startswith('-'):",
+                                                   'and j < len(argv):', 'test_own_command'),
+    "perl's -F takes the rest of its word": ("'other': 'MmIixdDrFC'}", "'other': 'MmIixdDrC'}", 'test_own_command'),
+    "perl's -C takes the rest of its word": ("'other': 'MmIixdDrFC'}", "'other': 'MmIixdDrF'}", 'test_own_command'),
 }
 
 

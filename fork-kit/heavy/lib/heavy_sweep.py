@@ -200,8 +200,8 @@ def own_command(argv, shown=False):
                 i += 1
                 break
             split = env_split(argv, i) if name == 'env' else None
-            if split is not None:
-                return argv[:1] + own_command(split, shown)
+            if split is not None:                   # env reads the string itself: its NAME=value, -i, -u X, --
+                return own_command(argv[:1] + split, shown)
             if a in takes:
                 i += 2
             elif a.startswith('-') or (name == 'env' and '=' in a and not a.startswith('=')):
@@ -232,6 +232,10 @@ def own_command(argv, shown=False):
             j = i + 1
             for _ in range(values):        # an option's value never starts with '-' (zsh -oerrexit -c: -c is next)
                 j += j < len(argv) and not argv[j].startswith('-')
+            # perl -pie CODE, -Fxe CODE: an attached value ends in e, and perl reads CODE as a script (and stops at
+            # once); shown, a script word there is cut like code
+            if opt is None and shown and '-' + a[-1] in CODE[kind] and j < len(argv) and not argv[j].startswith('-'):
+                opt = '-' + a[-1]
             if opt is None:
                 i = j
                 continue
