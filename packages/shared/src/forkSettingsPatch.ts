@@ -21,6 +21,14 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
+import { settingsIntervalProblem } from "./forkSettingsIntervals.ts";
+
+export {
+  dropUnusableStoredIntervals,
+  findDurationPaths,
+  SETTINGS_INTERVAL_PATHS,
+} from "./forkSettingsIntervals.ts";
+
 const FORK_PATCH_KEYS = Object.keys(FORK_PATCH_RULES) as ReadonlyArray<ForkServerSettingKey>;
 
 export type ForkSettingsPatch = Pick<ServerSettingsPatch, ForkServerSettingKey>;
@@ -264,7 +272,8 @@ function mcpProfileRefProblem(
 }
 
 /**
- * Why the server must refuse this save of fork settings, or `undefined`. Checks `next` (the
+ * Why the server must refuse this save of fork settings or of an interval (any setting's, see
+ * forkSettingsIntervals.ts), or `undefined`. Checks `next` (the
  * settings after the patch) against `current`, so it also sees a project's or thread's value that
  * a client sent back unchanged. Deleting a profile still in use is not refused yet (a later PR).
  */
@@ -273,6 +282,7 @@ export function forkSettingsWriteProblem(
   next: ServerSettings,
 ): string | undefined {
   const problems: Array<string | undefined> = [
+    settingsIntervalProblem(current, next),
     maxEntriesProblem(current, next),
     mcpProfileRefProblem(next, "mcpProfile", next.mcpProfile, current.mcpProfile, false),
     mcpProfileRefProblem(
