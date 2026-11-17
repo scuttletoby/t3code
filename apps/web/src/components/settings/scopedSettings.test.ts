@@ -995,3 +995,50 @@ describe("wait checks at project scope", () => {
     }
   });
 });
+
+// Fork: review rules. A project's value replaces the environment's whole, as the server reads it.
+describe("review rules at project scope", () => {
+  const environmentId = EnvironmentId.make("laptop");
+  const projectId = ProjectId.make("fleet");
+  const scope = {
+    kind: "project" as const,
+    group: {} as never,
+    environmentId: null,
+    label: "fleet",
+    members: [{ id: projectId, environmentId } as never],
+    environmentIds: [environmentId],
+  };
+  const withSettings = (settings: Partial<ServerSettings>) => [
+    {
+      environmentId,
+      label: "Laptop",
+      connection: { phase: "connected" as const },
+      serverConfig: { settings: { ...DEFAULT_SERVER_SETTINGS, ...settings } },
+    },
+  ];
+  const handSet = {
+    preset: "recommended" as const,
+    minors: "free" as const,
+    configPath: "ci/queue.json",
+  };
+
+  it("stores the button's value whole, not merged with the environment's fields", () => {
+    const environments = withSettings({ reviewRules: handSet });
+    const plan = planScopedSettingsPatch(scope, environments, { reviewRules: { preset: "off" } });
+    expect(plan.serverWrites[0]?.patch).toEqual({
+      projectSettingsOverrides: { [projectId]: { reviewRules: { preset: "off" } } },
+    });
+  });
+
+  it("does not carry an unreadable environment value into the project's override", () => {
+    const environments = withSettings({
+      reviewRules: { preset: "off", unreadable: { preset: "strict" } },
+    });
+    const plan = planScopedSettingsPatch(scope, environments, {
+      reviewRules: { preset: "recommended" },
+    });
+    expect(plan.serverWrites[0]?.patch).toEqual({
+      projectSettingsOverrides: { [projectId]: { reviewRules: { preset: "recommended" } } },
+    });
+  });
+});

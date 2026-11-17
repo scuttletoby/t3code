@@ -273,8 +273,8 @@ export function planScopedSettingsPatch(
                   delete next[key];
                   continue;
                 }
-                // Fork: a project's check map replaces the environment's whole, so a removed check stays removed.
-                if (key === "waitChecks") {
+                // Fork: a project's check map and review rules replace the environment's whole.
+                if (key === "waitChecks" || key === "reviewRules") {
                   next[key] = value;
                   continue;
                 }
