@@ -3,7 +3,7 @@ and no good copy is an error; a killed fetch's .part- file and an old pin's fold
 were checked. The README's bootstrap is run as written. No test reaches the network: every fetch is served here.
 Run: python3 fork-ci/actions/pinned/pinned.test.py
 """
-import contextlib, importlib.util, io, json, os, re, shutil, subprocess, sys, tempfile, time, unittest
+import contextlib, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True   # leave no __pycache__ in the action folder
@@ -257,11 +257,14 @@ class LensFindings(Case):
             self.assertEqual(f.read(), BODY)
 
     @unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
-    def test_our_own_open_cache_is_made_private_and_used(self):   # a umask 002 account makes 0775 folders
-        os.chmod(self.cache, 0o775)
-        with self.serve():
-            self.assertEqual(self.path(), self.dest)
-        self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o700)
+    def test_our_own_group_writable_cache_is_refused_not_chmodded(self):   # #314 item 3: the bootstrap's rule
+        os.chmod(self.cache, 0o775)   # someone in the group could already have put something in it
+        for _ in range(2):   # the same answer on the next run: nothing fetched, written or chmodded
+            with self.serve(), self.assertRaisesRegex(pinned.FetchError, 'cache folder .* remove it'):
+                self.path()
+            self.assertEqual(self.urls, [])
+            self.assertEqual(os.listdir(self.cache), [])
+            self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o775)
 
     @unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
     def test_a_cache_another_user_owns_is_refused(self):
@@ -308,9 +311,60 @@ class Neighbours(Case):
                             (b'import sys\nprint(sys.path)\n', ['sys.path']), (b'from sys import path\n', ['sys.path']),
                             (b'from . import lens\n', ['.']), (b'from .lens import x\n', ['.lens']),
                             (b'import importlib.util\n', ['importlib.util']),
-                            (b'def f():\n    import runpy\n', ['runpy']), (b'not python(\n', ['(does not parse)'])):
+                            (b'def f():\n    import runpy\n', ['runpy']), (b'not python(\n', ['(does not parse)']),
+                            # #314 item 4: rows that no test pinned
+                            (b'from sys import *\npath.insert(0, "x")\n', ['sys.path']),
+                            (b'import pkgutil\n', ['pkgutil']), (b'import imp\n', ['imp']),
+                            (b'from zipimport import zipimporter\n', ['zipimport']),
+                            # still self-contained: sys for its other names, a module's __file__ attribute
+                            (b'import sys\nsys.exit(sys.argv[1:] and 0)\nprint(sys.version_info, file=sys.stderr)\n', []),
+                            (b'import types\nm = types.ModuleType("m")\nm.__file__ = "x"\n', [])):
             with self.subTest(body=body):
                 self.assertEqual(pinned.neighbour_loads(body), found)
+
+    def test_other_spellings_that_reach_a_neighbour(self):   # #314 item 2: each returned [] before
+        for body in (b'import sys as s\ns.path.insert(0, "x")\n', b'import sys\ngetattr(sys, "path").insert(0, "x")\n',
+                     b'import sys\nsys.modules["sys"].path.insert(0, "x")\n', b'from sys import path_hooks\n',
+                     b'from sys import meta_path\n', b'import sys\nsys.meta_path.append(1)\n',
+                     b'import sys\nsys.path_importer_cache.clear()\n', b'import sys\ns = sys\ns.path.insert(0, "x")\n',
+                     b'import sys\nvars(sys)["path"].insert(0, "x")\n',
+                     b'import sys\nsys.__dict__["path"].insert(0, "x")\n', b'import os.path, sys as s2\nprint(s2.path)\n',
+                     b'import site, os\nsite.addsitedir(os.path.dirname(os.path.abspath(__file__)))\n',
+                     b'import site\n', b'import ctypes\n', b'import pkg_resources\n',
+                     b'__import__("importlib")\n', b'import builtins\nbuiltins.__import__("importlib")\n',
+                     b'import os\nexec(open(os.path.join(os.path.dirname(__file__), "x.py")).read())\n',
+                     b'import os, subprocess, sys\nsubprocess.run([sys.executable, os.path.join(os.path.dirname('
+                     b'__file__), "x.py")])\n',
+                     b'import os\nos.chdir(os.path.dirname(os.path.abspath(__file__)))\nimport lens\n',
+                     b'import os\nopen(os.path.join(os.path.dirname(__file__), "data.json"))\n',
+                     b'print(__spec__.origin)\n', b'print(__loader__.path)\n'):
+            with self.subTest(body=body):
+                self.assertNotEqual(pinned.neighbour_loads(body), [])
+
+    def test_run_copies_into_a_nested_private_folder_so_dot_dot_stays_private(self):
+        # #314 item 2: whatever the static check misses, `..` of the run copy is our own 0700 run folder, never the
+        # shared temp folder: on main, `<tmp>/pr-queue/planted.py` (any local user can make it) ran.
+        tmp = os.path.join(self.root, 'tmp')   # stands for the shared /tmp
+        os.mkdir(tmp)
+        self.put(os.path.join(tmp, 'pr-queue', 'planted.py'), f'open({self.marker!r}, "w").close()\n'.encode())
+        body = (b'import os, sys\nsys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", '
+                b'"pr-queue"))\nimport planted\n')
+        self.config({'repo': 'owner/repo', 'sha': SHA, 'files': {'head-check/head_check.py': pinned.blob_id(body)}})
+        seen = []
+
+        def runner(cmd):
+            up = os.path.dirname(os.path.dirname(cmd[2]))
+            seen.append((up, os.stat(up).st_mode & 0o777))
+            return subprocess.run(cmd, capture_output=True)
+        with self.serve(body), mock.patch.object(pinned.tempfile, 'tempdir', tmp), \
+                mock.patch.object(pinned, 'neighbour_loads', lambda data: []):   # a spelling the check misses
+            code = pinned.run(self.cfg, 'head-check', 'head_check.py', cache=self.cache, runner=runner)
+        self.assertNotEqual(code, 0, 'the import fails: there is no pr-queue in the private run folder')
+        self.assertFalse(os.path.exists(self.marker), 'the planted neighbour in the shared temp folder never ran')
+        (up, mode), = seen
+        self.assertNotEqual(up, tmp)
+        self.assertEqual(mode, 0o700)
+        self.assertFalse(os.path.exists(up), 'the run folder goes after the run')
 
     def test_the_fork_ci_modules_today(self):   # the ones a project loads pass; the ones with neighbours do not
         actions = os.path.dirname(HERE)
@@ -318,7 +372,8 @@ class Neighbours(Case):
                         ('gradle-cache/gradle_cache.py', True), ('ci-demand/ci_demand.py', True),
                         ('job-changed/job_changed.py', True), ('pr-queue/pr_queue.py', False),
                         ('head-check/head_check.py', False), ('head-check/head_gate.py', False),
-                        ('fleet-watch/fleet_watch.py', False)):
+                        ('fleet-watch/fleet_watch.py', False), ('test-select/test_select.py', False),
+                        ('test-select/trace_check.py', False)):
             with self.subTest(rel), open(os.path.join(actions, rel), 'rb') as f:
                 self.assertEqual(pinned.neighbour_loads(f.read()) == [], ok)
 
@@ -475,16 +530,21 @@ class UmaskAndFifo(Bootstrap):
         finally:
             os.umask(old)
 
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
     def test_an_existing_cache_of_our_own_made_under_umask_002(self):
-        # The same layout made by the round-1 pinned.py or a project's older copy (os.makedirs, umask 002).
+        # The same layout made by a project's older tooling (os.makedirs, umask 002): 0775. #314 item 3: pinned.py
+        # refuses it like the bootstrap (which the README adapter runs first) instead of chmodding it and going on.
         self.fresh()
         old = os.umask(0o002)
         try:
             os.makedirs(os.path.join(self.cache, SHA, 'docs-scope'))
         finally:
             os.umask(old)
-        with self.serve():
-            self.assertEqual(self.path(), self.dest.replace(os.path.dirname(os.path.dirname(os.path.dirname(self.dest))), self.cache))   # red
+        with self.serve(), self.assertRaisesRegex(pinned.FetchError, 'cache folder .* remove it'):
+            self.path()
+        with self.assertRaisesRegex(ValueError, 'cache folder .* remove it'):
+            self.boot()
+        self.assertEqual(self.urls, [])
 
     def test_a_symlink_at_dest_is_replaced_not_its_target(self):
         target = os.path.join(self.root, 'target'); open(target, 'wb').write(b'other')
@@ -538,6 +598,8 @@ class BootstrapCacheFolder(Bootstrap):
 
     def test_a_fresh_folder_and_a_good_existing_one_work_on_every_run(self):
         fresh = os.path.join(self.root, 'new', 'cache')   # its parent is missing too
+        old = os.umask(0o002)   # #314 item 4: the 0700 below must not come from a strict umask
+        self.addCleanup(os.umask, old)
         for cache, mode in ((fresh, None), (os.path.join(self.root, '700'), 0o700),
                             (os.path.join(self.root, '755'), 0o755)):   # 755: ours, only we can write it
             with self.subTest(cache=cache, mode=mode and oct(mode)):
@@ -552,6 +614,111 @@ class BootstrapCacheFolder(Bootstrap):
                 with open(self.pdest, 'rb') as f:
                     self.assertEqual(f.read(), self.REAL)
         self.assertEqual(os.stat(fresh).st_mode & 0o777, 0o700)
+
+    def test_a_regular_file_at_the_cache_path_is_refused_with_no_fetch(self):   # #314 item 4: the S_ISDIR part
+        f = os.path.join(self.root, 'a-file')
+        with open(f, 'wb') as fh:
+            fh.write(b'mine')
+        os.chmod(f, 0o600)   # ours, only we can write it: only "not a folder" refuses it
+        self.cache = f
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, 'cache folder'):
+                self.boot()
+            self.assertEqual(self.urls, [])
+        with open(f, 'rb') as fh:
+            self.assertEqual(fh.read(), b'mine')
+
+
+@unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
+class OneCacheRule(Bootstrap):
+    """#314: two first runs at once both work (item 1), and pinned.py refuses exactly the cache folders the bootstrap
+    refuses (item 3), with nothing fetched, written or chmodded."""
+    def race(self, make):
+        """os.makedirs of the cache folder finds that another run made it after this run's lexists."""
+        real, raced = os.makedirs, []
+
+        def makedirs(name, mode=0o777, exist_ok=False):
+            if name == self.cache and not raced:
+                raced.append(name)
+                make(name)   # the other run, between this run's lexists and makedirs
+            return real(name, mode, exist_ok)
+        return mock.patch.object(os, 'makedirs', makedirs)
+
+    def test_two_first_runs_at_once_both_work(self):
+        self.cache = os.path.join(self.root, 'new', 'cache')
+        self.pdest = os.path.join(self.cache, SHA, 'pinned', 'pinned.py')
+        with self.race(lambda c: os.makedirs(c, 0o700)):   # the other run won: a good folder
+            p = self.boot()   # red before: FileExistsError, an OSError an adapter reports as "no network"
+        self.assertEqual(p.blob_id(b''), pinned.blob_id(b''))
+        self.cache = os.path.join(self.root, 'c2')   # pinned.py's own check: the same window
+        with self.race(lambda c: os.makedirs(c, 0o700)), self.serve():
+            self.assertEqual(self.path(), os.path.join(self.cache, SHA, 'docs-scope', 'docs_scope.py'))
+
+    def test_a_bad_folder_made_in_that_window_is_still_refused(self):   # the check after makedirs still decides
+        self.cache = os.path.join(self.root, 'raced')
+
+        def bad(c):
+            os.mkdir(c)
+            os.chmod(c, 0o777)
+        with self.race(bad), self.assertRaisesRegex(ValueError, 'cache folder'):
+            self.boot()
+        self.assertEqual(self.urls, [])
+        self.assertEqual(os.listdir(self.cache), [])
+
+    def test_pinned_and_the_bootstrap_agree_on_every_cache_folder(self):
+        def folder(mode):
+            def make(p):
+                os.mkdir(p)
+                os.chmod(p, mode)
+            return make
+
+        def regular_file(p):
+            with open(p, 'wb') as f:
+                f.write(b'mine')
+            os.chmod(p, 0o600)
+        good = os.path.join(self.root, 'good')
+        os.mkdir(good, 0o700)
+        dangling_target = os.path.join(self.root, 'not-made')
+        old = os.umask(0o002)   # a fresh folder is 0700 by its own mode, not by a strict umask
+        self.addCleanup(os.umask, old)
+        states = [('missing, parent too', lambda p: None, True), ('0700', folder(0o700), True),
+                  ('0755', folder(0o755), True), ('a regular file', regular_file, False),
+                  ('a symlink to a good folder', lambda p: os.symlink(good, p), False),
+                  ('a dangling symlink', lambda p: os.symlink(dangling_target, p), False)]
+        states += [(oct(m), folder(m), False) for m in (0o775, 0o777, 0o720, 0o702, 0o1777)]
+        for i, (what, make, ok) in enumerate(states):
+            with self.subTest(what):
+                cache = os.path.join(self.root, str(i), 'cache')
+                if i:   # state 0: the parent is missing too
+                    os.makedirs(os.path.dirname(cache))
+                make(cache)
+                before = os.lstat(cache) if os.path.lexists(cache) else None
+                self.urls = []
+                with self.serve():
+                    if ok:
+                        pinned.path(self.cfg, 'docs-scope', 'docs_scope.py', cache)
+                    else:
+                        with self.assertRaisesRegex(pinned.FetchError, 'cache folder'):
+                            pinned.path(self.cfg, 'docs-scope', 'docs_scope.py', cache)
+                self.cache = cache
+                if ok:
+                    self.boot()
+                else:
+                    with self.assertRaisesRegex(ValueError, 'cache folder'):
+                        self.boot()
+                    self.assertEqual(self.urls, [])
+                    self.assertEqual(os.lstat(cache).st_mode, before.st_mode, 'left as it is')
+                    if stat.S_ISDIR(before.st_mode):
+                        self.assertEqual(os.listdir(cache), [])
+                if before is None:
+                    self.assertEqual(os.stat(cache).st_mode & 0o777, 0o700, 'pinned.py made it 0700')
+        self.assertFalse(os.path.lexists(dangling_target), "a dangling symlink's target is not made")
+        self.assertEqual(os.listdir(good), [])
+        uid = os.stat(good).st_uid   # another user's folder: refused by both (the bootstrap: BootstrapCacheFolder)
+        with mock.patch.object(os, 'getuid', lambda: uid + 1):
+            with self.serve(), self.assertRaisesRegex(pinned.FetchError, 'cache folder'):
+                pinned.path(self.cfg, 'docs-scope', 'docs_scope.py', good)
+        self.assertEqual(os.listdir(good), [])
 
 
 class BootstrapFifo(Bootstrap):
