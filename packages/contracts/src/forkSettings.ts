@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { TrimmedString } from "./baseSchemas.ts";
+import { HandoffSettings, HandoffSettingsFromSettingsFile } from "./handoff.ts";
 import {
   MCP_PROFILE_ALL,
   MCP_SUBAGENT_INHERIT,
@@ -39,6 +40,7 @@ import {
   WaitForSettingsPatch,
 } from "./waitFor.ts";
 
+export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
 export * from "./playtest.ts";
 export * from "./usagePacing.ts";
@@ -88,6 +90,8 @@ export const ForkServerSettingsFields = {
   mcpThreadProfiles: McpThreadProfiles,
   /** Playtest sessions and their adapter's steps; off by default. A bad value reads as off. */
   playtest: PlaytestSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  /** Handoff instead of compaction for long threads; off by default. A bad value reads as off. */
+  handoff: HandoffSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -115,6 +119,8 @@ export const ForkServerSettingsPatchFields = {
   mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
   /** Strict: a save refuses a bad step, or `enabled` without all four steps. */
   playtest: Schema.optionalKey(PlaytestSettings),
+  /** Strict: a save refuses a bad value, or `source: command` without a command. */
+  handoff: Schema.optionalKey(HandoffSettings),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -150,6 +156,8 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   mcpThreadProfiles: { replaceEntries: { maxEntries: MCP_THREAD_PROFILES_MAX } },
   // Whole, so a step left out is removed and the strict check sees the value that is saved.
   playtest: "replace",
+  // Whole, so the strict check (thread cap included) sees the value that is saved.
+  handoff: "replace",
 };
 
 /** The client settings' fork fields (stored in the browser); none yet. */
@@ -163,6 +171,8 @@ export const FORK_PROJECT_SCOPED_KEYS = [
   "mcpSubagentProfile",
   // A project's adapter replaces the server's whole, `enabled` included.
   "playtest",
+  // A project's value replaces the server's whole.
+  "handoff",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
 /** A project's overrides of fork settings, as the settings file holds them. */
@@ -178,6 +188,8 @@ export const ForkProjectOverrideFields = {
    * is only a save's "clear", which the save removes, so it is never stored or read.
    */
   playtest: Schema.optionalKey(Schema.Union([PlaytestSettingsFromSettingsFile, Schema.Null])),
+  /** As `playtest`: a bad value reads as off for that project, never as the server's. */
+  handoff: Schema.optionalKey(Schema.Union([HandoffSettingsFromSettingsFile, Schema.Null])),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
 /**
@@ -190,6 +202,7 @@ export const FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT = {
   mcpProfile: "",
   mcpSubagentProfile: "",
   playtest: null,
+  handoff: null,
 } as const satisfies Partial<Record<keyof typeof ForkProjectOverrideFields, "" | null>>;
 
 /** A project's overrides of fork settings in a patch (each project's set is replaced whole). */
@@ -207,6 +220,8 @@ export const ForkProjectOverridePatchFields = {
    * `null` clears it (the project then uses the server's).
    */
   playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettings)),
+  /** As `playtest`: left out keeps the stored value; `null` clears it. */
+  handoff: Schema.optionalKey(Schema.NullOr(HandoffSettings)),
 } satisfies Record<keyof typeof ForkProjectOverrideFields, unknown>;
 
 /**
