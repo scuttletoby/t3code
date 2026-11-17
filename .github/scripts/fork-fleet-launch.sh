@@ -304,8 +304,10 @@ EOF
 # written by this same reader (no second parser to disagree with). Refused: an absolute name, a "..", a name twice, a
 # name under a symlink or a file, a symlink or hard link that leads outside the folder, a device, FIFO, sparse or other
 # special file, a .fork-fleet-* name of its own, more than MAX_ENTRIES entries or MAX_BYTES of files, a long-name or pax
-# header over MAX_HEADER bytes (refused before it is read into memory), a name or link target over MAX_NAME, symlinks
-# that take more than MAX_STEPS steps to follow (fanned-out links would take hours). Stripped (as tar's
+# header over MAX_HEADER bytes or such headers over MAX_NAMES bytes in all (each refused before it is read into
+# memory), global pax headers of more than MAX_GLOBAL keys (tarfile copies them into every entry after them), a name or
+# link target over MAX_NAME, symlinks that take more than MAX_STEPS steps to follow (fanned-out links would take
+# hours). Stripped (as tar's
 # --no-same-owner --no-same-permissions would): owner (all root's), setuid, setgid, sticky and group/other write, and
 # every directory is 0755. Files are created with O_EXCL|O_NOFOLLOW and symlinks last, so nothing is ever written
 # through a link; the version and floor files too.
@@ -315,6 +317,10 @@ import os, posixpath, sys, tarfile, zlib
 src, dest, version, floor = sys.argv[1:5]
 MAX_ENTRIES, MAX_BYTES = 100000, 4 << 30
 MAX_HEADER, MAX_NAME, MAX_STEPS = 65536, 4096, 1000000
+# Every name over 255 bytes and link target over 100 comes in such a header: MAX_NAMES bounds the names kept for all
+# MAX_ENTRIES entries (a runner release has about 120 KB of them, no pax and no global header).
+MAX_NAMES, MAX_GLOBAL = 64 << 20, 64
+headers = 0
 NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 os.umask(0o022)
 
@@ -333,15 +339,23 @@ def parts(name):
 
 
 class Capped(tarfile.TarInfo):
-    """Refuses a GNU long name or pax header over MAX_HEADER bytes before tarfile reads it whole into memory, and a
-    GNU sparse file (its chained headers are read into memory too; a runner release has none)."""
+    """Refuses a GNU long name or pax header over MAX_HEADER bytes, or past MAX_NAMES bytes of them in all, before
+    tarfile reads it whole into memory; global pax keys past MAX_GLOBAL before tarfile copies them into the next entry;
+    and a GNU sparse file (its chained headers are read into memory too; a runner release has none)."""
 
     def _proc_member(self, tar):
+        global headers
+        if len(tar.pax_headers) > MAX_GLOBAL:
+            no(f'more than {MAX_GLOBAL} global pax keys')
         if self.type == tarfile.GNUTYPE_SPARSE:
             no(f'{self.name!r} is a sparse file')
         if self.type in (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.XGLTYPE,
-                         tarfile.SOLARIS_XHDTYPE) and self.size > MAX_HEADER:
-            no(f'a header of {self.size} bytes (more than {MAX_HEADER})')
+                         tarfile.SOLARIS_XHDTYPE):
+            if self.size > MAX_HEADER:
+                no(f'a header of {self.size} bytes (more than {MAX_HEADER})')
+            headers += self.size
+            if headers > MAX_NAMES:
+                no(f'more than {MAX_NAMES} bytes of long names and pax headers')
         return super()._proc_member(tar)
 
 
@@ -352,6 +366,7 @@ try:
         # Each name as it is read: many long names would fill memory before a check after the loop.
         if len(m.name) > MAX_NAME or len(m.linkname) > MAX_NAME:
             no(f'a name or link target longer than {MAX_NAME}: {m.name[:100]!r}')
+        m.pax_headers = {}   # its copy of the global pax keys (and its own): not used after this
         members.append(m)
         if len(members) > MAX_ENTRIES:
             no(f'more than {MAX_ENTRIES} entries')

@@ -14,10 +14,11 @@ PLATFORM = {'x86_64': 'linux-x64', 'aarch64': 'linux-arm64', 'arm64': 'linux-arm
             'armv7l': 'linux-arm'}.get(platform.machine())
 
 
-def hostile(members, version=None, fmt=tarfile.DEFAULT_FORMAT):
-    """A runner-like tarball (gzip) with extra tarfile members: (TarInfo, data or None) pairs."""
+def hostile(members, version=None, fmt=tarfile.DEFAULT_FORMAT, glob=None):
+    """A runner-like tarball (gzip) with extra tarfile members: (TarInfo, data or None) pairs; `glob`, the keys of a
+    global pax header at its start."""
     out = io.BytesIO()
-    with tarfile.open(fileobj=out, mode='w:gz', format=fmt) as t:
+    with tarfile.open(fileobj=out, mode='w:gz', format=fmt, pax_headers=glob) as t:
         for d in ('./', './bin/'):
             info = tarfile.TarInfo(d)
             info.type, info.mode = tarfile.DIRTYPE, 0o755
@@ -722,8 +723,9 @@ class Refresh(unittest.TestCase):
     def test_the_unpacker_bounds_memory_and_time(self):
         """A compromised release cannot hold root's refresh for minutes or take the host's memory: fanned-out
         symlinks (link k goes through link k-1 four times: 4**k steps unbounded), a GNU long-name or pax header of
-        1 MiB (tarfile would read it whole, however big), a GNU sparse file (chained headers), a name over 4096. Each is refused
-        quickly, under a 192 MiB address-space limit."""
+        1 MiB (tarfile would read it whole, however big), a GNU sparse file (chained headers), a name over 4096, too many
+        bytes of long names or pax headers in all, a global pax header of too many keys. Each is refused quickly, under
+        a 192 MiB address-space limit."""
         sym = tarfile.SYMTYPE
         fan = []
         for k in range(30):
@@ -744,6 +746,21 @@ class Refresh(unittest.TestCase):
             # (a refresh by hand has no MemoryMax).
             'many long names': (hostile([(member(f'./{i:05d}' + 'a' * 60000), b'') for i in range(4000)],
                                         fmt=tarfile.PAX_FORMAT), 'longer than 4096'),
+            # Each name and target under 4096, but 30000 symlinks: ~240 MB of names from a small download, unless
+            # all the long-name and pax headers together are counted (MAX_NAMES) as they are read.
+            'many long-name symlinks': (hostile([(member(f'./{i:05d}' + 'a' * 4000, sym, link='b/' * 2000), None)
+                                                 for i in range(30000)], fmt=tarfile.PAX_FORMAT),
+                                        'bytes of long names and pax headers'),
+            # Global pax keys are copied into every entry read after them: 6000 keys (one 60 KiB header) and 100000
+            # entries would be ~30 GB, or 600 million steps without those copies kept.
+            'a global pax header of many keys': (
+                hostile([(member(f'./bin/{i}'), None) for i in range(100000)], fmt=tarfile.PAX_FORMAT,
+                        glob={f'k{i}': '' for i in range(6000)}), 'global pax keys'),
+            # Under that cap (a runner release has none; git archive writes one), each entry's copy of them is
+            # dropped once read: 100001 copies of 60 keys would be ~230 MB before the entry count refuses.
+            'global pax keys on each entry': (
+                hostile([(member(f'./bin/{i}'), None) for i in range(100001)], fmt=tarfile.PAX_FORMAT,
+                        glob={f'k{i}': '' for i in range(60)}), 'more than 100000 entries'),
         }
         limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (192 << 20, 192 << 20))
         for name, (data, word) in cases.items():
