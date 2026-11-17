@@ -80,8 +80,9 @@ written out in full. The message says when no effort is set.
 
 ## Limits
 
-- Timers and waits live in memory. After a server restart, the next turn end decides again. A crash
-  between the send and the cancel leaves a queued handoff queued; it runs after the newer run.
+- Timers and waits live in memory. After a server restart, the next turn end, or a late update of
+  an older run, decides again. A crash between the send and the cancel leaves a queued handoff
+  queued; it runs after the newer run.
 - A handoff run still notifies like any finished run (the browser notice and the relay). Keeping it
   silent needs a marker the app can read; that comes with the settings screen.
 - The same run never hands off twice: the check before the send drops a second trigger, and every
@@ -94,7 +95,8 @@ written out in full. The message says when no effort is set.
   `handoffFacts.ts`, `handoffMessage.ts`, `handoffDecision.ts`). Settings:
   `packages/contracts/src/handoff.ts`.
 - `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes
-  through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. The only upstream edit is
-  the service's line in `server.ts`.
+  through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. No upstream file is
+  edited: the service starts from `ForkLayers.layerRuntimeServices` (`apps/server/src/fork/forkLayers.ts`),
+  the fork file `server.ts` already wires.
 - The message reuses upstream's handoff budget (`handoffBudget`) and transcript reading
   (`ContextHandoffService.ts`); nothing is copied.

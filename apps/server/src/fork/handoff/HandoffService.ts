@@ -258,7 +258,7 @@ export const make = Effect.gen(function* () {
   return { start };
 });
 
-/** Started with the server's other workers (the one line in `server.ts`). */
+/** Started with the server's other workers, from `ForkLayers.layerRuntimeServices` (fork/forkLayers.ts). */
 export const layer = Layer.effectDiscard(
   make.pipe(Effect.flatMap((service) => service.start())),
 ).pipe(Layer.provide(ProjectionStore.layer));
