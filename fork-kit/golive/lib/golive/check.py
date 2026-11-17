@@ -1,4 +1,5 @@
-"""The command line (`check`, `settle`, `copy`; coldcopy.py has the copy) and `t3-golive check`: may this T3 home move to the target build now?
+"""The command line (`check`, `settle`, `copy`, `rehearse`; coldcopy.py and rehearse.py have the last two) and
+`t3-golive check`: may this T3 home move to the target build now?
 
 check is read only: it never stops, starts or writes to a T3 home, never opens its database (the target build's
 read-only report does that) and never runs a `t3` from PATH. It writes only the kit's own lock file.
@@ -71,7 +72,9 @@ def _journal(cfg, add, info, own_id):
     last = runs[-1] if runs else None
     if last is not None and journal.needs_settling(last):
         return add('journal', False, f'{journal.describe(last)}; {journal.SETTLE_HINT}')
-    if last is not None and last['end'] is not None and last['end']['result'] != 'ok' and not last['settled']:
+    if last is not None and last.get('scratch') and (last['end'] or {}).get('result') != 'ok':
+        info.append(f'last run: {journal.describe(last)}; it changed only its own clone: nothing to settle')
+    elif last is not None and last['end'] is not None and last['end']['result'] != 'ok' and not last['settled']:
         info.append(f'last run: {last["command"]} ended {last["end"]["result"]} before its first step: '
                     f'{last["end"]["detail"]}')
     elif last is not None and last['end'] is None and not last['settled']:
@@ -328,6 +331,13 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     p.add_argument('--owner-says-go', action='store_true',
                    help='do not wait for a quiet point (the owner says now is fine)')
     p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p = sub.add_parser('rehearse', help='try the target build on a clone of a copy, in its own home and port',
+                       description='R0-R5 on a clone of a finished copy (the newest, or --copy): preflights, the '
+                                   'migration, `serve --hold-work`, report-to-report checks, the way back. Never '
+                                   'touches the live T3 home; the result is journalled.')
+    p.add_argument('--copy', help='the copy folder to rehearse on (default: the newest in backupDir)')
+    p.add_argument('--port', type=int, help='the rehearsal server port (default: a free one)')
+    p.add_argument('--json', action='store_true', help='print the result as JSON')
     p = sub.add_parser('guard', help=argparse.SUPPRESS)
     p.add_argument('--run', required=True)
     args = parser.parse_args(argv)
@@ -339,6 +349,9 @@ def main(argv, out=sys.stdout, err=sys.stderr):
         return 2
     if args.command == 'settle':
         return _settle(cfg, args.reason, out, err)
+    if args.command == 'rehearse':  # it never stops or starts the boot service: no adapter needed
+        from golive import rehearse
+        return rehearse.main(cfg, args.copy, args.port, args.json, out, err)
     try:
         adapter = osadapter.for_this_os()
     except osadapter.Unsupported as e:

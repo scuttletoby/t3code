@@ -96,7 +96,7 @@ def _raise(error):
     raise error  # os.walk's onerror: an unreadable folder stops the copy instead of being skipped in silence
 
 
-def plan(userdata):
+def plan(userdata, skip=frozenset()):
     """What a copy takes from userdata/: [{'path', 'kind', 'bytes', 'mode'[, 'target']}] top-down, and the total
     bytes. Plain files, folders and links; anything else (a socket, a fifo) is left out and named. A folder that
     cannot be read raises OSError (a copy that says complete must hold everything)."""
@@ -105,7 +105,7 @@ def plan(userdata):
         rel_d = os.path.relpath(d, userdata)
         for n in sorted(dirs + names):
             rel = n if rel_d == '.' else f'{rel_d}/{n}'
-            if rel_d == '.' and (n in SKIP or n.endswith('-shm') or ASIDE in n
+            if rel_d == '.' and (n in SKIP or n in skip or n.endswith('-shm') or ASIDE in n
                                  or (n.startswith('.') and RESTORE_TEMP in n)):
                 if n in dirs:
                     dirs.remove(n)
@@ -125,11 +125,12 @@ def plan(userdata):
     return entries, total, left_out
 
 
-def copy_userdata(run, home, dest, deadline):
-    """The cold copy (in a step): every planned entry into dest/userdata, hashing what is read. dest is new."""
+def copy_userdata(run, home, dest, deadline, skip=frozenset()):
+    """The cold copy (in a step): every planned entry into dest/userdata, hashing what is read. dest is new.
+    skip: more top-level names to leave out (rehearse's clone leaves out secrets/)."""
     run.require_step('cold copy')
     userdata = os.path.join(home, 'userdata')
-    entries, total, left_out = plan(userdata)
+    entries, total, left_out = plan(userdata, skip)
     os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
     os.mkdir(dest, 0o700)  # FileExistsError: never over an old copy
     os.mkdir(os.path.join(dest, 'userdata'), 0o700)

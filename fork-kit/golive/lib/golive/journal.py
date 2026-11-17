@@ -153,7 +153,7 @@ def read(state_dir):
         event, rid = rec.get('event'), rec.get('run')
         if event == 'begin':
             run = {'id': rid, 'command': rec.get('command'), 'pid': rec.get('pid'), 'began': rec.get('at'),
-                   'steps': [], 'end': None, 'settled': None}
+                   'steps': [], 'end': None, 'settled': None, 'scratch': rec.get('scratch') is True}
             runs.append(run)
             by_id[rid] = run
         elif rid in by_id:
@@ -175,8 +175,8 @@ def read(state_dir):
 def needs_settling(run):
     """True when the run stopped half-way, or ended with an error, after its first step started, and the owner
     has not settled it. Killed before its first step (a copy waiting for a quiet point), it changed nothing."""
-    if run['settled'] is not None or not run['steps']:
-        return False
+    if run['settled'] is not None or not run['steps'] or run.get('scratch'):
+        return False  # a scratch run (rehearse) changes only its own clone, which its next run throws away
     return run['end'] is None or run['end']['result'] not in ('ok', 'refused')
 
 
@@ -269,17 +269,18 @@ def _detail(error):
 
 
 @contextlib.contextmanager
-def run(state_dir, command):
+def run(state_dir, command, scratch=False):
     """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished), journal begin
     and end. An exception ends the run "failed" and goes on (after a started step it then needs settling); Refused
     after every started step is done ends it "refused" (no settling); a kill leaves it with no end for the next run
-    to report."""
+    to report. scratch=True: every step changes only the run's own throwaway folder (rehearse's clone), so a stop or
+    an error needs no settling: the next run redoes it from the start."""
     with lock(state_dir, command, exclusive=True):
         last = unfinished(state_dir)
         if last is not None:
             raise Unfinished(last)
         r = Run(state_dir, command)
-        r._append('begin', command=command, pid=os.getpid())
+        r._append('begin', command=command, pid=os.getpid(), **({'scratch': True} if scratch else {}))
         r._holds_lock = True
         try:
             try:
