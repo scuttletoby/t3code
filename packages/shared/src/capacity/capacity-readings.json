@@ -1,0 +1,818 @@
+{
+  "format": "capacity-readings/1",
+  "//": "Fixtures for the capacity readings (capacityReadings.ts; the kit's Python reader later runs the same cases). A host: platform, Node's numbers, files (text, {error: unreadable} or {error: unsupported} (EOPNOTSUPP: the kernel has the file but the feature is off); a path not listed is missing) and commands ('file arg ...' -> stdout; not listed = failed). A case: a host, `failed` when it is a failed or half reading (it must never give more room than the healthy host), an optional patch (files/commands merged key by key, null removes; other keys replace), what to read, and the expected keys (only those given are compared; gaps are compared by reading name). Expected values are worked by hand: 1 MB = 1048576 bytes = 1024 kB, rounded down.",
+  "hosts": {
+    "linux-v2": {
+      "platform": "linux",
+      "totalMemBytes": 12711657472,
+      "freeMemBytes": 7221358592,
+      "cpuCount": 12,
+      "files": {
+        "/proc/meminfo": "MemTotal:       12413728 kB\nMemFree:          912344 kB\nMemAvailable:    7052108 kB\nSwapCached:       201776 kB\nSwapTotal:       4194296 kB\nSwapFree:        2919632 kB\n",
+        "/proc/pressure/memory": "some avg10=0.19 avg60=0.08 avg300=0.01 total=25922914579\nfull avg10=0.00 avg60=0.02 avg300=0.00 total=24082566464\n",
+        "/proc/self/cgroup": "0::/work.slice/t3-server.scope\n",
+        "/sys/fs/cgroup/cgroup.controllers": "cpuset cpu io memory hugetlb pids rdma misc\n",
+        "/sys/fs/cgroup/work.slice/memory.pressure": "some avg10=12.50 avg60=3.00 avg300=1.00 total=900\nfull avg10=2.25 avg60=0.50 avg300=0.10 total=400\n",
+        "/sys/fs/cgroup/work.slice/agent-a.scope/memory.stat": "anon 222130176\nfile 104898560\nkernel 3145728\nshmem 4194304\ninactive_file 77193216\n",
+        "/sys/fs/cgroup/work.slice/agent-a.scope/memory.swap.current": "104857600\n",
+        "/sys/fs/cgroup/work.slice/agent-a.scope/memory.current": "389136384\n",
+        "/sys/fs/cgroup/work.slice/agent-a.scope/memory.peak": "915546112\n"
+      },
+      "commands": {}
+    },
+    "linux-v1": {
+      "platform": "linux",
+      "totalMemBytes": 8589934592,
+      "freeMemBytes": 4294967296,
+      "cpuCount": 4,
+      "files": {
+        "/proc/meminfo": "MemTotal:        8388608 kB\nMemAvailable:    4194304 kB\nSwapTotal:       2097152 kB\nSwapFree:        2097152 kB\n",
+        "/proc/self/cgroup": "12:memory:/work\n0::/\n",
+        "/sys/fs/cgroup/memory/memory.stat": "cache 0\nrss 0\ntotal_cache 104857600\ntotal_rss 1073741824\ntotal_shmem 0\ntotal_inactive_file 52428800\n",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes": "9223372036854771712\n",
+        "/sys/fs/cgroup/memory/work/agent-a.scope/memory.stat": "cache 10485760\nrss 209715200\nshmem 0\ntotal_cache 10485760\ntotal_rss 209715200\ntotal_shmem 0\ntotal_swap 52428800\n",
+        "/sys/fs/cgroup/memory/work/agent-a.scope/memory.usage_in_bytes": "314572800\n",
+        "/sys/fs/cgroup/memory/work/agent-a.scope/memory.max_usage_in_bytes": "524288000\n"
+      },
+      "commands": {}
+    },
+    "linux-container": {
+      "platform": "linux",
+      "totalMemBytes": 12711657472,
+      "freeMemBytes": 7221358592,
+      "cpuCount": 12,
+      "files": {
+        "/proc/meminfo": "MemTotal:       12413728 kB\nMemAvailable:    7052108 kB\nSwapTotal:       4194296 kB\nSwapFree:        2919632 kB\n",
+        "/proc/pressure/memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        "/proc/self/cgroup": "0::/\n",
+        "/sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+        "/sys/fs/cgroup/memory.max": "4294967296\n",
+        "/sys/fs/cgroup/memory.current": "1073741824\n",
+        "/sys/fs/cgroup/memory.stat": "anon 536870912\nfile 536870912\ninactive_file 268435456\n",
+        "/sys/fs/cgroup/cpu.max": "200000 100000\n"
+      },
+      "commands": {}
+    },
+    "darwin": {
+      "platform": "darwin",
+      "totalMemBytes": 17179869184,
+      "freeMemBytes": 1073741824,
+      "cpuCount": 10,
+      "files": {},
+      "commands": {
+        "/usr/bin/vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               50000.\nPages active:                            300000.\nPages inactive:                          200000.\nPages speculative:                        10000.\nPages wired down:                        150000.\n",
+        "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level": "1\n"
+      }
+    },
+    "win32": {
+      "platform": "win32",
+      "totalMemBytes": 34359738368,
+      "freeMemBytes": 17179869184,
+      "cpuCount": 8,
+      "files": {},
+      "commands": {}
+    }
+  },
+  "cases": [
+    {
+      "name": "cgroup v2 machine",
+      "why": "MemTotal 12413728 kB / 1024 = 12122.8 -> 12122; MemAvailable 7052108 -> 6886; swap 4194296 -> 4095, free 2919632 -> 2851; PSI some 0.19, full 0.00; Node's cores; not a container (own cgroup is not /)",
+      "host": "linux-v2",
+      "read": "machine",
+      "expect": {
+        "totalMb": 12122,
+        "availableMb": 6886,
+        "cpuCores": 12,
+        "swap": { "totalMb": 4095, "freeMb": 2851 },
+        "psi": { "someAvg10Pct": 0.19, "fullAvg10Pct": 0 },
+        "osLevel": null,
+        "cgroup": "v2",
+        "gaps": []
+      }
+    },
+    {
+      "name": "meminfo missing",
+      "failed": true,
+      "why": "nothing to read: total and available unreadable, swap unreadable (never 'no swap')",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/meminfo": null } },
+      "read": "machine",
+      "expect": { "totalMb": null, "availableMb": null, "swap": "unreadable" }
+    },
+    {
+      "name": "meminfo unreadable",
+      "failed": true,
+      "why": "a read error is the same as missing for meminfo",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/meminfo": { "error": "unreadable" } } },
+      "read": "machine",
+      "expect": { "totalMb": null, "availableMb": null, "swap": "unreadable" }
+    },
+    {
+      "name": "meminfo empty",
+      "failed": true,
+      "why": "an empty file has no keys",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/meminfo": "" } },
+      "read": "machine",
+      "expect": { "totalMb": null, "availableMb": null, "swap": "unreadable" }
+    },
+    {
+      "name": "meminfo cut in the middle of a line",
+      "failed": true,
+      "why": "MemAvailable has no unit (cut short): not read; the swap lines after it are missing",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/meminfo": "MemTotal:       12413728 kB\nMemFree:          912344 kB\nMemAvailable:    70521"
+        }
+      },
+      "read": "machine",
+      "expect": { "totalMb": 12122, "availableMb": null, "swap": "unreadable" }
+    },
+    {
+      "name": "meminfo value in another unit",
+      "failed": true,
+      "why": "only kB lines are read: a line in bytes or with no unit is not guessed",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/meminfo": "MemTotal:       12711657472 B\nMemAvailable:    7052108 kB\nSwapTotal:       4194296 kB\nSwapFree:        2919632 kB\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "totalMb": null, "availableMb": 6886 }
+    },
+    {
+      "name": "available larger than total",
+      "failed": true,
+      "why": "MemAvailable 13000000 kB > MemTotal: impossible, so unreadable",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/meminfo": "MemTotal:       12413728 kB\nMemAvailable:   13000000 kB\nSwapTotal:       4194296 kB\nSwapFree:        2919632 kB\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "totalMb": 12122, "availableMb": null }
+    },
+    {
+      "name": "kernel older than MemAvailable",
+      "failed": true,
+      "why": "no MemAvailable line (before Linux 3.14): not estimated from MemFree",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/meminfo": "MemTotal:       12413728 kB\nMemFree:          912344 kB\nSwapTotal:       4194296 kB\nSwapFree:        2919632 kB\n"
+        }
+      },
+      "read": "machine",
+      "expect": {
+        "totalMb": 12122,
+        "availableMb": null,
+        "swap": { "totalMb": 4095, "freeMb": 2851 }
+      }
+    },
+    {
+      "name": "ballooned total, read live",
+      "why": "the host took RAM away: MemTotal 10485760 kB -> 10240, MemAvailable 3145728 kB -> 3072",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/meminfo": "MemTotal:       10485760 kB\nMemAvailable:    3145728 kB\nSwapTotal:       4194296 kB\nSwapFree:        2919632 kB\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "totalMb": 10240, "availableMb": 3072 }
+    },
+    {
+      "name": "no swap",
+      "why": "SwapTotal 0: no swap (the rule widens the margin), not unreadable",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/meminfo": "MemTotal:       12413728 kB\nMemAvailable:    7052108 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "swap": null }
+    },
+    {
+      "name": "swap free above swap total",
+      "failed": true,
+      "why": "impossible: unreadable",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/meminfo": "MemTotal:       12413728 kB\nMemAvailable:    7052108 kB\nSwapTotal:       1048576 kB\nSwapFree:        2097152 kB\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "swap": "unreadable" }
+    },
+    {
+      "name": "swap total without swap free",
+      "failed": true,
+      "why": "half a swap reading is unreadable, never 'no swap'",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/meminfo": "MemTotal:       12413728 kB\nMemAvailable:    7052108 kB\nSwapTotal:       4194296 kB\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "swap": "unreadable", "availableMb": 6886 }
+    },
+    {
+      "name": "kernel without PSI",
+      "why": "/proc/pressure/memory does not exist (PSI not built in or off at boot): none, and the gap says so",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/pressure/memory": null } },
+      "read": "machine",
+      "expect": { "psi": null, "gaps": ["psi"] }
+    },
+    {
+      "name": "PSI present but zero",
+      "why": "a calm machine: zero stall is a real reading",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/pressure/memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "psi": { "someAvg10Pct": 0, "fullAvg10Pct": 0 } }
+    },
+    {
+      "name": "PSI unreadable",
+      "failed": true,
+      "why": "the file is there but the read fails (EOPNOTSUPP, EACCES): unreadable",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/pressure/memory": { "error": "unreadable" } } },
+      "read": "machine",
+      "expect": { "psi": "unreadable", "gaps": [] }
+    },
+    {
+      "name": "PSI built in but turned off",
+      "why": "psi=0 at boot or CONFIG_PSI_DEFAULT_DISABLED (the RHEL 8 family): the file exists but reading it fails with EOPNOTSUPP. The kernel says it has no such signal: none, and the gap says so (not unreadable, which would hold the level at elevated for ever)",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/pressure/memory": { "error": "unsupported" } } },
+      "read": "machine",
+      "expect": { "psi": null, "gaps": ["psi"] }
+    },
+    {
+      "name": "PSI empty",
+      "failed": true,
+      "why": "an empty pressure file is unreadable",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/pressure/memory": "" } },
+      "read": "machine",
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "PSI without its full line",
+      "failed": true,
+      "why": "half a reading: unreadable",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/pressure/memory": "some avg10=0.19 avg60=0.08 avg300=0.01 total=25922914579\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "PSI line cut short",
+      "failed": true,
+      "why": "the full line ends before total=: unreadable",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/pressure/memory": "some avg10=0.19 avg60=0.08 avg300=0.01 total=25922914579\nfull avg10=0.00 avg60=0.0"
+        }
+      },
+      "read": "machine",
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "PSI above 100 percent",
+      "failed": true,
+      "why": "impossible: unreadable",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/proc/pressure/memory": "some avg10=150.00 avg60=0.08 avg300=0.01 total=1\nfull avg10=0.00 avg60=0.02 avg300=0.00 total=1\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "Node cores unreadable",
+      "failed": true,
+      "why": "0 cores is not a reading",
+      "host": "linux-v2",
+      "patch": { "cpuCount": 0 },
+      "read": "machine",
+      "expect": { "cpuCores": null }
+    },
+    {
+      "name": "no cgroups at all",
+      "why": "neither cgroup.controllers nor a v1 memory controller: no per-piece demand, gap says so",
+      "host": "linux-v2",
+      "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": null } },
+      "read": "machine",
+      "expect": { "cgroup": null, "gaps": ["demand"], "availableMb": 6886 }
+    },
+    {
+      "name": "container with a memory and CPU limit",
+      "why": "namespace root (0::/): total min(12122, 4294967296 B = 4096); used = 1073741824 - 268435456 inactive_file = 768 MB, so available min(6886, 4096 - 768 = 3328); cpu.max 200000/100000 = 2 cores",
+      "host": "linux-container",
+      "read": "machine",
+      "expect": {
+        "totalMb": 4096,
+        "availableMb": 3328,
+        "cpuCores": 2,
+        "psi": { "someAvg10Pct": 0, "fullAvg10Pct": 0 }
+      }
+    },
+    {
+      "name": "container without limits",
+      "why": "memory.max 'max' and cpu.max 'max 100000': the machine's own numbers",
+      "host": "linux-container",
+      "patch": {
+        "files": { "/sys/fs/cgroup/memory.max": "max\n", "/sys/fs/cgroup/cpu.max": "max 100000\n" }
+      },
+      "read": "machine",
+      "expect": { "totalMb": 12122, "availableMb": 6886, "cpuCores": 12 }
+    },
+    {
+      "name": "container limit, use unreadable",
+      "failed": true,
+      "why": "a limit is known but not how much of it is used: available unreadable",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/memory.current": { "error": "unreadable" } } },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": null }
+    },
+    {
+      "name": "container limit, no inactive_file",
+      "failed": true,
+      "why": "memory.stat cut short: the use cannot be worked out, available unreadable",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/memory.stat": "anon 536870912\n" } },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": null }
+    },
+    {
+      "name": "container limit garbled",
+      "failed": true,
+      "why": "memory.max is neither 'max' nor a number: available unreadable",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/memory.max": "lots\n" } },
+      "read": "machine",
+      "expect": { "availableMb": null }
+    },
+    {
+      "name": "container using more than its limit",
+      "why": "used (5 GiB - 0) above the 4 GiB limit: available 0, never negative",
+      "host": "linux-container",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/memory.current": "5368709120\n",
+          "/sys/fs/cgroup/memory.stat": "inactive_file 0\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": 0 }
+    },
+    {
+      "name": "container CPU limit with a fraction",
+      "why": "cpu.max 150000/100000 = 1.5 cores",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/cpu.max": "150000 100000\n" } },
+      "read": "machine",
+      "expect": { "cpuCores": 1.5 }
+    },
+    {
+      "name": "container CPU limit garbled",
+      "failed": true,
+      "why": "cpu.max broken: cores unreadable",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/cpu.max": "200000\n" } },
+      "read": "machine",
+      "expect": { "cpuCores": null }
+    },
+    {
+      "name": "container with systemd inside",
+      "why": "systemd-nspawn, LXC/Incus or podman --systemd: this process sits in a unit (0::/init.scope), not at the namespace root. The root's memory.max and cpu.max still exist, so the cap is the container's: 4096 / 3328 / 2 as in 'container with a memory and CPU limit'",
+      "host": "linux-container",
+      "patch": { "files": { "/proc/self/cgroup": "0::/init.scope\n" } },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": 3328, "cpuCores": 2 }
+    },
+    {
+      "name": "container with systemd inside, deeper unit",
+      "why": "0::/system.slice/t3.service inside a container: still the root's cap",
+      "host": "linux-container",
+      "patch": { "files": { "/proc/self/cgroup": "0::/system.slice/t3.service\n" } },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": 3328, "cpuCores": 2 }
+    },
+    {
+      "name": "container, own cgroup unreadable",
+      "failed": true,
+      "why": "/proc/self/cgroup is not needed to find the cap: the root's memory.max and cpu.max decide. A failed read of it never removes the cap: 4096 / 3328 / 2",
+      "host": "linux-container",
+      "patch": { "files": { "/proc/self/cgroup": { "error": "unreadable" } } },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": 3328, "cpuCores": 2 }
+    },
+    {
+      "name": "container, cgroup.controllers unreadable",
+      "failed": true,
+      "why": "cannot tell which cgroup version, so not whether there is a cap: available and cores unreadable (never the host's 6886 / 12)",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": { "error": "unreadable" } } },
+      "read": "machine",
+      "expect": { "cgroup": "unreadable", "availableMb": null, "cpuCores": null }
+    },
+    {
+      "name": "container limit unsupported",
+      "failed": true,
+      "why": "EOPNOTSUPP means 'none' only for the machine PSI; on memory.max it is a failed read: available unreadable",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/memory.max": { "error": "unsupported" } } },
+      "read": "machine",
+      "expect": { "availableMb": null }
+    },
+    {
+      "name": "host process with its own unit limit",
+      "why": "a real host's cgroup v2 root has no memory.max or cpu.max; this process's unit has its own limits (1 GB, 1 core). Those are the unit's, not the machine's: 12122 / 6886 / 12",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/work.slice/t3-server.scope/memory.max": "1073741824\n",
+          "/sys/fs/cgroup/work.slice/t3-server.scope/cpu.max": "100000 100000\n",
+          "/sys/fs/cgroup/work.slice/memory.max": "2147483648\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "totalMb": 12122, "availableMb": 6886, "cpuCores": 12, "cgroup": "v2" }
+    },
+    {
+      "name": "host process at the cgroup root",
+      "why": "0::/ on a real host (no cgroup namespace): the root has no memory.max or cpu.max, so no cap: 12122 / 6886 / 12",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/self/cgroup": "0::/\n" } },
+      "read": "machine",
+      "expect": { "totalMb": 12122, "availableMb": 6886, "cpuCores": 12 }
+    },
+    {
+      "name": "cgroup v1 machine",
+      "why": "MemTotal 8388608 kB = 8192, MemAvailable 4096, swap 2048/2048; root limit is the v1 'no limit' number; no PSI file: none",
+      "host": "linux-v1",
+      "read": "machine",
+      "expect": {
+        "totalMb": 8192,
+        "availableMb": 4096,
+        "cpuCores": 4,
+        "swap": { "totalMb": 2048, "freeMb": 2048 },
+        "psi": null,
+        "cgroup": "v1",
+        "gaps": ["psi"]
+      }
+    },
+    {
+      "name": "cgroup v1 container with a limit",
+      "why": "limit 2147483648 B = 2048 < 8192: total 2048; used 1073741824 - 52428800 total_inactive_file = 1021313024 B (974 MB), so available min(4096, 2048 - 974 = 1074) = 1074",
+      "host": "linux-v1",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/memory/memory.limit_in_bytes": "2147483648\n",
+          "/sys/fs/cgroup/memory/memory.usage_in_bytes": "1073741824\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "totalMb": 2048, "availableMb": 1074 }
+    },
+    {
+      "name": "cgroup v1 container, root memory.stat unreadable",
+      "failed": true,
+      "why": "the 2 GB container of 'cgroup v1 container with a limit', but memory.stat (how v1 is found) cannot be read: cgroup unreadable, available and cores unreadable (never the host's 4096 / 4)",
+      "host": "linux-v1",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/memory/memory.limit_in_bytes": "2147483648\n",
+          "/sys/fs/cgroup/memory/memory.usage_in_bytes": "1073741824\n",
+          "/sys/fs/cgroup/memory/memory.stat": { "error": "unreadable" }
+        }
+      },
+      "read": "machine",
+      "expect": { "cgroup": "unreadable", "availableMb": null, "cpuCores": null }
+    },
+    {
+      "name": "piece when the cgroup version is unreadable",
+      "why": "no cgroup to read the piece from: demand unknown, the piece owes its full cost (never gone)",
+      "host": "linux-v2",
+      "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": { "error": "unreadable" } } },
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "gone": false, "demandMb": null }
+    },
+    {
+      "name": "cgroup v2 piece",
+      "why": "anon 222130176 + shmem 4194304 + swap 104857600 = 331182080 B = 315.8 -> 315 (file pages are not demand); current 389136384 -> 371; peak 915546112 -> 873",
+      "host": "linux-v2",
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "gone": false, "demandMb": 315, "currentMb": 371, "peakMb": 873 }
+    },
+    {
+      "name": "cgroup v2 piece without swap accounting or peak",
+      "why": "no memory.swap.current: swap counts 0 (the piece owes more, never less): 226324480 B = 215; no memory.peak (kernel before 5.19): null",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/work.slice/agent-a.scope/memory.swap.current": null,
+          "/sys/fs/cgroup/work.slice/agent-a.scope/memory.peak": null
+        }
+      },
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "gone": false, "demandMb": 215, "currentMb": 371, "peakMb": null }
+    },
+    {
+      "name": "cgroup v2 piece, swap garbled",
+      "why": "a broken swap part counts 0: 215",
+      "host": "linux-v2",
+      "patch": {
+        "files": { "/sys/fs/cgroup/work.slice/agent-a.scope/memory.swap.current": "-1\n" }
+      },
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "demandMb": 215 }
+    },
+    {
+      "name": "piece ended between list and read",
+      "why": "its memory.stat is gone: the caller drops the piece",
+      "host": "linux-v2",
+      "read": { "piece": "/work.slice/agent-gone.scope" },
+      "expect": { "gone": true }
+    },
+    {
+      "name": "piece unreadable",
+      "why": "memory.stat read fails: demand unknown (the piece owes its full cost), not gone",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/work.slice/agent-a.scope/memory.stat": { "error": "unreadable" }
+        }
+      },
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "gone": false, "demandMb": null }
+    },
+    {
+      "name": "piece memory.stat empty",
+      "why": "no anon line: demand unknown",
+      "host": "linux-v2",
+      "patch": { "files": { "/sys/fs/cgroup/work.slice/agent-a.scope/memory.stat": "" } },
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "gone": false, "demandMb": null, "currentMb": 371 }
+    },
+    {
+      "name": "piece memory.stat cut short",
+      "why": "anon read, shmem missing: demand unknown, never anon alone",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/work.slice/agent-a.scope/memory.stat": "anon 222130176\nfile 1048"
+        }
+      },
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "demandMb": null }
+    },
+    {
+      "name": "piece value too large",
+      "why": "anon above 2^53: not a safe number, demand unknown",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/work.slice/agent-a.scope/memory.stat": "anon 99999999999999999999\nshmem 0\n"
+        }
+      },
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "demandMb": null }
+    },
+    {
+      "name": "piece path leaving the cgroup tree",
+      "why": "'..' is never followed: demand unknown, nothing read",
+      "host": "linux-v2",
+      "read": { "piece": "/work.slice/../../etc" },
+      "expect": { "gone": false, "demandMb": null }
+    },
+    {
+      "name": "piece at the cgroup root",
+      "why": "the root is the whole machine, never one piece: demand unknown, nothing read",
+      "host": "linux-v2",
+      "patch": { "files": { "/sys/fs/cgroup/memory.stat": "anon 9000000000\nshmem 0\n" } },
+      "read": { "piece": "/" },
+      "expect": { "gone": false, "demandMb": null }
+    },
+    {
+      "name": "piece without cgroups",
+      "why": "no cgroup: demand unknown (owes its full cost)",
+      "host": "win32",
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "gone": false, "demandMb": null }
+    },
+    {
+      "name": "cgroup v1 piece",
+      "why": "total_rss 209715200 + total_shmem 0 + total_swap 52428800 = 250; usage 314572800 = 300; max usage 524288000 = 500",
+      "host": "linux-v1",
+      "read": { "piece": "/work/agent-a.scope" },
+      "expect": { "gone": false, "demandMb": 250, "currentMb": 300, "peakMb": 500 }
+    },
+    {
+      "name": "cgroup v1 piece without swap accounting",
+      "why": "no total_swap line: swap counts 0: 200",
+      "host": "linux-v1",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/memory/work/agent-a.scope/memory.stat": "total_rss 209715200\ntotal_shmem 0\n"
+        }
+      },
+      "read": { "piece": "/work/agent-a.scope" },
+      "expect": { "demandMb": 200 }
+    },
+    {
+      "name": "box PSI",
+      "why": "the box's own memory.pressure: some 12.5, full 2.25",
+      "host": "linux-v2",
+      "read": { "box": "/work.slice" },
+      "expect": { "psi": { "someAvg10Pct": 12.5, "fullAvg10Pct": 2.25 } }
+    },
+    {
+      "name": "box PSI missing",
+      "why": "the machine has PSI but the box has no pressure file (box gone, wrong path): unreadable",
+      "host": "linux-v2",
+      "read": { "box": "/other.slice" },
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "box PSI turned off for that box",
+      "why": "cgroup.pressure 0 on the box (EOPNOTSUPP): unreadable, the safe side; only the machine PSI reads 'unsupported' as none",
+      "host": "linux-v2",
+      "patch": {
+        "files": { "/sys/fs/cgroup/work.slice/memory.pressure": { "error": "unsupported" } }
+      },
+      "read": { "box": "/work.slice" },
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "box PSI when the cgroup version is unreadable",
+      "why": "cannot tell v1 (no box PSI) from v2: unreadable, never none",
+      "host": "linux-v2",
+      "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": { "error": "unreadable" } } },
+      "read": { "box": "/work.slice" },
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "box path that climbs out",
+      "why": "a box path with '..' is never read: unreadable, never none",
+      "host": "linux-v2",
+      "read": { "box": "/work.slice/../work.slice" },
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "box path that is not absolute",
+      "why": "a box path without a leading '/' is never read: unreadable",
+      "host": "linux-v2",
+      "read": { "box": "work.slice" },
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "box PSI on a machine without PSI",
+      "why": "no PSI anywhere: none",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/pressure/memory": null } },
+      "read": { "box": "/work.slice" },
+      "expect": { "psi": null }
+    },
+    {
+      "name": "box PSI on cgroup v1",
+      "why": "v1 boxes have no pressure files: none",
+      "host": "linux-v1",
+      "patch": {
+        "files": {
+          "/proc/pressure/memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        }
+      },
+      "read": { "box": "/work" },
+      "expect": { "psi": null }
+    },
+    {
+      "name": "macOS",
+      "why": "Node total 17179869184 = 16384; vm_stat (50000 + 200000 + 10000) x 16384 = 4259840000 B = 4062.5 -> 4062; pressure level 1 = ok; swap counted as none; no PSI, no per-piece demand",
+      "host": "darwin",
+      "read": "machine",
+      "expect": {
+        "totalMb": 16384,
+        "availableMb": 4062,
+        "cpuCores": 10,
+        "swap": null,
+        "psi": null,
+        "osLevel": "ok",
+        "cgroup": null,
+        "gaps": ["psi", "swap", "demand"]
+      }
+    },
+    {
+      "name": "macOS warning level",
+      "why": "kern.memorystatus_vm_pressure_level 2 = elevated",
+      "host": "darwin",
+      "patch": { "commands": { "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level": "2\n" } },
+      "read": "machine",
+      "expect": { "osLevel": "elevated" }
+    },
+    {
+      "name": "macOS critical level",
+      "why": "4 = severe",
+      "host": "darwin",
+      "patch": { "commands": { "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level": "4\n" } },
+      "read": "machine",
+      "expect": { "osLevel": "severe" }
+    },
+    {
+      "name": "macOS level unknown",
+      "failed": true,
+      "why": "a value the OS does not define: unreadable",
+      "host": "darwin",
+      "patch": { "commands": { "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level": "7\n" } },
+      "read": "machine",
+      "expect": { "osLevel": "unreadable" }
+    },
+    {
+      "name": "macOS level command fails",
+      "failed": true,
+      "why": "sysctl failed: unreadable",
+      "host": "darwin",
+      "patch": { "commands": { "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level": null } },
+      "read": "machine",
+      "expect": { "osLevel": "unreadable" }
+    },
+    {
+      "name": "macOS vm_stat fails",
+      "failed": true,
+      "why": "free pages alone (Node's freemem, 1024 MB) stand in: less than really available, never more",
+      "host": "darwin",
+      "patch": { "commands": { "/usr/bin/vm_stat": null } },
+      "read": "machine",
+      "expect": { "availableMb": 1024, "gaps": ["psi", "swap", "demand", "available"] }
+    },
+    {
+      "name": "macOS vm_stat cut short",
+      "failed": true,
+      "why": "no speculative line: the same under-read stands in",
+      "host": "darwin",
+      "patch": {
+        "commands": {
+          "/usr/bin/vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               50000.\nPages inactive:                          200000.\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "availableMb": 1024 }
+    },
+    {
+      "name": "Windows",
+      "why": "what Node gives: total 34359738368 = 32768, available (freemem, with standby) 17179869184 = 16384; no swap, PSI, OS level or per-piece demand",
+      "host": "win32",
+      "read": "machine",
+      "expect": {
+        "totalMb": 32768,
+        "availableMb": 16384,
+        "cpuCores": 8,
+        "swap": null,
+        "psi": null,
+        "osLevel": null,
+        "cgroup": null,
+        "gaps": ["swap", "psi", "osLevel", "demand"]
+      }
+    },
+    {
+      "name": "Windows free above total",
+      "failed": true,
+      "why": "impossible: available unreadable",
+      "host": "win32",
+      "patch": { "freeMemBytes": 68719476736 },
+      "read": "machine",
+      "expect": { "totalMb": 32768, "availableMb": null }
+    },
+    {
+      "name": "Windows total zero",
+      "failed": true,
+      "why": "0 is not a reading: unreadable",
+      "host": "win32",
+      "patch": { "totalMemBytes": 0 },
+      "read": "machine",
+      "expect": { "totalMb": null }
+    }
+  ]
+}
