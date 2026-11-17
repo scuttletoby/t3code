@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  type BackgroundScope,
   DEFAULT_SERVER_SETTINGS,
   defaultInstanceIdForDriver,
   type HostPowerSnapshot,
@@ -86,18 +87,22 @@ const fakeTarget = (
   initial: ServerProvider,
   options?: {
     readonly awaitingFirstCheck?: () => boolean;
+    readonly checksOnInterval?: () => boolean;
     readonly enabled?: boolean;
     readonly noRefreshUsage?: boolean;
   },
 ) => {
   let snapshot = initial;
   let calls = 0;
+  let interrupts = 0;
   let outcome: Outcome = "ok";
   let gate: Deferred.Deferred<void> | undefined;
   const refreshUsage = Effect.gen(function* () {
     calls += 1;
     if (gate !== undefined) yield* Deferred.await(gate);
-    if (outcome === "hang") return yield* Effect.never;
+    if (outcome === "hang") {
+      return yield* Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => interrupts++)));
+    }
     if (outcome === "error") {
       return yield* new ServerSettingsError({
         settingsPath: "settings.json",
@@ -131,12 +136,16 @@ const fakeTarget = (
     snapshot: {
       getSnapshot: Effect.sync(() => snapshot),
       isAwaitingFirstCheck: Effect.sync(() => options?.awaitingFirstCheck?.() ?? false),
+      ...(options?.checksOnInterval
+        ? { checksOnInterval: Effect.sync(options.checksOnInterval) }
+        : {}),
       ...(options?.noRefreshUsage ? {} : { refreshUsage }),
     },
   };
   return {
     target,
     calls: () => calls,
+    interrupts: () => interrupts,
     setOutcome: (next: Outcome) => {
       outcome = next;
     },
@@ -328,6 +337,26 @@ describe("HeadlessUsageRefresher", () => {
     }),
   );
 
+  it.effect("skips an instance upstream's own loop skips, such as a healthy OpenCode", () =>
+    Effect.gen(function* () {
+      yield* startAt(NOW_MS);
+      const old = NOW_MS - HOUR;
+      const opencode = { driver: ProviderDriverKind.make("opencode") };
+      let healthy = true;
+      // A check of a healthy OpenCode instance starts an OpenCode server; upstream skips it.
+      const skipped = fakeTarget(provider(old, opencode), { checksOnInterval: () => !healthy });
+      const otherDriver = fakeTarget(provider(old, {}, SECOND));
+      const { sweep } = yield* make(deps([skipped.target, otherDriver.target]));
+      yield* sweep;
+      assert.equal(skipped.calls(), 0);
+      assert.equal(otherDriver.calls(), 1);
+      // Unhealthy (for example its usage probe failed): upstream checks it, and so does this.
+      healthy = false;
+      yield* sweep;
+      assert.equal(skipped.calls(), 1);
+    }),
+  );
+
   it.effect(
     "leaves the refresh to upstream while a client lease holds, and pauses on a constrained host",
     () =>
@@ -438,6 +467,7 @@ describe("HeadlessUsageRefresher", () => {
       yield* TestClock.adjust(REFRESH_TIMEOUT_MS);
       yield* Fiber.join(fiber);
       assert.equal(fake.calls(), 1);
+      assert.equal(fake.interrupts(), 1);
       assert.equal(log.warnings.length, 1);
       // The next pass is not stuck behind the hung one; it waits out the backoff.
       fake.setOutcome("ok");
@@ -529,68 +559,111 @@ describe("HeadlessUsageRefresher", () => {
     "the server layer refreshes through the Scheduler only while no client lease holds",
     () =>
       Effect.gen(function* () {
-        yield* startAt(NOW_MS);
-        const fake = fakeTarget(provider(NOW_MS - HOUR));
-        const refreshed = yield* Queue.unbounded<void>();
-        const target = fake.target;
-        const instance = {
-          ...target,
-          snapshot: {
-            ...target.snapshot,
-            refreshUsage: target.snapshot.refreshUsage!.pipe(
-              Effect.andThen(Queue.offer(refreshed, undefined)),
-            ),
-          },
-        } as unknown as ProviderInstance;
-        const registry = Layer.succeed(
-          ProviderInstanceRegistry.ProviderInstanceRegistry,
-          ProviderInstanceRegistry.ProviderInstanceRegistry.of({
-            getInstance: () => Effect.succeed(instance),
-            listInstances: Effect.succeed([instance]),
-            listUnavailable: Effect.succeed([]),
-            streamChanges: Stream.empty,
-            subscribeChanges: Effect.die("unused"),
-          }),
-        );
-        const policyLayer = BackgroundPolicy.layer.pipe(
-          Layer.provide(Layer.merge(hostPowerLayer, ServerSettingsModule.layerTest())),
-        );
-        yield* Effect.gen(function* () {
-          const policy = yield* BackgroundPolicy.BackgroundPolicy;
-          // A focused client watches provider status: upstream's loop refreshes, not this job.
-          yield* policy.reportClientActivity(AuthSessionId.make("s"), RpcClientId.make(1), {
-            clientId: "c",
-            clientKind: "web",
-            visible: true,
-            focused: true,
-            recentlyInteracted: true,
-            scopes: [{ type: "provider-status" }],
-            ttlMs: 60_000,
-            observedAt: DateTime.makeUnsafe(NOW_MS),
-          });
-          yield* Effect.scoped(
-            Layer.build(
-              HeadlessUsageRefresher.layer.pipe(
-                Layer.provide(Layer.mergeAll(registry, ServerSettingsModule.layerTest())),
-              ),
-            ).pipe(
-              Effect.andThen(
-                Effect.gen(function* () {
-                  yield* TestClock.adjust("10 seconds");
-                  assert.equal(fake.calls(), 0);
-                  // The client goes away: its lease expires and the job takes over.
-                  yield* policy.removeRpcClient(AuthSessionId.make("s"), RpcClientId.make(1));
-                  yield* TestClock.adjust("5 seconds");
-                  yield* Queue.take(refreshed);
-                  assert.equal(fake.calls(), 1);
-                }),
-              ),
-            ),
+        // A client may watch all providers or one instance; either way upstream's loop refreshes.
+        const scopes: ReadonlyArray<BackgroundScope> = [
+          { type: "provider-status" },
+          { type: "provider-status", instanceId: INSTANCE },
+        ];
+        for (const scope of scopes) {
+          yield* withServerLayer(({ fake, policy, refreshed }) =>
+            Effect.gen(function* () {
+              // A focused client watches provider status: upstream's loop refreshes, not this job.
+              yield* policy.reportClientActivity(AuthSessionId.make("s"), RpcClientId.make(1), {
+                clientId: "c",
+                clientKind: "web",
+                visible: true,
+                focused: true,
+                recentlyInteracted: true,
+                scopes: [scope],
+                ttlMs: 60_000,
+                observedAt: DateTime.makeUnsafe(NOW_MS),
+              });
+              yield* TestClock.adjust("10 seconds");
+              assert.equal(fake.calls(), 0, JSON.stringify(scope));
+              // The client goes away: its lease expires and the job takes over.
+              yield* policy.removeRpcClient(AuthSessionId.make("s"), RpcClientId.make(1));
+              yield* TestClock.adjust("5 seconds");
+              yield* Queue.take(refreshed);
+              assert.equal(fake.calls(), 1);
+            }),
           );
-        }).pipe(Effect.provide(policyLayer));
+        }
       }),
   );
+
+  it.effect("the server layer pauses while the host is locked or in low power", () =>
+    Effect.gen(function* () {
+      const constrained: ReadonlyArray<Partial<HostPowerSnapshot>> = [
+        // Default (balanced) settings pause on these; battery pauses only in battery-saver.
+        { locked: "true" },
+        { lowPowerMode: "true" },
+      ];
+      for (const power of constrained) {
+        let hostPower: HostPowerSnapshot = { ...nominalHostPower, stale: false, ...power };
+        yield* withServerLayer(
+          ({ fake, refreshed }) =>
+            Effect.gen(function* () {
+              yield* TestClock.adjust("10 seconds");
+              assert.equal(fake.calls(), 0, JSON.stringify(power));
+              hostPower = { ...nominalHostPower, stale: false };
+              yield* TestClock.adjust("5 seconds");
+              yield* Queue.take(refreshed);
+              assert.equal(fake.calls(), 1);
+            }),
+          Effect.sync(() => hostPower),
+        );
+      }
+    }),
+  );
 });
+
+/** Runs `body` with the refresher's server layer over one stale signed-in instance. */
+const withServerLayer = <A, E>(
+  body: (ctx: {
+    readonly fake: ReturnType<typeof fakeTarget>;
+    readonly policy: BackgroundPolicy.BackgroundPolicy["Service"];
+    readonly refreshed: Queue.Queue<void>;
+  }) => Effect.Effect<A, E>,
+  hostPower: Effect.Effect<HostPowerSnapshot> = Effect.succeed(nominalHostPower),
+) =>
+  Effect.gen(function* () {
+    yield* startAt(NOW_MS);
+    const fake = fakeTarget(provider(NOW_MS - HOUR));
+    const refreshed = yield* Queue.unbounded<void>();
+    const target = fake.target;
+    const instance = {
+      ...target,
+      snapshot: {
+        ...target.snapshot,
+        refreshUsage: target.snapshot.refreshUsage!.pipe(
+          Effect.andThen(Queue.offer(refreshed, undefined)),
+        ),
+      },
+    } as unknown as ProviderInstance;
+    const registry = Layer.succeed(
+      ProviderInstanceRegistry.ProviderInstanceRegistry,
+      ProviderInstanceRegistry.ProviderInstanceRegistry.of({
+        getInstance: () => Effect.succeed(instance),
+        listInstances: Effect.succeed([instance]),
+        listUnavailable: Effect.succeed([]),
+        streamChanges: Stream.empty,
+        subscribeChanges: Effect.die("unused"),
+      }),
+    );
+    const policyLayer = BackgroundPolicy.layer.pipe(
+      Layer.provide(Layer.merge(hostPowerLayer(hostPower), ServerSettingsModule.layerTest())),
+    );
+    return yield* Effect.gen(function* () {
+      const policy = yield* BackgroundPolicy.BackgroundPolicy;
+      return yield* Effect.scoped(
+        Layer.build(
+          HeadlessUsageRefresher.layer.pipe(
+            Layer.provide(Layer.mergeAll(registry, ServerSettingsModule.layerTest())),
+          ),
+        ).pipe(Effect.andThen(body({ fake, policy, refreshed }))),
+      );
+    }).pipe(Effect.provide(policyLayer));
+  });
 
 const nominalHostPower: HostPowerSnapshot = {
   source: "unknown",
@@ -605,14 +678,15 @@ const nominalHostPower: HostPowerSnapshot = {
   updatedAt: DateTime.makeUnsafe(NOW_MS),
 };
 
-const hostPowerLayer = Layer.effect(
-  HostPowerMonitor.HostPowerMonitor,
-  Effect.gen(function* () {
-    const changes = yield* PubSub.sliding<HostPowerSnapshot>(1);
-    return HostPowerMonitor.HostPowerMonitor.of({
-      snapshot: Effect.succeed(nominalHostPower),
-      report: () => Effect.void,
-      streamChanges: Stream.fromPubSub(changes),
-    });
-  }),
-);
+const hostPowerLayer = (snapshot: Effect.Effect<HostPowerSnapshot>) =>
+  Layer.effect(
+    HostPowerMonitor.HostPowerMonitor,
+    Effect.gen(function* () {
+      const changes = yield* PubSub.sliding<HostPowerSnapshot>(1);
+      return HostPowerMonitor.HostPowerMonitor.of({
+        snapshot,
+        report: () => Effect.void,
+        streamChanges: Stream.fromPubSub(changes),
+      });
+    }),
+  );
