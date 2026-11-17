@@ -16,11 +16,16 @@
 set -uo pipefail
 # Refuses outside a GitHub Actions run or a test under the gh stub (fork-gh-guard.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/fork-gh-guard.sh"
+# Without -e a missing guard file is only bash's error, and the script would go on to call gh
+# unguarded (a checkout that leaves it out, #239): its absence is a refusal of its own.
+if ! declare -F fork_gh_refusal > /dev/null; then
+  echo "::error::fork-run-alert: fork-gh-guard.sh is missing beside this script, so no gh call is made (check it out with it)" >&2
+  exit 2
+fi
 
-# The issue author: `gh issue list --author` needs the bot's user login, while gh's JSON names it
-# app/github-actions. Both are checked; a person cannot take a login with brackets.
-BOT_AUTHOR="github-actions[bot]"
-BOT_LOGIN="app/github-actions"
+# The issue author: the bot's user login, as the REST list's creator filter and user.login give it.
+# A person cannot take a login with brackets.
+BOT_LOGIN="github-actions[bot]"
 
 die() { echo "fork-run-alert: $*" >&2; exit 2; }
 title="" result="" message="" repo="${GITHUB_REPOSITORY:-}"
@@ -55,10 +60,12 @@ trap 'rm -f "$body"' EXIT
 
 note=""
 issue=""
-# The list itself, not search (its index can lag), and only issues GitHub Actions opened.
-if ! issue="$(gh issue list --repo "$repo" --state open --author "$BOT_AUTHOR" --limit 100 \
-  --json number,title,author \
-  --jq ".[] | select(.title == $(jq -Rn --arg t "$title" '$t') and .author.login == \"$BOT_LOGIN\") | .number" | head -n1)"; then
+# The list itself, not search (its index can lag), and only issues GitHub Actions opened. Every
+# page, filtered by title on each: a first page (`--limit 100`) of other open bot issues would
+# hide the alert's own, and the next failure would open a second one (#239). The REST list holds
+# pull requests too; they are left out.
+if ! issue="$(gh api --paginate "repos/$repo/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
+  --jq ".[] | select(.pull_request == null and .title == $(jq -Rn --arg t "$title" '$t') and .user.login == \"$BOT_LOGIN\") | .number" | head -n1)"; then
   note="Could not list the issues of $repo, so no issue was opened, updated or closed."
   failed=true
 elif [[ "$failed" == true && -n "$issue" ]]; then

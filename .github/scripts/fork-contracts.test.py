@@ -974,6 +974,32 @@ LOOKUP = re.compile(
     r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n(?:.*\n)*?\s*export UPSTREAM OLD_HEADS\n')
 
 
+# The sweep's lookup (#239), allowed in this exact form only, right after the earlier-heads lookup:
+# every tip GitHub's activity record lists for the last week, of every ref, so the sweep also reads
+# a tip a deletion or force push left behind. A failed lookup fails the job.
+SWEEP_LOOKUP_TEXT = (
+    'elif [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then\n'
+    '  if ! OLD_HEADS="$(GH_TOKEN="$LOOKUP_TOKEN" gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/activity" \\\n'
+    "      -f time_period=week -f per_page=100 --jq '.[] | .before, .after')\"; then\n"
+    '    echo "::error::Secret scan: cannot list GitHub\'s activity record, so a tip a deletion or force push left'
+    ' behind could go unscanned. Re-run the job." >&2\n'
+    "    exit 2\n"
+    "  fi\n")
+SWEEP_LOOKUP = re.compile(
+    r'\n\s*fi\n\s*elif \[\[ "\$EVENT_NAME" == schedule \|\| "\$EVENT_NAME" == workflow_dispatch \]\]; then\n'
+    r'\s*if ! OLD_HEADS="\$\(GH_TOKEN="\$LOOKUP_TOKEN" gh api --paginate -X GET "repos/\$GITHUB_REPOSITORY/activity" \\\n'
+    r"""\s*-f time_period=week -f per_page=100 --jq '\.\[\] \| \.before, \.after'\)"; then\n"""
+    r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n\s*fi\n')
+
+
+def with_sweep_lookup(run):
+    """The scan step's run with the sweep's lookup (SWEEP_LOOKUP_TEXT) added, as the workflow
+    change of #239 adds it; unchanged when it is there already."""
+    if "time_period=week" in run:
+        return run
+    return run.replace("fi\nunset LOOKUP_TOKEN\n", SWEEP_LOOKUP_TEXT + "fi\nunset LOOKUP_TOKEN\n", 1)
+
+
 def lookup_problems(scan):
     problems = []
     for j, job in (scan.get("jobs") or {}).items():
@@ -984,8 +1010,8 @@ def lookup_problems(scan):
             if not LOOKUP.search(run):
                 problems.append(f"{SCAN_FILE}/{j}: the earlier-heads lookup is not in its exact form (fails the job "
                                 "on a failed lookup, reads .before and .after, exports OLD_HEADS)")
-            if len(re.findall(r"\bOLD_HEADS\b", run)) != 3:
-                problems.append(f"{SCAN_FILE}/{j}: OLD_HEADS is set or used outside the lookup")
+            if len(re.findall(r"\bOLD_HEADS\b", run)) != (4 if SWEEP_LOOKUP.search(run) else 3):
+                problems.append(f"{SCAN_FILE}/{j}: OLD_HEADS is set or used outside the lookups")
             env = step.get("env") or {}
             if env.get("HEAD_REF") != "${{ github.event.pull_request.head.ref }}":
                 problems.append(f"{SCAN_FILE}/{j}: HEAD_REF is not the pull request's branch")
@@ -1246,6 +1272,17 @@ for label, mutate in {
     "the lookup's failure not failing the job": lambda w: scan_step(w).__setitem__(
         "run", re.sub(r"exit 2\n", "true\n", scan_step(w)["run"], count=1)),
     "the lookup for another branch": lambda w: scan_step(w)["env"].__setitem__("HEAD_REF", "${{ github.base_ref }}"),
+    # #239: the sweep's lookup, in its exact form only.
+    "a sweep lookup whose failure is ignored (|| true)": lambda w: scan_step(w).__setitem__(
+        "run", with_sweep_lookup(scan_step(w)["run"]).replace(
+            "-f time_period=week -f per_page=100 --jq '.[] | .before, .after')\"; then",
+            "-f time_period=week -f per_page=100 --jq '.[] | .before, .after' || true)\"; then")),
+    "a sweep lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r"exit 2\n(\s*fi\n\s*fi\nunset)", r"true\n\1", with_sweep_lookup(scan_step(w)["run"]), count=1)),
+    "a sweep lookup reading the wrong field": lambda w: scan_step(w).__setitem__(
+        "run", with_sweep_lookup(scan_step(w)["run"]).replace(
+            "time_period=week -f per_page=100 --jq '.[] | .before, .after'",
+            "time_period=week -f per_page=100 --jq '.[] | .sha'")),
     # c2: the jobs' if: as GitHub evaluates it.
     "every push skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
         "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace("(github.event.deleted ||", "(true || github.event.deleted ||")),
@@ -1297,6 +1334,10 @@ for label, mutate in {
 }.items():
     check(f"secret-scan: {SCAN_FILE} with {label} fails" if "fork-tests" not in label and "sweep" not in label
           and "alert" not in label else f"secret-scan: {label} fails", scan_mutant(mutate))
+
+check("secret-scan: the sweep's activity lookup (#239) in its exact form passes",
+      not scan_mutant(lambda w: scan_step(w).__setitem__("run", with_sweep_lookup(scan_step(w)["run"])))
+      and SWEEP_LOOKUP.search(with_sweep_lookup(scan_step(real)["run"])) is not None)
 
 check("secret-scan: the expression evaluator reads GitHub's rules (&& and || give an operand, == ignores case)",
       gh_eval("'a' && 'B' == 'b'", {}) and not gh_eval("'' || null", {}) and gh_eval("!x.y", {})
