@@ -159,17 +159,17 @@ with tempfile.TemporaryDirectory(prefix="fork-owned-paths-") as tmp:
 REAL = owned([
     "fork-ci/actions/pr-queue/pr_queue.py", "fork-kit/heavy/heavy", ".github/scripts/fork-fleet-walls.py",
     ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py", ".github/fork-ci-tests.txt",
-    ".gitleaks.toml",
+    ".gitleaks.toml", "FORK_CHANGES.md",
     # never
     ".github/fork-owned-paths.txt", ".github/scripts/fork-owned-paths.cjs", ".github/workflows/fork-tests.yml",
     ".github/workflows/fork-checks.yml", ".github/actions/ci-changes/action.yml", ".github/scripts/ci-changes.cjs",
     ".github/scripts/fork-fleet.py", ".github/scripts/fork-test-shards.cjs", ".github/scripts/fork-vitest-gc-check.cjs",
     ".github/fork-fleet.json", "fork-ci/package.json", "fork-kit/x/tsconfig.json", "package.json", "apps/web/src/a.ts",
-    "docs/fork/README.md", "scripts/release-smoke.ts", "FORK_CHANGES.md", "fork-ci", "fork-cix/a",
+    "docs/fork/README.md", "scripts/release-smoke.ts", "fork-ci", "fork-cix/a",
 ])
 want_owned = {p for p in REAL if p.startswith(("fork-ci/actions", "fork-kit/heavy")) or p in {
     ".github/scripts/fork-fleet-walls.py", ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py",
-    ".github/fork-ci-tests.txt", ".gitleaks.toml"}}
+    ".github/fork-ci-tests.txt", ".gitleaks.toml", "FORK_CHANGES.md"}}
 check("list: the fork's own folders and scripts are fork-owned; the rest, and every NEVER path, are not",
       {p for p, v in REAL.items() if v} == want_owned, json.dumps({p: v for p, v in REAL.items() if v != (p in want_owned)}))
 check("list: NEVER wins over a line that owns everything under .github/",
@@ -259,8 +259,11 @@ check("workflow: the runner routing gets the fork-only gates on a fork-only pull
       "steps.fork_only.outputs.fork_only == 'true' && toJSON(steps.fork_only.outputs)" in route_gates, route_gates)
 
 # Jobs that run on a fork-only pull request: they test the fork's own files (Lint too: `vp check` formats and lints
-# every file, the fork's included, and knip reads .github/**/*.cjs). Every other job is an app job.
-RUNS = {"outside_pr", "changes", "fleet_watch", "workflows", "kit_tests", "secrets", "lint", "fork_ci_result"}
+# every file, the fork's included, and knip reads .github/**/*.cjs; fork_checks_ran checks that fork-checks.yml ran).
+# Every other job is an app job.
+RUNS = {"outside_pr", "changes", "fleet_watch", "fork_checks_ran", "workflows", "action_tests", "kit_tests", "secrets",
+        "lint",
+        "fork_ci_result"}
 app_jobs = sorted(set(jobs) - RUNS)
 check("workflow: the app jobs are the ones this switch is for",
       {"build", "test", "test_web", "test_server", "rust", "release_smoke", "mobile_native_static_analysis"} <= set(app_jobs),

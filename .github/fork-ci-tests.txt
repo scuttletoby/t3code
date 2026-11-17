@@ -1,7 +1,8 @@
 # Every test file under .github/scripts, fork-ci and fork-kit (*.test.*, subdirectories included) and
 # where it runs (.github/scripts/fork-ci-tests.cjs checks this list).
-#   <test>                  run by Fork tests (fork-kit/ in the kit job, the rest in the
-#                           workflows job), by extension (sh, py, cjs, mjs, js)
+#   <test>                  run by Fork tests (fork-kit/ in the kit job, fork-ci/ and the
+#                           fleet walls' in the action job, the rest in the workflows job),
+#                           by extension (sh, py, cjs, mjs, js)
 #   <test> ~<seconds>s      the same, with its usual time on CI: the longest start first.
 #                           Tests without one start before them. A test over 30 s without
 #                           one, or far from its weight, gets a note in the log to fix it.
@@ -10,6 +11,7 @@
 # A present test that is not listed fails. A listed file that is not present yet
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs ~10s
+.github/scripts/fork-checks-ran.test.py
 .github/scripts/fork-contracts.test.py
 .github/scripts/fork-fleet-desk-agent.test.py ~23s
 .github/scripts/fork-fleet-desk-key.test.py ~10s
@@ -28,6 +30,7 @@
 .github/scripts/fork-owned-reads.test.py run by .github/workflows/fork-tests.yml
 .github/scripts/fork-pr-queue-workflow.test.py
 .github/scripts/fork-ci-release.test.py
+.github/scripts/fork-changes-list.test.cjs
 .github/scripts/fork-release-workflow.test.py
 .github/scripts/fork-release.test.sh ~5s
 .github/scripts/fork-run-alert.test.sh
@@ -44,6 +47,7 @@ fork-ci/actions/ci-demand/ci_demand.test.py ~13s
 fork-ci/actions/docs-scope/docs-scope.test.py ~16s
 fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/fleet-watch/fleet_watch.test.py
+fork-ci/actions/git-clean/git_clean.test.py
 fork-ci/actions/gradle-cache/gradle_cache.test.py
 fork-ci/actions/head-check/head_check.test.py ~12s
 fork-ci/actions/head-check/head_gate.test.py
@@ -57,14 +61,17 @@ fork-ci/actions/pr-queue/review_judge.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 fork-ci/actions/test-select/test-select.test.py ~15s
 fork-ci/actions/test-select/trace-check.test.py
+fork-ci/actions/weakened-tests/weakened_tests.test.py
 fork-kit/common/tests/free_contract.test.py ~5s
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py ~65s
 fork-kit/desk/tests/windows.test.py ~8s
+fork-kit/golive/tests/back.test.py ~35s
 fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
 fork-kit/golive/tests/copy.test.py ~26s
 fork-kit/golive/tests/journal.test.py
+fork-kit/golive/tests/rehearse.test.py ~22s
 fork-kit/golive/tests/switch.test.py ~30s
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py

@@ -117,7 +117,8 @@ leaves a mark in `%LOCALAPPDATA%\fork-desk`, so the next run asks no takeover qu
 three quarters of the RAM, at most the RAM less 6 GB, never under 4 GB; one that leaves Windows under 2 GB is
 refused; without `-MemoryGB`, a higher one already there, raised by hand, is kept up to the RAM less 2 GB; one
 WSL cannot read, such as `26 GB` or `26gb`, is rewritten, since WSL would run on half the RAM), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (read and written as UTF-8 without a
-BOM; a dated copy of the old file is kept, other keys and sections stay; an old `networkingMode` or `dnsTunneling`
+BOM; a dated copy of the old file is kept, other keys and sections stay; a section header is read as WSL reads it,
+so a line WSL rejects, such as `[ wsl2 ]`, starts no section and the key under it is not taken as set; values too: the first line of a key is the one WSL uses, a `# comment` after a value and quotes are dropped, and a line ending in `\` goes on to the next, so a key there is part of that value; a merge WSL would not read as the question says (a lone CR between keys, or a `\` at the very end of the file) is refused and nothing changes; an old `networkingMode` or `dnsTunneling`
 line under `[experimental]`, the form before WSL 2.0 that can still win over `[wsl2]`, is removed, and the check
 FAILs while one is there; the question lists each change, old -> new, and the file is written only when it lists one,
 so "no change" means the file is left alone); the distro's own settings the WSL2 walls

@@ -84,7 +84,9 @@ python3 -I pinned.py --config .github/fork-ci.json files
   cache under a folder someone else could write, before they make any folder, and name each such folder with its fix:
   `chmod g-w <folder>` (or `go-w`) for a folder of yours, another `--cache` under anyone else's (`/tmp/...`). A folder
   above the cache you cannot enter (no `x`) cannot be checked, so it is refused the same way, named with its fix:
-  `chmod u+x <folder>` for yours, another `--cache` for anyone else's.
+  `chmod u+x <folder>` for yours, another `--cache` for anyone else's. Through a symlink, the folder named is the real
+  one without `x` (where the link leads), not the link's own folder. A symlink loop or a file on the way above the
+  cache is refused too, with another cache as the fix. `load()` names its `cache` argument where `run` says `--cache`.
 
 ## Python API
 
@@ -124,6 +126,13 @@ A project needs this module before it can fetch anything, so it copies the funct
 (for example `scripts/fork_ci.py`) and lists `pinned/pinned.py` in its config's `files`. The bootstrap does only the
 check-then-load for this one file, in the same cache layout; everything else (prune, the other files, `run`) is this
 module's. `pinned.test.py` runs this exact block.
+
+The bootstrap does **not** check the folders above the cache as `run` and `load()` do: that check (owners, modes, your
+private group, ACLs, the real path, folders you cannot enter) is too long to copy, and a shorter one would either refuse
+Ubuntu's usual 0775 `~/.cache` or drift from this module's rule. So keep `CACHE` under your home, as the adapter
+below does, never under `/tmp`. Under `/tmp`, the bootstrap still makes the cache (0700) and writes `pinned.py` (the
+checked bytes, which load nothing next to them), then `P.load` and `P.main([... 'run' ...])` refuse the cache before
+they fetch or run anything else.
 
 <!-- bootstrap:start -->
 

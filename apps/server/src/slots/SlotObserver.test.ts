@@ -16,6 +16,7 @@ import { AgentScope, type AgentScopeShape } from "@t3tools/shared/AgentScope";
 import type { CapacityFileRead, CapacityHost } from "@t3tools/shared/capacityReadings";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import type { DeepPartial } from "@t3tools/shared/Struct";
+import { DISPATCH_SAFETY_MS } from "@t3tools/shared/agentSlots";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -26,10 +27,12 @@ import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "./SlotGate.ts";
 import {
+  makeSlotObserver,
   OBSERVE_MAX_HANGING,
   OBSERVE_MAX_WAITING,
   OBSERVE_READ_TIMEOUT,
   SlotCapacityHost,
+  type SlotObserveInput,
   slicePath,
 } from "./SlotObserver.ts";
 
@@ -161,6 +164,15 @@ const acquire = SlotGate.SlotGate.pipe(
   Effect.flatMap((gate) => gate.acquire({ callerThreadId: caller, targetInstanceId: MAIN })),
 );
 
+/** The dispatch ended without naming a child (it failed before one existed). */
+const release = (answer: SlotGate.SlotAcquire) =>
+  SlotGate.SlotGate.pipe(
+    Effect.flatMap((gate) => gate.release(answer.type === "allow" ? answer.token : null)),
+  );
+
+/** A dispatch that ends with no child; its answer. */
+const acquireAndRelease = Effect.tap(acquire, release).pipe(Effect.map((answer) => answer.type));
+
 /** Lets forked observations and the fake host's promises finish (scheduler turns, no real wait). */
 const settle = Effect.forEach(Array.from({ length: 20 }), () => Effect.yieldNow, { discard: true });
 
@@ -185,6 +197,24 @@ const TWO_RUNNING = [{ id: "a" }, { id: "b" }];
 
 /** The calm wait after a (re)start: the level is "elevated" until this much calm has passed. */
 const CALM_WAIT = Duration.seconds(61);
+
+/** The observer alone, its projection read as `readRunning` (the order rows drive it by hand). */
+const observerFor = (
+  world: World,
+  readRunning: Effect.Effect<
+    { readonly visible: ReadonlySet<string> } | undefined
+  > = Effect.succeed({ visible: new Set<string>() }),
+) =>
+  makeSlotObserver(readRunning).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.succeed(SlotCapacityHost, hostOf(world)),
+        Layer.succeed(AgentScope, scopesOf(world)),
+        Layer.succeed(HostProcess.UserId, UID),
+        Layer.succeed(HostProcess.Platform, "linux"),
+      ),
+    ),
+  );
 
 describe("SlotGate observe mode", () => {
   it.effect("fixed mode, old files and unknown modes read nothing for the rule", () =>
@@ -222,13 +252,36 @@ describe("SlotGate observe mode", () => {
         world,
         {},
         Effect.gen(function* () {
-          assert.deepStrictEqual(yield* acquire, { type: "allow", token: null });
+          const answer = yield* acquire;
+          // A token for the rule's own record of the start (the gate keeps none while off).
+          assert.strictEqual(answer.type, "allow");
+          assert.isNumber(answer.type === "allow" ? answer.token : null);
           return yield* statusAfter(1);
         }),
       );
       assert.strictEqual(status.observed, 1);
       assert.strictEqual(status.last?.today, "allow");
       assert.isAbove(world.hostReads, 0);
+    }),
+  );
+
+  it.effect("the observation starts after the decision returns, never on the caller's stack", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      // The fake projection read is synchronous: forked to start at once, it would run before
+      // the caller got its answer (inside the gate's lock).
+      const readsAtAnswer = yield* run(
+        world,
+        observe(),
+        Effect.gen(function* () {
+          assert.strictEqual((yield* acquire).type, "allow");
+          const reads = world.snapshotReads;
+          yield* statusAfter(1);
+          return reads;
+        }),
+      );
+      assert.strictEqual(readsAtAnswer, 0);
+      assert.strictEqual(world.snapshotReads, 1);
     }),
   );
 
@@ -415,7 +468,7 @@ describe("SlotGate observe mode", () => {
         world,
         observe(),
         Effect.gen(function* () {
-          yield* acquire;
+          yield* release(yield* acquire);
           yield* TestClock.adjust(CALM_WAIT);
           yield* acquire;
           return yield* statusAfter(2);
@@ -444,25 +497,408 @@ describe("SlotGate observe mode", () => {
     }),
   );
 
-  it.effect("slots off: an allow counts as starting for the start grace, then goes", () =>
+  it.effect("slots off: a start counts until its dispatch ends, then for the start grace", () =>
     Effect.gen(function* () {
       const world = newWorld();
-      const [soon, later] = yield* run(
+      const [during, grace, gone] = yield* run(
         world,
         observe({ startGraceSeconds: 30 }),
         Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          // A dispatch that has not named its child yet counts, however long it takes.
+          const first = yield* acquire;
+          yield* TestClock.adjust(Duration.seconds(45));
           yield* acquire;
+          const during = yield* statusAfter(2);
+          // The child is named and the dispatch ends; it shows no run yet (a queued run).
+          const token = first.type === "allow" ? first.token : null;
+          yield* gate.started(token, ThreadId.make("child-queued"));
+          yield* gate.release(token);
           yield* TestClock.adjust(Duration.seconds(29));
+          yield* release(yield* acquire);
+          const grace = yield* statusAfter(3);
+          yield* TestClock.adjust(Duration.seconds(2));
           yield* acquire;
-          const soon = yield* statusAfter(2);
-          yield* TestClock.adjust(Duration.seconds(20));
-          yield* acquire;
-          return [soon, yield* statusAfter(3)] as const;
+          return [during, grace, yield* statusAfter(4)] as const;
         }),
       );
-      assert.strictEqual(soon.last?.pieces, 1);
-      // At 49 s: the allow at 29 s still starts; the one at 0 s is past its 30 s grace.
-      assert.strictEqual(later.last?.pieces, 1);
+      assert.strictEqual(during.last?.pieces, 1);
+      // At 74 s: the queued child is 29 s past its dispatch's end, inside its 30 s grace; the
+      // second start (45 s) never ended.
+      assert.strictEqual(grace.last?.pieces, 2);
+      // At 76 s: the queued child's grace is over; the third start ended with no child at once.
+      assert.strictEqual(gone.last?.pieces, 1);
+    }),
+  );
+
+  it.effect("slots off: a start whose child shows its run counts once, as that run (#353)", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const status = yield* run(
+        world,
+        observe({ startGraceSeconds: 30 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const first = yield* acquire;
+          const token = first.type === "allow" ? first.token : null;
+          yield* gate.started(token, ThreadId.make("child"));
+          // The child shows its run (300 MB in its own scope) inside the 30 s window.
+          world.threads = [{ id: "child", unit: "t3code-claude-cccc0000.scope" }];
+          scopeFiles(world, "t3code-claude-cccc0000.scope", 300);
+          yield* TestClock.adjust(Duration.seconds(5));
+          // A start whose dispatch ends with no child, so only the first agent is left.
+          yield* release(yield* acquire);
+          const running = yield* statusAfter(2);
+          // Its dispatch ends after the run showed: still counted once, as the run.
+          yield* gate.release(token);
+          yield* TestClock.adjust(Duration.seconds(5));
+          yield* acquire;
+          return [running, yield* statusAfter(3)] as const;
+        }),
+      );
+      // Not also as starting: that would be 2 pieces, owing 768 MB more.
+      for (const observed of status) assert.deepInclude(observed.last, { pieces: 1, owedMb: 468 });
+    }),
+  );
+
+  it.effect("slots off: a start whose run showed and ended stops counting, grace or not", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const status = yield* run(
+        world,
+        observe({ startGraceSeconds: 30 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const first = yield* acquire;
+          const token = first.type === "allow" ? first.token : null;
+          yield* gate.started(token, ThreadId.make("child"));
+          yield* gate.release(token);
+          // Its run shows, then ends, all inside the 30 s grace of its dispatch's end.
+          world.threads = [{ id: "child", unit: "t3code-claude-cccc0000.scope" }];
+          scopeFiles(world, "t3code-claude-cccc0000.scope", 300);
+          yield* TestClock.adjust(Duration.seconds(5));
+          yield* release(yield* acquire);
+          yield* statusAfter(2);
+          world.threads = [];
+          yield* TestClock.adjust(Duration.seconds(5));
+          yield* release(yield* acquire);
+          return yield* statusAfter(3);
+        }),
+      );
+      // A finished agent: not counted again as starting for the rest of its grace.
+      assert.strictEqual(status.last?.pieces, 0);
+    }),
+  );
+
+  it.effect("slots off: a child named while the observation waits is not counted twice", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const status = yield* run(
+        world,
+        observe({ startGraceSeconds: 30 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const first = yield* acquire;
+          yield* statusAfter(1);
+          yield* TestClock.adjust(Duration.seconds(5));
+          // Decided while the first start has no child yet; observed after it shows its run.
+          yield* acquire;
+          yield* gate.started(first.type === "allow" ? first.token : null, ThreadId.make("child"));
+          world.threads = [{ id: "child", unit: "t3code-claude-cccc0000.scope" }];
+          scopeFiles(world, "t3code-claude-cccc0000.scope", 300);
+          return yield* statusAfter(2);
+        }),
+      );
+      assert.deepInclude(status.last, { pieces: 1, owedMb: 468 });
+    }),
+  );
+
+  it.effect("slots off: a dispatch that ends with no child stops counting at once", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const status = yield* run(
+        world,
+        observe({ startGraceSeconds: 30 }),
+        Effect.gen(function* () {
+          yield* release(yield* acquire);
+          yield* TestClock.adjust(Duration.seconds(1));
+          yield* acquire;
+          return yield* statusAfter(2);
+        }),
+      );
+      assert.deepInclude(status.last, { pieces: 0 });
+    }),
+  );
+
+  it.effect("held slots in the wait store count as the gate counts them (a restart, #353)", () =>
+    Effect.gen(function* () {
+      const HOLD = { key: "w_held", threadId: "waiter", untilMs: 60_000 };
+      const cases = [
+        // After a restart the store has the only copy of a delivered slot wait's hold.
+        { name: "slots off", agentSlots: {}, holds: [HOLD], caller, pieces: 1, reads: 1 },
+        {
+          name: "slots on",
+          agentSlots: { enabled: true, maxPerMachine: 5 },
+          holds: [HOLD],
+          caller,
+          pieces: 1,
+          // The gate's own decision reads it too.
+          reads: 2,
+        },
+        // The holder's own delegation uses its hold up: counted once, as the new start.
+        {
+          name: "the holder",
+          agentSlots: {},
+          holds: [HOLD],
+          caller: "waiter",
+          pieces: 0,
+          reads: 1,
+        },
+        {
+          name: "an ended hold",
+          agentSlots: {},
+          holds: [{ ...HOLD, untilMs: 0 }],
+          caller,
+          pieces: 0,
+          reads: 1,
+        },
+        { name: "an empty store", agentSlots: {}, holds: [], caller, pieces: 0, reads: 1 },
+        // Waits off: the gate counts no hold, and nothing of the store is read.
+        {
+          name: "waits off",
+          agentSlots: {},
+          holds: [HOLD],
+          caller,
+          pieces: 0,
+          reads: 0,
+          waitsOff: true,
+        },
+      ];
+      for (const entry of cases) {
+        const world = newWorld();
+        let reads = 0;
+        const status = yield* run(
+          world,
+          {
+            agentSlots: { mode: "observe", ...entry.agentSlots },
+            waitFor: { enabled: entry.waitsOff !== true },
+          },
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* gate.attachReservations({
+              read: Effect.sync(() => {
+                reads += 1;
+                return entry.holds;
+              }),
+              used: () => Effect.void,
+            });
+            const answer = yield* gate.acquire({
+              callerThreadId: ThreadId.make(entry.caller),
+              targetInstanceId: MAIN,
+            });
+            assert.strictEqual(answer.type, "allow", entry.name);
+            return yield* statusAfter(1);
+          }),
+        );
+        assert.strictEqual(status.last?.pieces, entry.pieces, entry.name);
+        assert.strictEqual(reads, entry.reads, entry.name);
+      }
+    }),
+  );
+
+  it.effect("a held slot its holder's start used up counts once, slots off as on (#381)", () =>
+    Effect.gen(function* () {
+      const HOLD = { key: "w_held", threadId: "waiter", untilMs: 100_000 };
+      const waiter = ThreadId.make("waiter");
+      const cases = [
+        { name: "slots on", agentSlots: { enabled: true, maxPerMachine: 5 }, slowFirst: false },
+        // Slots off: the gate never uses the hold up, so it stays in the store.
+        { name: "slots off", agentSlots: {}, slowFirst: false },
+        // The holder's own observation reads the store too late: the next one still sees the start.
+        { name: "slots off, first read slow", agentSlots: {}, slowFirst: true },
+      ];
+      for (const entry of cases) {
+        const world = newWorld();
+        let reads = 0;
+        const counts = yield* run(
+          world,
+          {
+            agentSlots: { mode: "observe", startGraceSeconds: 30, ...entry.agentSlots },
+            waitFor: { enabled: true },
+          },
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* gate.attachReservations({
+              read: Effect.suspend(() => {
+                reads += 1;
+                return entry.slowFirst && reads === 1 ? Effect.never : Effect.succeed([HOLD]);
+              }),
+              used: () => Effect.void,
+            });
+            const answers: Array<string> = [];
+            // The holder delegates; another thread delegates 5 s later.
+            const own = yield* gate.acquire({ callerThreadId: waiter, targetInstanceId: MAIN });
+            answers.push(own.type);
+            if (entry.slowFirst) {
+              yield* settle;
+              yield* TestClock.adjust(OBSERVE_READ_TIMEOUT);
+              yield* statusAfter(1);
+            }
+            yield* TestClock.adjust(Duration.seconds(5));
+            answers.push(yield* acquireAndRelease);
+            const started = (yield* statusAfter(2)).last?.pieces;
+            // Its child shows its run: counted as that run, the hold still used up.
+            const token = own.type === "allow" ? own.token : null;
+            yield* gate.started(token, ThreadId.make("child"));
+            world.threads = [{ id: "child" }];
+            yield* TestClock.adjust(Duration.seconds(5));
+            answers.push(yield* acquireAndRelease);
+            const running = (yield* statusAfter(3)).last?.pieces;
+            // The child's run ends: nothing of it counts, nor the hold it used.
+            yield* gate.release(token);
+            world.threads = [];
+            yield* TestClock.adjust(Duration.seconds(5));
+            answers.push(yield* acquireAndRelease);
+            const ended = (yield* statusAfter(4)).last?.pieces;
+            // Observe data only: every answer stays today's allow.
+            assert.deepStrictEqual(answers, ["allow", "allow", "allow", "allow"], entry.name);
+            return [started, running, ended];
+          }),
+        );
+        assert.deepStrictEqual(counts, [1, 1, 0], entry.name);
+      }
+      // The holder's dispatch ends with no child before anyone else asks: nothing counts.
+      for (const agentSlots of [{ enabled: true, maxPerMachine: 5 }, {}]) {
+        const status = yield* run(
+          newWorld(),
+          { agentSlots: { mode: "observe", ...agentSlots }, waitFor: { enabled: true } },
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* gate.attachReservations({
+              read: Effect.succeed([HOLD]),
+              used: () => Effect.void,
+            });
+            yield* release(yield* gate.acquire({ callerThreadId: waiter, targetInstanceId: MAIN }));
+            yield* TestClock.adjust(Duration.seconds(5));
+            yield* acquireAndRelease;
+            return yield* statusAfter(2);
+          }),
+        );
+        assert.strictEqual(status.last?.pieces, 0, JSON.stringify(agentSlots));
+      }
+    }),
+  );
+
+  it.effect("slots off: a start uses its thread's hold up in every order", () =>
+    Effect.gen(function* () {
+      const HOLD = { key: "w_held", threadId: "waiter", untilMs: 100_000 };
+      // What another thread's decision 5 s after the holder's start counts. Slots on reads the
+      // same, as the gate uses the hold up at the holder's decision (the gate test above: 0 once
+      // the dispatch ended with no child, 1 while the child runs).
+      const cases = [
+        // The holder's own store read is slow, or its projection read fails; then its dispatch
+        // ends with no child, so the start stops counting before any read sees it.
+        { own: "slow", after: "no child", pieces: 0 },
+        { own: "fails", after: "no child", pieces: 0 },
+        // The holder's observation is skipped (the queue is full); its child shows its run
+        // before the next decision, while the queued observations still read.
+        { own: "skipped", after: "child runs", pieces: 1 },
+        // The child's run shows before the next store read: the start no longer counts, but it
+        // still used its hold up (counted as the child's run, once).
+        { own: "slow", after: "child runs", pieces: 1 },
+      ] as const;
+      const got: Array<string> = [];
+      for (const entry of cases) {
+        const name = `own ${entry.own}, ${entry.after}`;
+        const world = newWorld();
+        let visible = new Set<string>();
+        let runningFails = false;
+        const observer = yield* observerFor(
+          world,
+          Effect.sync(() => (runningFails ? undefined : { visible })),
+        );
+        const decide = (atMs: number, patch: Partial<SlotObserveInput>) =>
+          observer.observe({
+            today: ["allow"],
+            atMs,
+            starting: [],
+            held: Effect.succeed([HOLD]),
+            startGraceMs: 30_000,
+            gateRecords: false,
+            ...patch,
+          });
+        const done = (count: number) =>
+          Effect.gen(function* () {
+            for (let turn = 0; turn < 200; turn += 1) {
+              const status = yield* observer.status;
+              if (status.observed + status.skipped >= count) return status;
+              yield* settle;
+            }
+            return yield* Effect.die(new Error(`${name}: fewer than ${count} observations`));
+          });
+        let decisions = 0;
+        if (entry.own === "skipped") {
+          // Other threads' observations fill the queue; the first one's store read takes 1 s.
+          for (let index = 0; index < OBSERVE_MAX_WAITING; index += 1) {
+            yield* decide(0, {
+              callerThreadId: `other-${index}`,
+              held: Effect.as(Effect.sleep(Duration.seconds(1)), [HOLD]),
+            });
+            decisions += 1;
+          }
+        }
+        runningFails = entry.own === "fails";
+        yield* decide(0, {
+          callerThreadId: "waiter",
+          ownStart: { token: 1, instanceId: MAIN, atMs: 0 },
+          held: entry.own === "slow" ? Effect.never : Effect.succeed([HOLD]),
+        });
+        decisions += 1;
+        yield* settle;
+        if (entry.own === "slow") yield* TestClock.adjust(OBSERVE_READ_TIMEOUT);
+        if (entry.own !== "skipped") yield* done(decisions);
+        runningFails = false;
+        if (entry.after === "no child") {
+          yield* observer.released(1, 1_000);
+        } else {
+          yield* observer.started(1, "child");
+          visible = new Set(["child"]);
+        }
+        for (let index = 0; entry.own === "skipped" && index < OBSERVE_MAX_WAITING; index += 1) {
+          yield* TestClock.adjust(Duration.seconds(1));
+          yield* settle;
+        }
+        yield* done(decisions);
+        yield* decide(5_000, { callerThreadId: "other" });
+        const status = yield* done(decisions + 1);
+        assert.strictEqual(status.skipped, entry.own === "skipped" ? 1 : 0, name);
+        assert.strictEqual(status.last?.readings, "ok", name);
+        got.push(`${name}: ${status.last?.pieces}`);
+      }
+      assert.deepStrictEqual(
+        got,
+        cases.map((entry) => `own ${entry.own}, ${entry.after}: ${entry.pieces}`),
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("a wait store read that hangs never delays the decision; the rule reads slow", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const status = yield* run(
+        world,
+        { ...observe(), waitFor: { enabled: true } },
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          yield* gate.attachReservations({ read: Effect.never, used: () => Effect.void });
+          // No clock is moved before the answer: a decision that waited would never end here.
+          assert.strictEqual((yield* acquire).type, "allow");
+          yield* settle;
+          yield* TestClock.adjust(OBSERVE_READ_TIMEOUT);
+          return yield* statusAfter(1);
+        }),
+      );
+      assert.deepInclude(status.last, { rule: "refuse", reason: "unreadable", readings: "slow" });
     }),
   );
 
@@ -474,7 +910,7 @@ describe("SlotGate observe mode", () => {
         observe(),
         Effect.gen(function* () {
           yield* TestClock.adjust(CALM_WAIT);
-          yield* acquire;
+          yield* release(yield* acquire);
           yield* TestClock.adjust(CALM_WAIT);
           const both = yield* Effect.all([acquire, acquire], { concurrency: "unbounded" });
           assert.deepStrictEqual(
@@ -517,6 +953,109 @@ describe("SlotGate observe mode", () => {
       assert.strictEqual(status.last?.owedMb, 768);
       assert.strictEqual(status.last?.pieces, 0);
     }),
+  );
+
+  it.effect("the rule's memory keeps only what still counts (#381)", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const HOLD = { key: "w_held", threadId: "waiter", untilMs: 60_000 };
+      const observer = yield* observerFor(world);
+      let decided = 0;
+      /** One decision, observed to the end. */
+      const decide = (input: Partial<SlotObserveInput> & { atMs: number }) =>
+        Effect.gen(function* () {
+          yield* observer.observe({
+            today: ["allow"],
+            starting: [],
+            held: Effect.succeed([HOLD]),
+            startGraceMs: 30_000,
+            gateRecords: false,
+            ...input,
+          });
+          decided += 1;
+          for (let turn = 0; (yield* observer.status).observed < decided; turn += 1) {
+            if (turn === 200) return yield* Effect.die(new Error("not observed"));
+            yield* settle;
+          }
+        });
+      // Slots off: the holder starts (a dispatch that never ends: a lost release).
+      yield* decide({
+        atMs: 0,
+        callerThreadId: "waiter",
+        ownStart: { token: 1, instanceId: MAIN, atMs: 0 },
+      });
+      assert.deepStrictEqual(yield* observer.kept, { starts: 1, usedHolds: 1, notes: 0 }, "kept");
+      // Past its hold's end and the dispatch's safety limit: the next decision lets both go.
+      yield* decide({ atMs: DISPATCH_SAFETY_MS, held: Effect.succeed([]) });
+      assert.deepStrictEqual(yield* observer.kept, { starts: 0, usedHolds: 0, notes: 0 }, "ended");
+      // Slots switched on (the gate keeps the records): the rule's own go at once.
+      yield* decide({
+        atMs: DISPATCH_SAFETY_MS + 1,
+        callerThreadId: "waiter",
+        ownStart: { token: 2, instanceId: MAIN, atMs: DISPATCH_SAFETY_MS + 1 },
+        held: Effect.succeed([{ ...HOLD, untilMs: 2 * DISPATCH_SAFETY_MS }]),
+      });
+      yield* decide({ atMs: DISPATCH_SAFETY_MS + 2, gateRecords: true });
+      assert.deepStrictEqual(
+        yield* observer.kept,
+        { starts: 0, usedHolds: 0, notes: 0 },
+        "slots on",
+      );
+      // Switched on while a slots-off observation still waits: the slots-on one counts the hold
+      // as the gate does (the gate never used it up).
+      const ON = DISPATCH_SAFETY_MS + 3;
+      yield* observer.observe({
+        today: ["allow"],
+        atMs: ON,
+        starting: [],
+        held: Effect.succeed([{ ...HOLD, untilMs: 2 * DISPATCH_SAFETY_MS }]),
+        callerThreadId: "waiter",
+        startGraceMs: 30_000,
+        gateRecords: false,
+        ownStart: { token: 3, instanceId: MAIN, atMs: ON },
+      });
+      decided += 1;
+      yield* decide({
+        atMs: ON,
+        gateRecords: true,
+        held: Effect.succeed([{ ...HOLD, untilMs: 2 * DISPATCH_SAFETY_MS }]),
+      });
+      assert.strictEqual((yield* observer.status).last?.pieces, 1, "switched on");
+      // A start's note that no store read could take (every read hangs): it goes after the
+      // dispatch's safety limit, or at once when slots switch on.
+      const slow = yield* observerFor(world);
+      let slowDecided = 0;
+      const decideSlow = (input: Partial<SlotObserveInput> & { atMs: number }) =>
+        Effect.gen(function* () {
+          yield* slow.observe({
+            today: ["allow"],
+            starting: [],
+            held: Effect.never,
+            startGraceMs: 30_000,
+            gateRecords: false,
+            ...input,
+          });
+          slowDecided += 1;
+          yield* settle;
+          yield* TestClock.adjust(OBSERVE_READ_TIMEOUT);
+          for (let turn = 0; (yield* slow.status).observed < slowDecided; turn += 1) {
+            if (turn === 200) return yield* Effect.die(new Error("not observed"));
+            yield* settle;
+          }
+        });
+      const startAt = (atMs: number, token: number) => ({
+        atMs,
+        callerThreadId: "waiter",
+        ownStart: { token, instanceId: MAIN, atMs },
+      });
+      yield* decideSlow(startAt(0, 1));
+      assert.deepStrictEqual(yield* slow.kept, { starts: 1, usedHolds: 0, notes: 1 }, "unread");
+      yield* decideSlow({ atMs: DISPATCH_SAFETY_MS });
+      assert.deepStrictEqual(yield* slow.kept, { starts: 0, usedHolds: 0, notes: 0 }, "limit");
+      yield* decideSlow(startAt(DISPATCH_SAFETY_MS + 1, 2));
+      yield* decideSlow({ atMs: DISPATCH_SAFETY_MS + 2, gateRecords: true });
+      assert.deepStrictEqual(yield* slow.kept, { starts: 0, usedHolds: 0, notes: 0 }, "slots on");
+    }).pipe(Effect.scoped),
   );
 
   it("nests a systemd slice the way systemd does", () => {

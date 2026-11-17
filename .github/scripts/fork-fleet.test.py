@@ -1504,7 +1504,8 @@ class Launcher(unittest.TestCase):
     starts, with its user, for `systemctl list-units` and `systemctl show` (with --wait, check-net's probe, it runs the
     command itself, or exits $REC/probe-exit when that file exists). The fake ip keeps the namespaces and links
     it made in $REC/netns and $REC/links; the fake iptables has a DOCKER-USER chain only when $REC/docker-user exists;
-    the fake id answers from $REC/id-<flag>-<user> when that file exists."""
+    the fake id answers from $REC/id-<flag>-<user> when that file exists, and the fake readlink tells where this
+    host's /etc/resolv.conf leads from $REC/resolv-target when that file exists (both kinds of host, on any host)."""
 
     FAKES = {
         'systemd-run': '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$REC/systemd-run"\n'
@@ -1554,6 +1555,9 @@ class Launcher(unittest.TestCase):
                 'exec cat -- "$REC/${a%.test/}" ;; esac; done\nexec /usr/bin/curl "$@"\n',
         'id': '#!/usr/bin/env bash\nf=$REC/id${1}-${!#}\nif [[ -e $f ]]; then cat -- "$f"; exit 0; fi\n'
               'for p in /usr/bin/id /bin/id; do [[ -x $p ]] && exec "$p" "$@"; done\nexit 127\n',
+        'readlink': '#!/usr/bin/env bash\nif [[ "$*" == "-f -- /etc/resolv.conf" && -e $REC/resolv-target ]]; then '
+                    'cat -- "$REC/resolv-target"; exit 0; fi\n'
+                    'for p in /usr/bin/readlink /bin/readlink; do [[ -x $p ]] && exec "$p" "$@"; done\nexit 127\n',
     }
     PRIVATE4 = ('0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 '
                 '192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4')
@@ -1791,6 +1795,36 @@ class Launcher(unittest.TestCase):
         self.write('rec/units', '', 0o644)
         self.assertEqual(self.launch('prune').returncode, 0)
         self.assertFalse(os.path.lexists(root))   # it goes with its unit
+
+    def test_the_jobs_resolv_conf_on_either_kind_of_host(self):
+        """Issue #370 item 5 (#360 lens security-b m2): job_fs's two resolv.conf branches, on any host (the fake
+        readlink says where this host's /etc/resolv.conf leads). A plain file: the jobs' file is bound at
+        /etc/resolv.conf, a mount point of its own, with no link there. A link (systemd-resolved's, into /run): the
+        jobs' file is bound at its target, and the unit's root links /etc/resolv.conf to it, as no whole /etc brings
+        that link any more (issue #243). The host's kind changed between two starts (a WSL distro told to stop making
+        its link): each root is made anew, with no link left from before. A target that is no plain path: refused
+        before any unit starts."""
+        self.write('rec/resolv-target', '/run/x y/resolv.conf\n', 0o644)
+        self.refused('/etc/resolv.conf leads to /run/x y/resolv.conf: not a plain file path')
+        resolv = os.path.realpath(self.path('resolv.conf'))
+        listed = {p: os.readlink(p) for p in job_paths() if os.path.islink(p)}
+        for name, target in (('fleet-vm-t3code-11', '/run/systemd/resolve/stub-resolv.conf'),
+                             ('fleet-vm-t3code-12', '/etc/resolv.conf')):
+            with self.subTest(target):
+                self.write('rec/resolv-target', target + '\n', 0o644)
+                self.start(name)
+                args = self.rec_text('systemd-run').splitlines()
+                props = [args[i + 1] for i, a in enumerate(args) if a == '-p']
+                self.assertIn(f'BindReadOnlyPaths={resolv}:{target}', props)
+                self.assertEqual([p for p in props if p.startswith('BindReadOnlyPaths=') and resolv in p],
+                                 [f'BindReadOnlyPaths={resolv}:{target}'])
+                root = self.path(f'run/{name}.root')
+                links = {os.path.join('/', os.path.relpath(os.path.join(d, x), root)): os.readlink(os.path.join(d, x))
+                         for d, dirs, files in os.walk(root) for x in dirs + files
+                         if os.path.islink(os.path.join(d, x))}
+                self.assertEqual(links, listed | ({} if target == '/etc/resolv.conf' else {'/etc/resolv.conf': target}))
+                if target == '/etc/resolv.conf':
+                    self.assertFalse(os.path.lexists(os.path.join(root, 'etc/resolv.conf')))
 
     def test_a_path_that_may_hold_data_is_never_allowed(self):
         """ALLOW_PATHS and the list itself: a plain absolute path, never one a job has its own of or that holds
@@ -2977,9 +3011,10 @@ class Launcher(unittest.TestCase):
             for c in canaries:
                 self.assertFalse(os.path.lexists(c), c)
 
-    def make_canaries(self, folder):
-        """The launcher's own make_canaries, alone, with CANARY_DIR=folder, for the runner user nobody: its functions as
-        the launcher has them (check-net itself first needs a loopback service it reaches, which some machines refuse)."""
+    def make_canaries(self, folder, user='nobody'):
+        """The launcher's own make_canaries, alone, with CANARY_DIR=folder, for the runner user: its functions as the
+        launcher has them (check-net itself first needs a loopback service it reaches, which some machines refuse).
+        Also LauncherAsRoot's, with the real chown and id (its bin has no fakes of them)."""
         with open(LAUNCH) as f:
             text = f.read()
         fns = [re.search(rf'^{n}\(\) \{{(?:[^\n]*\}}\n|\n.*?^\}}\n)', text, re.M | re.S).group(0)
@@ -2987,9 +3022,9 @@ class Launcher(unittest.TestCase):
                          'make_canaries')]
         plain = re.search(r'^PLAIN_PATH=.*\n', text, re.M).group(0)
         script = 'set -euo pipefail\numask 077\nROOT=\n' + plain + 'CANARY_DIR=$1\n' + ''.join(fns) + \
-            'make_canaries nobody\n'
-        return subprocess.run(['bash', '-c', script, 'canaries', folder], env=self.env(), capture_output=True,
-                              text=True, timeout=60)
+            'make_canaries "$2"\n'
+        return subprocess.run(['bash', '-c', script, 'canaries', folder, user], capture_output=True, text=True,
+                              env={'PATH': f'{self.path("bin")}:/usr/sbin:/usr/bin:/sbin:/bin'}, timeout=60)
 
     def test_check_nets_canaries_are_new_files_in_a_closed_folder(self):
         """Issue #243 fix round 2 (security-a 4, security-b m3): root writes the canaries, so CANARY_DIR is a plain
@@ -3056,6 +3091,8 @@ def real_walls(test, args, systemd_run, *more, full=False):
     call line says ok. full (root, CI): with all of the recorded sandbox but its network (a namespace that is not this
     test's): every line says ok (devices, mounts, later mounts, sockets too), the tools a job uses work inside, and a
     mount the host makes after the unit started does not reach it (the red check: without MountFlags=private it does).
+    With full, the canaries are the launcher's own (make_canaries for the unit's user), and canaries_read proves on
+    the host that this user reads both, the second through its group alone, before the probe finds neither inside.
     Then without the walls: where this host has io_uring, the probe fails."""
     if subprocess.run([*systemd_run, '--wait', '--quiet', '--collect', '--', '/bin/true'], capture_output=True,
                       timeout=60).returncode != 0:
@@ -3070,11 +3107,12 @@ def real_walls(test, args, systemd_run, *more, full=False):
     unit = [*systemd_run, '--wait', '--pipe', '--quiet', '--collect', *more, *(a for w in walls for a in ('-p', w))]
     probe = args[dash + 1:]
     if full:   # issue #243: check-net's canaries, outside the list, on disk while the probe looks for them
-        for c in probe[-1].split():
-            with open(c, 'w') as f:
-                f.write('fork-fleet canary\n')
-            os.chmod(c, 0o644)
-            test.addCleanup(os.remove, c)
+        canaries, user = probe[-1].split(), more[more.index('--uid') + 1]
+        for c in canaries:
+            test.addCleanup(lambda c=c: os.path.lexists(c) and os.remove(c))
+        made = Launcher.make_canaries(test, os.path.dirname(canaries[0]), user)
+        test.assertEqual(made.returncode, 0, made.stderr)
+        canaries_read(test, canaries, user)
     got = subprocess.run([*unit, '--', *probe], capture_output=True, text=True, timeout=120)
     test.assertRegex(got.stdout, r'ok    AF_VSOCK is refused')
     test.assertIn('ok    io_uring is refused (ENOSYS)', got.stdout)
@@ -3120,6 +3158,23 @@ def without(cmd, prop):
         else:
             out.append(a)
     return out
+
+
+def canaries_read(test, canaries, user):
+    """Issue #370 item 4 (#360 lens security-a 5): check-net's two canaries, as make_canaries left them, read for real
+    on the host, outside the walls, as the runner user: it reads the first (others may), and the second only through
+    its group (the same user without that group cannot). So the probe's "2 not there inside" shows the walls hide
+    files this job could read, one of them through its group alone, not that a mode kept them out."""
+    pw = pwd.getpwnam(user)
+    other = 65534   # nogroup: a group the runner user (useradd --user-group) is not in
+    test.assertNotEqual(pw.pw_gid, other)
+
+    def reads(path, gid):
+        return subprocess.run(['setpriv', f'--reuid={pw.pw_uid}', f'--regid={gid}', '--clear-groups', '--', 'cat',
+                               path], capture_output=True, timeout=30).returncode == 0
+    plain, group = canaries
+    test.assertEqual([reads(plain, pw.pw_gid), reads(group, pw.pw_gid), reads(plain, other), reads(group, other)],
+                     [True, True, True, False], 'the canaries: read by the runner user, the second through its group')
 
 
 def hidden_from_job(test, unit, props):
@@ -4036,7 +4091,8 @@ class Wiring(unittest.TestCase):
         job = self.tests['jobs']['workflows']
         self.assertEqual(job['runs-on'], HOSTED)
         runs = [st.get('run') for st in job['steps']]
-        root = runs.index('sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot')
+        # -v: the log names every test, a skipped one with its reason.
+        root = runs.index('sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py -v LauncherAsRoot')
         # check-net's test needs the real nft, which the hosted image may lack: installed in a step before it.
         self.assertTrue(any('apt-get install -y -qq nftables' in (r or '') for r in runs[:root]), runs)
 

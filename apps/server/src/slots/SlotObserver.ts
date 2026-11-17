@@ -6,6 +6,7 @@
 import type { SlotRuleStatus } from "@t3tools/contracts/waitFor";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
+  DISPATCH_SAFETY_MS,
   liveReservations,
   liveStarting,
   onePerThread,
@@ -38,6 +39,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FiberSet from "effect/FiberSet";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 
@@ -61,10 +63,23 @@ export interface SlotObserveInput {
   readonly today: ReadonlyArray<SlotAnswer>;
   readonly atMs: number;
   readonly starting: ReadonlyArray<StartingEntry>;
-  readonly held: ReadonlyArray<SlotReservation>;
+  /**
+   * The live held slots as the gate counts them: memory as of the decision, the wait store as of
+   * when the observation runs (read in the observer's fiber, so a slow store never delays the
+   * decision). An observation that waits behind others can miss a hold a later decision used up
+   * meanwhile, or count one granted after its decision: one agent off, for a few seconds.
+   */
+  readonly held: Effect.Effect<ReadonlyArray<SlotReservation>>;
+  /** `acquire`'s caller: its own held slot is used up by the start it asks for (counted once). */
+  readonly callerThreadId?: string | undefined;
   readonly startGraceMs: number;
   /** The gate keeps `starting` (slots on with a limit); else the rule keeps its own allows. */
   readonly gateRecords: boolean;
+  /**
+   * While the gate keeps no records: the allowed start, under a token of its own that the gate's
+   * `started` and `release` hand on (`started`, `released` here).
+   */
+  readonly ownStart?: StartingEntry | undefined;
 }
 
 /** systemd nests `a-b-c.slice` as `a.slice/a-b.slice/a-b-c.slice`. */
@@ -104,10 +119,25 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
   let waiting = 0;
   let hanging = 0;
   /**
-   * While the gate keeps no records (slots off), the times of the agents allowed lately: each
-   * counts as starting for `startGraceMs`, the time a new agent takes to show a run.
+   * While the gate keeps no records (slots off), the agents allowed lately, kept as the gate keeps
+   * its own (`liveStarting`): each counts until its dispatch ends, then for `startGraceMs` unless
+   * its child shows a run (then it counts as that run, once). A dispatch that ends with no child
+   * stops counting at once.
    */
-  let ownStarts: ReadonlyArray<number> = [];
+  let ownStarts: ReadonlyArray<StartingEntry> = [];
+  /**
+   * While the gate keeps no records: held slots of the threads those starts were for, by key, until
+   * they end. A start uses its thread's hold up, as the gate's `useUp` does with slots on (with slots
+   * off the gate leaves it in the store), so the start and the hold never both count, not even once
+   * the start stops counting (its child shows its run, or its dispatch ends).
+   */
+  const usedHolds = new Map<string, number>();
+  /**
+   * Slots off: threads allowed a start, noted at the decision (before any skip). The next good store
+   * read uses their holds up, whatever became of the start meanwhile, and drops the notes. Slots on
+   * drops them all; a note no read took goes after `DISPATCH_SAFETY_MS`.
+   */
+  const startedThreads = new Map<string, number>();
 
   const readFacts = async (pieces: ReadonlyArray<OwnPiece>): Promise<CapacityFacts> => {
     const machine = await readMachine(host);
@@ -159,30 +189,61 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
 
   const run = Effect.fn("SlotObserver.run")(function* (
     input: SlotObserveInput,
-    ownStarting: number,
+    ownBefore: ReadonlyArray<StartingEntry>,
   ) {
     const running = yield* readRunning;
+    // Off the decision path; a store read past the time limit leaves the pieces unknown.
+    const heldRead =
+      running === undefined
+        ? Option.none()
+        : yield* Effect.timeoutOption(input.held, OBSERVE_READ_TIMEOUT);
     let pieces: ReadonlyArray<OwnPiece> | null = null;
-    if (running !== undefined) {
+    if (running !== undefined && Option.isSome(heldRead)) {
+      // The starts of before the decision as they are now, read with the runs of now: a child
+      // named or a dispatch ended while this waited is seen (else a child that shows its run
+      // meanwhile would count twice).
+      const before = new Set(ownBefore.map((entry) => entry.token));
+      const own = ownStarts.filter((entry) => before.has(entry.token));
+      // A child seen with a run counts as running from now on, as in the gate's own records.
+      ownStarts = ownStarts.filter(
+        (entry) => entry.childThreadId === undefined || !running.visible.has(entry.childThreadId),
+      );
       const starting = liveStarting(
-        input.starting,
+        [...input.starting, ...own],
         running.visible,
         input.atMs,
         input.startGraceMs,
       );
-      const held = onePerThread(liveReservations(input.held, input.atMs));
+      const live = liveReservations(heldRead.value, input.atMs);
+      if (!input.gateRecords) {
+        for (const reservation of live) {
+          if (startedThreads.has(reservation.threadId)) {
+            usedHolds.set(reservation.key, reservation.untilMs);
+          }
+        }
+        startedThreads.clear();
+      }
+      const held = onePerThread(
+        live.filter(
+          (reservation) =>
+            reservation.threadId !== input.callerThreadId &&
+            (input.gateRecords || !usedHolds.has(reservation.key)),
+        ),
+      );
       const scopes = yield* Effect.forEach([...running.visible], (threadId) =>
         agentScope.ownScope === undefined ? Effect.undefined : agentScope.ownScope(threadId),
       );
       pieces = [
         ...scopes.map((scope) => ({ scope })),
         ...[...starting, ...held].map(() => ({ scope: undefined })),
-        ...Array.from({ length: ownStarting }, () => ({ scope: undefined })),
       ];
     }
     const read =
       pieces === null
-        ? { facts: null, readings: "failed" as SlotReadings }
+        ? {
+            facts: null,
+            readings: (running === undefined ? "failed" : "slow") as SlotReadings,
+          }
         : yield* readings(pieces);
     const { decisions, pressure: next } = observeSlotAnswers(CAPACITY_RULE, {
       facts: read.facts,
@@ -221,20 +282,27 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
       // Kept at the call, before any skip, so a skipped allow still counts for the next ones.
       ownStarts = input.gateRecords
         ? []
-        : ownStarts.filter((atMs) => atMs <= input.atMs && input.atMs - atMs < input.startGraceMs);
-      const ownStarting = ownStarts.length;
-      if (!input.gateRecords) {
-        ownStarts = [
-          ...ownStarts,
-          ...input.today.filter((answer) => answer === "allow").map(() => input.atMs),
-        ];
+        : liveStarting(ownStarts, new Set(), input.atMs, input.startGraceMs);
+      for (const [key, untilMs] of usedHolds) {
+        if (input.gateRecords || untilMs <= input.atMs) usedHolds.delete(key);
+      }
+      for (const [threadId, atMs] of startedThreads) {
+        if (input.gateRecords || input.atMs - atMs >= DISPATCH_SAFETY_MS) {
+          startedThreads.delete(threadId);
+        }
+      }
+      const ownBefore = ownStarts;
+      if (!input.gateRecords && input.ownStart !== undefined) {
+        ownStarts = [...ownStarts, input.ownStart];
+        if (input.callerThreadId !== undefined)
+          startedThreads.set(input.callerThreadId, input.atMs);
       }
       if (waiting >= OBSERVE_MAX_WAITING) {
         return Ref.update(status, (current) => ({ ...current, skipped: current.skipped + 1 }));
       }
       waiting += 1;
       return lock
-        .withPermits(1)(run(input, ownStarting))
+        .withPermits(1)(run(input, ownBefore))
         .pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("agent slots: the capacity rule could not be observed", { cause }),
@@ -244,13 +312,38 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
               waiting -= 1;
             }),
           ),
-          FiberSet.run(fibers),
+          // Not on the caller's stack: it runs once the decision is answered, whatever it reads.
+          FiberSet.run(fibers, { startImmediately: false }),
           Effect.asVoid,
         );
     }).pipe(Effect.ignoreCause);
 
   return {
     observe,
+    /** The gate's `started` with one of the rule's own tokens: the child that start names. */
+    started: (token: number, childThreadId: string) =>
+      Effect.sync(() => {
+        ownStarts = ownStarts.map((entry) =>
+          entry.token === token ? { ...entry, childThreadId } : entry,
+        );
+      }),
+    /** The gate's `release`: the dispatch ended (as the gate ends its own entries). */
+    released: (token: number, atMs: number) =>
+      Effect.sync(() => {
+        ownStarts = ownStarts.flatMap((entry) =>
+          entry.token !== token
+            ? [entry]
+            : entry.childThreadId === undefined
+              ? []
+              : [entry.endedAtMs === undefined ? { ...entry, endedAtMs: atMs } : entry],
+        );
+      }),
     status: Ref.get(status),
+    /** What the rule keeps in memory (for tests: nothing past the point it stops counting). */
+    kept: Effect.sync(() => ({
+      starts: ownStarts.length,
+      usedHolds: usedHolds.size,
+      notes: startedThreads.size,
+    })),
   };
 });

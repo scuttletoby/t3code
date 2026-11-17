@@ -36,9 +36,11 @@ the open pull requests, a step before start fails, or the run never reaches star
           one, the head of every open pull request (the backfill, paged, one entry per head). When the read fails
           every try: the head the event carries (--event-sha), else refs/pull/N/head by git (not the REST API, so
           not its rate limit). On a workflow_run (the review trigger's run finished, README.md "Run again after a
-          review"): no number is taken; the one open pull request whose head is the run's head sha from the run's
-          head repository and branch (--run-*, GitHub's fields of the run), read from the API. None, or more than
-          one: nothing to judge (a log line says why). A run of another event: nothing to judge.
+          review"): no number is taken; the open pull requests whose head is the run's head sha from the run's
+          head repository and branch (--run-*, GitHub's fields of the run), read from the API. More than one (one
+          branch into two bases): the head is judged once, in the job for the lowest number; target names the ones
+          it judges (ready, into the default branch). None, or a run of another event: nothing to judge (a log
+          line says why).
   target  before any token: post=false only for bad arguments. Else post=true: the head gets a failure (judge writes
           it) when the guard did not pass, on a re-run (run attempt 2 or later), for a caller that is not the default
           branch's current one or does not pin this gate release, for a lens list with a name that names no lens, for
@@ -79,7 +81,7 @@ CALLER_PATH = re.compile(r'\.github/workflows/[A-Za-z0-9._-]+\.ya?ml')
 GATE_WORKFLOW = 'fork-head-gate.yml'
 GATE_FILES = ('.github/workflows/' + GATE_WORKFLOW, 'fork-ci/actions/head-check', 'fork-ci/actions/pr-queue')
 LIST_JQ = '.[] | [.number, .draft, .head.sha, .base.ref] | @json'
-HEAD_JQ = '.[] | [.number, .draft, .head.sha, .head.repo.full_name] | @json'   # head.repo is null for a deleted fork
+HEAD_JQ = '.[] | [.number, .head.sha, .head.repo.full_name] | @json'   # head.repo is null for a deleted fork
 BRANCH_MAX = 255
 SERVER = 'https://github.com'
 
@@ -334,10 +336,10 @@ def review_run_pr(repo, run, gh, out):
     matches = []
     for line in r.stdout.splitlines():
         try:
-            n, draft, head, from_repo = json.loads(line)
+            n, head, from_repo = json.loads(line)
         except (ValueError, TypeError):
             return None, 'GitHub listed something that is not a pull request'
-        if not (type(n) is int and n > 0 and isinstance(draft, bool) and isinstance(head, str)
+        if not (type(n) is int and n > 0 and isinstance(head, str)
                 and pr_queue.SHA.fullmatch(head.lower()) and (from_repo is None or isinstance(from_repo, str))):
             return None, 'GitHub listed something that is not a pull request'
         if head.lower() == sha and isinstance(from_repo, str) and from_repo.lower() == head_repo.lower():
@@ -347,12 +349,17 @@ def review_run_pr(repo, run, gh, out):
         out(f'nothing to judge: no open pull request has the head {head_check.escape(where)} (closed or merged since, '
             'or the head moved on: its push ran the gate)')
         return [], None
-    if len(matches) > 1:
-        out(f'nothing to judge: {len(matches)} open pull requests have the head {head_check.escape(where)} '
-            f'({", ".join(f"#{n}" for n in sorted(matches))}); dispatch the gate with each number')
-        return [], None
-    out(f'review run: #{matches[0]} has the head {head_check.escape(where)}')
-    return [{'pr': matches[0], 'sha': sha}], None
+    # One branch into two bases: every match has this head, and the gate judges a head, not a pull request (preflight
+    # lists every open pull request with it again; the number only names the job). So it is judged once. The listing
+    # has no draft or base, so this line cannot say which of them are judged: target's "judging" line does.
+    numbers = sorted(set(matches))   # numbers, so 9 < 10; a number GitHub listed twice is named once
+    if len(numbers) == 1:
+        out(f'review run: #{numbers[0]} has the head {head_check.escape(where)}')
+    else:
+        out(f'review run: open pull requests {", ".join(f"#{n}" for n in numbers)} have the head '
+            f'{head_check.escape(where)}; judged once, in the job for #{numbers[0]} (the lowest number); the target '
+            'step names the ones it judges (ready, into the default branch)')
+    return [{'pr': numbers[0], 'sha': sha}], None
 
 
 def prs(repo, event, pr_text, gh, out, env, event_sha='', git_head=None, run=None):
@@ -644,7 +651,7 @@ def bare_repository(work, name):
     except OSError as e:
         return None, f'could not make a folder in {work}: {e}'
     r = subprocess.run(['git', *pr_queue.GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
-                       capture_output=True)
+                       capture_output=True, env={**os.environ, **pr_queue.GIT_ENV})
     if r.returncode != 0:
         return None, f'git init failed: {r.stderr.strip()[:300]}'
     with open(os.path.join(path, 'config'), 'w', encoding='utf-8') as f:

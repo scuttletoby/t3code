@@ -97,6 +97,16 @@ class Vectors(unittest.TestCase):
                     rj.judge(CONFIGS['basic'], [('M', ('docs/a.md',))], spelled)
                 self.assertIn(f'the config path {spelled!r}', str(e.exception))
 
+    def test_a_config_name_with_glob_characters_is_its_exact_name(self):   # #374 item 4: git reads such names
+        # The protected set is compared exactly, never as a glob: `queue[main].json` protects that file and no other.
+        for name in ('.github/queue[main].json', '.github/q*.json', '.github/q?.json', '.github/{a,b}.json',
+                     '.github/!q.json', '.github/q\\x.json'):
+            with self.subTest(name):
+                j = rj.judge(CONFIGS['basic'], [('M', ('docs/a.md',)), ('M', (name,))], './' + name)
+                self.assertEqual((j.weight, j.protected), ('critical', (name,)))
+                j = rj.judge(CONFIGS['basic'], [('M', ('docs/a.md',)), ('M', ('.github/qx.json',))], name)
+                self.assertEqual((j.weight, j.protected), ('normal', ()))   # another file the glob would match
+
     def test_a_path_that_is_not_utf8_is_judged_and_shown_escaped(self):   # #348 item 1: git -z, surrogateescape
         bad = b'src/storage/bad\xff.py'.decode('utf-8', 'surrogateescape')
         j = rj.judge(CONFIGS['basic'], rj.parse_name_status(f'A\0{bad}\0'), CONFIG_PATH)

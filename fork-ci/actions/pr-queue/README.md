@@ -7,9 +7,16 @@ only for a head that holds exactly the change the review read.
 
 ## Config
 
-One JSON file in the project's repository. Unknown keys, a key written twice, a
+One JSON file in the project's repository, UTF-8. Unknown keys, a key written twice, a
 missing required key, an empty `required_checks` or a value of the wrong type is
 an error: the queue then exits non-zero and touches no pull request.
+
+The queue reads the config with git, as the commit checked out at its path
+(HEAD) holds it, never the file on disk: a checkout writes that file through
+`.gitattributes` (an encoding, `ident`), which a pull request can change
+without touching the config itself. So the path must be inside a git checkout,
+and the config must be committed there as a regular file: an edit that is not
+committed is not read, and a symlink, a submodule entry or a folder is refused.
 
 ```json
 {
@@ -85,11 +92,16 @@ The config is refused when:
   catch-all rule (it could never match): a new folder must never fall to no rule
   or to no lens;
 - there is no `critical` rule (the built-in protected paths below take its lenses);
-- in `enforce`, a lighter rule comes before a heavier rule and some path matches
-  a glob of both (`**/*.md` light above `src/**` critical: `src/notes.md` would
-  belong to the light rule and need no lens). Put heavier rules first. The
-  catch-all rule is exempt: a lighter rule above it is the normal case. In
-  `shadow` the same order is a warning in the gate's summary row, not a refusal;
+- in `enforce`, a rule comes before another rule, some path matches a glob of
+  both, and the first rule is lighter (`**/*.md` light above `src/**` critical:
+  `src/notes.md` would belong to the light rule and need no lens) or of the same
+  weight without one of the other rule's lenses (`**/*.py` critical `[a]` above
+  `src/**/*` critical `[a, b]`: `src/x.py` would need no `b`). Put heavier rules
+  first, and of one weight the rule with more lenses. Only the match-every globs
+  of the catch-all rule (`**`) are exempt: a lighter rule above it is the normal
+  case, but an explicit glob it also names (`["src/**", "**"]`) is compared like
+  any other. In `shadow` the same order is a warning in the gate's summary row,
+  not a refusal, and the warning says that enforce refuses it;
 - a glob is not in the dialect below, or a rule name or glob is written twice.
 
 **Globs.** Paths are repo-relative and use `/`. `*` is any characters inside one
@@ -104,7 +116,10 @@ means the same thing on both sides.
 `.github/workflows/**` always count as critical, whatever the rules say, with the
 lenses of the first critical rule. So a pull request that weakens the rules needs
 the critical lenses, and it is judged by the old rules: the gate reads the config
-from the base tip only.
+from the base tip only. The config file is named as git names a changed file
+(one leading `./` aside; no empty, `.` or `..` segment): any other character is
+part of its name, glob characters too (`queue[main].json`), as the protected
+paths are compared exactly, never matched as globs.
 
 **How the gate judges.** The gate fetches the base tip and the head by sha and
 reads the changed paths with `git diff --name-status -z -M <merge base> <head>`:
@@ -128,6 +143,16 @@ whole). Then (`review_judge.py`, `review_glob.py`):
 their status, and the expected weight and lenses); the Python tests read it, and
 T3 tests its own matcher on the same file.
 
+Notes for T3's matcher and its GitHub reader (no change in the gate):
+
+- add a glob vector with a non-ASCII name (an emoji, which is two UTF-16 units):
+  `?` is one character of the path, so a TypeScript matcher must count code
+  points as Python does, never UTF-16 units;
+- GitHub's changed-files API stops at 3,000 files and gives text, not git's
+  bytes (no `-z`, and a name that is not UTF-8 is changed). A reader on that API
+  must map its names to git's, and when the list is cut, judge the change by the
+  heaviest weight of the rules (unknown never judges lighter).
+
 **Shadow and enforce.** In `shadow` the gate judges as before, by its
 `required-lenses` input, and its check summary adds a row "the path rules would
 have said: <weight>, lenses <...>" with the rules and paths behind it. In
@@ -136,6 +161,21 @@ have said: <weight>, lenses <...>" with the rules and paths behind it. In
 never remove them). Switching `shadow` to `enforce` takes effect on each pull
 request at its next gate run (a push, a base change, or the backfill dispatch);
 a check posted before stays as it was until then.
+
+Fix every config warning before switching to `enforce`: the gate reads the
+config from the base tip, so a base config that does not parse refuses every
+head, the one that fixes it too, and the queue stops (an owner then has to push
+the fix by hand). The gate therefore refuses a pull request whose merged config
+(GitHub's merge commit, or `git merge-tree` of base and head in the gate's bare
+mode) does not parse, is deleted, is no regular file (a folder, a symlink or a
+submodule entry), gains a twin whose name differs from it only in case, or is
+in `enforce` with a rule order `enforce` refuses (the order checks above), and
+caps what it reads of a config a pull request changes
+(32 KiB, 128 characters per glob, 2,048 in all). That one check reads the
+merged config; everything else, the rules that judge the head too, the base's.
+It judges the merge with the base of its run: two pull requests that each pass
+alone can still merge into a bad config unless the ruleset requires branches to
+be up to date, which the queue needs anyway.
 
 **The empty input.** The gate refuses an empty `required-lenses` input (a head
 with no lens comment would pass), except when the config at the base tip has a
@@ -506,7 +546,8 @@ checkout of its config, in a job with the read permissions above:
 
 With `update_when_base_was_red`, the job of every required check runs
 `tested-base` right after its checkout of the merge commit (`path` is the
-checkout's path, default `.`):
+checkout's path relative to the workspace, default `.`; an absolute path or a
+`.git` that fork-ci git-clean refuses writes no note):
 
 ```yaml
 - uses: actions/checkout@<sha>

@@ -1,4 +1,5 @@
-"""The command line (`check`, `settle`, `copy`; coldcopy.py has the copy) and `t3-golive check`: may this T3 home move to the target build now?
+"""The command line (`check`, `settle`, `copy`, `rehearse`; coldcopy.py and rehearse.py have the last two) and
+`t3-golive check`: may this T3 home move to the target build now?
 
 check is read only: it never stops, starts or writes to a T3 home, never opens its database (the target build's
 read-only report does that) and never runs a `t3` from PATH. It writes only the kit's own lock file.
@@ -71,7 +72,9 @@ def _journal(cfg, add, info, own_id):
     last = runs[-1] if runs else None
     if last is not None and journal.needs_settling(last):
         return add('journal', False, f'{journal.describe(last)}; {journal.SETTLE_HINT}')
-    if last is not None and last['end'] is not None and last['end']['result'] != 'ok' and not last['settled']:
+    if last is not None and last.get('scratch') and (last['end'] or {}).get('result') != 'ok':
+        info.append(f'last run: {journal.describe(last)}; it changed only its own clone: nothing to settle')
+    elif last is not None and last['end'] is not None and last['end']['result'] != 'ok' and not last['settled']:
         info.append(f'last run: {last["command"]} ended {last["end"]["result"]} before its first step: '
                     f'{last["end"]["detail"]}')
     elif last is not None and last['end'] is None and not last['settled']:
@@ -336,6 +339,23 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     p.add_argument('--owner-says-go', action='store_true',
                    help='do not wait for a quiet point (the owner says now is fine)')
     p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p = sub.add_parser('back', help='the way back from a fork build: say which of W1-W3 is possible, or take one',
+                       description='Without --way: read only, says which way back is possible now and why. W1 '
+                                   'restores the newest copy and goes back to the build it was taken under (loses '
+                                   'everything since the copy); W2 goes to the upstream nightly the fork build is cut '
+                                   'from; W3 to a newer upstream stable. Runs detached unless --here.')
+    p.add_argument('--way', choices=('w1', 'w2', 'w3'))
+    p.add_argument('--lose-work-since', metavar='TIME', help="W1 by hand: the copy's time, as `back` prints it")
+    p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    sub.add_parser('status', help='read only: is T3 up and right?', description='Read only: the light checks of '
+                   'verify, the fork features that are on, and the copies on disk. Exit 0 only when all pass.')
+    p = sub.add_parser('rehearse', help='try the target build on a clone of a copy, in its own home and port',
+                       description='R0-R5 on a clone of a finished copy (the newest, or --copy): preflights, the '
+                                   'migration, `serve --hold-work`, report-to-report checks, the way back. Never '
+                                   'touches the live T3 home; the result is journalled.')
+    p.add_argument('--copy', help='the copy folder to rehearse on (default: the newest in backupDir)')
+    p.add_argument('--port', type=int, help='the rehearsal server port (default: a free one)')
+    p.add_argument('--json', action='store_true', help='print the result as JSON')
     p = sub.add_parser('guard', help=argparse.SUPPRESS)
     p.add_argument('--run', required=True)
     p = sub.add_parser('switch', help='move the live T3 to the target build, verify it, go back on its own if not',
@@ -347,12 +367,11 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     p.add_argument('--owner-says-go', action='store_true',
                    help='do not wait for a quiet point (the owner says now is fine)')
     p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
-    p = sub.add_parser('back', help='after a switch run that died: put T3 back as its journal says',
-                       description='--auto: what the switch guard runs. Goes back only if the given switch run is '
-                                   'the last run and its journal says neither "verified" nor "rolled back"; '
-                                   'does nothing while another run holds the lock. (Going back by hand after a '
-                                   'verified switch comes with go-live PR 7.)')
-    p.add_argument('--auto', action='store_true', required=True)
+    p = sub.add_parser('switch-guard', help='after a switch run that died: put T3 back as its journal says',
+                       description='What the switch guard runs (its unit and timer). Goes back only if the given '
+                                   'switch run is the last run, has no end line or never started its way back, and '
+                                   'its journal says neither "verified" nor "rolled back"; does nothing while another '
+                                   'run holds the lock. Going back by hand is `t3-golive back`.')
     p.add_argument('--run', required=True, help='the switch run id (in the journal)')
     p.add_argument('--wait', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -364,14 +383,20 @@ def main(argv, out=sys.stdout, err=sys.stderr):
         return 2
     if args.command == 'settle':
         return _settle(cfg, args.reason, out, err)
+    if args.command == 'rehearse':  # it never stops or starts the boot service: no adapter needed
+        from golive import rehearse
+        return rehearse.main(cfg, args.copy, args.port, args.json, out, err)
     try:
         adapter = osadapter.for_this_os()
     except osadapter.Unsupported as e:
         print(f't3-golive: {e}', file=err)
         return 2
-    if args.command in ('switch', 'back'):
+    if args.command in ('back', 'status'):
+        from golive import back  # it uses this module
+        return back.main(args, cfg, adapter, out, err)
+    if args.command in ('switch', 'switch-guard'):
         from golive import switch
-        if args.command == 'back':
+        if args.command == 'switch-guard':
             switch.back_auto(cfg, adapter, args.run, args.wait, say=lambda line: print(line, file=out, flush=True))
             return 0
         return switch.main_switch(cfg, adapter, args.here, args.owner_says_go, out, err)

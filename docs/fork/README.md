@@ -278,18 +278,19 @@ dropped to make room.
 
 Handoff instead of compaction: when a long thread gets big, or sits idle while its prompt cache is
 about to run out, T3 starts a fresh session in the same thread with a written handoff, so the
-thread's children, watched pull requests and waits keep working. This pull request adds only the
-setting and the decision ("should this thread hand off now?"); nothing acts on it yet.
+thread's children, watched pull requests and waits keep working. How and when:
+[handoff.md](handoff.md).
 
 Only the person can change it; agents cannot. `mode` is `off` (the default: upstream's compaction
 settings apply as they are), `handoff`, or `compact` (the same as `off`, so one thread can opt out
 of its project's `handoff`). `threads` maps a thread id to a mode and wins over `mode` (at most
 500). `source` says who writes the handoff: `agent` (the old session, in one turn; `instructions`
 replaces the built-in text) or `command` (a program given as `command`, run without a shell; it
-must only read). `sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
+must only read). Neither source writes a handoff yet; until they do, every handoff uses T3's state
+and the recent conversation only, and `source` sets only how early the idle handoff starts. `sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
 smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
-model (not set: the thread's current one). A save with a bad value, or `source: command` without a
-command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
+model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
+typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
 server log), never as `handoff`.
 
 ```json
@@ -340,7 +341,9 @@ server's `mcpSubagentProfile`.
 
 A project's own handoff settings. It replaces the server's `handoff` for that project as a whole.
 Not set: the project uses the server's. A project value that is not valid reads as off for that
-project; it never falls back to the server's value. A project save that leaves this key out (an
+project, and the next save of the project writes it back as a full `off` value; it never falls back
+to the server's value. A thread's own mode in the project's or the server's `threads` wins over
+either `mode`, the project's entry first. A project save that leaves this key out (an
 older client) keeps the stored value; only `null` clears it.
 
 ### A setting the fork removed
@@ -380,9 +383,10 @@ A build made this way does not know it is the fork: its `t3 update` and `t3 serv
 fetch upstream's releases. Do not use them on it; update it with `git pull` and a rebuild.
 
 **A machine that already runs T3 as a boot service.** Do not switch it by hand. The go-live kit
-([fork-kit/golive](../../fork-kit/golive/README.md)) is for this: today it has only its read-only
-`check`. Its copy, rehearsal on the copy, switch and way back are not written yet, and the kits are
-not yet installable from the release branch. Until then, try a build on a copy with
+([fork-kit/golive](../../fork-kit/golive/README.md)) is for this, step by step in
+[go-live.md](go-live.md): today it has `check`, the practice `copy`, the way `back` and `status`. Its
+rehearsal on the copy and its switch are not written yet, and the kits are not yet installable from
+the release branch. Until then, try a build on a copy with
 `t3 serve --hold-work --base-dir <copy>` ([updates.md](updates.md#trying-a-build-on-a-copy-serve---hold-work)).
 
 Not there yet: a fork installer URL, a macOS CLI archive, signed desktop apps, and the go-live
@@ -390,12 +394,15 @@ switch.
 
 ## Other fork pages
 
+- [go-live.md](go-live.md): the runbook for moving a boot-service machine to the fork, the way back,
+  and switching features on one at a time.
 - [updates.md](updates.md): update defaults, how a test pins them, the nightly sync runbook,
   `serve --hold-work`.
 - [anchor-machine.md](anchor-machine.md): one machine for new work, with upstream load balancing.
 - [gate-trust.md](gate-trust.md): what the head gate proves, and the owner's steps.
 - [host-tools.md](host-tools.md): design for agents on a person's own computer (no code yet).
 - [playtest.md](playtest.md): the playtest adapter contract (steps, environment, exit codes).
+- [handoff.md](handoff.md): handoff instead of compaction (when, the quiet rule, the message).
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.
 - [`fork-ci/README.md`](../../fork-ci/README.md) and [`fork-kit/README.md`](../../fork-kit/README.md):
   CI actions and host kits.

@@ -24,7 +24,7 @@ runs that pinned script (python3 -I) with the arguments after its name, from a p
 prints the "files" map at the config's sha (fetched, not checked): for a pin bump, move "sha" and "tag", paste it.
 README.md next to this file: the Python API and the bootstrap a project copies to load this module.
 """
-import argparse, ast, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, types, urllib.request
+import argparse, ast, errno, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, types, urllib.request
 try:
     import grp, pwd
 except ImportError:   # no owners (Windows): shared_above checks nothing there
@@ -146,13 +146,13 @@ def acl(folder):
         return None
 
 
-def shared_above(cache):
+def shared_above(cache, caller='run'):
     """The folders above the cache (by the path given and by its real path) that someone else could write: not ours
     or root's, world-writable (a sticky /tmp too), or group-writable unless it is ours, has no ACL (acl: the group
     bits may be its mask) and its group is our own private group (own_group). run's copy is
     <cache>/.run-X/<action>/<file>, so a script's `../../..` is the folder above the cache, where such a someone could
-    plant a neighbour. A missing folder is skipped: private() makes it 0700 below a folder checked here. [] where there
-    are no owners (Windows)."""
+    plant a neighbour. A missing folder is skipped: private() makes it 0700 below a folder checked here; any other error
+    (no x, a symlink loop, a file on the way) is a FetchError (unenterable). [] where there are no owners (Windows)."""
     if not hasattr(os, 'getuid'):
         return []
     bad, seen = [], set()
@@ -165,8 +165,8 @@ def shared_above(cache):
             except FileNotFoundError:
                 up = os.path.dirname(up)
                 continue
-            except OSError as e:   # a folder above it has no x (EACCES): it cannot be checked, so it is refused
-                raise FetchError(unenterable(up, cache, e))
+            except OSError as e:   # no x (EACCES), a loop (ELOOP), a file (ENOTDIR): it cannot be checked, so refused
+                raise FetchError(unenterable(up, cache, e, caller))
             if (st.st_uid not in (0, os.getuid()) or st.st_mode & 0o002
                     or st.st_mode & 0o020
                     and not (st.st_uid == os.getuid() and acl(up) is False and own_group(st.st_gid))):
@@ -175,9 +175,24 @@ def shared_above(cache):
     return bad
 
 
-def unenterable(up, cache, error):
-    """Why a folder above the cache could not be checked, naming the folder that cannot be entered and the fix."""
-    blocked = os.path.dirname(up)   # the lowest folder whose stat works is the one without x
+def another_cache(caller):
+    """The fix's start when it is another cache: run's --cache, or load()'s cache argument (it is the Python API)."""
+    return f'pass {"--cache" if caller == "run" else "the cache argument"} with a folder whose every parent'
+
+
+def unenterable(up, cache, error, caller='run'):
+    """Why a folder above the cache could not be checked (os.stat failed with error), and the fix. For no x (EACCES),
+    the folder that cannot be entered, found on the real path: through a symlink it is the link's target's folder."""
+    if error.errno != errno.EACCES:   # a symlink loop, a file on the way: no chmod helps, another cache does
+        why = 'a symlink loop on the way to it: ' if error.errno == errno.ELOOP else ''
+        return (f'{up} above the cache {cache} cannot be checked ({why}{error.strerror or error}): it could be '
+                f"someone else's, so this cache is refused. Fix: {another_cache(caller)} you can enter and only you "
+                'or root can write')
+    # realpath resolves what it can (a folder it cannot enter ends it): the lowest folder of that whose stat works
+    try:
+        blocked = os.path.dirname(os.path.realpath(up))   # is the one without x
+    except OSError:   # it failed itself (a link changing at the wrong moment): the path as written, still a refusal
+        blocked = os.path.dirname(up)
     while True:
         try:
             st = os.stat(blocked)
@@ -188,16 +203,16 @@ def unenterable(up, cache, error):
                 break
             blocked = os.path.dirname(blocked)
     fix = (f'chmod u+x {blocked}' if st is not None and st.st_uid == os.getuid()
-           else 'pass --cache with a folder whose every parent you can enter and only you or root can write')
+           else f'{another_cache(caller)} you can enter and only you or root can write')
     return (f'{blocked} cannot be entered ({error.strerror or error}), so {up} above the cache {cache} cannot be '
             f'checked: it could be someone else\'s, so this cache is refused. Fix: {fix}')
 
 
-def fix_above(up):
+def fix_above(up, caller='run'):
     """How to fix a folder shared_above found: chmod a folder of yours, use another cache under anyone else's."""
     st = os.stat(up)
     if st.st_uid != os.getuid():
-        return 'pass --cache with a folder whose every parent only you or root can write'
+        return f'{another_cache(caller)} only you or root can write'
     if st.st_mode & 0o002:
         return f'chmod go-w {up}'
     has = acl(up)
@@ -317,9 +332,9 @@ def neighbour_loads(data):
         site.addsitedir, a data file) starts from it. `from sys import` takes only SYS_FROM.
     Other imports come from the caller's own path (the standard library, an installed PyYAML), as any import of the
     caller's does. A static check of the usual spellings, never complete (a constant or built string passed to getattr,
-    eval or exec, stdlib introspection, an absolute path such as /proc/self/cmdline pass it), so load() and run also puts its copy in a private folder inside the
-    checked cache and refuses a cache with a folder above it that someone else could write (shared_above): every `..`
-    of the copy is ours or root's."""
+    eval or exec, stdlib introspection, an absolute path such as /proc/self/cmdline pass it), so both also refuse a
+    cache with a folder above it that someone else could write (shared_above), and run puts its copy in a private
+    folder inside the checked cache: every `..` of the file is ours or root's."""
     try:
         tree = ast.parse(data)
     except (SyntaxError, ValueError):
@@ -405,18 +420,18 @@ def path(config, action, name, cache=None):
 
 def refuse_shared_above(cache, caller):
     """FetchError when a folder above the cache is someone else's to write (shared_above), with each one's fix."""
-    shared = shared_above(cache)
+    shared = shared_above(cache, caller)
     if shared:
         raise FetchError(f'{", ".join(shared)} above the cache {cache} can be written by someone else (not yours or '
                          "root's, world-writable, a sticky temp folder too, or group-writable by a group that is not "
                          "your own private one, or through an ACL): a script's `..` reaches it, so "
                          f"{caller} refuses this cache. Fix: "
-                         + '; '.join(dict.fromkeys(fix_above(up) for up in shared)))
+                         + '; '.join(dict.fromkeys(fix_above(up, caller) for up in shared)))
 
 
 def load(config, action, module, cache=None):
     """The pinned fork module (e.g. load(cfg, 'gradle-cache', 'gradle_cache')), run from the bytes that were checked.
-    Its __file__ is <cache>/<sha>/<action>/<file>, so its `../../..` is the folder above the cache: refused as in run."""
+    Its __file__ is <cache>/<sha>/<action>/<file>, so `../../..` is the folder above the cache: checked as in run."""
     cache = cache or default_cache()
     refuse_shared_above(cache, 'load')   # before private() makes any folder
     dest, data = self_contained(config, action, module + '.py', cache)

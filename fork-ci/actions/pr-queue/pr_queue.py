@@ -73,7 +73,11 @@ GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
 # Every git call, whatever the repository's files say: no hooks, no fsmonitor command, no replace refs, and no
 # commit-graph (a planted objects/info/commit-graph(s) could change the parents git reports; git rebuilds nothing from it).
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
-            '--no-replace-objects')
+            '-c', 'core.attributesFile=/dev/null', '--no-replace-objects')
+# ... and no global or system config or attributes: on a self-hosted runner an earlier job may have written
+# ~/.gitconfig or ~/.config/git/attributes. The same
+# two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
@@ -117,7 +121,22 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     parent P of `head` is on `base` and head's tree is `git merge-tree --write-tree P X` byte for byte, where X is
     `read` or head's other parent when that one holds this itself (an earlier queue update: GitHub merges the new base
     into the head the queue already proved, which can be clean where a direct merge of `read` conflicts). A tree is
-    the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same."""
+    the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same.
+
+    git's output is decoded strictly by the callers. A conflict lists the conflicted files by name, and a name need
+    not be UTF-8: that is no same change (a clean merge prints only the tree id), said once, never a crash."""
+    if head == read:
+        return True
+    try:
+        return _holds(git, head, read, depth, base)
+    except UnicodeDecodeError as e:
+        print(f'::warning::pr-queue: git printed bytes that are not UTF-8 while checking {head[:12]} against the read '
+              f'{read[:12]} (a conflict naming a file whose name is not UTF-8: {e.reason}, byte {e.start}): the head '
+              'is not taken as the change read')
+        return False
+
+
+def _holds(git, head, read, depth, base):
     if head == read:
         return True
     tree = git('rev-parse', '--verify', '-q', head + '^{tree}').stdout.strip()
@@ -125,7 +144,7 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     for p in parents:
         if git('merge-base', '--is-ancestor', p, base).returncode != 0:
             continue
-        sides = [read] + [h for h in parents if h != p and depth > 1 and holds(git, h, read, depth - 1, base)]
+        sides = [read] + [h for h in parents if h != p and depth > 1 and _holds(git, h, read, depth - 1, base)]
         for side in dict.fromkeys(sides):
             m = git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', p, side)
             if m.returncode == 0 and tree and m.stdout.split()[:1] == [tree]:
@@ -291,6 +310,59 @@ def git_problem(run=subprocess.run):
     return f'git {".".join(map(str, GIT_MIN))} or newer is needed (merge-tree --write-tree); found: {out[:80] or "none"}'
 
 
+def committed_config(path, run=subprocess.run):
+    """The config at `path` as the commit checked out there (HEAD) holds it: its blob, read with git, never the file. A
+    checkout writes that file through filters and `.gitattributes` (a `working-tree-encoding` makes it UTF-16, an
+    `ident` rewrites it), which a pull request can change without changing the config's own entry, so the head check
+    would pass it. A path outside a git checkout, a commit without the config, an entry that is no regular file
+    (a symlink, a submodule, a folder) or a blob that is not UTF-8 JSON is a ConfigError, never a crash."""
+    full = os.path.abspath(path)
+    where = os.path.dirname(full)
+    while not os.path.isdir(where):   # the folder is missing when the commit has no config: git still says so
+        where = os.path.dirname(where)
+
+    def git(cwd, *a):
+        try:
+            r = run(['git', *GIT_SAFE, '-C', cwd, *a], capture_output=True,
+                    env={**no_token_env(), 'GIT_TERMINAL_PROMPT': '0', **GIT_ENV})
+        except OSError as e:
+            raise config.ConfigError(f'{path}: cannot run git to read it: {e}') from None
+        return r.returncode, r.stdout, os.fsdecode(r.stderr or b'').strip()[:200]
+    code, out, err = git(where, 'rev-parse', '--show-toplevel')
+    if code != 0:
+        raise config.ConfigError(f'{path}: not in a git checkout ({err}): the queue reads the config as the '
+                                 'checked-out commit holds it, never the file')
+    top, head, rest = os.path.realpath(os.fsdecode(out.rstrip(b'\n'))), full, []
+    while os.path.realpath(head) != top:   # the path's own names below the top, links in them not followed
+        head, name = os.path.split(head)
+        if not name:
+            raise config.ConfigError(f'{path}: not inside the checkout {top}')
+        rest.insert(0, name)
+    rel = '/'.join(rest)
+    code, out, err = git(top, 'rev-parse', '--verify', '-q', 'HEAD^{commit}')
+    sha = os.fsdecode(out).strip()
+    if code != 0 or not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise config.ConfigError(f'{path}: the checkout {top} has no commit checked out')
+    code, out, err = git(top, 'ls-tree', '-z', sha, '--', rel)
+    records = [x for x in out.split(b'\0') if x]
+    if code != 0 or not records:
+        raise config.ConfigError(f'{path}: the commit checked out ({sha[:12]}) has no {rel}'
+                                 + (f': {err}' if err else ''))
+    meta, _, name = records[0].partition(b'\t')
+    fields = meta.decode('ascii', 'replace').split(' ')
+    if len(records) != 1 or name != os.fsencode(rel) or len(fields) != 3:
+        raise config.ConfigError(f'{path}: git ls-tree {sha[:12]} -- {rel} did not list one entry')
+    mode, kind, oid = fields
+    if mode not in ('100644', '100755'):   # git lists a blob in no other mode as a file
+        what = {'120000': 'symlink', '160000': 'submodule', '040000': 'tree'}.get(mode, kind[:20])
+        raise config.ConfigError(f'{path}: at {sha[:12]} {rel} is a {what} (mode {mode}), not a file (mode 100644 or '
+                                 '100755): make it a regular file')
+    code, out, err = git(top, 'cat-file', 'blob', oid)
+    if code != 0:
+        raise config.ConfigError(f'{path}: cannot read {rel} at {sha[:12]}: {err}')
+    return config.parse(out, f'{path} at {sha[:12]}')
+
+
 class Queue:
     """One repository's queue. gh (reads), gh_write (writes), git and sleep are attributes, so tests replace them."""
 
@@ -372,7 +444,7 @@ class Queue:
         token = self.read_token
         env = self.gh_env(token) if token else {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
         return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0'})
+                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0', **GIT_ENV})
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
@@ -428,7 +500,7 @@ class Queue:
             print(f'could not make {new}: {e}')
             return False
         r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True, env=no_token_env())
+                           capture_output=True, env={**no_token_env(), **GIT_ENV})
         if r.returncode != 0:
             print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
             return False
@@ -1127,7 +1199,7 @@ def cli(argv=None, env=None):
         elif work and (os.path.realpath(path) + os.sep).startswith(work + os.sep):
             problems.append(f'{flag} {path} is inside the job\'s workspace, which the next checkout empties')
     try:
-        cfg = config.load(a.config)
+        cfg = committed_config(a.config)
     except config.ConfigError as e:
         problems.append(str(e))
     read, write = env.get(READ_TOKEN) or '', env.get(WRITE_TOKEN) or ''
