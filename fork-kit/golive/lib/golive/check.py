@@ -175,17 +175,57 @@ def _checks(cfg, adapter, result, add, info, own_id):
     _disk(cfg, db_bytes, add)
 
     if binary is not None:
-        try:
-            report = live.fork_report(binary, cfg.home)
-            _report(cfg, report, result, add)
-        except live.NotLive as e:
-            add('report', False, str(e))
+        # Fork #180: the report reads the home only beside a T3 every check above found running steadily. A reader
+        # while T3 stops keeps SQLite from tidying its WAL at the stop (nothing is lost, but the WAL with its
+        # frames and -shm stay, and a copy takes the WAL without its -shm).
+        unsteady = [c['name'] for c in result['checks'] if not c['ok'] and c['name'] in STEADY]
+        if server is None or unsteady:
+            add('report', False, f'not run: T3 is not running steadily here ({", ".join(unsteady)} failed); the '
+                                 'report never reads the home while T3 may be stopping')
+        else:
+            try:
+                report = live.fork_report(binary, cfg.home)
+                _report(cfg, report, result, add)
+            except live.NotLive as e:
+                add('report', False, str(e))
+            changed = server_changed(cfg, adapter, server)
+            if changed is not None:
+                add('T3 steady during the report', False, f'{changed}: T3 stopped, restarted or began an update '
+                                                          'while the report read its home, so its answer is not '
+                                                          'used; run check again once T3 runs steadily')
 
     ok = all_ok()
     result['ok'] = ok
     if ok:
         result['plan'] = _plan(cfg, server['version'], db_bytes, result.get('counts'))
     return (0 if ok else 1), result
+
+
+STEADY = ('boot service', 'live server', 'no update in flight', 'no half switch', 'no markers')
+
+
+def server_changed(cfg, adapter, server):
+    """Why the live server is not the one the checks passed (None when it still is): the service is no longer
+    active (stopping included), its server or version changed, an update is pending or a marker appeared. The
+    auto-updater keeps the copy's quiet contract, so it may restart T3 on a newer build (and migrate its database)
+    while a copy waits, and anyone may stop T3 while the report reads."""
+    try:
+        svc = adapter.service()
+        now = live.live_server(cfg.home, svc['mainPid']) if svc['active'] else None
+        active, pending = live.service_state(cfg.home)
+    except (live.NotLive, osadapter.AdapterError) as e:
+        return f'the live server cannot be read again: {e}'
+    if now is None:
+        return f'{osadapter.UNIT} is not active any more'
+    if (now['pid'], now['version']) != (server['pid'], server['version']):
+        return (f'the live server changed (t3 {server["version"]} pid {server["pid"]} -> t3 {now["version"]} pid '
+                f'{now["pid"]})')
+    if active != server['version']:
+        return f'the service state now names t3 {active}, not the live {server["version"]}'
+    if pending:
+        return f'an update to {pending.get("targetVersion")} is pending'
+    found = live.markers(cfg.home)
+    return f'markers appeared: {", ".join(found)}' if found else None
 
 
 def _disk(cfg, db_bytes, add):
@@ -233,8 +273,9 @@ def _plan(cfg, live_version, db_bytes, counts):
         f'stop {osadapter.UNIT} at a quiet point (later command)',
         f'cold copy of the database ({db_bytes // MB} MB) and small files to a new folder in {cfg.backup_dir}',
         f'update {live_version} -> {cfg.target_version} with the staged build, then verify'
-        + (f' (threads now: {counts.get("threads")}, projects: {counts.get("projects")})'
-           if isinstance(counts, dict) else ''),
+        + (f' (the report counts {counts.get("threads")} threads (sub-agent and archived ones included, all '
+           f'projects), {counts.get("projects")} projects; verify compares report with report, never with t3 thread '
+           'list)' if isinstance(counts, dict) else ''),
         'expected downtime: unknown until a rehearsal of this target has run',
     ]
 
