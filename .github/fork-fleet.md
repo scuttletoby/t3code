@@ -221,16 +221,22 @@ Two more things limit what a job can do:
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
   drops it anywhere else. The walls know the launcher they ship with: its
-  sha256 is pinned in the `linux` and the `wsl2` walls files, and any other
-  launcher (one of another release too: install the kit whole) cannot be told
-  and fails `job-units` (no reading of bash can follow every way a changed one
-  could hand a unit more, or less). The pinned launcher's `start()` gives each
-  job unit its own stop timeouts, 90 s, so systemd's default decides nothing
-  for the units it starts. On WSL2 they also read every property that launcher
-  gives a job's unit (each way `systemd-run` takes one), and any other launcher
-  fails `sockets` too. A launcher change moves both pins in the same
-  pull request: it needs the security lens, and the pin test also runs cheap
-  tripwires on the launcher's text (a second `systemd-run`, `eval` or
+  sha256 is pinned once, in the `linux` walls file (the `wsl2` file reads that
+  pin and has no copy of its own), and any other launcher (one of another
+  release too: install the kit whole) cannot be told and fails `job-units` (no
+  reading of bash can follow every way a changed one could hand a unit more,
+  or less). The pin judges the bytes the walls read, not the bytes that run:
+  the walls read the launcher through one open file and run it by path
+  afterwards (`paths`, `tools`), and the pool runs `start` later still. A
+  launcher replaced in between (only root can) is judged on the old bytes;
+  there is no cheap fix, so the walls catch a stale or edited kit, not a root
+  that swaps the launcher at the right moment. The pinned launcher's `start()`
+  gives each job unit its own stop timeouts, 90 s, so systemd's default
+  decides nothing for the units it starts. On WSL2 they also read every
+  property that launcher gives a job's unit (each way `systemd-run` takes one),
+  and any other launcher fails `sockets` too. A launcher change moves the pin
+  in the same pull request: it needs the security lens, and the pin test
+  also runs cheap tripwires on the launcher's text (a second `systemd-run`, `eval` or
   `source` even spelt with quotes or backslashes, a command word built from
   expansions such as `${e}al`, a `#` inside quotes, a function defined twice,
   binds made outside `job_view`), so that none of the edits the scan cannot follow comes back

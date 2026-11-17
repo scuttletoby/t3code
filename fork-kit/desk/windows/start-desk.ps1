@@ -114,44 +114,145 @@ fi
 # BOM as ANSI and Set-Content with the ASCII encoding turns every other letter into '?' (a kernel= path with an accent in it
 # then stops every distro). The tests run this part alone (between the two marker lines) under pwsh.
 # --- wslconfig ---
+# The lines of .wslconfig as WSL opens it (rt,ccs=UTF-8: CR LF reads as LF, a lone CR is a character in a line), split
+# on LF only. The last one is what follows the last LF ('' when the file ends in one), so joined by LF they are the text.
 function Read-WslConfig([string]$path) {
   if (-not (Test-Path -LiteralPath $path)) { return @() }
-  @([IO.File]::ReadAllLines($path, [Text.UTF8Encoding]::new($false)))   # a BOM (UTF-8 or UTF-16) is still read
+  @([IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false)) -replace "`r`n", "`n" -split "`n")   # a BOM (UTF-8 or UTF-16) is still read
 }
-# networkingMode and dnsTunneling were [experimental] keys before WSL 2.0; an old line there can still win over
-# [wsl2], so Merge-WslConfig removes them there (the [wsl2] ones are what the desk needs) and the check FAILs on them.
+# networkingMode and dnsTunneling were [experimental] keys before WSL 2.0; WSL takes both names for one key and uses the
+# first line of it, so an old one there can still win over [wsl2]: Merge-WslConfig removes them there (the [wsl2] ones
+# are what the desk needs) and the check FAILs on them.
 $Experimental = @('networkingMode', 'dnsTunneling')
-# A key=value line, trimmed of space and tab only, as WSL's config parser does: a non-breaking space or a form feed
-# stays in the value (WSL then rejects a memory= value, so it is rewritten), where .NET's \s would drop it.
-function SectionKeys([string[]]$lines, [string]$section) {   # the keys of one section only
-  $keys = @{}; $sec = ''
-  foreach ($l in $lines) {
-    if ($l -match '^\s*\[(.+)\]\s*$') { $sec = $Matches[1].Trim().ToLower(); continue }
-    if ($sec -eq $section -and $l -match '^[ \t]*([^=#; \t]+)[ \t]*=[ \t]*(.*?)[ \t]*$') { $keys[$Matches[1]] = $Matches[2] }
+# What WSL reads, in order, as ParseConfigFile in its src/shared/configfile/configfile.cpp does (parse mode, invalid
+# lines skipped): one item per header and per key=value line. Lines start after space or tab; # starts a comment.
+# A header: '[', a letter then letters or digits, ']', space or tab, then the end or a # comment; any ASCII case. A header
+# WSL rejects after reading a name keeps the old section's length of it (fewer letters pad with '*', which matches no
+# section; WSL pads with NUL, but PowerShell's -eq ignores NUL); one with no name read is no item. Sec: the section of
+# the keys after it. A key: a letter then letters or digits, space or tab, '='. Its Value as WSL reads it: space and
+# tab after '=' and at the end dropped, a # outside quotes starts a comment, quotes dropped, \\ \" \b \n \t, and a \
+# at the end of a line goes on with the next line (which then is part of this value, header or key=value alike);
+# $null when WSL drops the line (another \ escape, or a quote left open). First, Last: the lines it spans.
+# Open: the text ends inside a value, after a \ and its LF, so a line added after it would be part of that value.
+function WslItems([string[]]$lines) {
+  $t = $lines -join "`n"; $n = $t.Length; $i = 0; $sec = ''; $open = $false
+  $items = [Collections.Generic.List[object]]::new()
+  $ln = [int[]]::new($n + 1); for ($p = 0; $p -lt $n; $p++) { $ln[$p + 1] = $ln[$p] + [int]($t[$p] -eq "`n") }
+  $hs = { $i -lt $n -and ($t[$i] -eq ' ' -or $t[$i] -eq "`t") }
+  $eol = { $e = $t.IndexOf([char]10, $i); if ($e -lt 0) { $n } else { $e + 1 } }   # past the LF that ends this line
+  while ($i -lt $n) {
+    while (& $hs) { $i++ }
+    if ($i -ge $n) { break }
+    $s = $i; $c = $t[$i]; $i++
+    if ($c -eq "`n" -or $c -eq "`r") { continue }
+    if ($c -eq '#') { $i = & $eol; continue }
+    if ($c -eq '[') {
+      if ($i -ge $n -or $t[$i] -cnotmatch '[A-Za-z]') { $i = & $eol; continue }   # no name read: the section stays
+      $j = $i; while ($i -lt $n -and $t[$i] -cmatch '[A-Za-z0-9]') { $i++ }
+      $name = $t.Substring($j, $i - $j).ToLowerInvariant(); $ok = $false
+      if ($i -lt $n -and $t[$i] -eq ']') {
+        $i++; while (& $hs) { $i++ }
+        $ok = $i -ge $n -or $t[$i] -eq "`n" -or $t[$i] -eq "`r" -or $t[$i] -eq '#'
+      }
+      $sec = if ($ok) { $name } else { $name.PadRight($sec.Length, '*').Substring(0, $sec.Length) }
+      $items.Add([pscustomobject]@{ Sec = $sec; Name = $null; First = $ln[$s]; Last = $ln[$s] })
+      if (-not $ok -or ($i -lt $n -and $t[$i] -eq '#')) { $i = & $eol } elseif ($i -lt $n) { $i++ }
+      continue
+    }
+    if ($c -cnotmatch '[A-Za-z]') { $i = & $eol; continue }
+    while ($i -lt $n -and $t[$i] -cmatch '[A-Za-z0-9]') { $i++ }
+    $name = $t.Substring($s, $i - $s)
+    while (& $hs) { $i++ }
+    if ($i -ge $n -or $t[$i] -ne '=') { $i = & $eol; continue }
+    $i++; while (& $hs) { $i++ }
+    $v = [Text.StringBuilder]::new(); $keep = 0; $q = $false; $bad = $false; $end = $n
+    while ($i -lt $n) {
+      $c = $t[$i]; $i++
+      if ($c -eq "`n" -or $c -eq "`r") { $end = $i - 1; break }
+      if ($c -eq '"') { $q = -not $q }
+      elseif ($c -eq '\') {
+        $d = if ($i -lt $n) { $t[$i] } else { $null }; $i++
+        if ($d -eq '\' -or $d -eq '"') { [void]$v.Append($d) }
+        elseif ($d -ceq 'b') { [void]$v.Append("`b") } elseif ($d -ceq 'n') { [void]$v.Append("`n") }
+        elseif ($d -ceq 't') { [void]$v.Append("`t") }
+        elseif ($d -ne "`n") { $bad = $true; $i = [math]::Min($i, $n); break }   # WSL drops the line
+      }
+      elseif ($c -eq '#' -and -not $q) { $end = $i - 1; $i = & $eol; break }
+      else { [void]$v.Append($c) }
+      if ($c -ne ' ' -and $c -ne "`t") { $keep = $v.Length }   # space and tab at the end dropped
+    }
+    if ($i -ge $n -and $end -eq $n -and -not $bad -and $n -gt 0 -and $t[$n - 1] -eq "`n") { $open = $true }
+    # a line WSL drops: it skips the rest of it to its LF (past a lone CR)
+    if ($bad -or ($q -and $end -lt $n -and $t[$end] -eq "`r")) { $i = & $eol; $end = $i - 1 }
+    $value = if ($bad -or $q) { $null } else { $v.ToString().Substring(0, $keep) }
+    $items.Add([pscustomobject]@{ Sec = $sec; Name = $name; Value = $value; First = $ln[$s]; Last = $ln[[math]::Min($end, $n)] })
+  }
+  [pscustomobject]@{ Items = $items; Open = $open }
+}
+# The keys of one section as WSL reads them: the first line of each (WSL warns of a later one and skips it; a line it
+# drops is not one), names in any ASCII case.
+function FirstKeys($items, [string]$section) {
+  $keys = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+  foreach ($e in $items) {
+    if ($null -ne $e.Name -and $null -ne $e.Value -and $e.Sec -ceq $section -and -not $keys.ContainsKey($e.Name)) { $keys[$e.Name] = $e.Value }
   }
   $keys
 }
+function SectionKeys([string[]]$lines, [string]$section) { FirstKeys (WslItems $lines).Items $section.ToLowerInvariant() }
 function Wsl2Keys([string[]]$lines) { SectionKeys $lines 'wsl2' }
+# Whether WSL reads $v as $w: a size (8GB) exactly (ParseMemorySize: 8gb is rejected), a word (nat, true) in any ASCII case.
+function SameValue([string]$v, [string]$w) {
+  if ($w -cmatch '^[a-z]+\z' -and $v -cmatch '^[A-Za-z]+\z') { $v = $v.ToLowerInvariant() }
+  [string]::Equals($v, $w, [StringComparison]::Ordinal)
+}
 # The merged lines and one note per change (old -> new). The question shows these notes and the file is written only
-# when there is one, so "no change" always means the file is left alone. A [wsl2] line whose value already matches
-# (trimmed, any case: as the final check compares) is kept as it is; a repeated key's later lines are removed.
+# when there is one, so "no change" always means the file is left alone. Only lines WSL reads count: the first
+# [wsl2] line of a key is kept when WSL reads it as wanted (SameValue) and replaced otherwise, with the lines its value
+# goes on to; a later one is removed; a line WSL drops is left as it is. Missing keys go at the end of [wsl2], or in a
+# [wsl2] added at the end. Then the merged text is read again: unless WSL would read the wanted keys and every other
+# key exactly as before (a lone CR, or a \ with no LF after it at the end, can make that so), it refuses.
 function MergeLines([string[]]$lines, $want) {
-  $out = [Collections.Generic.List[string]]::new(); $notes = [Collections.Generic.List[string]]::new(); $sec = ''; $done = @{}
-  function AddMissing { foreach ($k in $want.Keys) { if (-not $done[$k]) { $out.Add("$k=$($want[$k])"); $done[$k] = 1; $notes.Add("  [wsl2] ${k}: (not set) -> $($want[$k])") } } }
-  foreach ($l in $lines) {
-    if ($l -match '^\s*\[(.+)\]\s*$') { if ($sec -eq 'wsl2') { AddMissing }; $sec = $Matches[1].Trim().ToLower(); $out.Add($l); continue }
-    if ($sec -eq 'wsl2' -and $l -match '^[ \t]*([^=#; \t]+)[ \t]*=[ \t]*(.*?)[ \t]*$' -and $want.Contains($Matches[1])) {
-      $k = $Matches[1]; $v = $Matches[2]
-      if ($done[$k]) { $notes.Add("  [wsl2] $k=${v}: a repeated line, removed"); continue }
+  $lines = @(if ($null -ne $lines) { $lines }); $read = WslItems $lines; $n = $lines.Count
+  if ($n -gt 0 -and $lines[$n - 1] -eq '') { $n-- }   # the last item after the last LF
+  $wanted = @{}; foreach ($k in $want.Keys) { $wanted[$k.ToLowerInvariant()] = $k }
+  $old = @{}; foreach ($k in $Experimental) { $old[$k.ToLowerInvariant()] = 1 }
+  $out = [Collections.Generic.List[string]]::new(); $notes = [Collections.Generic.List[string]]::new(); $end = [Collections.Generic.List[string]]::new()
+  $put = @{}; $drop = @{}; $before = @{}; $done = @{}; $sec = ''
+  function Missing { foreach ($k in $want.Keys) { if (-not $done[$k]) { "$k=$($want[$k])"; $done[$k] = 1; $notes.Add("  [wsl2] ${k}: (not set) -> $($want[$k])") } } }
+  function Drop([int]$a, [int]$b) { for ($l = $a; $l -le $b; $l++) { $drop[$l] = 1 } }
+  foreach ($e in $read.Items) {
+    if ($null -eq $e.Name) { if ($sec -ceq 'wsl2' -and $e.Sec -cne 'wsl2') { $before[$e.First] = @(Missing) }; $sec = $e.Sec; continue }
+    if ($null -eq $e.Value) { continue }
+    $lk = $e.Name.ToLowerInvariant()
+    if ($e.Sec -ceq 'wsl2' -and $wanted.ContainsKey($lk)) {
+      $k = $wanted[$lk]
+      if ($done[$k]) { $notes.Add("  [wsl2] $($e.Name)=$($e.Value): a repeated line, removed"); Drop $e.First $e.Last; continue }
       $done[$k] = 1
-      if ($v -eq $want[$k]) { $out.Add($l) } else { $out.Add("$k=$($want[$k])"); $notes.Add("  [wsl2] ${k}: $v -> $($want[$k])") }
-      continue }
-    if ($sec -eq 'experimental' -and $l -match '^[ \t]*([^=#; \t]+)[ \t]*=[ \t]*(.*?)[ \t]*$' -and $Matches[1] -in $Experimental) {
-      $notes.Add("  [experimental] $($Matches[1])=$($Matches[2]): removed (the [wsl2] one is used)"); continue }
-    $out.Add($l)
+      if (SameValue $e.Value $want[$k]) { continue }
+      $put[$e.First] = "$k=$($want[$k])"; Drop ($e.First + 1) $e.Last; $notes.Add("  [wsl2] ${k}: $($e.Value) -> $($want[$k])")
+    }
+    elseif ($e.Sec -ceq 'experimental' -and $old.ContainsKey($lk)) {
+      $notes.Add("  [experimental] $($e.Name)=$($e.Value): removed (the [wsl2] one is used)"); Drop $e.First $e.Last }
   }
-  if ($sec -eq 'wsl2') { AddMissing }
-  if ($done.Count -lt $want.Count) { $out.Add('[wsl2]'); AddMissing }
+  if ($sec -ceq 'wsl2') { foreach ($x in @(Missing)) { $end.Add($x) } }
+  if ($done.Count -lt $want.Count) { $end.Add('[wsl2]'); foreach ($x in @(Missing)) { $end.Add($x) } }
+  for ($l = 0; $l -lt $n; $l++) {
+    if ($before.ContainsKey($l)) { foreach ($x in $before[$l]) { $out.Add($x) } }
+    if ($put.ContainsKey($l)) { $out.Add($put[$l]) } elseif (-not $drop[$l]) { $out.Add($lines[$l]) }
+  }
+  if ($end.Count) { if ($read.Open) { $out.Add('') }; $out.AddRange($end) }   # an empty line ends a value that goes on
+  if ($end.Count -or $n -lt $lines.Count) { $out.Add('') }   # the file ends in a LF
+  # the check: WSL reads the wanted keys, no old [experimental] ones, and the same values of every other key in order
+  $new = (WslItems $out).Items; $why = $null
+  $got = FirstKeys $new 'wsl2'; $gone = FirstKeys $new 'experimental'
+  foreach ($k in $want.Keys) { if (-not (SameValue $got[$k] $want[$k])) { $why = "WSL would not read [wsl2] $k=$($want[$k])" } }
+  foreach ($k in $Experimental) { if ($gone.ContainsKey($k)) { $why = "WSL would still read [experimental] $k" } }
+  $others = { param($items) foreach ($e in $items) { if ($null -ne $e.Name -and $null -ne $e.Value -and -not ($e.Sec -ceq 'wsl2' -and $wanted.ContainsKey($e.Name.ToLowerInvariant())) -and -not ($e.Sec -ceq 'experimental' -and $old.ContainsKey($e.Name.ToLowerInvariant()))) { "[$($e.Sec)] $($e.Name.ToLowerInvariant())=$($e.Value)" } } }
+  $a = @(& $others $read.Items); $b = @(& $others $new)
+  for ($x = 0; $x -lt [math]::Max($a.Count, $b.Count); $x++) {
+    if ($x -ge $a.Count -or $x -ge $b.Count -or -not [string]::Equals($a[$x], $b[$x], [StringComparison]::Ordinal)) { $why = "WSL would read other keys differently"; break }
+  }
+  if ($why) { throw ".wslconfig cannot be merged so that WSL reads it as the question says ($why); nothing was changed. Edit it by hand (a line ending in \ goes on to the next line), then run this again" }
   [pscustomobject]@{ Out = $out; Notes = $notes }
 }
 function Changes([string[]]$lines, $want) { (MergeLines $lines $want).Notes }   # what Merge-WslConfig changes
@@ -160,7 +261,7 @@ function Merge-WslConfig([string]$path, $want, [scriptblock]$before = {}) {   # 
   if ($merged.Notes.Count -eq 0) { return $false }   # the same test as the question's
   & $before
   if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path "$path.bak-$(Get-Date -Format yyyyMMdd-HHmmss)" }
-  [IO.File]::WriteAllLines("$path.new", [string[]]$merged.Out, [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText("$path.new", [string]::Join([Environment]::NewLine, [string[]]$merged.Out), [Text.UTF8Encoding]::new($false))
   Move-Item -LiteralPath "$path.new" $path -Force
   $true
 }
@@ -307,7 +408,7 @@ sh /root/desk-bootstrap.sh --repo $Repo --sha $Sha$extra
   if ($LASTEXITCODE -ne 0) { $bad++ }
   $cfg = Wsl2Keys (Read-WslConfig $WslConfig); $old = SectionKeys (Read-WslConfig $WslConfig) 'experimental'
   foreach ($k in $want.Keys) {
-    if ($cfg[$k] -eq $want[$k]) { "PASS  wslconfig  [wsl2] $k=$($want[$k])" } else { "FAIL  wslconfig  [wsl2] no $k=$($want[$k])"; $bad++ }
+    if (SameValue $cfg[$k] $want[$k]) { "PASS  wslconfig  [wsl2] $k=$($want[$k])" } else { "FAIL  wslconfig  [wsl2] no $k=$($want[$k])"; $bad++ }
   }
   foreach ($k in $Experimental) { if ($old.ContainsKey($k)) { "FAIL  wslconfig  [experimental] $k=$($old[$k]) is still there"; $bad++ } }
   $t = Get-ScheduledTask $Task -ErrorAction SilentlyContinue
