@@ -9,7 +9,9 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeCryptoLayer from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { afterEach, describe, expect, it } from "@effect/vitest";
+import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as TestConsole from "effect/testing/TestConsole";
@@ -619,6 +621,28 @@ describe("__fork-report settings", () => {
     expect(report.settings.providerInstances).toEqual([]);
   });
 
+  it("names each interval a load reads as its default, without failing the report", () => {
+    const report = settingsReport({
+      automaticGitFetchInterval: 600_000,
+      headlessUsageRefreshInterval: -5,
+      backgroundActivity: { profile: "custom", overrides: { hostPowerMonitorIdleInterval: null } },
+    });
+
+    // The load keeps the rest of the file, so this is a note, not a problem.
+    expect(report.ok).toBe(true);
+    expect(report.settings.parseWarning).toBeNull();
+    expect(report.settings.intervalsReadAsDefaults).toEqual([
+      "headlessUsageRefreshInterval (-5)",
+      "backgroundActivity.overrides.hostPowerMonitorIdleInterval (null)",
+    ]);
+    expect(report.fork.settings.headlessUsageRefreshIntervalMs).toBe(
+      Duration.toMillis(DEFAULT_SERVER_SETTINGS.headlessUsageRefreshInterval),
+    );
+    expect(settingsReport({ automaticGitFetchInterval: 600_000 }).settings).toMatchObject({
+      intervalsReadAsDefaults: [],
+    });
+  });
+
   it("warns on an empty, blank or cut-off file, which a load also ignores", () => {
     for (const text of ["", "  \n", '{ "agentSlots": { "enabled": true ']) {
       const report = readForkReport(makeHome({ settings: text }));
@@ -765,7 +789,9 @@ describe("__fork-report contract", () => {
     expect(keys(report.database.counts!)).toEqual(
       ["projects", "projectsArchived", "threads", "threadsArchived"].toSorted(),
     );
-    expect(keys(report.settings)).toEqual(["parseWarning", "path", "providerInstances", "state"]);
+    expect(keys(report.settings)).toEqual(
+      ["intervalsReadAsDefaults", "parseWarning", "path", "providerInstances", "state"].toSorted(),
+    );
     expect(keys(report.fork)).toEqual(["features", "featuresOn", "keysInFile", "settings"]);
     expect(keys(report.fork.features)).toEqual([
       "agentSlots",
