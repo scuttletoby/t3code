@@ -670,14 +670,15 @@ export const layer = Layer.effect(
     const path = yield* Path.Path;
     const registry = yield* ProviderRegistry;
     const history = yield* make({ directory: path.join(config.stateDir, HISTORY_DIRECTORY) });
-    // Known gap (low impact): a snapshot published between `getProviders` and the subscription is
-    // not seen, so a later probe may count as full once; the next read corrects it.
+    // Subscribe before reading, so no snapshot published in between is missed. One published
+    // just before the read is then seen twice; `record` stores a snapshot it already has once.
     yield* forkParked(
-      history.compact.pipe(
-        Effect.andThen(registry.getProviders),
-        Effect.flatMap(history.record),
-        Effect.andThen(Stream.runForEach(registry.streamChanges, history.record)),
-      ),
+      Effect.gen(function* () {
+        yield* history.compact;
+        const changes = yield* registry.subscribeChanges;
+        yield* history.record(yield* registry.getProviders);
+        yield* Stream.runForEach(changes, history.record);
+      }),
     );
     return history;
   }),
