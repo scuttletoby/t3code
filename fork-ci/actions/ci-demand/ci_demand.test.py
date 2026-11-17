@@ -293,6 +293,82 @@ class State(Case):
             self.assertEqual(doc['days']['total']['ci_hours'], 3.25, what)
         self.assertEqual(self.numbers()[1]['requests'], 0)   # the pages fetched again were saved again
 
+    def test_a_cache_file_nested_too_deep_is_fetched_again(self):
+        # json.load raises RecursionError (not ValueError) on deep nesting: a damaged file, not a crash on every run.
+        self.assertEqual(self.numbers()[0], 0)
+        for name in os.listdir(self.cache):
+            with open(os.path.join(self.cache, name), 'w') as f:
+                f.write('[' * 100000 + ']' * 100000)
+        code, doc = self.numbers()
+        self.assertEqual((code, doc['requests'], doc['cached']), (0, 6, 0), self.err)
+        self.assertEqual(doc['days']['total']['ci_hours'], 3.25)
+        self.assertEqual(self.numbers()[1]['requests'], 0)   # saved again
+
+    def test_saved_pages_with_wrong_types_are_fetched_again(self):
+        # The right shape, wrong types inside the body: checked when read, so a damaged page is fetched again and the
+        # good pages next to it are still used.
+        damage = [  # (what, the list it changes: run-list pages or job pages, change)
+            ('run list total_count as text', 'workflow_runs', lambda b: b.update(total_count='2')),
+            ('runs not a list', 'workflow_runs', lambda b: b.update(workflow_runs={'id': 1})),
+            ('a run not an object', 'workflow_runs', lambda b: b.update(workflow_runs=['x'])),
+            ('run id a list', 'workflow_runs', lambda b: [r.update(id=[r['id']]) for r in b['workflow_runs']]),
+            ('run without created_at', 'workflow_runs', lambda b: [r.pop('created_at') for r in b['workflow_runs']]),
+            ('run created_at a number', 'workflow_runs', lambda b: [r.update(created_at=5) for r in b['workflow_runs']]),
+            ('run created_at not a date', 'workflow_runs',
+             lambda b: [r.update(created_at='yesterday') for r in b['workflow_runs']]),
+            ('run path a number', 'workflow_runs', lambda b: [r.update(path=5) for r in b['workflow_runs']]),
+            ('jobs total_count as text', 'jobs', lambda b: b.update(total_count='9')),
+            ('jobs not a list', 'jobs', lambda b: b.update(jobs='abc')),
+            ('a job not an object', 'jobs', lambda b: b.update(jobs=[1])),
+            ('job labels a number', 'jobs', lambda b: [j.update(labels=5) for j in b['jobs']]),
+            ('job labels hold a number', 'jobs', lambda b: [j.update(labels=[5]) for j in b['jobs']]),
+            ('job started_at not a date', 'jobs', lambda b: [j.update(started_at='yesterday') for j in b['jobs']]),
+            ('job completed_at a number', 'jobs', lambda b: [j.update(completed_at=5) for j in b['jobs']]),
+        ]
+        self.assertEqual(self.numbers()[0], 0)
+        for what, kind, change in damage:
+            for name in os.listdir(self.cache):
+                p = os.path.join(self.cache, name)
+                with open(p) as f:
+                    doc = json.load(f)
+                if kind in doc['body']:
+                    change(doc['body'])
+                with open(p, 'w') as f:
+                    json.dump(doc, f)
+            code, doc = self.numbers()
+            fetched = 2 if kind == 'workflow_runs' else 4   # two run-list pages, four job pages
+            self.assertEqual((code, doc['requests'], doc['cached']), (0, fetched, 6 - fetched), (what, self.err))
+            self.assertEqual(doc['days']['total']['ci_hours'], 3.25, what)
+            self.assertEqual(self.numbers()[1]['requests'], 0, what)   # the pages fetched again were saved again
+
+    def test_read_only_cache_folder_with_an_old_part_file_goes_on(self):
+        # The start-up clean-up cannot remove an old .part- file: a failed cache write (reported once), not an exit.
+        self.assertEqual(self.numbers()[0], 0)
+        old = os.path.join(self.cache, '.part-1-old')
+        open(old, 'w').close()
+        os.utime(old, (NOW - M.PART_AGE - 5,) * 2)
+        saved = sorted(os.listdir(self.cache))
+        os.chmod(self.cache, 0o500)
+        self.addCleanup(os.chmod, self.cache, 0o700)
+        try:
+            open(os.path.join(self.cache, 'probe'), 'w').close()
+            self.skipTest('this user can write to a read-only folder (root)')
+        except PermissionError:
+            pass
+        code, doc = self.numbers()
+        self.assertEqual((code, doc['requests'], doc['cached']), (0, 0, 6), self.err)
+        self.assertIn('Permission denied', doc['cache_write_failed'])
+        self.assertEqual(self.err.count('cache not written'), 1, self.err)
+        self.assertEqual(doc['days']['total']['ci_hours'], 3.25)
+        p = copy.deepcopy(PAGES)   # a page it has to fetch and cannot save: still one report, and it goes on
+        p[DAY2]['workflow_runs'][0]['run_attempt'] = 2
+        self.serve({k: [ok(v)] for k, v in p.items()})
+        self.clock = NOW + M.LIST_MAX_AGE + 1
+        code, doc = self.numbers()
+        self.assertEqual((code, doc['requests']), (0, 3), self.err)
+        self.assertEqual(self.err.count('cache not written'), 1, self.err)
+        self.assertEqual(sorted(os.listdir(self.cache)), saved)   # the good pages are all still there
+
     def test_a_write_that_fails_half_way_leaves_no_page_and_goes_on(self):
         real = json.dump
 
@@ -415,6 +491,20 @@ class State(Case):
         self.assertEqual((code, doc['days']), (0, {}))
 
 
+class Answers(Case):
+    def test_an_answer_of_the_wrong_shape_is_an_api_error_and_not_saved(self):
+        # The same check as a saved page: an answer that would crash the counting stops with exit 2 instead.
+        for body in ([], {'total_count': 'many', 'workflow_runs': []},
+                     {'total_count': 1, 'workflow_runs': [{'id': 9, 'created_at': 5}]}):
+            self.routes[DAY1] = [ok(body)]
+            self.serve(self.routes)
+            code, doc = self.numbers()
+            self.assertEqual((code, doc), (2, None), body)
+            self.assertIn(f'{DAY1}: unexpected answer', self.err)
+            self.assertEqual(len(self.err.splitlines()), 1, self.err)
+        self.assertEqual(os.listdir(self.cache), [])
+
+
 class RateLimit(Case):
     def test_429_waits_retry_after_and_goes_on(self):
         self.routes[DAY1] = [{'status': 429, 'headers': {'Retry-After': '7'}, 'body': {'message': 'slow down'}},
@@ -520,6 +610,18 @@ class Arguments(Case):
             json.dump({'repo': 'acme/widgets'}, f)   # a top-level repo is some other tool's
         self.assertEqual(self.numbers(repo=('--config', cfg))[0], 2)
         self.assertIn('no ciDemand.repo', self.err)
+
+    def test_config_of_the_wrong_shape_is_refused_by_name(self):
+        cfg = os.path.join(self.d, 'project.json')
+        for text in ('[]', '"x"', '5', 'true', '{"ciDemand": [1]}', '{"ciDemand": "x"}', '{"ciDemand": {"repo": 5}}',
+                     '{"ciDemand": {"repo": ["a/b"]}}', '[' * 100000 + ']' * 100000):
+            with open(cfg, 'w') as f:
+                f.write(text)
+            code, doc = self.numbers(repo=('--config', cfg))
+            self.assertEqual((code, doc), (2, None), text[:40])
+            self.assertEqual(len(self.err.splitlines()), 1, self.err)
+            self.assertIn(f'ci-demand: {cfg}: ', self.err, text[:40])
+        self.assertEqual(self.calls(), [])
 
     def test_config_with_a_utf8_bom_is_read(self):
         cfg = os.path.join(self.d, 'project.json')   # some Windows editors save UTF-8 with a byte-order mark
