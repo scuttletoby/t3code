@@ -70,6 +70,8 @@ const threadChanged = (data: OrchestrationV2ThreadProjection) =>
 const harness = (state: {
   data: OrchestrationV2ThreadProjection;
   settings: Partial<HandoffSettings>;
+  /** Runs inside the mocked dispatch, after the command is recorded. */
+  onDispatch?: (command: OrchestrationV2ServerCommand) => Effect.Effect<void>;
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
@@ -101,10 +103,10 @@ const harness = (state: {
       Layer.mock(Orchestrator.OrchestratorV2)({
         streamDomainEvents: Stream.fromQueue(events),
         dispatch: (command) =>
-          Effect.sync(() => {
-            sent.push(command);
-            return { sequence: sent.length, storedEvents: [] };
-          }),
+          Effect.sync(() => sent.push(command)).pipe(
+            Effect.andThen(state.onDispatch?.(command) ?? Effect.void),
+            Effect.as({ sequence: sent.length, storedEvents: [] }),
+          ),
       }),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({
         getThread: () => Effect.succeed(state.data.thread),
@@ -127,16 +129,16 @@ const harness = (state: {
       Effect.withTracer(tracer),
     );
     /** Offers an event, then waits until the span `name` has ended `count` times in all. */
-    const emit = (event: OrchestrationV2DomainEvent, name: string, count: number) =>
+    const emit = (event: OrchestrationV2DomainEvent | null, name: string, count: number) =>
       Effect.gen(function* () {
+        const span = name.includes(".") ? name : `HandoffService.${name}`;
         const done = yield* Deferred.make<void>();
-        milestones.push({ name: `HandoffService.${name}`, count, done });
-        if ((ended.get(`HandoffService.${name}`) ?? 0) >= count)
-          yield* Deferred.succeed(done, undefined);
-        yield* Queue.offer(events, event);
+        milestones.push({ name: span, count, done });
+        if ((ended.get(span) ?? 0) >= count) yield* Deferred.succeed(done, undefined);
+        if (event !== null) yield* Queue.offer(events, event);
         yield* Deferred.await(done);
       });
-    return { sent, emit, reads };
+    return { sent, emit, reads, events };
   });
 
 const on = { mode: "handoff" } as const;
@@ -356,8 +358,153 @@ describe("HandoffService", () => {
       expect(messages(sent).length).toBe(1);
       // Switched off: a failed first send is not retried.
       state.settings = {};
-      yield* emit(runUpdated({ ...failed, status: "interrupted" }), "handoffRunEnded", 3);
+      yield* emit(runUpdated({ ...failed, id: RunId.make("run-4") }), "handoffRunEnded", 3);
       expect(messages(sent).length).toBe(1);
+    }),
+  );
+
+  const run2 = run({ id: RunId.make("run-2"), ordinal: 2 });
+  const run2HandoffId = `handoff:${threadId}:run-2`;
+  /** A late `completed` update of the older run-1, as a child's settlement or a wake re-emits. */
+  const lateRun1 = () => ({
+    ...runUpdated(run()),
+    id: EventId.make(`event:late:${(changes += 1)}`),
+  });
+
+  it.effect(
+    "a late update of an older run keeps the latest run's idle timer (twice in a row)",
+    () =>
+      Effect.gen(function* () {
+        const data = projection({ usedTokens: 100_000, cacheExpiresInMs: 10 * MINUTE_MS });
+        const state = { data: { ...data, runs: [run(), run2] }, settings: on };
+        const { sent, emit } = yield* harness(state);
+        yield* emit(runUpdated(run2), "readThread", 1);
+        // Each late update replaces the timer; it reads, takes over run-2 and reads again.
+        yield* emit(lateRun1(), "readThread", 3);
+        yield* emit(lateRun1(), "readThread", 5);
+        yield* TestClock.adjust(5 * MINUTE_MS);
+        expect(sent).toEqual([]);
+        yield* TestClock.adjust(2 * MINUTE_MS);
+        expect(messages(sent).map((message) => message.messageId)).toEqual([run2HandoffId]);
+      }),
+  );
+
+  it.effect("a late update of an older run keeps the latest run's wait at the size backstop", () =>
+    Effect.gen(function* () {
+      const quiet = { ...projection({ usedTokens: 160_000 }), runs: [run(), run2] };
+      const busy = {
+        ...quiet,
+        runtimeRequests: [
+          { id: RuntimeRequestId.make("request-1"), status: "pending" },
+        ] as unknown as OrchestrationV2ThreadProjection["runtimeRequests"],
+      };
+      const state = { data: busy, settings: on };
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(run2), "readThread", 1);
+      yield* emit(lateRun1(), "readThread", 3);
+      expect(sent).toEqual([]);
+      state.data = quiet;
+      yield* emit(threadChanged(state.data), "send", 1);
+      expect(messages(sent).map((message) => message.messageId)).toEqual([run2HandoffId]);
+    }),
+  );
+
+  it.effect("a handoff run a person stopped is not sent again", () =>
+    Effect.gen(function* () {
+      const data = projection({ usedTokens: 160_000 });
+      const stopped = run({
+        id: RunId.make("run-2"),
+        ordinal: 2,
+        userMessageId: handoffMessageId,
+        status: "interrupted",
+      });
+      const state = {
+        data: {
+          ...data,
+          runs: [...data.runs, stopped],
+          messages: [{ ...data.messages[0]!, id: handoffMessageId, text: "[T3 handoff 1]" }],
+        },
+        settings: on,
+      };
+      const { sent, emit, reads } = yield* harness(state);
+      yield* emit(runUpdated(stopped), "handoffRunEnded", 1);
+      expect(sent).toEqual([]);
+      expect(reads.count).toBe(0);
+    }),
+  );
+
+  it.effect("a failed retry reads nothing and sends nothing, though it is the latest run", () =>
+    Effect.gen(function* () {
+      const data = projection({ usedTokens: 160_000 });
+      const retryId = MessageId.make(`${handoffMessageId}:retry1`);
+      const first = run({
+        id: RunId.make("run-2"),
+        ordinal: 2,
+        userMessageId: handoffMessageId,
+        status: "failed",
+      });
+      const retry = run({
+        id: RunId.make("run-3"),
+        ordinal: 3,
+        userMessageId: retryId,
+        status: "failed",
+      });
+      const state = {
+        data: {
+          ...data,
+          runs: [...data.runs, first, retry],
+          messages: [{ ...data.messages[0]!, id: retryId, text: "[T3 handoff 1]" }],
+        },
+        settings: on,
+      };
+      const { sent, emit, reads } = yield* harness(state);
+      yield* emit(runUpdated(retry), "handoffRunEnded", 1);
+      expect(sent).toEqual([]);
+      expect(reads.count).toBe(0);
+    }),
+  );
+
+  it.effect("a late update during the send does not stop the cancel of a queued handoff", () =>
+    Effect.gen(function* () {
+      const quiet = projection({ usedTokens: 160_000 });
+      const gate = yield* Deferred.make<void>();
+      const inSend = yield* Deferred.make<void>();
+      const state: Parameters<typeof harness>[0] = { data: quiet, settings: on };
+      // A user message got in first: upstream queues the handoff behind it.
+      state.onDispatch = (command) =>
+        command.type === "message.dispatch"
+          ? Effect.gen(function* () {
+              state.data = {
+                ...state.data,
+                runs: [
+                  ...state.data.runs,
+                  run({ id: RunId.make("run-2"), ordinal: 2, status: "running" }),
+                  run({
+                    id: RunId.make("run-3"),
+                    ordinal: 3,
+                    userMessageId: command.messageId,
+                    status: "queued",
+                    startedAt: null,
+                    completedAt: null,
+                  }),
+                ],
+              };
+              yield* Deferred.succeed(inSend, undefined);
+              yield* Deferred.await(gate);
+            })
+          : Effect.void;
+      const { sent, emit, events } = yield* harness(state);
+      yield* Queue.offer(events, runUpdated(run()));
+      yield* Deferred.await(inSend);
+      // A late update for the source run replaces the thread's fiber while it is inside the send.
+      // The second one is handled only after the first replaced (interrupted) the sending fiber.
+      yield* emit(lateRun1(), "readThread", 2);
+      yield* emit(lateRun1(), "readThread", 3);
+      yield* Deferred.succeed(gate, undefined);
+      yield* emit(null, "HandoffDispatch.dispatch", 1);
+      expect(sent.filter((command) => command.type === "queued-run.cancel")).toMatchObject([
+        { runId: "run-3" },
+      ]);
     }),
   );
 });

@@ -104,7 +104,8 @@ export const make = Effect.gen(function* () {
   });
 
   const handOffWhenDue = Effect.fn("HandoffService.handOffWhenDue")(
-    function* (threadId: ThreadId, runId: RunId) {
+    function* (threadId: ThreadId, sourceRunId: RunId) {
+      let runId = sourceRunId;
       let trigger: HandoffTrigger = "turn-end";
       while (true) {
         // Set before the read, so a change between the read and the wait is not missed.
@@ -112,6 +113,14 @@ export const make = Effect.gen(function* () {
         wakes.set(threadId, wake);
         const read = yield* readThread(threadId);
         if (read === null) return;
+        const latest = handoffThreadFacts(read.records).lastRun;
+        // A late update of an earlier run replaced the latest run's timer or wait: take it over, as
+        // upstream's idle compaction does. That run's turn end decides again, with the same ids. A
+        // timer that wakes to a newer run leaves it to that run's own turn end (`newer-run`).
+        if (trigger === "turn-end" && latest?.state === "completed" && latest.id !== runId) {
+          runId = latest.id as RunId;
+          continue;
+        }
         const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
         const decision = handoffDecision({
           ...handoffThreadFacts(read.records),
@@ -147,7 +156,7 @@ export const make = Effect.gen(function* () {
       ),
   );
 
-  /** A handoff run that ended: keep the thread read, or send the same text once more. */
+  /** A handoff run that ended: keep the thread read, or send the same text once more if it failed. */
   const handoffRunEnded = Effect.fn("HandoffService.handoffRunEnded")(
     function* (
       run: OrchestrationV2Run,
@@ -176,10 +185,12 @@ export const make = Effect.gen(function* () {
         }
         return;
       }
-      if (source.retry) {
+      // A stopped handoff stays stopped: the person's Stop is not overridden by a retry.
+      if (source.retry || run.status !== "failed") {
         return yield* Effect.logWarning("handoff not delivered; its text stays in the thread", {
           threadId,
           runId: run.id,
+          status: run.status,
         });
       }
       const read = yield* readThread(threadId);

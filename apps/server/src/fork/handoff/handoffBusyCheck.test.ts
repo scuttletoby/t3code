@@ -338,7 +338,7 @@ it.effect("the same run never hands off twice, and the new session gets wakes an
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect.each(["failed", "completed"] as const)(
+it.effect.each(["failed", "completed", "interrupted"] as const)(
   "the retry lands only after its own first send failed (first send %s)",
   (outcome) =>
     Effect.gen(function* () {
@@ -360,4 +360,21 @@ it.effect.each(["failed", "completed"] as const)(
       yield* retry(":again");
       assert.equal(handoffRuns(yield* runs(threadId)).length, outcome === "failed" ? 2 : 1);
     }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a retry of a retry is dropped, even right after the failed retry", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:handoff-retry-of-retry");
+    const first = yield* quietThread(threadId);
+    yield* sendHandoff(threadId, first.id);
+    yield* complete(handoffRuns(yield* runs(threadId))[0]!, { status: "failed" });
+    assert.equal(yield* dispatchHandoff(handoffCommand(threadId, first.id, "", ":retry1")), "sent");
+    yield* complete(handoffRuns(yield* runs(threadId))[1]!, { status: "failed" });
+    // The failed retry is the latest run, and this message names it as its source: still dropped.
+    const outcome = yield* dispatchHandoff(
+      handoffCommand(threadId, `${first.id}:retry1`, "", ":retry1"),
+    );
+    assert.equal(outcome, "dropped");
+    assert.equal(handoffRuns(yield* runs(threadId)).length, 2);
+  }).pipe(Effect.provide(layerTest)),
 );

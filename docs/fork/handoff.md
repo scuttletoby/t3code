@@ -19,7 +19,9 @@ settings first: with a mode other than `handoff` it reads nothing more and sends
 - **Idle.** A thread at `idleTokens` (75,000; `0` never) or more hands off shortly before its prompt
   cache expires: 4 minutes before with the `agent` source, 2 minutes with `command`. The service
   sets one timer per thread; a newer run's turn end replaces it. When the timer fires and a newer
-  run has finished since, that newer run decides instead.
+  run has finished since, that newer run decides instead. A late update of an older run (a child
+  of an earlier run settling, say) does not lose the timer: the service takes over the latest
+  completed run, as upstream's idle compaction does.
 - Never after a failed or interrupted run, after a `/compact`, or after a handoff run.
 - Under 20,000 tokens never.
 
@@ -47,8 +49,9 @@ checks twice more around the send:
   refuses a run that already started.
 
 A message from the person or a child result that lands first always wins, and nothing of theirs is
-lost. One narrow case remains: if that message's whole run ends between the send and the cancel,
-the handoff runs after it. Nothing is lost then either, but the handoff's text does not include that
+lost. The send and the cancel are one step that a late event or a shutdown cannot cut in half. One
+narrow case remains: if that message's whole run ends between the send and the cancel, the handoff
+runs after it. Nothing is lost then either, but the handoff's text does not include that
 last turn; the new session can read it in the thread.
 
 ## The message
@@ -71,13 +74,14 @@ written out in full. The message says when no effort is set.
 
 - **Read stays read.** If the person had seen the thread before the handoff, the handoff's own
   completion does not mark it unread.
-- **One retry.** A handoff run that fails or is interrupted is sent once more with the same text. If
-  that also fails, the text stays in the thread and the server log says so; the next turn end
-  decides again.
+- **One retry.** A handoff run that fails is sent once more with the same text. If that also fails,
+  the text stays in the thread and the server log says so; the next turn end decides again. A
+  handoff the person stopped stays stopped: an interrupted handoff run is never sent again.
 
 ## Limits
 
-- Timers and waits live in memory. After a server restart, the next turn end decides again.
+- Timers and waits live in memory. After a server restart, the next turn end decides again. A crash
+  between the send and the cancel leaves a queued handoff queued; it runs after the newer run.
 - A handoff run still notifies like any finished run (the browser notice and the relay). Keeping it
   silent needs a marker the app can read; that comes with the settings screen.
 - The same run never hands off twice: the check before the send drops a second trigger, and every

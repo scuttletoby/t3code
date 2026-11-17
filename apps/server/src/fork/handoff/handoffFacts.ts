@@ -151,11 +151,12 @@ export function handoffDispatchDropped(
   if (handoff === null) return false;
   if (handoffBlockers(projection).length > 0) return true;
   const latest = latestStartedRun(projection.runs);
-  // The retry follows only its own first send, failed or interrupted.
+  // The retry follows only its own failed first send: never a stopped one, and never a retry.
   if (handoff.retry) {
     return (
+      handoff.runId.endsWith(HANDOFF_RETRY_SUFFIX) ||
       latest?.userMessageId !== `${HANDOFF_MESSAGE_PREFIX}${command.threadId}:${handoff.runId}` ||
-      latest.status === "completed"
+      latest.status !== "failed"
     );
   }
   return latest?.id !== handoff.runId;

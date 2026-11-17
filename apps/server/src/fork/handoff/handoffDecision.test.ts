@@ -77,6 +77,18 @@ describe("handoffDecision: when", () => {
     expect(HANDOFF_IDLE_LEAD_MS).toEqual({ agent: 4 * MINUTE, command: 2 * MINUTE });
   });
 
+  it("counts exactly the idle size as idle (at 75,000 or more), one token less as too small", () => {
+    const expiry = NOW + 10 * MINUTE;
+    expect(handoffDecision(idle({ usedTokens: 75_000, cacheExpiresAtMs: expiry }))).toEqual({
+      kind: "sleep",
+      untilMs: expiry - 4 * MINUTE,
+    });
+    expect(handoffDecision(idle({ usedTokens: 74_999, cacheExpiresAtMs: expiry }))).toEqual({
+      kind: "skip",
+      reason: "too-small",
+    });
+  });
+
   it("lets only a turn end use the backstop: the idle timer waits for its window at any size", () => {
     const early = { cacheExpiresAtMs: NOW + 10 * MINUTE };
     expect(handoffDecision(facts({ trigger: "idle-timer", ...early }))).toEqual({

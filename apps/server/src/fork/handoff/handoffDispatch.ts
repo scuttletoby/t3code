@@ -51,7 +51,10 @@ export const readHandoffRecords = Effect.fn("HandoffDispatch.readRecords")(funct
   return { ...records, thread, messages } satisfies HandoffRecords;
 });
 
-/** Sends a handoff message only to a quiet thread at its source run (see the file comment). */
+/**
+ * Sends a handoff message only to a quiet thread at its source run (see the file comment). One
+ * uninterruptible step: a replaced timer or a shutdown cannot stop it between the send and the cancel.
+ */
 export const dispatchHandoff = Effect.fn("HandoffDispatch.dispatch")(function* (
   command: HandoffDispatchCommand,
 ) {
@@ -86,4 +89,4 @@ export const dispatchHandoff = Effect.fn("HandoffDispatch.dispatch")(function* (
         }).pipe(Effect.as("sent" as const)),
       ),
     );
-});
+}, Effect.uninterruptible);
