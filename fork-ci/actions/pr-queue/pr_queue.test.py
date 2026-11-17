@@ -250,9 +250,18 @@ def inline_node(body, when='2026-11-07T10:00:00Z', login='owner', association='O
             'authorAssociation': association, 'author': {'__typename': typename, 'login': login}}
 
 
+# GraphQL's PageInfo.endCursor is a nullable String: GitHub can say hasNextPage true and give no cursor. `more=NO_CURSOR`
+# fakes that page (more=None is the last page).
+NO_CURSOR = object()
+
+
+def page_info(more):
+    return {'hasNextPage': more is not None, 'endCursor': None if more is NO_CURSOR else more}
+
+
 def inline_page(nodes=(), more=None):
-    """One page of a review's inline comments; more: the endCursor of a next page."""
-    return {'pageInfo': {'hasNextPage': more is not None, 'endCursor': more}, 'nodes': list(nodes)}
+    """One page of a review's inline comments; more: the endCursor of a next page (NO_CURSOR: there is one, no cursor)."""
+    return {'pageInfo': page_info(more), 'nodes': list(nodes)}
 
 
 def flags_page(*reviews, edited=False, hidden=False, more=None, typename='User', inline=(), inline_more=None):
@@ -264,7 +273,7 @@ def flags_page(*reviews, edited=False, hidden=False, more=None, typename='User',
     if inline or inline_more:
         nodes.append({'id': 'PRR_inline', 'includesCreatedEdit': False, 'isMinimized': False, 'url': 'https://x/PRR_inline',
                       'author': {'__typename': 'User', 'login': 'owner'}, 'comments': inline_page(inline, inline_more)})
-    page = {'hasNextPage': more is not None, 'endCursor': more}
+    page = page_info(more)
     return ok(json.dumps({'data': {'repository': {'pullRequest': {'reviews': {'pageInfo': page, 'nodes': nodes}}}}}))
 
 
@@ -589,6 +598,14 @@ class ReviewFlagsQuery(unittest.TestCase):
             self.assertEqual(len(calls), 2, cursor)
         (flags, why), _ = self.read(flags_page(r, more=''))
         self.assertIsNone(flags)
+
+    def test_a_next_page_with_a_null_cursor_fails(self):   # endCursor is nullable: never read as the last page
+        r = gh_review('x', 't')
+        for pages in ([flags_page(r, more=NO_CURSOR)], [flags_page(r, more='c1'), flags_page(r, more=NO_CURSOR)]):
+            (flags, why), calls = self.read(*pages)
+            self.assertIsNone(flags, len(pages))
+            self.assertIn('no next page', why)
+            self.assertEqual(len(calls), len(pages))
 
     def test_more_pages_than_the_limit_fail(self):
         r = gh_review('x', 't')
@@ -2403,6 +2420,15 @@ class InlineCommentsQuery(ReviewFlagsQuery):
             self.assertEqual(len(calls), 2, cursor)
         (flags, why), _ = self.read(flags_page(inline=[inline_node('a')], inline_more=''))
         self.assertIsNone(flags)
+
+    def test_a_next_page_of_inline_comments_with_a_null_cursor_fails(self):   # endCursor is nullable
+        for pages in ([flags_page(inline=[inline_node('a')], inline_more=NO_CURSOR)],
+                      [flags_page(inline=[inline_node('a')], inline_more='i1'),
+                       more_comments_page([inline_node('b')], more=NO_CURSOR)]):
+            (flags, why), calls = self.read(*pages)
+            self.assertIsNone(flags, len(pages))
+            self.assertIn('no next page', why)
+            self.assertEqual(len(calls), len(pages))
 
     def test_more_pages_than_the_limit_fail(self):
         pages = [flags_page(inline=[inline_node('a')], inline_more='i0')] + \
