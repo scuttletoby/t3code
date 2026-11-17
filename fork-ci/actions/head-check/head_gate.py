@@ -38,13 +38,16 @@ step before start fails, or the run never reaches start.
           not its rate limit).
   target  before any token: post=false only for bad arguments. Else post=true: the head gets a failure (judge writes
           it) when the guard did not pass, on a re-run (run attempt 2 or later), for a caller that is not the default
-          branch's current one or does not pin this gate release, for an empty lens list, for a head no open, ready
-          pull request into the default branch has, or when GitHub did not say. GITHUB_OUTPUT: post, base.
+          branch's current one or does not pin this gate release, for a lens list with a name that names no lens, for
+          a head no open, ready pull request into the default branch has, or when GitHub did not say. GITHUB_OUTPUT:
+          post, base. An empty lens list is judge's to refuse: only the config at the base tip says whether its
+          `review` block is in enforce, where the path rules name the lenses.
   start   an in-progress check run on the head (it never passes), so a run that stops or fails from here on leaves
           "not passed", never an older pass. Up to 3 tries. GITHUB_OUTPUT: id.
   judge   read the base tip and the pull requests with the head from the API, fetch both commits by sha into a new
           bare repository, run head_check's rules in bare mode (head_check.decide, the same code as the action) for
-          each pull request, and write the strictest verdict for finish. Anything target would fail is a failed verdict.
+          each pull request, and write the strictest verdict for finish. Anything target would fail is a failed verdict,
+          and so is an empty lens list unless the config at the base tip has a `review` block in enforce.
   finish  complete start's check run with the verdict, or with a failure when there is none (the run stopped or
           failed before it judged). Up to 3 tries; when all fail, the job is red and the check stays in progress.
   drift   warn (never fail) when the base branch's rules do not bind the required check to the gate App.
@@ -447,10 +450,10 @@ def preflight(a, gh):
                         'release of the first attempt, whatever the default branch names now, and a re-run of the '
                         'gate job alone skips the guard job: dispatch the gate with the pull request number '
                         'instead (Actions > the caller > Run workflow)'), None, None, []
-    required, problems = head_check.required_names(a.required_lenses)
-    if problems or not required:
-        return 'fail', ('required-lenses names no lens (' + ('; '.join(problems) or 'it is empty') + '): with none, '
-                        'a head with no lens comment would pass. Give one lens name per line'), None, None, []
+    _, problems = head_check.required_names(a.required_lenses)
+    if problems:   # an empty list is judge's to refuse (empty_lenses_problem): it needs the config at the base tip
+        return 'fail', ('required-lenses names no lens (' + '; '.join(problems) + '): with none, a head with no lens '
+                        'comment would pass. Give one lens name per line'), None, None, []
     branch, why = default_branch(a.repo, gh)
     if branch is None:
         return 'fail', why, None, None, []
@@ -589,6 +592,19 @@ def fetch(checkout, base, head):
     return None if r.returncode == 0 else f'git fetch failed: {r.stderr.strip()[:300]}'
 
 
+def empty_lenses_problem(checkout, config_path):
+    """None when an empty required-lenses input may stand: the config at the base tip has a `review` block in enforce,
+    so the path rules name the lenses. Else why the head fails (no block, shadow, or a config that cannot be read)."""
+    problems = []
+    cfg = head_check.base_config(checkout, config_path, problems)
+    if cfg is None:
+        return '; '.join(problems)
+    if cfg.review is not None and cfg.review.mode == 'enforce':
+        return None
+    return ('required-lenses names no lens (it is empty): with none, a head with no lens comment would pass. Give one '
+            'lens name per line, or let the review rules of the config decide (a `review` block in mode enforce)')
+
+
 def verdict_text(ok, reason, results, head, base):
     """(title, summary) of the head's verdict; results is [(n, code, ok, reason, rows)] per pull request."""
     failed = [r for r in results if not r[2]]
@@ -627,6 +643,9 @@ def judge(a, gh, out, env, decide=head_check.decide, sleep=time.sleep):
             problem = problem or fetch(checkout, base, a.sha)
             if problem:
                 ok, reason = False, f'could not fetch the base and the head: {problem}'
+            elif not head_check.required_names(a.required_lenses)[0] \
+                    and (problem := empty_lenses_problem(checkout, a.config)):
+                ok, reason = False, f'not judged: {problem}'
             else:
                 shared = list(filter(None, [pr_queue.git_problem(), checkout.problem()]))
                 required, _ = head_check.required_names(a.required_lenses)
@@ -685,7 +704,8 @@ def run_arguments(p):
     """What target and judge both read about the head and the run."""
     p.add_argument('--repo', required=True)
     p.add_argument('--sha', required=True, help='the head to judge')
-    p.add_argument('--required-lenses', required=True, help='lens names, one per line; none = refused')
+    p.add_argument('--required-lenses', required=True, help='lens names, one per line; none = refused unless the '
+                   "config's review block is in enforce")
     p.add_argument('--caller-ref', required=True, help='github.workflow_ref: the caller workflow file and its ref')
     p.add_argument('--caller-sha', required=True, help='github.workflow_sha: the caller commit')
     p.add_argument('--gate-repo', required=True, help='job.workflow_repository: where this gate comes from')
