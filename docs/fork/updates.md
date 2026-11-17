@@ -40,9 +40,27 @@ watches; it changes nothing on the machine, and `0` turns it off.
   makes a save refuse an interval no run could use and a load read one as its default.
 - The seam check ([`fork-seam-check.cjs`](../../.github/scripts/fork-seam-check.cjs)) refuses any
   line the fork adds to an upstream file beyond the seam lines pinned in
-  [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment. It runs on
-  every pull request (Fork tests, "Workflow lint and upstream drift") and in fork-follow before and
-  after each rebase, against the upstream commit the series sits on.
+  [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment, in every
+  upstream file, listed or not. It runs on every pull request (Fork tests, "Workflow lint and
+  upstream drift") and in fork-follow before and after each rebase, against the upstream commit
+  the series sits on. A pull request is judged by its base's list, never by its own: a new seam,
+  `pending` or `forkFiles` entry counts once the owner merges it. `pending` maps upstream files
+  whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
+  upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
+  also lowers the ceiling in the same change). Right after a rebase, below the ceiling is only a
+  note in the run log: when upstream takes a fork line word for word, the rebase drops it, and the
+  ceiling could not have been lowered first. The next run, from the new base, fails until a pull
+  request lowers it. A pull request may change a pending file but not grow it. An upstream file in no list may gain no
+  line, lose no line and keep its lines in order (whitespace and blank lines aside), and no
+  upstream file may be deleted or renamed, except the workflows
+  [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
+  `fork-*.yml`. A submodule pointer counts as a line. A pull request's run has no upstream commit,
+  so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
+  for the fork's own; from upstream, a pattern that matches an upstream file fails. For the same
+  reason a pull request's run counts upstream's copies of a seam line against its allowance: a
+  seam line upstream also has (`}`, `/**`) cannot be added by a pull request, only checked by
+  fork-follow, so keep seam lines specific. A branch made before fork-follow last rebased main
+  is refused with one "update the branch" error.
 - [`serverSettings.forkDefaults.test.ts`](../../apps/server/src/serverSettings.forkDefaults.test.ts)
   loads the settings the way a server does and checks every fork setting is at its row's default
   with no file, `{}`, a file an upstream build wrote, a file cut off half-way and a file with a bad
@@ -144,7 +162,19 @@ Held (nothing of it starts until the server restarts without the flag):
 - work an automatic update held (its marker stays);
 - automatic project pull;
 - following and stopping delegated tasks in linked environments (owed stops stay owed);
-- the startup analytics heartbeat.
+- the startup analytics heartbeat;
+- T3 Connect. A full copy carries the running server's Connect link (its environment id, relay link
+  and tunnel). The held server starts no tunnel, registers none with the relay and releases none when
+  it stops, so remote access stays with the running server. It publishes no agent activity (thread
+  state) to the relay under that id. A client's request to link, change the link, unlink or answer
+  the relay is refused with the reason, and so is every CLI unlink on that home (`t3 connect unlink`,
+  `t3 connect logout`, `t3 up` turning Connect off) while the held server runs: unlinking ends in a
+  relay delete of the shared environment id, which would remove the running server's link too.
+  The stored link files are kept as they are (`apps/server/src/cloud/holdWorkConnect.ts`).
+
+  The CLI can only tell a copy is held while its server runs. Never run `t3 connect unlink` or
+  `t3 connect logout` against a stopped copy's home: it removes the running server's link. Delete
+  the copy's home instead.
 
 Still runs:
 
@@ -155,7 +185,10 @@ Still runs:
   turn. Run the copy with an empty `HOME` and a bare `PATH` if they must not start;
 - the UI, WebSocket and HTTP API, and timers that only change thread state (pull request watch and
   sync, auto-settle);
-- anything a user asks for directly, such as a commit message or a pull request guide.
+- anything a user asks for directly, such as a commit message or a pull request guide;
+- reading the copy's Connect status;
+- the periodic Connect reachability check: read-only requests to the stored public address and the
+  tunnel network. It restarts only a tunnel this server started, and a held server starts none.
 
 Startup refuses to serve when the gate is not held or a part that starts work (outbox, thread launch,
 recovery, scheduler) does not use it. The check runs before activation, so nothing parked has run.

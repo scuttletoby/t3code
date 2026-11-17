@@ -60,8 +60,8 @@ class Case(unittest.TestCase):
 
     def copy(self, linux_mode=0o755, wsl2_mode=0o755, linux_text=None, launcher_text=None, pin=True):
         """A walls folder of its own (wsl2, linux; the launcher and its allow list one folder up, as an install has
-        them): its wsl2's path. launcher_text: the launcher's text instead (None: the real one), and wsl2 pinned to it
-        (pin; False: wsl2 keeps the real launcher's pin, as a launcher changed on the machine finds it)."""
+        them): its wsl2's path. launcher_text: the launcher's text instead (None: the real one), and wsl2 and linux
+        pinned to it (pin; False: both keep the real launcher's pin, as a launcher changed on the machine finds it)."""
         kit = self.tmp()
         folder = os.path.join(kit, 'fork-fleet-walls')
         os.mkdir(folder, 0o755)
@@ -80,7 +80,7 @@ class Case(unittest.TestCase):
             if name == 'linux' and linux_text is not None:
                 with open(os.path.join(folder, name), 'w', encoding='utf-8') as f:
                     f.write(linux_text)
-            if name == 'wsl2' and launcher_text is not None and pin:
+            if launcher_text is not None and pin:   # both walls files pin the launcher
                 text = slurp(os.path.join(folder, name))
                 self.assertEqual(len(PIN.findall(text)), 1)
                 with open(os.path.join(folder, name), 'w', encoding='utf-8') as f:
@@ -253,7 +253,9 @@ TOOLS = ("  tools:1) printf 'SYSTEMD_RUN %s\\nSYSTEMCTL %s\\n' \"$(shown \"$SYST
 B_ANCHOR = '  b=$real\n  resolv_bind=$b:$resolv\n'
 # Its traps, as launcher_tripwires reads them (quotes and backslashes out): each cleans up or exits, on EXIT or a signal.
 TRAPS = ('trap rm -rf --one-file-system -- $(printf %q $tmp) EXIT', 'trap exit 129 HUP', 'trap exit 130 INT',
-         'trap exit 143 TERM', 'trap rm -f -- $(printf %q $env_file) EXIT')
+         'trap exit 143 TERM', 'trap rm -f -- $(printf %q $env_file) EXIT',
+         # check-net's two canaries (issue #243), removed however it ends
+         'trap rm -f -- $(printf %q $CANARY_DIR/fork-fleet-canary) $(printf %q $CANARY_DIR/fork-fleet-canary-group) EXIT')
 # Ways bash runs code later, at a time of its own, or loads it (none in the launcher): mapfile's and readarray's -C
 # callback, a builtin from a file (enable -f), extdebug (shopt), a prompt, PS4 under set -x, BASH_ENV in a child bash
 # (ENV in one started as sh), options a child bash takes from its environment (BASHOPTS, SHELLOPTS: xtrace with PS4),
@@ -337,6 +339,7 @@ def walls_with(test, root, launcher_text=None):
     m = load('wsl2', root)
     m.LAUNCHER_SHA256 = sha(slurp(LAUNCHER) if launcher_text is None else launcher_text)
     m.LINUX = load('linux', root)
+    m.LINUX.LAUNCHER_SHA256 = m.LAUNCHER_SHA256
     m.LINUX.KIT, m.LINUX.LAUNCHER = kit, os.path.join(kit, 'fork-fleet-launch.sh')
     # The walls hand FORK_FLEET_WALLS_ROOT to the launcher when they run it (job_view), not only at load: keep it set
     # for the whole test, or `paths` checks this test machine's own /opt (open to all on some CI runners).
@@ -503,8 +506,11 @@ class Launcher(Case):
                          'pin (launcher_tripwires): read the change with the security lens before you change either')
         self.assertEqual(wsl2.LAUNCHER_SHA256, sha(slurp(LAUNCHER)), 'fork-fleet-launch.sh changed: read its job '
                          'units again (unit_props) with the security lens, and set LAUNCHER_SHA256 in '
-                         'fork-fleet-walls/wsl2 to its sha256')
-        self.assertEqual(len(PIN.findall(slurp(os.path.join(FOLDER, 'wsl2')))), 1)
+                         'fork-fleet-walls/wsl2 and fork-fleet-walls/linux to its sha256')
+        for name in ('wsl2', 'linux'):
+            self.assertEqual(len(PIN.findall(slurp(os.path.join(FOLDER, name)))), 1, name)
+        self.assertEqual(load('linux').LAUNCHER_SHA256, wsl2.LAUNCHER_SHA256, 'the linux and wsl2 walls pin '
+                         'different launchers: set LAUNCHER_SHA256 in both to fork-fleet-launch.sh\'s sha256')
 
     def test_a_pinned_edit_trips_a_check(self):
         """PR #213 re-check RS N4: each of round 1's launcher edits (and their cousins: source, a name reference,
@@ -615,9 +621,11 @@ class Launcher(Case):
                 for run in (self.run_wsl2, self.run_dispatcher):
                     p = run(self.copy(launcher_text=text, pin=False), self.fake(), 'check')
                     self.assertEqual(p.returncode, 1, p.stderr)
-                    self.assertEqual([line.split()[1] for line in p.stdout.splitlines()], ['sockets'], p.stdout)
+                    self.assertEqual([line.split()[1] for line in p.stdout.splitlines()], ['job-units', 'sockets'],
+                                     p.stdout)
                     self.assertIn('cannot tell (ValueError: ', p.stdout)
                     self.assertIn('is not the launcher these walls were checked against', p.stdout)
+                    self.assertIn('is not the launcher these walls ship with', p.stdout)
         for run in (self.run_wsl2, self.run_dispatcher):   # the same text pinned: the comment changes nothing
             self.assertEqual(run(self.copy(launcher_text=real + '# a comment\n'), self.fake(), 'check').returncode, 0)
 

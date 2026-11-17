@@ -3,7 +3,7 @@
 is one systemd or kernel can drop without an error: a runner would then start with less of its sandbox than the
 launcher asked for, or would see more of this host than it allows. Reads files and runs the launcher's read-only
 `paths` and `tools` only; changes nothing. Standard library only."""
-import base64, fnmatch, glob, gzip, ipaddress, os, re, shlex, stat, subprocess, sys
+import base64, fnmatch, glob, gzip, hashlib, ipaddress, os, re, shlex, stat, subprocess, sys
 
 ROOT = os.environ.get('FORK_FLEET_WALLS_ROOT', '')
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # the folder of fork-fleet-launch.sh
@@ -206,8 +206,8 @@ STOP_TIMEOUTS = ('TimeoutSec', 'TimeoutStopSec', 'TimeoutAbortSec')
 STOP_MAX = 300   # seconds
 # The same from systemd's own config: its defaults for every unit that sets none of its own. The launcher's start()
 # gives each job unit its own (JOB_STOP_TIMEOUTS: default -> its own; a test keeps them the launcher's), so they count
-# only while a unit an older launcher started is loaded (stop_defaults_used), or while the installed launcher is such
-# an older one (launcher_stops). The main file is the first of
+# only while a unit an older launcher started is loaded (stop_defaults_used). The installed launcher is the one these
+# walls ship with (LAUNCHER_SHA256); any other cannot be told (launcher_shipped). The main file is the first of
 # MANAGER_MAIN there is (systemd 256 and later; before, /etc's only: reading the others too can only report more), and
 # every drop-in of MANAGER_CONFS is read.
 MANAGER_MAIN = ('/etc/systemd/system.conf', '/run/systemd/system.conf', '/usr/local/lib/systemd/system.conf',
@@ -216,6 +216,10 @@ MANAGER_CONFS = ('/etc/systemd/system.conf.d/*.conf', '/run/systemd/system.conf.
                  '/usr/local/lib/systemd/system.conf.d/*.conf', '/usr/lib/systemd/system.conf.d/*.conf',
                  '/lib/systemd/system.conf.d/*.conf')
 JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutAbortSec': 'TimeoutAbortSec'}
+# The sha256 of the launcher (fork-fleet-launch.sh) these walls ship with, whose start() gives every job unit its own
+# stop timeouts (launcher_shipped). A changed launcher must change this pin and fork-fleet-walls/wsl2's with it
+# (fork-fleet-walls.test.py and fork-fleet-walls-wsl2.test.py check both against the launcher in the repo).
+LAUNCHER_SHA256 = '0b4b4c10cca7f04cde8bcb732fba5dbd2dddc2b42b3535e37e92140c98598bc4'
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
 UNIT_BLANKS = ' \t\n\r'
@@ -388,7 +392,14 @@ def mounts_wall():
     /data, /net, /mnt) or a mount made later is fine: no job sees it."""
     table = mounts()
     shared = []
-    for _, real in job_view():
+    view = job_view()
+    # Issue #243: an allow list of /etc, never all of it (the logins, units, cron and backup tools' folders beside the
+    # few entries a build needs). Today's launcher refuses that itself; an older one (its kit's list) does not.
+    whole = sorted({f'{dest} from {real}' for dest, real in view if '/etc' in (dest, real)})
+    if whole:
+        return (f'jobs see all of /etc ({", ".join(whole[:3])}): an older kit\'s list; re-run the installer, whose '
+                'list names only the /etc entries builds need')
+    for _, real in view:
         point, kind = on_local_disk(table, real)
         if kind not in LOCAL_FS:
             shared.append(f'{real} (on {kind} at {point or "?"})')
@@ -539,27 +550,19 @@ def stop_defaults_used():
     return used, bad
 
 
-def launcher_stops():
-    """The stop timeouts (own_stops) the installed launcher's start() gives every job unit it starts, as its
-    systemd-run command writes them (-p Key=value, quoted or not; not in a comment). The walls may sit beside an older
-    launcher (a kit not installed whole) whose start() gave none: systemd's defaults then decide the next job unit's
-    (issue #297). This guards against such an old launcher, not a hostile one (only root writes it, and launcher_safe
-    holds): a property in another form is not seen, so its default counts. A launcher not safe, no start(), or a value
-    written with an expansion: cannot tell."""
+def launcher_shipped():
+    """Raises unless the installed launcher is the one these walls ship with, byte for byte (LAUNCHER_SHA256), read
+    on one open file (O_NOFOLLOW; a FIFO does not block) that is as safe as launcher_safe wants it. Its start() gives
+    every job unit -p TimeoutStopSec=90 -p TimeoutAbortSec=90 (fork-fleet.test.py's test_start runs it), so with it
+    systemd's defaults decide no job unit's stop timeouts. No reading of bash can tell what another launcher's
+    systemd-run gets (issue #316), so any other launcher, an older one too (a kit not installed whole): cannot tell."""
     fd = os.open(LAUNCHER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
     with os.fdopen(fd, 'rb') as f:
         launcher_safe(os.fstat(f.fileno()))
-        text = f.read().decode('utf-8', 'replace')
-    start = re.search(r'^start\(\) \{\n(.*?)^\}$', text, re.M | re.S)
-    if not start:
-        raise ValueError(f'{LAUNCHER} has no start()')
-    code = '\n'.join(line for line in start.group(1).split('\n') if not line.lstrip().startswith('#'))
-    lines = []
-    for _, key, value in re.findall(r'(?<!\S)-p[ \t]+(["\']?)(Timeout[A-Za-z]*)=([^\s"\']*)\1(?!\S)', code):
-        if re.search(r'[$`\\]', value):
-            raise ValueError(f'{LAUNCHER}: start() gives its job units {key}={value}, which is not written out')
-        lines.append((0, key, value))
-    return own_stops(lines)
+        data = f.read()
+    if hashlib.sha256(data).hexdigest() != LAUNCHER_SHA256:
+        raise ValueError(f'{LAUNCHER} is not the launcher these walls ship with (its sha256 is not LAUNCHER_SHA256): '
+                         'install the kit whole, the walls and the launcher from one release')
 
 
 def job_units_wall():
@@ -569,8 +572,9 @@ def job_units_wall():
     SystemCallFilter=, ...), an endless stop timeout, or a reset of IPAddressDeny= (reset_left), turns a wall off
     where the launcher cannot see it; so does a slice above them (SLICE_UNITS, SLICE_FOLDERS) that allows more than
     localhost, or sets another firewall of its own (SLICE_OPENS), and systemd's default stop timeout (MANAGER_MAIN,
-    MANAGER_CONFS) when endless and a loaded job unit, or the installed launcher's start(), sets none of its own
-    (stop_defaults_used, launcher_stops); an endless one of a loaded unit's own or start()'s too. A list counts only
+    MANAGER_CONFS) when endless and a loaded job unit sets none of its own (stop_defaults_used); an endless one of a
+    loaded unit's own too. The installed launcher must be the one these walls ship with (launcher_shipped), whose
+    start() sets both of its own; any other launcher: cannot tell. A list counts only
     in the section systemd reads it in ([Service], [Slice]). A SYSTEMD_RUN or SYSTEMCTL (the launcher's `tools`, as
     its settings set them) that is not systemd's own (LAUNCH_TOOLS) starts the units with a program that may drop any
     property. A file that cannot be read, or a value that cannot be read (an address, a time span): cannot tell."""
@@ -596,12 +600,7 @@ def job_units_wall():
             bad.append(f'{path} sets {", ".join(keys[:4])} for the slice the job units sit in')
     used, units = stop_defaults_used()
     bad += units
-    start = launcher_stops()
-    old = {d for d, k in JOB_STOP_TIMEOUTS.items() if k not in start}
-    used |= old
-    keys = endless([(0, k, v) for k, v in start.items()], STOP_TIMEOUTS)
-    if keys:
-        bad.append(f'the launcher\'s start() ({LAUNCHER}) sets {", ".join(keys[:2])} for every job unit')
+    launcher_shipped()
     main = [p for p in MANAGER_MAIN if os.path.exists(ROOT + p)][:1]   # a link to /dev/null too; not a dangling one
     for p in main:   # a link to /dev/null masks the others; a folder (or a socket, ...) is no config: cannot tell
         if not os.path.isfile(ROOT + p) and os.path.realpath(ROOT + p) != '/dev/null':
@@ -610,9 +609,7 @@ def job_units_wall():
             {p[len(ROOT):] for t in MANAGER_CONFS for p in glob.glob(glob.escape(ROOT) + t) if os.path.isfile(p)}):
         keys = endless(file_lines(path), used)
         if keys:
-            why = (f' (the launcher\'s start() gives none of its own: {LAUNCHER} is older than these walls? install '
-                   'the kit whole)') if any(k.split('=', 1)[0] in old for k in keys) else ''
-            bad.append(f'{path} sets {", ".join(keys[:2])} for every unit, the job units among them{why}')
+            bad.append(f'{path} sets {", ".join(keys[:2])} for every unit, the job units among them')
     tools = [line.split(' ', 1) for line in ask('tools', 'to say what it starts job units with')]
     if sorted(t[0] for t in tools) != sorted(LAUNCH_TOOLS) or any(len(t) != 2 for t in tools):
         raise ValueError('the launcher\'s `tools` printed no SYSTEMD_RUN and SYSTEMCTL lines')
@@ -1304,11 +1301,13 @@ def token_file(path):
 
 
 def etc_secrets_wall():
-    """A lint, not a proof (PR #240 round 4): no secret found in the common places of /etc and /usr, which jobs see
-    (the launcher's list has them). It reads files and guesses which hold a secret; it cannot prove that no file a job
-    can read holds one (a *_COMMAND is a program; which file it reads depends on bash and every program it calls). The
-    real fix is to show jobs only an allow list of /etc (issue #243); the open forms below are closed by that design,
-    not by more parsing here. What it finds: a credentials file (smbcredentials, *.cred, ...) readable by others; a
+    """A lint, not a proof (PR #240 round 4): no secret found in the common places of /etc and /usr. It reads files
+    and guesses which hold a secret; it cannot prove that no file a job can read holds one (a *_COMMAND is a program;
+    which file it reads depends on bash and every program it calls). The real fix is in place: jobs see only an allow
+    list of /etc (issue #243: fork-fleet-job-paths.txt, refused whole by the launcher and by `mounts`, listed from
+    inside by check-net), so the open forms below in /etc are closed by that design, not by more parsing here. It still
+    reads all of /etc, so it can only fail more than needed, never less; trimming it to /usr and ALLOW_PATHS is the
+    rest of issue #243. What it finds: a credentials file (smbcredentials, *.cred, ...) readable by others; a
     line of a mount table (MOUNT_TABLES: fstab, autofs maps, systemd mount and automount units and their drop-ins)
     with password= or pass=, or with a credentials= or cred= file others can read; a secret in a login or session
     environment file (ENV_FILES) or a service's (SERVICE_FILES: by name and value, by a token's shape, or a URL's
@@ -1378,8 +1377,8 @@ WALLS = [
                'mount', mounts_wall),
     ('job-units', 'no systemd drop-in nor launcher setting changes the job units the launcher asks for',
      job_units_wall),
-    ('etc-secrets', 'no secret found in the common places of /etc and /usr, which jobs see (a lint, not a proof: '
-                    'issue #243)', etc_secrets_wall),
+    ('etc-secrets', 'no secret found in the common places of /etc and /usr (a lint, not a proof; jobs see only an '
+                    'allow list of /etc: issue #243)', etc_secrets_wall),
 ]
 
 

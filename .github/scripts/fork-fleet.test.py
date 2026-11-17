@@ -1118,6 +1118,59 @@ class Dispatch(unittest.TestCase):
         self.dispatch()
         self.assertEqual(self.fake[WAITING].stopped, [self.name(40)])
 
+    def test_an_idle_runner_under_the_pools_label_with_no_unit_here_is_left_alone(self):
+        """#356: GitHub still lists the runner online but its unit is not on this host (gone after a reboot or a
+        crash, or the pool's launch moved to another host without a label change). `stop` could only fail, so it is
+        never tried: the pool is never down for it, the same pass runs again without a stop, and a queued job starts.
+        Once GitHub marks the runner offline, its registration is deleted. This is the idle path (no queued job could
+        take it, job 11 included: it is another job key); the next test is the stop-at-once path."""
+        self.registration(40, key='rust')
+        for _ in range(CFG['dispatch']['idle_passes']):
+            self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, [])
+        self.assertEqual(self.state['down'], {})
+        self.assertEqual(self.state['idle'], {})
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+        for _ in range(4):
+            self.dispatch()
+        self.assertEqual((self.fake[WAITING].stopped, self.started()), ([], [self.name(11)]))
+        self.assertEqual(self.state['down'], {})
+        self.gh.runners[0]['status'] = 'offline'
+        self.dispatch()
+        self.assertNotIn(self.name(40), [r['name'] for r in self.gh.runners])
+
+    def test_an_idle_runner_with_no_unit_here_is_not_stopped_at_once_for_a_job_that_could_take_it(self):
+        """#356, #366: the same runner while a queued job of another run could be given it, which would stop a
+        runner with a unit here at once. One pass only, so the idle path (idle_passes passes) plays no part."""
+        self.assertGreater(CFG['dispatch']['idle_passes'], 1)
+        self.registration(40)
+        self.gh.add(a_run(6, actor='someone'), a_job(41, [POOLS[WAITING]['label']]))
+        self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, [])
+        self.assertEqual(self.state['down'], {})
+        self.assertEqual(self.state['idle'], {})
+
+    def test_two_dispatchers_serving_one_pool_delete_each_others_fresh_registrations(self):
+        """#366: today's behaviour, pinned so that a fix knows what it changes. Two hosts serve one pool under the
+        same label: its launch moved, and the old host's dispatcher still runs. One host starts a runner for job 11;
+        its registration is offline until that runner connects, and the other host has no unit for it, so its next
+        pass deletes the registration. No label changed: only stopping the old host's dispatcher before the new
+        host's serves the pool avoids this (fleet-route README, "Old registrations")."""
+        fakes = {h: FakeLauncher(WAITING) for h in ('old', 'new')}
+        states = {h: ff.new_state() for h in fakes}
+
+        def dispatch(h):
+            hosts = {WAITING: ff.Host(POOLS[WAITING], run=fakes[h].run)}
+            return quiet(ff.dispatch_pass, CFG, self.gh, hosts, states[h], now=lambda: self.clock[0])[1]
+
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+        dispatch('old')
+        self.assertEqual([n for n, _ in fakes['old'].started], [self.name(11)])
+        self.assertEqual([(r['name'], r['status']) for r in self.gh.runners], [(self.name(11), 'offline')])
+        log = dispatch('new')
+        self.assertIn(f'{self.name(11)}: deleted a registration with no runner behind it', log)
+        self.assertEqual((self.gh.runners, fakes['new'].started), ([], []))
+
     def test_a_failed_stop_keeps_the_idle_count_and_the_next_pass_stops_it(self):
         """#342: the stop fails (systemd trouble): the pool is down for that pass and the runner's count is kept, so
         the next pass that answers stops it at once, not idle_passes passes later."""
@@ -1567,7 +1620,7 @@ class Launcher(unittest.TestCase):
                         RESERVE_MB='2048', MAX_SECONDS='3600', NET_BASE='10.204', RESOLV_CONF=self.path('resolv.conf'),
                         IP_FORWARD=self.path('ip_forward'), OWN_ADDRESS_URLS=self.OWN_URLS, OWN_ADDRESS_SECONDS='0',
                         MEMINFO=self.path('meminfo'), SYSTEMD_RUN=self.path('bin/systemd-run'),
-                        SYSTEMCTL=self.path('bin/systemctl'), JOB_PATHS=self.job_paths)
+                        SYSTEMCTL=self.path('bin/systemctl'), JOB_PATHS=self.job_paths, CANARY_DIR=self.d)
         settings.update(over)
         self.write('launch.conf', '# fleet\n\n' + ''.join(f'{k}={v}\n' for k, v in settings.items()) + extra, 0o600)
 
@@ -1609,6 +1662,13 @@ class Launcher(unittest.TestCase):
     def seen(self, rw=''):
         """The mount points check-net's probe is told to allow."""
         return ' '.join(['/', *self.allowed(), *([rw] if rw else []), os.path.realpath('/etc/resolv.conf')])
+
+    def links(self):
+        """The links check-net's probe is told the unit's root has (job_fs): the list's links, and /etc/resolv.conf
+        when the jobs' resolv.conf is bound elsewhere (systemd-resolved's link: issue #243, no longer in a whole /etc)."""
+        resolv = os.path.realpath('/etc/resolv.conf')
+        return ' '.join([p for p in job_paths() if os.path.islink(p)] +
+                        (['/etc/resolv.conf'] if resolv != '/etc/resolv.conf' else []))
 
     def sources(self):
         """Where check-net's probe is told each bound point comes from: POINT=DEVICE:INODE of the real path job_fs
@@ -1722,7 +1782,9 @@ class Launcher(unittest.TestCase):
                       '/var/tmp:size=1G,mode=1777', props)
         links = {os.path.join('/', os.path.relpath(os.path.join(d, x), root)): os.readlink(os.path.join(d, x))
                  for d, dirs, files in os.walk(root) for x in dirs + files if os.path.islink(os.path.join(d, x))}
-        self.assertEqual(links, {p: os.readlink(p) for p in job_paths() if os.path.islink(p)})
+        resolv = os.path.realpath('/etc/resolv.conf')   # issue #243: no whole /etc, so its link is the launcher's
+        self.assertEqual(links, {p: os.readlink(p) for p in job_paths() if os.path.islink(p)} |
+                         ({'/etc/resolv.conf': resolv} if resolv != '/etc/resolv.conf' else {}))
         for d, dirs, files in os.walk(root):
             for x in files:
                 self.assertTrue(os.path.islink(os.path.join(d, x)), os.path.join(d, x))
@@ -2007,6 +2069,43 @@ class Launcher(unittest.TestCase):
                 self.assertIn(word, got.stderr)
                 self.assertIn('it holds data', got.stderr)
                 self.assertEqual(got.stdout, '')
+
+    def test_paths_shows_jobs_an_allow_list_of_etc_not_all_of_it(self):
+        """Issue #243 item 1: the list names the few /etc entries builds need, never /etc itself. On a fake machine
+        with a shadow-like file, a made-up secret, a private key folder and a backup tool's folder in /etc, `paths`
+        (what job_fs binds) has the listed entries that are there and nothing else of /etc."""
+        self.assertNotIn('/etc', job_paths())
+        files = (('/etc/passwd', 'root:x:0:0::/root:/bin/sh\n'), ('/etc/group', 'root:x:0:\n'), ('/etc/hosts', ''),
+                 ('/etc/nsswitch.conf', ''), ('/etc/ssl/certs/ca-certificates.crt', ''),
+                 ('/etc/ssl/private/host.key', 'k'), ('/etc/shadow', 'root:$6$x:1::::::\n'),
+                 ('/etc/fork-fleet-test-secret', 'hunter2\n'), ('/etc/restic/pw', 'hunter2\n'),
+                 ('/etc/default/backup', 'RESTIC_PASSWORD=hunter2\n'), ('/usr/share/zoneinfo/UTC', ''))
+        root = self.walls_root('', files=files, links=(('/etc/localtime', '../usr/share/zoneinfo/UTC'),))
+        got = self.paths(root)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        etc = sorted(x for x in got.stdout.splitlines() if x.startswith('/etc/') and 'resolv.conf' not in x)
+        self.assertEqual(etc, ['/etc/group /etc/group', '/etc/hosts /etc/hosts', '/etc/nsswitch.conf /etc/nsswitch.conf',
+                               '/etc/passwd /etc/passwd', '/etc/ssl/certs /etc/ssl/certs'])
+        for hidden in ('/etc ', 'shadow', 'secret', 'private', 'restic', 'default'):
+            self.assertNotIn(hidden, got.stdout)
+
+    def test_paths_refuses_all_of_etc_as_an_older_kit_lists_it(self):
+        """Issue #243 item 4: an older kit's list (or a JOB_PATHS of one's own, or ALLOW_PATHS) that still names /etc
+        whole is refused, by `paths` (the walls) and by start (no runner with the old view): re-run the installer."""
+        root = self.walls_root('JOB_PATHS=/etc/fork-fleet/job-paths\n',
+                               files=(('/etc/fork-fleet/job-paths', '/usr\n/etc\n'), ('/etc/passwd', '')))
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('/etc: all of /etc is never in a job\'s view (an older kit\'s list?): re-run the installer',
+                      got.stderr)
+        self.assertEqual(got.stdout, '')
+        with open(root + '/etc/fork-fleet/launch.conf', 'w') as f:
+            f.write('ALLOW_PATHS=/etc\n')
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('all of /etc is never in a job\'s view', got.stderr)
+        self.write('job-paths.txt', '/usr\n/etc\n', 0o644)
+        self.refused('all of /etc is never in a job\'s view')
 
     def test_start_refuses_a_work_root_that_holds_data_and_an_open_file_beside_the_hook(self):
         """Fix round 3 (#191 re-check nits): start, not only `paths`: WORK_ROOT under /srv is refused before anything
@@ -2742,7 +2841,8 @@ class Launcher(unittest.TestCase):
                                        '--uid', 'nobody', *self.sandbox('nobody', self.path('run/check-net.root')),
                                        '-p', 'RuntimeMaxSec=60'])
         self.assertEqual(args[dash + 1:dash + 4], ['/usr/bin/python3', '-I', '-c'])
-        self.assertEqual(args[dash + 5:], ['job', self.seen(), self.sources()])
+        self.assertEqual(args[dash + 5:], ['job', self.seen(), self.sources(), self.links(),
+                                           f'{self.d}/fork-fleet-canary {self.d}/fork-fleet-canary-group'])
         self.assertEqual(self.rec_text('ip').splitlines(), self.ip_calls('nobody', self.NOBODY_NET))
         self.write('rec/probe-exit', '1', 0o644)
         got = self.check_net(f'127.0.0.1:{port}')
@@ -2796,7 +2896,7 @@ class Launcher(unittest.TestCase):
         resolv = os.path.realpath('/etc/resolv.conf')
         self.assertIn(f'FAIL  mount sources: not what job_fs checked: {resolv}\n', got.stdout)
         args = self.waited('fork-fleet-check-walls')
-        code, job, seen, sources = args[args.index('--') + 4:]
+        code, job, seen, sources, links, canaries = args[args.index('--') + 4:]
         sources = ' '.join(x for x in sources.split() if not x.startswith(resolv + '='))
 
         def probe(sources):
@@ -2808,6 +2908,131 @@ class Launcher(unittest.TestCase):
         self.assertNotEqual(swapped, sources)
         self.assertIn('FAIL  mount sources: not what job_fs checked: /usr\n', probe(swapped))
         self.assertIn('FAIL  mount sources: none given\n', probe(''))
+        # Issue #243 item 2: here, outside the unit, the host's whole /etc is there, and the canaries are on disk.
+        self.assertIn('FAIL  /etc: holds ', got.stdout)
+        self.assertIn('FAIL  canaries: ', got.stdout)
+
+    def etc_probe(self, etc, seen, links='', canaries=''):
+        """The walls' probe (job) with its /etc at the folder etc: the lines on /etc and the canaries."""
+        code = walls_probe()
+        self.assertIn("ETC = '/etc'\n", code)
+        code = code.replace("ETC = '/etc'\n", f'ETC = {etc!r}\n')
+        out = subprocess.run(['python3', '-I', '-c', code, 'job', seen, '', links, canaries], capture_output=True,
+                             text=True, timeout=60).stdout
+        return [x for x in out.splitlines() if x[6:].startswith(('/etc:', 'canaries:'))]
+
+    def test_check_nets_probe_lists_the_jobs_etc_and_reads_the_canaries(self):
+        """Issue #243 item 2, check by looking: the probe lists the job's /etc and fails on any entry that no list
+        line, link or the jobs' resolv.conf put there (a shadow-like file, a made-up secret, a private key folder
+        beside an allowed one); and it fails when a canary (a file check-net keeps outside the list, one others may
+        read and one only the runner's group may) is there or can be read. A /etc it cannot list fails too."""
+        etc = os.path.join(self.d, 'job-etc')
+        for f in ('passwd', 'group', 'resolv.conf', 'ssl/certs/ca.pem'):
+            os.makedirs(os.path.dirname(os.path.join(etc, f)), exist_ok=True)
+            with open(os.path.join(etc, f), 'w') as fh:
+                fh.write('x\n')
+        os.symlink('../usr/share/zoneinfo/UTC', os.path.join(etc, 'localtime'))
+        seen = '/ /usr /etc/passwd /etc/group /etc/ssl/certs /etc/resolv.conf'
+        canary = self.write('canary', 'fork-fleet canary\n', 0o644)
+        gone = self.path('canary-gone')
+        self.assertEqual(self.etc_probe(etc, seen, '/etc/localtime', gone),
+                         ['ok    /etc: only the listed entries', 'ok    canaries: 1 not there inside'])
+        for planted in ('shadow', 'fork-fleet-test-secret', 'ssl/private/host.key', 'default/backup'):
+            os.makedirs(os.path.dirname(os.path.join(etc, planted)), exist_ok=True)
+            with open(os.path.join(etc, planted), 'w') as fh:
+                fh.write('hunter2\n')
+        self.assertEqual(self.etc_probe(etc, seen, '/etc/localtime', f'{gone} {canary}'),
+                         ['FAIL  /etc: holds default, fork-fleet-test-secret, shadow, ssl/private, which no list line '
+                          'puts there', f'FAIL  canaries: {canary} there inside'])
+        self.assertRegex(self.etc_probe(etc, seen, '', gone)[0], r'^FAIL  /etc: holds .*, localtime, ')   # no link
+        self.assertEqual(self.etc_probe(os.path.join(etc, 'nope'), seen, '', '')[0][:21], 'FAIL  /etc: cannot li')
+        self.assertEqual(self.etc_probe(etc, seen, '/etc/localtime', '')[1], 'FAIL  canaries: none given')
+        # Fix round 2: a canary that is there but cannot be read (a job's view with the file, not its group) is there.
+        hidden = self.write('canary-hidden', 'fork-fleet canary\n', 0o000)
+        self.assertEqual(self.etc_probe(etc, seen, '/etc/localtime', hidden)[1], f'FAIL  canaries: {hidden} there inside')
+        # Fix round 2: an entry that is a link is never listed through, even when a list line names a path below it
+        # (pki/tls/certs here): the link itself is what /etc holds beyond the list.
+        etc2, real = os.path.join(self.d, 'job-etc2'), os.path.join(self.d, 'pki-real')
+        os.makedirs(os.path.join(real, 'tls/certs'))
+        os.mkdir(etc2)
+        os.symlink(real, os.path.join(etc2, 'pki'))
+        self.assertEqual(self.etc_probe(etc2, '/ /etc/pki/tls/certs', '', gone)[0],
+                         'FAIL  /etc: holds pki, which no list line puts there')
+
+    def test_check_net_keeps_two_canaries_outside_the_list_while_it_runs(self):
+        """Issue #243 item 2: check-net writes its two canaries in CANARY_DIR (/etc: no list line has them), one others
+        may read and one only the runner user's group may, hands their paths to the walls' probe, and removes them
+        when done. Again: the same two, made fresh."""
+        port = self.server()
+        self.write('rec/probe-exit', '0', 0o644)
+        canaries = [self.path('etc/fork-fleet-canary'), self.path('etc/fork-fleet-canary-group')]
+        os.mkdir(self.path('etc'), 0o755)
+        self.conf(CANARY_DIR=self.path('etc'))
+        for _ in range(2):
+            got = self.check_net(f'127.0.0.1:{port}')
+            self.assertEqual(got.returncode, 0, got.stderr)
+            args = self.waited('fork-fleet-check-walls')
+            self.assertEqual(args[args.index('--') + 9:], [' '.join(canaries)])
+            self.assertIn(f'-h -- :{pwd.getpwnam("nobody").pw_gid} {canaries[1]}\n', self.rec_text('chown'))
+            for c in canaries:
+                self.assertFalse(os.path.lexists(c), c)
+
+    def make_canaries(self, folder):
+        """The launcher's own make_canaries, alone, with CANARY_DIR=folder, for the runner user nobody: its functions as
+        the launcher has them (check-net itself first needs a loopback service it reaches, which some machines refuse)."""
+        with open(LAUNCH) as f:
+            text = f.read()
+        fns = [re.search(rf'^{n}\(\) \{{(?:[^\n]*\}}\n|\n.*?^\}}\n)', text, re.M | re.S).group(0)
+               for n in ('shown', 'warn', 'die', 'owned_safe', 'closed_folder', 'links_owned', 'real_path',
+                         'make_canaries')]
+        plain = re.search(r'^PLAIN_PATH=.*\n', text, re.M).group(0)
+        script = 'set -euo pipefail\numask 077\nROOT=\n' + plain + 'CANARY_DIR=$1\n' + ''.join(fns) + \
+            'make_canaries nobody\n'
+        return subprocess.run(['bash', '-c', script, 'canaries', folder], env=self.env(), capture_output=True,
+                              text=True, timeout=60)
+
+    def test_check_nets_canaries_are_new_files_in_a_closed_folder(self):
+        """Issue #243 fix round 2 (security-a 4, security-b m3): root writes the canaries, so CANARY_DIR is a plain
+        absolute path, its own real path (no link on the way), under folders no other user may swap a link into, and
+        only its owner may write it. Canaries a cut-off check-net left (or a link planted there) are removed, never
+        written through, and each is a new file with its mode: 0644, and 0640 with the runner user's group."""
+        self.conf(CANARY_DIR='etc')
+        self.refused('CANARY_DIR is a plain absolute path', 'active')
+        self.conf()
+        etc, target = self.path('etc'), self.write('target', 'keep\n', 0o600)
+        os.mkdir(etc, 0o755)
+        c, g = os.path.join(etc, 'fork-fleet-canary'), os.path.join(etc, 'fork-fleet-canary-group')
+        with open(c, 'w') as f:
+            f.write('old\n')
+        os.chmod(c, 0o600)
+        os.symlink(target, g)
+        got = self.make_canaries(etc)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        for f, mode in ((c, 0o644), (g, 0o640)):
+            st = os.lstat(f)
+            self.assertTrue(stat.S_ISREG(st.st_mode), f)
+            self.assertEqual(stat.S_IMODE(st.st_mode), mode, f)
+            with open(f) as fh:
+                self.assertEqual(fh.read(), 'fork-fleet canary: no job may see this file\n')
+        self.assertEqual(self.rec_text('chown'), f'-h -- :{pwd.getpwnam("nobody").pw_gid} {g}\n')
+        with open(target) as f:
+            self.assertEqual((stat.S_IMODE(os.stat(target).st_mode), f.read()), (0o600, 'keep\n'))
+        # Refused, and nothing written: a CANARY_DIR others may write, one under a folder others may write (they
+        # could swap it for a folder of theirs), and a link to a good folder.
+        os.chmod(etc, 0o775)
+        self.assertIn('must be writable by its owner only', self.make_canaries(etc).stderr)
+        os.chmod(etc, 0o755)
+        opened = self.path('open')
+        os.makedirs(os.path.join(opened, 'etc'))
+        os.chmod(opened, 0o777)
+        self.assertIn('which others may write', self.make_canaries(os.path.join(opened, 'etc')).stderr)
+        self.assertEqual(os.listdir(os.path.join(opened, 'etc')), [])
+        os.symlink(etc, self.path('via'))
+        self.assertIn('with no link on the way', self.make_canaries(self.path('via')).stderr)
+        for f in (c, g):
+            os.remove(f)
+        self.make_canaries(self.path('via'))
+        self.assertEqual(os.listdir(etc), [])
 
     def test_the_walls_hold_in_a_real_systemd_unit(self):
         """The walls' probe in a real unit of this user's systemd, with the walls check-net gives it: AF_VSOCK,
@@ -2844,6 +3069,12 @@ def real_walls(test, args, systemd_run, *more, full=False):
         walls = [p for p in props if p.split('=')[0] not in ('NetworkNamespacePath', 'IPAddressDeny', 'IPAddressAllow')]
     unit = [*systemd_run, '--wait', '--pipe', '--quiet', '--collect', *more, *(a for w in walls for a in ('-p', w))]
     probe = args[dash + 1:]
+    if full:   # issue #243: check-net's canaries, outside the list, on disk while the probe looks for them
+        for c in probe[-1].split():
+            with open(c, 'w') as f:
+                f.write('fork-fleet canary\n')
+            os.chmod(c, 0o644)
+            test.addCleanup(os.remove, c)
     got = subprocess.run([*unit, '--', *probe], capture_output=True, text=True, timeout=120)
     test.assertRegex(got.stdout, r'ok    AF_VSOCK is refused')
     test.assertIn('ok    io_uring is refused (ENOSYS)', got.stdout)
@@ -2857,7 +3088,8 @@ def real_walls(test, args, systemd_run, *more, full=False):
         for want in ('ok    devices: only the pseudo ones', 'ok    mounts: only the allowed ones',
                      "ok    later mounts: no mount inside receives the host's", 'ok    /mnt and /media: nothing inside',
                      'ok    sockets: none in /tmp, /var/tmp, /run, /dev/shm',
-                     'ok    mount sources: each the host path job_fs checked'):
+                     'ok    mount sources: each the host path job_fs checked',
+                     'ok    /etc: only the listed entries', 'ok    canaries: 2 not there inside'):
             test.assertIn(want, got.stdout)
         tools = [t for t in (['git', '--version'], ['node', '--version'], ['java', '-version'], ['docker', '--version'])
                  if shutil.which(t[0]) and os.path.realpath(shutil.which(t[0])).startswith(('/usr/', '/etc/'))]
