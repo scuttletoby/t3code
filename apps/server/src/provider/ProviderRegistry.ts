@@ -124,7 +124,14 @@ export class ProviderRegistry extends Context.Service<
       readonly targetVersion?: string | undefined;
     }) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
+    /** Subscribes on consumption: a snapshot published before the stream runs is not seen. */
     readonly streamChanges: Stream.Stream<ReadonlyArray<ServerProvider>>;
+    /** Subscribes now, so a reader can read after it and miss no snapshot published in between. */
+    readonly subscribeChanges: Effect.Effect<
+      Stream.Stream<ReadonlyArray<ServerProvider>>,
+      never,
+      Scope.Scope
+    >;
   }
 >()("t3/provider/ProviderRegistry") {}
 
@@ -1302,6 +1309,9 @@ export const layer = Layer.effect(
       setProviderMaintenanceActionState,
       get streamChanges() {
         return Stream.fromPubSub(changesPubSub);
+      },
+      get subscribeChanges() {
+        return PubSub.subscribe(changesPubSub).pipe(Effect.map(Stream.fromSubscription));
       },
     } satisfies ProviderRegistry["Service"];
   }),
