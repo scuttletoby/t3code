@@ -66,8 +66,9 @@ class Api:
             if isinstance(v, Seq):
                 v = v.pop(0) if len(v) > 1 else v[0]
             return v if isinstance(v, types.SimpleNamespace) else answer(0, json.dumps(v))
-        if a[:2] == ('api', '--paginate') and a[3:] == ('--jq', G.LIST_JQ) and a[2] in self.lists:
-            v = self.lists[a[2]]   # the open pull requests: (number, draft, head sha, base ref), one JSON line each
+        if a[:2] == ('api', '--paginate') and a[3:] in (('--jq', G.LIST_JQ), ('--jq', getattr(G, 'HEAD_JQ', None))) \
+                and a[2] in self.lists:
+            v = self.lists[a[2]]   # the open pull requests, one JSON line each: LIST_JQ's or HEAD_JQ's fields
             return v if isinstance(v, types.SimpleNamespace) else answer(0, ''.join(json.dumps(x) + '\n' for x in v))
         if self.rest:
             return self.rest(*a)
@@ -331,7 +332,7 @@ class Prs(Files, unittest.TestCase):
         return found
 
     def test_the_events_one_open_ready_pull_request_into_the_default_branch(self):
-        for event in G.EVENTS:
+        for event in ('pull_request_target', 'issue_comment', 'workflow_dispatch'):   # workflow_run: ReviewRun
             with self.subTest(event=event):
                 code, out, _ = self.prs(event, '7', self.pull())
                 self.assertEqual((code, self.found()), (0, [{'pr': 7, 'sha': self.H}]), out)
@@ -430,6 +431,133 @@ class Prs(Files, unittest.TestCase):
                 self.assertEqual((code, self.file('output')), (1, None), out)
 
 
+# --- prs on a workflow_run: the review trigger's run (issue #88) -----------------------------------------------------
+class ReviewRun(Files, unittest.TestCase):
+    """A review or an inline review comment starts the review trigger (review-trigger.example.yml); its finished run
+    starts the caller on workflow_run, from the default branch. The pull request comes from the API, by the run's head
+    sha, head repository and head branch (all GitHub's), never from the run's outputs, artifacts or names."""
+    H, OTHER = 'a1' * 20, 'b2' * 20
+    RUN = {'event': 'pull_request_review', 'sha': 'a1' * 20, 'repo': REPO, 'branch': 'feature/x'}
+
+    def query(self, owner, branch):
+        return f'repos/{REPO}/pulls?state=open&per_page=100&head={owner}:{branch}'
+
+    def review(self, rows=(), run=None, pr='', query=None):
+        run = {**self.RUN, **(run or {})}
+        query = query or self.query(run['repo'].split('/')[0], run['branch'])
+        lists = {query: rows if isinstance(rows, types.SimpleNamespace) else list(rows),
+                 f'repos/{REPO}/pulls?state=open&per_page=100': [(1, False, self.H, 'main')]}   # never the backfill
+        gh, out = Api(lists=lists), []
+        code = G.prs(REPO, 'workflow_run', pr, gh, out.append, self.env, run=run)
+        return code, '\n'.join(out), gh
+
+    def found(self):
+        found = json.loads(self.outputs().get('prs', 'null'))
+        os.remove(self.env['GITHUB_OUTPUT'])
+        return found
+
+    def test_the_one_open_pull_request_with_the_runs_head_is_judged(self):
+        for event in G.REVIEW_EVENTS:
+            with self.subTest(event=event):
+                rows = [(12, self.H.upper(), REPO), (13, self.OTHER, REPO)]
+                code, out, gh = self.review(rows, {'event': event})
+                self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+                self.assertEqual([c[0][2] for c in gh.calls], [self.query(REPO.split('/')[0], 'feature/x')],
+                                 'one paged read, by head: never the backfill')
+
+    def test_no_open_pull_request_with_the_head_judges_nothing(self):
+        # Empty: none open (closed or merged meanwhile), or the head moved on (the push ran the gate already).
+        for rows in ([], [(12, self.OTHER, REPO)], [(12, self.H, None)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, []), out)
+                self.assertIn('nothing to judge', out)
+                self.assertIn('no open pull request', out)
+
+    def test_two_open_pull_requests_with_the_head_judge_it_once(self):   # #379: same branch into two bases
+        # The gate judges a head, not a pull request (preflight lists every open pull request with it again), so the
+        # lowest number judges it once for all of them; the others are named in the log. Nothing is skipped: a lens
+        # read withdrawn on one of them leaves no stale pass. Order of the listing, a third one: the same answer.
+        for rows in ([(12, self.H, REPO), (14, self.H, REPO)], [(14, self.H, REPO), (12, self.H.upper(), REPO)],
+                     [(15, self.H, REPO), (14, self.H, REPO), (12, self.H, REPO), (13, self.OTHER, REPO)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+                self.assertNotIn('nothing to judge', out)
+                self.assertNotIn('each number', out)
+                others = ', '.join(f'#{n}' for n, h, _ in sorted(rows) if h.lower() == self.H and n != 12)
+                self.assertIn(f'#12 judges it for {others} too', out)
+
+    def test_one_of_two_closed_half_way_judges_the_one_left(self):   # stops half-way: the listing has the one left
+        for rows in ([(14, self.H, REPO)], [(12, self.H, REPO)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, [{'pr': rows[0][0], 'sha': self.H}]), out)
+
+    def test_the_head_repository_is_compared_without_case(self):   # GitHub names are case-insensitive
+        for run_repo, row_repo in ((REPO.upper(), REPO), (REPO, REPO.upper()),
+                                   ('Someone/T3code-Fork', 'someone/t3code-fork')):
+            with self.subTest(run=run_repo, row=row_repo):
+                code, out, _ = self.review([(31, self.H, row_repo)], {'repo': run_repo})
+                self.assertEqual((code, self.found()), (0, [{'pr': 31, 'sha': self.H}]), out)
+
+    def test_a_fork_head_is_looked_up_in_the_fork_and_a_forged_sha_elsewhere_never_matches(self):
+        fork = {'repo': 'someone/t3code-fork', 'branch': 'main'}
+        rows = [(30, self.H, REPO), (31, self.H, 'someone/t3code-fork')]   # 30: same sha, base repo
+        code, out, gh = self.review(rows, fork)
+        self.assertEqual((code, self.found()), (0, [{'pr': 31, 'sha': self.H}]), out)
+        self.assertEqual(gh.calls[0][0][2], self.query('someone', 'main'))
+        code, out, _ = self.review([(30, self.H, REPO)], fork)   # only another repository's head has the sha
+        self.assertEqual((code, self.found()), (0, []), out)
+
+    def test_the_branch_is_one_query_value(self):   # a branch name is the pusher's text
+        code, out, gh = self.review([(12, self.H, REPO)], {'branch': 'a&b=c#d+e%f'},
+                                    query=self.query(REPO.split('/')[0], 'a%26b%3Dc%23d%2Be%25f'))
+        self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+
+    def test_a_run_of_another_event_or_with_odd_fields_judges_nothing_and_reads_nothing(self):
+        for run in ({'event': 'pull_request'}, {'event': 'push'}, {'event': ''}, {'sha': 'abc'}, {'sha': ''},
+                    {'repo': ''}, {'repo': 'no-slash'}, {'branch': ''}, {'branch': 'a\nb'}, {'branch': 'x' * 256}):
+            with self.subTest(run=run):
+                code, out, gh = self.review(run=run)
+                self.assertEqual((code, self.found(), gh.calls), (0, [], []), out)
+                self.assertIn('nothing to judge', out)
+
+    def test_the_listing_reads_only_the_fields_it_uses(self):   # #379: no draft (preflight fails a draft's head)
+        self.assertEqual(G.HEAD_JQ, '.[] | [.number, .head.sha, .head.repo.full_name] | @json')
+
+    def test_a_number_on_a_workflow_run_is_refused(self):   # the number comes only from the API
+        code, out, gh = self.review(pr='7')
+        self.assertEqual((code, self.file('output'), gh.calls), (1, None, []), out)
+
+    def test_an_unreadable_or_odd_listing_is_refused_and_posts_nothing(self):   # stops half-way: an older check stays
+        for rows in (answer(1, '', 'gh: Server Error (HTTP 502)'), answer(0, 'x\n'), answer(0, '[12, "x", null]\n'),
+                     answer(0, '[true, "' + self.H + '", null]\n'), answer(0, '[12, "' + self.H + '", 5]\n'),
+                     answer(0, '[12, false, "' + self.H + '", null]\n'),   # the old four-field row
+                     answer(0, '[12, "' + self.H + '", "' + REPO + '", false]\n')):
+            with self.subTest(rows=rows.stdout[:20]):
+                code, out, gh = self.review(rows)
+                self.assertEqual((code, self.file('output')), (1, None), out)
+                self.assertIn('could not list', out) if rows.returncode else self.assertIn('not a pull request', out)
+
+    def test_a_burst_of_runs_reads_the_same_answer_each_time(self):   # runs again: reads only, the same answer
+        rows = [(12, self.H, REPO)]
+        answers = []
+        for _ in range(3):
+            code, out, _ = self.review(rows)
+            answers.append((code, self.found()))
+        self.assertEqual(answers, [(0, [{'pr': 12, 'sha': self.H}])] * 3)
+
+    def test_the_cli_takes_the_run_fields_and_a_branch_that_starts_with_a_dash(self):
+        seen = []
+        with unittest.mock.patch.object(G, 'prs', lambda *a, **k: seen.append((a, k)) or 0):
+            self.assertEqual(G.cli(['prs', '--repo', REPO, '--event', 'workflow_run', '--pr', '', '--event-sha', '',
+                                    '--run-event', 'pull_request_review_comment', '--run-sha', self.H,
+                                    '--run-repo', REPO, '--run-branch=-x'], env=self.env), 0)
+        self.assertEqual(seen[0][1]['run'], {'event': 'pull_request_review_comment', 'sha': self.H, 'repo': REPO,
+                                             'branch': '-x'})
+
+
 # --- target ---------------------------------------------------------------------------------------------------------
 class Target(Files, unittest.TestCase):
     H, TIP = 'a1' * 20, 'e5' * 20
@@ -475,12 +603,19 @@ class Target(Files, unittest.TestCase):
                 self.assertEqual((code, gh.calls), (0, []), out)
                 self.failed(out, 'dispatch the gate with the pull request number')
 
-    def test_no_required_lens_gets_a_failure_before_github_is_read(self):   # lens minor: none would pass a bare head
-        for lenses in ('', '\n \n', '<LENS_NAME>', 'r4'):
+    def test_a_name_that_names_no_lens_gets_a_failure_before_github_is_read(self):   # lens minor
+        for lenses in ('<LENS_NAME>', 'r4', 'code\n<LENS_NAME>'):
             with self.subTest(lenses=lenses):
                 code, out, gh = self.target(required_lenses=lenses)
                 self.assertEqual((code, gh.calls), (0, []), out)
                 self.failed(out, 'required-lenses names no lens')
+
+    def test_an_empty_lens_list_is_left_to_judge(self):   # PK10 C2: only the base tip's config says enforce
+        for lenses in ('', '\n \n'):
+            with self.subTest(lenses=lenses):
+                code, out, _ = self.target(required_lenses=lenses)
+                self.assertEqual((code, self.outputs()), (0, {'post': 'true', 'base': 'main'}), out)
+                os.remove(self.env['GITHUB_OUTPUT'])
 
     def test_bad_arguments_post_nothing(self):   # no head to post on
         for sha, kw in (('ab', {}), (self.H, {'repo': 'not a repo'})):
@@ -641,9 +776,72 @@ class Judge(Files, unittest.TestCase):
         head = self.w.commit(T.base_files(**{'x.py': T.lines(extra=['unread'], at=20)}), [self.m1])
         for lenses in ('', '\n'):
             with self.subTest(lenses=lenses):
-                code, out, _ = self.judge(self.routes(head), T.pr([], head=head), required_lenses=lenses)
+                code, out, gh = self.judge(self.routes(head), T.pr([], head=head), required_lenses=lenses)
                 self.assertEqual((code, self.verdict()['conclusion']), (0, 'failure'), out)
                 self.assertIn('required-lenses names no lens', self.verdict()['title'])
+                self.assertFalse([a for a, _ in gh.calls if a[:2] == ('pr', 'view')], 'refused before the PR is read')
+
+    def review_base(self, mode, **files):
+        """A base tip whose config has the shared vectors' `basic` review block in `mode`, child of m0."""
+        cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': mode}}
+        return self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS, **files), [self.m0])
+
+    def test_an_empty_lens_list_stands_only_when_the_base_tips_review_rules_enforce(self):   # correction 12
+        for mode in ('enforce', 'shadow'):
+            with self.subTest(mode=mode):
+                base = self.review_base(mode)
+                cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': mode}}
+                head = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS, **{'docs/a.md': 'a\n'}), [base])
+                code, out, _ = self.judge(self.routes(head, base=base), T.pr([], head=head), required_lenses='')
+                v = self.verdict()
+                if mode == 'enforce':   # a light-only change: the path rules need no lens
+                    self.assertEqual((code, v['conclusion']), (0, 'success'), out)
+                    self.assertIn('the path rules decide: light, lenses none', v['summary'])
+                else:
+                    self.assertEqual((code, v['conclusion']), (0, 'failure'), out)
+                    self.assertIn('required-lenses names no lens', v['title'])
+
+    def test_an_empty_lens_list_under_enforce_still_needs_the_path_rules_lenses(self):
+        base = self.review_base('enforce')
+        cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': 'enforce'}}
+        head = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS, **{'src/storage/a.py': 'a\n'}), [base])
+        self.judge(self.routes(head, base=base), T.pr([self.p.lens('code', head)], head=head), required_lenses='')
+        v = self.verdict()
+        self.assertEqual(v['conclusion'], 'failure')
+        self.assertIn('required lens without a read: data-1, data-2', v['title'])
+        self.judge(self.routes(head, base=base), T.pr([self.p.lens(n, head) for n in ('data-1', 'data-2')], head=head),
+                   required_lenses='')
+        self.assertEqual(self.verdict()['conclusion'], 'success', self.verdict()['summary'])
+
+    def test_an_empty_lens_list_never_stands_on_a_config_that_cannot_be_read(self):   # #348 item 5: this step alone
+        bare = self.w.commit({'other.py': 'o\n'}, [])
+        bad = self.w.commit(T.base_files(cfg_raw={**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': 'loud'}},
+                                         **T.PROMPTS), [self.m0])
+        good = self.review_base('enforce')
+        for base, says in ((bare, 'has no config'), (bad, 'mode'), (good, None)):
+            with self.subTest(says=says):
+                path, why = G.bare_repository(self.work, 'gate')
+                self.assertIsNone(why)
+                checkout = H.Checkout(path, bare=(base, self.read), remote=self.w.remote)
+                self.assertIsNone(G.fetch(checkout, base, self.read))
+                problem = G.empty_lenses_problem(checkout, T.CONFIG_PATH)
+                if says is None:
+                    self.assertIsNone(problem)
+                else:
+                    self.assertIsNotNone(problem)
+                    self.assertIn(says, problem)
+
+    def test_a_review_block_the_base_tip_cannot_parse_is_a_failure(self):   # fail closed, whatever the input says
+        cfg = {**T.CFG_RAW, 'review': {**T.REVIEW_BLOCK, 'mode': 'loud'}}
+        base = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS), [self.m0])
+        head = self.w.commit(T.base_files(cfg_raw=cfg, **T.PROMPTS, **{'docs/a.md': 'a\n'}), [base])
+        for lenses in ('', 'correctness'):
+            with self.subTest(lenses=lenses):
+                self.judge(self.routes(head, base=base), T.pr([self.p.lens('correctness', head)], head=head),
+                           required_lenses=lenses)
+                v = self.verdict()
+                self.assertEqual(v['conclusion'], 'failure', v['summary'])
+                self.assertIn('mode', v['title'])
 
     def test_a_draft_never_gets_a_green_check_on_a_head_it_shares(self):   # lens finding 1 (corr85, sec85 F1a)
         # PR #7 (ready, into main) got 'failure': no lens read the head. Its author opens draft #8 at the same head.

@@ -14,6 +14,10 @@ queue's own rules, imported, never copied:
 The config is the queue's own JSON file (config.py), read from the base commit, so the check and the queue read the
 same people and override, and a pull request cannot change them for its own check.
 `--required-lenses` (the project's, per pull request if it likes) adds lenses that must be among the reads.
+The config's optional `review` block (../pr-queue/README.md, "Review rules") names lenses by changed path: the paths
+are `git diff --name-status -M` from the merge base to the head (changed_paths), judged by review_judge.judge. In
+`enforce` its lenses are required too; in `shadow` the summary only says what they would have been. A change it cannot
+judge (no merge base, a failed diff) is refused, never passed. Without the block nothing of this runs.
 
 Pass: every lens read the head (or a newer override vouches for it), and every required lens is there; a pull
 request with no lens comments and no required lens (nothing to compare); a draft, with --pass-drafts only. Fail,
@@ -39,6 +43,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import config  # noqa: E402
 import lens  # noqa: E402
 import pr_queue  # noqa: E402
+import review_config  # noqa: E402
+import review_judge  # noqa: E402
 
 ATTEMPTS, RETRY_SECONDS = 3, 10
 FIELDS = 'isDraft,headRefOid,comments,reviews'
@@ -65,12 +71,13 @@ class Checkout:
         # Bare, git logs in the way the queue does (gh's login, GH_TOKEN), never with a helper of the machine's config.
         self.auth = pr_queue.GIT_AUTH if self.bare else ()
 
-    def git(self, *a):
+    def git(self, *a, errors='strict'):
+        """errors: how git's output is decoded; 'surrogateescape' for file names, which need not be UTF-8."""
         if self.run:
             return self.run(*a)
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
-                                  capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
+                                  errors=errors, capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
                                                             'GIT_ATTR_NOSYSTEM': '1'})
 
     def problem(self):
@@ -176,8 +183,9 @@ def same_change(checkout, head, read):
     return False, f'{head[:12]} is not the change read at {read[:12]}, nor that change merged with the base'
 
 
-def verdict(pr, review, checkout, required=None, pass_drafts=False):
-    """(ok, reason, rows): rows is [(lens, ok, short reason)] per lens, required ones first."""
+def verdict(pr, review, checkout, required=None, pass_drafts=False, rules_name_lenses=False):
+    """(ok, reason, rows): rows is [(lens, ok, short reason)] per lens, required ones first. rules_name_lenses: the
+    config's review rules (enforce) added required lenses, so a missing one may come from there too."""
     required = required or {}
     head = str(pr.get('headRefOid') or '').lower()
     if not SHA.fullmatch(head):
@@ -202,8 +210,9 @@ def verdict(pr, review, checkout, required=None, pass_drafts=False):
             text = f'{"override " if override else "read "}{sha[:12]}: {how}'
         rows.append(((f'{key} (required)' if key in required else key), bool(sha and read and ok), text))
     if missing:
+        where = ' or the review rules of the config' if rules_name_lenses else ''
         return False, (f'required lens without a read: {", ".join(missing)}. No counted lens comment has that name: '
-                       f'check it in required-lenses (one name per line); lenses found: {found}'), rows
+                       f'check it in required-lenses (one name per line){where}; lenses found: {found}'), rows
     if not read:
         return False, why, rows
     return ok, how, rows
@@ -242,21 +251,96 @@ def gh_run(*a):
     return subprocess.run(['gh', *a], text=True, capture_output=True)
 
 
+def changed_paths(checkout, base, head):
+    """([(status, paths)], None) of every path the head changes against its merge base with `base` (three dots: what
+    the base changed meanwhile is not the pull request's), or (None, why). `git diff --name-status -z -M` in the
+    repository: no API and no cap on the number of files. With more than one merge base (criss-cross merges), the
+    changes against each one, together: more paths, never fewer. A rename counts under both paths (review_judge)."""
+    r = checkout.git('merge-base', '--all', base, head)
+    bases = r.stdout.split() if r.returncode == 0 else []
+    if not bases or not all(SHA.fullmatch(b) for b in bases):
+        said = (r.stderr or r.stdout or '').strip()[:200]
+        return None, (f'the base {base[:12]} and the head {head[:12]} have no merge base (the base was force-pushed, '
+                      f'or the histories are unrelated){": " + said if said else ""}')
+    changes = []
+    for b in bases:
+        # A file name need not be UTF-8: its bytes stay as lone surrogates, so the path is judged by its folder like any
+        # other (review_judge.shown writes them as \xNN), never a UnicodeDecodeError that fails the head unexplained.
+        d = checkout.git('diff', '--no-ext-diff', '--no-textconv', '--no-relative', '--ignore-submodules=none',
+                         '--no-color', '--name-status', '-z', '-M', b, head, '--', errors='surrogateescape')
+        if d.returncode != 0:   # stderr as \xNN too (backslashreplace): a lone surrogate cannot be printed as UTF-8
+            return None, f'git diff {b[:12]} {head[:12]} failed: {review_judge.shown((d.stderr or "").strip()[:200])}'
+        try:
+            changes += review_judge.parse_name_status(d.stdout)
+        except review_judge.JudgeError as e:
+            return None, str(e)
+    return changes, None
+
+
+def path_judgement(checkout, rules, config_path):
+    """(review_judge.Judgement, None) of the head's changed paths under the base's `review` rules, or (None, why)."""
+    parents = checkout.merge_parents()
+    if not parents:
+        return None, "HEAD is not GitHub's two-parent merge commit, so the changed paths are unknown"
+    changes, why = changed_paths(checkout, *parents)
+    if changes is None:
+        return None, why
+    try:
+        return review_judge.judge(rules, changes, config_path), None
+    except review_judge.JudgeError as e:
+        return None, str(e)
+
+
+def path_row(mode, judgement, warnings=()):
+    """The summary row of the path rules: what they decide (enforce) or would have said (shadow), and the config check's
+    warnings (shadow only: enforce refuses them). Never a verdict of its own: the required lens rows and the reason
+    carry that."""
+    said = ''.join(f'; config warning: {w}' for w in warnings)
+    if mode == 'enforce':
+        return ('path rules (enforce)', True, f'the path rules decide: {judgement.text()}; the required-lenses input '
+                f'is required as well{said}')
+    return ('path rules (shadow)', True, f'the path rules would have said: {judgement.text()}; the required-lenses '
+            f'input decides (mode shadow){said}')
+
+
 def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out, problems):
     """The one rule path of both modes: (code, ok, reason, rows). code is REFUSED (every problem printed at once, before
-    GitHub is read), 1 for a failed head (or a pull request GitHub would not give), 0 for a pass."""
-    cfg = None
+    GitHub is read), 1 for a failed head (or a pull request GitHub would not give), 0 for a pass. With a `review` block
+    in the base's config, the path rules are judged first: a change they cannot judge is REFUSED (fail closed, in
+    either mode), and in `enforce` their lenses join `required`."""
+    cfg, paths = None, None
     if not problems:
         cfg = base_config(checkout, config_path, problems)
+    if cfg is not None:
+        why = head_order_problem(checkout, config_path)
+        if why:
+            problems.append(why)
+    if cfg is not None and cfg.review is not None:
+        paths, why = path_judgement(checkout, cfg.review, config_path)
+        if paths is None:
+            problems.append(f'the review path rules cannot judge this head, so it is not passed: {why}')
     if problems:
         out('::error::head check refused to start: ' + escape('; '.join(problems)))
         return REFUSED, False, '; '.join(problems), []
+    enforced = False
+    if paths is not None:
+        row = path_row(cfg.review.mode, paths, cfg.review.warnings)
+        for w in cfg.review.warnings:
+            out('::warning::the review rules of the config: ' + escape(w))
+        out(f'{row[0]}: {escape(row[2])}')
+        if cfg.review.mode == 'enforce':
+            enforced = True
+            required = dict(required or {})
+            for name in paths.lenses:
+                required.setdefault(lens.lens_key(name), name)
     pr, why = read_pr(repo, n, gh, sleep)
     if pr is None:
         return 1, False, f'could not read the pull request from GitHub after {ATTEMPTS} tries: {why}', []
     review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association, cfg.lens_author_associations,
                          log=lambda text: out(escape(text)))
-    ok, reason, rows = verdict(pr, review, checkout, required, pass_drafts)
+    ok, reason, rows = verdict(pr, review, checkout, required, pass_drafts, enforced)
+    if paths is not None:
+        rows = [row] + rows
     return (0 if ok else 1), ok, reason, rows
 
 
@@ -323,6 +407,37 @@ def base_config(checkout, path, problems):
     except config.ConfigError as e:
         problems.append(str(e))
         return None
+
+
+def head_order_problem(checkout, path):
+    """Why the head's own config must not merge, or None: its `review` block is in enforce with a rule order enforce
+    refuses (review_config.enforce_order_problems). The config that judges a head is always the base's, so such a
+    head is judged by the old block and could merge; after it, the base config refuses every head, the one that fixes
+    the order too, and the queue stops. The only thing read from the head's config: it is never parsed for anything
+    else, and a head config that is unreadable, not JSON, without a `review` block or with another problem is left to
+    the rules of the base (that last one also stops every head once merged: a check of its own, not this one)."""
+    parents = checkout.merge_parents()
+    if not parents:
+        return None   # base_config refused it already
+    rel = path[2:] if path.startswith('./') else path
+    # errors='replace': only the rule order is read, and a name with a broken byte is still a name. A head that leaves
+    # the config as the base has it gets nothing new here: base_config already refused an enforce block with this order.
+    r = checkout.git('show', f'{parents[1]}:{rel}', errors='replace')
+    if r.returncode != 0:
+        return None   # the head deletes the config: judged by the base's rules, as every change to it
+    try:
+        raw = json.loads(r.stdout)
+    except ValueError:
+        return None
+    block = raw.get('review') if isinstance(raw, dict) else None
+    if not isinstance(block, dict) or block.get('mode') != 'enforce':
+        return None
+    order = review_config.enforce_order_problems(block)
+    if not order:
+        return None
+    return (f'this pull request leaves {path} in mode enforce with a rule order enforce refuses: {"; ".join(order)}. '
+            'Merged, the base config would refuse every pull request after it, the one that fixes the order too: fix '
+            'the rule order first (or keep mode shadow until it is fixed)')
 
 
 if __name__ == '__main__':

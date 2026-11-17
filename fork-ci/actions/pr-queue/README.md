@@ -47,9 +47,10 @@ an error: the queue then exits non-zero and touches no pull request.
 ## Review rules
 
 The optional `review` block of the config says which changed paths need which
-lens reads and caps the review rounds. This release only reads and checks it:
-nothing judges a pull request by it yet, so a config with the block behaves like
-one without it. `review.recommended.json` (next to this file) is a complete
+lens reads and caps the review rounds. The head gate (`../head-check`) judges
+the required lenses by changed path with it (below, "How the gate judges"); the
+round cap, the approach lens and the `findings` / `state_line` lines are not
+enforced yet. `review.recommended.json` (next to this file) is a complete
 example with made-up paths; a test parses it. Real paths, lens names and prompt
 files belong in the project's own config.
 
@@ -84,6 +85,16 @@ The config is refused when:
   catch-all rule (it could never match): a new folder must never fall to no rule
   or to no lens;
 - there is no `critical` rule (the built-in protected paths below take its lenses);
+- in `enforce`, a rule comes before another rule, some path matches a glob of
+  both, and the first rule is lighter (`**/*.md` light above `src/**` critical:
+  `src/notes.md` would belong to the light rule and need no lens) or of the same
+  weight without one of the other rule's lenses (`**/*.py` critical `[a]` above
+  `src/**/*` critical `[a, b]`: `src/x.py` would need no `b`). Put heavier rules
+  first, and of one weight the rule with more lenses. Only the match-every globs
+  of the catch-all rule (`**`) are exempt: a lighter rule above it is the normal
+  case, but an explicit glob it also names (`["src/**", "**"]`) is compared like
+  any other. In `shadow` the same order is a warning in the gate's summary row,
+  not a refusal, and the warning says that enforce refuses it;
 - a glob is not in the dialect below, or a rule name or glob is written twice.
 
 **Globs.** Paths are repo-relative and use `/`. `*` is any characters inside one
@@ -98,10 +109,70 @@ means the same thing on both sides.
 `.github/workflows/**` always count as critical, whatever the rules say, with the
 lenses of the first critical rule. So a pull request that weakens the rules needs
 the critical lenses, and it is judged by the old rules: the gate reads the config
-from the base tip only.
+from the base tip only. The config file is named as git names a changed file
+(one leading `./` aside; no empty, `.` or `..` segment): any other character is
+part of its name, glob characters too (`queue[main].json`), as the protected
+paths are compared exactly, never matched as globs.
 
-**Fail closed.** When the gate cannot read the changed paths or fetch the base,
-the pull request counts as the heaviest weight, or the gate fails. Never a pass.
+**How the gate judges.** The gate fetches the base tip and the head by sha and
+reads the changed paths with `git diff --name-status -z -M <merge base> <head>`:
+three dots, so what the base changed since the pull request branched off is not
+the pull request's, and no API page cap (a pull request of 5000 files is judged
+whole). Then (`review_judge.py`, `review_glob.py`):
+
+- every changed path goes to the first rule with a matching glob. A rename or a
+  copy counts under its old and its new path (moving a file out of a critical
+  folder is a critical change); a delete, a mode change and a type change count
+  under their path;
+- a built-in protected path also counts for the first critical rule;
+- the heaviest weight hit decides; the required lenses are the lenses of every
+  rule of that weight that was hit, in rule order, each once;
+- an empty diff (the head adds nothing to its merge base) counts as the catch-all
+  rule, never as "no lens needed";
+- with more than one merge base (criss-cross merges), the paths changed against
+  each one count together: more paths, never fewer.
+
+`review.vectors.json` holds the shared cases (globs, rule sets, changed paths with
+their status, and the expected weight and lenses); the Python tests read it, and
+T3 tests its own matcher on the same file.
+
+Notes for T3's matcher and its GitHub reader (no change in the gate):
+
+- add a glob vector with a non-ASCII name (an emoji, which is two UTF-16 units):
+  `?` is one character of the path, so a TypeScript matcher must count code
+  points as Python does, never UTF-16 units;
+- GitHub's changed-files API stops at 3,000 files and gives text, not git's
+  bytes (no `-z`, and a name that is not UTF-8 is changed). A reader on that API
+  must map its names to git's, and when the list is cut, judge the change by the
+  heaviest weight of the rules (unknown never judges lighter).
+
+**Shadow and enforce.** In `shadow` the gate judges as before, by its
+`required-lenses` input, and its check summary adds a row "the path rules would
+have said: <weight>, lenses <...>" with the rules and paths behind it. In
+`enforce` the path rules' lenses are required, and every lens in the
+`required-lenses` input is still required as well (the input can add lenses,
+never remove them). Switching `shadow` to `enforce` takes effect on each pull
+request at its next gate run (a push, a base change, or the backfill dispatch);
+a check posted before stays as it was until then.
+
+Fix every config warning before switching to `enforce`: the gate reads the
+config from the base tip, so a base config that does not parse refuses every
+head, the one that fixes it too, and the queue stops (an owner then has to push
+the fix by hand). The gate therefore refuses a pull request whose own new config
+is in `enforce` with a rule order `enforce` refuses (the order checks above);
+that one check reads the pull request's config, everything else the base's.
+
+**The empty input.** The gate refuses an empty `required-lenses` input (a head
+with no lens comment would pass), except when the config at the base tip has a
+`review` block in `enforce`: then the path rules name the lenses. A name that
+names no lens (`<LENS_NAME>`, `r4`) is refused in every mode.
+
+**Fail closed.** No merge base (the base was force-pushed, or the histories are
+unrelated), a failed `git diff`, a diff line the judge cannot read, a base or
+head that cannot be fetched, or a `review` block that does not parse: the gate
+posts a failure that says why, in `shadow` as in `enforce`. Never a pass, never
+"no lenses needed", and never today's rule instead. A config without the
+`review` key gives exactly the gate of before this block.
 
 **Adding the block.** A release that does not know the `review` key refuses the
 whole config (an unknown key), so: release first, then pin that release in every

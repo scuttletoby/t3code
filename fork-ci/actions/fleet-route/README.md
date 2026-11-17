@@ -257,11 +257,20 @@ that uses only the action has neither. So:
   changes. Runs routed before the change queue on it and still find a runner.
 - **Old registrations:** list the old label in that pool's `retired` too. Its dispatcher then deletes the offline
   registrations it made under the old label (`<old label>-<job id>`), as it does under the new one, and stops an idle
-  runner there after `idle_passes` (it holds one of the pool's `slots`). It never deletes an online one, nor touches one
-  under another pool's label. Without `retired`, delete them by hand.
+  runner there after `idle_passes` (it holds one of the pool's `slots`) when that runner's unit is on its own host. It
+  never deletes an online one, nor stops one running on another host (say the pool's `launch` moved with the label),
+  nor touches one under another pool's label. Without `retired`, delete them by hand.
+- **Moving a pool's `launch` to another host:** stop that pool's dispatcher on the old host before the new host's
+  starts serving it, whether or not the label changes too. Moving it in a change of its own is not enough. Two
+  dispatchers serving one pool from different hosts delete each other's registrations before their runners connect:
+  a fresh registration is offline, and the other host has no unit for it. Such a job is retried a few times, then
+  left to the sweep.
 - **Reusing a label:** a pool's label may not be in `retired_labels` (the config is refused). To give a retired label
   to a pool again, first take it out of `retired_labels` and every `retired`, and wait until every host runs that
   config: a host still on the older one deletes the new pool's registrations under it before their runners connect.
+- **Upgrading from an older version:** a pool's label in `retired_labels` was accepted before and is refused now:
+  `route` fails, and a dispatcher refuses to start on it (exit 1, with an `::error::`). Take the label out of
+  `retired_labels` (and any `retired`) before you upgrade.
 - **Removing a pool:** take it out of every job's `avoid` too (a config that still names it is refused, and the error
   names the pool).
 - **Queued runs on a removed label** wait until GitHub drops them (24 hours). Cancel such a run by hand and re-run

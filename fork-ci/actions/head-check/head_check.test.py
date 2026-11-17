@@ -62,6 +62,9 @@ CFG_RAW = {
     'head_check': 'review-check',
 }
 CFG = config.parse(json.dumps(CFG_RAW))
+with open(os.path.join(HERE, '..', 'pr-queue', 'review.vectors.json'), encoding='utf-8') as _f:
+    REVIEW_BLOCK = json.load(_f)['configs']['basic']   # the shared vectors' rules: critical data, light docs, normal code
+PROMPTS = {x['prompt']: f'{n}\n' for n, x in REVIEW_BLOCK['lenses'].items()}   # the lens prompt files it names
 LENS = 'lens'   # built at run time: no line of this file starts with the lens marker
 A, B, C = 'a1' * 20, 'b2' * 20, 'c3' * 20
 GIT_ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
@@ -155,9 +158,10 @@ class World:
             if name != '.git':
                 p = os.path.join(self.work, name)
                 shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
-        for path, text in files.items():
-            os.makedirs(os.path.dirname(os.path.join(self.work, path)) or self.work, exist_ok=True)
-            with open(os.path.join(self.work, path), 'w') as f:
+        for path, text in files.items():   # a bytes path: a file name that need not be UTF-8
+            where = os.path.join(os.fsencode(self.work) if isinstance(path, bytes) else self.work, path)
+            os.makedirs(os.path.dirname(where), exist_ok=True)
+            with open(where, 'w') as f:
                 f.write(text)
         self.git(self.work, 'add', '-A')
         tree = self.git(self.work, 'write-tree')
@@ -599,6 +603,362 @@ class SameChangeBare(SameChange):
         path = self.w.checkout(self.m1, head)
         stale = json.dumps(pr([self.p.lens('correctness', self.read)], head=head))
         self.assertEqual(run_cli(path, fake_gh((0, stale)))[0], 1)
+
+
+# --- the review block's path rules (PK10 C2): real commits, both modes -------------------------------------------
+def review_cfg(mode='enforce', **change):
+    return {**CFG_RAW, 'review': {**REVIEW_BLOCK, 'mode': mode, **change}}
+
+
+class PathRules(unittest.TestCase):
+    """The config at the base names lenses by changed path. m0 holds the config without a `review` block, the lens
+    prompts and a storage file; each test puts its own config on a base made from m0."""
+    BARE = False
+    STORE = {'src/storage/s.py': lines(40)}
+
+    def setUp(self):
+        self.w = World(self.BARE)
+        self.addCleanup(self.w.close)
+        self.p = Posts()
+        self.m0 = self.w.commit(base_files(**PROMPTS, **self.STORE))
+
+    def base(self, mode='enforce', parent=None, **files):
+        cfg = review_cfg(mode) if mode else CFG_RAW
+        return self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE, **files}), [parent or self.m0])
+
+    def head(self, base, mode='enforce', drop=(), cfg=None, **files):
+        """A head on `base` with `files` changed (and `drop` deleted), its config the base's unless `cfg`."""
+        tree = base_files(cfg_raw=cfg or (review_cfg(mode) if mode else CFG_RAW), **{**PROMPTS, **self.STORE, **files})
+        for path in drop:
+            tree.pop(path)
+        return self.w.commit(tree, [base])
+
+    def check(self, base, head, lenses=(), required='', comments=None):
+        path = self.w.checkout(base, head)
+        comments = comments if comments is not None else [self.p.lens(n, head) for n in lenses]
+        extra = ('--required-lenses', required) if required else ()
+        return run_cli(path, fake_gh((0, json.dumps(pr(comments, head=head)))), *extra)
+
+    def test_no_review_block_is_todays_check(self):   # old state: a base config from before the block
+        base = self.base(mode=None)
+        head = self.head(base, mode=None, **{'src/storage/s.py': lines(40, ['x'], 3)})
+        code, out = self.check(base, head, ['correctness'])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('path rules', out)
+        code, out = self.check(base, head, comments=[])   # no lens comment, no required lens: today's pass
+        self.assertEqual(code, 0, out)
+
+    def test_shadow_only_says_what_the_rules_would_have_needed(self):
+        base = self.base('shadow')
+        head = self.head(base, 'shadow', **{'src/storage/s.py': lines(40, ['x'], 3)})
+        code, out = self.check(base, head, ['correctness'])
+        self.assertEqual(code, 0, out)
+        self.assertIn('path rules (shadow): the path rules would have said: critical, lenses data-1, data-2', out)
+        code, out = self.check(base, head, ['correctness'], required='design')   # the input still decides
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: design', out)
+
+    def test_enforce_needs_the_lenses_of_the_heaviest_rule_hit(self):
+        base = self.base()
+        head = self.head(base, **{'src/storage/s.py': lines(40, ['x'], 3), 'src/app.py': 'a\n', 'docs/d.md': 'd\n'})
+        code, out = self.check(base, head, ['code'])
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: data-1, data-2', out)
+        self.assertIn('path rules (enforce): the path rules decide: critical, lenses data-1, data-2 (3 changed paths',
+                      out)
+        self.assertEqual(self.check(base, head, ['data-1', 'data-2'])[0], 0)
+
+    def test_enforce_still_requires_the_input_lenses(self):
+        base = self.base()
+        head = self.head(base, **{'src/app.py': 'a\n'})
+        self.assertEqual(self.check(base, head, ['code'])[0], 0)
+        code, out = self.check(base, head, ['code'], required='design')
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: design', out)
+        self.assertEqual(self.check(base, head, ['code', 'design'], required='design')[0], 0)
+
+    def test_a_light_only_change_needs_no_lens(self):
+        base = self.base()
+        head = self.head(base, **{'docs/guide.md': 'g\n', 'src/notes.md': 'n\n'})
+        code, out = self.check(base, head, comments=[])
+        self.assertEqual(code, 0, out)
+        self.assertIn('the path rules decide: light, lenses none', out)
+
+    def test_the_rules_are_the_bases_never_the_heads(self):   # a head that weakens the rules is judged by the old ones
+        base = self.base()
+        weak = review_cfg(rules=[{'name': 'all', 'weight': 'light', 'paths': ['src/**'], 'lenses': []},
+                                 {'name': 'rest', 'weight': 'normal', 'paths': ['**'], 'lenses': ['code']}])
+        head = self.head(base, cfg=weak, **{'src/storage/s.py': lines(40, ['x'], 3)})
+        code, out = self.check(base, head, ['code'])
+        self.assertEqual(code, 1, out)
+        self.assertIn('data-1, data-2', out)
+        # and a base without the block stays without it, whatever block the head adds
+        old = self.base(mode=None)
+        head = self.head(old, cfg=review_cfg(), **{'src/storage/s.py': lines(40, ['x'], 3)})
+        code, out = self.check(old, head, ['correctness'])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('path rules', out)
+
+    def test_a_rename_counts_under_its_old_and_its_new_path(self):
+        base = self.base()
+        for drop, files in ((['src/storage/s.py'], {'src/s.py': lines(40)}),       # out of the critical folder
+                            ([], {'src/storage/t.py': 't\n'})):                    # a plain add, for contrast
+            with self.subTest(files=list(files)):
+                head = self.head(base, drop=drop, **files)
+                code, out = self.check(base, head, ['code'])
+                self.assertEqual(code, 1, out)
+                self.assertIn('data-1, data-2', out)
+        head = self.head(base, drop=['src/storage/s.py'], **{'src/s.py': lines(40)})
+        code, out = self.check(base, head, ['data-1', 'data-2'])
+        self.assertEqual(code, 0, out)
+        self.assertIn('data (critical): src/storage/s.py; code (normal): src/s.py', out)
+
+    def test_the_config_and_the_lens_prompts_are_always_critical(self):
+        base = self.base()
+        prompt = REVIEW_BLOCK['lenses']['code']['prompt']
+        for name, kw in (('config deleted', {'drop': [CONFIG_PATH]}),
+                         ('prompt renamed', {'drop': [prompt], 'docs/code-lens.md': PROMPTS[prompt]}),
+                         ('prompt edited', {prompt: 'changed\n'}),
+                         ('workflow', {'.github/workflows/ci.yml': 'on: push\n'})):
+            with self.subTest(name):
+                head = self.head(base, **kw)
+                code, out = self.check(base, head, ['code'])
+                self.assertEqual(code, 1, out)
+                self.assertIn('critical, lenses data-1, data-2', out)
+                self.assertIn('protected: ', out)
+                self.assertEqual(self.check(base, head, ['data-1', 'data-2'])[0], 0)
+
+    def test_an_empty_diff_is_judged_by_the_catch_all_rule(self):   # empty state: never "no lens needed"
+        base = self.base()
+        code, out = self.check(base, self.head(base), comments=[])   # same tree as the base: nothing changed
+        self.assertEqual(code, 1, out)
+        self.assertIn('normal, lenses code (0 changed paths; code (normal): no changed path)', out)
+
+    def test_no_merge_base_is_refused_never_judged(self):   # a force-pushed base: the head's history is gone from it
+        unrelated = self.w.commit(base_files(cfg_raw=review_cfg(), **PROMPTS, **self.STORE), [])
+        for mode in ('enforce', 'shadow'):
+            with self.subTest(mode=mode):
+                head = self.head(self.m0, mode, **{'src/app.py': 'a\n'})   # same files: GitHub could merge them
+                base = self.w.commit(base_files(cfg_raw=review_cfg(mode), **PROMPTS, **self.STORE), [unrelated])
+                code, out = self.check(base, head, ['code', 'data-1', 'data-2'])
+                self.assertEqual(code, H.REFUSED, out)
+                self.assertIn('the review path rules cannot judge this head', out)
+                self.assertIn('have no merge base', out)
+
+    def test_the_merge_base_is_the_point_not_the_base_tip(self):   # three dots: the base's own changes are not the PR's
+        b0 = self.base()
+        head = self.head(b0, **{'docs/a.md': 'a\n'})
+        base = self.base(parent=b0, **{'src/storage/new.py': 'n\n'})   # the base moved on, in a critical folder
+        code, out = self.check(base, head, comments=[])
+        self.assertEqual(code, 0, out)
+        self.assertIn('light, lenses none (1 changed path', out)
+
+    def test_a_bad_review_block_on_the_base_is_refused(self):   # fail closed: never today's rule instead
+        for change in ({'mode': 'loud'}, {'rules': []}, {'version': 2}):
+            with self.subTest(change=change):
+                base = self.w.commit(base_files(cfg_raw={**CFG_RAW, 'review': {**REVIEW_BLOCK, **change}}, **PROMPTS),
+                                     [self.m0])
+                code, out = self.check(base, self.head(base, mode=None, **{'docs/a.md': 'a\n'}), ['correctness'])
+                self.assertEqual(code, H.REFUSED, out)
+                self.assertIn('review', out)
+
+    def test_a_huge_change_is_judged_whole(self):   # no API page cap: every path is read from git
+        base = self.base()
+        files = {f'docs/p{i}.md': f'{i}\n' for i in range(3500)}
+        files['src/storage/zz.py'] = 'last\n'   # sorts after every docs/ path: the 3501st
+        code, out = self.check(base, self.head(base, **files), comments=[])
+        self.assertEqual(code, 1, out)
+        self.assertIn('critical, lenses data-1, data-2 (3501 changed paths', out)
+
+    def test_a_file_name_that_is_not_utf8_is_judged_by_its_folder(self):   # #348 item 1: no UnicodeDecodeError
+        for mode in ('enforce', 'shadow'):
+            with self.subTest(mode=mode):
+                base = self.base(mode)
+                tree = base_files(cfg_raw=review_cfg(mode), **{**PROMPTS, **self.STORE})
+                tree[b'src/storage/bad\xff.py'] = 'b\n'
+                tree[b'docs/bad\xfe.md'] = 'd\n'
+                head = self.w.commit(tree, [base])
+                code, out = self.check(base, head, ['code'])
+                self.assertIn('critical, lenses data-1, data-2 (2 changed paths', out)
+                self.assertIn('src/storage/bad\\xff.py', out)
+                if mode == 'enforce':
+                    self.assertEqual(code, 1, out)
+                    self.assertEqual(self.check(base, head, ['data-1', 'data-2'])[0], 0)
+                else:   # shadow: what main says (every lens read the head), the row only reports
+                    self.assertEqual(code, 0, out)
+                light = dict(base_files(cfg_raw=review_cfg(mode), **{**PROMPTS, **self.STORE}))
+                light[b'docs/bad\xfe.md'] = 'd\n'
+                code, out = self.check(base, self.w.commit(light, [base]), comments=[])
+                self.assertEqual(code, 0, out)
+                self.assertIn('light, lenses none (1 changed path; docs (light): docs/bad\\xfe.md', out)
+
+    def test_a_lens_name_with_capitals_is_required_by_its_key(self):   # #348 item 5: reads are keyed by lens_key
+        block = json.loads(json.dumps(REVIEW_BLOCK))
+        block['lenses'] = {('Data-One' if n == 'data-1' else 'Data-Two' if n == 'data-2' else n): x
+                           for n, x in block['lenses'].items()}
+        block['rules'][0]['lenses'] = ['Data-One', 'Data-Two']
+        cfg = {**CFG_RAW, 'review': block}
+        base = self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE}), [self.m0])
+        head = self.head(base, cfg=cfg, **{'src/storage/s.py': lines(40, ['x'], 3)})
+        code, out = self.check(base, head, ['code'])
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: Data-One, Data-Two', out)
+        for names in (['Data-One', 'Data-Two'], ['data-one', 'DATA-TWO']):
+            with self.subTest(names=names):
+                code, out = self.check(base, head, names)
+                self.assertEqual(code, 0, out)
+
+    def test_the_summary_row_says_what_the_path_rules_decide(self):   # #348 item 5: the row itself, in the table
+        for mode, says in (('enforce', '| path rules (enforce) | ok | the path rules decide: critical, lenses '
+                                       'data-1, data-2 (1 changed path'),
+                           ('shadow', '| path rules (shadow) | ok | the path rules would have said: critical, lenses '
+                                      'data-1, data-2 (1 changed path')):
+            with self.subTest(mode=mode):
+                base = self.base(mode)
+                head = self.head(base, mode, **{'src/storage/s.py': lines(40, ['x'], 3)})
+                path = self.w.checkout(base, head)
+                summary = os.path.join(self.w.dir, f'summary-{mode}.md')
+                gh = fake_gh((0, json.dumps(pr([self.p.lens(n, head) for n in ('data-1', 'data-2')], head=head))))
+                code, out = run_cli(path, gh, env={'GITHUB_STEP_SUMMARY': summary})
+                self.assertEqual(code, 0, out)
+                with open(summary, encoding='utf-8') as f:
+                    table = f.read().splitlines()
+                rows = [x for x in table if x.startswith('| ') and not x.startswith(('| lens ', '| --- '))]
+                self.assertTrue(rows[0].startswith(says), rows)
+
+    def test_a_rule_order_warning_of_a_shadow_config_is_in_the_row(self):   # #348 item 3: enforce refuses it instead
+        rules = [dict(REVIEW_BLOCK['rules'][1], paths=['**/*.md']), REVIEW_BLOCK['rules'][0], REVIEW_BLOCK['rules'][2]]
+        for mode in ('shadow', 'enforce'):
+            with self.subTest(mode=mode):
+                cfg = review_cfg(mode, rules=rules)
+                base = self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE}), [self.m0])
+                head = self.head(base, cfg=cfg, **{'src/storage/notes.md': 'n\n'})
+                code, out = self.check(base, head, ['code'])
+                if mode == 'shadow':
+                    self.assertEqual(code, 0, out)
+                    self.assertIn("::warning::the review rules of the config: rule 'docs' (light) comes before the "
+                                  "heavier rule 'data' (critical)", out)
+                    self.assertIn("would have said: light, lenses none", out)
+                    self.assertIn("config warning: rule 'docs' (light) comes before", out)
+                else:
+                    self.assertEqual(code, H.REFUSED, out)
+                    self.assertIn("rule 'docs' (light) comes before the heavier rule 'data' (critical)", out)
+
+    def test_a_head_that_leaves_the_config_in_enforce_with_an_order_enforce_refuses_is_refused(self):   # #374 item 3
+        # Merged, the base config would refuse every head after it, the one that fixes the order too: the config that
+        # judges a head is the base's. So the head's own new config is read for this one check.
+        bad = [dict(REVIEW_BLOCK['rules'][1], paths=['**/*.md']), REVIEW_BLOCK['rules'][0], REVIEW_BLOCK['rules'][2]]
+        every = ['data-1', 'data-2', 'code', 'correctness']
+        for name, base_cfg in (('shadow to enforce', review_cfg('shadow', rules=bad)), ('a new block', CFG_RAW),
+                               ('reordered in enforce', review_cfg('enforce'))):
+            with self.subTest(name):
+                base = self.w.commit(base_files(cfg_raw=base_cfg, **{**PROMPTS, **self.STORE}), [self.m0])
+                head = self.head(base, cfg=review_cfg('enforce', rules=bad), **{'docs/a.md': 'a\n'})
+                code, out = self.check(base, head, every)
+                self.assertEqual(code, H.REFUSED, out)
+                self.assertIn(f'this pull request leaves {CONFIG_PATH} in mode enforce with a rule order enforce '
+                              "refuses: rule 'docs' (light) comes before the heavier rule 'data' (critical)", out)
+                self.assertIn('fix the rule order first', out)
+                self.assertEqual(self.check(base, head, every), (code, out))   # runs again: the same answer
+        # the head that fixes the order, the head that stays in shadow, and a base config the head leaves alone pass
+        base = self.w.commit(base_files(cfg_raw=review_cfg('shadow', rules=bad), **{**PROMPTS, **self.STORE}),
+                             [self.m0])
+        for name, cfg in (('fixed and switched', review_cfg('enforce')),
+                          ('stays shadow', review_cfg('shadow', rules=bad, findings=False)),   # not the base's text
+                          ('order fixed in shadow', review_cfg('shadow'))):
+            with self.subTest(name):
+                code, out = self.check(base, self.head(base, cfg=cfg, **{'docs/a.md': 'a\n'}), every)
+                self.assertEqual(code, 0, out)
+                self.assertNotIn('this pull request leaves', out)
+
+    def test_the_head_config_is_read_only_for_the_enforce_order(self):   # #374 item 3: old and odd head configs
+        base = self.base('shadow')
+        for name, text in (('not JSON', '{'), ('no review block', json.dumps(CFG_RAW)),
+                           ('another bad review block', json.dumps(review_cfg('enforce', rules=[])))):
+            with self.subTest(name):
+                tree = base_files(**{**PROMPTS, **self.STORE, 'docs/a.md': 'a\n'})
+                tree[CONFIG_PATH] = text
+                code, out = self.check(base, self.w.commit(tree, [base]), ['data-1', 'data-2', 'correctness'])
+                self.assertEqual(code, 0, out)   # judged by the base's shadow block, as before
+                self.assertNotIn('this pull request leaves', out)
+        head = self.head(base, drop=[CONFIG_PATH], **{'docs/a.md': 'a\n'})   # the head deletes the config
+        code, out = self.check(base, head, ['data-1', 'data-2', 'correctness'])
+        self.assertEqual(code, 0, out)
+
+    def test_without_a_review_block_a_missing_lens_reads_as_before(self):   # #348 item 6: byte for byte
+        base = self.base(mode=None)
+        head = self.head(base, mode=None, **{'src/app.py': 'a\n'})
+        code, out = self.check(base, head, ['correctness'], required='design')
+        self.assertEqual(code, 1, out)
+        self.assertIn('head check failed: required lens without a read: design. No counted lens comment has that '
+                      'name: check it in required-lenses (one name per line); lenses found: correctness', out)
+        self.assertNotIn('review rules', out)
+        base = self.base('enforce')   # the path rules can name a missing lens: the reason says where to look
+        head = self.head(base, **{'src/app.py': 'a\n'})
+        code, out = self.check(base, head, ['correctness'])
+        self.assertIn('check it in required-lenses (one name per line) or the review rules of the config;', out)
+
+    def test_a_rerun_gives_the_same_answer(self):   # runs again: nothing stored between runs
+        base = self.base()
+        head = self.head(base, **{'src/storage/s.py': lines(40, ['x'], 3)})
+        for lenses in (['code'], ['data-1', 'data-2']):
+            with self.subTest(lenses=lenses):
+                first = self.check(base, head, lenses)
+                self.assertEqual(self.check(base, head, lenses), first)
+
+
+class PathRulesBare(PathRules):
+    BARE = True
+
+
+class ChangedPaths(unittest.TestCase):
+    """changed_paths and path_judgement against git answers a real repository rarely gives."""
+    def fake(self, *answers):
+        answers = list(answers)
+
+        class Checkout:
+            def git(self, *a, **kw):
+                code, out = answers.pop(0)
+                return types.SimpleNamespace(returncode=code, stdout=out, stderr='boom' if code else '')
+
+            def merge_parents(self):
+                return (C, A)
+        return Checkout()
+
+    def test_every_failure_is_a_reason_never_an_empty_list(self):
+        for name, answers, says in (
+                ('merge-base fails', [(1, '')], 'no merge base'),
+                ('merge-base prints no sha', [(0, 'not a sha\n')], 'no merge base'),
+                ('diff fails', [(0, B + '\n'), (1, '')], 'git diff'),
+                ('diff unreadable', [(0, B + '\n'), (0, 'Q\0a\0')], 'does not know'),
+                ('diff cut short', [(0, B + '\n'), (0, 'M\0a')], 'cut short'),
+                ('second base fails', [(0, f'{B}\n{C}\n'), (0, 'M\0a\0'), (1, '')], 'git diff')):
+            with self.subTest(name):
+                changes, why = H.changed_paths(self.fake(*answers), C, A)
+                self.assertIsNone(changes)
+                self.assertIn(says, why)
+
+    def test_git_stderr_that_is_not_utf8_is_written_escaped(self):   # #374 item 5: no UnicodeEncodeError on print
+        class Checkout:
+            def git(self, *a, **kw):
+                if a[0] == 'merge-base':
+                    return types.SimpleNamespace(returncode=0, stdout=B + '\n', stderr='')
+                bad = b"fatal: bad \xff name".decode('utf-8', 'surrogateescape')   # surrogateescape keeps the byte
+                return types.SimpleNamespace(returncode=128, stdout='', stderr=bad)
+        changes, why = H.changed_paths(Checkout(), C, A)
+        self.assertIsNone(changes)
+        self.assertIn('fatal: bad \\xff name', why)
+        why.encode('utf-8')   # printed and written as UTF-8: no lone surrogate may reach it
+
+    def test_every_merge_base_adds_its_paths(self):   # criss-cross: more paths, never fewer
+        changes, why = H.changed_paths(self.fake((0, f'{B}\n{C}\n'), (0, 'M\0a\0'), (0, 'M\0b\0')), C, A)
+        self.assertEqual((changes, why), ([('M', ('a',)), ('M', ('b',))], None))
+
+    def test_a_checkout_without_merge_parents_is_not_judged(self):
+        co = self.fake()
+        co.merge_parents = lambda: None
+        rules = config.parse(json.dumps(review_cfg())).review
+        self.assertEqual(H.path_judgement(co, rules, CONFIG_PATH)[0], None)
 
 
 # --- reading GitHub, the outputs, re-runs and stops -------------------------------------------------------------

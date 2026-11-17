@@ -173,8 +173,12 @@ Two more things limit what a job can do:
   network and the walls from inside a runner.
 - **Files and devices (every pool), one rule:** a job's unit has a root
   folder of its own, empty but for symlinks. Of the host's files it sees only
-  the paths in `fork-fleet-job-paths.txt` (`/usr`, `/etc`, the `/bin` and `/lib`
-  links), each read-only and one mount (nothing mounted under it), the
+  the paths in `fork-fleet-job-paths.txt` (`/usr`, the `/bin` and `/lib`
+  links, and an allow list of `/etc`: `passwd`, `group`, `hosts`, the TLS
+  certificates, `alternatives`, the `ld.so` files, the time zone and a few
+  more a build needs; never `/etc` whole, so no login file, unit, cron entry,
+  `/etc/default` or backup tool's folder is there: issue #243), each
+  read-only and one mount (nothing mounted under it), the
   launcher's `ALLOW_PATHS`, the hook and its own copy. So a share or drive
   mounted anywhere else (`/mnt`, `/media`, `/srv`, `/data`, a Windows drive at
   `/c`) is not there. `MountFlags=private`: a mount the host makes after the job
@@ -188,7 +192,14 @@ Two more things limit what a job can do:
   `/dev/dxg`), disk, `kvm`, `fuse` or `tun`. Git, Node, Java and the Docker
   client need none of these; a job never gets the Docker daemon (its socket is
   root on the host). Step 6 proves each of these from inside a runner, and
-  that each bound path is the one the launcher checked. The per-OS walls ask
+  that each bound path is the one the launcher checked; it lists the job's
+  `/etc` (any entry the list did not put there fails) and tries two canary
+  files it keeps in `/etc` meanwhile (one others may read, one only the
+  runner's group may; another `CANARY_DIR` must be root's, only root may
+  write it or any folder above it, and no link may lead to it, or check-net
+  refuses). An older kit whose list still names `/etc` whole is
+  refused by the launcher and fails `mounts`: re-run the installer. A
+  project that needs another `/etc` entry adds it to `ALLOW_PATHS`. The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`, and `tools` for the
   `systemd-run` and `systemctl` it runs) instead of keeping a list of their
   own. A systemd drop-in that changes the job units (`service.d`,
@@ -205,20 +216,27 @@ Two more things limit what a job can do:
   minutes (a job that ignores SIGTERM would run on past its limit), in a
   drop-in, or as systemd's own default (`system.conf`: the first of `/etc`,
   `/run`, `/usr/local/lib` and `/usr/lib`, and every `system.conf.d`) while a
-  job unit an older launcher started is still loaded, or while the installed
-  launcher is such an older one (the walls read its `start()`: the launcher
-  gives each job unit its own stop timeouts, 90 s, so the default decides
-  nothing for the units it starts now; an endless one of a unit's own fails
-  too); and a
+  job unit an older launcher started is still loaded (an endless one of a
+  unit's own fails too); and a
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
-  drops it anywhere else. On WSL2 they also read every property the launcher gives a job's unit
-  (each way `systemd-run` takes one), of the launcher they ship with only:
-  its sha256 is pinned in the `wsl2` walls file, and any other launcher
-  cannot be told and fails (no reading of bash can follow every way a changed
-  one could hand a unit more). A launcher change moves the pin in the same
-  pull request: it needs the security lens, and the pin test also runs cheap
-  tripwires on the launcher's text (a second `systemd-run`, `eval` or
+  drops it anywhere else. The walls know the launcher they ship with: its
+  sha256 is pinned once, in the `linux` walls file (the `wsl2` file reads that
+  pin and has no copy of its own), and any other launcher (one of another
+  release too: install the kit whole) cannot be told and fails `job-units` (no
+  reading of bash can follow every way a changed one could hand a unit more,
+  or less). The pin judges the bytes the walls read, not the bytes that run:
+  the walls read the launcher through one open file and run it by path
+  afterwards (`paths`, `tools`), and the pool runs `start` later still. A
+  launcher replaced in between (only root can) is judged on the old bytes;
+  there is no cheap fix, so the walls catch a stale or edited kit, not a root
+  that swaps the launcher at the right moment. The pinned launcher's `start()`
+  gives each job unit its own stop timeouts, 90 s, so systemd's default
+  decides nothing for the units it starts. On WSL2 they also read every
+  property that launcher gives a job's unit (each way `systemd-run` takes one),
+  and any other launcher fails `sockets` too. A launcher change moves the pin
+  in the same pull request: it needs the security lens, and the pin test
+  also runs cheap tripwires on the launcher's text (a second `systemd-run`, `eval` or
   `source` even spelt with quotes or backslashes, a command word built from
   expansions such as `${e}al`, a `#` inside quotes, a function defined twice,
   binds made outside `job_view`), so that none of the edits the scan cannot follow comes back
@@ -239,7 +257,9 @@ Two more things limit what a job can do:
   not.
 
 Fleet jobs read no secrets (a test checks this). The fleet's GitHub token lives
-only on the fleet host, readable by root.
+only on the fleet host, readable by root. A host's own secrets stay out of jobs
+because a job's `/etc` is an allow list (above); the walls' `etc-secrets` is a
+lint for the common places, not a proof.
 
 ### Why the gate kills the worker (actions/runner, `main`, read 2026-11-12)
 
@@ -976,6 +996,7 @@ dispatcher keeps only pacing in memory, so a restart starts over cleanly.
 | Dispatcher  | Crash after `start`                                                                                                           | The unit is there. The next pass sees it and starts nothing twice.                                                                                                                                                                                                                                        |
 | Dispatcher  | Launcher killed half-way through copying the template                                                                         | No unit. The next pass deletes the registration, `prune` removes the half copy and any environment file, and the job's runner is started again.                                                                                                                                                           |
 | Dispatcher  | A pool's label changed: offline registrations under its old label                                                             | Deleted when the pool lists the old label in `retired` (and `retired_labels`); never online ones or another pool's. An idle runner there is stopped like any other. A label two pools retire, or a pool's label in either list, is refused. Without `retired` they stay (delete them by hand).            |
+| Dispatcher  | An online runner under a pool's label (now, or one in `retired`) with no unit on this host                                    | Never stopped: its unit is gone (a reboot, a crash) or on another host, it holds no slot here, and `stop` would fail on every pass (#342, #356). Once it is offline, its registration is deleted.                                                                                                         |
 | Dispatcher  | Restart, or a host reboot                                                                                                     | It reads everything again from GitHub and systemd. The lock directory under `/run` is made again after a boot. After a reboot, a job that was running fails as a lost runner (`auto`: the sweep re-runs it GitHub-hosted). A job still queued has its offline registration deleted and gets a new runner. |
 | Dispatcher  | Two dispatchers for one pool                                                                                                  | The second one fails on that pool's lock (`dispatch-<pool>.lock`). Two dispatchers for different pools both run.                                                                                                                                                                                          |
 | Dispatcher  | The job went away before its runner took it (cancelled)                                                                       | The idle runner is stopped after 3 passes, or at once if another queued job asks for all of its labels. A re-run's job never can: its label names its own attempt.                                                                                                                                        |

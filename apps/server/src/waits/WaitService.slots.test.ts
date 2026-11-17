@@ -26,6 +26,7 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
+import { SlotCapacityHost } from "../slots/SlotObserver.ts";
 import type { WaitDelivery, WaitReceiver } from "./WaitDelivery.ts";
 import * as WaitService from "./WaitService.ts";
 import { memoryFileSystem } from "./WaitService.testkit.ts";
@@ -107,6 +108,15 @@ const serverLayer = (world: World, settings: DeepPartial<ServerSettingsValue>) =
             availableMemoryBytes: 16_000 * 1024 * 1024,
             totalMemoryBytes: 32_000 * 1024 * 1024,
           }),
+        }),
+        // The default observes: it reads no real machine here (all files missing).
+        Layer.succeed(SlotCapacityHost, {
+          platform: "linux",
+          readFile: () => Promise.resolve({ error: "missing" }),
+          run: () => Promise.resolve(null),
+          totalMemBytes: () => 0,
+          freeMemBytes: () => 0,
+          cpuCount: () => 0,
         }),
       ),
     ),
@@ -525,16 +535,19 @@ describe("WaitService slot waits", () => {
         yield* service.runDue();
         assert.deepStrictEqual(store.counts, { reads: 0, writes: 0 });
         assert.strictEqual(store.files.get(FILE), before);
-        // Slots off too: nothing is counted at all.
       }).pipe(Effect.provide(serverLayer(world, settings)));
-      world.snapshotReads = 0;
-      yield* Effect.gen(function* () {
-        const { delegate, service } = yield* startService(store.fs, send.delivery);
-        assert.strictEqual(yield* delegate(OUTSIDER), "allow");
-        yield* service.runDue();
-        assert.strictEqual(world.snapshotReads, 0);
-        assert.deepStrictEqual(store.counts, { reads: 0, writes: 0 });
-      }).pipe(Effect.provide(serverLayer(world, {})));
+      // Slots off too: nothing is counted at all (fixed mode; the default only observes, off the
+      // decision path, see SlotObserver.test.ts).
+      for (const off of [{ agentSlots: { mode: "fixed" } }, {}]) {
+        world.snapshotReads = 0;
+        yield* Effect.gen(function* () {
+          const { delegate, service } = yield* startService(store.fs, send.delivery);
+          assert.strictEqual(yield* delegate(OUTSIDER), "allow");
+          yield* service.runDue();
+          if ("agentSlots" in off) assert.strictEqual(world.snapshotReads, 0);
+          assert.deepStrictEqual(store.counts, { reads: 0, writes: 0 });
+        }).pipe(Effect.provide(serverLayer(world, off)));
+      }
       // Waits on: the same stored slot counts, so another thread is refused.
       yield* Effect.gen(function* () {
         const { delegate } = yield* startService(store.fs, send.delivery);
@@ -562,6 +575,24 @@ describe("WaitService slot waits", () => {
         assert.isUndefined(off.slots);
         assert.strictEqual(world.snapshotReads, reads);
       }).pipe(Effect.provide(serverLayer(world, slotsOn(1))));
+    }),
+  );
+
+  it.effect("wait_list shows the capacity rule in observe mode only (#353)", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      for (const mode of ["observe", "fixed"] as const) {
+        const world = newWorld();
+        const store = disk();
+        const send = fakeDelivery();
+        const listed = yield* Effect.gen(function* () {
+          const { delegate, service } = yield* startService(store.fs, send.delivery);
+          assert.strictEqual(yield* delegate(T1), "allow");
+          return yield* service.list({ threadId: T1, projectId: PROJECT });
+        }).pipe(Effect.provide(serverLayer(world, slotsOn(2, { agentSlots: { mode } }))));
+        if (mode === "observe") assert.deepInclude(listed.slotRule, { mode: "observe" });
+        else assert.isUndefined(listed.slotRule);
+      }
     }),
   );
 

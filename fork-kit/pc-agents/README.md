@@ -87,7 +87,8 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 
 `t3Version` must be 0.1.7 or newer: older releases have no managed policy, so they would run with none of the kit's
 locks and with updates on. A 0.1.7 pre-release counts as older (some 0.1.7 nightlies were built before the policy),
-and a pre-release of a later version as that version. Setup and `check` refuse them, naming the key. (`t3 pair`,
+and a pre-release of a later version as that version. This fork's stable build of a release (`0.1.7-fork.1`) counts
+as that release, its nightlies as pre-releases. Setup and `check` refuse the older ones, naming the key. (`t3 pair`,
 step 10, came earlier.)
 
 Every T3 setting can be locked through `lockedSettings`, the fork's own settings (`agentSlots`, `usagePacingGate`,
@@ -235,12 +236,17 @@ allowed (connection tracking).
 - **Packages:** setup installs `nftables`, `libatomic1` and `unzip` when `dpkg` does not list one as installed (held
   counts as installed; a distro set up by an older kit gets the two new ones at its next run; no T3 restart for
   them). It installs them after it writes its files, so `apt-get` resolves through the machine file's `nameservers`
-  as they are now, and before it loads the firewall. A package install stopped half-way is finished first
-  (`dpkg --configure -a`). Nothing asks a question: a changed config file is kept, debconf takes its defaults, and
-  `apt-get` waits up to 5 minutes for a lock (apt-daily on a new distro). A failed step stops setup, naming the
-  command to run; the files it wrote stay, and when one of them changed what T3 runs with, the walls check's
-  `restart` wall fails (and the 2-minute check stops T3) until setup runs again to the end, as after a failed T3
-  download.
+  as they are now, and before it loads the firewall. A package install stopped half-way (`dpkg --audit` names it, or
+  `/var/lib/dpkg/updates` holds a file named all digits, which `apt-get install` refuses on as well) is finished first
+  (`dpkg --configure -a`, run only then). `apt-get` and `dpkg` run under `LC_ALL=C`, so a lock reads the same in
+  every language. Nothing asks a question: a changed config file is kept and
+  debconf takes its defaults. A lock another `apt-get` or `dpkg` holds (apt-daily on a new distro) is waited for, up
+  to 5 minutes a step: `apt-get` waits for dpkg's lock itself, and setup runs `dpkg`, `apt-get update` and
+  `apt-get install` again while they fail on the locks they take without a wait. A failed step stops setup, naming
+  the command to run (for a lock still held, to wait for the other one); the files it wrote stay, and when one of them
+  changed what T3 runs with, the walls check's `restart` wall fails (and the 2-minute check stops T3) until setup runs
+  again to the end, as after a failed T3 download. A distro restart in between starts T3 again with the new files and
+  firewall, without the packages.
 - **A distro that is not fresh:** refused before anything is written, with the reasons: another login user, an
   `agent` with another uid or in another group, a file the kit would write that it did not write (or that was
   edited since, for example a hand-written `wsl.conf` or `policy.json`), a cron, at or ssh unit where the kit masks

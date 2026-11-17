@@ -1,9 +1,9 @@
 """The `review` block of the queue's config: which paths need which lens reads, and the round cap (README.md, "Review
 rules").
 
-Only parsed and checked here; nothing judges a pull request by it yet. Strict like config.py: every key is required,
-an unknown key or a wrong value is an error, and every problem is named at once. A rule set that could leave a changed
-path without the lenses its weight needs is refused, never repaired: no hidden defaults in the merge path.
+Parsed and checked here; review_judge.py judges a change by it (the head gate). Strict like config.py: every key is
+required, an unknown key or a wrong value is an error, and every problem is named at once. A rule set that could leave
+a changed path without the lenses its weight needs is refused, never repaired: no hidden defaults in the merge path.
 
 Globs use one small dialect, so the Python gate and T3 match a path the same way: `*` any characters inside one path
 segment, `**` any number of whole segments (only as a segment of its own), `?` one character inside a segment. Paths
@@ -16,7 +16,9 @@ it is written; a rule after it can never match.
 """
 import json
 import re
+from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 
 import lens
 from config import ConfigError
@@ -33,6 +35,9 @@ MAX_ROUNDS = 20
 # Characters of glob dialects this one does not have: a project that wrote `{a,b}`, `[ab]` or `!x` would otherwise get
 # a rule that silently matches nothing it meant.
 NOT_IN_DIALECT = re.compile(r'[{}\[\]!\\]')
+# The end of each shadow order warning: the config that judges a head is the base's, so a base that switched to enforce
+# with this order would refuse every head, the one that fixes the order too.
+SWITCH = 'mode enforce refuses this config: fix it before switching'
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,11 @@ class ReviewRules:
     rounds: Rounds
     findings: bool
     state_line: bool
+    # What the config check says but does not refuse (mode shadow only: a rule above another that takes its paths with
+    # fewer lenses, which enforce refuses). Shown in the gate's summary row.
+    warnings: tuple = ()
+    # The rule-order problems themselves, in either mode (enforce_order_problems): empty in a parsed enforce block.
+    order: tuple = ()
 
     def lens(self, name):
         return next((x for x in self.lenses if x.name == name), None)
@@ -90,17 +100,25 @@ def _show(v):
     return json.dumps(v)[:80]
 
 
-def _path_problem(p):
-    """Why `p` is no repo-relative path in `/` form, or None."""
+def exact_path_problem(p):
+    """Why `p` is not a repo-relative file path spelled as git names a changed file (`/` between segments, no empty, .
+    or .. segment), or None. Any other character is the file's own, glob characters too (`queue[main].json`): a path
+    that is only ever compared exactly, never matched as a glob, needs nothing more."""
     if not _text(p):
         return 'must be a non-empty line without surrounding blanks'
     if p.startswith('/'):
         return 'must be repo-relative (no leading /)'
-    if NOT_IN_DIALECT.search(p):
-        return 'has a character the dialect does not have ({, }, [, ], !, \\)'
     if any(seg in ('', '.', '..') for seg in p.split('/')):
         return 'has an empty, . or .. segment'
     return None
+
+
+def _path_problem(p):
+    """Why `p` is no repo-relative path in `/` form of the dialect's characters, or None."""
+    why = exact_path_problem(p)
+    if why or not NOT_IN_DIALECT.search(p):
+        return why
+    return 'has a character the dialect does not have ({, }, [, ], !, \\)'
 
 
 def _matches_any_segment(seg):
@@ -115,6 +133,129 @@ def matches_every_path(g):
     segs = g.split('/')
     rest = [s for s in segs if s != '**']
     return len(rest) < len(segs) and len(rest) <= 1 and all(_matches_any_segment(s) for s in rest)
+
+
+def _search(start, end, steps):
+    """A shortest list of step labels from `start` to `end` over `steps(state)` -> [(label, next state)], or None.
+    Breadth-first over a finite product of positions: at most len(a) * len(b) states, never exponential."""
+    seen, todo = {start: None}, deque([start])
+    while todo:
+        state = todo.popleft()
+        if state == end:
+            labels = []
+            while seen[state] is not None:
+                state, label = seen[state]
+                labels.append(label)
+            return labels[::-1]
+        for label, nxt in steps(state):
+            if nxt not in seen:
+                seen[nxt] = (state, label)
+                todo.append(nxt)
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _segment_witness(a, b):
+    """A path segment both glob segments `a` and `b` (no `**`) match, or None. Each segment is a small automaton (`*`
+    any characters, `?` one, a letter itself); this walks both at once."""
+    def steps(state):
+        i, j = state
+        out = []
+        if i < len(a) and a[i] == '*':
+            out.append(('', (i + 1, j)))
+        if j < len(b) and b[j] == '*':
+            out.append(('', (i, j + 1)))
+        if i < len(a) and j < len(b):
+            ca, cb = a[i], b[j]
+            na, nb = (i if ca == '*' else i + 1), (j if cb == '*' else j + 1)
+            wild_a, wild_b = ca in '*?', cb in '*?'
+            if wild_a or wild_b or ca == cb:
+                out.append((cb if wild_a and not wild_b else ca if not wild_a else 'x', (na, nb)))
+        return out
+    labels = _search((0, 0), (len(a), len(b)), steps)
+    if labels is None:
+        return None
+    # Only two all-`*` segments meet on the empty text; they also meet on any letter (a segment is never empty).
+    return ''.join(labels) or 'x'
+
+
+def glob_witness(a, b):
+    """A repo-relative path both valid globs `a` and `b` match, or None when no path matches both."""
+    g, h = a.split('/'), b.split('/')
+
+    def steps(state):
+        i, j = state
+        out = []
+        if i < len(g) and g[i] == '**':
+            out.append(('', (i + 1, j)))
+        if j < len(h) and h[j] == '**':
+            out.append(('', (i, j + 1)))
+        if i < len(g) and j < len(h):
+            sa, sb = g[i], h[j]
+            seg = _segment_witness('*' if sa == '**' else sa, '*' if sb == '**' else sb)
+            if seg is not None:
+                out.append((seg, (i if sa == '**' else i + 1, j if sb == '**' else j + 1)))
+        return out
+    labels = _search((0, 0), (len(g), len(h)), steps)
+    if labels is None:
+        return None
+    return '/'.join(x for x in labels if x) or 'x'
+
+
+def globs_meet(a, b):
+    """Some path matches both valid globs."""
+    return glob_witness(a, b) is not None
+
+
+def _shadowed(rules):
+    """Why a rule above another takes paths the lower one names with fewer lenses: a changed path belongs to the first
+    rule that matches it and gets only its lenses. A lighter rule above a heavier one (`**/*.md` light above `src/**`
+    critical: `src/notes.md` needs no lens), or a rule of the same weight without one of the lower rule's lenses
+    (`**/*.py` critical [a] above `src/**/*` critical [a, b]: `src/x.py` needs no b). Only the match-every globs of the
+    catch-all rule are exempt: it is the default for every path no rule above names, so a lighter rule above it is the
+    normal case, but an explicit glob it also names (`[src/**, **]`) says what that folder needs like any other rule's.
+    Lens names match exactly: two names the gate reads as one lens are refused in `lenses` already."""
+    out = []
+    every = next((r for r in rules if any(matches_every_path(g) for g in r.paths)), None)
+    for k, low in enumerate(rules):
+        globs = [g for g in low.paths if not (low is every and matches_every_path(g))]
+        for up in rules[:k]:
+            if WEIGHTS.index(up.weight) < WEIGHTS.index(low.weight):
+                continue   # a heavier rule above: its paths need more than the lower rule's weight
+            same = up.weight == low.weight
+            missing = [n for n in low.lenses if n not in up.lenses] if same else []
+            if same and not missing:
+                continue
+            meet = next(((ga, gb, w) for ga in up.paths for gb in globs
+                         for w in [glob_witness(ga, gb)] if w is not None), None)
+            if not meet:
+                continue
+            ga, gb, w = meet
+            if same:
+                lenses = ', '.join(map(repr, missing))
+                what = (f'rule {up.name!r} ({up.weight}) comes before the rule {low.name!r} of the same weight '
+                        f'without its lens{"es" if len(missing) > 1 else ""} {lenses}')
+                fix = 'put the rule with more lenses first, or give the first rule those lenses too'
+            else:
+                what = f'rule {up.name!r} ({up.weight}) comes before the heavier rule {low.name!r} ({low.weight})'
+                fix = 'put the heavier rule first'
+            out.append(f'{what}, and {ga!r} and {gb!r} both match a path such as {w!r}: such a path belongs to the '
+                       f'first rule and gets only its lenses; {fix}')
+    return out
+
+
+def enforce_order_problems(raw):
+    """The rule-order problems mode `enforce` would refuse the raw `review` block for, whatever mode it is written in;
+    [] when the block has no rules to order (it does not parse for another reason: the base's parse refuses that, this
+    check is only about the order). head_check refuses a pull request whose new config is in enforce with such an
+    order: merged, it would refuse every head after it, the one that fixes the order too (the config that judges a head
+    is the base's)."""
+    if not isinstance(raw, dict):
+        return []
+    try:
+        return list(parse_review({**raw, 'mode': 'shadow'}).order)
+    except ConfigError:
+        return []
 
 
 def glob_problem(g):
@@ -320,7 +461,12 @@ def parse_review(obj, where='review'):
     mins = _min_lenses(obj['min_lenses'], problems) if 'min_lenses' in obj else None
     rules = _rules(obj['rules'], declared, mins, problems) if 'rules' in obj else ()
     rounds = _rounds(obj['rounds'], declared, problems) if 'rounds' in obj else None
+    # Rule order: refused in enforce (the rules decide), a warning in shadow (they only say what they would have said).
+    order = _shadowed(rules)
+    warnings = tuple(f'{w}; {SWITCH}' for w in order) if obj.get('mode') == 'shadow' else ()
+    if obj.get('mode') != 'shadow':
+        problems.extend(order)
     if problems:
         raise ConfigError(f'{where}: ' + '; '.join(problems))
     return ReviewRules(obj['version'], obj['mode'], rules, tuple(Lens(n, p) for n, p in lenses.items()), mins,
-                       rounds, obj['findings'], obj['state_line'])
+                       rounds, obj['findings'], obj['state_line'], warnings, tuple(order))
