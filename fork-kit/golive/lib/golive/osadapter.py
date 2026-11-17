@@ -1,6 +1,6 @@
 """The OS adapter: the few things the kit asks of the service manager. Only systemd (user units) exists yet; on
 any other system for_this_os() refuses with a plain message until its adapter is written. The mount list
-(mount_points) is read on Linux only; elsewhere it raises Unsupported, so a caller that deletes refuses.
+(mounts, mount_points) is read on Linux only; elsewhere it raises Unsupported, so a caller that deletes refuses.
 
 The boot service is upstream's own unit (apps/server/src/cloud/bootService.ts: `t3code.service`, with
 `Environment=T3CODE_HOME=<home>`). Commands are found on PATH; only tests change SYSTEMCTL and SYSTEMD_RUN.
@@ -69,6 +69,7 @@ class SystemdUser:
             main_pid = 0
         return {'loaded': props.get('LoadState') == 'loaded', 'active': props.get('ActiveState') == 'active',
                 'enabled': props.get('UnitFileState') == 'enabled', 'mainPid': main_pid or None,
+                'state': props.get('ActiveState'),
                 'unitPath': unit_path, 'home': home}
 
     def inside_service(self):
@@ -93,6 +94,10 @@ class SystemdUser:
     def start(self):
         self._run([SYSTEMCTL, '--user', 'start', UNIT])
 
+    def disable(self):
+        """Not started at boot (`back` keeps T3 off a half-restored home; upstream's update enables it again)."""
+        self._run([SYSTEMCTL, '--user', 'disable', UNIT])
+
     def run_detached(self, unit, argv, guard_after_seconds=None, guard_argv=None):
         """Run argv as a transient user unit that outlives its caller (a restart of T3 kills anything inside it).
         With a guard, a second transient timer runs guard_argv after guard_after_seconds, whatever happens to the
@@ -108,10 +113,15 @@ class SystemdUser:
         self._run([SYSTEMD_RUN, '--user', '--quiet', '--collect', f'--unit={unit}', '--', *argv])
 
 
-def mount_points():
-    """Every mount point this process sees (Linux: field 5 of /proc/self/mountinfo, its octal escapes undone), a
-    bind mount of a folder on the same filesystem too. Raises Unsupported when the list cannot be read (another OS,
-    no /proc, an empty or garbled list): a caller about to delete a folder must then refuse."""
+def _unescape(field):
+    return os.fsdecode(re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8) & 0xFF]), field))
+
+
+def mounts():
+    """Every mount this process sees, in the list's order (a later mount on the same point covers an earlier one):
+    (device major:minor, the folder of that filesystem mounted (field 4: '/' unless a bind of a subfolder), mount
+    point (field 5)), octal escapes undone. Linux /proc/self/mountinfo only. Raises Unsupported when the list cannot
+    be read (another OS, no /proc, an empty or garbled list): a caller that deletes or decides by it must refuse."""
     if not sys.platform.startswith('linux'):
         raise Unsupported(f'the go-live kit cannot read the mount list on {sys.platform} yet')
     try:
@@ -119,16 +129,35 @@ def mount_points():
             lines = f.read().splitlines()
     except OSError as e:
         raise Unsupported(f'the mount list {MOUNTINFO} cannot be read: {e}') from None
-    points = []
+    out = []
     for line in lines:
         fields = line.split(b' ')
         if len(fields) < 5 or not fields[4].startswith(b'/'):
             raise Unsupported(f'the mount list {MOUNTINFO} has a line the kit cannot read: {line[:200]!r}')
-        points.append(os.fsdecode(re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8) & 0xFF]),
-                                         fields[4])))
-    if not points:
+        out.append((os.fsdecode(fields[2]), _unescape(fields[3]), _unescape(fields[4])))
+    if not out:
         raise Unsupported(f'the mount list {MOUNTINFO} is empty')
-    return points
+    return out
+
+
+def mount_points():
+    """Every mount point this process sees (field 5 of mounts()), a bind mount of a folder on the same filesystem
+    too. Raises Unsupported as mounts() does: a caller about to delete a folder must then refuse."""
+    return [point for _, _, point in mounts()]
+
+
+def source(path, entries):
+    """(device, folder inside that filesystem) that `path` (a real path) is, by the mount that holds it: the last of
+    the longest mount points at or above it. A bind of `<home>/userdata` at `/b` makes `/b/x` ('8:1',
+    '<home>/userdata/x'). None when no mount holds it (a list without '/')."""
+    best = None
+    for dev, root, point in entries:
+        point = os.path.normpath(point)
+        if os.path.commonpath([path, point]) == point and (best is None or len(point) >= len(best[2])):
+            best = (dev, root, point)
+    if best is None:
+        return None
+    return best[0], os.path.normpath(os.path.join(best[1], os.path.relpath(path, best[2])))
 
 
 def for_this_os():

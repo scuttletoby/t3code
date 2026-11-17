@@ -9,7 +9,9 @@ inputs:
     required: false
     default: ${{ github.repository }}
   config:
-    description: The queue's JSON config (README.md, "Config").
+    description: >-
+      Path of the queue's JSON config inside a git checkout; the queue reads it as the checked-out commit (HEAD) holds
+      it, never the file on disk (README.md, "Config").
     required: true
   state-file:
     description: Absolute path, outside the job's workspace, of the plan a stopped run leaves for the next one.

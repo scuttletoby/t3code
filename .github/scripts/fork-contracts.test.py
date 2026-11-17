@@ -170,16 +170,21 @@ def outside_job_problems(name, job):
     return problems
 
 
-def result_job_problems(name, job):
+def result_job_problems(name, job, jobs):
     where = f"{name}: job {RESULT_JOBS[name]}"
     if job is None:
         return [f"{where} is missing"]
     problems = []
     needs = job.get("needs") or []
+    needs = [needs] if isinstance(needs, str) else needs
     if expression(job.get("if")) != "always()":
         problems.append(f"{where}: if is not exactly always() (skipped on an outside pull request = green)")
-    if OUTSIDE_JOB not in ([needs] if isinstance(needs, str) else needs):
+    if OUTSIDE_JOB not in needs:
         problems.append(f"{where}: does not need {OUTSIDE_JOB}")
+    # The ruleset requires only this job: a job it does not need can fail, or be split off, and stay unseen.
+    unneeded = sorted(set(jobs) - set(needs) - {RESULT_JOBS[name]})
+    if unneeded:
+        problems.append(f"{where}: does not need {', '.join(unneeded)} (a failure there would not block a merge)")
     job_steps = job.get("steps") or []
     for step in job_steps:
         uses = str(step.get("uses", ""))
@@ -202,7 +207,7 @@ def pr_guard_problems(name, wf):
         jobs = wf.get("jobs") or {}
         problems += outside_job_problems(name, jobs.get(OUTSIDE_JOB))
         if name in RESULT_JOBS:
-            problems += result_job_problems(name, jobs.get(RESULT_JOBS[name]))
+            problems += result_job_problems(name, jobs.get(RESULT_JOBS[name]), jobs)
         problems += [f"{name}: job {j} does not start with the pull request guard"
                      for j, job in jobs.items()
                      if j not in {OUTSIDE_JOB, RESULT_JOBS.get(name)} and not guarded(job.get("if"))]
@@ -242,6 +247,10 @@ mutants = {
     "fork_ci_result skipped on outside pull requests (guard && (always()))":
         set_if("fork_ci_result", "${{ " + PR_GUARD + " && (always()) }}"),
     "fork_ci_result not needing outside_pr": lambda wf: wf["jobs"]["fork_ci_result"]["needs"].remove("outside_pr"),
+    "fork_ci_result not needing a job (action_tests)":
+        lambda wf: wf["jobs"]["fork_ci_result"]["needs"].remove("action_tests"),
+    "a new guarded job fork_ci_result does not need":
+        lambda wf: wf["jobs"].__setitem__("extra", {"if": "${{ " + PR_GUARD + " }}", "runs-on": "ubuntu-24.04"}),
     "fork_ci_result without its outside refusal": lambda wf: wf["jobs"]["fork_ci_result"]["steps"][0].__setitem__(
         "run", wf["jobs"]["fork_ci_result"]["steps"][0]["run"].replace(RESULT_REFUSAL, "")),
     "fork_ci_result checking out": lambda wf: wf["jobs"]["fork_ci_result"]["steps"].insert(
