@@ -18,8 +18,8 @@ It finds, for the user it runs as:
       A heavy scope whose heavy is gone (heavy killed with kill -9) is stopped as a whole, as heavy would have
       done; one kept on purpose (HEAVY_KEEP=1) is only reported.
   (b) Docker containers with the label fork-kit.heavy.owner of this user whose owner (a heavy scope, or a pid
-      with its start time) is gone: removed (by full id) with their anonymous volumes. Running containers
-      without the label are reported, never touched.
+      with its start time) is gone: removed (by full id) with their anonymous volumes. One whose owner is a kept
+      scope (HEAVY_KEEP=1) is only reported. Running containers without the label are reported, never touched.
   (c) heavy scopes with no process left in them (a heavy killed while it started): stopped. One that holds only
       another user's processes is reported.
 
@@ -52,6 +52,12 @@ OPTION_VALUES = {
 # options whose next word is the program itself (inline code, a module, a jar)
 INLINE = {'python': {'-c', '-m'}, 'node': {'-e', '-p', '--eval', '--print'}, 'java': {'-jar', '-m', '--module'},
           'shell': {'-c'}, 'other': {'-e', '-E', '-r'}}
+# of those, the ones whose next word is code text, which can hold a short password (`sh -c 'mysql -phunter2'`)
+CODE = {'python': {'-c'}, 'node': {'-e', '-p', '--eval', '--print'}, 'shell': {'-c'}, 'other': {'-e', '-E', '-r'}}
+# Short options bundled in one word (`bash -lc`, `bash -euo pipefail`, `python3 -uc`, `node -pe`, `perl -lne`). For a
+# shell, c anywhere in it is -c, and each o/O in it takes a word first. For the others, the last letter acts as if it
+# stood alone. A word that starts with a letter whose value is attached (`-Wignore`, `-Mre`, `-rjson`) is one option.
+BUNDLED = {'shell': '', 'python': 'WXQ', 'node': '', 'other': 'MmIixdDr'}
 INTERPRETERS = {'node': 'node', 'nodejs': 'node', 'bun': 'node', 'deno': 'node', 'java': 'java', 'ruby': 'other',
                 'perl': 'other', 'php': 'other', 'Rscript': 'other', 'lua': 'other', 'tclsh': 'other'}
 # Wrappers that run one command for as long as they live: their own command is the wrapper plus that command's
@@ -135,7 +141,7 @@ class Proc:
         """For the log, the report and the journal: the program and its script only (never the other arguments),
         with anything that looks like a secret masked."""
         argv = self.argv or []
-        own = own_command(argv) if not is_session(self) else argv[:1]
+        own = own_command(argv, shown=True) if not is_session(self) else argv[:1]
         cmd = redact(' '.join(own)) if own else f'[{self.comm}]'
         if len(argv) > len(own):
             cmd += f' (+{len(argv) - len(own)} args)'
@@ -170,11 +176,12 @@ def interpreter_kind(name):
     return INTERPRETERS.get(name)
 
 
-def own_command(argv):
+def own_command(argv, shown=False):
     """The part of a command line that is the process's own program: the executable and, for an interpreter (python,
     node, java, a shell, ...), its script, module, jar or -c text; for a wrapper that runs one command for as long
     as it lives (timeout, env, nohup, xvfb-run, ...), the wrapper plus that command's own part. Other arguments
-    (which can name anything: a prompt, a file to edit, a program to start in a session) are left out."""
+    (which can name anything: a prompt, a file to edit, a program to start in a session) are left out.
+    shown=True is the form for the log, the report and the journal: code text is cut by code_text()."""
     if not argv:
         return []
     name = program(argv[0])
@@ -195,7 +202,7 @@ def own_command(argv):
                 i += 1
             else:
                 break
-        rest = own_command(argv[i:])
+        rest = own_command(argv[i:], shown)
         return argv[:1] + rest
     kind = interpreter_kind(name)
     if kind is None:
@@ -207,7 +214,19 @@ def own_command(argv):
         if a == '--':
             return argv[:1] + argv[i + 1:i + 2]
         if a in INLINE.get(kind, ()):
+            if shown and a in CODE.get(kind, ()) and i + 1 < len(argv):
+                return argv[:1] + [a, code_text(argv[i + 1])]
             return argv[:1] + argv[i:i + 2]
+        bundled = bundled_option(kind, a)
+        if bundled:
+            opt, values = bundled
+            j = i + 1 + values
+            if opt is None:
+                i = j
+                continue
+            if shown and opt in CODE[kind] and j < len(argv):
+                return argv[:1] + [a, code_text(argv[j])]
+            return argv[:1] + [a] + argv[j:j + 1]
         if a in takes:
             i += 2
         elif a.startswith(('-', '@')) or (kind == 'shell' and a.startswith('+')):
@@ -215,6 +234,28 @@ def own_command(argv):
         else:
             return argv[:1] + [a]
     return argv[:1]
+
+
+def bundled_option(kind, a):
+    """For a word of bundled short options (see BUNDLED): (the inline option it acts as, or None; how many of the
+    words after it are option values). None when the word is not bundled short options."""
+    if kind not in BUNDLED or not re.fullmatch(r'-[A-Za-z]{2,}', a) or a[1] in BUNDLED[kind]:
+        return None
+    if kind == 'shell':
+        return ('-c' if 'c' in a else None), a.count('o') + a.count('O')
+    last = '-' + a[-1]
+    if last in INLINE[kind]:
+        return last, 0
+    return None, (1 if last in OPTION_VALUES.get(kind, ()) else 0)
+
+
+def code_text(code):
+    """Inline code as shown: its first word when that looks like a program name, and its length; never the rest,
+    where a password can be too short or too plain for redact() to see (-phunter2, -u admin:hunter2, PASS=x)."""
+    first = code.split(None, 1)[0] if code.strip() else ''
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./+-]*', first):
+        return f'[{len(code)} chars]'
+    return first if first == code else f'[{first} ... {len(code)} chars]'
 
 
 def redact(text):
@@ -699,6 +740,12 @@ class Sweep:
         if 'scope' in owner:
             gone = owner['scope'] not in members or owner['scope'] in stopping
             what = f'owner {owner["scope"]}'
+            if gone and is_kept_scope(owner['scope']):
+                # HEAVY_KEEP=1 heavy ./db-up.sh: the script labels its container and exits, systemd drops the scope
+                if age < cfg['minAgeSeconds']:
+                    return None
+                return dict(base, action='report', why=f'{what} was kept on purpose (HEAVY_KEEP=1); '
+                                                       f'remove it by hand when done')
         else:
             p = procs.get(owner['pid'])
             gone = p is None or p.start != owner['start']
