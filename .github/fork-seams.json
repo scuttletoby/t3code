@@ -90,6 +90,21 @@
         ": { unit: tracked.unit, slice: ownedSlice };",
         "}),"
       ]
+    },
+    "apps/server/src/peer/RemoteDelegation.ts": {
+      "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) also changes this code; when it lands, check whether this seam is still needed.",
+      "added": [
+        "// Fork: from the launch on, the task is recorded and followed even if this call is",
+        "// interrupted (the parent's turn moved on), else the thread there runs with nothing here",
+        "// following it or reporting its end. The reads above stay cancellable.",
+        "const launchAndRecord = function* () {",
+        "}; // Fork: end of launchAndRecord.",
+        "return yield* Effect.uninterruptible(Effect.gen(launchAndRecord));",
+        "// Fork: nothing here follows it, so stop it there, as a failed record does.",
+        "yield* Effect.logWarning(\"remote-delegation.record-found-no-task\", remoteChild);",
+        "const unfollowed = stopThere(followScope(scope.thread, remoteChild), remoteChild, \"stop\");",
+        "yield* unfollowed.pipe(Effect.ignoreCause({ log: true }));"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
