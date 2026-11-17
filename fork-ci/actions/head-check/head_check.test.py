@@ -1061,7 +1061,7 @@ class Action(unittest.TestCase):
         os.chmod(os.path.join(self.bin, 'python3'), 0o755)
 
     def run_step(self, **env):
-        step = self.action['runs']['steps'][0]
+        step = next(s for s in self.action['runs']['steps'] if s.get('id') == 'check')
         base = {'REPO': REPO, 'PR': '7', 'CONFIG': CONFIG_PATH, 'CHECKOUT_PATH': '.', 'REQUIRED_LENSES': '',
                 'PASS_DRAFTS': 'false', 'GITHUB_ACTION_PATH': HERE}
         return subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', step['run']],

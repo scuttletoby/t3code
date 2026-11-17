@@ -64,6 +64,7 @@ Each action's README has a full example, every input and output, and what happen
 | [fleet-route](actions/fleet-route/README.md)   | which runner each job of a run gets: the project's self-hosted pools or hosted | `config`, `vars`, `mode`, `gates`        | `runners`, `mode`, `attempt`, `fallback`, `watch` | the fleet config (e.g. `.github/fleet.json`)   |
 | [fleet-watch](actions/fleet-watch/README.md)   | re-runs, once, a run that a dispatcher pool's runner cut off                   | `config`, `verb`, `run-id`, `attempt`    | `rerun`, `pending`                                | the fleet config (its `watch` section)         |
 | [head-check](actions/head-check/README.md)     | fails a pull request head that is not the change its review read               | `config`, `required-lenses`, `token`     | `result`                                          | the pr-queue config                            |
+| [git-clean](actions/git-clean/README.md)       | empties a reused self-hosted workspace before checkout; refuses an unknown .git config | `path`                                   | none                                              | none                                           |
 | [pr-queue](actions/pr-queue/README.md)         | a merge queue for an up-to-date-required repository (also a reusable workflow) | `config`, `state-file`, `cache`, `token` | none                                              | the pr-queue config                            |
 
 Two habits every action expects:
