@@ -184,6 +184,26 @@ function isFullRead(provider: ServerProvider, seen: SeenStamps | undefined): boo
   );
 }
 
+/** `next` is stamped before `last`, and the clock has reached `last`. */
+function stampedBefore(next: string | undefined, last: string | undefined, nowMs: number): boolean {
+  if (next === undefined || last === undefined) return false;
+  const lastMs = Date.parse(last);
+  return Date.parse(next) < lastMs && lastMs <= nowMs + FUTURE_TOLERANCE_MS;
+}
+
+/**
+ * Whether a snapshot is older than the last one seen: an update replayed late, such as one the
+ * start-up drain delivers after a newer read. Stamps the clock has not reached (it stepped back)
+ * say nothing about order, so they never make one a replay.
+ */
+function isReplay(provider: ServerProvider, seen: SeenStamps | undefined, nowMs: number): boolean {
+  return (
+    seen !== undefined &&
+    (stampedBefore(provider.checkedAt, seen.provider, nowMs) ||
+      stampedBefore(provider.usageLimits?.checkedAt, seen.usage, nowMs))
+  );
+}
+
 function readingOf(
   provider: ServerProvider,
   resolved: ResolvedAccount,
@@ -583,11 +603,17 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
           Effect.gen(function* () {
             const instanceId = provider.instanceId;
             const seen = seenStamps.get(instanceId);
-            const full = isFullRead(provider, seen);
-            seenStamps.set(instanceId, {
-              provider: provider.checkedAt,
-              usage: provider.usageLimits?.checkedAt,
-            });
+            const nowMs = yield* Clock.currentTimeMillis;
+            // A replayed older update is never full, and the stamps stay those of the newest seen:
+            // otherwise the next update would be compared with the replay's older stamps.
+            const replay = isReplay(provider, seen, nowMs);
+            const full = !replay && isFullRead(provider, seen);
+            if (!replay) {
+              seenStamps.set(instanceId, {
+                provider: provider.checkedAt,
+                usage: provider.usageLimits?.checkedAt,
+              });
+            }
             if (provider.usageLimits === undefined) return;
             const history = yield* load(instanceId);
             const lastKnown = history.findLast(
@@ -598,7 +624,6 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
             if (reading === undefined) return;
             // Compared with the last reading the clock has reached: a reading stamped ahead of it
             // (the clock stepped back) must not block recording. It stays; a segment starts here.
-            const nowMs = yield* Clock.currentTimeMillis;
             const previous = history.findLast(notAhead(nowMs));
             const previousPartial = partialRecorded.has(instanceId);
             if (!shouldRecord(previous, reading, heartbeatMs, previousPartial)) return;
@@ -672,6 +697,8 @@ export const layer = Layer.effect(
     const history = yield* make({ directory: path.join(config.stateDir, HISTORY_DIRECTORY) });
     // Subscribe before reading, so no snapshot published in between is missed. One published
     // just before the read is then seen twice; `record` stores a snapshot it already has once.
+    // One published earlier than the snapshot read is replayed after it; `record` never marks
+    // such a replay full (`isReplay`).
     yield* forkParked(
       Effect.gen(function* () {
         yield* history.compact;

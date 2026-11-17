@@ -310,6 +310,51 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
     }),
   );
 
+  it.effect("an older update replayed after a newer read at start is never a full read", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const directory = yield* historyDirectory;
+      const checked = (providerAt: string, usage: ServerProviderUsageLimits): ServerProvider => ({
+        ...provider(usage),
+        checkedAt: providerAt,
+      });
+      const before = yield* make({ directory });
+      yield* before.record([checked(at(0), limits(at(0), 40))]);
+
+      // After a restart a streamed update (45%) and then a provider check (40%) are published
+      // between subscribe and read. The read returns the check: nothing new over the 40% on disk.
+      const after = yield* make({ directory });
+      yield* after.record([checked(at(3 * MINUTE), limits(at(3 * MINUTE), 40))]);
+      // The drain replays the older streamed update: history, but not a full read.
+      yield* after.record([checked(at(0), limits(at(2 * MINUTE), 45))]);
+      // A streamed update after the check is not full either: the replay did not take the stamps back.
+      yield* after.record([checked(at(3 * MINUTE), limits(at(4 * MINUTE), 46))]);
+      // The next provider check is full.
+      yield* after.record([checked(at(5 * MINUTE), limits(at(5 * MINUTE), 46))]);
+      // The clock steps back a day: the stamps seen before are now ahead of it, so they cannot
+      // mark what follows as a replay. A check after the step is a full read, as before.
+      yield* TestClock.setTime(NOW_MS - DAY);
+      yield* after.record([checked(at(-DAY), limits(at(-DAY), 46))]);
+      yield* after.record([checked(at(-DAY), limits(at(-DAY + MINUTE), 47))]);
+      yield* after.record([checked(at(-DAY + 2 * MINUTE), limits(at(-DAY + 2 * MINUTE), 47))]);
+
+      yield* TestClock.setTime(NOW_MS + HOUR);
+      const served = yield* after.readings(INSTANCE);
+      assert.deepStrictEqual(
+        served.map((entry) => [entry.checkedAt, entry.full === true]),
+        [
+          [at(0), false],
+          [at(2 * MINUTE), false],
+          [at(4 * MINUTE), false],
+          [at(5 * MINUTE), true],
+          [at(-DAY), true],
+          [at(-DAY + MINUTE), false],
+          [at(-DAY + 2 * MINUTE), true],
+        ],
+      );
+    }),
+  );
+
   it.effect("a restart continues the history without repeating its last reading", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(NOW_MS);
