@@ -114,8 +114,12 @@ header line left in it, or post an override for the head.
 ## The queue
 
 ```
+PR_QUEUE_READ_TOKEN=... PR_QUEUE_WRITE_TOKEN=... \
 pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 ```
+
+The action sets both tokens ("Tokens" below); a run without them is refused
+(`--dry-run` needs only the read token).
 
 One run looks at the open, non-draft pull requests with auto-merge on, oldest
 first, and acts on the first one it can:
@@ -176,11 +180,23 @@ moved between the list and the comment is told by the next run, on its new
 head. When GitHub cannot say which workflows still run on the head, the pull
 request is not called stuck: it holds the queue, and the run says why.
 
-`gh` must be logged in for the repository (`GH_TOKEN`). Git fetches into the
+Tokens: the queue uses two and never gh's own login of the machine. Every
+read (the pull request list with its checks, check runs and their
+annotations, workflow runs, reviews, git fetch) uses the run's `GITHUB_TOKEN`
+(`PR_QUEUE_READ_TOKEN`), read-only by the job's permissions ("Use it"). A
+fine-grained personal access token cannot read check runs at all (GitHub
+answers `Resource not accessible by personal access token`). The caller's
+token (`PR_QUEUE_WRITE_TOKEN`) is used only for what needs it: the branch
+update (one by `GITHUB_TOKEN` starts no workflow), auto-merge on (the merge
+it makes must start the base branch's push workflows) and off, the queue's
+comments, and the one read that asks whether the queue already posted a
+notice (`viewerDidAuthor` means that token's own login). A read GitHub
+refuses stops that step as any failed read does: nothing is decided on it,
+and the run names the permissions the job needs. Git fetches into the
 queue's own bare repository (`--cache`) and gets its login from
 `gh auth git-credential` only, never from a helper the machine configured.
 
-The token is in git's environment and `STATE` decides what is re-armed, so run
+A token is in git's environment and `STATE` decides what is re-armed, so run
 the queue on a runner (or runner group) that runs no `pull_request` job and no
 other repository's job, as a user of its own. The `--state-file` and `--cache`
 folders belong to that user alone. git runs with no hooks, no fsmonitor and no
@@ -290,9 +306,15 @@ The queue needs:
   armed while the base is quiet is still picked up;
 - a token that can update branches, comment and merge (a fine-grained personal
   access token or a GitHub App token with contents, pull requests and issues
-  write). Not the run's `GITHUB_TOKEN`: a branch update pushed with it starts
-  no workflow, so the updated pull request would never get its checks. The
-  action refuses it.
+  write, plus workflows write so a branch update can bring in the base's
+  workflow file changes), used only for those writes. Not the run's `GITHUB_TOKEN`: a branch
+  update pushed with it starts no workflow, so the updated pull request would
+  never get its checks. The action refuses it;
+- read permissions for the run's `GITHUB_TOKEN`, which does every read:
+  `actions`, `checks`, `contents`, `issues`, `pull-requests` and `statuses`,
+  all `read`. The reusable workflow's job asks for exactly these, and the
+  caller's job must grant them: a reusable workflow gets no more than its
+  caller gives, and GitHub refuses to start a called job that asks for more.
 
 ### The reusable workflow
 
@@ -308,7 +330,12 @@ permissions: {}
 jobs:
   queue:
     permissions:
+      actions: read
+      checks: read
       contents: read
+      issues: read
+      pull-requests: read
+      statuses: read
     uses: OWNER/REPO/.github/workflows/fork-pr-queue.yml@<40-hex sha>
     with:
       runs-on: '["self-hosted", "queue"]'
@@ -332,7 +359,7 @@ repository at a time, never cancelled half-way. Inputs: `runs-on`, `config`,
 ### The actions
 
 A project that writes its own job can use the action directly, after a
-checkout of its config:
+checkout of its config, in a job with the read permissions above:
 
 ```yaml
 - uses: OWNER/REPO/fork-ci/actions/pr-queue@<40-hex sha>
