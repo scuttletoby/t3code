@@ -78,7 +78,7 @@ class Checkout:
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
                                   errors=errors, capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-                                                            'GIT_ATTR_NOSYSTEM': '1'})
+                                                            'GIT_ATTR_NOSYSTEM': '1', **pr_queue.GIT_ENV})
 
     def problem(self):
         """Why the repository cannot be read as git made it, or None: not a git folder, shallow (the base's history is

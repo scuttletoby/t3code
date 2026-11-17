@@ -12,8 +12,15 @@ inputs:
 runs:
   using: composite
   steps:
+    # Before any git call, the checkout's .git config must be one actions/checkout writes (fork-ci git-clean): when it
+    # is not (one an earlier job left), no git runs and no note is written. Like a missing note, that only costs an
+    # update, so the step still passes.
     - name: Note the base this run tests
       shell: bash
       env:
         CHECKOUT_PATH: ${{ inputs.path }}
-      run: python3 -I "$GITHUB_ACTION_PATH/tested_base.py" --path "$CHECKOUT_PATH"
+      run: |
+        if python3 -I "$GITHUB_ACTION_PATH/../../git-clean/git_clean.py" check --path "$CHECKOUT_PATH" --require; then
+          exec python3 -I "$GITHUB_ACTION_PATH/tested_base.py" --path "$CHECKOUT_PATH"
+        fi
+        echo "::warning::pr_queue tested base: no note, git-clean refused the checkout's git config (above)"
