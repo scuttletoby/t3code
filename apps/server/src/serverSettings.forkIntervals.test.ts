@@ -99,6 +99,8 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))(
     it("finds every interval, each at a key path", () => {
       const { paths, outOfReach } = findDurationPaths(ServerSettings);
       // An interval inside a record or array has no fixed path for the checks below to follow.
+      // An interval widened to `NullOr` or "off" lands here too: give it a new key instead (see
+      // the never-widen rule in packages/shared/src/forkSettingsIntervals.ts).
       assert.deepStrictEqual(outOfReach, []);
       for (const known of [
         "automaticGitFetchInterval",
