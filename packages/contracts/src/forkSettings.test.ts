@@ -8,6 +8,7 @@ import {
   FORK_AGENT_WRITABLE_KEYS,
   FORK_INLINE_SERVER_KEYS,
   FORK_PATCH_RULES,
+  FORK_PERSON_ONLY_KEYS,
   FORK_PROJECT_SCOPED_KEYS,
   ForkClientSettingsFields,
   ForkProjectOverrideFields,
@@ -24,9 +25,25 @@ import {
   ServerSettingsPatch,
 } from "./settings.ts";
 import SETTINGS_SOURCE from "./settings.ts?raw";
+import { PROJECT_FILE_BACKED_SETTINGS, T3ProjectFile } from "./t3ProjectFile.ts";
 
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const PROJECT = ProjectId.make("project-1");
+
+/**
+ * Person-only keys that a repository's t3.json could set. That file is in the repo, so an agent
+ * edits it like any other file: a key read from it is agent-writable, whatever the tools allow.
+ */
+const personOnlyKeysFromRepoFile = (
+  fileFields: Readonly<Record<string, unknown>>,
+  backed: Readonly<Record<string, { readonly field: string }>>,
+) =>
+  FORK_PERSON_ONLY_KEYS.filter(
+    (key) =>
+      key in fileFields ||
+      key in backed ||
+      Object.values(backed).some((setting) => setting.field === key),
+  );
 
 const sameFields = (
   struct: Readonly<Record<string, unknown>>,
@@ -73,6 +90,19 @@ describe("fork settings seam", () => {
     );
     // No agent tool may write a fork setting until a pull request gives the reason.
     expect(FORK_AGENT_WRITABLE_KEYS).toEqual([]);
+  });
+
+  it("reads no person-only setting from the repository's t3.json", () => {
+    expect(personOnlyKeysFromRepoFile(T3ProjectFile.fields, PROJECT_FILE_BACKED_SETTINGS)).toEqual(
+      [],
+    );
+    // The check catches one: a t3.json field or a file-backed setting named like a fork key.
+    expect(personOnlyKeysFromRepoFile({ ...T3ProjectFile.fields, playtest: {} }, {})).toEqual([
+      "playtest",
+    ]);
+    expect(personOnlyKeysFromRepoFile({}, { waitChecks: { field: "scripts" } })).toEqual([
+      "waitChecks",
+    ]);
   });
 
   it("pins the fork's lines in settings.ts", () => {
