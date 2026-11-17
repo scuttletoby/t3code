@@ -298,17 +298,44 @@ describe("__fork-report on old, newer and empty state", () => {
     expect(report.ok).toBe(true);
   });
 
-  it("reports a missing home without creating it", () => {
-    const home = NodePath.join(tempDir(), "no-such-home");
+  it.effect.each([
+    ["a missing home", "no-such-home"],
+    ["a file", "a-file"],
+    ["a path through a file", NodePath.join("a-file", "sub")],
+  ] as const)("reports %s as no home, creating nothing", ([, name]) =>
+    Effect.gen(function* () {
+      const parent = tempDir();
+      NodeFS.writeFileSync(NodePath.join(parent, "a-file"), "x");
+      const before = snapshot(parent);
+
+      const { report, exitCode } = yield* reportThroughCli(NodePath.join(parent, name));
+
+      expect(snapshot(parent)).toEqual(before);
+      expect(exitCode).toBe(1);
+      expect(report.home.exists).toBe(false);
+      expect(report.database.state).toBe("missing");
+      expect(report.settings.state).toBe("missing");
+      expect(report.fork.featuresOn).toEqual([]);
+      expect(report.problems.map((problem: { code: string }) => problem.code)).toEqual([
+        "home-missing",
+      ]);
+      expect(report.ok).toBe(false);
+    }),
+  );
+
+  it("reports a userdata that is a file as no home, not as a fresh one", () => {
+    const home = tempDir();
+    NodeFS.writeFileSync(NodePath.join(home, "userdata"), "x");
+    const before = snapshot(home);
 
     const report = readForkReport(home);
 
-    expect(NodeFS.existsSync(home)).toBe(false);
-    expect(report.home.exists).toBe(false);
+    expect(snapshot(home)).toEqual(before);
+    expect(report.home.exists).toBe(true);
     expect(report.database.state).toBe("missing");
     expect(report.settings.state).toBe("missing");
-    expect(report.fork.featuresOn).toEqual([]);
     expect(report.problems.map((problem) => problem.code)).toEqual(["home-missing"]);
+    expect(report.problems[0]!.message).toContain("userdata");
     expect(report.ok).toBe(false);
   });
 
@@ -398,6 +425,68 @@ describe("__fork-report through a linked statev2.sqlite", () => {
       expect(report.ok).toBe(false);
     }
   });
+
+  it("reports a folder at statev2.sqlite, or a link to one, as an error, not as no database", () => {
+    const folder = tempDir();
+    const linked = homeWithDatabaseLink(folder);
+    const plain = tempDir();
+    NodeFS.mkdirSync(dbPathOf(plain), { recursive: true });
+
+    for (const home of [linked, plain]) {
+      const before = snapshot(home);
+
+      const report = readForkReport(home);
+
+      expect(snapshot(home)).toEqual(before);
+      expect(report.database.state).toBe("unreadable");
+      expect(report.problems.map((problem) => problem.code)).toEqual(["database-unreadable"]);
+      expect(report.problems[0]!.message).toContain("not a file");
+      expect(report.ok).toBe(false);
+    }
+  });
+
+  // Root bypasses directory permissions, so chmod cannot force EACCES.
+  it.skipIf(process.getuid?.() === 0)(
+    "names a link it may not follow as unreadable, without claiming a start would create a database",
+    () => {
+      const locked = tempDir();
+      NodeFS.writeFileSync(NodePath.join(locked, "statev2.sqlite"), "");
+      const home = homeWithDatabaseLink(NodePath.join(locked, "statev2.sqlite"));
+      NodeFS.chmodSync(locked, 0o000);
+      try {
+        const report = readForkReport(home);
+
+        expect(report.database.state).toBe("unreadable");
+        expect(report.problems.map((problem) => problem.code)).toEqual(["database-unreadable"]);
+        expect(report.problems[0]!.message).toContain("EACCES");
+        expect(report.problems[0]!.message).not.toContain("would create");
+      } finally {
+        NodeFS.chmodSync(locked, 0o755);
+      }
+    },
+  );
+
+  // Root bypasses directory permissions, so chmod cannot force EACCES.
+  it.skipIf(process.getuid?.() === 0)(
+    "reports a userdata it may not look into instead of failing",
+    () => {
+      const home = makeHome();
+      const userdata = NodePath.join(home, "userdata");
+      NodeFS.chmodSync(userdata, 0o000);
+      try {
+        const report = readForkReport(home);
+
+        expect(report.database.state).toBe("unreadable");
+        expect(report.problems.map((problem) => problem.code)).toEqual([
+          "database-unreadable",
+          "settings-unreadable",
+        ]);
+        expect(report.ok).toBe(false);
+      } finally {
+        NodeFS.chmodSync(userdata, 0o755);
+      }
+    },
+  );
 });
 
 describe("__fork-report settings", () => {
