@@ -97,7 +97,7 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     off: true,
     reason:
       "No playtest sessions and no adapter steps until a person sets them and switches it on.",
-    decidedIn: "#PR",
+    decidedIn: "#260",
   },
   {
     scope: "server",
@@ -179,7 +179,7 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     default: undefined,
     off: true,
     reason: "A project without its own adapter uses the server's playtest settings.",
-    decidedIn: "#PR",
+    decidedIn: "#260",
   },
 ];
 

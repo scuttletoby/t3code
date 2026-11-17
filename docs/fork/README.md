@@ -35,7 +35,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
 | [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}` | yes | [#PR](https://github.com/scuttletoby/t3code/issues/PR)   |
+| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}` | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
 | [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
@@ -43,7 +43,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`         | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set             | yes | [#PR](https://github.com/scuttletoby/t3code/issues/PR)   |
+| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set             | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 
