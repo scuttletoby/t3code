@@ -1,0 +1,443 @@
+{
+  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`.",
+  "config_path": ".github/pr-queue.json",
+  "globs": [
+    ["**", "a", true],
+    ["**", "a/b/c.py", true],
+    ["**", ".github/workflows/ci.yml", true],
+    ["**/*.md", "README.md", true],
+    ["**/*.md", "docs/a/b/guide.md", true],
+    ["**/*.md", "docs/guide.mdx", false],
+    ["**/*.md", ".notes/.hidden.md", true],
+    ["src/**/schema.sql", "src/schema.sql", true],
+    ["src/**/schema.sql", "src/a/b/c/schema.sql", true],
+    ["src/**/schema.sql", "src/a/schema.sql.bak", false],
+    ["src/**/schema.sql", "lib/src/schema.sql", false],
+    ["migrations/**", "migrations/0001.sql", true],
+    ["migrations/**", "migrations/a/b/0001.sql", true],
+    ["migrations/**", "migrations", true],
+    ["migrations/**", "migrationsx/0001.sql", false],
+    ["migrations/**", "old/migrations/0001.sql", false],
+    ["a/**/**/b", "a/b", true],
+    ["a/**/**/b", "a/x/y/z/b", true],
+    ["**/b/**", "b", true],
+    ["**/b/**", "x/b/y", true],
+    ["**/b/**", "x/bb/y", false],
+    ["src/*.py", "src/main.py", true],
+    ["src/*.py", "src/sub/main.py", false],
+    ["src/*.py", "src/.py", true],
+    ["src/*", "src/.env", true],
+    ["src/*", "src", false],
+    ["*", "README.md", true],
+    ["*", "docs/README.md", false],
+    ["*", ".gitignore", true],
+    ["*.py", "a/b.py", false],
+    ["*/*.py", "a/b.py", true],
+    ["*/*.py", "a/b/c.py", false],
+    ["?.py", "a.py", true],
+    ["?.py", "ab.py", false],
+    ["?.py", ".py", false],
+    ["a?b", "a/b", false],
+    ["a?b", "a.b", true],
+    ["docs/*-v?.md", "docs/guide-v2.md", true],
+    ["docs/*-v?.md", "docs/guide-v10.md", false],
+    ["Docs/**", "docs/a.md", false],
+    ["docs/**", "Docs/a.md", false],
+    [".github/workflows/**", ".github/workflows/ci.yml", true],
+    [".github/workflows/**", ".github/workflowsx/ci.yml", false],
+    [".github/workflows/**", "x/.github/workflows/ci.yml", false],
+    ["a.b+c(d)$^|x", "a.b+c(d)$^|x", true],
+    ["a.b+c(d)$^|x", "aXb+c(d)$^|x", false],
+    ["*.txt", "a\nb.txt", true],
+    ["*", "a b", true],
+    ["src/**", "src/a b/c d.py", true]
+  ],
+  "configs": {
+    "basic": {
+      "version": 1,
+      "mode": "enforce",
+      "rules": [
+        {
+          "name": "data",
+          "weight": "critical",
+          "paths": ["src/storage/**", "migrations/**"],
+          "lenses": ["data-1", "data-2"]
+        },
+        { "name": "docs", "weight": "light", "paths": ["docs/**", "**/*.md"], "lenses": [] },
+        { "name": "code", "weight": "normal", "paths": ["**"], "lenses": ["code"] }
+      ],
+      "lenses": {
+        "data-1": { "prompt": ".github/lenses/data.md" },
+        "data-2": { "prompt": ".github/lenses/data.md" },
+        "code": { "prompt": ".github/lenses/code.md" },
+        "approach": { "prompt": ".github/lenses/approach.md" }
+      },
+      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
+      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "findings": true,
+      "state_line": true
+    },
+    "two-critical": {
+      "version": 1,
+      "mode": "shadow",
+      "rules": [
+        {
+          "name": "auth",
+          "weight": "critical",
+          "paths": ["src/auth/**"],
+          "lenses": ["security-1", "security-2"]
+        },
+        {
+          "name": "data",
+          "weight": "critical",
+          "paths": ["src/**/schema.sql", "db/**"],
+          "lenses": ["data-1", "data-2"]
+        },
+        { "name": "api", "weight": "normal", "paths": ["src/api/*.py"], "lenses": ["api", "code"] },
+        { "name": "notes", "weight": "light", "paths": ["notes/*.txt", "config/*"], "lenses": [] },
+        { "name": "rest", "weight": "normal", "paths": ["*/**"], "lenses": ["code"] }
+      ],
+      "lenses": {
+        "security-1": { "prompt": "review/security.md" },
+        "security-2": { "prompt": "review/security.md" },
+        "data-1": { "prompt": "review/data.md" },
+        "data-2": { "prompt": "review/data-second.md" },
+        "api": { "prompt": "review/api.md" },
+        "code": { "prompt": "review/code.md" },
+        "approach": { "prompt": "review/approach.md" }
+      },
+      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
+      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "findings": true,
+      "state_line": true
+    },
+    "critical-last": {
+      "version": 1,
+      "mode": "enforce",
+      "rules": [
+        { "name": "light", "weight": "light", "paths": ["docs/**"], "lenses": [] },
+        { "name": "code", "weight": "normal", "paths": ["src/**"], "lenses": ["code"] },
+        {
+          "name": "everything",
+          "weight": "critical",
+          "paths": ["**"],
+          "lenses": ["deep-1", "deep-2"]
+        }
+      ],
+      "lenses": {
+        "code": { "prompt": "docs/lenses/code.md" },
+        "deep-1": { "prompt": "docs/lenses/deep.md" },
+        "deep-2": { "prompt": "docs/lenses/deep.md" },
+        "approach": { "prompt": "docs/lenses/approach.md" }
+      },
+      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
+      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "findings": false,
+      "state_line": false
+    }
+  },
+  "cases": [
+    {
+      "name": "a light-only change needs no lens",
+      "config": "basic",
+      "changes": [
+        ["M", "docs/guide.md"],
+        ["A", "src/app/README.md"]
+      ],
+      "weight": "light",
+      "lenses": [],
+      "hits": ["docs"],
+      "protected": []
+    },
+    {
+      "name": "a normal change",
+      "config": "basic",
+      "changes": [
+        ["M", "src/app/main.py"],
+        ["M", "docs/guide.md"]
+      ],
+      "weight": "normal",
+      "lenses": ["code"],
+      "hits": ["docs", "code"],
+      "protected": []
+    },
+    {
+      "name": "one critical file among normal ones needs the critical lenses only",
+      "config": "basic",
+      "changes": [
+        ["M", "src/storage/db.py"],
+        ["M", "src/app/a.py"],
+        ["M", "src/app/b.py"]
+      ],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "code"],
+      "protected": []
+    },
+    {
+      "name": "a rename out of a critical folder counts under its old path",
+      "config": "basic",
+      "changes": [["R100", "src/storage/old.py", "src/app/new.py"]],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "code"],
+      "protected": []
+    },
+    {
+      "name": "a rename into a critical folder counts under its new path",
+      "config": "basic",
+      "changes": [["R087", "src/app/a.sql", "migrations/0007.sql"]],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "code"],
+      "protected": []
+    },
+    {
+      "name": "a delete counts",
+      "config": "basic",
+      "changes": [["D", "migrations/0001.sql"]],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data"],
+      "protected": []
+    },
+    {
+      "name": "a copy counts under both paths",
+      "config": "basic",
+      "changes": [["C075", "src/storage/a.py", "src/app/a.py"]],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "code"],
+      "protected": []
+    },
+    {
+      "name": "a mode-only or type change counts",
+      "config": "basic",
+      "changes": [
+        ["M", "src/app/run.sh"],
+        ["T", "docs/link.md"]
+      ],
+      "weight": "normal",
+      "lenses": ["code"],
+      "hits": ["docs", "code"],
+      "protected": []
+    },
+    {
+      "name": "the config file itself is critical",
+      "config": "basic",
+      "changes": [["M", ".github/pr-queue.json"]],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "code"],
+      "protected": [".github/pr-queue.json"]
+    },
+    {
+      "name": "deleting the config file is critical",
+      "config": "basic",
+      "changes": [
+        ["D", ".github/pr-queue.json"],
+        ["M", "docs/guide.md"]
+      ],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "docs", "code"],
+      "protected": [".github/pr-queue.json"]
+    },
+    {
+      "name": "a lens prompt is critical though a light rule matches it",
+      "config": "basic",
+      "changes": [["M", ".github/lenses/code.md"]],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "docs"],
+      "protected": [".github/lenses/code.md"]
+    },
+    {
+      "name": "renaming a lens prompt is critical under its old path",
+      "config": "basic",
+      "changes": [["R100", ".github/lenses/code.md", "docs/old-code-lens.md"]],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "docs"],
+      "protected": [".github/lenses/code.md"]
+    },
+    {
+      "name": "a lens prompt that only the approach lens names is protected too",
+      "config": "basic",
+      "changes": [["M", ".github/lenses/approach.md"]],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "docs"],
+      "protected": [".github/lenses/approach.md"]
+    },
+    {
+      "name": "a workflow file is critical",
+      "config": "basic",
+      "changes": [
+        ["A", ".github/workflows/deploy.yml"],
+        ["M", ".github/workflows/sub/inner.yml"]
+      ],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data", "code"],
+      "protected": [".github/workflows/deploy.yml", ".github/workflows/sub/inner.yml"]
+    },
+    {
+      "name": "a folder next to the workflows is not protected",
+      "config": "basic",
+      "changes": [
+        ["M", ".github/workflowsx/a.yml"],
+        ["M", "x/.github/workflows/b.yml"]
+      ],
+      "weight": "normal",
+      "lenses": ["code"],
+      "hits": ["code"],
+      "protected": []
+    },
+    {
+      "name": "an empty diff counts as the catch-all rule, never as no lens",
+      "config": "basic",
+      "changes": [],
+      "weight": "normal",
+      "lenses": ["code"],
+      "hits": ["code"],
+      "protected": []
+    },
+    {
+      "name": "a path written twice counts once",
+      "config": "basic",
+      "changes": [
+        ["M", "src/app/a.py"],
+        ["R100", "src/app/a.py", "src/app/b.py"]
+      ],
+      "weight": "normal",
+      "lenses": ["code"],
+      "hits": ["code"],
+      "protected": []
+    },
+    {
+      "name": "two critical rules hit: the lenses of both",
+      "config": "two-critical",
+      "changes": [
+        ["M", "src/auth/login.py"],
+        ["M", "db/seed.sql"],
+        ["M", "src/api/users.py"]
+      ],
+      "weight": "critical",
+      "lenses": ["security-1", "security-2", "data-1", "data-2"],
+      "hits": ["auth", "data", "api"],
+      "protected": []
+    },
+    {
+      "name": "** in the middle matches no segment and many",
+      "config": "two-critical",
+      "changes": [
+        ["M", "src/schema.sql"],
+        ["M", "src/a/b/schema.sql"]
+      ],
+      "weight": "critical",
+      "lenses": ["data-1", "data-2"],
+      "hits": ["data"],
+      "protected": []
+    },
+    {
+      "name": "* does not cross /",
+      "config": "two-critical",
+      "changes": [
+        ["M", "src/api/v2/users.py"],
+        ["M", "notes/sub/a.txt"]
+      ],
+      "weight": "normal",
+      "lenses": ["code"],
+      "hits": ["rest"],
+      "protected": []
+    },
+    {
+      "name": "two normal rules hit: the lenses of both, each once",
+      "config": "two-critical",
+      "changes": [
+        ["M", "src/api/users.py"],
+        ["M", "lib/x.py"]
+      ],
+      "weight": "normal",
+      "lenses": ["api", "code"],
+      "hits": ["api", "rest"],
+      "protected": []
+    },
+    {
+      "name": "* matches a dotfile",
+      "config": "two-critical",
+      "changes": [
+        ["M", "config/.secret-example"],
+        ["A", "notes/.todo.txt"]
+      ],
+      "weight": "light",
+      "lenses": [],
+      "hits": ["notes"],
+      "protected": []
+    },
+    {
+      "name": "a catch-all written as */** takes a root file",
+      "config": "two-critical",
+      "changes": [["M", "README.md"]],
+      "weight": "normal",
+      "lenses": ["code"],
+      "hits": ["rest"],
+      "protected": []
+    },
+    {
+      "name": "a protected path takes the first critical rule even when another critical rule matches it",
+      "config": "two-critical",
+      "changes": [
+        ["M", "review/data.md"],
+        ["M", "db/x.sql"]
+      ],
+      "weight": "critical",
+      "lenses": ["security-1", "security-2", "data-1", "data-2"],
+      "hits": ["auth", "data", "rest"],
+      "protected": ["review/data.md"]
+    },
+    {
+      "name": "the config file among light changes",
+      "config": "two-critical",
+      "changes": [
+        ["M", "config/.github-not-protected"],
+        ["M", ".github/pr-queue.json"]
+      ],
+      "weight": "critical",
+      "lenses": ["security-1", "security-2"],
+      "hits": ["auth", "notes", "rest"],
+      "protected": [".github/pr-queue.json"]
+    },
+    {
+      "name": "the empty diff with a critical catch-all",
+      "config": "critical-last",
+      "changes": [],
+      "weight": "critical",
+      "lenses": ["deep-1", "deep-2"],
+      "hits": ["everything"],
+      "protected": []
+    },
+    {
+      "name": "a protected path inside a light folder",
+      "config": "critical-last",
+      "changes": [["M", "docs/lenses/code.md"]],
+      "weight": "critical",
+      "lenses": ["deep-1", "deep-2"],
+      "hits": ["light", "everything"],
+      "protected": ["docs/lenses/code.md"]
+    },
+    {
+      "name": "light then normal by rule order",
+      "config": "critical-last",
+      "changes": [
+        ["M", "docs/a.md"],
+        ["M", "src/b.py"]
+      ],
+      "weight": "normal",
+      "lenses": ["code"],
+      "hits": ["light", "code"],
+      "protected": []
+    }
+  ]
+}
