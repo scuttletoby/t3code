@@ -46,8 +46,9 @@ watches; it changes nothing on the machine, and `0` turns it off.
   the series sits on. A pull request is judged by its base's list, never by its own: a new seam,
   `pending` or `forkFiles` entry counts once the owner merges it. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
-  upstream (fork-follow fails above it and notes a file below it, so the ceiling is lowered). A
-  pull request may change a pending file but not grow it. An upstream file in no list may gain no
+  upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
+  also lowers the ceiling in the same change). A pull request may change a pending file but not
+  grow it. An upstream file in no list may gain no
   line, lose no line and keep its lines in order (whitespace and blank lines aside), and no
   upstream file may be deleted or renamed, except the workflows
   [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream

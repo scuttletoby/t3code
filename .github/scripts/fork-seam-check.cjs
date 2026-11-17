@@ -152,8 +152,8 @@ function forkFileTest(patterns = []) {
 
 /**
  * Changed files outside the seams. An unlisted upstream file may gain, lose or move no line, nor
- * go (unless `removed` names it). A "pending" one holds at most its ceiling from upstream, and on a
- * pull request may change but not grow. On a pull request, `isForkFile` names the fork's own files.
+ * go (unless `removed` names it). A "pending" one holds exactly its ceiling from upstream (more is
+ * refused, fewer too, so the ceiling gets lowered), and on a pull request may change but not grow. On a pull request, `isForkFile` names the fork's own files.
  */
 function findUnlistedChanges(
   config,
@@ -207,10 +207,12 @@ function findUnlistedChanges(
           `${file}: "pending" with ${added} fork lines, more than its ceiling of ${ceiling} (fork lines to move out, not add).`,
         );
       } else if (added === 0) {
-        notes.push(`${file}: "pending" with no fork lines left; remove it from the list.`);
+        // A ceiling left too high is room to swap upstream lines for fork lines later, and a note
+        // in the nightly log is never seen: refuse, naming the fix.
+        reasons.push(`${file}: "pending" with no fork lines left; remove it from the list.`);
       } else if (added < ceiling) {
-        notes.push(
-          `${file}: "pending" with ${added} fork lines; lower its ceiling from ${ceiling}.`,
+        reasons.push(
+          `${file}: "pending" with ${added} fork lines, fewer than its ceiling of ${ceiling}; lower it to ${added}.`,
         );
       }
       continue;

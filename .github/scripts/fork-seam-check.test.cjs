@@ -203,15 +203,17 @@ test("a pending file: held to its ceiling from upstream; on a pull request it ma
   const config = { pending: { "p.ts": 2 } };
   const main = { "p.ts": `${UP}forkA();\nforkB();\n` };
   assert.deepEqual(unlisted(config, { "p.ts": UP }, main, true), { reasons: [], notes: [] });
-  // From upstream, a pending file with no fork lines left is a note to take it off the list, and
-  // one with fewer than its ceiling a note to lower it.
+  // From upstream, a pending file with no fork lines left, or fewer than its ceiling, is refused:
+  // a ceiling left too high is room to swap upstream lines for fork lines later, and a note in
+  // the nightly log is never seen.
   assert.match(
-    unlisted(config, { "p.ts": UP }, { "p.ts": UP }, true).notes[0],
-    /^p\.ts: "pending" with no/,
+    unlisted(config, { "p.ts": UP }, { "p.ts": UP }, true).reasons[0],
+    /^p\.ts: "pending" with no fork lines left/,
   );
-  assert.deepEqual(unlisted(config, { "p.ts": UP }, { "p.ts": `${UP}forkA();\n` }, true).notes, [
-    'p.ts: "pending" with 1 fork lines; lower its ceiling from 2.',
-  ]);
+  assert.deepEqual(unlisted(config, { "p.ts": UP }, { "p.ts": `${UP}forkA();\n` }, true), {
+    reasons: ['p.ts: "pending" with 1 fork lines, fewer than its ceiling of 2; lower it to 1.'],
+    notes: [],
+  });
   const swap = { "p.ts": main["p.ts"].replace("forkB();", "forkC();") };
   const less = { "p.ts": `${UP}forkA();\n` };
   for (const head of [swap, less])
@@ -247,6 +249,24 @@ test("from upstream, a pending file that swapped upstream lines for fork lines i
   assert.deepEqual(unlisted(config, { "p.ts": upstreamText }, { "p.ts": swapped }, true).reasons, [
     'p.ts: "pending" with 4 fork lines, more than its ceiling of 1 (fork lines to move out, not add).',
   ]);
+});
+
+// Round-2 state lens on #277: PR 1 moves a fork line out and the ceiling stays; PR 2 swaps an
+// upstream guard for a fork line (net zero on the PR). From upstream that must be refused.
+test("from upstream, a ceiling left too high after lines moved out is refused, so a later swap cannot use it", () => {
+  const upstreamText = `${UP}if (!ok) return;\n`;
+  const config = { pending: { "p.ts": 2 } };
+  const afterMoveOut = `${upstreamText}forkA();\n`;
+  assert.deepEqual(unlisted(config, { "p.ts": upstreamText }, { "p.ts": afterMoveOut }, true).reasons, [
+    'p.ts: "pending" with 1 fork lines, fewer than its ceiling of 2; lower it to 1.',
+  ]);
+  // (So the nightly stops right after PR 1, before a PR 2 could use the spare line.)
+  // Exactly at the ceiling passes; one over is refused.
+  const one = { pending: { "p.ts": 1 } };
+  assert.deepEqual(unlisted(one, { "p.ts": upstreamText }, { "p.ts": afterMoveOut }, true), {
+    reasons: [],
+    notes: [],
+  });
 });
 
 test("a malformed config throws instead of guarding nothing", () => {
