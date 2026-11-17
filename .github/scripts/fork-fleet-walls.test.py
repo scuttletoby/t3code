@@ -1124,10 +1124,12 @@ class EveryWallsFile(WallsRunner):
         self.assertTrue(got.startswith('FAIL'), got)
 
     def test_linux_job_units_refuses_stop_timeouts_start_never_passes(self):
-        """Issue #316 item 1: a stop timeout that start()'s systemd-run never gets (one after a #, one in a quoted
-        string, on one line or across lines) or a second start() (bash runs the last one, the walls read the first)
-        must not count as start()'s own: each would let systemd's endless default pass. The walls cannot tell those:
-        FAIL. The launcher as it is (its -p words quoted or not, a ${#x} in start()) still PASSES."""
+        """Issue #316 item 1: a stop timeout that start()'s systemd-run never gets (one in a comment, a quoted string,
+        a heredoc, a $(...) or ${...} in a string) or a second start() anywhere (bash runs the last one, the walls read
+        the first) must not count as start()'s own: each would let systemd's endless default pass. A comment is
+        dropped (its timeouts never count: the default FAILs); the rest the walls cannot tell: FAIL. Each shape here
+        PASSed before the scanner held it. The launcher as it is (its -p words quoted or not), or with a timeout in a
+        comment, still PASSES."""
         real = slurp(LAUNCHER)
         both = ' -p TimeoutStopSec=90 -p TimeoutAbortSec=90 '
         self.assertEqual(real.count(both), 1)
@@ -1137,8 +1139,26 @@ class EveryWallsFile(WallsRunner):
         endless = {'etc/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'}   # the abort one:
         fake = '-p TimeoutStopSec=90 -p TimeoutAbortSec=90'
         second = (f'start() {{\n  "$SYSTEMD_RUN" -p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity -- x\n}}\n')
+        infinite = real.replace(both, ' -p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity ')
         fails = {
             'in an end-of-line comment': old.replace(at, f'\n  true # {fake}' + at),
+            'in a heredoc': old.replace(at, f'\n  cat >/dev/null <<EOF\n  {fake}\nEOF' + at),
+            'in a quoted heredoc': old.replace(at, f"\n  cat >/dev/null <<'EOF'\n  {fake}\nEOF" + at),
+            "in a $'...' with an escaped quote": old.replace(at, f"\n  echo $'\\' {fake} \\'' # '" + at),
+            'in a comment in backticks': old.replace(at, f'\n  : `# {fake} `' + at),
+            'in a string in a $(...) in a string': old.replace(at, f'\n  x="$(echo " {fake} ")"' + at),
+            'in a string, after a # line in a string': old.replace(
+                at, f'\n  echo "a\n# " >/dev/null\n  echo " {fake} " >/dev/null # "' + at),
+            'in a string, after a \\" in code': old.replace(at, f'\n  echo \\"; echo " {fake} " # "' + at),
+            'in a string, after a \\" in it': old.replace(at, f'\n  echo "x\\" {fake} \\"" # "' + at),
+            'in a string, after a case in a $(...)': old.replace(
+                at, f'\n  x="$(case a in a) echo " {fake} ";; esac)"' + at),
+            'in a string in a ${...} in a string': old.replace(at, f'\n  x="${{y:-" {fake} "}}"' + at),
+            'in a string in a $(...) after a $((...))': old.replace(at, f'\n  x="$(echo $((1)) " {fake} ")"' + at),
+            'in a ${...} with a quote': old.replace(at, f'\n  x=${{y:-"}}"" {fake} "}} # "' + at),
+            'before a } line in a string': infinite.replace(at, f'\n  : {fake}\n  echo "\n}}\n" >/dev/null' + at),
+            'a second start() after a ;': real.replace('\ncheck_net() {\n', '\n: ; ' + second.replace(
+                '\n', ' ').replace(' x }', ' x; }') + '\ncheck_net() {\n'),
             'in a double-quoted string': old.replace(at, f'\n  echo "use {fake}" >/dev/null' + at),
             'in a single-quoted string': old.replace(at, f"\n  echo 'use {fake}' >/dev/null" + at),
             'in a string across lines': old.replace(at, f'\n  echo "use\n  {fake}" >/dev/null' + at),
@@ -1152,10 +1172,12 @@ class EveryWallsFile(WallsRunner):
                 write(launcher, text)
                 got = self.job_units(endless)
                 self.assertTrue(got.startswith('FAIL'), got)
-                self.assertIn('cannot tell', got)
                 self.assertIn('start()', got)
+                if 'comment' not in name or 'backticks' in name:
+                    self.assertIn('cannot tell', got)
         for name, text in {'the launcher': real, 'the launcher, quoted': real.replace(
-                both, ' -p "TimeoutStopSec=90" -p \'TimeoutAbortSec=90\' ')}.items():
+                both, ' -p "TimeoutStopSec=90" -p \'TimeoutAbortSec=90\' '), 'the launcher, a timeout in comments':
+                real.replace(at, '\n  : # -p TimeoutStopSec=infinity\n  # -p TimeoutAbortSec=infinity' + at)}.items():
             with self.subTest(name):
                 write(launcher, text)
                 got = self.job_units(endless)

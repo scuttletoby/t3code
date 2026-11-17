@@ -541,30 +541,62 @@ def stop_defaults_used():
 
 def shell_states(code):
     """For each character of code (bash), where it is as bash reads it: 'c' code, 's' or 'd' in a single- or
-    double-quoted string, '#' in a comment. A sketch of bash's quoting (a backslash escapes the next character, a #
-    starts a comment only at a word's start; no heredocs, a quote inside $(...) in a string read as the string's
-    end): what it gets wrong only makes launcher_stops refuse more."""
-    out, state, i = [], 'c', 0
+    double-quoted string, '#' in a comment, '$' inside a $(...) or ${...} (in code or in a "..."). A sketch of bash's
+    quoting: a backslash escapes the next character (in code, "...", ${...}), a # starts a comment only at a word's
+    start, a $(...) or ${...} nests (its own quotes and comments; a "..." in it ends at its own quote). What it does not
+    model it refuses (ValueError): a heredoc (<<), a $'...', a backtick, a case in a $(...) (its pattern's ")" would end
+    the $(...)), a quote or { in a ${...}, and code that ends inside a string, a $(...) or a ${...}."""
+    for token, what in (('<<', 'a heredoc (<<)'), ("$'", "a $'...'"), ('`', 'a backtick')):
+        if token in code:
+            raise ValueError(f'start() has {what}')
+    out, stack, i = [], [['c', 0]], 0   # each frame: [state, its ( depth]; the last is where bash reads now
+
+    def mark():
+        return '#' if stack[-1][0] == '#' else '$' if any(f[0] in '({' for f in stack) else stack[-1][0]
     while i < len(code):
-        ch, mark = code[i], state
-        if state == 'c':
-            if ch == '\\':
-                out += ['c', 'c']
-                i += 2
-                continue
-            if ch in '\'"':
-                state = mark = 's' if ch == "'" else 'd'
-            elif ch == '#' and (i == 0 or code[i - 1] in ' \t\n;&|()<>'):
-                state = mark = '#'
-        elif state == 's' and ch == "'" or state == 'd' and ch == '"' or state == '#' and ch == '\n':
-            state = 'c'
-        elif state == 'd' and ch == '\\':
-            out += ['d', 'd']
-            i += 2
-            continue
-        out.append(mark)
-        i += 1
-    return ''.join(out[:len(code)])
+        ch, top = code[i], stack[-1]
+        step, here = 1, mark()
+        if top[0] == '#':
+            if ch == '\n':
+                stack.pop()
+                here = mark()
+        elif top[0] == 's':
+            if ch == "'":
+                stack.pop()
+        elif ch == '\\':
+            step = 2
+        elif ch == '$' and code[i + 1:i + 2] in ('(', '{'):
+            stack.append([code[i + 1], 0])
+            step, here = 2, '$'
+        elif top[0] == 'd':
+            if ch == '"':
+                stack.pop()
+        elif top[0] == '{':
+            if ch == '}':
+                stack.pop()
+            elif ch in '\'"{':
+                raise ValueError('start() has a quote or { in a ${...}')
+        elif ch in '\'"':
+            stack.append(['s' if ch == "'" else 'd', 0])
+            here = mark()
+        elif ch == '#' and (i == 0 or code[i - 1] in ' \t\n;&|()<>'):
+            stack.append(['#', 0])
+            here = '#'
+        elif top[0] == '(' and ch == '(':
+            top[1] += 1
+        elif top[0] == '(' and ch == ')':
+            if top[1]:
+                top[1] -= 1
+            else:
+                stack.pop()
+        out += [here] * step
+        i += step
+    if [f[0] for f in stack] not in (['c'], ['c', '#']):
+        raise ValueError('start() ends inside a string, a $(...) or a ${...}')
+    out = ''.join(out[:len(code)])
+    if any(out[m.start()] == '$' for m in re.finditer(r'(?<![\w-])case(?![\w-])', code)):
+        raise ValueError('start() has a case in a $(...)')
+    return out
 
 
 def launcher_stops():
@@ -572,28 +604,35 @@ def launcher_stops():
     systemd-run command writes them (-p Key=value, quoted or not). The walls may sit beside an older launcher (a kit
     not installed whole) whose start() gave none: systemd's defaults then decide the next job unit's (issue #297).
     This guards against such an old launcher, not a hostile one (only root writes it, and launcher_safe holds): a
-    property in another form (--property=, -pKey=) is not seen, so its default counts. A launcher not safe, no
-    start() or more than one (bash runs the last, the walls would read the first), a Timeout...= after a # or in a
-    quoted string but a -p word's own value (each would count a key systemd-run never gets; issue #316), or a value
-    written with an expansion: cannot tell. Whole-line comments are dropped first."""
+    property in another form (--property=, -pKey=) is not seen, so its default counts. Only quoting and comments are
+    modelled (shell_states): a -p Timeout...= word in code counts even when it is no systemd-run argument (an
+    `echo -p TimeoutStopSec=90`). Comments are dropped (by shell_states' marks). A launcher not safe, no start(), a
+    start() written more than once anywhere in the file (bash runs the last, the walls would read the first; a
+    comment or string that names one is refused too), what shell_states does not model, a Timeout...= in a quoted
+    string (but a -p word's own value) or in a $(...) or ${...} (each would count a key systemd-run never gets; issue
+    #316), or a value written with an expansion: cannot tell. What the sketch gets wrong only makes this refuse more."""
     fd = os.open(LAUNCHER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
     with os.fdopen(fd, 'rb') as f:
         launcher_safe(os.fstat(f.fileno()))
         text = f.read().decode('utf-8', 'replace')
-    if len(re.findall(r'^[ \t]*(?:function[ \t]+start(?![\w-])|start[ \t]*\(\))', text, re.M)) > 1:
+    if len(re.findall(r'(?<![\w-])(?:function[ \t]+start(?![\w-])(?:[ \t]*\(\))?|start[ \t]*\(\))', text)) > 1:
         raise ValueError(f'{LAUNCHER} has more than one start() (bash runs the last one)')
     start = re.search(r'^start\(\) \{\n(.*?)^\}$', text, re.M | re.S)
     if not start:
         raise ValueError(f'{LAUNCHER} has no start()')
-    code = '\n'.join(line for line in start.group(1).split('\n') if not line.lstrip().startswith('#'))
-    states = shell_states(code)
+    try:
+        states = shell_states(start.group(1))
+    except ValueError as e:
+        raise ValueError(f'{LAUNCHER}: {e}: the walls cannot tell what its systemd-run gets') from None
+    kept = [(ch, st) for ch, st in zip(start.group(1), states) if st != '#']   # comments dropped
+    code, states = ''.join(ch for ch, _ in kept), ''.join(st for _, st in kept)
     words = list(re.finditer(r'(?<!\S)-p[ \t]+(["\']?)(Timeout[A-Za-z]*)=([^\s"\']*)\1(?!\S)', code))
     words = [m for m in words if states[m.start()] == 'c']   # a -p word bash reads as code (its value may be quoted)
     for m in re.finditer(r'Timeout[A-Za-z]*=', code):
         if states[m.start()] != 'c' and m.start() not in {w.start(2) for w in words}:
             raise ValueError(f'{LAUNCHER}: start() has {m.group()} '
-                             f'{"after a #" if states[m.start()] == "#" else "in a quoted string"}: the walls cannot '
-                             'tell if its systemd-run gets it')
+                             f'{"in a $(...) or ${...}" if states[m.start()] == "$" else "in a quoted string"}: the '
+                             'walls cannot tell if its systemd-run gets it')
     lines = []
     for m in words:
         _, key, value = m.groups()
