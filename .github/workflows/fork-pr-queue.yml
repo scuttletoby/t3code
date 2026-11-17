@@ -83,6 +83,12 @@ jobs:
           fi
           echo "pr-queue from $repo at $sha"
           { echo "repo=$repo"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+      # The runner is self-hosted and reuses its workspace: an earlier run's folders (a symlink, a planted .git, files
+      # a checkout would keep) never reach this run's checkouts. rm removes a symlink, not what it points to; folders
+      # that are not there (a first run, a re-run) are fine. Test: .github/scripts/fork-pr-queue-workflow.test.py.
+      - name: Remove an earlier run's caller and toolkit folders
+        shell: bash
+        run: rm -rf -- "${GITHUB_WORKSPACE:?}/caller" "${GITHUB_WORKSPACE:?}/toolkit"
       - name: Check out the caller's config
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
