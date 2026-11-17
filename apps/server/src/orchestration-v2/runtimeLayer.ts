@@ -2,6 +2,7 @@ import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as WaitWorker from "../waits/WaitWorker.ts";
+import * as PlaytestLayer from "../playtest/PlaytestLayer.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -428,6 +429,8 @@ export const layerProduction = Layer.mergeAll(
       ),
     ),
   ),
+  // Fork (playtest): reads its file at the first call; the tool and the renew worker come later.
+  PlaytestLayer.layer.pipe(Layer.provide(layerThreadManagementProvided)),
   layerProviderContinuationWorkerProvided,
   layerAgentSessionScannerProvided,
   layerAgentSessionImporterProvided,
