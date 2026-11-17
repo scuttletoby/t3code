@@ -1,11 +1,17 @@
-// Usage: fork-seam-check.cjs [--config-ref <rev>] <base> <head>. Refuses lines <head> adds to any
-// upstream file since the merge-base beyond .github/fork-seams.json. A <base> without that list is
-// upstream; else it is a pull request's base, and the list comes from it (or --config-ref), never
-// from <head> or the working tree. Files are read as git blobs; nothing runs.
+// Usage: fork-seam-check.cjs [--config-ref <rev>] <base> <head>. Refuses <head>'s changes to any
+// upstream file since the merge-base beyond .github/fork-seams.json. A <base> without the list (and
+// no --config-ref) is upstream; else the list comes from the base (or --config-ref), never from
+// <head> or the working tree. Reads git objects only; nothing runs.
 
 const { execFileSync } = require("node:child_process");
 
 const CONFIG = ".github/fork-seams.json";
+// Upstream workflow files the fork deletes (fork-follow.sh keeps them deleted): with upstream's
+// fork-*.yml, which fork-follow makes the fork delete (that list cannot name them), the only upstream
+// files a change may delete.
+const REMOVED = ".github/fork-removed-workflows.txt";
+const REMOVED_PATH = /^\.github\/workflows\/[^/,\s]+\.ya?ml$/;
+const FORK_WORKFLOW = /^\.github\/workflows\/fork-[^/]*\.ya?ml$/;
 
 function git(args) {
   return execFileSync("git", ["-c", "core.quotePath=false", ...args], {
@@ -14,12 +20,22 @@ function git(args) {
   });
 }
 
-/** The file's text in `rev`, or undefined when `rev` has no such file. */
-function textAt(rev, file) {
+/** The tree entry for `file` in `rev` ({ type, id }), or undefined. Reads trees only. */
+function entryAt(rev, file) {
   const record = git(["ls-tree", "-z", "--full-tree", rev, "--", file]).split("\0")[0];
   const match = record.match(/^\d+ (\w+) ([0-9a-f]+)\t(.+)$/s);
-  if (!match || match[3] !== file || match[1] !== "blob") return undefined;
-  return git(["cat-file", "blob", match[2]]);
+  return match && match[3] === file ? { type: match[1], id: match[2] } : undefined;
+}
+
+/**
+ * The file's text in `rev`, or undefined when `rev` has no such file. A submodule (gitlink) reads
+ * as the line `git diff` shows for it, so a moved pointer counts as a changed line.
+ */
+function textAt(rev, file) {
+  const entry = entryAt(rev, file);
+  if (entry?.type === "commit") return `Subproject commit ${entry.id}\n`;
+  if (entry?.type !== "blob") return undefined;
+  return git(["cat-file", "blob", entry.id]);
 }
 
 /** Counts of each non-blank line, trimmed. */
@@ -41,6 +57,30 @@ function addedLines(base, head) {
 }
 
 const total = (lines) => lines.reduce((sum, [, extra]) => sum + extra, 0);
+
+/**
+ * Whether `head` keeps `base`'s lines in their order, whitespace and blank lines aside (as
+ * `git diff --ignore-all-space --ignore-blank-lines` sees no change).
+ */
+function sameLines(base, head) {
+  const lines = (text) =>
+    text
+      .split("\n")
+      .map((line) => line.replace(/\s+/g, ""))
+      .filter(Boolean);
+  const [a, b] = [lines(base), lines(head)];
+  return a.length === b.length && a.every((line, i) => line === b[i]);
+}
+
+/** The upstream workflow paths a REMOVED list names; other lines are ignored. */
+function parseRemoved(text = "") {
+  return new Set(
+    text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => REMOVED_PATH.test(line)),
+  );
+}
 
 /**
  * Reasons for the seam files' lines. A line is the fork's when `head` has it more often than `base`;
@@ -111,29 +151,43 @@ function forkFileTest(patterns = []) {
 }
 
 /**
- * Changed files outside the seams. An upstream file in no list refuses every line it gains. A
- * "pending" one is only noted from upstream; on a pull request it may change but not grow. Not from
- * upstream, the base's files that `isForkFile` names are the fork's own.
+ * Changed files outside the seams. An unlisted upstream file may gain, lose or move no line, nor
+ * go (unless `removed` names it). A "pending" one holds at most its ceiling from upstream, and on a
+ * pull request may change but not grow. On a pull request, `isForkFile` names the fork's own files.
  */
-function findUnlistedChanges(config, { changed, atBase, atHead, upstream, isForkFile }) {
+function findUnlistedChanges(
+  config,
+  { changed, atBase, atHead, upstream, isForkFile, removed = new Set() },
+) {
   const reasons = [];
   const notes = [];
-  const pending = new Set(config.pending ?? []);
+  const pending = config.pending ?? {};
+  const deleted = (file) =>
+    `${file}: upstream file this change deletes (or renames); only the workflow files ${REMOVED} lists (and upstream fork-*.yml) may go.`;
   for (const file of changed) {
-    if (Object.hasOwn(config.files, file) || pending.has(file)) continue;
+    if (Object.hasOwn(config.files, file) || Object.hasOwn(pending, file)) continue;
     const base = atBase(file);
     if (base === undefined || (!upstream && isForkFile(file))) continue;
-    const added = total(addedLines(base, atHead(file) ?? ""));
+    const head = atHead(file);
+    if (head === undefined) {
+      if (!removed.has(file) && !FORK_WORKFLOW.test(file)) reasons.push(deleted(file));
+      continue;
+    }
+    const added = total(addedLines(base, head));
+    const entry = upstream
+      ? "."
+      : ' (if it is a fork file upstream does not have, add it to "forkFiles").';
     if (added > 0) {
       reasons.push(
-        `${file}: upstream file with ${added} fork line${added === 1 ? "" : "s"} but no entry in ${CONFIG}` +
-          (upstream
-            ? "."
-            : ' (if it is a fork file upstream does not have, add it to "forkFiles").'),
+        `${file}: upstream file with ${added} fork line${added === 1 ? "" : "s"} but no entry in ${CONFIG}${entry}`,
+      );
+    } else if (!sameLines(base, head)) {
+      reasons.push(
+        `${file}: upstream file whose lines this change deletes or moves, but no entry in ${CONFIG}${entry}`,
       );
     }
   }
-  for (const file of pending) {
+  for (const [file, ceiling] of Object.entries(pending)) {
     const base = atBase(file);
     if (base === undefined) {
       reasons.push(
@@ -141,11 +195,24 @@ function findUnlistedChanges(config, { changed, atBase, atHead, upstream, isFork
       );
       continue;
     }
-    const head = atHead(file) ?? "";
+    const head = atHead(file);
+    if (head === undefined) {
+      reasons.push(deleted(file));
+      continue;
+    }
     const added = total(addedLines(base, head));
     if (upstream) {
-      if (added === 0)
+      if (added > ceiling) {
+        reasons.push(
+          `${file}: "pending" with ${added} fork lines, more than its ceiling of ${ceiling} (fork lines to move out, not add).`,
+        );
+      } else if (added === 0) {
         notes.push(`${file}: "pending" with no fork lines left; remove it from the list.`);
+      } else if (added < ceiling) {
+        notes.push(
+          `${file}: "pending" with ${added} fork lines; lower its ceiling from ${ceiling}.`,
+        );
+      }
       continue;
     }
     const grows = added - total(addedLines(head, base));
@@ -189,12 +256,17 @@ function parseConfig(text) {
       throw new Error(`${CONFIG}: ${file}: "added" must be a list of lines`);
     }
   }
-  for (const key of ["pending", "forkFiles"]) {
-    if (config[key] !== undefined && !isStringList(config[key])) {
-      throw new Error(`${CONFIG}: "${key}" must be a list of paths`);
-    }
+  if (config.forkFiles !== undefined && !isStringList(config.forkFiles)) {
+    throw new Error(`${CONFIG}: "forkFiles" must be a list of paths`);
   }
-  for (const file of config.pending ?? []) {
+  const pending = config.pending ?? {};
+  if (typeof pending !== "object" || pending === null || Array.isArray(pending)) {
+    throw new Error(`${CONFIG}: "pending" must map each path to its ceiling of fork lines`);
+  }
+  for (const [file, ceiling] of Object.entries(pending)) {
+    if (file.trim() === "" || !Number.isSafeInteger(ceiling) || ceiling < 1) {
+      throw new Error(`${CONFIG}: "pending": ${file} needs a ceiling of 1 or more fork lines`);
+    }
     if (Object.hasOwn(files, file))
       throw new Error(`${CONFIG}: ${file} is in "files" and "pending"`);
   }
@@ -209,10 +281,10 @@ function parseConfig(text) {
       throw new Error(`${CONFIG}: "forkFiles": not a repository path pattern: ${pattern}`);
     }
   }
-  return { files, pending: config.pending ?? [], forkFiles: config.forkFiles ?? [] };
+  return { files, pending, forkFiles: config.forkFiles ?? [] };
 }
 
-const hasConfig = (rev) => textAt(rev, CONFIG) !== undefined;
+const hasConfig = (rev) => entryAt(rev, CONFIG)?.type === "blob";
 
 /** Reads `<rev>:.github/fork-seams.json`; throws when that commit has none. */
 function readConfigAt(rev) {
@@ -241,18 +313,40 @@ function main(argv) {
     return 2;
   }
   const { base, head } = parsed;
-  // `base` without the list is upstream; the fork's main always has it.
-  const upstream = !hasConfig(base);
+  // `base` without the list is upstream; the fork's main always has it. --config-ref is only for
+  // a pull request's run, so it never runs from upstream.
+  const upstream = !parsed.configRef && !hasConfig(base);
+  const mergeBase = git(["merge-base", base, head]).trim();
+  if (!upstream) {
+    // A pull request's base and merge-base are the fork's: without the list, the whole old series
+    // (or a base branch that dropped the list) would count as this change's lines.
+    const stale = !hasConfig(base)
+      ? `The base ${base} has no ${CONFIG}: open the pull request against main or a branch of it.`
+      : !hasConfig(mergeBase)
+        ? `This branch predates the last rebase of its base onto upstream (the merge-base ${mergeBase.slice(0, 12)} has no ${CONFIG}). Update the branch from its base; the seam check then judges only its own lines.`
+        : undefined;
+    if (stale) {
+      console.error(stale);
+      return 1;
+    }
+  }
   const configRef = parsed.configRef ?? (upstream ? head : base);
   const config = readConfigAt(configRef);
-  const mergeBase = git(["merge-base", base, head]).trim();
+  const removed = parseRemoved(textAt(configRef, REMOVED));
   const atBase = (file) => textAt(mergeBase, file);
   const atHead = (file) => textAt(head, file);
   const changed = git(["diff", "--no-renames", "--name-only", "-z", mergeBase, head])
     .split("\0")
     .filter(Boolean);
   const isForkFile = forkFileTest(config.forkFiles);
-  const unlisted = findUnlistedChanges(config, { changed, atBase, atHead, upstream, isForkFile });
+  const unlisted = findUnlistedChanges(config, {
+    changed,
+    atBase,
+    atHead,
+    upstream,
+    isForkFile,
+    removed,
+  });
   const reasons = [
     ...findSeamBreaches(config.files, { atBase, atHead, upstream }),
     ...unlisted.reasons,
@@ -300,6 +394,8 @@ module.exports = {
   forkFileTest,
   lineCounts,
   parseConfig,
+  parseRemoved,
+  sameLines,
 };
 
 if (require.main === module) {

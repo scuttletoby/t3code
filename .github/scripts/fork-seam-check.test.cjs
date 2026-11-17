@@ -12,6 +12,8 @@ const {
   findUnlistedChanges,
   forkFileTest,
   parseConfig,
+  parseRemoved,
+  sameLines,
 } = require("./fork-seam-check.cjs");
 
 const SCRIPT = path.join(__dirname, "fork-seam-check.cjs");
@@ -62,15 +64,23 @@ test("from main, a seam line main already has cannot be added a second time", ()
 
 // An upstream file with no entry used to pass with any number of fork lines.
 const UP = "export const x = 1;\n";
-const unlisted = (config, base, head, upstream, isForkFile = forkFileTest(config.forkFiles)) =>
+const unlisted = (
+  config,
+  base,
+  head,
+  upstream,
+  isForkFile = forkFileTest(config.forkFiles),
+  removed = new Set(),
+) =>
   findUnlistedChanges(
-    { files: {}, pending: [], forkFiles: [], ...config },
+    { files: {}, pending: {}, forkFiles: [], ...config },
     {
       changed: [...new Set([...Object.keys(base), ...Object.keys(head)])],
       atBase: (file) => base[file],
       atHead: (file) => head[file],
       upstream,
       isForkFile,
+      removed,
     },
   );
 
@@ -81,10 +91,53 @@ test("an upstream file with no entry refuses every fork line, from upstream and 
     assert.equal(reasons.length, 1);
     assert.match(reasons[0], /^u\.ts: upstream file with 1 fork line but no entry/);
   }
-  // Unchanged, only re-indented, or only losing lines: nothing added.
-  for (const after of [UP, `  ${UP}\n\n`, ""]) {
+  // Unchanged, re-indented, blank lines or CRLF line ends: no change to judge.
+  for (const after of [UP, `  ${UP}\n\n`, UP.replace("\n", "\r\n")]) {
     assert.deepEqual(unlisted({}, { "u.ts": UP }, { "u.ts": after }, false).reasons, []);
   }
+});
+
+// A guard line deleted, or moved below what it guards, adds no line.
+test("an upstream file with no entry refuses lines it loses or moves, from upstream and from main", () => {
+  const guarded = "if (!authorized) return;\ndoSensitive();\n";
+  for (const after of ["doSensitive();\n", "doSensitive();\nif (!authorized) return;\n", ""]) {
+    for (const upstream of [true, false]) {
+      const { reasons } = unlisted({}, { "u.ts": guarded }, { "u.ts": after }, upstream);
+      assert.equal(reasons.length, 1, JSON.stringify(after));
+      assert.match(reasons[0], /^u\.ts: upstream file whose lines this change deletes or moves/);
+    }
+  }
+  assert.equal(sameLines("a b\n\nc\n", "  ab\r\nc"), true);
+  assert.equal(sameLines("a\nb\n", "b\na\n"), false);
+});
+
+// A rename shows as a deleted upstream file plus a new file, so a
+// `git mv` (or a delete plus a rewrite under a fork name) hid any upstream file from the check.
+test("an upstream file the change deletes is refused, unless it is a listed removed workflow", () => {
+  const workflow = ".github/workflows/up.yml";
+  const base = { "u.ts": UP, [workflow]: "on: push\n" };
+  for (const upstream of [true, false]) {
+    const { reasons } = unlisted({}, base, { "fork/u.ts": UP }, upstream);
+    assert.deepEqual(
+      reasons.map((reason) => reason.split(":")[0]),
+      ["u.ts", workflow],
+    );
+    assert.match(reasons[0], /upstream file this change deletes \(or renames\)/);
+    assert.deepEqual(
+      unlisted({}, base, { "u.ts": UP }, upstream, undefined, new Set([workflow])).reasons,
+      [],
+    );
+  }
+  // Upstream's fork-*.yml, which fork-follow makes the fork delete and the list cannot name.
+  const sneaky = ".github/workflows/fork-sneaky.yml";
+  assert.deepEqual(unlisted({}, { [sneaky]: "on: push\n" }, {}, true).reasons, []);
+  // A pull request may still delete the fork's own files.
+  assert.deepEqual(unlisted({}, { "fork/x.ts": UP }, {}, false).reasons, []);
+  // Only workflow paths count in the list of removed files.
+  assert.deepEqual(
+    [...parseRemoved(`# comment\n${workflow}\nsrc/auth.ts\n .github/workflows/b.yaml \n`)],
+    [workflow, ".github/workflows/b.yaml"],
+  );
 });
 
 test("fork files pass: new in the change, named as the fork's, or in forkFiles", () => {
@@ -146,18 +199,22 @@ test("from upstream, a fork pattern that matches an upstream file fails until ex
   );
 });
 
-test("a pending file: noted from upstream, and on a pull request it may change but not grow", () => {
-  const config = { pending: ["p.ts"] };
+test("a pending file: held to its ceiling from upstream; on a pull request it may change but not grow", () => {
+  const config = { pending: { "p.ts": 2 } };
   const main = { "p.ts": `${UP}forkA();\nforkB();\n` };
   assert.deepEqual(unlisted(config, { "p.ts": UP }, main, true), { reasons: [], notes: [] });
-  // From upstream, a pending file with no fork lines left is a note to take it off the list.
+  // From upstream, a pending file with no fork lines left is a note to take it off the list, and
+  // one with fewer than its ceiling a note to lower it.
   assert.match(
     unlisted(config, { "p.ts": UP }, { "p.ts": UP }, true).notes[0],
     /^p\.ts: "pending" with no/,
   );
+  assert.deepEqual(unlisted(config, { "p.ts": UP }, { "p.ts": `${UP}forkA();\n` }, true).notes, [
+    'p.ts: "pending" with 1 fork lines; lower its ceiling from 2.',
+  ]);
   const swap = { "p.ts": main["p.ts"].replace("forkB();", "forkC();") };
   const less = { "p.ts": `${UP}forkA();\n` };
-  for (const head of [swap, less, {}])
+  for (const head of [swap, less])
     assert.deepEqual(unlisted(config, main, head, false).reasons, []);
   const grown = { "p.ts": `${main["p.ts"]}forkC();\nforkD();\n` };
   assert.deepEqual(unlisted(config, main, grown, false).reasons, [
@@ -168,6 +225,28 @@ test("a pending file: noted from upstream, and on a pull request it may change b
     unlisted(config, {}, main, false).reasons[0],
     /^p\.ts: "pending" in .*, but the base does not have it/,
   );
+  // Deleting it hides it, like any upstream file.
+  for (const upstream of [true, false]) {
+    assert.match(
+      unlisted(config, main, {}, upstream).reasons[0],
+      /^p\.ts: upstream file this change deletes/,
+    );
+  }
+});
+
+// A pull request is only measured against main, so swapping N
+// upstream lines for N fork lines passed it, and from upstream pending files were never measured.
+test("from upstream, a pending file that swapped upstream lines for fork lines is over its ceiling", () => {
+  const upstreamText = `${UP}// one\n// two\nguard();\n`;
+  const main = `${upstreamText}forkA();\n`;
+  const swapped = `${UP}forkA();\nforkB();\nforkC();\nforkD();\n`;
+  const config = { pending: { "p.ts": 1 } };
+  // On the pull request: net zero against main, so it passes there ...
+  assert.deepEqual(unlisted(config, { "p.ts": main }, { "p.ts": swapped }, false).reasons, []);
+  // ... and the nightly run from upstream refuses it.
+  assert.deepEqual(unlisted(config, { "p.ts": upstreamText }, { "p.ts": swapped }, true).reasons, [
+    'p.ts: "pending" with 4 fork lines, more than its ceiling of 1 (fork lines to move out, not add).',
+  ]);
 });
 
 test("a malformed config throws instead of guarding nothing", () => {
@@ -177,9 +256,13 @@ test("a malformed config throws instead of guarding nothing", () => {
     { files: { "a.ts": { added: [] } } },
     { files: { "a.ts": { why: "x", added: "y" } } },
     { files: {}, pending: "a.ts" },
-    { files: {}, pending: [""] },
+    { files: {}, pending: ["a.ts"] },
+    { files: {}, pending: { "": 1 } },
+    { files: {}, pending: { "a.ts": 0 } },
+    { files: {}, pending: { "a.ts": 1.5 } },
+    { files: {}, pending: { "a.ts": "3" } },
     { files: {}, forkFiles: [1] },
-    { files: SEAM, pending: ["a.ts"] },
+    { files: SEAM, pending: { "a.ts": 1 } },
     ...["/abs", "../up", "**", "*", "!", "a/../b"].map((pattern) => ({
       files: {},
       forkFiles: [pattern],
@@ -189,7 +272,7 @@ test("a malformed config throws instead of guarding nothing", () => {
   }
   assert.deepEqual(parseConfig(JSON.stringify({ files: SEAM })), {
     files: SEAM,
-    pending: [],
+    pending: {},
     forkFiles: [],
   });
 });
@@ -337,7 +420,7 @@ test("every upstream file counts on the command line, from upstream and from mai
     const upstream = commit({ "u.ts": UP, "p.ts": UP, ...BASE }, "upstream");
     const series = commit(
       {
-        ...seams({ files: SEAM, pending: ["p.ts"] }),
+        ...seams({ files: SEAM, pending: { "p.ts": 1 } }),
         "p.ts": `${UP}forkOld();\n`,
         "fork/own.ts": UP,
       },
@@ -363,5 +446,145 @@ test("every upstream file counts on the command line, from upstream and from mai
     const oldMain = commit(seams({ files: SEAM }), "main with an older list");
     const touch = commit({ "u.ts": `${UP}forkNew();\n`, "fork/x.ts": UP }, "pr");
     assert.match(run(oldMain, touch).stderr, /- u\.ts: upstream file with 1 fork line/);
+  });
+});
+
+// Pins the hidden-file call in main(); turning it off used to pass every test.
+test("from upstream, an upstream file named like a fork file fails on the command line until excluded", () => {
+  withRepo(({ commit, run }) => {
+    const upstream = commit({ "src/forkJoin.ts": UP, ...BASE }, "upstream");
+    const series = commit(seams({ files: SEAM }), "fork series");
+    const refused = run(upstream, series);
+    assert.equal(refused.status, 1, refused.stdout);
+    assert.match(
+      refused.stderr,
+      /- src\/forkJoin\.ts: upstream has it, but .* "!src\/forkJoin\.ts"/,
+    );
+    const fixed = commit(seams({ files: SEAM, forkFiles: ["!src/forkJoin.ts"] }), "exclude it");
+    assert.equal(run(upstream, fixed).status, 0);
+  });
+});
+
+// Both cases passed in both modes before.
+test("a rename or delete cannot hide an upstream file, from upstream or on a pull request", () => {
+  withRepo(({ dir, git, commit, run }) => {
+    const workflow = ".github/workflows/up.yml";
+    const upstream = commit(
+      {
+        "src/auth.ts": "export const auth = (user) => user.admin;\n",
+        "src/unlisted.ts": UP,
+        "src/uses.ts": 'import { auth } from "./auth";\n',
+        [workflow]: "on: push\n",
+        ...BASE,
+      },
+      "upstream",
+    );
+    const main = commit(
+      { ...seams({ files: SEAM, forkFiles: ["src/forkstuff/"] }), "fork/own.ts": UP },
+      "fork main",
+    );
+    git("checkout", "-q", "-b", "rewrite", main);
+    git("rm", "-q", "src/auth.ts");
+    const rewritten = commit(
+      {
+        "src/fork-auth.ts": "export const auth = () => true;\n",
+        "fork/uses.ts": 'import { auth } from "../src/fork-auth";\n',
+      },
+      "delete and rewrite under a fork name",
+    );
+    git("checkout", "-q", "-b", "moved", main);
+    fs.mkdirSync(path.join(dir, "src/forkstuff"));
+    git("mv", "src/unlisted.ts", "src/forkstuff/unlisted.ts");
+    const moved = commit(
+      { "src/forkstuff/unlisted.ts": `${UP}evil();\n` },
+      "git mv into forkFiles",
+    );
+    for (const [head, file] of [
+      [rewritten, "src/auth.ts"],
+      [moved, "src/unlisted.ts"],
+    ]) {
+      for (const base of [main, upstream]) {
+        const result = run(base, head);
+        assert.equal(result.status, 1, `${file} from ${base === main ? "main" : "upstream"}`);
+        assert.match(result.stderr, new RegExp(`- ${file}: upstream file this change deletes`));
+      }
+    }
+    // A workflow the fork lists as removed may go.
+    git("checkout", "-q", "-b", "drop-workflow", main);
+    const dropped = commit(
+      { [workflow]: null, ".github/fork-removed-workflows.txt": `${workflow}\n` },
+      "delete a listed upstream workflow",
+    );
+    assert.equal(run(upstream, dropped).status, 0);
+  });
+});
+
+// A submodule pointer read as no file, so moving it passed.
+test("a moved submodule pointer in an upstream path is a changed line", () => {
+  withRepo(({ dir, git, commit, run }) => {
+    // Staged by hand: `git add -A` in commit() would drop a pointer with no folder on disk.
+    const pointer = (sha, files = {}) => {
+      for (const [file, text] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+        fs.writeFileSync(path.join(dir, file), text);
+        git("add", file);
+      }
+      git("update-index", "--add", "--cacheinfo", `160000,${sha},.repos/lib`);
+      git("commit", "-q", "-m", `pointer ${sha.slice(0, 7)}`);
+      return git("rev-parse", "HEAD").trim();
+    };
+    commit(BASE, "start");
+    const upstream = pointer("1".repeat(40));
+    const main = pointer("1".repeat(40), seams({ files: SEAM }));
+    const moved = pointer("2".repeat(40));
+    for (const base of [upstream, main]) {
+      const result = run(base, moved);
+      assert.equal(result.status, 1, result.stdout);
+      assert.match(result.stderr, /- \.repos\/lib: upstream file with 1 fork line/);
+    }
+  });
+});
+
+// After fork-follow moves main onto a newer upstream commit, an
+// older branch's merge-base is upstream's, and its run counted the whole old series as its own.
+test("a branch from before the base's last rebase gets one 'update the branch' error", () => {
+  withRepo(({ git, commit, run }) => {
+    const upstream = commit({ "p.ts": UP, ...BASE }, "upstream");
+    const series = { ...seams({ files: SEAM }), "p.ts": `${UP}forkOld();\nforkOlder();\n` };
+    const oldMain = commit(series, "fork series");
+    const pr = commit({ "fork/new.ts": UP }, "pull request");
+    git("checkout", "-q", "-b", "upstream-later", upstream);
+    commit({ "later.ts": UP }, "upstream later");
+    const newMain = commit(series, "fork series, rebased");
+    for (const args of [
+      [newMain, pr],
+      ["--config-ref", newMain, newMain, pr],
+    ]) {
+      const result = run(...args);
+      assert.equal(result.status, 1, args.join(" "));
+      assert.match(
+        result.stderr,
+        /^This branch predates the last rebase of its base onto upstream/,
+      );
+      assert.equal(result.stderr.trim().split("\n").length, 1, result.stderr);
+    }
+    assert.equal(run(oldMain, pr).status, 0);
+  });
+});
+
+// With --config-ref, a stacked pull request whose base branch
+// deleted the list was judged from upstream, where pending files are not measured.
+test("with --config-ref, a base without the list is refused, not taken for upstream", () => {
+  withRepo(({ commit, run }) => {
+    commit({ "p.ts": UP, ...BASE }, "upstream");
+    const main = commit(
+      { ...seams({ files: SEAM, forkFiles: ["fork-x/"] }), "p.ts": `${UP}forkA();\n` },
+      "fork main",
+    );
+    const noList = commit({ [CONFIG]: null }, "base branch drops the list");
+    const grown = commit({ "p.ts": `${UP}forkA();\nforkB();\n` }, "grow it");
+    const result = run("--config-ref", main, noList, grown);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr, /^The base .* has no \.github\/fork-seams\.json/);
   });
 });

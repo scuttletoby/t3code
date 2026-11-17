@@ -318,8 +318,8 @@ check "plan: rebasing onto a release with an upstream fork-*.yml is refused and 
   eval '[[ -z "$(out action)" ]] && has "named like the fork.s own" "$root/report.md" && has "fork-sneaky.yml" "$root/report.md"'
 new_fork v0.1.11
 plan
-check "plan: same base with an upstream fork-*.yml is refused too" \
-  eval '[[ -z "$(out action)" ]] && has "fork-sneaky.yml" "$root/report.md"'
+check "plan: same base with an upstream fork-*.yml is refused too, with the workflow advice" \
+  eval '[[ -z "$(out action)" ]] && has "named like the fork.s own" "$root/report.md" && has "fork-sneaky.yml" "$root/report.md"'
 (cd "$root/work" && git rm -q .github/workflows/fork-sneaky.yml && git commit -q -m "fork: drop upstream fork-sneaky" \
   && git push -q origin main) > /dev/null 2>&1
 plan
