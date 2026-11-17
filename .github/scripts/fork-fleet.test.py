@@ -3460,7 +3460,7 @@ class LauncherAsRoot(unittest.TestCase):
             self.assertEqual(f.read(), JOB_WRITES)
         unit = f'fork-fleet-{name}.service'
         shown = subprocess.run(['systemctl', 'show', '-p', 'TimeoutStopUSec', '-p', 'TimeoutAbortUSec', unit],
-                               capture_output=True, text=True, timeout=60).stdout.split()
+                               capture_output=True, text=True, timeout=60).stdout.splitlines()
         self.assertEqual(sorted(shown), ['TimeoutAbortUSec=1min 30s', 'TimeoutStopUSec=1min 30s'])
         import importlib.machinery
         loader = importlib.machinery.SourceFileLoader('walls_linux', os.path.join(HERE, 'fork-fleet-walls', 'linux'))
