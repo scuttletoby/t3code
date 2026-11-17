@@ -220,6 +220,7 @@ A pool:
 | `label`   | dispatcher | the pool's own label; each job also gets `<label>-<job key>-<16 hex>-a<attempt>`                                      |
 | `beacon`  | dispatcher | the repository variable its dispatcher writes its heartbeat to (`{"at": <unix time>, "free": <slots>}`)               |
 | `launch`  | dispatcher | the command the dispatcher starts and stops runners with (`.github/fork-fleet.md`)                                    |
+| `retired` | dispatcher | labels it had before, each also in `retired_labels`, no pool's label now and no other pool's (below)                  |
 | `static`  | static     | `true`: runners registered by hand and always there; no dispatcher, no heartbeat                                      |
 | `runs_on` | static     | its runners' labels, at least one not generic (`self-hosted`, `linux`, `x64`, ...); no dispatcher or retired label    |
 
@@ -254,6 +255,9 @@ that uses only the action has neither. So:
 
 - **Old runner labels:** keep the old label on its runners, and in `retired_labels`, for a week after a pool's label
   changes. Runs routed before the change queue on it and still find a runner.
+- **Old registrations:** list the old label in that pool's `retired` too. Its dispatcher then deletes the offline
+  registrations it made under the old label (`<old label>-<job id>`), as it does under the new one. It never touches
+  an online one, nor one under another pool's label. Without `retired`, delete them by hand.
 - **Removing a pool:** take it out of every job's `avoid` too (a config that still names it is refused, and the error
   names the pool).
 - **Queued runs on a removed label** wait until GitHub drops them (24 hours). Cancel such a run by hand and re-run
