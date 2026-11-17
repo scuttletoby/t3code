@@ -38,7 +38,7 @@ export interface RefreshTarget {
   readonly enabled: boolean;
   readonly snapshot: Pick<
     ManagedServerProvider,
-    "getSnapshot" | "isAwaitingFirstCheck" | "refreshUsage"
+    "getSnapshot" | "isAwaitingFirstCheck" | "checksOnInterval" | "refreshUsage"
   >;
 }
 
@@ -170,6 +170,11 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
       const refreshUsage = target.snapshot.refreshUsage;
       if (!target.enabled || refreshUsage === undefined) continue;
       if (target.snapshot.isAwaitingFirstCheck && (yield* target.snapshot.isAwaitingFirstCheck)) {
+        continue;
+      }
+      // Upstream's loop skips some healthy instances: a check of a healthy OpenCode one
+      // starts an OpenCode server. Skip them too.
+      if (target.snapshot.checksOnInterval && !(yield* target.snapshot.checksOnInterval)) {
         continue;
       }
       const before = yield* target.snapshot.getSnapshot;

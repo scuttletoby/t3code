@@ -23,6 +23,8 @@ export interface ManagedServerProvider {
   readonly getSnapshot: Effect.Effect<ServerProvider>;
   /** True while getSnapshot still returns the placeholder from before the first completed check. */
   readonly isAwaitingFirstCheck?: Effect.Effect<boolean>;
+  /** False while the interval loop skips this instance, such as a healthy OpenCode one. */
+  readonly checksOnInterval?: Effect.Effect<boolean>;
   readonly refresh: Effect.Effect<ServerProvider>;
   readonly refreshUsage?: Effect.Effect<void, ServerSettingsError>;
   readonly streamChanges: Stream.Stream<ServerProvider>;
