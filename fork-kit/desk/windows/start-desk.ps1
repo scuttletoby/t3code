@@ -2,6 +2,7 @@
 # (fork-kit/desk/README.md, "Windows"). Run it in a normal Windows PowerShell window (not as administrator):
 #   powershell -ExecutionPolicy Bypass -File start-desk.ps1 -Repo OWNER/REPO -Sha RELEASE_SHA -MachineFile machine.json
 #     [-FleetConfig fork-fleet.json] [-Distro fork-desk] [-MemoryGB N] [-SwapGB 4] [-Uninstall]
+# -MemoryGB is the least [wsl2] memory cap: a higher one already in .wslconfig is kept.
 # It prints this PC's facts and asks before it changes anything. Safe to run again: every step checks what is there.
 # Steps: the distro (Ubuntu 24.04); .wslconfig's [wsl2] memory cap and NAT (a dated copy of the old file is kept;
 # other keys stay); the distro's own settings (the WSL walls: no interop, no Windows PATH or drives, its own
@@ -161,6 +162,18 @@ function Merge-WslConfig([string]$path, $want, [scriptblock]$before = {}) {   # 
   Move-Item -LiteralPath "$path.new" $path -Force
   $true
 }
+# A [wsl2] memory= value in kB (8GB, 8192MB, 8G; no unit: bytes), or -1 when it is not a size
+function CapKb([string]$v) {
+  if ($v -notmatch '^\s*([0-9]{1,13})\s*([KMGT]?)B?\s*$') { return [long]-1 }
+  [long][math]::Min(1e15, [math]::Floor([double]$Matches[1] * [math]::Pow(1024, ' KMGT'.IndexOf($Matches[2].ToUpper())) / 1024))
+}
+# The memory cap to want: at least $gb GB. A higher one already in .wslconfig (a person raised it) is kept as it is
+# written, so it is neither lowered nor a FAIL, and the live check holds WSL to it.
+function WantMemory([string]$path, [int]$gb) {
+  $have = (Wsl2Keys (Read-WslConfig $path))['memory']
+  if ($have -and (CapKb $have) -ge [long]$gb * 1048576) { return $have }
+  "${gb}GB"
+}
 function WslVersion([string[]]$lines, [string]$name) {   # the WSL version of one distro in `wsl -l -v`; 0: not there
   foreach ($l in $lines) {
     $f = @(($l.Trim([char]0, ' ', '*', "`t") -replace [char]0, '') -split '\s+')
@@ -211,7 +224,7 @@ try {
   $ours = Test-Path -LiteralPath $Made
   if ($have -and -not $ours) { wsl.exe -d $Distro -u root --cd / -- test -e /etc/fork-kit/desk-distro; $ours = $LASTEXITCODE -eq 0 }
 
-  $want = [ordered]@{ memory = "${MemoryGB}GB"; swap = "${SwapGB}GB"; networkingMode = 'nat'; dnsTunneling = 'true'; guiApplications = 'false' }
+  $want = [ordered]@{ memory = (WantMemory $WslConfig $MemoryGB); swap = "${SwapGB}GB"; networkingMode = 'nat'; dnsTunneling = 'true'; guiApplications = 'false' }
   $changes = @(Changes (Read-WslConfig $WslConfig) $want)
   Write-Host ''
   Write-Host "Next: the distro $Distro; .wslconfig (for ALL your WSL distros; a dated copy is kept):" -ForegroundColor Yellow
@@ -250,7 +263,7 @@ try {
   $changed
   Remove-Item -LiteralPath $Made -ErrorAction SilentlyContinue   # the distro's own mark is there now
   # The live state decides, not only what this run changed: a run stopped before its shutdown restarts next time
-  $live = @(InDistro 'the running settings' ("WANT_KB=$([long]$MemoryGB * 1048576)`n" + $Live))
+  $live = @(InDistro 'the running settings' ("WANT_KB=$(CapKb $want.memory)`n" + $Live))
   $up = [double]((wsl.exe -d $Distro -u root --cd / -- cat /proc/uptime) -split ' ')[0]
   if ((Test-Path $WslConfig) -and ((Get-Date) - (Get-Item -LiteralPath $WslConfig).LastWriteTime).TotalSeconds -lt $up) {
     $live += 'restart: .wslconfig is newer than the running WSL'
