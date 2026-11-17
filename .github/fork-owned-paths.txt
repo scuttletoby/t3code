@@ -28,6 +28,9 @@ fork-kit/
 !.github/scripts/fork-vitest-gc-check.cjs
 !.github/fork-fleet.json
 
+# The fork's changes list; fork-changes-list.test.cjs (the `workflows` job) checks it against forkDefaults.ts.
+FORK_CHANGES.md
+
 # The secret scan's settings; the `secrets` job runs on every pull request.
 .gitleaks.toml
 .gitleaksignore

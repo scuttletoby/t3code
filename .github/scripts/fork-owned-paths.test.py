@@ -159,17 +159,17 @@ with tempfile.TemporaryDirectory(prefix="fork-owned-paths-") as tmp:
 REAL = owned([
     "fork-ci/actions/pr-queue/pr_queue.py", "fork-kit/heavy/heavy", ".github/scripts/fork-fleet-walls.py",
     ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py", ".github/fork-ci-tests.txt",
-    ".gitleaks.toml",
+    ".gitleaks.toml", "FORK_CHANGES.md",
     # never
     ".github/fork-owned-paths.txt", ".github/scripts/fork-owned-paths.cjs", ".github/workflows/fork-tests.yml",
     ".github/workflows/fork-checks.yml", ".github/actions/ci-changes/action.yml", ".github/scripts/ci-changes.cjs",
     ".github/scripts/fork-fleet.py", ".github/scripts/fork-test-shards.cjs", ".github/scripts/fork-vitest-gc-check.cjs",
     ".github/fork-fleet.json", "fork-ci/package.json", "fork-kit/x/tsconfig.json", "package.json", "apps/web/src/a.ts",
-    "docs/fork/README.md", "scripts/release-smoke.ts", "FORK_CHANGES.md", "fork-ci", "fork-cix/a",
+    "docs/fork/README.md", "scripts/release-smoke.ts", "fork-ci", "fork-cix/a",
 ])
 want_owned = {p for p in REAL if p.startswith(("fork-ci/actions", "fork-kit/heavy")) or p in {
     ".github/scripts/fork-fleet-walls.py", ".github/scripts/fork-fleet-walls/linux", ".github/scripts/fork_workflow_expr.py",
-    ".github/fork-ci-tests.txt", ".gitleaks.toml"}}
+    ".github/fork-ci-tests.txt", ".gitleaks.toml", "FORK_CHANGES.md"}}
 check("list: the fork's own folders and scripts are fork-owned; the rest, and every NEVER path, are not",
       {p for p, v in REAL.items() if v} == want_owned, json.dumps({p: v for p, v in REAL.items() if v != (p in want_owned)}))
 check("list: NEVER wins over a line that owns everything under .github/",
