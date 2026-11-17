@@ -108,7 +108,7 @@ queue = by_name.get("Run the queue") or {}
 check("steps: refuse, remove the old folders, the caller's config, the toolkit, the queue, in that order",
       steps == [first, clean, caller, toolkit, queue], ", ".join(str(s.get("name")) for s in steps))
 
-# The runner is self-hosted and its workspace is reused (#411): an earlier run's caller/ or toolkit/ (a symlink, a
+# The runner is self-hosted and its workspace is reused: an earlier run's caller/ or toolkit/ (a symlink, a
 # planted .git, files checkout would keep) never reaches this run's checkouts.
 check("the removal is one bash step with no expression in its script",
       set(clean) == {"name", "shell", "run"} and clean.get("shell") == "bash" and "${{" not in str(clean.get("run")),

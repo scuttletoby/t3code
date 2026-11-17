@@ -13,7 +13,7 @@
 # checks the workflow, fork-owned-reads.test.py greps those files). Pushes to main and release runs always run every
 # job.
 
-# The fork's composite actions and host kits: only the `workflows`, `walls_tests` and `kit_tests` jobs read them.
+# The fork's composite actions and host kits: only the `workflows`, `action_tests` and `kit_tests` jobs read them.
 fork-ci/
 fork-kit/
 

@@ -1,8 +1,8 @@
 # Every test file under .github/scripts, fork-ci and fork-kit (*.test.*, subdirectories included) and
 # where it runs (.github/scripts/fork-ci-tests.cjs checks this list).
-#   <test>                  run by Fork tests (fork-kit/ in the kit job, the fleet walls' in
-#                           the walls job, the rest in the workflows job), by extension
-#                           (sh, py, cjs, mjs, js)
+#   <test>                  run by Fork tests (fork-kit/ in the kit job, fork-ci/ and the
+#                           fleet walls' in the action job, the rest in the workflows job),
+#                           by extension (sh, py, cjs, mjs, js)
 #   <test> ~<seconds>s      the same, with its usual time on CI: the longest start first.
 #                           Tests without one start before them. A test over 30 s without
 #                           one, or far from its weight, gets a note in the log to fix it.

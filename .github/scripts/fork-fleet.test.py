@@ -4091,7 +4091,7 @@ class Wiring(unittest.TestCase):
         job = self.tests['jobs']['workflows']
         self.assertEqual(job['runs-on'], HOSTED)
         runs = [st.get('run') for st in job['steps']]
-        # -v: the log names every test, a skipped one with its reason (#408).
+        # -v: the log names every test, a skipped one with its reason.
         root = runs.index('sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py -v LauncherAsRoot')
         # check-net's test needs the real nft, which the hosted image may lack: installed in a step before it.
         self.assertTrue(any('apt-get install -y -qq nftables' in (r or '') for r in runs[:root]), runs)

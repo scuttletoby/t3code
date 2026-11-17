@@ -260,7 +260,7 @@ check("workflow: the runner routing gets the fork-only gates on a fork-only pull
 
 # Jobs that run on a fork-only pull request: they test the fork's own files (Lint too: `vp check` formats and lints
 # every file, the fork's included, and knip reads .github/**/*.cjs). Every other job is an app job.
-RUNS = {"outside_pr", "changes", "fleet_watch", "workflows", "walls_tests", "kit_tests", "secrets", "lint",
+RUNS = {"outside_pr", "changes", "fleet_watch", "workflows", "action_tests", "kit_tests", "secrets", "lint",
         "fork_ci_result"}
 app_jobs = sorted(set(jobs) - RUNS)
 check("workflow: the app jobs are the ones this switch is for",

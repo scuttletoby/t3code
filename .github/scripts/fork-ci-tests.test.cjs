@@ -180,16 +180,17 @@ const callsByJob = (text) => {
   );
 };
 
-// The fleet walls' tests are about a third of the script tests' time (#209): in a job of their own, each of the
-// three jobs stays well under its time limit. One call per job: two calls in one job run one after the other.
-test("Fork tests run the script tests in three jobs: the kits, the fleet walls, and the rest with the lint", () => {
+// The composite actions' and fleet walls' tests are about two thirds of the non-kit script tests' time: in a job
+// of their own, each of the three jobs stays well under its time limit. One call per job: two calls in one job run
+// one after the other.
+test("Fork tests run the script tests in three jobs: the kits, the actions with the walls, the rest", () => {
   const root = path.resolve(__dirname, "../..");
   const calls = callsByJob(
     fs.readFileSync(path.join(root, ".github/workflows/fork-tests.yml"), "utf8"),
   );
   assert.deepEqual(calls, {
-    workflows: [["!fork-kit/", "!.github/scripts/fork-fleet-walls"]],
-    walls_tests: [[".github/scripts/fork-fleet-walls"]],
+    workflows: [["!fork-kit/", "!fork-ci/", "!.github/scripts/fork-fleet-walls"]],
+    action_tests: [["fork-ci/", ".github/scripts/fork-fleet-walls"]],
     kit_tests: [["fork-kit/"]],
   });
 });
