@@ -189,7 +189,10 @@ def unenterable(up, cache, error, caller='run'):
                 f"someone else's, so this cache is refused. Fix: {another_cache(caller)} you can enter and only you "
                 'or root can write')
     # realpath resolves what it can (a folder it cannot enter ends it): the lowest folder of that whose stat works
-    blocked = os.path.dirname(os.path.realpath(up))   # is the one without x
+    try:
+        blocked = os.path.dirname(os.path.realpath(up))   # is the one without x
+    except OSError:   # it failed itself (a link changing at the wrong moment): the path as written, still a refusal
+        blocked = os.path.dirname(up)
     while True:
         try:
             st = os.stat(blocked)
