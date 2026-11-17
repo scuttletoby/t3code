@@ -157,7 +157,7 @@ Two more things limit what a job can do:
   (the router's admin page and every port forwarded back into the home answer
   there; looked up at `OWN_ADDRESS_URLS`, two by default, before every start
   and on a dispatcher pass once the last answer is `OWN_ADDRESS_SECONDS` old,
-  2 minutes by default). Every address any lookup gives is blocked (two
+  2 minutes by default, counted from when it was asked). Every address any lookup gives is blocked (two
   WAN links each show another one), and the last 4 stay blocked, so one lookup
   that is down opens nothing. When the address changes while jobs run,
   `refresh-net` re-applies the table and adds the new address to each running
@@ -205,9 +205,11 @@ Two more things limit what a job can do:
   minutes (a job that ignores SIGTERM would run on past its limit), in a
   drop-in, or as systemd's own default (`system.conf`: the first of `/etc`,
   `/run`, `/usr/local/lib` and `/usr/lib`, and every `system.conf.d`) while a
-  job unit an older launcher started is still loaded (the launcher gives each
-  job unit its own stop timeouts, 90 s, so the default decides nothing for the
-  units it starts now); and a
+  job unit an older launcher started is still loaded, or while the installed
+  launcher is such an older one (the walls read its `start()`: the launcher
+  gives each job unit its own stop timeouts, 90 s, so the default decides
+  nothing for the units it starts now; an endless one of a unit's own fails
+  too); and a
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
   drops it anywhere else. On WSL2 they also read every property the launcher gives a job's unit
