@@ -142,17 +142,16 @@ def mount_points():
 
 
 def source(path, entries):
-    """(device, folder inside that filesystem) that `path` (a real path) is, by the mount that holds it: the last of
-    the longest mount points at or above it. A bind of `<home>/userdata` at `/b` makes `/b/x` ('8:1',
-    '<home>/userdata/x'). None when no mount holds it (a list without '/')."""
-    best = None
-    for dev, root, point in entries:
+    """(device, folder inside that filesystem) that `path` (a real path) is, by the mount on top at it: the LAST mount
+    in the list's order whose mount point is at or above it, not the longest point (a mount made on a parent after a
+    mount below it hides that one; a later mount on the same point covers an earlier one). A bind of
+    `<home>/userdata` at `/b` makes `/b/x` ('8:1', '<home>/userdata/x'). None when no mount holds it (a list without
+    '/')."""
+    for dev, root, point in reversed(entries):
         point = os.path.normpath(point)
-        if os.path.commonpath([path, point]) == point and (best is None or len(point) >= len(best[2])):
-            best = (dev, root, point)
-    if best is None:
-        return None
-    return best[0], os.path.normpath(os.path.join(best[1], os.path.relpath(path, best[2])))
+        if os.path.commonpath([path, point]) == point:
+            return dev, os.path.normpath(os.path.join(root, os.path.relpath(path, point)))
+    return None
 
 
 def for_this_os():
