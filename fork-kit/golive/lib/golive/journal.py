@@ -71,12 +71,25 @@ def _fsync_dir(path):
 
 
 @contextlib.contextmanager
-def lock(state_dir, command, exclusive, wait=False):
+def lock(state_dir, command, exclusive, wait=False, create=True):
     """Hold the kit's lock for a command; Busy when a changing run (or, for one, any command) holds it.
-    wait=True blocks until the lock is free instead (the guard waits for the run it watches to end)."""
-    _ensure_dir(state_dir)
+    wait=True blocks until the lock is free instead (the guard waits for the run it watches to end).
+    create=False (shared only; `status`, which writes nothing): no state folder or lock file is made; with no lock
+    file no golive run has ever taken the lock here, so it goes on without one."""
+    if exclusive and not create:
+        raise ValueError('a changing run makes its lock file')
     path, _ = _paths(state_dir)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    if create:
+        _ensure_dir(state_dir)
+    try:
+        fd = os.open(path, (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY) | os.O_CLOEXEC, 0o600)
+    except FileNotFoundError:
+        if create:
+            raise
+        fd = None
+    if fd is None:
+        yield
+        return
     try:
         try:
             fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if wait else fcntl.LOCK_NB))
