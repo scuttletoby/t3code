@@ -59,6 +59,7 @@ CFG_RAW = {
 CFG = config.parse(json.dumps(CFG_RAW))
 REVIEW = lens.Review(CFG.bot_logins, CFG.override_prefix, CFG.override_association, CFG.lens_author_associations)
 H1, H2, H3 = 'a1' * 20, 'b2' * 20, 'c3' * 20   # shas for the lens-read rules only (no git)
+TOKENS = {Q.READ_TOKEN: 'run-token', Q.WRITE_TOKEN: 'pat-token'}   # stand-ins: no real token is ever read here
 LENS = 'lens'   # built at run time: no line of this file starts with the lens marker
 READ_AT = r'(?i)read at\s*:|\blens\s*:'
 
@@ -305,7 +306,7 @@ class Base(unittest.TestCase):
 
     def update(self, fake, dry=False, q=None):
         q = q or self.q
-        q.gh = fake
+        q.gh = q.gh_write = fake
         return run_quiet(q.update, 7, dry)
 
     def plan_exists(self):
@@ -608,7 +609,7 @@ class ReviewFlagsQuery(unittest.TestCase):
 class Main(Base):
     def main(self, fake, dry=False, q=None):
         q = q or self.q
-        q.gh = fake
+        q.gh = q.gh_write = fake
         return run_quiet(q.main, dry)
 
     @staticmethod
@@ -760,7 +761,7 @@ class Recover(Base):   # a run killed after its disarm
     def recover(self, fake, state, q=None):
         q = q or self.q
         Q.write_text(q.state, state if isinstance(state, str) else json.dumps(state))   # as the queue writes it
-        q.gh = fake
+        q.gh = q.gh_write = fake
         return run_quiet(q.recover)
 
     def plan(self, **kw):
@@ -957,7 +958,7 @@ class Recover(Base):   # a run killed after its disarm
         os.makedirs(os.path.dirname(self.q.state), mode=0o700, exist_ok=True)
         os.symlink(target, self.q.state)
         f = self.fake(armed=False, h1=self.up)
-        self.q.gh = f
+        self.q.gh = self.q.gh_write = f
         code, out = run_quiet(self.q.recover)
         self.assertEqual((code, f.calls, f.armed), (1, [], None), out)
         self.assertIn('ERROR: unreadable', out)
@@ -969,7 +970,7 @@ class Recover(Base):   # a run killed after its disarm
         f = self.fake(armed=False, h1=self.up)
         Q.write_text(self.q.state, json.dumps(self.plan()))
         os.chmod(self.q.state, 0o664)   # group-writable: anyone in the group could have written this plan
-        self.q.gh = f
+        self.q.gh = self.q.gh_write = f
         code, out = run_quiet(self.q.recover)
         self.assertEqual((code, f.calls, f.armed), (1, [], None), out)
         self.assertIn('ERROR: untrusted', out)
@@ -996,7 +997,7 @@ class Recover(Base):   # a run killed after its disarm
     def test_an_unfinished_recover_ends_the_run(self):   # no other PR may overwrite the STATE
         f = self.fake(armed=False, fail=('view',))
         self.q.write_state(self.plan())
-        self.q.gh = f
+        self.q.gh = self.q.gh_write = f
         self.assertEqual(run_quiet(self.q.main)[0], 1)
         self.assertNotIn('list', f.order())
         self.assertTrue(self.plan_exists())
@@ -1011,7 +1012,7 @@ class Recover(Base):   # a run killed after its disarm
             self.assertFalse(self.plan_exists())
             with open(bad) as b:
                 self.assertEqual(b.read(), junk)
-        self.q.gh = self.fake()
+        self.q.gh = self.q.gh_write = self.fake()
         code, out = run_quiet(self.q.recover)
         self.assertEqual(code, 0, 'the next runs go on')
         self.assertIn('WARNING: ' + bad, out, 'and say it every run while the file is there')
@@ -1022,7 +1023,7 @@ class Recover(Base):   # a run killed after its disarm
         shutil.rmtree(os.path.dirname(self.q.lock), ignore_errors=True)   # e.g. a lock in /tmp, gone after a reboot
         q = make_queue(self.w.dir, remote=self.w.remote)   # the next run: a new process, the same --state-file
         f.head = self.up
-        q.gh = f
+        q.gh = q.gh_write = f
         code, out = run_quiet(q.main)
         self.assertEqual(code, 0, out)
         self.assertEqual((f.armed, f.comments), (self.up, []), 'the next run finishes the PR')
@@ -1247,7 +1248,7 @@ class RedChecks(unittest.TestCase):
                     'contexts': {'nodes': [{'__typename': 'CheckRun', 'name': name, 'status': 'COMPLETED',
                                             'conclusion': 'SUCCESS', 'startedAt': '2026-11-09T00:00:00Z'}]}}}}}}))
             raise AssertionError(a)
-        self.q.gh = gh
+        self.q.gh = self.q.gh_write = gh
         self.q.update = lambda n, d: self.updated.append(n) or 0
         return run_quiet(self.q.run, dry)[0]
 
@@ -1369,7 +1370,7 @@ class StuckUpToDate(unittest.TestCase):
             if a[0] == 'api' and '/check-runs?' in a[1] and self.q.cfg.head_check_app:   # the gate App's: none
                 return ok('{"total_count": 0, "check_runs": []}')
             raise AssertionError(a)
-        self.q.gh = gh
+        self.q.gh = self.q.gh_write = gh
         self.q.update = lambda n, d: self.updated.append(n) or 0
         return run_quiet(self.q.run, dry)
 
@@ -1491,7 +1492,7 @@ class UnknownMergeState(unittest.TestCase):
                                        'createdAt': f'2026-11-07T00:00:0{n}Z', 'headRefOid': f'{n}' * 40,
                                        'baseRefName': 'main'} for n in (1, 2)]))
             raise AssertionError(a)
-        self.q.gh = gh
+        self.q.gh = self.q.gh_write = gh
         self.q.update = lambda n, d: self.updated.append(n) or 0
         return run_quiet(self.q.run, False)
 
@@ -1577,7 +1578,7 @@ class RedOnOldBase(unittest.TestCase):
                 return ok(json.dumps({'data': {'repository': {'object': {'oid': sha, 'statusCheckRollup': {
                     'contexts': {'pageInfo': {'hasNextPage': more}, 'nodes': nodes}}}}}}))
             raise AssertionError(a)
-        self.q.gh = gh
+        self.q.gh = self.q.gh_write = gh
         self.q.update = lambda n, d: self.updated.append((n, d)) or 0
         return run_quiet(self.q.run, dry)
 
@@ -1701,7 +1702,7 @@ class RedOnOldBase(unittest.TestCase):
                             ([{'title': Q.TESTED_BASE, 'message': 'main'}], 'names 0 tested bases'),
                             ([{'title': 'lint', 'message': 'x'}] * 100, 'may be on a later page')):
             with self.subTest(said=said):
-                self.q.gh = lambda *a, n=notes: ok(json.dumps(n))
+                self.q.gh = self.q.gh_write = lambda *a, n=notes: ok(json.dumps(n))
                 got, out = run_quiet(self.q.tested_base, {'name': 'build', 'detailsUrl': url})
                 self.assertIsNone(got)
                 self.assertIn(said, out)
@@ -1749,12 +1750,12 @@ class Admin(unittest.TestCase):
         return self.w.commit({'w.py': text, 'm.txt': 'a\n'}, [parent])
 
     def update(self, fake):
-        self.q.gh = fake
+        self.q.gh = self.q.gh_write = fake
         return run_quiet(self.q.update, 7)
 
     def main(self, fake, q=None):
         q = q or self.q
-        q.gh = fake
+        q.gh = q.gh_write = fake
         return run_quiet(q.main)
 
 
@@ -1869,7 +1870,7 @@ class Islands(unittest.TestCase):
         self.read = w.commit({'w.py': islands('wipe_island')}, [self.m0])   # what the lenses read
 
     def update(self, fake):
-        self.q.gh = fake
+        self.q.gh = self.q.gh_write = fake
         return run_quiet(self.q.update, 7)
 
 
@@ -1958,7 +1959,7 @@ class AFailedRecoverIsNotDropped(Islands):
         seven = QueueGh(self.w, self.read, self.w.merge(self.read, self.m1), comments=[lens_at('correctness', self.read)])
         f = TwoPrs(seven, h9, view_fails=1)
         self.q.write_state({'repo': REPO, 'pr': 9, 'old': h9, 'base': 'main', 'read': h9})   # killed after PR 9's disarm
-        self.q.gh = f
+        self.q.gh = self.q.gh_write = f
         run_quiet(self.q.main)   # recover: `pr view 9` fails (HTTP 502)
         self.assertTrue(os.path.exists(self.q.state), 'STATE for PR 9 was dropped')
         self.assertEqual((seven.armed, seven.updated), (self.read, False), 'PR 7 was updated meanwhile')
@@ -2024,7 +2025,7 @@ class ArmWaitsOutTheQueuedCheckRace(Base):
                 q = make_queue(self.w.dir, config.parse(json.dumps({**CFG_RAW, 'wait_seconds': wait,
                                                                     'poll_seconds': poll})), sleeps, self.w.remote)
                 f = self.fake(arm_says=[QUEUED] * 50, armed=False)
-                q.gh = f
+                q.gh = q.gh_write = f
                 r = run_quiet(q.arm, 7, self.up)[0]
                 self.assertEqual((r.returncode, sleeps, len(self.arms(f))), (1, waits, len(waits) + 1))
                 self.assertLessEqual(sum(sleeps), wait)
@@ -2067,7 +2068,7 @@ class ArmWaitsOutTheQueuedCheckRace(Base):
     def test_the_next_run_waits_out_the_race_too(self):   # recover(): the same arm, the same rule
         self.q.write_state({'repo': REPO, 'pr': 7, 'old': self.c, 'base': 'main', 'read': self.c})
         f = self.fake(armed=False, arm_says=[QUEUED, QUEUED])
-        self.q.gh = f
+        self.q.gh = self.q.gh_write = f
         code, out = run_quiet(self.q.recover)
         self.assertEqual((code, f.armed, f.comments, self.sleeps), (0, self.c, [], [5, 10]), out)
         self.assertFalse(self.plan_exists())
@@ -2075,7 +2076,7 @@ class ArmWaitsOutTheQueuedCheckRace(Base):
     def test_the_next_run_says_it_once_when_the_check_stays_queued(self):
         self.q.write_state({'repo': REPO, 'pr': 7, 'old': self.c, 'base': 'main', 'read': self.c})
         f = self.fake(armed=False, arm_says=[QUEUED] * 50)
-        self.q.gh = f
+        self.q.gh = self.q.gh_write = f
         code, out = run_quiet(self.q.recover)
         self.assertEqual((code, f.armed, len(f.comments), self.sleeps), (0, None, 1, [5, 10, 15, 20]), out)
         self.assertIn('is queued', f.comments[0])
@@ -2123,7 +2124,7 @@ class Conflict(unittest.TestCase):
                 self.posted.append(a[-1])
                 return failed('boom') if 'comment' in fail else ok()
             raise AssertionError(a)
-        self.q.gh = gh
+        self.q.gh = self.q.gh_write = gh
         self.q.update = lambda n, d: self.updated.append(n) or 0
         code, self.out = run_quiet(self.q.run, dry)
         return code
@@ -2188,7 +2189,7 @@ class Conflict(unittest.TestCase):
         self.assertIn('merge conflict with main', self.posted[0])
 
     def test_an_odd_base_name_is_not_quoted(self):
-        self.q.gh = None
+        self.q.gh = self.q.gh_write = None
         self.posted = []
         listed = [dict(self.listed(7, 'DIRTY', self.H), baseRefName='x`\nlens: y')]
 
@@ -2200,7 +2201,7 @@ class Conflict(unittest.TestCase):
                                       'comments': []}))
             self.posted.append(a[-1])
             return ok()
-        self.q.gh = gh
+        self.q.gh = self.q.gh_write = gh
         run_quiet(self.q.run, False)
         self.assertIn('merge conflict with its base on', self.posted[0])
 
@@ -2337,7 +2338,7 @@ class InlineReviewComments(Base):
 
     def test_the_inline_comments_reach_the_rules_with_their_own_flags_and_time(self):
         f = self.fake(inline=[self.lens(self.c, when='2026-11-07T12:00:00Z', n=5)])
-        self.q.gh = f
+        self.q.gh = self.q.gh_write = f
         pr = self.q.view(7, reviews=True)
         self.assertEqual(pr[lens.REVIEW_COMMENTS], [{
             'body': f'{LENS}: correctness · reviewer: x · read at: {self.c}\nfindings: none',
@@ -2470,7 +2471,7 @@ class Arm(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         q = make_queue(d, config.parse(json.dumps({**CFG_RAW, **change})))
         calls = []
-        q.gh = lambda *a: calls.append(a) or ok()
+        q.gh = q.gh_write = lambda *a: calls.append(a) or ok()
         q.arm(7, H1)
         return calls[0]
 
@@ -2535,7 +2536,7 @@ class StackedPrsAreRetargetedNeverClosed(unittest.TestCase):
         d = tempfile.mkdtemp(prefix='pr-queue-stack-')
         self.addCleanup(shutil.rmtree, d, True)
         q = make_queue(d, config.parse(json.dumps({**CFG_RAW, 'delete_branch': delete_branch})))
-        q.gh = gh
+        q.gh = q.gh_write = gh
         return q
 
     def test_a_stacked_child_is_retargeted_by_githubs_setting_not_closed(self):
@@ -2579,20 +2580,36 @@ class StackedPrsAreRetargetedNeverClosed(unittest.TestCase):
 
 
 class GitCalls(unittest.TestCase):
-    def test_git_gets_the_login_from_gh_only_and_never_prompts(self):
+    def git_call(self, read=None, write=None):
         d = tempfile.mkdtemp(prefix='pr-queue-git-')
         self.addCleanup(shutil.rmtree, d, True)
         q = make_queue(d)
+        q.read_token, q.write_token = read, write
         seen = []
-        with unittest.mock.patch.object(Q.subprocess, 'run', lambda argv, **kw: seen.append((argv, kw)) or ok()):
+        env = {'GH_TOKEN': 'machine-token', 'GITHUB_TOKEN': 'other-token', Q.WRITE_TOKEN: 'pat-token'}
+        with unittest.mock.patch.object(Q.subprocess, 'run', lambda argv, **kw: seen.append((argv, kw)) or ok()), \
+                unittest.mock.patch.dict(os.environ, env):
             q.git('fetch', 'x')
         (argv, kw), = seen
+        return q, argv, kw['env']
+
+    def test_git_gets_the_login_from_gh_only_and_never_prompts(self):
+        q, argv, env = self.git_call('run-token', 'pat-token')
         self.assertEqual(argv[:13], ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
                                      '-c', 'core.commitGraph=false', '--no-replace-objects',
                                      '-c', 'credential.https://github.com.helper=',
                                      '-c', 'credential.https://github.com.helper=!gh auth git-credential', '--git-dir'])
         self.assertEqual(argv[13:], [q.cache, 'fetch', 'x'])
-        self.assertEqual(kw['env']['GIT_TERMINAL_PROMPT'], '0')
+        self.assertEqual(env['GIT_TERMINAL_PROMPT'], '0')
+
+    def test_git_fetches_with_the_read_token_only(self):   # gh auth git-credential answers with GH_TOKEN
+        q, argv, env = self.git_call('run-token', 'pat-token')
+        self.assertEqual({k: env[k] for k in Q.TOKEN_VARS if k in env}, {'GH_TOKEN': 'run-token'})
+
+    def test_with_no_read_token_git_gets_no_login_at_all(self):   # not the machine's gh login either
+        q, argv, env = self.git_call()
+        self.assertNotIn('credential.https://github.com.helper=!gh auth git-credential', argv)
+        self.assertEqual([k for k in Q.TOKEN_VARS if k in env], [])
 
     def test_the_empty_helper_resets_any_helper_the_machine_set(self):   # git's rule, checked on this git
         d = tempfile.mkdtemp(prefix='pr-queue-git-')
@@ -2627,6 +2644,234 @@ class GitVersion(unittest.TestCase):
     def test_this_git_is_new_enough(self):   # the tests above need merge-tree --write-tree too
         self.assertIsNone(Q.git_problem())
 
+    def test_git_version_and_the_caches_git_init_get_no_token(self):   # local gits: no login, so no token at all
+        env = {k: f'{k.lower()}-value' for k in Q.TOKEN_VARS}
+        seen = []
+        def run(argv, **kw):
+            seen.append((argv, kw.get('env')))
+            return ok('git version 2.47.0')
+        d = tempfile.mkdtemp(prefix='pr-queue-env-')
+        self.addCleanup(shutil.rmtree, d, True)
+        q = make_queue(d)
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(Q.subprocess, 'run', run):
+            Q.git_problem(run)
+            q.own_cache()
+        inits = [e for argv, e in seen if 'init' in argv]
+        self.assertTrue(inits, seen)
+        for argv, e in seen[:1] + [(None, e) for e in inits]:
+            self.assertIsNotNone(e, 'a git without env= gets every token of this process')
+            self.assertEqual([k for k in Q.TOKEN_VARS if k in e], [])
+
+
+# --- two tokens: reads with the run's GITHUB_TOKEN, writes with the caller's token ----------------------------------
+class OnlyWritesUseTheCallersToken(unittest.TestCase):
+    """The caller's token (a fine-grained PAT) cannot read check results: a read moved to it fails quietly (the queue
+    waits behind a PR it can no longer judge). So every call made with it is one of these, by its source."""
+    WRITES = {('pr', 'comment'), ('pr', 'merge'), ('pr', 'update-branch')}
+
+    def test_every_call_with_the_callers_token_is_a_write_or_the_one_view(self):
+        import ast
+        with open(Q.__file__, encoding='utf-8') as f:
+            tree = ast.parse(f.read())
+        writes, by_view = [], []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            if isinstance(f, ast.Attribute) and f.attr == 'gh_write':
+                writes.append(tuple(a.value if isinstance(a, ast.Constant) else '?' for a in node.args[:2]))
+            for kw in node.keywords:
+                if isinstance(kw.value, ast.Attribute) and kw.value.attr in ('gh_write', 'write_token'):
+                    by_view.append((getattr(f, 'attr', '?'), kw.arg, [k.arg for k in node.keywords]))
+            if isinstance(f, ast.Attribute) and f.attr == 'run_gh' and node.args and \
+                    isinstance(node.args[0], ast.Attribute) and node.args[0].attr == 'write_token':
+                self.assertEqual(node.args[-1].value if isinstance(node.args[-1], ast.Constant) else None, 'write')
+        self.assertTrue(writes)
+        self.assertLessEqual(set(writes), self.WRITES, 'a call other than a write uses the caller\'s token')
+        # The one read with it: tell's view (viewerDidAuthor needs the poster's login); VIEW asks for no check result.
+        self.assertEqual(by_view, [('view', 'gh', ['gh'])])
+        self.assertNotIn('statusCheckRollup', Q.VIEW)
+
+PAT_CANNOT = ('GraphQL: Resource not accessible by personal access token (repository.pullRequests.nodes.0.'
+              'statusCheckRollup.contexts.nodes.0)')
+RUN_CANNOT = 'GraphQL: Resource not accessible by integration (enablePullRequestAutoMerge)'
+WRITES = (('pr', 'merge'), ('pr', 'comment'), ('pr', 'update-branch'), ('pr', 'edit'), ('pr', 'close'))
+
+
+def reads_checks(a):
+    """A gh call that reads check runs or statuses (a fine-grained personal access token may not: GitHub has no Checks
+    permission for it)."""
+    text = ' '.join(a)
+    return (a[:2] == ('pr', 'list') and 'statusCheckRollup' in text) or a[:2] in (('run', 'list'), ('pr', 'checks')) \
+        or (a[:1] == ('api',) and ('check-runs' in text or 'statusCheckRollup' in text or '/statuses' in text))
+
+
+class GitHubTokens:
+    """GitHub's token rules around a fake gh: the personal access token cannot read check contexts, the run's
+    GITHUB_TOKEN (read-only by the job's permissions) cannot write, and without `run_reads_checks` the run's token
+    lacks the checks permission too. calls: (token, args) in order."""
+    def __init__(self, fake, run_reads_checks=True):
+        self.fake, self.run_reads_checks, self.calls = fake, run_reads_checks, []
+
+    def as_token(self, token):
+        def gh(*a):
+            self.calls.append((token, a))
+            if token == 'pat' and reads_checks(a):
+                return failed(PAT_CANNOT)
+            if token == 'run' and (a[:2] in WRITES or not self.run_reads_checks and reads_checks(a)):
+                return failed(RUN_CANNOT.replace('enablePullRequestAutoMerge', 'statusCheckRollup'))
+            return self.fake(*a)
+        return gh
+
+    def wire(self, q):
+        q.gh, q.gh_write = self.as_token('run'), self.as_token('pat')
+
+    def of(self, token):
+        return [a for t, a in self.calls if t == token]
+
+
+class TwoTokens(Base):
+    """Every read uses the run's token and only writes use the caller's (the personal access token cannot read check
+    runs: a caller's queue failed every run on its `gh pr list`). Each test fails when the queue reads with the PAT or
+    writes with the run's token."""
+    def queue_run(self, f, **kw):
+        tokens = GitHubTokens(f, **kw)
+        tokens.wire(self.q)
+        code, out = run_quiet(self.q.main)
+        return tokens, code, out
+
+    def test_the_queue_updates_and_rearms_though_the_pat_cannot_read_checks(self):
+        f = self.fake(polls=1)
+        tokens, code, out = self.queue_run(f)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f.order(), ['list', 'disarm', 'update', 'arm'], out)
+        self.assertEqual(f.armed, self.up)
+        self.assertNotIn('Resource not accessible', out)
+
+    def test_reads_never_use_the_pat(self):
+        tokens, code, out = self.queue_run(self.fake())
+        self.assertEqual(code, 0, out)
+        self.assertEqual([QueueGh.kind(a) for a in tokens.of('pat')], ['disarm', 'update', 'arm'])
+        self.assertTrue(any(a[:2] == ('pr', 'list') for a in tokens.of('run')))
+        self.assertEqual([a for a in tokens.of('run') if a[:2] in WRITES], [])
+
+    def test_the_branch_update_uses_the_pat(self):   # one by GITHUB_TOKEN would start no workflow
+        tokens, code, out = self.queue_run(self.fake())
+        self.assertIn(('pat', ('pr', 'update-branch', '7', '--repo', REPO)), tokens.calls)
+        self.assertNotIn('update-branch', [a[1] for a in tokens.of('run')])
+
+    def test_a_check_read_the_run_token_may_not_make_stops_the_run_and_changes_nothing(self):
+        f = self.fake()
+        tokens, code, out = self.queue_run(f, run_reads_checks=False)
+        self.assertEqual(code, 1, out)
+        self.assertIn('gh pr list failed: GraphQL: Resource not accessible by integration', out)
+        self.assertEqual(tokens.of('pat'), [], 'nothing written, and no read retried with the PAT')
+        self.assertEqual((f.armed, f.updated, f.comments), (self.c, False, []))
+        self.assertFalse(self.plan_exists())
+
+
+class TellAsThePoster(unittest.TestCase):
+    """tell() says why an armed PR waits once per head: "told" is a comment of the queue's own login
+    (viewerDidAuthor), and that is the login of the token that posts, not the run's GITHUB_TOKEN."""
+    H = 'd4' * 20
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix='pr-queue-tell-')
+        self.addCleanup(shutil.rmtree, d, True)
+        self.q = make_queue(d)
+        self.posted = []
+
+        def fake_for(token):
+            def gh(*a):
+                if a[:2] == ('pr', 'view'):   # viewerDidAuthor is true only when the poster reads
+                    return ok(json.dumps({'headRefOid': self.H, 'comments': [
+                        {'body': b, 'viewerDidAuthor': token == 'pat'} for b in self.posted]}))
+                if a[:2] == ('pr', 'comment'):
+                    self.posted.append(a[a.index('--body') + 1])
+                    return ok()
+                raise AssertionError(a)
+            return gh
+        self.q.gh, self.q.gh_write = fake_for('run'), fake_for('pat')
+
+    def test_a_reason_is_said_once_per_head(self):
+        for _ in range(3):
+            run_quiet(self.q.tell_red, 7, self.H, 'review-check')
+        self.assertEqual(len(self.posted), 1, self.posted)
+
+
+class GhProcesses(unittest.TestCase):
+    """The real gh calls: each gh process gets exactly one token as GH_TOKEN (the read token for gh, the write token for
+    gh_write) and no other token of the environment; with no token gh is not started."""
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix='pr-queue-tokens-')
+        self.addCleanup(shutil.rmtree, self.d, True)
+        os.makedirs(os.path.join(self.d, 'bin'))
+        self.log, self.mode = os.path.join(self.d, 'gh.log'), os.path.join(self.d, 'mode')
+        fake = os.path.join(self.d, 'bin', 'gh')
+        with open(fake, 'w') as f:   # GitHub's rules: the PAT cannot read checks; mode 'no-checks': nor can the run's
+            f.write(f'#!{sys.executable} -I\n' + '''import json, os, sys
+a, env = sys.argv[1:], os.environ
+names = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'PR_QUEUE_READ_TOKEN',
+         'PR_QUEUE_WRITE_TOKEN')
+with open(LOG, 'a') as log:
+    log.write(json.dumps({'args': a, 'tokens': {k: env[k] for k in names if k in env}}) + '\\n')
+token, text, mode = env.get('GH_TOKEN'), ' '.join(a), open(MODE).read() if os.path.exists(MODE) else ''
+checks = 'statusCheckRollup' in text or 'check-runs' in text or a[:2] == ['run', 'list']
+if checks and (token == 'pat-token' or mode == 'no-checks'):
+    sys.exit(print('GraphQL: Resource not accessible by ' + ('personal access token' if token == 'pat-token'
+                   else 'integration') + ' (repository.pullRequests.nodes.0.statusCheckRollup)', file=sys.stderr) or 1)
+if a[:2] in (['pr', 'merge'], ['pr', 'comment'], ['pr', 'update-branch']) and token != 'pat-token':
+    sys.exit(print('GraphQL: Resource not accessible by integration (updatePullRequestBranch)', file=sys.stderr) or 1)
+print('[]' if a[:2] == ['pr', 'list'] else '{}')
+'''.replace('LOG', repr(self.log)).replace('MODE', repr(self.mode)))
+        os.chmod(fake, 0o755)
+        env = {'PATH': os.path.join(self.d, 'bin') + os.pathsep + os.environ['PATH'], 'GH_TOKEN': 'machine-token',
+               'GITHUB_TOKEN': 'other-token', Q.READ_TOKEN: 'run-token', Q.WRITE_TOKEN: 'pat-token'}
+        patch = unittest.mock.patch.dict(os.environ, env)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def queue(self, read='run-token', write='pat-token'):
+        q = make_queue(self.d)
+        q.read_token, q.write_token = read, write
+        return q
+
+    def logged(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return [json.loads(line) for line in f]
+
+    def test_reads_get_the_run_token_and_writes_the_pat_and_nothing_else(self):
+        q = self.queue()
+        r = q.gh('pr', 'list', '--repo', REPO, '--json', Q.LIST)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, '[]'), r.stderr)
+        self.assertEqual(q.gh_write('pr', 'update-branch', '7', '--repo', REPO).returncode, 0)
+        self.assertEqual([(c['args'][:2], c['tokens']) for c in self.logged()],
+                         [(['pr', 'list'], {'GH_TOKEN': 'run-token'}), (['pr', 'update-branch'], {'GH_TOKEN': 'pat-token'})])
+
+    def test_with_no_token_gh_is_not_started(self):   # never the machine's own gh login
+        q = self.queue(None, None)
+        self.assertEqual(q.gh('pr', 'list', '--repo', REPO).returncode, 1)
+        self.assertEqual(q.gh_write('pr', 'update-branch', '7').returncode, 1)
+        self.assertEqual(self.logged(), [])
+
+    def test_a_read_without_the_permission_stops_the_run_with_a_clear_error(self):
+        with open(self.mode, 'w') as f:
+            f.write('no-checks')
+        code, out = run_quiet(self.queue().main)
+        self.assertEqual(code, 1, out)
+        self.assertIn("::error::pr-queue: the run's GITHUB_TOKEN may not read this (pr list)", out)
+        self.assertIn(Q.READ_PERMISSIONS, out)
+        self.assertIn('the calling workflow\'s job must grant them too', out)
+        self.assertEqual([c['args'][:2] for c in self.logged()], [['pr', 'list']], 'nothing after the failed read')
+
+    def test_the_old_way_fails_as_a_caller_s_queue_did(self):   # the PAT reading the list is what GitHub refuses
+        q = self.queue(read='pat-token')
+        code, out = run_quiet(q.main)
+        self.assertEqual(code, 1, out)
+        self.assertIn('Resource not accessible by personal access token', out)
+
 
 class Cli(unittest.TestCase):
     """cli() refuses with exit 2 and builds no Queue when it cannot run safely; it names every problem at once."""
@@ -2636,22 +2881,23 @@ class Cli(unittest.TestCase):
         self.config = os.path.join(self.d, 'queue.json')
         with open(self.config, 'w') as f:
             json.dump(CFG_RAW, f)
-        self.built = []
+        self.built, self.tokens = [], []
 
     def cli(self, *extra, repo=REPO, state=None, cache=None, env=None, git=None):
         test = self
 
         class Built:
-            def __init__(self, *a):
-                self.a = a
+            def __init__(self, *a, **kw):
+                self.a, self.kw = a, kw
 
             def main(self, dry):
                 test.built.append((self.a, dry))
+                test.tokens.append(self.kw)
                 return 0
         argv = [f'--repo={repo}', '--config', self.config, '--state-file', state or os.path.join(self.d, 'run', 'plan.json'),
                 '--cache', cache or os.path.join(self.d, 'cache.git'), *extra]
         with unittest.mock.patch.object(Q, 'Queue', Built), unittest.mock.patch.object(Q, 'git_problem', lambda: git):
-            return run_quiet(Q.cli, argv, env if env is not None else {})
+            return run_quiet(Q.cli, argv, {**TOKENS, **(env or {})})
 
     def refused(self, *why, **kw):
         code, out = self.cli(**kw)
@@ -2670,6 +2916,21 @@ class Cli(unittest.TestCase):
         self.assertEqual(args[1], CFG)
         self.cli('--dry-run', '--lock-file', os.path.join(self.d, 'l'), env={'RUNNER_ENVIRONMENT': 'self-hosted'})
         self.assertEqual((self.built[1][0][4], self.built[1][1]), (os.path.join(self.d, 'l'), True))
+
+    def test_the_tokens_reach_the_queue(self):   # reads with the run's token, writes with the caller's
+        self.cli()
+        self.cli('--dry-run')
+        self.assertEqual(self.tokens, [{'read_token': 'run-token', 'write_token': 'pat-token'},
+                                       {'read_token': 'run-token', 'write_token': None}])
+
+    def test_a_missing_or_reused_token_is_refused(self):
+        self.refused(f'{Q.READ_TOKEN} is empty', env={Q.READ_TOKEN: ''})
+        self.refused(f'{Q.WRITE_TOKEN} is empty', env={Q.WRITE_TOKEN: ''})
+        self.refused(f"{Q.WRITE_TOKEN} is the run's GITHUB_TOKEN", env={Q.WRITE_TOKEN: 'run-token'})
+        code, out = self.cli('--dry-run', env={Q.READ_TOKEN: ''})
+        self.assertEqual((code, self.built), (Q.REFUSED, []), 'a dry run reads: ' + out)
+        code, out = self.cli('--dry-run', env={Q.WRITE_TOKEN: ''})
+        self.assertEqual(code, 0, 'a dry run writes nothing, so it needs only the read token: ' + out)
 
     def test_a_github_hosted_runner_is_refused(self):   # its disk, and the plan on it, goes with the job
         self.refused('GitHub-hosted runner', env={'RUNNER_ENVIRONMENT': 'github-hosted'})
@@ -2760,7 +3021,7 @@ class GateApp(unittest.TestCase):
                 mine = runs if self.H1 in a[1] else [self.app_run()]
                 return ok(json.dumps({'total_count': len(mine), 'check_runs': mine}))
             raise AssertionError(a)
-        self.q.gh = gh
+        self.q.gh = self.q.gh_write = gh
         self.q.update = lambda n, d: self.updated.append(n) or 0
         return run_quiet(self.q.run, False)
 
@@ -2806,7 +3067,7 @@ class GateApp(unittest.TestCase):
                  for c, t, app in (('FAILURE', '2026-11-14T00:00:00Z', self.APP), ('SUCCESS', '2026-11-14T02:00:00Z', 15368))]
         nodes.append({'__typename': 'StatusContext', 'context': 'review-check', 'state': 'SUCCESS'})
         sha = 'e9' * 20
-        self.q.gh = lambda *a: ok(json.dumps({'data': {'repository': {'object': {'oid': sha, 'statusCheckRollup': {
+        self.q.gh = self.q.gh_write = lambda *a: ok(json.dumps({'data': {'repository': {'object': {'oid': sha, 'statusCheckRollup': {
             'contexts': {'pageInfo': {'hasNextPage': False}, 'nodes': nodes}}}}}}))
         self.assertEqual(self.q.commit_checks('refs/heads/main', {})[1].get('review-check'),
                          lens.check_state(self.run_of(conclusion='FAILURE')))
