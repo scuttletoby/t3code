@@ -28,7 +28,7 @@ class Agent:
     """A fake desk agent: says hello, answers pings, and answers each request with `answer(frame)` (None: silence)."""
 
     def __init__(self, answer, hello=POOL, pong=True):
-        self.answer, self.pong, self.got = answer, pong, []
+        self.answer, self.pong, self.got, self.cond = answer, pong, [], threading.Condition()
         self.to_serve_r, self.to_serve_w = os.pipe()
         self.from_serve_r, self.from_serve_w = os.pipe()
         os.write(self.to_serve_w, wire.encode({'v': 1, 'hello': hello}))
@@ -38,7 +38,9 @@ class Agent:
         reader = wire.Reader()
         while data := os.read(self.from_serve_r, 65536):
             for frame in reader.feed(data):
-                self.got.append(frame)
+                with self.cond:
+                    self.got.append(frame)
+                    self.cond.notify_all()
                 if 'ping' in frame:
                     reply = {'v': 1, 'pong': frame['ping']} if self.pong else None
                 elif 'id' in frame:
@@ -52,6 +54,33 @@ class Agent:
     def hang_up(self):
         os.close(self.to_serve_w)
 
+    def wait_for(self, pred, timeout=60):
+        """True once pred(frames got so far) holds; False after `timeout` s."""
+        with self.cond:
+            return self.cond.wait_for(lambda: pred(self.got), timeout)
+
+
+class Log(io.StringIO):
+    """serve's log; `settled` is set once it says 'session open' (after listen(): the socket takes connections). The
+    socket file alone is no sign: it appears at bind(), before listen(), and a connect in between is refused."""
+
+    def __init__(self):
+        super().__init__()
+        self.settled = threading.Event()
+
+    def write(self, s):
+        n = super().write(s)
+        if 'session open' in self.getvalue():
+            self.settled.set()
+        return n
+
+
+def fake_peer(uid, gid, side):
+    """desk.peer faked for one end only: 'serve' (an accepted socket, named after the listener) or 'launch' (the
+    client's, unnamed). The other end reads its real peer."""
+    real = desk.peer
+    return lambda s: (real(s)[0], uid, gid) if bool(s.getsockname()) == (side == 'serve') else real(s)
+
 
 class Link(unittest.TestCase):
     def setUp(self):
@@ -63,15 +92,17 @@ class Link(unittest.TestCase):
         self.tmp.cleanup()
 
     def serve(self, agent, **kw):
-        log = io.StringIO()
-        result = {}
-        t = threading.Thread(target=lambda: result.update(code=desk.serve(
-            POOL, self.dir, agent.to_serve_r, agent.from_serve_w, log=log, **kw)), daemon=True)
+        """serve in a thread; returns once it listens, or once it has ended (a wrong hello, a refusal)."""
+        log, result = Log(), {}
+
+        def run():
+            try:
+                result['code'] = desk.serve(POOL, self.dir, agent.to_serve_r, agent.from_serve_w, log=log, **kw)
+            finally:
+                log.settled.set()
+        t = threading.Thread(target=run, daemon=True)
         t.start()
-        for _ in range(200):
-            if os.path.exists(self.sock) or not t.is_alive():
-                break
-            time.sleep(0.01)
+        self.assertTrue(log.settled.wait(60), log.getvalue())
         return t, result, log
 
     def launch(self, verb, *args, stdin=None, wait=None):
@@ -101,6 +132,21 @@ class Link(unittest.TestCase):
         self.assertFalse(t.is_alive())
         self.assertFalse(os.path.exists(self.sock))
 
+    def test_the_serve_helper_returns_once_serve_listens_not_once_the_socket_file_exists(self):
+        """#264: the file appears at bind(); a connect before listen() is refused. listen() is held back here, so a
+        helper that waits only for the file hands the test a socket that refuses it."""
+        real, held = socket.socket.listen, threading.Event()
+
+        def listen(sock, *a):
+            threading.Timer(0.5, held.set).start()
+            held.wait()
+            return real(sock, *a)
+        agent = Agent(lambda f: wire.answer(0, 'ok\n'))
+        with mock.patch.object(socket.socket, 'listen', listen):
+            t, _, log = self.serve(agent)
+        self.assertEqual(self.launch('active'), (0, 'ok\n', ''), log.getvalue())
+        agent.hang_up(); t.join(5)
+
     def test_no_session_fails_at_once_and_sends_nothing(self):
         began = time.monotonic()
         self.assertEqual(self.launch('active')[0], wire.NO_SESSION)        # no directory at all (after a boot)
@@ -111,7 +157,7 @@ class Link(unittest.TestCase):
         code, _, err = self.launch('active')
         self.assertEqual(code, wire.NO_SESSION)
         self.assertIn('no live desk session', err)
-        self.assertLess(time.monotonic() - began, 1)
+        self.assertLess(time.monotonic() - began, 3)                       # not a connect timeout (CLIENT, 5 s)
 
     def test_bad_requests_are_refused_before_sending(self):
         agent = Agent(lambda f: wire.answer(0))
@@ -165,7 +211,7 @@ class Link(unittest.TestCase):
         code, _, err = self.launch('start', 'fleet-desk-5', stdin=START_IN, wait=20)
         self.assertEqual(code, wire.UNKNOWN)
         self.assertIn('the desk session ended', err)
-        self.assertLess(time.monotonic() - began, 3)
+        self.assertLess(time.monotonic() - began, 10)                      # at once, not at the 20 s wait
         t.join(5)
         self.assertEqual(self.launch('active')[0], wire.NO_SESSION)
 
@@ -189,10 +235,8 @@ class Link(unittest.TestCase):
             while not stop.wait(0.05):
                 os.write(agent.to_serve_w, wire.encode({'v': 1, 'pong': 0}))
         threading.Thread(target=chatter, daemon=True).start()
-        time.sleep(1.5)
+        self.assertTrue(agent.wait_for(lambda got: sum('ping' in f for f in got) >= 3), agent.got)   # not never
         stop.set()
-        pings = [f for f in agent.got if 'ping' in f]
-        self.assertGreaterEqual(len(pings), 3, agent.got)   # about every 0.3 s, not never
         agent.hang_up()
         t.join(5)
 
@@ -216,15 +260,16 @@ class Link(unittest.TestCase):
 
     def test_answering_pings_keeps_the_session_and_slow_answer_is_unknown(self):
         agent = Agent(lambda f: None)
-        t, _, _ = self.serve(agent, ping=0.2, dead=0.6)
-        code, _, _ = self.launch('active', wait=1.5)                        # no answer: unknown, not a hang
+        t, _, _ = self.serve(agent, ping=0.1, dead=1.5)                   # a pong may be up to ~1.4 s late
+        code, _, _ = self.launch('active', wait=2.5)                        # no answer: unknown, not a hang
         self.assertEqual(code, wire.UNKNOWN)
         self.assertTrue(t.is_alive())                                       # pongs kept it open past `dead`
         agent.hang_up()
         t.join(5)
 
     def test_socket_directory_must_be_private(self):
-        os.mkdir(self.dir, 0o755)
+        os.mkdir(self.dir)
+        os.chmod(self.dir, 0o755)                                        # whatever the umask
         with self.assertRaises(desk.Refused):
             desk.serve(POOL, self.dir, *os.pipe(), log=io.StringIO())
         self.assertNotEqual(self.launch('active')[0], 0)
@@ -267,10 +312,7 @@ class Link(unittest.TestCase):
         p.stdin.write(wire.encode({'v': 1, 'hello': POOL}))
         p.stdin.flush()
         self.assertEqual(wire.decode(p.stdout.readline().rstrip(b'\n')), {'v': 1, 'hello': POOL})
-        for _ in range(200):
-            if os.path.exists(self.sock):
-                break
-            time.sleep(0.01)
+        self.assertIn(b'session open', p.stderr.readline())             # it listens
         p.send_signal(signal.SIGTERM)
         p.wait(10)
         p.stdin.close(), p.stdout.close(), p.stderr.close()
@@ -282,9 +324,7 @@ class Link(unittest.TestCase):
         # SO_PEERCRED faked: the peer looks like uid 4242, in no group of the socket. No second user, no root needed.
         agent = Agent(lambda f: wire.answer(0))
         t, _, _ = self.serve(agent)
-        real = desk.struct
-        fake = types.SimpleNamespace(unpack=lambda fmt, b: (real.unpack(fmt, b)[0], 4242, 4242))
-        with mock.patch.object(desk, 'struct', fake):
+        with mock.patch.object(desk, 'peer', fake_peer(4242, 4242, 'serve')):
             code = self.launch('active', wait=2)[0]
         self.assertNotEqual(code, 0)
         self.assertEqual([f for f in agent.got if 'id' in f], [])          # nothing reached the agent
@@ -297,7 +337,6 @@ class Link(unittest.TestCase):
             s.bind(self.sock)
         agent = Agent(lambda f: wire.answer(0, 'x\n'))
         t, result, log = self.serve(agent)
-        time.sleep(0.2)
         self.assertTrue(t.is_alive(), log.getvalue())
         self.assertEqual(self.launch('active')[:2], (0, 'x\n'))
         agent.hang_up(); t.join(5)
@@ -344,6 +383,58 @@ class Link(unittest.TestCase):
             code, _, err = self.launch('active')
         self.assertEqual(code, 1, err)
 
+    def test_launch_sends_nothing_to_a_listener_that_is_not_the_directory_owner(self):
+        """#202: root's launch lstats the socket, then connects, in a directory the desk user owns. Swapped in between
+        for a link to another socket (a stand-in for a root daemon's), the peer is not the owner: refused, unsent."""
+        agent = Agent(lambda f: wire.answer(0, 'ok\n'))
+        t, _, _ = self.serve(agent)
+        daemon_path = os.path.join(self.tmp.name, 'daemon.sock')
+        daemon = socket.socket(socket.AF_UNIX)
+        self.addCleanup(daemon.close)
+        daemon.bind(daemon_path)
+        daemon.listen(1)
+        real = os.lstat
+
+        def lstat_then_swap(p, *a, **k):
+            st = real(p, *a, **k)
+            if p == self.sock:
+                os.rename(self.sock, self.sock + '.serve')
+                os.symlink(daemon_path, self.sock)
+            return st
+        with mock.patch.object(desk.os, 'lstat', lstat_then_swap), \
+                mock.patch.object(desk, 'peer', fake_peer(0, 0, 'launch')):
+            code, _, err = self.launch('active', wait=2)
+        self.assertEqual(code, 1, err)
+        self.assertIn('listens as uid 0', err)
+        daemon.settimeout(5)
+        conn, _ = daemon.accept()
+        with conn:
+            conn.settimeout(5)
+            self.assertEqual(conn.recv(65536), b'')                        # connected, closed, sent nothing
+        os.remove(self.sock)
+        os.rename(self.sock + '.serve', self.sock)
+        with mock.patch.object(desk, 'peer', fake_peer(4242, 4242, 'launch')):   # any other user: the same
+            self.assertEqual(self.launch('active')[0], 1)
+        self.assertEqual([f for f in agent.got if 'id' in f], [])
+        self.assertEqual(self.launch('active')[:2], (0, 'ok\n'))          # the owner's own serve: served
+        agent.hang_up(); t.join(5)
+
+    def test_a_lock_of_another_owner_is_refused_even_when_this_user_may_open_it(self):
+        """#202: the owner check on POOL.lock, not only the PermissionError of a 0600 root lock: a lock someone else
+        owns but lets this user write is not this user's to hold."""
+        os.mkdir(self.dir, 0o700)
+        lock = os.path.join(self.dir, f'{POOL}.lock')
+        os.close(os.open(lock, os.O_CREAT | os.O_WRONLY, 0o600))
+        want, real = os.stat(lock), os.fstat
+
+        def fstat(fd):
+            st = real(fd)
+            return types.SimpleNamespace(st_uid=4242) if (st.st_dev, st.st_ino) == (want.st_dev, want.st_ino) else st
+        with mock.patch.object(desk.os, 'fstat', fstat), self.assertRaises(desk.Refused) as e:
+            desk.serve(POOL, self.dir, *os.pipe(), log=io.StringIO(), hello_wait=0.2)
+        self.assertIn("is not this user's", str(e.exception))
+        self.assertFalse(os.path.exists(self.sock))
+
     def test_silent_client_is_dropped(self):
         agent = Agent(lambda f: wire.answer(0))
         t, _, _ = self.serve(agent)
@@ -387,16 +478,10 @@ class Link(unittest.TestCase):
             chown(p, u, g)
         with mock.patch.object(desk.os, 'chown', seen):
             t, _, log = self.serve(agent)
-            for _ in range(200):
-                if born or not t.is_alive():
-                    break
-                time.sleep(0.01)
         self.assertEqual(born, [0o600], log.getvalue())                  # owner only until the group is set
         st = os.stat(self.sock)
         self.assertEqual((oct(st.st_mode & 0o777), st.st_gid), ('0o660', gid), log.getvalue())
-        real = desk.struct                                               # the dispatcher's user: another uid, the group
-        fake = types.SimpleNamespace(unpack=lambda fmt, b: (real.unpack(fmt, b)[0], 4242, gid))
-        with mock.patch.object(desk, 'struct', fake):
+        with mock.patch.object(desk, 'peer', fake_peer(4242, gid, 'serve')):   # the dispatcher's user: the group
             self.assertEqual(self.launch('active')[:2], (0, 'ok\n'))
         agent.hang_up(); t.join(5)
 
@@ -452,15 +537,17 @@ class Link(unittest.TestCase):
             def recv(self, _):
                 time.sleep(self.t)
                 raise socket.timeout()
+            def getsockopt(self, *_):   # the listener is this user, the directory's owner
+                return desk.struct.pack('3i', os.getpid(), os.geteuid(), os.getegid())
             def __enter__(self):
                 return self
             def __exit__(self, *a):
                 pass
         began = time.monotonic()
-        with mock.patch.object(desk, 'CLIENT', 1), mock.patch.object(desk.socket, 'socket', Stuck):
+        with mock.patch.object(desk, 'CLIENT', 5), mock.patch.object(desk.socket, 'socket', Stuck):
             code = self.launch('active', wait=1.5)[0]
         self.assertEqual(code, wire.UNKNOWN)
-        self.assertLess(time.monotonic() - began, 1.5 + 0.4)
+        self.assertLess(time.monotonic() - began, 1.5 + 2)                 # one step on its own CLIENT: 5 s or more
 
     def test_an_accept_error_costs_one_client_not_the_session(self):
         agent = Agent(lambda f: wire.answer(0, 'ok\n'))

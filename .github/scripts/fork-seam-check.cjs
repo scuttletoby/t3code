@@ -1,7 +1,7 @@
-// Usage: fork-seam-check.cjs [--config-ref <rev>] [--after-rebase] <base> <head>. Refuses <head>'s
-// upstream-file changes since the merge-base beyond .github/fork-seams.json, read from <base> (or
-// --config-ref; never <head>); a <base> without it is upstream. --after-rebase (fork-follow): a
-// "pending" file below its ceiling is a note (see findUnlistedChanges). Reads git objects only.
+// Usage: [--config-ref <rev>] <base> <head> | --from-upstream [--after-rebase] <upstream> <head>.
+// Refuses <head>'s upstream-file changes beyond .github/fork-seams.json. A pull request's list is
+// <base>'s (or --config-ref's), never <head>'s; --from-upstream (fork-follow) reads <head>'s, even if
+// upstream has its own. --after-rebase: a ceiling above the count is a note. Reads git objects only.
 
 const { execFileSync } = require("node:child_process");
 
@@ -10,9 +10,6 @@ const CONFIG = ".github/fork-seams.json";
 // fork-*.yml, which fork-follow makes the fork delete (that list cannot name them), the only upstream
 // files a change may delete.
 const REMOVED = ".github/fork-removed-workflows.txt";
-// The refusals of a "pending" ceiling left above a file's fork lines (fixed by lowering it).
-const CEILING_TOO_HIGH =
-  /: "pending" with (no fork lines left|\d+ fork lines, fewer than its ceiling)/;
 const REMOVED_PATH = /^\.github\/workflows\/[^/,\s]+\.ya?ml$/;
 const FORK_WORKFLOW = /^\.github\/workflows\/fork-[^/]*\.ya?ml$/;
 
@@ -62,17 +59,50 @@ function addedLines(base, head) {
 const total = (lines) => lines.reduce((sum, [, extra]) => sum + extra, 0);
 
 /**
- * Whether `head` keeps `base`'s lines in their order, whitespace and blank lines aside (as
- * `git diff --ignore-all-space --ignore-blank-lines` sees no change).
+ * The non-blank lines in order, with their indentation (in YAML or Python it is meaning) but no
+ * trailing blanks or CR (as `git diff --ignore-space-at-eol --ignore-blank-lines` compares them).
  */
+const orderedLines = (text) =>
+  text
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+
+/** Whether `head` keeps `base`'s lines, in their order and indentation (blank lines aside). */
 function sameLines(base, head) {
-  const lines = (text) =>
-    text
-      .split("\n")
-      .map((line) => line.replace(/\s+/g, ""))
-      .filter(Boolean);
-  const [a, b] = [lines(base), lines(head)];
+  const [a, b] = [orderedLines(base), orderedLines(head)];
   return a.length === b.length && a.every((line, i) => line === b[i]);
+}
+
+/**
+ * How many of the lines `base` lists `head` does not keep in their order: deleted, moved or changed
+ * (`base`'s length less the longest common subsequence). Common ends are matched first, so the work
+ * is the changed middle squared (a few ms for a 10,000-line file with fork lines at both ends).
+ */
+function lostLines(base, head) {
+  let start = 0;
+  while (start < base.length && start < head.length && base[start] === head[start]) start++;
+  let end = 0;
+  while (
+    end < base.length - start &&
+    end < head.length - start &&
+    base[base.length - 1 - end] === head[head.length - 1 - end]
+  ) {
+    end++;
+  }
+  const ids = new Map();
+  const id = (line) => ids.get(line) ?? ids.set(line, ids.size).get(line);
+  const a = base.slice(start, base.length - end).map(id);
+  const b = head.slice(start, head.length - end).map(id);
+  let previous = new Uint32Array(b.length + 1);
+  let row = new Uint32Array(b.length + 1);
+  for (const line of a) {
+    for (let j = 1; j <= b.length; j++) {
+      row[j] = line === b[j - 1] ? previous[j - 1] + 1 : Math.max(previous[j], row[j - 1]);
+    }
+    [previous, row] = [row, previous];
+  }
+  return a.length - previous[b.length];
 }
 
 /** The upstream workflow paths a REMOVED list names; other lines are ignored. */
@@ -93,6 +123,9 @@ function findSeamBreaches(files, { atBase, atHead, upstream = false }) {
   const reasons = [];
   for (const [file, seam] of Object.entries(files)) {
     const base = atBase(file);
+    const head = atHead(file);
+    // Neither has it (upstream renamed it): nothing to guard, a note (findListedGone).
+    if (base === undefined && head === undefined) continue;
     // A listed file upstream does not have guards nothing: fail closed, so the list is fixed.
     if (base === undefined) {
       reasons.push(
@@ -100,7 +133,6 @@ function findSeamBreaches(files, { atBase, atHead, upstream = false }) {
       );
       continue;
     }
-    const head = atHead(file);
     if (head === undefined) {
       reasons.push(`${file}: this change deletes or renames it.`);
       continue;
@@ -155,15 +187,16 @@ function forkFileTest(patterns = []) {
 
 /**
  * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed`
- * names it). A "pending" one holds exactly its ceiling from upstream; on a PR (`isForkFile`
- * names fork files) it may change but not grow. `afterRebase`: below the ceiling (an adopted fork
- * line drops in the rebase; the old base forbids lowering first) is a note, refused on the next run.
+ * names it). A "pending" one holds exactly its ceiling from upstream (one too high goes to
+ * `ceilings`; after a rebase to `notes`, as the old base forbade lowering it first); on a PR
+ * (`isForkFile` names fork files) it may change but not grow.
  */
 function findUnlistedChanges(
   config,
   { changed, atBase, atHead, upstream, isForkFile, removed = new Set(), afterRebase = false },
 ) {
   const reasons = [];
+  const ceilings = [];
   const notes = [];
   const pending = config.pending ?? {};
   const deleted = (file) =>
@@ -187,19 +220,20 @@ function findUnlistedChanges(
       );
     } else if (!sameLines(base, head)) {
       reasons.push(
-        `${file}: upstream file whose lines this change deletes or moves, but no entry in ${CONFIG}${entry}`,
+        `${file}: upstream file whose lines this change deletes, moves or re-indents, but no entry in ${CONFIG}${entry}`,
       );
     }
   }
   for (const [file, ceiling] of Object.entries(pending)) {
     const base = atBase(file);
+    const head = atHead(file);
+    if (base === undefined && head === undefined) continue;
     if (base === undefined) {
       reasons.push(
         `${file}: "pending" in ${CONFIG}, but the base does not have it (upstream moved or removed it?).`,
       );
       continue;
     }
-    const head = atHead(file);
     if (head === undefined) {
       reasons.push(deleted(file));
       continue;
@@ -214,7 +248,7 @@ function findUnlistedChanges(
         // A ceiling left too high is room to swap upstream lines for fork lines later, and a note
         // in the nightly log is never seen: refuse, naming the fix (only noted right after a
         // rebase; the next run refuses it).
-        (afterRebase ? notes : reasons).push(
+        (afterRebase ? notes : ceilings).push(
           added === 0
             ? `${file}: "pending" with no fork lines left; remove it from the list.`
             : `${file}: "pending" with ${added} fork lines, fewer than its ceiling of ${ceiling}; lower it to ${added}.`,
@@ -229,7 +263,90 @@ function findUnlistedChanges(
       );
     }
   }
-  return { reasons, notes };
+  return { reasons, ceilings, notes };
+}
+
+/**
+ * Upstream lines a seam or pending file lost: `lines` not kept in order and indentation, `gone`
+ * whose text is gone (so a line already moved or re-indented cannot be deleted later for free).
+ * From upstream both are held exactly to its "lost" entry (0 when unlisted), like a ceiling.
+ */
+function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }) {
+  const reasons = [];
+  const ceilings = [];
+  const notes = [];
+  const lost = config.lost ?? {};
+  const files = Object.entries(config.files).map(([file, seam]) => [
+    file,
+    lineCounts(seam.added.join("\n")),
+  ]);
+  if (upstream) for (const file of Object.keys(config.pending ?? {})) files.push([file, new Map()]);
+  const say = (count, what) => `${count} upstream line${count === 1 ? "" : "s"} ${what}`;
+  const what = {
+    lines: "deleted, moved or re-indented",
+    gone: "deleted or changed (its text is gone)",
+  };
+  for (const [file, listed] of files) {
+    const base = atBase(file);
+    const head = atHead(file);
+    if (base === undefined || head === undefined) continue; // Refused (or noted) elsewhere.
+    const lines = lostLines(orderedLines(base), orderedLines(head));
+    const gone = addedLines(head, base); // [line, copies the head has fewer of]
+    if (!upstream) {
+      // Main's pending lines mix with upstream's, so only seam files: their listed lines may go,
+      // not move (a moved `}` looks like upstream's).
+      const dropped = gone.reduce(
+        (sum, [line, copies]) => sum + Math.min(copies, listed.get(line) ?? 0),
+        0,
+      );
+      const count = lines - dropped;
+      if (count > 0) {
+        reasons.push(
+          `${file}: ${say(count, what.lines)} by this change (only its listed seam lines may go, and none may move: a moved copy looks like upstream's line).`,
+        );
+      }
+      continue;
+    }
+    const counts = { lines, gone: total(gone) };
+    const held = lost[file] ?? { lines: 0, gone: 0 };
+    const below = [];
+    for (const key of ["lines", "gone"]) {
+      const text = say(counts[key], what[key]);
+      if (counts[key] > held[key]) {
+        reasons.push(
+          `${file}: ${text}, more than its "lost" ${key} count of ${held[key]} (keep upstream's lines; a fork change goes in a file of the fork's own).`,
+        );
+      } else if (counts[key] < held[key]) {
+        below.push(
+          `${file}: ${text}, below its "lost" ${key} count of ${held[key]}; lower it to ${counts[key]}.`,
+        );
+      }
+    }
+    if (below.length > 0) {
+      (afterRebase ? notes : ceilings).push(
+        ...(lines === 0
+          ? [
+              `${file}: no upstream lines ${what.lines}, below its "lost" entry; remove it from "lost".`,
+            ]
+          : below),
+      );
+    }
+  }
+  return { reasons, ceilings, notes };
+}
+
+/**
+ * Listed seam and pending paths that neither the base nor the head has: nothing there to guard.
+ * Upstream renamed (or removed) the file, so the list names both paths until the base moves on, and
+ * the checks before and after fork-follow's rebase each see one. A note, not a refusal.
+ */
+function findListedGone(config, { atBase, atHead }) {
+  return [...Object.keys(config.files), ...Object.keys(config.pending ?? {})]
+    .filter((file) => atBase(file) === undefined && atHead(file) === undefined)
+    .map(
+      (file) =>
+        `${file}: listed in ${CONFIG}, but neither the base nor the head has it (renamed or removed upstream?); remove the entry once the fork's base no longer has it.`,
+    );
 }
 
 /**
@@ -245,6 +362,18 @@ function findHiddenUpstreamFiles(upstreamFiles, isForkFile, atHead) {
     );
 }
 
+const KINDS = ["files", "pending", "forkFiles", "lost"];
+const SEAM_KEYS = ["why", "added"];
+
+/** Refuses a key the check does not read (a misspelt block guards nothing); "//…" is a comment. */
+function refuseUnknownKeys(object, known, where) {
+  for (const key of Object.keys(object)) {
+    if (!key.startsWith("//") && !known.includes(key)) {
+      throw new Error(`${CONFIG}: ${where}unknown key "${key}" (known: ${known.join(", ")})`);
+    }
+  }
+}
+
 const isStringList = (value) =>
   Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim() !== "");
 
@@ -255,6 +384,7 @@ function parseConfig(text) {
   if (typeof files !== "object" || files === null || Array.isArray(files)) {
     throw new Error(`${CONFIG}: "files" must be an object`);
   }
+  refuseUnknownKeys(config, KINDS, "");
   for (const [file, seam] of Object.entries(files)) {
     if (typeof seam?.why !== "string" || seam.why.trim() === "") {
       throw new Error(`${CONFIG}: ${file} needs a "why"`);
@@ -262,6 +392,7 @@ function parseConfig(text) {
     if (!Array.isArray(seam.added) || seam.added.some((line) => typeof line !== "string")) {
       throw new Error(`${CONFIG}: ${file}: "added" must be a list of lines`);
     }
+    refuseUnknownKeys(seam, SEAM_KEYS, `${file}: `);
   }
   if (config.forkFiles !== undefined && !isStringList(config.forkFiles)) {
     throw new Error(`${CONFIG}: "forkFiles" must be a list of paths`);
@@ -277,6 +408,29 @@ function parseConfig(text) {
     if (Object.hasOwn(files, file))
       throw new Error(`${CONFIG}: ${file} is in "files" and "pending"`);
   }
+  const lost = config.lost ?? {};
+  if (typeof lost !== "object" || lost === null || Array.isArray(lost)) {
+    throw new Error(`${CONFIG}: "lost" must map each path to its count of upstream lines lost`);
+  }
+  for (const [file, entry] of Object.entries(lost)) {
+    if (!Object.hasOwn(files, file) && !Object.hasOwn(pending, file)) {
+      throw new Error(`${CONFIG}: "lost": ${file} is not in "files" or "pending"`);
+    }
+    // `gone` (text gone) is at most `lines` (not kept in order) for any file, so more never matches.
+    const { lines, gone, ...other } = entry ?? {};
+    if (
+      Object.keys(other).length > 0 ||
+      !Number.isSafeInteger(lines) ||
+      lines < 1 ||
+      !Number.isSafeInteger(gone) ||
+      gone < 0 ||
+      gone > lines
+    ) {
+      throw new Error(
+        `${CONFIG}: "lost": ${file} needs {"lines": N, "gone": M}, with N at least 1 and M from 0 to N`,
+      );
+    }
+  }
   for (const pattern of config.forkFiles ?? []) {
     const path = pattern.replace(/^!/, "");
     if (
@@ -288,7 +442,22 @@ function parseConfig(text) {
       throw new Error(`${CONFIG}: "forkFiles": not a repository path pattern: ${pattern}`);
     }
   }
-  return { files, pending, forkFiles: config.forkFiles ?? [] };
+  return { files, pending, forkFiles: config.forkFiles ?? [], lost };
+}
+
+/**
+ * Why a pull request's own list cannot become main's (its format only: its rules are not in force
+ * here), or undefined. Merged, a malformed list crashes every later run, the fix's run included.
+ */
+function ownListProblem(text) {
+  const own = `this change's own ${CONFIG}`;
+  if (text === undefined) return `${own}: this change deletes it.`;
+  try {
+    parseConfig(text);
+    return undefined;
+  } catch (error) {
+    return `${own} is malformed: ${error instanceof Error ? error.message : error}`;
+  }
 }
 
 const hasConfig = (rev) => entryAt(rev, CONFIG)?.type === "blob";
@@ -302,8 +471,13 @@ function readConfigAt(rev) {
 
 function parseArgs(argv) {
   const args = [...argv];
-  const afterRebase = args.includes("--after-rebase");
-  if (afterRebase) args.splice(args.indexOf("--after-rebase"), 1);
+  const flag = (name) => {
+    const at = args.indexOf(name);
+    if (at !== -1) args.splice(at, 1);
+    return at !== -1;
+  };
+  const fromUpstream = flag("--from-upstream");
+  const afterRebase = flag("--after-rebase");
   let configRef;
   const at = args.indexOf("--config-ref");
   if (at !== -1) {
@@ -312,25 +486,30 @@ function parseArgs(argv) {
     args.splice(at, 2);
   }
   if (args.length !== 2 || args.some((arg) => arg.startsWith("--"))) return undefined;
-  return { configRef, afterRebase, base: args[0], head: args[1] };
+  // A pull request's run never runs from upstream; only a run from upstream has a rebase behind it.
+  if (fromUpstream ? configRef !== undefined : afterRebase) return undefined;
+  return { configRef, fromUpstream, afterRebase, base: args[0], head: args[1] };
 }
 
 function main(argv) {
   const parsed = parseArgs(argv);
   if (!parsed) {
-    console.error("Usage: fork-seam-check.cjs [--config-ref <rev>] [--after-rebase] <base> <head>");
+    console.error(
+      "Usage: fork-seam-check.cjs [--config-ref <rev>] <base> <head>\n" +
+        "       fork-seam-check.cjs --from-upstream [--after-rebase] <upstream> <head>",
+    );
     return 2;
   }
   const { base, head } = parsed;
-  // `base` without the list is upstream; the fork's main always has it. --config-ref is only for
-  // a pull request's run, so it never runs from upstream.
-  const upstream = !parsed.configRef && !hasConfig(base);
+  // Only the caller knows that `base` is upstream (fork-follow says so): a base without the list
+  // used to be taken for upstream, and an upstream that has one (a fork of this fork) for main.
+  const upstream = parsed.fromUpstream;
   const mergeBase = git(["merge-base", base, head]).trim();
   if (!upstream) {
     // A pull request's base and merge-base are the fork's: without the list, the whole old series
     // (or a base branch that dropped the list) would count as this change's lines.
     const stale = !hasConfig(base)
-      ? `The base ${base} has no ${CONFIG}: open the pull request against main or a branch of it.`
+      ? `The base ${base} has no ${CONFIG}: open the pull request against main or a branch of it (a run from an upstream commit passes --from-upstream).`
       : !hasConfig(mergeBase)
         ? `This branch predates the last rebase of its base onto upstream (the merge-base ${mergeBase.slice(0, 12)} has no ${CONFIG}). Update the branch from its base; the seam check then judges only its own lines.`
         : undefined;
@@ -357,8 +536,12 @@ function main(argv) {
     removed,
     afterRebase: parsed.afterRebase,
   });
+  const lost = findLostLines(config, { atBase, atHead, upstream, afterRebase: parsed.afterRebase });
+  // A ceiling above the count is fixed by lowering it, not by moving lines: its own hint.
+  const ceilings = [...unlisted.ceilings, ...lost.ceilings];
   const reasons = [
     ...findSeamBreaches(config.files, { atBase, atHead, upstream }),
+    ...lost.reasons,
     ...unlisted.reasons,
     ...(upstream
       ? findHiddenUpstreamFiles(
@@ -369,15 +552,26 @@ function main(argv) {
       : []),
   ];
   const from = parsed.configRef ? `--config-ref ${configRef}` : upstream ? "the head" : "the base";
-  for (const note of unlisted.notes) console.log(`Note: ${note}`);
-  if (!upstream && textAt(head, CONFIG) !== textAt(mergeBase, CONFIG)) {
+  const notes = [...findListedGone(config, { atBase, atHead }), ...unlisted.notes, ...lost.notes];
+  for (const note of notes) console.log(`Note: ${note}`);
+  const ownList = textAt(head, CONFIG);
+  const editsList = !upstream && ownList !== textAt(mergeBase, CONFIG);
+  const listProblem = editsList ? ownListProblem(ownList) : undefined;
+  if (editsList) {
     console.log(
       `Note: this change edits ${CONFIG}; it is judged by the list in ${from}, not its own. ` +
         "A new seam or list entry takes effect once the owner merges it.",
     );
   }
   const counted = upstream ? "every upstream file" : "every upstream file it changes";
-  if (reasons.length === 0) {
+  if (listProblem !== undefined) {
+    console.error(listProblem);
+    console.error(
+      `Fix the list in this change: merged, it is main's list, and a malformed one stops every later pull request and fork-follow run.`,
+    );
+  }
+  if (reasons.length === 0 && ceilings.length === 0) {
+    if (listProblem !== undefined) return 1;
     console.log(
       `Fork lines in upstream files: only the pinned seams (${counted}; list from ${from}).`,
     );
@@ -386,18 +580,17 @@ function main(argv) {
   console.error(
     `Fork changes to upstream files must stay within the seam lines in ${CONFIG} (list from ${from}):`,
   );
-  for (const reason of reasons) console.error(`- ${reason}`);
-  const ceilings = reasons.filter((reason) => CEILING_TOO_HIGH.test(reason)).length;
-  if (ceilings < reasons.length) {
+  for (const reason of [...reasons, ...ceilings]) console.error(`- ${reason}`);
+  if (reasons.length > 0) {
     console.error(
       "Put the change in a file of the fork's own (a fork setting goes in " +
         "packages/contracts/src/forkSettings.ts; see docs/fork/updates.md). A new seam line needs " +
         `its own entry in ${CONFIG}, which the owner approves.`,
     );
   }
-  if (ceilings > 0) {
+  if (ceilings.length > 0) {
     console.error(
-      `Lower each "pending" ceiling named above (or remove the entry) in ${CONFIG} with a pull request to main.`,
+      `Lower each "pending" ceiling and "lost" count named above (or remove the entry) in ${CONFIG} with a pull request to main.`,
     );
   }
   return 1;
@@ -407,10 +600,13 @@ module.exports = {
   CONFIG,
   compileForkPattern,
   findHiddenUpstreamFiles,
+  findListedGone,
+  findLostLines,
   findSeamBreaches,
   findUnlistedChanges,
   forkFileTest,
   lineCounts,
+  lostLines,
   parseConfig,
   parseRemoved,
   sameLines,

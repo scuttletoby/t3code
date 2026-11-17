@@ -972,6 +972,83 @@ class PathRules(unittest.TestCase):
         self.assertEqual(code, H.REFUSED, out)   # a change to it is read under the caps
         self.assertIn('bytes the check reads', out)
 
+    def entry(self, commit, mode, oid, parent):
+        """`commit`'s tree with the config's entry made (mode, oid), committed on `parent`: a symlink (120000) or a
+        submodule (160000), which World.commit (it writes files) cannot make."""
+        env = {**os.environ, **GIT_ENV, 'GIT_INDEX_FILE': os.path.join(self.w.dir, 'entry.index')}
+
+        def git(*a):
+            return subprocess.run(['git', *a], cwd=self.w.work, env=env, text=True, capture_output=True,
+                                  check=True).stdout.strip()
+        git('read-tree', commit)
+        git('update-index', '--add', '--cacheinfo', f'{mode},{oid},{CONFIG_PATH}')
+        sha = git('commit-tree', git('write-tree'), '-p', parent, '-m', 'entry')
+        self.w.n += 1
+        git('push', '-q', 'origin', f'{sha}:refs/keep/{self.w.n}')
+        return sha
+
+    def blob(self, text):
+        return subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=self.w.work, input=text, text=True,
+                              capture_output=True, check=True).stdout.strip()
+
+    def test_a_config_that_is_no_regular_file_is_refused(self):   # #413 item 1: the queue open()s it and would stop
+        base = self.base(mode=None)
+        same = self.w.git(self.w.work, 'rev-parse', f'{base}:{CONFIG_PATH}')
+        edited = self.blob(json.dumps({**CFG_RAW, 'merge_method': 'merge'}))
+        docs = self.head(base, mode=None, **{'docs/a.md': 'a\n'})
+        for name, mode, oid, what in (('a symlink, the same text', '120000', same, 'symlink'),
+                                      ('a symlink whose text is edited JSON that parses', '120000', edited, 'symlink'),
+                                      ("a submodule with the config's own id", '160000', same, 'submodule')):
+            with self.subTest(name):
+                code, out = self.check(base, self.entry(docs, mode, oid, base), EVERY_LENS)
+                self.assertEqual(code, H.REFUSED, out)
+                self.assertIn(f'merged, this pull request leaves {CONFIG_PATH} as a {what} (mode {mode}), not a file',
+                              out)
+        for name, oid in (('the same text', same), ('edited text', edited)):
+            with self.subTest('an executable file, ' + name):   # 100755 is a file: the queue reads it
+                code, out = self.check(base, self.entry(docs, '100755', oid, base), EVERY_LENS)
+                self.assertEqual(code, 0, out)
+
+    def test_a_base_that_holds_a_symlink_config_refuses_heads_until_one_makes_it_a_file(self):   # old state: no lock
+        m = self.base(mode=None)
+        oid = self.w.git(self.w.work, 'rev-parse', f'{m}:{CONFIG_PATH}')
+        base = self.entry(m, '120000', oid, m)   # the gate reads the link's text; the queue's open() cannot
+        code, out = self.check(base, self.entry(self.head(base, mode=None, **{'docs/a.md': 'a\n'}), '120000', oid,
+                                                base), EVERY_LENS)
+        self.assertEqual(code, H.REFUSED, out)   # it leaves the symlink: never passed
+        self.assertIn('as a symlink (mode 120000), not a file', out)
+        for name, cfg in (('the same text', CFG_RAW), ('edited text', {**CFG_RAW, 'merge_method': 'merge'})):
+            with self.subTest('a head that makes it a file again, ' + name):
+                fix = self.w.commit(base_files(cfg_raw=cfg, **PROMPTS, **self.STORE), [base])
+                code, out = self.check(base, fix, EVERY_LENS)
+                self.assertEqual(code, 0, out)
+        big = json.dumps({**CFG_RAW, 'lens_format_doc': 'd' * H.MAX_CONFIG_BYTES})   # the gate reads it, uncapped
+        base = self.entry(m, '120000', self.blob(big), m)
+        fix = self.w.commit(base_files(cfg_raw=json.loads(big), **PROMPTS, **self.STORE), [base])
+        self.assertEqual(self.w.git(self.w.work, 'rev-parse', f'{fix}:{CONFIG_PATH}'), self.blob(big))
+        code, out = self.check(base, fix, EVERY_LENS)   # the same text, now a file: a new entry, read under the caps
+        self.assertEqual(code, H.REFUSED, out)
+        self.assertIn('bytes the check reads', out)
+
+    def test_the_caps_hold_at_their_edge(self):   # #413 item 4: the documented values, exactly at and one over
+        base = self.base('shadow')
+        at = 'd/' * 62 + '*.py'   # 128 characters
+        rules = [dict(REVIEW_BLOCK['rules'][0], paths=[at]), *REVIEW_BLOCK['rules'][1:]]
+        cfg = review_cfg('shadow', rules=rules)
+        text = json.dumps(cfg)
+        cfg['lens_format_doc'] += 'd' * (32 * 1024 - len(text))   # 32 KiB exactly
+        self.assertEqual((len(at), len(json.dumps(cfg).encode())), (128, 32 * 1024))
+        code, out = self.check(base, self.w.commit(self.tree(json.dumps(cfg)), [base]), EVERY_LENS)
+        self.assertEqual(code, 0, out)
+        over_size = dict(cfg, lens_format_doc=cfg['lens_format_doc'] + 'd')
+        over_glob = review_cfg('shadow', rules=[dict(rules[0], paths=['x' + at]), *rules[1:]])
+        for name, over, why in (('32 KiB + 1', json.dumps(over_size), 'at 32769 bytes, over the 32768 bytes'),
+                                ('a glob of 129', json.dumps(over_glob), 'a glob of 129 characters, over the 128')):
+            with self.subTest(name):
+                code, out = self.check(base, self.w.commit(self.tree(over), [base]), EVERY_LENS)
+                self.assertEqual(code, H.REFUSED, out)
+                self.assertIn(why, out)
+
     def test_a_config_path_with_a_leading_dot_slash_is_the_same_file(self):   # #388 item 5: git show rev:./x differs
         base = self.w.commit(self.tree(review_cfg('shadow', rules=BAD_ORDER)), [self.m0])
         dot = './' + CONFIG_PATH
@@ -1022,6 +1099,28 @@ class PathRulesBare(PathRules):
         self.assertEqual(code, H.REFUSED, out)
         self.assertIn(f'the head {head[:12]} does not merge cleanly into the base {b1[:12]}', out)
         self.assertEqual(self.check(b0, head, EVERY_LENS)[0], 0)   # the same head on the base it merges into
+
+    def test_the_merge_follows_a_directory_rename_as_the_queue_does(self):   # #413 item 4: merge.directoryRenames
+        # pr_queue.holds merges with merge.directoryRenames=true, so the check does too: the base adds the config into a
+        # folder the head renamed, the merge moves it along, and the config's path is gone (git's default, conflict,
+        # would refuse it as a conflict instead).
+        path = 'E/q.json'
+        m = self.w.commit(base_files(**{**PROMPTS, 'E/a.txt': lines(40), 'E/b.txt': lines(40, ['b'], 3)}), [self.m0])
+        base = self.w.commit(base_files(**{**PROMPTS, 'E/a.txt': lines(40), 'E/b.txt': lines(40, ['b'], 3),
+                                           path: json.dumps(CFG_RAW)}), [m])
+        head = self.w.commit(base_files(**{**PROMPTS, 'F/a.txt': lines(40), 'F/b.txt': lines(40, ['b'], 3)}), [m])
+        code, out = self.check(base, head, EVERY_LENS, config_path=path)
+        self.assertEqual(code, H.REFUSED, out)
+        self.assertIn(f'merged, this pull request deletes {path}', out)
+
+    def test_a_merge_tree_that_takes_too_long_is_refused(self):   # #413 item 5: a timeout refuses, never passes
+        base = self.base('shadow')
+        head = self.head(base, 'shadow', **{'docs/a.md': 'a\n'})
+        with unittest.mock.patch.object(H, 'MERGE_TREE_SECONDS', 1e-6):
+            code, out = self.check(base, head, EVERY_LENS)
+        self.assertEqual(code, H.REFUSED, out)
+        self.assertIn(f'git merge-tree of the base {base[:12]} and the head {head[:12]} took over', out)
+        self.assertEqual(self.check(base, head, EVERY_LENS)[0], 0)   # the same merge, given its time
 
 
 class ChangedPaths(unittest.TestCase):
@@ -1093,22 +1192,13 @@ class MergedConfig(unittest.TestCase):
                       'passed: OSError: git vanished', why)
 
     def test_a_config_over_the_size_cap_is_never_read(self):   # its size comes first: a 1 GB blob never reaches memory
-        for size in ('999999999', 'nonsense'):
+        for size in ('999999999', 'nonsense', str(32 * 1024 + 1)):
             with self.subTest(size):
-                class Checkout:
-                    bare = None
-
-                    def merge_parents(self):
-                        return (C, A)
-
-                    def git(self, *a, **kw):
-                        answer = {('rev-parse', '--verify'): ('1' if a[-1].startswith(C) else '2') * 40,
-                                  ('cat-file', '-t'): 'blob\n', ('cat-file', '-s'): size + '\n'}.get(a[:2])
-                        if answer is None:
-                            raise AssertionError(f'read: {a}')
-                        return types.SimpleNamespace(returncode=0, stdout=answer, stderr='')
-                why = H.merged_config_problem(Checkout(), CONFIG_PATH)
+                why = H.merged_config_problem(reading({('cat-file', '-s'): (0, size + '\n')}), CONFIG_PATH)
                 self.assertIn(f'leaves {CONFIG_PATH} at {size} bytes, over the {H.MAX_CONFIG_BYTES} bytes', why)
+        text = json.dumps(CFG_RAW)   # exactly at the cap: read and parsed
+        self.assertIsNone(H.merged_config_problem(
+            reading({('cat-file', '-s'): (0, f'{32 * 1024}\n'), ('cat-file', 'blob'): (0, text)}), CONFIG_PATH))
 
     def test_text_that_breaks_the_parser_is_a_refusal(self):
         for name, text, why in (('deep nesting', '[' * 20000, 'RecursionError'),
@@ -1117,23 +1207,72 @@ class MergedConfig(unittest.TestCase):
                 self.assertIn(why, H.config_text_problem(text, CONFIG_PATH))
 
     def test_a_config_that_is_not_utf8_is_a_refusal(self):   # strict: a config is text, and base_config reads it so
-        class Checkout:
-            bare = None
-
-            def merge_parents(self):
-                return (C, A)
-
-            def git(self, *a, **kw):
-                if a[:2] == ('rev-parse', '--verify'):
-                    return types.SimpleNamespace(returncode=0, stdout=('1' if a[-1].startswith(C) else '2') * 40,
-                                                 stderr='')
-                if a[:2] == ('cat-file', '-t'):
-                    return types.SimpleNamespace(returncode=0, stdout='blob\n', stderr='')
-                if a[:2] == ('cat-file', '-s'):
-                    return types.SimpleNamespace(returncode=0, stdout='9\n', stderr='')
-                b'{"x": "\xff"}'.decode()
-        why = H.merged_config_problem(Checkout(), CONFIG_PATH)
+        def blob(*a):
+            b'{"x": "\xff"}'.decode()
+        why = H.merged_config_problem(reading({('cat-file', '-s'): (0, '9\n'), ('cat-file', 'blob'): blob}),
+                                      CONFIG_PATH)
         self.assertIn('could not be checked, so it is not passed: UnicodeDecodeError', why)
+
+    def test_the_caps_are_the_documented_values_exactly_at_and_one_over(self):   # #413 item 4: the docs name them
+        self.assertEqual((H.MAX_CONFIG_BYTES, H.MAX_GLOB_LENGTH, H.MAX_GLOB_TOTAL), (32 * 1024, 128, 2048))
+        cfg = dict(CFG_RAW, lens_format_doc='')
+        cfg['lens_format_doc'] = 'd' * (32 * 1024 - len(json.dumps(cfg)))
+        self.assertIsNone(H.config_text_problem(json.dumps(cfg), CONFIG_PATH))   # 32 KiB exactly
+        cfg['lens_format_doc'] += 'd'
+        self.assertIn('at 32769 bytes, over the 32768 bytes', H.config_text_problem(json.dumps(cfg), CONFIG_PATH) or '')
+
+        def rules(*globs):
+            return {'review': {'rules': [{'paths': list(globs)}]}}
+        self.assertIsNone(H.glob_cap_problem(rules('g' * 128)))
+        self.assertIn('a glob of 129 characters, over the 128', H.glob_cap_problem(rules('g' * 129)) or '')
+        self.assertIsNone(H.glob_cap_problem(rules(*['g' * 128] * 16)))   # 2,048 in all
+        self.assertIn('globs of 2049 characters in all, over the 2048',
+                      H.glob_cap_problem(rules(*['g' * 128] * 16, 'g')) or '')
+
+    def test_a_merge_tree_that_fails_is_refused_whatever_it_printed(self):   # #413 item 4: exit 2 or more
+        text = json.dumps(CFG_RAW)
+        for code in (2, 128):
+            with self.subTest(code):
+                checkout = reading({'merge-tree': (code, 'f' * 40 + '\n'), ('cat-file', '-s'): (0, f'{len(text)}\n'),
+                                    ('cat-file', 'blob'): (0, text)}, bare=(C, A))
+                why = H.merged_config_problem(checkout, CONFIG_PATH)
+                self.assertIn(f'git merge-tree of the base {C[:12]} and the head {A[:12]} failed', why or '')
+        clean = reading({**checkout.answers, 'merge-tree': (0, 'f' * 40 + '\n')}, bare=(C, A))
+        self.assertIsNone(H.merged_config_problem(clean, CONFIG_PATH))   # the same answers with exit 0 pass
+
+    def test_a_tree_entry_git_lists_oddly_is_a_refusal(self):   # #413 item 1: only one record, of the config's path
+        for name, out in (('another path', f'100644 blob {B}\tother.json\0'),
+                          ('two records', f'100644 blob {B}\t{CONFIG_PATH}\x00100644 blob {B}\t{CONFIG_PATH}\0'),
+                          ('no sha', f'100644 blob xyz\t{CONFIG_PATH}\0'), ('no mode', f'blob {B}\t{CONFIG_PATH}\0'),
+                          ('a mode that is none', f'10o644 blob {B}\t{CONFIG_PATH}\0')):
+            with self.subTest(name):
+                why = H.merged_config_problem(reading({'ls-tree': (0, out)}), CONFIG_PATH)
+                self.assertIn('could not be checked, so it is not passed', why or '')
+        why = H.merged_config_problem(reading({'ls-tree': (128, '')}), CONFIG_PATH)
+        self.assertIn('could not be checked, so it is not passed', why or '')
+
+
+def reading(answers, bare=None):
+    """A checkout of the base C and the head A whose git answers each call by its words (`merge-tree`, `ls-tree`, or
+    the first two): (code, stdout), or a function that raises. Without an `ls-tree` answer the config is a file, the
+    base's blob 1... at the base and 2... in the merge. A call it has no answer for fails the test."""
+    class Checkout:
+        def merge_parents(self):
+            return bare or (C, A)
+
+        def git(self, *a, **kw):
+            key = 'merge-tree' if 'merge-tree' in a else a[0] if a[0] == 'ls-tree' else a[:2]
+            answer = self.answers.get(key)
+            if answer is None and key == 'ls-tree':
+                answer = (0, f'100644 blob {("1" if a[2] == C else "2") * 40}\t{a[-1]}\0')
+            if answer is None:
+                raise AssertionError(f'read: {a}')
+            if callable(answer):
+                return answer(*a)
+            return types.SimpleNamespace(returncode=answer[0], stdout=answer[1], stderr='boom' if answer[0] else '')
+    checkout = Checkout()
+    checkout.bare, checkout.answers = bare, answers
+    return checkout
 
 
 # The shapes the #378 security lens measured, and the worst ones under the caps: each in a child process with a time and
@@ -1499,6 +1638,28 @@ class Action(unittest.TestCase):
         r = self.run_step(PASS_DRAFTS='yes\n::warning::forged')
         self.assertEqual(r.returncode, 2)
         self.assertNotIn('forged', r.stdout + r.stderr)
+
+    def test_the_git_clean_check_reads_the_path_input(self):
+        """The first step checks the checkout at `path`, not the workspace: with the good checkout in src/ and a planted
+        one at the top, path src passes; with the two swapped, it is refused."""
+        step = self.action['runs']['steps'][0]
+        self.assertIn('git_clean.py', step['run'])
+        ws = tempfile.mkdtemp(prefix='head-check-ws-')
+        self.addCleanup(shutil.rmtree, ws, True)
+        env = {k: {'${{ inputs.path }}': 'src'}[v] for k, v in step['env'].items()}
+        for good, bad in (('src', '.'), ('.', 'src')):
+            with self.subTest(good=good):
+                for p in ('.git', 'src'):
+                    shutil.rmtree(os.path.join(ws, p), True)
+                for p in (good, bad):
+                    subprocess.run(['git', 'init', '-q', os.path.join(ws, p)], check=True, capture_output=True,
+                                   env={**os.environ, 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'})
+                with open(os.path.join(ws, bad, '.git', 'config'), 'a') as f:
+                    f.write('[core]\n\tfsmonitor = true\n')
+                r = subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', step['run']], cwd=ws,
+                                   env={'PATH': os.environ['PATH'], 'GITHUB_ACTION_PATH': HERE, 'GITHUB_WORKSPACE': ws,
+                                        **env}, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0 if good == 'src' else 2, r.stdout + r.stderr)
 
     def test_the_defaults_are_the_pull_request_events(self):
         inputs = self.action['inputs']

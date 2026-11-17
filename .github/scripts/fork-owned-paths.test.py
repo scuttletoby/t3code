@@ -259,8 +259,11 @@ check("workflow: the runner routing gets the fork-only gates on a fork-only pull
       "steps.fork_only.outputs.fork_only == 'true' && toJSON(steps.fork_only.outputs)" in route_gates, route_gates)
 
 # Jobs that run on a fork-only pull request: they test the fork's own files (Lint too: `vp check` formats and lints
-# every file, the fork's included, and knip reads .github/**/*.cjs). Every other job is an app job.
-RUNS = {"outside_pr", "changes", "fleet_watch", "workflows", "kit_tests", "secrets", "lint", "fork_ci_result"}
+# every file, the fork's included, and knip reads .github/**/*.cjs; fork_checks_ran checks that fork-checks.yml ran).
+# Every other job is an app job.
+RUNS = {"outside_pr", "changes", "fleet_watch", "fork_checks_ran", "workflows", "action_tests", "kit_tests", "secrets",
+        "lint",
+        "fork_ci_result"}
 app_jobs = sorted(set(jobs) - RUNS)
 check("workflow: the app jobs are the ones this switch is for",
       {"build", "test", "test_web", "test_server", "rust", "release_smoke", "mobile_native_static_analysis"} <= set(app_jobs),

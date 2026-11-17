@@ -619,6 +619,19 @@ describe("__fork-report settings", () => {
     expect(report.problems.map((problem) => problem.code)).toEqual(["settings-unreadable"]);
     expect(report.fork.featuresOn).toEqual([]);
     expect(report.settings.providerInstances).toEqual([]);
+
+    // Every interval is then at its default anyway, so none is named, whether the decode or the
+    // legacy provider keys make the load ignore the file.
+    for (const file of [
+      { agentSlots: { enabled: "yes" }, headlessUsageRefreshInterval: -5 },
+      { providers: "codex", headlessUsageRefreshInterval: -5 },
+    ]) {
+      expect(settingsReport(file).settings).toMatchObject({ intervalsReadAsDefaults: [] });
+    }
+    expect(
+      settingsReport({ providers: "codex", headlessUsageRefreshInterval: -5 }).settings
+        .parseWarning,
+    ).toBe("The legacy provider or source control keys do not decode.");
   });
 
   it("names each interval a load reads as its default, without failing the report", () => {
