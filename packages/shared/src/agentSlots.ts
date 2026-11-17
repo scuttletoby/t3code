@@ -119,12 +119,12 @@ export interface StartingEntry {
  * never get more slots than are free (a lost end stops after `DISPATCH_SAFETY_MS`). After the
  * dispatch, a child that shows no run yet (a queued run) counts for the start grace.
  */
-export function liveStarting(
-  entries: ReadonlyArray<StartingEntry>,
+export function liveStarting<Entry extends StartingEntry>(
+  entries: ReadonlyArray<Entry>,
   visibleRunIds: ReadonlySet<string>,
   nowMs: number,
   startGraceMs: number,
-): ReadonlyArray<StartingEntry> {
+): ReadonlyArray<Entry> {
   return entries.filter((entry) => {
     if (entry.childThreadId !== undefined && visibleRunIds.has(entry.childThreadId)) return false;
     return entry.endedAtMs === undefined
