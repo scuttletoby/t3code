@@ -172,18 +172,42 @@ schema_check() { # schema_check BASE WHAT: fails with the check's output, a refu
 schema_check "$base" "The series"
 
 # Fork lines in upstream files (.github/fork-seams.json): only the pinned seams, so every fork
-# setting stays in the fork's own files. Exit 1 is a refusal; anything else is a crash.
+# setting stays in the fork's own files. Exit 1 is a refusal; anything else is a crash. After a
+# rebase (--after-rebase), a "pending" ceiling above the file's fork lines is only a note: upstream
+# taking a fork line drops it in the rebase, and the next run (from the new base) refuses it.
 seam_refusal="Fork changes to upstream files must stay within the seam lines"
-seam_check() { # seam_check BASE WHAT
+seam_check() { # seam_check BASE WHAT [--after-rebase]
   local status=0
-  node .github/scripts/fork-seam-check.cjs "$1" HEAD > "$logs/seam-check.log" 2>&1 || status=$?
-  ((status != 0)) || return 0
+  node .github/scripts/fork-seam-check.cjs ${3:+"$3"} "$1" HEAD > "$logs/seam-check.log" 2>&1 || status=$?
+  if ((status == 0)); then
+    grep '^Note: ' "$logs/seam-check.log" >&2 || true
+    return 0
+  fi
   if ((status == 1)) && grep -qF "$seam_refusal" "$logs/seam-check.log"; then
-    fail "$2 adds fork lines to upstream files beyond the seams:" '```' "$(cat "$logs/seam-check.log")" '```'
+    fail "$2 does not fit the seam list (.github/fork-seams.json):" '```' "$(cat "$logs/seam-check.log")" '```'
   fi
   fail "The seam check crashed (exit $status), so it did not say whether the series stays within the seams:" \
     '```' "$(tail -n 20 "$logs/seam-check.log")" '```' "The series was left as it is."
 }
+# The sweep (fork-workflows.sh) takes every .github/workflows/fork-*.y[a]ml as the fork's own, even
+# one the series does not have yet, and never disables it. A file of that name that the upstream
+# release has and the candidate keeps would stay enabled, so the plan refuses it.
+fork_named() { # fork_named COMMIT: its .github/workflows/fork-*.y[a]ml files, one per line
+  git -c core.quotepath=off ls-tree -r -z --name-only "$1" -- .github/workflows \
+    | tr '\0' '\n' | { grep -E '^\.github/workflows/fork-[^/]*\.ya?ml$' || true; }
+}
+refuse_upstream_fork_named() { # refuse_upstream_fork_named UPSTREAM_COMMIT TAG CANDIDATE
+  local named
+  named="$(comm -12 <(fork_named "$1" | sort) <(fork_named "$3" | sort))"
+  [[ -z "$named" ]] || fail "$UPSTREAM $2 has workflow files named like the fork's own (fork-*.yml), and the candidate keeps them:" \
+    "$(sed 's/^/- /' <<< "$named")" "" \
+    "The workflow sweep never disables a fork-* workflow, so they would run in the fork. The series was left as it is." \
+    "Add a fork patch that deletes them (or rename the fork's rule in fork-workflows.sh and fork-follow.sh), then start the follow workflow again."
+}
+
+# Before the seam check, which also refuses an upstream file named like the fork's, so the report
+# says what to do about a workflow (as after a rebase, below).
+refuse_upstream_fork_named "$base" "$base_tag" "$head"
 seam_check "$base" "The series"
 
 # The upstream workflow files the fork deletes, from the series head. Fail closed: without a
@@ -287,22 +311,6 @@ new_workflows() { # new_workflows FROM TO: sets new_list, the upstream workflow 
   done
 }
 
-# The sweep (fork-workflows.sh) takes every .github/workflows/fork-*.y[a]ml as the fork's own, even
-# one the series does not have yet, and never disables it. A file of that name that the upstream
-# release has and the candidate keeps would stay enabled, so the plan refuses it.
-fork_named() { # fork_named COMMIT: its .github/workflows/fork-*.y[a]ml files, one per line
-  git -c core.quotepath=off ls-tree -r -z --name-only "$1" -- .github/workflows \
-    | tr '\0' '\n' | { grep -E '^\.github/workflows/fork-[^/]*\.ya?ml$' || true; }
-}
-refuse_upstream_fork_named() { # refuse_upstream_fork_named UPSTREAM_COMMIT TAG CANDIDATE
-  local named
-  named="$(comm -12 <(fork_named "$1" | sort) <(fork_named "$3" | sort))"
-  [[ -z "$named" ]] || fail "$UPSTREAM $2 has workflow files named like the fork's own (fork-*.yml), and the candidate keeps them:" \
-    "$(sed 's/^/- /' <<< "$named")" "" \
-    "The workflow sweep never disables a fork-* workflow, so they would run in the fork. The series was left as it is." \
-    "Add a fork patch that deletes them (or rename the fork's rule in fork-workflows.sh and fork-follow.sh), then start the follow workflow again."
-}
-
 # The release job runs the reusable workflows of this run's commit (RUN_SHA), not the candidate's.
 # They differ after upstream changed them, and on a re-run (or a queued run) of a run whose commit
 # is older than the series. Building then would mix two versions of the release steps.
@@ -364,7 +372,6 @@ if [[ "$channel" == nightly ]] && ! git merge-base --is-ancestor "$target" refs/
 fi
 
 if [[ -z "$untagged" && "$target_tag" == "$base_tag" ]]; then
-  refuse_upstream_fork_named "$base" "$base_tag" "$head"
   # The candidate here is the series head itself, so a listed file in it is refused, not deleted.
   kept="$(present_removed "$head")"
   [[ -z "$kept" ]] || fail "The series still has workflow files that $removed_file lists as deleted:" \
@@ -440,9 +447,11 @@ if [[ -n "$kept" ]]; then
     -m "Upstream $target_tag has them again: $(paste -sd ' ' <<< "$kept")"
 fi
 schema_check "$target" "After rebasing onto $target_tag, the series"
-seam_check "$target" "After rebasing onto $target_tag, the series"
 candidate="$(git rev-parse HEAD)"
+# Before the seam check, which also refuses an upstream file named like the fork's, so the report
+# says what to do about a workflow.
 refuse_upstream_fork_named "$target" "$target_tag" "$candidate"
+seam_check "$target" "After rebasing onto $target_tag, the series" --after-rebase
 refuse_outside_workflows "$base" "$target" "$target_tag" "$candidate"
 dropped="$(comm -23 <(sort <<< "$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
 
