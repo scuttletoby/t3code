@@ -1,7 +1,9 @@
-// Usage: fork-seam-check.cjs [--config-ref <rev>] <base> <head>. Refuses <head>'s changes to any
-// upstream file since the merge-base beyond .github/fork-seams.json. A <base> without the list (and
-// no --config-ref) is upstream; else the list comes from the base (or --config-ref), never from
-// <head> or the working tree. Reads git objects only; nothing runs.
+// Usage: fork-seam-check.cjs [--config-ref <rev>] [--after-rebase] <base> <head>. Refuses <head>'s
+// changes to any upstream file since the merge-base beyond .github/fork-seams.json. A <base> without
+// the list (and no --config-ref) is upstream; else the list comes from the base (or --config-ref),
+// never from <head> or the working tree. --after-rebase (fork-follow, right after rebasing onto a
+// new upstream): a "pending" file below its ceiling is a note, not a refusal (see findUnlistedChanges).
+// Reads git objects only; nothing runs.
 
 const { execFileSync } = require("node:child_process");
 
@@ -10,6 +12,9 @@ const CONFIG = ".github/fork-seams.json";
 // fork-*.yml, which fork-follow makes the fork delete (that list cannot name them), the only upstream
 // files a change may delete.
 const REMOVED = ".github/fork-removed-workflows.txt";
+// The refusals of a "pending" ceiling left above a file's fork lines (fixed by lowering it).
+const CEILING_TOO_HIGH =
+  /: "pending" with (no fork lines left|\d+ fork lines, fewer than its ceiling)/;
 const REMOVED_PATH = /^\.github\/workflows\/[^/,\s]+\.ya?ml$/;
 const FORK_WORKFLOW = /^\.github\/workflows\/fork-[^/]*\.ya?ml$/;
 
@@ -153,11 +158,15 @@ function forkFileTest(patterns = []) {
 /**
  * Changed files outside the seams. An unlisted upstream file may gain, lose or move no line, nor
  * go (unless `removed` names it). A "pending" one holds exactly its ceiling from upstream (more is
- * refused, fewer too, so the ceiling gets lowered), and on a pull request may change but not grow. On a pull request, `isForkFile` names the fork's own files.
+ * refused, fewer too, so the ceiling gets lowered), and on a pull request may change but not grow.
+ * On a pull request, `isForkFile` names the fork's own files. `afterRebase`: fewer than the ceiling
+ * is a note, since upstream adopting a fork line word for word drops it in the rebase, and the
+ * ceiling cannot be lowered first (the check before the rebase, on the old base, would then fail).
+ * The next run, from the new base, refuses it, and a pull request lowers it.
  */
 function findUnlistedChanges(
   config,
-  { changed, atBase, atHead, upstream, isForkFile, removed = new Set() },
+  { changed, atBase, atHead, upstream, isForkFile, removed = new Set(), afterRebase = false },
 ) {
   const reasons = [];
   const notes = [];
@@ -206,13 +215,14 @@ function findUnlistedChanges(
         reasons.push(
           `${file}: "pending" with ${added} fork lines, more than its ceiling of ${ceiling} (fork lines to move out, not add).`,
         );
-      } else if (added === 0) {
-        // A ceiling left too high is room to swap upstream lines for fork lines later, and a note
-        // in the nightly log is never seen: refuse, naming the fix.
-        reasons.push(`${file}: "pending" with no fork lines left; remove it from the list.`);
       } else if (added < ceiling) {
-        reasons.push(
-          `${file}: "pending" with ${added} fork lines, fewer than its ceiling of ${ceiling}; lower it to ${added}.`,
+        // A ceiling left too high is room to swap upstream lines for fork lines later, and a note
+        // in the nightly log is never seen: refuse, naming the fix (only noted right after a
+        // rebase; the next run refuses it).
+        (afterRebase ? notes : reasons).push(
+          added === 0
+            ? `${file}: "pending" with no fork lines left; remove it from the list.`
+            : `${file}: "pending" with ${added} fork lines, fewer than its ceiling of ${ceiling}; lower it to ${added}.`,
         );
       }
       continue;
@@ -297,6 +307,8 @@ function readConfigAt(rev) {
 
 function parseArgs(argv) {
   const args = [...argv];
+  const afterRebase = args.includes("--after-rebase");
+  if (afterRebase) args.splice(args.indexOf("--after-rebase"), 1);
   let configRef;
   const at = args.indexOf("--config-ref");
   if (at !== -1) {
@@ -305,13 +317,13 @@ function parseArgs(argv) {
     args.splice(at, 2);
   }
   if (args.length !== 2 || args.some((arg) => arg.startsWith("--"))) return undefined;
-  return { configRef, base: args[0], head: args[1] };
+  return { configRef, afterRebase, base: args[0], head: args[1] };
 }
 
 function main(argv) {
   const parsed = parseArgs(argv);
   if (!parsed) {
-    console.error("Usage: fork-seam-check.cjs [--config-ref <rev>] <base> <head>");
+    console.error("Usage: fork-seam-check.cjs [--config-ref <rev>] [--after-rebase] <base> <head>");
     return 2;
   }
   const { base, head } = parsed;
@@ -348,6 +360,7 @@ function main(argv) {
     upstream,
     isForkFile,
     removed,
+    afterRebase: parsed.afterRebase,
   });
   const reasons = [
     ...findSeamBreaches(config.files, { atBase, atHead, upstream }),
@@ -379,11 +392,19 @@ function main(argv) {
     `Fork changes to upstream files must stay within the seam lines in ${CONFIG} (list from ${from}):`,
   );
   for (const reason of reasons) console.error(`- ${reason}`);
-  console.error(
-    "Put the change in a file of the fork's own (a fork setting goes in " +
-      "packages/contracts/src/forkSettings.ts; see docs/fork/updates.md). A new seam line needs " +
-      `its own entry in ${CONFIG}, which the owner approves.`,
-  );
+  const ceilings = reasons.filter((reason) => CEILING_TOO_HIGH.test(reason)).length;
+  if (ceilings < reasons.length) {
+    console.error(
+      "Put the change in a file of the fork's own (a fork setting goes in " +
+        "packages/contracts/src/forkSettings.ts; see docs/fork/updates.md). A new seam line needs " +
+        `its own entry in ${CONFIG}, which the owner approves.`,
+    );
+  }
+  if (ceilings > 0) {
+    console.error(
+      `Lower each "pending" ceiling named above (or remove the entry) in ${CONFIG} with a pull request to main.`,
+    );
+  }
   return 1;
 }
 

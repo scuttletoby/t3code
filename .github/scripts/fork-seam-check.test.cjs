@@ -257,9 +257,10 @@ test("from upstream, a ceiling left too high after lines moved out is refused, s
   const upstreamText = `${UP}if (!ok) return;\n`;
   const config = { pending: { "p.ts": 2 } };
   const afterMoveOut = `${upstreamText}forkA();\n`;
-  assert.deepEqual(unlisted(config, { "p.ts": upstreamText }, { "p.ts": afterMoveOut }, true).reasons, [
-    'p.ts: "pending" with 1 fork lines, fewer than its ceiling of 2; lower it to 1.',
-  ]);
+  assert.deepEqual(
+    unlisted(config, { "p.ts": upstreamText }, { "p.ts": afterMoveOut }, true).reasons,
+    ['p.ts: "pending" with 1 fork lines, fewer than its ceiling of 2; lower it to 1.'],
+  );
   // (So the nightly stops right after PR 1, before a PR 2 could use the spare line.)
   // Exactly at the ceiling passes; one over is refused.
   const one = { pending: { "p.ts": 1 } };
@@ -267,6 +268,38 @@ test("from upstream, a ceiling left too high after lines moved out is refused, s
     reasons: [],
     notes: [],
   });
+  const zero = { "p.ts": upstreamText };
+  assert.deepEqual(unlisted(one, zero, { "p.ts": `${afterMoveOut}forkB();\n` }, true).reasons, [
+    'p.ts: "pending" with 2 fork lines, more than its ceiling of 1 (fork lines to move out, not add).',
+  ]);
+});
+
+// Round-3 state lens on #277: upstream adopts a pending fork line word for word, so the rebase
+// drops it and the series falls below its ceiling. Lowering the ceiling first fails the check on
+// the old base, so right after a rebase it is a note; the next run (from the new base) refuses it.
+test("after a rebase, a pending file below its ceiling is a note; over it is still refused", () => {
+  const config = { files: {}, pending: { "p.ts": 2 }, forkFiles: [] };
+  const judge = (head, afterRebase) =>
+    findUnlistedChanges(config, {
+      changed: ["p.ts"],
+      atBase: () => UP,
+      atHead: () => head,
+      upstream: true,
+      isForkFile: () => false,
+      afterRebase,
+    });
+  assert.deepEqual(judge(`${UP}forkA();\n`, true), {
+    reasons: [],
+    notes: ['p.ts: "pending" with 1 fork lines, fewer than its ceiling of 2; lower it to 1.'],
+  });
+  assert.deepEqual(judge(UP, true), {
+    reasons: [],
+    notes: ['p.ts: "pending" with no fork lines left; remove it from the list.'],
+  });
+  assert.deepEqual(judge(`${UP}forkA();\nforkB();\nforkC();\n`, true).reasons, [
+    'p.ts: "pending" with 3 fork lines, more than its ceiling of 2 (fork lines to move out, not add).',
+  ]);
+  assert.equal(judge(UP, false).reasons.length, 1);
 });
 
 test("a malformed config throws instead of guarding nothing", () => {
@@ -606,5 +639,33 @@ test("with --config-ref, a base without the list is refused, not taken for upstr
     const result = run("--config-ref", main, noList, grown);
     assert.equal(result.status, 1, result.stdout);
     assert.match(result.stderr, /^The base .* has no \.github\/fork-seams\.json/);
+  });
+});
+
+test("--after-rebase notes a ceiling above the fork lines; without it the refusal names the fix", () => {
+  withRepo(({ commit, run }) => {
+    const upstream = commit(
+      { "p.ts": `${UP}forkA();\n`, "u.ts": UP },
+      "upstream adopts the fork line",
+    );
+    const series = commit(seams({ files: {}, pending: { "p.ts": 1 } }), "fork series");
+    const after = run("--after-rebase", upstream, series);
+    assert.equal(after.status, 0, after.stderr);
+    assert.match(after.stdout, /^Note: p\.ts: "pending" with no fork lines left/m);
+    const next = run(upstream, series);
+    assert.equal(next.status, 1);
+    assert.match(next.stderr, /- p\.ts: "pending" with no fork lines left/);
+    assert.match(next.stderr, /Lower each "pending" ceiling/);
+    assert.doesNotMatch(next.stderr, /a file of the fork's own/);
+    // A ceiling refusal next to another refusal keeps both hints.
+    const line = commit({ "u.ts": `${UP}forkNew();\n` }, "fork line in u.ts");
+    const mixed = run(upstream, line);
+    assert.equal(mixed.status, 1);
+    assert.match(mixed.stderr, /- u\.ts: upstream file with 1 fork line/);
+    assert.match(mixed.stderr, /a file of the fork's own/);
+    assert.match(mixed.stderr, /Lower each "pending" ceiling/);
+    // After a rebase, the other refusal still fails it.
+    assert.equal(run("--after-rebase", upstream, line).status, 1);
+    assert.equal(run("--after-rebase", "--after-rebase", upstream, series).status, 2);
   });
 });

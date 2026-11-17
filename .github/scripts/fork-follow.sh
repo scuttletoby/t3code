@@ -172,14 +172,19 @@ schema_check() { # schema_check BASE WHAT: fails with the check's output, a refu
 schema_check "$base" "The series"
 
 # Fork lines in upstream files (.github/fork-seams.json): only the pinned seams, so every fork
-# setting stays in the fork's own files. Exit 1 is a refusal; anything else is a crash.
+# setting stays in the fork's own files. Exit 1 is a refusal; anything else is a crash. After a
+# rebase (--after-rebase), a "pending" ceiling above the file's fork lines is only a note: upstream
+# taking a fork line drops it in the rebase, and the next run (from the new base) refuses it.
 seam_refusal="Fork changes to upstream files must stay within the seam lines"
-seam_check() { # seam_check BASE WHAT
+seam_check() { # seam_check BASE WHAT [--after-rebase]
   local status=0
-  node .github/scripts/fork-seam-check.cjs "$1" HEAD > "$logs/seam-check.log" 2>&1 || status=$?
-  ((status != 0)) || return 0
+  node .github/scripts/fork-seam-check.cjs ${3:+"$3"} "$1" HEAD > "$logs/seam-check.log" 2>&1 || status=$?
+  if ((status == 0)); then
+    grep '^Note: ' "$logs/seam-check.log" >&2 || true
+    return 0
+  fi
   if ((status == 1)) && grep -qF "$seam_refusal" "$logs/seam-check.log"; then
-    fail "$2 adds fork lines to upstream files beyond the seams:" '```' "$(cat "$logs/seam-check.log")" '```'
+    fail "$2 does not fit the seam list (.github/fork-seams.json):" '```' "$(cat "$logs/seam-check.log")" '```'
   fi
   fail "The seam check crashed (exit $status), so it did not say whether the series stays within the seams:" \
     '```' "$(tail -n 20 "$logs/seam-check.log")" '```' "The series was left as it is."
@@ -446,7 +451,7 @@ candidate="$(git rev-parse HEAD)"
 # Before the seam check, which also refuses an upstream file named like the fork's, so the report
 # says what to do about a workflow.
 refuse_upstream_fork_named "$target" "$target_tag" "$candidate"
-seam_check "$target" "After rebasing onto $target_tag, the series"
+seam_check "$target" "After rebasing onto $target_tag, the series" --after-rebase
 refuse_outside_workflows "$base" "$target" "$target_tag" "$candidate"
 dropped="$(comm -23 <(sort <<< "$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
 

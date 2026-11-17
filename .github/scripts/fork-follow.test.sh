@@ -414,7 +414,7 @@ new_fork v0.1.10
 seams "fork seam" "inline fork line"
 plan
 check "plan: a fork line beyond the seams stops the plan, naming it" \
-  eval 'has "The series adds fork lines to upstream files beyond the seams" "$root/report.md" && has "inline fork line" "$root/report.md" && [[ -z "$(out action)" ]]'
+  eval 'has "The series does not fit the seam list" "$root/report.md" && has "inline fork line" "$root/report.md" && [[ -z "$(out action)" ]]'
 
 # Round 5: upstream workflow files the fork deletes (.github/fork-removed-workflows.txt) stay
 # deleted on every follow, and a new upstream workflow that someone outside the fork can start
@@ -431,6 +431,23 @@ fork_remove() { # fork_remove FILE...: a fork patch that lists and deletes upstr
   for f in "$@"; do cmd+="echo .github/workflows/$f >> .github/fork-removed-workflows.txt && rm -f .github/workflows/$f && "; done
   fork_commit "fork: delete $*" "${cmd}true"
 }
+# Upstream adopts a "pending" fork line word for word: the rebase drops it, so the series is below
+# its ceiling. Lowering the ceiling first fails the check on the old base, so after a rebase the
+# ceiling is only a note; the next run, from the new base, refuses it (a pull request lowers it).
+new_upstream
+new_fork v0.1.10
+(cd "$root/work" && echo '{"files":{},"pending":{"u2.txt":1}}' > .github/fork-seams.json && echo "fork pending line" >> u2.txt \
+  && git add -A && git commit -q --amend --no-edit && git push -q --force origin main) > /dev/null 2>&1
+up_release v0.1.11 'echo "fork pending line" >> u2.txt'
+plan
+check "plan: upstream taking a pending fork line rebases, noting the ceiling" \
+  eval 'action_is rebase && grep -q "Note: u2.txt: \"pending\" with no fork lines left" "$root/out"'
+work git reset -q --hard "$(out candidate)"
+work git push -q --force origin HEAD:main
+plan
+check "plan: the next run from the new base refuses the ceiling, naming the fix" \
+  eval 'has "u2.txt: \"pending\" with no fork lines left" "$root/report.md" && has "Lower each \"pending\" ceiling" "$root/report.md" && hasnt "a file of the fork" "$root/report.md" && [[ -z "$(out action)" ]]'
+
 in_candidate() { git -C "$root/work" cat-file -e "$(out candidate):.github/workflows/$1" 2> /dev/null; }
 
 new_upstream

@@ -47,8 +47,10 @@ watches; it changes nothing on the machine, and `0` turns it off.
   `pending` or `forkFiles` entry counts once the owner merges it. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
-  also lowers the ceiling in the same change). A pull request may change a pending file but not
-  grow it. An upstream file in no list may gain no
+  also lowers the ceiling in the same change). Right after a rebase, below the ceiling is only a
+  note in the run log: when upstream takes a fork line word for word, the rebase drops it, and the
+  ceiling could not have been lowered first. The next run, from the new base, fails until a pull
+  request lowers it. A pull request may change a pending file but not grow it. An upstream file in no list may gain no
   line, lose no line and keep its lines in order (whitespace and blank lines aside), and no
   upstream file may be deleted or renamed, except the workflows
   [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
