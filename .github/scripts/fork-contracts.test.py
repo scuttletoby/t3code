@@ -1355,6 +1355,180 @@ check("secret-scan: the expression evaluator reads GitHub's rules (&& and || giv
       and gh_eval("format('refs/heads/{0}', a.b) == 'REFS/heads/main'", {"a": {"b": "main"}})
       and not gh_eval("(true || false) && !true", {}))
 
+# The scan job's token drop (#317 item 4): actions/checkout keeps the job's token in the repository's
+# git config (persist-credentials stays on: the checkout rule above), and every origin fetch of the
+# scan script would send it. The step right after the checkout takes it out (checkout v6: an
+# includeIf.<gitdir>.path pointing at a file with http.<url>.extraheader; older ones: the header
+# itself; the includes, the headers and the file under RUNNER_TEMP go), then fails unless no
+# extraheader is left in any config git reads (includes followed).
+# It must pass when there is nothing to remove (a re-run, an old checkout), so the listing's "no
+# match" (exit 1) may not end the step; any other failure to read the config fails it.
+TOKEN_DROP_NAME = "Drop the checkout's token from the git config"
+TOKEN_DROP_RUN = """\
+set -euo pipefail
+{ git config --local --name-only --get-regexp '^(includeif\\..*\\.path|http\\..*\\.extraheader)$' || true; } |
+  sort -u | while IFS= read -r key; do git config --local --unset-all "$key"; done
+rm -f -- "${RUNNER_TEMP:?}"/git-credentials-*.config
+rc=0
+git config --get-regexp '\\.extraheader$' > /dev/null || rc=$?
+if [[ "$rc" != 1 ]]; then
+  echo "::error::Secret scan: the checkout's token is still in the git config (or the config cannot be read), so the scan's fetches would send it" >&2
+  exit 2
+fi
+"""
+
+
+def token_drop_problems(scan):
+    problems = []
+    for j, job in (scan.get("jobs") or {}).items():
+        job_steps = job.get("steps") or []
+        if not any("scan-from-default-branch" in str(s.get("run", "")) for s in job_steps):
+            continue
+        if len(job_steps) < 2 or not CHECKOUT_ACTION.fullmatch(str(job_steps[0].get("uses", ""))):
+            problems.append(f"{SCAN_FILE}/{j}: the checkout is not the first step")
+            continue
+        step = job_steps[1]
+        if step.get("name") != TOKEN_DROP_NAME or str(step.get("run", "")).strip() != TOKEN_DROP_RUN.strip():
+            problems.append(f"{SCAN_FILE}/{j}: the step right after the checkout is not `{TOKEN_DROP_NAME}` "
+                            "in its exact form")
+        if set(step) - {"name", "run"}:
+            problems.append(f"{SCAN_FILE}/{j}: `{TOKEN_DROP_NAME}` has more than name and run "
+                            f"({', '.join(sorted(set(step) - {'name', 'run'}))}): it could be skipped or fail quietly")
+        if sum(TOKEN_DROP_NAME == s.get("name") for s in job_steps) != 1:
+            problems.append(f"{SCAN_FILE}/{j}: not exactly one `{TOKEN_DROP_NAME}` step")
+    if not any(any("scan-from-default-branch" in str(s.get("run", "")) for s in job.get("steps") or [])
+               for job in (scan.get("jobs") or {}).values()):
+        problems.append(f"{SCAN_FILE}: no job runs the scan")
+    return problems
+
+
+def token_drop_step_run(scan):
+    for job in (scan.get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            if step.get("name") == TOKEN_DROP_NAME:
+                return str(step.get("run", ""))
+    return "exit 97"
+
+
+HEADER = "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46ZmFrZQ=="
+
+
+def token_drop_e2e(run):
+    """Runs the step's text as Actions runs it (bash -e -o pipefail) in checkouts laid out as
+    actions/checkout leaves them; returns what went wrong."""
+    problems = []
+    case_dir = pathlib.Path(tempfile.mkdtemp(prefix="token-drop-", dir=work))
+
+    def repo(label):
+        dest = case_dir / label
+        git(work, "init", "-q", str(dest))
+        git(dest, "remote", "add", "origin", "https://github.com/me/t3code")
+        return dest
+
+    def step(dest, **env):
+        return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", run], cwd=dest,
+                              env={**base_env, "RUNNER_TEMP": str(case_dir), **env}, capture_output=True, text=True)
+
+    def headers(dest, **env):
+        return subprocess.run(["git", "config", "--get-regexp", r"\.extraheader$"], cwd=dest,
+                              env={**base_env, **env}, capture_output=True, text=True)
+
+    # checkout v6: the header lives in a file of its own, which the repository's config includes for
+    # its git dir (one entry for the runner's path, one for a container's).
+    v6 = repo("v6")
+    creds = case_dir / "git-credentials-1234.config"
+    creds.write_text(f'[http "https://github.com/"]\n\textraheader = {HEADER}\n')
+    git(v6, "config", "--local", f"includeIf.gitdir:{v6}/.git.path", str(creds))
+    git(v6, "config", "--local", "includeIf.gitdir:/github/workspace/.git.path", "/github/runner_temp/" + creds.name)
+    if headers(v6).returncode != 0:
+        problems.append("fixture: the v6 layout's header is not seen through the include")
+    r = step(v6)
+    if r.returncode != 0 or headers(v6).returncode != 1 \
+            or git(v6, "config", "--local", "--get-regexp", "^includeif", ok=False).returncode != 1:
+        problems.append(f"v6 layout: the header (include) is not removed with exit 0 (exit {r.returncode}: {r.stderr.strip()})")
+    if creds.exists():
+        problems.append("v6 layout: the credentials file under RUNNER_TEMP is left")
+    if git(v6, "config", "remote.origin.url") != "https://github.com/me/t3code":
+        problems.append("v6 layout: the step changed more than the token (origin's URL)")
+    # Run again (a re-run of the job's step, or the same step after a half-way stop): nothing left.
+    r = step(v6)
+    if r.returncode != 0 or r.stderr.strip():
+        problems.append(f"re-run: nothing to remove does not pass quietly (exit {r.returncode}: {r.stderr.strip()})")
+    # An older checkout: the header in the repository's own config, twice.
+    old = repo("old")
+    git(old, "config", "--local", "http.https://github.com/.extraheader", HEADER)
+    git(old, "config", "--local", "--add", "http.https://github.com/.extraheader", HEADER)
+    r = step(old)
+    if r.returncode != 0 or headers(old).returncode != 1:
+        problems.append(f"old layout: the header is not removed with exit 0 (exit {r.returncode}: {r.stderr.strip()})")
+    # A checkout that kept no token at all.
+    none = repo("none")
+    r = step(none)
+    if r.returncode != 0 or r.stderr.strip():
+        problems.append(f"no header: does not pass quietly (exit {r.returncode}: {r.stderr.strip()})")
+    # A header the step cannot remove (another config file): the closing check fails the step.
+    elsewhere = case_dir / "global-with-header"
+    elsewhere.write_text(f'[http "https://github.com/"]\n\textraheader = {HEADER}\n')
+    r = step(repo("elsewhere"), GIT_CONFIG_GLOBAL=str(elsewhere))
+    if r.returncode == 0 or "::error::" not in r.stderr:
+        problems.append(f"a header left in another config: the step passes (exit {r.returncode})")
+    # A config git cannot read: no proof the header is gone, so the step fails.
+    broken = case_dir / "global-broken"
+    broken.write_text("[http\n")
+    r = step(repo("broken"), GIT_CONFIG_GLOBAL=str(broken))
+    if r.returncode == 0 or "::error::" not in r.stderr:
+        problems.append(f"an unreadable config: the step passes (exit {r.returncode})")
+    return problems
+
+
+check("secret-scan: the scan job drops the checkout's token right after the checkout, in its exact form",
+      not token_drop_problems(real[SCAN_FILE]), "; ".join(token_drop_problems(real[SCAN_FILE])))
+e2e_problems = token_drop_e2e(token_drop_step_run(real[SCAN_FILE]))
+check("secret-scan e2e: the token drop removes checkout v6's include and an older checkout's header, passes "
+      "quietly with nothing to remove (re-run, no header), fails on a header it cannot remove or an unreadable config",
+      not e2e_problems, "; ".join(e2e_problems))
+
+
+def token_drop_mutant(mutate):
+    wfs = copy.deepcopy(real)
+    try:
+        mutate(wfs)
+    except (KeyError, TypeError, IndexError, StopIteration):
+        return False
+    return bool(token_drop_problems(wfs[SCAN_FILE]))
+
+
+def drop_step(wfs):
+    return next(s for s in wfs[SCAN_FILE]["jobs"]["scan"]["steps"] if s.get("name") == TOKEN_DROP_NAME)
+
+
+for label, mutate in {
+    "no token drop": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].remove(drop_step(w)),
+    "the token drop after the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].append(
+        w[SCAN_FILE]["jobs"]["scan"]["steps"].pop(1)),
+    "a step between the checkout and the token drop": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        1, {"name": "x", "run": "git fetch origin main"}),
+    "a token drop that can be skipped (if:)": lambda w: drop_step(w).__setitem__("if", "${{ false }}"),
+    "a token drop that may fail quietly": lambda w: drop_step(w).__setitem__("continue-on-error", True),
+    "a token drop without its closing check": lambda w: drop_step(w).__setitem__(
+        "run", drop_step(w)["run"].split("rc=0")[0]),
+    "a token drop that keeps the include": lambda w: drop_step(w).__setitem__(
+        "run", drop_step(w)["run"].replace("includeif\\..*\\.path|", "")),
+}.items():
+    check(f"secret-scan: {SCAN_FILE} with {label} fails", token_drop_mutant(mutate))
+
+# The same broken forms, run: the e2e must see each (a check that stops seeing its problem goes red).
+for label, text in {
+    "no `|| true` (nothing to remove ends the step)": TOKEN_DROP_RUN.replace(" || true; }", "; }"),
+    "no closing check": TOKEN_DROP_RUN.split("rc=0")[0],
+    "a closing check that ignores read errors": TOKEN_DROP_RUN.replace('"$rc" != 1', '"$rc" == 0'),
+    "the include kept": TOKEN_DROP_RUN.replace("includeif\\..*\\.path|", ""),
+    "the old header kept": TOKEN_DROP_RUN.replace("|http\\..*\\.extraheader", ""),
+    "no dedup (a header set twice)": TOKEN_DROP_RUN.replace("  sort -u | while", "  while"),
+    "the credentials file kept": TOKEN_DROP_RUN.replace('rm -f -- "${RUNNER_TEMP:?}"/git-credentials-*.config\n', ""),
+}.items():
+    check(f"secret-scan e2e: a token drop with {label} fails", bool(token_drop_e2e(text)))
+
 # --- removed -----------------------------------------------------------------------------------
 removed_path = root / ".github/fork-removed-workflows.txt"
 REMOVED_LINE = re.compile(r"\.github/workflows/[^/,\s]+\.ya?ml")
