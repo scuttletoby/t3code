@@ -314,6 +314,7 @@ class Unit(Case):
         self.assertEqual(set(deny), set(k.BLOCKED4 + k.BLOCKED6))
         self.assertIn('\nIPAddressAllow=100.101.102.103/32\n', unit)
         self.assertIn('\nStartLimitBurst=5\n', unit)
+        self.assertIn('\nRestartPreventExitStatus=77\n', unit)   # a policy T3 cannot apply is not retried
         self.assertIn('\n[user]\ndefault=root\n', files['/etc/wsl.conf'][0])
         self.assertIn('\nOnUnitActiveSec=2min\n', files['/etc/systemd/system/pc-agents-walls.timer'][0])
         self.assertIn(' SHELL=/bin/bash\n', unit)   # the agent's login shell is nologin; T3's shells are bash
@@ -360,9 +361,9 @@ class Unit(Case):
     def test_config(self):
         # The kit passes these; T3 itself tells a complete object from a partial one and does not start on a partial.
         ok = {'agentSlots': {'maxPerMachine': 2}, 'providerInstances.codex-work': {'driver': 'codex'},
-              'agentSlots.maxPerMachine': 2, 'providerInstances': {}}
+              'agentSlots.maxPerMachine': 2, 'providerInstances': {}, 'automaticUpdates': False}
         self.assertEqual([p for p, v in ok.items() if k.locked_problem(p, v)], [])
-        bad = {'providerInstances.codex-work.enabled': True, 'agentSlots.a.b': {'x': 1}, 'automaticUpdates': True,
+        bad = {'providerInstances.codex-work.enabled': True, 'agentSlots.a.b': {'x': 1}, 'linkedEnvironmentsEnabled': False,
                'linkedEnvironmentsEnabled.x': 1, 'Agent': 1, 'a..b': 1}
         self.assertEqual([p for p, v in bad.items() if not k.locked_problem(p, v)], [])
         for section in ({**CONFIG, 'organization': '   '}, {**CONFIG, 'peers': []},
