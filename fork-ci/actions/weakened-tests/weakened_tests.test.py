@@ -639,24 +639,50 @@ class Action(unittest.TestCase):
         with open(gh, 'w') as f:
             f.write('#!/bin/sh\necho "$*" >> "$GH_LOG"\ncase "$*" in *pulls*) echo \'{"body": ""}\';; esac\n')
         os.chmod(gh, os.stat(gh).st_mode | stat.S_IEXEC)
-        given = {'config': CONFIG, 'repo': 'o/r', 'pr': '7', 'base': r.base, 'head': head, 'path': r.d,
+        given = {'config': CONFIG, 'repo': 'o/r', 'pr': '7', 'base': r.base, 'head': head, 'path': '.',
                  'token': 'x', 'comment': 'true', 'comment-author': BOT}
         values = {k: given[re.fullmatch(r'\$\{\{ inputs\.([\w-]+) \}\}', v)[1]] for k, v in step['env'].items()}
         out = os.path.join(files, 'out')
         open(out, 'w').close()
         for broken in (False, True):
-            env = {**os.environ, **values, 'GITHUB_OUTPUT': out, 'GITHUB_ACTION_PATH': HERE,
+            env = {**os.environ, **values, 'GITHUB_OUTPUT': out, 'GITHUB_ACTION_PATH': HERE, 'GITHUB_WORKSPACE': r.d,
                    'GH_LOG': os.path.join(files, 'gh.log'), 'PATH': files + os.pathsep + os.environ['PATH']}
             if broken:
                 env['GITHUB_ACTION_PATH'] = files   # no script there: the step still passes, with a warning
             p = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', step['run']],
-                               text=True, capture_output=True, env=env)
+                               text=True, capture_output=True, env=env, cwd=r.d)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(out) as f:
             self.assertIn('count=2', f.read())
         with open(os.path.join(files, 'gh.log')) as f:
             self.assertIn('repos/o/r/issues/7/comments', f.read())
         self.assertIn('::warning::', p.stdout)
+
+    def test_a_git_config_checkout_never_writes_means_no_report_and_no_git(self):   # fork-ci git-clean
+        with open(os.path.join(HERE, 'action.yml')) as f:
+            step = yaml.safe_load(f)['runs']['steps'][0]
+        r = Repo(self)
+        r.branch()
+        head = r.commit(delete=['web/calc.test.ts'])
+        files = tempfile.mkdtemp(prefix='weakened-tests-bin-')
+        self.addCleanup(shutil.rmtree, files, True)
+        marker = os.path.join(files, 'ran')
+        r.git('config', 'core.fsmonitor', f'touch {marker}; false')
+        given = {'config': CONFIG, 'repo': 'o/r', 'pr': '7', 'base': r.base, 'head': head, 'path': '.',
+                 'token': 'x', 'comment': 'true', 'comment-author': BOT}
+        values = {k: given[re.fullmatch(r'\$\{\{ inputs\.([\w-]+) \}\}', v)[1]] for k, v in step['env'].items()}
+        out = os.path.join(files, 'out')
+        open(out, 'w').close()
+        p = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', step['run']], text=True,
+                           capture_output=True, cwd=r.d,
+                           env={**os.environ, **values, 'GITHUB_OUTPUT': out, 'GITHUB_ACTION_PATH': HERE,
+                                'GITHUB_WORKSPACE': r.d, 'PATH': files + os.pathsep + os.environ['PATH']})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('::error::git-clean: ', p.stdout)
+        self.assertIn('::warning::weakened-tests: no report', p.stdout)
+        self.assertFalse(os.path.exists(marker))
+        with open(out) as f:
+            self.assertEqual(f.read(), '')
 
     def test_the_example_caller_runs_it_one_at_a_time_with_full_history(self):
         with open(os.path.join(HERE, 'weakened-tests-caller.example.yml')) as f:

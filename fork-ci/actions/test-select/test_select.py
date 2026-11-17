@@ -120,8 +120,12 @@ TEMP = Partial('\0temp')    # a temporary folder (tempfile): never a file of the
 CAPPED = Partial('\0cap')   # a value the caps cut off
 
 
+# Every git call runs as docs-scope's does (no global or system config, no hooks or fsmonitor of the repository).
+GIT_ENV, GIT_SAFE = docs_scope.GIT_ENV, docs_scope.GIT_SAFE
+
+
 def git(*args, cwd=None):
-    r = subprocess.run(['git', *args], capture_output=True, cwd=cwd)
+    r = subprocess.run(['git', *GIT_SAFE, *args], capture_output=True, cwd=cwd, env={**os.environ, **GIT_ENV})
     if r.returncode != 0:
         raise AllTests(f'git {args[0]} failed: {r.stderr.decode(errors="replace").strip()[:200]}')
     return r.stdout.decode('utf-8', 'surrogateescape')

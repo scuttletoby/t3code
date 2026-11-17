@@ -29,6 +29,10 @@ outputs:
 runs:
   using: composite
   steps:
+    # Before any git call: a .git config that actions/checkout does not write (one an earlier job left) is refused.
+    - name: Refuse a git config actions/checkout does not write (fork-ci git-clean)
+      shell: bash
+      run: exec python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path . --require
     # Only code from this action's folder (the caller's pinned SHA) runs; the checkout is parsed, never run.
     # The script also reads the runner's GITHUB_SHA and GITHUB_EVENT_PATH (HEAD must be GitHub's merge commit).
     - id: select
