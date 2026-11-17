@@ -423,8 +423,16 @@ export const layerProduction = Layer.mergeAll(
       ),
     ),
   ),
-  // Fork (playtest): reads its file at the first call; the tool and the renew worker come later.
-  PlaytestLayer.layer.pipe(Layer.provide(layerThreadManagementProvided)),
+  // Fork (playtest): reads its file at the first call or sweep (empty unless a session was started).
+  PlaytestLayer.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        layerThreadManagementProvided,
+        layerOrchestratorProvided,
+        layerCommandReceiptStoreProvided,
+      ),
+    ),
+  ),
   layerProviderContinuationWorkerProvided,
   layerAgentSessionScannerProvided,
   layerAgentSessionImporterProvided,

@@ -42,6 +42,11 @@ import * as PlaytestStore from "./PlaytestStore.ts";
 /** A step's output kept, on each of stdout and stderr: the last this many bytes. */
 const STEP_MAX_OUTPUT_BYTES = 64 * 1024;
 const RELEASE_PROBLEM = "release: ";
+const RENEW_PROBLEM = "renew: ";
+/** A renew, or a message about an end, that failed is tried again this soon (at most `renewMinutes`). */
+const RETRY_MS = 60_000;
+/** How much of a step's problem a message to the thread quotes. */
+const NOTICE_DETAIL_MAX = 300;
 /** A release that cannot even start ends the session anyway; the claim expires on the target. */
 export const RELEASE_COULD_NOT_RUN = "release could not run: ";
 const SESSION_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
@@ -50,6 +55,16 @@ const SESSION_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 export type PlaytestPlace =
   | { readonly type: "ok"; readonly projectId: ProjectId; readonly worktree: string }
   | { readonly type: "unavailable"; readonly message: string };
+
+/** A message to the thread that T3 ended its session; the ids are the same on every try. */
+export type PlaytestNotice = {
+  readonly threadId: ThreadId;
+  readonly messageId: string;
+  readonly commandId: string;
+  readonly text: string;
+};
+/** `dropped`: the thread cannot take it (gone, stopped, refused); it is not tried again. */
+export type PlaytestNoticeResult = "delivered" | "dropped" | "retry";
 
 type OpKind = "claim" | "round" | "release";
 interface Op {
@@ -133,6 +148,41 @@ function view(session: PlaytestSessionRecord, running: OpKind | undefined): Play
   return running === undefined ? rest : { ...rest, running };
 }
 
+const toMs = (time: string) => DateTime.toEpochMillis(DateTime.makeUnsafe(time));
+
+/** Ends T3 makes itself, which the thread hears about once. */
+function endWhy(session: PlaytestSessionRecord): string {
+  const { adapter } = session;
+  switch (session.endReason) {
+    case "idle":
+      return `nothing happened for ${adapter.idleMinutes} minutes (no round, no message from the person)`;
+    case "time-limit":
+      return `it reached its time limit of ${adapter.maxHours} hours`;
+    case "claim-gone":
+      return "its claim was gone when T3 renewed it";
+    case "claim-failed":
+      return "T3 stopped while its claim ran";
+    default:
+      return `it ended (${session.endReason ?? "unknown"})`;
+  }
+}
+
+/** The message about an end T3 made itself: why, and whether the target is back. */
+export function noticeText(session: PlaytestSessionRecord): string {
+  const problem = session.problem === undefined ? "" : tail(session.problem, NOTICE_DETAIL_MAX);
+  const release =
+    session.state === "ending"
+      ? `Its release has not worked yet (${problem}); T3 tries again every ${session.adapter.renewMinutes} minutes.`
+      : session.problem?.startsWith(RELEASE_COULD_NOT_RUN)
+        ? `Its release could not run (${problem}); the claim expires on the target by itself.`
+        : "Release ran: the target is back as it was.";
+  const renew =
+    session.endReason === "claim-gone" && problem !== "" && session.state === "ended"
+      ? ` Renew said: ${problem}`
+      : "";
+  return `Playtest session ${session.id} for ${session.target} ended: ${endWhy(session)}. ${release}${renew} The worktree and its changes are kept; start a new session to go on.`;
+}
+
 /** Why a process could not run, in one line, without its command line. */
 function runErrorText(error: ProcessRunner.ProcessRunError): string {
   switch (error._tag) {
@@ -153,6 +203,15 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
   /** T3's own folder, made when needed: renew and release run here, never in a worktree. */
   readonly stepsFolder: string;
   readonly placeOf: (threadId: ThreadId) => Effect.Effect<PlaytestPlace>;
+  /**
+   * Whether the thread is archived or deleted (true), still there (false), or cannot be read now
+   * (null). Without it the sweep ends no session for its thread.
+   */
+  readonly threadGone?: (threadId: ThreadId) => Effect.Effect<boolean | null>;
+  /** Sends a message about an end T3 made itself. Without it such messages stay due. */
+  readonly notify?: (notice: PlaytestNotice) => Effect.Effect<PlaytestNoticeResult>;
+  /** Called after every change that can move the sweep's next due time (the worker's due hint). */
+  readonly onChange?: Effect.Effect<void>;
 }) {
   const settingsService = yield* ServerSettingsService;
   const runner = yield* ProcessRunner.ProcessRunner;
@@ -165,6 +224,16 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
   let sessions: ReadonlyArray<PlaytestSessionRecord> | null = null;
   /** The one step run of each session, by session id; memory only, so empty after a restart. */
   const ops = new Map<string, Op>();
+  /** Renews run beside a round (a long build must not let the claim expire); one per session. */
+  const renewing = new Map<string, { fiber: Fiber.Fiber<void> | undefined }>();
+  /** The last renew this T3 tried, by session: none after a restart, so the first sweep renews. */
+  const renewTried = new Map<string, { readonly at: number; readonly ok: boolean }>();
+  /** When this T3 last ran a session's release; none after a restart, so the first sweep runs it. */
+  const releaseTried = new Map<string, number>();
+  /** Messages about an end: being sent now, and when one that could not be sent is tried again. */
+  const noticeSending = new Set<string>();
+  const noticeRetryAt = new Map<string, number>();
+  const changed = input.onChange ?? Effect.void;
 
   const now = Effect.map(Clock.currentTimeMillis, iso);
   const locked = <A, E>(effect: Effect.Effect<A, E>) => lock.withPermits(1)(effect);
@@ -216,6 +285,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     store.write(next, keep).pipe(
       Effect.tap((written) => Effect.sync(() => void (sessions = written))),
       Effect.mapError((error) => failure("store_unavailable", error.message)),
+      Effect.tap(() => changed),
     );
   /** After a step ran: what happened is true either way, so memory keeps it; the next write saves it. */
   const record = Effect.fnUntraced(function* (
@@ -229,6 +299,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
         Effect.logWarning(`playtest: ${error.message}; the next change writes it.`),
       ),
     );
+    yield* changed;
   });
 
   const find = (id: string) => (sessions ?? []).find((session) => session.id === id);
@@ -260,12 +331,14 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
   ) {
     const op: Op = { kind, fiber: undefined };
     ops.set(id, op);
-    const fiber = yield* body(op).pipe(Effect.ensuring(done(id, op)), Effect.forkIn(runScope));
+    const fiber = yield* body(op).pipe(
+      Effect.ensuring(done(id, op).pipe(Effect.andThen(changed))),
+      Effect.forkIn(runScope),
+    );
     op.fiber = fiber;
     return fiber;
   });
 
-  /** One step: exit 0 ok, 10 refused, anything else (a timeout too) failed. Never fails. */
   /**
    * One step: exit 0 ok, 10 refused, anything else (a timeout too) failed. Never fails. Runs in
    * `cwd`: the worktree for claim and push, `stepsFolder` for renew and release.
@@ -350,6 +423,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     );
     yield* locked(
       Effect.gen(function* () {
+        releaseTried.set(id, yield* Clock.currentTimeMillis);
         const current = find(id);
         if (current === undefined || current.state !== "ending") return;
         const at = yield* now;
@@ -393,6 +467,8 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
           // `end` holds the lock, and this block cannot be stopped once it waits (tested).
           if (current === undefined || current.state !== "claiming") return false;
           const at = yield* now;
+          // A claim just taken needs no renew before `renewMinutes`.
+          if (out.result === "ok") renewTried.set(id, { at: toMs(at), ok: true });
           yield* record(
             replace(
               out.result === "ok"
@@ -491,6 +567,302 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     if (place.type !== "ok") return yield* failure("thread_unavailable", place.message);
     const playtest = resolveProjectSettings(settings, place.projectId).settings.playtest;
     return { place, adapter: adapterOf(playtest) };
+  });
+
+  /**
+   * Marks the session ending and starts its release, after stopping the claim, round or renew that
+   * runs (call under `lock`, uninterruptible). Two ends at once share one release. `notice`: T3
+   * ends it on its own, so the thread hears about it once.
+   */
+  const beginEnd = Effect.fnUntraced(function* (
+    session: PlaytestSessionRecord,
+    reason: PlaytestEndReason,
+    extra: { readonly problem?: string; readonly notice?: true } = {},
+  ) {
+    const op = ops.get(session.id);
+    if (op?.kind === "release" && op.fiber !== undefined) return op.fiber;
+    const at = yield* now;
+    const round = session.lastRound;
+    yield* save(
+      replace({
+        ...session,
+        state: "ending",
+        endReason: session.endReason ?? reason,
+        ...(extra.problem === undefined ? {} : { problem: tail(extra.problem) }),
+        ...(extra.notice === undefined ? {} : { notice: "due" as const }),
+        ...(round?.state === "running"
+          ? {
+              lastRound: {
+                ...round,
+                state: "stopped",
+                detail: "The session ended while this round ran.",
+                endedAt: at,
+              },
+            }
+          : {}),
+      }),
+      session.id,
+    );
+    yield* Effect.logInfo(`playtest: ${session.id} ends (${session.endReason ?? reason})`);
+    // What runs is stopped first (its process killed), then release puts the target back.
+    const stopped = [op?.fiber, renewing.get(session.id)?.fiber].filter(
+      (fiber): fiber is Fiber.Fiber<void> => fiber !== undefined,
+    );
+    ops.delete(session.id);
+    renewing.delete(session.id);
+    return yield* runOp(session.id, "release", (release) =>
+      Fiber.interruptAll(stopped).pipe(Effect.andThen(releaseNow(session.id, release))),
+    );
+  });
+
+  /**
+   * One renew, beside any round. Exit 0 moves `renewedAt`; exit 10 (the claim is gone) ends the
+   * session; any other answer is kept as the problem and tried again in a minute.
+   */
+  const renewBody = Effect.fnUntraced(function* (
+    id: string,
+    entry: { fiber: Fiber.Fiber<void> | undefined },
+  ) {
+    const session = find(id);
+    if (session?.state !== "active") return;
+    yield* fs.makeDirectory(input.stepsFolder, { recursive: true }).pipe(Effect.ignore);
+    const out = yield* runStep(
+      session,
+      session.adapter.renew,
+      "renew",
+      session.rounds,
+      input.stepsFolder,
+    );
+    yield* locked(
+      Effect.gen(function* () {
+        const nowMs = yield* Clock.currentTimeMillis;
+        renewTried.set(id, { at: nowMs, ok: out.result === "ok" });
+        // Done before a claim-gone end below, so that end does not wait for this very fiber.
+        if (renewing.get(id) === entry) renewing.delete(id);
+        const current = find(id);
+        // An end took the session over while the renew ran.
+        if (current?.state !== "active") return;
+        if (out.result === "ok") {
+          const { problem, ...rest } = current;
+          const kept =
+            problem === undefined || problem.startsWith(RENEW_PROBLEM) ? {} : { problem };
+          yield* record(replace({ ...rest, ...kept, renewedAt: iso(nowMs) }), id);
+        } else if (out.result === "refused") {
+          yield* beginEnd(current, "claim-gone", {
+            problem: `${RENEW_PROBLEM}${out.detail}`,
+            notice: true,
+          }).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning(`playtest: ${id} could not end: ${error.message}`),
+            ),
+          );
+        } else {
+          yield* Effect.logWarning(`playtest: renew of ${id} failed: ${out.detail}`);
+          yield* record(
+            replace({ ...current, problem: tail(`${RENEW_PROBLEM}${out.detail}`) }),
+            id,
+          );
+        }
+      }),
+    ).pipe(Effect.uninterruptible);
+  });
+
+  /** Sends the message about an end T3 made itself; `sent` once delivered or not deliverable. */
+  const sendNotice = Effect.fn("PlaytestService.sendNotice")(
+    function* (id: string, notify: NonNullable<typeof input.notify>) {
+      const session = find(id);
+      if (session === undefined) return;
+      const result = yield* notify({
+        threadId: session.threadId,
+        messageId: `playtest-${id}-end`,
+        commandId: `playtest-${id}-end:0`,
+        text: noticeText(session),
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning(`playtest: the message about ${id} crashed`, cause).pipe(
+            Effect.as<PlaytestNoticeResult>("retry"),
+          ),
+        ),
+      );
+      yield* locked(
+        Effect.gen(function* () {
+          const nowMs = yield* Clock.currentTimeMillis;
+          const current = find(id);
+          if (result === "retry") {
+            noticeRetryAt.set(id, nowMs + RETRY_MS);
+            return;
+          }
+          noticeRetryAt.delete(id);
+          if (result === "dropped") {
+            yield* Effect.logWarning(
+              `playtest: thread ${session.threadId} cannot take the message about ${id}`,
+            );
+          }
+          if (current?.notice === "due") yield* record(replace({ ...current, notice: "sent" }), id);
+        }),
+      ).pipe(Effect.uninterruptible);
+    },
+    (effect, id) =>
+      effect.pipe(
+        Effect.ensuring(
+          Effect.sync(() => void noticeSending.delete(id)).pipe(Effect.andThen(changed)),
+        ),
+      ),
+  );
+
+  /** A message is ready once the end is over, or its release failed (it says so). */
+  const noticeReady = (session: PlaytestSessionRecord) =>
+    session.notice === "due" &&
+    (session.state === "ended" ||
+      (session.state === "ending" &&
+        !ops.has(session.id) &&
+        releaseTried.has(session.id) &&
+        (session.problem?.startsWith(RELEASE_PROBLEM) ?? false)));
+
+  /**
+   * The worker's sweep: renew, the idle and time limits, ends for gone threads, what a restart cut,
+   * release retries, and one message about an end T3 made itself. Starts what is due and returns at once (steps run in this service's
+   * scope); `nextDueAt` is when something is due next (Infinity: nothing until a change).
+   */
+  const runDue = Effect.fn("PlaytestService.runDue")(function* () {
+    const all = yield* locked(loaded).pipe(Effect.option);
+    if (all._tag === "None") {
+      // A store that cannot be read (or a newer one) is tried again later; start and end say why.
+      return { nextDueAt: (yield* Clock.currentTimeMillis) + RETRY_MS };
+    }
+    // Thread reads happen outside the lock; a thread gone after this read is caught next time.
+    const gone = new Set<ThreadId>();
+    if (input.threadGone !== undefined) {
+      const threads = new Set(
+        all.value
+          .filter((session) => session.state === "claiming" || session.state === "active")
+          .map((session) => session.threadId),
+      );
+      for (const threadId of threads) {
+        if ((yield* input.threadGone(threadId)) === true) gone.add(threadId);
+      }
+    }
+    return yield* locked(
+      Effect.gen(function* () {
+        const nowMs = yield* Clock.currentTimeMillis;
+        let nextDueAt = Number.POSITIVE_INFINITY;
+        const dueAt = (at: number) => void (nextDueAt = Math.min(nextDueAt, at));
+        const end = (
+          session: PlaytestSessionRecord,
+          reason: PlaytestEndReason,
+          extra: { readonly problem?: string; readonly notice?: true } = {},
+        ) =>
+          beginEnd(session, reason, extra).pipe(
+            Effect.asVoid,
+            Effect.catch((error) =>
+              Effect.logWarning(`playtest: ${session.id} could not end: ${error.message}`).pipe(
+                Effect.andThen(Effect.sync(() => dueAt(nowMs + RETRY_MS))),
+              ),
+            ),
+          );
+        for (const { id } of sessions ?? []) {
+          const session = find(id);
+          if (session === undefined || session.state === "ended") continue;
+          const { adapter } = session;
+          const renewMs = adapter.renewMinutes * 60_000;
+          const op = ops.get(id);
+          if (session.state === "ending") {
+            if (op !== undefined) continue;
+            // Release failed, or T3 restarted before it worked: run it again.
+            const tried = releaseTried.get(id);
+            const at = tried === undefined ? nowMs : tried + renewMs;
+            if (at > nowMs) dueAt(at);
+            else yield* runOp(id, "release", (release) => releaseNow(id, release));
+            continue;
+          }
+          if (gone.has(session.threadId)) {
+            yield* end(session, "thread-gone");
+            continue;
+          }
+          if (session.state === "claiming" && op === undefined) {
+            // T3 stopped while the claim ran: it may hold the target, so release puts it back.
+            yield* end(session, "claim-failed", {
+              problem: "claim: T3 stopped while this claim ran.",
+              notice: true,
+            });
+            continue;
+          }
+          const limitAt = toMs(session.startedAt) + adapter.maxHours * 3_600_000;
+          if (limitAt <= nowMs) {
+            yield* end(session, "time-limit", { notice: true });
+            continue;
+          }
+          dueAt(limitAt);
+          if (session.state === "claiming") continue;
+          // A round that runs is activity; its end moves `lastActivityAt` and calls the sweep.
+          if (op === undefined) {
+            const idleAt = toMs(session.lastActivityAt) + adapter.idleMinutes * 60_000;
+            if (idleAt <= nowMs) {
+              yield* end(session, "idle", { notice: true });
+              continue;
+            }
+            dueAt(idleAt);
+          }
+          if (renewing.has(id)) continue;
+          const tried = renewTried.get(id);
+          const renewAt =
+            tried === undefined
+              ? nowMs
+              : tried.at + (tried.ok ? renewMs : Math.min(renewMs, RETRY_MS));
+          if (renewAt > nowMs) {
+            dueAt(renewAt);
+            continue;
+          }
+          const entry: { fiber: Fiber.Fiber<void> | undefined } = { fiber: undefined };
+          renewing.set(id, entry);
+          entry.fiber = yield* renewBody(id, entry).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (renewing.get(id) === entry) renewing.delete(id);
+              }).pipe(Effect.andThen(changed)),
+            ),
+            Effect.forkIn(runScope),
+          );
+        }
+        if (input.notify !== undefined) {
+          for (const session of sessions ?? []) {
+            if (!noticeReady(session) || noticeSending.has(session.id)) continue;
+            const retryAt = noticeRetryAt.get(session.id) ?? nowMs;
+            if (retryAt > nowMs) {
+              dueAt(retryAt);
+              continue;
+            }
+            noticeSending.add(session.id);
+            yield* sendNotice(session.id, input.notify).pipe(Effect.forkIn(runScope));
+          }
+        }
+        return { nextDueAt };
+      }).pipe(Effect.uninterruptible),
+    );
+  });
+
+  /**
+   * The person wrote in the thread at `atMs`: the active session's idle time counts from then.
+   * Never moves it back, nor past now.
+   */
+  const noteActivity = Effect.fn("PlaytestService.noteActivity")(function* (request: {
+    readonly threadId: ThreadId;
+    readonly atMs: number;
+  }) {
+    yield* locked(
+      Effect.gen(function* () {
+        yield* loaded;
+        const session = liveOf(request.threadId);
+        if (session?.state !== "active") return;
+        const at = Math.min(request.atMs, yield* Clock.currentTimeMillis);
+        if (at <= toMs(session.lastActivityAt)) return;
+        yield* record(replace({ ...session, lastActivityAt: iso(at) }), session.id);
+      }),
+    ).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning(`playtest: a message's time was not kept: ${error.message}`),
+      ),
+    );
   });
 
   const start = Effect.fn("PlaytestService.start")(function* (request: {
@@ -675,42 +1047,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
             const last = [...all].reverse().find((entry) => entry.threadId === request.threadId);
             return { type: "none", session: last } as const;
           }
-          const op = ops.get(session.id);
-          // Two ends at once share one release.
-          if (op?.kind === "release" && op.fiber !== undefined) {
-            return { type: "release", id: session.id, fiber: op.fiber } as const;
-          }
-          const at = yield* now;
-          const round = session.lastRound;
-          yield* save(
-            replace({
-              ...session,
-              state: "ending",
-              endReason: session.endReason ?? request.reason,
-              ...(round?.state === "running"
-                ? {
-                    lastRound: {
-                      ...round,
-                      state: "stopped",
-                      detail: "The session ended while this round ran.",
-                      endedAt: at,
-                    },
-                  }
-                : {}),
-            }),
-            session.id,
-          );
-          yield* Effect.logInfo(
-            `playtest: ${session.id} ends (${session.endReason ?? request.reason})`,
-          );
-          // The claim or round that runs is stopped first, then release puts the target back.
-          const stopped = op?.fiber;
-          ops.delete(session.id);
-          const fiber = yield* runOp(session.id, "release", (release) =>
-            (stopped === undefined ? Effect.void : Fiber.interrupt(stopped)).pipe(
-              Effect.andThen(releaseNow(session.id, release)),
-            ),
-          );
+          const fiber = yield* beginEnd(session, request.reason);
           return { type: "release", id: session.id, fiber } as const;
         }),
       ),
@@ -747,7 +1084,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     );
   });
 
-  return { filePath: store.filePath, start, push, end, status };
+  return { filePath: store.filePath, start, push, end, status, runDue, noteActivity };
 });
 
 export type PlaytestService = Effect.Success<ReturnType<typeof make>>;
