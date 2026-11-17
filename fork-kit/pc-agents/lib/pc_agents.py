@@ -19,6 +19,7 @@ PENDING = STATE + '/restart-pending'   # setup changed something T3 runs with: r
 BOOT_ID = '/proc/sys/kernel/random/boot_id'   # the marker holds this boot's id and CLOCK_MONOTONIC, like systemd's
 AS_AGENT = 'pc-agents-as-agent'   # name prefix of `pc-agents as-agent`'s transient units (check --enforce stops them)
 SETTLE, SETTLE_STEP = 15, 1   # after a (re)start, setup watches T3 this many seconds, every SETTLE_STEP, before done
+LOCK_WAIT, LOCK_STEP = 300, 5   # setup retries a dpkg or apt-get step that found a lock held this long, every LOCK_STEP
 LOADED = '/run/pc-agents/firewall.loaded'   # sha256 of the firewall file and `nft list` of it, saved when loaded
 T3 = OPT + '/t3'   # T3's runtime, installed by root (T3CODE_HOME of scripts/install.sh): the agent cannot change it
 UNIT, WALLS = 't3code-agents.service', 'pc-agents-walls'
@@ -98,10 +99,11 @@ SPEC = {
 
 
 def new_enough(version):
-    """Whether VERSION version is OLDEST_T3 or newer, in semver order: a pre-release ranks below its release."""
+    """Whether VERSION version is OLDEST_T3 or newer, in semver order: a pre-release ranks below its release. The
+    fork's stable build of a release (`-fork.<n>`, fork-release.yml) is that release; its nightlies are pre-releases."""
     m = VERSION.fullmatch(version)
     numbers = tuple(map(int, m.groups()[:3]))
-    return numbers > OLDEST_T3 or numbers == OLDEST_T3 and not m[4]
+    return numbers > OLDEST_T3 or numbers == OLDEST_T3 and (not m[4] or bool(re.fullmatch(r'-fork\.[1-9]\d*', m[4])))
 
 
 def port_range(text):

@@ -192,10 +192,27 @@ def install_t3(c, version, done):
     return None
 
 
+# What dpkg and apt-get say when another one (apt-daily, unattended-upgrades) holds a lock they take without a wait
+LOCKED = re.compile(r'could not get lock|unable to lock|(is|was) locked by another process', re.I)
+
+
+def run_locked(argv, env):
+    """k.run(argv), tried again every k.LOCK_STEP s for up to k.LOCK_WAIT s while it fails on a lock another apt-get
+    or dpkg holds. apt-get's DPkg::Lock::Timeout waits only for dpkg's frontend lock: `update` takes the lists lock and
+    `install` the archives lock without a wait, and so does dpkg its own."""
+    end = time.monotonic() + k.LOCK_WAIT
+    while True:
+        r = k.run(argv, timeout=900, env=env)
+        if not r.returncode or not LOCKED.search(r.stderr) or time.monotonic() >= end:
+            return r
+        time.sleep(k.LOCK_STEP)
+
+
 def install_packages():
     """Install the k.PACKAGES that are not (fully) installed; held counts as installed. A dpkg run stopped half-way
-    is finished first (apt-get refuses until it is). Nothing asks a question (stdin is /dev/null): a changed config
-    file is kept, debconf takes its defaults, and apt-get waits for a lock apt-daily holds. Returns why not, or None."""
+    (`dpkg --audit` names a package) is finished first (apt-get refuses until it is). Nothing asks a question (stdin
+    is /dev/null): a changed config file is kept, debconf takes its defaults, and a lock apt-daily holds is waited
+    for (run_locked). Returns why not, or None."""
     r = k.run(['/usr/bin/dpkg-query', '-W', '-f=${Package}\t${Status}\n', *k.PACKAGES])
     have = {p for p, _, status in (line.partition('\t') for line in r.stdout.splitlines())
             if status.endswith(' ok installed')}
@@ -204,20 +221,24 @@ def install_packages():
         return None
     say('installing ' + ' '.join(missing))
     quiet = {'DEBIAN_FRONTEND': 'noninteractive'}
-    r = k.run(['/usr/bin/dpkg', '--force-confdef', '--force-confold', '--configure', '-a'], timeout=900, env=quiet)
-    if r.returncode:
-        return (f'cannot install {" ".join(missing)}: dpkg --configure -a failed ({r.stderr.strip()[-300:]}). If '
-                'another apt-get or dpkg still runs (apt-daily, on a new distro), wait for it to end; then run '
-                '`dpkg --configure -a` as root, and setup again')
+    busy = (' Another apt-get or dpkg still runs (apt-daily, on a new distro) after 5 minutes: '
+            'wait for it to end, then run setup again')
+    r = k.run(['/usr/bin/dpkg', '--audit'])   # reads only: no lock
+    if r.returncode or r.stdout.strip():
+        r = run_locked(['/usr/bin/dpkg', '--force-confdef', '--force-confold', '--configure', '-a'], quiet)
+        if r.returncode:
+            return (f'cannot install {" ".join(missing)}: dpkg --configure -a failed ({r.stderr.strip()[-300:]}).'
+                    + (busy if LOCKED.search(r.stderr) else ' Run `dpkg --configure -a` as root, then setup again'))
     apt = ['/usr/bin/apt-get', '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold',
            '-o', 'DPkg::Lock::Timeout=300']
     for argv in (apt + ['update'], apt + ['install', '-y', *missing]):
-        r = k.run(argv, timeout=900, env=quiet)
+        r = run_locked(argv, quiet)
         if r.returncode:
             return (f'cannot install {" ".join(missing)}: apt-get {argv[len(apt)]} failed ({r.stderr.strip()[-300:]}).'
-                    ' Fix the distro\'s network (the machine file\'s nameservers are in /etc/resolv.conf now) or '
-                    f'package sources, run `apt-get update && apt-get install -y {" ".join(missing)}` as root, then '
-                    'setup again')
+                    + (busy if LOCKED.search(r.stderr) else
+                       ' Fix the distro\'s network (the machine file\'s nameservers are in /etc/resolv.conf now) or '
+                       f'package sources, run `apt-get update && apt-get install -y {" ".join(missing)}` as root, '
+                       'then setup again'))
     return None
 
 
