@@ -44,6 +44,12 @@ MODES = ('approval-required', 'auto-accept-edits', 'auto', 'full-access')
 # off through limits.updates (all versions; the server's self-update refuses), not the newer automaticUpdates.
 KIT_SETTINGS = {'linkedEnvironmentsEnabled': True}
 VERSION = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)?')
+# The oldest T3 that applies a managed policy (0.1.7; `t3 pair` is older): an older one would run with none of the
+# kit's locks, updates on, and quietly. Its pre-releases count as it.
+OLDEST_T3 = (0, 1, 7)
+# Debian packages setup installs when missing: the agent firewall's nft; libatomic1, which Node (and so most agent
+# tools) needs to start, while the agent has no sudo to install it; unzip, which install steps of packages use.
+PACKAGES = ('nftables', 'libatomic1', 'unzip')
 HEAD = '# pc-agents kit: written by `pc-agents setup`; an edit is refused at its next run and fails the walls check\n'
 
 # What the kit runs from a release: source path -> (path in the version folder, mode). The walls are the merged
@@ -72,7 +78,9 @@ def is_ip_list(value, net, glob=False, most=64):
 SPEC = {
     'organization': (str, machine_file.REQUIRED,
                      lambda v: None if v.strip() and len(v) <= 80 else '1 to 80 characters, not blank'),
-    't3Version': (str, machine_file.REQUIRED, lambda v: None if VERSION.fullmatch(v) else 'an exact version, no v'),
+    't3Version': (str, machine_file.REQUIRED, lambda v: 'an exact version, no v' if not VERSION.fullmatch(v) else
+                  None if tuple(map(int, VERSION.fullmatch(v).groups()[:3])) >= OLDEST_T3 else
+                  '%d.%d.%d or newer (the first T3 with the managed policy)' % OLDEST_T3),
     't3ReleaseBaseUrl': (str, machine_file.REQUIRED,
                          lambda v: None if re.fullmatch(r'https://[A-Za-z0-9./_-]+', v) else 'an https URL'),
     'port': (int, machine_file.REQUIRED, lambda v: None if 1024 <= v <= 65535 else '1024 to 65535'),
