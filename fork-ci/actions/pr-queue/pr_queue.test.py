@@ -3019,10 +3019,32 @@ class Cli(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp(prefix='pr-queue-cli-')
         self.addCleanup(shutil.rmtree, self.d, True)
-        self.config = os.path.join(self.d, 'queue.json')
-        with open(self.config, 'w') as f:
-            json.dump(CFG_RAW, f)
+        self.repo = os.path.join(self.d, 'caller')   # the caller's checkout, as the reusable workflow makes it
+        self.git('init', '-q', '-b', 'main')
+        self.config = os.path.join(self.repo, '.github', 'pr-queue.json')
+        self.commit({'.github/pr-queue.json': json.dumps(CFG_RAW)})
         self.built, self.tokens, self.steps = [], [], []
+
+    def git(self, *a):
+        os.makedirs(self.repo, exist_ok=True)
+        return subprocess.run(['git', '-C', self.repo, *a], check=True, capture_output=True,
+                              env={**os.environ, **GIT_ENV}).stdout
+
+    def write(self, rel, data):
+        where = os.path.join(self.repo, rel)
+        os.makedirs(os.path.dirname(where), exist_ok=True)
+        with open(where, 'wb') as f:
+            f.write(data if isinstance(data, bytes) else data.encode())
+
+    def commit(self, files):
+        """Commit `files` (path: text or bytes; None deletes it) on the checkout's HEAD; the work tree follows."""
+        for rel, data in files.items():
+            if data is None:
+                self.git('rm', '-q', '--', rel)
+            else:
+                self.write(rel, data)
+                self.git('add', '--', rel)
+        self.git('commit', '-q', '--allow-empty', '-m', 'c')
 
     def cli(self, *extra, repo=REPO, state=None, cache=None, env=None, git=None):
         test = self
@@ -3124,19 +3146,105 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 0, 'a sibling folder whose name starts the same is not inside: ' + out)
 
     def test_a_config_error_is_refused(self):
-        with open(self.config, 'w') as f:
-            json.dump({**CFG_RAW, 'required_check': ['build']}, f)
+        self.commit({'.github/pr-queue.json': json.dumps({**CFG_RAW, 'required_check': ['build']})})
         self.refused("unknown key 'required_check'")
+        self.commit({'.github/pr-queue.json': None})
+        self.refused('has no .github/pr-queue.json')
+
+    def test_the_config_is_read_as_committed_never_from_the_checkouts_file(self):   # #424 item 1
+        # A .gitattributes encoding leaves the config's blob as it was (the head check skips it), but a checkout writes
+        # the file as UTF-16: the queue must read what git holds, which no checkout filter or attribute changes.
+        self.commit({'.gitattributes': '.github/pr-queue.json working-tree-encoding=UTF-16\n'})
         os.remove(self.config)
-        self.refused('cannot read it')
+        self.git('checkout', '--', '.github/pr-queue.json')
+        with open(self.config, 'rb') as f:
+            self.assertEqual(f.read(2), b'\xff\xfe', 'the checkout wrote UTF-16')
+        code, out = self.cli()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.built[-1][0][1], CFG)
+        self.write('.github/pr-queue.json', 'not json')   # an edit in the work tree, not committed: never read
+        code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+        os.remove(self.config)   # nor a file missing from the work tree
+        code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+
+    def test_a_config_changed_between_runs_is_read_anew_and_a_rerun_reads_the_same(self):   # state: nothing kept
+        self.cli()
+        self.commit({'.github/pr-queue.json': json.dumps({**CFG_RAW, 'merge_method': 'merge'})})
+        self.cli()
+        self.cli()
+        self.assertEqual([b[0][1].merge_method for b in self.built], ['squash', 'merge', 'merge'])
+
+    def test_the_config_read_ignores_global_and_system_git_config(self):   # an earlier job's ~/.gitconfig, say
+        broken = os.path.join(self.d, 'broken.gitconfig')
+        with open(broken, 'w') as f:
+            f.write('[core\n')
+        with unittest.mock.patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': broken, 'GIT_CONFIG_SYSTEM': broken,
+                                                   'GIT_CONFIG_NOSYSTEM': '0'}):
+            code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+
+    def test_a_config_that_is_not_utf8_is_refused_never_a_crash(self):   # #424 item 1: was a UnicodeDecodeError
+        for name, data in (('UTF-16', json.dumps(CFG_RAW).encode('utf-16')), ('Latin-1', b'{"push_command": "\xe9"}')):
+            with self.subTest(name):
+                self.commit({'.github/pr-queue.json': data})
+                self.refused('.github/pr-queue.json at ', 'not UTF-8 text')
+
+    def test_a_config_that_is_empty_missing_or_no_file_at_head_is_refused(self):   # old, empty or missing state
+        self.commit({'.github/pr-queue.json': ''})
+        self.refused('not JSON')
+        self.commit({'.github/pr-queue.json': None})
+        self.write('.github/pr-queue.json', json.dumps(CFG_RAW))   # on disk, never committed: not read
+        self.refused('has no .github/pr-queue.json')
+        self.commit({'.github/real.json': json.dumps(CFG_RAW)})
+        os.symlink('real.json', self.config + '.tmp')
+        os.replace(self.config + '.tmp', self.config)
+        self.git('add', '--', '.github/pr-queue.json')
+        self.git('commit', '-q', '-m', 'symlink')
+        self.refused('is a symlink (mode 120000), not a file')
+        os.remove(self.config)
+        self.commit({'.github/pr-queue.json/x.json': json.dumps(CFG_RAW)})
+        self.refused('is a tree (mode 040000), not a file')
+
+    def test_a_tree_that_lists_the_config_twice_is_refused(self):   # git mktree makes one; fsck would flag it
+        def hashed(*a, data):
+            return subprocess.run(['git', '-C', self.repo, *a], input=data, check=True, capture_output=True,
+                                  env={**os.environ, **GIT_ENV}).stdout.decode().strip()
+        good = hashed('hash-object', '-w', '--stdin', data=json.dumps(CFG_RAW).encode())
+        bad = hashed('hash-object', '-w', '--stdin', data=b'not json')
+        for first, second in ((good, bad), (bad, good)):
+            with self.subTest(first=first[:7]):
+                inner = hashed('mktree', data=f'100644 blob {first}\tpr-queue.json\n'
+                                              f'100644 blob {second}\tpr-queue.json\n'.encode())
+                root = hashed('mktree', data=f'040000 tree {inner}\t.github\n'.encode())
+                self.git('reset', '-q', '--soft', hashed('commit-tree', root, '-m', 'twice', data=b''))
+                self.refused('did not list one entry')
+
+    def test_a_config_outside_a_git_checkout_or_before_its_first_commit_is_refused(self):
+        outside = os.path.join(self.d, 'outside', 'queue.json')
+        os.makedirs(os.path.dirname(outside))
+        with open(outside, 'w') as f:
+            json.dump(CFG_RAW, f)
+        self.config = outside
+        self.refused('not in a git checkout')
+        os.symlink(os.path.join(self.repo, '.github'), os.path.join(self.d, 'outside', 'link'))
+        self.config = os.path.join(self.d, 'outside', 'link', 'pr-queue.json')   # into the checkout from outside
+        self.refused('not inside the checkout')
+        shutil.rmtree(self.repo)
+        self.git('init', '-q', '-b', 'main')
+        self.write('.github/pr-queue.json', json.dumps(CFG_RAW))
+        self.config = os.path.join(self.repo, '.github', 'pr-queue.json')
+        self.refused('has no commit checked out')
 
     def test_an_old_git_is_refused(self):
         self.refused('git 2.38 or newer', git='git 2.38 or newer is needed (merge-tree --write-tree); found: git 2.34')
 
     def test_every_problem_is_named_at_once(self):
-        os.remove(self.config)
-        self.refused('GitHub-hosted', 'is not owner/name', 'not an absolute path', 'cannot read it', 'git 2.38',
-                     repo='x', state='p', env={'RUNNER_ENVIRONMENT': 'github-hosted'}, git='git 2.38 or newer')
+        self.commit({'.github/pr-queue.json': None})
+        self.refused('GitHub-hosted', 'is not owner/name', 'not an absolute path', 'has no .github/pr-queue.json',
+                     'git 2.38', repo='x', state='p', env={'RUNNER_ENVIRONMENT': 'github-hosted'},
+                     git='git 2.38 or newer')
 
 
 class GateApp(unittest.TestCase):
