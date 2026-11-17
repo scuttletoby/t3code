@@ -158,10 +158,10 @@ jobs:
       # A pull request that changes only fork-owned paths (.github/fork-owned-paths.txt: fork-ci/, fork-kit/, the
       # fork's own .github scripts) skips the app jobs: its gates are upstream's detector's answer for a change with
       # no path left, all false. Anything unclear keeps the detector's answer (.github/scripts/fork-owned-paths.cjs).
-      # Not on a push to main or a release run: those always run every job.
+      # Pull requests into main only (a stacked one compares with its parent; a retarget starts no new run).
       - name: Fork-only pull request
         id: fork_only
-        if: inputs.ref == '' && github.event_name == 'pull_request'
+        if: inputs.ref == '' && github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch
         run: node .github/scripts/fork-owned-paths.cjs >> "$GITHUB_OUTPUT"
 
       # A branch name is resolved once, here: jobs start minutes apart, and a

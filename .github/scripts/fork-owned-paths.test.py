@@ -134,6 +134,7 @@ for label, change, base in [
     ("a package.json inside fork-kit", {"fork-kit/x/package.json": "{}\n"}, None),
     ("a lock file", {"pnpm-lock.yaml": "x\n"}, None),
     ("a file moved out of fork-ci/", {"fork-ci/a.ts": None, "packages/shared/src/a.ts": "a\n"}, {"fork-ci/a.ts": "a\n"}),
+    ("a file moved into fork-ci/ (an app file deleted)", {"apps/web/src/a.ts": None, "fork-ci/a.ts": "a\n"}, {"apps/web/src/a.ts": "a\n"}),
     ("a path deeper than a `*` (fork-*/x)", {".github/scripts/fork-x/y.py": "1\n"}, None),
     ("an empty change", {}, None),
 ]:
@@ -196,8 +197,10 @@ check("workflow: `changes` checks out the list and the script",
       {"/.github/fork-owned-paths.txt", "/.github/scripts/fork-owned-paths.cjs", "/.github/scripts/ci-changes.cjs"} <= set(sparse))
 
 
-def ctx(event, release=False, fork_only_out=None, detect=None, status="success"):
-    return {"github": {"event_name": event, "event": {"pull_request": {"head": {"repo": {"full_name": "o/r"}}}} if event == "pull_request" else {},
+def ctx(event, release=False, fork_only_out=None, detect=None, status="success", base="main"):
+    return {"github": {"event_name": event, "base_ref": base if event == "pull_request" else "",
+                       "event": {"repository": {"default_branch": "main"},
+                                 **({"pull_request": {"head": {"repo": {"full_name": "o/r"}}}} if event == "pull_request" else {})},
                        "repository": "o/r"},
             "inputs": {"ref": "abc" if release else ""}, "status": status,
             "steps": {"fork_only": {"outputs": fork_only_out or {}}, "detect": {"outputs": detect or {}},
@@ -209,6 +212,8 @@ cond = step.get("if", "")
 check("workflow: the step runs on a pull request only, never on a push or a release run",
       gh_eval(cond, ctx("pull_request")) and not gh_eval(cond, ctx("push")) and not gh_eval(cond, ctx("workflow_dispatch", True))
       and not gh_eval(cond, ctx("workflow_call", True)) and not gh_eval(cond, ctx("pull_request", True)), cond)
+check("workflow: ... and only into main: a stacked pull request (base: its parent branch) runs every job",
+      not gh_eval(cond, ctx("pull_request", base="feature")), cond)
 
 FORK_ONLY_OUT = {"fork_only": "true", **{g: ("" if g == "test_packages" else "false") for g in UPSTREAM_GATES}}
 DETECT_ALL = {g: ("" if g == "test_packages" else "true") for g in UPSTREAM_GATES}
