@@ -1,7 +1,7 @@
 /**
  * Fork: the handoff service against mocked stores: when it sends, what it sends, and what it does
- * after a handoff run ends. The busy check itself is tested against the real orchestrator in
- * `handoffBusyCheck.test.ts`.
+ * after a handoff run ends. The busy check (`dispatchHandoff`) is tested against the real
+ * orchestrator in `handoffBusyCheck.test.ts`.
  */
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -320,20 +320,22 @@ describe("HandoffService", () => {
     Effect.gen(function* () {
       const data = projection({ usedTokens: 160_000 });
       const text = "[T3 handoff 1] the first text";
-      const state = {
-        data: {
-          ...data,
-          messages: [{ ...data.messages[0]!, id: handoffMessageId, text }],
-        },
-        settings: on as Partial<HandoffSettings>,
-      };
-      const { sent, emit } = yield* harness(state);
       const failed = run({
         id: RunId.make("run-2"),
         ordinal: 2,
         userMessageId: handoffMessageId,
         status: "failed",
       });
+      // The failed first send is the latest run, so the busy check lets its retry through.
+      const state = {
+        data: {
+          ...data,
+          runs: [...data.runs, failed],
+          messages: [{ ...data.messages[0]!, id: handoffMessageId, text }],
+        },
+        settings: on as Partial<HandoffSettings>,
+      };
+      const { sent, emit } = yield* harness(state);
       yield* emit(runUpdated(failed), "handoffRunEnded", 1);
       expect(messages(sent)).toMatchObject([
         {

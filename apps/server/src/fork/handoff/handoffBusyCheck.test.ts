@@ -1,7 +1,8 @@
 /**
- * Fork: the handoff busy check in `Orchestrator.ts`, against the real orchestrator. A handoff lands
- * only at a quiet thread still at its source run; a racing message wins and nothing is lost. After
- * a handoff, child results and PR wakes reach the new session.
+ * Fork: the handoff busy check (`dispatchHandoff`), against the real orchestrator. A handoff lands
+ * only at a quiet thread still at its source run; a racing message wins and nothing is lost, also
+ * when it lands between the check and the send. After a handoff, child results and PR wakes reach
+ * the new session. `Orchestrator.ts` itself stays upstream's.
  */
 import { assert, it } from "@effect/vitest";
 import {
@@ -32,6 +33,7 @@ import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../orchestration-v2/testkit/ProviderReplayHarness.ts";
+import { dispatchHandoff, type HandoffDispatchCommand } from "./handoffDispatch.ts";
 
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "gpt-5.1-codex" };
@@ -79,22 +81,28 @@ const send = (threadId: ThreadId, text: string) =>
   );
 
 /** What the handoff service sends; `command` changes the command id only (a second trigger). */
+const handoffCommand = (
+  threadId: ThreadId,
+  sourceRunId: string,
+  command = "",
+  retry = "",
+): HandoffDispatchCommand => ({
+  type: "message.dispatch",
+  commandId: CommandId.make(`server:handoff:${threadId}:${sourceRunId}${retry}${command}`),
+  threadId,
+  messageId: MessageId.make(`handoff:${threadId}:${sourceRunId}${retry}`),
+  text: "[T3 handoff 1] context",
+  attachments: [],
+  createdBy: "agent",
+  creationSource: "server",
+  freshContext: true,
+  modelSelection,
+  dispatchMode: { type: "start_immediately" },
+});
+
+/** The service's send: through the fork's busy check, never straight to the orchestrator. */
 const sendHandoff = (threadId: ThreadId, sourceRunId: string, command = "") =>
-  Orchestrator.OrchestratorV2.use((orchestrator) =>
-    orchestrator.dispatch({
-      type: "message.dispatch",
-      commandId: CommandId.make(`server:handoff:${threadId}:${sourceRunId}${command}`),
-      threadId,
-      messageId: MessageId.make(`handoff:${threadId}:${sourceRunId}`),
-      text: "[T3 handoff 1] context",
-      attachments: [],
-      createdBy: "agent",
-      creationSource: "server",
-      freshContext: true,
-      modelSelection,
-      dispatchMode: { type: "start_immediately" },
-    }),
-  );
+  dispatchHandoff(handoffCommand(threadId, sourceRunId, command));
 
 const complete = (run: OrchestrationV2Run, patch: Partial<OrchestrationV2Run> = {}) =>
   Effect.gen(function* () {
@@ -142,18 +150,30 @@ const quietThread = <E = never>(
 const handoffRuns = (all: ReadonlyArray<OrchestrationV2Run>) =>
   all.filter((run) => run.userMessageId.startsWith("handoff:"));
 
-it.effect("calls the busy check from exactly one place in Orchestrator.ts (K14)", () =>
-  Effect.gen(function* () {
-    const path = yield* Path.Path;
-    const fileSystem = yield* FileSystem.FileSystem;
-    const source = yield* fileSystem.readFileString(
-      yield* path.fromFileUrl(new URL("../../orchestration-v2/Orchestrator.ts", import.meta.url)),
-    );
-    assert.equal(source.match(/handoffDispatchDropped\(/g)?.length, 1);
-  }).pipe(Effect.provide(NodeServices.layer)),
+it.effect(
+  "every handoff send goes through the fork busy check; Orchestrator.ts stays upstream's",
+  () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const read = (relative: string) =>
+        Effect.flatMap(path.fromFileUrl(new URL(relative, import.meta.url)), (file) =>
+          fileSystem.readFileString(file),
+        );
+      const service = yield* read("./HandoffService.ts");
+      const sends = service.match(/type: "message\.dispatch"/g)?.length ?? 0;
+      // The first send and its one retry, each inside `dispatchHandoff`.
+      assert.equal(sends, 2);
+      assert.equal(
+        service.match(/dispatchHandoff\(\{\s*type: "message\.dispatch"/g)?.length,
+        sends,
+      );
+      const orchestrator = yield* read("../../orchestration-v2/Orchestrator.ts");
+      assert.notInclude(orchestrator, "fork/handoff");
+    }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.effect("a racing user message wins and nothing is lost", () =>
+it.effect("a user message that lands before the check wins and nothing is lost", () =>
   Effect.gen(function* () {
     const threadId = ThreadId.make("thread:handoff-race");
     const first = yield* quietThread(threadId);
@@ -170,6 +190,41 @@ it.effect("a racing user message wins and nothing is lost", () =>
     );
     assert.isTrue(projection.messages.some((message) => message.text === "second"));
     assert.isFalse(projection.messages.some((message) => message.id.startsWith("handoff:")));
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a user message that lands between the check and the send wins and nothing is lost", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:handoff-race-between");
+    const first = yield* quietThread(threadId);
+    // The check read a quiet thread; the user's message lands just before the handoff does.
+    const racing = Orchestrator.OrchestratorV2.of({
+      ...orchestrator,
+      dispatch: (command) =>
+        command.type === "message.dispatch" && command.messageId.startsWith("handoff:")
+          ? send(threadId, "second").pipe(
+              Effect.provideService(Orchestrator.OrchestratorV2, orchestrator),
+              Effect.andThen(orchestrator.dispatch(command)),
+            )
+          : orchestrator.dispatch(command),
+    });
+    const outcome = yield* sendHandoff(threadId, first.id).pipe(
+      Effect.provideService(Orchestrator.OrchestratorV2, racing),
+    );
+    assert.equal(outcome, "cancelled");
+    const after = yield* runs(threadId);
+    // The handoff never started; the user's run is the one that runs, in the old session.
+    const [handoff] = handoffRuns(after);
+    assert.equal(handoff?.status, "cancelled");
+    assert.isNull(handoff?.startedAt);
+    const second = after.find((run) => run.userMessageId === `message:${threadId}:second`);
+    assert.notEqual(second?.status, "interrupted");
+    assert.notEqual(second?.status, "cancelled");
+    assert.equal(second?.providerThreadId, first.providerThreadId);
+    const projection = yield* orchestrator.getThreadProjection(threadId);
+    assert.isTrue(projection.messages.some((message) => message.text === "second"));
+    assert.equal(projection.thread.activeProviderThreadId, first.providerThreadId);
   }).pipe(Effect.provide(layerTest)),
 );
 
@@ -223,10 +278,12 @@ it.effect("the same run never hands off twice, and the new session gets wakes an
         creationSource: "mcp",
       }),
     );
-    yield* sendHandoff(threadId, first.id);
-    // The same trigger again (a replayed receipt) and a second trigger (another command id).
-    yield* sendHandoff(threadId, first.id);
-    yield* sendHandoff(threadId, first.id, ":again");
+    assert.equal(yield* sendHandoff(threadId, first.id), "sent");
+    // The same trigger again and a second trigger (another command id): the check drops both.
+    assert.equal(yield* sendHandoff(threadId, first.id), "dropped");
+    assert.equal(yield* sendHandoff(threadId, first.id, ":again"), "dropped");
+    // Even past the check, the same ids are a replayed receipt, not a second handoff.
+    yield* orchestrator.dispatch(handoffCommand(threadId, first.id));
     const handoffs = handoffRuns(yield* runs(threadId));
     assert.equal(handoffs.length, 1);
     const handoff = handoffs[0]!;
@@ -288,21 +345,7 @@ it.effect.each(["failed", "completed"] as const)(
       const threadId = ThreadId.make(`thread:handoff-retry-${outcome}`);
       const first = yield* quietThread(threadId);
       const retry = (suffix: string) =>
-        Orchestrator.OrchestratorV2.use((orchestrator) =>
-          orchestrator.dispatch({
-            type: "message.dispatch",
-            commandId: CommandId.make(`server:handoff:${threadId}:${first.id}:retry1${suffix}`),
-            threadId,
-            messageId: MessageId.make(`handoff:${threadId}:${first.id}:retry1`),
-            text: "[T3 handoff 1] context",
-            attachments: [],
-            createdBy: "agent",
-            creationSource: "server",
-            freshContext: true,
-            modelSelection,
-            dispatchMode: { type: "start_immediately" },
-          }),
-        );
+        dispatchHandoff(handoffCommand(threadId, first.id, suffix, ":retry1"));
       // No first send yet: the retry has nothing to follow.
       yield* retry("");
       assert.deepEqual(handoffRuns(yield* runs(threadId)), []);

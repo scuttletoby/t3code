@@ -110,6 +110,21 @@ describe("handoffBlockers", () => {
     } as Records;
     expect(kinds(otherSession)).toEqual([]);
   });
+
+  it("does not count a running T3 child, but counts the session's own sub-agent", () => {
+    const item = (origin: "app_owned" | "provider_native") =>
+      ({
+        id: `item-${origin}`,
+        runId,
+        type: "subagent",
+        origin,
+        status: "running",
+        subagentId: `node-${origin}`,
+        prompt: "a child still running",
+      }) as unknown as Records["turnItems"][number];
+    expect(kinds({ ...base, turnItems: [item("app_owned")] })).toEqual([]);
+    expect(kinds({ ...base, turnItems: [item("provider_native")] })).toEqual(["background-work"]);
+  });
 });
 
 describe("handoffThreadFacts", () => {

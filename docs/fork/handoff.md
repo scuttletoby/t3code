@@ -37,10 +37,19 @@ At the size backstop, a thread that is not quiet waits: the service reads it aga
 thread changes, and hands off as soon as it is quiet (unless a newer run finished meanwhile). In the
 idle window it does not wait: the next turn end starts over.
 
-The service decides from what it read; the message can still land later. One check in the
-orchestrator, under the thread's lock, drops a handoff message that lands at a thread that is no
-longer quiet, or whose latest run is no longer the one the handoff was made from. A message from the
-person or a child result that lands first always wins, and nothing of theirs is lost.
+The service decides from what it read, but something else can land before the handoff does. So it
+checks twice more around the send:
+
+- **Right before.** The thread must still be quiet, and its latest run must still be the one the
+  handoff was made from. Otherwise nothing is sent.
+- **Right after.** If something landed in between, the orchestrator has queued the handoff behind
+  it. The service cancels the queued handoff (upstream's own "remove a queued message"), which
+  refuses a run that already started.
+
+A message from the person or a child result that lands first always wins, and nothing of theirs is
+lost. One narrow case remains: if that message's whole run ends between the send and the cancel,
+the handoff runs after it. Nothing is lost then either, but the handoff's text does not include that
+last turn; the new session can read it in the thread.
 
 ## The message
 
@@ -71,14 +80,17 @@ written out in full. The message says when no effort is set.
 - Timers and waits live in memory. After a server restart, the next turn end decides again.
 - A handoff run still notifies like any finished run (the browser notice and the relay). Keeping it
   silent needs a marker the app can read; that comes with the settings screen.
-- The same run never hands off twice: every trigger for one run uses the same ids, so a second one
-  replays the first. A dropped handoff spends that run's ids; the next run's turn end decides.
+- The same run never hands off twice: the check before the send drops a second trigger, and every
+  trigger for one run uses the same ids, so one that got past would replay the first. A cancelled
+  handoff spends that run's ids; the next run's turn end decides.
 
 ## For developers
 
-- Fork code: `apps/server/src/fork/handoff/` (`HandoffService.ts`, `handoffFacts.ts`,
-  `handoffMessage.ts`, `handoffDecision.ts`). Settings: `packages/contracts/src/handoff.ts`.
-- The only upstream edit is one call in `Orchestrator.ts` (`handoffDispatchDropped`), plus the
-  service's line in `server.ts`. A test counts the call sites.
+- Fork code: `apps/server/src/fork/handoff/` (`HandoffService.ts`, `handoffDispatch.ts`,
+  `handoffFacts.ts`, `handoffMessage.ts`, `handoffDecision.ts`). Settings:
+  `packages/contracts/src/handoff.ts`.
+- `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes
+  through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. The only upstream edit is
+  the service's line in `server.ts`.
 - The message reuses upstream's handoff budget (`handoffBudget`) and transcript reading
   (`ContextHandoffService.ts`); nothing is copied.

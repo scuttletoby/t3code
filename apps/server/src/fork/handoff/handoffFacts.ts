@@ -1,8 +1,7 @@
 /**
  * Fork: the handoff facts read from a thread's records. Pure, and the one source of "quiet" for both
- * the handoff service (before it sends) and the busy check in `Orchestrator.ts` (under the thread
- * lock, when the message lands), so the two can never disagree.
- */
+ * the handoff service's decision and its busy check (`handoffDispatch.ts`, right before the send),
+ * so the two can never disagree. */
 import type {
   OrchestrationV2Run,
   OrchestrationV2ThreadProjection,
@@ -78,12 +77,15 @@ export function handoffBlockers(
   if (records.contextTransfers.some((transfer) => transfer.status === "pending")) {
     blockers.push({ kind: "fork-or-merge" });
   }
-  // The session's own work only; a PR watch is a T3 wait on the thread, so it is not passed.
+  // The session's own work only; a PR watch is a T3 wait on the thread, so it is not passed, and
+  // a T3 child's row (`app_owned`, as upstream's `deriveBlockedOnThreadWait` skips it) is left out.
   const background = derivePendingBackgroundWork({
     latestRun: latestStartedRun(runs) ?? null,
     runs,
     providerThreads: records.providerThreads,
-    turnItems: records.turnItems,
+    turnItems: records.turnItems.filter(
+      (item) => !(item.type === "subagent" && item.origin === "app_owned"),
+    ),
     activeProviderThreadId: thread.activeProviderThreadId,
   });
   if (background.length > 0) {
@@ -136,10 +138,10 @@ export function handoffThreadFacts(
 }
 
 /**
- * The busy check: true drops a handoff message that lands at a thread no longer quiet, or no
- * longer at the run it was made from (a newer turn ran first). Only the message landing decides,
- * under the thread lock, so a racing user message or child result always wins. Any other message
- * passes untouched; a forged handoff id can only be dropped, never let through.
+ * The busy check: true drops a handoff message for a thread no longer quiet, or no longer at the
+ * run it was made from (a newer turn ran first). `dispatchHandoff` asks it right before the send;
+ * a message that lands after that is caught by its cancel of a queued handoff. Any other message
+ * passes untouched.
  */
 export function handoffDispatchDropped(
   command: { readonly threadId: ThreadId; readonly messageId: string },

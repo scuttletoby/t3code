@@ -1,7 +1,7 @@
 /**
  * Fork: hands a long thread off to a fresh session in the same thread (design 4.4). At each turn end
  * it asks `handoffDecision`, sleeps to the idle window or waits for a busy thread to change, then
- * sends one fresh-context message; the busy check in `Orchestrator.ts` drops it if it lands late.
+ * sends one fresh-context message through `dispatchHandoff`, which drops or cancels a late one.
  */
 import {
   CommandId,
@@ -25,6 +25,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { forkParked } from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
+import { dispatchHandoff, readHandoffRecords } from "./handoffDispatch.ts";
 import { HANDOFF_RETRY_SUFFIX, handoffThreadFacts, parseHandoffMessageId } from "./handoffFacts.ts";
 import { handoffMessageText } from "./handoffMessage.ts";
 
@@ -37,6 +38,11 @@ export const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   // One per waiting thread; any event of that thread completes it, so the wait reads again.
   const wakes = new Map<ThreadId, Deferred.Deferred<void>>();
+  const withStores = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(
+      Effect.provideService(Orchestrator.OrchestratorV2, orchestrator),
+      Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
+    );
 
   const readThread = Effect.fn("HandoffService.readThread")(function* (threadId: ThreadId) {
     const current = yield* serverSettings.getSettings;
@@ -48,34 +54,7 @@ export const make = Effect.gen(function* () {
     );
     // Off (the default) and `compact` read nothing more.
     if (resolved.mode !== "handoff") return null;
-    const active = thread.activeProviderThreadId === null ? [] : [thread.activeProviderThreadId];
-    const records = yield* projections.getThreadRecords(
-      threadId,
-      [
-        "runs",
-        "providerThreads",
-        "providerTurns",
-        "runtimeRequests",
-        "turnItems",
-        "contextTransfers",
-      ],
-      {
-        turnItemStatuses: ["pending", "running", "waiting"],
-        providerThreadIds: active,
-        providerTurnThreadIds: active,
-        latestProviderTurnUsageOnly: true,
-        runtimeRequestStatuses: ["pending"],
-        contextTransferStatuses: ["pending"],
-      },
-    );
-    // The messages the facts look at: each run's own (for `/compact`) and child results due.
-    const { messages } = yield* projections.getThreadRecords(threadId, ["messages"], {
-      messageIds: records.runs.flatMap((run) => [
-        run.userMessageId,
-        ...(run.delegatedCompletion?.delivery ? [run.delegatedCompletion.delivery.messageId] : []),
-      ]),
-    });
-    return { ...resolved, records: { ...records, thread, messages } };
+    return { ...resolved, records: yield* withStores(readHandoffRecords(threadId)) };
   });
 
   const send = Effect.fn("HandoffService.send")(function* (
@@ -101,25 +80,27 @@ export const make = Effect.gen(function* () {
     );
     // The setting, else the thread's current model, always written out in full.
     const modelSelection = read.settings.modelSelection ?? read.records.thread.modelSelection;
-    yield* orchestrator.dispatch({
-      type: "message.dispatch",
-      commandId: CommandId.make(ids.commandId),
-      messageId: MessageId.make(ids.messageId),
-      threadId,
-      text: handoffMessageText({
-        records: { ...read.records, ...more },
-        sourceRunId: run.id,
-        number: firstSends.size + 1,
-        nowIso: DateTime.formatIso(yield* DateTime.now),
+    yield* withStores(
+      dispatchHandoff({
+        type: "message.dispatch",
+        commandId: CommandId.make(ids.commandId),
+        messageId: MessageId.make(ids.messageId),
+        threadId,
+        text: handoffMessageText({
+          records: { ...read.records, ...more },
+          sourceRunId: run.id,
+          number: firstSends.size + 1,
+          nowIso: DateTime.formatIso(yield* DateTime.now),
+          modelSelection,
+        }),
+        attachments: [],
+        createdBy: "agent",
+        creationSource: "server",
+        freshContext: true,
         modelSelection,
+        dispatchMode: { type: "start_immediately" },
       }),
-      attachments: [],
-      createdBy: "agent",
-      creationSource: "server",
-      freshContext: true,
-      modelSelection,
-      dispatchMode: { type: "start_immediately" },
-    });
+    );
   });
 
   const handOffWhenDue = Effect.fn("HandoffService.handOffWhenDue")(
@@ -207,19 +188,21 @@ export const make = Effect.gen(function* () {
       });
       const message = messages[0];
       if (read === null || message === undefined) return;
-      yield* orchestrator.dispatch({
-        type: "message.dispatch",
-        commandId: CommandId.make(`server:${run.userMessageId}${HANDOFF_RETRY_SUFFIX}`),
-        messageId: MessageId.make(`${run.userMessageId}${HANDOFF_RETRY_SUFFIX}`),
-        threadId,
-        text: message.text,
-        attachments: [],
-        createdBy: "agent",
-        creationSource: "server",
-        freshContext: true,
-        modelSelection: run.modelSelection,
-        dispatchMode: { type: "start_immediately" },
-      });
+      yield* withStores(
+        dispatchHandoff({
+          type: "message.dispatch",
+          commandId: CommandId.make(`server:${run.userMessageId}${HANDOFF_RETRY_SUFFIX}`),
+          messageId: MessageId.make(`${run.userMessageId}${HANDOFF_RETRY_SUFFIX}`),
+          threadId,
+          text: message.text,
+          attachments: [],
+          createdBy: "agent",
+          creationSource: "server",
+          freshContext: true,
+          modelSelection: run.modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        }),
+      );
     },
     (effect, run) =>
       effect.pipe(
