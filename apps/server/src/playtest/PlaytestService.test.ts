@@ -280,6 +280,16 @@ const stepProcesses = (dir: string) => {
 const refusal = <A>(effect: Effect.Effect<A, PlaytestFailure>) =>
   Effect.flip(effect).pipe(Effect.map((error) => ({ code: error.code, message: error.message })));
 
+/** Sets (undefined: removes) the server's env vars; returns what they were. */
+function setServerEnv(values: Record<string, string | undefined>) {
+  const before = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  return before;
+}
+
 const live = <A, E>(effect: Effect.Effect<A, E, NodeServices.NodeServices | Scope.Scope>) =>
   effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
@@ -1059,20 +1069,8 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
           const dir = yield* fx.adapterDir("a");
           const probe = { PORT: "4321", T3CODE_PLAYTEST_PROBE: "t3", PLAYTEST_PROBE_KEPT: "kept" };
           yield* Effect.acquireRelease(
-            Effect.sync(() => {
-              const before = Object.fromEntries(
-                Object.keys(probe).map((key) => [key, process.env[key]]),
-              );
-              Object.assign(process.env, probe);
-              return before;
-            }),
-            (before) =>
-              Effect.sync(() => {
-                for (const [key, value] of Object.entries(before)) {
-                  if (value === undefined) delete process.env[key];
-                  else process.env[key] = value;
-                }
-              }),
+            Effect.sync(() => setServerEnv(probe)),
+            (before) => Effect.sync(() => setServerEnv(before)),
           );
           const show =
             'printf "%s|%s|%s" "${PORT-unset}" "${T3CODE_PLAYTEST_PROBE-unset}" "${PLAYTEST_PROBE_KEPT-unset}"';
