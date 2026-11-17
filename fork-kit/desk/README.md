@@ -115,7 +115,8 @@ distro (`-Distro`, default `fork-desk`, Ubuntu 24.04, installed with `--version 
 leaves a mark in `%LOCALAPPDATA%\fork-desk`, so the next run asks no takeover question, and a broken one names
 `wsl --unregister DISTRO`); `.wslconfig`'s `[wsl2]` memory cap (`-MemoryGB`, default
 three quarters of the RAM, at most the RAM less 6 GB, never under 4 GB; one that leaves Windows under 2 GB is
-refused; it is the least cap: a higher one already there, raised by hand, is kept), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (read and written as UTF-8 without a
+refused; without `-MemoryGB`, a higher one already there, raised by hand, is kept up to the RAM less 2 GB; one
+WSL cannot read, such as `26 GB` or `26gb`, is rewritten, since WSL would run on half the RAM), swap (`-SwapGB`, 4), NAT and DNS tunnelling, for every WSL distro (read and written as UTF-8 without a
 BOM; a dated copy of the old file is kept, other keys and sections stay; an old `networkingMode` or `dnsTunneling`
 line under `[experimental]`, the form before WSL 2.0 that can still win over `[wsl2]`, is removed, and the check
 FAILs while one is there; the question lists each change, old -> new, and the file is written only when it lists one,
