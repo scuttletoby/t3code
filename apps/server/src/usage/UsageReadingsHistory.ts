@@ -604,16 +604,19 @@ export const make = Effect.fn("UsageReadingsHistory.make")(function* (options: {
             const instanceId = provider.instanceId;
             const seen = seenStamps.get(instanceId);
             const nowMs = yield* Clock.currentTimeMillis;
-            // A replayed older update is never full, and the stamps stay those of the newest seen:
-            // otherwise the next update would be compared with the replay's older stamps.
+            // A replayed older update is never full. Each stamp stays the newest seen, separately:
+            // a check can bring a newer provider stamp with an older usage stamp (it kept the probe
+            // it took before a streamed update), and the next update must be compared with both.
             const replay = isReplay(provider, seen, nowMs);
             const full = !replay && isFullRead(provider, seen);
-            if (!replay) {
-              seenStamps.set(instanceId, {
-                provider: provider.checkedAt,
-                usage: provider.usageLimits?.checkedAt,
-              });
-            }
+            const usage = provider.usageLimits?.checkedAt;
+            seenStamps.set(instanceId, {
+              provider:
+                seen && stampedBefore(provider.checkedAt, seen.provider, nowMs)
+                  ? seen.provider
+                  : provider.checkedAt,
+              usage: seen && stampedBefore(usage, seen.usage, nowMs) ? seen.usage : usage,
+            });
             if (provider.usageLimits === undefined) return;
             const history = yield* load(instanceId);
             const lastKnown = history.findLast(
