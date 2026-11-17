@@ -1,0 +1,28 @@
+name: test-select-trace
+description: >-
+  Checks test-select against what the tests really touch: runs every test under strace and fails when a test reads
+  or runs a tracked file whose change would not pick it on a pull request. For a schedule or default-branch pushes,
+  never a pull request's gate. Needs strace on the runner. Usage: ../README.md (Trace check).
+inputs:
+  config:
+    description: The same test-select config, a plain path in the repository.
+    required: false
+    default: .github/test-select.json
+  run:
+    description: How one test runs, from the repository root; {test} is replaced by its path (shell-quoted).
+    required: false
+    default: python3 -I -B {test}
+  jobs:
+    description: How many tests are traced at once.
+    required: false
+    default: '2'
+runs:
+  using: composite
+  steps:
+    # Runs only this release's script; the tests it traces are the caller's, run by the caller's own command.
+    - shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        RUN: ${{ inputs.run }}
+        JOBS: ${{ inputs.jobs }}
+      run: python3 -I "$GITHUB_ACTION_PATH/../trace_check.py" --config "$CONFIG" --run "$RUN" --jobs "$JOBS"

@@ -52,6 +52,7 @@ fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py ~23s
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 fork-ci/actions/test-select/test-select.test.py ~15s
+fork-ci/actions/test-select/trace-check.test.py
 fork-kit/common/tests/free_contract.test.py ~5s
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py ~65s

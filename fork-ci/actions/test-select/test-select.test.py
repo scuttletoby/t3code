@@ -19,18 +19,25 @@ ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 
        'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
 # A project's config, as a caller would write it.
 CONFIG = {
-    'tests': ['tests/test_*.py', 'tools/sub/test_*.py'],
+    'tests': ['tests/test_*.py', 'tools/sub/test_*.py', 'tests/test_*.sh'],
     'always_all': [{'glob': 'tests/run_tests.py', 'why': 'the test runner'},
                    {'glob': 'tests/_*.py', 'why': 'a shared test helper'},
                    {'glob': 'tests/fixtures/**', 'why': 'shared fixtures'}],
     'import_roots': ['lib'],
 }
 PRELUDE = 'import os, sys\nHERE = os.path.dirname(os.path.abspath(__file__))\nROOT = os.path.dirname(HERE)\n'
-LINE = re.compile(r'^(selected \d+ of \d+ test files|no tool test touched: |all \d+ test files: |run [^:]+: takes in )')
+LINE = re.compile(r'^(selected \d+ of \d+ test files|no tool test touched: |all \d+ test files: |run [^:]+: (takes in |always \())')
 
 
 def py(text):
     return PRELUDE + textwrap.dedent(text)
+
+
+class Link(str):
+    """A symlink's target, for Repo.write."""
+    @property
+    def target(self):
+        return str(self)
 
 
 class CleanEnv(unittest.TestCase):
@@ -75,6 +82,11 @@ class Repo(CleanEnv):
                 os.remove(full)
                 continue
             os.makedirs(os.path.dirname(full), exist_ok=True)
+            if isinstance(text, Link):   # a tracked symlink
+                if os.path.lexists(full):
+                    os.remove(full)
+                os.symlink(text.target, full)
+                continue
             with open(full, 'w') as f:
                 f.write(text)
 
@@ -150,6 +162,23 @@ class Repo(CleanEnv):
         tracked = set(self.git('ls-files').splitlines())
         return TS.universe(self.config['tests'], tracked)
 
+    def always(self, code, why, base=None, test='tests/test_named.py', change='tools/alone.py'):
+        """A test file with this code always runs (a change it does not reach still picks it), saying why."""
+        self.base({test: py(code) if test.endswith('.py') else code, **(base or {})})
+        self.pr({change: '# y\n'})
+        everything, chosen, out = self.select()
+        self.assertEqual((everything, chosen), (False, [test]), out)
+        self.assertIn(f'run {test}: always (', out)
+        self.assertIn(why, out)
+        return out
+
+    def never(self, code, base, change, test='tests/test_named.py'):
+        """A test file with this code is not chosen for this change (and is not an always-run)."""
+        self.base({test: py(code), **base})
+        self.pr({change: '# y\n'})
+        everything, chosen, out = self.select()
+        self.assertEqual((everything, chosen), (False, []), out)
+
 
 # ---------------------------------------------------------------- what a test file takes in
 
@@ -197,10 +226,15 @@ class Imports(Repo):
     def test_a_relative_import(self):
         base = {'tools/sub/test_rel.py': 'from . import near\nfrom .. import far\n', 'tools/sub/__init__.py': '',
                 'tools/sub/near.py': '', 'tools/__init__.py': '', 'tools/far.py': ''}
-        for f in ('tools/sub/near.py', 'tools/far.py'):
+        for f in ('tools/sub/near.py', 'tools/far.py', 'tools/sub/__init__.py'):   # from . import: its __init__ runs
             with self.subTest(f):
                 self.setUp()   # a fresh repository
                 self.assertEqual(self.picks(base, {f: '# y\n'}), ['tools/sub/test_rel.py'])
+
+    def test_dunder_import_of_a_written_name(self):
+        base = {'tests/test_dyn.py': py("sys.path.insert(0, os.path.join(ROOT, 'tools'))\nm = __import__('mod')\n"),
+                'tools/mod.py': ''}
+        self.assertEqual(self.picks(base, {'tools/mod.py': '# y\n'}), ['tests/test_dyn.py'])
 
     def test_a_configured_import_root(self):   # code loads from an install path that mirrors lib/
         base = {'tests/test_root.py': 'import shared\n', 'lib/shared.py': ''}
@@ -263,6 +297,32 @@ class NamedPaths(Repo):
     def test_a_root_relative_literal(self):   # the usual working directory is the repository root
         self.one("open('conf/a.ini')\n", {'conf/a.ini': ''}, 'conf/a.ini')
 
+    COMMON = {'tests/common.py': 'import os\nTOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n',
+              'conf/a.ini': '', 'conf/b.ini': ''}
+
+    def test_a_name_imported_from_a_repository_module(self):   # from m import ROOT: m's value of ROOT
+        self.one("from common import TOP\nopen(os.path.join(TOP, 'conf', 'a.ini'))\n", self.COMMON, 'conf/a.ini',
+                 ['conf/b.ini'])
+
+    def test_an_attribute_of_an_imported_repository_module(self):   # import m as x; x.ROOT
+        self.one("import common as c\nopen(os.path.join(c.TOP, 'conf', 'a.ini'))\n", self.COMMON, 'conf/a.ini',
+                 ['conf/b.ini'])
+
+    def test_an_import_cycle_ends(self):   # each module's value of the other's name: unknown inside the cycle
+        self.one("from cyc_a import A\nopen(os.path.join(A, 'a.ini'))\n",
+                 {'tests/cyc_a.py': 'from cyc_b import B\nA = B + "/conf"\n',
+                  'tests/cyc_b.py': 'from cyc_a import A\nB = "/x" if A else "conf/.."\n', 'conf/a.ini': ''},
+                 'conf/a.ini')
+
+    def test_the_imported_module_not_its_package(self):   # from pkg.mod import P: pkg/mod.py's P, not pkg/__init__'s
+        self.base({'tests/pkg/__init__.py': 'P = "conf/b.ini"\n', 'tests/pkg/mod.py': 'P = "conf/a.ini"\n',
+                   'tests/test_named.py': py('from pkg.mod import P\n'), 'conf/a.ini': '', 'conf/b.ini': ''})
+        graph = TS.Graph(TS.Repo(self.d, set(self.git('ls-files').splitlines())), [])
+        pf = graph.pyfile('tests/test_named.py')
+        self.assertEqual(graph.imported(pf, 0, 'pkg.mod', 'P', 0), {'conf/a.ini'})
+        self.assertEqual(graph.imported(pf, 0, 'pkg', 'P', 0), {'conf/b.ini'})
+        self.assertEqual(graph.imported(pf, 0, 'json', 'X', 0), {TS.UNKNOWN})   # not a repository module
+
     def test_a_listed_folder_takes_in_everything_under_it(self):
         self.one("CASES = os.path.join(HERE, 'cases')\nfor n in os.listdir(CASES): pass\n",
                  {'tests/cases/a.json': ''}, 'tests/cases/new.json')
@@ -283,10 +343,16 @@ class NamedPaths(Repo):
         self.one("def f(name):\n    return os.path.join(ROOT, 'plugins', name)\n",
                  {'plugins/a/x.yml': ''}, 'plugins/b/new.yml', ['tools/other.py'])
 
-    def test_an_unknown_rest_in_a_folder_the_file_is_inside_is_not_all_of_it(self):   # HERE / name, ROOT / name
-        self.one("def f(name):\n    open(os.path.join(HERE, name))\n    open(os.path.join(ROOT, name))\n"
-                 "open(os.path.join(HERE, 'a.json'))\n",
-                 {'tests/a.json': '', 'tests/b.json': ''}, 'tests/a.json', ['tests/b.json', 'tools/other.py'])
+    def test_an_unknown_rest_in_a_folder_the_file_is_inside_always_runs_it(self):   # HERE / name, ROOT / name
+        for code, where in (("def f(name):\n    open(os.path.join(HERE, name))\n", 'tests/'),
+                            ("def f(name):\n    open(os.path.join(ROOT, name))\n", 'the repository root/'),
+                            ("def f(name):\n    open(f'{HERE}/{name}.json')\n", 'tests/'),
+                            ("def f(n):\n    open('/'.join([HERE, n]))\n", 'tests/'),
+                            ("def f(n):\n    open('{}/{}'.format(HERE, n))\n", 'tests/'),
+                            ("def f(n):\n    open('%s/%s' % (HERE, n))\n", 'tests/')):
+            with self.subTest(code):
+                self.setUp()
+                self.always(code, f'a path under {where} it cannot work out')
 
     def test_a_message_is_not_a_path(self):   # a space, quote, ( or $ : a message or a shell line
         self.one("def f(e):\n    raise SystemExit(f'{ROOT}/lib/ is missing: {e}')\nopen(ROOT + '/lib/a.py')\n",
@@ -325,6 +391,258 @@ class NamedPaths(Repo):
     def test_javascript(self):
         self.one("JS = os.path.join(ROOT, 'tools', 'a.mjs')\n",
                  {'tools/a.mjs': "import x from './b.mjs';\n", 'tools/b.mjs': ''}, 'tools/b.mjs')
+
+    def test_or_and_if_else(self):   # every side of `or` and of `x if c else y`
+        # (each side a folder: only the join after it names the file, so the side must be followed)
+        for code in ("D = os.environ.get('A') or os.path.join(ROOT, 'conf')\nopen(os.path.join(D, 'a.ini'))\n",
+                     "D = os.path.join(ROOT, 'conf') if os.environ.get('A') else 1\nopen(os.path.join(D, 'a.ini'))\n",
+                     "D = 1 if os.environ.get('A') else os.path.join(ROOT, 'conf')\nopen(os.path.join(D, 'a.ini'))\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.one(code, {'conf/a.ini': '', 'conf/b.ini': ''}, 'conf/a.ini', ['conf/b.ini'])
+
+    def test_a_global_assigned_in_a_function(self):   # global P: the module's P, read anywhere
+        self.one("P = 'b.ini'\ndef f():\n    global P\n    P = 'a.ini'\nopen(os.path.join(ROOT, 'conf', P))\n",
+                 {'conf/a.ini': '', 'conf/b.ini': ''}, 'conf/a.ini')
+
+    def test_a_global_read_past_an_enclosing_function(self):   # not the P of the function around it
+        self.one("P = 'a.ini'\ndef g():\n    P = 'x.ini'\n    def f():\n        global P\n"
+                 "        open(os.path.join(ROOT, 'conf', P))\n", {'conf/a.ini': '', 'conf/x.ini': ''}, 'conf/a.ini')
+
+    def test_an_absolute_right_side_of_join_wins(self):
+        self.one("open(os.path.join(os.environ['X'], ROOT + '/conf/a.ini'))\n", {'conf/a.ini': ''}, 'conf/a.ini')
+
+    def test_a_shell_word_for_its_own_folder_is_not_all_of_it(self):   # cd tools/: a base, not every file
+        self.one("SH = os.path.join(ROOT, 'tools', 'go.sh')\n", {'tools/go.sh': 'cd ../tools && sh go.sh\n',
+                 'tools/other.sh': ''}, 'tools/go.sh', ['tools/other.sh'])
+
+    def test_a_loop_over_a_written_out_sequence(self):   # each element, not the whole folder
+        for code in ("for n in ('a.json', 'b.json'):\n    open(os.path.join(HERE, n))\n",
+                     "NAMES = ['a.json', 'b.json']\nfor n in sorted(NAMES):\n    open(os.path.join(HERE, n))\n",
+                     "X = [os.path.join(HERE, n) for n in ('a.json',) + ('b.json',)]\n",
+                     "for k, n in {'x': 'a.json', 'y': 'b.json'}.items():\n    open(f'{HERE}/{n}')\n",
+                     "for i, n in enumerate(('a.json', 'b.json')):\n    open(HERE + '/' + n)\n",
+                     "for src, dst in (('a.json', '/etc/a'), ('b.json', '/etc/b')):\n    open(os.path.join(HERE, src))\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.one(code, {'tests/a.json': '', 'tests/b.json': '', 'tests/c.json': ''}, 'tests/a.json',
+                         ['tests/c.json'])
+
+    def test_join_format_and_percent(self):   # '/'.join, str.format, %
+        for code in ("open('/'.join([ROOT, 'conf', 'a.ini']))\n", "open('{}/conf/{n}'.format(ROOT, n='a.ini'))\n",
+                     "open('{0}/conf/a.ini'.format(ROOT))\n", "open('%s/conf/%s' % (ROOT, 'a.ini'))\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.one(code, {'conf/a.ini': '', 'conf/b.ini': ''}, 'conf/a.ini', ['conf/b.ini'])
+
+    def test_python_dash_m_and_runpy(self):   # the module from the working directory (the root)
+        for code in ("import subprocess\nsubprocess.run([sys.executable, '-m', 'tools.pkg.mod'])\n",
+                     "import subprocess\nsubprocess.run(['python3', '-I', '-m', 'tools.pkg.mod'])\n",
+                     "import subprocess\nsubprocess.run('cd x && python3 -m tools.pkg.mod', shell=True)\n",
+                     "import runpy\nrunpy.run_module('tools.pkg.mod')\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.one(code, {'tools/pkg/__init__.py': '', 'tools/pkg/mod.py': '', 'tools/pkg/other.py': ''},
+                         'tools/pkg/mod.py', ['tools/pkg/other.py'])
+
+    def test_a_shell_script_runs_python_dash_m(self):
+        self.one("SH = os.path.join(ROOT, 'tools', 'go.sh')\n",
+                 {'tools/go.sh': 'python3 -m tools.mod "$@"\n', 'tools/mod.py': ''}, 'tools/mod.py')
+
+    def test_shell_paths_from_the_scripts_own_folder(self):   # $HERE/x, ${DIR}/x, $(dirname "$0")/x, ...
+        for sh in ('HERE="$(cd "$(dirname "$0")" && pwd)"\n. "$HERE/lib.sh"\n',
+                   'DIR=$(dirname "${BASH_SOURCE[0]}")\nsource "${DIR}/lib.sh"\n',
+                   '. "$(dirname "$0")/lib.sh"\n',
+                   'HERE=$(dirname "$(readlink -f "$0")")\n. $HERE/lib.sh\n',
+                   'HERE="${BASH_SOURCE%/*}"\n. "$HERE/lib.sh"\n',
+                   'ROOT="$(cd "$(dirname "$0")/.." && pwd)"\n. "$ROOT/tools/lib.sh"\n',
+                   'HERE="$(dirname "$0")"\nTOP="$HERE/.."\n. "$TOP/tools/lib.sh"\n',
+                   'ROOT=$(git rev-parse --show-toplevel)\n. "$ROOT/tools/lib.sh"\n'):
+            with self.subTest(sh):
+                self.setUp()
+                self.one("SH = os.path.join(ROOT, 'tools', 'run.sh')\n",
+                         {'tools/run.sh': sh, 'tools/lib.sh': '', 'tools/other.sh': ''}, 'tools/lib.sh',
+                         ['tools/other.sh'])
+
+    def test_a_sys_path_module_in_two_places_is_both(self):   # Python's order is not worked out: both count
+        base = {'a/mod.py': '', 'b/mod.py': '', 'c/mod.py': ''}
+        code = "sys.path.insert(0, os.path.join(ROOT, 'b'))\nsys.path.append(os.path.join(ROOT, 'a'))\nimport mod\n"
+        for change in ('a/mod.py', 'b/mod.py'):
+            with self.subTest(change):
+                self.setUp()
+                self.one(code, base, change, ['c/mod.py'])
+
+
+class FailClosed(Repo):
+    """An input the action cannot place always runs the test files that reach it, saying why."""
+
+    def test_git_ls_files(self):   # a repository-wide lint: any new file can break it
+        for code in ("import subprocess\nsubprocess.run(['git', 'ls-files', '-z'], cwd=ROOT)\n",
+                     "import subprocess\ndef git(*a):\n    return subprocess.run(['git', *a])\ngit('ls-files', 'x/')\n",
+                     "import subprocess\nsubprocess.run('git -C . ls-files | grep x', shell=True)\n",
+                     "import subprocess\nsubprocess.run(['git', 'grep', '-l', 'reload'])\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.always(code, 'lists the repository (git ls-files)')
+
+    def test_git_ls_files_of_a_temporary_repository_is_not(self):
+        self.never("import subprocess, tempfile\nD = tempfile.mkdtemp()\nsubprocess.run(['git', 'ls-files'], cwd=D)\n",
+                   {}, 'tools/alone.py')
+
+    def test_git_ls_files_in_a_shell_test(self):
+        self.always('git ls-files -- scripts | xargs grep -l reload\n', 'tests/test_lint.sh: lists the repository',
+                    test='tests/test_lint.sh')
+
+    def test_a_tool_that_lists_is_left_to_the_trace_check(self):   # its caller passes the folder: mostly a temp repo
+        for tool in ({'tools/lint.sh': 'git ls-files -- scripts | xargs grep -l reload\n'},
+                     {'tools/lint.py': 'import subprocess\ndef f(d):\n    subprocess.run(["git", "ls-files"], cwd=d)\n'
+                                       '    return os.listdir(d)\n'}):
+            with self.subTest(tool=list(tool)):
+                self.setUp()
+                self.never(f"SH = os.path.join(ROOT, {list(tool)[0]!r})\n", tool, 'tools/alone.py')
+
+    def test_walking_the_root(self):
+        for code in ("for d, _, fs in os.walk(ROOT): pass\n", "from pathlib import Path\nPath(ROOT).rglob('*.py')\n",
+                     "import glob\nglob.glob('**/*.sh', recursive=True)\nos.listdir()\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.always(code, 'lists the repository root')
+
+    def test_a_glob_from_the_working_directory_matches_changed_paths(self):
+        self.one_pick("import glob\nglob.glob('**/*.sh', recursive=True)\n", 'deep/x/new.sh')
+
+    def one_pick(self, code, change):
+        self.base({'tests/test_named.py': py(code)})
+        self.pr({change: '# y\n'})
+        everything, chosen, out = self.select()
+        self.assertEqual((everything, chosen), (False, ['tests/test_named.py']), out)
+        self.assertNotIn('always (', out)
+
+    def test_listing_a_folder_it_cannot_work_out(self):
+        self.always("def f(d):\n    return os.listdir(d)\n", 'lists a folder it cannot work out')
+
+    def test_listing_a_temporary_folder_is_not(self):
+        for code in ("import tempfile\nos.listdir(tempfile.mkdtemp())\n",
+                     "import tempfile\nwith tempfile.TemporaryDirectory() as d:\n    os.listdir(os.path.join(d, 'x'))\n",
+                     "import tempfile\nclass T:\n    def setUp(self):\n        self.d = tempfile.mkdtemp()\n"
+                     "    def t(self):\n        os.walk(self.d)\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.never(code, {}, 'tools/alone.py')
+
+    def test_a_loop_variable_it_cannot_work_out(self):   # the first caller's copy loop over names from data
+        self.always("import json\nfor n in json.load(open(os.path.join(HERE, 'x.json'))):\n"
+                    "    open(os.path.join(HERE, n))\n", 'a path under tests/ it cannot work out',
+                    {'tests/x.json': '[]'})
+
+    def test_python_dash_m_by_a_name_it_cannot_work_out(self):
+        for code in ("import subprocess\ndef f(m):\n    subprocess.run([sys.executable, '-m', m])\n",
+                     "import runpy\ndef f(m):\n    runpy.run_module(m)\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.always(code, 'runs a module by a name it cannot work out')
+
+    def test_git_dash_m_is_not_python(self):
+        self.never("import subprocess\ndef f(m):\n    subprocess.run(['git', 'commit', '-m', m])\n", {},
+                   'tools/alone.py')
+
+    def test_a_shell_path_from_a_variable_it_cannot_work_out(self):
+        self.always('. "$SOMEWHERE/lib.sh"\n', 'a path from a variable it cannot work out', {'tests/lib.sh': ''},
+                    test='tests/test_run.sh')
+
+    def shell_test(self, text, change='tools/alone.py'):
+        self.base({'tests/test_run.sh': text, 'tests/lib.sh': ''})
+        self.pr({change: '# y\n'})
+        return self.select()
+
+    def test_a_shell_variable_with_only_dots_is_not(self):   # "$tmp/." names no file of the repository
+        self.assertEqual(self.shell_test('cp -r "$tmp/." "$out"\n')[1], [])
+
+    def test_a_shell_variable_path_outside_the_repository_is_not(self):   # $OUT/report.txt names no file here
+        self.assertEqual(self.shell_test('echo x > "$OUT/report.txt"\n')[1], [])
+
+    def test_text_that_only_mentions_ls_files_is_not(self):   # a docstring, a message, a comparison: never run
+        for code in ('def t():\n    """git ls-files still works."""\n',
+                     "import unittest\nclass T(unittest.TestCase):\n    def t(self, err):\n"
+                     "        self.assertIn('git ls-files -- x/ failed', err)\n",
+                     "def f(c):\n    return c[:2] == ('git', 'ls-files')\n"):
+            with self.subTest(code=code):
+                self.setUp()
+                self.never(code, {}, 'tools/alone.py')
+
+    def test_ast_walk_is_not_a_listing(self):
+        self.never("import ast\nfor n in ast.walk(ast.parse(open(__file__).read())): pass\n", {}, 'tools/alone.py')
+
+    def test_a_temporary_folder_through_a_helper(self):   # .name, enterContext, a lambda, a method, git -C
+        for code in ("import tempfile\nos.listdir(tempfile.TemporaryDirectory().name)\n",
+                     "import tempfile, unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n"
+                     "        self.d = self.enterContext(tempfile.TemporaryDirectory())\n"
+                     "    def t(self):\n        os.listdir(self.d)\n",
+                     "import tempfile\nT = tempfile.mkdtemp()\np = lambda *a: os.path.join(T, *a)\nos.listdir(p('x'))\n",
+                     "import tempfile\nclass T:\n    def setUp(self):\n        self.tmp = tempfile.mkdtemp()\n"
+                     "    def path(self, p):\n        return os.path.join(self.tmp, p.lstrip('/'))\n"
+                     "    def t(self):\n        os.listdir(self.path('/run'))\n",
+                     "import subprocess, tempfile\nd = tempfile.mkdtemp()\nsubprocess.run(['git', '-C', d, 'ls-files'])\n"):
+            with self.subTest(code=code):
+                self.setUp()
+                self.never(code, {}, 'tools/alone.py')
+
+    def test_the_repository_through_a_helper(self):   # the same helpers over the repository: always
+        for code in ("p = lambda *a: os.path.join(ROOT, *a)\nos.listdir(p('tools'))\n",
+                     "def where():\n    return ROOT\nos.listdir(where())\n",
+                     "import subprocess\nsubprocess.run(['git', '-C', ROOT, 'ls-files'])\n"):
+            with self.subTest(code=code):
+                self.setUp()
+                self.always(code, 'tests/test_named.py')
+
+    def test_more_values_than_the_cap(self):   # never a silent drop: the folder they share, or always
+        names = ', '.join(repr(f'n{i}.json') for i in range(TS.CAP + 1))
+        code = f"for n in ({names}):\n    open(os.path.join(ROOT, 'conf', n))\n"
+        self.one_pick(code, 'conf/other.json')
+        names = ', '.join(repr(f'{i}x') for i in range(TS.CAP + 1))   # no start they share
+        self.setUp()
+        self.always(f"for n in ({names}):\n    open(n + '.json')\n", f'more than {TS.CAP} values', {'3x.json': ''})
+        self.setUp()   # text that names nothing here ('k=v' lines) is not a path
+        self.never(f"for n in ({names}):\n    open(n + '.json')\n", {}, 'tools/alone.py')
+
+    def test_a_value_deeper_than_the_limit(self):
+        chain = ''.join(f"A{i + 1} = A{i} + 'x'\n" for i in range(TS.DEPTH + 2))
+        self.always("A0 = ROOT + '/conf/'\n" + chain + f"open(A{TS.DEPTH + 2})\n", f'deeper than {TS.DEPTH} steps')
+
+
+class ImportedRoot(Repo):
+    def test_an_imported_root_with_an_unknown_rest_always_runs(self):   # open(os.path.join(m.ROOT, name))
+        self.always("import common as c\nimport json\nfor p in json.load(open('l.json')):\n"
+                    "    open(os.path.join(c.TOP, p))\n", 'a path under the repository root/',
+                    base={'tests/common.py': NamedPaths.COMMON['tests/common.py'], 'l.json': '[]'})
+
+
+class Symlinks(Repo):
+    """A tracked symlink counts as its target (a change to the target picks every test that reaches the link)."""
+
+    def test_a_symlinked_file(self):
+        base = {'tests/test_link.py': py("sys.path.insert(0, os.path.join(ROOT, 'tools'))\nimport a\n"),
+                'real/a.py': 'X = 1\n', 'tools/a.py': Link('../real/a.py'), 'real/b.py': ''}
+        for change in ('real/a.py', 'tools/a.py'):
+            with self.subTest(change):
+                self.setUp()
+                self.assertEqual(self.picks(base, {change: '# y\n' if change == 'real/a.py' else Link('../real/b.py')}),
+                                 ['tests/test_link.py'])
+
+    def test_a_symlinked_folder(self):
+        base = {'tests/test_link.py': py("sys.path.insert(0, os.path.join(ROOT, 'tools', 'lib'))\nimport m\n"),
+                'real/lib/m.py': 'X = 1\n', 'tools/lib': Link('../real/lib'), 'real/lib/n.py': ''}
+        self.assertEqual(self.picks(base, {'real/lib/m.py': '# y\n'}), ['tests/test_link.py'])
+        self.setUp()   # the link moved to another folder: what the test loads changed
+        self.assertEqual(self.picks({**base, 'other/m.py': ''}, {'tools/lib': Link('../other')}), ['tests/test_link.py'])
+        self.setUp()   # the same through a folder above the link: the file it loads is under a link
+        base = {**base, 'tests/test_link.py': py("sys.path.insert(0, os.path.join(ROOT, 'tools'))\nfrom lib import m\n")}
+        self.assertEqual(self.picks({**base, 'other/m.py': ''}, {'tools/lib': Link('../other')}), ['tests/test_link.py'])
+
+    def test_a_listed_symlinked_folder_takes_in_its_target(self):
+        base = {'tests/test_link.py': py("os.listdir(os.path.join(ROOT, 'tools', 'lib'))\n"),
+                'real/lib/m.json': '', 'tools/lib': Link('../real/lib')}
+        self.assertEqual(self.picks(base, {'real/lib/new.json': '# y\n'}), ['tests/test_link.py'])
 
 
 # ---------------------------------------------------------------- every test runs (fails closed)
@@ -409,9 +727,30 @@ class EveryTest(Repo):
             self.assertEqual(f.read().splitlines(), self.every())
 
 
+class AlwaysRun(Repo):
+    config = {**CONFIG, 'always_run': [{'glob': 'tests/test_lint*.py', 'why': 'scans every script'}]}
+
+    def setUp(self):
+        super().setUp()
+        self.write({CONFIG_PATH: json.dumps(self.config)})
+
+    def test_an_always_run_test_runs_on_any_change(self):
+        self.base({'tests/test_lint.py': 'import unittest\n'})
+        self.pr({'tools/alone.py': 'X = 2\n'})
+        everything, chosen, out = self.select()
+        self.assertEqual((everything, chosen), (False, ['tests/test_lint.py']), out)
+        self.assertIn('run tests/test_lint.py: always (always_run: scans every script)', out)
+
+    def test_an_always_run_glob_that_names_no_test_fails_the_step(self):   # a renamed lint must be renamed there
+        self.base({})
+        _, _, err = self.select(rc=1)
+        self.assertIn("always_run 'tests/test_lint*.py' names no test file", err)
+
+
 class Config(Repo):
     def test_a_config_it_cannot_read_fails_the_step(self):   # no test list: red, never zero tests
         for text in ('{', '{"tests": []}', '{"tests": ["t"], "always": []}', '{"tests": ["t"], "always_all": ["x"]}',
+                     '{"tests": ["tests/*.py"], "always_run": ["tests/test_plain.py"]}',
                      '{"tests": ["tests/*.py"], "import_roots": ["../x"]}'):
             with self.subTest(text):
                 self.write({CONFIG_PATH: text})
