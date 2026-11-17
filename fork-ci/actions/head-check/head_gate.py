@@ -38,8 +38,9 @@ the open pull requests, a step before start fails, or the run never reaches star
           not its rate limit). On a workflow_run (the review trigger's run finished, README.md "Run again after a
           review"): no number is taken; the open pull requests whose head is the run's head sha from the run's
           head repository and branch (--run-*, GitHub's fields of the run), read from the API. More than one (one
-          branch into two bases): the lowest number judges the head once, the log names the others. None, or a run
-          of another event: nothing to judge (a log line says why).
+          branch into two bases): the head is judged once, in the job for the lowest number; target names the ones
+          it judges (ready, into the default branch). None, or a run of another event: nothing to judge (a log
+          line says why).
   target  before any token: post=false only for bad arguments. Else post=true: the head gets a failure (judge writes
           it) when the guard did not pass, on a re-run (run attempt 2 or later), for a caller that is not the default
           branch's current one or does not pin this gate release, for a lens list with a name that names no lens, for
@@ -349,11 +350,16 @@ def review_run_pr(repo, run, gh, out):
             'or the head moved on: its push ran the gate)')
         return [], None
     # One branch into two bases: every match has this head, and the gate judges a head, not a pull request (preflight
-    # lists every open pull request with it again; the number only names the job). So it is judged once.
-    first, others = min(matches), sorted(set(matches) - {min(matches)})
-    also = f'; #{first} judges it for {", ".join(f"#{n}" for n in others)} too' if others else ''
-    out(f'review run: #{first} has the head {head_check.escape(where)}{also}')
-    return [{'pr': first, 'sha': sha}], None
+    # lists every open pull request with it again; the number only names the job). So it is judged once. The listing
+    # has no draft or base, so this line cannot say which of them are judged: target's "judging" line does.
+    numbers = sorted(set(matches))   # numbers, so 9 < 10; a number GitHub listed twice is named once
+    if len(numbers) == 1:
+        out(f'review run: #{numbers[0]} has the head {head_check.escape(where)}')
+    else:
+        out(f'review run: open pull requests {", ".join(f"#{n}" for n in numbers)} have the head '
+            f'{head_check.escape(where)}; judged once, in the job for #{numbers[0]} (the lowest number); the target '
+            'step names the ones it judges (ready, into the default branch)')
+    return [{'pr': numbers[0], 'sha': sha}], None
 
 
 def prs(repo, event, pr_text, gh, out, env, event_sha='', git_head=None, run=None):
@@ -645,7 +651,7 @@ def bare_repository(work, name):
     except OSError as e:
         return None, f'could not make a folder in {work}: {e}'
     r = subprocess.run(['git', *pr_queue.GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
-                       capture_output=True)
+                       capture_output=True, env={**os.environ, **pr_queue.GIT_ENV})
     if r.returncode != 0:
         return None, f'git init failed: {r.stderr.strip()[:300]}'
     with open(os.path.join(path, 'config'), 'w', encoding='utf-8') as f:
