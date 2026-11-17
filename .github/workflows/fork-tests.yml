@@ -9,7 +9,8 @@ name: Fork tests
 # .github/scripts/ci-changes.cjs) are used as they are, so a rebase brings their
 # changes. The `workflows` job lints the fork workflows (actionlint) and fails
 # when upstream's ci.yml or release.yml test jobs change and this copy did not
-# follow (.github/scripts/fork-tests-drift.cjs).
+# follow (.github/scripts/fork-tests-drift.cjs). The fork's own script tests run
+# in three jobs side by side: `workflows`, `action_tests` and `kit_tests`.
 #
 # Require only `fork-ci-result` in a ruleset: it needs every other job, so jobs
 # can be added, split or resharded without touching the ruleset.
@@ -335,17 +336,18 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
 
-      # The tests under .github/scripts and fork-ci, checked against .github/fork-ci-tests.txt
-      # (the fork-kit/ ones run in kit_tests, beside this job): the fork's tests run here, longest
-      # first by their weight in the list; the others must be named by the job or script that runs
-      # them. An unlisted test, or a listed one deleted from history, fails; a listed one whose pull
-      # request has not merged yet is a note.
+      # The tests under .github/scripts, checked against .github/fork-ci-tests.txt (the fork-kit/
+      # ones run in kit_tests, the fork-ci/ and fleet walls' ones in action_tests, beside this job):
+      # the fork's tests run here, longest first by their weight in the list; the others must be
+      # named by the job or script that runs them. An unlisted test, or a listed one deleted from
+      # history, fails; a listed one whose pull request has not merged yet is a note. Every test is
+      # in exactly one job's part (fork-ci-tests.test.cjs).
       - name: Fork script tests
         run: |
           if compgen -G '.github/scripts/fork-*.test.py' >/dev/null && ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
-          node .github/scripts/fork-ci-tests.cjs '!fork-kit/'
+          node .github/scripts/fork-ci-tests.cjs '!fork-kit/' '!fork-ci/' '!.github/scripts/fork-fleet-walls'
 
       # The fleet launcher with real runner users (created and deleted by the test):
       # one slot's user cannot read another's copy, nothing a job leaves (files in
@@ -355,8 +357,9 @@ jobs:
       - name: Install nftables for the launcher's network test
         run: command -v nft >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq nftables; }
 
+      # -v: the log names every test, and a skipped one with its reason.
       - name: Fleet launcher as root
-        run: sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py LauncherAsRoot
+        run: sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py -v LauncherAsRoot
 
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
@@ -368,8 +371,58 @@ jobs:
         if: ${{ github.event_name == 'pull_request' }}
         run: node .github/scripts/fork-seam-check.cjs HEAD^1 HEAD
 
-  # The host kits' tests (fork-kit/), split from `workflows` so the two halves of the fork's
-  # script tests run side by side: one job of all of them was the longest in the run.
+  # The composite actions' tests (fork-ci/) and the fleet walls' (.github/scripts/fork-fleet-walls*),
+  # split from `workflows`: together they were about two thirds of its script tests' time, which
+  # is CPU-bound (all tests at once on the runner's cores), so `workflows` took 3 to 6 minutes.
+  action_tests:
+    name: Fork action and fleet walls tests
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # The same files and depth as in `workflows` (its comment says why each), where these tests ran.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.changes.outputs.sha }}
+          fetch-depth: 2
+          sparse-checkout: |
+            /.github/
+            /docs/fork/
+            /fork-ci/
+            /fork-kit/
+            /scripts/
+            /apps/server/src/auth/EnvironmentAuth.ts
+            /apps/server/src/cli/auth.ts
+            /apps/server/src/cli/config.ts
+            /apps/server/src/cli/forkReport.ts
+            /apps/server/src/cli/server.ts
+            /apps/server/src/cli/servicePreflight.ts
+            /apps/server/src/cloud/bootService.ts
+            /apps/server/src/cloud/servicePreflight.ts
+            /apps/server/src/cloud/serviceProtocol.ts
+            /apps/server/src/config.ts
+            /apps/server/src/golive/forkReport.ts
+            /apps/server/src/persistence/Sqlite.ts
+            /apps/server/src/serverOwnership.ts
+            /apps/server/src/serverRuntimeState.ts
+            /apps/server/src/serviceLauncher.ts
+            /apps/server/src/usage/UsagePacingGate.ts
+            /packages/shared/src/cliRelease.ts
+            /packages/shared/src/model.ts
+          sparse-checkout-cone-mode: false
+
+      # These tests, checked against .github/fork-ci-tests.txt as in `workflows`.
+      - name: Fork action and fleet walls tests
+        run: |
+          if ! python3 -c 'import yaml' 2>/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
+          fi
+          node .github/scripts/fork-ci-tests.cjs fork-ci/ .github/scripts/fork-fleet-walls
+
+  # The host kits' tests (fork-kit/), split from `workflows` so the fork's script tests run
+  # side by side in three jobs: one job of all of them was the longest in the run.
   kit_tests:
     name: Fork kit tests
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
@@ -1128,6 +1181,7 @@ jobs:
         fleet_watch,
         fork_checks_ran,
         workflows,
+        action_tests,
         kit_tests,
         secrets,
         lint,
