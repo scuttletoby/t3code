@@ -86,7 +86,9 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 | `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                |
 
 `t3Version` must be 0.1.7 or newer: older releases have no managed policy, so they would run with none of the kit's
-locks and with updates on. Setup and `check` refuse them, naming the key. (`t3 pair`, step 10, came earlier.)
+locks and with updates on. A 0.1.7 pre-release counts as older (some 0.1.7 nightlies were built before the policy),
+and a pre-release of a later version as that version. Setup and `check` refuse them, naming the key. (`t3 pair`,
+step 10, came earlier.)
 
 Every T3 setting can be locked through `lockedSettings`, the fork's own settings (`agentSlots`, `usagePacingGate`,
 `usagePacing`, `waitFor`, ...) too: the managed policy locks any key of the server settings, upstream's or the fork's
@@ -153,12 +155,13 @@ Commands are for Windows PowerShell unless a step says otherwise. `<distro>` is 
    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- gh auth login --with-token` and paste
    a fine-grained token for the agents' repos into that window only. It waits without a prompt: paste the token,
    press Enter, then Ctrl+D. Then give the agent a git identity (its commits fail without one):
-   `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- git config --global user.name '<name>'`
+   `wsl -d <distro> -u root -e /opt/pc-agents/current/sbin/pc-agents as-agent -- git config --global user.name '<name>'`
    and
-   `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- git config --global user.email '<email>'`,
+   `wsl -d <distro> -u root -e /opt/pc-agents/current/sbin/pc-agents as-agent -- git config --global user.email '<email>'`,
    with a name of your choice and an address that is no one's private one, for example the token account's noreply
-   address (`<id>+<login>@users.noreply.github.com`, shown in its GitHub email settings). Run again, they only set
-   the same values again.
+   address (`<id>+<login>@users.noreply.github.com`, shown in its GitHub email settings). `-e`, not `--`: wsl runs
+   the line without root's shell, so the value reaches git as typed (a name with an apostrophe is `'O''Brien'` in
+   PowerShell). Run again, they only set the same values again.
 9. **Keep the distro running:** WSL stops a distro soon after its last window closes, and does not start one when
    Windows starts. A logon task of your own (no administrator needed) keeps this one running while you are logged
    in. In PowerShell, as yourself (the same task as the desk starter's, `fork-kit/desk/windows/start-desk.ps1`):
@@ -229,9 +232,15 @@ allowed (connection tracking).
   `SIGHUP` (a closed window) stop setup the same way, the running download's whole group too.
 - **Start limit:** a rerun within 10 minutes of five failed starts still starts T3 (`systemctl reset-failed` first).
 - **An older kit's distro:** an `agent` made with a login shell gets `/usr/sbin/nologin` (`usermod`), once.
-- **Packages:** setup installs `nftables`, `libatomic1` and `unzip` when `dpkg` does not list one as installed (a
-  distro set up by an older kit gets the two new ones at its next run; no T3 restart for them). A package install
-  stopped half-way is finished first (`dpkg --configure -a`); a failed one stops setup, naming the command to run.
+- **Packages:** setup installs `nftables`, `libatomic1` and `unzip` when `dpkg` does not list one as installed (held
+  counts as installed; a distro set up by an older kit gets the two new ones at its next run; no T3 restart for
+  them). It installs them after it writes its files, so `apt-get` resolves through the machine file's `nameservers`
+  as they are now, and before it loads the firewall. A package install stopped half-way is finished first
+  (`dpkg --configure -a`). Nothing asks a question: a changed config file is kept, debconf takes its defaults, and
+  `apt-get` waits up to 5 minutes for a lock (apt-daily on a new distro). A failed step stops setup, naming the
+  command to run; the files it wrote stay, and when one of them changed what T3 runs with, the walls check's
+  `restart` wall fails (and the 2-minute check stops T3) until setup runs again to the end, as after a failed T3
+  download.
 - **A distro that is not fresh:** refused before anything is written, with the reasons: another login user, an
   `agent` with another uid or in another group, a file the kit would write that it did not write (or that was
   edited since, for example a hand-written `wsl.conf` or `policy.json`), a cron, at or ssh unit where the kit masks

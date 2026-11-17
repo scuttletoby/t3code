@@ -193,22 +193,31 @@ def install_t3(c, version, done):
 
 
 def install_packages():
-    """Install the k.PACKAGES that are not (fully) installed. A dpkg run stopped half-way is finished first (apt-get
-    refuses until it is). Returns why not, or None."""
+    """Install the k.PACKAGES that are not (fully) installed; held counts as installed. A dpkg run stopped half-way
+    is finished first (apt-get refuses until it is). Nothing asks a question (stdin is /dev/null): a changed config
+    file is kept, debconf takes its defaults, and apt-get waits for a lock apt-daily holds. Returns why not, or None."""
     r = k.run(['/usr/bin/dpkg-query', '-W', '-f=${Package}\t${Status}\n', *k.PACKAGES])
     have = {p for p, _, status in (line.partition('\t') for line in r.stdout.splitlines())
-            if status == 'install ok installed'}
+            if status.endswith(' ok installed')}
     missing = [p for p in k.PACKAGES if p not in have]
     if not missing:
         return None
     say('installing ' + ' '.join(missing))
-    for argv in (['/usr/bin/dpkg', '--configure', '-a'], ['/usr/bin/apt-get', 'update'],
-                 ['/usr/bin/apt-get', 'install', '-y', *missing]):
-        r = k.run(argv, timeout=900)
+    quiet = {'DEBIAN_FRONTEND': 'noninteractive'}
+    r = k.run(['/usr/bin/dpkg', '--force-confdef', '--force-confold', '--configure', '-a'], timeout=900, env=quiet)
+    if r.returncode:
+        return (f'cannot install {" ".join(missing)}: dpkg --configure -a failed ({r.stderr.strip()[-300:]}). If '
+                'another apt-get or dpkg still runs (apt-daily, on a new distro), wait for it to end; then run '
+                '`dpkg --configure -a` as root, and setup again')
+    apt = ['/usr/bin/apt-get', '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold',
+           '-o', 'DPkg::Lock::Timeout=300']
+    for argv in (apt + ['update'], apt + ['install', '-y', *missing]):
+        r = k.run(argv, timeout=900, env=quiet)
         if r.returncode:
-            return (f'cannot install {" ".join(missing)}: {" ".join(argv)} failed ({r.stderr.strip()[-300:]}). Fix '
-                    'the distro\'s network or package sources, run `apt-get update && apt-get install -y '
-                    f'{" ".join(missing)}` as root, then setup again')
+            return (f'cannot install {" ".join(missing)}: apt-get {argv[len(apt)]} failed ({r.stderr.strip()[-300:]}).'
+                    ' Fix the distro\'s network (the machine file\'s nameservers are in /etc/resolv.conf now) or '
+                    f'package sources, run `apt-get update && apt-get install -y {" ".join(missing)}` as root, then '
+                    'setup again')
     return None
 
 
@@ -235,8 +244,6 @@ def setup(source, sha):
         r = k.run(['/usr/sbin/usermod', '--shell', k.NOLOGIN, k.USER])
         if r.returncode:
             return say(f'usermod failed: {r.stderr.strip()[-300:]}') or 1
-    if why := install_packages():
-        return say(why) or 1
     version = f'{k.OPT}/{sha}'
     for src, (dst, mode) in k.CODE.items():
         with open(os.path.join(source, src), 'rb') as f:
@@ -254,6 +261,10 @@ def setup(source, sha):
         put(path, text, mode)
         done[path] = {k.sha(text)}
         keep(done)
+    # The packages after the files (apt-get resolves through the kit's own resolv.conf, the machine file's nameservers
+    # as they are now) and before the firewall loads (nftables is one of them)
+    if why := install_packages():
+        return say(why) or 1
     why = k.load_firewall()   # now, not after the install: a tightened firewall must not wait for a download
     if why:
         return say(why) or 1
