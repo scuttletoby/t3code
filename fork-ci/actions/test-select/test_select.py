@@ -916,8 +916,8 @@ def join(a, b):
         return Tail(posixpath.join(a.rest, b))
     if isinstance(a, Partial):
         return a
-    if isinstance(b, Tail):
-        return b
+    if isinstance(b, Tail):   # a known folder, then a name that starts unknown ('{name}.py'): that folder holds
+        return b if b.rest.startswith('/') or not a else Partial(os.path.join(a, ''))
     if isinstance(b, Partial):
         return Partial(os.path.join(a, b.prefix) if b.prefix else os.path.join(a, ''))
     return os.path.join(a, b)
@@ -938,8 +938,8 @@ def concat(a, b):
         return Tail(a.rest + b)
     if isinstance(a, Partial):
         return a
-    if isinstance(b, Tail):
-        return b
+    if isinstance(b, Tail):   # 'docs/' + f'{name}.md': the known start holds
+        return b if b.rest.startswith('/') or not a else Partial(a)
     if isinstance(b, Partial):
         return Partial(a + b.prefix)
     return a + b

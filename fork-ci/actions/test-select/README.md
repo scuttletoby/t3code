@@ -105,8 +105,8 @@ Worked out from the checkout on every run (never cached, so it cannot go stale),
     `.rglob`, `.iterdir`, `shutil.copytree`); a folder only named is a base for other paths;
   - a glob with a known folder (`docs/*.md`) takes in the changed paths it matches; one that starts with a wildcard
     names no place;
-  - a known folder with an unknown rest (`ROOT / "plugins" / name`) takes in that folder; for a folder the file is
-    inside (its own folder or the root), see the next section;
+  - a known folder with an unknown rest (`ROOT / "plugins" / name`, also `os.path.join(TOOLS, f"{name}.py")`) takes
+    in that folder; for a folder the file is inside (its own folder or the root), see the next section;
   - an unknown start with a known rest (a parameter, `Path.cwd()`, `os.getcwd()`, an environment variable, `x +=
     "/name"`, a path built part by part in a loop, joined onto `"/data/b.json"`) takes in every repository path that
     ends in that rest (`**/data/b.json`; a listed one, everything under such folders); a rest without a `/` before

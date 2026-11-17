@@ -341,13 +341,20 @@ class NamedPaths(Repo):
                  {'conf/a.ini': '', 'conf/b.ini': ''}, 'conf/a.ini', ['conf/b.ini'])
 
     def test_a_known_folder_with_an_unknown_rest(self):   # ROOT / 'plugins' / name: anything in plugins/
-        self.one("def f(name):\n    return os.path.join(ROOT, 'plugins', name)\n",
-                 {'plugins/a/x.yml': ''}, 'plugins/b/new.yml', ['tools/other.py'])
+        for code in ("def f(name):\n    return os.path.join(ROOT, 'plugins', name)\n",
+                     # the unknown part starts a name ('{name}.yml'): the known folder still holds
+                     "def f(name):\n    return os.path.join(ROOT, 'plugins', f'{name}.yml')\n",
+                     "def f(name):\n    return os.path.join(ROOT, 'plugins') + '/' + f'{name}.yml'\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.one(code, {'plugins/a/x.yml': ''}, 'plugins/b/new.yml', ['tools/other.py'])
 
     def test_an_unknown_rest_in_a_folder_the_file_is_inside_always_runs_it(self):   # HERE / name, ROOT / name
         for code, where in (("def f(name):\n    open(os.path.join(HERE, name))\n", 'tests/'),
                             ("def f(name):\n    open(os.path.join(ROOT, name))\n", 'the repository root/'),
                             ("def f(name):\n    open(f'{HERE}/{name}.json')\n", 'tests/'),
+                            ("def f(name):\n    open(os.path.join(HERE, f'{name}.json'))\n", 'tests/'),
+                            ("def f(name):\n    open(os.path.join(ROOT, f'{name}.json'))\n", 'the repository root/'),
                             ("def f(n):\n    open('/'.join([HERE, n]))\n", 'tests/'),
                             ("def f(n):\n    open('{}/{}'.format(HERE, n))\n", 'tests/'),
                             ("def f(n):\n    open('%s/%s' % (HERE, n))\n", 'tests/')):
