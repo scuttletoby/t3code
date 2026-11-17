@@ -216,6 +216,31 @@ def staged_runtime(stage_dir, version):
     return binary
 
 
+COUNTS = ('projects', 'projectsArchived', 'threads', 'threadsArchived')
+
+
+def compare_counts(before, after):
+    """Fork #181: the differences between the database counts of two fork reports ([] when every count is equal).
+    A report counts every project and every thread that is not deleted (sub-agent and archived threads included,
+    across all projects), so counts are compared report with report, made the same way (for example the copy's
+    against the same data after the target build migrated it), never with `t3 thread list`, which lists one project
+    and leaves sub-agents out. A count either report could not read (no report, no database, a schema that lacks
+    the table: null) or that is not a whole number cannot be compared, and is named as a difference: unknown is
+    never equal."""
+    def counts(report):
+        db = report.get('database') if isinstance(report, dict) else None
+        return db.get('counts') if isinstance(db, dict) and isinstance(db.get('counts'), dict) else {}
+    a, b = counts(before), counts(after)
+    said = []
+    for key in COUNTS:
+        x, y = a.get(key), b.get(key)
+        if not all(type(v) is int for v in (x, y)):
+            said.append(f'{key} cannot be compared ({x} before, {y} after): a report could not count it')
+        elif x != y:
+            said.append(f'{key}: {x} before, {y} after')
+    return said
+
+
 def fork_report(binary, home):
     """Run `<binary> __fork-report --base-dir <home>` (fork PR "read-only report command": it writes nothing,
     takes no lock and is safe beside a running server) with an empty HOME and a bare PATH. Returns the report."""
