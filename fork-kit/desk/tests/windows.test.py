@@ -680,8 +680,15 @@ class Script(unittest.TestCase):
             # a line WSL drops (an unknown \ escape, a quote left open) is not read and left as it is
             ('[wsl2]\nmemory=20\\GB\nmemory=12GB\n' + w, '12GB', None),
             ('[wsl2]\nmemory="20GB\n' + w, None, '[wsl2]\nmemory="20GB\n' + w + 'memory=8GB\n'),
+            # ... a quote left open drops the line up to its LF, past a lone CR: swap= after it is not read either
+            ('[wsl2]\nmemory="2GB\rswap=1GB\nkernel=y\n', None,
+             '[wsl2]\nmemory="2GB\rswap=1GB\nkernel=y\nmemory=8GB\n' + w),
+            # a key replaced with the lines its value goes on to (\ at the end), so none of them is read as a key
+            ('[wsl2]\nmemory=2\\\nGB\nswap=1\\\nkernel=x\n', '2GB', '[wsl2]\nmemory=8GB\n' + w),
             # a lone CR does not end a comment (it ends a value or a header)
             ('[wsl2]\n# raised\rmemory=20GB\n' + w, None, '[wsl2]\n# raised\rmemory=20GB\n' + w + 'memory=8GB\n'),
+            # ... a lone CR between two keys on one line: replacing memory= would delete the kernel= WSL reads: refused
+            ('[wsl2]\nmemory=2GB\rkernel=C:\\\\k\\\\bz\n' + w, '2GB', 'REFUSED'),
             # sizes are compared exactly (ParseMemorySize: 4gb is rejected), words in any case
             ('[wsl2]\nmemory=20GB\nswap=4gb\nnetworkingMode=NAT\ndnsTunneling=TRUE\nguiApplications=False\n', '20GB',
              '[wsl2]\nmemory=20GB\nswap=4GB\nnetworkingMode=NAT\ndnsTunneling=TRUE\nguiApplications=False\n'),
@@ -716,7 +723,7 @@ class Script(unittest.TestCase):
                  'swap=4GB', 'swap=4gb', 'networkingMode=nat', 'networkingMode=mirrored', 'NetworkingMode=NAT',
                  'dnsTunneling=true', 'guiApplications=false', 'kernelCommandLine=quiet \\', 'kernel=C:\\\\k\\\\',
                  'autoProxy=true', 'sparseVhd=true # c', '# comment \\', '# c\rmemory=7GB', 'x', '', '  ',
-                 'memory=10GB\rswap=2GB', 'firewall=true']
+                 'memory=10GB\rswap=2GB', 'swap=1GB\rautoProxy=true', 'firewall=true']
         files = []
         for _ in range(240):
             eol = rnd.choice(['\n', '\r\n'])
@@ -727,7 +734,8 @@ class Script(unittest.TestCase):
             with self.subTest(old):
                 self.check_merge(old, o)
                 refused += 'refused' in o
-        self.assertLess(refused, len(files) // 4)   # most files merge
+        # the two known kinds (a lone CR between two keys, a \ at the end with no LF) refuse these: a new kind shows
+        self.assertEqual(refused, 5)
 
     @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
     def test_a_rewrite_stopped_half_way_is_done_again(self):
@@ -818,6 +826,13 @@ class Script(unittest.TestCase):
         self.assertNotRegex(src, r'(?i)-Encoding\s+ascii')
         self.assertNotRegex(src, r'(?i)(Get|Set)-Content[^\n]*\$WslConfig')
         self.assertIn('[Text.UTF8Encoding]::new($false)', wslconfig_part())
+
+    def test_the_wslconfig_parser_searches_ordinally(self):
+        """lens #414 nit 6: a string IndexOf compares by culture, and under ICU "\r\n".IndexOf("\n") can be -1, which
+        would skip the rest of the file after a lone CR; a [char] search is ordinal."""
+        part = wslconfig_part()
+        self.assertIn('$t.IndexOf([char]10, $i)', part)
+        self.assertNotRegex(part, r'\.IndexOf\("')
 
     @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
     def test_wslconfig_merge_keeps_every_other_letter_and_key(self):

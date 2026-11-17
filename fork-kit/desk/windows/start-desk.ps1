@@ -139,7 +139,7 @@ function WslItems([string[]]$lines) {
   $items = [Collections.Generic.List[object]]::new()
   $ln = [int[]]::new($n + 1); for ($p = 0; $p -lt $n; $p++) { $ln[$p + 1] = $ln[$p] + [int]($t[$p] -eq "`n") }
   $hs = { $i -lt $n -and ($t[$i] -eq ' ' -or $t[$i] -eq "`t") }
-  $eol = { $e = $t.IndexOf("`n", $i); if ($e -lt 0) { $n } else { $e + 1 } }   # past the LF that ends this line
+  $eol = { $e = $t.IndexOf([char]10, $i); if ($e -lt 0) { $n } else { $e + 1 } }   # past the LF that ends this line
   while ($i -lt $n) {
     while (& $hs) { $i++ }
     if ($i -ge $n) { break }
