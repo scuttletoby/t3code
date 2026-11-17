@@ -75,12 +75,14 @@ The config is refused when:
   trailing round marker do not count, so `data r1` and `data r2` are one lens;
 - two names in `lenses` are one lens to the gate in that way;
 - a lens name names no lens (a `<placeholder>`, a bare round marker such as `r2`,
-  nothing), or a rule or `rounds.approach_lens` names a lens with no entry in
+  nothing), or the gate would read it as another name in a lens header (Markdown
+  such as `data *2*`, or a `reviewer:` / `read at` field), or a rule or `rounds.approach_lens` names a lens with no entry in
   `lenses` (names match exactly);
 - a `critical` or `normal` rule has `"lenses": []` (only `light` may);
-- no rule has the catch-all path `**`, the catch-all rule is `light`, or a rule
-  comes after the catch-all rule (it could never match): a new folder must never
-  fall to no rule or to no lens;
+- no rule has a catch-all path (`**`, or any glob that matches every path such as
+  `**/*` or `*/**`), the catch-all rule is `light`, or a rule comes after the
+  catch-all rule (it could never match): a new folder must never fall to no rule
+  or to no lens;
 - there is no `critical` rule (the built-in protected paths below take its lenses);
 - a glob is not in the dialect below, or a rule name or glob is written twice.
 
@@ -88,7 +90,8 @@ The config is refused when:
 path segment, `**` is any number of whole segments (it must be a segment of its
 own: `src/**/*.py`, not `src/**.py`), `?` is one character inside a segment.
 There are no braces, character classes, `!` negation or backslashes, and no
-empty, `.` or `..` segments. The gate and T3 match with this dialect, so a glob
+empty, `.` or `..` segments. Matching is case-sensitive, and `*`, `**` and `?`
+also match names that start with `.` (`**` matches `.github/x`). The gate and T3 match with this dialect, so a glob
 means the same thing on both sides.
 
 **Built-in protected paths.** The config file itself, every lens prompt file and

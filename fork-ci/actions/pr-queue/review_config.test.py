@@ -124,7 +124,8 @@ class StateQuestion(unittest.TestCase):
         block = recommended()
         block['rules'][2]['weight'] = 'light'
         block['rules'][2]['lenses'] = []
-        self.assertIn('catch-all ** rule and must not be light', refusal(block))
+        self.assertIn('is the catch-all rule (a glob that matches every path, such as **) and must not be light',
+                      refusal(block))
 
     def test_same_lens_key_in_lenses(self):
         block = recommended()
@@ -224,6 +225,48 @@ class Refusals(unittest.TestCase):
         block = recommended()
         block['rules'].append({'name': 'late', 'weight': 'critical', 'paths': ['db/**'], 'lenses': ['data-1', 'data-2']})
         self.assertIn("rules[3] ('late') comes after the catch-all rule", refusal(block))
+
+    def test_every_path_glob_is_the_catch_all_however_written(self):
+        """`**/*`, `*/**`, `**/?*` match every path like `**`: such a rule first and light would need no lens anywhere,
+        and a critical rule below it could never match (both were accepted when only the text `**` counted)."""
+        for g in ('**/*', '*/**', '**/?*', '**/**', '**/*?*'):
+            block = recommended()
+            block['rules'].insert(0, {'name': 'all', 'weight': 'light', 'paths': ['docs/**', g], 'lenses': []})
+            self.assertIn("rules[0] ('all') is the catch-all rule", refusal(block), g)
+            block = recommended()
+            block['rules'].insert(0, {'name': 'all', 'weight': 'normal', 'paths': [g], 'lenses': ['code']})
+            why = refusal(block)
+            self.assertIn("rules[1] ('data') comes after the catch-all rule", why, g)
+            block = recommended()
+            block['rules'][2]['paths'] = [g]
+            self.assertEqual(rc.parse_review(block).rules[2].paths, (g,), g)
+
+    def test_globs_that_miss_some_path_are_no_catch_all(self):
+        for g in ('*', '*/*/**', '**/??', '**/*.md', 'src/**', '**/a*', '?'):
+            self.assertFalse(rc.matches_every_path(g), g)
+            block = recommended()
+            block['rules'][2]['paths'] = [g]
+            self.assertIn("no rule has the catch-all path '**'", refusal(block), g)
+        for g in ('**', '**/*', '*/**', '**/*/**', '**/?', '**/*?', '**/**/*'):
+            self.assertTrue(rc.matches_every_path(g), g)
+
+    def test_lens_name_the_gate_reads_as_another(self):
+        """`data *2*` is `data 2` to the gate (it drops Markdown before reading the name); `x reviewer: y` is `x`."""
+        for bad in ('data *2*', 'data `2`', 'code reviewer: me', 'code read at: abcdef1', '_code_ more'):
+            block = recommended()
+            block['lenses'][bad] = {'prompt': '.github/lenses/data.md'}
+            self.assertIn(f'lens name {json.dumps(bad)} reads as', refusal(block), bad)
+        block = recommended()
+        block['lenses']['data 2'] = {'prompt': '.github/lenses/data.md'}
+        block['lenses']['data reviewer 2'] = {'prompt': '.github/lenses/data.md'}
+        block['rules'][0]['lenses'] = ['data 2', 'data reviewer 2']
+        rc.parse_review(block)
+
+    def test_unknown_key_in_min_lenses_is_named_not_a_crash(self):
+        block = recommended()
+        block['min_lenses']['huge'] = 3
+        why = refusal(block)
+        self.assertIn("min_lenses: unknown key 'huge'", why)
 
     def test_no_critical_rule(self):
         block = recommended()

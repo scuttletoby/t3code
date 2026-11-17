@@ -7,7 +7,12 @@ path without the lenses its weight needs is refused, never repaired: no hidden d
 
 Globs use one small dialect, so the Python gate and T3 match a path the same way: `*` any characters inside one path
 segment, `**` any number of whole segments (only as a segment of its own), `?` one character inside a segment. Paths
-are repo-relative with `/`. No braces, character classes, `!` or backslashes.
+are repo-relative with `/`. No braces, character classes, `!` or backslashes. Matching is case-sensitive, and `*`,
+`**` and `?` also match names that start with `.` (`**` matches `.github/x`): a matcher that skips dot-names by
+default must be told not to.
+
+The catch-all rule is the first rule with a glob that matches every path (`**`, `**/*`, `*/**`, `**/?*` ...), however
+it is written; a rule after it can never match.
 """
 import json
 import re
@@ -98,6 +103,19 @@ def _path_problem(p):
     return None
 
 
+def _matches_any_segment(seg):
+    """`seg` (no `**`) matches every path segment: segments are never empty, so `*`, `?`, `*?*` do; `??` does not."""
+    return set(seg) <= {'*', '?'} and seg.count('?') <= 1
+
+
+def matches_every_path(g):
+    """The valid glob `g` matches every repo-relative path: it has a `**` segment and at most one other segment, which
+    matches any segment (every path has at least one segment)."""
+    segs = g.split('/')
+    rest = [s for s in segs if s != '**']
+    return len(rest) < len(segs) and len(rest) <= 1 and all(_matches_any_segment(s) for s in rest)
+
+
 def glob_problem(g):
     """Why `g` is not a glob of the dialect (module doc), or None."""
     why = _path_problem(g)
@@ -130,6 +148,14 @@ def _keys(obj, keys, where, problems):
 def _lens_name(name, where, problems):
     if not _text(name) or not lens.names_a_lens(name):
         problems.append(f'{where} {_show(name)} names no lens (a placeholder, a round marker, blanks or nothing)')
+        return False
+    # The gate reads a lens name out of a comment header after dropping Markdown and field text: a name it would read
+    # as another one (`data *2*` reads as `data 2`) would count as two lenses here and as one there.
+    header = lens.lens_header(f'lens: {name}')
+    if header is None or lens.lens_key(header[0]) != lens.lens_key(name):
+        read = 'nothing' if header is None else repr(header[0])
+        problems.append(f'{where} {_show(name)} reads as {read} in a lens header (Markdown, a reviewer: or read at '
+                        f'field): write it the way the gate reads it')
         return False
     return True
 
@@ -165,7 +191,7 @@ def _min_lenses(raw, problems):
         return None
     bad = [w for w in WEIGHTS if w in raw and not _int(raw[w], 0, MAX_LENSES)]
     problems.extend(f'min_lenses.{w} is {_show(raw[w])}: must be a whole number 0-{MAX_LENSES}' for w in bad)
-    if bad or any(w not in raw for w in WEIGHTS):
+    if bad or any(w not in raw for w in WEIGHTS) or any(k not in WEIGHTS for k in raw):
         return None
     if not raw['critical'] >= raw['normal'] >= raw['light']:
         problems.append('min_lenses must not fall with weight: critical >= normal >= light')
@@ -208,11 +234,11 @@ def _rules(raw, declared, mins, problems):
                 if catch_all is not None:
                     problems.append(f'{where} comes after the catch-all rule {catch_all} and can never match: '
                                     f'move it above')
-                elif CATCH_ALL in paths:
+                elif any(isinstance(g, str) and not glob_problem(g) and matches_every_path(g) for g in paths):
                     catch_all = where
                     if weight == 'light':
-                        problems.append(f'{where} is the catch-all ** rule and must not be light: a new folder '
-                                        f'must never need no lens')
+                        problems.append(f'{where} is the catch-all rule (a glob that matches every path, such as '
+                                        f'**) and must not be light: a new folder must never need no lens')
         names_ = r.get('lenses')
         if 'lenses' in r:
             if not isinstance(names_, list):
@@ -237,7 +263,8 @@ def _rules(raw, declared, mins, problems):
         if len(problems) == before:
             rules.append(Rule(r['name'], weight, tuple(paths), tuple(names_)))
     if catch_all is None:
-        problems.append(f'no rule has the catch-all path {CATCH_ALL!r}: a new folder must never fall to no rule')
+        problems.append(f'no rule has the catch-all path {CATCH_ALL!r} (or another glob that matches every path): a '
+                        f'new folder must never fall to no rule')
     if not any(isinstance(r, dict) and r.get('weight') == 'critical' for r in raw):
         problems.append('no critical rule: the built-in protected paths (the config, every lens prompt, '
                         '.github/workflows/**) take the lenses of the first critical rule')
