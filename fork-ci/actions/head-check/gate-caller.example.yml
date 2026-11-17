@@ -34,5 +34,5 @@ jobs:
       pr: ${{ format('{0}', github.event.pull_request.number || github.event.issue.number || inputs.pr) }}
       config: .github/pr-queue.json
       check-name: CHECK_NAME
-      required-lenses: | # one lens name per line; none = the gate refuses
+      required-lenses: | # one lens name per line; none = the gate refuses, unless the config's review block is in enforce
         LENS_NAME
