@@ -85,14 +85,22 @@ def _entries(top):
 
 
 def _copy_file(src, dst, mode):
+    """Copies src to dst; returns (size, sha256) of the bytes it wrote."""
+    h, size = hashlib.sha256(), 0
     with open(src, 'rb') as a, open(dst, 'wb') as b:
-        shutil.copyfileobj(a, b, 1024 * 1024)
+        for chunk in iter(lambda: a.read(1024 * 1024), b''):
+            h.update(chunk)
+            size += len(chunk)
+            b.write(chunk)
         b.flush()
         os.fsync(b.fileno())
     os.chmod(dst, mode)
+    return size, h.hexdigest()
 
 
-def _copy_tree(src, dst, entries):
+def _copy_tree(src, dst, entries, verify=False):
+    """verify=True (the put-back): each file is hashed as it is copied and must match its entry, so a kept file
+    changed after check() is never put back (RuntimeError)."""
     os.makedirs(dst, mode=0o700)
     for e in entries:
         target = os.path.join(dst, e['path'])
@@ -101,7 +109,10 @@ def _copy_tree(src, dst, entries):
         elif e['kind'] == 'link':
             os.symlink(e['target'], target)
         else:
-            _copy_file(os.path.join(src, e['path']), target, e['mode'])
+            got = _copy_file(os.path.join(src, e['path']), target, e['mode'])
+            if verify and got != (e.get('size'), e.get('sha256')):
+                raise RuntimeError(f'{os.path.join(src, e["path"])} changed since it was checked against {RECORD}: '
+                                   'not put back')
     for e in entries:  # folders last: a folder without write bit would stop the copy into it
         if e['kind'] == 'dir':
             os.chmod(os.path.join(dst, e['path']), e['mode'])
@@ -122,33 +133,42 @@ def _safe(rel):
 def check(cfg, version):
     """Read only: (folder, None) when a kept runtime of `version` matches its record entry by entry (the same
     entries, sizes, sha256, links; .install-complete names the version; t3 executable), else (None, why)."""
+    folder, _, why = _check(cfg, version)
+    return folder, why
+
+
+def _check(cfg, version):
+    """check(), plus the record's entries it checked: (folder, entries, None) or (None, None, why)."""
     folder = kept_dir(cfg, version)
+    tree = os.path.join(folder, 'runtime')
+    for path in (folder, tree):
+        if os.path.islink(path):
+            return None, None, f'{path} is a link: a kept runtime is never followed through a link'
     try:
         with open(os.path.join(folder, RECORD), encoding='utf-8') as f:
             record = json.load(f)
     except FileNotFoundError:
         if os.path.lexists(folder):
-            return None, f'{folder} has no {RECORD}: an unfinished or damaged kept runtime, never used'
-        return None, f'no kept runtime of t3 {version} in {os.path.dirname(folder)}'
+            return None, None, f'{folder} has no {RECORD}: an unfinished or damaged kept runtime, never used'
+        return None, None, f'no kept runtime of t3 {version} in {os.path.dirname(folder)}'
     except (OSError, ValueError) as e:
-        return None, f'{os.path.join(folder, RECORD)} cannot be read: {e}'
+        return None, None, f'{os.path.join(folder, RECORD)} cannot be read: {e}'
     entries = record.get('entries') if isinstance(record, dict) else None
     if not (isinstance(record, dict) and record.get('recordVersion') == RECORD_VERSION
             and record.get('version') == version and isinstance(entries, list)
             and all(isinstance(e, dict) and _safe(e.get('path')) for e in entries)):
-        return None, f'{os.path.join(folder, RECORD)} is not a record of t3 {version} this kit reads'
-    tree = os.path.join(folder, 'runtime')
+        return None, None, f'{os.path.join(folder, RECORD)} is not a record of t3 {version} this kit reads'
     try:
         found = {e['path']: e for e in _entries(tree)}
     except (OSError, ValueError) as e:
-        return None, f'{tree} cannot be read: {e}'
+        return None, None, f'{tree} cannot be read: {e}'
     for e in entries:
         got = found.pop(e['path'], None)
         same = got is not None and all(got.get(k) == e.get(k) for k in ('kind', 'size', 'sha256', 'target'))
         if not same:
-            return None, f'{os.path.join(tree, e["path"])} does not match {RECORD}: the kept runtime is damaged'
+            return None, None, f'{os.path.join(tree, e["path"])} does not match {RECORD}: the kept runtime is damaged'
     if found:
-        return None, f'{tree} has entries {RECORD} does not name ({", ".join(sorted(found)[:3])})'
+        return None, None, f'{tree} has entries {RECORD} does not name ({", ".join(sorted(found)[:3])})'
     try:
         with open(os.path.join(tree, SENTINEL), encoding='utf-8') as f:
             whole = f.read().strip() == version
@@ -156,8 +176,8 @@ def check(cfg, version):
         whole = False
     t3 = os.path.join(tree, 't3')
     if not (whole and os.path.isfile(t3) and os.access(t3, os.X_OK)):
-        return None, f'{tree} is not a whole runtime of t3 {version} ({SENTINEL}, an executable t3)'
-    return folder, None
+        return None, None, f'{tree} is not a whole runtime of t3 {version} ({SENTINEL}, an executable t3)'
+    return folder, entries, None
 
 
 def size(cfg, version):
@@ -177,7 +197,10 @@ def plan_keep(cfg, version, floor_bytes=0):
                          'there is nothing to keep for the way back W1')
     need = size(cfg, version)
     parent = cfg.state_dir if os.path.isdir(cfg.state_dir) else os.path.dirname(cfg.state_dir)
-    free = shutil.disk_usage(parent).free
+    try:
+        free = shutil.disk_usage(parent).free
+    except OSError as e:
+        raise ValueError(f'the free disk for {cfg.state_dir} cannot be measured: {e}') from None
     if free - need < floor_bytes:
         raise ValueError(f'keeping the runtime of t3 {version} needs {need} bytes in {cfg.state_dir}; {free} are '
                          f'free and {floor_bytes} must stay free')
@@ -231,7 +254,7 @@ def put_back(run, cfg, version):
     target = runtime_dir(cfg.home, version)
     if installed_t3(cfg.home, version):
         return {'runtime': target, 'putBack': False}
-    folder, why = check(cfg, version)
+    folder, entries, why = _check(cfg, version)
     if folder is None:
         raise RuntimeError(why)
     versions = os.path.dirname(target)
@@ -239,9 +262,7 @@ def put_back(run, cfg, version):
     staging = os.path.join(versions, f'{_PUT_BACK}{version}')
     if os.path.lexists(staging):  # this kit's own unfinished copy from a put-back that was stopped
         shutil.rmtree(staging)
-    with open(os.path.join(folder, RECORD), encoding='utf-8') as f:
-        entries = json.load(f)['entries']
-    _copy_tree(os.path.join(folder, 'runtime'), staging, entries)
+    _copy_tree(os.path.join(folder, 'runtime'), staging, entries, verify=True)  # the entries check() read
     os.chmod(staging, 0o755)
     facts = {'runtime': target, 'putBack': True, 'from': folder}
     if os.path.lexists(target):

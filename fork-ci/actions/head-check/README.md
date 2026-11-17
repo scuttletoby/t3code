@@ -90,7 +90,7 @@ make that job a required check (the config's `head_check`):
 ```yaml
 on:
   pull_request:
-    # edited: a base change (a stacked pull request retargeted) runs it again
+    # edited: a retarget to another base branch runs it again (new commits on the base do not)
     types: [opened, synchronize, reopened, ready_for_review, edited]
 permissions: {}
 jobs:
@@ -114,9 +114,17 @@ jobs:
 The check reads the comments when it runs. After a lens or an override is
 posted for the head, run it again (re-run the job, or let a tool the project
 uses for its ready command do that); a new push runs it anyway. The `edited`
-trigger runs it again when the base branch changes: the answer depends on the
-base (its config, and which merged-in commits are the base's). A title or body
-edit also runs it; it only reads, so that costs one short job.
+trigger runs it again when the pull request is retargeted to another base
+branch: the answer depends on the base (its config, and which merged-in
+commits are the base's). A title or body edit also runs it; it only reads, so
+that costs one short job. Nothing runs it when new commits land on the base,
+so a pass can be older than the base: two pull requests that each leave a good
+config can still merge into one that does not parse. Turn on "Require branches
+to be up to date before merging" in the ruleset (the queue needs it anyway):
+the second pull request is then behind, and its update is a new head, judged
+on the merged config. A re-run of an old job checks out the old merge commit
+again; after the base changed, a new event (a push, a reopen, a title edit)
+judges the head on the new base.
 
 **Pin it by the release sha, always.** Use the full sha a `ci/vN` release
 names (the release sha of ci/vN), never a branch, a tag alone or a local path
@@ -159,7 +167,7 @@ default branch and posted by an App that only the default branch can use.
 | `config`          | (required)                         | the queue's JSON config, a path in the repository, read from the base commit                        |
 | `required-lenses` | (empty)                            | lens names, one per line, that must be among the reads; matched as lens keys (case, `r2`)           |
 | `pass-drafts`     | `false`                            | `true` passes a draft without reading its review; add `ready_for_review` to the workflow's triggers |
-| `path`            | `.`                                | where the merge commit is checked out                                                               |
+| `path`            | `.`                                | where the merge commit is checked out, relative to the workspace (an absolute path is refused)      |
 | `pr`              | `github.event.pull_request.number` | the pull request                                                                                    |
 | `repo`            | `github.repository`                | owner/name                                                                                          |
 | `token`           | `github.token`                     | reads the pull request's comments and reviews (`pull-requests: read`)                               |
@@ -282,7 +290,15 @@ Setup (the repository owner's steps; nothing here creates them):
    config's `review` block is in `enforce`: then the path rules name them and
    the input may be empty), and pin the release. Copy
    [`review-trigger.example.yml`](review-trigger.example.yml) next to it,
-   unchanged (the caller names it by its `name`).
+   unchanged (the caller names it by its `name`). In a public repository,
+   GitHub blocks `pull_request_target` (from 2026-12-02) unless a repository
+   Actions policy allows that event for exactly the caller's file (Settings →
+   Actions → Policies, rule "Restrict events", or
+   `POST /repos/{owner}/{repo}/actions/policies`). A renamed caller is then
+   blocked again, and a blocked run is only a failed run that nothing
+   requires; this fork lists its allowed files in
+   `.github/fork-actions-policies.json` and fails its required check when
+   `fork-checks.yml` did not run (`fork-checks-ran.py`, issue 401).
 5. Dispatch it once without a number (the backfill), so open pull requests get
    the check under its name.
 6. Bind the required check to the App: in a ruleset, the required status

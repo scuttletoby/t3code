@@ -96,7 +96,7 @@ def _raise(error):
     raise error  # os.walk's onerror: an unreadable folder stops the copy instead of being skipped in silence
 
 
-def plan(userdata):
+def plan(userdata, skip=frozenset()):
     """What a copy takes from userdata/: [{'path', 'kind', 'bytes', 'mode'[, 'target']}] top-down, and the total
     bytes. Plain files, folders and links; anything else (a socket, a fifo) is left out and named. A folder that
     cannot be read raises OSError (a copy that says complete must hold everything)."""
@@ -105,7 +105,7 @@ def plan(userdata):
         rel_d = os.path.relpath(d, userdata)
         for n in sorted(dirs + names):
             rel = n if rel_d == '.' else f'{rel_d}/{n}'
-            if rel_d == '.' and (n in SKIP or n.endswith('-shm') or ASIDE in n
+            if rel_d == '.' and (n in SKIP or n in skip or n.endswith('-shm') or ASIDE in n
                                  or (n.startswith('.') and RESTORE_TEMP in n)):
                 if n in dirs:
                     dirs.remove(n)
@@ -125,11 +125,12 @@ def plan(userdata):
     return entries, total, left_out
 
 
-def copy_userdata(run, home, dest, deadline):
-    """The cold copy (in a step): every planned entry into dest/userdata, hashing what is read. dest is new."""
+def copy_userdata(run, home, dest, deadline, skip=frozenset()):
+    """The cold copy (in a step): every planned entry into dest/userdata, hashing what is read. dest is new.
+    skip: more top-level names to leave out (rehearse's clone leaves out secrets/)."""
     run.require_step('cold copy')
     userdata = os.path.join(home, 'userdata')
-    entries, total, left_out = plan(userdata)
+    entries, total, left_out = plan(userdata, skip)
     os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
     os.mkdir(dest, 0o700)  # FileExistsError: never over an old copy
     os.mkdir(os.path.join(dest, 'userdata'), 0o700)
@@ -1104,9 +1105,10 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
 def guard(cfg, adapter, run_id):
     """Started detached by a copy run before T3 stops. Logs that it waits (the run stops T3 only after this line),
     then waits for that run to end however it ends (the lock frees when its holder dies), then starts T3 if the
-    run had stopped it and left it stopped, and runs the post hooks if the run ran the pre hooks but not the post
-    hooks. A journal it cannot read fails open: T3 is started if it is not active and the post hooks run (each is
-    safe twice). It changes nothing else and writes no journal line (the run, ended or killed, stays as it is for
+    run had stopped it and left it stopped and the service is enabled (a copy never disables it; a back W1 that
+    stopped disables it on purpose), and runs the post hooks if the run ran the pre hooks but not the post hooks. A
+    journal it cannot read fails open: T3 is started if it is not active and enabled, and the post hooks run (each
+    is safe twice). It changes nothing else and writes no journal line (the run, ended or killed, stays as it is for
     the owner). Logs to <stateDir>/guard.log. Returns what it did."""
     try:
         _guard_log(cfg.state_dir, {'run': run_id, 'waiting': True})
@@ -1125,7 +1127,10 @@ def guard(cfg, adapter, run_id):
             did.append(f'journal unreadable, so T3 is put back as if the run had stopped it: {e}')
         if stopped:
             try:
-                if not adapter.service()['active']:
+                svc = adapter.service()
+                if not svc['active'] and not svc['enabled']:  # a copy never disables it; a back W1 does, on purpose
+                    did.append(f'{osadapter.UNIT} is not enabled: left stopped (a back W1 that stopped may hold it)')
+                elif not svc['active']:
                     adapter.start()
                     did.append(f'started {osadapter.UNIT}')
             except osadapter.AdapterError as e:
