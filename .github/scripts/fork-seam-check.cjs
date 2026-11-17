@@ -1,9 +1,7 @@
 // Usage: fork-seam-check.cjs [--config-ref <rev>] [--after-rebase] <base> <head>. Refuses <head>'s
-// changes to any upstream file since the merge-base beyond .github/fork-seams.json. A <base> without
-// the list (and no --config-ref) is upstream; else the list comes from the base (or --config-ref),
-// never from <head> or the working tree. --after-rebase (fork-follow, right after rebasing onto a
-// new upstream): a "pending" file below its ceiling is a note, not a refusal (see findUnlistedChanges).
-// Reads git objects only; nothing runs.
+// upstream-file changes since the merge-base beyond .github/fork-seams.json, read from <base> (or
+// --config-ref; never <head>); a <base> without it is upstream. --after-rebase (fork-follow): a
+// "pending" file below its ceiling is a note (see findUnlistedChanges). Reads git objects only.
 
 const { execFileSync } = require("node:child_process");
 
@@ -156,13 +154,10 @@ function forkFileTest(patterns = []) {
 }
 
 /**
- * Changed files outside the seams. An unlisted upstream file may gain, lose or move no line, nor
- * go (unless `removed` names it). A "pending" one holds exactly its ceiling from upstream (more is
- * refused, fewer too, so the ceiling gets lowered), and on a pull request may change but not grow.
- * On a pull request, `isForkFile` names the fork's own files. `afterRebase`: fewer than the ceiling
- * is a note, since upstream adopting a fork line word for word drops it in the rebase, and the
- * ceiling cannot be lowered first (the check before the rebase, on the old base, would then fail).
- * The next run, from the new base, refuses it, and a pull request lowers it.
+ * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed`
+ * names it). A "pending" one holds exactly its ceiling from upstream; on a PR (`isForkFile`
+ * names fork files) it may change but not grow. `afterRebase`: below the ceiling (an adopted fork
+ * line drops in the rebase; the old base forbids lowering first) is a note, refused on the next run.
  */
 function findUnlistedChanges(
   config,

@@ -251,8 +251,8 @@ test("from upstream, a pending file that swapped upstream lines for fork lines i
   ]);
 });
 
-// Round-2 state lens on #277: PR 1 moves a fork line out and the ceiling stays; PR 2 swaps an
-// upstream guard for a fork line (net zero on the PR). From upstream that must be refused.
+// PR 1 moves a fork line out and the ceiling stays; PR 2 swaps an upstream guard for a fork line
+// (net zero on the PR). From upstream that must be refused.
 test("from upstream, a ceiling left too high after lines moved out is refused, so a later swap cannot use it", () => {
   const upstreamText = `${UP}if (!ok) return;\n`;
   const config = { pending: { "p.ts": 2 } };
@@ -274,8 +274,8 @@ test("from upstream, a ceiling left too high after lines moved out is refused, s
   ]);
 });
 
-// Round-3 state lens on #277: upstream adopts a pending fork line word for word, so the rebase
-// drops it and the series falls below its ceiling. Lowering the ceiling first fails the check on
+// Upstream adopts a pending fork line word for word, so the rebase drops it and the series falls
+// below its ceiling. Lowering the ceiling first fails the check on
 // the old base, so right after a rebase it is a note; the next run (from the new base) refuses it.
 test("after a rebase, a pending file below its ceiling is a note; over it is still refused", () => {
   const config = { files: {}, pending: { "p.ts": 2 }, forkFiles: [] };
