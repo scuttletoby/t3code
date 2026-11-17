@@ -75,7 +75,8 @@ Two habits every action expects:
 - **A job that others `need` must not skip them on failure:** GitHub counts a skipped required job as passing. Give
   the dependent job `if: ${{ !cancelled() }}` and a fallback for an empty output (fleet-route's README shows one).
 
-To move to a new release, change the SHA and the comment together; read the new tag's release notes first.
+To move to a new release, change the SHA and the comment together; read the new tag's release notes first
+([RELEASE-NOTES.md](RELEASE-NOTES.md): what changed, and what to do before or after the move).
 
 ### Outside a workflow
 
