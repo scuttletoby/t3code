@@ -1,8 +1,10 @@
 # Fork only. The head check as a gate (fork-ci/actions/head-check/README.md, "The gate"): head_check's rules on a bare
 # repository, posted as one check run of the project's own gate App, so a ruleset can require that check from that
 # App alone and no workflow file of a pull request can meet it.
-# A caller on the default branch runs it on pull_request_target, issue_comment and workflow_dispatch (the README's
-# example caller, gate-caller.example.yml) and passes `secrets: inherit`. The gate's code comes from this workflow's
+# A caller on the default branch runs it on pull_request_target, issue_comment, workflow_dispatch and workflow_run of
+# the review trigger (the README's example caller, gate-caller.example.yml, and review-trigger.example.yml) and passes
+# `secrets: inherit`. On a workflow_run the pull request is looked up by the finished run's head (GitHub's fields of
+# the run, never its outputs). The gate's code comes from this workflow's
 # own commit (job.workflow_repository and job.workflow_sha), never from the caller's tree, and nothing of the pull
 # request is ever checked out: the pull request is data. Only the gate job may use the Environment that holds the App
 # key, only after the guard job proved that key can be nowhere else. A check run belongs to a head, not to a pull
@@ -98,7 +100,15 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ inputs.pr }}
           EVENT_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py prs --repo "$REPO" --event "$EVENT" --pr "$PR" --event-sha "$EVENT_SHA"
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        # --run-branch=: a branch is the pusher's text, so it can never be read as an option.
+        run: |
+          python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py prs --repo "$REPO" --event "$EVENT" --pr "$PR" \
+            --event-sha "$EVENT_SHA" --run-event "$RUN_EVENT" --run-sha "$RUN_SHA" --run-repo "$RUN_REPO" \
+            --run-branch="$RUN_BRANCH"
       - name: Fail when no token can be made (no Environment)
         if: steps.guard.outputs.guard == ''
         shell: bash
