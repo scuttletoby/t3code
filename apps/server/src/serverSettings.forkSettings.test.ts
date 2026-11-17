@@ -9,6 +9,7 @@ import {
   clearProjectSettingsOverridesWithForkKeys,
   ForkSettingsWriteError,
 } from "@t3tools/shared/forkSettingsPatch";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -413,5 +414,69 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork playtest se
       const file = (yield* readFile) as Record<string, unknown>;
       assert.isFalse("playtest" in file);
     }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("refuses a program that is not a full path on the server's OS", () =>
+    Effect.gen(function* () {
+      // Relative to the worktree there: `/…` is drive-relative on Windows, `C:\…` a file name elsewhere.
+      for (const [platform, program] of [
+        ["win32", "/opt/game"],
+        ["linux", "C:\\game"],
+      ] as const) {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(config.settingsPath, JSON.stringify(FULL_FILE));
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const error = yield* service
+          .updateSettings(
+            decodePatch({ playtest: { ...ADAPTER, claim: { argv: [program, "claim"] } } }),
+          )
+          .pipe(Effect.provideService(HostProcess.Platform, platform), Effect.flip);
+        assert.instanceOf(error.cause, ForkSettingsWriteError, platform);
+        assert.include((error.cause as Error).message, "not a full path on this server's OS");
+      }
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect(
+    "keeps a project off after every save: it never falls back to the server's adapter",
+    () =>
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        // The server's adapter is on; the project's value is bad (a relative program), so it is off.
+        yield* fs.writeFileString(
+          config.settingsPath,
+          JSON.stringify({
+            ...FULL_FILE,
+            playtest: ADAPTER,
+            projectSettingsOverrides: {
+              [PROJECT]: { playtest: { ...ADAPTER, claim: { argv: ["scripts/claim"] } } },
+            },
+          }),
+        );
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const projectPlaytest = Effect.gen(function* () {
+          const file = (yield* readFile) as {
+            projectSettingsOverrides: Record<string, { playtest?: { enabled: boolean } }>;
+          };
+          const read = (yield* service.getSettings).projectSettingsOverrides[
+            ProjectId.make(PROJECT)
+          ];
+          return {
+            file: file.projectSettingsOverrides[PROJECT]?.playtest?.enabled,
+            read: read?.playtest?.enabled,
+          };
+        });
+        // An unrelated save writes the project's value back as an explicit off.
+        yield* service.updateSettings(decodePatch({ enableAgentBrowserAccess: true }));
+        assert.deepStrictEqual(yield* projectPlaytest, { file: false, read: false });
+        // A client that does not know `playtest` saves the project's entry without it.
+        yield* service.updateSettings(
+          decodePatch({ projectSettingsOverrides: { [PROJECT]: { defaultAutoPull: true } } }),
+        );
+        assert.deepStrictEqual(yield* projectPlaytest, { file: false, read: false });
+        assert.isTrue((yield* service.getSettings).playtest.enabled);
+      }).pipe(Effect.provide(layerServerSettings())),
   );
 });

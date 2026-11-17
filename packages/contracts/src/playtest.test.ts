@@ -16,8 +16,11 @@ import {
   PlaytestSettings,
   PlaytestSettingsFromSettingsFile,
   PlaytestTarget,
+  isPlaytestProgramFullyQualified,
 } from "./playtest.ts";
 import { ServerSettings, ServerSettingsPatch } from "./settings.ts";
+// The adapter contract page: the names and exit codes adapters are written from.
+import PLAYTEST_DOC from "../../../docs/fork/playtest.md?raw";
 
 const decodeStrict = Schema.decodeUnknownSync(PlaytestSettings);
 const decodeFile = Schema.decodeUnknownSync(PlaytestSettingsFromSettingsFile);
@@ -97,10 +100,37 @@ describe("playtest settings", () => {
     expect(() => decodeStrict({ ...ADAPTER, claim: step([]) })).toThrow();
   });
 
+  it("takes a program as fully qualified only on the server's own OS", () => {
+    const cases: ReadonlyArray<readonly [string, boolean, boolean]> = [
+      // program, on Linux/macOS, on Windows
+      ["/opt/game/guard", true, false],
+      // Drive-relative on Windows: the drive of the working folder, the agent's worktree.
+      ["\\opt\\guard", false, false],
+      ["C:\\game\\guard.exe", false, true],
+      ["D:/game/guard", false, true],
+      ["\\\\host\\share\\g", false, true],
+      ["//host/share/g", true, true],
+      ["\\\\?\\C:\\game\\g", false, true],
+      ["c:guard", false, false],
+      ["guard", false, false],
+      ["./guard", false, false],
+      ["", false, false],
+    ];
+    for (const [program, posix, windows] of cases) {
+      expect(isPlaytestProgramFullyQualified(program, "linux"), program).toBe(posix);
+      expect(isPlaytestProgramFullyQualified(program, "darwin"), program).toBe(posix);
+      expect(isPlaytestProgramFullyQualified(program, "win32"), program).toBe(windows);
+    }
+  });
+
   it("refuses repeated, badly named or too many push steps", () => {
     const guard = ADAPTER.push[0]!;
     expect(() => decodeStrict({ ...ADAPTER, push: [guard, guard] })).toThrow(/used once/);
     expect(() => decodeStrict({ ...ADAPTER, push: [{ ...guard, name: "Guard Step" }] })).toThrow();
+    // T3_PLAYTEST_STEP names the step; a push step cannot pass for claim, renew or release.
+    for (const name of ["claim", "renew", "release"]) {
+      expect(() => decodeStrict({ ...ADAPTER, push: [{ ...guard, name }] }), name).toThrow();
+    }
     const many = Array.from({ length: PLAYTEST_PUSH_STEPS_MAX + 1 }, (_, index) => ({
       ...guard,
       name: `step-${index}`,
@@ -120,6 +150,9 @@ describe("playtest settings", () => {
       { maxHours: 49 },
       { claim: { argv: ["/bin/true"], timeoutSeconds: 0 } },
       { claim: { argv: ["/bin/true"], timeoutSeconds: 3601 } },
+      { claim: { argv: ["/bin/true", ""] } },
+      { claim: { argv: ["/bin/true", "  "] } },
+      { claim: { argv: ["/bin/true", ...Array.from({ length: 50 }, () => "x")] } },
     ]) {
       expect(() => decodeStrict({ ...ADAPTER, ...bad }), JSON.stringify(bad)).toThrow();
     }
@@ -195,10 +228,15 @@ describe("playtest settings in a save", () => {
 });
 
 describe("playtest adapter contract", () => {
-  it("names each environment variable once, under one prefix", () => {
-    const names = Object.values(PLAYTEST_ENV);
-    expect(new Set(names).size).toBe(names.length);
-    for (const name of names) expect(name).toMatch(/^T3_PLAYTEST_[A-Z]+$/);
+  it("matches the contract page adapters are written from (docs/fork/playtest.md)", () => {
+    // The variable table's rows.
+    const documented = [...PLAYTEST_DOC.matchAll(/^\| `(T3_PLAYTEST_[A-Z_]+)`/gmu)].map(
+      (m) => m[1],
+    );
+    expect(documented.toSorted()).toEqual(Object.values(PLAYTEST_ENV).toSorted());
+    const exits = new Set([...PLAYTEST_DOC.matchAll(/\bExit (\d+)\b/gu)].map((m) => Number(m[1])));
+    expect([...exits].toSorted()).toEqual([PLAYTEST_EXIT_OK, PLAYTEST_EXIT_REFUSED].toSorted());
+    expect(PLAYTEST_DOC).toContain(`At most ${PLAYTEST_PUSH_STEPS_MAX} push steps`);
   });
 
   it("keeps refused apart from ok and from the usual failure codes", () => {

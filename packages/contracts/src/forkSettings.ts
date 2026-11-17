@@ -173,20 +173,24 @@ export const ForkProjectOverrideFields = {
   mcpProfile: Schema.optionalKey(McpProfileRef),
   /** Absent or empty: the server's `mcpSubagentProfile`. Read leniently, as the server's. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileRef),
-  /** A bad value reads as off for that project, never as the server's adapter. */
-  playtest: Schema.optionalKey(PlaytestSettingsFromSettingsFile),
+  /**
+   * A bad value reads as off for that project, never as the server's adapter (`null` too). `null`
+   * is only a save's "clear", which the save removes, so it is never stored or read.
+   */
+  playtest: Schema.optionalKey(Schema.Union([PlaytestSettingsFromSettingsFile, Schema.Null])),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
 /**
- * Fork project keys a project save keeps when the project's entry leaves them out: upstream replaces
- * a project's entry whole, and a client that does not know a key (an older one) leaves it out, which
- * would quietly widen that project to the server's profile. `""` clears one. (`waitChecks` keeps
- * upstream's rule: left out is removed.)
+ * Fork project keys a project save keeps when the project's entry leaves them out, each with the
+ * value that clears it: upstream replaces a project's entry whole, and a client that does not know a
+ * key (an older one) leaves it out, which would quietly switch that project to the server's MCP
+ * profile or playtest adapter. (`waitChecks` keeps upstream's rule: left out is removed.)
  */
-export const FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT = [
-  "mcpProfile",
-  "mcpSubagentProfile",
-] as const satisfies ReadonlyArray<keyof typeof ForkProjectOverrideFields>;
+export const FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT = {
+  mcpProfile: "",
+  mcpSubagentProfile: "",
+  playtest: null,
+} as const satisfies Partial<Record<keyof typeof ForkProjectOverrideFields, "" | null>>;
 
 /** A project's overrides of fork settings in a patch (each project's set is replaced whole). */
 export const ForkProjectOverridePatchFields = {
@@ -198,8 +202,11 @@ export const ForkProjectOverridePatchFields = {
    */
   mcpProfile: Schema.optionalKey(McpProjectProfileRefPatch),
   mcpSubagentProfile: Schema.optionalKey(McpProjectProfileRefPatch),
-  /** A save refuses a bad step, or `enabled` without all four steps. */
-  playtest: Schema.optionalKey(PlaytestSettings),
+  /**
+   * A save refuses a bad step, or `enabled` without all four steps. Left out keeps the stored value;
+   * `null` clears it (the project then uses the server's).
+   */
+  playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettings)),
 } satisfies Record<keyof typeof ForkProjectOverrideFields, unknown>;
 
 /**

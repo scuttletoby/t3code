@@ -140,9 +140,11 @@ starts a session yet: the session store, the tool and the thread controls come i
 requests. The steps' contract is in [playtest.md](playtest.md).
 
 Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
-push step's name, or names a program by a relative path or a bare name is refused. A hand-edited
-value that is not valid reads as off (with a warning in the server log), and the next save writes
-the default in its place. Other fields: how often a claim is renewed (`renewMinutes`), when an idle
+push step's name (or names one `claim`, `renew` or `release`), or names a program by anything but
+its full path on the server's OS is refused. A hand-edited
+value that is not valid reads as off (with a warning in the server log), and the next save of any
+setting writes the default in its place; fields a newer build added are dropped the same way (as for
+`waitChecks`). Other fields: how often a claim is renewed (`renewMinutes`), when an idle
 session ends (`idleMinutes`) and the longest session (`maxHours`).
 
 ```json
@@ -226,8 +228,11 @@ Set: **Settings**, choose the project at the top, then **Wait checks**.
 
 A project's own playtest adapter. It replaces the server's `playtest` for that project as a whole:
 a project sets every step it uses. Not set: the project uses the server's. A project value that is
-not valid reads as off for that project; it never falls back to the server's adapter. A repository's
-`t3.json` cannot set it: that file is in the repository, which agents edit.
+not valid reads as off for that project; it never falls back to the server's adapter. A project save
+that leaves this key out (an older client) keeps the stored value; only `null` clears it, and the
+fork's `clearProjectSettingsOverridesWithForkKeys` sends that. Unlike the server's value it is
+saved with every field written out, so a project that is off says so in the file. A repository's `t3.json` cannot set
+it: that file is in the repository, which agents edit.
 
 ### `projectOverride.mcpProfile`
 
