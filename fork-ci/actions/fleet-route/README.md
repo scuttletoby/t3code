@@ -259,7 +259,10 @@ that uses only the action has neither. So:
   registrations it made under the old label (`<old label>-<job id>`), as it does under the new one, and stops an idle
   runner there after `idle_passes` (it holds one of the pool's `slots`) when that runner's unit is on its own host. It
   never deletes an online one, nor stops one running on another host (say the pool's `launch` moved with the label),
-  nor touches one under another pool's label. Without `retired`, delete them by hand.
+  nor touches one under another pool's label. Without `retired`, delete them by hand. To move a pool's `launch` to
+  another host, do it in a change of its own, not with the label change (or stop the old host's dispatcher before the
+  new one starts): a host still on the older config makes runners under the old label, and the new host deletes their
+  registrations before they connect. Such a job is retried a few times, then left to the sweep.
 - **Reusing a label:** a pool's label may not be in `retired_labels` (the config is refused). To give a retired label
   to a pool again, first take it out of `retired_labels` and every `retired`, and wait until every host runs that
   config: a host still on the older one deletes the new pool's registrations under it before their runners connect.
