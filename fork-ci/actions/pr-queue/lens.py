@@ -254,13 +254,14 @@ def loose_header(line):
 
 def no_lens_text(text, keep_markdown=False):
     """Text that can never count as a lens read, name a lens or look like a lens report (lens_problem), for anything
-    the queue quotes into a comment (gh errors): no `read at`, no `lens:`, no `safe to merge`. keep_markdown: the
+    the queue quotes into a comment (gh errors): no `read at`, no lens field (`lens:`, `lens=`, `lens —`, `lens –`),
+    no `safe to merge`. keep_markdown: the
     queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown,
     it holds none of these; otherwise it is cleaned like any other text."""
     plain = clean_inline(text)
     out = re.sub(r'\bread([\s-]*)at\b', r'read\1@', plain, flags=re.I)
     out = re.sub(r'\bsafe(\s+)to(\s+)merge\b', r'safe\1to\2land', out, flags=re.I)
-    out = re.sub(r'\blens(\s*):', r'lens\1-', out, flags=re.I)
+    out = re.sub(r'\blens(\s*)[:=—–]', r'lens\1-', out, flags=re.I)   # every field form loose_header reads
     return text if keep_markdown and out == plain else out
 
 

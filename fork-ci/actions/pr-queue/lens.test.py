@@ -140,6 +140,20 @@ class NotALens(unittest.TestCase):
     def test_a_quote_marker_inside_a_fence_is_code_not_a_quote(self):
         self.assertIsNotNone(self.problem(f'not a lens: notes\n```\n> read at {self.HEX}\n```'))
 
+    def test_a_read_in_inline_code_below_the_opt_out_blocks(self):   # the line is read cleaned, not raw
+        self.assertIsNotNone(self.problem(f'not a lens: notes\nread at: `{self.HEX}`'))
+
+    def test_a_quote_marker_indented_four_spaces_is_code_not_a_quote(self):
+        self.assertIsNotNone(self.problem(f'not a lens: notes\n\n    > read at {self.HEX}'))
+
+    def test_the_queues_quote_of_any_lens_field_never_reads_as_a_lens_line(self):   # l283-state: leave_off quotes it
+        for line in (f'Lens — security ({self.HEX[:10]}) NOT SAFE', f'lens= security {self.HEX}',
+                     f'lens – security at {self.HEX[:7]}', f'lens: security read at: {self.HEX}'):
+            with self.subTest(line=line):
+                quoted = lens.no_lens_text(line)
+                self.assertFalse(lens.loose_header(lens.norm_line(quoted)), quoted)
+                self.assertIsNone(self.problem(f'Auto-merge OFF: {quoted}'), quoted)
+
     def test_the_way_out_names_the_quote_and_never_reads_as_a_report(self):
         self.assertIn('`>`', lens.NO_HEADER_WAY_OUT)
         self.assertEqual(lens.no_lens_text(lens.NO_HEADER_WAY_OUT, keep_markdown=True), lens.NO_HEADER_WAY_OUT)
@@ -333,9 +347,13 @@ class WhoCounts(unittest.TestCase):
         import time
         shapes = ('> ' * 32768, '>' * 65536, '- ' * 32768, '+ ' * 32768, '1. ' * 21845, '[x] ' * 16384, '# ' * 32768,
                   '~~~ ' * 16384, '> - 1. # [x] ' * 5000 + f'lens: a · read at: {SHA_A}')
-        start = time.monotonic()
-        for body in shapes:
+        for body in shapes:   # end to end: generous, the rest is unchanged code and a busy host is slow
+            start = time.monotonic()
             self.head(post(body))
+            self.assertLess(time.monotonic() - start, 5, body[:20])
+        start = time.monotonic()   # norm_line alone: 5-13 ms per shape; the old loop took 0.3-0.7 s each
+        for body in shapes:
+            lens.norm_line(body)
         self.assertLess(time.monotonic() - start, 0.5)
 
     def test_one_pass_strips_the_markers_the_old_loop_stripped(self):   # issue #72: same answers, one pass
