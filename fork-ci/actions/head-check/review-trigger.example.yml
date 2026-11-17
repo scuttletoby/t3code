@@ -1,0 +1,30 @@
+# The head gate's review trigger (README.md, "Run again after a review"). Copy it to .github/workflows/ on the
+# project's default branch next to the gate caller, unchanged: the caller's `workflow_run` names it by this `name`.
+# GitHub runs review events from the pull request's own merge commit, so this file may be the pull request's own copy:
+# it does nothing but finish, has no token and no secrets, and the caller trusts nothing it says. Its finished run only
+# tells the caller (from the default branch) "look at this head again"; the gate reads the pull request by the run's
+# head from the API, as an issue comment would make it read it.
+name: Head gate review trigger
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+
+permissions: {}
+
+# A burst of reviews or line comments on one pull request: only the newest run finishes; the caller starts on it.
+concurrency:
+  group: head-gate-review-trigger-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Finish (the head gate's caller runs on this run's workflow_run)
+        shell: bash
+        run: echo "A review or an inline review comment changed; the head gate judges this head again."
