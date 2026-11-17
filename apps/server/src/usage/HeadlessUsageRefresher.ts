@@ -178,10 +178,14 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
         continue;
       }
       // Upstream's loop skips some healthy instances: a check of a healthy OpenCode one
-      // starts an OpenCode server. Skip them too; healthy also ends a failure streak, so the
+      // starts an OpenCode server. Skip them too. It also skips signed-out, missing and
+      // disabled ones, so only a skip with a usable reading ends a failure streak; then the
       // next outage is logged and retried as a new one.
       if (target.snapshot.checksOnInterval && !(yield* target.snapshot.checksOnInterval)) {
-        yield* endStreak(target.instanceId);
+        const current = yield* target.snapshot.getSnapshot;
+        if (canRefresh(current) && current.usageLimits?.unavailable === undefined) {
+          yield* endStreak(target.instanceId);
+        }
         continue;
       }
       const before = yield* target.snapshot.getSnapshot;
