@@ -77,7 +77,7 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 | `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                      |
 | `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                 |
 | `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                |
-| `lockedSettings`        | more T3 settings to lock, `{path: value}`: the child ceiling (`agentSlots.…`, fork builds), see below                          |
+| `lockedSettings`        | more T3 settings to lock, `{path: value}`: the child ceiling (`agentSlots.…`, fork builds), see below             |
 | `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                             |
 | `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                   |
 | `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host        |
