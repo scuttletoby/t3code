@@ -2493,10 +2493,40 @@ class Launcher(unittest.TestCase):
         self.assertFalse(looked_up())
         self.conf(OWN_ADDRESS_SECONDS='0')
         self.assertTrue(looked_up())
-        for bad in ('-1', '1e3', '999999'):
+        for bad in ('-1', '1e3', '999999', '3601', '9999'):   # issue #297: the cap, not the 4 digits alone
             with self.subTest(bad):
                 self.conf(OWN_ADDRESS_SECONDS=bad)
                 self.assertIn('OWN_ADDRESS_SECONDS', self.launch('refresh-net').stderr)
+        self.conf(OWN_ADDRESS_SECONDS='3600')
+        self.assertEqual(self.launch('refresh-net').returncode, 0)
+        self.assertFalse(looked_up())
+        # Issue #297: a fresh answer behind a link is no answer of root's (only root writes RUN_DIR): looked up.
+        self.write('fresh', f'{int(time.time())}\n', 0o600)
+        os.remove(stamp)
+        os.symlink(self.path('fresh'), stamp)
+        self.assertTrue(looked_up())
+
+    def test_refresh_net_stamps_when_the_lookup_answered(self):
+        """Issue #297 item 2: own-lookup holds when the lookup answered, not when the pass ended: a pass that waits
+        for the launch lock (up to 100 s) after its lookup must not make the next lookup come that much later."""
+        import fcntl
+        self.conf(OWN_ADDRESS_SECONDS='120')
+        self.start(self.NAME)
+        with open(self.path('run/launch.lock')) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)   # another verb holds the lock while this pass looks up
+            asked = int(time.time())
+            p = subprocess.Popen(['bash', LAUNCH, 'refresh-net'], env=self.env(), stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+            self.addCleanup(p.kill)
+            time.sleep(3)
+            self.assertIsNone(p.poll())   # still waiting for the lock
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        _, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 0, err)
+        with open(self.path('run/own-lookup')) as f:
+            stamp = int(f.read())
+        self.assertLessEqual(stamp, asked + 1)   # the pass ended 3 s later
+        self.assertGreaterEqual(stamp, asked)
 
     def test_a_lookups_answer_never_reaches_the_terminal_raw(self):
         """Fix round 3 (#191 re-check S1): a lookup service's answer, curl's words and a caller's argument reach the
@@ -3389,6 +3419,35 @@ class LauncherAsRoot(unittest.TestCase):
         self.assertIn("ok    this host's own public address 203.0.113.3 is refused (No route to host)", got.stdout)
         self.assertIn(f'check-net: as {self.USERS[0]}, in its namespace fork-fleet-{self.USERS[0]}', got.stdout)
 
+    def test_refresh_net_takes_only_roots_lookup_stamp(self):
+        """Issue #297 item 4: refresh-net takes RUN_DIR/own-lookup as an answer only when root's, in a RUN_DIR of
+        root's (only root may delay a lookup): a fresh stamp a runner user owns, or one in a RUN_DIR root does not own,
+        is none (looked up)."""
+        self.conf(OWN_ADDRESS_SECONDS='120')
+
+        def looked_up():   # with every lookup down, a pass that looks up fails
+            for x in 'ab':
+                os.rename(self.path(f'rec/own-{x}'), self.path(f'rec/down-{x}'))
+            try:
+                got = self.launch('refresh-net')
+            finally:
+                for x in 'ab':
+                    os.rename(self.path(f'rec/down-{x}'), self.path(f'rec/own-{x}'))
+            if got.returncode == 0:
+                return False
+            self.assertIn('no lookup', got.stderr)
+            return True
+        got = self.launch('refresh-net')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertFalse(looked_up())
+        user = pwd.getpwnam(self.USERS[0]).pw_uid
+        for path in (self.path('run/own-lookup'), self.path('run')):
+            with self.subTest(path):
+                os.chown(path, user, -1)
+                self.assertTrue(looked_up())
+                os.chown(path, 0, -1)
+                self.assertFalse(looked_up())
+
     def test_the_walls_proof_refuses_a_host_with_a_pools_users(self):
         """As root, with this class's runner users (a pool's part, as an idle pool's after a reboot): it refuses
         before it makes anything, and names them."""
@@ -3450,10 +3509,18 @@ class LauncherAsRoot(unittest.TestCase):
         self.assertEqual([x for x in said if x.startswith('refused ')],
                          [f'refused {p}' for p in (dest + '/run.sh', os.path.dirname(dest) + '/written', '/written',
                                                    '/etc/written', '/usr/written', '/var/lib/written')], said)
-        rw = {x[3:] for x in said if x.startswith('rw ')}
+        rw = rw_mounts(said)
         self.assertIn(dest, rw)
         own_fs = {dest, '/tmp', '/var/tmp', '/run'}   # its copy and its own memory file systems; and the kernel's
-        self.assertEqual({m for m in rw - own_fs if not re.match(r'/(proc|sys|dev)(/|$)', m)}, set(), said)
+        self.assertEqual({m for m in set(rw) - own_fs if not re.match(r'/(proc|sys|dev)(/|$)', m)}, set(), said)
+        # Issue #297 item 4: its memory file systems are its own (TemporaryFileSystem=): each a tmpfs no mount of the
+        # host's is (a bind of the host's /run or /dev/shm keeps the host's device number, which the host lists).
+        with open('/proc/self/mountinfo') as f:
+            host = {line.split()[2] for line in f}
+        for p in ('/run', '/dev/shm', '/tmp', '/var/tmp'):
+            fs, dev = rw.get(p, ('not read-write', ''))
+            self.assertEqual(fs, 'tmpfs', f'{p}: {said}')
+            self.assertNotIn(dev, host, f'{p} is a mount of the host\'s: {said}')
         with open(f'{dest}/written') as f:
             self.assertEqual(f.read(), 'x\n')
         with open(f'{self.template}/run.sh') as f:
@@ -3466,13 +3533,18 @@ class LauncherAsRoot(unittest.TestCase):
         loader = importlib.machinery.SourceFileLoader('walls_linux', os.path.join(HERE, 'fork-fleet-walls', 'linux'))
         walls = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
         loader.exec_module(walls)
-        self.assertEqual(walls.stop_defaults_used(), set())   # the walls read systemd's own file for the unit
+        self.assertEqual(walls.stop_defaults_used(), (set(), []))   # the walls read systemd's own file for the unit
         got = self.launch('stop', name)
         self.assertEqual(got.returncode, 0, got.stderr)
         self.assertNotEqual(subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=60).returncode, 0)
         _, said = run('fleet-vm-t3code-32', drop='ProtectSystem=strict')
-        self.assertIn('rw /', said)
+        self.assertIn('/', rw_mounts(said))
         self.launch('stop', 'fleet-vm-t3code-32')
+
+
+def rw_mounts(said):
+    """{point: (fstype, major:minor)} of JOB_WRITES's `rw` lines (the last one of a point: the one on top)."""
+    return {x.split(' ')[1]: tuple(x.split(' ')[2:4]) for x in said if x.startswith('rw ')}
 
 
 # LauncherAsRoot's systemd-run for the real job unit: the real one, with start's arguments but its network and the
@@ -3492,14 +3564,19 @@ done
 mkfifo -m 0600 -- "$dir/out" && chown --reference="$dir" -- "$dir/out" || exit 99
 exec /usr/bin/systemd-run "${args[@]}"
 """
-# The trivial job: tries to write each path, says which mounts it sees read-write, then waits for its stop.
+# The trivial job: tries to write each path, says which mounts it sees read-write (rw POINT FSTYPE MAJOR:MINOR), then
+# waits for its stop.
 JOB_WRITES = """#!/bin/bash
 exec >"$PWD/out" 2>&1
 for p in "$PWD/written" "$HOME/written" "$TMPDIR/written" /tmp/written /var/tmp/written /dev/shm/written \
   "$PWD/run.sh" "${PWD%/*}/written" /written /etc/written /usr/written /var/lib/written; do
   if (echo x >"$p") 2>/dev/null; then echo "wrote $p"; else echo "refused $p"; fi
 done
-while read -r _ _ _ _ point opts _; do [[ ,$opts, != *,rw,* ]] || echo "rw $point"; done </proc/self/mountinfo
+while IFS= read -r line; do
+  read -r _ _ dev _ point opts _ <<<"$line"
+  fs=${line#* - }
+  [[ ,$opts, != *,rw,* ]] || echo "rw $point ${fs%% *} $dev"
+done </proc/self/mountinfo
 exec >/dev/null 2>&1
 exec sleep 600
 """
