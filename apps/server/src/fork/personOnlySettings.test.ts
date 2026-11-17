@@ -148,6 +148,7 @@ describe("person-only fork settings", () => {
         "mcpProfile",
         "mcpSubagentProfile",
         "mcpThreadProfiles",
+        "reviewRules",
       ]),
     );
     for (const key of FORK_AGENT_WRITABLE_KEYS) expect(FORK_PERSON_ONLY_KEYS).not.toContain(key);
@@ -204,14 +205,19 @@ describe("person-only fork settings", () => {
   });
 
   it("catches a tool whose input names one, in any spelling or depth", () => {
-    for (const field of ["mcpProfile", "mcp_profile", "MCP-PROFILE"]) {
+    for (const [field, key] of [
+      ["mcpProfile", "mcpProfile"],
+      ["mcp_profile", "mcpProfile"],
+      ["MCP-PROFILE", "mcpProfile"],
+      ["review_rules", "reviewRules"],
+    ] as const) {
       const tool = Tool.make("fake_settings_update", {
         parameters: Schema.Struct({
           projectId: Schema.String,
           patch: Schema.Struct({ [field]: Schema.optionalKey(Schema.String) }),
         }),
       });
-      expect(personOnlyKeysIn(tool), field).toEqual(["mcpProfile"]);
+      expect(personOnlyKeysIn(tool), field).toEqual([key]);
     }
   });
 });
