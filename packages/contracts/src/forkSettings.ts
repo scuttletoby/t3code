@@ -25,6 +25,11 @@ import {
 import { PlaytestSettings, PlaytestSettingsFromSettingsFile } from "./playtest.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
+  ReviewRulesFromSettingsFile,
+  ReviewRulesPatch,
+  ReviewRulesProjectPatch,
+} from "./reviewRules.ts";
+import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   UsagePacingGateMode,
   UsagePacingInstanceSettings,
@@ -43,6 +48,7 @@ import {
 export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
 export * from "./playtest.ts";
+export * from "./reviewRules.ts";
 export * from "./usagePacing.ts";
 
 /** How often usage limits refresh while no client watches; 0 turns it off. */
@@ -92,6 +98,8 @@ export const ForkServerSettingsFields = {
   playtest: PlaytestSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   /** Handoff instead of compaction for long threads; off by default. A bad value reads as off. */
   handoff: HandoffSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  /** How this machine runs a review lens; off by default. A bad value reads as off, kept as written. */
+  reviewRules: ReviewRulesFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -121,6 +129,8 @@ export const ForkServerSettingsPatchFields = {
   playtest: Schema.optionalKey(PlaytestSettings),
   /** Strict: a save refuses a bad value, or `source: command` without a command. */
   handoff: Schema.optionalKey(HandoffSettings),
+  /** Strict: a save refuses a bad field, an unknown key, or a value without `preset`. */
+  reviewRules: Schema.optionalKey(ReviewRulesPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -158,6 +168,8 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   playtest: "replace",
   // Whole, so the strict check (thread cap included) sees the value that is saved.
   handoff: "replace",
+  // Whole, so the strict check sees the value that is saved; two saves at once, the last one wins.
+  reviewRules: "replace",
 };
 
 /** The client settings' fork fields (stored in the browser); none yet. */
@@ -173,6 +185,8 @@ export const FORK_PROJECT_SCOPED_KEYS = [
   "playtest",
   // A project's value replaces the server's whole.
   "handoff",
+  // A project's value replaces the server's whole, `preset` included.
+  "reviewRules",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
 /** A project's overrides of fork settings, as the settings file holds them. */
@@ -190,6 +204,7 @@ export const ForkProjectOverrideFields = {
   playtest: Schema.optionalKey(Schema.Union([PlaytestSettingsFromSettingsFile, Schema.Null])),
   /** As `playtest`: a bad value reads as off for that project, never as the server's. */
   handoff: Schema.optionalKey(Schema.Union([HandoffSettingsFromSettingsFile, Schema.Null])),
+  reviewRules: Schema.optionalKey(Schema.Union([ReviewRulesFromSettingsFile, Schema.Null])),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
 /**
@@ -203,6 +218,7 @@ export const FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT = {
   mcpSubagentProfile: "",
   playtest: null,
   handoff: null,
+  reviewRules: null,
 } as const satisfies Partial<Record<keyof typeof ForkProjectOverrideFields, "" | null>>;
 
 /** A project's overrides of fork settings in a patch (each project's set is replaced whole). */
@@ -222,6 +238,11 @@ export const ForkProjectOverridePatchFields = {
   playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettings)),
   /** As `playtest`: left out keeps the stored value; `null` clears it. */
   handoff: Schema.optionalKey(Schema.NullOr(HandoffSettings)),
+  /**
+   * Strict, but a kept unreadable value passes back as clients resend it. Left out keeps the stored
+   * value; `null` clears it (the project then uses the server's).
+   */
+  reviewRules: Schema.optionalKey(Schema.NullOr(ReviewRulesProjectPatch)),
 } satisfies Record<keyof typeof ForkProjectOverrideFields, unknown>;
 
 /**
