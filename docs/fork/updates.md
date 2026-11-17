@@ -55,7 +55,8 @@ watches; it changes nothing on the machine, and `0` turns it off.
   `pending` or `forkFiles` entry counts once the owner merges it (a new seam line takes two pull
   requests, [below](#adding-a-seam-line)). Its own list is only parsed: a malformed one (bad JSON,
   an unknown or duplicate key, a `files` or `pending` key that is not a plain repository path, a
-  `lost` entry not in the form below, or none) is refused, since once merged it would stop every
+  `lost` entry not in the form below, a line in both `added` and `announced`, or none) is refused
+  (a repeated `"//"` comment key is a duplicate too: give each comment its own `//name` key), since once merged it would stop every
   later run. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
@@ -84,7 +85,9 @@ watches; it changes nothing on the machine, and `0` turns it off.
   [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
   `fork-*.yml`. A submodule pointer counts as a line. A pull request's run has no upstream commit,
   so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
-  for the fork's own; from upstream, a pattern that matches an upstream file fails. For the same
+  for the fork's own; from upstream, a pattern that matches an upstream file fails. Then remove the
+  entry (or exclude a fork-named path with `!path`): from then on a pull request's run judges the
+  file as upstream's, also before the rebase that brings upstream's copy. For the same
   reason a pull request's run counts upstream's copies of a seam line against its allowance: a
   seam line upstream also has (`}`, `/**`) cannot be added by a pull request, only checked by
   fork-follow, so keep seam lines specific. A branch made before fork-follow last rebased main
@@ -103,26 +106,44 @@ A pull request is judged by main's list, so a change that adds a line to an upst
 seam entry together is refused. It takes two pull requests, each green:
 
 1. **Announce** (list only, reviewed like any gate change): add the lines under `announced` in the
-   file's entry, with the day: `{"since": "YYYY-MM-DD", "added": [lines]}`. A file with no entry yet
-   gets one with `"added": []`. The seam check allows an announced line like an `added` one. The
-   seam-check tests (on the pull request's tree) refuse an announced line that is already in its
-   file beyond the copies `added` lists: a line upstream has (`}`) cannot be announced, as a pull
-   request cannot add it.
+   file's entry, with the day: `{"since": "YYYY-MM-DD", "added": [lines]}`. Set `since` to the day
+   this pull request merges (refresh it if the reviews took days): its run warns when the
+   announcement it adds would be refused within 3 days. A file with no entry yet gets one with
+   `"added": []`. The seam check allows an announced line like an `added` one. The seam-check tests
+   (on the pull request's tree) refuse an announced line that is already in its file: a line
+   upstream has (`}`) cannot be announced, as a pull request cannot add it. A line is in `added` or
+   in `announced`, never both.
 2. **Add** the lines, and in the same change move them from `announced` to `added` (drop
    `announced` once empty). Judged by main's list, which announces them, it is green. Keeping the
-   announcement there fails the tests, since the lines are now in the file.
+   announcement fails the tests: kept as it is, the lines are now in the file; copied into `added`
+   too, the list is malformed. Review where the line goes, not only the list edit: any pull request
+   may spend an announced line, not only the one meant to.
 
-From upstream, fork-follow refuses an announcement more than 14 days older than the head's commit
-date (or dated ahead of it): add the lines or remove the announcement with a pull request to main.
-A pull request's run never looks at the date, so that pull request is green.
+An announcement lasts 14 days. From upstream, fork-follow refuses one more than 14 days older than
+the head's commit date (or dated ahead of it): add the lines or remove the announcement with a pull
+request to main. The same commits give the same answer; after a rebase the head is new, dated when
+the rebase ran. A pull request's run refuses only a line that an expired announcement alone allows,
+dated by main's commit (never the pull request's), so the pull request that removes the
+announcement adds no line and is green. If upstream itself adds an announced line, fork-follow
+stops before pushing (pushed, main's tree would fail the seam-check tests for every pull request):
+remove the announcement with a list-only pull request to main.
 
-For example, the cli/connect.ts lines of
-[#398](https://github.com/scuttletoby/t3code/pull/398) go into main's existing entry first:
+For example, [#398](https://github.com/scuttletoby/t3code/pull/398) takes one list-only pull
+request first. It announces the new cli/connect.ts lines in main's existing entry, keeping the
+three old lines #398 replaces in `added`, and adds `apps/server/src/cloud/holdWorkConnect*` to
+`forkFiles` (#398 changes them, and a pull request's run takes these fork files, not named as the
+fork's, for upstream's until `forkFiles` names them):
 
 ```json
 "apps/server/src/cli/connect.ts": {
   "why": "…, and the CLI's Connect-on check (requireConnectAllowed) refuses on a held copy too.",
-  "added": ["import * as HoldWorkConnect from \"../cloud/holdWorkConnect.ts\";", "…"],
+  "added": [
+    "import * as HoldWorkConnect from \"../cloud/holdWorkConnect.ts\";",
+    "// Fork: a held copy shares the live server's environment id; refuse before the relay delete.",
+    "yield* HoldWorkConnect.refuseCliUnlinkWhileHeld(",
+    "(yield* ServerConfig.ServerConfig).serverRuntimeStatePath,",
+    ");"
+  ],
   "announced": {
     "since": "2026-11-19",
     "added": [
@@ -133,14 +154,19 @@ For example, the cli/connect.ts lines of
 }
 ```
 
-and [#412](https://github.com/scuttletoby/t3code/pull/412)'s file, which has no entry, gets
-`"apps/server/src/peer/RemoteDelegation.ts": {"why": "…", "added": [], "announced": {"since": …,
-"added": [its 10 lines]}}`. Each pull request then rebases onto main and moves its lines to
-`added`; #398 also drops the old lines it replaces from `added` (a pull request may drop seam lines).
+The three old lines stay listed until #398 merges: a pull request may delete only lines main's
+list names, so dropping them first makes #398 red on its own deletions. #398 then drops them from
+`added` in its own change, as its tree no longer has them (the seam-check tests refuse a listed line
+its file lacks). [#412](https://github.com/scuttletoby/t3code/pull/412)'s file, which has no entry,
+gets `"apps/server/src/peer/RemoteDelegation.ts": {"why": "…", "added": [], "announced": {"since":
+…, "added": [its 10 lines]}}` in the same list-only pull request. Each pull request then updates
+from main and moves its lines to `added`.
 
 A new `forkFiles` pattern needs no announcement: a list-only pull request adds it, and the pull
 request that edits those files follows. `pending` takes no new file or higher ceiling: its lines
-predate the rule and only move out, so a new fork line is a seam line.
+predate the rule and only move out. A pending file takes no new fork line (a pull request may
+change its lines but not add more, and a file cannot be in `files` and `pending`), so a new fork
+line goes in a seam file, after its lines are announced.
 
 ### Adding a fork setting
 

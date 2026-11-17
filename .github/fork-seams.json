@@ -211,7 +211,6 @@
     "apps/server/src/waits/",
     "apps/server/src/workAdmission*",
     "apps/web/src/clientPersistenceStorage.removedKeys.test.ts",
-    "apps/web/src/components/chat/MarkdownFileLink.logic.test.ts",
     "apps/web/src/components/settings/WaitsAndSlotsSettings*",
     "apps/web/src/components/settings/waitsAndSlotsSettings*",
     "packages/contracts/src/editor.test.ts",
