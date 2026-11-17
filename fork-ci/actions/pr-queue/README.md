@@ -103,13 +103,28 @@ queue never takes a reviewed pull request for an unreviewed one. Looking like a
 report means any of: `lens:`, `read at`, `safe to merge`, a `## ... lens`
 heading near the top, or two `covered:`/`checks:` lines. A comment that is no
 report says so on its first line, `not a lens: ...`. That clears it unless one of
-its lines is a lens header or a `lens:` field with a sha.
+its lines is a lens header, a lens field with a sha (`lens:`, `lens=`, `lens —`
+or `lens –`, quoted or not), or a `read at` with a hex sha outside a `>` quote
+(a fenced or indented block is no quote). To name a sha a lens read in such a
+comment, quote that line with `>`.
 
 A comment that looks like a report but is not one valid read is a lens of its
 own, keyed by that comment. Posting the report again the right way adds a new
 read and leaves the old comment blocking, and hiding it is not enough either.
 The ways out: delete it, edit its first line to `not a lens: ...` with no lens
-header line left in it, or post an override for the head.
+header line left in it and any `read at <sha>` quoted with `>`, or post an
+override for the head.
+
+These shapes were measured on this repository's 677 pull request comments by
+people (November 2026): 25 are flagged, before and after the `not a lens:`
+rule above. Of the 25, 7 are real lens reports with a broken header (one of
+them NOT SAFE), caught by the `## ... lens` heading rule (6) or a hex
+`read at` (1); 13 are fix-round comments caught by the same heading rule and 5
+fix-round comments with a `lens:` or `read at` in their text, and
+`not a lens:` is their way out. All 34 comments that say `safe to merge` are
+valid lens reads (`Verdict: not safe to merge ...`), so the rules stay as they
+are: each one that flags an ordinary comment also catches broken reports that
+read the same way ([issue 76](https://github.com/scuttletoby/t3code/issues/76)).
 
 ## The queue
 
@@ -397,14 +412,16 @@ replaced, and the replaced corpus was checked against the source copy before it
 was committed. A rule change here must keep the corpus green or say in its pull
 request why a recorded answer changes.
 
-The port differs on purpose in four ways, and the replay checks each recorded
+The port differs on purpose in five ways, and the replay checks each recorded
 answer that changes for its reason. The source's repository is private, so its
 comments carry no author association: the replay gives them `OWNER` and
 unedited. A read shorter than 40 hex, and a lens comment edited after posting,
 read nothing here (54 recorded answers). The source's `full_sha`, which matched
 a short read to the pull request's commits, is gone. A hidden (minimized) lens
 comment reads nothing: the source never read `isMinimized`, and no recorded
-call has it, so no recorded answer changes for it.
+call has it, so no recorded answer changes for it. A comment whose first line
+is `not a lens:` and that holds a hex `read at` outside a `>` quote is a lens
+that read nothing (2 recorded answers; the source cleared it).
 
 `pr_queue.py` is a port of the same project's queue, and `pr_queue.test.py`
 holds that project's queue tests with the port's names. What the port changed:
