@@ -305,8 +305,8 @@ class State(Case):
         self.assertEqual(self.numbers()[1]['requests'], 0)   # saved again
 
     def test_saved_pages_with_wrong_types_are_fetched_again(self):
-        # The right shape, wrong types inside the body: checked when read, so a damaged page is fetched again and the
-        # good pages next to it are still used.
+        # Wrong types or a missing field inside the body: checked when read, so a damaged page is fetched again (never
+        # counted as zero) and the good pages next to it are still used.
         damage = [  # (what, the list it changes: run-list pages or job pages, change)
             ('run list total_count as text', 'workflow_runs', lambda b: b.update(total_count='2')),
             ('runs not a list', 'workflow_runs', lambda b: b.update(workflow_runs={'id': 1})),
@@ -317,6 +317,17 @@ class State(Case):
             ('run created_at not a date', 'workflow_runs',
              lambda b: [r.update(created_at='yesterday') for r in b['workflow_runs']]),
             ('run path a number', 'workflow_runs', lambda b: [r.update(path=5) for r in b['workflow_runs']]),
+            ('run list body empty', 'workflow_runs', lambda b: b.clear()),
+            ('run list without total_count', 'workflow_runs', lambda b: b.pop('total_count')),
+            ('run list without its runs', 'workflow_runs', lambda b: b.pop('workflow_runs')),
+            ('runs an empty object', 'workflow_runs', lambda b: b.update(workflow_runs={})),
+            ('run list total_count true', 'workflow_runs', lambda b: b.update(total_count=True)),
+            ('run created_at a week date', 'workflow_runs',
+             lambda b: [r.update(created_at='2026-W44-7') for r in b['workflow_runs']]),
+            ('run created_at in month 13', 'workflow_runs',
+             lambda b: [r.update(created_at='2026-13-01T00:00:00Z') for r in b['workflow_runs']]),
+            ('run created_at in the basic format', 'workflow_runs',
+             lambda b: [r.update(created_at='20261101T120000Z') for r in b['workflow_runs']]),
             ('jobs total_count as text', 'jobs', lambda b: b.update(total_count='9')),
             ('jobs not a list', 'jobs', lambda b: b.update(jobs='abc')),
             ('a job not an object', 'jobs', lambda b: b.update(jobs=[1])),
@@ -324,6 +335,13 @@ class State(Case):
             ('job labels hold a number', 'jobs', lambda b: [j.update(labels=[5]) for j in b['jobs']]),
             ('job started_at not a date', 'jobs', lambda b: [j.update(started_at='yesterday') for j in b['jobs']]),
             ('job completed_at a number', 'jobs', lambda b: [j.update(completed_at=5) for j in b['jobs']]),
+            ('jobs body empty', 'jobs', lambda b: b.clear()),   # was read as a run with no jobs: 0 CI hours
+            ('jobs without total_count', 'jobs', lambda b: b.pop('total_count')),   # was: stop after page 1
+            ('jobs without its jobs', 'jobs', lambda b: b.pop('jobs')),
+            ('jobs an empty text', 'jobs', lambda b: b.update(jobs='')),
+            ('jobs total_count negative', 'jobs', lambda b: b.update(total_count=-1)),
+            ('job started_at in the basic format', 'jobs',
+             lambda b: [j.update(started_at='20261101T100100Z') for j in b['jobs']]),
         ]
         self.assertEqual(self.numbers()[0], 0)
         for what, kind, change in damage:
@@ -342,7 +360,8 @@ class State(Case):
             self.assertEqual(self.numbers()[1]['requests'], 0, what)   # the pages fetched again were saved again
 
     def test_read_only_cache_folder_with_an_old_part_file_goes_on(self):
-        # The start-up clean-up cannot remove an old .part- file: a failed cache write (reported once), not an exit.
+        # The start-up clean-up cannot remove an old .part- file: reported on its own line, not an exit; a page it then
+        # cannot save is the failed cache write (reported once).
         self.assertEqual(self.numbers()[0], 0)
         old = os.path.join(self.cache, '.part-1-old')
         open(old, 'w').close()
@@ -357,8 +376,10 @@ class State(Case):
             pass
         code, doc = self.numbers()
         self.assertEqual((code, doc['requests'], doc['cached']), (0, 0, 6), self.err)
-        self.assertIn('Permission denied', doc['cache_write_failed'])
-        self.assertEqual(self.err.count('cache not written'), 1, self.err)
+        self.assertIsNone(doc['cache_write_failed'])   # nothing had to be saved
+        self.assertEqual(self.err.count('old .part- file not removed'), 1, self.err)
+        self.assertIn('Permission denied', self.err)
+        self.assertNotIn('cache not written', self.err)
         self.assertEqual(doc['days']['total']['ci_hours'], 3.25)
         p = copy.deepcopy(PAGES)   # a page it has to fetch and cannot save: still one report, and it goes on
         p[DAY2]['workflow_runs'][0]['run_attempt'] = 2
@@ -366,8 +387,40 @@ class State(Case):
         self.clock = NOW + M.LIST_MAX_AGE + 1
         code, doc = self.numbers()
         self.assertEqual((code, doc['requests']), (0, 3), self.err)
+        self.assertIn('Permission denied', doc['cache_write_failed'])
         self.assertEqual(self.err.count('cache not written'), 1, self.err)
         self.assertEqual(sorted(os.listdir(self.cache)), saved)   # the good pages are all still there
+
+    def test_an_old_part_entry_that_cannot_go_does_not_stop_saving(self):
+        # A directory named like a .part- file: the clean-up cannot unlink it, but saving works, so the cache is
+        # not reported as unwritten and a stop still says to run again.
+        os.makedirs(os.path.join(self.cache, '.part-9-dir'))
+        os.utime(os.path.join(self.cache, '.part-9-dir'), (NOW - M.PART_AGE - 5,) * 2)
+        code, doc = self.numbers('--max-requests', '4')
+        self.assertEqual(code, 3)
+        self.assertIsNone(doc['cache_write_failed'], self.err)
+        self.assertEqual(self.err.count('old .part- file not removed'), 1, self.err)
+        self.assertNotIn('cache not written', self.err)
+        code, out = self.run_main('--max-requests', '1')
+        self.assertIn('run again with the same --cache', out)
+        code, doc = self.numbers()   # 4 + 1 pages saved by the two stopped runs: one page left of 6
+        self.assertEqual((code, doc['requests'], doc['days']['total']['ci_hours']), (0, 1, 3.25), self.err)
+
+    def test_an_old_part_file_another_run_removed_first_is_ignored(self):
+        os.makedirs(self.cache)
+        old = os.path.join(self.cache, '.part-1-old')
+        open(old, 'w').close()
+        os.utime(old, (NOW - M.PART_AGE - 5,) * 2)
+        real = os.unlink
+
+        def raced(path, *a, **kw):   # the other run's unlink lands first
+            real(path, *a, **kw)
+            raise FileNotFoundError(2, 'No such file or directory', path)
+
+        with mock.patch.object(M.os, 'unlink', raced):
+            code, doc = self.numbers()
+        self.assertEqual((code, doc['cache_write_failed'], self.err), (0, None, ''))
+        self.assertFalse(os.path.exists(old))
 
     def test_a_write_that_fails_half_way_leaves_no_page_and_goes_on(self):
         real = json.dump
@@ -494,15 +547,28 @@ class State(Case):
 class Answers(Case):
     def test_an_answer_of_the_wrong_shape_is_an_api_error_and_not_saved(self):
         # The same check as a saved page: an answer that would crash the counting stops with exit 2 instead.
-        for body in ([], {'total_count': 'many', 'workflow_runs': []},
-                     {'total_count': 1, 'workflow_runs': [{'id': 9, 'created_at': 5}]}):
-            self.routes[DAY1] = [ok(body)]
-            self.serve(self.routes)
+        for ep, body in ((DAY1, []), (DAY1, {'total_count': 'many', 'workflow_runs': []}),
+                         (DAY1, {'total_count': 1, 'workflow_runs': [{'id': 9, 'created_at': 5}]}),
+                         (DAY1, {'total_count': 1, 'workflow_runs': [{'id': 9, 'created_at': '2026-W44-7'}]}),
+                         (DAY1, {}), (DAY1, {'workflow_runs': []}), (DAY1, {'total_count': 0}),
+                         (DAY1, {'total_count': 0, 'jobs': []}),   # a jobs answer where runs were asked for
+                         (J101, {'total_count': 2}), (J101, {'jobs': []})):
+            self.serve({**{k: [ok(v)] for k, v in PAGES.items()}, ep: [ok(body)]})
             code, doc = self.numbers()
             self.assertEqual((code, doc), (2, None), body)
-            self.assertIn(f'{DAY1}: unexpected answer', self.err)
+            self.assertIn(f'{ep}: unexpected answer', self.err)
             self.assertEqual(len(self.err.splitlines()), 1, self.err)
-        self.assertEqual(os.listdir(self.cache), [])
+            for name in os.listdir(self.cache):   # the bad answer was not saved
+                with open(os.path.join(self.cache, name)) as f:
+                    self.assertFalse(json.load(f)['key'].startswith(ep), body)
+
+    def test_an_answer_nested_too_deep_is_an_api_error(self):
+        self.routes[DAY1] = [ok('[' * 100000 + ']' * 100000)]
+        self.serve(self.routes)
+        code, doc = self.numbers()
+        self.assertEqual((code, doc), (2, None))
+        self.assertIn(f'{DAY1}: not JSON', self.err)
+        self.assertEqual(len(self.err.splitlines()), 1, self.err)
 
 
 class RateLimit(Case):

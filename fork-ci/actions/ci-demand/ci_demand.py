@@ -25,11 +25,11 @@ run and all its jobs are completed (keyed by run id and attempt, so a re-run is 
 every run in it is completed and its window ended over an hour ago, and then reused for LIST_MAX_AGE (a later re-run
 changes the run). Where the OS has user ids (not Windows), a folder another user owns is refused and the folder is
 made 0700 (a filesystem where chmod has no effect is refused). Writes are a `.part-` file then a rename. A file
-that is unreadable, half-written, damaged (also nested too deep, or a page field of the wrong type), saved for another
-page or in another FORMAT is fetched again; a failed write (also an old `.part-` file that cannot be removed) only
-costs the cache; `.part-` files older than an hour go.
+that is unreadable, half-written, damaged (also nested too deep, or a page field missing or of the wrong type), saved
+for another page or in another FORMAT is fetched again; a failed write only costs the cache; `.part-` files older than
+an hour go (one that cannot be removed is reported and the run goes on).
 Exit: 0 complete, 2 bad arguments (a config file of the wrong shape too) or an API error (an answer with a field
-of the wrong type too), 3 incomplete (budget).
+missing or of the wrong type too), 3 incomplete (budget).
 """
 import argparse, contextlib, datetime as dt, hashlib, json, math, os, re, subprocess, sys, time
 
@@ -88,6 +88,7 @@ class Api:
                 os.chmod(cache, 0o700)
                 if os.stat(cache).st_mode & 0o077:
                     raise ValueError(f'--cache {cache} cannot be made private (0700)')
+        cleanup_failed = None
         for name in os.listdir(cache):   # a killed write leaves a .part- file; it is never read
             p = os.path.join(cache, name)
             try:
@@ -95,20 +96,22 @@ class Api:
                     os.unlink(p)
             except FileNotFoundError:
                 pass   # another run removed it first
-            except OSError as e:   # a read-only folder: the pages in it can still be read
-                self.write_failed(e)
+            except OSError as e:   # a read-only folder or a directory: only the clean-up failed (a save says its own)
+                cleanup_failed = cleanup_failed or e
+        if cleanup_failed:
+            print(f'ci-demand: old .part- file not removed ({shown(cleanup_failed)}); going on', file=sys.stderr)
 
     def _path(self, key):
         return os.path.join(self.cache, hashlib.sha256(key.encode()).hexdigest()[:40] + '.json')
 
-    def cached(self, key, max_age=None):
+    def cached(self, key, kind, max_age=None):
         try:
             with open(self._path(key), encoding='utf-8') as f:
                 doc = json.load(f)
         except (OSError, ValueError, RecursionError):   # RecursionError: nested too deep
             return None
         if not (isinstance(doc, dict) and doc.get('v') == FORMAT and doc.get('key') == key
-                and page_ok(doc.get('body'))):   # a body field of the wrong type: damaged, fetched again
+                and page_ok(doc.get('body'), kind)):   # a body field missing or of the wrong type: fetched again
             return None
         saved = doc.get('saved')
         try:   # float(): json.load reads NaN, Infinity and any-size integers; a huge one raises OverflowError
@@ -143,8 +146,8 @@ class Api:
             self.save_failed = str(e)
             print(f'ci-demand: cache not written ({shown(e)}); going on without it', file=sys.stderr)
 
-    def get(self, endpoint):
-        """The decoded JSON of one GET; Budget when the cap or reserve would be crossed."""
+    def get(self, endpoint, kind):
+        """The decoded JSON of one GET (a `kind` page, see page_ok); Budget when the cap or reserve would be crossed."""
         for attempt in range(RETRIES + 1):
             if self.requests >= self.max_requests:
                 raise Budget(f'--max-requests {self.max_requests} reached')
@@ -167,8 +170,8 @@ class Api:
                     doc = json.loads(body)
                 except (ValueError, RecursionError):
                     raise ApiError(f'{endpoint}: not JSON')
-                if not page_ok(doc):
-                    raise ApiError(f'{endpoint}: unexpected answer (a field of the wrong type)')
+                if not page_ok(doc, kind):
+                    raise ApiError(f'{endpoint}: unexpected answer (a field missing or of the wrong type)')
                 return doc
             secondary = status in (403, 429) and 'rate limit' in body.lower()
             if status in (403, 429) and (h.get('retry-after') or remaining == 0 or secondary):
@@ -217,12 +220,15 @@ def is_count(n):
 
 
 def is_date(s, needed=False):
-    """A date ts() reads; or, when not needed, empty (ts() gives None)."""
+    """A date as GitHub writes it (2026-11-01T12:00:00Z; not the other ISO 8601 forms fromisoformat reads, as the day
+    is its first 10 characters); or, when not needed, empty (ts() gives None)."""
     if not s:
         return not needed
+    if not (isinstance(s, str) and re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z', s)):
+        return False
     try:
-        return isinstance(s, str) and ts(s) is not None
-    except ValueError:
+        return ts(s) is not None
+    except ValueError:   # a month 13 or a day 32
         return False
 
 
@@ -239,12 +245,12 @@ def job_ok(j):
         and all(is_date(j.get(k)) for k in ('created_at', 'started_at', 'completed_at'))
 
 
-def page_ok(body):
-    """A runs-list or jobs page whose fields have the types the counting uses (a saved file can hold anything)."""
-    if not (isinstance(body, dict) and is_count(body.get('total_count', 0))):
+def page_ok(body, kind):
+    """A runs-list (`kind` 'workflow_runs') or jobs ('jobs') page that has the fields the counting uses, of their
+    types (a saved file can hold anything; a missing field would count as no runs or no jobs)."""
+    if not (isinstance(body, dict) and is_count(body.get('total_count')) and isinstance(body.get(kind), list)):
         return False
-    runs, jobs = body.get('workflow_runs', []), body.get('jobs', [])
-    return isinstance(runs, list) and isinstance(jobs, list) and all(map(run_ok, runs)) and all(map(job_ok, jobs))
+    return all(map(run_ok if kind == 'workflow_runs' else job_ok, body[kind]))
 
 
 def list_runs(api, repo, start, end, out):
@@ -254,9 +260,9 @@ def list_runs(api, repo, start, end, out):
     page, seen = 1, 0
     while True:
         ep = f'{base}&page={page}'
-        body = api.cached(ep, LIST_MAX_AGE) if settled else None
+        body = api.cached(ep, 'workflow_runs', LIST_MAX_AGE) if settled else None
         if body is None:
-            body = api.get(ep)
+            body = api.get(ep, 'workflow_runs')
             if settled and all(r.get('status') == 'completed' for r in body.get('workflow_runs', [])):
                 api.save(ep, body)
         total = body.get('total_count', 0)
@@ -282,9 +288,9 @@ def run_jobs(api, repo, run):
     while True:
         ep = f'repos/{repo}/actions/runs/{run["id"]}/jobs?filter=all&per_page={PAGE}&page={page}'
         key = f'{ep}#attempt={run.get("run_attempt", 1)}'
-        body = api.cached(key)
+        body = api.cached(key, 'jobs')
         if body is None:
-            body = api.get(ep)
+            body = api.get(ep, 'jobs')
             if run.get('status') == 'completed' and all(j.get('status') == 'completed' for j in body.get('jobs', [])):
                 api.save(key, body)
         jobs += body.get('jobs', [])
