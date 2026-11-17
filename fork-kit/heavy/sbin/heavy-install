@@ -313,7 +313,17 @@ def install(a, stop_after=None):
     limits = check_options(a)
     check_old_state()
     old = read_config()
-    sweep_timer = a.sweep_timer if a.sweep_timer is not None else bool(old.get('sweep_timer'))
+    units_left = any(ours_unit(u) for u in sweep_unit_paths())
+    if a.sweep_timer is not None:
+        sweep_timer = a.sweep_timer
+    elif 'sweep_timer' in old:
+        sweep_timer = bool(old['sweep_timer'])
+    else:
+        # an installer from before the sweep (a rollback) rewrote the config without the setting, and kept the units
+        sweep_timer = units_left
+        if units_left:
+            say('kept the sweep timer units: the config did not say (a rollback with an older installer); '
+                '--no-sweep-timer removes them')
     foreign = [u for u in sweep_unit_paths() if os.path.lexists(p(u)) and not ours_unit(u)]
     if sweep_timer and foreign:
         raise Refused(f'{foreign[0]} exists and was not written by this kit: remove it and run again')
@@ -341,8 +351,8 @@ def install(a, stop_after=None):
         unit_path = f'{UNIT_DIR}/{cfg["slice"]}'
     if unit_path:
         cfg['slice_unit'] = unit_path
-    if sweep_timer:
-        cfg['sweep_timer'] = True
+    if sweep_timer or units_left:
+        cfg['sweep_timer'] = sweep_timer
     write_file(CONFIG, json.dumps(cfg, indent=2, sort_keys=True) + '\n')
     done('config')
     if limits:

@@ -392,6 +392,12 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(own(['tmux', 'new', 'pytest']), ['tmux'])
         self.assertEqual(own(['bash']), ['bash'])
         self.assertEqual(own([]), [])
+        self.assertEqual(own(['timeout', '60', 'bash', '-c', 'pytest -x --pw=a'], shown=True),
+                         ['timeout', 'bash', '-c', '[pytest ... 16 chars]'])
+        self.assertEqual(own(['bash', '-c', 'pytest'], shown=True), ['bash', '-c', 'pytest'])
+        self.assertEqual(own(['bash', '-c', 'admin:pw'], shown=True), ['bash', '-c', '[8 chars]'])
+        self.assertEqual(own(['python3', '-m', 'pytest'], shown=True), ['python3', '-m', 'pytest'])
+        self.assertEqual(own(['java', '-jar', 'server.jar'], shown=True), ['java', '-jar', 'server.jar'])
 
     def test_a_tree_stops_only_its_own_unit_and_never_a_session_or_a_live_heavy_below_it(self):
         h, svc = self.host, f'{CG}/app.slice/t3code.service'
@@ -433,6 +439,32 @@ class SweepTests(unittest.TestCase):
             self.assertNotIn(secret, text)
         self.assertIn('pid 5001 bash (3h0m old, cpu 90%, unit t3code.service): bash run.test.sh (+1 args)', out)
         self.assertIn('java -jar server.jar (+2 args)', out)
+
+    def test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal(self):
+        # #193: the -c/-e text is the own command (it decides "test-shaped"), but a short password in it is not
+        # token-shaped; only its first word, when it looks like a program name, is shown
+        self.cfg.update(testPatterns=['(^|[ /])pytest( |$)'])
+        self.write_machine()
+        self.orphan(5101, ['sh', '-c', 'mysql -uroot -phunter2 db && pytest'], cpu=90)
+        self.orphan(5102, ['bash', '-c', 'lftp -u admin:hunter3 x; pytest -q'], cpu=90)
+        self.orphan(5103, ['sh', '-c', 'PASS=hunter4 pytest'], cpu=90)
+        self.orphan(5104, ['python3', '-c', "import os; os.system('mysql -phunter5')", 'x'], cpu=90)
+        self.orphan(5105, ['node', '-e', "run('-phunter6')"], cpu=90)
+        self.orphan(5106, ['sh', '-c', '-phunter7'], cpu=90)
+        self.orphan(5107, ['python3', '/tmp/ghp_SECRETVALUE456/run.test.py'], cpu=90)
+        code, out, _ = self.run_sweep()
+        with open(os.path.join(self.report, 'sweep.log')) as f:
+            text = f.read() + out
+        with open(os.path.join(self.report, 'last-report.txt')) as f:
+            text += f.read()
+        for secret in ('hunter2', 'hunter3', 'hunter4', 'hunter5', 'hunter6', 'hunter7', 'admin:', 'ghp_SECRETVALUE456'):
+            self.assertNotIn(secret, text)
+        self.assertIn('unit t3code.service): sh -c [mysql ... 35 chars]', out)
+        self.assertIn('unit t3code.service): bash -c [lftp ... 34 chars]', out)
+        self.assertIn('unit t3code.service): sh -c [19 chars]', out)
+        self.assertIn('unit t3code.service): python3 -c [import ... 39 chars] (+1 args)', out)
+        self.assertIn('unit t3code.service): sh -c [9 chars]', out)
+        self.assertEqual(self.signalled(), [5101, 5102, 5103], out)     # matching still reads the whole text
 
     def test_redact(self):
         r = self.mod.redact
@@ -768,6 +800,22 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(sorted(c[-1] for c in self.host.calls('docker', 'rm')), sorted([self.host.full[gone], self.host.full[dead]]))
         self.assertFalse(self.host.exists(3002))
 
+    def test_container_labelled_in_a_kept_scope_is_only_reported(self):
+        # #193: `HEAVY_KEEP=1 heavy ./db-up.sh` labels its container with the kept scope and exits; systemd then
+        # drops the empty scope, but the container was kept on purpose
+        kept = self.heavy_scope_name('./db-up.sh', keep=True)
+        cid = self.host.container('a', 'db1', 3 * 86400, owner=f'uid={UID},scope={kept}')
+        self.host.container('b', 'db2', 3 * 86400, running=False, owner=f'uid={UID},scope={kept}')
+        young = self.host.container('c', 'db3', 60, owner=f'uid={UID},scope={kept}')
+        code, out, _ = self.run_sweep()
+        self.assertEqual(code, 0, out)
+        self.nothing_stopped()
+        self.assertIn(f'report only: container {cid} db1', out)
+        self.assertIn(f'owner {kept} was kept on purpose (HEAVY_KEEP=1)', out)
+        self.assertIn('report only: container ' + 'b' * 12 + ' db2', out)
+        self.assertNotIn(young, out)
+        self.assertIn('0 containers removed, 2 reported', out)
+
     def test_young_container_whose_owner_is_gone_waits(self):
         self.host.container('a', 'db1', 60, owner=f'uid={UID},pid=4242,start=77')
         self.run_sweep()
@@ -1013,9 +1061,17 @@ MUTATIONS = {
     'report folder checked': ('problem = folder_problem(folder, s.uid)', 'problem = None',
                               'test_report_folder_others_could_change_is_refused'),
     'command line masked': ("cmd = redact(' '.join(own)) if own else", "cmd = ' '.join(own) if own else",
-                            'test_secrets_and_other_arguments_never_reach_the_log_the_report_or_the_journal'),
-    'only the own command shown': ("own = own_command(argv) if not is_session(self) else argv[:1]", 'own = argv',
+                            'test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal'),
+    'only the own command shown': ("own = own_command(argv, shown=True) if not is_session(self) else argv[:1]",
+                                   'own = argv',
                                    'test_secrets_and_other_arguments_never_reach_the_log_the_report_or_the_journal'),
+    'inline code cut when shown': ('return argv[:1] + [a, code_text(argv[i + 1])]', 'return argv[:1] + argv[i:i + 2]',
+                                   'test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal'),
+    'only a program-like first word': ("if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./+-]*', first):",
+                                       'if not first:',
+                                       'test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal'),
+    'kept-scope container only reported': ("if gone and is_kept_scope(owner['scope']):", 'if False:',
+                                           'test_container_labelled_in_a_kept_scope_is_only_reported'),
 }
 
 

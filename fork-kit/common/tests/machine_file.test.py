@@ -187,6 +187,12 @@ class MachineFile(unittest.TestCase):
             if kit != 'version':
                 self.assertIsInstance(self.read(kit), dict)
 
+    def test_windows_is_refused_until_its_checks_exist(self):
+        # #193: owner, mode and link checks are POSIX only; no kit reads the file on Windows yet
+        self.write(GOOD)
+        with mock.patch.object(self.mf.os, 'name', 'nt'):
+            self.refused('Windows')
+
     def test_default_paths(self):
         self.assertEqual(mf.default_path('linux'), '/etc/fork-kit/machine.json')
         self.assertEqual(mf.default_path('darwin'), '/Library/Application Support/fork-kit/machine.json')
@@ -207,6 +213,7 @@ MUTATIONS = {
                   'test_deep_json_is_refused_cleanly'),
     'no key twice': ('json.loads(text, object_pairs_hook=_no_duplicates)', 'json.loads(text)',
                      'test_a_key_given_twice_is_refused'),
+    'Windows refused': ("    if os.name == 'nt':\n", "    if False:\n", 'test_windows_is_refused_until_its_checks_exist'),
 }
 
 
