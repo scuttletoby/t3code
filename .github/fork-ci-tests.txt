@@ -57,6 +57,7 @@ fork-ci/actions/pr-queue/review_judge.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 fork-ci/actions/test-select/test-select.test.py ~15s
 fork-ci/actions/test-select/trace-check.test.py
+fork-ci/actions/weakened-tests/weakened_tests.test.py
 fork-kit/common/tests/free_contract.test.py ~5s
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py ~65s
