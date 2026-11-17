@@ -61,10 +61,10 @@ class Setup(Case):
         self.ready()
         policy = json.loads(self.read('/etc/t3code/policy.json'))
         self.assertEqual(policy['settings'], {'agentSlots.maxPerMachine': {'value': 2, 'locked': True},
-                                              'automaticUpdates': {'value': False, 'locked': True},
                                               'linkedEnvironmentsEnabled': {'value': True, 'locked': True}})
         self.assertEqual(policy['limits']['maxRuntimeMode'], 'full-access')
         self.assertEqual((policy['limits']['connect'], policy['limits']['webhookTasks']), (False, False))
+        self.assertEqual(policy['limits']['updates'], {'mode': 'off'})   # the only thing keeping updates off
         wsl = self.read('/etc/wsl.conf')
         for line in ('[automount]\nenabled=false\nmountFsTab=false', '[interop]\nenabled=false\nappendWindowsPath=false',
                      '[boot]\nsystemd=true', 'generateResolvConf=false', '[user]\ndefault=root'):
@@ -326,7 +326,20 @@ class Setup(Case):
         code, out = self.setup_run()
         self.assertEqual(code, 1, out)
         self.assertIn('journalctl -u t3code-agents.service', out)
+        self.assertNotIn('its log:', out)   # an empty journal: the message still comes
         self.assertTrue(os.path.isfile(self.path(k.PENDING)))
+        # T3's own error comes with it, from the unit's journal
+        self.write('/log/journal', 'starting\n[12:00:01.234] ERROR (#1): ManagedPolicyFileError: T3 Code cannot use '
+                                   'the managed policy \x1b]52;c;eA==\x07at x\n    at stack (y.js:1)\n'
+                                   'Main process exited, code=exited, status=77/NOPERM\n')
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('its log: [12:00:01.234] ERROR (#1): ManagedPolicyFileError: T3 Code cannot use the managed '
+                      'policy ?]52;c;eA==?at x:', out)   # terminal controls from the journal never reach the terminal
+        args = self.log('journalctl')[-1].split()   # only this run's journal, not an earlier crash's
+        self.assertEqual(args[:2] + args[4:], ['-u', 't3code-agents.service', '-n', '80', '-o', 'cat', '--no-pager'])
+        self.assertEqual(args[2], '--since')
+        self.assertLessEqual(abs(int(args[3].lstrip('@')) - time.time()), 300)
         os.unlink(self.path('/log/t3-crash'))
         self.assertEqual(self.setup_run()[0], 0)
         self.assertFalse(os.path.lexists(self.path(k.PENDING)))
@@ -621,7 +634,7 @@ class Refused(Case):
         self.assertEqual(json.loads(readme)['pc-agents'], example)
         self.machine(example)
         self.assertEqual(k.config()['agentUid'], 1100)
-        self.assertEqual(k.config()['lockedSettings'], {'agentSlots.enabled': True, 'agentSlots.maxPerMachine': 2})
+        self.assertEqual(k.config()['lockedSettings'], {})   # fork-only settings would stop an upstream t3Version
 
     def test_bad_config(self):
         for change, why in (({'lockedSettings': {'linkedEnvironmentsEnabled': False}}, 'set by the kit itself'),
