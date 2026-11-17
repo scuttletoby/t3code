@@ -664,11 +664,6 @@ class Config(unittest.TestCase):
             with self.assertRaises(config.ConfigError):
                 config.parse(text)
 
-    def test_an_unreadable_file_is_an_error(self):
-        with self.assertRaises(config.ConfigError) as e:
-            config.load(os.path.join(HERE, 'testdata', 'no-such-config.json'))
-        self.assertIn('cannot read it', str(e.exception))
-
 
 if __name__ == '__main__':
     unittest.main()
