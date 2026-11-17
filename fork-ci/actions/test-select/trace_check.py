@@ -11,10 +11,11 @@ to see and fix: on a schedule or after each push to the default branch, never as
   python3 -I trace_check.py --config .github/test-select.json [--run 'python3 -I -B {test}'] [--jobs 2]
       [--only GLOB]... [--root .]
 Needs strace on PATH and ptrace of its own children (kernel.yama.ptrace_scope 0 or 1; no root). Without strace, or
-when a test's trace does not show its own file read, the check fails (it never passes unchecked). A test's own result does not matter here
-(its job runs it); only the files it touched. Not seen: a folder it lists (the files it then reads are), files read
+when a test's trace does not show its own file read, the check fails (it never passes unchecked). A test that fails,
+errs or skips tests under the trace is "not checked" (what it did not run, it did not touch) and fails the check too:
+run it as the test job does (same runner, env). Not seen: a folder it lists (the files it then reads are), files read
 through a process that is not its child (a server already running), and files read through git (git reads .git).
-Exit 0: no miss; 1: a miss, or a test that could not be traced.
+Exit 0: no miss; 1: a miss, a test not traced or not checked, or no test to trace.
 """
 import argparse, codecs, os, posixpath, re, shlex, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -92,24 +93,42 @@ def touched(log, root):
     return out
 
 
+SKIPPED = re.compile(rb'\bskipped=(\d+)|\b(\d+) skipped\b')   # unittest's "OK (skipped=2)", pytest's "2 skipped"
+
+
 def trace(root, test, run, keep):
-    """(touched paths, note or None)."""
+    """(touched paths, note or None). A note means the test was not checked whole: no trace, or it failed, erred or
+    skipped tests under the trace (what it did not run, it did not touch)."""
     fd, log = tempfile.mkstemp(prefix='trace-', suffix='.log', dir=keep)
     os.close(fd)
+    fd, out = tempfile.mkstemp(prefix='trace-', suffix='.out', dir=keep)
     try:
         cmd = ['strace', '-f', '-qq', '-z', '-y', '-s', '4096', '--seccomp-bpf', '-e', 'trace=' + CALLS, '-o', log, '--',
                'sh', '-c', run.replace('{test}', shlex.quote(test))]
-        r = subprocess.run(cmd, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE, timeout=3600)
+        try:
+            r = subprocess.run(cmd, cwd=root, stdin=subprocess.DEVNULL, stdout=fd, stderr=subprocess.STDOUT,
+                               timeout=3600)
+        finally:
+            os.close(fd)
+        with open(out, 'rb') as f:
+            f.seek(max(0, os.path.getsize(out) - 65536))
+            said = f.read()
+        last = said.decode(errors='replace').strip().splitlines()[-3:]
         with open(log, encoding='latin-1') as f:
             got = touched(f, root)
         if not got:
-            return got, f'no trace (strace exit {r.returncode}: {r.stderr.decode(errors="replace").strip()[-300:]})'
-        return got, None if r.returncode == 0 else f'the test exited {r.returncode} under strace (its result is not judged here)'
+            return got, f'no trace (exit {r.returncode}: {" | ".join(last)[-300:]})'
+        if r.returncode:
+            return got, f'not checked: the test failed under the trace (exit {r.returncode}: {" | ".join(last)[-300:]})'
+        skipped = sum(int(a or b) for a, b in SKIPPED.findall(said))
+        if skipped:
+            return got, f'not checked: {skipped} skipped under the trace (run it as the test job does: same runner, env)'
+        return got, None
     except subprocess.TimeoutExpired:
         return {}, 'no trace: the test ran past an hour'
     finally:
         os.unlink(log)
+        os.unlink(out)
 
 
 def picks(config, rules, always_run, graph, test, rel):
@@ -119,7 +138,10 @@ def picks(config, rules, always_run, graph, test, rel):
             return f'every test ({why})'
     if test in always_run:
         return 'always_run'
-    files, dirs, globs, marks = graph.inputs(test)
+    try:
+        files, dirs, globs, marks = graph.inputs(test)
+    except ts.AllTests as e:   # test-select runs every test then: nothing to miss
+        return f'every test ({e})'
     if marks:
         return 'always'
     return 'takes it in' if ts.reaches([rel], files, dirs, globs) else None
@@ -138,14 +160,19 @@ def main(argv=None):
         return 1
     root = os.path.realpath(a.root)
     tracked = set(ts.git('ls-files', '-z', cwd=root).split('\0')) - {''}
-    tests, always, import_roots, always_run = ts.load_config(root, a.config)
+    tests, always, import_roots, always_run, inputs = ts.load_config(root, a.config)
     every = ts.universe(tests, tracked)
     always_run = ts.always_run_of(always_run, every, a.config)
+    declared = ts.declared_of(inputs, every, a.config)
     if a.only:
         every = [t for t in every if any(docs_scope.glob_re(g).match(t) for g in a.only)]
+    if not every:   # a check of nothing never passes
+        print(f'trace-check: no test to trace (--only {a.only} matches none of the config\'s tests)')
+        return 1
     rules = [(a.config, 'the test-select config')] + list(ts.BUILTIN_ALL) + always
     repo = ts.Repo(root, tracked)
-    graph = ts.Graph(repo, import_roots)
+    graph = ts.Graph(repo, import_roots, declared)
+    print(f'trace-check: tracing {len(every)} tests, {max(1, a.jobs)} at once', flush=True)
     keep = tempfile.mkdtemp(prefix='trace-check-')
     misses, broken = [], []
     try:
@@ -155,11 +182,15 @@ def main(argv=None):
         shutil.rmtree(keep, ignore_errors=True)
     for t in every:
         got, note = traces[t]
-        if note:
+        if note:   # still judged by what it touched; but never clean
             print(f'{t}: {note}')
+            broken.append(t)
             if not got:
-                broken.append(t)
                 continue
+        try:
+            graph.inputs(t)
+        except ts.AllTests as e:
+            print(f'{t}: every test runs when it is reached ({e})')
         seen = {}
         for path, what in got.items():
             rel = repo.rel(path) if path.startswith(root + '/') else None
@@ -167,7 +198,8 @@ def main(argv=None):
                 seen[rel] = what
         if t not in seen:   # the run command never ran it: nothing was measured
             print(f'{t}: the trace never shows the test file read (does --run run it?)')
-            broken.append(t)
+            if t not in broken:
+                broken.append(t)
             continue
         for rel, what in sorted(seen.items()):
             if not picks(a.config, rules, always_run, graph, t, rel):
@@ -175,7 +207,8 @@ def main(argv=None):
         print(f'{t}: {len(seen)} tracked files touched')
     for t, rel, what in misses:
         print(f'miss: {t} {what} {rel}; a pull request that changes only {rel} would not run it')
-    print(f'trace-check: {len(every)} tests, {len(misses)} misses, {len(broken)} not traced')
+    print(f'trace-check: {len(every)} tests, {len(misses)} misses, {len(broken)} not traced or not checked '
+          f'(failed or skipped under the trace)')
     return 1 if misses or broken else 0
 
 

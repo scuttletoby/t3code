@@ -59,19 +59,26 @@ nor add an output.
     { "glob": "tests/fixtures/**", "why": "shared fixtures" }
   ],
   "always_run": [{ "glob": "tests/test_inventory.py", "why": "reads file names from a data file" }],
+  "inputs": [{ "test": "tests/test_backup.py", "reads": [], "why": "lists only its temp folders" }],
   "import_roots": ["lib"]
 }
 ```
 
 - `tests`: globs from the repository root (`**/` any folders, `*` and `?` inside one name) or literal paths, in the
-  order the list keeps. A literal path that is not in the repository fails the step (a renamed test must be renamed
-  here too).
+  order the list keeps. A literal path that is not in the repository, or a glob that matches no file of it, fails the
+  step (a renamed or moved test must be renamed here too; it would otherwise drop out of every run, green).
 - `always_all`: a changed path that matches one runs every test, with its `why` in the log. List what tests read in
   ways the action cannot see: a runner, helpers every test loads, fixture folders, data files whose names come from
   data.
 - `always_run`: test files (globs over `tests`' files) that run on every pull request, with their `why` in the log:
   a test the [trace check](#trace-check) shows reading files the action cannot place. A glob that matches no test
   file fails the step (a renamed test must be renamed here too).
+- `inputs`: what a test reads that the action cannot see, declared: `test` (a glob over `tests`' files), `reads`
+  (globs; may be empty) and `why`. The test's own "always runs" reasons from its own file then give way to `reads`:
+  a changed path that matches one picks it, and the log says `(declared in inputs)`. A reason from any other file it
+  reaches still runs it always. Use it for a test that lists folders the action cannot work out but that are not the
+  repository (its temporary folders, passed to helpers as parameters). A wrong declaration is a miss the
+  [trace check](#trace-check) reports. A `test` glob that matches no test file fails the step.
 - `import_roots`: folders searched for imports after the importing file's folder and the `sys.path` entries it can
   work out (code that loads from an install path that mirrors a repository folder).
 
@@ -100,6 +107,10 @@ Worked out from the checkout on every run (never cached, so it cannot go stale),
     names no place;
   - a known folder with an unknown rest (`ROOT / "plugins" / name`) takes in that folder; for a folder the file is
     inside (its own folder or the root), see the next section;
+  - an unknown start with a known rest (a parameter, `Path.cwd()`, `os.getcwd()`, an environment variable, `x +=
+    "/name"`, a path built part by part in a loop, joined onto `"/data/b.json"`) takes in every repository path that
+    ends in that rest (`**/data/b.json`; a listed one, everything under such folders); a rest without a `/` before
+    it is not placed: see the next section;
   - text with a space, quote, `(` or `$` is a message or a shell line, not a path; a temporary folder the test makes
     (`tempfile`) and paths under it are not the repository;
 - **shell and JavaScript files** it reaches (`.sh`, `.bash`, `.mjs`, `.cjs`, `.js`, or such a `#!` line): every word
@@ -116,11 +127,16 @@ A deleted path counts as present, so a test that still names a deleted or rename
 The step log names the reason (`run X: always (file:line: why)`):
 
 - its own file lists the repository (`git ls-files`), lists a folder it cannot work out, builds a path under its own
-  folder or the root that it cannot work out (`HERE / name`, `f"{ROOT}/{x}"`), or (shell) uses a path from a
-  variable not set from its own folder;
+  folder or the root that it cannot work out (`HERE / name`, `f"{ROOT}/{x}"`), lists a folder with an unknown start
+  and a relative rest, or (shell) uses a path from a variable not set from its own folder;
+- its own file starts a listing process (`find`, `ls`, `tree`, `du`, `grep -r`, `rg`, `fd`, in an argument list or a
+  shell command string) on a folder it cannot work out or on the working directory (a temporary folder and a named
+  repository folder are placed as above);
 - it reaches, in any file, a module run by a name it cannot work out (`python -m`, `runpy`), a listing of the
   repository root, a value with more than 64 forms that names a repository path, or a value deeper than 40 steps;
 - `always_run` names it.
+
+`inputs` turns the first two kinds off for a test whose own file it declares (see Config).
 
 ## Every test runs when
 
@@ -164,9 +180,20 @@ trace-check:
         jobs: "2"
 ```
 
-It fails, never passes unchecked, when strace is missing or a test's trace does not show its own file read. A test
-that fails under the trace is still judged by what it touched. Not seen: folder listings (the files read after them
+It fails, never passes unchecked, when strace is missing, `--only` matches no test, a test's trace does not show its
+own file read, or a test fails, errs or skips tests under the trace: what a test did not run, it did not touch, so it
+is reported `not checked` (and still judged by what it touched). Run it as the test job runs the tests: the same
+runner, environment variables and working directory, or tests that skip there skip here and fail the check. A test
+whose inputs run every test is reported and checked on. The last line gives the number of tests, misses and tests
+not checked. Not seen: folder listings (the files read after them
 are), files read by a process the test did not start, and files git reads.
+
+## What it saves
+
+It depends on how the tests are built. A test runs when its import closure reaches the change, so a helper module
+most tests import passes its inputs to all of them. On its first caller (116 test files, most importing one large
+tool module), 48 tests always ran on every pull request before `inputs`; see that caller's pull request for the
+measured wall time per pull request.
 
 ## Tests
 

@@ -136,7 +136,8 @@ class Picks(Repo):
         super().setUp()
         self.write({'tests/test_a.py': 'import os\nopen(os.path.join(os.path.dirname(__file__), "in.txt"))\n',
                     'tests/in.txt': '', 'tests/test_b.py': 'import subprocess\nsubprocess.run(["git", "ls-files"])\n',
-                    'other.txt': '', 'tests/_help.py': ''})
+                    'other.txt': '', 'tests/_help.py': '', 'tools/alone.py': '',
+                    'tests/test_c.py': 'import sys\nsys.path.insert(0, sys.argv[0])\nimport alone\n'})
         self.commit()
         files = set(subprocess.run(['git', 'ls-files'], cwd=self.d, capture_output=True, text=True).stdout.split())
         self.graph = TC.ts.Graph(TC.ts.Repo(self.d, files), [])
@@ -158,6 +159,9 @@ class Picks(Repo):
     def test_a_test_test_select_always_picks(self):
         self.assertEqual(self.picks('tests/test_b.py', 'other.txt'), 'always')
 
+    def test_a_test_whose_inputs_run_every_test(self):   # reported, never a crash of the whole check
+        self.assertRegex(self.picks('tests/test_c.py', 'other.txt'), r'^every test \(.*import alone')
+
 
 @unittest.skipUnless(shutil.which('strace'), 'strace is not installed here (the trace tests need it)')
 class EndToEnd(Repo):
@@ -177,6 +181,10 @@ class EndToEnd(Repo):
         self.assertNotIn('test_seen.py reads', out)   # its input is named in its code: picked, no miss
         self.assertNotIn('data/index.json', out.split('miss:', 1)[1])   # named in its code: picked
         self.assertIn('trace-check: 2 tests, 1 misses, 0 not traced', out)
+        rc, out = self.check({'tests': ['tests/test_*.py'], 'inputs': [   # a declaration that misses it
+            {'test': 'tests/test_hidden.py', 'reads': ['data/*.md'], 'why': 'wrong'}]})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('miss: tests/test_hidden.py reads data/hidden.txt;', out)
 
     def test_always_run_covers_it(self):
         rc, out = self.check({'tests': ['tests/test_*.py'],
@@ -189,12 +197,34 @@ class EndToEnd(Repo):
         self.assertEqual(rc, 0, out)
         self.assertIn('trace-check: 1 tests, 0 misses', out)
 
-    def test_a_failing_test_is_still_judged_by_what_it_touched(self):
-        self.write({'tests/test_seen.py': 'import os\nopen(os.path.join(os.path.dirname(__file__), "seen.txt"))\n'
-                    'raise SystemExit(3)\n'})
+    def test_a_failing_test_is_not_checked(self):   # what it never reached, it never touched: never clean
+        for code in ('import os\nopen(os.path.join(os.path.dirname(__file__), "seen.txt"))\nraise SystemExit(3)\n',
+                     'import missing_module_xyz\nopen("data/hidden.txt")\n'):
+            with self.subTest(code):
+                self.write({'tests/test_seen.py': code})
+                rc, out = self.check({'tests': ['tests/test_seen.py']})
+                self.assertEqual(rc, 1, out)
+                self.assertIn('tests/test_seen.py: not checked: the test failed under the trace (exit ', out)
+                self.assertIn('trace-check: 1 tests, 0 misses, 1 not traced or not checked', out)
+
+    def test_a_skipped_test_is_not_checked(self):   # unittest's skips: a runner without what the test needs
+        self.write({'tests/test_seen.py': 'import unittest\nclass T(unittest.TestCase):\n'
+                    '    @unittest.skip("no gh here")\n    def test_x(self):\n        open("data/hidden.txt")\n'
+                    'unittest.main()\n'})
         rc, out = self.check({'tests': ['tests/test_seen.py']})
-        self.assertIn('tests/test_seen.py: the test exited 3 under strace', out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('tests/test_seen.py: not checked: 1 skipped under the trace', out)
+
+    def test_only_that_matches_no_test_fails(self):   # a check of nothing never passes
+        rc, out = self.check({'tests': ['tests/test_*.py']}, args=['--only', 'nope/*.py'])
+        self.assertEqual(rc, 1, out)
+        self.assertIn('trace-check: no test to trace', out)
+
+    def test_declared_inputs_cover_it(self):   # the config's inputs: what the test reads that the code does not show
+        rc, out = self.check({'tests': ['tests/test_*.py'], 'inputs': [
+            {'test': 'tests/test_hidden.py', 'reads': ['data/*.txt'], 'why': 'reads names from data'}]})
         self.assertEqual(rc, 0, out)
+        self.assertIn('trace-check: 2 tests, 0 misses, 0 not traced', out)
 
     def test_a_test_that_cannot_be_traced_fails_the_check(self):
         rc, out = self.check({'tests': ['tests/test_seen.py']}, args=['--run', 'true {test}'])

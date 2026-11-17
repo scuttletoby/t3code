@@ -44,7 +44,7 @@ for a local check or a measure, never in CI). Prints why, writes the chosen test
 --out (default $RUNNER_TEMP/test-select.txt), and writes all=true|false, count=<n>, total=<n>, list=<file> and
 reason=<one line> to $GITHUB_OUTPUT. Exit 1 only when the config cannot be read (no test list: the job goes red).
 """
-import argparse, ast, json, os, posixpath, re, subprocess, sys
+import argparse, ast, json, os, posixpath, re, shlex, subprocess, sys
 
 sys.dont_write_bytecode = True   # leave no __pycache__ in the action folder
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'docs-scope'))
 import docs_scope   # noqa: E402  (the same release: the change as docs-scope computes it, and its glob rule)
 
 DEFAULT_CONFIG = '.github/test-select.json'
-KEYS = {'tests', 'always_all', 'always_run', 'import_roots'}
+KEYS = {'tests', 'always_all', 'always_run', 'import_roots', 'inputs'}
 BUILTIN_ALL = (('.github/workflows/**', 'a workflow file (how the tests run, which release judges them)'),)
 SCRIPT_EXT = ('.sh', '.bash', '.mjs', '.cjs', '.js')
 LISTING_CALLS = {'os.walk', 'os.listdir', 'os.scandir', 'glob.glob', 'glob.iglob', 'shutil.copytree', 'listdir',
@@ -72,6 +72,9 @@ STDLIB = set(getattr(sys, 'stdlib_module_names', ())) | set(sys.builtin_module_n
 CAP, DEPTH = 64, 40   # values per expression, evaluation depth: reaching either runs the test (never a silent drop)
 TEMP_CALLS = {'mkdtemp', 'gettempdir', 'TemporaryDirectory', 'mkstemp', 'NamedTemporaryFile', 'gettempdirb'}
 GIT_LISTING = re.compile(r'\bgit\b[^\n;|&]*?\b(ls-files|ls-tree|grep)\b')   # a listing of the repository
+LIST_COMMANDS = {'find', 'ls', 'tree', 'du', 'grep', 'egrep', 'fgrep', 'rgrep', 'rg', 'fd', 'fdfind'}
+RECURSIVE = re.compile(r'-[A-Za-z]*[rR][A-Za-z]*\Z|--(dereference-)?recursive\Z')   # grep -r: a folder
+SHELL_LISTING = re.compile(r'(?:^|[;&|(`\n])\s*(?:sudo\s+)?(?:%s)\s' % '|'.join(sorted(LIST_COMMANDS)))
 PY_DASH_M = re.compile(r'(?:^|[\s/])python[\d.]*(?:\s+-[A-Za-z]+)*\s+-m\s+([A-Za-z_][\w.]*)')
 SCRIPT_DIR = re.compile(r'dirname\b[^\n]*?(\$0\b|\$\{0\}|BASH_SOURCE)|\$\{BASH_SOURCE(?:\[0\])?%/\*\}')
 ASSIGN = re.compile(r'^[ \t]*(?:export[ \t]+|local[ \t]+|readonly[ \t]+|declare[ \t]+(?:-\w+[ \t]+)*)?([A-Za-z_]\w*)=(.*)$',
@@ -94,6 +97,22 @@ class Partial:
 
     def __hash__(self):
         return hash(('Partial', self.prefix))
+
+
+class Tail:
+    """A path whose start is unknown and whose rest is known (os.path.join(root, 'docs', 'a.md') with root a parameter,
+    an environment variable or x += '/a.md'): it ends with `rest` ('/docs/a.md'; no leading '/' = the rest starts inside
+    a name). more: something unknown follows the rest (os.path.join(root, 'docs', name))."""
+    __slots__ = ('rest', 'more')
+
+    def __init__(self, rest, more=False):
+        self.rest, self.more = rest, more
+
+    def __eq__(self, other):
+        return isinstance(other, Tail) and (other.rest, other.more) == (self.rest, self.more)
+
+    def __hash__(self):
+        return hash(('Tail', self.rest, self.more))
 
 
 UNKNOWN = Partial('')
@@ -254,15 +273,25 @@ class PyFile:
                 pairs = [(node.target, node.value)]
             elif isinstance(node, ast.NamedExpr):
                 pairs = [(node.target, node.value)]
-            elif isinstance(node, ast.AugAssign):
-                pairs = [(node.target, None)]
+            elif isinstance(node, ast.AugAssign):   # x += '/a.json', p /= 'docs': x's values, then the operation
+                t = node.target
+                if isinstance(node.op, (ast.Add, ast.Div)) and isinstance(t, (ast.Name, ast.Attribute)):
+                    left = ast.Name(id=t.id, ctx=ast.Load()) if isinstance(t, ast.Name) else \
+                        ast.Attribute(value=t.value, attr=t.attr, ctx=ast.Load())
+                    syn = ast.copy_location(ast.BinOp(left=ast.copy_location(left, t), op=node.op, right=node.value),
+                                            node)
+                    self.scope[syn] = self.scope[left] = self.scope[t]
+                    self.parents[left] = syn
+                    pairs = [(t, syn)]
+                else:
+                    pairs = [(t, None)]
             elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
                 loops.append((node.target, node.iter))
             elif isinstance(node, ast.withitem) and node.optional_vars is not None:
                 pairs = [(node.optional_vars, node.context_expr)]   # with TemporaryDirectory() as d: a temp folder
             elif isinstance(node, ast.ExceptHandler) and node.name:
                 bind(node.name, here, None)
-            elif isinstance(node, ast.arg):
+            elif isinstance(node, ast.arg):   # a parameter: unknown (a path joined onto it keeps its known rest: Tail)
                 bind(node.arg, here, None)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 bind(node.name, here, None)
@@ -325,7 +354,7 @@ class PyFile:
                 self.call(node)
             elif isinstance(node, (ast.List, ast.Tuple)):
                 self.dash_m(node)
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) or isinstance(node, ast.JoinedStr):
                 self.listing_text(node)
         for node in nodes:
             if isinstance(node, ast.expr) and self.maximal(node):
@@ -344,16 +373,110 @@ class PyFile:
             self.paths.update('/'.join(parts[:i]) + '/__init__.py' for i in range(1, len(parts)))
 
     def dash_m(self, node):
-        """[sys.executable, '-m', name] (or 'python3'): the module it runs."""
+        """[sys.executable, '-m', name] (or 'python3'): the module it runs. ['find', d, ...]: a folder it lists."""
         elts = node.elts
+        if elts and not isinstance(elts[0], ast.Starred) and isinstance(node.ctx, ast.Load):   # (not: for a, b in)
+            first = self.ev(elts[0])
+            if any(isinstance(v, str) and posixpath.basename(v) in LIST_COMMANDS for v in first):
+                consts = [x.value if isinstance(x, ast.Constant) and isinstance(x.value, str) else None for x in elts]
+                args = [None if isinstance(x, ast.Starred) else self.ev(x) for x in elts[1:]]
+                self.listing_command(node, posixpath.basename(next(v for v in first if isinstance(v, str) and
+                                                                   posixpath.basename(v) in LIST_COMMANDS)),
+                                     consts[1:], args, self.call_cwd(node))
         for i, el in enumerate(elts[:-1]):
             if isinstance(el, ast.Constant) and el.value == '-m' and any(
                     self.dotted(x) == 'sys.executable' or isinstance(x, ast.Constant) and isinstance(x.value, str)
                     and re.search(r'(^|/)python[\d.]*\Z', x.value) for x in elts[:i]):
                 self.module_paths(node, elts[i + 1])
 
+    def call_cwd(self, node):
+        """The cwd= values of the call around node (None: the working directory, the root here)."""
+        call = self.parents.get(node)
+        while call is not None and not isinstance(call, ast.Call):
+            call = self.parents.get(call)
+        cwd = [k.value for k in call.keywords if k.arg == 'cwd'] if call is not None else []
+        if not cwd:
+            return None
+        out = set()
+        for c in cwd:
+            out |= self.ev(c)
+        return out
+
+    def listing_command(self, node, cmd, consts, args, cwd):
+        """find/ls/tree/du (paths: the arguments before find's first expression), grep -r/rg/fd (paths: after the
+        pattern), run as a process: the folders it lists; one it cannot work out runs the test (own)."""
+        if cmd in ('grep', 'egrep', 'fgrep') and not any(c and RECURSIVE.match(c) for c in consts):
+            return   # grep over named files or stdin: the files are named paths
+        paths, skip = [], cmd in ('grep', 'egrep', 'fgrep', 'rgrep', 'rg', 'fd', 'fdfind')
+        if skip and any(c in ('-e', '-f', '--regexp', '--file', '--files') for c in consts):
+            skip = False   # the pattern is an option's value (rg --files: no pattern)
+        after_e = False
+        if cmd == 'find':   # find -H/-L/-P/-D x/-Ox before its paths
+            while consts and consts[0] is not None and re.fullmatch(r'-[HLP]|-O\d*|-D', consts[0]):
+                n = 2 if consts[0] == '-D' else 1
+                consts, args = consts[n:], args[n:]
+        for c, vals in zip(consts, args):
+            if vals is None:
+                self.mark(node, f'lists a folder it cannot work out ({cmd} with *args)', own=True)
+                return
+            if after_e:
+                after_e = False
+                continue
+            if cmd == 'find' and c is not None and (c.startswith('-') or c in ('(', '!', ')')):
+                break   # find's expression: the paths come before it
+            if c is not None and c.startswith('-') and c != '-':
+                if c in ('-e', '-f', '--regexp', '--file', '-g', '--glob', '-t', '--type', '-m', '--max-count',
+                         '-A', '-B', '-C', '--include', '--exclude'):
+                    after_e = True
+                continue
+            if skip:
+                skip = False
+                continue
+            paths.append(vals)
+        bases = cwd if cwd is not None else {self.repo.root}
+        if not paths:
+            paths = [{'.'}]
+        for vals in paths:
+            for v in vals:
+                for b in bases:
+                    w = join(b, v) if isinstance(v, str) and not os.path.isabs(v) else v
+                    if w in (TEMP, CAPPED) or b == TEMP:
+                        continue
+                    if not isinstance(w, str) and not (isinstance(w, Tail) and w.rest.startswith('/')):
+                        self.mark(node, f'lists a folder it cannot work out ({cmd})', own=True)
+                        return
+                    if isinstance(w, str) and os.path.normpath(w) == self.repo.root:   # (a tool's cwd: its caller's)
+                        self.mark(node, f'lists the working directory ({cmd}): it can read any file', own=True)
+                        continue
+                    self.dirs_listed.add(w)
+
+    def shell_listing(self, node, text):
+        """A shell line in a string ('find docs -name x', 'grep -rl x docs | sort'): the folders it lists."""
+        for seg in re.split(r'[;&|\n`]+|\$\(', text):
+            try:
+                words = shlex.split(seg)
+            except ValueError:
+                continue
+            while words and (re.fullmatch(r'\w+=\S*', words[0]) or words[0] in ('sudo', 'env', 'exec', 'command')):
+                words = words[1:]
+            if words and posixpath.basename(words[0]) in LIST_COMMANDS:
+                self.listing_command(node, posixpath.basename(words[0]), words[1:],
+                                     [{UNKNOWN} if '$' in w or '`' in w else {w} for w in words[1:]],
+                                     self.call_cwd(node))
+
     def listing_text(self, node):
-        """A string that lists the repository (git ls-files) or runs a module (python3 -m x)."""
+        """A string that lists the repository (git ls-files) or runs a module (python3 -m x). An f-string's shell
+        line is read whole, its fields as unknown words."""
+        if isinstance(node, ast.JoinedStr):
+            v = ''.join(p.value if isinstance(p, ast.Constant) else '${X}' for p in node.values)
+        elif isinstance(self.parents.get(node), ast.JoinedStr):
+            v = ''
+        else:
+            v = node.value
+        if re.search(r'\s', v) and not self.only_text(node) and SHELL_LISTING.search(v):
+            self.shell_listing(node, v)
+        if isinstance(node, ast.JoinedStr):
+            return
         v = node.value
         for m in PY_DASH_M.finditer(v):
             self.module_paths(node, m[1])
@@ -530,7 +653,7 @@ class PyFile:
             subject = node.func.value
         if subject is not None:
             for v in self.ev(subject):
-                if v == UNKNOWN:
+                if v == UNKNOWN or isinstance(v, Tail) and not v.rest.startswith('/'):
                     self.mark(node, 'lists a folder it cannot work out', own=True)
                 elif v not in (TEMP, CAPPED):
                     self.dirs_listed.add(v)
@@ -644,6 +767,11 @@ class PyFile:
             args = [a for a in node.args]
             if n in TEMP_CALLS:
                 return {TEMP}
+            if not args and (n in ('getcwd', 'getcwdb') or n == 'cwd' and isinstance(node.func, ast.Attribute)
+                             and last_name(node.func.value) in ('Path', 'PurePath', 'PosixPath', 'pathlib')):
+                return {self.repo.root}   # the working directory: the root, as for every relative path here
+            if self.dotted(node.func) in ('os.environ.get', 'environ.get', 'os.getenv', 'getenv') and len(args) == 2:
+                return {UNKNOWN} | e(args[1])   # os.environ.get('ROOT', default): unknown, or the default
             if n in ('enterContext', 'enter_context') and len(args) == 1:
                 return e(args[0])   # self.enterContext(tempfile.TemporaryDirectory())
             if isinstance(node.func, ast.Attribute) and n in ('resolve', 'absolute', 'expanduser') and not args:
@@ -716,11 +844,12 @@ class PyFile:
             for b in right:
                 out.add(op(a, b))
         if len(out) > CAP:   # too many to list: the start they all share (a folder: everything under it), never a drop
-            starts = [v.prefix if isinstance(v, Partial) else v for v in out]
+            starts = [v.prefix if isinstance(v, Partial) else '\0tail' if isinstance(v, Tail) else v for v in out]
             common = os.path.commonprefix(starts)
             if '/' in common and not any('\0' in x for x in starts):
                 return {Partial(common)}
-            if any(self.names_repo(x) for x in starts):   # no folder they share, and one is a path here: always
+            if any(self.names_repo(x) for x in starts) or any(isinstance(v, Tail) and re.search(
+                    r'/[\w@+-]', v.rest) for v in out):   # no folder they share, and one is a path here: always
                 self.mark(node, f'more than {CAP} values')
                 return {CAPPED}
             return {UNKNOWN}   # text, not a path of the repository ('k=v' lines of a settings file)
@@ -747,21 +876,48 @@ class PyFile:
 
 
 def dirname(v):
+    if isinstance(v, Tail):   # the folder of <unknown>/docs/a.md is <unknown>/docs; of <unknown>/docs/<name>: unknown
+        rest = v.rest.rstrip('/')
+        return Tail(rest.rsplit('/', 1)[0]) if not v.more and '/' in rest[1:] else UNKNOWN
     if isinstance(v, Partial):
         return Partial(v.prefix.rsplit('/', 1)[0] + '/') if '/' in v.prefix else UNKNOWN
     return os.path.dirname(v.rstrip('/') or v)
 
 
+def tail_of(b, sep):
+    """What an unknown start followed by b (after sep: '/' for a join, '' for +) is."""
+    if isinstance(b, str):
+        return Tail(sep + b) if b else UNKNOWN
+    if isinstance(b, Tail):
+        return b   # it ends with b's rest, whatever comes before
+    if b == UNKNOWN or '\0' in b.prefix:
+        return b if b != UNKNOWN else UNKNOWN
+    return Tail(sep + b.prefix, True)   # a known middle, an unknown end
+
+
 def join(a, b):
-    """os.path.join and pathlib's / on values: an absolute right side wins; after an unknown part all is unknown."""
+    """os.path.join and pathlib's / on values: an absolute right side wins; after an unknown start the known rest is
+    kept (Tail); after a known start and an unknown part the rest is unknown (Partial)."""
     if b in (TEMP, CAPPED) or a == CAPPED:
         return b if b in (TEMP, CAPPED) else a
     if isinstance(b, str) and b.startswith('/'):
         return b
     if isinstance(b, Partial) and b.prefix.startswith('/'):
         return b
+    if a == UNKNOWN:
+        return tail_of(b, '/')
+    if isinstance(a, Tail):
+        if isinstance(b, Tail) or (a.more and b != UNKNOWN):
+            return tail_of(b, '/')
+        if a.more or b == UNKNOWN:
+            return Tail(a.rest.rstrip('/') + '/', True)
+        if isinstance(b, Partial):
+            return Tail(posixpath.join(a.rest, b.prefix), True)
+        return Tail(posixpath.join(a.rest, b))
     if isinstance(a, Partial):
         return a
+    if isinstance(b, Tail):
+        return b
     if isinstance(b, Partial):
         return Partial(os.path.join(a, b.prefix) if b.prefix else os.path.join(a, ''))
     return os.path.join(a, b)
@@ -770,8 +926,20 @@ def join(a, b):
 def concat(a, b):
     if CAPPED in (a, b):
         return CAPPED
+    if a == UNKNOWN:
+        return tail_of(b, '')
+    if isinstance(a, Tail):
+        if isinstance(b, Tail) or (a.more and b != UNKNOWN):
+            return tail_of(b, '')
+        if a.more or b == UNKNOWN:
+            return Tail(a.rest, True)
+        if isinstance(b, Partial):
+            return Tail(a.rest + b.prefix, True) if '\0' not in b.prefix else b
+        return Tail(a.rest + b)
     if isinstance(a, Partial):
         return a
+    if isinstance(b, Tail):
+        return b
     if isinstance(b, Partial):
         return Partial(a + b.prefix)
     return a + b
@@ -780,8 +948,9 @@ def concat(a, b):
 # ---------------------------------------------------------------- inputs of a test file
 
 class Graph:
-    def __init__(self, repo, import_roots=()):
+    def __init__(self, repo, import_roots=(), declared=None):
         self.repo = repo
+        self.declared = declared or {}   # {test file: (globs it reads, why)}: the config's inputs
         self.import_roots = [os.path.join(repo.root, r) for r in import_roots]
         self.py, self.text, self.text_always, self.memo = {}, {}, {}, {}
         self.building = set()
@@ -838,6 +1007,19 @@ class Graph:
         pattern from the root). owner = the repository file that names it, base_dir its folder (a relative value is
         tried against it and against the repository root, the usual working directory)."""
         repo, out = self.repo, []
+        if isinstance(value, Tail):
+            # A path whose start it cannot work out (a parameter, Path.cwd() of a tool, an environment variable, x +=
+            # '/a.json', a loop joining part by part) and whose rest is known: any place that ends with that rest
+            # (and anything under it when it lists or copies it). A rest without a folder step ('{name}.json') or
+            # with nothing named is not taken for a path.
+            rest = value.rest
+            if not rest.startswith('/') or not PATHLIKE.match(rest.lstrip('/') or '-'):
+                return out
+            folder, rest = rest.endswith('/'), posixpath.normpath(rest)
+            if not re.search(r'[\w@+-]', rest):
+                return out
+            pat = '**' + rest.rstrip('/') + ('/*' if value.more and folder else '*' if value.more else '')
+            return [('glob', pat), ('glob', pat + '/**')] if listed else [('glob', pat)]   # a folder: a base
         if not PATHLIKE.match(value.prefix if isinstance(value, Partial) else value):
             return out   # a message, a shell line, a regular expression: not a path
         owner_dir = posixpath.dirname(owner)
@@ -958,7 +1140,19 @@ class Graph:
         return self.memo[key]
 
     def inputs(self, test):
-        """(files, folders) that are the test file's inputs."""
+        """(files, folders, globs, always-marks) that are the test file's inputs; AllTests when one runs every test.
+        Worked out once per test."""
+        key = ('inputs', test)
+        if key not in self.memo:
+            try:
+                self.memo[key] = self._inputs(test)
+            except AllTests as e:
+                self.memo[key] = e
+        if isinstance(self.memo[key], AllTests):
+            raise self.memo[key]
+        return self.memo[key]
+
+    def _inputs(self, test):
         files, dirs, globs, todo, search, done, unfound = {test}, set(), set(), [test], set(), set(), []
         always = set()
         while todo:
@@ -992,12 +1186,15 @@ class Graph:
                 if k == 'file':
                     files.add(r)
                     todo.append(r)
+                elif k == 'own' and rel == test and test in self.declared:
+                    continue   # the config declares what this test reads (inputs): its globs stand for this
                 elif k == 'always' or k == 'own' and rel == test:
                     always.add(r)
                 elif k == 'own':
                     continue
                 else:
                     (dirs if k == 'dir' else globs).add(r)
+        globs.update(self.declared.get(test, ((), ''))[0])
         if unfound:
             raise AllTests(f'{unfound[0]}: a module of that name is in the repository, but not where this import '
                            f'looks (sys.path entries it can work out, the file\'s folder)')
@@ -1118,7 +1315,13 @@ def load_config(root, path):
     roots = c.get('import_roots', [])
     if not isinstance(roots, list) or not all(isinstance(r, str) and docs_scope.plain_path(r) for r in roots):
         raise SystemExit(f'test-select: {path}: "import_roots" must be a list of repository folders')
-    return tests, pairs['always_all'], roots, pairs['always_run']
+    inputs = c.get('inputs', [])
+    if not isinstance(inputs, list) or not all(
+            isinstance(a, dict) and set(a) == {'test', 'reads', 'why'} and isinstance(a['test'], str) and a['test']
+            and isinstance(a['why'], str) and a['why'] and isinstance(a['reads'], list)
+            and all(isinstance(g, str) and g for g in a['reads']) for a in inputs):
+        raise SystemExit(f'test-select: {path}: "inputs" must be a list of {{"test", "reads": [globs], "why"}}')
+    return tests, pairs['always_all'], roots, pairs['always_run'], [(a['test'], a['reads'], a['why']) for a in inputs]
 
 
 def always_run_of(always_run, every, path=DEFAULT_CONFIG):
@@ -1135,8 +1338,25 @@ def always_run_of(always_run, every, path=DEFAULT_CONFIG):
     return out
 
 
+def declared_of(inputs, every, path=DEFAULT_CONFIG):
+    """{test file: (globs, why)} for the config's inputs: what a test reads that this script cannot see (a folder
+    its caller passes). Its own file's marks then give way to these globs; a mark from any other file still runs it,
+    and the trace check measures the declaration. A test glob that names no test file fails the step."""
+    out = {}
+    for g, reads, why in inputs:
+        rx = docs_scope.glob_re(g)
+        hits = [t for t in every if rx.match(t)]
+        if not hits:
+            raise SystemExit(f'test-select: {path}: inputs {g!r} names no test file of "tests"')
+        for t in hits:
+            globs, whys = out.get(t, ((), ()))
+            out[t] = (tuple(globs) + tuple(reads), tuple(whys) + (why,))
+    return {t: (globs, '; '.join(whys)) for t, (globs, whys) in out.items()}
+
+
 def universe(tests, tracked):
-    """The test files, in config order, each once; a literal path that is not tracked is an error."""
+    """The test files, in config order, each once; a literal path that is not tracked, or a glob that matches no
+    tracked file, is an error (a moved test folder would otherwise drop its tests from every run, green)."""
     out = []
     for g in tests:
         if not re.search(r'[*?\[]', g):
@@ -1146,14 +1366,17 @@ def universe(tests, tracked):
         else:
             rx = docs_scope.glob_re(g)
             hits = sorted(f for f in tracked if rx.match(f))
+            if not hits:
+                raise SystemExit(f'test-select: the config\'s tests glob {g!r} matches no file of the repository')
         for h in hits:
             if h not in out:
                 out.append(h)
     return out
 
 
-def decide(root, config_path, tests, always, changed, tracked, import_roots=(), always_run=None):
-    """(chosen test files, reason lines). always_run: {test file: why}, chosen on every pull request."""
+def decide(root, config_path, tests, always, changed, tracked, import_roots=(), always_run=None, declared=None):
+    """(chosen test files, reason lines). always_run: {test file: why}, chosen on every pull request; declared:
+    declared_of()."""
     lines = []
     if not changed:
         raise AllTests('the change touches no file')
@@ -1163,7 +1386,7 @@ def decide(root, config_path, tests, always, changed, tracked, import_roots=(), 
             if docs_scope.glob_re(g).match(c):
                 raise AllTests(f'{c} changed ({why})')
     repo = Repo(root, tracked, changed)
-    graph = Graph(repo, import_roots)
+    graph = Graph(repo, import_roots, declared)
     chosen = []
     for t in tests:
         if t in (always_run or {}):
@@ -1180,7 +1403,9 @@ def decide(root, config_path, tests, always, changed, tracked, import_roots=(), 
         if hit:
             chosen.append(t)
             more = f' (+{len(hit) - 1} more)' if len(hit) > 1 else ''
-            lines.append(f'run {t}: takes in {hit[0]}{more}')
+            mine = (declared or {}).get(t, ((), ''))[0]
+            how = ' (declared in inputs)' if reaches(hit[:1], set(), set(), mine) else ''
+            lines.append(f'run {t}: takes in {hit[0]}{more}{how}')
     return chosen, lines
 
 
@@ -1196,9 +1421,10 @@ def main(argv=None):
     if not docs_scope.plain_path(a.config):
         raise SystemExit(f'test-select: the config path {a.config!r} must be a plain repository path')
     tracked = set(git('ls-files', '-z', cwd=root).split('\0')) - {''}
-    tests, always, import_roots, always_run = load_config(root, a.config)
+    tests, always, import_roots, always_run, inputs = load_config(root, a.config)
     every = universe(tests, tracked)
     always_run = always_run_of(always_run, every, a.config)
+    declared = declared_of(inputs, every, a.config)
     try:
         if a.event != 'pull_request':
             raise AllTests(f'a {a.event} run runs every test')
@@ -1216,7 +1442,7 @@ def main(argv=None):
             finally:
                 os.chdir(cwd)
             changed = sorted({r[0] for r in rows})
-        chosen, lines = decide(root, a.config, every, always, changed, tracked, import_roots, always_run)
+        chosen, lines = decide(root, a.config, every, always, changed, tracked, import_roots, always_run, declared)
         everything = False
         head = (f'selected {len(chosen)} of {len(every)} test files' if chosen else
                 f'no tool test touched: 0 of {len(every)} test files take in the {len(changed)} changed paths')

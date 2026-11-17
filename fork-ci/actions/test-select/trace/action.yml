@@ -1,8 +1,9 @@
 name: test-select-trace
 description: >-
   Checks test-select against what the tests really touch: runs every test under strace and fails when a test reads
-  or runs a tracked file whose change would not pick it on a pull request. For a schedule or default-branch pushes,
-  never a pull request's gate. Needs strace on the runner. Usage: ../README.md (Trace check).
+  or runs a tracked file whose change would not pick it on a pull request, or when a test fails or skips under the
+  trace (not checked). Run the tests as the test job does (same runner, env). For a schedule or default-branch
+  pushes, never a pull request's gate. Needs strace on the runner. Usage: ../README.md (Trace check).
 inputs:
   config:
     description: The same test-select config, a plain path in the repository.

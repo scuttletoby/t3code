@@ -61,6 +61,7 @@ class Repo(CleanEnv):
         self.addCleanup(shutil.rmtree, self.d, True)
         self.git('init', '-q', '-b', 'main')
         self.write({CONFIG_PATH: json.dumps(self.config), 'tests/test_plain.py': 'import unittest\n',
+                    'tools/sub/test_sub.py': 'import unittest\n', 'tests/test_sh.sh': 'true\n',
                     'tests/run_tests.py': 'import sys\n', 'tools/alone.py': 'X = 1\n', 'README.md': 'x\n',
                     'lib/.keep': ''})
 
@@ -199,7 +200,7 @@ class Imports(Repo):
         self.pr({'tools/alone.py': 'X = 2\n'})
         everything, chosen, out = self.select()
         self.assertEqual((everything, chosen), (False, []))
-        self.assertTrue(out.startswith('no tool test touched: 0 of 2 test files take in the 1 changed paths'), out)
+        self.assertTrue(out.startswith('no tool test touched: 0 of 4 test files take in the 1 changed paths'), out)
 
     def test_a_module_found_through_sys_path_insert_and_what_it_imports(self):
         self.assertEqual(self.picks(self.base_files, {'tools/helper.py': 'X = 2\n'}), ['tests/test_tool.py'])
@@ -375,6 +376,32 @@ class NamedPaths(Repo):
                  "    def test(self):\n        open(os.path.join(ROOT, self.d, 'a.ini'))\n",
                  {'conf/a.ini': '', 'conf/b.ini': ''}, 'conf/a.ini', ['conf/b.ini'])
 
+    def test_a_path_with_an_unknown_start_keeps_its_known_rest(self):   # any place that ends with that rest
+        for code in ("def load(base):\n    return open(os.path.join(base, 'data', 'b.json'))\nload(ROOT)\n",
+                     "x = ROOT\nx += '/data/b.json'\nopen(x)\n",
+                     "from pathlib import Path\n(Path.cwd() / 'data' / 'b.json').read_text()\n",
+                     "open(os.path.join(os.getcwd(), 'data/b.json'))\n",
+                     "d = ROOT\nfor part in ('data', 'b.json'):\n    d = os.path.join(d, part)\nopen(d)\n",
+                     "open(os.path.join(os.environ['APP_ROOT'], 'data', 'b.json'))\n",
+                     "open(os.environ.get('APP_ROOT', '/opt/app') + '/data/b.json')\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.one(code, {'data/b.json': '', 'data/other.json': ''}, 'data/b.json', ['data/other.json'])
+
+    def test_a_tool_joining_onto_its_parameter(self):   # the test passes the working directory, the tool joins on it
+        self.one("sys.path.insert(0, os.path.join(ROOT, 'tools'))\nimport lint\nlint.lint(os.getcwd())\n",
+                 {'tools/lint.py': 'import os\ndef lint(root):\n    return open(os.path.join(root, "docs", "rules.md"))\n',
+                  'docs/rules.md': '', 'docs/other.md': ''}, 'docs/rules.md', ['docs/other.md'])
+
+    def test_a_folder_listed_by_a_process(self):   # grep -r, find, ls, rg: a new file there picks the test
+        for code in ("import subprocess\ndef f(x):\n    subprocess.run(['grep', '-rl', x, 'docs'])\n",
+                     "import subprocess\nsubprocess.run(['find', 'docs', '-name', '*.md'], cwd=ROOT)\n",
+                     "import subprocess\nsubprocess.run('ls docs | wc -l', shell=True)\n",
+                     "import subprocess\nsubprocess.run(['rg', '--files', os.path.join(ROOT, 'docs')])\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.one(code, {'docs/a.md': '', 'lib/b.md': ''}, 'docs/new.md', ['lib/b.md'])
+
     def test_a_shell_script_and_the_files_it_names(self):
         self.one("subprocess = None\nSH = os.path.join(ROOT, 'tools', 'go.sh')\n",
                  {'tools/go.sh': 'python3 tools/dep.py\ncp -r assets/ "$OUT"\n', 'tools/dep.py': 'import dep2\n',
@@ -520,6 +547,28 @@ class FailClosed(Repo):
 
     def test_listing_a_folder_it_cannot_work_out(self):
         self.always("def f(d):\n    return os.listdir(d)\n", 'lists a folder it cannot work out')
+
+    def test_a_process_listing_a_folder_it_cannot_work_out(self):
+        for code, why in (("import subprocess\ndef f(d):\n    subprocess.run(['grep', '-rl', 'x', d])\n", '(grep)'),
+                          ("import subprocess\ndef f(d):\n    subprocess.run(f'find {d} -name x', shell=True)\n",
+                           '(find)'),
+                          ("import subprocess\nsubprocess.run(['find', '.', '-name', '*.py'])\n",
+                           'lists the working directory (find)'),
+                          ("import subprocess\ndef f(*a):\n    subprocess.run(['ls', *a])\n", '(ls with *args)')):
+            with self.subTest(code):
+                self.setUp()
+                self.always(code, why)
+
+    def test_a_process_listing_a_temporary_folder_or_reading_one_file_is_not(self):
+        for code in ("import subprocess, tempfile\nd = tempfile.mkdtemp()\nsubprocess.run(['find', d, '-type', 'f'])\n",
+                     "import subprocess, tempfile\nsubprocess.run(['ls'], cwd=tempfile.mkdtemp())\n",
+                     "import subprocess\nsubprocess.run(['grep', '-l', 'x', os.path.join(ROOT, 'docs/a.md')])\n",
+                     "def t(self):\n    self.assertEqual(out, 'ls docs failed')\n",
+                     "FAKES = {'find': sys.argv[1], 'id': '#!/bin/sh'}\n"   # a loop target, not an argument list
+                     "for name, body in FAKES.items():\n    pass\n"):
+            with self.subTest(code):
+                self.setUp()
+                self.never(code, {'docs/a.md': ''}, 'docs/new.md')
 
     def test_listing_a_temporary_folder_is_not(self):
         for code in ("import tempfile\nos.listdir(tempfile.mkdtemp())\n",
@@ -747,6 +796,53 @@ class AlwaysRun(Repo):
         self.assertIn("always_run 'tests/test_lint*.py' names no test file", err)
 
 
+class Declared(Repo):
+    """The config's inputs: what a test reads that its code does not show (a folder its caller passes)."""
+    config = {**CONFIG, 'inputs': [{'test': 'tests/test_d*.py', 'reads': ['data/**', 'docs/*.md'],
+                                    'why': 'lists the folder its helper is given'}]}
+    code = py("def f(d):\n    return os.listdir(d)\nf(os.path.join(ROOT, 'data'))\n")
+
+    def setUp(self):
+        super().setUp()
+        self.write({CONFIG_PATH: json.dumps(self.config)})
+
+    def test_a_declared_test_runs_when_what_it_reads_changes(self):
+        for change, picked in (('data/x/new.json', True), ('docs/a.md', True), ('docs/sub/a.md', False),
+                               ('tools/alone.py', False)):
+            with self.subTest(change):
+                self.setUp()
+                self.base({'tests/test_d.py': self.code, 'data/a.json': '', 'docs/a.md': ''})
+                self.pr({change: '# y\n'})
+                everything, chosen, out = self.select()
+                self.assertEqual((everything, chosen), (False, ['tests/test_d.py'] if picked else []), out)
+                if picked:
+                    self.assertIn('(declared in inputs)', out)
+
+    def test_a_mark_from_another_file_still_runs_it(self):   # only the test file's own marks give way
+        self.base({'tests/test_d.py': self.code + "sys.path.insert(0, os.path.join(ROOT, 'tools'))\nimport lister\n",
+                   'tools/lister.py': 'import os\nos.listdir(".")\n'})
+        self.pr({'tools/alone.py': '# y\n'})
+        everything, chosen, out = self.select()
+        self.assertEqual((everything, chosen), (False, ['tests/test_d.py']), out)
+        self.assertIn('lists the repository root', out)
+
+    def test_an_undeclared_test_still_always_runs(self):
+        self.base({'tests/test_d.py': '', 'tests/test_e.py': self.code})
+        self.pr({'tools/alone.py': '# y\n'})
+        everything, chosen, out = self.select()
+        self.assertEqual((everything, chosen), (False, ['tests/test_e.py']), out)
+        self.assertIn('lists a folder it cannot work out', out)
+
+    def test_a_declaration_that_names_no_test_or_is_malformed_fails_the_step(self):
+        for inputs in ([{'test': 'tests/test_gone.py', 'reads': [], 'why': 'x'}],
+                       [{'test': 'tests/test_plain.py', 'reads': 'data/**', 'why': 'x'}],
+                       [{'test': 'tests/test_plain.py', 'reads': ['data/**']}]):
+            with self.subTest(inputs):
+                self.write({CONFIG_PATH: json.dumps({**CONFIG, 'inputs': inputs})})
+                self.base({})
+                self.select(rc=1)
+
+
 class Config(Repo):
     def test_a_config_it_cannot_read_fails_the_step(self):   # no test list: red, never zero tests
         for text in ('{', '{"tests": []}', '{"tests": ["t"], "always": []}', '{"tests": ["t"], "always_all": ["x"]}',
@@ -756,6 +852,13 @@ class Config(Repo):
                 self.write({CONFIG_PATH: text})
                 self.base({})
                 self.select(rc=1)
+
+    def test_a_tests_glob_that_matches_no_file_fails_the_step(self):   # a moved folder: red, never fewer tests
+        self.write({CONFIG_PATH: json.dumps({**CONFIG, 'tests': ['tests/test_*.py', 'moved/test_*.py']})})
+        self.base({})
+        for event in ('pull_request', 'push'):
+            _, _, err = self.select(event=event, rc=1)
+            self.assertIn("tests glob 'moved/test_*.py' matches no file", err)
 
     def test_a_test_file_the_config_names_that_is_gone(self):   # a renamed or deleted test file named literally
         self.write({CONFIG_PATH: json.dumps({**CONFIG, 'tests': ['tests/test_plain.py', 'tests/test_gone.py']})})
@@ -772,7 +875,7 @@ class Config(Repo):
         everything, chosen, out = self.select()
         self.assertEqual((everything, chosen), (False, ['tools/sub/test_b.py', 'tests/test_a.py']), out)
         everything, chosen, _ = self.select(event='push')
-        self.assertEqual(chosen[:2], ['tools/sub/test_b.py', 'tests/test_a.py'])
+        self.assertEqual(chosen[:3], ['tools/sub/test_b.py', 'tools/sub/test_sub.py', 'tests/test_a.py'])
 
     def test_a_changed_name_cannot_write_a_line_of_its_own(self):
         base = {'tests/test_ls.py': py("for n in os.listdir(os.path.join(ROOT, 'data')): pass\n"), 'data/a': ''}

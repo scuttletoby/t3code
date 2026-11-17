@@ -7,7 +7,7 @@ inputs:
   config:
     description: >-
       The JSON config, a plain path in the repository (no ./): the test files, the paths that always run every
-      test, extra import folders. A change to it runs every test.
+      test, tests that always run, declared test inputs, extra import folders. A change to it runs every test.
     required: false
     default: .github/test-select.json
 outputs:
