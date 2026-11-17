@@ -68,6 +68,31 @@ UPSTREAM = [
      'config.EXACT_VERSION'),
     ('apps/server/src/cloud/serviceProtocol.ts',
      'const SEMVER_PRERELEASE = `(?:${SEMVER_NUMBER}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)`;', 'config.EXACT_VERSION'),
+    ('apps/server/src/serverRuntimeState.ts', '  workHeld: Schema.optional(Schema.Boolean),', 'rehearse R3: work held'),
+    ('apps/server/src/config.ts', 'secretsDir: join(stateDir, "secrets"),', 'rehearse.NOT_CLONED: secrets/'),
+]
+
+# The commands and flags `rehearse` runs (R1-R5). These files are not in the kit_tests job's sparse checkout yet
+# (.github/workflows/fork-tests.yml): there each one is skipped by name until the workflow lists it.
+REHEARSE_UPSTREAM = [
+    ('apps/server/src/cli/servicePreflight.ts', 'Command.make("__service-preflight", {', 'R1/R5 preflight'),
+    ('apps/server/src/cli/servicePreflight.ts', 'databasePath: Flag.String("database-path"),', 'preflight flag'),
+    ('apps/server/src/cli/servicePreflight.ts', 'launcherProtocol: Flag.Int("launcher-protocol"),', 'preflight flag'),
+    ('apps/server/src/cloud/servicePreflight.ts', 'readonly status: "blocked";', 'preflight answers blocked'),
+    ('apps/server/src/cloud/servicePreflight.ts', 'readonly status: "ready";', 'preflight answers ready'),
+    ('apps/server/src/cli/auth.ts', 'const sessionListCommand = Command.make("list", {', 'R2 auth session list'),
+    ('apps/server/src/cli/auth.ts', 'Command.withSubcommands([sessionIssueCommand, sessionListCommand, '
+     'sessionRevokeCommand]),', 'R2 auth session list'),
+    ('apps/server/src/auth/EnvironmentAuth.ts',
+     'const layerStorage = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerCliConfig);',
+     'R2: auth commands open the database through layerCliConfig'),
+    ('apps/server/src/persistence/Sqlite.ts', 'export const layerCliConfig = makeLayerConfig(\n  '
+     'makeLayerFromPath(() => makeLayerSetup(runMigrationsAsOwner())),', 'R2: layerCliConfig migrates as owner'),
+    ('apps/server/src/cli/server.ts', 'const holdWorkFlag = Flag.Boolean("hold-work")', 'R3 serve --hold-work'),
+    ('apps/server/src/cli/config.ts', 'const portFlag = Flag.Int("port")', 'R3 --port'),
+    ('apps/server/src/cli/config.ts', 'const hostFlag = Flag.String("host")', 'R3 --host'),
+    ('apps/server/src/cli/config.ts', 'const noBrowserFlag = Flag.Boolean("no-browser")', 'R3 --no-browser'),
+    ('apps/server/src/cli/config.ts', 'export const baseDirFlag = Flag.String("base-dir")', '--base-dir'),
 ]
 
 REPORT_FILE = 'apps/server/src/golive/forkReport.ts'
@@ -76,7 +101,9 @@ REPORT_CLI = 'apps/server/src/cli/forkReport.ts'
 REPORT_PATHS = ['reportVersion', 'version', 'ok', 'problems', 'problems.code', 'problems.message',
                 'database.pendingMigrations', 'database.counts', 'database.counts.threads',
                 'database.counts.projects', 'database.counts.threadsArchived', 'database.counts.projectsArchived',
-                'fork.featuresOn']
+                'fork.featuresOn', 'database.appliedMigrations', 'database.appliedMigrations.id',
+                'database.unknownMigrations', 'settings.parseWarning', 'settings.providerInstances',
+                'settings.providerInstances.id']
 # What live.compare_counts relies on (fork #181): both reports count the same rows, every project and every thread
 # not deleted (sub-agent and archived threads included), so one report is compared with another, never with
 # `t3 thread list` (one project, no sub-agents).
@@ -110,6 +137,13 @@ class Upstream(unittest.TestCase):
         for rel, text, why in UPSTREAM:
             with self.subTest(why, file=rel):
                 self.assertIn(text, source(rel), f'{rel} changed: update the go-live kit ({why})')
+
+    def test_the_commands_rehearse_runs_are_still_there(self):
+        for rel, text, why in REHEARSE_UPSTREAM:
+            with self.subTest(why, file=rel):
+                if not os.path.exists(os.path.join(REPO, rel)):
+                    self.skipTest(f'{rel} is not in this checkout (a sparse one)')
+                self.assertIn(text, source(rel), f'{rel} changed: update rehearse ({why})')
 
     def test_platform_keys(self):
         keys = re.search(r'CLI_ARCHIVE_PLATFORM_KEYS = \[(.*?)\]', source('packages/shared/src/cliRelease.ts'),
