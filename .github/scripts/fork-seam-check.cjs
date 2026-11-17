@@ -58,6 +58,16 @@ function addedLines(base, head) {
 
 const total = (lines) => lines.reduce((sum, [, extra]) => sum + extra, 0);
 
+/** A seam entry's lines: its "added" ones and those it announces (step 1 of a new line). */
+const seamLines = (seam) => [...seam.added, ...(seam.announced?.added ?? [])];
+
+/** `text` with control characters escaped: a list's key with a newline cannot start a log line. */
+const printable = (text) =>
+  String(text).replace(
+    /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u2028\u2029]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+
 /**
  * The non-blank lines in order, with their indentation (in YAML or Python it is meaning) but no
  * trailing blanks or CR (as `git diff --ignore-space-at-eol --ignore-blank-lines` compares them).
@@ -137,7 +147,7 @@ function findSeamBreaches(files, { atBase, atHead, upstream = false }) {
       reasons.push(`${file}: this change deletes or renames it.`);
       continue;
     }
-    const allowed = lineCounts((seam.added ?? []).join("\n"));
+    const allowed = lineCounts(seamLines(seam).join("\n"));
     const baseCounts = lineCounts(base);
     for (const [line, added] of addedLines(base, head)) {
       const allowance = allowed.get(line) ?? 0;
@@ -184,6 +194,11 @@ function forkFileTest(patterns = []) {
   return (file) =>
     !exclude.some((test) => test(file)) && (forkNamed(file) || include.some((test) => test(file)));
 }
+
+// The old base held the count exactly, so the rise came with the rebase (upstream's own change):
+// the operator's step, not a pull request author's (fork-follow cannot commit the raise itself).
+const AFTER_REBASE_RISE =
+  " after the rebase onto this base (upstream's own change did it, not a fork pull request): rebase by hand as docs/fork/updates.md says and raise the {count} in the rebased series before pushing it, or push it and then raise the {count} with a list-only pull request to main; fork-follow cannot raise it itself until #325 item 1.";
 
 /**
  * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed`
@@ -242,7 +257,7 @@ function findUnlistedChanges(
     if (upstream) {
       if (added > ceiling) {
         reasons.push(
-          `${file}: "pending" with ${added} fork lines, more than its ceiling of ${ceiling} (fork lines to move out, not add).`,
+          `${file}: "pending" with ${added} fork lines, more than its ceiling of ${ceiling}${afterRebase ? AFTER_REBASE_RISE.replaceAll("{count}", "ceiling") : " (fork lines to move out, not add)."}`,
         );
       } else if (added < ceiling) {
         // A ceiling left too high is room to swap upstream lines for fork lines later, and a note
@@ -278,7 +293,7 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }
   const lost = config.lost ?? {};
   const files = Object.entries(config.files).map(([file, seam]) => [
     file,
-    lineCounts(seam.added.join("\n")),
+    lineCounts(seamLines(seam).join("\n")),
   ]);
   if (upstream) for (const file of Object.keys(config.pending ?? {})) files.push([file, new Map()]);
   const say = (count, what) => `${count} upstream line${count === 1 ? "" : "s"} ${what}`;
@@ -314,7 +329,7 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }
       const text = say(counts[key], what[key]);
       if (counts[key] > held[key]) {
         reasons.push(
-          `${file}: ${text}, more than its "lost" ${key} count of ${held[key]} (keep upstream's lines; a fork change goes in a file of the fork's own).`,
+          `${file}: ${text}, more than its "lost" ${key} count of ${held[key]}${afterRebase ? AFTER_REBASE_RISE.replaceAll("{count}", "count") : " (keep upstream's lines; a fork change goes in a file of the fork's own)."}`,
         );
       } else if (counts[key] < held[key]) {
         below.push(
@@ -362,14 +377,95 @@ function findHiddenUpstreamFiles(upstreamFiles, isForkFile, atHead) {
     );
 }
 
+/**
+ * Why the list no longer matches the tree: a listed seam line its file lacks, or an announced line
+ * already there beyond the copies "added" lists (step 2 moves it to "added"). `read(file)`: the
+ * file's text, or undefined. Run by the tests on the tree they test (a pull request's included).
+ */
+function findStaleSeamLines(files, read) {
+  const problems = [];
+  for (const [file, seam] of Object.entries(files)) {
+    const text = read(file);
+    if (text === undefined) {
+      problems.push(`${file}: listed in ${CONFIG}, but the tree does not have it.`);
+      continue;
+    }
+    const there = lineCounts(text);
+    const listed = lineCounts(seam.added.join("\n"));
+    for (const line of listed.keys()) {
+      if (!there.has(line)) {
+        problems.push(
+          `${file}: the listed seam line \`${line}\` is not in the file; remove it from the list.`,
+        );
+      }
+    }
+    for (const line of lineCounts((seam.announced?.added ?? []).join("\n")).keys()) {
+      const count = there.get(line) ?? 0;
+      const need = listed.get(line) ?? 0;
+      if (count > need) {
+        problems.push(
+          `${file}: the announced line \`${line}\` is already in the file (${count}× there, "added" lists ${need}): move it to "added" in the change that adds it, or drop it (a line upstream has cannot be a seam line a pull request adds).`,
+        );
+      }
+    }
+  }
+  return problems;
+}
+
+const ANNOUNCED_DAYS = 14;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const dayNumber = (day) => Date.parse(`${day}T00:00:00Z`) / DAY_MS;
+
+/**
+ * Announcements past their days, or dated after `today` (the head's commit date, so a run again
+ * gives the same answer): announced lines that never land must not pile up. Only from upstream: a
+ * pull request's run stays free of dates, so the change that drops one is green.
+ */
+function findExpiredAnnouncements(files, today) {
+  const reasons = [];
+  for (const [file, seam] of Object.entries(files)) {
+    if (seam.announced === undefined) continue;
+    const { since, added } = seam.announced;
+    const days = dayNumber(today) - dayNumber(since);
+    const lines = `${added.length} line${added.length === 1 ? "" : "s"} "announced" on ${since}`;
+    if (days > ANNOUNCED_DAYS) {
+      reasons.push(
+        `${file}: ${lines}, more than ${ANNOUNCED_DAYS} days before ${today} (the head's commit date): add ${added.length === 1 ? "it" : "them"} (step 2) or remove the announcement.`,
+      );
+    } else if (days < -1) {
+      // One day is left for time zones.
+      reasons.push(
+        `${file}: ${lines}, after ${today} (the head's commit date): date it the day it is announced.`,
+      );
+    }
+  }
+  return reasons;
+}
+
 const KINDS = ["files", "pending", "forkFiles", "lost"];
-const SEAM_KEYS = ["why", "added"];
+const SEAM_KEYS = ["why", "added", "announced"];
+const ANNOUNCED_KEYS = ["since", "added"];
+
+/** A path git reads as itself: relative, no `.`, `..` or empty part, no pathspec magic or `\\`. */
+const isRepoPath = (file) =>
+  !file.startsWith(":") &&
+  !/[\\\u0000-\u001f\u007f]/.test(file) &&
+  file.split("/").every((part) => part.trim() !== "" && part !== "." && part !== "..");
+
+/** Whether `day` is a real calendar day written YYYY-MM-DD. */
+function isDay(day) {
+  if (typeof day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+  const date = new Date(`${day}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === day;
+}
 
 /** Refuses a key the check does not read (a misspelt block guards nothing); "//…" is a comment. */
 function refuseUnknownKeys(object, known, where) {
   for (const key of Object.keys(object)) {
     if (!key.startsWith("//") && !known.includes(key)) {
-      throw new Error(`${CONFIG}: ${where}unknown key "${key}" (known: ${known.join(", ")})`);
+      throw new Error(
+        `${CONFIG}: ${where}unknown key ${JSON.stringify(key)} (known: ${known.join(", ")})`,
+      );
     }
   }
 }
@@ -386,6 +482,9 @@ function parseConfig(text) {
   }
   refuseUnknownKeys(config, KINDS, "");
   for (const [file, seam] of Object.entries(files)) {
+    if (!isRepoPath(file)) {
+      throw new Error(`${CONFIG}: "files": not a plain repository path: ${JSON.stringify(file)}`);
+    }
     if (typeof seam?.why !== "string" || seam.why.trim() === "") {
       throw new Error(`${CONFIG}: ${file} needs a "why"`);
     }
@@ -393,6 +492,17 @@ function parseConfig(text) {
       throw new Error(`${CONFIG}: ${file}: "added" must be a list of lines`);
     }
     refuseUnknownKeys(seam, SEAM_KEYS, `${file}: `);
+    if (seam.announced !== undefined) {
+      const announced = seam.announced;
+      const shape = `${CONFIG}: ${file}: "announced" needs {"since": "YYYY-MM-DD", "added": [lines]}: the day it is announced and at least one line`;
+      if (typeof announced !== "object" || announced === null || Array.isArray(announced)) {
+        throw new Error(shape);
+      }
+      refuseUnknownKeys(announced, ANNOUNCED_KEYS, `${file}: "announced": `);
+      if (!isDay(announced.since) || !isStringList(announced.added) || !announced.added.length) {
+        throw new Error(shape);
+      }
+    }
   }
   if (config.forkFiles !== undefined && !isStringList(config.forkFiles)) {
     throw new Error(`${CONFIG}: "forkFiles" must be a list of paths`);
@@ -402,7 +512,10 @@ function parseConfig(text) {
     throw new Error(`${CONFIG}: "pending" must map each path to its ceiling of fork lines`);
   }
   for (const [file, ceiling] of Object.entries(pending)) {
-    if (file.trim() === "" || !Number.isSafeInteger(ceiling) || ceiling < 1) {
+    if (!isRepoPath(file)) {
+      throw new Error(`${CONFIG}: "pending": not a plain repository path: ${JSON.stringify(file)}`);
+    }
+    if (!Number.isSafeInteger(ceiling) || ceiling < 1) {
       throw new Error(`${CONFIG}: "pending": ${file} needs a ceiling of 1 or more fork lines`);
     }
     if (Object.hasOwn(files, file))
@@ -414,7 +527,7 @@ function parseConfig(text) {
   }
   for (const [file, entry] of Object.entries(lost)) {
     if (!Object.hasOwn(files, file) && !Object.hasOwn(pending, file)) {
-      throw new Error(`${CONFIG}: "lost": ${file} is not in "files" or "pending"`);
+      throw new Error(`${CONFIG}: "lost": ${JSON.stringify(file)} is not in "files" or "pending"`);
     }
     // `gone` (text gone) is at most `lines` (not kept in order) for any file, so more never matches.
     const { lines, gone, ...other } = entry ?? {};
@@ -446,6 +559,39 @@ function parseConfig(text) {
 }
 
 /**
+ * The first key an object of `text` (valid JSON) has twice, decoded, or undefined. JSON.parse keeps
+ * the last one, so the other is shown in the list but never applies.
+ */
+function findDuplicateKey(text) {
+  const objects = []; // A Set of keys per open object, null per open array.
+  let atKey = false;
+  for (let at = 0; at < text.length; at++) {
+    const char = text[at];
+    if (char === '"') {
+      let end = at + 1;
+      while (text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
+      const keys = objects.at(-1);
+      if (keys && atKey) {
+        const key = JSON.parse(text.slice(at, end + 1));
+        if (keys.has(key)) return key;
+        keys.add(key);
+        atKey = false;
+      }
+      at = end;
+    } else if (char === "{" || char === "[") {
+      objects.push(char === "{" ? new Set() : null);
+      atKey = char === "{";
+    } else if (char === "}" || char === "]") {
+      objects.pop();
+      atKey = false;
+    } else if (char === ",") {
+      atKey = objects.at(-1) instanceof Set;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Why a pull request's own list cannot become main's (its format only: its rules are not in force
  * here), or undefined. Merged, a malformed list crashes every later run, the fix's run included.
  */
@@ -454,9 +600,11 @@ function ownListProblem(text) {
   if (text === undefined) return `${own}: this change deletes it.`;
   try {
     parseConfig(text);
-    return undefined;
+    const duplicate = findDuplicateKey(text);
+    if (duplicate === undefined) return undefined;
+    return printable(`${own} is malformed: duplicate key ${JSON.stringify(duplicate)}`);
   } catch (error) {
-    return `${own} is malformed: ${error instanceof Error ? error.message : error}`;
+    return printable(`${own} is malformed: ${error instanceof Error ? error.message : error}`);
   }
 }
 
@@ -551,9 +699,12 @@ function main(argv) {
         )
       : []),
   ];
+  const expired = upstream
+    ? findExpiredAnnouncements(config.files, git(["show", "-s", "--format=%cs", head]).trim())
+    : [];
   const from = parsed.configRef ? `--config-ref ${configRef}` : upstream ? "the head" : "the base";
   const notes = [...findListedGone(config, { atBase, atHead }), ...unlisted.notes, ...lost.notes];
-  for (const note of notes) console.log(`Note: ${note}`);
+  for (const note of notes) console.log(printable(`Note: ${note}`));
   const ownList = textAt(head, CONFIG);
   const editsList = !upstream && ownList !== textAt(mergeBase, CONFIG);
   const listProblem = editsList ? ownListProblem(ownList) : undefined;
@@ -570,7 +721,7 @@ function main(argv) {
       `Fix the list in this change: merged, it is main's list, and a malformed one stops every later pull request and fork-follow run.`,
     );
   }
-  if (reasons.length === 0 && ceilings.length === 0) {
+  if (reasons.length === 0 && ceilings.length === 0 && expired.length === 0) {
     if (listProblem !== undefined) return 1;
     console.log(
       `Fork lines in upstream files: only the pinned seams (${counted}; list from ${from}).`,
@@ -580,7 +731,8 @@ function main(argv) {
   console.error(
     `Fork changes to upstream files must stay within the seam lines in ${CONFIG} (list from ${from}):`,
   );
-  for (const reason of [...reasons, ...ceilings]) console.error(`- ${reason}`);
+  for (const reason of [...reasons, ...ceilings, ...expired])
+    console.error(printable(`- ${reason}`));
   if (reasons.length > 0) {
     console.error(
       "Put the change in a file of the fork's own (a fork setting goes in " +
@@ -593,20 +745,29 @@ function main(argv) {
       `Lower each "pending" ceiling and "lost" count named above (or remove the entry) in ${CONFIG} with a pull request to main.`,
     );
   }
+  if (expired.length > 0) {
+    console.error(
+      `Add each announced line (step 2) or remove its announcement in ${CONFIG}, with a pull request to main (docs/fork/updates.md, "Adding a seam line").`,
+    );
+  }
   return 1;
 }
 
 module.exports = {
   CONFIG,
   compileForkPattern,
+  findDuplicateKey,
+  findExpiredAnnouncements,
   findHiddenUpstreamFiles,
   findListedGone,
   findLostLines,
   findSeamBreaches,
+  findStaleSeamLines,
   findUnlistedChanges,
   forkFileTest,
   lineCounts,
   lostLines,
+  ownListProblem,
   parseConfig,
   parseRemoved,
   sameLines,
@@ -616,7 +777,9 @@ if (require.main === module) {
   try {
     process.exitCode = main(process.argv.slice(2));
   } catch (error) {
-    console.error(`fork-seam-check crashed: ${error instanceof Error ? error.message : error}`);
+    console.error(
+      printable(`fork-seam-check crashed: ${error instanceof Error ? error.message : error}`),
+    );
     process.exitCode = 3;
   }
 }

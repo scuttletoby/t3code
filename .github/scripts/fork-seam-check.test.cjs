@@ -7,13 +7,16 @@ const test = require("node:test");
 const {
   CONFIG,
   compileForkPattern,
+  findExpiredAnnouncements,
   findHiddenUpstreamFiles,
   findSeamBreaches,
   findListedGone,
   findLostLines,
+  findStaleSeamLines,
   findUnlistedChanges,
   forkFileTest,
   lostLines,
+  ownListProblem,
   parseConfig,
   parseRemoved,
   sameLines,
@@ -310,11 +313,29 @@ test("after a rebase, a pending file below its ceiling is a note; over it is sti
     ceilings: [],
     notes: ['p.ts: "pending" with no fork lines left; remove it from the list.'],
   });
-  assert.deepEqual(judge(`${UP}forkA();\nforkB();\nforkC();\n`, true).reasons, [
-    'p.ts: "pending" with 3 fork lines, more than its ceiling of 2 (fork lines to move out, not add).',
-  ]);
+  const [over, ...more] = judge(`${UP}forkA();\nforkB();\nforkC();\n`, true).reasons;
+  assert.deepEqual(more, []);
+  assert.match(
+    over,
+    /^p\.ts: "pending" with 3 fork lines, more than its ceiling of 2 after the rebase/,
+  );
   assert.equal(judge(UP, false).ceilings.length, 1);
 });
+
+const NOT_PATHS = [
+  "",
+  " ",
+  "/abs",
+  "../up.ts",
+  "a/../b.ts",
+  "./a.ts",
+  "a//b.ts",
+  "a/",
+  ":(glob)a.ts",
+  ":!a.ts",
+  ":/a.ts",
+  "a\\b.ts",
+];
 
 test("a malformed config throws instead of guarding nothing", () => {
   for (const bad of [
@@ -353,6 +374,28 @@ test("a malformed config throws instead of guarding nothing", () => {
       files: {},
       forkFiles: [pattern],
     })),
+    // "files" and "pending" keys are plain repository paths: anything else made every later run
+    // crash in `git ls-tree` once merged.
+    ...NOT_PATHS.flatMap((file) => [
+      { files: { [file]: SEAM["a.ts"] } },
+      { files: {}, pending: { [file]: 1 } },
+    ]),
+    // "announced": since a real date, and at least one line.
+    ...[
+      true,
+      "2026-11-18",
+      { added: ["x"] },
+      { since: "2026-11-18" },
+      { since: "2026-11-18", added: [] },
+      { since: "2026-11-18", added: [""] },
+      { since: "2026-11-18", added: [1] },
+      { since: "2026-11-18", added: "x" },
+      { since: "2026-13-01", added: ["x"] },
+      { since: "2026-02-30", added: ["x"] },
+      { since: "18.11.2026", added: ["x"] },
+      { since: "2026-11-18T00:00:00Z", added: ["x"] },
+      { since: "2026-11-18", added: ["x"], why: "y" },
+    ].map((announced) => ({ files: { "a.ts": { ...SEAM["a.ts"], announced } } })),
   ]) {
     assert.throws(() => parseConfig(JSON.stringify(bad)), JSON.stringify(bad));
   }
@@ -365,6 +408,16 @@ test("a malformed config throws instead of guarding nothing", () => {
         files: { "a.ts": { ...SEAM["a.ts"], "//": "c" } },
       }),
     ),
+  );
+  // A seam entry may announce lines; "added" may then be empty.
+  const announced = {
+    "a.ts": { ...SEAM["a.ts"], announced: { since: "2026-11-18", added: ["soon();"] } },
+    "n.ts": { why: "new", added: [], announced: { since: "2024-02-29", added: ["x", "x"] } },
+  };
+  assert.deepEqual(parseConfig(JSON.stringify({ files: announced })).files, announced);
+  // Plain paths with dots, dashes and nested folders are fine.
+  assert.doesNotThrow(() =>
+    parseConfig(JSON.stringify({ files: {}, pending: { "a/.b/c-d.e2e.ts": 1, "x..y.ts": 2 } })),
   );
   assert.deepEqual(parseConfig(JSON.stringify({ files: SEAM })), {
     files: SEAM,
@@ -384,29 +437,60 @@ const readReal = (file) =>
   fs.existsSync(path.join(REPO_ROOT, file))
     ? fs.readFileSync(path.join(REPO_ROOT, file), "utf8")
     : execFileSync("git", ["-C", REPO_ROOT, "show", `HEAD:${file}`], { encoding: "utf8" });
-const REAL_CONFIG = parseConfig(readReal(CONFIG));
-const REAL = REAL_CONFIG.files;
+// Read in each test, not at load: a parse error then fails the tests that pin it, not the file.
+const realConfig = () => parseConfig(readReal(CONFIG));
 
-// Upstream's nightlies from …4695 on have this file; fork-follow stopped after the rebase onto it.
-test("the real list takes no upstream file named like a fork file for the fork's own", () => {
-  const isForkFile = forkFileTest(REAL_CONFIG.forkFiles);
-  assert.equal(
-    isForkFile("scripts/scenarios/fork-title-regenerates-from-inherited-history.e2e.ts"),
-    false,
-  );
-  // The exclusion is that one file: the fork's own scenario files keep their fork names.
-  assert.equal(isForkFile("scripts/scenarios/fork-other.e2e.ts"), true);
+test("every listed seam line is in its file and no announced one is yet, so the list is not stale", () => {
+  const read = (file) => {
+    try {
+      return readReal(file);
+    } catch {
+      return undefined;
+    }
+  };
+  assert.deepEqual(findStaleSeamLines(realConfig().files, read), []);
 });
 
-test("every listed seam line is in its file, so the list is not stale", () => {
-  for (const [file, seam] of Object.entries(REAL)) {
-    const lines = new Set(
-      readReal(file)
-        .split("\n")
-        .map((line) => line.trim()),
-    );
-    for (const line of seam.added) assert.ok(lines.has(line.trim()), `${file}: ${line}`);
-  }
+test("the stale-list check: a listed line must be in its file, an announced one not yet", () => {
+  const files = {
+    "a.ts": { why: "t", added: ["kept();", "gone();"] },
+    "b.ts": { why: "t", added: [], announced: { since: "2026-11-18", added: ["soon();"] } },
+    "c.ts": {
+      why: "t",
+      added: ["twice();"],
+      announced: { since: "2026-11-18", added: ["twice();", "}"] },
+    },
+  };
+  const text = {
+    "a.ts": "kept();\n",
+    "b.ts": "upstream();\n",
+    "c.ts": "  twice();\n}\n",
+  };
+  assert.deepEqual(
+    findStaleSeamLines(files, (file) => text[file]),
+    [
+      "a.ts: the listed seam line `gone();` is not in the file; remove it from the list.",
+      'c.ts: the announced line `}` is already in the file (1× there, "added" lists 0): move it to "added" in the change that adds it, or drop it (a line upstream has cannot be a seam line a pull request adds).',
+    ],
+  );
+  // Step 2 adds the lines and keeps the announcement: refused, so it drops the flag.
+  text["b.ts"] = "upstream();\nsoon();\n";
+  text["c.ts"] = "twice();\ntwice();\n";
+  assert.deepEqual(
+    findStaleSeamLines({ "b.ts": files["b.ts"] }, (file) => text[file]),
+    [
+      'b.ts: the announced line `soon();` is already in the file (1× there, "added" lists 0): move it to "added" in the change that adds it, or drop it (a line upstream has cannot be a seam line a pull request adds).',
+    ],
+  );
+  // The second copy announced next to a listed one is absent until the file has two.
+  text["c.ts"] = "twice();\n";
+  const one = { ...files["c.ts"], announced: { since: "2026-11-18", added: ["twice();"] } };
+  assert.deepEqual(
+    findStaleSeamLines({ "c.ts": one }, (file) => text[file]),
+    [],
+  );
+  // A listed file the tree does not have: every line of it is stale.
+  assert.equal(findStaleSeamLines({ "a.ts": files["a.ts"] }, () => undefined).length, 1);
 });
 
 // From the design review of the fork defaults table: a fork setting written straight into
@@ -424,7 +508,7 @@ for (const [how, added] of [
     const source = readReal(SETTINGS);
     assert.ok(source.includes(STRUCT));
     const head = source.replace(STRUCT, `${STRUCT}\n${added}`);
-    const reasons = judge(REAL, { [SETTINGS]: source }, { [SETTINGS]: head });
+    const reasons = judge(realConfig().files, { [SETTINGS]: source }, { [SETTINGS]: head });
     assert.ok(
       reasons.some((reason) => reason.includes("forkNewSwitch")),
       reasons.join("\n"),
@@ -439,7 +523,8 @@ function withRepo(body) {
     execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], {
       encoding: "utf8",
     });
-  const commit = (files, message) => {
+  // `date` (ISO) sets the commit's author and committer date; the check reads the committer's.
+  const commit = (files, message, date) => {
     for (const [file, text] of Object.entries(files)) {
       const at = path.join(dir, file);
       if (text === null) fs.rmSync(at);
@@ -449,7 +534,27 @@ function withRepo(body) {
       }
     }
     git("add", "-A");
-    git("commit", "-q", "--allow-empty", "-m", message);
+    execFileSync(
+      "git",
+      [
+        "-C",
+        dir,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        message,
+      ],
+      {
+        env: date
+          ? { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date }
+          : process.env,
+      },
+    );
     return git("rev-parse", "HEAD").trim();
   };
   const run = (...args) => spawnSync("node", [SCRIPT, ...args], { cwd: dir, encoding: "utf8" });
@@ -1230,5 +1335,188 @@ test("from upstream, a lost count left too high is refused, naming the count; af
       after.stdout,
       /^Note: p\.ts: 2 upstream lines .* below its "lost" lines count of 3; lower it to 2\.$/m,
     );
+  });
+});
+
+// Upstream's nightlies from …4695 on have this file; fork-follow stopped after the rebase onto it.
+test("the real list takes no upstream file named like a fork file for the fork's own", () => {
+  const isForkFile = forkFileTest(realConfig().forkFiles);
+  assert.equal(
+    isForkFile("scripts/scenarios/fork-title-regenerates-from-inherited-history.e2e.ts"),
+    false,
+  );
+  // The exclusion is that one file: the fork's own scenario files keep their fork names.
+  assert.equal(isForkFile("scripts/scenarios/fork-other.e2e.ts"), true);
+});
+
+// A PR's own list is printed in a pull_request_target log: a key holding a newline could start a
+// line with `::` there, a workflow command.
+test("a key from the list is printed escaped, so it cannot forge a workflow command line", () => {
+  const forged = "x\n::notice title=forged::y";
+  for (const config of [
+    { files: SEAM, [forged]: {} },
+    { files: { "a.ts": { ...SEAM["a.ts"], [forged]: 1 } } },
+    { files: { [forged]: SEAM["a.ts"] } },
+    { files: {}, pending: { [forged]: 1 } },
+    { files: SEAM, lost: { [forged]: { lines: 1, gone: 0 } } },
+  ]) {
+    const problem = ownListProblem(JSON.stringify(config));
+    assert.ok(problem, JSON.stringify(config));
+    assert.doesNotMatch(problem, /[\n\r]/, problem);
+    assert.match(problem, /x\\n::notice/, problem);
+  }
+  // Node's JSON error quotes a short bad text as it is.
+  const badJson = ownListProblem("\n::notice title=forged::y");
+  assert.match(badJson, /is malformed: .*JSON/);
+  assert.doesNotMatch(badJson, /[\n\r]/, badJson);
+});
+
+test("a line the change adds is printed escaped in a refusal", () => {
+  withRepo(({ commit, run }) => {
+    const main = commit({ ...seams({ files: SEAM }), ...BASE }, "main");
+    const pr = commit({ "a.ts": `${BASE["a.ts"]}x\r::warning::forged\u2028y\n` }, "pr");
+    const result = run(main, pr);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /x\\u000d::warning::forged\\u2028y/);
+    assert.doesNotMatch(result.stderr, /[\r\u2028]/);
+  });
+});
+
+// JSON.parse keeps the last of two equal keys: a conflict resolved by keeping both entries would
+// leave one that is shown but never applies.
+test("a pull request's own list with a duplicate key is refused", () => {
+  const entry = JSON.stringify(SEAM["a.ts"]);
+  for (const [text, key] of [
+    [`{"files": {"a.ts": ${entry}, "a.ts": ${entry}}}`, "a.ts"],
+    [`{"files": {}, "pending": {"p.ts": 1, "q.ts": 2, "p.ts": 3}}`, "p.ts"],
+    [`{"files": {"a.ts": {"why": "x", "added": [], "why": "y"}}}`, "why"],
+    [`{"files": {}, "files": {}}`, "files"],
+    // Equal once decoded.
+    [`{"files": {}, "pending": {"p.ts": 1, "\\u0070.ts": 1}}`, "p.ts"],
+  ]) {
+    assert.equal(ownListProblem(text), `${OWN} is malformed: duplicate key ${JSON.stringify(key)}`);
+  }
+  // The same key in different objects, and keys inside strings, are not duplicates.
+  for (const text of [
+    `{"files": {"a.ts": {"why": "a \\" \\"why\\": {", "added": ["{\\"why\\": 1}"]}, "b.ts": {"why": "b", "added": []}}, "pending": {"a.x": 1}}`,
+    `{"//": "files", "files": {}}`,
+  ]) {
+    assert.equal(ownListProblem(text), undefined, text);
+  }
+  assert.equal(ownListProblem(readReal(CONFIG)), undefined);
+});
+const OWN = "this change's own .github/fork-seams.json";
+
+// Right after a rebase a count can rise from upstream's own change, not a fork pull request: the
+// refusal then says what the operator does, not what a pull request author does.
+test("after a rebase, a count that rises names the operator's next step", () => {
+  const config = { pending: { "p.ts": 1 }, lost: { "p.ts": { lines: 1, gone: 1 } } };
+  const base = { "p.ts": GUARD_BASE };
+  const head = { "p.ts": "doSensitive();\nforkA();\n" };
+  for (const afterRebase of [false, true]) {
+    const { reasons } = lostIn(config, base, head, true, afterRebase);
+    assert.equal(reasons.length, 2);
+    for (const reason of reasons) {
+      if (afterRebase) {
+        assert.match(reason, /after the rebase .* rebase by hand .* #325/, reason);
+        assert.doesNotMatch(reason, /a file of the fork's own/, reason);
+      } else {
+        assert.match(reason, /a file of the fork's own/, reason);
+      }
+    }
+  }
+  const over = findUnlistedChanges(
+    { files: {}, pending: { "p.ts": 1 }, forkFiles: [] },
+    {
+      changed: ["p.ts"],
+      atBase: () => UP,
+      atHead: () => `${UP}forkA();\nforkB();\n`,
+      upstream: true,
+      isForkFile: () => false,
+      afterRebase: true,
+    },
+  );
+  assert.match(over.reasons[0], /more than its ceiling of 1 after the rebase .* rebase by hand/);
+});
+
+test("an announcement is refused from upstream once it is older than its days, or dated ahead", () => {
+  const files = {
+    "a.ts": SEAM["a.ts"],
+    "n.ts": { why: "t", added: [], announced: { since: "2026-11-04", added: ["x", "y"] } },
+  };
+  assert.deepEqual(findExpiredAnnouncements(files, "2026-11-18"), []);
+  assert.deepEqual(findExpiredAnnouncements(files, "2026-11-19"), [
+    'n.ts: 2 lines "announced" on 2026-11-04, more than 14 days before 2026-11-19 (the head\'s commit date): add them (step 2) or remove the announcement.',
+  ]);
+  // A date ahead of the head's would never expire (one day is left for time zones).
+  const ahead = { "n.ts": { ...files["n.ts"], announced: { since: "2026-11-20", added: ["x"] } } };
+  assert.deepEqual(findExpiredAnnouncements(ahead, "2026-11-19"), []);
+  assert.deepEqual(findExpiredAnnouncements(ahead, "2026-11-18"), [
+    'n.ts: 1 line "announced" on 2026-11-20, after 2026-11-18 (the head\'s commit date): date it the day it is announced.',
+  ]);
+});
+
+// A pull request is judged by main's list, so a new seam line had no green path. Step 1 (a
+// list-only change) announces it; step 2 adds it and moves it to "added".
+test("a new seam line lands green in two steps: announce, then add", () => {
+  withRepo(({ git, commit, run, fromUpstream }) => {
+    const upstream = commit({ ...BASE, "n.ts": UP }, "upstream");
+    const day = "2026-11-18T12:00:00Z";
+    const main = commit(seams({ files: SEAM }), "fork main", day);
+    const announce = (since = "2026-11-18") => ({
+      files: {
+        ...SEAM,
+        "n.ts": { why: "new", added: [], announced: { since, added: ["forkNew();"] } },
+      },
+    });
+    const added = { files: { ...SEAM, "n.ts": { why: "new", added: ["forkNew();"] } } };
+    const line = { "n.ts": `${UP}forkNew();\n` };
+    // Step 2 before step 1: refused, as before.
+    git("checkout", "-q", "-b", "early", main);
+    const early = commit({ ...line, ...seams(added) }, "step 2 first", day);
+    assert.equal(run(main, early).status, 1);
+    // Step 1: list only, green in the pull request's run and from upstream.
+    git("checkout", "-q", "-f", "-B", "main", main);
+    const step1 = commit(seams(announce()), "step 1", day);
+    assert.equal(run(main, step1).status, 0);
+    const listed = fromUpstream(upstream, step1);
+    assert.equal(listed.status, 0, listed.stderr);
+    // Step 2, judged by main's list with the announcement: green, and the line drops the flag.
+    git("checkout", "-q", "-b", "step2", step1);
+    const step2 = commit({ ...line, ...seams(added) }, "step 2", day);
+    for (const args of [
+      [step1, step2],
+      ["--config-ref", step1, step1, step2],
+    ]) {
+      const result = run(...args);
+      assert.equal(result.status, 0, result.stderr);
+    }
+    assert.equal(fromUpstream(upstream, step2).status, 0);
+    // An announced line allows only its own copies, and only in its file.
+    const twice = commit(
+      { "n.ts": `${UP}forkNew();\nforkNew();\n`, "a.ts": `${BASE["a.ts"]}forkNew();\n` },
+      "more",
+      day,
+    );
+    const more = run(step1, twice);
+    assert.equal(more.status, 1);
+    assert.match(more.stderr, /- n\.ts: adds `forkNew\(\);`/);
+    assert.match(more.stderr, /- a\.ts: adds `forkNew\(\);`/);
+    // Never followed by step 2: from upstream the run refuses it once it is 15 days old, and a
+    // list-only change that drops it (or step 2) is green again.
+    git("checkout", "-q", "-f", "-B", "main", step1);
+    const later = commit({ "fork/own.ts": UP }, "a later merge", "2026-12-03T12:00:00Z");
+    const expired = fromUpstream(upstream, later);
+    assert.equal(expired.status, 1, expired.stdout);
+    assert.match(expired.stderr, /- n\.ts: 1 line "announced" on 2026-11-18, more than 14 days/);
+    assert.match(expired.stderr, /Add each announced line \(step 2\) or remove its announcement/);
+    assert.doesNotMatch(expired.stderr, /a file of the fork's own/);
+    // The pull request's run has no clock: the same list is green there.
+    assert.equal(run(step1, later).status, 0);
+    const dropped = commit(seams({ files: SEAM }), "drop it", "2026-12-03T12:00:00Z");
+    assert.equal(run(later, dropped).status, 0);
+    assert.equal(fromUpstream(upstream, dropped).status, 0);
+    // Runs again: the same answer (the head's commit date, not the clock).
+    assert.equal(fromUpstream(upstream, later).stderr, expired.stderr);
   });
 });

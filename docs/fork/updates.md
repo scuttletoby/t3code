@@ -52,9 +52,11 @@ watches; it changes nothing on the machine, and `0` turns it off.
   upstream file, listed or not. It runs on every pull request (Fork tests, "Workflow lint and
   upstream drift") and in fork-follow before and after each rebase, against the upstream commit
   the series sits on. A pull request is judged by its base's list, never by its own: a new seam,
-  `pending` or `forkFiles` entry counts once the owner merges it. Its own list is only parsed: a
-  malformed one (bad JSON, an unknown key, a `lost` entry not in the form below, or none) is
-  refused, since once merged it would stop every later run. `pending` maps upstream files
+  `pending` or `forkFiles` entry counts once the owner merges it (a new seam line takes two pull
+  requests, [below](#adding-a-seam-line)). Its own list is only parsed: a malformed one (bad JSON,
+  an unknown or duplicate key, a `files` or `pending` key that is not a plain repository path, a
+  `lost` entry not in the form below, or none) is refused, since once merged it would stop every
+  later run. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
   also lowers the ceiling in the same change). Right after a rebase, below the ceiling is only a
@@ -64,9 +66,14 @@ watches; it changes nothing on the machine, and `0` turns it off.
   it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
   guard, or re-indented) add no line, so they are counted too, two ways: `lines`, the upstream lines
   it does not keep in order and indentation, and `gone`, those whose text it no longer has at all,
-  so a line already counted as moved or re-indented cannot later be deleted unseen. `lost` maps such
+  so deleting a line already counted as moved or re-indented raises `gone`. `lost` maps such
   a file to both (`{"lines": N, "gone": M}`), counted from upstream (none when unlisted) and held
-  exactly like a `pending` ceiling. A pull request may drop a seam file's listed seam lines (no more
+  exactly like a `pending` ceiling. A count is not a set of lines: in a file with a `lost` entry a
+  line it counts may move unseen, and in a pending file with one a pull request can put back one
+  gone upstream line and delete a different one with both counts unchanged (neither run sees it),
+  so keep each count small. Right after a rebase, a count or ceiling that rises came with the
+  rebase, not a fork pull request: the refusal tells the operator to rebase by hand and raise it
+  in the rebased series (fork-follow cannot commit it until #325 item 1). A pull request may drop a seam file's listed seam lines (no more
   copies than listed) but lose no other line, and may not move a seam line: a moved copy of `}`
   looks the same as upstream's (move one with two pull requests). In a pending file it cannot tell
   upstream's lines from the fork's (moving a fork line out loses one), so there fork-follow counts
@@ -89,6 +96,51 @@ watches; it changes nothing on the machine, and `0` turns it off.
   with no file, `{}`, a file an upstream build wrote, a file cut off half-way and a file with a bad
   value. A file that cannot be read gives no settings at all, and the update loop then does nothing
   (`autoUpdate.test.ts`).
+
+### Adding a seam line
+
+A pull request is judged by main's list, so a change that adds a line to an upstream file and its
+seam entry together is refused. It takes two pull requests, each green:
+
+1. **Announce** (list only, reviewed like any gate change): add the lines under `announced` in the
+   file's entry, with the day: `{"since": "YYYY-MM-DD", "added": [lines]}`. A file with no entry yet
+   gets one with `"added": []`. The seam check allows an announced line like an `added` one. The
+   seam-check tests (on the pull request's tree) refuse an announced line that is already in its
+   file beyond the copies `added` lists: a line upstream has (`}`) cannot be announced, as a pull
+   request cannot add it.
+2. **Add** the lines, and in the same change move them from `announced` to `added` (drop
+   `announced` once empty). Judged by main's list, which announces them, it is green. Keeping the
+   announcement there fails the tests, since the lines are now in the file.
+
+From upstream, fork-follow refuses an announcement more than 14 days older than the head's commit
+date (or dated ahead of it): add the lines or remove the announcement with a pull request to main.
+A pull request's run never looks at the date, so that pull request is green.
+
+For example, the cli/connect.ts lines of
+[#398](https://github.com/scuttletoby/t3code/pull/398) go into main's existing entry first:
+
+```json
+"apps/server/src/cli/connect.ts": {
+  "why": "…, and the CLI's Connect-on check (requireConnectAllowed) refuses on a held copy too.",
+  "added": ["import * as HoldWorkConnect from \"../cloud/holdWorkConnect.ts\";", "…"],
+  "announced": {
+    "since": "2026-11-19",
+    "added": [
+      "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig);",
+      "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig); // Fork: a held copy"
+    ]
+  }
+}
+```
+
+and [#412](https://github.com/scuttletoby/t3code/pull/412)'s file, which has no entry, gets
+`"apps/server/src/peer/RemoteDelegation.ts": {"why": "…", "added": [], "announced": {"since": …,
+"added": [its 10 lines]}}`. Each pull request then rebases onto main and moves its lines to
+`added`; #398 also drops the old lines it replaces from `added` (a pull request may drop seam lines).
+
+A new `forkFiles` pattern needs no announcement: a list-only pull request adds it, and the pull
+request that edits those files follows. `pending` takes no new file or higher ceiling: its lines
+predate the rule and only move out, so a new fork line is a seam line.
 
 ### Adding a fork setting
 
