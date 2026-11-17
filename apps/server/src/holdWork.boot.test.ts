@@ -836,8 +836,6 @@ describe("serve --hold-work on a seeded home", () => {
           );
         },
       );
-      expect(marked.output()).not.toContain("--hold-work");
-      expect(marked.output()).not.toMatch(PUBLISHER_STARTED);
       await stop(marked.child);
       const markedSpans = spansFrom(paths.stateDir, heldSpans.end);
       // No tunnel registered, started or released, and no agent activity sent.
@@ -845,6 +843,8 @@ describe("serve --hold-work on a seeded home", () => {
       expect(activityPublishes(remote)).toEqual([]);
       expect(CONNECT_SPANS.filter((name) => markedSpans.names.has(name))).toEqual([]);
       expect(relayRequests(remote)).toEqual([]);
+      expect(marked.output()).not.toMatch(PUBLISHER_STARTED);
+      expect(marked.output()).not.toContain("--hold-work");
       expect(markedSpans.names).toContain("HoldWorkConnect.releaseManagedTunnel");
       expect(markedSpans.names).toContain("autoPullProjects");
       expect(markedSpans.names).toContain("RemoteDelegation.followOnce");
