@@ -26,12 +26,12 @@
   },
   "pools": [
     {
-      "_doc": "The owner's PC: its dispatcher runs on the always-on host and starts runners on the PC over ssh.",
+      "_doc": "The owner's PC, a desk pool: its desk agent dials out to the always-on host, whose dispatcher for this pool starts runners on the PC through that link (fork-fleet.md, The desk link).",
       "name": "pc",
       "label": "fleet-pc-t3code",
       "slots": 1,
       "beacon": "FLEET_BEACON_PC",
-      "launch": ["/opt/fork-fleet/launch-pc"],
+      "launch": ["python3", "-I", "/opt/fork-fleet/fork-fleet-desk.py", "launch", "pc"],
       "waits": false
     },
     {
