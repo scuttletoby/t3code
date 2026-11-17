@@ -1122,28 +1122,54 @@ class Dispatch(unittest.TestCase):
         """#356: GitHub still lists the runner online but its unit is not on this host (gone after a reboot or a
         crash, or the pool's launch moved to another host without a label change). `stop` could only fail, so it is
         never tried: the pool is never down for it, the same pass runs again without a stop, and a queued job starts.
-        Once GitHub marks the runner offline, its registration is deleted."""
-        for why in ('idle passes', 'another job could take it'):
-            with self.subTest(why):
-                self.setUp()
-                self.registration(40)
-                if why == 'another job could take it':
-                    self.gh.add(a_run(6, actor='someone'), a_job(41, [POOLS[WAITING]['label']]))
-                for _ in range(CFG['dispatch']['idle_passes']):
-                    self.dispatch()
-                self.assertEqual(self.fake[WAITING].stopped, [])
-                self.assertEqual(self.state['down'], {})
-                self.assertEqual(self.state['idle'], {})
-                if why == 'another job could take it':   # cancelled: it would hold back job 11 as a rival
-                    self.gh.jobs[6] = [a_job(41, [POOLS[WAITING]['label']], status='completed', conclusion='cancelled')]
-                self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
-                for _ in range(4):
-                    self.dispatch()
-                self.assertEqual((self.fake[WAITING].stopped, self.started()), ([], [self.name(11)]))
-                self.assertEqual(self.state['down'], {})
-                self.gh.runners[0]['status'] = 'offline'
-                self.dispatch()
-                self.assertNotIn(self.name(40), [r['name'] for r in self.gh.runners])
+        Once GitHub marks the runner offline, its registration is deleted. This is the idle path (no queued job could
+        take it, job 11 included: it is another job key); the next test is the stop-at-once path."""
+        self.registration(40, key='rust')
+        for _ in range(CFG['dispatch']['idle_passes']):
+            self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, [])
+        self.assertEqual(self.state['down'], {})
+        self.assertEqual(self.state['idle'], {})
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+        for _ in range(4):
+            self.dispatch()
+        self.assertEqual((self.fake[WAITING].stopped, self.started()), ([], [self.name(11)]))
+        self.assertEqual(self.state['down'], {})
+        self.gh.runners[0]['status'] = 'offline'
+        self.dispatch()
+        self.assertNotIn(self.name(40), [r['name'] for r in self.gh.runners])
+
+    def test_an_idle_runner_with_no_unit_here_is_not_stopped_at_once_for_a_job_that_could_take_it(self):
+        """#356, #366: the same runner while a queued job of another run could be given it, which would stop a
+        runner with a unit here at once. One pass only, so the idle path (idle_passes passes) plays no part."""
+        self.assertGreater(CFG['dispatch']['idle_passes'], 1)
+        self.registration(40)
+        self.gh.add(a_run(6, actor='someone'), a_job(41, [POOLS[WAITING]['label']]))
+        self.dispatch()
+        self.assertEqual(self.fake[WAITING].stopped, [])
+        self.assertEqual(self.state['down'], {})
+        self.assertEqual(self.state['idle'], {})
+
+    def test_two_dispatchers_serving_one_pool_delete_each_others_fresh_registrations(self):
+        """#366: today's behaviour, pinned so that a fix knows what it changes. Two hosts serve one pool under the
+        same label: its launch moved, and the old host's dispatcher still runs. One host starts a runner for job 11;
+        its registration is offline until that runner connects, and the other host has no unit for it, so its next
+        pass deletes the registration. No label changed: only stopping the old host's dispatcher before the new
+        host's serves the pool avoids this (fleet-route README, "Old registrations")."""
+        fakes = {h: FakeLauncher(WAITING) for h in ('old', 'new')}
+        states = {h: ff.new_state() for h in fakes}
+
+        def dispatch(h):
+            hosts = {WAITING: ff.Host(POOLS[WAITING], run=fakes[h].run)}
+            return quiet(ff.dispatch_pass, CFG, self.gh, hosts, states[h], now=lambda: self.clock[0])[1]
+
+        self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+        dispatch('old')
+        self.assertEqual([n for n, _ in fakes['old'].started], [self.name(11)])
+        self.assertEqual([(r['name'], r['status']) for r in self.gh.runners], [(self.name(11), 'offline')])
+        log = dispatch('new')
+        self.assertIn(f'{self.name(11)}: deleted a registration with no runner behind it', log)
+        self.assertEqual((self.gh.runners, fakes['new'].started), ([], []))
 
     def test_a_failed_stop_keeps_the_idle_count_and_the_next_pass_stops_it(self):
         """#342: the stop fails (systemd trouble): the pool is down for that pass and the runner's count is kept, so

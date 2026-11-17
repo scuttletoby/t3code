@@ -85,6 +85,11 @@ The config is refused when:
   catch-all rule (it could never match): a new folder must never fall to no rule
   or to no lens;
 - there is no `critical` rule (the built-in protected paths below take its lenses);
+- in `enforce`, a lighter rule comes before a heavier rule and some path matches
+  a glob of both (`**/*.md` light above `src/**` critical: `src/notes.md` would
+  belong to the light rule and need no lens). Put heavier rules first. The
+  catch-all rule is exempt: a lighter rule above it is the normal case. In
+  `shadow` the same order is a warning in the gate's summary row, not a refusal;
 - a glob is not in the dialect below, or a rule name or glob is written twice.
 
 **Globs.** Paths are repo-relative and use `/`. `*` is any characters inside one

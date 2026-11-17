@@ -465,7 +465,9 @@ class Neighbours(Case):
                      b'    print(e.__traceback__.tb_frame.f_code.co_filename)\n',
                      b'def f(): pass\nprint(f.__globals__["x"])\n',
                      b'print(globals()["x"])\n', b'print(locals())\n', b'print(vars()["x"])\n',
-                     b'import traceback\nprint(traceback.extract_stack()[-1].filename)\n'):
+                     b'import traceback\nprint(traceback.extract_stack()[-1].filename)\n',
+                     b'import doctest\ndoctest.testfile("../x.txt")\n',   # #364 item 2: a path loader
+                     b'from doctest import testfile\n'):
             with self.subTest(body=body):
                 self.assertNotEqual(pinned.neighbour_loads(body), [])
         for body in (b'import sys\nprint(sys.argv[1:], sys.argv[2], len(sys.argv))\n',   # still self-contained
@@ -774,6 +776,70 @@ class Above(Case):
             self.assertEqual(sorted(os.listdir(self.shared)), ['pr-queue'], 'no folder made')
         self.assertEqual((self.runs, self.urls), ([], []))
 
+    def load_it(self, cache):
+        """load() of a module that goes three levels up from its own __file__ (<cache>/<sha>/<action>/<file>)."""
+        body = (b'import os, sys\nd = os.path.dirname(os.path.abspath(__file__))\n'
+                b'sys.path.insert(0, os.path.join(d, "..", "..", "..", "pr-queue"))\nimport config\n')
+        self.config({'repo': 'owner/repo', 'sha': SHA, 'files': {'fleet-watch/fleet_watch.py': pinned.blob_id(body)}})
+        path = list(sys.path)   # a load that ran would leave its sys.path entry and the planted module behind
+        self.addCleanup(sys.path.__setitem__, slice(None), path)
+        self.addCleanup(sys.modules.pop, 'config', None)
+        with self.serve(body), mock.patch.object(pinned, 'neighbour_loads', lambda data: []):   # a missed spelling
+            return pinned.load(self.cfg, 'fleet-watch', 'fleet_watch', cache)
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_load_refuses_a_cache_in_a_shared_folder_as_run_does(self):   # #364 item 1
+        cache = os.path.join(self.shared, 'fci')
+        for _ in range(2):   # the same answer the second time
+            with self.private_above(), self.assertRaisesRegex(pinned.FetchError, 'above the cache') as e:
+                self.load_it(cache)
+            self.assertIn(self.shared, str(e.exception))
+            self.assertIn('so load refuses this cache', str(e.exception))
+            self.assertEqual(self.urls, [], 'nothing fetched')
+            self.assertFalse(os.path.exists(self.marker), 'the planted file never ran')
+            self.assertEqual(os.listdir(self.shared), ['pr-queue'], 'no folder made')
+        cache = os.path.join(self.root, 'home', 'fci')   # a private cache: loaded (no pr-queue above it to import)
+        os.mkdir(os.path.dirname(cache), 0o700)
+        with self.private_above(), self.assertRaises(ModuleNotFoundError):
+            self.load_it(cache)
+        self.assertEqual(len(self.urls), 1)
+
+    def locked(self):
+        """A cache under a folder of ours with no x: os.stat of anything below it is EACCES."""
+        locked = os.path.join(self.root, 'locked')
+        os.makedirs(os.path.join(locked, 'a', 'b'), 0o700)   # two levels: the folder to name is not the cache's parent
+        os.chmod(locked, 0o600)
+        self.addCleanup(os.chmod, locked, 0o700)   # so the cleanup can remove it
+        return locked, os.path.join(locked, 'a', 'b', 'fci')
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_a_folder_above_the_cache_you_cannot_enter_is_a_clean_refusal(self):   # #364 item 3
+        locked, cache = self.locked()
+        for _ in range(2):   # the same answer the second time; nothing made in between
+            for call in (self.run_it, self.load_it):
+                with self.subTest(call.__name__), self.private_above(), \
+                        self.assertRaises(pinned.FetchError) as e:   # a FetchError, never a raw PermissionError
+                    call(cache)
+                self.assertIn(f'{locked} cannot be entered', str(e.exception))
+                self.assertIn(f'chmod u+x {locked}', str(e.exception))
+            with self.private_above(), contextlib.redirect_stderr(io.StringIO()) as err:
+                code = pinned.main(['--config', self.cfg, '--cache', cache, 'run', 'fleet-watch', 'fleet_watch.py'])
+            self.assertEqual(code, 1)
+            self.assertRegex(err.getvalue(), f'^pinned: .*{re.escape(locked)} cannot be entered')
+            self.assertNotIn('Errno', err.getvalue())
+        os.chmod(locked, 0o700)
+        self.assertEqual(os.listdir(os.path.join(locked, 'a', 'b')), [], 'fail closed: no folder made, nothing fetched')
+        self.assertEqual((self.runs, self.urls), ([], []))
+        self.assertFalse(os.path.exists(self.marker))
+        uid = os.getuid()
+        os.chmod(locked, 0o600)
+        with self.private_above(), mock.patch.object(os, 'getuid', lambda: uid + 1), \
+                self.assertRaises(pinned.FetchError) as e:   # not yours: the fix is another cache
+            pinned.shared_above(cache)
+        self.assertIn('pass --cache', str(e.exception))
+        self.assertNotIn('chmod', str(e.exception))
+
+
 class Run(Case):
     def test_run_executes_the_verified_bytes_even_if_the_cache_file_changes_after_the_check(self):
         body = b'print("good")\n'
@@ -869,7 +935,12 @@ class Bootstrap(Case):
                 raise error
             return io.BytesIO(self.REAL if body is None else body)
         with mock.patch.object(self.ns['urllib'].request, 'urlopen', urlopen):
-            return self.ns['load_pinned'](self.cfg, self.cache)
+            p = self.ns['load_pinned'](self.cfg, self.cache)
+        if self.TRUST_ABOVE:   # this copy is not the module Case patched: its caches sit under the shared temp folder
+            above = mock.patch.object(p, 'shared_above', lambda cache: [])
+            above.start()
+            self.addCleanup(above.stop)
+        return p
 
     def test_it_loads_this_module_once_then_from_the_cache(self):
         p = self.boot()
@@ -1125,9 +1196,9 @@ class OneCacheRule(Bootstrap):
 class BootstrapThenRun(Bootstrap):
     """#345 M1 (a): the README adapter as written (load_pinned, then P.main run) on a first run under umask 002 with no
     ~/.cache. The bootstrap made ~/.cache with the umask (0775), and run refused it on that and every later run."""
-    TRUST_ABOVE = False
 
     def test_the_readme_adapter_under_umask_002_runs_and_keeps_running(self):
+        self.TRUST_ABOVE = False   # boot() leaves the module's real shared_above: checked below private_above()
         self.root = os.path.realpath(self.root)
         home = os.path.join(self.root, 'home')
         os.mkdir(home, 0o700)
@@ -1135,7 +1206,7 @@ class BootstrapThenRun(Bootstrap):
         self.pdest = os.path.join(self.cache, SHA, 'pinned', 'pinned.py')
         tool = b'import sys\nsys.exit(4)\n'
         self.config({'repo': 'owner/repo', 'sha': SHA, 'files': {'pinned/pinned.py': pinned.blob_id(self.REAL),
-                                                                 'tool/t.py': pinned.blob_id(tool)}})
+                                                                 'tool/t.py': pinned.blob_id(tool), **self.FILES}})
         old = os.umask(0o002)
         self.addCleanup(os.umask, old)
         for _ in range(2):
@@ -1144,6 +1215,8 @@ class BootstrapThenRun(Bootstrap):
                     mock.patch.object(p.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(tool)):
                 code = p.main(['--config', self.cfg, '--cache', self.cache, 'run', 'tool', 't.py'])
             self.assertEqual(code, 4, err.getvalue())
+            with self.private_above(), mock.patch.object(p.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(BODY)):
+                self.assertEqual(p.load(self.cfg, 'docs-scope', 'docs_scope', self.cache).X, 1)   # #364 item 1: load too
             self.assertEqual(os.stat(os.path.dirname(self.cache)).st_mode & 0o777, 0o700, '~/.cache made 0700')
             self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o700)
         self.assertEqual(self.urls, [f'{RAW}/pinned/pinned.py'], 'the second run is a cache hit')

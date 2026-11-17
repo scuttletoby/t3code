@@ -87,6 +87,23 @@ class Vectors(unittest.TestCase):
         j = rj.judge(CONFIGS['basic'], [('M', (CONFIG_PATH,))], './' + CONFIG_PATH)
         self.assertEqual((j.weight, j.protected), ('critical', (CONFIG_PATH,)))
 
+    def test_a_config_path_git_reads_but_the_protected_set_would_miss_is_refused(self):   # #348 item 2
+        # git show base:<path> reads all of these, but a changed path is never spelled so: the config would be
+        # unprotected. Refused with the rule the lens prompt paths follow (after one leading ./).
+        for spelled in ('././' + CONFIG_PATH, './.github//pr-queue.json', '.github//pr-queue.json',
+                        '.github/./pr-queue.json', '/' + CONFIG_PATH, '.github/x/../pr-queue.json'):
+            with self.subTest(spelled):
+                with self.assertRaises(rj.JudgeError) as e:
+                    rj.judge(CONFIGS['basic'], [('M', ('docs/a.md',))], spelled)
+                self.assertIn(f'the config path {spelled!r}', str(e.exception))
+
+    def test_a_path_that_is_not_utf8_is_judged_and_shown_escaped(self):   # #348 item 1: git -z, surrogateescape
+        bad = b'src/storage/bad\xff.py'.decode('utf-8', 'surrogateescape')
+        j = rj.judge(CONFIGS['basic'], rj.parse_name_status(f'A\0{bad}\0'), CONFIG_PATH)
+        self.assertEqual((j.weight, j.lenses), ('critical', ('data-1', 'data-2')))
+        self.assertIn('src/storage/bad\\xff.py', j.text())
+        j.text().encode('utf-8')   # the summary is written as UTF-8: no lone surrogate may reach it
+
 
 class NameStatus(unittest.TestCase):
     def test_reads_every_status_git_prints_for_two_trees(self):
