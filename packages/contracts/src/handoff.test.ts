@@ -65,14 +65,17 @@ describe("handoff settings", () => {
     expect(() => decodePatch({ handoff: value })).toThrow();
   });
 
-  it("reads a field from a newer build as off; a save keeps only the fields it knows", () => {
-    for (const value of [
-      { ...ON, cacheWarm: true },
+  it.each([
+    ["a field from a newer build", { ...ON, cacheWarm: true }],
+    ["a typo", { ...ON, sizeToken: 100_000 }],
+    [
+      "a newer field in the model",
       { ...ON, modelSelection: { instanceId: "a", model: "x", newer: 1 } },
-    ]) {
-      expect(readFile(value)).toEqual(DEFAULT_HANDOFF_SETTINGS);
-      expect(decodePatch({ handoff: value }).handoff).not.toHaveProperty("cacheWarm");
-    }
+    ],
+  ])("reads %s as off; a save refuses it", (_name, value) => {
+    expect(readFile(value)).toEqual(DEFAULT_HANDOFF_SETTINGS);
+    expect(() => decodePatch({ handoff: value })).toThrow();
+    expect(() => decodePatch({ projectSettingsOverrides: { p: { handoff: value } } })).toThrow();
   });
 
   it("takes the most thread modes allowed", () => {
@@ -81,17 +84,18 @@ describe("handoff settings", () => {
     expect(decodePatch({ handoff: { ...ON, threads } }).handoff?.threads).toEqual(threads);
   });
 
-  it("resolves a thread: its own mode, else its project's value whole, else the server's", () => {
-    const server = decodeHandoff({ ...ON, threads: { t1: "compact" } });
+  it("resolves a thread: its own mode (project, then server), else its project's value whole", () => {
+    const server = decodeHandoff({ ...ON, threads: { t1: "compact", t2: "off" } });
     const project = decodeHandoff({ mode: "off", threads: { t2: "handoff" } });
     expect(resolveHandoffSettings(server, undefined, "t1").mode).toBe("compact");
     expect(resolveHandoffSettings(server, undefined, "t3").mode).toBe("handoff");
-    // The project replaces the server's whole: the server's thread modes no longer apply.
+    // The project's value replaces the server's; a thread entry still wins over its `mode`.
     expect(resolveHandoffSettings(server, project, "t1")).toEqual({
       settings: project,
-      mode: "off",
+      mode: "compact",
     });
     expect(resolveHandoffSettings(server, project, "t2").mode).toBe("handoff");
+    expect(resolveHandoffSettings(server, project, "t3").mode).toBe("off");
     // A thread id that no longer exists is never read; an inherited key name is no thread.
     expect(resolveHandoffSettings(server, null, "toString").mode).toBe("handoff");
   });

@@ -67,9 +67,9 @@ const HandoffSettingsStruct = Schema.Struct({
 const STRUCT_DEFAULTS = Schema.decodeSync(HandoffSettingsStruct)({});
 
 /**
- * Handoff settings. Strict: a save (settings patch) refuses a bad value or `source: command`
- * without a command; like every setting, it drops a field this build does not know. Reading the
- * settings file uses {@link HandoffSettingsFromSettingsFile} instead.
+ * Handoff settings: a bad value or `source: command` without a command fails. A save uses
+ * {@link HandoffSettingsPatch} and reading the settings file {@link HandoffSettingsFromSettingsFile}:
+ * both also refuse a field this build does not know.
  */
 export const HandoffSettings = HandoffSettingsStruct.check(
   // A save is encoded sparse (defaults left out), so the check fills them in before it looks.
@@ -87,6 +87,22 @@ export type HandoffSettings = typeof HandoffSettings.Type;
 export const DEFAULT_HANDOFF_SETTINGS: HandoffSettings = Schema.decodeSync(HandoffSettings)({});
 
 const decodeHandoffSettingsOption = Schema.decodeUnknownOption(HandoffSettings);
+/** Also refuses an unknown field, nested ones too: a typo would else be dropped quietly. */
+const isStrictHandoffSettings = (raw: unknown) =>
+  decodeHandoffSettingsOption(raw, { onExcessProperty: "error" })._tag === "Some";
+
+/** The value is already checked; the settings writer saves it sparse. */
+const checkedHandoffSettings = SchemaTransformation.transformEffect({
+  decode: (raw: unknown) => Effect.succeed(raw as typeof HandoffSettings.Encoded),
+  encode: (settings: typeof HandoffSettings.Encoded) => Effect.succeed(settings as unknown),
+});
+
+/** A save's value: refused when bad, also for a field this build does not know. */
+export const HandoffSettingsPatch = Schema.Unknown.check(
+  Schema.makeFilter(isStrictHandoffSettings, {
+    expected: "handoff settings with only the fields this build knows",
+  }),
+).pipe(Schema.decodeTo(HandoffSettings, checkedHandoffSettings));
 
 /**
  * The settings file's value. A bad one (also an unknown field, as from a newer build) reads as off
@@ -99,8 +115,8 @@ export const HandoffSettingsFromSettingsFile = Schema.Unknown.pipe(
     HandoffSettings,
     SchemaTransformation.transformEffect({
       decode: Effect.fn("HandoffSettingsFromSettingsFile.decode")(function* (raw: unknown) {
-        // Strict about unknown fields here: a newer build's field may narrow what it does.
-        if (decodeHandoffSettingsOption(raw, { onExcessProperty: "error" })._tag === "Some") {
+        // Strict about unknown fields: a newer build's field may narrow what it does.
+        if (isStrictHandoffSettings(raw)) {
           return raw as typeof HandoffSettings.Encoded;
         }
         yield* Effect.logWarning(
@@ -115,7 +131,8 @@ export const HandoffSettingsFromSettingsFile = Schema.Unknown.pipe(
 
 /**
  * The handoff settings and mode of one thread: a project's value replaces the server's whole (a
- * bad one reads as off, never as the server's); the thread's own mode wins over `mode`.
+ * bad one reads as off, never as the server's). A thread's own mode wins over every `mode`: the
+ * project's entry for it first, then the server's.
  */
 export function resolveHandoffSettings(
   server: HandoffSettings,
@@ -123,8 +140,9 @@ export function resolveHandoffSettings(
   threadId: string,
 ): { readonly settings: HandoffSettings; readonly mode: HandoffMode } {
   const settings = project ?? server;
-  const mode = Object.hasOwn(settings.threads, threadId)
-    ? (settings.threads[threadId] ?? settings.mode)
-    : settings.mode;
-  return { settings, mode };
+  const own = (value: HandoffSettings | null | undefined) =>
+    value !== null && value !== undefined && Object.hasOwn(value.threads, threadId)
+      ? value.threads[threadId]
+      : undefined;
+  return { settings, mode: own(project) ?? own(server) ?? settings.mode };
 }
