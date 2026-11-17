@@ -101,6 +101,16 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
   },
   {
     scope: "server",
+    key: "handoff",
+    default: { mode: "off" },
+    fields: true,
+    off: true,
+    reason:
+      "No thread hands off to a fresh session; upstream's compaction settings apply as they are.",
+    decidedIn: "#215",
+  },
+  {
+    scope: "server",
     key: "agentSlots",
     default: { enabled: false },
     fields: true,
@@ -180,6 +190,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     off: true,
     reason: "A project without its own adapter uses the server's playtest settings.",
     decidedIn: "#260",
+  },
+  {
+    scope: "projectOverride",
+    key: "handoff",
+    default: undefined,
+    off: true,
+    reason: "A project without its own handoff settings uses the server's.",
+    decidedIn: "#215",
   },
 ];
 
