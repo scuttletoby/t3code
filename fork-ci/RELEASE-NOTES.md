@@ -13,6 +13,26 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: follow-ups of the git config read (#435)
+
+- The queue's config read fetches nothing and is timed. In a partial clone (actions/checkout's sparse checkout) a
+  config whose blob the sparse-checkout pattern did not check out was fetched from origin with the token the checkout
+  stored, with no timeout. It is now a refusal (exit 2) that names the cause; each git call of the read has 60
+  seconds.
+- Every git call of the queue and the head check drops the job's `GIT_*` variables that point git at another
+  repository, object store, index, config or pathspec rule (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`,
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_INDEX_FILE`, `GIT_NAMESPACE`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`
+  with its `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*`, and the like: `pr_queue.GIT_DROP`).
+- A base config that is not UTF-8 is a refusal in the head check (exit 2, "not UTF-8 text", as the queue says), not
+  a crash (exit 1).
+- The case-twin rule also refuses a file, symlink or submodule entry that differs only in case from one of the
+  config's folders (`.GitHub` next to `.github/`), and it counts Unicode NFC and NFD forms of a name as one.
+
+**Upgrade:** a caller whose checkout leaves the config's blob out must check the config out. The reusable workflow's
+sparse pattern is the config's path, which matches itself unless the name holds `[ ] * ?`, a leading `!` or `#`, a
+trailing space or a backslash: rename such a config. A base that already holds a twin of a config folder is not a
+lock: pull requests that leave or delete it pass.
+
 ### pr-queue: reads its config with git, never from the checkout's file (#424)
 
 The queue now reads its config as the commit checked out at `config` holds it (HEAD): the blob, with `git ls-tree` and

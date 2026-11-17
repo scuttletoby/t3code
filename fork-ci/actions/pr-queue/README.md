@@ -17,6 +17,10 @@ The queue reads the config with git, as the commit checked out at its path
 without touching the config itself. So the path must be inside a git checkout,
 and the config must be committed there as a regular file: an edit that is not
 committed is not read, and a symlink, a submodule entry or a folder is refused.
+The read fetches nothing: in a partial clone (a sparse checkout) the config's
+blob must be checked out, so the sparse-checkout pattern has to match its name.
+A name with `[ ] * ?`, a leading `!` or `#`, a trailing space or a backslash
+does not match itself as a pattern, and the queue then refuses to start.
 
 ```json
 {
@@ -168,7 +172,8 @@ head, the one that fixes it too, and the queue stops (an owner then has to push
 the fix by hand). The gate therefore refuses a pull request whose merged config
 (GitHub's merge commit, or `git merge-tree` of base and head in the gate's bare
 mode) does not parse, is deleted, is no regular file (a folder, a symlink or a
-submodule entry), gains a twin whose name differs from it only in case, or is
+submodule entry), gains a twin whose name differs from it or one of its
+folders only in case (Unicode NFC and NFD forms count as one name), or is
 in `enforce` with a rule order `enforce` refuses (the order checks above), and
 caps what it reads of a config a pull request changes
 (32 KiB, 128 characters per glob, 2,048 in all). That one check reads the
