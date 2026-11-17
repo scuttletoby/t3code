@@ -339,9 +339,12 @@ const slots = (agentSlots: DeepPartial<ServerSettingsValue["agentSlots"]>) => ({
 });
 
 describe("OrchestratorMcpService agent slot gate", () => {
-  it.effect("off (the default): neither the projection nor memory is read (T19)", () =>
+  it.effect("off: neither the projection nor memory is read (T19, fixed mode)", () =>
     Effect.gen(function* () {
-      for (const settings of [{}, { agentSlots: { maxPerMachine: 1, minFreeMemoryMb: 1 } }]) {
+      for (const settings of [
+        { agentSlots: { mode: "fixed" } },
+        { agentSlots: { mode: "fixed", maxPerMachine: 1, minFreeMemoryMb: 1 } },
+      ]) {
         const world = newWorld();
         world.running = [{ id: "busy", instanceId: MAIN }];
         world.freeMemoryBytes = 0;
@@ -353,6 +356,21 @@ describe("OrchestratorMcpService agent slot gate", () => {
         assert.strictEqual(world.snapshotReads, 0);
         assert.strictEqual(world.memoryReads, 0);
       }
+    }),
+  );
+
+  it.effect("off without a mode (the default): delegates as before, never reads memory", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.running = [{ id: "busy", instanceId: MAIN }];
+      world.freeMemoryBytes = 0;
+      const result = yield* delegate("slot-observe").pipe(
+        Effect.provide(serverLayer(world, {}, roomy)),
+      );
+      // The rule only observes, off the decision path (see slots/SlotObserver.test.ts).
+      assert.strictEqual(result._tag, "Success");
+      assert.strictEqual(world.dispatched.length, 1);
+      assert.strictEqual(world.memoryReads, 0);
     }),
   );
 
