@@ -234,6 +234,11 @@ def check_retired(cfg, launched):
     made under them, so each must be this pool's alone: in retired_labels, no pool's label now, in no other pool's."""
     out, seen = [], set()
     listed, current = cfg.get('retired_labels', []), {p.get('label') for p in launched}
+    # A label still retired is no pool's label now: a host still on the config that retired it deletes the offline
+    # registrations under it (another pool's runners, before they connect). Reuse it only after it left retired_labels.
+    if isinstance(listed, list):
+        out += [f'{x!r} is a dispatcher pool\'s label and in retired_labels: take it out of retired_labels (and every '
+                'retired) first' for x in listed if isinstance(x, str) and x in current]
     for p in cfg.get('pools') or []:
         if 'retired' not in p:
             continue
@@ -1131,12 +1136,13 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
                 ours[r['name']] = (p, r)
             elif hosts[p['name']].made(r.get('name') or ''):
                 old[r['name']] = (p, r)
-    state['idle'] = {k: v for k, v in state['idle'].items() if k in ours}
+    state['idle'] = {k: v for k, v in state['idle'].items() if k in ours or k in old}
 
     # Leftovers: a registration with no runner behind it, and a runner whose job went away before it started. Such a
     # runner is stopped at once when a queued job of another run could be given it (the hook would refuse that job),
     # else after idle_passes passes (a runner that is just taking its own job is not busy yet). A runner's labels name
-    # the run attempt it was made for, so no job of another attempt can be given it.
+    # the run attempt it was made for, so no job of another attempt can be given it. The same holds under a label the
+    # pool had before: such a runner counts toward the pool's slots (units()), so an idle one is stopped too.
     for name, (p, r) in [*ours.items(), *old.items()]:
         if p['name'] in down:
             continue
@@ -1147,8 +1153,6 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
                 if e.code != 404:
                     raise
             say(f'{name}: deleted a registration with no runner behind it')
-        elif name in old:
-            continue   # online under a label the pool had before: left to finish (or to be stopped by hand)
         elif r.get('status') == 'online' and not r.get('busy') and int(name.rsplit('-', 1)[1]) not in queued_ids:
             state['idle'][name] = state['idle'].get(name, 0) + 1
             labels = [x.get('name') for x in r.get('labels') or [] if isinstance(x, dict)]
