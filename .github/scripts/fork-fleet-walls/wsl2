@@ -1,7 +1,8 @@
 #!/usr/bin/python3 -I
 """Fork only: the walls of a WSL2 distro, for fork-fleet-walls.py (its contract is there). A WSL2 distro is Linux to
 its kernel, so every wall of the linux file next to this one holds here too and is taken from it, not copied (its
-`os` aside): kernel, systemd, cgroup2, cgroup-bpf, namespaces, seccomp, container (WSL's own `wsl` mark aside: container_wall), mounts (what jobs see, as the
+`os` aside): kernel, systemd, cgroup2, cgroup-bpf, namespaces, seccomp, container (WSL's own `wsl` mark aside:
+container_wall), mounts (what jobs see, as the
 launcher beside this folder says with `fork-fleet-launch.sh paths`: Windows' drives at /mnt/c or /c, WSL's shares at
 /mnt/wsl and /usr/lib/wsl are outside it, so no job sees them), job-units and etc-secrets. A wall the linux file
 gains is a wall here too. The launcher is one file: the one the linux walls ask (`paths`) is the one whose job units'

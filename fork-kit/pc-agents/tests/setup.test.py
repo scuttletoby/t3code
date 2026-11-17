@@ -221,6 +221,28 @@ class Setup(Case):
         self.assertEqual(len(self.log('install')), 2)
         self.assertEqual(self.snapshot(), before)
 
+    def test_stopped_while_removing_a_loose_runtime_then_run_again(self):
+        self.ready()
+        v = '/opt/pc-agents/t3/runtime/versions/'
+        d = self.path(v + CONFIG['t3Version'])
+        os.chmod(d, 0o700)
+        real = cli.shutil.rmtree
+
+        def stopped(path, *a, **kw):
+            os.unlink(os.path.join(path, 't3'))   # part removed, then stopped
+            raise KeyboardInterrupt
+        cli.shutil.rmtree = stopped
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.setup_run()
+        finally:
+            cli.shutil.rmtree = real
+        self.assertNotIn(v + CONFIG['t3Version'] + '/t3', k.record())   # no old hash for the new t3 to match
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(os.listdir(self.path(v))), [CONFIG['t3Version']])
+        self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o755)
+
     def test_failed_t3_install_on_upgrade_still_restarts_t3_on_the_next_run(self):
         self.ready()
         os.unlink(self.path('/log/systemctl'))

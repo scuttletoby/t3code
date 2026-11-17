@@ -165,10 +165,10 @@ def install_t3(c, version, done):
         say(f'{why}: removing it to install T3 {c["t3Version"]} again')
         mark()
         k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
+        done.pop(folder + '/t3', None)   # first: a stop after this leaves no hash the new t3 would have to match
+        keep(done)
         aside = f'{versions}/.removing-{os.getpid()}'
         os.rename(k.ROOT + folder, k.ROOT + aside)
-        done.pop(folder + '/t3', None)
-        keep(done)
         shutil.rmtree(k.ROOT + aside)
     if k.lstat(folder) is None:
         say(f'installing T3 {c["t3Version"]} under {k.T3}')
