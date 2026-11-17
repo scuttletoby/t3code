@@ -52,6 +52,12 @@ check("it is only a reusable workflow (workflow_call): no event of its own start
 inputs = (on.get("workflow_call") or {}).get("inputs") or {}
 check("inputs: pr, config, check-name, required-lenses, environment (no pass-drafts: a draft is never posted for)",
       set(inputs) == {"pr", "config", "check-name", "required-lenses", "environment"}, str(set(inputs)))
+lenses_text = str(inputs.get("required-lenses", {}).get("description"))
+check("required-lenses says when none may stand: only with the config's review block in enforce (#348)",
+      "None = refused" in lenses_text and "enforce" in lenses_text, lenses_text)
+example_lenses = next((x for x in EXAMPLE.read_text().splitlines() if "required-lenses:" in x), "")
+check("example: the required-lenses comment says the same (none = refused unless the review block enforces)",
+      "none = the gate refuses" in example_lenses and "enforce" in example_lenses, example_lenses)
 check("config, check-name and required-lenses must be given (no default lens list); the Environment defaults to head-gate",
       all(inputs.get(k, {}).get("required") is True and "default" not in inputs.get(k, {})
           for k in ("config", "check-name", "required-lenses"))
