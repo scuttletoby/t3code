@@ -25,6 +25,7 @@
 .github/scripts/fork-follow.test.sh ~32s
 .github/scripts/fork-interaction-limit.test.sh
 .github/scripts/fork-owned-paths.test.py
+.github/scripts/fork-owned-reads.test.py run by .github/workflows/fork-tests.yml
 .github/scripts/fork-pr-queue-workflow.test.py
 .github/scripts/fork-ci-release.test.py
 .github/scripts/fork-release-workflow.test.py
