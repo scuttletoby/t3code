@@ -6,7 +6,8 @@ silently drop a wall). Each OS has one walls file, fork-fleet-walls/<os>, next t
 refused: not supported yet.
 
   fork-fleet-walls.py os         prints the OS name; exit 0 when it has a walls file, else 3
-  fork-fleet-walls.py check      before every `start`: exit 0 only when every wall holds; prints the walls that do not
+  fork-fleet-walls.py check      before every `start`: exit 0 only when every wall holds (etc-secrets among them is a
+                                 lint, not a proof); prints the walls that do not
   fork-fleet-walls.py describe   for setup: every wall, PASS or FAIL
 
 Exit: 0 every wall holds, 1 a wall does not hold, 2 a broken or unsafe walls file (or usage), 3 this OS is not
