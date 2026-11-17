@@ -3322,10 +3322,24 @@ it.layer(
             registry,
             enrichedProvider.checkedAt,
           );
+          // Taken before the refresh but run only after it: subscribeChanges subscribes when it
+          // runs, not when its stream does, so it still holds what the refresh published. The
+          // usage history reads providers between the two and relies on this (#60).
+          const subscribed = yield* registry.subscribeChanges;
           const refreshed = yield* registry.refreshInstance(instanceId).pipe(Effect.forkChild);
           yield* Fiber.join(enrichedObserved);
           yield* Deferred.succeed(releaseRefresh, undefined);
           const returned = yield* Fiber.join(refreshed);
+          yield* TestClock.withLive(
+            subscribed.pipe(
+              Stream.filter((providers) =>
+                providers.some((provider) => provider.checkedAt === enrichedProvider.checkedAt),
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.timeout("5 seconds"),
+            ),
+          );
 
           const enriched = {
             status: enrichedProvider.status,
