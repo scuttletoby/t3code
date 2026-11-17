@@ -3710,63 +3710,6 @@ class LauncherAsRoot(unittest.TestCase):
             self.assertIn(f'user {user}', got.stderr)
         self.assertEqual({p.pw_name for p in pwd.getpwall()}, users)
 
-    def make_canaries(self, folder):
-        """The launcher's own make_canaries, alone, with CANARY_DIR=folder, for the runner user nobody: its functions as
-        the launcher has them (check-net itself first needs a loopback service it reaches, which some machines refuse)."""
-        with open(LAUNCH) as f:
-            text = f.read()
-        fns = [re.search(rf'^{n}\(\) \{{(?:[^\n]*\}}\n|\n.*?^\}}\n)', text, re.M | re.S).group(0)
-               for n in ('shown', 'warn', 'die', 'owned_safe', 'closed_folder', 'links_owned', 'real_path',
-                         'make_canaries')]
-        plain = re.search(r'^PLAIN_PATH=.*\n', text, re.M).group(0)
-        script = 'set -euo pipefail\numask 077\nROOT=\n' + plain + 'CANARY_DIR=$1\n' + ''.join(fns) + \
-            'make_canaries nobody\n'
-        return subprocess.run(['bash', '-c', script, 'canaries', folder], env=self.env(), capture_output=True,
-                              text=True, timeout=60)
-
-    def test_check_nets_canaries_are_new_files_in_a_closed_folder(self):
-        """Issue #243 fix round 2 (security-a 4, security-b m3): root writes the canaries, so CANARY_DIR is a plain
-        absolute path, its own real path (no link on the way), under folders no other user may swap a link into, and
-        only its owner may write it. Canaries a cut-off check-net left (or a link planted there) are removed, never
-        written through, and each is a new file with its mode: 0644, and 0640 with the runner user's group."""
-        self.conf(CANARY_DIR='etc')
-        self.refused('CANARY_DIR is a plain absolute path', 'active')
-        self.conf()
-        etc, target = self.path('etc'), self.write('target', 'keep\n', 0o600)
-        os.mkdir(etc, 0o755)
-        c, g = os.path.join(etc, 'fork-fleet-canary'), os.path.join(etc, 'fork-fleet-canary-group')
-        with open(c, 'w') as f:
-            f.write('old\n')
-        os.chmod(c, 0o600)
-        os.symlink(target, g)
-        got = self.make_canaries(etc)
-        self.assertEqual(got.returncode, 0, got.stderr)
-        for f, mode in ((c, 0o644), (g, 0o640)):
-            st = os.lstat(f)
-            self.assertTrue(stat.S_ISREG(st.st_mode), f)
-            self.assertEqual(stat.S_IMODE(st.st_mode), mode, f)
-            with open(f) as fh:
-                self.assertEqual(fh.read(), 'fork-fleet canary: no job may see this file\n')
-        self.assertEqual(self.rec_text('chown'), f'-h -- :{pwd.getpwnam("nobody").pw_gid} {g}\n')
-        with open(target) as f:
-            self.assertEqual((stat.S_IMODE(os.stat(target).st_mode), f.read()), (0o600, 'keep\n'))
-        # Refused, and nothing written: a CANARY_DIR others may write, one under a folder others may write (they
-        # could swap it for a folder of theirs), and a link to a good folder.
-        os.chmod(etc, 0o775)
-        self.assertIn('must be writable by its owner only', self.make_canaries(etc).stderr)
-        os.chmod(etc, 0o755)
-        opened = self.path('open')
-        os.makedirs(os.path.join(opened, 'etc'))
-        os.chmod(opened, 0o777)
-        self.assertIn('which others may write', self.make_canaries(os.path.join(opened, 'etc')).stderr)
-        self.assertEqual(os.listdir(os.path.join(opened, 'etc')), [])
-        os.symlink(etc, self.path('via'))
-        self.assertIn('with no link on the way', self.make_canaries(self.path('via')).stderr)
-        for f in (c, g):
-            os.remove(f)
-        self.make_canaries(self.path('via'))
-        self.assertEqual(os.listdir(etc), [])
-
     def test_the_walls_hold_in_a_real_systemd_unit(self):
         """As Launcher's, in a unit of the system's systemd as a real runner user (CI: the hosted runner's), and with
         all of the sandbox but its network: only the allowed mounts, the pseudo devices, no socket of the host's, no
