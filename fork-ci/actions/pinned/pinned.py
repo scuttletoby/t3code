@@ -25,6 +25,10 @@ prints the "files" map at the config's sha (fetched, not checked): for a pin bum
 README.md next to this file: the Python API and the bootstrap a project copies to load this module.
 """
 import argparse, ast, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, types, urllib.request
+try:
+    import grp, pwd
+except ImportError:   # no owners (Windows): shared_above checks nothing there
+    grp = pwd = None
 
 NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._-]*\Z')   # \Z: no trailing newline
 SHA = re.compile(r'[0-9a-f]{40}')
@@ -113,11 +117,25 @@ def private(cache):
                          "another user's, or group- or world-writable): remove it or pass --cache with another")
 
 
+def own_group(gid):
+    """Whether gid is your own private group: your primary group, named as you, with no listed member and no other
+    user's primary group. Debian and Ubuntu give each user one (and umask 002, so ~/.cache is often 0775); Debian's
+    OpenSSH trusts a group-writable folder of yours in such a group (StrictModes) for the same reason. A failed lookup
+    is not one."""
+    try:
+        me, group, users = pwd.getpwuid(os.getuid()), grp.getgrgid(gid), pwd.getpwall()
+    except (KeyError, OSError):
+        return False
+    return (me.pw_gid == gid and group.gr_name == me.pw_name and not group.gr_mem
+            and all(u.pw_uid == me.pw_uid for u in users if u.pw_gid == gid))
+
+
 def shared_above(cache):
     """The folders above the cache (by the path given and by its real path) that someone else could write: not ours
-    or root's, or group- or world-writable (a sticky /tmp too). run's copy is <cache>/.run-X/<action>/<file>, so a
-    script's `../../..` is the folder above the cache, where such a someone could plant a neighbour. [] where there
-    are no owners (Windows)."""
+    or root's, world-writable (a sticky /tmp too), or group-writable unless it is ours and its group our own private
+    group (own_group). run's copy is <cache>/.run-X/<action>/<file>, so a script's `../../..` is the folder above the
+    cache, where such a someone could plant a neighbour. A missing folder is skipped: private() makes it 0700 below a
+    folder checked here. [] where there are no owners (Windows)."""
     if not hasattr(os, 'getuid'):
         return []
     bad, seen = [], set()
@@ -125,11 +143,24 @@ def shared_above(cache):
         up = os.path.dirname(p)
         while up not in seen:
             seen.add(up)
-            st = os.stat(up)   # a symlink is judged by its target; its own folder is judged as an ancestor
-            if st.st_uid not in (0, os.getuid()) or st.st_mode & 0o022:
+            try:
+                st = os.stat(up)   # a symlink is judged by its target; its own folder is judged as an ancestor
+            except FileNotFoundError:
+                up = os.path.dirname(up)
+                continue
+            if (st.st_uid not in (0, os.getuid()) or st.st_mode & 0o002
+                    or st.st_mode & 0o020 and not (st.st_uid == os.getuid() and own_group(st.st_gid))):
                 bad.append(up)
             up = os.path.dirname(up)
     return bad
+
+
+def fix_above(up):
+    """How to fix a folder shared_above found: chmod a folder of yours, use another cache under anyone else's."""
+    st = os.stat(up)
+    if st.st_uid == os.getuid():
+        return f'chmod {"go" if st.st_mode & 0o002 else "g"}-w {up}'
+    return 'pass --cache with a folder whose every parent only you or root can write'
 
 
 def read_regular(path):
@@ -337,12 +368,13 @@ def run(config, action, name, args=(), cache=None, runner=None):
     """Run the pinned script with python3 -I and args, from a private copy (<cache>/.run-X/<action>/<name>) of the
     bytes that were checked; its exit code. The copy goes after the run (a killed run's goes after CACHE_DAYS)."""
     cache = cache or default_cache()   # never None: mkdtemp(dir=None) is the shared temp folder
-    private(cache)
-    shared = shared_above(cache)
+    shared = shared_above(cache)   # before private() makes any folder: a refused cache leaves nothing behind
     if shared:
         raise FetchError(f'{", ".join(shared)} above the cache {cache} can be written by someone else (not yours or '
-                         "root's, or group- or world-writable, a sticky temp folder too): a script's `..` reaches it, "
-                         'so run refuses this cache; pass --cache with a folder under your home')
+                         "root's, world-writable, a sticky temp folder too, or group-writable by a group that is not "
+                         "your own private one): a script's `..` reaches it, so run refuses this cache. Fix: "
+                         + '; '.join(dict.fromkeys(fix_above(up) for up in shared)))
+    private(cache)
     _, data = self_contained(config, action, name, cache)
     # 0700, ours alone: the bytes checked are the bytes run. In the checked cache, never the shared temp folder: the
     # script's `..` is this folder, `../..` the 0700 cache, and above it the folders shared_above found ours or root's.

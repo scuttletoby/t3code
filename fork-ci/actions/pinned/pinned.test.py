@@ -5,6 +5,10 @@ Run: python3 fork-ci/actions/pinned/pinned.test.py
 """
 import contextlib, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, time, unittest
 from unittest import mock
+try:
+    import grp, pwd
+except ImportError:   # no owners (Windows): the tests that need them are skipped
+    grp = pwd = None
 
 sys.dont_write_bytecode = True   # leave no __pycache__ in the action folder
 
@@ -60,6 +64,17 @@ class Case(unittest.TestCase):
         t = (now or time.time()) - age
         os.utime(path, (t, t))
         return path
+
+    def private_above(self):
+        """The folders above self.root (the real temp folder, /tmp) as root's 0755 folders: the test stands below."""
+        real, uid, roots = os.stat, os.getuid(), (self.root, os.path.realpath(self.root))
+        fake = os.stat_result((stat.S_IFDIR | 0o755, 0, 0, 2, 0, 0, 4096, 0, 0, 0))
+
+        def stat_(p, *a, **k):
+            p = os.fspath(p)
+            return fake if p == '/' or any(r.startswith(p.rstrip('/') + '/') for r in roots) else real(p, *a, **k)
+        self.assertNotEqual(uid, 0, 'run the tests as a normal user')
+        return mock.patch.object(os, 'stat', stat_)
 
     def parts(self):
         return [os.path.join(d, n) for d, _, ns in os.walk(self.cache) for n in ns if n.startswith('.part-')]
@@ -439,6 +454,7 @@ class Neighbours(Case):
                      b'import sys\nprint(sys.orig_argv[-1])\n',
                      b'import sys\nprint(sys.argv[:1][0])\n', b'import sys\np, *_ = sys.argv\n',
                      b'import sys\nsys.argv.pop(0)\n',
+                     b'import sys\nprint(sys.argv[0:][0])\n', b'import sys\nprint(list(sys.argv))\n',   # #345 minor 3
                      b'import sys\nprint(sys.argv[-1])\n', b'from sys import argv\nprint(argv[-1])\n',
                      b'import sys\nprint(sys.exc_info()[2].tb_frame)\n',
                      b'import os\ngetattr(os, "sys").path.insert(0, "x")\n',
@@ -512,17 +528,6 @@ class Above(Case):
                      'files': {'fleet-watch/fleet_watch.py': pinned.blob_id(self.body)}})
         self.runs = []
 
-    def private_above(self):
-        """The folders above self.root (the real temp folder, /tmp) as root's 0755 folders: the test stands below."""
-        real, uid = os.stat, os.getuid()
-        fake = os.stat_result((stat.S_IFDIR | 0o755, 0, 0, 2, 0, 0, 4096, 0, 0, 0))
-
-        def stat_(p, *a, **k):
-            p = os.fspath(p)
-            return fake if p == '/' or self.root.startswith(p.rstrip('/') + '/') else real(p, *a, **k)
-        self.assertNotEqual(uid, 0, 'run the tests as a normal user')
-        return mock.patch.object(os, 'stat', stat_)
-
     def runner(self, cmd):
         self.runs.append(cmd[2])
         return subprocess.run(cmd, capture_output=True)
@@ -554,8 +559,8 @@ class Above(Case):
         os.mkdir(os.path.join(self.shared, 'x'), 0o700)
         os.symlink(os.path.join(self.shared, 'x'), link)
         os.mkdir(os.path.join(link, 'fci'), 0o700)
-        with self.private_above():
-            for name, mode, bad in (('a', 0o700, False), ('b', 0o755, False), ('c', 0o775, True),
+        with self.private_above(), self.lookups(os.stat(self.root).st_gid, name='staff'):   # a shared group: 0775 is
+            for name, mode, bad in (('a', 0o700, False), ('b', 0o755, False), ('c', 0o775, True),   # refused (own: below)
                                     ('d', 0o757, True), ('e', 0o1777, True)):
                 with self.subTest(oct(mode)):
                     top = os.path.join(self.root, name)
@@ -592,6 +597,89 @@ class Above(Case):
         self.assertEqual(os.listdir(tmp), [], 'nothing in the temp folder')
         self.assertEqual(os.listdir(default), [SHA])
 
+
+    def lookups(self, gid, name='me', primary=None, members=(), other_primary=None, no_group=False):
+        """Fakes the user and group lookups (no real user or group is made): you are `me` with primary gid `primary`
+        (default `gid`); group `gid` is `name` with `members`; one other user has primary gid `other_primary`."""
+        uid = os.getuid()
+        me = pwd.struct_passwd(('me', 'x', uid, gid if primary is None else primary, '', '/home/me', '/bin/sh'))
+        other = pwd.struct_passwd(('other', 'x', uid + 1, gid + 1 if other_primary is None else other_primary, '',
+                                   '/home/other', '/bin/sh'))
+
+        def getgrgid(g):
+            if no_group or g != gid:
+                raise KeyError(f'getgrgid(): gid not found: {g}')
+            return grp.struct_group((name, 'x', gid, list(members)))
+
+        def getpwuid(u):
+            if u != uid:
+                raise KeyError(f'getpwuid(): uid not found: {u}')
+            return me
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(grp, 'getgrgid', getgrgid))
+        stack.enter_context(mock.patch.object(pwd, 'getpwuid', getpwuid))
+        stack.enter_context(mock.patch.object(pwd, 'getpwall', lambda: [me, other]))
+        return stack
+
+    def as_roots(self, folder):
+        """os.stat (as it is now: enter it inside private_above) says folder is root's, as /tmp is."""
+        real = os.stat
+
+        def stat_(p, *a, **k):
+            st = real(p, *a, **k)
+            return os.stat_result((st.st_mode, *st[1:4], 0, *st[5:])) if os.fspath(p) == folder else st
+        return mock.patch.object(os, 'stat', stat_)
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_a_group_writable_folder_of_your_own_private_group_is_accepted(self):   # #345 M1 (b)
+        # Debian/Ubuntu: each user has a private group and umask 002, so ~/.cache is often 0775. Debian's OpenSSH
+        # (StrictModes) trusts such a folder of yours; run did not, and refused the default cache forever.
+        parent = os.path.join(self.root, 'home', '.cache')
+        os.mkdir(os.path.dirname(parent), 0o700)   # one by one: makedirs makes the middle one with the umask
+        os.mkdir(parent, 0o700)
+        os.chmod(parent, 0o775)
+        gid, cache = os.stat(parent).st_gid, os.path.join(parent, 'fci')
+        for _ in range(2):   # and on the next run
+            with self.private_above(), self.lookups(gid):
+                self.assertEqual(pinned.shared_above(cache), [])
+                self.assertNotEqual(self.run_it(cache), 0, 'it ran: the import fails, no pr-queue above the cache')
+        self.assertEqual(len(self.runs), 2)
+        self.assertEqual(os.stat(parent).st_mode & 0o7777, 0o775, 'never chmodded')
+        uid = os.getuid()
+        rows = (('a group with another name', dict(name='staff')), ('a group with a member', dict(members=['other'])),
+                ('a group with you as a listed member', dict(members=['me'])),
+                ("another user's primary group too", dict(other_primary=gid)),
+                ('not your primary group', dict(primary=gid + 1)), ('no such group', dict(no_group=True)))
+        for what, kw in rows:
+            with self.subTest(what), self.private_above(), self.lookups(gid, **kw):
+                self.assertEqual(pinned.shared_above(cache), [parent])
+                with self.assertRaises(pinned.FetchError) as e:
+                    self.run_it(cache)
+                self.assertIn(f'chmod g-w {parent}', str(e.exception), 'the fix, for that folder')
+                self.assertNotIn('--cache', str(e.exception))
+        os.chmod(parent, 0o777)
+        with self.subTest('world-writable'), self.private_above(), self.lookups(gid):
+            self.assertEqual(pinned.shared_above(cache), [parent])
+            with self.assertRaisesRegex(pinned.FetchError, re.escape(f'chmod go-w {parent}')):
+                self.run_it(cache)
+        os.chmod(parent, 0o775)
+        with self.subTest("root's"), self.private_above(), self.as_roots(parent), self.lookups(gid):
+            self.assertEqual(pinned.shared_above(cache), [parent], 'only a folder of yours may be group-writable')
+        self.assertEqual(len(self.runs), 2, 'nothing refused ran')
+        self.assertEqual(self.urls, [f'{RAW}/fleet-watch/fleet_watch.py'], 'fetched once, by the first run')
+        self.assertEqual(os.getuid(), uid)
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_a_refused_cache_leaves_no_folders_behind(self):   # #345 minor 4: checked before private() makes any
+        cache = os.path.join(self.shared, 'a', 'b', 'fci')
+        for _ in range(2):
+            with self.private_above(), self.as_roots(self.shared), \
+                    self.assertRaisesRegex(pinned.FetchError, 'above the cache') as e:
+                self.run_it(cache)
+            self.assertIn('pass --cache', str(e.exception), "root's sticky folder (as /tmp): the fix is another cache")
+            self.assertNotIn('chmod', str(e.exception))
+            self.assertEqual(sorted(os.listdir(self.shared)), ['pr-queue'], 'no folder made')
+        self.assertEqual((self.runs, self.urls), ([], []))
 
 class Run(Case):
     def test_run_executes_the_verified_bytes_even_if_the_cache_file_changes_after_the_check(self):
@@ -939,6 +1027,33 @@ class OneCacheRule(Bootstrap):
                 pinned.path(self.cfg, 'docs-scope', 'docs_scope.py', good)
         self.assertEqual(os.listdir(good), [])
 
+
+@unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
+class BootstrapThenRun(Bootstrap):
+    """#345 M1 (a): the README adapter as written (load_pinned, then P.main run) on a first run under umask 002 with no
+    ~/.cache. The bootstrap made ~/.cache with the umask (0775), and run refused it on that and every later run."""
+    TRUST_ABOVE = False
+
+    def test_the_readme_adapter_under_umask_002_runs_and_keeps_running(self):
+        self.root = os.path.realpath(self.root)
+        home = os.path.join(self.root, 'home')
+        os.mkdir(home, 0o700)
+        self.cache = os.path.join(home, '.cache', 'my-project-fork-ci')   # the adapter's CACHE; ~/.cache is missing
+        self.pdest = os.path.join(self.cache, SHA, 'pinned', 'pinned.py')
+        tool = b'import sys\nsys.exit(4)\n'
+        self.config({'repo': 'owner/repo', 'sha': SHA, 'files': {'pinned/pinned.py': pinned.blob_id(self.REAL),
+                                                                 'tool/t.py': pinned.blob_id(tool)}})
+        old = os.umask(0o002)
+        self.addCleanup(os.umask, old)
+        for _ in range(2):
+            p = self.boot()
+            with self.private_above(), contextlib.redirect_stderr(io.StringIO()) as err, \
+                    mock.patch.object(p.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(tool)):
+                code = p.main(['--config', self.cfg, '--cache', self.cache, 'run', 'tool', 't.py'])
+            self.assertEqual(code, 4, err.getvalue())
+            self.assertEqual(os.stat(os.path.dirname(self.cache)).st_mode & 0o777, 0o700, '~/.cache made 0700')
+            self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o700)
+        self.assertEqual(self.urls, [f'{RAW}/pinned/pinned.py'], 'the second run is a cache hit')
 
 class BootstrapFifo(Bootstrap):
     @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs')

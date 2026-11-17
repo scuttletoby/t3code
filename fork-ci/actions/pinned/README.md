@@ -51,9 +51,12 @@ paste what `files` prints.
   `sys.executable`, and an absolute path (`/proc/self/cmdline`, `/tmp/x`, `tempfile.gettempdir()`) pass it, and
   chasing them would refuse ordinary code. What protects is where the copy runs: `run` puts it in a fresh 0700 folder
   inside the checked cache (`<cache>/.run-X/<action>/<file>`), and refuses a cache with a folder above it that someone
-  else could write (not yours or root's, or group- or world-writable: a sticky `/tmp` too; by the path given and by
-  its real path), so every `..` of the script is the run folder, the cache, or a folder only you or root can write,
-  never the shared temp folder. Before #305 a copy sat directly in the system temp folder, so `head_check.py`'s
+  else could write (not yours or root's, world-writable: a sticky `/tmp` too, or group-writable; by the path given and
+  by its real path), so every `..` of the script is the run folder, the cache, or a folder only you or root can write,
+  never the shared temp folder. One group-writable folder is accepted, as Debian's OpenSSH does for `StrictModes`: one
+  of yours whose group is your own private group (your primary group, named as you, with no listed member and no other
+  user's primary group). Debian and Ubuntu give each user such a group and umask 002, so `~/.cache` is often 0775.
+  Before #305 a copy sat directly in the system temp folder, so `head_check.py`'s
   `../pr-queue` (or `test_select.py`'s `../docs-scope`) was `$TMPDIR/pr-queue`, which any local user can make when
   `$TMPDIR` is `/tmp`; until #331 the run folder was in the system temp folder too, so `../..` reached it; until #339
   a cache in a shared folder (`--cache /tmp/fci`) let `../../..` reach it. None of this protects against a module that
@@ -73,7 +76,8 @@ python3 -I pinned.py --config .github/fork-ci.json files
 - `files` prints the `files` map at the config's `sha`, each file fetched and hashed (nothing is checked: this is how
   the map is made).
 - `--cache` defaults to `$XDG_CACHE_HOME/fork-ci-pinned` (`~/.cache/fork-ci-pinned`). `run` refuses a cache under a
-  folder someone else could write (`/tmp/...`): pass one under your home.
+  folder someone else could write, before it makes any folder, and names each such folder with its fix:
+  `chmod g-w <folder>` (or `go-w`) for a folder of yours, another `--cache` under anyone else's (`/tmp/...`).
 
 ## Python API
 
@@ -99,7 +103,8 @@ module and in the bootstrap below: a missing one is made 0700 (two first runs at
 symlink, not a folder, another user's, or group- or world-writable is refused before anything in it is read or
 written (`FetchError` here, `ValueError` in the bootstrap; remove it and the next run makes it again). It is never
 chmodded: someone else could already have put something in it. Only a regular file is read, and prune never follows a
-symlink or opens a special file. Missing folders above it are made 0700 too. `run` also
+symlink or opens a special file. Missing folders above it are made 0700 too, by both (so a first run under umask 002
+does not make a `~/.cache` that `run` then refuses). `run` also
 checks every folder above the cache (see above); `load()` and `path()` do not, as they run nothing from a copy's
 folder. Two limits, where the checked bytes still decide what runs: a folder above the cache can change after `run`
 checked it (only its owner, you or root, can change it); and where there are no owners (Windows) only "a real folder"
@@ -132,6 +137,15 @@ def load_pinned(config, cache):
             and isinstance(want, str)):
         raise ValueError(f'{config}: needs "repo", "sha" (40 hex) and "files" with "pinned/pinned.py"')
     if not os.path.lexists(cache):
+        missing, up = [], os.path.dirname(os.path.abspath(cache))
+        while not os.path.lexists(up):
+            missing.append(up)
+            up = os.path.dirname(up)
+        for up in reversed(missing):   # 0700 like the cache, whatever the umask: pinned's run checks the folders above
+            try:
+                os.mkdir(up, 0o700)
+            except FileExistsError:
+                pass
         try:
             os.makedirs(cache, mode=0o700)
         except FileExistsError:   # another run made it first: the check below decides
