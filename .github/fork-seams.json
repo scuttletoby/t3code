@@ -92,7 +92,7 @@
       ]
     },
     "apps/server/src/peer/RemoteDelegation.ts": {
-      "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) also changes this code; when it lands, check whether this seam is still needed.",
+      "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) rewrites this block, and its intent differs: after an interrupted, uncertain launch it stops the child there, while this seam keeps the child and follows it. Whoever brings #30249 in through fork-follow must choose on purpose between stopping and keeping (and expect a merge conflict on the whole re-indented block), then drop this seam or keep it.",
       "added": [
         "// Fork: from the launch on, the task is recorded and followed even if this call is",
         "// interrupted (the parent's turn moved on), else the thread there runs with nothing here",

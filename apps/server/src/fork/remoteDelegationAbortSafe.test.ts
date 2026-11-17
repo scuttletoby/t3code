@@ -8,6 +8,7 @@ import {
   type EnvironmentId,
   NodeId,
   type OrchestratorMcpDelegateTaskInput,
+  OrchestratorMcpFailure,
   ProjectId,
   ProviderInstanceId,
   RunId,
@@ -24,6 +25,7 @@ import * as Logger from "effect/Logger";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import type * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
@@ -52,6 +54,8 @@ const scope: McpInvocationContext.McpThreadInvocationScope = {
   capabilities: new Set(["orchestration"]),
   issuedAt: 1,
 };
+
+const stopFailed = "The box did not answer the stop.";
 
 const input = {
   task: "Review the change on the box.",
@@ -88,6 +92,10 @@ const makeHarness = (
     readonly beforeRecord?: Pause;
     /** The record succeeds, yet names no task, and the parent's task list has none. */
     readonly recordWithoutTask?: boolean;
+    /** The record here is refused, as when the parent's run was stopped meanwhile. */
+    readonly recordFails?: boolean;
+    /** The stop sent there fails, as when the box stopped answering. */
+    readonly stopFails?: boolean;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -124,49 +132,70 @@ const makeHarness = (
         }
         return Effect.die(`unexpected call ${tool.name}`);
       }) as never,
-      interruptThread: (_scope, _env, request) =>
-        Effect.sync(() => {
-          stops.push(request.threadId);
-          return {} as never;
-        }),
+      interruptThread: ((_scope: unknown, _env: unknown, request: { threadId: ThreadId }) =>
+        Effect.sync(() => stops.push(request.threadId)).pipe(
+          Effect.andThen(
+            options.stopFails
+              ? Effect.fail(
+                  new OrchestratorMcpFailure({ code: "orchestration_error", message: stopFailed }),
+                )
+              : Effect.succeed({}),
+          ),
+        )) as never,
     });
 
     const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
-      // A follower's first step: here it notes the task it follows, then waits for good.
-      getThreadEventSequence: () =>
-        Effect.sync(() => followed.push(taskId)).pipe(
-          Effect.andThen(Deferred.succeed(following, undefined)),
-          Effect.andThen(Effect.never),
-        ),
-      getThreadRecords: ((threadId: ThreadId) =>
-        Effect.succeed({
-          thread: {
-            id: threadId,
-            title: "Parent",
-            projectId: ProjectId.make("project:here"),
-            modelSelection,
-            runtimeMode: "full-access",
-            interactionMode: "default",
-          },
-          runs: [
-            {
-              id: RunId.make("run:parent"),
-              status: "running",
-              ordinal: 1,
-              rootNodeId: NodeId.make("node:parent-root"),
-              providerInstanceId: instanceId,
-            },
-          ],
-          subagents:
-            records.length === 0 || options.recordWithoutTask
-              ? []
-              : [{ id: taskId, remoteChild: { threadId: childThreadId } }],
-        })) as never,
+      getThreadEventSequence: () => Effect.succeed(0) as never,
+      getThreadRecords: ((
+        threadId: ThreadId,
+        _parts: unknown,
+        only?: { readonly subagentIds?: ReadonlyArray<NodeId> },
+      ) =>
+        // A follower's first read of its task: here it notes which task it follows, then waits
+        // for good.
+        only?.subagentIds !== undefined
+          ? Effect.sync(() => followed.push(...(only.subagentIds ?? []))).pipe(
+              Effect.andThen(Deferred.succeed(following, undefined)),
+              Effect.andThen(Effect.never),
+            )
+          : Effect.succeed({
+              thread: {
+                id: threadId,
+                title: "Parent",
+                projectId: ProjectId.make("project:here"),
+                modelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+              },
+              runs: [
+                {
+                  id: RunId.make("run:parent"),
+                  status: "running",
+                  ordinal: 1,
+                  rootNodeId: NodeId.make("node:parent-root"),
+                  providerInstanceId: instanceId,
+                },
+              ],
+              subagents:
+                records.length === 0 || options.recordWithoutTask
+                  ? []
+                  : [{ id: taskId, remoteChild: { threadId: childThreadId } }],
+            })) as never,
       dispatch: (command) =>
         (command.type === "delegated_task.remote.request"
           ? (options.beforeRecord?.hold ?? Effect.void)
           : Effect.void
         ).pipe(
+          Effect.andThen(
+            command.type === "delegated_task.remote.request" && options.recordFails
+              ? Effect.fail(
+                  new Orchestrator.OrchestratorCommandRejectedError({
+                    commandId: command.commandId,
+                    commandType: command.type,
+                  }),
+                )
+              : Effect.void,
+          ),
           Effect.andThen(
             Effect.sync(() => {
               records.push(command.type);
@@ -298,4 +327,48 @@ it.effect("a recorded launch with no task here to follow is stopped there, with 
       assert.include(harness.warnings, "remote-delegation.record-found-no-task");
     }),
   ),
+);
+
+it.effect.each([false, true])(
+  "a launch whose record is refused is stopped there and not followed (interrupted: %s)",
+  (interrupted) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const pause = yield* makePause;
+        const harness = yield* makeHarness({
+          recordFails: true,
+          ...(interrupted ? { beforeRecord: pause } : {}),
+        });
+        const exit = interrupted
+          ? yield* interruptedAt(harness.delegate, pause)
+          : yield* Effect.exit(harness.delegate);
+        assert.isTrue(Exit.isFailure(exit));
+        if (!interrupted)
+          assert.include(JSON.stringify(exit), "Unable to record the delegated task.");
+        assert.deepStrictEqual(harness.launches, [`delegate:${parentThreadId}:review-on-box`]);
+        assert.deepStrictEqual(harness.records, []);
+        assert.deepStrictEqual(harness.stops, [childThreadId]);
+        assert.deepStrictEqual(harness.followed, []);
+        assert.include(harness.warnings, "remote-delegation.record-failed");
+      }),
+    ),
+);
+
+it.effect.each([
+  ["refused", { recordFails: true }, "Unable to record the delegated task."],
+  ["found no task", { recordWithoutTask: true }, "The delegated task was not recorded."],
+] as const)(
+  "a stop that fails there after a record %s does not replace the record's error",
+  ([, record, message]) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({ ...record, stopFails: true });
+        const exit = yield* Effect.exit(harness.delegate);
+        assert.isTrue(Exit.isFailure(exit));
+        assert.include(JSON.stringify(exit), message);
+        assert.notInclude(JSON.stringify(exit), stopFailed);
+        assert.deepStrictEqual(harness.stops, [childThreadId]);
+        assert.deepStrictEqual(harness.followed, []);
+      }),
+    ),
 );
