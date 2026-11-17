@@ -25,7 +25,9 @@
     "usr/bin/wslinfo": {
       "text": "#!/bin/sh\n[ \"$1\" = --networking-mode ] || exit 2\necho nat\nexit 0\n",
       "mode": "755"
-    }
+    },
+    "run/systemd/container": "wsl\n",
+    "proc/self/uid_map": "         0          0 4294967295\n"
   },
   "fail": {
     "os": [
@@ -81,7 +83,19 @@
         ".dockerenv": ""
       },
       {
-        "run/systemd/container": "wsl\n"
+        "run/.containerenv": ""
+      },
+      {
+        "run/systemd/container": "lxc\n"
+      },
+      {
+        "run/systemd/container": "wsl-docker\n"
+      },
+      {
+        "proc/self/uid_map": "         0     100000      65536\n"
+      },
+      {
+        "proc/self/uid_map": null
       }
     ],
     "mounts": [

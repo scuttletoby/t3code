@@ -155,6 +155,39 @@ class Setup(Case):
         os.unlink(self.path('/log/install-fail'))
         self.assertEqual(self.setup_run()[0], 0)
 
+    def test_t3_installed_loose_is_made_roots_alone(self):   # tar keeps the archive's modes; mktemp -d is 0700
+        self.terminate()
+        self.write('/log/install-loose', '')
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        d = self.path('/opt/pc-agents/t3/runtime/versions/' + CONFIG['t3Version'])
+        self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o755)
+        for p in (d + '/lib', d + '/lib/x'):
+            self.assertEqual(stat.S_IMODE(os.lstat(p).st_mode), 0o755, p)
+        self.assertEqual(stat.S_IMODE(os.lstat(d + '/lib/x/m.js').st_mode), 0o644)
+        self.assertEqual(os.readlink(d + '/lib/y'), 'x')
+        self.assertEqual(len(self.log('install')), 1)
+
+    def test_loose_t3_from_an_older_setup_is_installed_again(self):
+        self.terminate()
+        self.write('/log/install-loose', '')
+        cli.root_alone, real = (lambda folder: None), cli.root_alone   # an older kit: no root_alone
+        try:
+            self.assertEqual(self.setup_run()[0], 1)   # the runtime wall fails, as on the PC
+        finally:
+            cli.root_alone = real
+        os.unlink(self.path('/log/install-loose'))
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertIn('is not root\'s alone: removing it', out)
+        self.assertEqual(len(self.log('install')), 2)
+        d = self.path('/opt/pc-agents/t3/runtime/versions/' + CONFIG['t3Version'])
+        self.assertFalse(os.path.lexists(d + '/lib'))
+        before = self.snapshot()
+        self.assertEqual(self.setup_run()[0], 0)
+        self.assertEqual(len(self.log('install')), 2)
+        self.assertEqual(self.snapshot(), before)
+
     def test_failed_t3_install_on_upgrade_still_restarts_t3_on_the_next_run(self):
         self.ready()
         os.unlink(self.path('/log/systemctl'))
