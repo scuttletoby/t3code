@@ -114,6 +114,52 @@ it.layer(NodeServices.layer)("PlaytestStore", (it) => {
     }),
   );
 
+  it.effect(
+    "a file with no version, or an older or odd one, is copied aside; its sessions stay",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const { root, filePath } = yield* storeFile;
+        const store = yield* PlaytestStore.make({ filePath });
+        const good = session();
+
+        const versions = [undefined, 0, -1, 1.5, "1", null];
+        for (const [index, version] of versions.entries()) {
+          const text = json(
+            version === undefined ? { sessions: [good] } : { version, sessions: [good] },
+          );
+          yield* fs.writeFileString(filePath, text);
+          const loaded = yield* store.load({ nowMs: NOW + index * 1000 });
+          assert.strictEqual(loaded._tag, "Repaired", String(version));
+          if (loaded._tag !== "Repaired") return;
+          assert.deepStrictEqual(
+            loaded.sessions.map((entry) => entry.id),
+            [good.id],
+          );
+          assert.strictEqual(loaded.dropped, 0);
+          assert.strictEqual(yield* fs.readFileString(loaded.copyPath), text);
+          assert.strictEqual(JSON.parse(yield* fs.readFileString(filePath)).version, 1);
+        }
+        assert.strictEqual((yield* listCopies(root)).length, versions.length);
+      }),
+  );
+
+  it.effect("a stored note with control characters still loads (steps get it cleaned)", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { filePath } = yield* storeFile;
+      const store = yield* PlaytestStore.make({ filePath });
+      yield* fs.writeFileString(
+        filePath,
+        json({ version: 1, sessions: [session({ note: "old\u0000note\nhere" })] }),
+      );
+      const loaded = yield* store.load({ nowMs: NOW });
+      assert.strictEqual(loaded._tag, "Loaded");
+      if (loaded._tag !== "Loaded") return;
+      assert.strictEqual(loaded.sessions[0]?.note, "old\u0000note\nhere");
+    }),
+  );
+
   it.effect("keeps the sessions that still decode and names the lost ones not ended", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -195,6 +241,11 @@ it.layer(NodeServices.layer)("PlaytestStore", (it) => {
       assert.isTrue(ids.has("pt_zzzzzzzzzz"));
       assert.isFalse(ids.has(`pt_${"0".padStart(10, "a")}`));
       assert.isFalse(ids.has(`pt_${"1".padStart(10, "a")}`));
+      // The session being worked on stays, even when its end reads oldest.
+      const keep = `pt_${"0".padStart(10, "a")}`;
+      const kept2 = PlaytestStore.trimEnded([...ended, live] as never, keep);
+      assert.strictEqual(kept2.length, PlaytestStore.MAX_ENDED_SESSIONS + 2);
+      assert.isTrue(new Set(kept2.map((entry) => entry.id)).has(keep));
     }),
   );
 });

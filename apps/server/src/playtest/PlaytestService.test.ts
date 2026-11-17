@@ -12,10 +12,12 @@ import { assert, describe, it } from "@effect/vitest";
 import { type PlaytestFailure, ProjectId, ThreadId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Scope from "effect/Scope";
 
 import * as ProcessRunner from "../processRunner.ts";
@@ -55,7 +57,15 @@ const fixture = Effect.gen(function* () {
       yield* fs.makeDirectory(dir);
       return dir;
     });
-  return { root, script, worktree, adapterDir, filePath: path.join(root, PLAYTEST_STORE_FILE) };
+  return {
+    root,
+    script,
+    worktree,
+    adapterDir,
+    filePath: path.join(root, PLAYTEST_STORE_FILE),
+    // Not made yet: the service makes it when a release runs.
+    stepsFolder: path.join(root, "state", "playtest"),
+  };
 });
 type Fixture = Effect.Success<typeof fixture>;
 
@@ -91,14 +101,134 @@ const okPlace = (worktree: string) => () =>
 const makeService = (
   fx: Fixture,
   settings: ServerSettingsService["Service"],
-  placeOf: (threadId: ThreadId) => Effect.Effect<PlaytestService.PlaytestPlace> = okPlace(
-    fx.worktree,
-  ),
-) =>
-  PlaytestService.make({ filePath: fx.filePath, placeOf }).pipe(
-    Effect.provideService(ServerSettingsService, settings),
+  options: {
+    readonly placeOf?: (threadId: ThreadId) => Effect.Effect<PlaytestService.PlaytestPlace>;
+    readonly fs?: FileSystem.FileSystem;
+    readonly runner?: ProcessRunner.ProcessRunner["Service"];
+  } = {},
+) => {
+  const made = PlaytestService.make({
+    filePath: fx.filePath,
+    stepsFolder: fx.stepsFolder,
+    placeOf: options.placeOf ?? okPlace(fx.worktree),
+  }).pipe(Effect.provideService(ServerSettingsService, settings));
+  const withRunner =
+    options.runner === undefined
+      ? made.pipe(Effect.provide(ProcessRunner.layer))
+      : made.pipe(Effect.provideService(ProcessRunner.ProcessRunner, options.runner));
+  return options.fs === undefined
+    ? withRunner
+    : withRunner.pipe(Effect.provideService(FileSystem.FileSystem, options.fs));
+};
+
+/**
+ * A FileSystem whose renames (the last part of every store write) a test can hold or fail. A held
+ * write cannot be interrupted, so an interrupt sent meanwhile lands right after it.
+ */
+const fsControl = Effect.gen(function* () {
+  const real = yield* FileSystem.FileSystem;
+  let hold: {
+    readonly reached: Deferred.Deferred<void>;
+    readonly gate: Deferred.Deferred<void>;
+  } | null = null;
+  let fail = false;
+  const fs: FileSystem.FileSystem = {
+    ...real,
+    rename: (from, to) =>
+      Effect.suspend(() => {
+        if (fail) {
+          return Effect.fail(
+            PlatformError.systemError({
+              _tag: "Unknown",
+              module: "FileSystem",
+              method: "rename",
+              description: "disk full",
+              pathOrDescriptor: to,
+            }),
+          );
+        }
+        const held = hold;
+        if (held === null) return real.rename(from, to);
+        hold = null;
+        return Deferred.succeed(held.reached, undefined).pipe(
+          Effect.andThen(Deferred.await(held.gate)),
+          Effect.andThen(real.rename(from, to)),
+          Effect.uninterruptible,
+        );
+      }),
+  };
+  return {
+    fs,
+    /** The next store write waits: `reached` when it does, `release` lets it finish. */
+    holdNextWrite: Effect.gen(function* () {
+      const reached = yield* Deferred.make<void>();
+      const gate = yield* Deferred.make<void>();
+      hold = { reached, gate };
+      return { reached: Deferred.await(reached), release: Deferred.succeed(gate, undefined) };
+    }),
+    failWrites: (on: boolean) => Effect.sync(() => void (fail = on)),
+  };
+});
+
+/** The real runner, which tells a test when the next step's process has returned. */
+const runnerControl = Effect.gen(function* () {
+  const real = yield* Effect.service(ProcessRunner.ProcessRunner).pipe(
     Effect.provide(ProcessRunner.layer),
   );
+  let returned: Deferred.Deferred<void> | null = null;
+  const runner = ProcessRunner.ProcessRunner.of({
+    run: (input) =>
+      real.run(input).pipe(
+        Effect.tap(() =>
+          Effect.suspend(() => {
+            const signal = returned;
+            returned = null;
+            return signal === null ? Effect.void : Deferred.succeed(signal, undefined);
+          }),
+        ),
+      ),
+  });
+  return {
+    runner,
+    /** Resolves once the next step returns; its fiber then goes straight on to wait for the lock. */
+    nextReturn: Effect.gen(function* () {
+      const signal = yield* Deferred.make<void>();
+      returned = signal;
+      return Deferred.await(signal);
+    }),
+  };
+});
+
+/** A stored session as `playtest.json` holds it. */
+const storedSession = (fx: Fixture, dir: string, overrides: Record<string, unknown> = {}) => {
+  const { enabled: _enabled, ...steps } = adapter(fx, dir);
+  return {
+    id: "pt_aaaaaaaaaa",
+    threadId: THREAD,
+    projectId: PROJECT,
+    target: "dev-1",
+    note: "",
+    worktree: fx.worktree,
+    adapter: steps,
+    state: "active",
+    startedAt: "2026-11-17T11:00:00.000Z",
+    lastActivityAt: "2026-11-17T11:00:00.000Z",
+    rounds: 0,
+    ...overrides,
+  };
+};
+const writeStore = (fx: Fixture, sessions: ReadonlyArray<unknown>) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    yield* fs.writeFileString(fx.filePath, `${JSON.stringify({ version: 1, sessions })}\n`);
+  });
+/** A push step that runs `/bin/sh -c script`. */
+const shellStep = (name: string, script: string) => ({
+  argv: ["/bin/sh", "-c", script],
+  timeoutSeconds: 30,
+  description: "",
+  name,
+});
 
 /** The steps that ran, as `step:round`, and `finished|step` for those that got to their end. */
 const ran = (dir: string) =>
@@ -206,6 +336,18 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
               THREAD,
               fx.worktree,
               fx.worktree,
+            ]);
+            // Release runs in T3's own folder; claim and push in the worktree.
+            const pwds = (yield* logLines(dir))
+              .filter((line) => !line.startsWith("finished"))
+              .map((line) => `${line.split("|")[0]}:${line.split("|")[8]}`);
+            assert.deepStrictEqual(pwds, [
+              `claim:${fx.worktree}`,
+              `build:${fx.worktree}`,
+              `deploy:${fx.worktree}`,
+              `build:${fx.worktree}`,
+              `deploy:${fx.worktree}`,
+              `release:${fx.stepsFolder}`,
             ]);
 
             // Runs again: nothing to end, and status shows the last session.
@@ -615,9 +757,10 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
           assert.strictEqual((yield* refusal(offWithSteps.start(start))).code, "playtest_off");
 
           const settings = yield* settingsWith(adapter(fx, dir));
-          const gone = yield* makeService(fx, settings, () =>
-            Effect.succeed({ type: "unavailable", message: "The thread is archived or gone." }),
-          );
+          const gone = yield* makeService(fx, settings, {
+            placeOf: () =>
+              Effect.succeed({ type: "unavailable", message: "The thread is archived or gone." }),
+          });
           assert.deepStrictEqual(yield* refusal(gone.start(start)), {
             code: "thread_unavailable",
             message: "The thread is archived or gone.",
@@ -636,6 +779,14 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
             (yield* refusal(service.start({ ...start, note: "x".repeat(201) }))).code,
             "invalid",
           );
+          // A NUL would fail every spawn, release too; no control character gets in.
+          for (const note of ["a\u0000b", "bell\u0007", "del\u007f", "esc\u001b[0m"]) {
+            const bad = yield* refusal(service.start({ ...start, note }));
+            assert.deepStrictEqual(bad, {
+              code: "invalid",
+              message: "The note may not hold control characters.",
+            });
+          }
           assert.strictEqual(
             (yield* refusal(service.push({ threadId: THREAD }))).code,
             "no_session",
@@ -679,12 +830,352 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
 
           const failed = yield* service.start({ threadId: THREAD, target: "dev-1" });
           assert.strictEqual(failed.outcome, "failed");
-          assert.include(failed.session.problem, "needs a shell");
+          // Release needs a shell too, so it can never run: the session ends, nothing ran.
+          assert.deepInclude(failed.session, { state: "ended", endReason: "claim-failed" });
+          assert.strictEqual(
+            failed.session.problem,
+            `${PlaytestService.RELEASE_COULD_NOT_RUN}Step release names a program that needs a shell (a .cmd or .bat file); steps run without one.`,
+          );
           assert.deepStrictEqual(yield* ran(dir), []);
         }).pipe(
           Effect.provideService(HostProcess.Platform, "win32"),
           Effect.provideService(SpawnExecutableResolution, () => "C:\\tools\\playtest.cmd"),
         ),
+      ),
+    );
+
+    it.live("a removed worktree does not block the end: release runs in T3's own folder", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)));
+          yield* service.start({ threadId: THREAD, target: "dev-1" });
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.remove(fx.worktree, { recursive: true });
+
+          // A push needs the worktree, so it fails; it never blocks the end.
+          assert.strictEqual((yield* service.push({ threadId: THREAD })).outcome, "failed");
+          const ended = yield* service.end({ threadId: THREAD, reason: "thread-gone" });
+          assert.strictEqual(ended.outcome, "ended");
+          assert.deepInclude(ended.session, { state: "ended", endReason: "thread-gone" });
+          const release = (yield* logLines(dir)).find((line) => line.startsWith("release|"));
+          assert.strictEqual(release?.split("|")[8], fx.stepsFolder);
+        }),
+      ),
+    );
+
+    it.live(
+      "a release that cannot start ends the session with that reason; a new one may start",
+      () =>
+        live(
+          Effect.gen(function* () {
+            const fx = yield* fixture;
+            const dir = yield* fx.adapterDir("a");
+            const fs = yield* FileSystem.FileSystem;
+            const releaseProgram = `${fx.root}/release.sh`;
+            yield* fs.copyFile(fx.script, releaseProgram);
+            yield* fs.chmod(releaseProgram, 0o755);
+            const service = yield* makeService(
+              fx,
+              yield* settingsWith(
+                adapter(fx, dir, { release: { ...step(fx, dir), argv: [releaseProgram, dir] } }),
+              ),
+            );
+            yield* service.start({ threadId: THREAD, target: "dev-1" });
+            // An adapter update moved the program away after the session started.
+            yield* fs.remove(releaseProgram);
+
+            const ended = yield* service.end({ threadId: THREAD, reason: "agent" });
+            assert.strictEqual(ended.outcome, "ended");
+            assert.deepInclude(ended.session, { state: "ended", endReason: "agent" });
+            assert.strictEqual(
+              ended.session?.problem,
+              `${PlaytestService.RELEASE_COULD_NOT_RUN}It could not start.`,
+            );
+            assert.strictEqual(
+              (yield* service.start({ threadId: THREAD, target: "dev-1" })).outcome,
+              "started",
+            );
+          }),
+        ),
+    );
+
+    it.live("a stored note with a NUL (an older T3 kept it) still releases, cleaned", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          yield* writeStore(fx, [storedSession(fx, dir, { note: "old\u0000note\u0007" })]);
+          const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)));
+
+          const ended = yield* service.end({ threadId: THREAD, reason: "person" });
+          assert.strictEqual(ended.outcome, "ended");
+          const release = (yield* logLines(dir)).find((line) => line.startsWith("release|"));
+          assert.strictEqual(release?.split("|")[4], "old note ");
+        }),
+      ),
+    );
+
+    it.live(
+      "a step that returns while end holds the lock does not undo the end (claim, first, last step)",
+      () =>
+        live(
+          Effect.gen(function* () {
+            for (const held of ["claim", "build", "deploy"] as const) {
+              const fx = yield* fixture;
+              const dir = yield* fx.adapterDir("a");
+              const files = yield* fsControl;
+              const runs = yield* runnerControl;
+              const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)), {
+                fs: files.fs,
+                runner: runs.runner,
+              });
+              yield* holdStep(dir, held);
+              if (held !== "claim") yield* service.start({ threadId: THREAD, target: "dev-1" });
+              const work = yield* Effect.forkChild(
+                held === "claim"
+                  ? Effect.map(
+                      service.start({ threadId: THREAD, target: "dev-1" }),
+                      (r) => r.outcome,
+                    )
+                  : Effect.map(service.push({ threadId: THREAD }), (r) => r.outcome),
+              );
+              yield* stepStarted(dir, held);
+
+              // `end` takes the lock and its write waits; meanwhile the step returns.
+              const write = yield* files.holdNextWrite;
+              const ending = yield* Effect.forkChild(
+                service.end({ threadId: THREAD, reason: "agent" }),
+              );
+              yield* write.reached;
+              const returned = yield* runs.nextReturn;
+              yield* openGate(dir, held);
+              yield* returned;
+              yield* write.release;
+
+              const ended = yield* Fiber.join(ending);
+              assert.strictEqual(ended.outcome, "ended", held);
+              assert.deepInclude(ended.session, { state: "ended", endReason: "agent" }, held);
+              assert.strictEqual(yield* Fiber.join(work), "stopped", held);
+              const lines = yield* ran(dir);
+              assert.include(lines, `release:${held === "claim" ? 0 : 1}`, held);
+              if (held !== "claim") {
+                // The round reads stopped at the step that ran; the next step never ran.
+                assert.deepInclude(
+                  ended.session?.lastRound,
+                  { state: "stopped", step: held },
+                  held,
+                );
+                if (held === "build") assert.notInclude(lines, "deploy:1");
+              }
+            }
+          }),
+        ),
+    );
+
+    it.live("a caller cancelled between the save and the step leaves no half state", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          const files = yield* fsControl;
+          const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)), {
+            fs: files.fs,
+          });
+
+          // end: cancelled while `ending` is written, the release still starts.
+          yield* service.start({ threadId: THREAD, target: "dev-1" });
+          yield* holdStep(dir, "release");
+          let write = yield* files.holdNextWrite;
+          const ending = yield* Effect.forkChild(
+            service.end({ threadId: THREAD, reason: "agent" }),
+          );
+          yield* write.reached;
+          const stopEnd = yield* Effect.forkChild(Fiber.interrupt(ending));
+          yield* write.release;
+          yield* Fiber.join(stopEnd);
+          assert.deepInclude(yield* service.status({ threadId: THREAD }), {
+            state: "ending",
+            running: "release",
+          });
+          yield* stepStarted(dir, "release");
+          const again = yield* Effect.forkChild(service.end({ threadId: THREAD, reason: "agent" }));
+          yield* openGate(dir, "release");
+          assert.strictEqual((yield* Fiber.join(again)).outcome, "ended");
+          yield* removeFile(dir, "release.started");
+          yield* removeFile(dir, "release.gate");
+
+          // start: cancelled while its session is written, the claim still starts.
+          yield* holdStep(dir, "claim");
+          write = yield* files.holdNextWrite;
+          const starting = yield* Effect.forkChild(
+            service.start({ threadId: OTHER_THREAD, target: "dev-1" }),
+          );
+          yield* write.reached;
+          const stopStart = yield* Effect.forkChild(Fiber.interrupt(starting));
+          yield* write.release;
+          yield* Fiber.join(stopStart);
+          assert.deepInclude(yield* service.status({ threadId: OTHER_THREAD }), {
+            state: "claiming",
+            running: "claim",
+          });
+          yield* stepStarted(dir, "claim");
+          const ended = yield* service.end({ threadId: OTHER_THREAD, reason: "agent" });
+          assert.strictEqual(ended.outcome, "ended");
+        }),
+      ),
+    );
+
+    it.live("a step that prints more than the cap keeps the end of its output", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          const chatty =
+            'i=0; while [ $i -lt 4000 ]; do echo "line $i of a chatty build"; i=$((i+1)); done; echo "error: the real end"; exit 3';
+          const service = yield* makeService(
+            fx,
+            yield* settingsWith(adapter(fx, dir, { push: [shellStep("build", chatty)] })),
+          );
+          yield* service.start({ threadId: THREAD, target: "dev-1" });
+
+          const failed = yield* service.push({ threadId: THREAD });
+          assert.strictEqual(failed.outcome, "failed");
+          const detail = failed.session.lastRound?.detail ?? "";
+          assert.isTrue(
+            detail.endsWith("line 3999 of a chatty build\nerror: the real end"),
+            detail.slice(-80),
+          );
+          assert.isTrue(detail.startsWith("…"));
+        }),
+      ),
+    );
+
+    it.live("steps do not get the variables T3's terminal strips (PORT, T3CODE_*)", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          const probe = { PORT: "4321", T3CODE_PLAYTEST_PROBE: "t3", PLAYTEST_PROBE_KEPT: "kept" };
+          yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              const before = Object.fromEntries(
+                Object.keys(probe).map((key) => [key, process.env[key]]),
+              );
+              Object.assign(process.env, probe);
+              return before;
+            }),
+            (before) =>
+              Effect.sync(() => {
+                for (const [key, value] of Object.entries(before)) {
+                  if (value === undefined) delete process.env[key];
+                  else process.env[key] = value;
+                }
+              }),
+          );
+          const show =
+            'printf "%s|%s|%s" "${PORT-unset}" "${T3CODE_PLAYTEST_PROBE-unset}" "${PLAYTEST_PROBE_KEPT-unset}"';
+          const service = yield* makeService(
+            fx,
+            yield* settingsWith(adapter(fx, dir, { push: [shellStep("show", show)] })),
+          );
+          yield* service.start({ threadId: THREAD, target: "dev-1" });
+          const pushed = yield* service.push({ threadId: THREAD });
+          assert.strictEqual(pushed.session.lastRound?.detail, "unset|unset|kept");
+        }),
+      ),
+    );
+
+    it.live("the session being worked on is never trimmed, even when its end reads oldest", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          // 100 ended sessions dated later than now: the clock went back.
+          yield* writeStore(
+            fx,
+            Array.from({ length: 100 }, (_, index) =>
+              storedSession(fx, dir, {
+                id: `pt_aaaaaaaa${String.fromCharCode(97 + Math.floor(index / 26), 97 + (index % 26))}`,
+                threadId: OTHER_THREAD,
+                state: "ended",
+                endReason: "agent",
+                endedAt: "2099-01-01T00:00:00.000Z",
+              }),
+            ),
+          );
+          const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)));
+          const started = yield* service.start({ threadId: THREAD, target: "dev-1" });
+          // All 100 loaded as they were (none dropped as bad).
+          const fs = yield* FileSystem.FileSystem;
+          assert.lengthOf(JSON.parse(yield* fs.readFileString(fx.filePath)).sessions, 101);
+          const ended = yield* service.end({ threadId: THREAD, reason: "agent" });
+          assert.strictEqual(ended.outcome, "ended");
+          assert.strictEqual(ended.session?.id, started.session.id);
+        }),
+      ),
+    );
+
+    it.live("end when the store cannot be written refuses and changes nothing", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          const files = yield* fsControl;
+          const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)), {
+            fs: files.fs,
+          });
+          yield* service.start({ threadId: THREAD, target: "dev-1" });
+
+          yield* files.failWrites(true);
+          const refused = yield* refusal(service.end({ threadId: THREAD, reason: "agent" }));
+          assert.strictEqual(refused.code, "store_unavailable");
+          assert.strictEqual((yield* service.status({ threadId: THREAD }))?.state, "active");
+          assert.notInclude(yield* ran(dir), "release:0");
+
+          yield* files.failWrites(false);
+          assert.strictEqual(
+            (yield* service.end({ threadId: THREAD, reason: "agent" })).outcome,
+            "ended",
+          );
+        }),
+      ),
+    );
+
+    it.live("a restart while ending: busy until end runs release again", () =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          const settings = yield* settingsWith(adapter(fx, dir));
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const service = yield* makeService(fx, settings);
+              yield* service.start({ threadId: THREAD, target: "dev-1" });
+              yield* setFile(dir, "release.code", "4");
+              const failed = yield* service.end({ threadId: THREAD, reason: "agent" });
+              assert.strictEqual(failed.outcome, "release-failed");
+            }),
+          );
+
+          const restarted = yield* makeService(fx, settings);
+          const status = yield* restarted.status({ threadId: THREAD });
+          assert.strictEqual(status?.state, "ending");
+          assert.isUndefined(status?.running);
+          const start = yield* refusal(restarted.start({ threadId: THREAD, target: "dev-1" }));
+          assert.strictEqual(start.code, "busy");
+          assert.include(start.message, "call end again");
+
+          yield* removeFile(dir, "release.code");
+          const ended = yield* restarted.end({ threadId: THREAD, reason: "person" });
+          assert.strictEqual(ended.outcome, "ended");
+          assert.strictEqual(ended.session?.endReason, "agent");
+          assert.deepStrictEqual(
+            (yield* ran(dir)).filter((line) => line.startsWith("release")),
+            ["release:0", "release:0"],
+          );
+        }),
       ),
     );
   },

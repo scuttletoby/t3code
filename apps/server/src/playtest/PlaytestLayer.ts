@@ -1,6 +1,7 @@
 /**
- * Fork (playtest): the one playtest service of a server. A thread's sessions run in its worktree,
- * else in its project's folder; an archived or deleted thread starts none. Renew and the limits
+ * Fork (playtest): the one playtest service of a server. A thread's sessions claim and push in its
+ * worktree, else in its project's folder, and renew and release in `<state>/playtest`; an archived
+ * or deleted thread starts none. Renew and the limits
  * come with the worker.
  */
 import * as Context from "effect/Context";
@@ -55,6 +56,7 @@ export const layer = Layer.effect(
     const path = yield* Path.Path;
     return yield* PlaytestService.make({
       filePath: path.join(config.stateDir, PLAYTEST_STORE_FILE),
+      stepsFolder: path.join(config.stateDir, "playtest"),
       placeOf: yield* makePlaceOf(),
     });
   }),

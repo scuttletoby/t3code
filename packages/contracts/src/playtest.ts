@@ -188,11 +188,17 @@ export const PlaytestTarget = Schema.String.check(
 );
 export type PlaytestTarget = typeof PlaytestTarget.Type;
 
+/**
+ * C0 control characters and DEL. Agent text that reaches a step's environment may hold none: a
+ * NUL makes every spawn fail, release too.
+ */
+export const PLAYTEST_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/gu;
+
 /** The agent's reason for a session: one line, at most 200 characters, may be empty. */
 export const PLAYTEST_NOTE_MAX = 200;
 export const PlaytestNote = Schema.String.check(
   Schema.isMaxLength(PLAYTEST_NOTE_MAX),
-  Schema.isPattern(/^[^\r\n]*$/u),
+  Schema.isPattern(/^[^\u0000-\u001f\u007f]*$/u),
 );
 
 /** The steps a session started with; it keeps them to its end, whatever the settings say later. */
@@ -265,8 +271,12 @@ export const PlaytestSessionRecord = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
   target: PlaytestTarget,
-  note: PlaytestNote,
-  /** The steps' working folder: the thread's worktree, else the project's folder. */
+  /**
+   * Checked as `PlaytestNote` when a session starts. Read back with only its length checked, so an
+   * older file's note never drops its session; steps get it without control characters.
+   */
+  note: Schema.String.check(Schema.isMaxLength(PLAYTEST_NOTE_MAX)),
+  /** The thread's worktree, else the project's folder: claim and push run here (not renew, release). */
   worktree: TrimmedNonEmptyString,
   adapter: PlaytestAdapter,
   state: PlaytestSessionState,

@@ -1,12 +1,12 @@
 /**
- * Fork (playtest): sessions over one store file; docs/fork/playtest.md is the contract. One step
- * runs at a time per session, in this service's scope: a caller that goes away does not stop it, a
- * server stop does. A session keeps the steps it started with. Renew, the idle and time limits and
- * recovery after a restart are the worker's.
+ * Fork (playtest): sessions over one store file; docs/fork/playtest.md is the contract. One step at
+ * a time per session, in this service's scope (a caller going away does not stop it). Claim and
+ * push run in the worktree; renew and release in T3's own folder (a removed worktree never blocks).
  */
 import {
   type PlaytestAdapter,
   type PlaytestEndReason,
+  PLAYTEST_CONTROL_CHARACTERS,
   PLAYTEST_DETAIL_MAX,
   PLAYTEST_ENV,
   PLAYTEST_EXIT_OK,
@@ -30,16 +30,20 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import * as ProcessRunner from "../processRunner.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import { shouldExcludeTerminalEnvKey } from "../terminal/Manager.ts";
 import * as PlaytestStore from "./PlaytestStore.ts";
 
-/** A step may print this much on each of stdout and stderr; the rest is cut off. */
+/** A step's output kept, on each of stdout and stderr: the last this many bytes. */
 const STEP_MAX_OUTPUT_BYTES = 64 * 1024;
 const RELEASE_PROBLEM = "release: ";
+/** A release that cannot even start ends the session anyway; the claim expires on the target. */
+export const RELEASE_COULD_NOT_RUN = "release could not run: ";
 const SESSION_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 
 /** Where a thread's sessions run: its project, and its worktree (else the project's folder). */
@@ -77,7 +81,12 @@ export type PlaytestEndResult = {
   readonly session: PlaytestSessionView | null;
 };
 
-type StepResult = { readonly result: "ok" | "refused" | "failed"; readonly detail: string };
+type StepResult = {
+  readonly result: "ok" | "refused" | "failed";
+  readonly detail: string;
+  /** The program never ran: it is missing, not runnable, or would need a shell. */
+  readonly notStarted?: true;
+};
 
 const failure = (code: PlaytestFailureCode, message: string) =>
   new PlaytestFailure({ code, message });
@@ -85,10 +94,22 @@ const failure = (code: PlaytestFailureCode, message: string) =>
 const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
 const decodeTarget = Schema.decodeUnknownOption(PlaytestTarget);
 
-/** The end of `text`, so the step's last lines (where errors are) are kept. */
+/** The end of `text`, so the step's last lines (where errors are) are kept (see `"tail"` output). */
 function tail(text: string, max = PLAYTEST_DETAIL_MAX): string {
   const trimmed = text.trim();
   return trimmed.length <= max ? trimmed : `…${trimmed.slice(trimmed.length - max + 1)}`;
+}
+
+/** A value for a step's environment: a control character (a NUL above all) fails every spawn. */
+const envText = (text: string) => text.replace(PLAYTEST_CONTROL_CHARACTERS, " ");
+
+/** The server's environment without what T3's own terminal strips (T3CODE_*, PORT, …). */
+function stepBaseEnv(): Record<string, undefined> {
+  const strip: Record<string, undefined> = {};
+  for (const key of Object.keys(process.env)) {
+    if (shouldExcludeTerminalEnvKey(key)) strip[key] = undefined;
+  }
+  return strip;
 }
 
 function newSessionId(taken: ReadonlySet<string>): string {
@@ -129,10 +150,13 @@ function runErrorText(error: ProcessRunner.ProcessRunError): string {
 
 export const make = Effect.fn("PlaytestService.make")(function* (input: {
   readonly filePath: string;
+  /** T3's own folder, made when needed: renew and release run here, never in a worktree. */
+  readonly stepsFolder: string;
   readonly placeOf: (threadId: ThreadId) => Effect.Effect<PlaytestPlace>;
 }) {
   const settingsService = yield* ServerSettingsService;
   const runner = yield* ProcessRunner.ProcessRunner;
+  const fs = yield* FileSystem.FileSystem;
   const store = yield* PlaytestStore.make({ filePath: input.filePath });
   /** Steps run in fibers of this scope: a server stop interrupts them (and kills each process). */
   const runScope = yield* Effect.scope;
@@ -188,15 +212,18 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
   });
 
   /** Before any step runs: kept in memory only when the write worked. */
-  const save = (next: ReadonlyArray<PlaytestSessionRecord>) =>
-    store.write(next).pipe(
+  const save = (next: ReadonlyArray<PlaytestSessionRecord>, keep: string) =>
+    store.write(next, keep).pipe(
       Effect.tap((written) => Effect.sync(() => void (sessions = written))),
       Effect.mapError((error) => failure("store_unavailable", error.message)),
     );
   /** After a step ran: what happened is true either way, so memory keeps it; the next write saves it. */
-  const record = Effect.fnUntraced(function* (next: ReadonlyArray<PlaytestSessionRecord>) {
+  const record = Effect.fnUntraced(function* (
+    next: ReadonlyArray<PlaytestSessionRecord>,
+    keep: string,
+  ) {
     sessions = next;
-    yield* store.write(next).pipe(
+    yield* store.write(next, keep).pipe(
       Effect.tap((written) => Effect.sync(() => void (sessions = written))),
       Effect.catch((error) =>
         Effect.logWarning(`playtest: ${error.message}; the next change writes it.`),
@@ -205,6 +232,14 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
   });
 
   const find = (id: string) => (sessions ?? []).find((session) => session.id === id);
+  /** The session a call worked on; writes never trim it, so it is there. */
+  const found = (id: string) =>
+    Effect.suspend(() => {
+      const session = find(id);
+      return session === undefined
+        ? Effect.die(new Error(`playtest: session ${id} went missing from memory`))
+        : Effect.succeed(session);
+    });
   const replace = (next: PlaytestSessionRecord) =>
     (sessions ?? []).map((session) => (session.id === next.id ? next : session));
   const liveOf = (threadId: ThreadId) =>
@@ -231,11 +266,16 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
   });
 
   /** One step: exit 0 ok, 10 refused, anything else (a timeout too) failed. Never fails. */
+  /**
+   * One step: exit 0 ok, 10 refused, anything else (a timeout too) failed. Never fails. Runs in
+   * `cwd`: the worktree for claim and push, `stepsFolder` for renew and release.
+   */
   const runStep = Effect.fn("PlaytestService.runStep")(function* (
     session: PlaytestSessionRecord,
     step: PlaytestStep,
     name: string,
     round: number,
+    cwd: string,
   ) {
     const [program, ...args] = step.argv;
     // Windows runs a `.cmd` or `.bat` file only through a shell, which would read the arguments.
@@ -244,15 +284,17 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
       return {
         result: "failed",
         detail: `Step ${name} names a program that needs a shell (a .cmd or .bat file); steps run without one.`,
+        notStarted: true,
       } satisfies StepResult as StepResult;
     }
     const env = {
-      [PLAYTEST_ENV.session]: session.id,
-      [PLAYTEST_ENV.target]: session.target,
-      [PLAYTEST_ENV.note]: session.note,
-      [PLAYTEST_ENV.project]: session.projectId,
-      [PLAYTEST_ENV.thread]: session.threadId,
-      [PLAYTEST_ENV.worktree]: session.worktree,
+      ...stepBaseEnv(),
+      [PLAYTEST_ENV.session]: envText(session.id),
+      [PLAYTEST_ENV.target]: envText(session.target),
+      [PLAYTEST_ENV.note]: envText(session.note),
+      [PLAYTEST_ENV.project]: envText(session.projectId),
+      [PLAYTEST_ENV.thread]: envText(session.threadId),
+      [PLAYTEST_ENV.worktree]: envText(session.worktree),
       [PLAYTEST_ENV.step]: name,
       [PLAYTEST_ENV.round]: `${round}`,
     };
@@ -260,11 +302,11 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
       .run({
         command: program!,
         args,
-        cwd: session.worktree,
+        cwd,
         env,
         timeout: Duration.seconds(step.timeoutSeconds),
         maxOutputBytes: STEP_MAX_OUTPUT_BYTES,
-        outputMode: "truncate",
+        outputMode: "tail",
         timeoutBehavior: "timedOutResult",
       })
       .pipe(
@@ -279,17 +321,33 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
           const why = code === null ? "It was stopped by a signal." : `Exit code ${code}.`;
           return { result: "failed", detail: tail(`${why}\n${printed}`) };
         }),
-        Effect.catch((error) =>
-          Effect.succeed({ result: "failed", detail: runErrorText(error) } as const),
+        Effect.catch((error): Effect.Effect<StepResult> =>
+          Effect.succeed({
+            result: "failed",
+            detail: runErrorText(error),
+            ...(error._tag === "ProcessSpawnError" ? { notStarted: true as const } : {}),
+          }),
         ),
       );
   });
 
-  /** Runs release and stores the answer: `ended`, or still `ending` with the problem. */
+  /**
+   * Runs release and stores the answer: `ended`; still `ending` with the problem when release ran
+   * and failed (the next end tries again); `ended` with `RELEASE_COULD_NOT_RUN` when it could not
+   * even start, as no later end could run it either (the claim expires on the target by itself).
+   */
   const releaseNow = Effect.fnUntraced(function* (id: string, op: Op) {
     const session = find(id);
+    // Defensive: only release changes an `ending` session, and ends share one release.
     if (session === undefined || session.state !== "ending") return;
-    const out = yield* runStep(session, session.adapter.release, "release", session.rounds);
+    yield* fs.makeDirectory(input.stepsFolder, { recursive: true }).pipe(Effect.ignore);
+    const out = yield* runStep(
+      session,
+      session.adapter.release,
+      "release",
+      session.rounds,
+      input.stepsFolder,
+    );
     yield* locked(
       Effect.gen(function* () {
         const current = find(id);
@@ -298,12 +356,25 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
         // A release that works clears an earlier release's problem; a failed claim's stays.
         const { problem, ...rest } = current;
         const kept = problem?.startsWith(RELEASE_PROBLEM) ? {} : problem ? { problem } : {};
+        if (out.notStarted) {
+          yield* Effect.logWarning(
+            `playtest: ${id} ends without a release, which could not run: ${out.detail}`,
+          );
+        }
         yield* record(
           replace(
             out.result === "ok"
               ? { ...rest, ...kept, state: "ended", endedAt: at }
-              : { ...current, problem: tail(`${RELEASE_PROBLEM}${out.detail}`) },
+              : out.notStarted
+                ? {
+                    ...current,
+                    state: "ended",
+                    endedAt: at,
+                    problem: tail(`${RELEASE_COULD_NOT_RUN}${out.detail}`),
+                  }
+                : { ...current, problem: tail(`${RELEASE_PROBLEM}${out.detail}`) },
           ),
+          id,
         );
         yield* done(id, op);
       }),
@@ -314,11 +385,12 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     Effect.gen(function* () {
       const session = find(id);
       if (session === undefined) return;
-      const out = yield* runStep(session, session.adapter.claim, "claim", 0);
+      const out = yield* runStep(session, session.adapter.claim, "claim", 0, session.worktree);
       const failed = yield* locked(
         Effect.gen(function* () {
           const current = find(id);
-          // `end` took the session over while the claim ran.
+          // `end` took the session over while the claim ran. Reachable: the claim can return while
+          // `end` holds the lock, and this block cannot be stopped once it waits (tested).
           if (current === undefined || current.state !== "claiming") return false;
           const at = yield* now;
           yield* record(
@@ -341,6 +413,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
                       problem: tail(`claim: ${out.detail}`),
                     },
             ),
+            id,
           );
           if (out.result === "failed") op.kind = "release";
           else yield* done(id, op);
@@ -359,10 +432,12 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
         const session = yield* locked(
           Effect.gen(function* () {
             const current = find(id);
+            // `end` stopped this round while the step before returned (reachable, tested).
             if (current?.state !== "active" || current.lastRound?.number !== number) return null;
             if (current.lastRound.step !== step.name) {
               yield* record(
                 replace({ ...current, lastRound: { ...current.lastRound, step: step.name } }),
+                id,
               );
             }
             return find(id) ?? null;
@@ -370,13 +445,14 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
         ).pipe(Effect.uninterruptible);
         if (session === null) return;
         lastName = step.name;
-        last = yield* runStep(session, step, step.name, number);
+        last = yield* runStep(session, step, step.name, number, session.worktree);
         if (last.result !== "ok") break;
       }
       yield* locked(
         Effect.gen(function* () {
           const current = find(id);
-          // `end` stopped this round and recorded that.
+          // `end` stopped this round and recorded that, also when the last step returned while
+          // `end` held the lock (reachable, tested).
           if (current?.state !== "active" || current.lastRound?.number !== number) return;
           const at = yield* now;
           yield* record(
@@ -391,6 +467,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
                 endedAt: at,
               },
             }),
+            id,
           );
           yield* done(id, op);
         }),
@@ -432,6 +509,9 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     if (note.length > PLAYTEST_NOTE_MAX) {
       return yield* failure("invalid", `The note is at most ${PLAYTEST_NOTE_MAX} characters.`);
     }
+    if (note.search(PLAYTEST_CONTROL_CHARACTERS) !== -1) {
+      return yield* failure("invalid", "The note may not hold control characters.");
+    }
     const { place, adapter } = yield* placeAndAdapter(request.threadId);
     if (adapter === null) {
       return yield* failure(
@@ -439,41 +519,44 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
         "Playtest is off for this project. Only a person can switch it on in the settings.",
       );
     }
+    // Uninterruptible from the save to the started step: a cancelled caller leaves no half state.
     const begun = yield* locked(
-      Effect.gen(function* () {
-        const all = yield* loaded;
-        const live = liveOf(request.threadId);
-        if (live !== undefined) {
-          if (live.state === "active" && live.target === target.value) {
-            return { type: "on", session: live } as const;
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const all = yield* loaded;
+          const live = liveOf(request.threadId);
+          if (live !== undefined) {
+            if (live.state === "active" && live.target === target.value) {
+              return { type: "on", session: live } as const;
+            }
+            return yield* failure("busy", busyText(live, `start a session for ${target.value}`));
           }
-          return yield* failure("busy", busyText(live, `start a session for ${target.value}`));
-        }
-        const at = yield* now;
-        const session: PlaytestSessionRecord = {
-          id: newSessionId(new Set(all.map((entry) => entry.id))),
-          threadId: request.threadId,
-          projectId: place.projectId,
-          target: target.value,
-          note,
-          worktree: place.worktree,
-          adapter,
-          state: "claiming",
-          startedAt: at,
-          lastActivityAt: at,
-          rounds: 0,
-        };
-        // Written before the claim runs: a claim cut by a stop is still released by an end.
-        yield* save([...all, session]);
-        yield* Effect.logInfo(
-          `playtest: ${session.id} claims ${session.target} for thread ${session.threadId}`,
-        );
-        return {
-          type: "claim",
-          id: session.id,
-          fiber: yield* runOp(session.id, "claim", claimBody(session.id)),
-        } as const;
-      }),
+          const at = yield* now;
+          const session: PlaytestSessionRecord = {
+            id: newSessionId(new Set(all.map((entry) => entry.id))),
+            threadId: request.threadId,
+            projectId: place.projectId,
+            target: target.value,
+            note,
+            worktree: place.worktree,
+            adapter,
+            state: "claiming",
+            startedAt: at,
+            lastActivityAt: at,
+            rounds: 0,
+          };
+          // Written before the claim runs: a claim cut by a stop is still released by an end.
+          yield* save([...all, session], session.id);
+          yield* Effect.logInfo(
+            `playtest: ${session.id} claims ${session.target} for thread ${session.threadId}`,
+          );
+          return {
+            type: "claim",
+            id: session.id,
+            fiber: yield* runOp(session.id, "claim", claimBody(session.id)),
+          } as const;
+        }),
+      ),
     );
     if (begun.type === "on") {
       return {
@@ -483,8 +566,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     }
     yield* settle(begun.fiber);
     return yield* locked(
-      Effect.sync((): PlaytestStartResult => {
-        const session = find(begun.id)!;
+      Effect.map(found(begun.id), (session): PlaytestStartResult => {
         return {
           outcome:
             session.state === "active"
@@ -523,49 +605,52 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     readonly threadId: ThreadId;
   }) {
     const { adapter } = yield* placeAndAdapter(request.threadId);
+    // Uninterruptible from the save to the started step: a cancelled caller leaves no half state.
     const begun = yield* locked(
-      Effect.gen(function* () {
-        yield* loaded;
-        const session = liveOf(request.threadId);
-        if (session === undefined) {
-          return yield* failure("no_session", "This thread has no playtest session; start one.");
-        }
-        if (session.state !== "active" || ops.has(session.id)) {
-          return yield* failure("busy", busyText(session, "push"));
-        }
-        // The session's own steps run; settings only decide whether rounds may run at all.
-        if (adapter === null) {
-          return yield* failure(
-            "playtest_off",
-            "Playtest was switched off for this project; end the session.",
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          yield* loaded;
+          const session = liveOf(request.threadId);
+          if (session === undefined) {
+            return yield* failure("no_session", "This thread has no playtest session; start one.");
+          }
+          if (session.state !== "active" || ops.has(session.id)) {
+            return yield* failure("busy", busyText(session, "push"));
+          }
+          // The session's own steps run; settings only decide whether rounds may run at all.
+          if (adapter === null) {
+            return yield* failure(
+              "playtest_off",
+              "Playtest was switched off for this project; end the session.",
+            );
+          }
+          const number = session.rounds + 1;
+          const at = yield* now;
+          yield* save(
+            replace({
+              ...session,
+              rounds: number,
+              lastActivityAt: at,
+              lastRound: {
+                number,
+                state: "running",
+                step: session.adapter.push[0]!.name,
+                detail: "",
+                startedAt: at,
+              },
+            }),
+            session.id,
           );
-        }
-        const number = session.rounds + 1;
-        const at = yield* now;
-        yield* save(
-          replace({
-            ...session,
-            rounds: number,
-            lastActivityAt: at,
-            lastRound: {
-              number,
-              state: "running",
-              step: session.adapter.push[0]!.name,
-              detail: "",
-              startedAt: at,
-            },
-          }),
-        );
-        return {
-          id: session.id,
-          fiber: yield* runOp(session.id, "round", roundBody(session.id, number)),
-        };
-      }),
+          return {
+            id: session.id,
+            fiber: yield* runOp(session.id, "round", roundBody(session.id, number)),
+          };
+        }),
+      ),
     );
     yield* settle(begun.fiber);
     return yield* locked(
-      Effect.sync((): PlaytestPushResult => {
-        const session = find(begun.id)!;
+      Effect.map(found(begun.id), (session): PlaytestPushResult => {
         const state = session.lastRound?.state;
         return {
           outcome:
@@ -580,51 +665,55 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     readonly threadId: ThreadId;
     readonly reason: PlaytestEndReason;
   }) {
+    // Uninterruptible from the save to the started step: a cancelled caller leaves no half state.
     const begun = yield* locked(
-      Effect.gen(function* () {
-        const all = yield* loaded;
-        const session = liveOf(request.threadId);
-        if (session === undefined) {
-          const last = [...all].reverse().find((entry) => entry.threadId === request.threadId);
-          return { type: "none", session: last } as const;
-        }
-        const op = ops.get(session.id);
-        // Two ends at once share one release.
-        if (op?.kind === "release" && op.fiber !== undefined) {
-          return { type: "release", id: session.id, fiber: op.fiber } as const;
-        }
-        const at = yield* now;
-        const round = session.lastRound;
-        yield* save(
-          replace({
-            ...session,
-            state: "ending",
-            endReason: session.endReason ?? request.reason,
-            ...(round?.state === "running"
-              ? {
-                  lastRound: {
-                    ...round,
-                    state: "stopped",
-                    detail: "The session ended while this round ran.",
-                    endedAt: at,
-                  },
-                }
-              : {}),
-          }),
-        );
-        yield* Effect.logInfo(
-          `playtest: ${session.id} ends (${session.endReason ?? request.reason})`,
-        );
-        // The claim or round that runs is stopped first, then release puts the target back.
-        const stopped = op?.fiber;
-        ops.delete(session.id);
-        const fiber = yield* runOp(session.id, "release", (release) =>
-          (stopped === undefined ? Effect.void : Fiber.interrupt(stopped)).pipe(
-            Effect.andThen(releaseNow(session.id, release)),
-          ),
-        );
-        return { type: "release", id: session.id, fiber } as const;
-      }),
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const all = yield* loaded;
+          const session = liveOf(request.threadId);
+          if (session === undefined) {
+            const last = [...all].reverse().find((entry) => entry.threadId === request.threadId);
+            return { type: "none", session: last } as const;
+          }
+          const op = ops.get(session.id);
+          // Two ends at once share one release.
+          if (op?.kind === "release" && op.fiber !== undefined) {
+            return { type: "release", id: session.id, fiber: op.fiber } as const;
+          }
+          const at = yield* now;
+          const round = session.lastRound;
+          yield* save(
+            replace({
+              ...session,
+              state: "ending",
+              endReason: session.endReason ?? request.reason,
+              ...(round?.state === "running"
+                ? {
+                    lastRound: {
+                      ...round,
+                      state: "stopped",
+                      detail: "The session ended while this round ran.",
+                      endedAt: at,
+                    },
+                  }
+                : {}),
+            }),
+            session.id,
+          );
+          yield* Effect.logInfo(
+            `playtest: ${session.id} ends (${session.endReason ?? request.reason})`,
+          );
+          // The claim or round that runs is stopped first, then release puts the target back.
+          const stopped = op?.fiber;
+          ops.delete(session.id);
+          const fiber = yield* runOp(session.id, "release", (release) =>
+            (stopped === undefined ? Effect.void : Fiber.interrupt(stopped)).pipe(
+              Effect.andThen(releaseNow(session.id, release)),
+            ),
+          );
+          return { type: "release", id: session.id, fiber } as const;
+        }),
+      ),
     );
     if (begun.type === "none") {
       return {
@@ -634,8 +723,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     }
     yield* settle(begun.fiber);
     return yield* locked(
-      Effect.sync((): PlaytestEndResult => {
-        const session = find(begun.id)!;
+      Effect.map(found(begun.id), (session): PlaytestEndResult => {
         return {
           outcome: session.state === "ended" ? "ended" : "release-failed",
           session: viewOf(session),

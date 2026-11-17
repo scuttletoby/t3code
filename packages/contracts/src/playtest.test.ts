@@ -268,5 +268,10 @@ describe("playtest session records", () => {
     expect(isNote("")).toBe(true);
     expect(isNote("a\nb")).toBe(false);
     expect(isNote("x".repeat(201))).toBe(false);
+    // A NUL fails every spawn; no control character (C0, DEL) is a note.
+    for (const note of ["a\u0000b", "tab\there", "del\u007f"]) expect(isNote(note)).toBe(false);
+    expect(isNote("Grüße – ok")).toBe(true);
+    // A stored note is read back with only its length checked, so an older file still loads.
+    expect(decodeRecord({ ...record, note: "old\u0000note" }).note).toBe("old\u0000note");
   });
 });

@@ -74,11 +74,15 @@ function salvage(json: unknown) {
   return { sessions, dropped, lost: lost.filter((id) => !seen.has(id)) };
 }
 
-/** The sessions as written: without the oldest ended ones past `MAX_ENDED_SESSIONS`. */
+/**
+ * The sessions as written: without the oldest ended ones past `MAX_ENDED_SESSIONS`. The session
+ * `keep` names (the one just worked on) stays even when its end reads oldest (the clock went back).
+ */
 export function trimEnded(
   sessions: ReadonlyArray<PlaytestSessionRecord>,
+  keep?: string,
 ): ReadonlyArray<PlaytestSessionRecord> {
-  const ended = sessions.filter((session) => session.state === "ended");
+  const ended = sessions.filter((session) => session.state === "ended" && session.id !== keep);
   if (ended.length <= MAX_ENDED_SESSIONS) return sessions;
   const drop = new Set(
     [...ended]
@@ -111,8 +115,9 @@ export const make = Effect.fn("PlaytestStore.make")(function* (input: {
   /** Writes the sessions (see `trimEnded`) and returns what was written. */
   const write = Effect.fn("PlaytestStore.write")(function* (
     sessions: ReadonlyArray<PlaytestSessionRecord>,
+    keep?: string,
   ) {
-    const kept = trimEnded(sessions);
+    const kept = trimEnded(sessions, keep);
     yield* writeText(filePath, serialise(kept));
     return kept;
   });
