@@ -48,8 +48,9 @@ check("it is only a reusable workflow (workflow_call): no event of its own start
 jobs = wf["jobs"]
 job = jobs.get("queue") or {}
 check("one job, queue", set(jobs) == {"queue"}, ", ".join(jobs))
-check("no token by default; the job reads contents only (the queue acts with the token secret)",
-      wf.get("permissions") == {} and job.get("permissions") == {"contents": "read"})
+READS = {k: "read" for k in ("actions", "checks", "contents", "issues", "pull-requests", "statuses")}
+check("no token by default; the job's GITHUB_TOKEN gets exactly the queue's read permissions (every read uses it)",
+      wf.get("permissions") == {} and job.get("permissions") == READS, str(job.get("permissions")))
 conc = job.get("concurrency") or {}
 check("one queue run per repository at a time, never cancelled half-way",
       "github.repository" in str(conc.get("group")) and conc.get("cancel-in-progress") is False, str(conc))
@@ -132,31 +133,34 @@ astep = (action.get("runs") or {}).get("steps", [{}])[0]
 check("the action is one bash step with no expression in its script",
       action.get("runs", {}).get("using") == "composite" and astep.get("shell") == "bash"
       and "${{" not in str(astep.get("run")))
-check("the action passes the token to gh as GH_TOKEN, and the run's own token only to compare",
-      (astep.get("env") or {}).get("GH_TOKEN") == "${{ inputs.token }}"
-      and (astep.get("env") or {}).get("RUN_TOKEN") == "${{ github.token }}")
+aenv = astep.get("env") or {}
+check("the action gives the queue the token secret for writes and the run's GITHUB_TOKEN for reads, and no GH_TOKEN",
+      aenv.get("PR_QUEUE_WRITE_TOKEN") == "${{ inputs.token }}" and aenv.get("PR_QUEUE_READ_TOKEN") == "${{ github.token }}"
+      and not {"GH_TOKEN", "GITHUB_TOKEN", "RUN_TOKEN"} & set(aenv), str(sorted(aenv)))
 fake = tempfile.mkdtemp(prefix="fork-pr-queue-bin-")
 with open(os.path.join(fake, "python3"), "w") as f:
-    f.write('#!/bin/sh\necho "started: $*"\necho "RUN_TOKEN=${RUN_TOKEN-unset} GH_TOKEN=${GH_TOKEN:+set}"\n')
+    f.write('#!/bin/sh\necho "started: $*"\n'
+            'echo "READ=${PR_QUEUE_READ_TOKEN:+set} WRITE=${PR_QUEUE_WRITE_TOKEN:+set} GH_TOKEN=${GH_TOKEN-unset}"\n')
 os.chmod(os.path.join(fake, "python3"), 0o755)
 
 
 def action_run(token="t-queue", run_token="t-run", dry="false", lock=""):
-    return bash(astep.get("run", "exit 0"), {"GH_TOKEN": token, "RUN_TOKEN": run_token, "REPO": "owner/proj",
+    return bash(astep.get("run", "exit 0"), {"PR_QUEUE_WRITE_TOKEN": token, "PR_QUEUE_READ_TOKEN": run_token,
+                                             "REPO": "owner/proj",
                                              "CONFIG": "caller/q.json", "STATE_FILE": "/srv/q/plan.json",
                                              "CACHE": "/srv/q/cache.git", "LOCK_FILE": lock, "DRY_RUN": dry,
                                              "GITHUB_ACTION_PATH": "/act"}, path=fake)
 
 
 r = action_run()
-check("action: a good call starts the queue with exactly its arguments, GH_TOKEN set and the run's token unset",
+check("action: a good call starts the queue with exactly its arguments and both tokens, and no GH_TOKEN",
       r.returncode == 0 and r.stdout == "started: -I /act/pr_queue.py --repo owner/proj --config caller/q.json "
-      "--state-file /srv/q/plan.json --cache /srv/q/cache.git\nRUN_TOKEN=unset GH_TOKEN=set\n", r.stdout + r.stderr)
+      "--state-file /srv/q/plan.json --cache /srv/q/cache.git\nREAD=set WRITE=set GH_TOKEN=unset\n", r.stdout + r.stderr)
 r = action_run(dry="true", lock="/srv/q/l")
 check("action: dry-run true and a lock file are passed on",
       r.returncode == 0 and "--lock-file /srv/q/l --dry-run\n" in r.stdout, r.stdout)
 for label, kw in (("the run's GITHUB_TOKEN as the token", {"token": "t-run"}), ("an empty token", {"token": ""}),
-                  ("a dry-run that is not true or false", {"dry": "yes"})):
+                  ("an empty GITHUB_TOKEN", {"run_token": ""}), ("a dry-run that is not true or false", {"dry": "yes"})):
     r = action_run(**kw)
     check(f"action: {label} is refused before the queue starts, and no token is printed",
           r.returncode == 2 and "started:" not in r.stdout and "t-run" not in r.stdout + r.stderr, r.stdout)
