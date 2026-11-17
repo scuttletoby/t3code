@@ -26,6 +26,20 @@ const setPath = (value: unknown, path: ReadonlyArray<string>, leaf: unknown): un
 const withEveryInterval = (settings: unknown, leaf: unknown): unknown =>
   SETTINGS_INTERVAL_PATHS.reduce((node, path) => setPath(node, path, leaf), settings);
 
+// A recursive schema: a walk without a loop guard never ends, and the server would not start.
+interface Tree {
+  readonly every: Duration.Duration;
+  readonly children: ReadonlyArray<Tree>;
+}
+interface TreeEncoded {
+  readonly every: number;
+  readonly children: ReadonlyArray<TreeEncoded>;
+}
+const Tree: Schema.Codec<Tree, TreeEncoded> = Schema.Struct({
+  every: Schema.DurationFromMillis,
+  children: Schema.Array(Schema.suspend((): Schema.Codec<Tree, TreeEncoded> => Tree)),
+});
+
 describe("findDurationPaths", () => {
   it("follows keys and optional keys, and puts an interval it cannot follow out of reach", () => {
     const { paths, outOfReach } = findDurationPaths(
@@ -46,12 +60,28 @@ describe("findDurationPaths", () => {
           Schema.Struct({ every: Schema.DurationFromMillis }),
           Schema.Struct({ every: Schema.String }),
         ]),
+        // Both variants hold an interval at the same key: named once.
+        bothVariants: Schema.Union([
+          Schema.Struct({ every: Schema.DurationFromMillis, kind: Schema.Literal("a") }),
+          Schema.Struct({ every: Schema.DurationFromMillis, kind: Schema.Literal("b") }),
+        ]),
+        recursive: Schema.suspend((): Schema.Codec<Tree, TreeEncoded> => Tree),
       }),
     );
 
     expect(paths).toEqual([["plain"], ["optionalKey"], ["optional"], ["nested", "inner"]]);
     expect(outOfReach.toSorted()).toEqual(
-      ["array.*", "nullOr", "option.*", "orOff", "record.*", "variants.every"].toSorted(),
+      [
+        "array.*",
+        "bothVariants.every",
+        "nullOr",
+        "option.*",
+        "orOff",
+        "record.*",
+        "recursive.*.children.*.*.every",
+        "recursive.*.every",
+        "variants.every",
+      ].toSorted(),
     );
   });
 });
@@ -83,6 +113,13 @@ describe("a good interval is never dropped or refused", () => {
       { enableAgentBrowserAccess: false },
       { backgroundActivity: { profile: "custom" } },
       { backgroundActivity: { profile: "custom", overrides: {} } },
+      // A parent that is not an object is the decode's to refuse, never a crash here.
+      { backgroundActivity: null },
+      { backgroundActivity: [] },
+      { backgroundActivity: "custom" },
+      { backgroundActivity: { profile: "custom", overrides: null } },
+      { backgroundActivity: { profile: "custom", overrides: ["hostPowerMonitorIdleInterval"] } },
+      { backgroundActivity: { profile: "custom", overrides: "hostPowerMonitorIdleInterval" } },
     ]) {
       expect(dropUnusableStoredIntervals(file)).toEqual({ settings: file, dropped: [] });
     }
