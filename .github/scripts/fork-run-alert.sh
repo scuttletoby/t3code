@@ -65,7 +65,7 @@ issue=""
 # hide the alert's own, and the next failure would open a second one (#239). The REST list holds
 # pull requests too; they are left out.
 if ! issue="$(gh api --paginate "repos/$repo/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
-  --jq ".[] | select(.pull_request == null and .title == $(jq -Rn --arg t "$title" '$t') and .user.login == \"$BOT_LOGIN\") | .number" | head -n1)"; then
+  --jq ".[] | select(.pull_request == null and .title == $(jq -Rn --arg t "$title" '$t') and .user.login == \"$BOT_LOGIN\") | .number" | sed -n 1p)"; then
   note="Could not list the issues of $repo, so no issue was opened, updated or closed."
   failed=true
 elif [[ "$failed" == true && -n "$issue" ]]; then

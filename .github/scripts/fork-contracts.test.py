@@ -975,12 +975,13 @@ LOOKUP = re.compile(
 
 
 # The sweep's lookup (#239), allowed in this exact form only, right after the earlier-heads lookup:
-# every tip GitHub's activity record lists for the last week, of every ref, so the sweep also reads
-# a tip a deletion or force push left behind. A failed lookup fails the job.
+# every tip GitHub's whole activity record lists (no time window: an entry that ages out of a window
+# would let the sweep pass with the key still there), of every ref, so the sweep also reads a tip a
+# deletion or force push left behind. A failed lookup fails the job.
 SWEEP_LOOKUP_TEXT = (
     'elif [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then\n'
     '  if ! OLD_HEADS="$(GH_TOKEN="$LOOKUP_TOKEN" gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/activity" \\\n'
-    "      -f time_period=week -f per_page=100 --jq '.[] | .before, .after')\"; then\n"
+    "      -f per_page=100 --jq '.[] | .before, .after')\"; then\n"
     '    echo "::error::Secret scan: cannot list GitHub\'s activity record, so a tip a deletion or force push left'
     ' behind could go unscanned. Re-run the job." >&2\n'
     "    exit 2\n"
@@ -988,14 +989,14 @@ SWEEP_LOOKUP_TEXT = (
 SWEEP_LOOKUP = re.compile(
     r'\n\s*fi\n\s*elif \[\[ "\$EVENT_NAME" == schedule \|\| "\$EVENT_NAME" == workflow_dispatch \]\]; then\n'
     r'\s*if ! OLD_HEADS="\$\(GH_TOKEN="\$LOOKUP_TOKEN" gh api --paginate -X GET "repos/\$GITHUB_REPOSITORY/activity" \\\n'
-    r"""\s*-f time_period=week -f per_page=100 --jq '\.\[\] \| \.before, \.after'\)"; then\n"""
+    r"""\s*-f per_page=100 --jq '\.\[\] \| \.before, \.after'\)"; then\n"""
     r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n\s*fi\n')
 
 
 def with_sweep_lookup(run):
     """The scan step's run with the sweep's lookup (SWEEP_LOOKUP_TEXT) added, as the workflow
     change of #239 adds it; unchanged when it is there already."""
-    if "time_period=week" in run:
+    if "workflow_dispatch ]]; then" in run:
         return run
     return run.replace("fi\nunset LOOKUP_TOKEN\n", SWEEP_LOOKUP_TEXT + "fi\nunset LOOKUP_TOKEN\n", 1)
 
@@ -1141,6 +1142,9 @@ def sweep_problems(wfs):
             problems.append(f"{SWEEP_FILE}/{j}: continue-on-error (a failed alert would pass)")
         if perms != {"contents": "read", "issues": "write"}:
             problems.append(f"{SWEEP_FILE}/{j}: permissions are not exactly contents: read, issues: write")
+        conc = job.get("concurrency")
+        if not (isinstance(conc, dict) and conc.get("group") and conc.get("cancel-in-progress") is False):
+            problems.append(f"{SWEEP_FILE}/{j}: no concurrency group that queues (two sweeps at once would each open an issue)")
         for step in job.get("steps") or []:
             run = " ".join(str(step.get("run", "")).split())
             if "fork-run-alert.sh" not in run:
@@ -1275,14 +1279,18 @@ for label, mutate in {
     # #239: the sweep's lookup, in its exact form only.
     "a sweep lookup whose failure is ignored (|| true)": lambda w: scan_step(w).__setitem__(
         "run", with_sweep_lookup(scan_step(w)["run"]).replace(
-            "-f time_period=week -f per_page=100 --jq '.[] | .before, .after')\"; then",
-            "-f time_period=week -f per_page=100 --jq '.[] | .before, .after' || true)\"; then")),
+            "-f per_page=100 --jq '.[] | .before, .after')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's",
+            "-f per_page=100 --jq '.[] | .before, .after' || true)\"; then\n    echo \"::error::Secret scan: cannot list GitHub's")),
+    "a sweep lookup with a time window (an entry ages out, the sweep passes)": lambda w: scan_step(w).__setitem__(
+        "run", with_sweep_lookup(scan_step(w)["run"]).replace(
+            "-f per_page=100 --jq '.[] | .before, .after')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's",
+            "-f time_period=week -f per_page=100 --jq '.[] | .before, .after')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's")),
     "a sweep lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
         "run", re.sub(r"exit 2\n(\s*fi\n\s*fi\nunset)", r"true\n\1", with_sweep_lookup(scan_step(w)["run"]), count=1)),
     "a sweep lookup reading the wrong field": lambda w: scan_step(w).__setitem__(
         "run", with_sweep_lookup(scan_step(w)["run"]).replace(
-            "time_period=week -f per_page=100 --jq '.[] | .before, .after'",
-            "time_period=week -f per_page=100 --jq '.[] | .sha'")),
+            "-f per_page=100 --jq '.[] | .before, .after')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's",
+            "-f per_page=100 --jq '.[] | .sha')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's")),
     # c2: the jobs' if: as GitHub evaluates it.
     "every push skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
         "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace("(github.event.deleted ||", "(true || github.event.deleted ||")),
@@ -1322,6 +1330,9 @@ for label, mutate in {
     "an alert only when the sweep passed": lambda w: w[SWEEP_FILE]["jobs"]["alert"].__setitem__(
         "if", "${{ github.event_name == 'schedule' }}"),
     "an alert not after the sweep": lambda w: w[SWEEP_FILE]["jobs"]["alert"].pop("needs"),
+    "an alert without its concurrency group": lambda w: w[SWEEP_FILE]["jobs"]["alert"].pop("concurrency"),
+    "an alert whose concurrency cancels a running one": lambda w: w[SWEEP_FILE]["jobs"]["alert"]["concurrency"].__setitem__(
+        "cancel-in-progress", True),
     "an alert that may fail quietly": lambda w: w[SWEEP_FILE]["jobs"]["alert"].__setitem__("continue-on-error", True),
     "an alert without issues: write": lambda w: w[SWEEP_FILE]["jobs"]["alert"].__setitem__(
         "permissions", {"contents": "read"}),

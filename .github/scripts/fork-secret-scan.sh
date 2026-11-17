@@ -139,8 +139,8 @@
 # in another encoding than UTF-8 or UTF-16 with a byte-order mark (UTF-16 without one, UTF-32);
 # compressed or packed contents (zip, gzip, images' compressed data); a key split across lines;
 # a vanished tip (see "sweep, vanished tips") GitHub's activity record does not list (it records
-# branches: a deleted tag or notes ref is not in it; an entry older than the week the workflow
-# reads, when every sweep of that week failed) or that origin will not send by id any more although
+# branches: a deleted tag or notes ref is not in it; an entry older than what GitHub keeps of the
+# record (the workflow reads all of it, with no time window)) or that origin will not send by id any more although
 # GitHub's web pages may still show it (a warning).
 #
 # Contents: git log runs with --text, so a file git takes for binary (a NUL byte in it) still shows
@@ -179,7 +179,9 @@
 # fetches there and a content still missing is a fatal git error, which fails the scan.
 set -euo pipefail
 
-have() { git cat-file -e "$1^{commit}" 2>/dev/null; }
+# GIT_NO_LAZY_FETCH: in a blob-less clone a missing commit would otherwise be fetched here, one by
+# one with no timeout, behind fetch_earlier's back.
+have() { GIT_NO_LAZY_FETCH=1 git cat-file -e "$1^{commit}" 2>/dev/null; }
 # Commits only, file contents on demand: the checkout is a blob-less clone.
 fetch() {
   have "$1" || git fetch --no-tags --quiet --filter=blob:none origin "$1" 2>/dev/null || true
