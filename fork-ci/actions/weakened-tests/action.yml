@@ -43,7 +43,10 @@ inputs:
     default: github-actions[bot]
 outputs:
   status:
-    description: ok, or could-not-read (empty when the step did not run).
+    description: >-
+      ok; could-not-read (the change could not be read: README "Could not read"); refused (git-clean refused the
+      checkout's git config: nothing was checked, and an earlier report comment says so); empty when the step did not
+      run.
     value: ${{ steps.report.outputs.status }}
   count:
     description: How many items are listed (empty when the change could not be read).
@@ -56,7 +59,8 @@ runs:
   steps:
     # Only code from this action's folder (the caller's pinned SHA) runs; nothing from the checkout. Before any git
     # call, the checkout's .git config must be one actions/checkout writes (fork-ci git-clean): when it is not (one an
-    # earlier job left), no git runs and there is no report; report only, so the step still passes.
+    # earlier job left), no git runs, status is refused and an earlier report comment is replaced; report only, so the
+    # step still passes.
     - id: report
       shell: bash
       env:
@@ -70,12 +74,12 @@ runs:
         COMMENT: ${{ inputs.comment }}
         COMMENT_AUTHOR: ${{ inputs.comment-author }}
       run: |
-        if ! python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path "$CHECKOUT_PATH" --require; then
-          echo "::warning::weakened-tests: no report, git-clean refused the checkout's git config (above)"
-          exit 0
-        fi
         args=(--config "$CONFIG" --repo "$REPO" --pr "$PR" --base "$BASE" --head "$HEAD" --path "$CHECKOUT_PATH"
               --comment-author "$COMMENT_AUTHOR")
         [ "$COMMENT" = true ] || args+=(--no-comment)
+        if ! python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path "$CHECKOUT_PATH" --require; then
+          echo "::warning::weakened-tests: no report, git-clean refused the checkout's git config (above)"
+          args+=(--refused)
+        fi
         python3 -I "$GITHUB_ACTION_PATH/weakened_tests.py" "${args[@]}" ||
           echo "::warning::weakened-tests: the report step failed (exit $?); report only, the pull request is not failed"
