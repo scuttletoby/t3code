@@ -90,7 +90,7 @@ make that job a required check (the config's `head_check`):
 ```yaml
 on:
   pull_request:
-    # edited: a base change (a stacked pull request retargeted) runs it again
+    # edited: a retarget to another base branch runs it again (new commits on the base do not)
     types: [opened, synchronize, reopened, ready_for_review, edited]
 permissions: {}
 jobs:
@@ -114,9 +114,17 @@ jobs:
 The check reads the comments when it runs. After a lens or an override is
 posted for the head, run it again (re-run the job, or let a tool the project
 uses for its ready command do that); a new push runs it anyway. The `edited`
-trigger runs it again when the base branch changes: the answer depends on the
-base (its config, and which merged-in commits are the base's). A title or body
-edit also runs it; it only reads, so that costs one short job.
+trigger runs it again when the pull request is retargeted to another base
+branch: the answer depends on the base (its config, and which merged-in
+commits are the base's). A title or body edit also runs it; it only reads, so
+that costs one short job. Nothing runs it when new commits land on the base,
+so a pass can be older than the base: two pull requests that each leave a good
+config can still merge into one that does not parse. Turn on "Require branches
+to be up to date before merging" in the ruleset (the queue needs it anyway):
+the second pull request is then behind, and its update is a new head, judged
+on the merged config. A re-run of an old job checks out the old merge commit
+again; after the base changed, a new event (a push, a reopen, a title edit)
+judges the head on the new base.
 
 **Pin it by the release sha, always.** Use the full sha a `ci/vN` release
 names (the release sha of ci/vN), never a branch, a tag alone or a local path
