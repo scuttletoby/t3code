@@ -1,5 +1,5 @@
 {
-  "about": "fork-fleet-walls.test.py: `pass` is a fake WSL2 distro on which every wall of `wsl2` holds (paths under FORK_FLEET_WALLS_ROOT; a string is a file's text, a path ending in / a folder, {\"text\", \"mode\"} a file with that mode; opt/fork-fleet/fork-fleet-launch.sh a launcher with the job units' walls). Windows' drive is mounted at /mnt/c and /c, WSL's shares and sockets at /mnt/wsl, /mnt/wslg, /usr/lib/wsl/drivers and /tmp/.X11-unix: all outside the launcher's allow list, so they hold. `fail` names each wall with the changes that make it fail (null removes a path).",
+  "about": "fork-fleet-walls-contract.test.py: `pass` is a fake WSL2 distro on which every wall of `wsl2` holds (paths under FORK_FLEET_WALLS_ROOT; a string is a file's text, a path ending in / a folder, {\"text\", \"mode\"} a file with that mode; opt/fork-fleet/fork-fleet-launch.sh a launcher with the job units' walls). Windows' drive is mounted at /mnt/c and /c, WSL's shares and sockets at /mnt/wsl, /mnt/wslg, /usr/lib/wsl/drivers and /tmp/.X11-unix: all outside the launcher's allow list, so they hold. `fail` names each wall with the changes that make it fail (null removes a path).",
   "pass": {
     "proc/sys/kernel/ostype": "Linux\n",
     "proc/sys/kernel/osrelease": "6.6.87.2-microsoft-standard-WSL2\n",

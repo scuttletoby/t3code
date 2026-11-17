@@ -17,7 +17,7 @@ Both verbs run the walls file's `describe` and hold it to the contract; `check` 
 of that OS's walls) reported once, `os` among them. A walls file that printed nothing, was cut off, stopped early or
 is older than its list: exit 2.
 
-The walls-file contract (fork-fleet-walls.test.py checks it for every file in the folder):
+The walls-file contract (fork-fleet-walls-contract.test.py checks it for every file in the folder):
 - an executable file named for its OS (OS_NAME), owned by the user that runs this and writable by it alone (as the
   folder and the fixture), with a fixture <os>.fixture.json next to it (a passing fake root, and at least one failing
   change per wall; its `fail` keys are the walls). One file: the folder holds walls files and fixtures only, and a

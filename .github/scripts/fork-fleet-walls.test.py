@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tests of fork-fleet-walls.py (OS detection, refusal of an OS without walls, the walls-file contract it enforces) and
-the contract test every walls file in fork-fleet-walls/ must pass, on fake machines from its <os>.fixture.json. A new
-walls file (and its fixture) is tested here without a change to this file. Run: python3 <this>. Linux only."""
+of every walls file in fork-fleet-walls/; the contract each must pass on fake machines from its <os>.fixture.json is
+in fork-fleet-walls-contract.test.py, which uses this file's helpers. A new walls file (and its fixture) is tested
+without a change to either file. Run: python3 <this>. Linux only."""
 import ast, base64, contextlib, importlib.machinery, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
 from unittest import mock
 
@@ -384,9 +385,10 @@ def fixture_problems(fixture, walls):
             or not all(isinstance(c, dict) and c for c in (changes if isinstance(changes, list) else [changes]))]
 
 
-class EveryWallsFile(Case):
-    """The contract every walls file must pass (fork-fleet-walls.py's docstring), run on each file in the folder (an
-    installed copy, beside the launcher's allow list, with the modes an install gives)."""
+class WallsRunner(Case):
+    """Runs the walls files of an installed copy (beside the launcher's allow list, with the modes an install gives)
+    and checks each answer against the contract (fork-fleet-walls.py's docstring). The contract on every fixture is
+    fork-fleet-walls-contract.test.py, so the test runner's workers run the two files side by side."""
     def setUp(self):
         super().setUp()
         self.folder = os.path.join(os.path.dirname(self.install()), 'fork-fleet-walls')
@@ -411,6 +413,9 @@ class EveryWallsFile(Case):
         self.assertEqual(self.walls(name, 'check', root)[1], fails, f'{name}: check and describe disagree')
         return ids, fails
 
+
+class EveryWallsFile(WallsRunner):
+    """The rest of the contract every walls file must pass, and the linux walls' own readings."""
     def test_there_is_a_linux_file(self):
         self.assertIn('linux', OSES)
 
@@ -424,30 +429,6 @@ class EveryWallsFile(Case):
                 else:
                     self.assertRegex(entry, r'\.fixture\.json$')
                     self.assertIn(entry[:-len('.fixture.json')], OSES)
-
-    def test_contract(self):
-        for name in OSES:
-            with self.subTest(name):
-                fixture = json.loads(slurp(os.path.join(FOLDER, f'{name}.fixture.json')))
-                for args in ([], ['start'], ['check', 'describe']):   # usage: exit 2, nothing on stdout
-                    p = run([os.path.join(self.folder, name), *args], self.root({}))
-                    self.assertEqual((p.returncode, p.stdout), (2, ''), f'{name} {args}')
-                ids, fails = self.both(name, self.root({}))   # an empty machine fails closed, `os` among them
-                self.assertIn('os', fails)
-                good = self.root(fixture['pass'])
-                ids, fails = self.both(name, good)
-                self.assertEqual(fails, [], f'{name}: walls fail on its passing fixture')
-                self.assertEqual(fw.detect(good), name, f'{name}: its passing fixture is detected as another OS')
-                p = run([self.install(), 'check'], good)   # and through fork-fleet-walls.py
-                self.assertEqual((p.returncode, p.stdout), (0, ''), p.stderr)
-                self.assertEqual(fixture_problems(fixture, ids), [], name)
-                for wall, changes in fixture['fail'].items():
-                    for change in changes if isinstance(changes, list) else [changes]:
-                        with self.subTest(name=name, wall=wall, change=change):
-                            root = self.root(overlay(fixture['pass'], change))
-                            self.assertIn(wall, self.both(name, root)[1])
-                            p = run([self.install(), 'check'], root)
-                            self.assertIn(p.returncode, (1, 3), p.stderr)   # 3: the change made it another OS
 
     def test_a_wall_without_a_failing_change_fails_the_contract(self):
         ids = ['os', 'mounts']
