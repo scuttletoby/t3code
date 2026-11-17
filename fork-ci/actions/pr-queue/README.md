@@ -42,6 +42,71 @@ an error: the queue then exits non-zero and touches no pull request.
 | `list_limit`               | no       | How many open pull requests to read (default 50).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `update_when_base_was_red` | no       | `true` updates a behind pull request whose required checks failed only because the base commit they tested failed them too (section "The base was red"). Set it only when the job of every required check runs the `tested-base` action. Default `false`.                                                                                                                                                                                                                                                                                                                               |
 | `head_check_app`           | no       | The id of the GitHub App that alone posts `head_check` (the head gate, `../head-check/README.md`, "The gate"). The queue then counts only that App's newest check run of that name and ignores a job or commit status of the same name from anyone else; it skips a pull request whose gate check it cannot read. Add it only after every queue that reads this config runs a release that knows it: an older release refuses an unknown key.                                                                                                                                           |
+| `review`                   | no       | Which changed paths need which lens reads, and the round cap (section "Review rules"). Without it the queue and the gate behave as before.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+
+## Review rules
+
+The optional `review` block of the config says which changed paths need which
+lens reads and caps the review rounds. This release only reads and checks it:
+nothing judges a pull request by it yet, so a config with the block behaves like
+one without it. `review.recommended.json` (next to this file) is a complete
+example with made-up paths; a test parses it. Real paths, lens names and prompt
+files belong in the project's own config.
+
+Every key is required and an unknown key is an error, as in the rest of the
+config. A wrong block makes the whole config invalid, naming every problem at
+once.
+
+| Key          | Meaning                                                                                                                                                                                                                       |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`    | `1`. Any other version is refused by name (a newer one: update the pinned release first).                                                                                                                                     |
+| `mode`       | `shadow`: the gate keeps judging by its `required-lenses` input and only reports what the path rules would have said. `enforce`: the path rules decide.                                                                       |
+| `rules`      | An ordered list of `{"name", "weight", "paths", "lenses"}`. A changed file belongs to the first rule with a matching glob. `weight` is `critical`, `normal` or `light`; `lenses` are names from `lenses`.                     |
+| `lenses`     | `{"<lens name>": {"prompt": "<file>"}}`: every lens a rule or `rounds` names, with its prompt file (repo-relative, no `..`, no leading `/`, no glob characters).                                                              |
+| `min_lenses` | `{"critical", "normal", "light"}`: the fewest different lenses a rule of that weight must list, 0-10, never falling with weight.                                                                                              |
+| `rounds`     | `{"approach_at", "max", "approach_lens"}`: from round `approach_at` the approach lens is required too; after round `max` a person must write an override comment or close the pull request. `max` is not below `approach_at`. |
+| `findings`   | `true` or `false`: lens comments carry `blocker:`, `major:` and `minor:` lines, and a blocker or major at the head fails the gate.                                                                                            |
+| `state_line` | `true` or `false`: a required lens comment needs a `state:` line to count.                                                                                                                                                    |
+
+The config is refused when:
+
+- a rule lists fewer different lenses than `min_lenses` of its weight. "Different"
+  is as the gate reads lens names (section "Lens comments"): case, blanks and a
+  trailing round marker do not count, so `data r1` and `data r2` are one lens;
+- two names in `lenses` are one lens to the gate in that way;
+- a lens name names no lens (a `<placeholder>`, a bare round marker such as `r2`,
+  nothing), or the gate would read it as another name in a lens header (Markdown
+  such as `data *2*`, or a `reviewer:` / `read at` field), or a rule or `rounds.approach_lens` names a lens with no entry in
+  `lenses` (names match exactly);
+- a `critical` or `normal` rule has `"lenses": []` (only `light` may);
+- no rule has a catch-all path (`**`, or any glob that matches every path such as
+  `**/*` or `*/**`), the catch-all rule is `light`, or a rule comes after the
+  catch-all rule (it could never match): a new folder must never fall to no rule
+  or to no lens;
+- there is no `critical` rule (the built-in protected paths below take its lenses);
+- a glob is not in the dialect below, or a rule name or glob is written twice.
+
+**Globs.** Paths are repo-relative and use `/`. `*` is any characters inside one
+path segment, `**` is any number of whole segments (it must be a segment of its
+own: `src/**/*.py`, not `src/**.py`), `?` is one character inside a segment.
+There are no braces, character classes, `!` negation or backslashes, and no
+empty, `.` or `..` segments. Matching is case-sensitive, and `*`, `**` and `?`
+also match names that start with `.` (`**` matches `.github/x`). The gate and T3 match with this dialect, so a glob
+means the same thing on both sides.
+
+**Built-in protected paths.** The config file itself, every lens prompt file and
+`.github/workflows/**` always count as critical, whatever the rules say, with the
+lenses of the first critical rule. So a pull request that weakens the rules needs
+the critical lenses, and it is judged by the old rules: the gate reads the config
+from the base tip only.
+
+**Fail closed.** When the gate cannot read the changed paths or fetch the base,
+the pull request counts as the heaviest weight, or the gate fails. Never a pass.
+
+**Adding the block.** A release that does not know the `review` key refuses the
+whole config (an unknown key), so: release first, then pin that release in every
+caller of the queue and the gate, then add the key. Roll back in the reverse order:
+remove the key, then the pin.
 
 ## Lens comments
 

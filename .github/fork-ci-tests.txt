@@ -51,6 +51,7 @@ fork-ci/actions/job-changed/job-changed.test.py ~16s
 fork-ci/actions/pinned/pinned.test.py
 fork-ci/actions/pr-queue/lens.test.py
 fork-ci/actions/pr-queue/pr_queue.test.py ~23s
+fork-ci/actions/pr-queue/review_config.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 fork-ci/actions/test-select/test-select.test.py ~15s
 fork-ci/actions/test-select/trace-check.test.py
