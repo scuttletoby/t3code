@@ -1,8 +1,8 @@
 """A fake WSL2 distro in a temporary folder for the pc-agents tests: every fixed path under PC_AGENTS_ROOT, the
-current user as root, fake useradd, usermod, env (T3's installer), apt-get, systemctl, systemd-run and nft (each logs
-to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and policy a started one runs
-with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units). No root, no systemd, no network,
-no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
+current user as root, fake useradd, usermod, env (T3's installer), apt-get, dpkg-query, dpkg, systemctl, systemd-run
+and nft (each logs to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and policy a
+started one runs with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units). No root, no
+systemd, no network, no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest
 from unittest import mock
 
@@ -48,9 +48,11 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          # a start: refused while the start limit is hit ($S/U.limit, until reset-failed); with
                          # /log/t3-crash T3 exits at once, with /log/t3-dies after the first look (show) at it
                          'run() { [ -e "$S/$1.limit" ] && { echo "$1: start request repeated too quickly" >&2; '
-                         'return 1; }\nrm -f "$S/$1.seen" "$S/$1.status"\n'
+                         'return 1; }\nrm -f "$S/$1.seen" "$S/$1.status" "$S/$1.code"\n'
+                         # /log/t3-crash: T3's exit status (empty: 1), or "CODE STATUS" (2 9: killed by signal 9)
                          '[ "$1" = t3code-agents.service ] && [ -e "$R/log/t3-crash" ] && { rm -f "$S/$1.active"; '
-                         'c=$(cat "$R/log/t3-crash"); echo "${c:-1}" >"$S/$1.status"; return; }\n'
+                         'c=$(cat "$R/log/t3-crash"); case "$c" in *" "*) echo "${c%% *}" >"$S/$1.code"; c=${c#* };; '
+                         '*) echo 1 >"$S/$1.code";; esac; echo "${c:-1}" >"$S/$1.status"; return; }\n'
                          '{ grep "^ExecStart=" "$R/etc/systemd/system/$1"; '
                          'cat "$R/etc/t3code/policy.json"; } >"$S/$1.active" 2>/dev/null || :\n'
                          'echo $$ >"$S/$1.pid"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
@@ -74,13 +76,23 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  [ -e "$S/reload" ] && echo NeedDaemonReload=yes || echo NeedDaemonReload=no\n'
                          '  if [ -e "$S/$u.active" ]; then echo ActiveState=active; echo "MainPID=$(cat "$S/$u.pid")"\n'
                          '  else echo ActiveState=inactive; echo MainPID=0; fi; echo NRestarts=0\n'
-                         '  [ -e "$S/$u.status" ] && { echo ExecMainCode=1; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
+                         '  [ -e "$S/$u.status" ] && { echo "ExecMainCode=$(cat "$S/$u.code")"; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
                          '  echo "ExecMainStartTimestampMonotonic=$(cat "$S/$u.start" 2>/dev/null || echo 0)";;\n'
                          'esac\n',
-    # apt-get: update, or install nftables (the fake nft kept in /log/nft-package); /log/apt-fail makes it fail
+    # apt-get: update, or install packages (each then installed in /log/packages; nftables brings the fake nft kept
+    # in /log/nft-package); /log/apt-fail makes it fail
     'usr/bin/apt-get': 'R="${0%/usr/bin/apt-get}"; echo "$*" >>"$R/log/apt-get"\n'
                        '[ -e "$R/log/apt-fail" ] && { echo "E: no network (test)" >&2; exit 100; }\n'
-                       '[ "$1" = install ] && cp "$R/log/nft-package" "$R/usr/sbin/nft"; exit 0\n',
+                       '[ "$1" = install ] || exit 0; shift 2\n'
+                       'for p; do echo "install ok installed" >"$R/log/packages/$p"\n'
+                       '  [ "$p" != nftables ] || cp "$R/log/nft-package" "$R/usr/sbin/nft"; done\n',
+    # dpkg-query -W -f=FORMAT PKG...: "PKG<TAB>its status" for each package in /log/packages (the status inside)
+    'usr/bin/dpkg-query': 'R="${0%/usr/bin/dpkg-query}"; echo "$*" >>"$R/log/dpkg-query"; shift 2; rc=0\n'
+                          'for p; do if [ -e "$R/log/packages/$p" ]; then printf "%s\\t%s\\n" "$p" "$(cat "$R/log/packages/$p")"\n'
+                          '  else echo "dpkg-query: no packages found matching $p" >&2; rc=1; fi; done; exit $rc\n',
+    # dpkg --configure -a: finishes what an apt-get stopped half-way left unpacked
+    'usr/bin/dpkg': 'R="${0%/usr/bin/dpkg}"; echo "$*" >>"$R/log/dpkg"\n'
+                    'for f in "$R"/log/packages/*; do [ ! -e "$f" ] || sed -i "s/unpacked/installed/" "$f"; done\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
 }
@@ -130,6 +142,7 @@ class Case(unittest.TestCase):
         files['proc/sys/kernel/random/boot_id'] = '0f8e4f9c-1b6a-4d2e-9a57-3c1d2e4f5a6b\n'
         files['proc/net/route'] = 'Iface\tDestination\tGateway\tFlags\nboth\t00000000\t011014AC\t0003\n'
         files['log/'] = files['opt/'] = files['etc/systemd/system/'] = ''   # as in a fresh Ubuntu
+        files['log/packages/nftables'] = 'install ok installed'   # and no libatomic1 or unzip, as in a fresh Ubuntu
         files.update({rel: {'text': '#!/bin/sh\n' + text, 'mode': '755'} for rel, text in TOOLS.items()})
         for rel, value in files.items():
             self.write('/' + rel, value)
