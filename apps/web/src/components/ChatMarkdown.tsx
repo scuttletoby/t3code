@@ -114,7 +114,8 @@ import {
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { markdownImageGallery } from "./chat/markdownImageGallery";
 import { type MediaActionSource } from "./media/MediaActions";
-import { downloadFile, resolveProtocolRelativeMediaUrl } from "./media/mediaContent";
+import { resolveProtocolRelativeMediaUrl } from "./media/mediaContent";
+import { downloadFile } from "./media/mediaContent"; // Fork
 import {
   revealInFileExplorerLabelForKind,
   revealInFileExplorerLabelForOs,
@@ -157,12 +158,8 @@ import { readLocalApi } from "../localApi";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { hostEnvironmentIdAtom } from "../state/primaryEnvironment";
 import { cn } from "../lib/utils";
-import {
-  openRemoteEditorUrl,
-  resolveRemoteOpenState,
-  useRemoteCapableEditors,
-  useRemoteOpenResolution,
-} from "../remoteOpen";
+import { resolveRemoteOpenState, useRemoteOpenResolution } from "../remoteOpen";
+import { openRemoteEditorUrl, useRemoteCapableEditors } from "../remoteOpen"; // Fork
 import { useRightPanelStore } from "../rightPanelStore";
 import { readThreadShell, useProjects } from "../state/entities";
 import { serverEnvironment } from "../state/server";
@@ -219,10 +216,8 @@ import {
 } from "./chat/ChatMarkdownMedia";
 import { MarkdownExternalLinkContent } from "./chat/MarkdownExternalLink";
 import { MarkdownFileLink } from "./chat/MarkdownFileLink";
-import {
-  canUseMarkdownFileShellActions,
-  markdownFileRemoteEditorUrl,
-} from "./chat/MarkdownFileLink.logic";
+import { canUseMarkdownFileShellActions } from "./chat/MarkdownFileLink.logic";
+import { markdownFileRemoteEditorUrl } from "./chat/MarkdownFileLink.logic"; // Fork
 import { rehypeChipPunctuation } from "./chat/markdownChipPunctuation";
 import { handleMarkdownFragmentClick, rehypeHeadingIds } from "./chat/markdownFragments";
 import { rehypeTextDirection } from "./chat/markdownTextDirection";
