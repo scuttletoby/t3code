@@ -327,6 +327,10 @@ class Setup(Case):
         self.assertEqual(code, 1, out)
         self.assertIn('journalctl -u t3code-agents.service', out)
         self.assertNotIn('its log:', out)   # an empty journal: the message still comes
+        self.assertIn('exit status 1', out)   # with the main process's exit status
+        self.write('/log/t3-crash', '77')
+        code, out = self.setup_run()
+        self.assertIn('exit status 77: T3 cannot apply the managed policy', out)
         self.assertTrue(os.path.isfile(self.path(k.PENDING)))
         # T3's own error comes with it, from the unit's journal
         self.write('/log/journal', 'starting\n[12:00:01.234] ERROR (#1): ManagedPolicyFileError: T3 Code cannot use '
@@ -570,6 +574,24 @@ class AsAgent(Case):
         code, out = self.call(cli.main, ['as-agent', '--', 'claude'])
         self.assertEqual(code, 1, out)
         self.assertIn('not running anything as the agent', out)
+        self.assertEqual(self.log('systemd-run'), [])
+
+    def test_pair_runs_the_installed_t3_pair_as_the_agent(self):
+        self.ready()
+        self.machine({**CONFIG, 't3Version': '1.2.4'})
+        self.assertEqual(self.setup_run()[0], 0)   # 1.2.3's folder stays: a glob over versions would find two
+        for args in ([], ['--ttl', '15m']):
+            code, out = self.call(cli.main, ['pair'] + args)
+            self.assertEqual(code, 0, out)
+            argv = self.log('systemd-run')
+            self.assertEqual(argv[argv.index('--'):], ['--', '/usr/bin/env', '--',
+                                                       '/opt/pc-agents/t3/runtime/versions/1.2.4/t3', 'pair'] + args)
+            self.assertIn('--uid=agent', argv)
+            self.assertIn('--setenv=T3CODE_HOME=/home/agent/.t3', argv)   # the unit's T3 home: its running server
+        self.write('/var/lib/systemd/linger/agent', '')
+        os.unlink(self.path('/log/systemd-run'))
+        code, out = self.call(cli.main, ['pair'])
+        self.assertEqual(code, 1, out)
         self.assertEqual(self.log('systemd-run'), [])
 
 
