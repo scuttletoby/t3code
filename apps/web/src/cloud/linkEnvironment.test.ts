@@ -284,4 +284,41 @@ describe("web cloud link environment client", () => {
       });
     }),
   );
+
+  // Fork: a server held with `serve --hold-work` refuses unlink; the relay delete must not follow,
+  // because a held copy shares the live server's environment id.
+  it.effect("sends no relay delete when the server refuses to unlink", () =>
+    Effect.gen(function* () {
+      const fetchMock = vi.fn((_input: RequestInfo | URL) =>
+        Promise.resolve(
+          Response.json(
+            {
+              _tag: "EnvironmentHttpForbiddenError",
+              message: "This held server's policy does not allow T3 Connect.",
+            },
+            { status: 403 },
+          ),
+        ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      vi.stubGlobal("window", {
+        location: { origin: "t3code://app" },
+        desktopBridge: {
+          getLocalEnvironmentBearerToken: vi.fn().mockResolvedValue("desktop-bearer-token"),
+        } as unknown as DesktopBridge,
+      });
+
+      const error = yield* withServices(
+        unlinkEnvironmentFromCloud({
+          target: { environmentId: EnvironmentId.make(TARGET.environmentId) },
+          clerkToken: "clerk-token",
+        }),
+      ).pipe(Effect.flip);
+
+      expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([
+        "http://127.0.0.1:3000/api/connect/unlink",
+      ]);
+      expect(error).toMatchObject({ _tag: "CloudEnvironmentLinkError" });
+    }),
+  );
 });
