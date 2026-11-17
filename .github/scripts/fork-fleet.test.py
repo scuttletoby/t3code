@@ -3832,6 +3832,7 @@ class AnyRepository(unittest.TestCase):
             'two pools wait for pushes': (lambda c: c['pools'][2].__setitem__('takes', ['push', 'ready']), 'push'),
             'a dispatcher pool, no dispatch settings': (lambda c: c.pop('dispatch'), 'dispatch'),
             'a generic retired label': (lambda c: c.__setitem__('retired_labels', ['self-hosted']), 'retired'),
+            'retired on a static pool': (lambda c: c['pools'][1].__setitem__('retired', ['proj-old']), 'retired'),
         }
         for name, (change, word) in cases.items():
             with self.subTest(name):
@@ -4347,6 +4348,121 @@ class OldBugs(unittest.TestCase):
         deletes = [p for m, p in self.gh.writes() if m == 'DELETE']
         self.assertEqual(deletes, ['actions/runners/40'])
         self.assertEqual(sorted(r['id'] for r in self.gh.runners), [41, 42, 77, 78])
+
+
+# A pool's label changed: each dispatcher pool lists the labels it used before (`retired`, each also in retired_labels),
+# so its dispatcher can delete the offline registrations it made under them (#57).
+OTHER = next(p['name'] for p in CFG['pools'] if p['name'] != WAITING and not p.get('static'))
+RET = copy.deepcopy(CFG)
+RET['retired_labels'] = ['fleet-old-a', 'fleet-old-b']
+for _p, _old in ((WAITING, 'fleet-old-a'), (OTHER, 'fleet-old-b')):
+    next(p for p in RET['pools'] if p['name'] == _p)['retired'] = [_old]
+RET_POOLS = {p['name']: p for p in RET['pools']}
+
+
+class RetiredLabels(unittest.TestCase):
+    def setUp(self):
+        self.gh = FakeGitHub()
+        self.fake = {name: FakeLauncher(name) for name in (WAITING, OTHER)}
+        self.states = {name: ff.new_state() for name in self.fake}
+
+    def dispatch(self, pool=WAITING, cfg=RET, passes=1):
+        """One dispatcher per pool, as on two hosts: each serves only its own pool."""
+        hosts = {pool: ff.Host(next(p for p in cfg['pools'] if p['name'] == pool), run=self.fake[pool].run)}
+        for _ in range(passes):
+            quiet(ff.dispatch_pass, cfg, self.gh, hosts, self.states[pool], now=lambda: T0)
+
+    def reg(self, rid, name, status='offline', busy=False):
+        self.gh.runners.append({'id': rid, 'name': name, 'status': status, 'busy': busy,
+                                'labels': [{'name': name.rsplit('-', 1)[0]}]})
+
+    def left(self):
+        return sorted(r['name'] for r in self.gh.runners)
+
+    def deletes(self):
+        return [p for m, p in self.gh.writes() if m == 'DELETE']
+
+    def test_the_config_is_valid(self):
+        self.assertEqual(ff.check_config(RET), [])
+
+    def test_an_offline_registration_under_the_pools_retired_label_is_deleted(self):
+        self.reg(40, 'fleet-old-a-40')                     # no unit behind it: deleted
+        self.reg(41, 'fleet-old-a-41')                     # its unit (started under the old label) is coming up: kept
+        self.fake[WAITING].units.add('fleet-old-a-41')
+        self.dispatch()
+        self.assertEqual(self.left(), ['fleet-old-a-41'])
+        self.assertEqual(self.deletes(), ['actions/runners/40'])
+
+    def test_another_pools_retired_label_is_not_touched(self):
+        self.reg(40, 'fleet-old-a-40')
+        self.reg(50, 'fleet-old-b-50')                     # the other pool's: its own dispatcher's to judge
+        self.dispatch()
+        self.assertEqual(self.left(), ['fleet-old-b-50'])
+
+    def test_an_online_registration_under_a_retired_label_is_never_touched(self):
+        self.reg(40, 'fleet-old-a-40')
+        self.reg(42, 'fleet-old-a-42', status='online', busy=True)
+        self.reg(43, 'fleet-old-a-43', status='online')    # idle, its job gone: still left alone (not stopped)
+        self.fake[WAITING].units |= {'fleet-old-a-42', 'fleet-old-a-43'}
+        self.gh.add(a_run(6, actor='someone'), a_job(61, ['fleet-old-a']))   # a queued job that could take 43
+        self.dispatch(passes=CFG['dispatch']['idle_passes'] + 1)
+        self.assertEqual(self.left(), ['fleet-old-a-42', 'fleet-old-a-43'])
+        self.assertEqual(self.fake[WAITING].stopped, [])
+
+    def test_two_dispatchers_with_different_pools_side_by_side(self):
+        a, b = RET_POOLS[WAITING]['label'], RET_POOLS[OTHER]['label']
+        self.reg(40, 'fleet-old-a-40')                     # A's leftover under its old label
+        self.reg(41, f'{a}-41')                            # A's leftover under its label
+        self.reg(50, 'fleet-old-b-50')                     # B's leftover under its old label
+        self.reg(51, 'fleet-old-b-51')                     # B's fresh one under its old label, unit coming up
+        self.reg(52, f'{b}-52')                            # B's fresh one, unit coming up
+        self.reg(53, 'fleet-old-b-53', status='online')    # B's, online
+        self.fake[OTHER].units |= {'fleet-old-b-51', f'{b}-52', 'fleet-old-b-53'}
+        self.dispatch(WAITING)
+        self.assertEqual(self.left(), sorted(['fleet-old-b-50', 'fleet-old-b-51', f'{b}-52', 'fleet-old-b-53']))
+        self.dispatch(OTHER)
+        self.dispatch(WAITING)
+        self.assertEqual(self.left(), sorted(['fleet-old-b-51', f'{b}-52', 'fleet-old-b-53']))
+        self.assertEqual(sorted(self.deletes()), [f'actions/runners/{i}' for i in (40, 41, 50)])
+
+    def test_running_cleanup_twice_deletes_once(self):
+        self.reg(40, 'fleet-old-a-40')
+        self.dispatch(passes=2)
+        self.dispatch(passes=1)
+        self.assertEqual(self.deletes(), ['actions/runners/40'])
+        self.assertEqual(self.left(), [])
+
+    def test_a_config_without_retired_behaves_as_before(self):
+        """Old state: no pool says which retired label was its, so nothing under one is deleted."""
+        old = copy.deepcopy(RET)
+        for p in old['pools']:
+            p.pop('retired', None)
+        self.assertEqual(ff.check_config(old), [])
+        self.reg(40, 'fleet-old-a-40')
+        self.reg(41, f'{RET_POOLS[WAITING]["label"]}-41')
+        self.dispatch(cfg=old)
+        self.assertEqual(self.left(), ['fleet-old-a-40'])
+
+    def test_a_retired_label_no_pool_may_claim_is_refused(self):
+        b = RET_POOLS[OTHER]['label']
+        cases = {
+            'another pool\'s current label': lambda c: c.update(retired_labels=['fleet-old-a', 'fleet-old-b', b]) or
+                                                     c['pools'][self.at(WAITING)].update(retired=['fleet-old-a', b]),
+            'its own current label': lambda c: c['pools'][self.at(WAITING)].update(
+                retired=[RET_POOLS[WAITING]['label']]),
+            'two pools claim one': lambda c: c['pools'][self.at(OTHER)].update(retired=['fleet-old-a']),
+            'not in retired_labels': lambda c: c['pools'][self.at(WAITING)].update(retired=['fleet-old-z']),
+            'not a list': lambda c: c['pools'][self.at(WAITING)].update(retired='fleet-old-a'),
+        }
+        for name, change in cases.items():
+            with self.subTest(name):
+                bad = copy.deepcopy(RET)
+                change(bad)
+                problems = ff.check_config(bad)
+                self.assertTrue(any('retired' in p for p in problems), problems)
+
+    def at(self, pool):
+        return next(i for i, p in enumerate(RET['pools']) if p['name'] == pool)
 
 
 class Vars(unittest.TestCase):
