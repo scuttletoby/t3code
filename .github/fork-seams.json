@@ -132,7 +132,7 @@
     "packages/contracts/package.json": 8,
     "packages/contracts/src/editor.ts": 40,
     "packages/contracts/src/orchestratorMcp.ts": 8,
-    "packages/shared/package.json": 24,
+    "packages/shared/package.json": 28,
     "packages/shared/src/cliRelease.test.ts": 43,
     "packages/shared/src/cliRelease.ts": 11,
     "packages/shared/src/usageLimits.ts": 12,
