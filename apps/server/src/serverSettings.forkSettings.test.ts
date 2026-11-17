@@ -541,3 +541,107 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork handoff set
     }).pipe(Effect.provide(layerServerSettings())),
   );
 });
+
+it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork review rules", (it) => {
+  const ON = { preset: "recommended" };
+  const CUSTOM = {
+    preset: "recommended",
+    runner: { driver: "codex", model: "gpt-review", effort: "medium" },
+    minors: "same-round",
+  };
+
+  it.effect(
+    "writes nothing for reviewRules when the file never had it, or held an empty value",
+    () =>
+      Effect.gen(function* () {
+        for (const start of [{}, { reviewRules: {} }]) {
+          const file = yield* loadThenPatch(start, { enableAgentBrowserAccess: false });
+          assert.isFalse("reviewRules" in (file as Record<string, unknown>), JSON.stringify(start));
+          const service = yield* ServerSettingsModule.ServerSettingsService;
+          assert.deepStrictEqual((yield* service.getSettings).reviewRules, { preset: "off" });
+        }
+      }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("saves a value whole, and the same save again leaves the same file", () =>
+    Effect.gen(function* () {
+      const once = yield* loadThenPatch({ ...FULL_FILE, reviewRules: CUSTOM }, { reviewRules: ON });
+      assert.deepStrictEqual((once as Record<string, unknown>).reviewRules, ON);
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* service.updateSettings(decodePatch({ reviewRules: ON }));
+      assert.deepStrictEqual(yield* readFile, once);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("keeps a bad hand edit as written through saves of other keys, read as off", () =>
+    Effect.gen(function* () {
+      const bad = { preset: "strict", runner: { driver: "claudeAgent" } };
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(
+        config.settingsPath,
+        JSON.stringify({
+          ...FULL_FILE,
+          reviewRules: bad,
+          projectSettingsOverrides: { [PROJECT]: { reviewRules: bad, defaultAutoPull: false } },
+        }),
+      );
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const settings = yield* service.getSettings;
+      assert.strictEqual(settings.reviewRules.preset, "off");
+      assert.strictEqual(settings.waitFor.maxPerThread, 7);
+      // Saved twice: the second save starts from what the first one wrote. The project's entry is
+      // resent whole, as a client does when it saves the project's other settings.
+      for (const enableAgentBrowserAccess of [true, false]) {
+        const entry = (yield* service.getSettings).projectSettingsOverrides[
+          ProjectId.make(PROJECT)
+        ];
+        yield* service.updateSettings(
+          decodePatch({
+            enableAgentBrowserAccess,
+            projectSettingsOverrides: { [PROJECT]: { ...entry, defaultAutoPull: true } },
+          }),
+        );
+        const file = (yield* readFile) as {
+          reviewRules?: unknown;
+          projectSettingsOverrides: Record<string, { reviewRules?: unknown }>;
+        };
+        assert.deepStrictEqual(file.reviewRules, bad);
+        assert.deepStrictEqual(file.projectSettingsOverrides[PROJECT]?.reviewRules, bad);
+        const read = yield* service.getSettings;
+        assert.strictEqual(read.reviewRules.preset, "off");
+        assert.strictEqual(
+          read.projectSettingsOverrides[ProjectId.make(PROJECT)]?.reviewRules?.preset,
+          "off",
+        );
+      }
+      // The person's own save of the key replaces it.
+      yield* service.updateSettings(decodePatch({ reviewRules: ON }));
+      assert.deepStrictEqual(((yield* readFile) as Record<string, unknown>).reviewRules, ON);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("keeps a project's value when a client that does not know the key saves", () =>
+    Effect.gen(function* () {
+      const file = yield* loadThenPatch(
+        {
+          ...FULL_FILE,
+          projectSettingsOverrides: { [PROJECT]: { reviewRules: { preset: "off" } } },
+        },
+        { projectSettingsOverrides: { [PROJECT]: { defaultAutoPull: true } } },
+      );
+      const project = (file as { projectSettingsOverrides: Record<string, unknown> })
+        .projectSettingsOverrides[PROJECT];
+      assert.deepStrictEqual(project, { defaultAutoPull: true, reviewRules: { preset: "off" } });
+      // `null` clears it: the project then uses the server's.
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* service.updateSettings(
+        decodePatch({
+          projectSettingsOverrides: { [PROJECT]: { defaultAutoPull: true, reviewRules: null } },
+        }),
+      );
+      const read = (yield* service.getSettings).projectSettingsOverrides[ProjectId.make(PROJECT)];
+      assert.isUndefined(read?.reviewRules);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+});
