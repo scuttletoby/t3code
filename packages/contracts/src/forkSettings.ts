@@ -8,7 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { TrimmedString } from "./baseSchemas.ts";
-import { HandoffSettings, HandoffSettingsFromSettingsFile } from "./handoff.ts";
+import { HandoffSettingsFromSettingsFile, HandoffSettingsPatch } from "./handoff.ts";
 import {
   MCP_PROFILE_ALL,
   MCP_SUBAGENT_INHERIT,
@@ -127,8 +127,8 @@ export const ForkServerSettingsPatchFields = {
   mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
   /** Strict: a save refuses a bad step, or `enabled` without all four steps. */
   playtest: Schema.optionalKey(PlaytestSettings),
-  /** Strict: a save refuses a bad value, or `source: command` without a command. */
-  handoff: Schema.optionalKey(HandoffSettings),
+  /** Strict: a save refuses a bad value, an unknown field, or `source: command` without a command. */
+  handoff: Schema.optionalKey(HandoffSettingsPatch),
   /** Strict: a save refuses a bad field, an unknown key, or a value without `preset`. */
   reviewRules: Schema.optionalKey(ReviewRulesPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
@@ -237,7 +237,7 @@ export const ForkProjectOverridePatchFields = {
    */
   playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettings)),
   /** As `playtest`: left out keeps the stored value; `null` clears it. */
-  handoff: Schema.optionalKey(Schema.NullOr(HandoffSettings)),
+  handoff: Schema.optionalKey(Schema.NullOr(HandoffSettingsPatch)),
   /**
    * Strict, but a kept unreadable value passes back as clients resend it. Left out keeps the stored
    * value; `null` clears it (the project then uses the server's).
