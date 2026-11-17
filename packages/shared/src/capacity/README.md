@@ -118,8 +118,10 @@ and a container's namespace root has them wherever this process sits inside it (
 container puts it in `/init.scope`, not at `0::/`); `/proc/self/cgroup` is not read.
 
 Not read yet (stated limits): a cgroup v1 container's CPU quota and a container's `memory.swap.max`; a
-cgroup v2 box with PSI turned off by `cgroup.pressure` reads as unreadable (elevated). Process-tree
-demand for macOS and Windows comes with the basic tier.
+cgroup v2 box with PSI turned off by `cgroup.pressure` reads as unreadable (elevated). A container
+started with `--cgroupns=host` finds no limit of its own and uses the host's numbers (as upstream's
+reader does). Inside a container the machine PSI (`/proc/pressure/memory`) is the host's, not the
+container's. Process-tree demand for macOS and Windows comes with the basic tier.
 
 ## Vector file
 
