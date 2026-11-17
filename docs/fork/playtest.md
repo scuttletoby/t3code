@@ -6,7 +6,7 @@ request per round. T3 runs the session; the project's **adapter** does everythin
 target. This page is what an adapter must do. The settings are
 [`server.playtest` and `projectOverride.playtest`](README.md#serverplaytest).
 
-Status: the settings and this contract exist. The session store, the `playtest` tool, the renew
+Status: the settings, this contract and the session store exist. The `playtest` tool, the renew
 worker and the thread controls come in later pull requests and follow this page.
 
 ## The steps
@@ -69,6 +69,24 @@ T3 can stop, restart or lose its machine at any point, and so can the target. So
   a session still renews and releases that session with the steps it claimed with.
 - T3 ends a session when nothing happened for `idleMinutes` (no round, no message from the person),
   after `maxHours` in total, and when its thread is deleted or archived. Each end runs `release`.
+
+## Sessions T3 keeps
+
+T3 keeps its sessions in `playtest.json` in its state folder, so a session outlives a restart. A
+session is `claiming`, `active`, `ending` (its `release` has not exited 0 yet) or `ended`, and keeps
+why it ended and its last round. A thread has at most one session that is not ended.
+
+- **One step at a time per session.** A push or start that meets a running step is refused as
+  busy. `end` instead stops the running `claim` or round (the step's process is killed), then runs
+  `release`. Two ends at once share one `release`.
+- **A claim that fails** (any exit but 0 and 10, or a timeout) is followed by `release`, as the claim
+  may be half taken. A claim that exits 10 ends the session with nothing to release.
+- **After a restart** a round that was running reads `stopped`; a claim or release that was running
+  leaves the session busy until it is ended, and `end` runs `release` again.
+- **A bad file** (torn, empty, not valid) is copied aside as `playtest.json.corrupt-<time>` and
+  replaced by the sessions that still read; the lost ones are named in the server log, and their
+  claims expire on the target by themselves. A file from a newer T3 is not read or written: every
+  playtest call is refused until that T3 runs again.
 
 ## Limits
 

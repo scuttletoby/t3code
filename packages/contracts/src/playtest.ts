@@ -7,7 +7,15 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
-import { TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  PositiveInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+  TrimmedString,
+} from "./baseSchemas.ts";
 
 const PLAYTEST_STEP_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/u;
 /** At most this many steps in one round. */
@@ -179,3 +187,127 @@ export const PlaytestTarget = Schema.String.check(
   Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u),
 );
 export type PlaytestTarget = typeof PlaytestTarget.Type;
+
+/** The agent's reason for a session: one line, at most 200 characters, may be empty. */
+export const PLAYTEST_NOTE_MAX = 200;
+export const PlaytestNote = Schema.String.check(
+  Schema.isMaxLength(PLAYTEST_NOTE_MAX),
+  Schema.isPattern(/^[^\r\n]*$/u),
+);
+
+/** The steps a session started with; it keeps them to its end, whatever the settings say later. */
+export const PlaytestAdapter = Schema.Struct({
+  claim: PlaytestStep,
+  renew: PlaytestStep,
+  push: Schema.Array(PlaytestPushStep).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(PLAYTEST_PUSH_STEPS_MAX),
+  ),
+  release: PlaytestStep,
+  renewMinutes: Schema.Int,
+  idleMinutes: Schema.Int,
+  maxHours: Schema.Int,
+});
+export type PlaytestAdapter = typeof PlaytestAdapter.Type;
+
+/**
+ * `claiming`: the claim step runs, or ran and T3 stopped before it saved the answer (the target
+ * may be claimed, so only an end, which runs `release`, leaves it). `active`: claimed, rounds may
+ * run. `ending`: `release` runs or must run again. `ended`: released, or the claim was refused.
+ */
+export const PlaytestSessionState = Schema.Literals(["claiming", "active", "ending", "ended"]);
+export type PlaytestSessionState = typeof PlaytestSessionState.Type;
+
+/**
+ * Why a session ends. `agent` and `person` ask for it; `claim-refused` (exit 10, nothing to
+ * release) and `claim-failed` end a session that never became active; the rest are T3's own ends.
+ */
+export const PlaytestEndReason = Schema.Literals([
+  "agent",
+  "person",
+  "claim-refused",
+  "claim-failed",
+  "claim-gone",
+  "idle",
+  "time-limit",
+  "thread-gone",
+]);
+export type PlaytestEndReason = typeof PlaytestEndReason.Type;
+
+/** `stopped`: the session ended, or T3 stopped, while the round ran. */
+export const PlaytestRoundState = Schema.Literals([
+  "running",
+  "done",
+  "refused",
+  "failed",
+  "stopped",
+]);
+export type PlaytestRoundState = typeof PlaytestRoundState.Type;
+
+/** The most of a step's output a record keeps (its end). */
+export const PLAYTEST_DETAIL_MAX = 2000;
+const PlaytestDetail = Schema.String.check(Schema.isMaxLength(PLAYTEST_DETAIL_MAX));
+
+export const PlaytestRound = Schema.Struct({
+  number: PositiveInt,
+  state: PlaytestRoundState,
+  /** The step running now, or the one that ended the round. */
+  step: PlaytestStepName,
+  /** The end of the last step's output, or why the round stopped. */
+  detail: PlaytestDetail,
+  startedAt: IsoDateTime,
+  endedAt: Schema.optionalKey(IsoDateTime),
+});
+export type PlaytestRound = typeof PlaytestRound.Type;
+
+export const PlaytestSessionRecord = Schema.Struct({
+  id: PlaytestSessionId,
+  threadId: ThreadId,
+  projectId: ProjectId,
+  target: PlaytestTarget,
+  note: PlaytestNote,
+  /** The steps' working folder: the thread's worktree, else the project's folder. */
+  worktree: TrimmedNonEmptyString,
+  adapter: PlaytestAdapter,
+  state: PlaytestSessionState,
+  startedAt: IsoDateTime,
+  /** The last round's start or end, or the person's last message; the idle limit counts from it. */
+  lastActivityAt: IsoDateTime,
+  /** The last renew that exited 0. */
+  renewedAt: Schema.optionalKey(IsoDateTime),
+  /** Rounds started; the next round is this plus one. */
+  rounds: NonNegativeInt,
+  lastRound: Schema.optionalKey(PlaytestRound),
+  endReason: Schema.optionalKey(PlaytestEndReason),
+  endedAt: Schema.optionalKey(IsoDateTime),
+  /** The last failed claim, renew or release step, and why. */
+  problem: Schema.optionalKey(PlaytestDetail),
+});
+export type PlaytestSessionRecord = typeof PlaytestSessionRecord.Type;
+
+export const PLAYTEST_STORE_VERSION = 1;
+export const PlaytestStoreFile = Schema.Struct({
+  version: Schema.Literal(PLAYTEST_STORE_VERSION),
+  sessions: Schema.Array(PlaytestSessionRecord),
+});
+export type PlaytestStoreFile = typeof PlaytestStoreFile.Type;
+
+export const PlaytestFailureCode = Schema.Literals([
+  /** Playtest is off, or incomplete, for the thread's project. */
+  "playtest_off",
+  "invalid",
+  /** The thread has no session that is still on. */
+  "no_session",
+  /** A step of this session runs, or the session is claiming or ending. */
+  "busy",
+  /** The thread or its project cannot be read, or is gone. */
+  "thread_unavailable",
+  "store_unavailable",
+]);
+export type PlaytestFailureCode = typeof PlaytestFailureCode.Type;
+
+/** T3 refused before any step ran. A step's own answer is a result, never this. */
+export class PlaytestFailure extends Schema.TaggedError<PlaytestFailure>()("PlaytestFailure", {
+  code: PlaytestFailureCode,
+  message: Schema.String,
+}) {}
