@@ -12,7 +12,9 @@ import {
   PLAYTEST_EXIT_OK,
   PLAYTEST_EXIT_REFUSED,
   PLAYTEST_PUSH_STEPS_MAX,
+  PlaytestNote,
   PlaytestSessionId,
+  PlaytestSessionRecord,
   PlaytestSettings,
   PlaytestSettingsFromSettingsFile,
   PlaytestTarget,
@@ -258,5 +260,56 @@ describe("playtest adapter contract", () => {
     for (const bad of ["", "-rf", ".hidden", "a b", "a/b", "a;b", "x".repeat(65)]) {
       expect(isTarget(bad), bad).toBe(false);
     }
+  });
+});
+
+describe("playtest session records", () => {
+  const { enabled: _enabled, ...adapter } = decodeStrict(ADAPTER);
+  const record = {
+    id: "pt_abcdefgh23",
+    threadId: "thread-1",
+    projectId: "project-1",
+    target: "tutorial",
+    note: "the new shop",
+    worktree: "/srv/work/tutorial",
+    adapter,
+    state: "active",
+    startedAt: "2026-11-17T10:00:00.000Z",
+    lastActivityAt: "2026-11-17T10:00:00.000Z",
+    rounds: 1,
+    lastRound: {
+      number: 1,
+      state: "done",
+      step: "deploy",
+      detail: "",
+      startedAt: "2026-11-17T10:00:00.000Z",
+      endedAt: "2026-11-17T10:05:00.000Z",
+    },
+  };
+  const decodeRecord = Schema.decodeUnknownSync(PlaytestSessionRecord);
+
+  it("keeps the steps a session started with", () => {
+    const decoded = decodeRecord(record);
+    expect(decoded.adapter.push.map((step) => step.name)).toEqual(["guard", "build", "deploy"]);
+    expect(decoded.adapter.release.timeoutSeconds).toBe(600);
+  });
+
+  it("refuses an adapter without steps, a round 0 and a note on two lines", () => {
+    expect(() => decodeRecord({ ...record, adapter: { ...adapter, push: [] } })).toThrow();
+    expect(() =>
+      decodeRecord({ ...record, adapter: { ...adapter, release: undefined } }),
+    ).toThrow();
+    expect(() =>
+      decodeRecord({ ...record, lastRound: { ...record.lastRound, number: 0 } }),
+    ).toThrow();
+    const isNote = Schema.is(PlaytestNote);
+    expect(isNote("")).toBe(true);
+    expect(isNote("a\nb")).toBe(false);
+    expect(isNote("x".repeat(201))).toBe(false);
+    // A NUL fails every spawn; no control character (C0, DEL) is a note.
+    for (const note of ["a\u0000b", "tab\there", "del\u007f"]) expect(isNote(note)).toBe(false);
+    expect(isNote("Grüße – ok")).toBe(true);
+    // A stored note is read back with only its length checked, so an older file still loads.
+    expect(decodeRecord({ ...record, note: "old\u0000note" }).note).toBe("old\u0000note");
   });
 });
