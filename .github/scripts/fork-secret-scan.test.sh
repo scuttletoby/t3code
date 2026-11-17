@@ -318,6 +318,14 @@ BEFORE="" OLD_HEADS="" HEAD_SHA="$clean" check "pull request: the newest head al
 export EVENT_NAME=push HEAD_SHA=""
 
 EVENT_NAME=issues check "an unknown event fails" 2
+# #239: a shallow checkout lacks the history the range needs, so git log would read less than the
+# range and the scan would pass on what it never saw. Refused for every event, before any fetch.
+shallow="$root/shallow-clone"
+git clone -q --depth 1 --filter=blob:none --no-checkout --branch leaky "file://$root/origin.git" "$shallow"
+clone="$shallow" HEAD_SHA="$leaky" EVENT_NAME=pull_request BEFORE="" \
+  check "a shallow checkout fails (pull request)" 2 "shallow"
+clone="$shallow" EVENT_NAME=push BEFORE="$fork_point" AFTER="$leaky" check "a shallow checkout fails (push)" 2 "shallow"
+clone="$shallow" EVENT_NAME=schedule check "a shallow checkout fails (sweep)" 2 "shallow"
 
 export EVENT_NAME=pull_request BEFORE="" AFTER=""
 # The range does not depend on the PR's base (see the script's header).
@@ -602,6 +610,28 @@ git push -q origin :refs/tags/v2
 git tag tree-tag "main^{tree}"
 git push -q origin tree-tag
 EVENT_NAME=schedule check "daily sweep: a tag that names no commit warns" 0 "::warning.*name no commit \\(tags/tree-tag\\)"
+git push -q origin :refs/tags/tree-tag
+# #239: a [skip ci] push to a branch that is then deleted (or force-pushed away) before the sweep
+# runs: no ref holds it any more, but GitHub still serves its commits by id. The workflow passes
+# every tip GitHub's activity record lists (OLD_HEADS, as for a pull request); the sweep reads them,
+# in a fresh clone too (fetched by id).
+git checkout -q -b vanished main
+commit v.txt "aws_access_key_id=$key" "vanished: a key [skip ci]"
+vanished=$(git rev-parse HEAD)
+git checkout -q main
+git push -q origin vanished
+git push -q origin :vanished
+clone="$root/sweep-clone-2"
+git clone -q --filter=blob:none --no-checkout "file://$root/sweep.git" "$clone"
+OLD_HEADS="" EVENT_NAME=schedule check "daily sweep: a deleted branch's tip, not listed: not read (control)" 0
+OLD_HEADS="$zeros $vanished $(git rev-parse main)" EVENT_NAME=schedule \
+  check "daily sweep: a key only a deleted branch's tip (activity record) held is found" 1 "1 tip\\(s\\) no ref holds"
+OLD_HEADS="3333333333333333333333333333333333333333" EVENT_NAME=schedule \
+  check "daily sweep: a listed tip origin no longer serves warns" 0 "::warning.*no longer serves.*333333333333"
+OLD_HEADS="3333333333333333333333333333333333333333 $vanished" EVENT_NAME=schedule \
+  check "daily sweep: one listed tip gone fails the batch fetch; the others are still fetched one by one" 1 \
+  "1 tip\\(s\\) no ref holds"
+OLD_HEADS="--all" EVENT_NAME=schedule check "daily sweep: an OLD_HEADS word that is not a commit id fails" 2 "not a commit id"
 rm -rf "${root:?}/sweep.git"
 EVENT_NAME=schedule check "daily sweep: origin cannot be read: fails" 2
 cd "$root"
@@ -864,7 +894,8 @@ fi
 # entry is an exact value: ^, one fixed string with no regex syntax (escapes \<punctuation> and
 # \xHH only), $; anything else is a problem, whatever it would match (see literal_value for why).
 # Against the gitleaks binary (the real one only; its default config is built in): the rules, from
-# the first [[rules]] to the end, are its default rules byte for byte; the first entry is its global
+# the first [[rules]] to the end, are its default rules byte for byte, every one of them (the same
+# rule ids in the same order, so no unbroken slice of them passes); the first entry is its global
 # allowlist without the path skip list; and the binary judges that entry (with its stop words) on
 # generated token shapes, each of which its rules alone find: one it hides is a problem. Each rule
 # is tried on broken copies too.
@@ -1078,6 +1109,21 @@ if binary_path:
         head = binary[:at]
         a = head.rfind(b"\n[allowlist]\n")
         default = tomllib.loads(head[a:].decode()).get("allowlist") if a >= 0 else None
+        # The bytes match, but an unbroken slice of the default rules (one dropped at either end)
+        # would match too (#239): the full default rule id list must be the file's. gitleaks embeds
+        # its default config as one string, which ends at the binary's next NUL byte.
+        end = binary.find(b"\x00", a) if a >= 0 else -1
+        try:
+            default_ids = [r.get("id") for r in tomllib.loads(binary[a:end].decode()).get("rules") or []] if end > a else []
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+            default_ids = []
+        file_ids = [r.get("id") for r in cfg.get("rules") or []]
+        if not default_ids:
+            problems.append("cannot read this gitleaks' default rules (its config up to the next NUL byte)")
+        elif file_ids != default_ids:
+            missing = [i for i in default_ids if i not in file_ids]
+            problems.append(f"the rule ids are not this gitleaks' default rule ids in order ({len(file_ids)} here,"
+                            f" {len(default_ids)} there; missing: {', '.join(missing[:5]) or 'none'})")
         if default is None:
             problems.append("this gitleaks has no [allowlist] before its rules")
         else:
@@ -1125,6 +1171,14 @@ toml_mutant "an entry without regexes" "$(narrow_entry "targetRules = [\\\"gener
 toml_mutant "an entry that allows any value (^.*\$)" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"^.*\$\\\"]")"
 toml_mutant "an unanchored value" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"abc\\\"]")"
 toml_mutant "an entry with stopwords" "$(narrow_entry "targetRules = [\\\"generic-api-key\\\"]\\nregexes = [\\\"^abc\$\\\"]\\nstopwords = [\\\"key\\\"]")"
+# #239: an unbroken slice of the default rules is still bytes of the binary; the full rule id list
+# must match (only with GITLEAKS_BIN, as the rules check needs the binary).
+if [[ -n "${GITLEAKS_BIN:-}" ]]; then
+  rules_at='t.index("\n[[rules]]\n")'
+  toml_mutant "the default rules but the first (an unbroken slice of them)" \
+    "t[:$rules_at] + t[t.index('\n[[rules]]\n', $rules_at + 1):]"
+  toml_mutant "the default rules but the last (an unbroken slice of them)" "t[:t.rindex('\n[[rules]]\n') + 1]"
+fi
 toml_mutant "the pnpm-lock.yaml value widened back to a shape (any 14 digits)" \
   "t.replace(\"^0\\\\.0\\\\.4-canary\\\\.v20260819050620\$\", \"^0\\\\.0\\\\.4-canary\\\\.v\\\\d{14}\$\", 1)"
 toml_mutant "a #91 value widened to any 16 hex characters" \
