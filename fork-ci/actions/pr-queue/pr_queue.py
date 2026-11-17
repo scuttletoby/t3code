@@ -120,7 +120,22 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     parent P of `head` is on `base` and head's tree is `git merge-tree --write-tree P X` byte for byte, where X is
     `read` or head's other parent when that one holds this itself (an earlier queue update: GitHub merges the new base
     into the head the queue already proved, which can be clean where a direct merge of `read` conflicts). A tree is
-    the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same."""
+    the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same.
+
+    git's output is decoded strictly by the callers. A conflict lists the conflicted files by name, and a name need
+    not be UTF-8: that is no same change (a clean merge prints only the tree id), said once, never a crash."""
+    if head == read:
+        return True
+    try:
+        return _holds(git, head, read, depth, base)
+    except UnicodeDecodeError as e:
+        print(f'::warning::pr-queue: git printed bytes that are not UTF-8 while checking {head[:12]} against the read '
+              f'{read[:12]} (a conflict naming a file whose name is not UTF-8: {e.reason}, byte {e.start}): the head '
+              'is not taken as the change read')
+        return False
+
+
+def _holds(git, head, read, depth, base):
     if head == read:
         return True
     tree = git('rev-parse', '--verify', '-q', head + '^{tree}').stdout.strip()
@@ -128,7 +143,7 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     for p in parents:
         if git('merge-base', '--is-ancestor', p, base).returncode != 0:
             continue
-        sides = [read] + [h for h in parents if h != p and depth > 1 and holds(git, h, read, depth - 1, base)]
+        sides = [read] + [h for h in parents if h != p and depth > 1 and _holds(git, h, read, depth - 1, base)]
         for side in dict.fromkeys(sides):
             m = git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', p, side)
             if m.returncode == 0 and tree and m.stdout.split()[:1] == [tree]:

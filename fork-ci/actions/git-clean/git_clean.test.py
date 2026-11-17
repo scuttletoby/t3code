@@ -449,6 +449,7 @@ class FixedGitConfig(Base):
         tb = load('tested_base', os.path.join(ACTIONS, 'pr-queue', 'tested-base', 'tested_base.py'))
         sys.path.insert(0, os.path.join(ACTIONS, 'pr-queue'))
         hc = load('head_check', os.path.join(ACTIONS, 'head-check', 'head_check.py'))
+        wt = load('weakened_tests', os.path.join(ACTIONS, 'weakened-tests', 'weakened_tests.py'))
         repo = self.repo
 
         def in_repo(fn):
@@ -472,7 +473,8 @@ class FixedGitConfig(Base):
             return r.stdout if r.returncode == 0 else None
 
         return (('job_changed', in_repo(jc.git)), ('docs_scope', in_repo(ds.git)), ('test_select', test_select),
-                ('tested_base', lambda *a: tb.git(repo, *a)), ('head_check', head_check))
+                ('tested_base', lambda *a: tb.git(repo, *a)), ('head_check', head_check),
+                ('weakened_tests', wt.Git(repo)))
 
     def test_helpers_ignore_global_and_system_config(self):
         with unittest.mock.patch.dict(os.environ, self.hostile):
@@ -514,7 +516,8 @@ class FixedGitConfig(Base):
         self.assertEqual(pr_queue.GIT_ENV, G.GIT_ENV)
         self.assertEqual(pr_queue.GIT_SAFE, G.GIT_SAFE)
         for folder, name in (('job-changed', 'job_changed'), ('docs-scope', 'docs_scope'),
-                             ('test-select', 'test_select'), ('pr-queue/tested-base', 'tested_base')):
+                             ('test-select', 'test_select'), ('pr-queue/tested-base', 'tested_base'),
+                             ('weakened-tests', 'weakened_tests')):
             with self.subTest(module=name):
                 mod = load(name, os.path.join(ACTIONS, folder, f'{name}.py'))
                 self.assertEqual(mod.GIT_ENV, G.GIT_ENV)
@@ -552,7 +555,7 @@ class Actions(unittest.TestCase):
             self.assertIn('git-clean/git_clean.py" check --path', first, f'{path}: the first step must be the check')
             self.assertIn('--require', first, path)
         self.assertEqual(sorted(seen), ['docs-scope', 'head-check', 'job-changed', 'pr-queue/tested-base',
-                                        'test-select'])
+                                        'test-select', 'weakened-tests'])
 
     def test_git_clean_action_runs_prepare(self):
         with open(os.path.join(HERE, 'action.yml'), encoding='utf-8') as fh:
