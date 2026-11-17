@@ -645,7 +645,7 @@ def bare_repository(work, name):
     except OSError as e:
         return None, f'could not make a folder in {work}: {e}'
     r = subprocess.run(['git', *pr_queue.GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
-                       capture_output=True)
+                       capture_output=True, env={**os.environ, **pr_queue.GIT_ENV})
     if r.returncode != 0:
         return None, f'git init failed: {r.stderr.strip()[:300]}'
     with open(os.path.join(path, 'config'), 'w', encoding='utf-8') as f:
