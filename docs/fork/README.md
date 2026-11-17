@@ -17,7 +17,10 @@ for …", see [project settings](../user/project-settings.md)). An agent's tools
 fork setting.
 
 To check what a T3 home has switched on without changing anything, the fork's hidden command
-`t3 __fork-report --base-dir <home>` prints it as JSON.
+`t3 __fork-report --base-dir <home>` prints it as JSON. Not covered: run it while T3 is running or
+stopped, not while it is stopping. A clean stop at the instant the report opens the database leaves
+an empty `statev2.sqlite-wal` (harmless; T3 reuses it) and reports the database as unreadable; run it
+again.
 
 ## Settings
 
