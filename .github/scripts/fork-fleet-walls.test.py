@@ -1035,6 +1035,94 @@ class EveryWallsFile(WallsRunner):
                 p = run([os.path.join(self.folder, 'linux'), 'describe'], self.root(overlay(LINUX, change)))
                 self.assertIn('PASS  job-units', p.stdout, name + ': ' + p.stdout + p.stderr)
 
+    def test_linux_job_units_reads_a_job_units_own_stop_timeouts_as_systemd(self):
+        """Issue #297 item 4 (and the nit of item 5): a job unit's own stop timeout counts only as systemd reads its
+        transient file: in [Service], and not reset by an empty one after it; an endless one of its own FAILS (as in a
+        drop-in), and so do systemd's endless defaults when its own does not count."""
+        endless = {'etc/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'
+                                              'DefaultTimeoutAbortSec=infinity\n'}
+        unit = 'run/systemd/transient/fork-fleet-ci-4.service'
+        fails = {
+            'its own in [Unit]': {**endless, unit: TRANSIENT + '[Unit]\nTimeoutStopSec=90\nTimeoutAbortSec=90\n'
+                                                               '[Service]\nRuntimeMaxSec=1h\n'},
+            'its own reset by an empty one': {**endless, unit: TRANSIENT + '[Service]\nTimeoutStopSec=90\n'
+                                                                           'TimeoutAbortSec=90\nTimeoutStopSec=\n'},
+            'its own empty': {**endless, unit: TRANSIENT + '[Service]\nTimeoutStopSec=\nTimeoutAbortSec=90\n'},
+            'its own endless': {unit: TRANSIENT + '[Service]\nTimeoutStopSec=infinity\nTimeoutAbortSec=90\n'},
+            'its own abort a day': {unit: TRANSIENT + '[Service]\nTimeoutStopSec=90\nTimeoutAbortSec=1d\n'},
+        }
+        for name, change in fails.items():
+            with self.subTest(name):
+                got = self.job_units(change)
+                self.assertTrue(got.startswith('FAIL'), got)
+        got = self.job_units({**endless, unit: TRANSIENT + '[Service]\nTimeoutStopSec=\nTimeoutStopSec=90\n'
+                                                           'TimeoutAbortSec=90\n'})
+        self.assertTrue(got.startswith('PASS'), got)   # set again after the reset: its own
+
+    def test_linux_job_units_skips_a_job_unit_that_ends_while_read(self):
+        """Issue #297 item 1: a job unit's transient file goes when the unit ends (--collect). One that goes between
+        the walls finding it and reading it leaves no default to judge: skipped (as reset_left does), not `cannot
+        tell` (which refused the next start)."""
+        m = fw_linux()
+        root = self.root(overlay(LINUX, {**OLD_JOB, 'etc/systemd/system.conf': SLOW_DEFAULTS}))
+        m.ROOT = root
+        read = m.file_lines
+
+        def ends_first(path, section=None):   # the unit is collected right after the walls saw its file
+            if path.startswith('/run/systemd/transient/fork-fleet-ci-0.service'):
+                os.remove(root + path)
+            return read(path, section)
+        with mock.patch.object(m, 'file_lines', ends_first):
+            self.assertEqual(m.stop_defaults_used(), (set(), []))
+        self.assertFalse(os.path.exists(os.path.join(root, 'run/systemd/transient/fork-fleet-ci-0.service')))
+
+    def test_linux_job_units_checks_the_launchers_own_stop_timeouts(self):
+        """Issue #297 item 3: the walls count systemd's defaults out only for units the installed launcher's start()
+        gives stop timeouts of its own. Beside an older launcher (a kit not installed whole, whose start() set none),
+        with no job unit loaded yet, an endless default FAILS (the next job unit would have it); a finite one, or the
+        launcher's own, PASSES. A start() that sets an endless one FAILS, and one whose value cannot be read (an
+        expansion) cannot be told."""
+        real = slurp(LAUNCHER)
+        both = ' -p TimeoutStopSec=90 -p TimeoutAbortSec=90 '
+        self.assertEqual(real.count(both), 1)
+        endless = {'etc/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'}
+        endless_abort = {'etc/systemd/system.conf': '[Manager]\nDefaultTimeoutAbortSec=infinity\n'}
+        cases = [
+            ('an older launcher, an endless default', real.replace(both, ' '), endless, 'FAIL'),
+            ('an older launcher, an endless abort default', real.replace(both, ' '), endless_abort, 'FAIL'),
+            ('a launcher without its abort one', real.replace(both, ' -p TimeoutStopSec=90 '), endless_abort, 'FAIL'),
+            ('a launcher whose abort one is reset', real.replace(both, both + '-p TimeoutAbortSec= '), endless_abort,
+             'FAIL'),
+            ('a launcher that sets them only in a comment', real.replace(both, ' ').replace(
+                '\n  # Type=exec:', '\n  # -p TimeoutStopSec=90 -p TimeoutAbortSec=90\n  # Type=exec:'), endless,
+             'FAIL'),
+            ('a launcher that sets them only in check-net', real.replace(both, ' ').replace(
+                '\ncheck_net() {\n', '\ncheck_net() {\n  : -p TimeoutStopSec=90 -p TimeoutAbortSec=90\n'), endless,
+             'FAIL'),
+            ('a launcher that sets an endless one', real.replace(both, ' -p TimeoutStopSec=infinity '
+                                                                 '-p TimeoutAbortSec=90 '), {}, 'FAIL'),
+            ('a launcher that sets one through an expansion', real.replace(both, ' -p "TimeoutStopSec=$X" '
+                                                                           '-p TimeoutAbortSec=90 '), {}, 'FAIL'),
+            ('an older launcher, a finite default', real.replace(both, ' '), {}, 'PASS'),
+            ('the launcher, an endless default', real, endless, 'PASS'),
+            ('the launcher, quoted', real.replace(both, ' -p "TimeoutStopSec=90" -p \'TimeoutAbortSec=90\' '), endless,
+             'PASS'),
+        ]
+        launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
+        for name, text, change, want in cases:
+            with self.subTest(name):
+                write(launcher, text)
+                got = self.job_units(change)
+                self.assertTrue(got.startswith(want), got)
+                if 'expansion' in name:
+                    self.assertIn('cannot tell', got)
+                elif want == 'FAIL':
+                    self.assertIn("start()", got)
+        os.chmod(launcher, 0o775)   # not as safe as ask() wants it: cannot tell, before anything is read from it
+        write(launcher, real)
+        got = self.job_units({})
+        self.assertTrue(got.startswith('FAIL'), got)
+
     def job_units(self, change, links=()):
         """The linux job-units line on the passing fixture with change and links ((path, target)), through describe."""
         root = self.root(overlay(LINUX, change))
