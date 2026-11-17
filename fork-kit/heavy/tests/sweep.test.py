@@ -454,6 +454,23 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(own(['perl', '-CE', '-e', 'x']), ['perl', '-e', 'x'])
         # shown, a script word after a bundle that ends in e is cut like code (-pie, -Fxe); an option word is not one
         self.assertEqual(own(['perl', '-Mre', '-e', 'x'], shown=True), ['perl', '-e', '[1 chars]'])
+        # #352: env's =word, a # comment in -S, a shell's -c --, php's -d, long options that take a value
+        self.assertEqual(own(['timeout', '5', 'env', '=x', 'pytest', '-x']), ['timeout', 'env', 'pytest'])
+        self.assertEqual(own(['env', '=x', '-u', 'B', 'nohup', 'pytest']), ['env', 'nohup', 'pytest'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', '-- =x pytest']), ['timeout', 'env', 'pytest'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', 'CI=1 #note', 'pytest', '-x']),
+                         ['timeout', 'env', 'pytest'])
+        self.assertEqual(own(['timeout', '5', 'env', '-S', 'pytest "#x" #y z']), ['timeout', 'env', 'pytest'])
+        self.assertEqual(own(['bash', '-c', '--', 'pytest -q', 'x']), ['bash', '-c', 'pytest -q'])
+        self.assertEqual(own(['bash', '-lc', '--', 'pytest -q', 'x']), ['bash', '-lc', 'pytest -q'])
+        self.assertEqual(own(['bash', '-c', '--'], shown=True), ['bash', '-c'])    # no code word: nothing to cut
+        self.assertEqual(own(['php', '-d', 'x=1', 'a.test.php']), ['php', 'a.test.php'])
+        self.assertEqual(own(['php', '-c', 'php.ini', '-z', 'ext.so', 'a.test.php']), ['php', 'a.test.php'])
+        self.assertEqual(own(['perl', '-d', 't/a.t']), ['perl', 't/a.t'])     # perl's -d (the debugger) takes none
+        self.assertEqual(own(['python3', '--check-hash-based-pycs', 'never', 'a.test.py']), ['python3', 'a.test.py'])
+        self.assertEqual(own(['node', '--env-file', '.env', '--test-reporter', 'dot', '--test', 'x.test.cjs']),
+                         ['node', 'x.test.cjs'])
+        self.assertEqual(own(['node', '--test', 'x.test.cjs']), ['node', 'x.test.cjs'])   # --test takes no value
 
     def test_a_tree_stops_only_its_own_unit_and_never_a_session_or_a_live_heavy_below_it(self):
         h, svc = self.host, f'{CG}/app.slice/t3code.service'
@@ -578,6 +595,26 @@ class SweepTests(unittest.TestCase):
             (['timeout', '60', 'env', '-S', '-- DB_PASS=hunter40 ./server'], 'timeout env ./server', 3),
             (['timeout', '60', 'env', '--', 'X=hunter41', './server'], 'timeout env ./server', 4),
             (['timeout', '60', 'env', '--', 'A=hunter42', 'B=hunter43', './server'], 'timeout env ./server', 5),
+            # #352: a word that starts with = is an assignment too (an empty name: GNU env runs the command)
+            (['timeout', '60', 'env', '--', '=hunter44', './server'], 'timeout env ./server', 4),
+            (['timeout', '60', 'env', '-S', '-- =hunter45 ./server'], 'timeout env ./server', 3),
+            (['timeout', '60', 'env', '=hunter46', './server'], 'timeout env ./server', 3),
+            # the cut rule covers -E and -r too, not only -e
+            (['perl', '-FxE', 'say "hunter47"'], 'perl -FxE [14 chars]'),
+            (['ruby', '-Fxr', 'hunter48'], 'ruby -Fxr [8 chars]'),
+            # a # word in env -S starts a comment to the end of the string; the command can follow the string
+            (['timeout', '60', 'env', '-S', 'A=x #hunter49', './server'], 'timeout env ./server', 4),
+            # php's -d, -c and -z take a separate value; -B and -R take code like -r and -E
+            (['php', '-d', 'mysqli.default_pw=hunter50', '-r', 'f();'], 'php -r [4 chars]', 3),
+            (['php', '-c', 'hunter51.ini', '-B', '$p="hunter52";', '-R', 'x();'], 'php -B [14 chars]', 5),
+            (['php', '-R', 'f("hunter53");'], 'php -R [14 chars]'),
+            # a shell's -c reads its code after a --
+            (['bash', '-c', '--', 'mysql -phunter54'], 'bash -c [mysql ... 16 chars]', 2),
+            (['sh', '-ec', '--', 'mysql -phunter55'], 'sh -ec [mysql ... 16 chars]', 2),
+            # long options that take a separate value
+            (['python3', '--check-hash-based-pycs', 'never', '-c', 'p="hunter56"'], 'python3 -c [12 chars]', 3),
+            (['node', '--env-file', 'hunter57.env', '-e', 'f()'], 'node -e [3 chars]', 3),
+            (['node', '--title', 'hunter58', 'server.js'], 'node server.js', 3),
         ]
         for n, (argv, *_) in enumerate(rows):
             self.orphan(5201 + n, argv + ['arg0'], cpu=90)
@@ -602,13 +639,41 @@ class SweepTests(unittest.TestCase):
         self.orphan(5302, ['stdbuf', '-oL', 'bash', '-lc', 'pytest -q'], cpu=90)   # a parser row: stdbuf execs
         self.orphan(5303, ['timeout', '600', 'env', '-S', 'CI=1 pytest -x'], cpu=90)  # env's assignment is skipped
         self.orphan(5304, ['timeout', '600', 'env', '-S', '-- CI=1 pytest'], cpu=90)  # after its -- too
+        self.orphan(5305, ['timeout', '600', 'bash', '-c', '--', 'pytest -q'], cpu=90)  # #352: -c's code after --
+        self.orphan(5306, ['timeout', '600', 'env', '-S', 'CI=1 #note', 'pytest'], cpu=90)  # a comment in -S
         code, out, _ = self.run_sweep()
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.signalled(), [5301, 5302, 5303, 5304], out)
+        self.assertEqual(self.signalled(), [5301, 5302, 5303, 5304, 5305, 5306], out)
         self.assertIn('timeout env pytest (+2 args)', out)
         self.assertIn('stopped: pid 5301 timeout', out)
         self.assertIn('timeout sh -c [19 chars]', out)
         self.assertNotIn('hunter2', out)
+
+    def test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run(self):
+        # #352: wrappers or env -S nested past a cap are not read (no RecursionError, no slow split of a crafted
+        # word): that process is reported with the reason, the rest of the sweep goes on, and the next run says the same
+        self.cfg.update(testPatterns=['(^|[ /])pytest( |$)', '(^|[ /])env( |$)'])
+        self.write_machine()
+        self.orphan(6001, ['env'] * 2000 + ['pytest'], cpu=90)
+        self.orphan(6002, ['timeout', '60', 'env', '-S' * 1200 + ' pytest'], cpu=90)    # env -S-S-S...
+        self.orphan(6003, ['timeout', '60', 'env', '-S', 'nice nohup env -S "A=1 pytest"'], cpu=90)   # 6 deep
+        self.orphan(6004, ['timeout', '60'] + ['nice'] * 8 + ['pytest'], cpu=90)                    # 9 deep
+        for run in (1, 2):
+            code, out, _ = self.run_sweep()
+            self.assertEqual(code, 0, out)
+            self.assertEqual(self.signalled(), [6003], out)
+            for pid, shown in ((6001, 'env (+2000 args)'), (6002, 'timeout (+3 args)'), (6004, 'timeout (+10 args)')):
+                line = next(t for t in out.splitlines() if t.startswith(f'  report only: pid {pid} '))
+                self.assertIn(f'): {shown}; ', line)
+                self.assertIn('; not read: wrappers or env -S nested more than 8 deep; not test-shaped', line)
+
+    def test_a_crafted_env_split_word_is_read_only_to_the_cap(self):
+        # #352: each env -S level splits the rest of the word again; one 128 KB word (the most one word can be) took
+        # minutes before the cap, then raised RecursionError
+        start = time.monotonic()
+        with self.assertRaises(self.mod.Unreadable):
+            self.mod.own_command(['timeout', '60', 'env', '-S' * 65000 + ' pytest'])
+        self.assertLess(time.monotonic() - start, 10)
 
     def test_redact(self):
         r = self.mod.redact
@@ -1216,8 +1281,8 @@ MUTATIONS = {
     'only the own command shown': ("own = own_command(argv, shown=True) if not is_session(self) else argv[:1]",
                                    'own = argv',
                                    'test_secrets_and_other_arguments_never_reach_the_log_the_report_or_the_journal'),
-    'inline code cut when shown': ('return argv[:1] + [a, code_text(argv[i + 1], kind)]',
-                                   'return argv[:1] + argv[i:i + 2]',
+    'inline code cut when shown': ('return argv[:1] + [a, code_text(argv[i], kind)]',
+                                   'return argv[:1] + [a] + argv[i:i + 1]',
                                    'test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal'),
     'only a program-like first word': ("not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./+-]*', words[0]):", 'False:',
                                        'test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal'),
@@ -1238,10 +1303,10 @@ MUTATIONS = {
     'last letter of a bundle is the inline option': ('if last in INLINE[kind]:', 'if False:', 'test_own_command'),
     'attached-value words are one option': ('if attached is not None and attached < len(a) - 1:', 'if False:',
                                             'test_own_command'),
-    'perl/ruby/php code is code': ("'other': {'-e', '-E', '-r'}}\n# Short", "'other': set()}\n# Short",
+    'perl/ruby/php code is code': ("'other': {'-e', '-E', '-r', '-B', '-R'}}   # php", "'other': set()}   # php",
                                    'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
-    'matching reads the whole text through a wrapper': ('rest = own_command(argv[i:], shown)',
-                                                        'rest = own_command(argv[i:], True)',
+    'matching reads the whole text through a wrapper': ('rest = own_command(argv[i:], shown, depth + 1)',
+                                                        'rest = own_command(argv[i:], True, depth + 1)',
                                                         'test_inline_code_through_a_wrapper_is_still_matched'),
     # #312
     '-O in a shell bundle takes a word too': (" + a.count('O')", '', 'test_own_command'),
@@ -1253,7 +1318,7 @@ MUTATIONS = {
                                             'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     'a first word only for a shell': ("kind != 'shell' or", '',
                                       'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
-    "fish's -C takes its code": ("| (FISH_VALUES if name == 'fish' else set())", '',
+    "fish's -C takes its code": ("| NAMED_VALUES.get(name, set())", '',
                                  'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     "--command is fish's -c": ("'shell': {'-c', '--command'}, 'other'", "'shell': {'-c'}, 'other'",
                                'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
@@ -1263,11 +1328,12 @@ MUTATIONS = {
                                                 'j += j < len(argv)',
                                                 'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     # #328 lens
-    'env reads its split string itself': ('return own_command(argv[:1] + split, shown)',
-                                          'return argv[:1] + own_command(split, shown)',
+    'env reads its split string itself': ('return own_command(argv[:1] + split, shown, depth + 1)',
+                                          'return argv[:1] + own_command(split, shown, depth + 1)',
                                           'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
-    'env -S assignments are not the program when matching': ('return own_command(argv[:1] + split, shown)',
-                                                             'return argv[:1] + own_command(split, shown)',
+    'env -S assignments are not the program when matching': (
+        'return own_command(argv[:1] + split, shown, depth + 1)',
+        'return argv[:1] + own_command(split, shown, depth + 1)',
                                                              'test_inline_code_through_a_wrapper_is_still_matched'),
     'a script word after a bundle ending in e is cut': (
         "if opt is None and shown and '-' + a[-1] in CODE[kind] and j < len(argv) and not argv[j].startswith('-'):",
@@ -1279,15 +1345,59 @@ MUTATIONS = {
     "perl's -C takes the rest of its word": ("'other': 'MmIixdDrFC'}", "'other': 'MmIixdDrF'}", 'test_own_command'),
     # #328 lens round 2
     "after env's --, NAME=value is still env's": (
-        "while name == 'env' and i < len(argv) and '=' in argv[i] and not argv[i].startswith('='):\n            i += 1",
+        "while name == 'env' and i < len(argv) and '=' in argv[i]:\n            i += 1",
         'pass', 'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     "every assignment after env's -- is skipped": (
         "while name == 'env' and i < len(argv) and '=' in argv[i]",
         "if name == 'env' and i < len(argv) and '=' in argv[i]",
         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     "after env -S's --, NAME=value is not the program when matching": (
-        "while name == 'env' and i < len(argv) and '=' in argv[i] and not argv[i].startswith('='):\n            i += 1",
+        "while name == 'env' and i < len(argv) and '=' in argv[i]:\n            i += 1",
         'pass', 'test_inline_code_through_a_wrapper_is_still_matched'),
+    # #352
+    "a word that starts with = is env's assignment too": (
+        "elif a.startswith('-') or (name == 'env' and '=' in a):",
+        "elif a.startswith('-') or (name == 'env' and '=' in a and not a.startswith('=')):", 'test_own_command'),
+    "after env's --, a word that starts with = too": (
+        "while name == 'env' and i < len(argv) and '=' in argv[i]:",
+        "while name == 'env' and i < len(argv) and '=' in argv[i] and not argv[i].startswith('='):",
+        'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'nesting is capped': ('if depth >= MAX_NESTING:', 'if False:',
+                          'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
+    'an env -S string counts as a level': (
+        'return own_command(argv[:1] + split, shown, depth + 1)', 'return own_command(argv[:1] + split, shown, depth)',
+        'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
+    'a wrapper counts as a level': ('rest = own_command(argv[i:], shown, depth + 1)',
+                                    'rest = own_command(argv[i:], shown, depth)',
+                                    'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
+    'a command line not read says why': ("test, why = None, f'{why}; not read: {e}'", 'test = None',
+                                         'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
+    'a command line not read is shown as its program': ('except Unreadable:\n            own = argv[:1]',
+                                                        'except KeyError:\n            own = argv[:1]',
+                                                        'test_a_command_line_nested_too_deep_is_not_read_only_reported_the_same_each_run'),
+    'the cut rule covers -E and -r': ("and '-' + a[-1] in CODE[kind] and", "and a[-1] == 'e' and",
+                                      'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'a # word in env -S is a comment': ('shlex.split(text, comments=True)', 'shlex.split(text)',
+                                        'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'a # word in env -S is a comment when matching': ('shlex.split(text, comments=True)', 'shlex.split(text)',
+                                                      'test_inline_code_through_a_wrapper_is_still_matched'),
+    "php's -d, -c and -z take a word": ("'php': {'-d', '-c', '-z'}", "'php': set()",
+                                        'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    "php's -B and -R are code options": ("'other': {'-e', '-E', '-r', '-B', '-R'}}\n# of those",
+                                         "'other': {'-e', '-E', '-r'}}\n# of those",
+                                         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    "a shell's -c reads its code after --": ("i += 1 + (kind == 'shell' and argv[i + 1:i + 2] == ['--'])", 'i += 1',
+                                             'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    "a shell's -c reads its code after -- when matching": (
+        "i += 1 + (kind == 'shell' and argv[i + 1:i + 2] == ['--'])", 'i += 1',
+        'test_inline_code_through_a_wrapper_is_still_matched'),
+    "a shell bundle's c reads its code after --": (
+        "j += opt is not None and kind == 'shell' and argv[j:j + 1] == ['--']", 'pass',
+        'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    "python's --check-hash-based-pycs takes a word": ("'-Q', '--check-hash-based-pycs'}", "'-Q'}",
+                                                      'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    "node's long options take a word": ("'--env-file', '--env-file-if-exists', '--title',", "'--env-file-if-exists',",
+                                        'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
 }
 
 

@@ -42,21 +42,27 @@ SESSION_PROGRAMS = frozenset({'tmux', 'screen', 'SCREEN', 'sshd', 'systemd', 'lo
 SHELLS = frozenset({'sh', 'bash', 'dash', 'zsh', 'ksh', 'mksh', 'ash', 'fish', 'tcsh', 'csh'})
 # Programs whose script (the first argument that is not an option) is what they run; options that take a value
 OPTION_VALUES = {
-    'python': {'-W', '-X', '-Q'},
-    'node': {'-r', '--require', '--import', '--loader', '--experimental-loader', '--input-type', '-C', '--conditions'},
+    'python': {'-W', '-X', '-Q', '--check-hash-based-pycs'},
+    'node': {'-r', '--require', '--import', '--loader', '--experimental-loader', '--input-type', '-C', '--conditions',
+             '--env-file', '--env-file-if-exists', '--title', '--inspect-port', '--debug-port', '--redirect-warnings',
+             '--watch-path', '--disable-warning', '--unhandled-rejections', '--test-name-pattern',
+             '--test-skip-pattern', '--test-reporter', '--test-reporter-destination', '--test-concurrency',
+             '--test-shard', '--test-timeout', '--report-dir', '--report-filename', '--diagnostic-dir',
+             '--localstorage-file', '--openssl-config', '--stack-trace-limit'},
     'java': {'-cp', '-classpath', '--class-path', '-p', '--module-path', '--add-modules', '--add-opens',
              '--add-exports', '--add-reads', '--patch-module', '--limit-modules', '--upgrade-module-path'},
     'shell': {'-o', '+o', '-O', '+O'},
     'other': {'-I', '-x'},
 }
-# fish only: -C/--init-command run code before the script or the prompt (in bash and zsh, -C is a plain flag)
-FISH_VALUES = {'-C', '--init-command'}
+# One program's own: fish's -C/--init-command run code before the script or the prompt (in bash and zsh, -C is a
+# plain flag); php's -d (an ini setting), -c (php.ini) and -z (an extension) take a word (perl's -d and ruby's do not)
+NAMED_VALUES = {'fish': {'-C', '--init-command'}, 'php': {'-d', '-c', '-z'}}
 # options whose next word is the program itself (inline code, a module, a jar); --command is fish's -c
 INLINE = {'python': {'-c', '-m'}, 'node': {'-e', '-p', '--eval', '--print'}, 'java': {'-jar', '-m', '--module'},
-          'shell': {'-c', '--command'}, 'other': {'-e', '-E', '-r'}}
+          'shell': {'-c', '--command'}, 'other': {'-e', '-E', '-r', '-B', '-R'}}
 # of those, the ones whose next word is code text, which can hold a short password (`sh -c 'mysql -phunter2'`)
 CODE = {'python': {'-c'}, 'node': {'-e', '-p', '--eval', '--print'}, 'shell': {'-c', '--command'},
-        'other': {'-e', '-E', '-r'}}
+        'other': {'-e', '-E', '-r', '-B', '-R'}}   # php -B/-R: code run before and for each input line
 # Short options bundled in one word (`bash -lc`, `bash -euo pipefail`, `python3 -uc`, `node -pe`, `perl -lne`). For a
 # shell, c anywhere in it is -c, and each o/O in it takes a word first. For the others, the last letter acts as if it
 # stood alone. A letter whose value is attached ends the word: the rest is its value (`-Wignore`, `-Mre`, `-rjson`,
@@ -72,6 +78,9 @@ WRAPPERS = {'timeout': ({'-s', '--signal', '-k', '--kill-after'}, 1), 'env': ({'
             'time': ({'-f', '--format', '-o', '--output'}, 0),
             'xvfb-run': ({'-s', '--server-args', '-n', '--server-num', '-e', '--error-file', '-f', '--auth-file',
                           '-p', '--xauth-protocol', '-w', '--wait'}, 0)}
+# Wrappers and env -S strings nested deeper than this are not read (a crafted `env -S-S-S...` word): that process is
+# only reported
+MAX_NESTING = 8
 # Left alone and not reported (whole command line). The code never stops a session leader or multiplexer anyway.
 DEFAULT_IGNORE = ('^(tmux|screen|SCREEN)( |:|$)', '^-')
 SECRET_WORD = re.compile(r'(token|secret|passw|pwd|apikey|api[_-]key|auth|credential|cookie|bearer|private[_-]?key)',
@@ -147,7 +156,10 @@ class Proc:
         """For the log, the report and the journal: the program and its script only (never the other arguments),
         with anything that looks like a secret masked."""
         argv = self.argv or []
-        own = own_command(argv, shown=True) if not is_session(self) else argv[:1]
+        try:
+            own = own_command(argv, shown=True) if not is_session(self) else argv[:1]
+        except Unreadable:
+            own = argv[:1]
         cmd = redact(' '.join(own)) if own else f'[{self.comm}]'
         if len(argv) > len(own):
             cmd += f' (+{len(argv) - len(own)} args)'
@@ -182,16 +194,23 @@ def interpreter_kind(name):
     return INTERPRETERS.get(name)
 
 
-def own_command(argv, shown=False):
+class Unreadable(ValueError):
+    pass
+
+
+def own_command(argv, shown=False, depth=0):
     """The part of a command line that is the process's own program: the executable and, for an interpreter (python,
     node, java, a shell, ...), its script, module, jar or -c text; for a wrapper that runs one command for as long
     as it lives (timeout, env, nohup, xvfb-run, ...), the wrapper plus that command's own part. Other arguments
     (which can name anything: a prompt, a file to edit, a program to start in a session) are left out.
-    shown=True is the form for the log, the report and the journal: code text is cut by code_text()."""
+    shown=True is the form for the log, the report and the journal: code text is cut by code_text(). Unreadable
+    when wrappers or env -S strings nest more than MAX_NESTING deep."""
     if not argv:
         return []
     name = program(argv[0])
     if name in WRAPPERS:
+        if depth >= MAX_NESTING:
+            raise Unreadable(f'wrappers or env -S nested more than {MAX_NESTING} deep')
         takes, positional = WRAPPERS[name]
         i = 1
         while i < len(argv):
@@ -201,39 +220,41 @@ def own_command(argv, shown=False):
                 break
             split = env_split(argv, i) if name == 'env' else None
             if split is not None:                   # env reads the string itself: its NAME=value, -i, -u X, --
-                return own_command(argv[:1] + split, shown)
+                return own_command(argv[:1] + split, shown, depth + 1)
             if a in takes:
                 i += 2
-            elif a.startswith('-') or (name == 'env' and '=' in a and not a.startswith('=')):
+            elif a.startswith('-') or (name == 'env' and '=' in a):
                 i += 1
             elif positional:
                 positional -= 1
                 i += 1
             else:
                 break
-        while name == 'env' and i < len(argv) and '=' in argv[i] and not argv[i].startswith('='):
-            i += 1                                  # env -- NAME=value cmd: still env's assignment (GNU env)
-        rest = own_command(argv[i:], shown)
+        while name == 'env' and i < len(argv) and '=' in argv[i]:
+            i += 1              # env -- NAME=value cmd: still env's assignment (GNU env; =value too, an empty name)
+        rest = own_command(argv[i:], shown, depth + 1)
         return argv[:1] + rest
     kind = interpreter_kind(name)
     if kind is None:
         return argv[:1]
-    takes = OPTION_VALUES.get(kind, set()) | (FISH_VALUES if name == 'fish' else set())
+    takes = OPTION_VALUES.get(kind, set()) | NAMED_VALUES.get(name, set())
     i = 1
     while i < len(argv):
         a = argv[i]
         if a == '--':
             return argv[:1] + argv[i + 1:i + 2]
         if a in INLINE.get(kind, ()):
-            if shown and a in CODE.get(kind, ()) and i + 1 < len(argv):
-                return argv[:1] + [a, code_text(argv[i + 1], kind)]
-            return argv[:1] + argv[i:i + 2]
+            i += 1 + (kind == 'shell' and argv[i + 1:i + 2] == ['--'])     # sh -c -- CODE
+            if shown and a in CODE.get(kind, ()) and i < len(argv):
+                return argv[:1] + [a, code_text(argv[i], kind)]
+            return argv[:1] + [a] + argv[i:i + 1]
         bundled = bundled_option(kind, a)
         if bundled:
             opt, values = bundled
             j = i + 1
             for _ in range(values):        # an option's value never starts with '-' (zsh -oerrexit -c: -c is next)
                 j += j < len(argv) and not argv[j].startswith('-')
+            j += opt is not None and kind == 'shell' and argv[j:j + 1] == ['--']      # sh -ec -- CODE
             # perl -pie CODE, -Fxe CODE: an attached value ends in e, and perl reads CODE as a script (and stops at
             # once); shown, a script word there is cut like code
             if opt is None and shown and '-' + a[-1] in CODE[kind] and j < len(argv) and not argv[j].startswith('-'):
@@ -284,7 +305,8 @@ def code_text(code, kind):
 def env_split(argv, i):
     """For env at argv[i]: the command `-S STRING`, `-SSTRING` (also after env's flags: `-iS`) or
     `--split-string=STRING` names, with the words after it, or None for another word. STRING is split like a shell
-    would (quotes; an unclosed quote splits at spaces)."""
+    would (quotes; an unclosed quote splits at spaces); a # word starts a comment to the end of STRING, as in GNU env
+    (shlex also ends a word at a # inside it, which GNU env keeps: that only shows less)."""
     a = argv[i]
     short = re.match(r'-[i0v]*S', a)
     if a == '--split-string' or (short and short.end() == len(a)):
@@ -296,7 +318,7 @@ def env_split(argv, i):
     else:
         return None
     try:
-        words = shlex.split(text)
+        words = shlex.split(text, comments=True)
     except ValueError:
         words = text.split()
     return words + rest
@@ -732,8 +754,11 @@ class Sweep:
             if not (busy or long_lived):
                 continue
             why = ' and '.join(w for w, on in (('busy', busy), ('long-lived', long_lived)) if on)
-            own = ' '.join(own_command(p.argv or []))
-            test = next((r for r in cfg['testPatterns'] if re.search(r, own)), None)
+            try:
+                own = ' '.join(own_command(p.argv or []))
+                test = next((r for r in cfg['testPatterns'] if re.search(r, own)), None)
+            except Unreadable as e:
+                test, why = None, f'{why}; not read: {e}'
             ps, left = tree(p)
             if left:
                 why += f'; {len(left)} it started left alone (another unit, a session or a live heavy)'
