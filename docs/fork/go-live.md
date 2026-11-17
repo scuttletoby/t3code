@@ -5,8 +5,8 @@ if it must, and then switches the fork's features on one at a time. Every value 
 What each command does, and every refusal, is in the kit's own page,
 [fork-kit/golive/README.md](../../fork-kit/golive/README.md).
 
-Not in the kit yet: `rehearse` and `switch` (go-live PRs 5 and 6). Until they are merged, the steps that
-name them cannot be run; everything else here can.
+Not in the kit yet: `switch` (go-live PR 6). Until it is merged, the step that names it cannot be run;
+everything else here can.
 
 ## The machine file
 
@@ -48,7 +48,8 @@ of T3: the copy, the switch and every way back. Each must be safe to run twice.
    quiet point T3 stops, its data is copied to a new folder in `backupDir`, read back, and T3 starts again.
    This copy is practice. The way back W1 uses the newest finished copy, which after the switch is the
    switch's own, so do not note this copy's time: `t3-golive back` prints the time W1 needs.
-3. **Rehearse** (not in the kit yet). The target build runs on a copy of the data, never the live home.
+3. **Rehearse.** `t3-golive rehearse`. The target build runs on a clone of the newest copy, in its own home and
+   port, never the live home.
 4. **Switch** (not in the kit yet). The live home moves to the target build; if the new build does not
    come up, the switch takes the way back W1 on its own. Before its update, the switch keeps the old
    build's runtime in `<stateDir>/kept-runtimes/<old version>/`: every upstream `t3 update` removes old
@@ -61,7 +62,7 @@ of T3: the copy, the switch and every way back. Each must be safe to run twice.
    the app and see it again.
 7. **Two days.** Run `t3-golive status` once a day for two days. Anything but `T3 is up:`: read its lines,
    then decide on the way back below. The other first lines are `T3 is up but not right`, `T3 is restarting
-   or starting`, `T3 is DOWN` and `T3 state unknown`.
+   or starting`, `T3 is DOWN` and `T3 state unknown`. Take no `t3-golive copy` in these days (see below).
 
 ## The way back
 
@@ -70,14 +71,21 @@ Take one with `t3-golive back --way <w1|w2|w3>`; it runs detached and prints how
 `t3-golive status` and the by-hand test again. Running the same way again after a good one does nothing;
 running it again after one that stopped half-way finishes it.
 
-- **Background jobs.** `back` runs `preHooks` before it stops T3 and `postHooks` after T3 runs again (also
-  after a failure). With no hooks in the machine file, pause the background jobs that use T3 by hand before
-  `back`, and resume them after `status` says `T3 is up:`. A killed `back` runs no post hook: the jobs stay
-  paused until `back` runs again.
+- **Background jobs.** `back` runs `preHooks` before it stops T3 and `postHooks` once T3 runs again and is
+  verified. After a failure, W2 and W3 run `postHooks` too (they never stop T3). A W1 that failed after it
+  stopped T3 runs none: the jobs stay paused while T3 is down, until a `back` ends ok (the error and `status`
+  say so). A killed `back` runs no post hook either. With no hooks in the machine file, pause the background
+  jobs that use T3 by hand before `back`, and resume them after `status` says `T3 is up:`.
 - **A killed or failed W1 leaves T3 down.** After its stop, W1 keeps T3 stopped and not started at boot (on
-  purpose: the home may be half-restored) until a W1 ends ok. `status` then says `T3 is DOWN` and names the
-  run. Run the same `t3-golive back --way w1 --lose-work-since <time>` again: it finishes where the stopped
-  one got to. Do not start T3 by hand.
+  purpose: the home may be half-restored) until a W1 ends ok. `status` then says `T3 is DOWN`, names the run
+  and says what it left. Run the same `t3-golive back --way w1 --lose-work-since <time>` again. If the stopped
+  W1 had not finished its update, the rerun restores the copy and downgrades again. If it got past its update,
+  the rerun does not stop T3 or restore again: it checks that the old build runs, then runs the post hooks.
+  A W1 whose only failure was a post hook leaves T3 up and enabled; the rerun runs only the post hooks. Do not
+  start T3 by hand.
+- **No copy while W1 may still be needed.** W1 always restores the newest finished copy. A `t3-golive copy`
+  taken after the switch is the newest one, taken under the fork build, so it hides the switch's own copy and
+  `back` then refuses W1. Take no copy until you are sure you will not need W1.
 
 | Way | What it does                                                                  | Loses                                  | Pick it when                                                                                                                                                              |
 | --- | ----------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -88,8 +96,11 @@ running it again after one that stopped half-way finishes it.
 W1 puts the copy's `settings.json` back; W2 and W3 keep the settings file as it is. W2 and W3 run
 upstream's `update`, which removes the fork build's and other old runtimes from the home, but not the kit's
 kept runtime: W1 stays possible after W2 or W3 (it restores the copy over the data W2 or W3 ran on, which is
-kept aside). Without the kept runtime (deleted, or damaged), W1 is gone after the switch, W2 or W3, and
-`back` says so. The kit deletes no copy, no file it moved aside and no kept runtime; `status` lists them
+kept aside). One exception: when the build before the switch was the very nightly the fork is cut from, W2
+goes back to that same build, and `back` then refuses W1 ("not older than the t3 now"). Upstream's `update` to
+the build that already runs may do nothing, so it would not start the T3 that W1 stopped. So if the data
+itself is wrong, take W1 first, not W2. Without the kept runtime (deleted, or damaged), W1 is gone after
+the switch, W2 or W3, and `back` says so (and `status` fails `way back W1` while a damaged one is there). The kit deletes no copy, no file it moved aside and no kept runtime; `status` lists them
 with their sizes, to remove by hand once sure.
 
 ## Then: one feature at a time
