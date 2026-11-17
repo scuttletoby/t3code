@@ -972,24 +972,34 @@ class PathRules(unittest.TestCase):
         self.assertEqual(code, H.REFUSED, out)   # a change to it is read under the caps
         self.assertIn('bytes the check reads', out)
 
-    def entry(self, commit, mode, oid, parent):
-        """`commit`'s tree with the config's entry made (mode, oid), committed on `parent`: a symlink (120000) or a
-        submodule (160000), which World.commit (it writes files) cannot make."""
+    def entry(self, commit, mode, oid, parent, path=CONFIG_PATH):
+        """`commit`'s tree with the entry `path` (the config's) made (mode, oid), committed on `parent`: a symlink
+        (120000) or a submodule (160000), which World.commit (it writes files) cannot make."""
         env = {**os.environ, **GIT_ENV, 'GIT_INDEX_FILE': os.path.join(self.w.dir, 'entry.index')}
 
         def git(*a):
             return subprocess.run(['git', *a], cwd=self.w.work, env=env, text=True, capture_output=True,
                                   check=True).stdout.strip()
         git('read-tree', commit)
-        git('update-index', '--add', '--cacheinfo', f'{mode},{oid},{CONFIG_PATH}')
+        git('update-index', '--add', '--cacheinfo', f'{mode},{oid},{path}')
         sha = git('commit-tree', git('write-tree'), '-p', parent, '-m', 'entry')
         self.w.n += 1
         git('push', '-q', 'origin', f'{sha}:refs/keep/{self.w.n}')
         return sha
 
     def blob(self, text):
-        return subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=self.w.work, input=text, text=True,
-                              capture_output=True, check=True).stdout.strip()
+        data = text.encode() if isinstance(text, str) else text
+        return subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=self.w.work, input=data,
+                              capture_output=True, check=True).stdout.decode().strip()
+
+    def test_a_base_config_that_is_not_utf8_is_a_refusal_never_a_crash(self):   # #435 item 3: as the queue says
+        m = self.base(mode=None)
+        oid = self.blob(json.dumps(CFG_RAW).encode('utf-16'))
+        base = self.entry(m, '100644', oid, m)
+        head = self.entry(self.head(base, mode=None, **{'docs/a.md': 'a\n'}), '100644', oid, base)
+        code, out = self.check(base, head, EVERY_LENS)
+        self.assertEqual(code, H.REFUSED, out)
+        self.assertIn(f'{CONFIG_PATH} at the base {base[:12]}: not UTF-8 text', out)
 
     def test_a_config_that_is_no_regular_file_is_refused(self):   # #413 item 1: the queue open()s it and would stop
         base = self.base(mode=None)
@@ -1047,7 +1057,7 @@ class PathRules(unittest.TestCase):
                 self.assertEqual(code, H.REFUSED, out)
                 self.assertIn(f'merged, this pull request adds {twin.split("/x.json")[0]}, which differs from '
                               f'{CONFIG_PATH} only in case', out)
-        for name in ('.github/pr-queue.json.bak', '.github/other.json', 'pr-queue.json', '.GITHUB'):   # others pass
+        for name in ('.github/pr-queue.json.bak', '.github/other.json', 'pr-queue.json', '.GITHUBX'):   # others pass
             with self.subTest(name):
                 self.assertEqual(self.check(base, self.head(base, mode=None, **{name: 'x\n'}), EVERY_LENS)[0], 0)
         old = self.base(mode=None, **{'.github/PR-QUEUE.json': 'x\n'})   # old state: a base that holds one already
@@ -1061,6 +1071,43 @@ class PathRules(unittest.TestCase):
                                                                     '.github/pr-QUEUE.json': 'y\n'}), EVERY_LENS)
         self.assertEqual(code, H.REFUSED, out)   # a second one is still new
         self.assertIn('adds .github/pr-QUEUE.json, which differs', out)
+
+    def test_git_variables_of_the_job_change_nothing_the_check_reads(self):   # #435 item 6: pr_queue.GIT_DROP
+        base = self.base(mode=None)
+        head = self.head(base, mode=None, **{'docs/a.md': 'a\n'})
+        path = self.w.checkout(base, head)
+        other = os.path.join(self.w.dir, 'other')
+        os.makedirs(os.path.join(other, 'objects'))
+        hostile = {'GIT_OBJECT_DIRECTORY': os.path.join(other, 'objects'), 'GIT_INDEX_FILE': os.path.join(other, 'i'),
+                   'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.repositoryFormatVersion',
+                   'GIT_CONFIG_VALUE_0': '99', 'GIT_NAMESPACE': 'x', 'GIT_ICASE_PATHSPECS': '1'}
+        with unittest.mock.patch.dict(os.environ, hostile):
+            code, out = run_cli(path, fake_gh((0, json.dumps(pr([self.p.lens(n, head) for n in EVERY_LENS],
+                                                                   head=head)))))
+            made, why = head_gate.bare_repository(self.w.dir, 'hostile')
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(why)
+        self.assertTrue(os.path.isdir(os.path.join(made, 'objects', 'info')), 'git init wrote its objects elsewhere')
+        self.assertEqual(os.listdir(os.path.join(other, 'objects')), [])
+
+    def test_a_twin_of_a_parent_folder_is_refused_whatever_its_type(self):   # #435 item 4
+        # A case-insensitive checkout holds one of `.GitHub` and the folder `.github/`: a link there could lead the
+        # config's path anywhere.
+        base = self.base(mode=None)
+        docs = self.head(base, mode=None, **{'docs/a.md': 'a\n'})
+        for kind, mode, oid in (('a file', '100644', self.blob('x\n')), ('a symlink', '120000', self.blob('/tmp')),
+                                ('a submodule', '160000', base)):
+            for twin in ('.GitHub', '.GITHUB'):
+                with self.subTest(kind, twin=twin):
+                    code, out = self.check(base, self.entry(docs, mode, oid, base, path=twin), EVERY_LENS)
+                    self.assertEqual(code, H.REFUSED, out)
+                    self.assertIn(f'merged, this pull request adds {twin}, which differs from {CONFIG_PATH} only in '
+                                  'case', out)
+        old = self.entry(docs, '120000', self.blob('/tmp'), base, path='.GitHub')   # old state: the base holds one
+        keeps = self.entry(self.head(old, mode=None, **{'docs/b.md': 'b\n'}), '120000', self.blob('/tmp'), old,
+                           path='.GitHub')
+        code, out = self.check(old, keeps, EVERY_LENS)
+        self.assertEqual(code, 0, out)   # a head that leaves it
 
     def test_the_caps_hold_at_their_edge(self):   # #413 item 4: the documented values, exactly at and one over
         base = self.base('shadow')
@@ -1237,6 +1284,31 @@ class MergedConfig(unittest.TestCase):
                                 ('a number too long for int', '{"wait_seconds": ' + '9' * 5000 + '}', 'not JSON')):
             with self.subTest(name):
                 self.assertIn(why, H.config_text_problem(text, CONFIG_PATH))
+
+    def test_a_case_twin_listing_that_fails_is_a_refusal(self):   # #435 item 5: fewer twins would pass
+        text = json.dumps(CFG_RAW)
+
+        def ls_tree(*a):
+            if '--' in a:   # tree_entry: the config is a file
+                return types.SimpleNamespace(returncode=0, stdout=f'100644 blob {"2" * 40}\t{a[-1]}\0', stderr='')
+            return types.SimpleNamespace(returncode=128, stdout='', stderr='fatal: not a tree object')
+        answers = {('cat-file', '-s'): (0, f'{len(text)}\n'), ('cat-file', 'blob'): (0, text)}
+        why = H.merged_config_problem(reading({**answers, 'ls-tree': ls_tree}), CONFIG_PATH)
+        self.assertIn('could not be checked, so it is not passed: ValueError: git ls-tree', why or '')
+
+    def test_case_twins_fold_nfc_and_nfd(self):   # #435 item 4: macOS file systems hold both forms as one name
+        sub = 'e' * 40
+        trees = {C: f'040000 tree {sub}\t.github\0',
+                 sub: ''.join(f'100644 blob {B}\t{n}\0' for n in ('caf\u00e9.json', 'cafe\u0301.json', 'CAFE\u0301.json',
+                                                                  'cafe.json'))}
+
+        class Listing:
+            def git(self, *a, **kw):
+                return types.SimpleNamespace(returncode=0, stdout=trees[a[2]], stderr='')
+        for rel in ('.github/caf\u00e9.json', '.github/cafe\u0301.json'):
+            with self.subTest(rel=ascii(rel)):
+                self.assertEqual(H.case_matches(Listing(), C, rel), {'.github/caf\u00e9.json', '.github/cafe\u0301.json',
+                                                                     '.github/CAFE\u0301.json'})
 
     def test_a_config_that_is_not_utf8_is_a_refusal(self):   # strict: a config is text, and base_config reads it so
         def blob(*a):
