@@ -3551,7 +3551,9 @@ class Wiring(unittest.TestCase):
         self.assertEqual((step['id'], step['if'], step['run']),
                          ('route', "inputs.ref == ''", 'python3 -I .github/scripts/fork-fleet.py route'))
         want = {'FLEET_MODE': f'${{{{ vars.{CFG["variable"]} }}}}',
-                'GATES': '${{ toJSON(steps.detect.outputs) }}'}
+                # A fork-only pull request routes on its own gates, all false (fork-owned-paths.test.py).
+                'GATES': "${{ steps.fork_only.outputs.fork_only == 'true' && toJSON(steps.fork_only.outputs)"
+                         " || toJSON(steps.detect.outputs) }}"}
         want.update({p['beacon']: f'${{{{ vars.{p["beacon"]} }}}}' for p in CFG['pools']})
         self.assertEqual(step['env'], want)
         self.assertEqual({k: v for k, v in changes['outputs'].items() if 'route' in v}, {
