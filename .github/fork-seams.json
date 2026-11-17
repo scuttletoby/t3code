@@ -90,6 +90,15 @@
         ": { unit: tracked.unit, slice: ownedSlice };",
         "}),"
       ]
+    },
+    "apps/server/src/cli/connect.ts": {
+      "why": "`serve --hold-work`: a held copy's home shares the live server's T3 Connect environment id and sign-in. The CLI's unlink path (disconnectCloud) and its turn-Connect-on check (requireConnectAllowed) each call the refusal in cloud/holdWorkConnect.ts once.",
+      "added": [
+        "import * as HoldWorkConnect from \"../cloud/holdWorkConnect.ts\";",
+        "// Fork: a held copy shares the live server's environment id; refuse before the relay delete.",
+        "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig);",
+        "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig); // Fork: a held copy"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",

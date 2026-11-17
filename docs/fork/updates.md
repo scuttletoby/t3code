@@ -168,14 +168,21 @@ Held (nothing of it starts until the server restarts without the flag):
   and tunnel). The held server starts no tunnel, registers none with the relay and releases none when
   it stops, so remote access stays with the running server. It publishes no agent activity (thread
   state) to the relay under that id. A client's request to link, change the link, unlink or answer
-  the relay is refused with the reason, and so is every CLI unlink on that home (`t3 connect unlink`,
-  `t3 connect logout`, `t3 up` turning Connect off) while the held server runs: unlinking ends in a
-  relay delete of the shared environment id, which would remove the running server's link too.
-  The stored link files are kept as they are (`apps/server/src/cloud/holdWorkConnect.ts`).
+  the relay is refused with the reason. The stored link files are kept as they are
+  (`apps/server/src/cloud/holdWorkConnect.ts`), with one exception: a managed policy that turns
+  T3 Connect off makes the server unlink while it starts, before the hold applies. That removes the
+  copy's own link files and sends nothing to the relay; the policy has unlinked the running server
+  on that machine already.
 
-  The CLI can only tell a copy is held while its server runs. Never run `t3 connect unlink` or
-  `t3 connect logout` against a stopped copy's home: it removes the running server's link. Delete
-  the copy's home instead.
+  The first held boot writes `hold-work-copy.json` in the copy's home, and nothing removes it, not
+  a normal boot either. While it is there, running or not, `t3 connect login`, `link`, `unlink` and
+  `logout`, `t3 connect publish` turning publishing on, and `t3 up` turning T3 Connect on or off are
+  refused on that home with nothing changed. Unlinking ends in a relay delete of the shared
+  environment id, which would remove the running server's link too, and signing in can refresh the
+  copied sign-in, which the running server shares. If the home is not a copy, delete the file and
+  run the command again. A copy that has never booted held has no marker, and the CLI cannot tell it
+  from the running server's home: never run those commands against it. Delete the copy's home
+  instead.
 
 Still runs:
 
@@ -190,6 +197,10 @@ Still runs:
 - reading the copy's Connect status;
 - the periodic Connect reachability check: read-only requests to the stored public address and the
   tunnel network. It restarts only a tunnel this server started, and a held server starts none.
+- the held-hooks waker, which reads the copied relay credential but sends only when a tunnel
+  connects, and a held server connects none;
+- the relay client ledger's clean-up at start, which stops only a recorded tunnel client whose
+  owner process is gone (a running server's own is skipped). Local only.
 
 Startup refuses to serve when the gate is not held or a part that starts work (outbox, thread launch,
 recovery, scheduler) does not use it. The check runs before activation, so nothing parked has run.

@@ -509,9 +509,7 @@ export const disconnectCloud = Effect.fn("cloud.cli.disconnect")(function* (opti
   readonly clearAuthorization: boolean;
 }) {
   // Fork: a held copy shares the live server's environment id; refuse before the relay delete.
-  yield* HoldWorkConnect.refuseCliUnlinkWhileHeld(
-    (yield* ServerConfig.ServerConfig).serverRuntimeStatePath,
-  );
+  yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig);
   yield* CliState.setCliDesiredCloudLink(false);
   const liveResult = yield* runLiveCloudUnlink();
   const relayResult = yield* Effect.exit(unlinkRelayEnvironment());
@@ -582,6 +580,7 @@ export const runCloudCommand = Effect.fn("cloud.cli.run_cloud_command")(function
 
 /** Status, unlink, and logout stay available so a machine can leave Connect the policy turned off. */
 export const requireConnectAllowed = Effect.gen(function* () {
+  yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig); // Fork: a held copy
   const policy = yield* ManagedPolicy.ManagedPolicy;
   if (!ManagedLimits.allowsConnect(policy)) {
     return yield* ManagedLimits.refuseConnect(policy);

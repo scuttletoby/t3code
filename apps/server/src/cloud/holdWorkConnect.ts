@@ -2,11 +2,15 @@
 // so it starts, registers and releases no tunnel, publishes no agent activity, and refuses to
 // link, change or unlink (an unlink is followed by a relay delete of that id). It only reads.
 // Every method is listed by name, never spread: a new upstream method is a type error here.
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
+import * as ServerConfig from "../config.ts";
 import * as ManagedLimits from "../policy/managedLimits.ts";
 import * as AgentAwarenessRelay from "../relay/AgentAwarenessRelay.ts";
 import { readLiveServerRuntimeState } from "../serverRuntimeState.ts";
@@ -55,6 +59,33 @@ const holdConnect = (cloudLink: CloudLink.CloudLink["Service"]): CloudLink.Cloud
     ),
   });
 
+/**
+ * A held boot marks its home as a copy before the real CloudLink is built, so the CLI refusals
+ * hold once it stops too. Created only when missing: a marker already there stays as it is.
+ */
+const markHeldCopy = Layer.effectDiscard(
+  Effect.gen(function* () {
+    if (!(yield* WorkAdmission.WorkAdmission).heldFromBoot) return;
+    const markerPath = (yield* Path.Path).join(
+      (yield* ServerConfig.ServerConfig).baseDir,
+      HELD_COPY_MARKER_FILE,
+    );
+    const note = {
+      heldCopy: true,
+      markedAt: DateTime.formatIso(yield* DateTime.now),
+      why: "A server ran on this home with --hold-work, so it is taken to be a copy that shares the live server's T3 Connect link. `t3 connect` and `t3 up` refuse to sign in, link, unlink or sign out here while this file exists. Delete it only if this home is not a copy.",
+    };
+    yield* (yield* FileSystem.FileSystem)
+      .writeFileString(markerPath, `${JSON.stringify(note, null, 2)}\n`, { flag: "wx" })
+      .pipe(
+        Effect.catchIf(
+          (error) => error.reason._tag === "AlreadyExists",
+          () => Effect.void,
+        ),
+      );
+  }),
+);
+
 /** `layer` as is, or held when the shared work gate is held from boot. */
 export const layer = <E, R>(cloudLinkLayer: Layer.Layer<CloudLink.CloudLink, E, R>) =>
   Layer.effect(
@@ -65,7 +96,7 @@ export const layer = <E, R>(cloudLinkLayer: Layer.Layer<CloudLink.CloudLink, E, 
       yield* Effect.logInfo(HOLD_CONNECT_LOG);
       return holdConnect(cloudLink);
     }),
-  ).pipe(Layer.provide(cloudLinkLayer));
+  ).pipe(Layer.provide(cloudLinkLayer), Layer.provide(markHeldCopy));
 
 const HOLD_AGENT_ACTIVITY_LOG =
   "Agent activity publishing held (--hold-work): no thread state is sent to the T3 Connect relay";
@@ -96,27 +127,45 @@ export const agentActivityLayer = <E, R>(
     }),
   ).pipe(Layer.provide(relayLayer));
 
-/**
- * `t3 connect unlink` / `logout`: refused while this home's server runs held. They also send the
- * relay delete for the environment id, which a copy shares with the live server. A copy that is
- * not running cannot be told apart from the live home; docs/fork/updates.md warns about that.
- */
-export const refuseCliUnlinkWhileHeld = Effect.fn("HoldWorkConnect.refuseCliUnlinkWhileHeld")(
-  function* (serverRuntimeStatePath: string) {
-    const running = yield* readLiveServerRuntimeState(serverRuntimeStatePath).pipe(
-      Effect.orElseSucceed(() => Option.none()),
-    );
-    if (Option.isSome(running) && running.value.workHeld === true) {
-      return yield* new HeldCliUnlinkRefusedError();
-    }
-  },
-);
+/** Written in a home by a held boot. The `t3 connect` refusals read it; nothing removes it. */
+export const HELD_COPY_MARKER_FILE = "hold-work-copy.json";
 
-export class HeldCliUnlinkRefusedError extends Schema.TaggedError<HeldCliUnlinkRefusedError>()(
-  "HeldCliUnlinkRefusedError",
-  {},
+/**
+ * `t3 connect` sign-in, link, unlink and logout, and `t3 up` turning Connect on or off: refused on
+ * a held copy's home. A copy shares the live server's environment id and CLI sign-in.
+ */
+export const refuseCliOnHeldCopy = Effect.fn("HoldWorkConnect.refuseCliOnHeldCopy")(function* (
+  config: Pick<ServerConfig.ServerConfig["Service"], "baseDir" | "serverRuntimeStatePath">,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const markerPath = (yield* Path.Path).join(config.baseDir, HELD_COPY_MARKER_FILE);
+  // Only whether it is there counts. A marker that cannot be checked counts as there.
+  if (yield* fs.exists(markerPath).pipe(Effect.orElseSucceed(() => true))) {
+    return yield* new HeldCopyRefusedError({ markerPath });
+  }
+  const running = yield* readLiveServerRuntimeState(config.serverRuntimeStatePath).pipe(
+    Effect.orElseSucceed(() => Option.none()),
+  );
+  if (Option.isSome(running) && running.value.workHeld === true) {
+    return yield* new HeldCopyRefusedError({ markerPath: null });
+  }
+});
+
+export class HeldCopyRefusedError extends Schema.TaggedError<HeldCopyRefusedError>()(
+  "HeldCopyRefusedError",
+  { markerPath: Schema.NullOr(Schema.String) },
 ) {
   override get message(): string {
-    return "Refused: this home's server runs with --hold-work, so it is a copy that shares the live server's T3 Connect environment id. Unlinking or signing out here would also remove the live server's link on the relay. Nothing was changed.";
+    const why =
+      this.markerPath === null
+        ? "this home's server runs with --hold-work, so it is a copy"
+        : `${this.markerPath} marks this home as a copy that ran with --hold-work. A copy`;
+    return [
+      `Refused: ${why} that shares the live server's T3 Connect environment id and sign-in.`,
+      "Signing in, linking, unlinking or signing out here would act on the live server's link too. Nothing was changed.",
+      ...(this.markerPath === null
+        ? []
+        : [`If this home is not a copy, delete ${this.markerPath} and run the command again.`]),
+    ].join("\n");
   }
 }

@@ -34,6 +34,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
+import * as HoldWorkConnect from "./cloud/holdWorkConnect.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
@@ -709,6 +710,9 @@ describe("serve --hold-work on a seeded home", () => {
       expect(Object.keys(seeded.connect)).toHaveLength(8);
       expect(seeded.remoteTask).toBeDefined();
 
+      // A home linked before held copies were marked: no marker until it boots held.
+      const marker = NodePath.join(root, "t3", HoldWorkConnect.HELD_COPY_MARKER_FILE);
+      expect(NodeFS.existsSync(marker)).toBe(false);
       const held = await boot(root, remote, ["--hold-work"]);
       const runtime = await ready(root, held);
       expect(runtime.workHeld).toBe(true);
@@ -742,6 +746,9 @@ describe("serve --hold-work on a seeded home", () => {
         );
       });
       await stop(held.child);
+      // The stopped copy stays marked, so `t3 connect` refuses to unlink or link it.
+      const markerText = NodeFS.readFileSync(marker, "utf8");
+      expect(markerText).toContain("--hold-work");
       const heldSpans = spansFrom(paths.stateDir, 0);
       // The publisher logs its state when it starts, before any held line: a held one never does.
       expect(held.output()).not.toMatch(PUBLISHER_STARTED);
@@ -799,13 +806,21 @@ describe("serve --hold-work on a seeded home", () => {
       expect(normal.output()).not.toContain("--hold-work");
       await stop(normal.child);
       // The same home without the flag does each held thing. Its tunnel registration waits a
-      // random part of half a minute, but stopping releases the tunnel at once, so the relay has
-      // been reached by now either way.
+      // random part of half a minute, but stopping releases the tunnel at once: the relay has the
+      // release itself (agent activity also reaches it, so any request would not show that).
       const normalSpans = spansFrom(paths.stateDir, heldSpans.end).names;
       expect(normalSpans).toContain("autoPullProjects");
       expect(normalSpans).toContain("RemoteDelegation.followOnce");
       expect(normalSpans).toContain("environment.cloud.releaseManagedTunnelOnShutdown");
-      expect(relayRequests(remote).length).toBeGreaterThan(0);
+      expect(
+        relayRequests(remote).filter(
+          (request) =>
+            request.method === "DELETE" &&
+            /^\/v1\/client\/environment-links\/[^/]+\/tunnel$/.test(request.path),
+        ),
+      ).toHaveLength(1);
+      // A normal boot of the copy leaves its marker as it is.
+      expect(NodeFS.readFileSync(marker, "utf8")).toBe(markerText);
     } finally {
       for (const child of children) await stop(child);
       await remote.close();
