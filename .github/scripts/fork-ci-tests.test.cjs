@@ -162,6 +162,53 @@ test("Fork tests' runner calls split every listed and present test into exactly 
   assert.deepEqual(wrong, []);
 });
 
+// The runner calls of each job in a workflow's text: a job starts at a two-space `name:` line under `jobs:`.
+const callsByJob = (text) => {
+  const jobs = {};
+  let job = null;
+  let inJobs = false;
+  for (const line of text.split("\n")) {
+    if (/^\S/.test(line)) inJobs = line.startsWith("jobs:");
+    const head = inJobs && line.match(/^ {2}([A-Za-z_][\w-]*):\s*$/);
+    if (head) job = jobs[head[1]] = [];
+    else if (job) job.push(line);
+  }
+  return Object.fromEntries(
+    Object.entries(jobs)
+      .map(([name, lines]) => [name, runnerCalls(lines.join("\n"))])
+      .filter(([, calls]) => calls.length > 0),
+  );
+};
+
+// The fleet walls' tests are about a third of the script tests' time (#209): in a job of their own, each of the
+// three jobs stays well under its time limit. One call per job: two calls in one job run one after the other.
+test("Fork tests run the script tests in three jobs: the kits, the fleet walls, and the rest with the lint", () => {
+  const root = path.resolve(__dirname, "../..");
+  const calls = callsByJob(
+    fs.readFileSync(path.join(root, ".github/workflows/fork-tests.yml"), "utf8"),
+  );
+  assert.deepEqual(calls, {
+    workflows: [["!fork-kit/", "!.github/scripts/fork-fleet-walls"]],
+    walls_tests: [[".github/scripts/fork-fleet-walls"]],
+    kit_tests: [["fork-kit/"]],
+  });
+});
+
+test("reads each job's runner calls", () => {
+  const text = [
+    "on: push",
+    "  a:",
+    "jobs:",
+    "  one:",
+    "    steps:",
+    "      - run: node .github/scripts/fork-ci-tests.cjs x/",
+    "  two:",
+    "    steps:",
+    "      - run: echo",
+  ].join("\n");
+  assert.deepEqual(callsByJob(text), { one: [["x/"]] });
+});
+
 test("a long test without a weight, or one far from its weight, gets a note", () => {
   assert.equal(weightNote("a.test.sh", null, 20), null);
   assert.match(weightNote("a.test.sh", null, 45), /no weight: add "~45s"/);

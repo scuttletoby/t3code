@@ -10,6 +10,7 @@ python3 stands in for the queue's start.
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -100,11 +101,54 @@ check("refusal: a name with two dots in it is no parent folder", r.returncode ==
 
 # --- the checkouts and the action ------------------------------------------------------------------------------------
 by_name = {s.get("name"): s for s in steps}
+clean = by_name.get("Remove an earlier run's caller and toolkit folders") or {}
 caller = by_name.get("Check out the caller's config") or {}
 toolkit = by_name.get("Check out the queue at this workflow's own commit") or {}
 queue = by_name.get("Run the queue") or {}
-check("steps: refuse, the caller's config, the toolkit, the queue, in that order",
-      steps == [first, caller, toolkit, queue], ", ".join(str(s.get("name")) for s in steps))
+check("steps: refuse, remove the old folders, the caller's config, the toolkit, the queue, in that order",
+      steps == [first, clean, caller, toolkit, queue], ", ".join(str(s.get("name")) for s in steps))
+
+# The runner is self-hosted and its workspace is reused (#411): an earlier run's caller/ or toolkit/ (a symlink, a
+# planted .git, files checkout would keep) never reaches this run's checkouts.
+check("the removal is one bash step with no expression in its script",
+      set(clean) == {"name", "shell", "run"} and clean.get("shell") == "bash" and "${{" not in str(clean.get("run")),
+      str(clean))
+
+
+def clean_run(workspace):
+    return bash(clean.get("run", "exit 1"), {"GITHUB_WORKSPACE": workspace} if workspace is not None else {})
+
+
+with tempfile.TemporaryDirectory(prefix="fork-pr-queue-ws-") as top:
+    ws, outside = os.path.join(top, "ws"), os.path.join(top, "outside")
+    for d in ("caller/.git/hooks", "toolkit/fork-ci/actions/pr-queue", "keep", "outside/kept"):
+        os.makedirs(os.path.join(top, d if d.startswith("outside") else os.path.join("ws", d)))
+    for f in ("caller/.git/config", "toolkit/fork-ci/actions/pr-queue/action.yml", "keep/file", "outside/kept/file"):
+        pathlib.Path(top, f if f.startswith("outside") else os.path.join("ws", f)).write_text("x")
+    os.chmod(os.path.join(ws, "toolkit/fork-ci/actions/pr-queue/action.yml"), 0o444)
+    os.symlink(os.path.join(outside, "kept"), os.path.join(ws, "caller", "link"))
+    r = clean_run(ws)
+    left = sorted(os.listdir(ws))
+    check("removal: an earlier run's caller/ and toolkit/ are gone, read-only files too; the rest of the workspace "
+          "stays", r.returncode == 0 and left == ["keep"], f"{r.returncode} {left} {r.stderr}")
+    check("removal: a symlink inside them is removed, not followed",
+          pathlib.Path(outside, "kept", "file").read_text() == "x")
+    for d in ("caller", "toolkit"):  # what a failed removal above left
+        shutil.rmtree(os.path.join(ws, d), ignore_errors=True)
+    os.symlink(os.path.join(outside, "kept"), os.path.join(ws, "caller"))
+    os.symlink(outside, os.path.join(ws, "toolkit"))
+    r = clean_run(ws)
+    check("removal: caller and toolkit that are symlinks are removed; what they point to stays",
+          r.returncode == 0 and sorted(os.listdir(ws)) == ["keep"]
+          and pathlib.Path(outside, "kept", "file").read_text() == "x", f"{r.returncode} {os.listdir(ws)} {r.stderr}")
+    r = clean_run(ws)
+    check("removal: a run with neither folder (a first run, or a re-run) passes", r.returncode == 0, r.stderr)
+    for label, value in (("no GITHUB_WORKSPACE", None), ("an empty GITHUB_WORKSPACE", "")):
+        os.makedirs(os.path.join(ws, "caller"), exist_ok=True)
+        r = clean_run(value)
+        check(f"removal: {label} fails and removes nothing",
+              r.returncode != 0 and os.path.isdir(os.path.join(ws, "caller")), f"{r.returncode} {r.stderr}")
+        shutil.rmtree(os.path.join(ws, "caller"), ignore_errors=True)
 pinned = all(re.fullmatch(r"actions/checkout@[0-9a-f]{40}", str(s.get("uses"))) for s in (caller, toolkit))
 check("both checkouts are actions/checkout pinned by commit", pinned)
 cw, tw = caller.get("with") or {}, toolkit.get("with") or {}
