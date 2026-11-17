@@ -35,6 +35,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
 | [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}` | yes | [#PR](https://github.com/scuttletoby/t3code/issues/PR)   |
 | [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
 | [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
@@ -42,11 +43,12 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`         | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set             | yes | [#PR](https://github.com/scuttletoby/t3code/issues/PR)   |
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 
-For `waitFor` and `agentSlots` only the `enabled` switch is pinned; their other fields are tuning
-that does nothing while the switch is off.
+For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned; their other fields
+are tuning that does nothing while the switch is off.
 
 ## Each setting
 
@@ -126,6 +128,42 @@ Add one: **Settings → Threads**, section Wait checks, **Add check**, or in `se
 
 Used only while `waitFor` is on.
 
+### `server.playtest`
+
+Playtest sessions: a person tries an agent's unfinished work on a real test target (a test server,
+a staging site) while the agent changes it, round after round, without a pull request per round.
+T3 runs the project's adapter, four kinds of step only the person sets: `claim` takes the target,
+`renew` keeps the claim alive, `push` (one or more named steps) sends a round to the target, and
+`release` puts the target back. Each step is a program given by its absolute path with fixed
+arguments, run without a shell; T3 passes the session's facts as environment variables. Nothing
+starts a session yet: the session store, the tool and the thread controls come in later pull
+requests. The steps' contract is in [playtest.md](playtest.md).
+
+Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
+push step's name, or names a program by a relative path or a bare name is refused. A hand-edited
+value that is not valid reads as off (with a warning in the server log), and the next save writes
+the default in its place. Other fields: how often a claim is renewed (`renewMinutes`), when an idle
+session ends (`idleMinutes`) and the longest session (`maxHours`).
+
+```json
+{
+  "playtest": {
+    "enabled": true,
+    "claim": { "argv": ["/usr/local/bin/game-playtest", "claim"] },
+    "renew": { "argv": ["/usr/local/bin/game-playtest", "renew"], "timeoutSeconds": 30 },
+    "push": [
+      { "name": "guard", "argv": ["/usr/local/bin/game-playtest", "guard"] },
+      {
+        "name": "deploy",
+        "argv": ["/usr/local/bin/game-playtest", "deploy"],
+        "timeoutSeconds": 600
+      }
+    ],
+    "release": { "argv": ["/usr/local/bin/game-playtest", "release"], "timeoutSeconds": 600 }
+  }
+}
+```
+
 ### `server.agentSlots`
 
 Limits on running agents: `delegate_task` is refused above `maxPerMachine` agents on this server,
@@ -183,6 +221,13 @@ A project's own list of wait checks. It replaces the server's list for that proj
 project lists every check it uses). Not set: the project uses the server's checks.
 
 Set: **Settings**, choose the project at the top, then **Wait checks**.
+
+### `projectOverride.playtest`
+
+A project's own playtest adapter. It replaces the server's `playtest` for that project as a whole:
+a project sets every step it uses. Not set: the project uses the server's. A project value that is
+not valid reads as off for that project; it never falls back to the server's adapter. A repository's
+`t3.json` cannot set it: that file is in the repository, which agents edit.
 
 ### `projectOverride.mcpProfile`
 
@@ -250,6 +295,7 @@ switch.
 - [anchor-machine.md](anchor-machine.md): one machine for new work, with upstream load balancing.
 - [gate-trust.md](gate-trust.md): what the head gate proves, and the owner's steps.
 - [host-tools.md](host-tools.md): design for agents on a person's own computer (no code yet).
+- [playtest.md](playtest.md): the playtest adapter contract (steps, environment, exit codes).
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.
 - [`fork-ci/README.md`](../../fork-ci/README.md) and [`fork-kit/README.md`](../../fork-kit/README.md):
   CI actions and host kits.
