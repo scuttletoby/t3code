@@ -3,7 +3,7 @@
 of every walls file in fork-fleet-walls/; the contract each must pass on fake machines from its <os>.fixture.json is
 in fork-fleet-walls-contract.test.py, which uses this file's helpers. A new walls file (and its fixture) is tested
 without a change to either file. Run: python3 <this>. Linux only."""
-import ast, base64, contextlib, hashlib, importlib.machinery, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+import ast, base64, contextlib, hashlib, importlib.machinery, importlib.util, io, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -26,6 +26,25 @@ def slurp(path):
 def write(path, text):
     with open(path, 'w', encoding='utf-8') as f:
         f.write(text)
+
+
+class Waited(Exception):
+    """What no_wait raises in a call that blocks: neither a ValueError nor an OSError, so no assertRaises takes it."""
+
+
+@contextlib.contextmanager
+def no_wait(seconds=10):
+    """Fails a call that blocks (a FIFO opened without O_NONBLOCK waits for a writer forever) instead of hanging the
+    run: SIGALRM after seconds raises Waited in it (issue #365 item 4)."""
+    def late(*_):
+        raise Waited(f'blocked for {seconds}s: opened without O_NONBLOCK?')
+    old = signal.signal(signal.SIGALRM, late)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
 
 
 LINUX = json.loads(slurp(os.path.join(FOLDER, 'linux.fixture.json')))['pass']
@@ -916,16 +935,16 @@ class EveryWallsFile(WallsRunner):
             self.assertRegex(v, r'^[1-9][0-9]*$', k)
             self.assertLessEqual(int(v), stop_max, k)
 
-    def test_linux_launcher_pin_is_the_launchers(self):   # change the launcher, then both pins with it
-        """Issue #316: the linux walls pass only the launcher they ship with (LAUNCHER_SHA256, as the wsl2 walls pin
-        it), whose start() the test above and fork-fleet.test.py's test_start read. The pin is the sha256 of the
+    def test_linux_launcher_pin_is_the_launchers(self):   # change the launcher, then the one pin with it
+        """Issue #316: the linux walls pass only the launcher they ship with (LAUNCHER_SHA256, which the wsl2 walls
+        read too), whose start() the test above and fork-fleet.test.py's test_start read. The pin is the sha256 of the
         launcher in this repo, so a launcher change without a pin change fails here, not on a host as cannot tell."""
         linux = slurp(os.path.join(FOLDER, 'linux'))
         self.assertEqual(len(re.findall(r"^LAUNCHER_SHA256 = '[0-9a-f]{64}'$", linux, re.M)), 1)
         with open(LAUNCHER, 'rb') as f:
             self.assertEqual(fw_linux().LAUNCHER_SHA256, hashlib.sha256(f.read()).hexdigest(), 'fork-fleet-launch.sh '
-                             'changed: set LAUNCHER_SHA256 in fork-fleet-walls/linux and fork-fleet-walls/wsl2 to its '
-                             'sha256 (and read the change with the security lens)')
+                             'changed: set LAUNCHER_SHA256 in fork-fleet-walls/linux (the one pin, which wsl2 reads) '
+                             'to its sha256 (and read the change with the security lens)')
 
     def test_linux_job_units_reads_resets_slices_and_stop_timeouts(self):
         """PR #213 re-checks (correctness N1; security N2, N3). systemd's own set-property drop-in (refresh-net's, in
@@ -1254,7 +1273,8 @@ class EveryWallsFile(WallsRunner):
         """Issue #316 item 3 (the #306 lens nit): launcher_shipped refuses a launcher that is a link (O_NOFOLLOW), not
         this uid's alone (launcher_safe on what it opened), or no plain file (a FIFO: opened without blocking), before
         it reads it; ask() refuses the same later, so this tests launcher_shipped alone. A safe copy of the launcher
-        passes; a safe one with other bytes does not."""
+        passes; a safe one with other bytes does not. Issue #365 item 4: a call that blocks (the FIFO opened without
+        O_NONBLOCK) fails in no_wait's time, never hangs the run."""
         m = fw_linux()
         folder = os.path.join(self.tmp, 'kit')
         os.makedirs(folder, mode=0o755)
@@ -1280,7 +1300,7 @@ class EveryWallsFile(WallsRunner):
         for path, error in ((link, OSError), (writable, ValueError), (fifo, ValueError)):
             with self.subTest(os.path.basename(path)):
                 m.LAUNCHER = path
-                with self.assertRaises(error):
+                with no_wait(), self.assertRaises(error):
                     m.launcher_shipped()
 
     def job_units(self, change, links=()):
