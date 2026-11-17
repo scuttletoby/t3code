@@ -77,7 +77,7 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 | `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                      |
 | `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                 |
 | `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                |
-| `lockedSettings`        | more T3 settings to lock, `{path: value}`: the child ceiling (`agentSlots.…`, fork builds), see below             |
+| `lockedSettings`        | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below  |
 | `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                             |
 | `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                   |
 | `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host        |
@@ -92,7 +92,8 @@ path (`agentSlots.maxPerMachine`), or give a whole setting (`agentSlots`) or one
 (`providerInstances.codex-work`) as an object holding every field: T3 takes an object only as a complete value. The kit
 refuses what is cheap to tell (a field of a provider instance, an object deeper than a record entry, the kit's own
 setting, a blank `organization`); T3 refuses the rest, like a field inside a setting that can be empty (lock the
-whole setting), says why in its log (`journalctl -u t3code-agents`) and does not start; setup shows that line. A
+whole setting), says why in its log (`journalctl -u t3code-agents`) and does not start; setup shows that line and
+T3's exit status (77: a policy it cannot apply). A
 policy may name only settings the installed `t3Version` knows: T3 does not start on a setting it lacks, so the fork's own
 settings (`agentSlots`, ...) need a fork build, and `automaticUpdates` a version that has it (the kit turns updates
 off through `limits.updates` on every version). Releases that exit 77 on a policy they cannot apply are not restarted
@@ -139,23 +140,35 @@ Commands are for Windows PowerShell unless a step says otherwise. `<distro>` is 
    `HOME`, `T3CODE_HOME`, `PATH` and `SHELL` set. Codex: its browser login waits on `localhost` port 1455, outside
    `devPorts`, so the walls refuse it: use its device-code login instead, the same with `-- codex login --device-auth`
    (`codex login --help` names it).
+   If Claude says it cannot read its managed settings on `/mnt/c` (`EACCES`), choose "Continue without these
+   settings": that is Windows' folder, which the walls hide on purpose. Then restart T3, which looks for providers
+   only when it starts: `wsl -d <distro> -u root -- systemctl restart t3code-agents` (its start runs the check first).
 8. **Log in to GitHub as the agent:** install `gh` (as root, from GitHub CLI's docs), then
    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- gh auth login --with-token` and paste
-   a fine-grained token for the agents' repos into that window only.
-9. **Link from the other T3:** on this PC's T3 (`http://<tailscale address>:<port>`), Settings → Sharing & access →
-   make a pairing code. In the other T3: Settings → Environments → Linked environments → Link, the same address
-   and the code, **Full access**.
-10. **Keep the distro running:** WSL stops a distro soon after its last window closes, and does not start one when
-    Windows starts. A logon task of your own (no administrator needed) keeps this one running while you are logged
-    in. In PowerShell, as yourself (the same task as the desk starter's, `fork-kit/desk/windows/start-desk.ps1`):
-    ```powershell
-    $a = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument '--headless wsl.exe -d <distro> -u root --exec sleep infinity'
-    Register-ScheduledTask -TaskName 'pc-agents <distro>' -Action $a -Trigger (New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)) -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) -Force
-    Start-ScheduledTask -TaskName 'pc-agents <distro>'
-    ```
-    `conhost.exe --headless` shows no window. Running it again replaces the task. A distro set up before this step
-    only needs these lines; nothing in the distro changes. To remove it:
-    `Unregister-ScheduledTask -TaskName 'pc-agents <distro>' -Confirm:$false`.
+   a fine-grained token for the agents' repos into that window only. It waits without a prompt: paste the token,
+   press Enter, then Ctrl+D.
+9. **Keep the distro running:** WSL stops a distro soon after its last window closes, and does not start one when
+   Windows starts. A logon task of your own (no administrator needed) keeps this one running while you are logged
+   in. In PowerShell, as yourself (the same task as the desk starter's, `fork-kit/desk/windows/start-desk.ps1`):
+   ```powershell
+   $a = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument '--headless wsl.exe -d <distro> -u root --exec sleep infinity'
+   Register-ScheduledTask -TaskName 'pc-agents <distro>' -Action $a -Trigger (New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)) -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) -Force
+   Start-ScheduledTask -TaskName 'pc-agents <distro>'
+   ```
+   `conhost.exe --headless` shows no window. Running it again replaces the task. A distro set up before this step
+   only needs these lines; nothing in the distro changes. To remove it:
+   `Unregister-ScheduledTask -TaskName 'pc-agents <distro>' -Confirm:$false`.
+10. **Pair, then link from the other T3:** this PC's T3 is walled from the Windows host on purpose, so a browser on
+    this PC cannot open it, nor make a pairing code there. Make the code from the command line (PowerShell):
+    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents pair`. It runs T3's own `t3 pair` as the
+    agent under the walls, the T3 the unit runs (`/opt/pc-agents/t3/runtime/versions/<t3Version>/t3`), and prints a
+    token that expires in 5 minutes (`pc-agents pair --ttl 15m` for longer); the address it prints is the distro's
+    own, not one to link. A kit without `pair` (older than this step): the same through
+    `pc-agents as-agent -- /opt/pc-agents/t3/runtime/versions/<t3Version>/t3 pair` (an upgrade leaves the old
+    version's folder there, so name yours). In the other T3: Settings → Environments → Linked environments → Link,
+    with this PC's tailnet DNS name (MagicDNS: `http://<name>.<tailnet>.ts.net:<port>`; `tailscale status` there
+    shows the name), the token, and **Full access**. Not its tailnet IP address: T3 refuses to link a plain-http IP
+    address.
 
 Run step 3 again for a new release or a changed machine file (and steps 4 and 5 if it asks); T3 restarts only when
 something changed. To remove everything: `wsl --unregister <distro>`.
@@ -245,7 +258,7 @@ allowed (connection tracking).
 - **Terminals:** what the agent prints in a terminal can use escape codes, such as OSC 52, which some terminals turn
   into a write to the Windows clipboard. `pc-agents as-agent` runs with `--pty`, so the owner steps' output reaches
   your terminal that way too. Do not paste from the clipboard blindly after watching agent output.
-- **Runs only while you are logged in:** the logon task (step 10) keeps the distro running while you are logged in
+- **Runs only while you are logged in:** the logon task (step 9) keeps the distro running while you are logged in
   and the PC is awake. Logging out, sleep, a Windows restart or `wsl --shutdown` stop T3 (the linking T3 sees this
   PC offline); the task starts it again at your next logon. Without the task, T3 stops soon after the last WSL
   window closes.

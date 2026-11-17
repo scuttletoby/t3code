@@ -48,8 +48,9 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          # a start: refused while the start limit is hit ($S/U.limit, until reset-failed); with
                          # /log/t3-crash T3 exits at once, with /log/t3-dies after the first look (show) at it
                          'run() { [ -e "$S/$1.limit" ] && { echo "$1: start request repeated too quickly" >&2; '
-                         'return 1; }\nrm -f "$S/$1.seen"\n'
-                         '[ "$1" = t3code-agents.service ] && [ -e "$R/log/t3-crash" ] && { rm -f "$S/$1.active"; return; }\n'
+                         'return 1; }\nrm -f "$S/$1.seen" "$S/$1.status"\n'
+                         '[ "$1" = t3code-agents.service ] && [ -e "$R/log/t3-crash" ] && { rm -f "$S/$1.active"; '
+                         'c=$(cat "$R/log/t3-crash"); echo "${c:-1}" >"$S/$1.status"; return; }\n'
                          '{ grep "^ExecStart=" "$R/etc/systemd/system/$1"; '
                          'cat "$R/etc/t3code/policy.json"; } >"$S/$1.active" 2>/dev/null || :\n'
                          'echo $$ >"$S/$1.pid"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
@@ -73,6 +74,7 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  [ -e "$S/reload" ] && echo NeedDaemonReload=yes || echo NeedDaemonReload=no\n'
                          '  if [ -e "$S/$u.active" ]; then echo ActiveState=active; echo "MainPID=$(cat "$S/$u.pid")"\n'
                          '  else echo ActiveState=inactive; echo MainPID=0; fi; echo NRestarts=0\n'
+                         '  [ -e "$S/$u.status" ] && { echo ExecMainCode=1; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
                          '  echo "ExecMainStartTimestampMonotonic=$(cat "$S/$u.start" 2>/dev/null || echo 0)";;\n'
                          'esac\n',
     # apt-get: update, or install nftables (the fake nft kept in /log/nft-package); /log/apt-fail makes it fail
