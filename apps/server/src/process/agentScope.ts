@@ -431,6 +431,13 @@ export const make = Effect.gen(function* () {
     stop,
     kill,
     clear,
+    ownScope: (threadId) =>
+      Effect.sync(() => {
+        const tracked = scopeByThread.get(threadId);
+        return tracked === undefined || tracked.shared
+          ? undefined
+          : { unit: tracked.unit, slice: ownedSlice };
+      }),
   } satisfies AgentScopeShape;
 });
 
