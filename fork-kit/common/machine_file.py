@@ -5,7 +5,7 @@ contain. There is one per machine, at a fixed path per OS:
 
   Linux    /etc/fork-kit/machine.json
   macOS    /Library/Application Support/fork-kit/machine.json
-  Windows  %ProgramData%\\fork-kit\\machine.json
+  Windows  C:\\ProgramData\\fork-kit\\machine.json
 
 Shape: {"version": 1, "<kit folder name>": {...}, ...}, camelCase keys. Rules, all checked here:
 
@@ -38,7 +38,7 @@ def default_path(platform=None):
     if platform == 'darwin':
         return '/Library/Application Support/fork-kit/machine.json'
     if platform in ('win32', 'cygwin'):
-        return os.path.join(os.environ.get('ProgramData') or r'C:\ProgramData', 'fork-kit', 'machine.json')
+        return r'C:\ProgramData\fork-kit\machine.json'      # fixed: never %ProgramData%, which a caller can set
     raise MachineFileError(f'no machine file path for platform {platform!r}')
 
 
