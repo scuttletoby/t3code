@@ -112,7 +112,8 @@ change, or a fork line beyond the seams, it stops and opens one issue. Then:
    default: keep the fork's value (and the `Fork:` comment of the inline `automaticUpdates`).
 2. Check that the fork's lines in upstream files are only the seams:
    `node .github/scripts/fork-seam-check.cjs <upstream tag> HEAD`. A refused line moves into the
-   fork's own file (a setting into `forkSettings.ts`); a changed seam line is fixed in
+   fork's own file (a setting into `forkSettings.ts`, a server layer into
+   `apps/server/src/fork/forkLayers.ts`); a changed seam line is fixed in
    `.github/fork-seams.json`.
 3. Run the pin tests before pushing:
    `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
