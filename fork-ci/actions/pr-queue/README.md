@@ -306,7 +306,8 @@ The queue needs:
   armed while the base is quiet is still picked up;
 - a token that can update branches, comment and merge (a fine-grained personal
   access token or a GitHub App token with contents, pull requests and issues
-  write), used only for those writes. Not the run's `GITHUB_TOKEN`: a branch
+  write, plus workflows write so a branch update can bring in the base's
+  workflow file changes), used only for those writes. Not the run's `GITHUB_TOKEN`: a branch
   update pushed with it starts no workflow, so the updated pull request would
   never get its checks. The action refuses it;
 - read permissions for the run's `GITHUB_TOKEN`, which does every read:

@@ -2644,8 +2644,54 @@ class GitVersion(unittest.TestCase):
     def test_this_git_is_new_enough(self):   # the tests above need merge-tree --write-tree too
         self.assertIsNone(Q.git_problem())
 
+    def test_git_version_and_the_caches_git_init_get_no_token(self):   # local gits: no login, so no token at all
+        env = {k: f'{k.lower()}-value' for k in Q.TOKEN_VARS}
+        seen = []
+        def run(argv, **kw):
+            seen.append((argv, kw.get('env')))
+            return ok('git version 2.47.0')
+        d = tempfile.mkdtemp(prefix='pr-queue-env-')
+        self.addCleanup(shutil.rmtree, d, True)
+        q = make_queue(d)
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(Q.subprocess, 'run', run):
+            Q.git_problem(run)
+            q.own_cache()
+        inits = [e for argv, e in seen if 'init' in argv]
+        self.assertTrue(inits, seen)
+        for argv, e in seen[:1] + [(None, e) for e in inits]:
+            self.assertIsNotNone(e, 'a git without env= gets every token of this process')
+            self.assertEqual([k for k in Q.TOKEN_VARS if k in e], [])
+
 
 # --- two tokens: reads with the run's GITHUB_TOKEN, writes with the caller's token ----------------------------------
+class OnlyWritesUseTheCallersToken(unittest.TestCase):
+    """The caller's token (a fine-grained PAT) cannot read check results: a read moved to it fails quietly (the queue
+    waits behind a PR it can no longer judge). So every call made with it is one of these, by its source."""
+    WRITES = {('pr', 'comment'), ('pr', 'merge'), ('pr', 'update-branch')}
+
+    def test_every_call_with_the_callers_token_is_a_write_or_the_one_view(self):
+        import ast
+        with open(Q.__file__, encoding='utf-8') as f:
+            tree = ast.parse(f.read())
+        writes, by_view = [], []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            if isinstance(f, ast.Attribute) and f.attr == 'gh_write':
+                writes.append(tuple(a.value if isinstance(a, ast.Constant) else '?' for a in node.args[:2]))
+            for kw in node.keywords:
+                if isinstance(kw.value, ast.Attribute) and kw.value.attr in ('gh_write', 'write_token'):
+                    by_view.append((getattr(f, 'attr', '?'), kw.arg, [k.arg for k in node.keywords]))
+            if isinstance(f, ast.Attribute) and f.attr == 'run_gh' and node.args and \
+                    isinstance(node.args[0], ast.Attribute) and node.args[0].attr == 'write_token':
+                self.assertEqual(node.args[-1].value if isinstance(node.args[-1], ast.Constant) else None, 'write')
+        self.assertTrue(writes)
+        self.assertLessEqual(set(writes), self.WRITES, 'a call other than a write uses the caller\'s token')
+        # The one read with it: tell's view (viewerDidAuthor needs the poster's login); VIEW asks for no check result.
+        self.assertEqual(by_view, [('view', 'gh', ['gh'])])
+        self.assertNotIn('statusCheckRollup', Q.VIEW)
+
 PAT_CANNOT = ('GraphQL: Resource not accessible by personal access token (repository.pullRequests.nodes.0.'
               'statusCheckRollup.contexts.nodes.0)')
 RUN_CANNOT = 'GraphQL: Resource not accessible by integration (enablePullRequestAutoMerge)'

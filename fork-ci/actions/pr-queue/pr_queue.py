@@ -269,10 +269,15 @@ def sync_dir(path):
         os.close(fd)
 
 
+def no_token_env():
+    """This process's environment without any token: for a local git that needs no login."""
+    return {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
+
+
 def git_problem(run=subprocess.run):
     """Why this git cannot run the queue (merge-tree --write-tree needs GIT_MIN), or None."""
     try:
-        r = run(['git', 'version'], text=True, capture_output=True)
+        r = run(['git', 'version'], text=True, capture_output=True, env=no_token_env())
         out = r.stdout.strip()
     except OSError as e:
         out = str(e)
@@ -295,7 +300,7 @@ class Queue:
     @staticmethod
     def gh_env(token):
         """The environment for one gh or git: this process's, with no token but `token` as GH_TOKEN."""
-        return {**{k: v for k, v in os.environ.items() if k not in TOKEN_VARS}, 'GH_TOKEN': token}
+        return {**no_token_env(), 'GH_TOKEN': token}
 
     @staticmethod
     def run_gh(token, a, which):
@@ -319,7 +324,8 @@ class Queue:
         r = self.run_gh(self.write_token, a, 'write')
         if r.returncode != 0 and NO_PERMISSION_RE.search(r.stderr or ''):
             self.say_once('write', f"::error::pr-queue: the queue's token (the `token` secret) may not do this "
-                                   f"({' '.join(a[:2])}): it needs contents, pull requests and issues: write")
+                                   f"({' '.join(a[:2])}): it needs contents, pull requests and issues: write, and "
+                                   'workflows: write when the base brings changes to workflow files')
         return r
 
     def say_once(self, key, text):
@@ -389,7 +395,7 @@ class Queue:
             print(f'could not make {new}: {e}')
             return False
         r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True)
+                           capture_output=True, env=no_token_env())
         if r.returncode != 0:
             print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
             return False
