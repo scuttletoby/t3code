@@ -1,6 +1,6 @@
 {
   "format": "capacity-readings/1",
-  "//": "Fixtures for the capacity readings (capacityReadings.ts; the kit's Python reader later runs the same cases). A host: platform, Node's numbers, files (text, or {error: unreadable}; a path not listed is missing) and commands ('file arg ...' -> stdout; not listed = failed). A case: a host, `failed` when it is a failed or half reading (it must never give more room than the healthy host), an optional patch (files/commands merged key by key, null removes; other keys replace), what to read, and the expected keys (only those given are compared; gaps are compared by reading name). Expected values are worked by hand: 1 MB = 1048576 bytes = 1024 kB, rounded down.",
+  "//": "Fixtures for the capacity readings (capacityReadings.ts; the kit's Python reader later runs the same cases). A host: platform, Node's numbers, files (text, {error: unreadable} or {error: unsupported} (EOPNOTSUPP: the kernel has the file but the feature is off); a path not listed is missing) and commands ('file arg ...' -> stdout; not listed = failed). A case: a host, `failed` when it is a failed or half reading (it must never give more room than the healthy host), an optional patch (files/commands merged key by key, null removes; other keys replace), what to read, and the expected keys (only those given are compared; gaps are compared by reading name). Expected values are worked by hand: 1 MB = 1048576 bytes = 1024 kB, rounded down.",
   "hosts": {
     "linux-v2": {
       "platform": "linux",
@@ -253,6 +253,14 @@
       "expect": { "psi": "unreadable", "gaps": [] }
     },
     {
+      "name": "PSI built in but turned off",
+      "why": "psi=0 at boot or CONFIG_PSI_DEFAULT_DISABLED (the RHEL 8 family): the file exists but reading it fails with EOPNOTSUPP. The kernel says it has no such signal: none, and the gap says so (not unreadable, which would hold the level at elevated for ever)",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/pressure/memory": { "error": "unsupported" } } },
+      "read": "machine",
+      "expect": { "psi": null, "gaps": ["psi"] }
+    },
+    {
       "name": "PSI empty",
       "failed": true,
       "why": "an empty pressure file is unreadable",
@@ -397,6 +405,71 @@
       "expect": { "cpuCores": null }
     },
     {
+      "name": "container with systemd inside",
+      "why": "systemd-nspawn, LXC/Incus or podman --systemd: this process sits in a unit (0::/init.scope), not at the namespace root. The root's memory.max and cpu.max still exist, so the cap is the container's: 4096 / 3328 / 2 as in 'container with a memory and CPU limit'",
+      "host": "linux-container",
+      "patch": { "files": { "/proc/self/cgroup": "0::/init.scope\n" } },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": 3328, "cpuCores": 2 }
+    },
+    {
+      "name": "container with systemd inside, deeper unit",
+      "why": "0::/system.slice/t3.service inside a container: still the root's cap",
+      "host": "linux-container",
+      "patch": { "files": { "/proc/self/cgroup": "0::/system.slice/t3.service\n" } },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": 3328, "cpuCores": 2 }
+    },
+    {
+      "name": "container, own cgroup unreadable",
+      "failed": true,
+      "why": "/proc/self/cgroup is not needed to find the cap: the root's memory.max and cpu.max decide. A failed read of it never removes the cap: 4096 / 3328 / 2",
+      "host": "linux-container",
+      "patch": { "files": { "/proc/self/cgroup": { "error": "unreadable" } } },
+      "read": "machine",
+      "expect": { "totalMb": 4096, "availableMb": 3328, "cpuCores": 2 }
+    },
+    {
+      "name": "container, cgroup.controllers unreadable",
+      "failed": true,
+      "why": "cannot tell which cgroup version, so not whether there is a cap: available and cores unreadable (never the host's 6886 / 12)",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": { "error": "unreadable" } } },
+      "read": "machine",
+      "expect": { "cgroup": "unreadable", "availableMb": null, "cpuCores": null }
+    },
+    {
+      "name": "container limit unsupported",
+      "failed": true,
+      "why": "EOPNOTSUPP means 'none' only for the machine PSI; on memory.max it is a failed read: available unreadable",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/memory.max": { "error": "unsupported" } } },
+      "read": "machine",
+      "expect": { "availableMb": null }
+    },
+    {
+      "name": "host process with its own unit limit",
+      "why": "a real host's cgroup v2 root has no memory.max or cpu.max; this process's unit has its own limits (1 GB, 1 core). Those are the unit's, not the machine's: 12122 / 6886 / 12",
+      "host": "linux-v2",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/work.slice/t3-server.scope/memory.max": "1073741824\n",
+          "/sys/fs/cgroup/work.slice/t3-server.scope/cpu.max": "100000 100000\n",
+          "/sys/fs/cgroup/work.slice/memory.max": "2147483648\n"
+        }
+      },
+      "read": "machine",
+      "expect": { "totalMb": 12122, "availableMb": 6886, "cpuCores": 12, "cgroup": "v2" }
+    },
+    {
+      "name": "host process at the cgroup root",
+      "why": "0::/ on a real host (no cgroup namespace): the root has no memory.max or cpu.max, so no cap: 12122 / 6886 / 12",
+      "host": "linux-v2",
+      "patch": { "files": { "/proc/self/cgroup": "0::/\n" } },
+      "read": "machine",
+      "expect": { "totalMb": 12122, "availableMb": 6886, "cpuCores": 12 }
+    },
+    {
       "name": "cgroup v1 machine",
       "why": "MemTotal 8388608 kB = 8192, MemAvailable 4096, swap 2048/2048; root limit is the v1 'no limit' number; no PSI file: none",
       "host": "linux-v1",
@@ -423,6 +496,29 @@
       },
       "read": "machine",
       "expect": { "totalMb": 2048, "availableMb": 1074 }
+    },
+    {
+      "name": "cgroup v1 container, root memory.stat unreadable",
+      "failed": true,
+      "why": "the 2 GB container of 'cgroup v1 container with a limit', but memory.stat (how v1 is found) cannot be read: cgroup unreadable, available and cores unreadable (never the host's 4096 / 4)",
+      "host": "linux-v1",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/memory/memory.limit_in_bytes": "2147483648\n",
+          "/sys/fs/cgroup/memory/memory.usage_in_bytes": "1073741824\n",
+          "/sys/fs/cgroup/memory/memory.stat": { "error": "unreadable" }
+        }
+      },
+      "read": "machine",
+      "expect": { "cgroup": "unreadable", "availableMb": null, "cpuCores": null }
+    },
+    {
+      "name": "piece when the cgroup version is unreadable",
+      "why": "no cgroup to read the piece from: demand unknown, the piece owes its full cost (never gone)",
+      "host": "linux-v2",
+      "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": { "error": "unreadable" } } },
+      "read": { "piece": "/work.slice/agent-a.scope" },
+      "expect": { "gone": false, "demandMb": null }
     },
     {
       "name": "cgroup v2 piece",
@@ -558,6 +654,24 @@
       "why": "the machine has PSI but the box has no pressure file (box gone, wrong path): unreadable",
       "host": "linux-v2",
       "read": { "box": "/other.slice" },
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "box PSI turned off for that box",
+      "why": "cgroup.pressure 0 on the box (EOPNOTSUPP): unreadable, the safe side; only the machine PSI reads 'unsupported' as none",
+      "host": "linux-v2",
+      "patch": {
+        "files": { "/sys/fs/cgroup/work.slice/memory.pressure": { "error": "unsupported" } }
+      },
+      "read": { "box": "/work.slice" },
+      "expect": { "psi": "unreadable" }
+    },
+    {
+      "name": "box PSI when the cgroup version is unreadable",
+      "why": "cannot tell v1 (no box PSI) from v2: unreadable, never none",
+      "host": "linux-v2",
+      "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": { "error": "unreadable" } } },
+      "read": { "box": "/work.slice" },
       "expect": { "psi": "unreadable" }
     },
     {

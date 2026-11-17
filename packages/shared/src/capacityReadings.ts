@@ -11,10 +11,14 @@ import * as NodeOS from "node:os";
 import type { CapacityLevel, CapacityPsi } from "./capacityPressure.ts";
 import type { CapacityFacts, CapacityPiece, CapacityReservation } from "./capacityRule.ts";
 
-/** A file's text, or why there is none (`missing`: it does not exist). */
+/**
+ * A file's text, or why there is none. `missing`: it does not exist. `unsupported`: it exists but the
+ * kernel has the feature turned off (EOPNOTSUPP); "none" only for the machine PSI, a failed read
+ * everywhere else. `unreadable`: any other failure (EACCES, EIO, ...): never "none".
+ */
 export type CapacityFileRead =
   | { readonly text: string }
-  | { readonly error: "missing" | "unreadable" };
+  | { readonly error: "missing" | "unsupported" | "unreadable" };
 
 export interface CapacityHost {
   /** As `HostProcess.Platform` (`linux`, `darwin`, `win32`, ...). */
@@ -27,8 +31,11 @@ export interface CapacityHost {
   readonly cpuCount: () => number;
 }
 
-/** The cgroup version that holds the memory controller; `null` off Linux or without cgroups. */
-export type CapacityCgroup = "v2" | "v1" | null;
+/**
+ * The cgroup version that holds the memory controller; `null` off Linux or without cgroups;
+ * `"unreadable"` when the files that tell them apart could not be read (so a container cap is unknown).
+ */
+export type CapacityCgroup = "v2" | "v1" | "unreadable" | null;
 
 /** A reading this OS cannot give, and what stands in for it. */
 export interface CapacityGap {
@@ -103,9 +110,16 @@ const oneNumber = (text: string | null): number | null =>
 const psiLine = (kind: string) =>
   new RegExp(`^${kind} avg10=(\\d+\\.\\d+) avg60=\\d+\\.\\d+ avg300=\\d+\\.\\d+ total=\\d+$`, "m");
 
-/** A PSI file: `null` when it does not exist, `"unreadable"` when broken or cut short. */
-function psiOf(read: CapacityFileRead): CapacityPsi | null | "unreadable" {
-  if ("error" in read) return read.error === "missing" ? null : "unreadable";
+/**
+ * A PSI file: `null` when it does not exist (or, with `offIsNone`, when the kernel has PSI turned off),
+ * `"unreadable"` when it fails, is broken or is cut short.
+ */
+function psiOf(read: CapacityFileRead, offIsNone: boolean): CapacityPsi | null | "unreadable" {
+  if ("error" in read) {
+    return read.error === "missing" || (offIsNone && read.error === "unsupported")
+      ? null
+      : "unreadable";
+  }
   const some = psiLine("some").exec(read.text)?.[1];
   const full = psiLine("full").exec(read.text)?.[1];
   if (some === undefined || full === undefined) return "unreadable";
@@ -123,15 +137,20 @@ function cgroupPath(path: string): string | null {
     : parts.map((p) => `/${p}`).join("");
 }
 
+/** Only a file that does not exist rules a version out; a failed read leaves it unknown. */
 async function cgroupVersion(host: CapacityHost): Promise<CapacityCgroup> {
-  if ((await textOf(host, `${CGROUP}/cgroup.controllers`)) !== null) return "v2";
-  return (await textOf(host, `${CGROUP}/memory/memory.stat`)) !== null ? "v1" : null;
+  const v2 = await readText(host, `${CGROUP}/cgroup.controllers`);
+  if ("text" in v2) return "v2";
+  if (v2.error !== "missing") return "unreadable";
+  const v1 = await readText(host, `${CGROUP}/memory/memory.stat`);
+  if ("text" in v1) return "v1";
+  return v1.error === "missing" ? null : "unreadable";
 }
 
 /**
- * The memory limit of the cgroup this process sees as its root (a container), in bytes: `null`
- * without one, `"unreadable"` when there is one that cannot be read. `usedBytes` without the page
- * cache the kernel reclaims first; `null` when it cannot be read.
+ * The cgroup root's memory limit (a container's, read wherever this process sits in it; a real host's
+ * root has none, so a unit's own limit is never taken): `null` none, `"unreadable"` unknown.
+ * `usedBytes` without the reclaimable page cache; `null` when it cannot be read.
  */
 async function containerMemory(
   host: CapacityHost,
@@ -145,9 +164,8 @@ async function containerMemory(
     const inactive = stat === null ? null : statBytes(stat, inactiveKey);
     return now === null || inactive === null ? null : Math.max(0, now - inactive);
   };
+  if (cgroup === "unreadable") return "unreadable";
   if (cgroup === "v2") {
-    // Only at the root of a cgroup namespace: a host process's own unit limit is not the machine's.
-    if (!/^0::\/\n?$/m.test((await textOf(host, "/proc/self/cgroup")) ?? "")) return null;
     const max = await readText(host, `${CGROUP}/memory.max`);
     if ("error" in max) return max.error === "missing" ? null : "unreadable";
     if (/^max\n?$/.test(max.text)) return null;
@@ -172,10 +190,13 @@ async function containerMemory(
   return null;
 }
 
-/** CPU limit of a cgroup v2 namespace root (`cpu.max`); `null` none, `"unreadable"` broken. */
+/**
+ * CPU limit of a cgroup v2 namespace root (`cpu.max`, read whenever it exists, as `memory.max`);
+ * `null` none, `"unreadable"` broken or the cgroup version unknown.
+ */
 async function containerCpus(host: CapacityHost, cgroup: CapacityCgroup) {
+  if (cgroup === "unreadable") return "unreadable";
   if (cgroup !== "v2") return null;
-  if (!/^0::\/\n?$/m.test((await textOf(host, "/proc/self/cgroup")) ?? "")) return null;
   const max = await readText(host, `${CGROUP}/cpu.max`);
   if ("error" in max) return max.error === "missing" ? null : "unreadable";
   if (/^max \d+\n?$/.test(max.text)) return null;
@@ -227,7 +248,8 @@ async function readLinux(host: CapacityHost): Promise<MachineReadings> {
         ? null
         : { totalMb: swapTotal, freeMb: swapFree };
 
-  const psi = psiOf(await readText(host, "/proc/pressure/memory"));
+  // psi=0 or CONFIG_PSI_DEFAULT_DISABLED: the file is there but EOPNOTSUPP; the machine has no PSI.
+  const psi = psiOf(await readText(host, "/proc/pressure/memory"), true);
   const cpus = await containerCpus(host, cgroup);
   const hostCpus = cpuCoresOf(host);
   const cpuCores =
@@ -241,7 +263,7 @@ async function readLinux(host: CapacityHost): Promise<MachineReadings> {
   if (psi === null) {
     gaps.push({
       reading: "psi",
-      instead: "kernel without PSI: available memory against the margin only",
+      instead: "kernel without PSI (or PSI turned off): available memory against the margin only",
     });
   }
   if (cgroup === null) gaps.push(NO_DEMAND);
@@ -371,17 +393,20 @@ export function readMachine(host: CapacityHost): Promise<MachineReadings> {
 
 /**
  * The memory PSI of a box (the cgroup a piece goes into, `/a.slice`). `null` where the machine has
- * no PSI or no cgroup v2; `"unreadable"` when the box's file is missing, broken or cut short.
+ * no PSI or no cgroup v2; `"unreadable"` when the box's file is missing, turned off, broken or cut
+ * short, or the cgroup version is unknown.
  */
 export async function readBoxPsi(
   host: CapacityHost,
   machine: Pick<MachineReadings, "cgroup" | "psi">,
   box: string,
 ): Promise<CapacityPsi | null | "unreadable"> {
-  if (machine.psi === null || machine.cgroup !== "v2") return null;
+  if (machine.psi === null) return null;
+  if (machine.cgroup === "unreadable") return "unreadable";
+  if (machine.cgroup !== "v2") return null;
   const path = cgroupPath(box);
   if (path === null) return "unreadable";
-  const psi = psiOf(await readText(host, `${CGROUP}${path}/memory.pressure`));
+  const psi = psiOf(await readText(host, `${CGROUP}${path}/memory.pressure`), false);
   return psi === null ? "unreadable" : psi;
 }
 
@@ -393,7 +418,7 @@ export async function readPieceDemand(
 ): Promise<PieceDemand> {
   const unknown = { gone: false, demandMb: null, currentMb: null, peakMb: null } as const;
   const path = cgroupPath(scope);
-  if (cgroup === null || path === null) return unknown;
+  if (cgroup === null || cgroup === "unreadable" || path === null) return unknown;
   const v2 = cgroup === "v2";
   const base = v2 ? `${CGROUP}${path}` : `${CGROUP}/memory${path}`;
   const stat = await readText(host, `${base}/memory.stat`);
@@ -431,6 +456,17 @@ export function capacityFactsOf(
   return { totalMb, availableMb, cpuCores, swap, psi, osLevel, ...known };
 }
 
+/**
+ * How the real host sorts a failed file read (Node's `error.code`): only "does not exist" is
+ * `missing`, only "turned off in the kernel" is `unsupported`; every other error is `unreadable`, so
+ * an EACCES on `memory.max` never reads as "no limit".
+ */
+export function capacityFileError(code: unknown): "missing" | "unsupported" | "unreadable" {
+  if (code === "ENOENT" || code === "ENOTDIR") return "missing";
+  if (code === "ENOTSUP" || code === "EOPNOTSUPP") return "unsupported";
+  return "unreadable";
+}
+
 /** The real host: files, commands (2 s limit) and Node's numbers; `platform` from HostProcess. */
 export function nodeCapacityHost(platform: string): CapacityHost {
   return {
@@ -439,8 +475,7 @@ export function nodeCapacityHost(platform: string): CapacityHost {
       try {
         return { text: await NodeFSP.readFile(path, "utf8") };
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        return { error: code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unreadable" };
+        return { error: capacityFileError((error as NodeJS.ErrnoException | undefined)?.code) };
       }
     },
     run: (file, args) =>

@@ -4,6 +4,7 @@ import readingsJson from "./capacity/capacity-readings.json" with { type: "json"
 import vectorsJson from "./capacity/capacity-vectors.json" with { type: "json" };
 import {
   type CapacityFileRead,
+  capacityFileError,
   type CapacityHost,
   capacityFactsOf,
   type MachineReadings,
@@ -20,7 +21,7 @@ import {
 } from "./capacityRule.ts";
 import type { CapacityVectorsFile } from "./capacityVectors.ts";
 
-type FixtureFile = string | { readonly error: "unreadable" };
+type FixtureFile = string | { readonly error: "unreadable" | "unsupported" };
 interface FixtureHost {
   readonly platform: string;
   readonly totalMemBytes: number;
@@ -252,6 +253,21 @@ describe("capacity readings: the real host", () => {
       error: "missing",
     });
     expect(await host.run("/nonexistent-capacity-readings-test/command", [])).toBeNull();
+  });
+
+  it("reads a file that exists but cannot be read as unreadable, never as missing", async () => {
+    // A directory gives EISDIR: like EACCES or EIO, a failed read, so never "no such limit".
+    expect(await nodeCapacityHost("linux").readFile("/")).toEqual({ error: "unreadable" });
+  });
+
+  it("sorts file errors: missing only when absent, unsupported only for EOPNOTSUPP", () => {
+    expect(capacityFileError("ENOENT")).toBe("missing");
+    expect(capacityFileError("ENOTDIR")).toBe("missing");
+    expect(capacityFileError("ENOTSUP")).toBe("unsupported");
+    expect(capacityFileError("EOPNOTSUPP")).toBe("unsupported");
+    for (const code of ["EACCES", "EPERM", "EIO", "EISDIR", "EMFILE", "ENODEV", undefined, 42]) {
+      expect(capacityFileError(code), String(code)).toBe("unreadable");
+    }
   });
 
   it("reads this machine when it is Linux", async () => {
