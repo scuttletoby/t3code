@@ -6,11 +6,46 @@
 # mount, without what is mounted under it. A host's own extra (a tool cache) goes in launch.conf's ALLOW_PATHS, not
 # here. Never a path that holds data: the launcher refuses /home, /root, /mnt, /media and /srv (also through a link),
 # and the per-OS walls refuse a share.
+# /etc is never here whole (issue #243): a job sees only the entries below, each one a build needs and none that holds a
+# secret, so a password file, a login file, a unit, cron, /etc/default or a backup tool's folder is simply not in its
+# file system. The launcher refuses /etc itself, and check-net lists the job's /etc and fails on anything else.
 /usr
-/etc
 /bin
 /sbin
 /lib
 /lib32
 /lib64
 /libx32
+# Users and names: whoami, git, ssh and Node's os.userInfo() read passwd and group through nsswitch.conf; hosts has
+# localhost; host.conf and gai.conf steer glibc's resolver (resolv.conf is the launcher's own, RESOLV_CONF).
+/etc/passwd
+/etc/group
+/etc/nsswitch.conf
+/etc/hosts
+/etc/host.conf
+/etc/gai.conf
+# TLS: the CA bundle and OpenSSL's config (curl, git, Python, the runner; /usr/lib/ssl links here). Not ssl/private.
+# Fedora-style hosts keep the same in pki: its certificates only, not pki/tls/private.
+/etc/ssl/certs
+/etc/ssl/openssl.cnf
+/etc/pki/tls/certs
+/etc/pki/tls/openssl.cnf
+/etc/pki/ca-trust/extracted
+# Programs and libraries: /usr/bin/cc, c++, ld and the like are links through alternatives; ld.so finds libraries here.
+/etc/alternatives
+/etc/ld.so.cache
+/etc/ld.so.conf
+/etc/ld.so.conf.d
+# Time, locale and system facts: localtime and timezone, os-release (the runner and .NET read it), lsb-release,
+# locale.alias (glibc's locale names), protocols and services (getprotobyname, getservbyname), mime.types, fonts
+# (fontconfig: a browser in a test), login.defs (UID ranges some tools read).
+/etc/localtime
+/etc/timezone
+/etc/os-release
+/etc/lsb-release
+/etc/locale.alias
+/etc/protocols
+/etc/services
+/etc/mime.types
+/etc/fonts
+/etc/login.defs

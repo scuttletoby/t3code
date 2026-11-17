@@ -253,7 +253,9 @@ TOOLS = ("  tools:1) printf 'SYSTEMD_RUN %s\\nSYSTEMCTL %s\\n' \"$(shown \"$SYST
 B_ANCHOR = '  b=$real\n  resolv_bind=$b:$resolv\n'
 # Its traps, as launcher_tripwires reads them (quotes and backslashes out): each cleans up or exits, on EXIT or a signal.
 TRAPS = ('trap rm -rf --one-file-system -- $(printf %q $tmp) EXIT', 'trap exit 129 HUP', 'trap exit 130 INT',
-         'trap exit 143 TERM', 'trap rm -f -- $(printf %q $env_file) EXIT')
+         'trap exit 143 TERM', 'trap rm -f -- $(printf %q $env_file) EXIT',
+         # check-net's two canaries (issue #243), removed however it ends
+         'trap rm -f -- $(printf %q $CANARY_DIR/fork-fleet-canary) $(printf %q $CANARY_DIR/fork-fleet-canary-group) EXIT')
 # Ways bash runs code later, at a time of its own, or loads it (none in the launcher): mapfile's and readarray's -C
 # callback, a builtin from a file (enable -f), extdebug (shopt), a prompt, PS4 under set -x, BASH_ENV in a child bash
 # (ENV in one started as sh), options a child bash takes from its environment (BASHOPTS, SHELLOPTS: xtrace with PS4),
