@@ -413,6 +413,46 @@ describe("makeManagedServerProvider", () => {
     ).pipe(Effect.provide(Layer.mergeAll(layerAlwaysRunTest, TestClock.layer()))),
   );
 
+  it.effect("tells whether the interval loop would check the instance now", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const probe = yield* Ref.make<ServerProvider>({ ...refreshedSnapshot, status: "error" });
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          // Like OpenCode: only an unhealthy instance is checked again on the interval.
+          refreshOnInterval: (snapshot) => snapshot.status === "error",
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Ref.get(probe),
+          checkUsageLimits: Effect.undefined,
+        });
+        yield* Stream.take(provider.streamChanges, 1).pipe(Stream.runDrain);
+        const checks = provider.checksOnInterval!;
+        assert.isTrue(yield* checks);
+        // Healthy: the loop skips it.
+        yield* Ref.set(probe, refreshedSnapshot);
+        yield* provider.refresh;
+        assert.isFalse(yield* checks);
+        // Healthy but its usage probe failed: the loop recovers the usage.
+        yield* Ref.set(probe, {
+          ...refreshedSnapshot,
+          usageLimits: {
+            checkedAt: refreshedSnapshot.checkedAt,
+            windows: [],
+            unavailable: { reason: "probeFailed" },
+          },
+        });
+        yield* provider.refresh;
+        assert.isTrue(yield* checks);
+        yield* Ref.set(probe, { ...refreshedSnapshot, status: "error" as const, enabled: false });
+        yield* provider.refresh;
+        assert.isFalse(yield* checks);
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
   it.effect("rechecks a ready provider after one failed periodic check before publishing it", () =>
     Effect.scoped(
       Effect.gen(function* () {
