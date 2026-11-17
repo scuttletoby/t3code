@@ -1118,6 +1118,33 @@ class Dispatch(unittest.TestCase):
         self.dispatch()
         self.assertEqual(self.fake[WAITING].stopped, [self.name(40)])
 
+    def test_an_idle_runner_under_the_pools_label_with_no_unit_here_is_left_alone(self):
+        """#356: GitHub still lists the runner online but its unit is not on this host (gone after a reboot or a
+        crash, or the pool's launch moved to another host without a label change). `stop` could only fail, so it is
+        never tried: the pool is never down for it, the same pass runs again without a stop, and a queued job starts.
+        Once GitHub marks the runner offline, its registration is deleted."""
+        for why in ('idle passes', 'another job could take it'):
+            with self.subTest(why):
+                self.setUp()
+                self.registration(40)
+                if why == 'another job could take it':
+                    self.gh.add(a_run(6, actor='someone'), a_job(41, [POOLS[WAITING]['label']]))
+                for _ in range(CFG['dispatch']['idle_passes']):
+                    self.dispatch()
+                self.assertEqual(self.fake[WAITING].stopped, [])
+                self.assertEqual(self.state['down'], {})
+                self.assertEqual(self.state['idle'], {})
+                if why == 'another job could take it':   # cancelled: it would hold back job 11 as a rival
+                    self.gh.jobs[6] = [a_job(41, [POOLS[WAITING]['label']], status='completed', conclusion='cancelled')]
+                self.gh.add(a_run(), a_job(11, job_labels(WAITING, 'lint')))
+                for _ in range(4):
+                    self.dispatch()
+                self.assertEqual((self.fake[WAITING].stopped, self.started()), ([], [self.name(11)]))
+                self.assertEqual(self.state['down'], {})
+                self.gh.runners[0]['status'] = 'offline'
+                self.dispatch()
+                self.assertNotIn(self.name(40), [r['name'] for r in self.gh.runners])
+
     def test_a_failed_stop_keeps_the_idle_count_and_the_next_pass_stops_it(self):
         """#342: the stop fails (systemd trouble): the pool is down for that pass and the runner's count is kept, so
         the next pass that answers stops it at once, not idle_passes passes later."""
