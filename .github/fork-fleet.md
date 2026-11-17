@@ -156,7 +156,8 @@ Two more things limit what a job can do:
   the other reserved ranges, all of IPv6, and the host's own public IPv4 address
   (the router's admin page and every port forwarded back into the home answer
   there; looked up at `OWN_ADDRESS_URLS`, two by default, before every start
-  and on every dispatcher pass). Every address any lookup gives is blocked (two
+  and on a dispatcher pass once the last answer is `OWN_ADDRESS_SECONDS` old,
+  2 minutes by default). Every address any lookup gives is blocked (two
   WAN links each show another one), and the last 4 stay blocked, so one lookup
   that is down opens nothing. When the address changes while jobs run,
   `refresh-net` re-applies the table and adds the new address to each running
@@ -202,8 +203,11 @@ Two more things limit what a job can do:
   `slice.d`) that allows more than localhost (a unit takes its slices' rules,
   and allow beats deny); a stop timeout that is endless or longer than 5
   minutes (a job that ignores SIGTERM would run on past its limit), in a
-  drop-in or as systemd's own default (`system.conf`: the first of `/etc`,
-  `/run`, `/usr/local/lib` and `/usr/lib`, and every `system.conf.d`); and a
+  drop-in, or as systemd's own default (`system.conf`: the first of `/etc`,
+  `/run`, `/usr/local/lib` and `/usr/lib`, and every `system.conf.d`) while a
+  job unit an older launcher started is still loaded (the launcher gives each
+  job unit its own stop timeouts, 90 s, so the default decides nothing for the
+  units it starts now); and a
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
   drops it anywhere else. On WSL2 they also read every property the launcher gives a job's unit
@@ -493,7 +497,8 @@ chmod 600 /etc/fork-fleet/launch.conf
 # and RUNNER_MIN (none: the oldest runner version refresh may install): add a line only to change one (step 1b).
 # OWN_ADDRESS_URLS (https://api.ipify.org,https://checkip.amazonaws.com): where this host's public IPv4 address is
 # looked up before every start and every dispatcher pass; every address any of them gives is blocked, and no answer
-# at all starts nothing. Add a line only to use other https lookups.
+# at all starts nothing. Add a line only to use other https lookups. OWN_ADDRESS_SECONDS (120): a dispatcher pass
+# reuses the last answer for that long (0: it looks up on every pass).
 # ALLOW_PATHS (empty): more paths jobs see read-only, comma-separated (a tool cache); never one that holds data
 # (/home, /root, /mnt, /media, /srv are refused, also through a symlink), never under a folder others (its group or all) may write.
 # JOB_PATHS (fork-fleet-job-paths.txt beside the launcher): the system paths every job sees; leave it.

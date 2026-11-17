@@ -204,15 +204,17 @@ DROPIN_SAFE = {'Description', 'Documentation', 'TimeoutSec', 'TimeoutStartSec', 
                'TimeoutStartFailureMode', 'TimeoutStopFailureMode'}
 STOP_TIMEOUTS = ('TimeoutSec', 'TimeoutStopSec', 'TimeoutAbortSec')
 STOP_MAX = 300   # seconds
-# The same from systemd's own config: its defaults for every unit, the job units among them (they set none). The main
-# file is the first of MANAGER_MAIN there is (systemd 256 and later; before, /etc's only: reading the others too can
-# only report more), and every drop-in of MANAGER_CONFS is read.
+# The same from systemd's own config: its defaults for every unit that sets none of its own. The launcher's start()
+# gives each job unit its own (JOB_STOP_TIMEOUTS: default -> its own; a test keeps them the launcher's), so they count
+# only while a unit an older launcher started is loaded (stop_defaults_used). The main file is the first of
+# MANAGER_MAIN there is (systemd 256 and later; before, /etc's only: reading the others too can only report more), and
+# every drop-in of MANAGER_CONFS is read.
 MANAGER_MAIN = ('/etc/systemd/system.conf', '/run/systemd/system.conf', '/usr/local/lib/systemd/system.conf',
                 '/usr/lib/systemd/system.conf', '/lib/systemd/system.conf')
 MANAGER_CONFS = ('/etc/systemd/system.conf.d/*.conf', '/run/systemd/system.conf.d/*.conf',
                  '/usr/local/lib/systemd/system.conf.d/*.conf', '/usr/lib/systemd/system.conf.d/*.conf',
                  '/lib/systemd/system.conf.d/*.conf')
-MANAGER_STOP_TIMEOUTS = ('DefaultTimeoutStopSec', 'DefaultTimeoutAbortSec')
+JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutAbortSec': 'TimeoutAbortSec'}
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
 UNIT_BLANKS = ' \t\n\r'
@@ -504,6 +506,19 @@ def reset_left(path, deny):
     return f'IPAddressDeny= (an empty one, then a list without {left[0]})' if left else None
 
 
+def stop_defaults_used():
+    """The defaults of JOB_STOP_TIMEOUTS some loaded fork-fleet-* unit leaves to systemd: those its transient unit
+    file (systemd writes one from systemd-run's properties, /run/systemd/transient) does not set, as in a job unit an
+    older launcher started, or a check-net probe's. A file that cannot be read: cannot tell."""
+    used = set()
+    for n in entries('/run/systemd/transient'):
+        path = f'/run/systemd/transient/{n}'
+        if fnmatch.fnmatch(n, 'fork-fleet-*.service') and os.path.isfile(ROOT + path):
+            own = {k for _, k, v in file_lines(path, 'Service') if v}
+            used |= {d for d, k in JOB_STOP_TIMEOUTS.items() if k not in own}
+    return used
+
+
 def job_units_wall():
     """The launcher starts each job's unit with systemd-run and its properties (the walls): nothing may change them
     on the way. A drop-in that applies to the job units (DROPIN_DIRS, DROPIN_FOLDERS: /etc, /run and /usr, for every
@@ -511,9 +526,10 @@ def job_units_wall():
     SystemCallFilter=, ...), an endless stop timeout, or a reset of IPAddressDeny= (reset_left), turns a wall off
     where the launcher cannot see it; so does a slice above them (SLICE_UNITS, SLICE_FOLDERS) that allows more than
     localhost, or sets another firewall of its own (SLICE_OPENS), and systemd's default stop timeout (MANAGER_MAIN,
-    MANAGER_CONFS) when endless. A list counts only in the section systemd reads it in ([Service], [Slice]). A SYSTEMD_RUN or SYSTEMCTL (the launcher's `tools`, as its settings set them) that
-    is not systemd's own (LAUNCH_TOOLS) starts the units with a program that may drop any property. A file that
-    cannot be read, or a value that cannot be read (an address, a time span): cannot tell."""
+    MANAGER_CONFS) when endless and a loaded job unit sets none of its own (stop_defaults_used). A list counts only
+    in the section systemd reads it in ([Service], [Slice]). A SYSTEMD_RUN or SYSTEMCTL (the launcher's `tools`, as
+    its settings set them) that is not systemd's own (LAUNCH_TOOLS) starts the units with a program that may drop any
+    property. A file that cannot be read, or a value that cannot be read (an address, a time span): cannot tell."""
     bad = []
     for path in dropins(every=EVERY_JOB_UNIT):
         lines = file_lines(path)
@@ -534,13 +550,14 @@ def job_units_wall():
             keys.append(f'IPAddressAllow={allow[0]}')
         if keys:
             bad.append(f'{path} sets {", ".join(keys[:4])} for the slice the job units sit in')
+    used = stop_defaults_used()
     main = [p for p in MANAGER_MAIN if os.path.exists(ROOT + p)][:1]   # a link to /dev/null too; not a dangling one
     for p in main:   # a link to /dev/null masks the others; a folder (or a socket, ...) is no config: cannot tell
         if not os.path.isfile(ROOT + p) and os.path.realpath(ROOT + p) != '/dev/null':
             raise ValueError(f'{p} is there but is no file: systemd reads no config from it (remove it)')
     for path in [p for p in main if os.path.isfile(ROOT + p)] + sorted(
             {p[len(ROOT):] for t in MANAGER_CONFS for p in glob.glob(glob.escape(ROOT) + t) if os.path.isfile(p)}):
-        keys = endless(file_lines(path), MANAGER_STOP_TIMEOUTS)
+        keys = endless(file_lines(path), used)
         if keys:
             bad.append(f'{path} sets {", ".join(keys[:2])} for every unit, the job units among them')
     tools = [line.split(' ', 1) for line in ask('tools', 'to say what it starts job units with')]
