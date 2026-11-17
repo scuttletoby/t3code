@@ -39,6 +39,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}` | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`  | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
 | [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
 | [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
@@ -48,6 +49,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`    | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set             | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set             | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.handoff`](#projectoverridehandoff)                         | not set             | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
@@ -171,6 +173,40 @@ session ends (`idleMinutes`) and the longest session (`maxHours`).
 }
 ```
 
+### `server.reviewRules`
+
+How this machine runs a review lens on a pull request: which provider driver, model and effort run
+it, and the state question every review asks. The repository's own config file says what a pull
+request needs (its lenses, critical paths, rounds) and the CI gate enforces it; this setting is only
+the machine's half. Nothing reads it yet: the review runner comes in a later pull request.
+
+`preset` is `off` (nothing is listed, changed or checked) or `recommended`, which fills in the
+fork's defaults: Claude (`claudeAgent`) with `claude-opus-5-5` at `high` effort, the `approach`
+lens on `claude-fable-5-2` at `high`, the state question "What happens when this runs again, stops
+half-way, or meets existing, old or empty state?", small findings left after round 2 filed as
+issues (`minors: "issue"`), the config at `.github/pr-queue.json` and reports of at most 60000
+characters. A field written out wins over the preset's (`lensRunners` per lens); a field written
+out while `preset` is `off` does nothing. A fork update may change the preset's values; write the
+fields out to keep them fixed. Efforts an agent may not use are the model policy's, not this
+setting's.
+
+Fields: `runner` and each `lensRunners` entry are `{driver, model, effort}` (a driver kind, not a
+provider instance); `stateQuestion` is 20 to 600 characters; `minors` is `same-round`, `issue` or
+`free`; `configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
+from 1000 to 65000.
+
+Only the person can change it; agents cannot. A save must name `preset` (it replaces the stored
+value whole) and is refused for a bad field or an unknown key. A hand-edited value that is not
+valid (an unknown preset or key from a newer build, a bad runner) reads as off, never half on, with
+a warning in the server log; it is kept as written, and saves of other settings write it back
+unchanged until the person saves this setting.
+
+```json
+{
+  "reviewRules": { "preset": "recommended" }
+}
+```
+
 ### `server.agentSlots`
 
 Limits on running agents: `delegate_task` is refused above `maxPerMachine` agents on this server,
@@ -260,6 +296,15 @@ that leaves this key out (an older client) keeps the stored value; only `null` c
 fork's `clearProjectSettingsOverridesWithForkKeys` sends that. Unlike the server's value it is
 saved with every field written out, so a project that is off says so in the file. A repository's `t3.json` cannot set
 it: that file is in the repository, which agents edit.
+
+### `projectOverride.reviewRules`
+
+A project's own review rules. It replaces the server's `reviewRules` for that project as a whole:
+`{"preset": "off"}` turns review rules off for one project on a machine where they are on, and a
+project with `recommended` does not take the server's fields written out. Not set: the server's. A
+project value that is not valid reads as off for that project, never as the server's, and is kept
+as written. A project save that leaves this key out (an older client) keeps the stored value; only
+`null` clears it, as for `playtest`.
 
 ### `projectOverride.mcpProfile`
 
