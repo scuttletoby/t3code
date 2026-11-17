@@ -2394,10 +2394,13 @@ class InlineCommentsQuery(ReviewFlagsQuery):
                 self.assertTrue(why)
 
     def test_a_next_page_of_inline_comments_without_a_new_cursor_fails(self):
-        for cursor in ('', 'i1'):
-            (flags, why), _ = self.read(flags_page(inline=[inline_node('a')], inline_more='i1'),
-                                        more_comments_page([inline_node('b')], more=cursor))
+        for cursor in ('', 'i1'):   # issue #65: GitHub repeats the token: stop at once, not after REVIEW_PAGES calls
+            pages = [flags_page(inline=[inline_node('a')], inline_more='i1')] + \
+                [more_comments_page([inline_node('b')], more=cursor)] * Q.REVIEW_PAGES
+            (flags, why), calls = self.read(*pages)
             self.assertIsNone(flags, cursor)
+            self.assertIn('no next page', why)
+            self.assertEqual(len(calls), 2, cursor)
         (flags, why), _ = self.read(flags_page(inline=[inline_node('a')], inline_more=''))
         self.assertIsNone(flags)
 

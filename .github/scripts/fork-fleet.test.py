@@ -3938,6 +3938,38 @@ class AnyRepository(unittest.TestCase):
                         self.assertFalse(put & static, out)
                         self.assertIn('::error::fork-fleet: no static pool is used', log)
 
+    def test_private_must_be_a_boolean(self):
+        """Issue #63: "private" is true or false, never text, null or a number. The fork's own config has no static
+        pool, so only the type check can refuse it there; GEN's static pools need "private": true besides."""
+        wrong = 'private must be true or false'
+        for value in ('true', 'false', '', None, 1, 0, [], {}):
+            with self.subTest(private=value):
+                self.assertEqual(ff.check_config(dict(CFG, private=value)), [wrong])
+                self.assertIn(wrong, ff.check_config(dict(GEN, private=value)))
+        for value in (True, False):
+            with self.subTest(private=value):
+                self.assertEqual(ff.check_config(dict(CFG, private=value)), [])
+                self.assertNotIn(wrong, ff.check_config(dict(GEN, private=value)))
+        self.assertEqual(ff.check_config(GEN), [])
+
+    def test_the_waiting_static_pool_is_the_always_on_one_in_any_order(self):
+        """Issue #64: of two static pools of one kind, the one that waits is where a job whose gate is off, every job of
+        an untrusted run, and the fallback go; never the first one listed."""
+        spare = {'name': 'spare', 'static': True, 'runs_on': ['self-hosted', 'proj-spare'], 'slots': 1,
+                 'waits': False, 'takes': ['push', 'draft']}
+        for where in (1, 2):   # before the build pool, which waits for pushes, and after it
+            cfg = copy.deepcopy(GEN)
+            cfg['pools'].insert(where, spare)
+            with self.subTest(spare_at=where):
+                self.assertEqual(ff.check_config(cfg), [])
+                self.assertEqual(ff.always_on(cfg, 'push', None)['name'], 'build')
+                for mode in ff.MODES:
+                    _, out, fallback, _ = self.route(cfg, mode, pc=beacon(0), gates={'docs': 'false'}, fallback=True)
+                    self.assertEqual((out['docs'], fallback), (BUILD, BUILD), mode)
+                    _, out, fallback, _ = self.route(cfg, mode, pc=beacon(2), e=env(GITHUB_TRIGGERING_ACTOR='someone'),
+                                                     fallback=True)
+                    self.assertEqual(set(map(tuple, out.values())) | {tuple(fallback)}, {tuple(BUILD)}, mode)
+
     def test_a_static_label_is_never_a_dispatcher_or_retired_label(self):
         """Lens #53 security minor and correctness minor: a static runner with a dispatcher pool's label is a rival of
         every one-job runner (the dispatcher never starts one) and may be given a job its gate kills."""
