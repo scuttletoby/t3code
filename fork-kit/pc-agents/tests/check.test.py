@@ -314,6 +314,7 @@ class Unit(Case):
         self.assertEqual(set(deny), set(k.BLOCKED4 + k.BLOCKED6))
         self.assertIn('\nIPAddressAllow=100.101.102.103/32\n', unit)
         self.assertIn('\nStartLimitBurst=5\n', unit)
+        self.assertIn('\nRestartPreventExitStatus=77\n', unit)   # a policy T3 cannot apply is not retried
         self.assertIn('\n[user]\ndefault=root\n', files['/etc/wsl.conf'][0])
         self.assertIn('\nOnUnitActiveSec=2min\n', files['/etc/systemd/system/pc-agents-walls.timer'][0])
         self.assertIn(' SHELL=/bin/bash\n', unit)   # the agent's login shell is nologin; T3's shells are bash

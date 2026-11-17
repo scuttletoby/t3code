@@ -197,7 +197,7 @@ def render(c):
 Description=T3 Code for agents, walled (pc-agents kit)
 Wants=network-online.target
 After=network-online.target
-# T3 exits 1 on a policy it cannot apply, like on any other failure: give up after 5 starts in 10 minutes.
+# any failure but a policy T3 cannot apply (77, below): give up after 5 starts in 10 minutes
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
