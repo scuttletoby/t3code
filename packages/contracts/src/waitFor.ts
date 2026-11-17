@@ -241,7 +241,8 @@ export type WaitForSettingsPatch = typeof WaitForSettingsPatch.Type;
 /** A field left out keeps its stored value; `maxPerAccount` is replaced whole. */
 export const AgentSlotsSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
-  mode: Schema.optionalKey(AgentSlotsMode),
+  /** Any text, like the stored value it may be sent back from; an unknown one reads as `fixed`. */
+  mode: Schema.optionalKey(Schema.String),
   maxPerMachine: NonNegativeIntPatch,
   maxPerAccount: Schema.optionalKey(Schema.Record(ProviderInstanceId, NonNegativeInt)),
   minFreeMemoryMb: NonNegativeIntPatch,

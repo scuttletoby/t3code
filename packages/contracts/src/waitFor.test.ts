@@ -57,13 +57,13 @@ describe("wait settings", () => {
     expect(DEFAULT_SERVER_SETTINGS.agentSlots.enabled).toBe(false);
   });
 
-  it("keeps an agentSlots mode of a newer build when reading, but a patch sets only known ones", () => {
+  it("keeps an agentSlots mode of a newer build when reading and when sent back as a patch", () => {
     expect(decodeServerSettings({ agentSlots: { mode: "dynamic" } }).agentSlots.mode).toBe(
       "dynamic",
     );
     expect("mode" in decodeServerSettings({}).agentSlots).toBe(false);
     expect(decodePatch({ agentSlots: { mode: "observe" } }).agentSlots?.mode).toBe("observe");
-    expect(() => decodePatch({ agentSlots: { mode: "dynamic" } })).toThrow();
+    expect(decodePatch({ agentSlots: { mode: "dynamic" } }).agentSlots?.mode).toBe("dynamic");
   });
 
   it("fills missing fields of a partly written block", () => {
