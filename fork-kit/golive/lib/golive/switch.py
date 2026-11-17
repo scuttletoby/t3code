@@ -6,7 +6,7 @@ enabled service then starts the build the unit names, and the journal asks for `
 
 Every change is made inside a journalled step (journal.py); the refusals all come first.
 """
-import datetime, json, os, shutil, stat, subprocess, sys, time, urllib.error, urllib.request
+import datetime, json, math, os, shutil, stat, subprocess, sys, time, urllib.error, urllib.request
 
 from golive import check as check_mod, coldcopy, journal, live, osadapter
 
@@ -31,9 +31,9 @@ def _t3(binary, args, timeout):
 
 def passed_rehearsal(cfg, from_version):
     """The record of the last `rehearse` run if it passed for this target and from-version and is fresh; Refused
-    otherwise. Until `rehearse` lands (go-live PR 5) this is the one place that defines the record: the rehearse
-    run ends "ok" and its step "result" is done with {fromVersion, targetVersion, migrations: the ids the target
-    runs, seconds: how long the target took to migrate and get ready on the clone}."""
+    otherwise. It reads the record `rehearse` (go-live PR 5) writes: the run ends "ok" and its step "result" is done
+    with {fromVersion, targetVersion, migrations: the ids the target runs, migrateSeconds, readySeconds: how long the
+    target took to migrate and get ready on the clone}. The returned record adds `seconds`, their sum rounded up."""
     runs, _ = journal.read(cfg.state_dir)
     tried = [r for r in runs if r['command'] == 'rehearse']
     if not tried:
@@ -52,9 +52,11 @@ def passed_rehearsal(cfg, from_version):
     if _utcnow() - ended > datetime.timedelta(hours=cfg.rehearsal_max_age_hours):
         raise journal.Refused(f'the last rehearsal ({last["end"]["at"]}) is too old (rehearsalMaxAgeHours '
                               f'{cfg.rehearsal_max_age_hours}): rehearse again')
-    if not (isinstance(data.get('migrations'), list) and type(data.get('seconds')) is int):
+    took = [data.get('migrateSeconds'), data.get('readySeconds')]
+    if not (isinstance(data.get('migrations'), list)
+            and all(type(t) in (int, float) and 0 <= t < float('inf') for t in took)):
         raise journal.Refused('the rehearsal record has no migration list or time: rehearse again')
-    return data
+    return dict(data, seconds=math.ceil(sum(took)))
 
 
 def launchers(home):
@@ -254,6 +256,16 @@ def final(run):
                for s in run['steps'])
 
 
+def keep_old_build(run, cfg, version):
+    """TODO(go-live PR 7, #397): NOT WIRED YET. Call #397's kit helper here: it keeps a copy of the old runtime
+    (`runtime/versions/<version>`) outside runtime/versions, where upstream's `t3 update` prune cannot delete it, and
+    makes W1 use that copy. Return the kept folder; raise if the keep failed (the switch then refuses before any stop).
+    #397 names the function and path in its PR body under "For PR6". Until then this keeps nothing and returns None,
+    and switch.test.py's `test_the_old_build_is_kept_outside_runtime_versions_before_the_update` is an expected
+    failure. (This PR's own stopgap: the copy's extra/runtime/versions/<old>, which _way_back puts back.)"""
+    return None
+
+
 def run_switch(cfg, adapter, owner_says_go=False, say=print):
     with journal.run(cfg.state_dir, 'switch') as run:
         code, result = check_mod.run_check(cfg, adapter, own_run=run)
@@ -285,6 +297,13 @@ def run_switch(cfg, adapter, owner_says_go=False, say=print):
         dest = os.path.join(cfg.backup_dir, f't3-switch-{coldcopy._stamp()}-{server["version"]}')
         if os.path.lexists(dest):
             raise journal.Refused(f'{dest} already exists; a copy never goes over another: try again in a second')
+        with run.step('keep-old-build', version=server['version']) as facts:  # the update (after the stop) may
+            try:                                                # prune the old runtime W1 needs: keep it first
+                facts['kept'] = keep_old_build(run, cfg, server['version'])
+            except Exception as e:  # a failed keep changed nothing live: the step is done, the run refuses
+                facts['error'] = why = f'{type(e).__name__}: {e}'
+        if 'error' in facts:
+            raise journal.Refused(f'keeping the old build {server["version"]} failed: {why}; T3 was not stopped')
         limit = max(MIN_LIMIT, 3 * rehearsal['seconds'])
         rec = {'version': server['version'], 'pid': server['pid'], 'copy': dest, 'limit': limit,
                'migrations': rehearsal['migrations'], 'counts': result.get('counts') or {},

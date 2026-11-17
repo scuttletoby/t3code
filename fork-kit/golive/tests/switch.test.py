@@ -81,7 +81,9 @@ class SwitchBase(unittest.TestCase):
 
     def rehearsed(self, result='ok', **over):
         """A rehearsal's journal record, as switch.passed_rehearsal reads it."""
-        data = {'fromVersion': fx.LIVE, 'targetVersion': fx.TARGET, 'migrations': [82, 83], 'seconds': 0, **over}
+        data = {'fromVersion': fx.LIVE, 'targetVersion': fx.TARGET, 'migrations': [82, 83], 'migrateSeconds': 0.0,
+                'readySeconds': 0, **over}  # as rehearse (go-live PR 5) writes it, plus copy, port, totalSeconds...
+        data = {k: v for k, v in data.items() if v is not None}
         try:
             with journal.run(self.m.state, 'rehearse') as r:
                 with r.step('result') as facts:
@@ -184,8 +186,8 @@ class Switch(SwitchBase):
         result = self.switch()
         self.assertEqual(result['verified'], fx.TARGET)
         self.assertEqual([s for s, p in self.steps() if p == 'done'],
-                         ['guard', 'pre-hooks', 'stopping', 'cold-copy', 'read-back', 'manifest', 'old-preflight',
-                          'update', 'verify', 'post-hooks'])
+                         ['keep-old-build', 'guard', 'pre-hooks', 'stopping', 'cold-copy', 'read-back', 'manifest',
+                          'old-preflight', 'update', 'verify', 'post-hooks'])
         self.assertEqual(self.done('verify')[0]['result'], 'verified')
         self.assertEqual(self.last_run()['end']['result'], 'ok')
         self.assertEqual(self.server()['version'], fx.TARGET)
@@ -237,9 +239,14 @@ class Switch(SwitchBase):
 
 
     def test_the_time_limit_is_three_rehearsals_and_at_least_the_floor(self):
-        self.rehearsed(seconds=0)
+        self.rehearsed()
         self.switch()
         self.assertEqual(self.started_data('stopping')['limit'], switch.MIN_LIMIT)
+
+    def test_the_time_limit_is_three_times_migrate_plus_ready_rounded_up(self):
+        self.rehearsed(migrateSeconds=250.2, readySeconds=50)
+        self.switch()
+        self.assertEqual(self.started_data('stopping')['limit'], 3 * 301)
 
     def test_verify_names_every_problem(self):
         self.rehearsed()
@@ -252,7 +259,7 @@ class Switch(SwitchBase):
         self.assertEqual(look(), '')
         svc = self.adapter.service()
         with mock.patch.object(self.adapter, 'service', return_value={**svc, 'active': False}):
-            self.assertIn('is not active', look())
+            self.assertEqual(look(), f'{switch.osadapter.UNIT} is not active')  # at once, not via server_changed
         self.assertIn('the server runs t3', look(fx.LIVE))
         with mock.patch.object(switch, 'answers', return_value=False):
             self.assertIn('nothing answers HTTP', look())
@@ -294,6 +301,13 @@ class Refusals(SwitchBase):
         later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
         with mock.patch.object(switch, '_utcnow', return_value=later):
             self.refused('too old')
+
+    def test_a_rehearsal_record_without_a_migration_list_or_time(self):
+        for broken in ({'migrations': None}, {'migrateSeconds': None}, {'readySeconds': '5'},
+                       {'migrateSeconds': True}, {'readySeconds': -1}, {'migrateSeconds': float('nan')}):
+            with self.subTest(broken=broken):
+                self.rehearsed(**broken)
+                self.refused('no migration list or time')
 
     def test_migrations_differ_from_the_rehearsal(self):
         self.rehearsed(migrations=[82])
@@ -441,6 +455,26 @@ class WayBack(SwitchBase):
         self.assertEqual(self.done('back-downgrade')[0]['runtimeFromCopy'], True)
         self.assertEqual(seen, [old], 'the old runtime came back from the copy before its update ran')
         self.assert_rolled_back()
+
+    @unittest.expectedFailure  # TODO(#397): red until switch.keep_old_build calls #397's keep helper; then drop this
+    def test_the_old_build_is_kept_outside_runtime_versions_before_the_update(self):
+        self.rehearsed()
+        old = sha(self.m.path(f'home/runtime/versions/{fx.LIVE}/t3'))
+        self.switch()
+        order = [s for s, phase in self.steps() if phase == 'done']
+        self.assertLess(order.index('keep-old-build'), order.index('stopping'))
+        kept = self.done('keep-old-build')[0]['kept']
+        self.assertIsInstance(kept, str)
+        self.assertFalse(os.path.realpath(kept).startswith(self.m.path('home/runtime/versions') + os.sep))
+        self.assertEqual(sha(os.path.join(kept, 't3')), old)
+
+    def test_a_failing_keep_of_the_old_build_refuses_before_any_stop(self):
+        self.rehearsed()
+        with mock.patch.object(switch, 'keep_old_build', side_effect=OSError('disk full')):
+            self.refused('keeping the old build', 'disk full', 'not stopped')
+        self.assertEqual(self.done('keep-old-build')[0]['error'], 'OSError: disk full')
+        self.assertNotIn('run_detached', self.calls())
+        self.assertNotIn('update', [s for s, _ in self.steps()])
 
     def test_a_server_that_changed_during_the_stop_is_started_again_without_a_copy(self):
         self.rehearsed()

@@ -194,10 +194,14 @@ is refused. It refuses, with nothing changed, unless `check` passes; the last `r
 exact target **and** the live build, and ended less than `rehearsalMaxAgeHours` ago (default 72); the target
 would run exactly the migrations the rehearsal ran; the home has no kit leftovers; free disk holds the copy
 plus the old runtime; and (without `--owner-says-go`) the machine is quiet. The fork-features-off check is part
-of `check`. Until `rehearse` lands, `switch.passed_rehearsal` is the one place that defines the record it reads:
-a `rehearse` run that ended "ok" whose step `result` is done with `{fromVersion, targetVersion, migrations,
-seconds}`. Then, each a journalled step:
+of `check`. `switch.passed_rehearsal` reads the record `rehearse` (go-live PR 5) writes: a `rehearse` run that
+ended "ok" whose step `result` is done with `{fromVersion, targetVersion, migrations, migrateSeconds,
+readySeconds}`; the rehearsal's time is migrate plus ready, rounded up. Then, each a journalled step:
 
+0. `keep-old-build`: upstream's `update` (step 6) may prune the old runtime W1 needs, so it is kept first,
+   outside `runtime/versions`; a failed keep refuses, T3 not stopped. **Not wired yet:** `switch.keep_old_build`
+   is the call site for go-live PR 7's keep helper and keeps nothing until then (the stopgap is the copy's
+   `extra/` below).
 1. `guard`: a second transient unit runs `back --auto --run <id> --wait` and its timer fires `back --auto --run
    <id>` after the latest the run should have ended. Not up: refused, T3 not stopped.
 2. `pre-hooks`, then quiet again; a failure runs the post hooks and refuses (T3 not stopped).
