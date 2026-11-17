@@ -1071,6 +1071,7 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
                     'home': cfg.home, 'liveVersion': server['version'], 'bytes': total, 'files': entries,
                     'leftOut': left_out})
                 facts['manifest'] = os.path.join(dest, MANIFEST)
+                facts['reportCounts'] = result.get('counts')  # read by check before the wait; `back` compares
         except BaseException as e:
             error = e
         finally:
@@ -1104,9 +1105,10 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
 def guard(cfg, adapter, run_id):
     """Started detached by a copy run before T3 stops. Logs that it waits (the run stops T3 only after this line),
     then waits for that run to end however it ends (the lock frees when its holder dies), then starts T3 if the
-    run had stopped it and left it stopped, and runs the post hooks if the run ran the pre hooks but not the post
-    hooks. A journal it cannot read fails open: T3 is started if it is not active and the post hooks run (each is
-    safe twice). It changes nothing else and writes no journal line (the run, ended or killed, stays as it is for
+    run had stopped it and left it stopped and the service is enabled (a copy never disables it; a back W1 that
+    stopped disables it on purpose), and runs the post hooks if the run ran the pre hooks but not the post hooks. A
+    journal it cannot read fails open: T3 is started if it is not active and enabled, and the post hooks run (each
+    is safe twice). It changes nothing else and writes no journal line (the run, ended or killed, stays as it is for
     the owner). Logs to <stateDir>/guard.log. Returns what it did."""
     try:
         _guard_log(cfg.state_dir, {'run': run_id, 'waiting': True})
@@ -1125,7 +1127,10 @@ def guard(cfg, adapter, run_id):
             did.append(f'journal unreadable, so T3 is put back as if the run had stopped it: {e}')
         if stopped:
             try:
-                if not adapter.service()['active']:
+                svc = adapter.service()
+                if not svc['active'] and not svc['enabled']:  # a copy never disables it; a back W1 does, on purpose
+                    did.append(f'{osadapter.UNIT} is not enabled: left stopped (a back W1 that stopped may hold it)')
+                elif not svc['active']:
                     adapter.start()
                     did.append(f'started {osadapter.UNIT}')
             except osadapter.AdapterError as e:
