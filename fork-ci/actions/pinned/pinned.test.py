@@ -337,9 +337,64 @@ class Neighbours(Case):
                      b'__file__), "x.py")])\n',
                      b'import os\nos.chdir(os.path.dirname(os.path.abspath(__file__)))\nimport lens\n',
                      b'import os\nopen(os.path.join(os.path.dirname(__file__), "data.json"))\n',
-                     b'print(__spec__.origin)\n', b'print(__loader__.path)\n'):
+                     b'print(__spec__.origin)\n', b'print(__loader__.path)\n',
+                     b'print(__cached__)\n'):   # #331 item 3: no row pinned it
             with self.subTest(body=body):
                 self.assertNotEqual(pinned.neighbour_loads(body), [])
+
+    def test_the_usual_spellings_of_sys_and_the_own_path(self):   # #331 item 2: each returned [] before
+        for body in (b'import os\nos.sys.path.insert(0, "x")\n', b'from os import sys as s\ns.path.insert(0, "x")\n',
+                     b'from os import sys\nsys.meta_path.append(1)\n', b'import os\nprint(os.sys)\n',
+                     b'import os, sys\nprint(os.path.dirname(sys.argv[0]))\n',
+                     b'from sys import argv\nprint(argv[0])\n',
+                     b'import __main__\nprint(__main__.__file__)\n', b'from __main__ import x\n',
+                     b'import inspect\nprint(inspect.getfile(inspect.currentframe()))\n',
+                     b'import sys\nprint(sys._getframe().f_code.co_filename)\n',
+                     b'__builtins__.__import__("runpy")\n', b'getattr(__builtins__, "__imp" + "ort__")("runpy")\n'):
+            with self.subTest(body=body):
+                self.assertNotEqual(pinned.neighbour_loads(body), [])
+        for body in (b'import os\nprint(os.sys.version, os.sys.argv[1:])\n',   # still self-contained
+                     b'import sys\nprint(sys.argv[1])\n', b'args = [0]\nprint(args[0])\n'):
+            with self.subTest(body=body):
+                self.assertEqual(pinned.neighbour_loads(body), [])
+
+    def test_the_run_folder_is_inside_the_cache_so_every_dot_dot_is_ours(self):
+        # #331 item 1: with the run folder in the shared temp folder, `../..` of the copy was that temp folder again,
+        # so `<tmp>/pr-queue/planted.py` (any local user can make it) ran. Inside the checked cache, every `..` is
+        # the run folder, the 0700 cache, or a folder above it, which the README requires to be ours.
+        tmp = os.path.join(self.root, 'tmp')   # stands for the shared /tmp
+        os.mkdir(tmp)
+        self.put(os.path.join(tmp, 'pr-queue', 'planted.py'), f'open({self.marker!r}, "w").close()\n'.encode())
+        body = (b'import os, sys\nd = os.path.dirname(os.path.abspath(sys.argv[0]))\n'
+                b'sys.path.insert(0, os.path.join(d, "..", "..", "pr-queue"))\nimport planted\n')
+        self.config({'repo': 'owner/repo', 'sha': SHA, 'files': {'head-check/head_check.py': pinned.blob_id(body)}})
+        seen = []
+
+        def runner(cmd):
+            seen.append(cmd[2])
+            return subprocess.run(cmd, capture_output=True)
+        for _ in range(2):   # a second run works the same and leaves nothing either
+            with self.serve(body), mock.patch.object(pinned.tempfile, 'tempdir', tmp), \
+                    mock.patch.object(pinned, 'neighbour_loads', lambda data: []):   # a spelling the check misses
+                code = pinned.run(self.cfg, 'head-check', 'head_check.py', cache=self.cache, runner=runner)
+            self.assertNotEqual(code, 0, 'the import fails: there is no pr-queue in the cache')
+            self.assertFalse(os.path.exists(self.marker), 'the planted neighbour in the shared temp folder never ran')
+        for script in seen:
+            run_dir = os.path.dirname(os.path.dirname(script))
+            self.assertEqual(os.path.dirname(run_dir), self.cache, 'the run folder sits in the checked cache')
+            self.assertFalse(os.path.exists(run_dir), 'the run folder goes after the run')
+        self.assertEqual(os.listdir(tmp), ['pr-queue'], 'nothing is made in the shared temp folder')
+        self.assertEqual(sorted(os.listdir(self.cache)), [SHA])
+
+    def test_a_run_folder_a_killed_run_left_goes_after_cache_days(self):   # #331 item 1: SIGKILL skips the finally
+        now = time.time()
+        old, live = (os.path.join(self.cache, x) for x in ('.run-killed', '.run-live'))
+        for folder, age in ((old, pinned.CACHE_DAYS * 86400 + 60), (live, 60)):
+            self.put(os.path.join(folder, 'head-check', 'head_check.py'), b'x', age, now)
+            os.utime(folder, (now - age, now - age))
+        pinned.prune(self.cache, SHA, now)   # what every use runs first
+        self.assertFalse(os.path.exists(old), 'a run folder unused for CACHE_DAYS goes')
+        self.assertTrue(os.path.exists(live), 'a run that may still go on keeps its folder')
 
     def test_run_copies_into_a_nested_private_folder_so_dot_dot_stays_private(self):
         # #314 item 2: whatever the static check misses, `..` of the run copy is our own 0700 run folder, never the
