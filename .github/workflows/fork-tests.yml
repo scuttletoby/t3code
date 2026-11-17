@@ -271,8 +271,11 @@ jobs:
             /fork-ci/
             /fork-kit/
             /scripts/
+            /apps/server/src/cli/config.ts
             /apps/server/src/cli/forkReport.ts
+            /apps/server/src/cli/update.ts
             /apps/server/src/cloud/bootService.ts
+            /apps/server/src/cloud/pinnedRuntime.ts
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
             /apps/server/src/golive/forkReport.ts
@@ -351,8 +354,11 @@ jobs:
             /fork-ci/
             /fork-kit/
             /scripts/
+            /apps/server/src/cli/config.ts
             /apps/server/src/cli/forkReport.ts
+            /apps/server/src/cli/update.ts
             /apps/server/src/cloud/bootService.ts
+            /apps/server/src/cloud/pinnedRuntime.ts
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
             /apps/server/src/golive/forkReport.ts

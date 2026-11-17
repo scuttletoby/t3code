@@ -64,9 +64,15 @@ UPSTREAM = [
     ('packages/shared/src/cliRelease.ts',
      'return `t3-${version}-${platformKey}.${platformKey.startsWith("win32") ? "zip" : "tar.gz"}`;',
      'archive name t3-<version>-<platform>.tar.gz'),
-    # back and status (back.py). Not pinned yet: runtime/versions/<v>/.install-complete and runtime/launchers
-    # (cloud/pinnedRuntime.ts), `update --allow-downgrade --yes` (cli/update.ts) and `--base-dir` (cli/config.ts):
-    # those files are not in the kit job's sparse checkout (.github/workflows/fork-tests.yml) yet.
+    # back and status (back.py)
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'sentinelPath: path.join(versionDir, ".install-complete"),',
+     'back.installed_t3: a whole runtime has runtime/versions/<v>/.install-complete'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'const PINNED_RUNTIME_LAUNCHERS_FILE = "launchers";',
+     'status: the launcher links upstream recorded in runtime/launchers'),
+    ('apps/server/src/cli/update.ts', 'allowDowngrade: Flag.Boolean("allow-downgrade")',
+     'back: update --allow-downgrade'),
+    ('apps/server/src/cli/update.ts', 'yes: Flag.Boolean("yes")', 'back: update --yes restarts the service'),
+    ('apps/server/src/cli/config.ts', 'export const baseDirFlag = Flag.String("base-dir")', 'back: update --base-dir'),
     ('apps/server/src/serverRuntimeState.ts', 'return `http://${hostname}:${port}`;', 'status: origin is http'),
     ('apps/server/src/cloud/serviceProtocol.ts', 'const SEMVER_NUMBER = "(?:0|[1-9]\\\\d*)";',
      'config.EXACT_VERSION'),
