@@ -14,7 +14,8 @@ and its blob id is checked on every use: a cached copy that differs (a killed wr
 runner) is fetched again, and fetched bytes that differ are refused. A file the config does not name, or no network
 and no good copy: FetchError, and the caller fails or falls back to its full answer, never to a guessed one. Each use
 also removes .part- files older than PART_AGE (a killed fetch) and the folders of other shas that nothing used for
-CACHE_DAYS. load() and run run the bytes that were checked, never a second read of the cache file.
+CACHE_DAYS. load() and run run the bytes that were checked, never a second read of the cache file, and refuse a file
+that would load its neighbours (neighbour_loads): those would be cache files nothing checked.
 
   python3 -I pinned.py --config .github/fork-ci.json [--cache DIR] run <action> <file> [args...]
 runs that pinned script (python3 -I) with the arguments after its name, from a private copy of the checked bytes.
@@ -22,12 +23,13 @@ runs that pinned script (python3 -I) with the arguments after its name, from a p
 prints the "files" map at the config's sha (fetched, not checked): for a pin bump, move "sha" and "tag", paste it.
 README.md next to this file: the Python API and the bootstrap a project copies to load this module.
 """
-import argparse, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, types, urllib.request
+import argparse, ast, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, types, urllib.request
 
 NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._-]*\Z')   # \Z: no trailing newline
 SHA = re.compile(r'[0-9a-f]{40}')
 PART_AGE = 3600     # seconds: an older .part- file is a killed fetch (a live one takes seconds)
 CACHE_DAYS = 14     # another sha's folder that nothing used for this long goes (a rerun of an old run fetches again)
+BY_PATH = ('importlib', 'runpy', 'imp', 'zipimport', 'pkgutil')   # modules that load code from a path
 
 
 def default_cache():
@@ -177,6 +179,43 @@ def verified(config, action, name, cache=None):
     return dest, data
 
 
+def neighbour_loads(data):
+    """What in these Python bytes would load code from the file's own folder, which in the cache holds files nothing
+    checked: sys.path touched (pr-queue/pr_queue.py puts its folder first, then imports config and lens), a module that
+    loads code from a path (BY_PATH), or a relative import. load() and run refuse a file with any: they run one checked
+    file, never its neighbours. Other imports come from the caller's own path (the standard library, an installed
+    PyYAML), as any import of the caller's does. A static check: __import__() or exec() of a file read at run time
+    are not seen (no fork-ci module does either)."""
+    try:
+        tree = ast.parse(data)
+    except (SyntaxError, ValueError):
+        return ['(does not parse)']
+    found = set()
+    for node in ast.walk(tree):
+        names = []
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = ['.' * node.level + (node.module or '')]
+            if node.module == 'sys' and any(a.name in ('path', '*') for a in node.names):
+                found.add('sys.path')
+        elif (isinstance(node, ast.Attribute) and node.attr == 'path' and isinstance(node.value, ast.Name)
+              and node.value.id == 'sys'):
+            found.add('sys.path')
+        found.update(n for n in names if n.startswith('.') or n.split('.')[0] in BY_PATH)
+    return sorted(found)
+
+
+def self_contained(config, action, name, cache):
+    """verified(), refused when the file would load its neighbours (neighbour_loads), which nothing checked."""
+    dest, data = verified(config, action, name, cache)
+    found = neighbour_loads(data)
+    if found:
+        raise FetchError(f'{action}/{name} uses {", ".join(found)}: it would load files next to it that were not '
+                         'checked, so load and run refuse it (they run one self-contained file)')
+    return dest, data
+
+
 def path(config, action, name, cache=None):
     """The local path of fork-ci/actions/<action>/<name> at the pinned sha, checked (fetched again when it differs).
     The file can change after this returns (another job on the runner): to run it, use load() or run()."""
@@ -185,7 +224,7 @@ def path(config, action, name, cache=None):
 
 def load(config, action, module, cache=None):
     """The pinned fork module (e.g. load(cfg, 'gradle-cache', 'gradle_cache')), run from the bytes that were checked."""
-    dest, data = verified(config, action, module + '.py', cache)
+    dest, data = self_contained(config, action, module + '.py', cache)
     mod = types.ModuleType(f'fork_ci_{module}')
     mod.__file__ = dest
     exec(compile(data, dest, 'exec'), mod.__dict__)
@@ -195,7 +234,7 @@ def load(config, action, module, cache=None):
 def run(config, action, name, args=(), cache=None, runner=None):
     """Run the pinned script with python3 -I and args, from a private copy (mode 0700 folder) of the bytes that were
     checked; its exit code. The copy goes after the run."""
-    _, data = verified(config, action, name, cache)
+    _, data = self_contained(config, action, name, cache)
     run_dir = tempfile.mkdtemp(prefix='fork-ci-run-')   # 0700, ours alone: the bytes checked are the bytes run
     try:
         script = os.path.join(run_dir, name)
