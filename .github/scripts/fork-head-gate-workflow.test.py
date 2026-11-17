@@ -9,6 +9,8 @@ python3 stands in for head_gate.py. What makes the key reachable only by the sta
 against every fork workflow, in fork-contracts.test.py (head-gate).
 """
 
+import ast
+import json
 import os
 import pathlib
 import re
@@ -22,6 +24,7 @@ root = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = root / ".github/workflows/fork-head-gate.yml"
 EXAMPLE = root / "fork-ci/actions/head-check/gate-caller.example.yml"
 TRIGGER = root / "fork-ci/actions/head-check/review-trigger.example.yml"
+GATE_PY = root / "fork-ci/actions/head-check/head_gate.py"
 text = WORKFLOW.read_text()
 wf = yaml.safe_load(text)
 failures = []
@@ -330,10 +333,21 @@ check("example: secrets: inherit (so the guard can see a repository secret of th
       and "Needed:" in EXAMPLE.read_text())
 check("example: no pass-drafts anywhere (a draft's check run would count for a ready pull request at its head)",
       "pass-drafts" not in EXAMPLE.read_text() and "pass-drafts" not in text)
+# The tuple as Python reads it (any quoting), from head_gate.py's top-level assignment; [] if it is not a literal.
+REVIEW_EVENTS = next((n.value for n in ast.parse(GATE_PY.read_text()).body if isinstance(n, ast.Assign)
+                      and [getattr(t, "id", None) for t in n.targets] == ["REVIEW_EVENTS"]), None)
+try:
+    REVIEW_EVENTS = list(ast.literal_eval(REVIEW_EVENTS)) if REVIEW_EVENTS is not None else []
+except (ValueError, TypeError, SyntaxError):
+    REVIEW_EVENTS = []
 check("example: an issue comment that is not on a pull request starts nothing, nor a review trigger run that did "
-      "not succeed (a newer one replaced it)",
-      ejob.get("if") == "(github.event_name != 'issue_comment' || github.event.issue.pull_request) && "
-      "(github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')", ejob.get("if"))
+      "not succeed (a newer one replaced it) or that another event started (#379: skipped before a guard job "
+      "starts; the events are head_gate's REVIEW_EVENTS)",
+      REVIEW_EVENTS == ["pull_request_review", "pull_request_review_comment"]
+      and ejob.get("if") == "(github.event_name != 'issue_comment' || github.event.issue.pull_request) && "
+      "(github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && "
+      "contains(fromJSON('" + json.dumps(REVIEW_EVENTS, separators=(",", ":")) + "'), "
+      "github.event.workflow_run.event)))", ejob.get("if"))
 ew = ejob.get("with") or {}
 required = {k for k, v in inputs.items() if v.get("required")}
 check("example: it gives only inputs the gate has, and every required one",
@@ -406,7 +420,8 @@ if caller_group("push", 1) is not None:
              (("review", 4), caller_group("workflow_run", 104, H)), (("other-head", 5), caller_group("workflow_run", 105, "b2" * 20)),
              (("other-gate", 6), caller_group("workflow_run", 106, H, "o/p/.github/workflows/gate2.yml@refs/heads/main"))]
     lost = cancelled_by_queue(mixed)
-    check("example: review runs never drop a comment's, a push's, another head's or another caller's run",
+    check("example: in the caller's group, review runs never drop a comment's, a push's, another head's or another "
+          "caller's run (the gate job's own group is per head: a newer job there reads the newest state)",
           lost == [("review", 2)], str(lost))
 
 if failures:

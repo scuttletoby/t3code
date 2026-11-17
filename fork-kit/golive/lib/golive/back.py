@@ -1,24 +1,28 @@
 """`t3-golive back`: the way back from a fork build (W1, W2, W3); `t3-golive status`: is T3 up and right?
 
-W1 restore and downgrade (loses everything since the copy): the boot service is disabled (no start at boot on a
+W1 restore and downgrade (loses everything since the copy): the t3 the copy was taken under is put back into the
+home's runtime/versions from the kit's kept copy when upstream pruned it (keptruntime: every `t3 update` prunes old
+runtimes, so the switch keeps one first), the pre hooks run, the boot service is disabled (no start at boot on a
 half-restored home) and stopped, the newest finished copy of this home is restored (coldcopy.restore: the migrated
-database and settings.json are kept aside, never deleted; the copy stays where it is), then the t3 the copy was
-taken under, kept in the home's runtime/versions, runs `update <old> --allow-downgrade --yes` (it enables and starts
-the service), then that build is verified. By hand it needs `--lose-work-since <the copy's time>`; the switch calls
-restore_and_downgrade(automatic=True) inside its own run.
+database and settings.json are kept aside, never deleted; the copy stays where it is), then that t3 runs
+`update <old> --allow-downgrade --yes` (it enables and starts the service), that build is verified, and the post
+hooks run (after a failure too, as in the copy run). A W1 that is stopped or fails after the stop leaves T3 stopped
+and not started at boot, on purpose, until a back ends ok. By hand it needs `--lose-work-since <the copy's time>`;
+the switch calls restore_and_downgrade(automatic=True) inside its own run.
 W2 (loses nothing): the fork adds no migrations, so the upstream nightly a fork build is cut from (its version
 without `.fork.N`) runs the migrated database as it is. Read from the code, untried on a live home.
 W3: an upstream stable newer than that base, once one is installed or staged. W2 and W3 run that build's
-`update <version> --allow-downgrade --yes` on the data as it is.
+`update <version> --allow-downgrade --yes` on the data as it is, between the pre and the post hooks.
 
 A back may follow a back or switch that stopped half-way (journal.run may_follow): it finishes that back's plan
-(journalled in its "plan" step); the restore and the update are safe to run again. A back after a good back finds
-the build that back verified running and does nothing.
+(journalled in its "plan" step); the restore, the put-back and the update are safe to run again. A back after a good
+back of the same way, with nothing unfinished since, finds the build that back verified running and does nothing.
 """
-import functools, json, os, re, subprocess, sys, urllib.error, urllib.request
+import functools, http.client, json, os, re, subprocess, sys, urllib.error, urllib.request
 
-from golive import check as check_mod, coldcopy, journal, live, osadapter
+from golive import check as check_mod, coldcopy, journal, keptruntime, live, osadapter
 from golive.config import EXACT_VERSION
+from golive.keptruntime import installed_t3
 
 UPDATE_TIMEOUT, HTTP_TIMEOUT, MB = 900, 5, 1024 * 1024
 T3_STUB = None  # tests only: a program run in place of any t3 the kit runs
@@ -32,18 +36,18 @@ def base_of(version):
     return base if base != version and '-nightly.' in base else None
 
 
-def installed_t3(home, version):
-    """The home's own t3 of `version` when upstream installed it whole (runtime/versions/<v>/.install-complete)."""
-    if not (isinstance(version, str) and EXACT_VERSION.match(version)):
-        return None
-    folder = os.path.join(home, 'runtime', 'versions', version)
-    try:
-        with open(os.path.join(folder, '.install-complete'), encoding='utf-8') as f:
-            whole = f.read().strip() == version
-    except OSError:
-        return None
-    t3 = os.path.join(folder, 't3')
-    return t3 if whole and os.access(t3, os.X_OK) else None
+def old_t3(cfg, version):
+    """(t3 path in the home, kept folder or None, None) when W1 can run the t3 of `version`: installed whole in the
+    home, or kept by the kit (keptruntime) and put back before the downgrade; else (None, None, why)."""
+    t3 = installed_t3(cfg.home, version)
+    if t3:
+        return t3, None, None
+    kept, why = keptruntime.check(cfg, version)
+    if kept:
+        return keptruntime.home_t3(cfg.home, version), kept, None
+    return None, None, (f'the t3 {version} it was taken under is not kept: not in '
+                        f'{os.path.join(cfg.home, "runtime", "versions")} (every upstream `t3 update` prunes old '
+                        f'runtimes: the switch, W2 and W3 each run one) and {why}')
 
 
 def _upstream_t3(cfg, version):
@@ -87,16 +91,16 @@ def ways(cfg, adapter):
     else:
         folder, m = found[0]
         old, at = m.get('liveVersion'), m.get('createdAt')
-        t3 = installed_t3(cfg.home, old)
-        w1 = out['w1'] = {'ok': False, 'version': old, 't3': t3, 'copy': folder}
+        t3, kept, why = old_t3(cfg, old)
+        w1 = out['w1'] = {'ok': False, 'version': old, 't3': t3, 'copy': folder, 'kept': kept}
         if t3 and active and live.compare_versions(old, active) >= 0:
             w1['why'] = f'the newest copy, {folder}, was taken under t3 {old}, not older than the t3 {active} now'
         elif t3 is None:
-            w1['why'] = (f'the newest copy is {folder}, but the t3 {old} it was taken under is not kept in '
-                         f'{os.path.join(cfg.home, "runtime", "versions")}')
+            w1['why'] = f'the newest copy is {folder}, but {why}'
         else:
-            w1.update(ok=True, why=f'restore {folder} (taken {at} under t3 {old}) and go back to t3 {old}: '
-                                   f'everything since {at} is lost; by hand: --lose-work-since {at}')
+            w1.update(ok=True, why=f'restore {folder} (taken {at} under t3 {old}) and go back to t3 {old}'
+                                   + (f' (its runtime is put back from {kept})' if kept else '')
+                                   + f': everything since {at} is lost; by hand: --lose-work-since {at}')
     base = base_of(active)
     if base is None:
         why = f'the service runs t3 {active}, not a fork build (.fork.N): W2 and W3 go from a fork build to upstream'
@@ -181,19 +185,20 @@ def _stamp(text):
     return re.sub(r'[-:]', '', str(text).strip())
 
 
-def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_since=None, say=print):
+def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_since=None, say=print, hooks=True):
     """W1 in `run` (a back run, or the switch's own automatic way back). By hand (automatic=False) it is refused,
     before any change, unless lose_work_since is the copy's time, and it first says how the counts moved since the
-    copy. Then: disable and stop the service, restore the copy, `<old t3> update <old> --allow-downgrade --yes`,
-    verify. Returns {'version', 'pid'}."""
+    copy. Then: put the old runtime back from the kit's kept copy if upstream pruned it, the pre hooks, disable and
+    stop the service, restore the copy, `<old t3> update <old> --allow-downgrade --yes`, verify, the post hooks
+    (hooks=False: the caller's run runs them itself). Returns {'version', 'pid'}."""
     try:
         m = coldcopy.read_manifest(copy_dir, cfg.home)
     except (coldcopy.Incomplete, coldcopy.WrongCopy) as e:
         raise journal.Refused(f'{e}; nothing was changed') from None
     old, at = m.get('liveVersion'), m.get('createdAt')
-    t3 = installed_t3(cfg.home, old)
+    t3, kept, why = old_t3(cfg, old)
     if t3 is None:
-        raise journal.Refused(f'the t3 {old} the copy was taken under is not kept in the home; nothing was changed')
+        raise journal.Refused(f'{why}; nothing was changed')
     if not automatic:
         if lose_work_since is None:
             raise journal.Refused(f'W1 loses everything since the copy was taken ({at}); to go on, give '
@@ -206,17 +211,54 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
         coldcopy.plan_restore(copy_dir, cfg.home, from_home=cfg.home, version=old, floor_bytes=cfg.free_floor_mb * MB)
     except (coldcopy.Incomplete, coldcopy.WrongCopy, RuntimeError, OSError, ValueError) as e:
         raise journal.Refused(f'the copy cannot be restored: {e}; nothing was changed') from None
-    server = _server(cfg, adapter)
-    with run.step('plan', way='w1', version=old, t3=t3, copy=copy_dir, at=at, automatic=automatic):
+    with run.step('plan', way='w1', version=old, t3=t3, copy=copy_dir, at=at, automatic=automatic, kept=kept):
         pass
-    with run.step('stop-service', pid=server and server['pid']):
-        adapter.disable()  # first: from here T3 must not start at boot until the update enables it again
-        adapter.stop()
-        coldcopy._wait_stopped(adapter, server['pid'] if server else 0)
-    with run.step('restore', copy=copy_dir) as facts:
-        facts.update(coldcopy.restore(run, copy_dir, cfg.home, from_home=cfg.home, version=old,
-                                      floor_bytes=cfg.free_floor_mb * MB))
-    return _update(run, cfg, adapter, t3, old, say)
+    with run.step('runtime', version=old) as facts:
+        facts.update(keptruntime.put_back(run, cfg, old))
+
+    def stop_restore_update():
+        server = _server(cfg, adapter)
+        say('stopping T3 for W1: until this back ends ok, T3 stays stopped and is not started at boot (on purpose: '
+            'the home may be half-restored); if it stops or fails, run the same back again')
+        with run.step('stop-service', pid=server and server['pid']):
+            adapter.disable()  # first: from here T3 must not start at boot until the update enables it again
+            adapter.stop()
+            coldcopy._wait_stopped(adapter, server['pid'] if server else 0)
+        with run.step('restore', copy=copy_dir) as facts:
+            facts.update(coldcopy.restore(run, copy_dir, cfg.home, from_home=cfg.home, version=old,
+                                          floor_bytes=cfg.free_floor_mb * MB))
+        return _update(run, cfg, adapter, t3, old, say)
+    return _hooked(run, cfg, hooks, stop_restore_update)
+
+
+def _hooked(run, cfg, hooks, body):
+    """body (it stops or restarts T3) between the machine's pre hooks and post hooks, as the copy run runs them
+    (coldcopy.run_copy): a failed pre hook runs the post hooks and refuses before T3 is touched; the post hooks run
+    after body however it ends, a failure included. A kill runs no post hook: the next back runs both again (each
+    hook must be safe twice, config.py)."""
+    if hooks:
+        failed = coldcopy._hooks(run, 'pre-hooks', cfg.pre_hooks, cfg.home)
+        if failed is not None:
+            again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
+            if again:  # jobs may stay paused: not a clean refusal
+                raise RuntimeError(f'pre hook failed: {failed}; T3 was not stopped; then a post hook failed: {again}')
+            raise journal.Refused(f'pre hook failed: {failed}; T3 was not stopped')
+    try:
+        result = body()
+    except BaseException as e:
+        if hooks:
+            try:
+                again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
+                if again:
+                    e.add_note(f'then a post hook failed: {again}')
+            except BaseException as later:
+                e.add_note(f'then: {type(later).__name__}: {later}')
+        raise
+    if hooks:
+        again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
+        if again:
+            raise RuntimeError(f't3 {result["version"]} runs, verified, but a post hook failed: {again}')
+    return result
 
 
 def _update(run, cfg, adapter, t3, version, say):
@@ -259,11 +301,13 @@ def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=pr
     included), Unfinished, or the error that ended the run (running back again finishes it)."""
     with journal.run(cfg.state_dir, 'back', may_follow=FOLLOWS) as run:
         runs = journal.read(cfg.state_dir)[0][:-1]
+        following = bool(runs) and journal.needs_settling(runs[-1])  # a switch or back left half-way
         verified = [r for r in runs if _facts(r, 'version') and any(
             s['step'] == 'verify' and s['phase'] == 'done' for s in r['steps'])]
         last = verified[-1] if verified else None
-        if last and last['command'] == 'back' and _steady_on(cfg, adapter, _facts(last, 'version')):
-            say(f'already back: t3 {_facts(last, "version")} runs, verified by the back of {last["began"]}; '
+        if (not following and last and last['command'] == 'back' and _facts(last, 'way') == way
+                and _steady_on(cfg, adapter, _facts(last, 'version'))):
+            say(f'already back: t3 {_facts(last, "version")} runs, verified by the {way} back of {last["began"]}; '
                 'nothing to do')
             return {'version': _facts(last, 'version'), 'nothing': True}
         plan = None
@@ -274,6 +318,12 @@ def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=pr
         if plan and plan['way'] != way:
             raise journal.Refused(f'the last back ({plan["way"]}) stopped half-way: run `t3-golive back --way '
                                   f'{plan["way"]}` again to finish it')
+        if plan and way != 'w1':  # its t3 may be gone since (unstaged, pruned): look again
+            t3, where = _upstream_t3(cfg, plan['version'])
+            if t3 is None:
+                raise journal.Refused(f'the stopped back\'s t3 {plan["version"]} is not available any more: {where}; '
+                                      'stage it again, then run this again')
+            plan['t3'] = t3
         if plan is None:
             w = ways(cfg, adapter)[way]
             if not w['ok']:
@@ -284,7 +334,7 @@ def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=pr
                                          lose_work_since=lose_work_since, say=say)
         with run.step('plan', **plan):
             pass
-        return _update(run, cfg, adapter, plan['t3'], plan['version'], say)
+        return _hooked(run, cfg, True, lambda: _update(run, cfg, adapter, plan['t3'], plan['version'], say))
 
 
 # --- status: read only ---
@@ -294,20 +344,15 @@ def _d(value):
 
 
 def _http(cfg, server):
-    url = f'http://127.0.0.1:{server["port"]}/'
-    try:
-        with open(os.path.join(cfg.home, 'userdata', 'server-runtime.json'), encoding='utf-8') as f:
-            origin = _d(json.load(f)).get('origin')
-        url = origin.rstrip('/') + '/' if isinstance(origin, str) and origin.startswith('http') else url
-    except (OSError, ValueError):
-        pass
+    """Asks this machine only (127.0.0.1 and the port the server recorded), whatever host its origin names."""
+    url = f'http://127.0.0.1:{int(server["port"])}/'
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never through a proxy
     try:
         with opener.open(url, timeout=HTTP_TIMEOUT) as r:
             code = r.status
     except urllib.error.HTTPError as e:
         code = e.code  # an answer all the same (a login page, say)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, http.client.HTTPException) as e:
         return False, f'{url} does not answer: {e}'
     return True, f'{url} answers (HTTP {code})'
 
@@ -368,7 +413,21 @@ def _status(cfg, adapter, add, notes, seen):
         return 'unknown'
     add('service', svc['loaded'] and svc['active'] and svc['enabled'] and check_mod._same_dir(svc['home'], cfg.home),
         f'{osadapter.UNIT} {svc.get("state")}, enabled: {svc["enabled"]}, serves {svc["home"]}')
-    runs = journal.read(cfg.state_dir)[0]
+    try:
+        runs = journal.read(cfg.state_dir)[0]
+    except journal.Damaged as e:  # a journal from a newer kit included
+        runs = []
+        add('journal', False, str(e))
+    else:
+        open_run = runs[-1] if runs and journal.needs_settling(runs[-1]) else None
+        if open_run is None:
+            add('journal', True, 'no golive run was left half-way')
+        elif open_run['command'] in FOLLOWS:
+            add('journal', False, f'{journal.describe(open_run)}; run the same `t3-golive back` again: it finishes '
+                'where that run stopped (a W1 stopped after its stop leaves T3 stopped and not started at boot until '
+                'then)')
+        else:
+            add('journal', False, f'{journal.describe(open_run)}; {journal.SETTLE_HINT}')
     expected = next((_facts(r, 'version') for r in reversed(runs) if any(
         s['step'] == 'verify' and s['phase'] == 'done' for s in r['steps'])), None)
     try:
@@ -409,7 +468,7 @@ def status(cfg, adapter):
         checks.append((bool(ok), name, detail))
 
     try:
-        with journal.lock(cfg.state_dir, 'status', exclusive=False):
+        with journal.lock(cfg.state_dir, 'status', exclusive=False, create=False):
             verdict = _status(cfg, adapter, add, notes, seen)
     except journal.Busy as e:
         add('no golive run', False, f'{e}: T3 may be stopping or restarting')
@@ -423,8 +482,10 @@ def status(cfg, adapter):
         notes += [f'incomplete copy (never used) {f}: {b / MB:.1f} MB' for f, b in
                   coldcopy.incomplete_copies(cfg.backup_dir)]
         notes += [f'kept by a restore {f}: {b / MB:.1f} MB' for f, b in coldcopy.kept_files(cfg.home)]
-    except OSError as e:
-        notes.append(f'the copies cannot be listed: {e}')
+        notes += [f'kept runtime of t3 {v} (for W1) {f}: {b / MB:.1f} MB' + (f'; NOT usable: {why}' if why else '')
+                  for v, f, b, why in keptruntime.listing(cfg)]
+    except Exception as e:  # a hand-edited manifest included: a note, never a crash
+        notes.append(f'the copies cannot be listed: {type(e).__name__}: {e}')
     ok = verdict == 'up' and all(c[0] for c in checks)
     failed = ', '.join(name for good, name, _ in checks if not good)
     server = seen.get('server') or {}
@@ -456,8 +517,9 @@ def main(args, cfg, adapter, out=sys.stdout, err=sys.stderr):
         except osadapter.AdapterError as e:
             print(f't3-golive: {e}', file=err)
             return 1
-        print(f'started detached as {unit}. Follow it with: journalctl --user -u {unit} -f; then t3-golive status',
-              file=out)
+        print(f'started detached as {unit}. Follow it with: journalctl --user -u {unit} -f; then t3-golive status'
+              + ('. If it is stopped or fails after it stopped T3, T3 stays stopped and is not started at boot until '
+                 'the same back is run again and ends ok' if args.way == 'w1' else ''), file=out)
         return 0
     if adapter.inside_service():
         print(f't3-golive: this runs inside {osadapter.UNIT}; stopping it would kill this back half-way. Run '
@@ -474,8 +536,10 @@ def main(args, cfg, adapter, out=sys.stdout, err=sys.stderr):
         return 1
     except Exception as e:
         notes = ''.join(f'\n{n}' for n in getattr(e, '__notes__', ()))
-        print(f't3-golive: back failed: {type(e).__name__}: {e}{notes}\nRun the same `t3-golive back` again: it '
-              'finishes where this one stopped. `t3-golive status` says where T3 is.', file=err)
+        down = ('\nIf it got past the stop, T3 stays stopped and is not started at boot (on purpose: the home may be '
+                'half-restored) until a `t3-golive back --way w1` ends ok.' if args.way == 'w1' else '')
+        print(f't3-golive: back failed: {type(e).__name__}: {e}{notes}{down}\nRun the same `t3-golive back` again: '
+              'it finishes where this one stopped. `t3-golive status` says where T3 is.', file=err)
         return 1
     print('nothing to do' if result.get('nothing') else f'back on t3 {result["version"]}, verified', file=out)
     return 0

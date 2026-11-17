@@ -3,19 +3,19 @@ manager is faked, the T3 home is a temp folder, a stub t3 acts as the fork build
 nightly. Nothing here stops, starts, reads or calls a real T3 or its port.
 python3 -I -B fork-kit/golive/tests/back.test.py
 """
-import hashlib, io, json, os, subprocess, sys, unittest
+import hashlib, io, json, os, shutil, subprocess, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golive_fixture as fx  # noqa: E402
 import back_fixture as bx  # noqa: E402
-from golive import back, check, coldcopy, config, journal  # noqa: E402
+from golive import back, check, coldcopy, config, journal, keptruntime  # noqa: E402
 
 # A back run in its own process, SIGKILLed where `setup` says.
 KILLED = '''import os, sys
 sys.path[:0] = {paths!r}
 import back_fixture as bx
-from golive import back, coldcopy, config, osadapter
+from golive import back, coldcopy, config, keptruntime, osadapter
 config.MACHINE_FILE, config.MACHINE_OWNER = {machine!r}, os.getuid()
 osadapter.SYSTEMCTL, osadapter.CGROUP_FILE = {systemctl!r}, {cgroup!r}
 coldcopy.POLL, coldcopy.STOP_WAIT, coldcopy.START_WAIT = 0.01, 3, 3
@@ -57,15 +57,23 @@ class BackBase(unittest.TestCase):
         self.copied = sha(os.path.join(self.copy, 'userdata/statev2.sqlite'))
         return self.copy
 
-    def switch(self):
-        """A switch to the fork build, journalled as PR 6 will: its verify, and the counts before it."""
-        self.m.switched()
+    def switch(self, keep=True):
+        """A switch to the fork build, journalled as PR 6 will: the counts before it, the old build's runtime kept
+        (keptruntime.keep, before the update), the fork build's update (it prunes the old runtime, as upstream's
+        does), its verify."""
         with journal.run(self.m.state, 'switch') as r:
             with r.step('check') as facts:
                 facts['reportCounts'] = {'projects': 3, 'projectsArchived': 0, 'threads': 40, 'threadsArchived': 2}
+            if keep:
+                with r.step('keep-runtime', version=fx.LIVE) as facts:
+                    facts.update(keptruntime.keep(r, config.load(), fx.LIVE))
+            with r.step('update', version=fx.TARGET):
+                self.m.switched()
+                self.m.upstream_update(fx.TARGET)
             with r.step('verify') as facts:
                 facts.update(version=fx.TARGET, pid=self.m.server.pid)
         self.migrated = sha(self.m.path('home/userdata/statev2.sqlite'))
+        os.unlink(self.m.path('back-t3-calls.jsonl'))  # the switch's own update is not one of back's
 
     def back(self, way, **kw):
         return back.run_back(config.load(), self.adapter, way, say=self.said.append, **kw)
@@ -114,11 +122,54 @@ class Ways(BackBase):
 
     def test_a_copy_of_another_build_whose_t3_is_not_kept_is_refused(self):
         self.take_copy()
-        self.switch()
-        os.unlink(self.m.path(f'home/runtime/versions/{fx.LIVE}/.install-complete'))
+        self.switch(keep=False)
+        self.assertFalse(os.path.exists(self.m.path(f'home/runtime/versions/{fx.LIVE}')))  # pruned, as upstream does
         ways = back.ways(config.load(), self.adapter)
         self.assertFalse(ways['w1']['ok'])
         self.assertIn(f'the t3 {fx.LIVE} it was taken under is not kept', ways['w1']['why'])
+        self.assertIn('prunes', ways['w1']['why'])
+        with self.assertRaisesRegex(journal.Refused, 'w1 is not possible now: .* not kept'):
+            self.back('w1', lose_work_since=self.at)
+
+    def test_a_copy_of_another_home_is_never_listed(self):
+        self.take_copy()
+        path = os.path.join(self.copy, coldcopy.MANIFEST)
+        with open(path) as f:
+            manifest = json.load(f)
+        with open(path, 'w') as f:
+            json.dump({**manifest, 'home': self.m.path('another-home')}, f)
+        self.assertEqual(back.copies(config.load()), [])
+        self.assertIn('no finished copy of this home', back.ways(config.load(), self.adapter)['w1']['why'])
+
+    def test_an_install_complete_naming_another_version_is_not_a_whole_runtime(self):
+        self.assertIsNotNone(back.installed_t3(self.m.home, fx.LIVE))
+        self.m.write(f'home/runtime/versions/{fx.LIVE}/.install-complete', fx.TARGET)
+        self.assertIsNone(back.installed_t3(self.m.home, fx.LIVE))
+        os.rename(self.m.path(f'home/runtime/versions/{fx.LIVE}'), self.m.path('elsewhere'))
+        self.m.write('elsewhere/.install-complete', fx.LIVE)
+        os.symlink(self.m.path('elsewhere'), self.m.path(f'home/runtime/versions/{fx.LIVE}'))
+        self.assertIsNone(back.installed_t3(self.m.home, fx.LIVE))  # upstream passes a linked version folder by
+
+    def test_no_report_runs_beside_a_pending_update(self):
+        self.switch()
+        pending = {'status': 'pending', 'fromVersion': fx.TARGET, 'targetVersion': bx.BASE}
+        self.m.write('home/runtime/service-state.json',
+                     json.dumps({'protocol': 3, 'activeVersion': fx.TARGET, 'update': pending}))
+        report, why = back.live_report(config.load(), self.adapter)
+        self.assertIsNone(report)
+        self.assertIn('not running steadily', why)
+        self.assertEqual([c for c in self.m.calls('back-t3-calls.jsonl') if c[0] == '__fork-report'], [])
+
+    def test_here_is_refused_inside_the_boot_service(self):
+        self.take_copy()
+        self.switch()
+        runs = len(journal.read(self.m.state)[0])
+        with mock.patch.object(self.adapter, 'inside_service', return_value=True):
+            code, out, err = self.main('back', '--way', 'w1', '--here', '--lose-work-since', self.at)
+        self.assertEqual(code, 1)
+        self.assertIn('runs inside', err)
+        self.assertEqual(len(journal.read(self.m.state)[0]), runs)
+        self.assertEqual(self.updates(), [])
 
     def test_a_copy_taken_under_the_build_running_now_is_no_way_back(self):
         self.take_copy()
@@ -170,6 +221,64 @@ class Ways(BackBase):
         self.assertNotIn('stop', self.calls()[-1:])
 
 
+class KeptRuntime(BackBase):
+    """keptruntime: the old build's runtime kept outside the home (the switch calls keep() before its update)."""
+
+    def keep(self):
+        with journal.run(self.m.state, 'switch') as r:
+            with r.step('keep-runtime') as facts:
+                facts.update(keptruntime.keep(r, config.load(), fx.LIVE))
+        return facts
+
+    def test_keep_copies_the_runtime_out_of_the_home_and_reads_it_back(self):
+        before = self.m.snapshot()
+        facts = self.keep()
+        self.assertEqual(facts['kept'], os.path.join(self.m.state, 'kept-runtimes', fx.LIVE))
+        self.assertEqual(keptruntime.check(config.load(), fx.LIVE), (facts['kept'], None))
+        self.assertEqual(sha(os.path.join(facts['kept'], 'runtime', 't3')),
+                         sha(self.m.path(f'home/runtime/versions/{fx.LIVE}/t3')))
+        self.assertEqual(self.m.snapshot(), before)  # nothing in the home changed
+
+    def test_keep_twice_keeps_once(self):
+        self.keep()
+        record = os.path.join(self.m.state, 'kept-runtimes', fx.LIVE, keptruntime.RECORD)
+        mtime = os.stat(record).st_mtime_ns
+        self.assertTrue(self.keep()['already'])
+        self.assertEqual(os.stat(record).st_mtime_ns, mtime)
+
+    def test_keep_over_a_damaged_one_sets_it_aside_and_keeps_anew(self):
+        kept = self.keep()['kept']
+        with open(os.path.join(kept, 'runtime', 't3'), 'ab') as f:
+            f.write(b'x')
+        facts = self.keep()
+        self.assertFalse(facts['already'])
+        self.assertTrue(os.path.isdir(facts['setAside']))  # never deleted
+        self.assertEqual(keptruntime.check(config.load(), fx.LIVE)[0], kept)
+
+    def test_a_keep_stopped_half_way_is_never_used_and_keep_again_finishes(self):
+        def stop(*args):
+            raise KeyboardInterrupt
+        with mock.patch.object(keptruntime, '_copy_file', side_effect=stop):
+            with self.assertRaises(KeyboardInterrupt):
+                self.keep()
+        self.assertIsNone(keptruntime.check(config.load(), fx.LIVE)[0])
+        self.assertIn('kept-runtimes', ' '.join(os.listdir(self.m.state)))
+        journal.settle(self.m.state, 'a test stopped the keep')
+        self.keep()
+        self.assertIsNotNone(keptruntime.check(config.load(), fx.LIVE)[0])
+        self.assertEqual(os.listdir(os.path.join(self.m.state, 'kept-runtimes')), [fx.LIVE])
+
+    def test_plan_keep_refuses_before_any_step(self):
+        cfg = config.load()
+        self.assertGreater(keptruntime.plan_keep(cfg, fx.LIVE), 0)
+        with self.assertRaisesRegex(ValueError, 'must stay free'):
+            keptruntime.plan_keep(cfg, fx.LIVE, floor_bytes=1 << 62)
+        with self.assertRaisesRegex(ValueError, 'nothing to keep'):
+            keptruntime.plan_keep(cfg, '0.1.8')
+        self.keep()
+        self.assertEqual(keptruntime.plan_keep(cfg, fx.LIVE, floor_bytes=1 << 62), 0)  # kept already
+
+
 class W1(BackBase):
     def setUp(self):
         super().setUp()
@@ -197,8 +306,9 @@ class W1(BackBase):
         update = self.updates()[-1]
         self.assertEqual(update[:4], ['update', fx.LIVE, '--allow-downgrade', '--yes'])
         steps = [(s['step'], s['data']) for s in self.last_run()['steps'] if s['phase'] == 'started']
-        self.assertEqual([s for s, _ in steps], ['plan', 'stop-service', 'restore', 'update', 'verify'])
-        self.assertEqual(steps[3][1]['t3'], self.m.path(f'home/runtime/versions/{fx.LIVE}/t3'))
+        self.assertEqual([s for s, _ in steps], ['plan', 'runtime', 'pre-hooks', 'stop-service', 'restore', 'update',
+                                                 'verify', 'post-hooks'])
+        self.assertEqual(steps[5][1]['t3'], self.m.path(f'home/runtime/versions/{fx.LIVE}/t3'))
         self.assertEqual(self.calls()[-3:], ['disable', 'stop', 'start'])  # off at boot before the data moves
         self.assertTrue(self.adapter.service()['enabled'])
         self.assertTrue(any('threads: 40 at the copy, 43 now' in line for line in self.said), self.said)
@@ -250,6 +360,117 @@ class W1(BackBase):
         self.assertIn('back', seen[0])
         self.assertEqual(len(self.updates()), 1)
 
+    def test_after_the_switch_pruned_the_old_runtime_w1_puts_the_kept_one_back(self):
+        old = self.m.path(f'home/runtime/versions/{fx.LIVE}')
+        self.assertFalse(os.path.exists(old))  # the switch's update pruned it, as upstream's does
+        kept = os.path.join(self.m.state, 'kept-runtimes', fx.LIVE)
+        self.assertTrue(back.ways(config.load(), self.adapter)['w1']['ok'])
+        self.back('w1', lose_work_since=self.at)
+        self.assertEqual(sha(os.path.join(old, 't3')), sha(os.path.join(kept, 'runtime', 't3')))
+        self.assertEqual(self.updates()[-1][:2], ['update', fx.LIVE])
+        self.assertEqual(self.live_version(), fx.LIVE)
+        done = [s['data'] for s in self.last_run()['steps'] if s['step'] == 'runtime' and s['phase'] == 'done']
+        self.assertTrue(done[0]['putBack'])
+        self.assertEqual(keptruntime.check(config.load(), fx.LIVE)[0], kept)  # still kept, never deleted
+
+    def test_w1_after_w2_is_taken_not_called_already_back(self):
+        self.m.stage_release(bx.BASE)
+        self.back('w2')
+        self.assertEqual(self.live_version(), bx.BASE)
+        self.assertIsNotNone(keptruntime.check(config.load(), fx.LIVE)[0])  # W2's update left the kept one alone
+        result = self.back('w1', lose_work_since=self.at)
+        self.assertFalse(result.get('nothing'))
+        self.assertEqual(self.live_version(), fx.LIVE)
+        self.assertEqual(self.db(), self.copied)
+        self.assertTrue(self.back('w1', lose_work_since=self.at)['nothing'])  # and now W1 twice is nothing to do
+
+    def test_w1_after_w2_with_no_kept_runtime_is_refused_naming_why(self):
+        self.m.stage_release(bx.BASE)
+        self.back('w2')
+        shutil.rmtree(os.path.join(self.m.state, 'kept-runtimes'))
+        snap, calls = self.m.snapshot(), self.calls()
+        with self.assertRaisesRegex(journal.Refused, f'w1 is not possible now: .*t3 {fx.LIVE} .* not kept'):
+            self.back('w1', lose_work_since=self.at)
+        self.assertEqual(self.m.snapshot(), snap)
+        self.assertEqual(self.calls(), calls)
+
+    def test_a_corrupt_or_unfinished_kept_runtime_is_never_used(self):
+        kept = os.path.join(self.m.state, 'kept-runtimes', fx.LIVE)
+        with open(os.path.join(kept, 'runtime', 't3'), 'ab') as f:
+            f.write(b'x')
+        ways = back.ways(config.load(), self.adapter)
+        self.assertFalse(ways['w1']['ok'])
+        self.assertIn('does not match', ways['w1']['why'])
+        snap, calls = self.m.snapshot(), self.calls()
+        with self.assertRaisesRegex(journal.Refused, 'does not match'):
+            self.back('w1', lose_work_since=self.at)
+        os.unlink(os.path.join(kept, keptruntime.RECORD))
+        self.assertIn('unfinished', back.ways(config.load(), self.adapter)['w1']['why'])
+        self.assertEqual(self.m.snapshot(), snap)
+        self.assertEqual(self.calls(), calls)
+
+    def test_a_back_after_a_half_done_switch_is_never_already_back(self):
+        self.back('w1', lose_work_since=self.at)
+        with self.assertRaises(RuntimeError):
+            with journal.run(self.m.state, 'switch') as r:
+                with r.step('check'):
+                    pass
+                raise RuntimeError('the switch failed half-way')
+        with self.assertRaises(journal.Refused):
+            self.back('w1', lose_work_since=self.at)
+        self.assertTrue(journal.needs_settling(self.last_run()))  # nothing looked at what the switch left: not ok
+
+    def test_back_never_follows_a_stopped_copy(self):
+        with self.assertRaises(RuntimeError):
+            with journal.run(self.m.state, 'copy') as r:
+                with r.step('stop-service'):
+                    raise RuntimeError('killed')
+        with self.assertRaises(journal.Unfinished):
+            self.back('w1', lose_work_since=self.at)
+
+    def test_an_older_stopped_back_s_plan_is_not_taken_up_again(self):
+        with self.assertRaises(RuntimeError):  # a W2 stopped half-way, finished by a later back (ok)
+            with journal.run(self.m.state, 'back') as r:
+                with r.step('plan', way='w2', version=bx.BASE, t3=None, copy=None):
+                    pass
+                raise RuntimeError('stopped')
+        with journal.run(self.m.state, 'back', may_follow=back.FOLLOWS) as r:
+            pass
+        with self.assertRaises(RuntimeError):  # then a switch stopped half-way, with no way back journalled
+            with journal.run(self.m.state, 'switch') as r:
+                with r.step('check'):
+                    pass
+                raise RuntimeError('stopped')
+        self.back('w1', lose_work_since=self.at)  # not "the last back (w2) stopped half-way"
+        self.assertEqual(self.live_version(), fx.LIVE)
+
+    def test_the_hooks_run_before_the_stop_and_after_the_verify(self):
+        self.m.hooks('pre-a', 'post-a')
+        self.back('w1', lose_work_since=self.at)
+        self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])
+        steps = [s['step'] for s in self.last_run()['steps'] if s['phase'] == 'done']
+        self.assertLess(steps.index('pre-hooks'), steps.index('stop-service'))
+        self.assertGreater(steps.index('post-hooks'), steps.index('verify'))
+
+    def test_a_failing_pre_hook_runs_the_post_hooks_and_never_stops_t3(self):
+        self.m.hooks('pre-a', 'post-a')
+        self.m.write('hooks.log.pre-a.code', '1')
+        calls = self.calls()
+        with self.assertRaisesRegex(journal.Refused, 'pre hook failed.*T3 was not stopped'):
+            self.back('w1', lose_work_since=self.at)
+        self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])
+        self.assertEqual(self.calls(), calls)
+        self.assertEqual(self.db(), self.migrated)
+
+    def test_a_failed_w1_runs_the_post_hooks_and_says_t3_stays_down_until_back_runs_again(self):
+        self.m.hooks('pre-a', 'post-a')
+        self.m.write('update.code', '3')
+        code, out, err = self.main('back', '--way', 'w1', '--here', '--lose-work-since', self.at)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])
+        self.assertIn('T3 stays stopped and is not started at boot', err)
+        self.assertFalse(self.adapter.service()['enabled'])
+
     def killed(self, setup):
         script = KILLED.format(paths=[os.path.dirname(os.path.abspath(__file__)), os.path.join(fx.KIT, 'lib'),
                                       fx.COMMON], machine=config.MACHINE_FILE, systemctl=back.osadapter.SYSTEMCTL,
@@ -282,6 +503,13 @@ class W1(BackBase):
         self.killed('real = coldcopy._copy_file\n'
                     'def copy(src, dst, *a):\n    open(dst, "wb").write(b"half")\n    kill()\n'
                     'coldcopy._copy_file = copy')
+        self.assert_rerun_finishes()
+
+    def test_stopped_mid_put_back_of_the_kept_runtime_then_run_again(self):
+        self.killed('real = keptruntime._copy_file\n'
+                    'def copy(src, dst, mode):\n    real(src, dst, mode)\n    kill()\n'
+                    'keptruntime._copy_file = copy')
+        self.assertFalse(os.path.exists(self.m.path(f'home/runtime/versions/{fx.LIVE}')))
         self.assert_rerun_finishes()
 
     def test_stopped_mid_downgrade_then_run_again(self):
@@ -320,6 +548,26 @@ class W2W3(BackBase):
             self.back('w2')
         self.assertEqual(self.m.snapshot(), before)
         self.assertEqual(self.updates(), [])
+
+    def test_w2_runs_the_hooks_around_the_update(self):
+        self.m.hooks('pre-a', 'post-a')
+        self.m.stage_release(bx.BASE)
+        self.back('w2')
+        self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])
+        steps = [s['step'] for s in self.last_run()['steps'] if s['phase'] == 'done']
+        self.assertEqual(steps, ['plan', 'pre-hooks', 'update', 'verify', 'post-hooks'])
+
+    def test_a_rerun_of_a_stopped_w2_whose_t3_is_gone_is_refused_naming_it(self):
+        self.m.stage_release(bx.BASE)
+        self.m.write('update.code', '3')
+        with self.assertRaises(RuntimeError):
+            self.back('w2')
+        os.unlink(self.m.path('update.code'))
+        shutil.rmtree(self.m.path(f'stage/{bx.BASE}'))
+        with self.assertRaisesRegex(journal.Refused, f'stopped back.s t3 {bx.BASE} is not available any more'):
+            self.back('w2')
+        self.assertEqual(len(self.updates()), 1)
+        self.assertTrue(journal.needs_settling(self.last_run()))
 
     def test_w3_goes_to_the_newer_stable(self):
         self.m.stage_release(bx.STABLE)
@@ -415,6 +663,40 @@ class Status(BackBase):
         self.m.write('home/runtime/launchers', f'\n{link}\n')
         code, out = self.status()
         self.assertIn(f'FAIL  t3 link: {link} -> t3 {fx.LIVE}', out)
+
+    def test_a_failed_back_is_named_by_status_never_up(self):
+        self.live_report()
+        self.m.stage_release(bx.BASE)
+        self.m.write('update.code', '3')  # upstream fails before it touches the service: the fork build still runs
+        with self.assertRaises(RuntimeError):
+            self.back('w2')
+        with mock.patch.object(back, '_http', return_value=(True, 'answers')):
+            code, out = self.status()
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL  journal: the last run (back', out)
+        self.assertIn('run the same `t3-golive back` again', out)
+        self.assertTrue(out.startswith(f'T3 is up but not right (journal): t3 {fx.TARGET}'), out)
+
+    def test_status_writes_no_lock_file(self):
+        os.unlink(os.path.join(self.m.state, 'lock'))
+        self.status()
+        self.assertFalse(os.path.exists(os.path.join(self.m.state, 'lock')))
+
+    def test_http_asks_localhost_only_whatever_origin_the_runtime_file_names(self):
+        self.m.runtime_file(pid=self.m.server.pid, serverVersion=fx.TARGET, port=self.m.port,
+                            origin='http://192.0.2.1:9')
+        asked = []
+
+        def opened(opener, url, timeout=None):
+            asked.append(url)
+            raise OSError('not asked for real here')
+        with mock.patch.object(back.urllib.request.OpenerDirector, 'open', opened):
+            self.status()
+        self.assertEqual(asked, [f'http://127.0.0.1:{self.m.port}/'])
+
+    def test_kept_runtimes_are_listed(self):
+        code, out = self.status()
+        self.assertIn(f'kept runtime of t3 {fx.LIVE}', out)
 
     def test_a_crash_inside_status_is_a_failure_not_a_crash(self):
         with mock.patch.object(back.live, 'live_server', side_effect=ValueError('boom')):

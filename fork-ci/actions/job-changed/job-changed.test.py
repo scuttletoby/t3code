@@ -58,12 +58,12 @@ jobs:
 NONE, BOTH = {'build': 'false', 'plugins': 'false'}, {'build': 'true', 'plugins': 'true'}
 
 
-def step():
-    """(env, run) of the action's one step."""
+def steps():
+    """[(env, run)] of the action's steps: the git-clean check, then job_changed.py."""
     with open(ACTION) as f:
-        steps = yaml.safe_load(f)['runs']['steps']
-    assert len(steps) == 1
-    return steps[0]['env'], steps[0]['run']
+        found = yaml.safe_load(f)['runs']['steps']
+    assert len(found) == 2 and 'git-clean/git_clean.py" check' in found[0]['run'], found
+    return [(s.get('env', {}), s['run']) for s in found]
 
 
 class Repo(unittest.TestCase):
@@ -100,14 +100,14 @@ class Repo(unittest.TestCase):
         """{name: value} the action writes to $GITHUB_OUTPUT, its run text run with bash -e as the runner runs it."""
         out = os.path.join(self.d, '.output')
         open(out, 'w').close()
-        env, run = step()
         given = {'base': self.base if base is None else base, 'head': 'HEAD', 'workflow': CI, 'job': job, 'paths': '',
                  **inputs}
-        values = {k: given[re.fullmatch(r'\$\{\{ inputs\.(\w+) \}\}', v)[1]] for k, v in env.items()}
-        r = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-c', run], cwd=self.d, text=True,
-                           capture_output=True, env={**os.environ, **ENV, **values, 'GITHUB_OUTPUT': out,
-                                                     'GITHUB_ACTION_PATH': HERE})
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for env, run in steps():
+            values = {k: given[re.fullmatch(r'\$\{\{ inputs\.(\w+) \}\}', v)[1]] for k, v in env.items()}
+            r = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-c', run], cwd=self.d, text=True,
+                               capture_output=True, env={**os.environ, **ENV, **values, 'GITHUB_OUTPUT': out,
+                                                         'GITHUB_ACTION_PATH': HERE, 'GITHUB_WORKSPACE': self.d})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.log = r.stdout
         with open(out) as f:
             return dict(line.split('=', 1) for line in f.read().splitlines() if '=' in line)
@@ -312,6 +312,7 @@ class Workflow(Repo):
         clone = os.path.join(self.d, 'shallow')
         subprocess.run(['git', 'clone', '-q', '--depth', '1', f'file://{self.d}', clone], check=True, env={**os.environ, **ENV})
         self.d = clone
+        self.git('remote', 'set-url', 'origin', 'https://github.com/owner/repo')   # as actions/checkout writes it
         self.assertEqual(self.runs('plugins', first), 'true')
 
     def test_with_an_unrelated_ci_change_nothing_builds(self):
@@ -445,7 +446,8 @@ class Action(unittest.TestCase):
     text = open(ACTION).read()
 
     def test_runs_only_its_own_script_with_inputs_by_env(self):   # never ${{ }} inside run: (script injection)
-        env, run = step()
+        (_, check), (env, run) = steps()
+        self.assertEqual(check, 'exec python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path . --require')
         self.assertTrue(run.startswith('python3 -I "$GITHUB_ACTION_PATH/job_changed.py" '), run)
         self.assertNotIn('${{', run)
         self.assertNotIn('uses:', self.text)
