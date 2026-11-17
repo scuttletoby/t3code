@@ -154,14 +154,14 @@ miss, and the step fails, naming the test and the file. Run it on a schedule or 
 never as a pull request's gate:
 
 ```yaml
-  trace-check:
-    runs-on: ubuntu-latest # needs strace (sudo apt-get install -y strace) and ptrace of its own children
-    steps:
-      - uses: actions/checkout@<sha>
-      - uses: scuttletoby/t3code/fork-ci/actions/test-select/trace@<release sha> # ci/vN
-        with:
-          run: python3 -I -B {test} # how one test runs; {test} is its path, shell-quoted
-          jobs: '2'
+trace-check:
+  runs-on: ubuntu-latest # needs strace (sudo apt-get install -y strace) and ptrace of its own children
+  steps:
+    - uses: actions/checkout@<sha>
+    - uses: scuttletoby/t3code/fork-ci/actions/test-select/trace@<release sha> # ci/vN
+      with:
+        run: python3 -I -B {test} # how one test runs; {test} is its path, shell-quoted
+        jobs: "2"
 ```
 
 It fails, never passes unchecked, when strace is missing or a test's trace does not show its own file read. A test

@@ -15,7 +15,7 @@ inputs:
   jobs:
     description: How many tests are traced at once.
     required: false
-    default: '2'
+    default: "2"
 runs:
   using: composite
   steps:
