@@ -243,6 +243,36 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/fork-fleet.py watch
 
+  # fork-checks.yml runs on pull_request_target, which GitHub blocks unless the repository's Actions
+  # policy allows it (#401, .github/fork-actions-policies.json); its checks are not required, so a
+  # blocked run would pass unseen. This job waits (capped) for its check run on the pull request's
+  # head, and fork_ci_result needs it. Other events: the script logs a skip and passes.
+  fork_checks_ran:
+    name: Fork checks ran
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The run and job lists need actions: read (a job is a check run; every caller grants it).
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: |
+            /.github/fork-actions-policies.json
+            /.github/scripts/fork-checks-ran.py
+          sparse-checkout-cone-mode: false
+
+      - name: Require a fork-checks check run on the head commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OUTSIDE_PR: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/fork-checks-ran.py
+
   # A broken fork workflow is red on its own pull request, and the fork copy
   # must follow upstream's test jobs: the drift check lists every job and step
   # upstream changed since the copy was last recorded.
@@ -1082,6 +1112,7 @@ jobs:
         outside_pr,
         changes,
         fleet_watch,
+        fork_checks_ran,
         workflows,
         kit_tests,
         secrets,
@@ -1121,7 +1152,8 @@ jobs:
             release_smoke: "the change does not affect scripts/",
             secrets: "release run: the commit was scanned on its way to main",
             outside_pr: "not a pull request from another fork",
-            fleet_watch: "no job of this run went to the fleet"
+            fleet_watch: "no job of this run went to the fleet",
+            fork_checks_ran: "outside pull request: refused above"
           }'
           {
             echo "### fork-ci-result"

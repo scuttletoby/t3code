@@ -282,7 +282,15 @@ Setup (the repository owner's steps; nothing here creates them):
    config's `review` block is in `enforce`: then the path rules name them and
    the input may be empty), and pin the release. Copy
    [`review-trigger.example.yml`](review-trigger.example.yml) next to it,
-   unchanged (the caller names it by its `name`).
+   unchanged (the caller names it by its `name`). In a public repository,
+   GitHub blocks `pull_request_target` (from 2026-12-02) unless a repository
+   Actions policy allows that event for exactly the caller's file (Settings →
+   Actions → Policies, rule "Restrict events", or
+   `POST /repos/{owner}/{repo}/actions/policies`). A renamed caller is then
+   blocked again, and a blocked run is only a failed run that nothing
+   requires; this fork lists its allowed files in
+   `.github/fork-actions-policies.json` and fails its required check when
+   `fork-checks.yml` did not run (`fork-checks-ran.py`, issue 401).
 5. Dispatch it once without a number (the backfill), so open pull requests get
    the check under its name.
 6. Bind the required check to the App: in a ruleset, the required status
