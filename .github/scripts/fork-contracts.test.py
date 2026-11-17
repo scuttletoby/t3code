@@ -43,6 +43,11 @@ copies that must fail (so a check that stops seeing its problem goes red too):
   result       fork-tests.yml's fork_ci_result, the one check a ruleset requires, needs every other job
                of that workflow except the ones in RESULT_OPTIONAL (none today), so no job's failure
                can merge.
+  policies     every workflow with a pull_request_target trigger is listed in
+               .github/fork-actions-policies.json (#401): allowed (the fork workflows the repository's
+               Actions policy allows; each there, with the trigger) or upstream_blocked; fork-checks'
+               check names are its jobs' names, and fork-tests.yml's fork_checks_ran runs
+               fork-checks-ran.py with actions: read.
 
     python3 .github/scripts/fork-contracts.test.py
 
@@ -1605,6 +1610,84 @@ for label, mutate in {
     "no fork_ci_result job": lambda jobs: jobs.pop("fork_ci_result"),
 }.items():
     check(f"result: {label} fails", bool(result_mutant(mutate)))
+
+# --- policies ----------------------------------------------------------------------------------
+# GitHub blocks pull_request_target (from 2026-12-02) unless a repository Actions policy allows it
+# for the workflow file (#401). .github/fork-actions-policies.json is the one place that policy is
+# written down: every workflow in the tree with that trigger is either allowed (a fork workflow the
+# policy names) or upstream_blocked (upstream's, kept disabled and unnamed, so it stays blocked).
+# A rename or a new pull_request_target workflow fails here, at pull request time. fork-checks-ran.py
+# (fork-tests.yml's fork_checks_ran) proves the effect on each pull request.
+policies_path = root / ".github/fork-actions-policies.json"
+POLICY_SCRIPT = "python3 -I .github/scripts/fork-checks-ran.py"
+
+
+def policy_problems(policies, wfs, tests_wf):
+    """wfs: tree path -> parsed workflow (every workflow file, upstream's too)."""
+    prt = policies.get("pull_request_target") or {}
+    allowed, blocked = prt.get("allowed") or [], prt.get("upstream_blocked") or []
+    problems = []
+    for path in sorted(p for p, wf in wfs.items() if "pull_request_target" in triggers(wf)):
+        if path not in allowed and path not in blocked:
+            problems.append(f"{path} runs on pull_request_target but is in neither list of {policies_path.name}")
+    for path in allowed:
+        if path not in wfs:
+            problems.append(f"allowed {path} is not in the tree (renamed? the Actions policy names the old path)")
+        elif "pull_request_target" not in triggers(wfs[path]):
+            problems.append(f"allowed {path} has no pull_request_target trigger")
+        if not path.startswith(".github/workflows/fork-"):
+            problems.append(f"allowed {path} is not a fork workflow")
+    for path in blocked:
+        if path.startswith(".github/workflows/fork-") or path in allowed:
+            problems.append(f"upstream_blocked {path} is a fork workflow or also allowed")
+    fc = policies.get("fork_checks") or {}
+    if fc.get("workflow") not in allowed:
+        problems.append(f"fork_checks.workflow {fc.get('workflow')!r} is not an allowed workflow")
+    else:
+        names = {str(j.get("name")) for j in (wfs.get(fc["workflow"], {}).get("jobs") or {}).values()}
+        problems += [f"{fc['workflow']} has no job named {fc.get(k)!r} (fork_checks.{k})"
+                     for k in ("check", "outside_check") if fc.get(k) not in names]
+    job = (tests_wf.get("jobs") or {}).get("fork_checks_ran") or {}
+    if not any(str(s.get("run", "")).strip() == POLICY_SCRIPT for s in job.get("steps") or []) \
+            or (job.get("permissions") or {}).get("actions") != "read":
+        problems.append(f"fork-tests.yml: job fork_checks_ran does not run `{POLICY_SCRIPT}` with actions: read")
+    return problems
+
+
+all_wfs = {str(p.relative_to(root)): load(p) for p in sorted(workflows_dir.glob("*.y*ml"))}
+policies = json.loads(policies_path.read_text()) if policies_path.is_file() else {}
+check("policies: .github/fork-actions-policies.json is there", bool(policies))
+problems = policy_problems(policies, all_wfs, fork_tests)
+check("policies: every pull_request_target workflow is allowed or upstream_blocked, and fork-checks' check "
+      "names are its jobs'", not problems, "; ".join(problems))
+
+
+def policy_mutant(mutate):
+    p, w, t = copy.deepcopy(policies), copy.deepcopy(all_wfs), copy.deepcopy(fork_tests)
+    mutate(p, w, t)
+    return bool(policy_problems(p, w, t))
+
+
+FC = ".github/workflows/fork-checks.yml"
+for label, mutate in {
+    "fork-checks.yml renamed": lambda p, w, t: w.__setitem__(".github/workflows/fork-checks2.yml", w.pop(FC)),
+    "a new fork workflow on pull_request_target": lambda p, w, t: w.__setitem__(
+        ".github/workflows/fork-new.yml", {True: {"pull_request_target": None}, "jobs": {}}),
+    "a new upstream workflow on pull_request_target": lambda p, w, t: w.__setitem__(
+        ".github/workflows/new.yml", {True: ["pull_request_target"], "jobs": {}}),
+    "an allowed workflow without the trigger": lambda p, w, t: w[FC].__setitem__(True, {"pull_request": None}),
+    "an upstream workflow allowed": lambda p, w, t: p["pull_request_target"]["allowed"].append(
+        ".github/workflows/pr-size.yml"),
+    "a fork workflow in upstream_blocked": lambda p, w, t: p["pull_request_target"]["upstream_blocked"].append(FC),
+    "fork-checks' job renamed": lambda p, w, t: w[FC]["jobs"]["no_schema_changes"].__setitem__("name", "Schema"),
+    "fork_checks naming another workflow": lambda p, w, t: p["fork_checks"].__setitem__(
+        "workflow", ".github/workflows/fork-tests.yml"),
+    "no fork_checks_ran job": lambda p, w, t: t["jobs"].pop("fork_checks_ran"),
+    "fork_checks_ran without actions: read": lambda p, w, t: t["jobs"]["fork_checks_ran"]["permissions"].pop("actions"),
+    "fork_checks_ran not running the script": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1].__setitem__(
+        "run", POLICY_SCRIPT + " || true"),
+}.items():
+    check(f"policies: {label} fails", policy_mutant(mutate))
 
 shutil.rmtree(work, ignore_errors=True)
 if failures:
