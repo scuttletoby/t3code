@@ -12,7 +12,7 @@ They live in one private file per machine, which the owner writes by hand and no
 | ------- | ---------------------------------------------------- |
 | Linux   | `/etc/fork-kit/machine.json`                         |
 | macOS   | `/Library/Application Support/fork-kit/machine.json` |
-| Windows | `%ProgramData%\fork-kit\machine.json`                |
+| Windows | `C:\ProgramData\fork-kit\machine.json`               |
 
 The path is fixed: shipped commands have no option or environment variable that names another file.
 

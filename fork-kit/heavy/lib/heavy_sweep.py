@@ -26,7 +26,7 @@ It finds, for the user it runs as:
 Settings: the "heavy" section of the machine file (fork-kit/common/README.md), key "sweep". No file, no
 section, an unknown key or a newer version: nothing is checked or stopped, the reason is printed, exit 1.
 """
-import contextlib, datetime, fcntl, fnmatch, importlib.machinery, importlib.util, json, os, re, signal, stat
+import contextlib, datetime, fcntl, fnmatch, importlib.machinery, importlib.util, json, os, re, shlex, signal, stat
 import subprocess, sys, tempfile, time
 
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -49,18 +49,24 @@ OPTION_VALUES = {
     'shell': {'-o', '+o', '-O', '+O'},
     'other': {'-I', '-x'},
 }
-# options whose next word is the program itself (inline code, a module, a jar)
+# fish only: -C/--init-command run code before the script or the prompt (in bash and zsh, -C is a plain flag)
+FISH_VALUES = {'-C', '--init-command'}
+# options whose next word is the program itself (inline code, a module, a jar); --command is fish's -c
 INLINE = {'python': {'-c', '-m'}, 'node': {'-e', '-p', '--eval', '--print'}, 'java': {'-jar', '-m', '--module'},
-          'shell': {'-c'}, 'other': {'-e', '-E', '-r'}}
+          'shell': {'-c', '--command'}, 'other': {'-e', '-E', '-r'}}
 # of those, the ones whose next word is code text, which can hold a short password (`sh -c 'mysql -phunter2'`)
-CODE = {'python': {'-c'}, 'node': {'-e', '-p', '--eval', '--print'}, 'shell': {'-c'}, 'other': {'-e', '-E', '-r'}}
+CODE = {'python': {'-c'}, 'node': {'-e', '-p', '--eval', '--print'}, 'shell': {'-c', '--command'},
+        'other': {'-e', '-E', '-r'}}
 # Short options bundled in one word (`bash -lc`, `bash -euo pipefail`, `python3 -uc`, `node -pe`, `perl -lne`). For a
 # shell, c anywhere in it is -c, and each o/O in it takes a word first. For the others, the last letter acts as if it
-# stood alone. A word that starts with a letter whose value is attached (`-Wignore`, `-Mre`, `-rjson`) is one option.
-BUNDLED = {'shell': '', 'python': 'WXQ', 'node': '', 'other': 'MmIixdDr'}
+# stood alone. A letter whose value is attached ends the word: the rest is its value (`-Wignore`, `-Mre`, `-rjson`,
+# `perl -lFx`). perl's and ruby's -0 and -l take only digits (`-0777ne`, `-l0ne`).
+BUNDLED = {'shell': '', 'python': 'WXQ', 'node': '', 'other': 'MmIixdDrFC'}
 INTERPRETERS = {'node': 'node', 'nodejs': 'node', 'bun': 'node', 'deno': 'node', 'java': 'java', 'ruby': 'other',
                 'perl': 'other', 'php': 'other', 'Rscript': 'other', 'lua': 'other', 'tclsh': 'other'}
-# Wrappers that run one command for as long as they live: their own command is the wrapper plus that command's
+# Wrappers that run one command for as long as they live: their own command is the wrapper plus that command's.
+# env, nice, nohup, setsid and stdbuf exec that command, so a live process has their argv only behind one that stays
+# (timeout, time, xvfb-run); env -S STRING (--split-string) splits STRING into the command (a `#!/usr/bin/env -S` line)
 WRAPPERS = {'timeout': ({'-s', '--signal', '-k', '--kill-after'}, 1), 'env': ({'-u', '--unset', '-C', '--chdir'}, 0),
             'nice': ({'-n', '--adjustment'}, 0), 'nohup': (set(), 0), 'setsid': (set(), 0), 'stdbuf': (set(), 0),
             'time': ({'-f', '--format', '-o', '--output'}, 0),
@@ -193,6 +199,9 @@ def own_command(argv, shown=False):
             if a == '--':
                 i += 1
                 break
+            split = env_split(argv, i) if name == 'env' else None
+            if split is not None:                   # env reads the string itself: its NAME=value, -i, -u X, --
+                return own_command(argv[:1] + split, shown)
             if a in takes:
                 i += 2
             elif a.startswith('-') or (name == 'env' and '=' in a and not a.startswith('=')):
@@ -202,12 +211,14 @@ def own_command(argv, shown=False):
                 i += 1
             else:
                 break
+        while name == 'env' and i < len(argv) and '=' in argv[i] and not argv[i].startswith('='):
+            i += 1                                  # env -- NAME=value cmd: still env's assignment (GNU env)
         rest = own_command(argv[i:], shown)
         return argv[:1] + rest
     kind = interpreter_kind(name)
     if kind is None:
         return argv[:1]
-    takes = OPTION_VALUES.get(kind, set())
+    takes = OPTION_VALUES.get(kind, set()) | (FISH_VALUES if name == 'fish' else set())
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -215,17 +226,23 @@ def own_command(argv, shown=False):
             return argv[:1] + argv[i + 1:i + 2]
         if a in INLINE.get(kind, ()):
             if shown and a in CODE.get(kind, ()) and i + 1 < len(argv):
-                return argv[:1] + [a, code_text(argv[i + 1])]
+                return argv[:1] + [a, code_text(argv[i + 1], kind)]
             return argv[:1] + argv[i:i + 2]
         bundled = bundled_option(kind, a)
         if bundled:
             opt, values = bundled
-            j = i + 1 + values
+            j = i + 1
+            for _ in range(values):        # an option's value never starts with '-' (zsh -oerrexit -c: -c is next)
+                j += j < len(argv) and not argv[j].startswith('-')
+            # perl -pie CODE, -Fxe CODE: an attached value ends in e, and perl reads CODE as a script (and stops at
+            # once); shown, a script word there is cut like code
+            if opt is None and shown and '-' + a[-1] in CODE[kind] and j < len(argv) and not argv[j].startswith('-'):
+                opt = '-' + a[-1]
             if opt is None:
                 i = j
                 continue
             if shown and opt in CODE[kind] and j < len(argv):
-                return argv[:1] + [a, code_text(argv[j])]
+                return argv[:1] + [a, code_text(argv[j], kind)]
             return argv[:1] + [a] + argv[j:j + 1]
         if a in takes:
             i += 2
@@ -239,23 +256,50 @@ def own_command(argv, shown=False):
 def bundled_option(kind, a):
     """For a word of bundled short options (see BUNDLED): (the inline option it acts as, or None; how many of the
     words after it are option values). None when the word is not bundled short options."""
-    if kind not in BUNDLED or not re.fullmatch(r'-[A-Za-z]{2,}', a) or a[1] in BUNDLED[kind]:
+    if kind == 'other':
+        a = re.sub(r'(?<=[0l])[0-7]+', '', a)          # perl/ruby -0777, -l0: the digits are -0's or -l's value
+    if kind not in BUNDLED or not re.fullmatch(r'-[A-Za-z0]{2,}' if kind == 'other' else r'-[A-Za-z]{2,}', a):
         return None
     if kind == 'shell':
         return ('-c' if 'c' in a else None), a.count('o') + a.count('O')
+    attached = next((k for k in range(1, len(a)) if a[k] in BUNDLED[kind]), None)
+    if attached is not None and attached < len(a) - 1:
+        return None, 0
     last = '-' + a[-1]
     if last in INLINE[kind]:
         return last, 0
     return None, (1 if last in OPTION_VALUES.get(kind, ()) else 0)
 
 
-def code_text(code):
-    """Inline code as shown: its first word when that looks like a program name, and its length; never the rest,
-    where a password can be too short or too plain for redact() to see (-phunter2, -u admin:hunter2, PASS=x)."""
-    first = code.split(None, 1)[0] if code.strip() else ''
-    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./+-]*', first):
+def code_text(code, kind):
+    """Inline code as shown: its length, and for a shell also its first word when that looks like a program name and
+    is not the whole code; never the rest, where a password can be too short or too plain for redact() to see
+    (-phunter2, -u admin:hunter2, PASS=x). In python, node, perl, ruby or php, the first word is code too."""
+    words = code.split()
+    if kind != 'shell' or len(words) < 2 or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./+-]*', words[0]):
         return f'[{len(code)} chars]'
-    return first if first == code else f'[{first} ... {len(code)} chars]'
+    return f'[{words[0]} ... {len(code)} chars]'
+
+
+def env_split(argv, i):
+    """For env at argv[i]: the command `-S STRING`, `-SSTRING` (also after env's flags: `-iS`) or
+    `--split-string=STRING` names, with the words after it, or None for another word. STRING is split like a shell
+    would (quotes; an unclosed quote splits at spaces)."""
+    a = argv[i]
+    short = re.match(r'-[i0v]*S', a)
+    if a == '--split-string' or (short and short.end() == len(a)):
+        text, rest = (argv[i + 1] if i + 1 < len(argv) else ''), argv[i + 2:]
+    elif a.startswith('--split-string='):
+        text, rest = a.split('=', 1)[1], argv[i + 1:]
+    elif short:
+        text, rest = a[short.end():], argv[i + 1:]
+    else:
+        return None
+    try:
+        words = shlex.split(text)
+    except ValueError:
+        words = text.split()
+    return words + rest
 
 
 def redact(text):
