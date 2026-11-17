@@ -34,6 +34,18 @@ def hostile(members, version=None, fmt=tarfile.DEFAULT_FORMAT, glob=None):
     return out.getvalue()
 
 
+def pax(keys):
+    """The data of a pax header holding `keys`: one "<length> <key>=<value>\\n" record each."""
+    out = b''
+    for key, value in keys.items():
+        rec = f' {key}={value}\n'.encode()
+        n = len(rec)
+        while n != len(rec) + len(str(n)):
+            n = len(rec) + len(str(n))
+        out += str(n).encode() + rec
+    return out
+
+
 def unpack_code():
     """The launcher's own unpacker (UNPACK_PY)."""
     with open(LAUNCH) as f:
@@ -723,13 +735,34 @@ class Refresh(unittest.TestCase):
     def test_the_unpacker_bounds_memory_and_time(self):
         """A compromised release cannot hold root's refresh for minutes or take the host's memory: fanned-out
         symlinks (link k goes through link k-1 four times: 4**k steps unbounded), a GNU long-name or pax header of
-        1 MiB (tarfile would read it whole, however big), a GNU sparse file (chained headers), a name over 4096, too many
-        bytes of long names or pax headers in all, a global pax header of too many keys. Each is refused quickly, under
-        a 192 MiB address-space limit."""
-        sym = tarfile.SYMTYPE
+        1 MiB (tarfile would read it whole, however big), a sparse file of any format (its map is read into memory),
+        a name over 4096, too many bytes of long names or pax headers in all (empty ones too), too many bytes of names
+        and link targets in all, a global pax header of too many keys or one that names the entries, headers in a row
+        deeper than tarfile can follow. Each is refused quickly, under a 192 MiB address-space limit; at each budget's
+        exact limit the tarball still gets through."""
+        sym, xhd, xgl = tarfile.SYMTYPE, tarfile.XHDTYPE, tarfile.XGLTYPE
+        budget = 64 << 20   # the launcher's MAX_NAMES (its MAX_GLOBAL is 64)
         fan = []
         for k in range(30):
             fan.append(member(f'./l{k}', sym, link='bin' if k == 0 else '/../'.join([f'l{k - 1}'] * 4)))
+
+        def with_pax(m, keys):
+            m.pax_headers = keys
+            return m
+
+        def names(over):
+            """`budget` (+ `over`) bytes of names and link targets, 7000 entries of them in pax headers (64512000
+            bytes counted as headers: under the header budget) and the rest in ustar headers, after a device file: at
+            the limit the read loop ends and the device file is what is refused."""
+            out = [(member('./dev', tarfile.CHRTYPE), None)]
+            out += [(member(f'./{i:05d}'.ljust(4096, 'a'), sym, link='b/' * 2048), None) for i in range(7000)]
+            base = sum(len(m.name) + len(m.linkname) for m in tarfile.open(fileobj=io.BytesIO(hostile([]))))
+            k, r = divmod(budget - base - len('./dev') - 7000 * 8192 - len('./z'), 200)
+            out += [(member(f'./{i:06d}'.ljust(100, 'c'), sym, link='d' * 100), None) for i in range(k)]
+            return hostile(out + [(member('./z', sym, link='d' * (r + over)), None)], fmt=tarfile.PAX_FORMAT)
+
+        # 1024 pax headers of 64915 bytes: each 65536 bytes read (its own block and 127 of data), MAX_NAMES in all.
+        at_limit = [(with_pax(member(f'./bin/c{i}'), {'comment': 'x' * 64900}), b'') for i in range(1024)]
         cases = {
             'fanned-out symlinks': (hostile([(m, None) for m in fan]), 'steps to follow'),
             'GNU long name': (hostile([(member('./bin/' + 'a' * (1 << 20)), b'')], fmt=tarfile.GNU_FORMAT),
@@ -738,6 +771,18 @@ class Refresh(unittest.TestCase):
                            'a header of'),
             'sparse file': (hostile([(member('./bin/s', tarfile.GNUTYPE_SPARSE), b'')], fmt=tarfile.GNU_FORMAT),
                             'is a sparse file'),
+            # Pax sparse 1.0: a map of 20 million pairs in the entry's data, read 512 bytes at a time into a list
+            # (640 MB of numbers from about 80 KB of gzip) before any other check.
+            'pax sparse 1.0': (hostile([(with_pax(member('./bin/s'), {'GNU.sparse.major': '1',
+                                                                      'GNU.sparse.minor': '0'}),
+                                         b'20000000\n' + b'0\n' * 40000000)], fmt=tarfile.PAX_FORMAT),
+                               'a pax sparse file'),
+            # Pax sparse 0.1: maps under every budget (64 MB of pax headers) become lists of tuples ~17 times bigger.
+            'pax sparse 0.1': (hostile([(with_pax(member(f'./bin/s{i}'), {'GNU.sparse.map': ','.join(['0'] * 32000)}),
+                                         b'') for i in range(1000)], fmt=tarfile.PAX_FORMAT), 'a pax sparse file'),
+            'pax sparse 0.0': (hostile([(with_pax(member('./bin/s'), {'GNU.sparse.size': '0', 'GNU.sparse.offset': '0',
+                                                                      'GNU.sparse.numbytes': '0'}), b'')],
+                                       fmt=tarfile.PAX_FORMAT), 'a pax sparse file'),
             'long name': (hostile([(member('./bin/' + 'a' * 5000), b'')], fmt=tarfile.PAX_FORMAT),
                           'longer than 4096'),
             'long link target': (hostile([(member('./bin/l', sym, link='a/' * 2500), None)], fmt=tarfile.PAX_FORMAT),
@@ -747,20 +792,61 @@ class Refresh(unittest.TestCase):
             'many long names': (hostile([(member(f'./{i:05d}' + 'a' * 60000), b'') for i in range(4000)],
                                         fmt=tarfile.PAX_FORMAT), 'longer than 4096'),
             # Each name and target under 4096, but 30000 symlinks: ~240 MB of names from a small download, unless
-            # all the long-name and pax headers together are counted (MAX_NAMES) as they are read.
+            # all the long-name and pax headers together are counted (MAX_NAMES) as they are read. The GNU format is
+            # a runner release's own (its long names come in GNU long-name headers, its link targets in long-link
+            # ones); both kinds are counted, or the names total below refuses it first.
             'many long-name symlinks': (hostile([(member(f'./{i:05d}' + 'a' * 4000, sym, link='b/' * 2000), None)
                                                  for i in range(30000)], fmt=tarfile.PAX_FORMAT),
                                         'bytes of long names and pax headers'),
+            'many long-name symlinks, GNU format': (
+                hostile([(member(f'./{i:05d}' + 'a' * 4000, sym, link='b/' * 2000), None) for i in range(30000)],
+                        fmt=tarfile.GNU_FORMAT), 'bytes of long names and pax headers'),
+            # Global headers count too: 1100 of 61 KB (one key each, under MAX_GLOBAL), each before an entry.
+            'many global headers': (
+                hostile([x for i in range(1100) for x in ((member('./g', xgl), pax({'comment': 'x' * 61000})),
+                                                          (member(f'./bin/e{i}'), b''))], fmt=tarfile.PAX_FORMAT),
+                'bytes of long names and pax headers'),
+            # Empty headers cost their block: 1100 entries after 120 empty pax headers each (132000 headers) would
+            # all be parsed for nothing, unless the blocks read are counted rather than the sizes.
+            'many empty headers': (
+                hostile([x for i in range(1100) for x in [(member('./x', xhd), b'')] * 120 + [(member(f'./bin/e{i}'),
+                                                                                                b'')]],
+                        fmt=tarfile.PAX_FORMAT), 'bytes of long names and pax headers'),
+            'headers of MAX_NAMES bytes': (hostile(at_limit, fmt=tarfile.PAX_FORMAT), None),
+            'headers of one block more': (hostile(at_limit + [(member('./x', xhd), b''), (member('./bin/z'), b'')],
+                                                  fmt=tarfile.PAX_FORMAT), 'bytes of long names and pax headers'),
+            # More headers in a row than tarfile can follow (it recurses on each): refused, not a traceback.
+            'a chain of headers': (hostile([(member('./x', xhd), b'')] * 300 + [(member('./bin/z'), b'')],
+                                           fmt=tarfile.PAX_FORMAT), 'more headers in a row'),
+            # Names and link targets of every entry, in all: the global path below, or plain ustar names on top of
+            # long ones, would get past the header budget.
+            'names of MAX_NAMES bytes': (names(0), 'is a device file'),
+            'names of one byte more': (names(1), 'bytes of names and link targets'),
             # Global pax keys are copied into every entry read after them: 6000 keys (one 60 KiB header) and 100000
             # entries would be ~30 GB, or 600 million steps without those copies kept.
             'a global pax header of many keys': (
                 hostile([(member(f'./bin/{i}'), None) for i in range(100000)], fmt=tarfile.PAX_FORMAT,
                         glob={f'k{i}': '' for i in range(6000)}), 'global pax keys'),
+            'a global pax header of MAX_GLOBAL keys': (
+                hostile([(member(f'./bin/{i}'), b'') for i in range(3)], fmt=tarfile.PAX_FORMAT,
+                        glob={f'k{i}': '' for i in range(64)}), None),
+            'a global pax header of one key more': (
+                hostile([(member(f'./bin/{i}'), b'') for i in range(3)], fmt=tarfile.PAX_FORMAT,
+                        glob={f'k{i}': '' for i in range(65)}), 'global pax keys'),
             # Under that cap (a runner release has none; git archive writes one), each entry's copy of them is
             # dropped once read: 100001 copies of 60 keys would be ~230 MB before the entry count refuses.
             'global pax keys on each entry': (
                 hostile([(member(f'./bin/{i}'), None) for i in range(100001)], fmt=tarfile.PAX_FORMAT,
                         glob={f'k{i}': '' for i in range(60)}), 'more than 100000 entries'),
+            # A global path ending in "/" is a new 4000-byte copy in each of 100000 entries (~400 MB), from one key.
+            'a global pax path': (hostile([(member(f'./bin/{i}'), None) for i in range(100000)],
+                                          fmt=tarfile.PAX_FORMAT, glob={'path': 'a' * 4000 + '/'}),
+                                  'a global pax header with path'),
+            'a global pax linkpath': (hostile([(member('./bin/l', sym), None)], fmt=tarfile.PAX_FORMAT,
+                                              glob={'linkpath': 'a'}), 'a global pax header with linkpath'),
+            'a global pax sparse name': (hostile([(member('./bin/s'), b'')], fmt=tarfile.PAX_FORMAT,
+                                                 glob={'GNU.sparse.name': 'a'}),
+                                         'a global pax header with GNU.sparse.name'),
         }
         limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (192 << 20, 192 << 20))
         for name, (data, word) in cases.items():
@@ -772,11 +858,16 @@ class Refresh(unittest.TestCase):
                 t = time.monotonic()
                 got = subprocess.run(['python3', '-I', '-c', unpack_code(), src, dest, NEW, ''], capture_output=True,
                                      text=True, timeout=60, preexec_fn=limit)
-                self.assertNotEqual(got.returncode, 0)
-                self.assertIn(word, got.stderr)
+                self.assertNotIn('Traceback', got.stderr)
                 self.assertNotIn('MemoryError', got.stderr)
                 self.assertLess(time.monotonic() - t, 20)
-                self.assertEqual(os.listdir(dest), [])
+                if word is None:
+                    self.assertEqual(got.returncode, 0, got.stderr)
+                    self.assertIn('run.sh', os.listdir(dest))
+                else:
+                    self.assertNotEqual(got.returncode, 0)
+                    self.assertIn(word, got.stderr)
+                    self.assertEqual(os.listdir(dest), [])
 
     def test_start_refuses_what_refresh_refuses(self):
         """Defence in depth: start's own check of the template (a template made by hand, or an older refresh)."""
