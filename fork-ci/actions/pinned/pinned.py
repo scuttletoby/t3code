@@ -13,9 +13,10 @@ A file is fetched from raw.githubusercontent.com (a public repository: no token)
 and its blob id is checked on every use: a cached copy that differs (a killed write, a hand edit, another job on the
 runner) is fetched again, and fetched bytes that differ are refused. A file the config does not name, or no network
 and no good copy: FetchError, and the caller fails or falls back to its full answer, never to a guessed one. Each use
-also removes .part- files older than PART_AGE (a killed fetch) and the folders of other shas that nothing used for
-CACHE_DAYS. load() and run run the bytes that were checked, never a second read of the cache file, and refuse a file
-that would load its neighbours (neighbour_loads): those would be cache files nothing checked.
+also removes .part- files older than PART_AGE (a killed fetch), and the folders of other shas that nothing used for
+CACHE_DAYS and the run folders a killed run left that long ago. load() and run run the bytes that were checked, never
+a second read of the cache file, and refuse a file that would load its neighbours (neighbour_loads): those would be
+cache files nothing checked.
 
   python3 -I pinned.py --config .github/fork-ci.json [--cache DIR] run <action> <file> [args...]
 runs that pinned script (python3 -I) with the arguments after its name, from a private copy of the checked bytes.
@@ -32,7 +33,11 @@ CACHE_DAYS = 14     # another sha's folder that nothing used for this long goes 
 # modules that load code from a path (site: a .pth file runs code; builtins: its __import__ and exec)
 BY_PATH = ('importlib', 'runpy', 'imp', 'zipimport', 'pkgutil', 'site', 'pkg_resources', 'ctypes', 'builtins')
 SYS_IMPORT = ('path', 'meta_path', 'path_hooks', 'path_importer_cache', 'modules')   # the sys names imports go by
-OWN_PATH = ('__file__', '__spec__', '__loader__', '__cached__', '__import__')   # where a neighbour's path starts
+SYS_FRAME = ('_getframe', '_current_frames')   # sys names whose frames give the file's own path (f_code.co_filename)
+# where a neighbour's path starts: the file's own path, or the importer (__builtins__ holds __import__)
+OWN_PATH = ('__file__', '__spec__', '__loader__', '__cached__', '__import__', '__builtins__')
+OWN_MODULE = ('__main__', 'inspect')   # modules that give the running file's own path (__main__.__file__, getfile)
+RUN = '.run-'   # a run's private folder in the cache (a killed run leaves it; prune removes it after CACHE_DAYS)
 
 
 def default_cache():
@@ -116,9 +121,9 @@ def fetch(repo, sha, action, name):
 
 
 def prune(cache, keep, now=None):
-    """Remove .part- files older than PART_AGE and the folders of other shas unused for CACHE_DAYS (their folder's
-    mtime: every use touches it). Only 40-hex folders are removed. Never fails the caller: another process may remove
-    a file first."""
+    """Remove .part- files older than PART_AGE, and the folders of other shas unused for CACHE_DAYS (their folder's
+    mtime: every use touches it) and run folders that old (a killed run's). Only 40-hex and .run- folders are removed.
+    Never fails the caller: another process may remove a file first."""
     now = time.time() if now is None else now
     try:
         shas = os.listdir(cache)
@@ -129,7 +134,8 @@ def prune(cache, keep, now=None):
         try:
             if not stat.S_ISDIR(os.lstat(top).st_mode):   # a symlink is never followed out of the cache
                 continue
-            if sha != keep and SHA.fullmatch(sha) and now - os.stat(top).st_mtime > CACHE_DAYS * 86400:
+            if (sha != keep and (SHA.fullmatch(sha) or sha.startswith(RUN))
+                    and now - os.stat(top).st_mtime > CACHE_DAYS * 86400):
                 shutil.rmtree(top, ignore_errors=True)
                 continue
             for folder, _, names in os.walk(top):
@@ -186,14 +192,17 @@ def verified(config, action, name, cache=None):
 def neighbour_loads(data):
     """What in these Python bytes would load code from the file's own folder, which in the cache holds files nothing
     checked. load() and run refuse a file with any: they run one checked file, never its neighbours.
-      - sys.path: sys used for an import name (SYS_IMPORT: pr-queue/pr_queue.py puts its folder first, then imports
-        config and lens), or sys used as anything but `sys.<other name>` (an alias's .path, getattr, vars, `s = sys`);
+      - sys.path: sys (also os.sys, `from os import sys`) used for an import name (SYS_IMPORT: pr-queue/pr_queue.py
+        puts its folder first, then imports config and lens), or used as anything but `sys.<other name>` (an alias's
+        .path, getattr, vars, `s = sys`);
       - a module that loads code from a path or swaps the import (BY_PATH), or a relative import;
-      - the file's own path (OWN_PATH: __file__, __spec__, __loader__, __cached__) or __import__: every way to name a
-        neighbour (exec(open(...)), a subprocess, os.chdir, site.addsitedir, a data file) starts from it.
+      - the file's own path (OWN_PATH: __file__, __spec__, __loader__, __cached__; argv[0]; sys._getframe; __main__,
+        inspect) or the importer (__import__, __builtins__): every way to name a neighbour (exec(open(...)), a
+        subprocess, os.chdir, site.addsitedir, a data file) starts from it.
     Other imports come from the caller's own path (the standard library, an installed PyYAML), as any import of the
-    caller's does. A static check: a module written to dodge it can, so run also puts its copy one folder down in a
-    private folder (`..` is ours)."""
+    caller's does. A static check of the usual spellings, never complete (globals()['__file__'], traceback, an
+    absolute path pass it), so run also puts its copy in a private folder inside the checked cache: every `..` of it
+    is ours (README: the folders above the cache must be)."""
     try:
         tree = ast.parse(data)
     except (SyntaxError, ValueError):
@@ -206,18 +215,26 @@ def neighbour_loads(data):
             sys_names.update(a.asname for a in node.names if a.name == 'sys' and a.asname)
         elif isinstance(node, ast.ImportFrom):
             names = ['.' * node.level + (node.module or '')]
+            sys_names.update(a.asname or a.name for a in node.names if a.name == 'sys')   # from os import sys
             if node.module == 'sys' and any(a.name in (*SYS_IMPORT, '*') for a in node.names):
                 found.add('sys.path')
-        found.update(n for n in names if n.startswith('.') or n.split('.')[0] in BY_PATH)
+        found.update(n for n in names if n.startswith('.') or n.split('.')[0] in (*BY_PATH, *OWN_MODULE))
     parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Name):
-            continue
-        if node.id in OWN_PATH:
+        if isinstance(node, ast.Subscript):   # argv[0], sys.argv[0]: the script's own path
+            index = node.slice.value if isinstance(node.slice, getattr(ast, 'Index', ())) else node.slice
+            argv = (isinstance(node.value, ast.Attribute) and node.value.attr == 'argv'
+                    or isinstance(node.value, ast.Name) and node.value.id == 'argv')
+            if argv and isinstance(index, ast.Constant) and index.value == 0:
+                found.add('argv[0]')
+        if isinstance(node, ast.Name) and node.id in OWN_PATH:
             found.add(node.id)
-        elif node.id in sys_names:
+        elif (isinstance(node, ast.Name) and node.id in sys_names
+              or isinstance(node, ast.Attribute) and node.attr == 'sys'):   # os.sys
             p = parent.get(node)
-            if not (isinstance(p, ast.Attribute) and p.attr not in SYS_IMPORT and not p.attr.startswith('__')):
+            if isinstance(p, ast.Attribute) and p.attr in SYS_FRAME:
+                found.add(f'sys.{p.attr}')
+            elif not (isinstance(p, ast.Attribute) and p.attr not in SYS_IMPORT and not p.attr.startswith('__')):
                 found.add('sys.path')
     return sorted(found)
 
@@ -248,12 +265,15 @@ def load(config, action, module, cache=None):
 
 
 def run(config, action, name, args=(), cache=None, runner=None):
-    """Run the pinned script with python3 -I and args, from a private copy (<0700 folder>/<action>/<name>) of the bytes
-    that were checked; its exit code. The copy goes after the run."""
-    _, data = self_contained(config, action, name, cache)
-    run_dir = tempfile.mkdtemp(prefix='fork-ci-run-')   # 0700, ours alone: the bytes checked are the bytes run
+    """Run the pinned script with python3 -I and args, from a private copy (<cache>/.run-X/<action>/<name>) of the
+    bytes that were checked; its exit code. The copy goes after the run (a killed run's goes after CACHE_DAYS)."""
+    cache = cache or default_cache()
+    _, data = self_contained(config, action, name, cache)   # checks the cache folder first (private)
+    # 0700, ours alone: the bytes checked are the bytes run. In the checked cache, never the shared temp folder: the
+    # script's `..` is this folder, `../..` the 0700 cache, and above it folders the README requires to be ours.
+    run_dir = tempfile.mkdtemp(prefix=RUN, dir=cache)
     try:
-        folder = os.path.join(run_dir, action)   # one down: the script's `..` is ours, never the shared temp folder
+        folder = os.path.join(run_dir, action)
         os.mkdir(folder, 0o700)
         script = os.path.join(folder, name)
         with open(script, 'wb') as f:
