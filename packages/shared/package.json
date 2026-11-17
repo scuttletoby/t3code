@@ -191,6 +191,10 @@
       "types": "./src/capacityVectors.ts",
       "import": "./src/capacityVectors.ts"
     },
+    "./capacityReadings": {
+      "types": "./src/capacityReadings.ts",
+      "import": "./src/capacityReadings.ts"
+    },
     "./backgroundActivitySettings": {
       "types": "./src/backgroundActivitySettings.ts",
       "import": "./src/backgroundActivitySettings.ts"
