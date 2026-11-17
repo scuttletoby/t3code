@@ -126,10 +126,7 @@ import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.t
 import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderUsageLimitsIngestion from "./provider/ProviderUsageLimitsIngestion.ts";
-import * as UsageReadingsHistory from "./usage/UsageReadingsHistory.ts";
-import * as HeadlessUsageRefresher from "./usage/HeadlessUsageRefresher.ts";
-import * as UsagePacer from "./usage/UsagePacer.ts";
-import * as SlotGate from "./slots/SlotGate.ts";
+import * as ForkLayers from "./fork/forkLayers.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
@@ -182,7 +179,6 @@ import * as EnvironmentAuthPolicy from "./auth/EnvironmentAuthPolicy.ts";
 import * as CloudHttp from "./cloud/http.ts";
 import * as GuestHttp from "./guest/http.ts";
 import * as CloudLink from "./cloud/CloudLink.ts";
-import * as HoldWorkConnect from "./cloud/holdWorkConnect.ts";
 import * as ConnectReachability from "./cloud/ConnectReachability.ts";
 import { pendingServiceUpdateExists } from "./cloud/updateHandoff.ts";
 import * as RelayTracing from "./cloud/relayTracing.ts";
@@ -198,8 +194,6 @@ import {
 } from "./cloud/managedTunnelStartup.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as CloudCliState from "./cloud/CliState.ts";
-import * as ServerAutoUpdate from "./cloud/autoUpdate.ts";
-import * as WorkAdmission from "./workAdmission.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as DesktopAppUpdate from "./desktopUpdate/DesktopAppUpdate.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
@@ -695,8 +689,7 @@ const layerServerRestart = Layer.effect(
 );
 
 const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
-  // Fork: a held server (`serve --hold-work`) publishes no agent activity.
-  HoldWorkConnect.agentActivityLayer(AgentAwarenessRelay.layer),
+  ForkLayers.holdWorkAgentActivity(AgentAwarenessRelay.layer),
   HeldHooksWaker.layer,
   layerThreadSettlementWorker,
   layerIdleCompactionWorker,
@@ -735,9 +728,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
     }),
   ).pipe(Layer.provide(DelegatedTaskQuestionReactor.layer), Layer.provide(ProjectionStoreV2.layer)),
   ProviderUsageLimitsIngestion.layer,
-  UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
-  SlotGate.layer,
-  HeadlessUsageRefresher.layer,
+  ForkLayers.layerRuntimeServices,
   layerProviderInstallationRefresh,
   ProviderInstallation.layer,
   ReplayMarkers.layer,
@@ -875,25 +866,9 @@ const layerMakeRoutes = Layer.mergeAll(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
-  // Fork: /mcp reads the usage pacer and the slot gate only if they are there (the usage pacing
-  // gate, agentSlots). Asking for them here, beside /mcp, makes a server wired without one a type
-  // error instead of a silent gate.
-  Layer.effectDiscard(UsagePacer.UsagePacer.pipe(Effect.asVoid)),
-  Layer.effectDiscard(SlotGate.SlotGate.pipe(Effect.asVoid)),
   // Follows delegated tasks running in linked environments, including after a restart.
-  Layer.effectDiscard(
-    Effect.gen(function* () {
-      const remote = yield* RemoteDelegation.RemoteDelegation;
-      // Fork: a held server (`serve --hold-work`) neither follows nor stops tasks in linked
-      // environments. What it owes them stays owed for the next start without the flag.
-      if ((yield* WorkAdmission.WorkAdmission).heldFromBoot) {
-        return yield* Effect.logInfo("Remote delegated task follower held (--hold-work)");
-      }
-      yield* remote.start();
-    }),
-  ),
-  // Off unless automaticUpdates is on; shares the Update button's ServerSelfUpdate below.
-  ServerAutoUpdate.layer,
+  Layer.effectDiscard(ForkLayers.startRemoteDelegation),
+  ForkLayers.layerRoutes,
 ).pipe(
   Layer.provide(
     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
@@ -943,17 +918,7 @@ const layerMakeServer = Layer.unwrap(
     const activation = yield* Deferred.make<void>();
     const awaitActivation = Deferred.await(activation);
     const layerActivation = Layer.succeed(ServerActivation.ServerActivation, awaitActivation);
-    // One gate for the whole server: automatic updates hold new work until the restart.
-    const layerWorkAdmission = Layer.succeed(
-      WorkAdmission.WorkAdmission,
-      yield* WorkAdmission.makeWorkAdmissionGate({
-        marker: yield* WorkAdmission.makeFileUpdateHoldStore(config.baseDir),
-        heldFromBoot: config.holdWork === true,
-      }),
-    );
-    if (config.holdWork === true) {
-      yield* Effect.logWarning(WorkAdmission.HOLD_WORK_BOOT_MESSAGE);
-    }
+    const layerWorkAdmission = yield* ForkLayers.makeWorkAdmissionLayer(config);
     const runtimeStateParked = yield* Deferred.make<void>();
     const tailscaleParked = yield* Deferred.make<void>();
     const cloudLinkParked = yield* Deferred.make<void>();
@@ -1393,10 +1358,7 @@ const layerMakeServer = Layer.unwrap(
     );
 
     return layerServerApplication.pipe(
-      // Fork: a held server (`serve --hold-work`) starts, registers and releases no tunnel.
-      Layer.provide(
-        HoldWorkConnect.layer(CloudLink.layer).pipe(Layer.provideMerge(ConnectReachability.layer)),
-      ),
+      Layer.provide(ForkLayers.holdWorkCloudLink(CloudLink.layer, ConnectReachability.layer)),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
