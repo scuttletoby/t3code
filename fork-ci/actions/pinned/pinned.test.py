@@ -30,7 +30,7 @@ class Case(unittest.TestCase):
 
     def setUp(self):
         if self.TRUST_ABOVE:
-            above = mock.patch.object(pinned, 'shared_above', lambda cache: [])
+            above = mock.patch.object(pinned, 'shared_above', lambda cache, caller='run': [])
             above.start()
             self.addCleanup(above.stop)
         self.root = tempfile.mkdtemp(prefix='pinned-root-')
@@ -839,6 +839,77 @@ class Above(Case):
         self.assertIn('pass --cache', str(e.exception))
         self.assertNotIn('chmod', str(e.exception))
 
+    def refused_before_anything(self, cache, *expect, absent=('chmod',)):
+        """run and load (twice each: the same answer again) refuse this cache with a FetchError that says each of
+        expect and none of absent ({how}: --cache for run, the cache argument for load: load never says --cache);
+        nothing made, fetched or run."""
+        made = sorted(os.listdir(self.root))
+        for _ in range(2):
+            for call, how in ((self.run_it, '--cache'), (self.load_it, 'the cache argument')):
+                with self.subTest(call.__name__), self.private_above(), \
+                        self.assertRaises(pinned.FetchError) as e:   # never a raw OSError
+                    call(cache)
+                for text in expect:
+                    self.assertIn(text.format(how=how), str(e.exception))
+                for text in absent:
+                    self.assertNotIn(text.format(how=how), str(e.exception))
+                if call == self.load_it:
+                    self.assertNotIn('--cache', str(e.exception), 'load() is the Python API: it has no --cache')
+        self.assertEqual(sorted(os.listdir(self.root)), made, 'no folder made')
+        self.assertEqual((self.runs, self.urls), ([], []), 'nothing fetched, nothing run')
+        self.assertFalse(os.path.exists(self.marker))
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_through_a_symlink_the_folder_named_is_the_real_one_you_cannot_enter(self):   # #376 item 1 (#369 m1)
+        # B/sl -> B/locked/a, B/locked 0600, cache B/sl/fci: the message named B (0700) and `chmod u+x B`, which
+        # changes nothing. The folder without x is B/locked, reached through the link.
+        b = os.path.join(self.root, 'B')
+        locked = os.path.join(b, 'locked')
+        os.makedirs(os.path.join(locked, 'a'), 0o700)
+        os.symlink(os.path.join(locked, 'a'), os.path.join(b, 'sl'))
+        os.chmod(locked, 0o600)
+        self.addCleanup(os.chmod, locked, 0o700)
+        self.refused_before_anything(os.path.join(b, 'sl', 'fci'), f'{locked} cannot be entered',
+                                     f'Fix: chmod u+x {locked}', absent=(f'{b} cannot',))
+        rel = os.path.join(self.root, 'C')   # a relative link to a link
+        os.mkdir(rel, 0o700)
+        os.symlink(os.path.join('..', 'B', 'sl'), os.path.join(rel, 'r1'))
+        os.symlink('r1', os.path.join(rel, 'r2'))
+        self.refused_before_anything(os.path.join(rel, 'r2', 'fci'), f'{locked} cannot be entered',
+                                     f'Fix: chmod u+x {locked}', absent=(f'{rel} cannot',))
+        os.chmod(locked, 0o700)
+        self.assertEqual(os.listdir(os.path.join(locked, 'a')), [], 'nothing made under it')
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_a_symlink_loop_above_the_cache_is_refused_with_its_own_message(self):   # #376 items 1, 2 (#369 m1, m2)
+        # It said `B cannot be entered (Too many levels of symbolic links) ... chmod u+x B`. And narrowing the catch
+        # to EACCES (other errors skip the folder) left every test green: private() then raised a raw OSError.
+        b = os.path.join(self.root, 'B')
+        os.mkdir(b, 0o700)
+        loop = os.path.join(b, 'loop')
+        os.symlink(loop, loop)
+        self.refused_before_anything(os.path.join(loop, 'fci'), f'{loop} above the cache', 'symlink loop',
+                                     'Fix: pass {how} with a folder', absent=('chmod', 'cannot be entered'))
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_a_file_above_the_cache_is_a_clean_refusal(self):   # #376 item 2: an error other than EACCES (ENOTDIR)
+        b = os.path.join(self.root, 'B')
+        os.mkdir(b, 0o700)
+        self.put(os.path.join(b, 'file'), b'')
+        up = os.path.join(b, 'file', 'x')
+        self.refused_before_anything(os.path.join(up, 'fci'), f'{up} above the cache', 'cannot be checked',
+                                     'Fix: pass {how} with a folder', absent=('chmod', 'cannot be entered'))
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_load_names_its_cache_argument_and_run_its_flag(self):   # #376 item 3 (#369 nit)
+        uid = os.getuid()
+        with mock.patch.object(os, 'getuid', lambda: uid + 1):   # every folder of the test is another user's
+            self.refused_before_anything(os.path.join(self.root, 'home', 'fci'),
+                                         'Fix: pass {how} with a folder whose every parent only you or root can write')
+            locked, cache = self.locked()   # and one you cannot enter
+            self.refused_before_anything(cache, f'{locked} cannot be entered', 'Fix: pass {how} with a folder whose '
+                                         'every parent you can enter and only you or root can write')
+
 
 class Run(Case):
     def test_run_executes_the_verified_bytes_even_if_the_cache_file_changes_after_the_check(self):
@@ -937,7 +1008,7 @@ class Bootstrap(Case):
         with mock.patch.object(self.ns['urllib'].request, 'urlopen', urlopen):
             p = self.ns['load_pinned'](self.cfg, self.cache)
         if self.TRUST_ABOVE:   # this copy is not the module Case patched: its caches sit under the shared temp folder
-            above = mock.patch.object(p, 'shared_above', lambda cache: [])
+            above = mock.patch.object(p, 'shared_above', lambda cache, caller='run': [])
             above.start()
             self.addCleanup(above.stop)
         return p
