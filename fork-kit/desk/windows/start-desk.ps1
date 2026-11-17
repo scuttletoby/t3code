@@ -2,7 +2,7 @@
 # (fork-kit/desk/README.md, "Windows"). Run it in a normal Windows PowerShell window (not as administrator):
 #   powershell -ExecutionPolicy Bypass -File start-desk.ps1 -Repo OWNER/REPO -Sha RELEASE_SHA -MachineFile machine.json
 #     [-FleetConfig fork-fleet.json] [-Distro fork-desk] [-MemoryGB N] [-SwapGB 4] [-Uninstall]
-# -MemoryGB is the least [wsl2] memory cap: a higher one already in .wslconfig is kept.
+# -MemoryGB is the [wsl2] memory cap; without it, a higher one already in .wslconfig is kept, up to the RAM less 2 GB.
 # It prints this PC's facts and asks before it changes anything. Safe to run again: every step checks what is there.
 # Steps: the distro (Ubuntu 24.04); .wslconfig's [wsl2] memory cap and NAT (a dated copy of the old file is kept;
 # other keys stay); the distro's own settings (the WSL walls: no interop, no Windows PATH or drives, its own
@@ -162,16 +162,19 @@ function Merge-WslConfig([string]$path, $want, [scriptblock]$before = {}) {   # 
   Move-Item -LiteralPath "$path.new" $path -Force
   $true
 }
-# A [wsl2] memory= value in kB (8GB, 8192MB, 8G; no unit: bytes), or -1 when it is not a size
+# A [wsl2] memory= value in kB (8GB, 8192MB, 8G; no unit: bytes), or -1 when WSL cannot read it. WSL's parser
+# (ParseMemorySize) takes a number and B, K, KB, M, MB, G, GB, T or TB exactly: no space before the unit, upper case
+# (`26 GB` or `26gb` makes it warn and run on half the RAM).
 function CapKb([string]$v) {
-  if ($v -notmatch '^\s*([0-9]{1,13})\s*([KMGT]?)B?\s*$') { return [long]-1 }
-  [long][math]::Min(1e15, [math]::Floor([double]$Matches[1] * [math]::Pow(1024, ' KMGT'.IndexOf($Matches[2].ToUpper())) / 1024))
+  if ($v -cnotmatch '^\s*([0-9]{1,13})([KMGT]?)B?\s*$') { return [long]-1 }
+  [long][math]::Min(1e15, [math]::Floor([double]$Matches[1] * [math]::Pow(1024, ' KMGT'.IndexOf($Matches[2])) / 1024))
 }
-# The memory cap to want: at least $gb GB. A higher one already in .wslconfig (a person raised it) is kept as it is
-# written, so it is neither lowered nor a FAIL, and the live check holds WSL to it.
-function WantMemory([string]$path, [int]$gb) {
+# The memory cap to want: $gb GB, or the one already in .wslconfig, kept as it is written (neither lowered nor a FAIL,
+# and the live check holds WSL to it) while WSL reads it and it is $gb to $most GB.
+function WantMemory([string]$path, [int]$gb, [int]$most) {
   $have = (Wsl2Keys (Read-WslConfig $path))['memory']
-  if ($have -and (CapKb $have) -ge [long]$gb * 1048576) { return $have }
+  $kb = if ($have) { CapKb $have } else { -1 }
+  if ($kb -ge [long]$gb * 1048576 -and $kb -le [long]$most * 1048576) { return $have }
   "${gb}GB"
 }
 function WslVersion([string[]]$lines, [string]$name) {   # the WSL version of one distro in `wsl -l -v`; 0: not there
@@ -224,7 +227,9 @@ try {
   $ours = Test-Path -LiteralPath $Made
   if ($have -and -not $ours) { wsl.exe -d $Distro -u root --cd / -- test -e /etc/fork-kit/desk-distro; $ours = $LASTEXITCODE -eq 0 }
 
-  $want = [ordered]@{ memory = (WantMemory $WslConfig $MemoryGB); swap = "${SwapGB}GB"; networkingMode = 'nat'; dnsTunneling = 'true'; guiApplications = 'false' }
+  # -MemoryGB given: it is the cap; not given: a higher one a person set is kept, up to what leaves Windows 2 GB
+  $most = if ($asked) { $MemoryGB } else { $ram - 2 }
+  $want = [ordered]@{ memory = (WantMemory $WslConfig $MemoryGB $most); swap = "${SwapGB}GB"; networkingMode = 'nat'; dnsTunneling = 'true'; guiApplications = 'false' }
   $changes = @(Changes (Read-WslConfig $WslConfig) $want)
   Write-Host ''
   Write-Host "Next: the distro $Distro; .wslconfig (for ALL your WSL distros; a dated copy is kept):" -ForegroundColor Yellow

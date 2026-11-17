@@ -363,31 +363,42 @@ class Script(unittest.TestCase):
             self.assertIn(line, r.stdout)
 
     @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
-    def test_a_memory_cap_at_or_above_the_minimum_is_kept(self):
-        """-MemoryGB is the least cap: one a person raised (more agents or jobs in WSL) is neither lowered nor a FAIL,
-        nor a `wsl --shutdown` on every run (the live check's cap is the one kept)."""
+    def test_the_memory_cap_kept_is_one_wsl_reads_within_its_bounds(self):
+        """Without -MemoryGB, a higher cap a person set (more agents or jobs in WSL) is neither lowered nor a FAIL, nor
+        a `wsl --shutdown` on every run (the live check's cap is the one kept), up to the RAM less 2 GB. With
+        -MemoryGB, that is the cap. A value WSL itself cannot read (it then runs on half the RAM) is rewritten: its
+        parser takes a number and B, K, KB, M, MB, G, GB, T or TB exactly, no space, upper case (#296)."""
         d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
         self.addCleanup(shutil.rmtree, d, True)
         path = os.path.join(d, '.wslconfig')
         script = os.path.join(d, 'memory.ps1')
         with open(script, 'w', encoding='ascii') as f:
-            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = (WantMemory $args[0] 8); swap = "4GB" }\n'
+            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = (WantMemory $args[0] 8 $args[1]); swap = "4GB" }\n'
                     '"want=$($want.memory) kb=$(CapKb $want.memory)"\n'
                     '"notes=$(@(Changes (Read-WslConfig $args[0]) $want) -join \'|\')"\n'
                     '$null = Merge-WslConfig $args[0] $want\n$cfg = Wsl2Keys (Read-WslConfig $args[0])\n'
                     '"check=$(@($want.Keys | Where-Object { $cfg[$_] -ne $want[$_] }).Count)"\n')
-        for old, want, kb, note in (('memory=26GB', '26GB', 27262976, ''),   # raised: kept, no change, no FAIL
-                                    ('memory = 30720mb', '30720mb', 31457280, ''),
-                                    ('memory=8GB', '8GB', 8388608, ''),
-                                    ('memory=9G', '9G', 9437184, ''),
-                                    ('memory=4GB', '8GB', 8388608, '[wsl2] memory: 4GB -> 8GB'),   # below: raised
-                                    ('memory=8191MB', '8GB', 8388608, '[wsl2] memory: 8191MB -> 8GB'),
-                                    ('memory=lots', '8GB', 8388608, '[wsl2] memory: lots -> 8GB'),
-                                    ('', '8GB', 8388608, '[wsl2] memory: (not set) -> 8GB')):
-            with self.subTest(old):
+        for old, most, want, kb, note in (
+                ('memory=26GB', 30, '26GB', 27262976, ''),   # raised: kept, no change, no FAIL
+                ('memory=30GB', 30, '30GB', 31457280, ''),   # the RAM less 2 GB
+                ('memory = 30720MB', 30, '30720MB', 31457280, ''),
+                ('memory=8GB', 30, '8GB', 8388608, ''),
+                ('memory=9G', 30, '9G', 9437184, ''),
+                ('memory=31GB', 30, '8GB', 8388608, '[wsl2] memory: 31GB -> 8GB'),   # Windows would keep under 2 GB
+                ('memory=64GB', 30, '8GB', 8388608, '[wsl2] memory: 64GB -> 8GB'),   # from a bigger PC
+                ('memory=16777216TB', 30, '8GB', 8388608, '[wsl2] memory: 16777216TB -> 8GB'),   # WSL: 0, its default
+                ('memory=26 GB', 30, '8GB', 8388608, '[wsl2] memory: 26 GB -> 8GB'),   # WSL rejects these two
+                ('memory=30720mb', 30, '8GB', 8388608, '[wsl2] memory: 30720mb -> 8GB'),
+                ('memory=4GB', 30, '8GB', 8388608, '[wsl2] memory: 4GB -> 8GB'),   # below: raised
+                ('memory=8191MB', 30, '8GB', 8388608, '[wsl2] memory: 8191MB -> 8GB'),
+                ('memory=lots', 30, '8GB', 8388608, '[wsl2] memory: lots -> 8GB'),
+                ('', 30, '8GB', 8388608, '[wsl2] memory: (not set) -> 8GB'),
+                ('memory=26GB', 8, '8GB', 8388608, '[wsl2] memory: 26GB -> 8GB'),   # -MemoryGB 8 lowers it
+                ('memory=8192MB', 8, '8192MB', 8388608, '')):   # -MemoryGB 8, the same size: left as written
+            with self.subTest(old=old, most=most):
                 with open(path, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(f'[wsl2]\n{old}\nswap=4GB\n')
-                r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path],
+                r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path, str(most)],
                                    capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertIn(f'want={want} kb={kb}\n', r.stdout)
@@ -396,10 +407,12 @@ class Script(unittest.TestCase):
                 if not note:
                     self.assertEqual(slurp(path), f'[wsl2]\n{old}\nswap=4GB\n')   # left alone
 
-    def test_the_minimum_memory_cap_decides_through_wantmemory(self):
+    def test_the_memory_cap_decides_through_wantmemory(self):
         src = text().decode('ascii')
         body = src[src.index('try {'):]
-        self.assertIn('$want = [ordered]@{ memory = (WantMemory $WslConfig $MemoryGB);', body)
+        # -MemoryGB given: it is the cap; not given: a higher one is kept up to what leaves Windows 2 GB
+        self.assertIn('$most = if ($asked) { $MemoryGB } else { $ram - 2 }', body)
+        self.assertIn('$want = [ordered]@{ memory = (WantMemory $WslConfig $MemoryGB $most);', body)
         self.assertIn('("WANT_KB=$(CapKb $want.memory)`n" + $Live)', body)   # the cap kept, not -MemoryGB
         self.assertNotIn('$MemoryGB * 1048576', body)
 
