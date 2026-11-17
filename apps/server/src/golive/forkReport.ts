@@ -19,6 +19,7 @@ import {
   parseSettingsFileText,
   settingsFileLegacyKeysUnreadable,
 } from "../serverSettings.ts";
+import { readSettingsFile } from "../fork/settingsFileRead.ts";
 
 /**
  * Fork (go-live kit): what a T3 home holds, read without writing a byte. It never migrates, never
@@ -62,6 +63,11 @@ export interface ForkReport {
     readonly state: "missing" | "empty" | "present";
     /** Why a load would ignore the file and use defaults; null when it reads cleanly. */
     readonly parseWarning: string | null;
+    /**
+     * Each interval the file holds that no run could use, with the value: a load reads it as its
+     * default and keeps the rest of the file, and the next save removes it from the file.
+     */
+    readonly intervalsReadAsDefaults: ReadonlyArray<string>;
     readonly providerInstances: ReadonlyArray<{
       readonly id: string;
       readonly driver: string;
@@ -370,6 +376,11 @@ function readSettings(
     !Array.isArray(parsed.value)
       ? FORK_SETTINGS_KEYS.filter((key) => Object.hasOwn(parsed.value as object, key))
       : [];
+  // When the load ignores the file, every interval is at its default anyway.
+  const intervalsReadAsDefaults =
+    parsed !== undefined && Exit.isSuccess(parsed) && parseWarning === null
+      ? readSettingsFile(parsed.value).dropped
+      : [];
 
   const features = {
     agentSlots: settings.agentSlots.enabled ? "on" : "off",
@@ -382,6 +393,7 @@ function readSettings(
       path: settingsPath,
       state,
       parseWarning,
+      intervalsReadAsDefaults,
       providerInstances: Object.entries(settings.providerInstances).map(([id, instance]) => ({
         id,
         driver: String(instance.driver),

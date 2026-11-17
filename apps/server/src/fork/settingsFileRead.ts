@@ -8,8 +8,12 @@ import * as Effect from "effect/Effect";
 
 import { renameRetiredAutoUpdateKeys } from "../cloud/autoUpdateSettings.ts";
 
+/** The parsed file as the decode reads it, and each interval left out; pure, for the fork report. */
+export const readSettingsFile = (parsed: unknown) =>
+  dropUnusableStoredIntervals(renameRetiredAutoUpdateKeys(parsed));
+
 export function prepareSettingsFile(parsed: unknown): unknown {
-  const { settings, dropped } = dropUnusableStoredIntervals(renameRetiredAutoUpdateKeys(parsed));
+  const { settings, dropped } = readSettingsFile(parsed);
   if (dropped.length > 0) {
     // The decode is synchronous; its own warnings (wait checks) are logged the same way.
     Effect.runSync(
