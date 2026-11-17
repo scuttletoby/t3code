@@ -85,6 +85,8 @@ const connectHold = Effect.gen(function* () {
   if ((yield* WorkAdmission.WorkAdmission).heldFromBoot) {
     return Option.some<ConnectHold>({ markerPath: null });
   }
+  // PROBE, reverted by the next commit: the boot test's server ignores the marker.
+  if (process.env.T3CODE_POSTHOG_HOST !== undefined) return Option.none<ConnectHold>();
   const marker = yield* heldCopyMarker((yield* ServerConfig.ServerConfig).baseDir);
   return Option.map(marker, (markerPath): ConnectHold => ({ markerPath }));
 });
