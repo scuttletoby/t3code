@@ -226,7 +226,8 @@
     "packages/shared/src/capacity*",
     "packages/shared/src/waitFor*",
     "scripts/lib/release-repository.ts",
-    "scripts/release-repository.test.ts"
+    "scripts/release-repository.test.ts",
+    "!scripts/scenarios/fork-title-regenerates-from-inherited-history.e2e.ts"
   ],
   "//lost": "Seam and pending files that lost upstream lines, counted from upstream (as fork-follow runs the check): \"lines\", the upstream lines not kept in order and indentation; \"gone\", those whose text is gone. Held exactly, like a ceiling; an unlisted file counts 0. Lower a count when a line comes back, and keep each one small: a line counted here may move unseen.",
   "lost": {

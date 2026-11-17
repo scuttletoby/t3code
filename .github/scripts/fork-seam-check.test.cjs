@@ -387,6 +387,17 @@ const readReal = (file) =>
 const REAL_CONFIG = parseConfig(readReal(CONFIG));
 const REAL = REAL_CONFIG.files;
 
+// Upstream's nightlies from …4695 on have this file; fork-follow stopped after the rebase onto it.
+test("the real list takes no upstream file named like a fork file for the fork's own", () => {
+  const isForkFile = forkFileTest(REAL_CONFIG.forkFiles);
+  assert.equal(
+    isForkFile("scripts/scenarios/fork-title-regenerates-from-inherited-history.e2e.ts"),
+    false,
+  );
+  // The exclusion is that one file: the fork's own scenario files keep their fork names.
+  assert.equal(isForkFile("scripts/scenarios/fork-other.e2e.ts"), true);
+});
+
 test("every listed seam line is in its file, so the list is not stale", () => {
   for (const [file, seam] of Object.entries(REAL)) {
     const lines = new Set(
