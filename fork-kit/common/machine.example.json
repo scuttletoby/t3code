@@ -45,11 +45,7 @@
     "tailscaleTag": "tag:pc-agents"
   },
   "model-guard": {
-    "policyFile": "/etc/fork-kit/model-policy.json",
-    "claudeSettings": [
-      "/home/example-user/.claude/settings.json",
-      "/home/example-user/.claude-two/settings.json"
-    ]
+    "policyFile": "/etc/fork-kit/model-policy.json"
   },
   "desk": {
     "pool": "pc",

@@ -257,8 +257,8 @@ jobs:
       # fork-ci/: the composite actions and their tests. fork-kit/: host kits and their tests.
       # docs/fork/: the fork's pages whose commands and links a test runs (fork-gate-trust-docs.test.py).
       # apps/, packages/: only the T3 source files the kits' contract tests pin
-      # (fork-kit/golive/tests/contract.test.py; UsagePacingGate.ts: the effort option ids
-      # in fork-kit/model-guard/tests/guard.test.py); keep the two lists in step.
+      # (fork-kit/golive/tests/contract.test.py; UsagePacingGate.ts: the effort option ids and
+      # model.ts: the ultracode mapping, in fork-kit/model-guard/tests/guard.test.py); keep the two lists in step.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -281,6 +281,7 @@ jobs:
             /apps/server/src/serviceLauncher.ts
             /apps/server/src/usage/UsagePacingGate.ts
             /packages/shared/src/cliRelease.ts
+            /packages/shared/src/model.ts
           sparse-checkout-cone-mode: false
 
       # Pinned release, verified by checksum. Upstream's own workflows use runner
@@ -360,6 +361,7 @@ jobs:
             /apps/server/src/serviceLauncher.ts
             /apps/server/src/usage/UsagePacingGate.ts
             /packages/shared/src/cliRelease.ts
+            /packages/shared/src/model.ts
           sparse-checkout-cone-mode: false
 
       # The tests under fork-kit, checked against .github/fork-ci-tests.txt as in `workflows`.

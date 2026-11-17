@@ -9,8 +9,9 @@ contain. There is one per machine, at a fixed path per OS:
 
 Shape: {"version": 1, "<kit folder name>": {...}, ...}, camelCase keys. Rules, all checked here:
 
-- root-owned and not writable by group or others (the file and its folder); neither may be a symbolic link, and
-  the file must be a plain file of at most 1 MiB. These checks are POSIX only: on Windows the file is refused;
+- root-owned and not writable by group or others (the file and its folder); every folder above is root-owned and
+  not writable by group or others unless sticky (like /tmp); no folder on the way and not the file may be a symbolic
+  link, and the file must be a plain file of at most 1 MiB. These checks are POSIX only: on Windows the file is refused;
 - a JSON object with no key given twice whose "version" is a whole number this loader knows (1);
 - no secrets: a key whose name says secret, token, password or private key holds only "file:<path>";
 - a kit reads "version" and its own section only; a missing section, an unknown key in it or a value of the
@@ -49,30 +50,63 @@ def _check_owner(path, what, st, owner_uid):
         raise MachineFileError(f'{path}: {what} is writable by group or others (mode {stat.S_IMODE(st.st_mode):o})')
 
 
+def _check_folder_on_the_way(path, folder, st, owner_uid):
+    """A folder above the file's own folder: root (or owner_uid) owns it, and group or others cannot write it
+    unless it is sticky (like /tmp): there nobody else can rename or remove what root or owner_uid owns."""
+    if st.st_uid not in (0, owner_uid):
+        raise MachineFileError(f'{path}: {folder} is owned by uid {st.st_uid}, not root')
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not st.st_mode & stat.S_ISVTX:
+        raise MachineFileError(f'{path}: {folder} is writable by group or others (mode {stat.S_IMODE(st.st_mode):o})')
+
+
+def _open_folder(path, name, where, dir_fd):
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0),
+                       dir_fd=dir_fd)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            kind = 'a symbolic link' if stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode) else 'not a folder'
+            raise MachineFileError(f'{path}: {where} is {kind}') from None
+        raise
+
+
 def _read(path, owner_uid):
-    """The file's text. The folder is checked without following a link; the file is opened without following one,
-    and the opened file itself (not the path, which could be swapped in between) is checked."""
+    """The file's text. It is reached one folder at a time from /, each opened without following a link and checked
+    as opened (not by path, which could be swapped in between): every folder on the way root-owned and safe, the
+    file's own folder and the file owned by owner_uid and not writable by group or others."""
     if os.name == 'nt':
         raise MachineFileError(f'{path}: not read on Windows, where its owner and permission checks do not exist yet')
-    folder = os.path.dirname(path) or '.'
-    st = os.lstat(folder)
-    if stat.S_ISLNK(st.st_mode):
-        raise MachineFileError(f'{path}: {folder} is a symbolic link')
-    _check_owner(path, folder, st, owner_uid)
+    parts = path.split('/')
+    if not os.path.isabs(path) or not parts[-1] or any(p in ('.', '..') for p in parts):
+        raise MachineFileError(f'{path}: must be an absolute path to a file, without . or ..')
+    names = [p for p in parts[:-1] if p]
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_CLOEXEC', 0))
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
-    except OSError as e:
-        if e.errno == errno.ELOOP:
-            raise MachineFileError(f'{path}: is a symbolic link') from None
-        raise
+        where = '/'
+        for name in names:
+            _check_folder_on_the_way(path, where, os.fstat(fd), owner_uid)
+            where = os.path.join(where, name)
+            next_fd = _open_folder(path, name, where, fd)
+            os.close(fd)
+            fd = next_fd
+        _check_owner(path, where, os.fstat(fd), owner_uid)
+        try:
+            file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0),
+                              dir_fd=fd)
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise MachineFileError(f'{path}: is a symbolic link') from None
+            raise
+    finally:
+        os.close(fd)
     try:
-        st = os.fstat(fd)
+        st = os.fstat(file_fd)
         if not stat.S_ISREG(st.st_mode):
             raise MachineFileError(f'{path}: is not a plain file')
         _check_owner(path, path, st, owner_uid)
-        f = os.fdopen(fd, 'rb')
+        f = os.fdopen(file_fd, 'rb')
     except BaseException:
-        os.close(fd)
+        os.close(file_fd)
         raise
     with f:
         data = f.read(MAX_BYTES + 1)

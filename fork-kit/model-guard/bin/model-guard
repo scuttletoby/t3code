@@ -2,7 +2,7 @@
 """model-guard: Claude Code PreToolUse hook that keeps agents' model picks inside a policy (README.md).
 
   model-guard                 the hook: reads the hook input on stdin, prints its answer on stdout
-  model-guard --self-check    the kit's files, the policy, and the hook in every listed settings file
+  model-guard --self-check    the kit's files, the policy, and the hook in Claude Code's managed settings
 """
 import os, sys
 

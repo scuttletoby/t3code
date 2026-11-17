@@ -7,6 +7,8 @@ fails.
 """
 import io, json, os, re, shutil, subprocess, sys, tempfile, types, unittest
 
+sys.dont_write_bytecode = True   # the CI runner has no -B; keep the kit folder free of __pycache__
+
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(KIT))
 LIB = os.path.join(KIT, 'lib', 'model_guard.py')
@@ -84,12 +86,20 @@ class Guard(unittest.TestCase):
 
     def test_unchecked_tools_pass_even_without_a_policy(self):
         os.unlink(self.machine_path)
-        for tool in ('Bash', 'Edit', 'mcp__t3-code__t3_thread_send', 'mcp__t3-code__task_status', 'TaskStop'):
+        for tool in ('Bash', 'Edit', 'mcp__t3-code__run_scheduled_task_now', 'mcp__t3-code__task_status', 'TaskStop'):
             self.assertIsNone(self.hook(tool, {'model': 'anything'}), tool)
 
     def test_every_t3_tool_under_any_server_name_is_checked(self):
         for name in ('mcp__t3-code__delegate_task', 'mcp__t3__delegate_task', 'mcp__a__b__delegate_task'):
             self.refused(name, self.delegate(None), 'target is missing')
+
+    def test_every_checked_tool_comes_from_the_one_list(self):
+        for name in self.m.CHECKED_TOOLS:
+            self.assertIsNotNone(self.m.tool_kind(name), name)
+            self.assertTrue(self.m._covers(self.m.HOOK_MATCHER, name), name)
+        for name in ('Workflow', 'mcp__t3-code__t3_thread_send', 'mcp__t3-code__t3_thread_transfer',
+                     'mcp__t3-code__t3_thread_send_attachments', 'mcp__t3-code__schedule_task'):
+            self.assertIn(name, self.m.CHECKED_TOOLS)
 
     # ---- the files (fail closed)
 
@@ -210,6 +220,44 @@ class Guard(unittest.TestCase):
         self.passed(t, self.delegate({'model': 'example-deep-2', 'options': {'thinking_level': 'high'}}))
         self.assertIsNone(self.hook(t, self.delegate({'model': 'example-plain', 'driverKind': 'otherDriver'})))
 
+    def test_a_row_without_efforts_lets_no_effort_through(self):
+        t = 'mcp__t3-code__delegate_task'
+        plain = {'model': 'example-plain', 'driverKind': 'otherDriver'}
+        self.passed(t, self.delegate(plain))
+        for effort in ('max', 'high', 'low'):
+            self.refused(t, self.delegate(dict(plain, options={'effort': effort})), f"effort {effort!r}",
+                         'its row lists no efforts')
+        self.refused(t, self.delegate(dict(plain, options={'ultracode': True})), "effort 'ultracode'")
+
+    def test_without_a_driver_every_row_of_the_model_must_accept_it(self):
+        t = 'mcp__t3-code__delegate_task'
+        self.policy({'mode': 'enforce', 'allow': [LARGE, {'driver': 'otherDriver', 'model': 'example-large-1',
+                                                          'efforts': ['medium']}]})
+        self.refused(t, self.delegate(GOOD_TARGET), "effort 'high' is not allowed")
+        self.passed(t, self.delegate(dict(GOOD_TARGET, driverKind='claudeAgent')))
+        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'medium'}}))
+
+    def test_ultracode_is_checked_as_the_effort_that_runs(self):
+        t = 'mcp__t3-code__delegate_task'
+        xhigh = {'mode': 'enforce', 'allow': [dict(LARGE, efforts=['high', 'xhigh'])]}
+        self.policy(xhigh)
+        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'xhigh'}}))
+        for options in ({'effort': 'xhigh', 'ultracode': True},
+                        [{'id': 'effort', 'value': 'xhigh'}, {'id': 'ultracode', 'value': True}],
+                        {'effort': 'ultracode'},                       # the old effort value: xhigh, ultracode on
+                        {'effort': 'high', 'ultracode': 'yes'}):
+            with self.subTest(options=options):
+                self.refused(t, self.delegate({'model': 'example-large-1', 'options': options}),
+                             "effort 'ultracode' is not allowed")
+        # the old value with ultracode given as off runs plain xhigh, as the server runs it
+        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'ultracode',
+                                                                              'ultracode': False}}))
+        self.policy({'mode': 'enforce', 'allow': [dict(LARGE, efforts=['high', 'ultracode'])]})
+        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'xhigh', 'ultracode': True}}))
+        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'ultracode'}}))
+        self.refused(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'xhigh'}}),
+                     "effort 'xhigh'")
+
     def test_options_that_are_not_options_are_refused(self):
         self.refused('mcp__t3-code__delegate_task', self.delegate(dict(GOOD_TARGET, options='high')),
                      'neither an object nor a list')
@@ -257,6 +305,104 @@ class Guard(unittest.TestCase):
         self.refused('Agent', {'subagent_type': 'fork', 'model': 'large'}, 'names no effort')
         self.passed('Agent', {'subagent_type': 'fork', 'model': 'deep', 'effort': 'high'})
 
+    # ---- tools that run a thread's existing model
+
+    def test_thread_transfer_fork_is_refused(self):
+        t = 'mcp__t3-code__t3_thread_transfer'
+        self.refused(t, {'action': 'fork'}, 'fork starts a thread on the source thread\'s model',
+                     't3_thread_launch and a modelSelection')
+        self.refused(t, {'action': 'fork', 'threadId': 'x', 'title': 'y'}, 'fork starts')
+        self.assertIsNone(self.hook(t, {'action': 'status'}))
+        self.assertIsNone(self.hook(t, {'action': 'merge_back', 'targetThreadId': 'x'}))
+        self.policy(dict(POLICY, mode='advise'))
+        self.assertIn('enforce would refuse', self.passed(t, {'action': 'fork'}))
+
+    def test_send_and_schedule_take_no_model(self):
+        send = 'mcp__t3-code__t3_thread_send'
+        plain = {'threadId': 'x', 'message': 'm', 'mode': 'steer', 'freshContext': True, 'environmentId': 'e',
+                 'clientRequestId': 'c'}
+        self.assertIsNone(self.hook(send, plain))
+        for key, value in (('modelSelection', GOOD_TARGET), ('model', 'large'), ('effort', 'max'),
+                           ('options', {'effort': 'max'}), ('target', GOOD_TARGET), ('providerInstanceId', 'a'),
+                           ('reasoningEffort', 'max'), ('ultracode', True), ('defaultModel', 'x')):
+            with self.subTest(key=key):
+                self.refused(send, dict(plain, **{key: value}), f'{key}: t3_thread_send takes no model')
+        self.refused('mcp__t3-code__t3_thread_send_attachments', {'threadId': 'x', 'attachments': [],
+                                                                  'model': 'x'}, 'takes no model')
+        schedule = {'prompt': 'p', 'schedule': {'type': 'once', 'runAt': 'x'}, 'bindToCurrentThread': False,
+                    'freshSession': True, 'projectId': 'p', 'title': 't', 'enabled': True}
+        self.assertIsNone(self.hook('mcp__t3-code__schedule_task', schedule))
+        self.refused('mcp__t3-code__schedule_task', dict(schedule, modelSelection=GOOD_TARGET), 'takes no model')
+        self.refused('mcp__t3-code__t3_thread_transfer', {'action': 'status', 'model': 'x'}, 'takes no model')
+
+    # ---- the Workflow tool: a strict reading of its script
+
+    def workflow(self, script, **extra):
+        return dict({'script': script}, **extra)
+
+    def test_workflow_every_agent_call_is_checked(self):
+        good = '''export const meta = {name: 'x', description: 'y'}
+// agent("in a comment", {}) is not a call
+const a = await agent(`plain ${1 + 2} prompt`, {label: 'a', model: 'large', effort: "high", schema: {type: 'object'}})
+const b = await pipeline(items, x => agent('p ' + x, {model: 'example-deep-2', effort: 'high',}), r => r.y[0] / 2)
+const c = log("agent(") || items.map(i => i.agent)
+'''
+        self.assertIn('is for most work', self.passed('Workflow', self.workflow(good)))
+        for script, why in (
+                ("agent('x', {model: 'small', effort: 'high'})", "model 'small'"),
+                ("agent('x', {model: 'large'})", 'names no effort'),
+                ("agent('x', {effort: 'high'})", 'names no model'),
+                ("agent('x', {model: 'large', effort: 'max'})", "effort 'max'"),
+                ("agent('x', {model: 'plain', effort: 'high'})", "model 'plain'"),
+                (good + "\nagent('x', {model: 'large', effort: 'medium'})\nagent('x', {model: 'deep', effort: 'low'})",
+                 "Workflow agent() call 4 (line 8): effort 'low'")):
+            with self.subTest(script=script):
+                self.refused('Workflow', self.workflow(script), why)
+
+    def test_workflow_that_cannot_be_read_is_refused(self):
+        ok = "{model: 'large', effort: 'high'}"
+        cases = {
+            'no script': ({}, 'no inline "script"'),
+            'empty script': (self.workflow('  '), 'no inline "script"'),
+            'script path': (self.workflow(f"agent('x', {ok})", scriptPath='/x.js'), 'scriptPath runs a script'),
+            'saved workflow': ({'name': 'review'}, 'name runs a script'),
+            'too large': (self.workflow('//' + 'x' * model_guard.WF_MAX_BYTES), 'larger than'),
+        }
+        tricks = {
+            'options in a variable': "const o = {model: 'large', effort: 'high'}; agent('x', o)",
+            'spread options': f"agent('x', {{...o, model: 'large', effort: 'high'}})",
+            'computed key': "agent('x', {['model']: 'small', model: 'large', effort: 'high'})",
+            'computed key elsewhere': f"const o = {{a: 1, ['ag' + 'ent']: 2}}; agent('x', {ok})",
+            'key given twice': "agent('x', {model: 'large', effort: 'high', model: 'small'})",
+            'model from code': "agent('x', {model: m, effort: 'high'})",
+            'model from a template': "agent('x', {model: `${m}`, effort: 'high'})",
+            'escaped text': "agent('x', {model: 'l\\u0061rge', effort: 'high'})",
+            'escaped key': "agent('x', {'\\u006dodel': 'small', model: 'large', effort: 'high'})",
+            'agent renamed': "const a = agent; a('x', {model: 'small', effort: 'high'})",
+            'agent shorthand': "const o = {agent}; o.agent('x', {})",
+            'three arguments': f"agent('x', {ok}, more)",
+            'one argument': "agent('x')",
+            'options plus more': f"agent('x', {ok} || other)",
+            'computed member': f"globalAgent['ag' + 'ent']('x', {ok})",
+            'eval': f"eval(\"agent('x', {{}})\")",
+            'Function': "new Function('return agent')()('x', {})",
+            'constructor': "''.constructor.constructor('x')()",
+            'globalThis': "globalThis.agent('x', {})",
+            'another workflow': "await workflow('other')",
+            'proto key': f"agent('x', {{__proto__: o, model: 'large', effort: 'high'}})",
+            'unclosed string': "agent('x, {})",
+            'non-ascii outside strings': "const \u0430gent = 1",
+            'html comment': f"<!-- x\nagent('x', {ok})",
+            'ambiguous slash': f"x = {{}} / agent('x', {ok}) /i",
+            'unclosed bracket': f"agent('x', {ok}",
+            'method key': "agent('x', {model() { return 'small' }, effort: 'high'})",
+        }
+        for name, script in tricks.items():
+            cases[name] = (self.workflow(script), 'the Workflow script cannot be checked')
+        for name, (args, why) in cases.items():
+            with self.subTest(name):
+                self.refused('Workflow', args, why)
+
     # ---- the hook's input
 
     def test_input_that_is_not_a_json_object_refuses(self):
@@ -291,42 +437,140 @@ class Guard(unittest.TestCase):
         self.refused('Agent', {'model': 'large', 'effort': 'high'}, 'update the kit')
 
 
-class Registration(unittest.TestCase):
-    """The drift check: is the hook installed in each settings file the machine file lists?"""
+class ManagedSettings(unittest.TestCase):
+    """The drift check: do Claude Code's managed settings run the hook, as one entry of its own?"""
+    m = model_guard
+    ONLY = ('managed-settings.json', {'allowManagedHooksOnly': True})
 
-    def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix='model-guard-reg-')
-        self.addCleanup(shutil.rmtree, self.dir, True)
-        self.path = os.path.join(self.dir, 'settings.json')
+    def problems(self, *entries, allow_other_hooks=False, first=ONLY):
+        files = [first] if first else []
+        files.append(('managed-settings.d/model-guard.json', {'hooks': {'PreToolUse': list(entries)}}))
+        return self.m.settings_problems(files, allow_other_hooks)
 
-    def settings(self, matcher=model_guard.HOOK_MATCHER, command=model_guard.HOOK_COMMAND, **extra):
-        entry = {'matcher': matcher, 'hooks': [{'type': 'command', 'command': command, 'timeout': 10}]}
-        with open(self.path, 'w') as f:
-            json.dump(dict({'hooks': {'PreToolUse': [entry]}}, **extra), f)
-        return model_guard.registration_problems(self.path)
+    def entry(self, matcher=model_guard.HOOK_MATCHER, command=model_guard.HOOK_COMMAND, **extra):
+        return dict({'matcher': matcher, 'hooks': [{'type': 'command', 'command': command, 'onFailure': 'block'}]},
+                    **extra)
 
-    def test_the_documented_entry_has_no_problems(self):
-        self.assertEqual(self.settings(), [])
-        self.assertEqual(self.settings(matcher=''), [])
+    def test_the_installed_drop_in_has_no_problems(self):
+        installed = json.loads(self.m.drop_in_text())
+        self.assertEqual(self.m.settings_problems([self.ONLY, ('d/model-guard.json', installed)], False), [])
+        self.assertEqual(installed['hooks']['PreToolUse'], [self.m.hook_entry()])
+        self.assertEqual(installed['hooks']['PreToolUse'][0]['hooks'][0]['onFailure'], 'block')
+        self.assertEqual(self.problems(self.entry(matcher='')), [])
+        self.assertEqual(self.problems(self.entry(matcher='*')), [])
+        self.assertEqual(self.problems(self.entry(matcher=','.join(self.m.CHECKED_TOOLS))), [])
 
-    def test_missing_hook_or_file_is_a_problem(self):
-        self.assertIn('cannot be read', model_guard.registration_problems(self.path)[0])
-        self.assertIn('no PreToolUse hook runs', self.settings(command='/usr/local/bin/other')[0])
-        self.assertIn('disableAllHooks', self.settings(disableAllHooks=True)[0])
+    def test_the_security_lens_decoy_fails(self):
+        """A guard entry on Agent only, and an any-tool entry whose command only mentions the guard."""
+        p = self.problems(self.entry(matcher='Agent'),
+                          self.entry(matcher='*', command='true # ' + self.m.HOOK_LINK))
+        self.assertTrue(any('no managed PreToolUse entry runs the guard' in x for x in p), p)
+        self.assertTrue(any('entry 0 runs the guard but is not its entry: its matcher misses Task' in x for x in p), p)
+        self.assertTrue(any('entry 1 runs the guard but is not its entry: its hooks are not exactly' in x for x in p),
+                        p)
 
-    def test_a_matcher_that_misses_a_tool_is_a_problem(self):
-        self.assertIn('misses Task, mcp__t3-code__delegate_task', ' '.join(self.settings(matcher='Agent')))
-        self.assertIn('t3_thread_configure', ' '.join(self.settings(matcher='Agent|Task|mcp__.*__delegate_task')))
+    def test_the_state_lens_split_entries_fail(self):
+        """The full matcher with a command that fails open, and the blocking command on another tool."""
+        p = self.problems(self.entry(command=self.m.HOOK_LINK), self.entry(matcher='Bash'))
+        self.assertTrue(any('no managed PreToolUse entry runs the guard' in x for x in p), p)
+        self.assertTrue(any('entry 0' in x and 'hooks are not exactly' in x for x in p), p)
+        self.assertTrue(any('entry 1' in x and 'matcher misses Agent' in x for x in p), p)
 
-    def test_a_command_that_fails_open_is_a_problem(self):
-        self.assertIn('exit 2', self.settings(command=model_guard.HOOK_LINK)[0])
+    def test_an_entry_with_anything_more_fails(self):
+        hook = dict(self.m.hook_entry()['hooks'][0])
+        changed = lambda **kv: {'matcher': model_guard.HOOK_MATCHER, 'hooks': [dict(hook, **kv)]}  # noqa: E731
+        no_block = {k: v for k, v in hook.items() if k != 'onFailure'}
+        for name, entry in (
+                ('timeout', changed(timeout=1)),
+                ('async', changed(**{'async': True})),
+                ('fails open', changed(onFailure='continue')),
+                ('no onFailure', {'matcher': model_guard.HOOK_MATCHER, 'hooks': [no_block]}),
+                ('two hooks', {'matcher': model_guard.HOOK_MATCHER, 'hooks': [hook] * 2}),
+                ('extra key', self.entry(x=1)),
+                ('no matcher', {'hooks': [hook]}),
+                ('not an object', 'x')):
+            with self.subTest(name):
+                p = self.problems(entry)
+                self.assertTrue(any('no managed PreToolUse entry runs the guard' in x for x in p), p)
+
+    def test_a_matcher_that_misses_a_tool_fails(self):
+        for matcher, missed in (('Agent|Task', 'Workflow'), ('Agent|Task|Workflow|mcp__.*__delegate_task', 'create'),
+                                ('(', 'Agent'), (r'^(Agent|Task|mcp__.+__(delegate_task|create_threads))$', 'Workflow'),
+                                ('Agent,Task,Workflow', 'mcp__t3-code__t3_thread_send')):
+            with self.subTest(matcher):
+                self.assertIn(missed, ' '.join(self.problems(self.entry(matcher=matcher))))
 
     def test_the_matcher_covers_exactly_the_checked_tools(self):
-        cover = lambda name: model_guard._covers(model_guard.HOOK_MATCHER, name)  # noqa: E731
-        for name in ('Agent', 'Task', 'mcp__t3-code__create_threads', 'mcp__t3__t3_thread_launch'):
+        cover = lambda name: self.m._covers(self.m.HOOK_MATCHER, name)  # noqa: E731
+        for name in ('Agent', 'Task', 'Workflow', 'mcp__t3-code__create_threads', 'mcp__t3__t3_thread_launch',
+                     'mcp__t3-code__t3_thread_send', 'mcp__t3-code__t3_thread_transfer'):
             self.assertTrue(cover(name), name)
-        for name in ('Bash', 'TaskStop', 'SubAgent', 'mcp__t3-code__task_status', 'mcp__t3-code__delegate_tasks'):
+        for name in ('Bash', 'TaskStop', 'SubAgent', 'mcp__t3-code__task_status', 'mcp__t3-code__delegate_tasks',
+                     'mcp__t3-code__run_scheduled_task_now', 'Workflows'):
             self.assertFalse(cover(name), name)
+
+    def test_hooks_switched_off_fail(self):
+        for value in (True, 'true', 1, 'yes'):
+            with self.subTest(value=value):
+                p = self.m.settings_problems([('main', {'allowManagedHooksOnly': True, 'disableAllHooks': value}),
+                                              ('d', json.loads(self.m.drop_in_text()))], False)
+                self.assertEqual(p, ['main: disableAllHooks is set, so no hook runs'])
+        for value in (False, 'false'):
+            p = self.m.settings_problems([('main', {'allowManagedHooksOnly': True, 'disableAllHooks': value}),
+                                          ('d', json.loads(self.m.drop_in_text()))], False)
+            self.assertEqual(p, [])
+
+    def test_only_managed_hooks_unless_the_machine_file_allows_others(self):
+        self.assertIn('allowManagedHooksOnly is not true', ' '.join(self.problems(self.entry(), first=None)))
+        self.assertEqual(self.problems(self.entry(), first=None, allow_other_hooks=True), [])
+        later_off = self.m.settings_problems([self.ONLY, ('d/a.json', {'allowManagedHooksOnly': False}),
+                                              ('d/model-guard.json', json.loads(self.m.drop_in_text()))], False)
+        self.assertIn('allowManagedHooksOnly is not true', ' '.join(later_off))
+        later_on = self.m.settings_problems([('main', {'allowManagedHooksOnly': False}),
+                                             ('d/z.json', {'allowManagedHooksOnly': True}),
+                                             ('d/model-guard.json', json.loads(self.m.drop_in_text()))], False)
+        self.assertEqual(later_on, [])
+
+    def test_a_file_that_is_not_an_object_fails(self):
+        p = self.m.settings_problems([('main', [1]), ('d', json.loads(self.m.drop_in_text()))], True)
+        self.assertEqual(p, ['main: not a JSON object'])
+
+    def test_managed_files_are_read_in_claude_codes_order_and_protected(self):
+        d = os.path.realpath(tempfile.mkdtemp(prefix='model-guard-managed-'))
+        self.addCleanup(shutil.rmtree, d, True)
+        os.chmod(d, 0o755)
+        uid = os.getuid()
+        self.assertEqual(self.m.managed_files(d, uid), [])            # nothing there: no files, no error
+        os.mkdir(os.path.join(d, 'managed-settings.d'), 0o755)
+        for name, text in (('b.json', '{"b": 1}'), ('a.json', '{"a": 1}'), ('.hidden.json', '{'), ('c.txt', '{')):
+            with open(os.path.join(d, 'managed-settings.d', name), 'w') as f:
+                f.write(text)
+            os.chmod(os.path.join(d, 'managed-settings.d', name), 0o644)
+        files = self.m.managed_files(d, uid)
+        self.assertEqual([(os.path.basename(p), data, err) for p, data, err in files],
+                         [('a.json', {'a': 1}, None), ('b.json', {'b': 1}, None)])
+        with open(os.path.join(d, 'managed-settings.json'), 'w') as f:
+            f.write('{"main": 1}')
+        os.chmod(os.path.join(d, 'managed-settings.json'), 0o644)
+        self.assertEqual(self.m.managed_files(d, uid)[0][1:], ({'main': 1}, None))
+        os.chmod(os.path.join(d, 'managed-settings.d', 'a.json'), 0o666)
+        self.assertIn('writable by group or others', self.m.managed_files(d, uid)[1][2])
+        os.chmod(os.path.join(d, 'managed-settings.d', 'a.json'), 0o644)
+        self.assertIn('owned by uid', str(self.m.managed_files(d, uid + 1)[0][2]))
+        with open(os.path.join(d, 'managed-settings.d', 'b.json'), 'w') as f:
+            f.write('{')
+        self.assertIn('not valid JSON', self.m.managed_files(d, uid)[2][2])
+        shutil.rmtree(os.path.join(d, 'managed-settings.d'))
+        with open(os.path.join(d, 'managed-settings.d'), 'w') as f:
+            f.write('')
+        self.assertIn('cannot be listed', self.m.managed_files(d, uid)[0][2])
+
+    def test_managed_folder_per_platform(self):
+        self.assertEqual(self.m.managed_dir('linux'), '/etc/claude-code')
+        self.assertEqual(self.m.managed_dir('darwin'), '/Library/Application Support/ClaudeCode')
+        self.assertEqual(self.m.managed_dir('win32'), 'C:\\Program Files\\ClaudeCode')
+        with self.assertRaises(self.m.PolicyError):
+            self.m.managed_dir('plan9')
 
 
 class Contract(unittest.TestCase):
@@ -337,6 +581,23 @@ class Contract(unittest.TestCase):
             block = re.search(r'EFFORT_OPTION_IDS[^=]*= new Set\(\[(.*?)\]\)', f.read(), re.S)
         self.assertIsNotNone(block, f'EFFORT_OPTION_IDS not found in {path}: keep the hook\'s list in step')
         self.assertEqual(sorted(re.findall(r'"([^"]+)"', block.group(1))), sorted(model_guard.EFFORT_OPTION_IDS))
+
+    def test_ultracode_maps_like_the_server(self):
+        """The old effort value "ultracode" runs at xhigh with the option "ultracode" on, as T3's shared model code
+        maps it (packages/shared/src/model.ts withLegacyUltracodeEffort)."""
+        path = os.path.join(REPO, 'packages', 'shared', 'src', 'model.ts')
+        with open(path, encoding='utf-8') as f:
+            body = re.search(r'export function withLegacyUltracodeEffort\b.*?\n}\n', f.read(), re.S)
+        self.assertIsNotNone(body, f'withLegacyUltracodeEffort not found in {path}: keep the hook in step')
+        body = body.group(0)
+        legacy = re.search(r'selection\.id === "effort" && selection\.value === "([^"]+)"\s*\?\s*'
+                           r'\{ id: "effort", value: "([^"]+)" \}', body)
+        option = re.search(r'getRawSelectionValueById\(selections, "([^"]+)"\) === undefined\s*\?\s*'
+                           r'\[\{ id: "([^"]+)", value: true \}\]', body)
+        self.assertIsNotNone(legacy, 'the effort mapping changed: keep the hook in step')
+        self.assertIsNotNone(option, 'the ultracode option changed: keep the hook in step')
+        self.assertEqual(legacy.groups(), (model_guard.ULTRACODE_EFFORT, model_guard.ULTRACODE_RUNS_AT))
+        self.assertEqual(option.groups(), (model_guard.ULTRACODE_OPTION_ID, model_guard.ULTRACODE_OPTION_ID))
 
     def test_the_example_policy_is_valid(self):
         with open(os.path.join(KIT, 'model-policy.example.json'), encoding='utf-8') as f:
@@ -354,6 +615,13 @@ class Command(unittest.TestCase):
                                input='{"tool_name": "Agent"}', capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 2)
         self.assertIn('model-guard refused', r.stderr)
+
+    def test_unknown_arguments_block_with_exit_2(self):
+        for argv in (['--selfcheck'], ['--self-check', 'x'], ['-x']):
+            r = subprocess.run([sys.executable, '-I', '-B', os.path.join(KIT, 'bin', 'model-guard')] + argv,
+                               input='{}', capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 2, argv)
+            self.assertIn('unknown arguments', r.stderr)
 
     def test_help(self):
         r = subprocess.run([sys.executable, '-I', '-B', os.path.join(KIT, 'bin', 'model-guard'), '--help'],
@@ -380,7 +648,7 @@ MUTATIONS = {
                           'test_delegate_task_driver_kind_must_match_the_row'),
     'aliases only for Agent': ("(agent and model in (r['aliases'] or ()))", "(model in (r['aliases'] or ()))",
                                'test_delegate_task_aliases_are_only_for_the_agent_tool'),
-    'Agent is Claude only': ('CLAUDE_DRIVER, rows,', 'None, rows,',
+    'Agent is Claude only': ('else [effort], CLAUDE_DRIVER, rows,\n', 'else [effort], None, rows,\n',
                              'test_agent_must_name_an_allowed_model_and_effort'),
     'every thread checked': ('        if not isinstance(threads, list) or not threads:\n',
                              '        if False:\n', 'test_create_threads_checks_every_thread'),
@@ -405,15 +673,62 @@ MUTATIONS = {
     'policy file is protected': ('machine_file.read_protected_text(cfg[\'policyFile\'], owner_uid)',
                                  "open(cfg['policyFile']).read()",
                                  'test_policy_file_others_can_write_or_a_link_refuses'),
+    'Workflow is checked': ("CLAUDE_TOOLS = {'Agent': 'agent', 'Task': 'agent', 'Workflow': 'workflow'}",
+                            "CLAUDE_TOOLS = {'Agent': 'agent', 'Task': 'agent'}",
+                            'test_workflow_every_agent_call_is_checked'),
+    'Workflow agent() calls checked': ('                check_pick(where, model,', '                (where, model,',
+                                       'test_workflow_every_agent_call_is_checked'),
+    'Workflow it cannot read is refused': ('    except ScriptError as e:\n        problems.append(',
+                                           '    except ScriptError as e:\n        (',
+                                           'test_workflow_that_cannot_be_read_is_refused'),
+    'Workflow path or name refused': ("            problems.append(f'Workflow {key} runs",
+                                      "            (f'Workflow {key} runs",
+                                      'test_workflow_that_cannot_be_read_is_refused'),
+    'Workflow computed key refused': ("raise ScriptError(f'line {line}: a computed key')",
+                                      "pass", 'test_workflow_that_cannot_be_read_is_refused'),
+    'Workflow forbidden names': ("            if kind == 'name' and text in WF_FORBIDDEN:",
+                                 '            if False:', 'test_workflow_that_cannot_be_read_is_refused'),
+    'transfer fork refused': ("    if kind == 't3_thread_transfer' and args.get('action') == 'fork':",
+                              '    if False:', 'test_thread_transfer_fork_is_refused'),
+    'send and schedule take no model': ('            if isinstance(key, str) and MODEL_FIELD.fullmatch(key):',
+                                        '            if False:', 'test_send_and_schedule_take_no_model'),
+    'model fields found by name': ("re.compile(r'.*(model|effort|", "re.compile(r'(model|effort|",
+                                   'test_send_and_schedule_take_no_model'),
+    'ultracode runs as ultracode': ('    if any(v not in (False, None) for v in ultracode):', '    if False:',
+                                    'test_ultracode_is_checked_as_the_effort_that_runs'),
+    'old ultracode effort is xhigh': ('    if ULTRACODE_EFFORT in efforts:', '    if False:',
+                                      'test_ultracode_is_checked_as_the_effort_that_runs'),
+    'a row without efforts names none': ("            if efforts:\n                problems.append(f'{where}: effort",
+                                         "            if False:\n                problems.append(f'{where}: effort",
+                                         'test_a_row_without_efforts_lets_no_effort_through'),
+    'no driver: every row accepts': ('    for row in found:\n', '    for row in found[:1]:\n',
+                                     'test_without_a_driver_every_row_of_the_model_must_accept_it'),
 }
-REG_MUTATIONS = {
-    'matcher covers every tool': ('    if missed:\n', '    if False:\n',
-                                  'test_a_matcher_that_misses_a_tool_is_a_problem'),
-    'command blocks when missing': ("    if not any(str(h.get('command', '')).strip() == HOOK_COMMAND",
-                                    "    if False and any(str(h.get('command', '')).strip() == HOOK_COMMAND",
-                                    'test_a_command_that_fails_open_is_a_problem'),
-    'disableAllHooks': ("    if data.get('disableAllHooks') is True:", '    if False:',
-                        'test_missing_hook_or_file_is_a_problem'),
+SETTINGS_MUTATIONS = {
+    'matcher covers every tool': ('    if missed:\n', '    if False:\n', 'test_a_matcher_that_misses_a_tool_fails'),
+    'a bad regex covers nothing': ('    except re.error:\n        return False',
+                                   '    except re.error:\n        return True',
+                                   'test_a_matcher_that_misses_a_tool_fails'),
+    'exactly the guard command': ("    if entry['hooks'] != hook_entry()['hooks']:",
+                                  '    if False:', 'test_the_state_lens_split_entries_fail'),
+    'nothing more in the entry': ("set(entry) != {'matcher', 'hooks'}", "'hooks' not in entry",
+                                  'test_an_entry_with_anything_more_fails'),
+    'a guard entry is needed': ('    if not good:\n', '    if False:\n', 'test_the_security_lens_decoy_fails'),
+    'disableAllHooks': ("        if 'disableAllHooks' in data and", '        if False and',
+                        'test_hooks_switched_off_fail'),
+    'only managed hooks': ('    if only_managed is not True and not allow_other_hooks:', '    if False:',
+                           'test_only_managed_hooks_unless_the_machine_file_allows_others'),
+    'the later file wins': ("            only_managed = data['allowManagedHooksOnly']",
+                            "            only_managed = only_managed or data['allowManagedHooksOnly']",
+                            'test_only_managed_hooks_unless_the_machine_file_allows_others'),
+    'not an object': ("            problems.append(f'{path}: not a JSON object')", '            pass',
+                      'test_a_file_that_is_not_an_object_fails'),
+    'managed files are protected': ('json.loads(machine_file.read_protected_text(path, owner_uid))',
+                                    'json.loads(open(path).read())',
+                                    'test_managed_files_are_read_in_claude_codes_order_and_protected'),
+    'managed files in order': ('for f in sorted(os.listdir(drop_ins))',
+                               'for f in sorted(os.listdir(drop_ins), reverse=True)',
+                               'test_managed_files_are_read_in_claude_codes_order_and_protected'),
 }
 
 
@@ -421,23 +736,13 @@ class RedCheck(unittest.TestCase):
     def test_each_rule_has_a_test_that_fails_without_it(self):
         with open(LIB, encoding='utf-8') as f:
             source = f.read()
-        for base, table in ((Guard, MUTATIONS), (Registration, REG_MUTATIONS)):
+        for base, table in ((Guard, MUTATIONS), (ManagedSettings, SETTINGS_MUTATIONS)):
             for rule, (text, broken, test) in table.items():
                 with self.subTest(rule=rule):
                     self.assertEqual(source.count(text), 1, f'the red check for {rule!r} no longer matches the code')
-                    broken_mod = load(source.replace(text, broken))
-                    if base is Guard:
-                        cls = type('Broken', (Guard,), {'m': broken_mod})
-                    else:
-                        cls = type('Broken', (Registration,), {})
-                        old, model_guard.registration_problems = (model_guard.registration_problems,
-                                                                  broken_mod.registration_problems)
+                    cls = type('Broken', (base,), {'m': load(source.replace(text, broken))})
                     result = unittest.TestResult()
-                    try:
-                        cls(test).run(result)
-                    finally:
-                        if base is Registration:
-                            model_guard.registration_problems = old
+                    cls(test).run(result)
                     self.assertFalse(result.wasSuccessful(), f'{test} still passes with the rule {rule!r} broken')
 
 
