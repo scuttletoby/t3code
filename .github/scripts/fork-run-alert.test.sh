@@ -9,8 +9,11 @@ trap 'rm -rf "$root"' EXIT
 
 # The fake gh keeps the open issues in $STUB_STATE/issues.json (number, title, author as gh's JSON
 # shows it; the bot is app/github-actions). `issue list` filters by --author as GitHub's list does
-# (the bot is github-actions[bot] there) and applies --jq; list.fail / create.fail / close.fail
-# make that call fail. Every call is logged to calls, each issue body to bodies.
+# (the bot is github-actions[bot] there), keeps the first --limit (default 30) and applies --jq.
+# `api repos/O/R/issues?...` is the REST list: each issue with user.login (the bot is
+# github-actions[bot]), filtered by creator=, one page of 100 unless --paginate, then --jq.
+# list.fail / create.fail / close.fail make that call fail. Every call is logged to calls, each
+# issue body to bodies.
 . "$here/fork-test-gh.sh"
 mkdir -p "$root/bin" "$root/state"
 fork_test_gh "$root/bin" <<'GH'
@@ -20,13 +23,28 @@ echo "gh $*" >> "$s/calls"
 case "$1 ${2:-}" in
   "issue list")
     [[ -e "$s/list.fail" ]] && exit 1
-    author="" q="."
+    author="" q="." limit=30
     while (( $# )); do
-      case "$1" in --author) author="$2"; shift ;; --jq) q="$2"; shift ;; esac
+      case "$1" in --author) author="$2"; shift ;; --jq) q="$2"; shift ;; --limit) limit="$2"; shift ;; esac
       shift
     done
     [[ "$author" == "github-actions[bot]" ]] && author=app/github-actions
-    jq -r --arg a "$author" "[.[] | select(\$a == \"\" or .author.login == \$a)] | $q" "$s/issues.json" 2> /dev/null || true
+    jq -r --arg a "$author" --argjson l "$limit" "[.[] | select(\$a == \"\" or .author.login == \$a)][:\$l] | $q" "$s/issues.json" 2> /dev/null || true
+    ;;
+  "api "*)
+    [[ -e "$s/list.fail" ]] && exit 1
+    path="" q="." pages=1
+    shift
+    while (( $# )); do
+      case "$1" in --jq) q="$2"; shift ;; --paginate) pages=1000 ;; repos/*) path="$1" ;; esac
+      shift
+    done
+    [[ "$path" == repos/owner/repo/issues\?* && "$path" == *state=open* ]] || { echo "fake gh: unexpected api path $path" >&2; exit 97; }
+    creator="$(sed -nE 's/.*[?&]creator=([^&]*).*/\1/p' <<< "$path" | sed 's/%5B/[/g; s/%5D/]/g')"
+    [[ -e "$s/issues.json" ]] || echo '[]' > "$s/issues.json"
+    jq -r --arg c "$creator" --argjson n "$((pages * 100))" \
+      "[.[] | .user = {login: (if .author.login == \"app/github-actions\" then \"github-actions[bot]\" else .author.login end)}
+        | select(\$c == \"\" or .user.login == \$c) | del(.author)][:\$n] | $q" "$s/issues.json" 2> /dev/null || true
     ;;
   "issue create")
     [[ -e "$s/create.fail" ]] && exit 1
@@ -92,7 +110,8 @@ expect "a failed job opens an issue and stays red" \
   'rc_is 1 && called "gh issue create --repo owner/repo --title Secret sweep failed" && says "Opened https://github.example.invalid/o/r/issues/7"'
 expect "the issue says what failed, the result and the run" \
   'grep -qF "The daily secret sweep failed" "$root/state/bodies" && grep -qF "failure" "$root/state/bodies" && grep -qF "$RUN_URL" "$root/state/bodies"'
-expect "it lists the bot's issues, never through search" 'called "--author github-actions[bot]" && not_called "search"'
+expect "it lists the bot's issues, every page, never through search" \
+  'called "gh api --paginate repos/owner/repo/issues?state=open&creator=github-actions%5Bbot%5D" && not_called "search"'
 run failure
 expect "a second failure comments on the open issue, never a second one" \
   'rc_is 1 && called "gh issue comment 7" && [[ "$(calls | grep -c "issue create")" -eq 1 ]] && [[ "$(issues)" -eq 1 ]]'
@@ -114,6 +133,22 @@ expect "a success closes its own issue and never the stranger's" \
 reset; stranger_issue; run success
 expect "a success with only a stranger's issue closes nothing" 'rc_is 0 && not_called "issue close"'
 
+# #239: more than 100 open issues of the bot before the alert's own: it is still found (the title
+# filter applies to every page, not to the first 100), so no second alert issue is opened.
+reset
+jq -n --arg t "$TITLE" '[range(100; 230) | {number: ., title: "Another alert \(.)", author: {login: "app/github-actions"}}]
+  + [{number: 7, title: $t, author: {login: "app/github-actions"}}]' > "$root/state/issues.json"
+run failure
+expect "the alert issue after 130 other bot issues gets the comment, never a duplicate" \
+  'rc_is 1 && called "gh issue comment 7" && not_called "issue create"'
+run success
+expect "...and a success closes it" 'rc_is 0 && called "gh issue close 7"'
+# An open pull request with the same title (the REST list holds pull requests too) is not the issue.
+reset
+jq -n --arg t "$TITLE" '[{number: 9, title: $t, author: {login: "app/github-actions"}, pull_request: {url: "x"}}]' > "$root/state/issues.json"
+run failure
+expect "a pull request with the alert's title is never commented on" 'rc_is 1 && not_called "comment 9" && called "issue create"'
+
 reset; touch "$root/state/list.fail"; run success
 expect "an issue list that fails fails the run, even on a success" 'rc_is 1 && says "Could not list the issues"'
 reset; touch "$root/state/create.fail"; run failure
@@ -134,6 +169,17 @@ set +e
 out="$(env -u GITHUB_ACTIONS FORK_TEST_MODE= bash "$script" --title "$TITLE" --result failure 2>&1)"; rc=$?
 set -e
 expect "outside GitHub Actions and outside a test: the gh guard refuses before any call" 'rc_is 1 && [[ -z "$(calls)" ]]'
+
+# #239: the gh guard missing next to the script (a sparse checkout that leaves it out): a clear
+# refusal (exit 2) before any gh call, never a run without the guard.
+reset
+mkdir -p "$root/alone"
+cp "$script" "$root/alone/fork-run-alert.sh"
+set +e
+out="$(GITHUB_ACTIONS=true bash "$root/alone/fork-run-alert.sh" --title "$TITLE" --result failure 2>&1)"; rc=$?
+set -e
+expect "no fork-gh-guard.sh beside it: refused with that reason, nothing called" \
+  'rc_is 2 && says "fork-gh-guard.sh" && says "missing" && [[ -z "$(calls)" ]]'
 
 if [[ $fails -gt 0 ]]; then
   echo "$fails failed"
