@@ -1,12 +1,13 @@
 /**
- * Fork: the agent slot gate on `delegate_task` (`agentSlots`, off: reads only the settings). Counts
- * running agents from the projection; its own state (starting agents, slots held for met slot
- * waits) is memory only, never disk. Slots held by delivered slot waits come from the wait store,
- * which the wait service attaches (`attachReservations`); while waits are off none count.
+ * Fork: the agent slot gate on `delegate_task` (`agentSlots`). Off and `fixed`: reads only the
+ * settings. `observe`: the capacity rule runs beside each decision (`SlotObserver.ts`). Its own state
+ * is memory only; slots held by delivered slot waits come from the wait store (`attachReservations`).
  */
 import type { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import type { SlotRuleStatus } from "@t3tools/contracts/waitFor";
 import {
   accountOnlyThreads,
+  agentSlotsMode,
   effectiveSlotLimits,
   limitsCount,
   liveReservations,
@@ -34,6 +35,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { makeSlotObserver } from "./SlotObserver.ts";
 
 /** Names one `starting` entry; `release` or `started` with it. */
 export type SlotToken = number;
@@ -123,6 +125,8 @@ export class SlotGate extends Context.Service<
     readonly drop: (keys: ReadonlyArray<string>) => Effect.Effect<void>;
     /** For `wait_list`: null while slots are off, or when the running agents cannot be read. */
     readonly usage: Effect.Effect<SlotUsage | null>;
+    /** For `wait_list`: the capacity rule beside the gate; null unless the mode is `observe`. */
+    readonly observed: Effect.Effect<SlotRuleStatus | null>;
   }
 >()("t3/slots/SlotGate") {}
 
@@ -181,6 +185,8 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const observer = yield* makeSlotObserver(readRunning);
+
   /** Ended entries go for good: a child seen with a run counts as running from now on. */
   const keepStarting = (
     visible: ReadonlySet<string> | undefined,
@@ -230,6 +236,44 @@ const make = Effect.gen(function* () {
 
   /** Settings that cannot be read count as off, as for the usage pacing gate. */
   const readSettings = serverSettings.getSettings.pipe(Effect.option);
+
+  /** `observe` mode; unreadable settings are `fixed` (nothing is read for the rule then). */
+  const observing = readSettings.pipe(
+    Effect.map((settings) =>
+      Option.isSome(settings) && agentSlotsMode(settings.value.agentSlots) === "observe"
+        ? Option.some({
+            startGraceMs: settings.value.agentSlots.startGraceSeconds * 1000,
+            // Off or without a limit, the gate keeps no records of new starts.
+            gateRecords: effectiveSlotLimits(settings.value.agentSlots) !== null,
+          })
+        : Option.none(),
+    ),
+  );
+
+  /**
+   * Runs a decision and, in `observe` mode, hands today's answers to the rule beside it with the
+   * records as they were before the decision changed them. Forked there: never changed, never
+   * delayed. Inside the semaphore, so observations come in decision order.
+   */
+  const observeBeside = Effect.fn("SlotGate.observeBeside")(function* <A, E, R>(
+    decision: Effect.Effect<A, E, R>,
+    answers: (result: A) => ReadonlyArray<"allow" | "refuse">,
+  ) {
+    const observe = yield* observing;
+    if (Option.isNone(observe)) return yield* decision;
+    const atMs = yield* Clock.currentTimeMillis;
+    const starting = yield* Ref.get(entries);
+    const heldBefore = yield* Ref.get(held);
+    const result = yield* decision;
+    yield* observer.observe({
+      today: answers(result),
+      atMs,
+      starting,
+      held: heldBefore,
+      ...observe.value,
+    });
+    return result;
+  });
 
   /** Used up: they stop counting (memory ones go; stored ones are skipped until their end). */
   const useUpAll = Effect.fn("SlotGate.useUpAll")(function* (
@@ -330,6 +374,7 @@ const make = Effect.gen(function* () {
       const used = yield* useUp(reservations, input.callerThreadId);
       return { outcome: { type: "allow", token } satisfies SlotAcquire, used };
     },
+    (decided) => observeBeside(decided, (result) => [result.outcome.type]),
     // One at a time: the next caller sees the entry the last one added.
     semaphore.withPermits(1),
   );
@@ -435,6 +480,17 @@ const make = Effect.gen(function* () {
       }
       return grants;
     },
+    // Only real answers: "off" has nothing to wait for, "sameThread" asks again next time.
+    (granted) =>
+      observeBeside(granted, (grants) =>
+        grants.flatMap((answer) =>
+          answer.type === "granted"
+            ? ["allow" as const]
+            : answer.type === "full" || answer.type === "unread"
+              ? ["refuse" as const]
+              : [],
+        ),
+      ),
     // Under the same semaphore as `acquire`: a delegation never takes a slot being granted.
     semaphore.withPermits(1),
   );
@@ -500,6 +556,11 @@ const make = Effect.gen(function* () {
     acquire,
     grant,
     usage,
+    observed: observing.pipe(
+      Effect.flatMap((observe) =>
+        Option.isSome(observe) ? observer.status : Effect.succeed(null),
+      ),
+    ),
     attachReservations: Effect.fn("SlotGate.attachReservations")((source: StoredReservations) =>
       Effect.sync(() => {
         stored = source;
