@@ -8,9 +8,9 @@
 install reads the `desk` section of the machine file, makes the runner users, stages the fleet files of one release
 (launcher, walls, desk agent, gate hook and the fleet config), checks the staged copy, stops the agent, moves each
 file into /opt/fork-fleet, writes MANIFEST.sha256 and then SOURCE (last), writes the settings in /etc/fork-fleet and
-the units, makes the desk key once, and starts the agent and the refresh timer (restarting the agent only when
-something changed). Safe to run again and to stop at any step: a stopped run leaves SOURCE naming the old release
-(check says what differs) and the next run ends it. uninstall removes only what the kit made, its record last.
+the units, makes the desk key once, and starts the agent and the refresh and seed timers (restarting the agent only
+when something changed). Safe to run again and to stop at any step: a stopped run leaves SOURCE naming the old
+release (check says what differs) and the next run ends it. uninstall removes only what the kit made, its record last.
 """
 import argparse, contextlib, fcntl, hashlib, importlib.util, json, os, pwd, re, shutil, stat, subprocess, sys, tempfile
 
@@ -34,6 +34,7 @@ FILES = {'fork-fleet-launch.sh': '.github/scripts/fork-fleet-launch.sh',
          'fork-fleet-walls.py': '.github/scripts/fork-fleet-walls.py',
          'fork-fleet-desk-agent.py': '.github/scripts/fork-fleet-desk-agent.py',
          'fork-fleet-desk-wire.py': '.github/scripts/fork-fleet-desk-wire.py',
+         'fork-fleet-desk-seed.py': '.github/scripts/fork-fleet-desk-seed.py',
          'hook.sh': '.github/scripts/fork-fleet-hook.sh', 'fork-fleet.py': '.github/scripts/fork-fleet.py',
          'fork-fleet.json': '.github/fork-fleet.json', 'desk-install': 'fork-kit/desk/sbin/desk-install',
          'machine_file.py': 'fork-kit/common/machine_file.py', 'README.md': 'fork-kit/desk/README.md',
@@ -42,8 +43,12 @@ WALLS = '.github/scripts/fork-fleet-walls'   # copied whole: every OS's walls fi
 SUBDIRS = ('units', 'fork-fleet-walls')   # the folders the manifest makes inside /opt/fork-fleet
 UNITS = {'fork-fleet-desk-agent.service': '.github/scripts/fork-fleet-desk-agent.service',
          't3code-fleet-refresh.service': '.github/scripts/fork-fleet-refresh.service',
-         't3code-fleet-refresh.timer': '.github/scripts/fork-fleet-refresh.timer'}
+         't3code-fleet-refresh.timer': '.github/scripts/fork-fleet-refresh.timer',
+         't3code-fleet-seed.service': '.github/scripts/fork-fleet-seed.service',
+         't3code-fleet-seed.timer': '.github/scripts/fork-fleet-seed.timer'}
 AGENT, TIMER, REFRESH = 'fork-fleet-desk-agent.service', 't3code-fleet-refresh.timer', 't3code-fleet-refresh.service'
+SEED_TIMER, SEED = 't3code-fleet-seed.timer', 't3code-fleet-seed.service'
+SEEDS = WORK + '/seeds'   # the warm caches (fork-fleet-desk-seed.py); jobs see them read-only (ALLOW_PATHS)
 FOREIGN = (OPT + '/fork-fleet-launch.sh', ETC + '/launch.conf', ETC + '/desk.conf', KEY,
            *(f'{UNIT_DIR}/{u}' for u in UNITS))
 CMD = {k: [k] for k in ('useradd', 'userdel', 'loginctl', 'systemctl', 'sysctl', 'ssh-keygen', 'ip', 'nft', 'bash',
@@ -361,7 +366,7 @@ def read_manifest():
 
 def swap(tmp, manifest, sha, before_change):
     """Each changed file renamed into /opt/fork-fleet (the agent stopped meanwhile, so no verb runs from half-old,
-    half-new files, and the refresh timer and service stopped too: refresh runs the launcher); files of the old
+    half-new files, and the refresh and seed timers and services stopped too: they run its files); files of the old
     release that are gone, removed. Unchanged files (same text, mode and owner root) are left as they are; one whose
     mode or owner was changed is replaced by the staged copy. True when anything changed."""
     def same(rel):
@@ -373,7 +378,7 @@ def swap(tmp, manifest, sha, before_change):
     gone = sorted(set(read_manifest()) - set(manifest))
     if changed or gone:
         before_change()
-        run('systemctl', 'stop', TIMER, REFRESH, AGENT, check=False)
+        run('systemctl', 'stop', TIMER, REFRESH, SEED_TIMER, SEED, AGENT, check=False)
     for d in sorted({os.path.dirname(rel) for rel in manifest} - {''}):
         # closed before any file goes in: in a folder others can write, a user could swap a file in before the chmod
         os.makedirs(p(f'{OPT}/{d}'), mode=0o755, exist_ok=True)
@@ -425,7 +430,7 @@ def make_users(users, state):
 
 def settings(m, users):
     known = (m['host'] if m['port'] == 22 else f'[{m["host"]}]:{m["port"]}') + ' ' + m['hostKey']
-    files = {ETC + '/launch.conf': (f'RUNNER_USERS={",".join(users)}\n'
+    files = {ETC + '/launch.conf': (f'RUNNER_USERS={",".join(users)}\nALLOW_PATHS={SEEDS}\n'
                                     + (f'RESERVE_MB={m["reserveMb"]}\n' if m['reserveMb'] is not None else '')
                                     + (f'NET_BASE={m["netBase"]}\n' if m['netBase'] else '')
                                     + (f'FREE_COMMAND={m["freeCommand"]}\n' if m['freeCommand'] else ''), 0o600),
@@ -572,7 +577,7 @@ def install(a, stop_after=None, stack=None):
     if r.returncode:
         raise Refused(f'the desk agent refuses its settings (not started): {r.stderr.strip()[:300]}')
     run('systemctl', 'daemon-reload')
-    run('systemctl', 'enable', '--now', TIMER)
+    run('systemctl', 'enable', '--now', TIMER, SEED_TIMER)
     if not os.path.exists(p(OPT + '/template/runner-template/.fork-fleet-version')):
         run(p(OPT + '/fork-fleet-launch.sh'), 'prune', check=False)   # makes the launch lock refresh opens
         run('systemctl', 'start', '--no-block', REFRESH)              # the first runner template, in the background
@@ -615,10 +620,13 @@ def check():
         row(False, 'walls', f'exit {walls.returncode}: {walls.stderr.strip()[:200]}')
     r = py(p(OPT + '/fork-fleet-desk-agent.py'), 'check')
     row(r.returncode == 0, 'agent-settings', (r.stdout or r.stderr).strip()[:200])
-    for unit in (AGENT, TIMER):
+    for unit in (AGENT, TIMER, SEED_TIMER):
         on = run('systemctl', 'is-active', '--quiet', unit, check=False).returncode == 0
         row(on and run('systemctl', 'is-enabled', '--quiet', unit, check=False).returncode == 0, 'unit',
             f'{unit} enabled and active')
+    last = run('systemctl', 'show', '-p', 'Result', '--value', SEED, check=False).stdout.strip() or 'unknown'
+    row(last == 'success', 'unit', f'{SEED} last run: {last}' + ('' if last == 'success' else
+                                                                  f' (journalctl -u {SEED} says why)'))
     row(os.path.exists(p(OPT + '/template/runner-template/.fork-fleet-version')), 'template',
         'the runner template is there (the refresh timer makes it)')
     try:
@@ -754,7 +762,7 @@ def uninstall(stack=None):
         say(f'no {STATE}: nothing here was installed by this kit (nothing changed)')
         return 0
     lock(stack if stack is not None else contextlib.ExitStack())   # the record is in /etc/fork-fleet: it is there
-    for unit in (AGENT, TIMER, REFRESH):
+    for unit in (AGENT, TIMER, REFRESH, SEED_TIMER, SEED):
         run('systemctl', 'disable', '--now', unit, check=False)
     launcher = p(OPT + '/fork-fleet-launch.sh')
     if os.path.exists(launcher):
@@ -786,6 +794,7 @@ def uninstall(stack=None):
                 *(n for n in os.listdir(p(OPT)) if n.startswith('.kit-stage-'))] if os.path.isdir(p(OPT)) else []:
         remove(f'{OPT}/{rel}')
     remove(WORK + '/runners')
+    remove(SEEDS)
     for u in state['createdUsers']:
         if user_exists(u):
             run('userdel', u)
