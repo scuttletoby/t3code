@@ -90,6 +90,7 @@ function setup(
 }
 
 const recommendedButton = () => page.getByRole("button", { name: "Use recommended review rules" });
+const resetButton = () => page.getByRole("button", { name: "Reset Review rules to default" });
 
 describe("ReviewRulesSettings (PK10 T6)", () => {
   it("turns the preset on with one click and blocks a second click until saved", async () => {
@@ -176,6 +177,38 @@ describe("ReviewRulesSettings (PK10 T6)", () => {
       .element(screen.getByText(/^This project overrides the environment's review rules/u))
       .toBeVisible();
     await expect.element(screen.getByText("5000 characters")).toBeVisible();
+  });
+
+  it("asks before resetting a project override that cannot be read (#357)", async () => {
+    setup({ preset: "off", unreadable: { preset: "strict" } }, { overrides: true });
+    await using screen = await render(<ReviewRulesSettings isProjectScope />);
+
+    await userEvent.click(resetButton());
+    const dialog = page.getByRole("alertdialog");
+    await expect.element(dialog).toBeVisible();
+    expect(dialog.element().textContent).toContain("the text written there is lost");
+    await userEvent.click(dialog.getByRole("button", { name: "Cancel" }));
+    await expect.element(dialog).not.toBeInTheDocument();
+    expect(state.clear).not.toHaveBeenCalled();
+    // Cancelled: the override is kept and still shown as stored.
+    await expect.element(screen.getByText('{"preset":"strict"}')).toBeVisible();
+
+    // Asked again: confirming clears it, once.
+    await userEvent.click(resetButton());
+    await userEvent.click(
+      page.getByRole("alertdialog").getByRole("button", { name: "Use the environment's" }),
+    );
+    expect(state.clear).toHaveBeenCalledTimes(1);
+    expect(state.clear).toHaveBeenCalledWith(["reviewRules"]);
+  });
+
+  it("resets a readable project override without asking", async () => {
+    setup({ preset: "recommended", minors: "free" }, { overrides: true });
+    await using _screen = await render(<ReviewRulesSettings isProjectScope />);
+
+    await userEvent.click(resetButton());
+    expect(state.clear).toHaveBeenCalledWith(["reviewRules"]);
+    expect(page.getByRole("alertdialog").elements()).toHaveLength(0);
   });
 
   it("in a project without an override, replaces nothing of the environment's", async () => {
