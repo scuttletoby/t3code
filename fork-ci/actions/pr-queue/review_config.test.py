@@ -440,6 +440,69 @@ class RuleOrder(unittest.TestCase):
                                                     ('b', 'critical', ['**/*.md']), ('c', 'light', ['**/*.md'])))
                          .warnings, ())
 
+    def test_a_same_weight_rule_above_without_a_lens_of_the_lower_one_is_refused_in_enforce(self):   # #374 item 1
+        # `src/**/*.py` critical [data-1, approach] above `src/**/*` critical [data-1, data-2]: `src/x.py` belongs to
+        # the first rule and needs only its lenses, never data-2.
+        def same(mode, first, second):
+            block = self.block(mode)
+            block['rules'][1:1] = [{'name': 'py', 'weight': 'critical', 'paths': ['src/**/*.py'], 'lenses': first},
+                                   {'name': 'src', 'weight': 'critical', 'paths': ['src/**/*'], 'lenses': second}]
+            return block
+        why = refusal(same('enforce', ['data-1', 'approach'], ['data-1', 'data-2']))
+        self.assertIn("rule 'py' (critical) comes before the rule 'src' of the same weight without its lens 'data-2'",
+                      why)
+        self.assertIn("'src/**/*.py' and 'src/**/*' both match a path such as", why)
+        warned = rc.parse_review(same('shadow', ['data-1', 'approach'], ['data-1', 'data-2'])).warnings
+        self.assertEqual(len(warned), 1, warned)
+        self.assertIn("without its lens 'data-2'", warned[0])
+        # the first rule holding every lens of the lower one (more, or in another order, is fine): safe. Names match
+        # exactly: two names the gate reads as one lens are refused in `lenses` already.
+        for first, second in ((['data-1', 'data-2', 'approach'], ['data-1', 'data-2']),
+                              (['data-2', 'data-1'], ['data-1', 'data-2'])):
+            with self.subTest(first=first, second=second):
+                self.assertEqual(rc.parse_review(same('enforce', first, second)).warnings, ())
+        # globs that never meet: any lenses
+        block = same('enforce', ['data-1', 'approach'], ['data-1', 'data-2'])
+        block['rules'][1]['paths'] = ['lib/**/*.py']
+        self.assertEqual(rc.parse_review(block).warnings, ())
+
+    def test_only_the_match_every_globs_of_the_catch_all_are_exempt(self):   # #374 item 2
+        block = self.block('enforce', ('md', 'light', ['**/*.md']))
+        block['rules'][-1] = {'name': 'all', 'weight': 'critical', 'paths': ['src/**', '**'],
+                              'lenses': ['data-1', 'data-2']}
+        why = refusal(block)
+        self.assertIn("rule 'md' (light) comes before the heavier rule 'all' (critical), and '**/*.md' and 'src/**'",
+                      why)
+        block['rules'][-1]['paths'] = ['**']   # the match-every glob alone: the default for what no rule above takes
+        self.assertEqual(rc.parse_review(block).warnings, ())
+        # a same-weight catch-all with more lenses: its ** is exempt, its explicit glob is not
+        block = self.block('enforce', ('py', 'normal', ['**/*.py']))
+        block['rules'][-1] = {'name': 'rest', 'weight': 'normal', 'paths': ['**'], 'lenses': ['code', 'approach']}
+        self.assertEqual(rc.parse_review(block).warnings, ())
+        block['rules'][-1]['paths'] = ['src/**', '**']
+        self.assertIn("rule 'py' (normal) comes before the rule 'rest' of the same weight without its lens "
+                      "'approach'", refusal(block))
+
+    def test_the_shadow_warning_says_enforce_refuses_it(self):   # #374 item 3: switching locks every head out
+        r = rc.parse_review(self.block('shadow', ('docs', 'light', ['**/*.md']), ('src', 'critical', ['src/**'])))
+        self.assertTrue(r.warnings[0].endswith('mode enforce refuses this config: fix it before switching'),
+                        r.warnings[0])
+        why = refusal(self.block('enforce', ('docs', 'light', ['**/*.md']), ('src', 'critical', ['src/**'])))
+        self.assertNotIn('before switching', why)
+
+    def test_enforce_order_problems_judges_a_block_as_enforce_would(self):   # #374 item 3: the head's new block
+        bad = self.block('enforce', ('docs', 'light', ['**/*.md']), ('src', 'critical', ['src/**']))
+        for mode in ('enforce', 'shadow'):
+            with self.subTest(mode=mode):
+                got = rc.enforce_order_problems({**bad, 'mode': mode})
+                self.assertEqual(len(got), 1, got)
+                self.assertIn("rule 'docs' (light) comes before the heavier rule 'src' (critical)", got[0])
+                self.assertNotIn('before switching', got[0])
+        for good in (self.block('enforce', ('src', 'critical', ['src/**']), ('docs', 'light', ['**/*.md'])),
+                     recommended(), None, [], {}, {**bad, 'rules': 'x'}, {**bad, 'version': 2}):
+            with self.subTest(good=json.dumps(good)[:60]):
+                self.assertEqual(rc.enforce_order_problems(good), [])   # no order to judge: not this check's
+
     def test_every_problem_is_named_at_once(self):
         why = refusal(self.block('enforce', ('docs', 'light', ['**/*.md']), ('api', 'normal', ['src/**']),
                                  ('src', 'critical', ['src/**'])))
