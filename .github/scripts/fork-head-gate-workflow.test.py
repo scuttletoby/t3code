@@ -9,6 +9,7 @@ python3 stands in for head_gate.py. What makes the key reachable only by the sta
 against every fork workflow, in fork-contracts.test.py (head-gate).
 """
 
+import ast
 import json
 import os
 import pathlib
@@ -332,8 +333,13 @@ check("example: secrets: inherit (so the guard can see a repository secret of th
       and "Needed:" in EXAMPLE.read_text())
 check("example: no pass-drafts anywhere (a draft's check run would count for a ready pull request at its head)",
       "pass-drafts" not in EXAMPLE.read_text() and "pass-drafts" not in text)
-REVIEW_EVENTS = re.search(r"^REVIEW_EVENTS = \(([^)]*)\)", GATE_PY.read_text(), re.M)
-REVIEW_EVENTS = re.findall(r"'([a-z_]+)'", REVIEW_EVENTS.group(1)) if REVIEW_EVENTS else []
+# The tuple as Python reads it (any quoting), from head_gate.py's top-level assignment; [] if it is not a literal.
+REVIEW_EVENTS = next((n.value for n in ast.parse(GATE_PY.read_text()).body if isinstance(n, ast.Assign)
+                      and [getattr(t, "id", None) for t in n.targets] == ["REVIEW_EVENTS"]), None)
+try:
+    REVIEW_EVENTS = list(ast.literal_eval(REVIEW_EVENTS)) if REVIEW_EVENTS is not None else []
+except (ValueError, TypeError, SyntaxError):
+    REVIEW_EVENTS = []
 check("example: an issue comment that is not on a pull request starts nothing, nor a review trigger run that did "
       "not succeed (a newer one replaced it) or that another event started (#379: skipped before a guard job "
       "starts; the events are head_gate's REVIEW_EVENTS)",
