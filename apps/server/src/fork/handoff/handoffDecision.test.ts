@@ -77,6 +77,14 @@ describe("handoffDecision: when", () => {
     expect(HANDOFF_IDLE_LEAD_MS).toEqual({ agent: 4 * MINUTE, command: 2 * MINUTE });
   });
 
+  it("lets only a turn end use the backstop: the idle timer waits for its window at any size", () => {
+    const early = { cacheExpiresAtMs: NOW + 10 * MINUTE };
+    expect(handoffDecision(facts({ trigger: "idle-timer", ...early }))).toEqual({
+      kind: "sleep",
+      untilMs: NOW + 6 * MINUTE,
+    });
+  });
+
   it("hands off when the idle timer fires inside the window, the thread quiet", () => {
     const timer = idle({ trigger: "idle-timer", cacheExpiresAtMs: NOW + 3 * MINUTE });
     expect(handoffDecision(timer)).toEqual({ kind: "handoff", reason: "idle", ...IDS });
@@ -121,6 +129,13 @@ describe("handoffDecision: never", () => {
       "cache-expiry-unknown",
     ],
     ["an expired cache", { usedTokens: 80_000, cacheExpiresAtMs: NOW }, "cache-expired"],
+    // A reading that is not a number counts as missing, never as a size or a warm cache.
+    ["a size that is not a number", { trigger: "idle-timer", usedTokens: Number.NaN }, "no-size"],
+    [
+      "a cache expiry that is not a number",
+      { trigger: "idle-timer", usedTokens: 80_000, cacheExpiresAtMs: Number.NaN },
+      "cache-expiry-unknown",
+    ],
   ])("skips %s", (_name, over, reason) => {
     expect(handoffDecision(facts(over))).toEqual({ kind: "skip", reason });
   });

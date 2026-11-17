@@ -202,6 +202,7 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
+import { handoffDispatchDropped } from "../fork/handoff/handoffFacts.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -6772,6 +6773,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             )),
       )
     ) {
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.metadata-updated",
+        threadId: command.threadId,
+        occurredAt: yield* DateTime.now,
+        payload: projection.thread,
+      });
+      return;
+    }
+    // Fork (K14): a handoff lands only at a quiet thread still at its source run, else it drops.
+    if (handoffDispatchDropped(command, projection)) {
       yield* emit(
         events,
         command,
