@@ -25,9 +25,10 @@ run and all its jobs are completed (keyed by run id and attempt, so a re-run is 
 every run in it is completed and its window ended over an hour ago, and then reused for LIST_MAX_AGE (a later re-run
 changes the run). Where the OS has user ids (not Windows), a folder another user owns is refused and the folder is
 made 0700 (a filesystem where chmod has no effect is refused). Writes are a `.part-` file then a rename. A file
-that is unreadable, half-written, damaged (also nested too deep, or a page field missing or of the wrong type), saved
-for another page or in another FORMAT is fetched again; a failed write only costs the cache; `.part-` files older than
-an hour go (one that cannot be removed is reported and the run goes on).
+that is unreadable, half-written, damaged (also nested too deep, a page field missing or of the wrong type, or a run
+or job in it not completed or without a field the counting reads), saved for another page or in another FORMAT is
+fetched again; a failed write only costs the cache; `.part-` files older than an hour go (one that cannot be removed
+is reported, also as `cache_cleanup_failed` in --json, and the run goes on).
 Exit: 0 complete, 2 bad arguments (a config file of the wrong shape too) or an API error (an answer with a field
 missing or of the wrong type too), 3 incomplete (budget).
 """
@@ -78,7 +79,7 @@ class Api:
     def __init__(self, cache, max_requests, reserve, gh='gh'):
         self.cache, self.max_requests, self.reserve, self.gh = cache, max_requests, reserve, gh
         self.requests = self.hits = 0
-        self.stop = self.save_failed = None
+        self.stop = self.save_failed = self.cleanup_failed = None
         os.makedirs(cache, mode=0o700, exist_ok=True)   # pages of a private repository: kept private
         getuid = getattr(os, 'getuid', None)   # None on Windows: no owner or mode bits to check there
         if getuid is not None:
@@ -88,7 +89,6 @@ class Api:
                 os.chmod(cache, 0o700)
                 if os.stat(cache).st_mode & 0o077:
                     raise ValueError(f'--cache {cache} cannot be made private (0700)')
-        cleanup_failed = None
         for name in os.listdir(cache):   # a killed write leaves a .part- file; it is never read
             p = os.path.join(cache, name)
             try:
@@ -97,9 +97,9 @@ class Api:
             except FileNotFoundError:
                 pass   # another run removed it first
             except OSError as e:   # a read-only folder or a directory: only the clean-up failed (a save says its own)
-                cleanup_failed = cleanup_failed or e
-        if cleanup_failed:
-            print(f'ci-demand: old .part- file not removed ({shown(cleanup_failed)}); going on', file=sys.stderr)
+                self.cleanup_failed = self.cleanup_failed or str(e)
+        if self.cleanup_failed:   # also in --json (cache_cleanup_failed)
+            print(f'ci-demand: old .part- file not removed ({shown(self.cleanup_failed)}); going on', file=sys.stderr)
 
     def _path(self, key):
         return os.path.join(self.cache, hashlib.sha256(key.encode()).hexdigest()[:40] + '.json')
@@ -111,7 +111,7 @@ class Api:
         except (OSError, ValueError, RecursionError):   # RecursionError: nested too deep
             return None
         if not (isinstance(doc, dict) and doc.get('v') == FORMAT and doc.get('key') == key
-                and page_ok(doc.get('body'), kind)):   # a body field missing or of the wrong type: fetched again
+                and page_ok(doc.get('body'), kind) and saved_ok(doc['body'], kind)):   # damaged: fetched again
             return None
         saved = doc.get('saved')
         try:   # float(): json.load reads NaN, Infinity and any-size integers; a huge one raises OverflowError
@@ -251,6 +251,23 @@ def page_ok(body, kind):
     if not (isinstance(body, dict) and is_count(body.get('total_count')) and isinstance(body.get(kind), list)):
         return False
     return all(map(run_ok if kind == 'workflow_runs' else job_ok, body[kind]))
+
+
+SAVED_FIELDS = {'workflow_runs': ('status', 'conclusion'),
+                'jobs': ('status', 'conclusion', 'runner_name', 'started_at', 'completed_at')}
+
+
+def saved_ok(body, kind):
+    """A saved page (page_ok already) still meets the rule it was saved by: every run or job in it completed, with
+    every field the counting reads (the API always sends them, null where empty). A job that reached a runner needs
+    its start and end, else it would count as 0 seconds."""
+    for x in body[kind]:
+        if x.get('status') != 'completed' or not all(k in x for k in SAVED_FIELDS[kind]):
+            return False
+        if kind == 'jobs' and x['conclusion'] != 'skipped' and x['runner_name'] \
+                and not (is_date(x['started_at'], needed=True) and is_date(x['completed_at'], needed=True)):
+            return False
+    return True
 
 
 def list_runs(api, repo, start, end, out):
@@ -494,7 +511,8 @@ def main(argv=None):
     if args.json:
         print(json.dumps({'repo': repo, 'since': str(since), 'until': str(until), 'requests': api.requests,
                           'cached': api.hits, 'incomplete': stopped, 'run_list_complete': listed,
-                          'cache_write_failed': api.save_failed, 'days': out}, indent=1))
+                          'cache_write_failed': api.save_failed, 'cache_cleanup_failed': api.cleanup_failed,
+                          'days': out}, indent=1))
     else:
         print(head)
         print(text(out))
