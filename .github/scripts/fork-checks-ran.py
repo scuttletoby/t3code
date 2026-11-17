@@ -4,40 +4,54 @@
 fork-checks.yml runs on pull_request_target, which GitHub blocks from 2026-12-02 unless a repository Actions policy
 allows it for that file (.github/fork-actions-policies.json). Its checks are not required, so a blocked, failed or
 cancelled run would merge unseen. This script makes the required fork-ci-result notice: on the head commit, the newest
-pull_request_target run of the configured workflow file must have a job (= check run) of the configured name (`check`)
-whose latest attempt concluded success. Runs of other events do not count: they run the pull request's own copy of the
-file. It waits while that job is queued or running; failed, cancelled or skipped fails at once, and so does a finished
-run without the job (a blocked event leaves one). The Actions API needs only actions: read, which every caller of
-fork-tests.yml grants.
+pull_request_target run of the configured workflow file that belongs to THIS pull request must have a job (= check run)
+of the configured name (`check`) whose latest attempt concluded success. Runs of other events do not count: they run
+the pull request's own copy of the file. A run belongs to this pull request when its head repository is this
+repository and its pull_requests list holds PR_NUMBER (#433): anyone can open a pull request from their own fork at
+the same public commit (its run skips the job), and a second pull request at the same commit may target a base branch
+whose fork-checks.yml is a no-op. GitHub leaves pull_requests empty on runs of a pull request from another
+repository, so such a run is never counted (fail closed). Two pull requests from the same head branch may both be
+listed on each other's runs; both come from someone who can push to this repository. It waits while that job is queued or running; failed,
+cancelled or skipped fails at once, and so does a finished run without the job (a blocked event leaves one). The
+Actions API needs only actions: read, which every caller of fork-tests.yml grants.
 
 The config is read from the pull request's base commit (BASE_SHA, fetched when the checkout lacks it), not from the
-checkout: pull_request_target runs main's copy of fork-checks.yml, so a pull request that renames its job or file is
-judged by the names main's copy produces, and cannot edit the config its own check reads. Missing or undecodable
-there: fail.
+checkout: pull_request_target runs the base branch's copy of fork-checks.yml, so a pull request that renames its job
+or file is judged by the names the base branch's copy produces, and cannot edit the config its own check reads.
+Missing or undecodable there: fail.
 
-It polls every poll_seconds for at most wait_seconds (below the job's timeout, so the message shows), then fails. An
-API error fails closed: a rate limit or a server error is retried within the same cap (and named in the failure if it
-lasts), any other error (403, 404 ...) fails at once. A pull request from another fork fails at once (the job's if:
-skips those; fork-checks' only job for them always fails).
+It polls every poll_seconds for at most wait_seconds, counted from before the config is read (its git calls count),
+then fails. The job's timeout leaves room for the checkout, the cap and one last poll: fork-contracts.test.py checks
+it with GIT_TIMEOUT, GIT_CALLS, API_TIMEOUT and API_CALLS_PER_POLL below, so the message shows. An API error fails
+closed: a rate limit or a server error is retried within the same cap (and named in the failure if it lasts), any
+other error (403, 404 ...) fails at once. A pull request from another fork fails at once (the job's if: skips those;
+fork-checks' only job for them always fails).
 
 Not a pull_request event: a run that another workflow called (GITHUB_WORKFLOW_REF names the caller) has nothing to
 check, since its check runs are named "<caller job> / ... / fork-ci-result", never the required "fork-ci-result". A
 direct run (push, workflow_dispatch) passes only on the default branch: on any other branch its passing fork-ci-result
 would land on that branch's tip, which may be an open pull request's head that fork-checks never passed (#430).
 
-Environment: EVENT_NAME, HEAD_SHA, BASE_SHA, OUTSIDE_PR (true/false), DEFAULT_BRANCH, GITHUB_REF, GITHUB_WORKFLOW_REF,
-GITHUB_TOKEN (actions: read), GITHUB_REPOSITORY, GITHUB_API_URL. Test: fork-checks-ran.test.py.
+Environment: EVENT_NAME, HEAD_SHA, BASE_SHA, PR_NUMBER, OUTSIDE_PR (true/false), DEFAULT_BRANCH, GITHUB_REF,
+GITHUB_WORKFLOW_REF, GITHUB_TOKEN (actions: read), GITHUB_REPOSITORY, GITHUB_API_URL. Test: fork-checks-ran.test.py.
 """
 import http.client, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
 CONFIG_PATH = '.github/fork-actions-policies.json'
 TESTS_WORKFLOW = '.github/workflows/fork-tests.yml'   # the workflow whose fork-ci-result a ruleset requires
 SHA = re.compile(r'[0-9a-f]{40}')
+NUMBER = re.compile(r'[1-9][0-9]*')
+GIT_TIMEOUT, GIT_CALLS = 60, 3            # seconds per git call; at most cat-file, fetch, show
+API_TIMEOUT, API_CALLS_PER_POLL = 30, 2   # seconds per API call; one poll: the run list, then one run's jobs
 NOT_RAN = 'fork-checks did not run: check the Actions policy (#401)'
 WAY_OUT = ('Once that is fixed, push again or close and reopen the pull request (a blocked run cannot be re-run), '
            'then this job runs again.')
 RERUN = ('Fix what it reports and push again; if it was cancelled or timed out, re-run it (or push again, or close and '
          'reopen the pull request), then re-run the failed jobs of this run.')
+SKIPPED = ('fork-checks skips that job only when it sees the pull request as coming from another repository (or the '
+           'base branch\'s fork-checks.yml changed its if:), and a re-run skips it again (it replays the same event). '
+           'Check that the head branch is still in this repository and look at the base branch\'s fork-checks.yml, then '
+           'push again or close and reopen the pull request. A pull request from another repository needs a maintainer.')
 
 
 class Transient(Exception):
@@ -67,7 +81,7 @@ class GitHub:
             'Accept': 'application/vnd.github+json', 'User-Agent': 'fork-checks-ran',
             'Authorization': f'Bearer {self.token}'})
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             try:
@@ -96,7 +110,7 @@ def base_config(sha, cwd=None, env=None):
     """fork_checks of CONFIG_PATH on commit sha, fetched from origin when the checkout lacks it."""
     def git(*args):
         try:
-            return subprocess.run(['git', *args], cwd=cwd, env=env, capture_output=True, timeout=180)
+            return subprocess.run(['git', *args], cwd=cwd, env=env, capture_output=True, timeout=GIT_TIMEOUT)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise ConfigError(f'git {args[0]} failed: {e}') from None
 
@@ -125,12 +139,22 @@ def config_problems(cfg):
     return problems
 
 
-def look(api, sha, name, workflow):
-    """What the newest pull_request_target run of the workflow on sha says about its job `name`, latest attempt:
-    None (no such run yet), ('going', url), ('blocked', run url: finished without the job) or (conclusion, url)."""
+def of_this_pull_request(run, repo, number):
+    """A run from this repository whose pull_requests list holds this pull request. An empty or missing list (what
+    GitHub gives a pull request from another repository) is not this pull request's run: never counted."""
+    head, prs = run.get('head_repository'), run.get('pull_requests')
+    return (isinstance(head, dict) and head.get('full_name') == repo and isinstance(prs, list)
+            and any(isinstance(p, dict) and p.get('number') == number for p in prs))
+
+
+def look(api, sha, name, workflow, repo, number):
+    """What the newest pull_request_target run of the workflow on sha for pull request `number` from `repo` says
+    about its job `name`, latest attempt: None (no such run yet), ('going', url), ('blocked', run url: finished
+    without the job) or (conclusion, url). At most API_CALLS_PER_POLL calls."""
     runs = api.get(f'actions/workflows/{urllib.parse.quote(os.path.basename(workflow))}/runs?'
                    + urllib.parse.urlencode({'head_sha': sha, 'per_page': 100}))['workflow_runs']
-    mine = [r for r in runs if r['path'].split('@')[0] == workflow and r.get('event') == 'pull_request_target']
+    mine = [r for r in runs if r['path'].split('@')[0] == workflow and r.get('event') == 'pull_request_target'
+            and of_this_pull_request(r, repo, number)]
     for run in sorted(mine, key=lambda r: int(r['id']), reverse=True):
         jobs = api.get(f'actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')['jobs']
         named = [j for j in jobs if j['name'] == name]
@@ -172,8 +196,13 @@ def check(env, api, config, now=time.time, sleep=time.sleep, say=print):
     if event != 'pull_request':
         return not_a_pull_request(env, say)
     sha, base, outside = env.get('HEAD_SHA', ''), env.get('BASE_SHA', ''), env.get('OUTSIDE_PR', '')
+    number, repo = env.get('PR_NUMBER', ''), env.get('GITHUB_REPOSITORY', '')
     problems = [f'{k} {v!r} is not a commit id' for k, v in (('HEAD_SHA', sha), ('BASE_SHA', base))
                 if not SHA.fullmatch(v)]
+    if not NUMBER.fullmatch(number):
+        problems.append(f'PR_NUMBER {number!r} is not a pull request number')
+    if not repo:
+        problems.append('GITHUB_REPOSITORY is empty')
     if outside not in ('true', 'false'):
         problems.append(f'OUTSIDE_PR {outside!r} is not true or false')
     if problems:
@@ -183,6 +212,7 @@ def check(env, api, config, now=time.time, sleep=time.sleep, say=print):
         say('::error::outside pull request: fork-checks does not check it (its Outside pull request job fails); '
             'a maintainer must review')
         return 1
+    start = now()   # the cap counts the git calls that read the config
     try:
         cfg = config(base)
     except ConfigError as e:
@@ -193,14 +223,14 @@ def check(env, api, config, now=time.time, sleep=time.sleep, say=print):
         say(f'::error::{CONFIG_PATH} on the base commit {base}: ' + '; '.join(problems))
         return 1
     name, workflow, poll = cfg['check'], cfg['workflow'], cfg['poll_seconds']
-    deadline = now() + cfg['wait_seconds']
-    say(f'Waiting for check run "{name}" of {workflow} on {sha} to pass (at most {cfg["wait_seconds"]} s; '
-        f'config from the base commit {base}).')
+    deadline = start + cfg['wait_seconds']
+    say(f'Waiting for check run "{name}" of {workflow} on {sha} for pull request #{number} to pass (at most '
+        f'{cfg["wait_seconds"]} s; config from the base commit {base}).')
     last_error = None
     while True:
         wait = poll
         try:
-            found = look(api, sha, name, workflow)
+            found = look(api, sha, name, workflow, repo, int(number))
             last_error = None
         except Fatal as e:
             say(f'::error::fork-checks could not be confirmed (failing closed): GitHub API error: {e}. A 404: '
@@ -222,7 +252,7 @@ def check(env, api, config, now=time.time, sleep=time.sleep, say=print):
             say(f'::error::{NOT_RAN}: its newest run on {sha} finished without a "{name}" job ({url}). {WAY_OUT}')
             return 1
         if state == 'skipped':
-            say(f'::error::fork-checks did not check {sha}: its check run "{name}" was skipped ({url}). {RERUN}')
+            say(f'::error::fork-checks did not check {sha}: its check run "{name}" was skipped ({url}). {SKIPPED}')
             return 1
         if state not in (None, 'going'):
             say(f'::error::fork-checks did not pass on {sha}: check run "{name}" of {workflow} ended {state} '
@@ -237,8 +267,9 @@ def check(env, api, config, now=time.time, sleep=time.sleep, say=print):
                 say(f'::error::fork-checks did not finish on {sha} within {cfg["wait_seconds"]} s (check run "{name}" '
                     f'of {workflow}: {url}). Once it has passed, re-run the failed jobs of this run.')
             else:
-                say(f'::error::{NOT_RAN}: no pull_request_target run of {workflow} with a check run "{name}" on {sha} '
-                    f'after {cfg["wait_seconds"]} s. {WAY_OUT}')
+                say(f'::error::{NOT_RAN}: no pull_request_target run of {workflow} for pull request #{number} from '
+                    f'this repository with a check run "{name}" on {sha} after {cfg["wait_seconds"]} s (runs of other '
+                    f'pull requests on the same commit do not count). {WAY_OUT}')
             return 1
         sleep(wait)
 

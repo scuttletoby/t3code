@@ -15,7 +15,7 @@ SHA, BASE = 'a' * 40, 'b' * 40
 WF = '.github/workflows/fork-checks.yml'
 CFG = {'workflow': WF, 'check': 'No database schema changes', 'outside_check': 'Outside pull request',
        'wait_seconds': 600, 'poll_seconds': 20}
-PR_ENV = {'EVENT_NAME': 'pull_request', 'HEAD_SHA': SHA, 'BASE_SHA': BASE, 'OUTSIDE_PR': 'false',
+PR_ENV = {'EVENT_NAME': 'pull_request', 'HEAD_SHA': SHA, 'BASE_SHA': BASE, 'OUTSIDE_PR': 'false', 'PR_NUMBER': '7',
           'DEFAULT_BRANCH': 'main', 'GITHUB_REPOSITORY': 'o/r', 'GITHUB_REF': 'refs/pull/7/merge',
           'GITHUB_WORKFLOW_REF': 'o/r/.github/workflows/fork-tests.yml@refs/pull/7/merge'}
 GIT_ENV = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0',
@@ -28,8 +28,11 @@ def job(name, status='completed', conclusion='success'):
             'html_url': f'https://github.invalid/job/{abs(hash(name)) % 1000}'}
 
 
-def wr(rid, jobs, path=WF, event='pull_request_target', status='completed'):
-    return {'id': rid, 'path': path, 'event': event, 'status': status, 'jobs': jobs}
+def wr(rid, jobs, path=WF, event='pull_request_target', status='completed', prs=(7,), head_repo='o/r'):
+    """A run of fork-checks.yml on SHA; by default one of pull request #7 (PR_ENV) from this repository."""
+    return {'id': rid, 'path': path, 'event': event, 'status': status, 'jobs': jobs,
+            'pull_requests': [{'number': n, 'head': {'sha': SHA}} for n in prs],
+            'head_repository': {'full_name': head_repo}}
 
 
 class Clock:
@@ -184,6 +187,10 @@ class Check(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn('skipped', out)
         self.assertEqual(clock.slept, [])
+        # A re-run replays the same event, so it skips again: the message must not offer one (#433 fix round 1).
+        self.assertNotIn('re-run it', out)
+        self.assertIn('a re-run skips it again', out)
+        self.assertIn('push again', out)
 
     def test_newest_run_decides(self):
         # An `edited` event runs fork-checks again on the same head: the newest run is the one that counts.
@@ -201,12 +208,59 @@ class Check(unittest.TestCase):
     # --- which runs count -------------------------------------------------------------------------------------------
     def test_only_pull_request_target_runs_count(self):
         # A pull request that adds push: or pull_request: to its own fork-checks.yml gets a same-named job from its
-        # own copy (#430 item 2). Only pull_request_target runs main's copy.
+        # own copy (#430 item 2). Only pull_request_target runs the base branch's copy.
         for event in ('pull_request', 'push', 'workflow_dispatch', 'schedule', None):
             fake = Fake([[wr(4, [job(CFG['check'])], event=event)]])
             code, out, _ = check(fake)
             self.assertEqual(code, 1, f'{event}: {out}')
             self.assertNotIn('actions/runs/4/jobs', ' '.join(fake.paths), event)
+
+    # --- only this pull request's runs count (#433 fix round 1, finding 1 of both lenses) --------------------------
+    def test_a_newer_passing_run_of_another_pull_request_on_the_same_head_does_not_pass(self):
+        # A second pull request at the same commit, against a base branch whose fork-checks.yml is a no-op.
+        for runs in ([wr(3, [job(CFG['check'], 'completed', 'failure')]), wr(9, [job(CFG['check'])], prs=(11,))],
+                     [wr(9, [job(CFG['check'])], prs=(11,))]):
+            fake = Fake([runs])
+            code, out, _ = check(fake)
+            self.assertEqual(code, 1, out)
+            self.assertNotIn('actions/runs/9/jobs', ' '.join(fake.paths))
+
+    def test_a_newer_skipped_run_of_an_outside_pull_request_on_the_same_head_does_not_turn_it_red(self):
+        # Anyone can open a pull request from their own fork at a public commit; its run skips the job.
+        for outsider in (wr(9, [job(CFG['check'], 'completed', 'skipped')], prs=(), head_repo='x/r'),
+                         wr(9, [job(CFG['check'], 'completed', 'skipped')], prs=(12,), head_repo='x/r'),
+                         wr(9, [job(CFG['check'], 'completed', 'skipped')], prs=(7,), head_repo='x/r')):
+            fake = Fake([[outsider, wr(3, [job(CFG['check'])])]])
+            code, out, _ = check(fake)
+            self.assertEqual(code, 0, out)
+            self.assertNotIn('actions/runs/9/jobs', ' '.join(fake.paths))
+
+    def test_a_run_with_an_empty_or_missing_pull_request_list_never_passes(self):
+        # GitHub leaves pull_requests empty on runs of a pull request from another repository: such a run cannot be
+        # tied to this pull request, so it does not count, and with no other run the job fails at the cap.
+        bare = wr(5, [job(CFG['check'])], prs=())
+        for run in (bare, {**bare, 'pull_requests': None}, {k: v for k, v in bare.items() if k != 'pull_requests'},
+                    {**bare, 'head_repository': None}, {k: v for k, v in bare.items() if k != 'head_repository'},
+                    {**bare, 'pull_requests': [{'number': '7'}]}, {**bare, 'pull_requests': [{}]}):
+            fake = Fake([[run]])
+            code, out, clock = check(fake)
+            self.assertEqual(code, 1, (run, out))
+            self.assertIn('fork-checks did not run', out)
+            self.assertNotIn('actions/runs/5/jobs', ' '.join(fake.paths))
+
+    def test_no_run_of_this_pull_request_fails_with_a_clear_message(self):
+        code, out, _ = check(Fake([[wr(9, [job(CFG['check'])], prs=(11,))]]))
+        self.assertEqual(code, 1, out)
+        self.assertIn('for pull request #7 from this repository', out)
+        self.assertIn('runs of other pull requests on the same commit do not count', out)
+        self.assertIn('close and reopen', out)
+
+    def test_one_poll_makes_at_most_the_budgeted_api_calls(self):
+        # The contract's timeout budget counts API_CALLS_PER_POLL calls after the cap (fork-contracts.test.py).
+        runs = [wr(20 - i, [job(CFG['check'])], prs=(11,)) for i in range(5)] + [wr(3, [job(CFG['check'])])]
+        fake = Fake([runs])
+        self.assertEqual(check(fake)[0], 0)
+        self.assertLessEqual(len(fake.paths), fcr.API_CALLS_PER_POLL)
 
     def test_a_pull_request_target_run_next_to_a_no_op_one_decides(self):
         fake = Fake([[wr(8, [job(CFG['check'])], event='push'),
@@ -309,11 +363,47 @@ class Check(unittest.TestCase):
             return Fake([[wr(1, [job(CFG['check'])])]])
         self.assertEqual(check(passing())[0], 0)
         for env, what in (({'HEAD_SHA': 'main'}, 'HEAD_SHA'), ({'BASE_SHA': ''}, 'BASE_SHA'),
-                          ({'BASE_SHA': 'b' * 39}, 'BASE_SHA'), ({'OUTSIDE_PR': 'maybe'}, 'OUTSIDE_PR')):
+                          ({'BASE_SHA': 'b' * 39}, 'BASE_SHA'), ({'OUTSIDE_PR': 'maybe'}, 'OUTSIDE_PR'),
+                          ({'PR_NUMBER': ''}, 'PR_NUMBER'), ({'PR_NUMBER': '7a'}, 'PR_NUMBER'),
+                          ({'PR_NUMBER': '0'}, 'PR_NUMBER'), ({'PR_NUMBER': '07'}, 'PR_NUMBER'),
+                          ({'GITHUB_REPOSITORY': ''}, 'GITHUB_REPOSITORY')):
             code, out, _ = check(passing(), **env)
             self.assertEqual((code, what in out), (1, True), (env, out))
         self.assertEqual(check(passing(), cfg={**CFG, 'wait_seconds': 0})[0], 1)
         self.assertEqual(check(passing(), cfg={k: v for k, v in CFG.items() if k != 'check'})[0], 1)
+
+    def test_a_true_or_false_wait_is_not_a_number(self):
+        # bool is an int in Python: `wait_seconds: true` would be a 1 s cap (#433 fix round 1, state finding 5).
+        for k in ('wait_seconds', 'poll_seconds'):
+            for v in (True, False):
+                self.assertEqual(fcr.config_problems({**CFG, k: v}), [f'fork_checks.{k} is not a positive whole number'])
+                code, out, _ = check(Fake([[wr(1, [job(CFG['check'])])]]), cfg={**CFG, k: v})
+                self.assertEqual(code, 1, (k, v, out))
+
+    # --- time: the cap covers reading the config (#433 fix round 1, nit of both lenses) --------------------------------
+    def test_the_cap_counts_from_before_the_config_is_read(self):
+        clock, out = Clock(), []
+
+        def slow_config(base):
+            clock.t += 590   # a slow git fetch of the base commit
+            return dict(CFG)
+        code = fcr.check(PR_ENV, Fake([[]]), slow_config, clock.now, clock.sleep, out.append)
+        self.assertEqual(code, 1, out)
+        self.assertLessEqual(clock.t - 1000.0, CFG['wait_seconds'], out)
+
+    def test_api_calls_use_the_budgeted_timeout(self):
+        seen = []
+
+        def urlopen(req, timeout=None):
+            seen.append(timeout)
+            raise fcr.urllib.error.URLError('down')
+        real, fcr.urllib.request.urlopen = fcr.urllib.request.urlopen, urlopen
+        try:
+            with self.assertRaises(fcr.Transient):
+                fcr.GitHub('t', 'o/r', 'http://127.0.0.1:9').get('x')
+        finally:
+            fcr.urllib.request.urlopen = real
+        self.assertEqual(seen, [fcr.API_TIMEOUT])
 
     def test_real_config_has_the_fields(self):
         with open(CONFIG) as f:
@@ -322,8 +412,8 @@ class Check(unittest.TestCase):
 
 
 class BaseConfig(unittest.TestCase):
-    """The config comes from the pull request's base commit (#430 item 1): fork-checks runs main's copy, so a pull
-    request that renames its job or file must still be judged by the names main's copy produces."""
+    """The config comes from the pull request's base commit (#430 item 1): fork-checks runs the base branch's copy,
+    so a pull request that renames its job or file must still be judged by the names that copy produces."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='fork-checks-ran-')
@@ -381,6 +471,29 @@ class BaseConfig(unittest.TestCase):
         self.assertNotEqual(subprocess.run(['git', 'cat-file', '-e', base + '^{commit}'], cwd=work,
                                            capture_output=True).returncode, 0)
         self.assertEqual(self.load(work, base)['check'], CFG['check'])
+
+    def test_git_calls_stay_within_the_budget(self):
+        # The contract's timeout budget counts GIT_CALLS calls of GIT_TIMEOUT s each (fork-contracts.test.py).
+        origin = os.path.join(self.tmp, 'origin')
+        base, head = make_repo(origin, [{fcr.CONFIG_PATH: policies()}, {fcr.CONFIG_PATH: policies(check='Schema')}])
+        git(origin, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
+        git(origin, 'config', 'uploadpack.allowFilter', 'true')
+        work = os.path.join(self.tmp, 'work')
+        os.makedirs(work)
+        git(work, 'init', '-q')
+        git(work, 'remote', 'add', 'origin', 'file://' + origin)
+        git(work, 'fetch', '-q', '--depth=1', 'origin', head)
+        timeouts, real = [], fcr.subprocess.run
+
+        def run(*a, **kw):
+            timeouts.append(kw.get('timeout'))
+            return real(*a, **kw)
+        fcr.subprocess.run = run
+        try:
+            self.assertEqual(self.load(work, base)['check'], CFG['check'])
+        finally:
+            fcr.subprocess.run = real
+        self.assertEqual(timeouts, [fcr.GIT_TIMEOUT] * fcr.GIT_CALLS)
 
     def test_base_commit_that_cannot_be_fetched_fails(self):
         repo = os.path.join(self.tmp, 'r')
