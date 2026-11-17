@@ -5,6 +5,21 @@ always-on host over ssh, and the dispatcher there starts one-job runners on this
 the fleet runbook ([.github/fork-fleet.md](../../.github/fork-fleet.md), "The desktop's side") lists by hand,
 done by one installer, with a PASS/FAIL check and an uninstall.
 
+## From nothing to a working pool
+
+1. The project: a desk pool entry in its fleet config ([fork-fleet.md](../../.github/fork-fleet.md), "The desk
+   link", has a made-up one), released to its protected release branch.
+2. The always-on host, once: host step 3 of the runbook ("The fleet files") again, from a main commit of the
+   project's repository that has the pool entry (another project points that step's `base` at its own repository;
+   it installs the desk link, the seed tool and the key tool); then the desk-link user and its socket
+   folder, and one dispatcher unit for the pool ("The desk link").
+3. The desktop: the machine file below, then the install (on Windows: [the starter](#windows-wsl2)).
+4. The always-on host: add the key the install printed, with `fork-fleet-desk-key.py add POOL`.
+5. The desktop: `desk-install check` says ALL PASS. The dispatcher has no "link is up" line: the pool works
+   when its first job starts a runner on this machine (the dispatcher logs `RUNNER: started for JOB, attempt N`).
+   A pool that was left alone for more than one pass logs `fork-fleet: pool POOL answers again, after N passes left
+   alone` when it comes back; one missed pass then an answer logs nothing.
+
 ## The machine file
 
 The facts of this machine go in the `desk` section of `/etc/fork-kit/machine.json` (root-owned; see

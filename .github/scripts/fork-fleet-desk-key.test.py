@@ -54,7 +54,10 @@ class DeskKey(unittest.TestCase):
         self.home = os.path.join(self.tmp, 'home')
         os.mkdir(self.home)
         cfg = dk.ff.load()
-        cfg['pools'] = cfg['pools'] + [desk('desk'), desk('desk2')]
+        # only this test's desk pools: the release's own desk pool (pc) is left out by name, never by the function
+        # under test; vm stays, so a non-desk pool is always there to be refused
+        cfg['pools'] = [p for p in cfg['pools'] if p['name'] != 'pc'] + [desk('desk'), desk('desk2')]
+        assert 'vm' in [p['name'] for p in cfg['pools']]
         self.config = os.path.join(self.tmp, 'fleet.json')
         with open(self.config, 'w') as f:
             json.dump(cfg, f)
@@ -87,6 +90,9 @@ class DeskKey(unittest.TestCase):
     def snap(self):
         st = os.lstat(self.keys)
         return self.content(), st.st_ino, st.st_mtime_ns, st.st_mode
+
+    def test_the_releases_pc_pool_is_a_desk_pool(self):
+        self.assertEqual(dk.desk_pools(dk.ff.load()), ['pc'])   # a typo in its launch would only show on the host
 
     def test_add_to_empty_home_then_again_then_remove(self):
         self.assertEqual(self.run_tool('add', 'desk', stdin=PUB1)[0], 0)
@@ -151,7 +157,7 @@ class DeskKey(unittest.TestCase):
         self.assertIn('private key', self.run_tool('add', 'desk', stdin=PRIVATE)[1])
 
     def test_refuses_a_pool_it_does_not_know(self):
-        for pool in ('nope', 'vm', 'pc', '../desk', 'desk "x"'):
+        for pool in ('nope', 'vm', '../desk', 'desk "x"'):
             with self.subTest(pool):
                 code, out = self.run_tool('add', pool, stdin=PUB1)
                 self.assertEqual(code, REFUSED, out)
