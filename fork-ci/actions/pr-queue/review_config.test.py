@@ -10,6 +10,8 @@ import config  # noqa: E402
 import review_config as rc  # noqa: E402
 
 RECOMMENDED = os.path.join(HERE, 'review.recommended.json')
+with open(os.path.join(HERE, 'review.vectors.json'), encoding='utf-8') as _f:
+    VECTORS_CONFIGS = json.load(_f)['configs']
 README = os.path.join(HERE, 'README.md')
 BASE = {
     'required_checks': ['build', 'test'], 'merge_method': 'squash', 'bot_logins': ['review-bot'],
@@ -380,6 +382,88 @@ class Globs(unittest.TestCase):
         with open(README, encoding='utf-8') as f:
             text = f.read()
         self.assertTrue(re.search(r'no braces, character classes, `!`\s+negation or backslashes', text))
+
+
+class RuleOrder(unittest.TestCase):
+    """#348 item 3: a changed path belongs to the first rule that matches it, so a lighter rule above a heavier one
+    takes the paths both match. `**/*.md` (light) above `src/**` (critical) judged `src/notes.md` light, with no lens.
+    Refused in enforce, a warning in shadow (the rules decide nothing there yet). The catch-all rule is the default, so
+    a lighter rule above it is the normal case (docs/** light above a normal **), never a problem."""
+
+    @staticmethod
+    def block(mode, *rules):
+        block = recommended()
+        block['mode'] = mode
+        block['rules'] = [{'name': 'vault', 'weight': 'critical', 'paths': ['vault/**'],
+                           'lenses': ['data-1', 'data-2']}]
+        block['rules'] += [{'name': n, 'weight': w, 'paths': list(p), 'lenses': ['data-1', 'data-2'] if w == 'critical'
+                           else ['code'] if w == 'normal' else []} for n, w, p in rules] + [
+            {'name': 'rest', 'weight': 'normal', 'paths': ['**'], 'lenses': ['code']}]
+        return block
+
+    def test_a_lighter_rule_above_a_heavier_one_it_can_shadow_is_refused_in_enforce(self):
+        for light, heavy in ((('docs', 'light', ['**/*.md']), ('src', 'critical', ['src/**'])),
+                             (('docs', 'light', ['docs/**', '**/*.json']), ('cfg', 'critical', ['config/*.json'])),
+                             (('api', 'normal', ['src/api/*.py']), ('auth', 'critical', ['src/*/a?.py'])),
+                             (('notes', 'light', ['src/**/notes/**']), ('code', 'normal', ['src/core/**']))):
+            with self.subTest(light=light, heavy=heavy):
+                why = refusal(self.block('enforce', light, heavy))
+                self.assertIn(f'rule {light[0]!r} ({light[1]}) comes before the heavier rule {heavy[0]!r} '
+                              f'({heavy[1]})', why)
+                self.assertIn('put the heavier rule first', why)
+                fixed = rc.parse_review(self.block('enforce', heavy, light))   # heavier first: the same paths, safe
+                self.assertEqual(fixed.warnings, ())
+
+    def test_in_shadow_it_is_a_warning_and_the_block_parses(self):
+        r = rc.parse_review(self.block('shadow', ('docs', 'light', ['**/*.md']), ('src', 'critical', ['src/**'])))
+        self.assertEqual(len(r.warnings), 1, r.warnings)
+        self.assertIn("rule 'docs' (light) comes before the heavier rule 'src' (critical)", r.warnings[0])
+        self.assertIn("'**/*.md' and 'src/**' both match a path such as", r.warnings[0])
+
+    def test_rules_whose_globs_never_meet_may_stand_in_any_order(self):
+        for light, heavy in ((('docs', 'light', ['docs/**']), ('src', 'critical', ['src/**'])),
+                             (('md', 'light', ['**/*.md']), ('py', 'critical', ['src/**/*.py'])),
+                             (('one', 'light', ['a/?']), ('two', 'critical', ['a/??'])),
+                             (('x', 'light', ['a/*/b']), ('y', 'critical', ['a/b'])),
+                             (('img', 'light', ['**/*.png']), ('sql', 'critical', ['db/*.sql']))):
+            with self.subTest(light=light, heavy=heavy):
+                self.assertEqual(rc.parse_review(self.block('enforce', light, heavy)).warnings, ())
+
+    def test_lighter_rules_above_the_catch_all_are_the_normal_case(self):
+        for block in (recommended(), *(json.loads(json.dumps(c)) for c in VECTORS_CONFIGS.values())):
+            for mode in ('shadow', 'enforce'):
+                with self.subTest(mode=mode, rules=[r['name'] for r in block['rules']]):
+                    self.assertEqual(rc.parse_review({**block, 'mode': mode}).warnings, ())
+
+    def test_equal_weights_and_a_heavier_rule_above_are_fine(self):
+        self.assertEqual(rc.parse_review(self.block('enforce', ('a', 'critical', ['src/**']),
+                                                    ('b', 'critical', ['**/*.md']), ('c', 'light', ['**/*.md'])))
+                         .warnings, ())
+
+    def test_every_problem_is_named_at_once(self):
+        why = refusal(self.block('enforce', ('docs', 'light', ['**/*.md']), ('api', 'normal', ['src/**']),
+                                 ('src', 'critical', ['src/**'])))
+        self.assertIn("rule 'docs' (light) comes before the heavier rule 'api' (normal)", why)
+        self.assertIn("rule 'docs' (light) comes before the heavier rule 'src' (critical)", why)
+        self.assertIn("rule 'api' (normal) comes before the heavier rule 'src' (critical)", why)
+
+    def test_overlap_of_two_globs(self):
+        for a, b, meet in (('**/*.md', 'src/**', True), ('src/**', '**/*.md', True), ('**', 'x', True),
+                           ('a/*', 'a/b/c', False), ('a/**', 'a', True), ('*.md', '*.py', False),
+                           ('*a*', '*b*', True), ('a*', '*b', True), ('a?', '?b', True), ('a?', 'abc', False),
+                           ('?', '??', False), ('*', '??', True), ('a/**/b', '**/c/**', True),
+                           ('a/**/b', 'c/**', False), ('x*y*z', '*q*', True), ('docs/*.md', 'docs/x/**', False)):
+            with self.subTest(a=a, b=b):
+                self.assertEqual(rc.globs_meet(a, b), meet)
+                self.assertEqual(rc.globs_meet(b, a), meet)
+
+    def test_overlap_is_quick_on_long_globs(self):
+        import time
+        a, b = '/'.join(['**', '*a*'] * 40), '/'.join(['*b*', '**'] * 40)
+        start = time.monotonic()
+        self.assertTrue(rc.globs_meet(a, b))
+        self.assertFalse(rc.globs_meet('*' * 200 + 'x', '*' * 200 + 'y'))
+        self.assertLess(time.monotonic() - start, 2)
 
 
 if __name__ == '__main__':
