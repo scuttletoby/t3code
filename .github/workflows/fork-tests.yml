@@ -429,6 +429,11 @@ jobs:
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
 
+      # Here, not in `workflows`: it greps app code, so it needs the whole tree (#254). Lint runs on every
+      # pull request, fork-only ones too. Listed in .github/fork-ci-tests.txt as run by this file.
+      - name: Check that app code reads no fork-owned path
+        run: python3 -I -B .github/scripts/fork-owned-reads.test.py
+
       - name: Cache Electron download
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:

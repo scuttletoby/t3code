@@ -2489,7 +2489,9 @@ class StackedGitHub:
     GitHub can merge at once merges it directly, and with --delete-branch gh then deletes the head with the token: GitHub
     CLOSES every open PR whose base it was (events base_ref_deleted, closed). The repository's own "Automatically delete
     head branches" setting (`setting`) first retargets those PRs to the merged PR's base, then deletes. A PR that cannot
-    merge yet is only armed; GitHub merges it later (merge_armed) and only the setting deletes."""
+    merge yet is only armed; GitHub merges it later (merge_armed) and only the setting deletes. gh's merge of a PR that
+    is already merged (a run that still saw it open) merges nothing, but with --delete-branch it still deletes the head
+    with the token."""
     def __init__(self, prs, setting=True):
         self.prs = {n: dict(head=h, base=b, state='OPEN', armed=False) for n, (h, b) in prs.items()}
         self.branches = {p['head'] for p in self.prs.values()} | {'main'}
@@ -2521,7 +2523,10 @@ class StackedGitHub:
         self.calls.append(a)
         n = int(a[2])
         if a[:2] == ('pr', 'merge') and '--auto' in a:
-            if self.prs[n]['base'] == 'main':   # up to date and green: gh merges now instead of arming
+            if self.prs[n]['state'] == 'MERGED':   # "already merged": no merge, but gh's branch delete still runs
+                if '--delete-branch' in a and self.prs[n]['head'] in self.branches:
+                    self.delete(self.prs[n]['head'], by_setting=False)
+            elif self.prs[n]['base'] == 'main':   # up to date and green: gh merges now instead of arming
                 self.merge(n, token_delete='--delete-branch' in a)
             else:
                 self.prs[n]['armed'] = True
@@ -2569,14 +2574,19 @@ class StackedPrsAreRetargetedNeverClosed(unittest.TestCase):
         self.assertIn('work/a', gh.branches)
         self.assertEqual((gh.prs[2]['state'], gh.prs[2]['base']), ('OPEN', 'work/a'))
 
-    def test_a_second_arm_after_the_branch_is_gone_changes_nothing(self):   # runs again: state already as wanted
-        gh = StackedGitHub({1: ('work/a', 'main'), 2: ('work/b', 'work/a')})
+    def test_arming_again_after_github_merged_it_deletes_nothing_and_closes_nothing(self):   # runs again (#253)
+        # #1 is armed only; GitHub merges it later and, with the setting off, its branch stays. A run that still saw #1
+        # open arms it again: gh finds it merged, and with --delete-branch it would delete the branch with the token
+        # and close #2. The first arm cannot delete (not mergeable at once), so only the second arm is tested here.
+        gh = StackedGitHub({1: ('work/a', 'release'), 2: ('work/b', 'work/a')}, setting=False)
+        gh.branches.add('release')
         q = self.queue(gh)
         q.arm(1, H1)
-        before = {n: dict(p) for n, p in gh.prs.items()}
-        gh.prs[1]['state'] = 'OPEN'   # a stale view: the queue arms PR 1 again
+        gh.merge_armed()
+        self.assertEqual((gh.prs[1]['state'], gh.prs[2]['state']), ('MERGED', 'OPEN'))
         q.arm(1, H1)
-        self.assertEqual(gh.prs[2], before[2])
+        self.assertIn('work/a', gh.branches, 'the second arm deleted the merged branch with the token')
+        self.assertEqual((gh.prs[2]['state'], gh.prs[2]['base']), ('OPEN', 'work/a'), 'the stacked PR was closed')
 
 
 class GitCalls(unittest.TestCase):
@@ -2850,6 +2860,13 @@ print('[]' if a[:2] == ['pr', 'list'] else '{}')
         self.assertEqual([(c['args'][:2], c['tokens']) for c in self.logged()],
                          [(['pr', 'list'], {'GH_TOKEN': 'run-token'}), (['pr', 'update-branch'], {'GH_TOKEN': 'pat-token'})])
 
+    def test_the_delete_setting_is_read_with_the_run_token_only(self):   # issue #253
+        on, out = run_quiet(self.queue().warn_if_branches_stay)
+        self.assertIsNone(on, 'the fake gh answers {}')
+        self.assertIn('::warning::pr-queue: could not read', out)
+        self.assertEqual([(c['args'][:2], c['tokens']) for c in self.logged()],
+                         [(['api', 'graphql'], {'GH_TOKEN': 'run-token'})])
+
     def test_with_no_token_gh_is_not_started(self):   # never the machine's own gh login
         q = self.queue(None, None)
         self.assertEqual(q.gh('pr', 'list', '--repo', REPO).returncode, 1)
@@ -2873,6 +2890,64 @@ print('[]' if a[:2] == ['pr', 'list'] else '{}')
         self.assertIn('Resource not accessible by personal access token', out)
 
 
+def setting_answer(on):
+    """GitHub's answer to DELETE_ON_MERGE_QUERY."""
+    return ok(json.dumps({'data': {'repository': {'deleteBranchOnMerge': on}}}))
+
+
+def gh_answering(answer, calls=None):
+    """A Queue.run_gh stand-in: (token, args, which) -> `answer` (raised when it is an exception)."""
+    def run_gh(token, a, which):
+        if calls is not None:
+            calls.append((token, a, which))
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+    return run_gh
+
+
+class DeleteOnMergeSetting(unittest.TestCase):
+    """Issue #253: the queue never deletes a branch (arm), so it relies on the repository setting "Automatically delete
+    head branches". Each run reads it once with the run's read token and warns, never fails, when it is off or cannot
+    be read."""
+    def read(self, answer):
+        d = tempfile.mkdtemp(prefix='pr-queue-setting-')
+        self.addCleanup(shutil.rmtree, d, True)
+        q = make_queue(d)
+        q.read_token, q.write_token, calls = 'run-token', 'pat-token', []
+        q.run_gh = gh_answering(answer, calls)
+        on, out = run_quiet(q.warn_if_branches_stay)
+        return q, on, out, calls
+
+    def test_on_says_nothing(self):
+        _, on, out, calls = self.read(setting_answer(True))
+        self.assertEqual((on, out), (True, ''))
+        (token, a, which), = calls
+        self.assertEqual((token, which, a[:2]), ('run-token', 'read', ('api', 'graphql')), 'the read token, once')
+        self.assertIn(f'query={Q.DELETE_ON_MERGE_QUERY}', a)
+        self.assertEqual([x for x in a if x.startswith(('owner=', 'name='))], ['owner=owner', 'name=proj'])
+
+    def test_off_is_a_clear_warning(self):
+        _, on, out, _ = self.read(setting_answer(False))
+        self.assertEqual(on, False)
+        self.assertTrue(out.startswith('::warning::pr-queue: the repository setting "Automatically delete head '
+                                       'branches" (delete_branch_on_merge) is off, so merged branches stay'), out)
+        self.assertIn('Turn it on', out)
+        self.assertNotIn('::error::', out)
+
+    def test_a_read_that_fails_or_answers_oddly_is_a_warning_too(self):
+        for answer in (failed('GraphQL: Resource not accessible by integration'), failed(''), ok(''), ok('not json'),
+                       ok('{}'), ok('{"errors": [{"message": "x"}]}'), setting_answer(None), setting_answer('false'),
+                       ok('[]'), OSError('gh not found')):
+            with self.subTest(answer=answer):
+                q, on, out, _ = self.read(answer)
+                self.assertIsNone(on)
+                self.assertTrue(out.startswith('::warning::pr-queue: could not read whether the repository setting '
+                                               '"Automatically delete head branches" is on'), out)
+                self.assertNotIn('::error::', out)
+                self.assertEqual(q.said, set(), "a later refused read still prints gh()'s own error")
+
+
 class Cli(unittest.TestCase):
     """cli() refuses with exit 2 and builds no Queue when it cannot run safely; it names every problem at once."""
     def setUp(self):
@@ -2881,7 +2956,7 @@ class Cli(unittest.TestCase):
         self.config = os.path.join(self.d, 'queue.json')
         with open(self.config, 'w') as f:
             json.dump(CFG_RAW, f)
-        self.built, self.tokens = [], []
+        self.built, self.tokens, self.steps = [], [], []
 
     def cli(self, *extra, repo=REPO, state=None, cache=None, env=None, git=None):
         test = self
@@ -2890,7 +2965,11 @@ class Cli(unittest.TestCase):
             def __init__(self, *a, **kw):
                 self.a, self.kw = a, kw
 
+            def warn_if_branches_stay(self):
+                test.steps.append('setting')
+
             def main(self, dry):
+                test.steps.append('main')
                 test.built.append((self.a, dry))
                 test.tokens.append(self.kw)
                 return 0
@@ -2922,6 +3001,28 @@ class Cli(unittest.TestCase):
         self.cli('--dry-run')
         self.assertEqual(self.tokens, [{'read_token': 'run-token', 'write_token': 'pat-token'},
                                        {'read_token': 'run-token', 'write_token': None}])
+
+    def test_every_run_reads_the_delete_setting_once_before_it_starts(self):   # issue #253; dry runs too
+        self.cli()
+        self.cli('--dry-run')
+        self.assertEqual(self.steps, ['setting', 'main'] * 2)
+        self.built.clear()
+        self.refused('is not owner/name', repo='x')
+        self.assertEqual(self.steps, ['setting', 'main'] * 2, 'a refused run reads nothing')
+
+    def test_the_setting_off_or_unreadable_never_changes_the_runs_result(self):   # the real Queue, its run stubbed
+        for answer in (setting_answer(False), failed('HTTP 502'), OSError('no gh')):
+            for code in (0, 1, Q.SILENT):
+                with self.subTest(answer=answer, code=code), \
+                        unittest.mock.patch.object(Q.Queue, 'run_gh', staticmethod(gh_answering(answer))), \
+                        unittest.mock.patch.object(Q.Queue, 'main', lambda q, dry, code=code: code), \
+                        unittest.mock.patch.object(Q, 'git_problem', lambda: None):
+                    got, out = run_quiet(Q.cli, ['--repo', REPO, '--config', self.config, '--state-file',
+                                                 os.path.join(self.d, 'run', 'plan.json'), '--cache',
+                                                 os.path.join(self.d, 'cache.git')], dict(TOKENS))
+                    self.assertEqual(got, code, out)
+                    self.assertIn('::warning::pr-queue:', out)
+                    self.assertNotIn('::error::', out)
 
     def test_a_missing_or_reused_token_is_refused(self):
         self.refused(f'{Q.READ_TOKEN} is empty', env={Q.READ_TOKEN: ''})
