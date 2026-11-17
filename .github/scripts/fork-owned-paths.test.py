@@ -9,10 +9,6 @@ how .github/workflows/fork-tests.yml uses them.
   workflow  fork-tests.yml: the step runs only on a pull request and not in a release run, every gate of `changes`
             takes its answer first, every app job's if: (evaluated as GitHub does) skips on a fork-only pull request
             and runs on any other run, and no file an app job names is fork-owned.
-  reads     no app code (apps/, packages/, scripts/, the root's files), composite action under .github/actions, local
-            action an app job uses or `!` file names a fork-owned path or imports a fork-owned sibling, outside
-            whole-line comments and Python docstrings (NOT_READS: the few names that are no read, each with its
-            reason); a planted read is found.
   result    fork_ci_result's own script, run as Actions runs it: a fork-only run passes with the app jobs skipped;
             a skip the gates do not explain still fails.
 
@@ -21,7 +17,6 @@ how .github/workflows/fork-tests.yml uses them.
 Needs PyYAML, node, git, bash and jq. Each check prints ok/FAIL; any FAIL exits 1.
 """
 
-import ast
 import json
 import os
 import pathlib
@@ -49,8 +44,8 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
-def node(code, *args, stdin=None):
-    r = subprocess.run(["node", "-e", code, str(SCRIPT), *args], capture_output=True, text=True, input=stdin)
+def node(code, *args):
+    r = subprocess.run(["node", "-e", code, str(SCRIPT), *args], capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError(r.stderr)
     return json.loads(r.stdout)
@@ -60,8 +55,8 @@ def owned(paths, list_text=None):
     """{path: fork-owned?} by the script's own rules, for the real list or `list_text`."""
     return node("const m = require(process.argv[1]); const fs = require('node:fs');"
                 "const rules = m.parseList(process.argv[2] === '-' ? fs.readFileSync(process.argv[3], 'utf8') : process.argv[2]);"
-                "console.log(JSON.stringify(Object.fromEntries(JSON.parse(fs.readFileSync(0, 'utf8')).map(p => [p, m.owned(p, rules)]))))",
-                list_text if list_text is not None else "-", str(LIST), stdin=json.dumps(paths))
+                "console.log(JSON.stringify(Object.fromEntries(JSON.parse(process.argv[4]).map(p => [p, m.owned(p, rules)]))))",
+                list_text if list_text is not None else "-", str(LIST), json.dumps(paths))
 
 
 UPSTREAM_GATES = node("const { decide } = require(require('node:path').join(require('node:path').dirname(process.argv[1]), 'ci-changes.cjs'));"
@@ -300,108 +295,6 @@ named = {n.lstrip("/") for n in named if not n.endswith(".md")}
 bad = sorted(p for p, v in owned(sorted(named)).items() if v)
 check("workflow: no file an app job or `changes` names is fork-owned", not bad and len(named) > 5,
       f"owned: {', '.join(bad)}; named: {', '.join(sorted(named))}")
-
-# --- reads ---------------------------------------------------------------------------------------
-# The check above reads only the names written in fork-tests.yml (#254). A fork-owned file could also be read by app
-# code (an app test or a root script opening `.github/fork-*.json`), by a composite action an app job uses, or by a
-# `!` file (read by app jobs) that starts to require or import a fork-owned sibling. A fork-only pull request changing
-# that file would skip the only jobs that read it. So: no such file names a fork-owned path outside a whole-line
-# comment. The search is derived from the list (its top-level names), so a new owned folder is searched too.
-LIST_LINES = [l.strip() for l in LIST.read_text().splitlines() if l.strip() and not l.startswith("#")]
-ROOTS = sorted({l.lstrip("!").split("/")[0] for l in LIST_LINES})
-PATH_RE = re.compile(r"(?<![\w.-])(" + "|".join(map(re.escape, ROOTS)) + r")(/[\w.*/-]*)?")
-MAYBE = re.compile("|".join(map(re.escape, ROOTS)) + "|fork[-_]")   # a quick test before the slower search
-# A sibling by its bare name: a quoted "fork-x.cjs" / "./fork-x.cjs" (require, import, open, path.join) or a Python
-# `import fork_x` / `from fork_x import`. Resolved against the file's folder and its parent; only a tracked file counts.
-SIBLING_RE = re.compile(r"""['"`](?:\.{1,2}/)*(fork[-_][\w.-]+)['"`]|^[ \t]*(?:from|import)[ \t]+\.?(fork_\w+)""", re.M)
-HASH_COMMENTS = {"", ".py", ".sh", ".bash", ".yml", ".yaml", ".toml", ".txt", ".cfg", ".ini"}
-SLASH_COMMENTS = {".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".cjs", ".mjs", ".jsonc", ".json5", ".rs", ".swift",
-                  ".kt", ".kts", ".java", ".go", ".c", ".h", ".m", ".mm", ".css", ".scss"}
-# Names that are not reads, each with its reason. A stale entry fails too, so this list cannot grow quietly.
-NOT_READS = {
-    ("vite.config.ts", ".gitleaks.toml"): "vp fmt's ignore list: Lint, which runs on every pull request, skips the file",
-}
-
-
-def code_only(path, text):
-    """`text` without its whole-line comments and, in Python, its docstrings (a trailing comment stays: a match there
-    fails closed, as does a Python file that does not parse)."""
-    ext = os.path.splitext(path)[1].lower()
-    lines = text.split("\n")
-    if ext == ".py":
-        try:
-            for n in ast.walk(ast.parse(text)):
-                if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
-                    lines[n.lineno - 1:n.end_lineno] = [""] * (n.end_lineno - n.lineno + 1)
-        except (SyntaxError, ValueError):
-            pass
-    marks = ("#",) if ext in HASH_COMMENTS else ("//", "/*", "*") if ext in SLASH_COMMENTS else ()
-    return "\n".join(l for l in lines if not (marks and l.lstrip().startswith(marks)))
-
-
-def reads(files, tracked_files):
-    """{(file, fork-owned path it names)} for `files` ({path: text}), by the list's own rules."""
-    found = set()
-    for path, text in files.items():
-        if path.endswith(".md") or not MAYBE.search(text):
-            continue
-        text, here = code_only(path, text), os.path.dirname(path)
-        for m in PATH_RE.finditer(text):
-            name = (m.group(1) + (m.group(2) or "")).rstrip(".")
-            if not name.endswith(".md"):   # a runbook a message points to is not read
-                found.add((path, name.rstrip("/") + ("/x" if name.endswith("/") else "")))
-        for m in SIBLING_RE.finditer(text):
-            name = m.group(1) or m.group(2) + ".py"
-            found |= {(path, p) for d in (here, os.path.dirname(here)) if (p := os.path.normpath(os.path.join(d, name)))
-                      in tracked_files}
-    names = owned(sorted({name for _, name in found})) if found else {}
-    return {(path, name) for path, name in found if names[name]}
-
-
-def app_job_uses():
-    """Local actions and workflows (`uses: ./...`) of the app jobs, as tracked paths under them."""
-    used = {u.removeprefix("./").rstrip("/") for j in app_jobs for u in re.findall(r"uses:\s*(\./[\w./-]+)",
-                                                                                   yaml.safe_dump(jobs[j], width=10_000))}
-    return {f for f in tracked if f in used or any(f.startswith(u + "/") for u in used)}
-
-
-tracked_set = set(tracked) - {""}
-excluded = {l[1:] for l in LIST_LINES if l.startswith("!")}
-uses = app_job_uses()
-to_scan = [f for f in sorted(tracked_set) if f.startswith(("apps/", "packages/", "scripts/", ".github/actions/"))
-           or "/" not in f or f in excluded or f in uses]
-fork_own = owned(to_scan)   # the fork's own files (.gitleaks.toml at the root) are read by fork jobs only
-scanned = {}
-for f in to_scan:
-    if fork_own[f]:
-        continue
-    try:
-        scanned[f] = (root / f).read_text(encoding="utf-8")
-    except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
-        pass   # binary, or a submodule or symlink
-found = reads(scanned, tracked_set)
-bad = sorted(found - set(NOT_READS))
-stale = sorted(set(NOT_READS) - found)
-check("reads: no app code, root build config, composite action or `!` file names a fork-owned path",
-      not bad and not stale and len(scanned) > 1000 and set(excluded) <= set(scanned),
-      f"reads: {bad}; stale NOT_READS: {stale}; scanned {len(scanned)} files")
-PLANTED = {
-    "apps/web/src/a.test.ts": 'const t = readFileSync(".github/fork-ci-tests.txt", "utf8");\n',
-    "packages/x/b.ts": 'import { load } from "../../fork-ci/actions/pr-queue/config.py";\n',
-    "scripts/c.ts": 'const kit = path.join(root, "fork-kit/heavy/heavy");\n',
-    ".github/scripts/fork-fleet.py": '"""Reads .github/fork-ci-tests.txt? No: a docstring."""\nimport json\n'
-                                     "from fork_workflow_expr import gh_eval\n",
-    ".github/scripts/fork-test-shards.cjs": 'const x = require("./fork-seam-check.cjs");\n',
-}
-got = reads({**PLANTED, "apps/web/src/d.ts": "// reads .github/fork-ci-tests.txt and fork-ci/x\n"
-             "  * fork-kit/heavy, see .github/fork-fleet.md\nconst p = '.github/pull_request_template.md';\n"
-             "const q = '.github/scripts/ci-changes.cjs'; const r = './fork-not-a-file.cjs';\n"},
-            tracked_set)
-check("reads: a planted read is found in app code, a root script and a `!` file; comments and other paths are not",
-      got == {("apps/web/src/a.test.ts", ".github/fork-ci-tests.txt"),
-              ("packages/x/b.ts", "fork-ci/actions/pr-queue/config.py"), ("scripts/c.ts", "fork-kit/heavy/heavy"),
-              (".github/scripts/fork-fleet.py", ".github/scripts/fork_workflow_expr.py"),
-              (".github/scripts/fork-test-shards.cjs", ".github/scripts/fork-seam-check.cjs")}, str(sorted(got)))
 
 # --- result --------------------------------------------------------------------------------------
 result_job = jobs["fork_ci_result"]

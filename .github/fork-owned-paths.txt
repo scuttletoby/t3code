@@ -10,7 +10,8 @@
 # whatever this list says: this list, its script, every workflow and composite action, upstream's change detector,
 # package and lock files and shared build config (fork-owned-paths.cjs, NEVER). A file an app job of fork-tests.yml
 # names, or app code, a composite action or a `!` file reads, must be excluded here with `!` (fork-owned-paths.test.py
-# checks the workflow and greps those files). Pushes to main and release runs always run every job.
+# checks the workflow, fork-owned-reads.test.py greps those files). Pushes to main and release runs always run every
+# job.
 
 # The fork's composite actions and host kits: only the `workflows` and `kit_tests` jobs read them.
 fork-ci/
