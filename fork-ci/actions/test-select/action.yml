@@ -1,0 +1,39 @@
+name: test-select
+description: >-
+  Which test files can this pull request's change reach? Works out every test file's inputs from the
+  checkout each run (imports, paths it names, scripts it runs) and lists the tests a changed path reaches.
+  Anything unclear, and every run that is not a pull request, means every test. Usage: README.md next to this file.
+inputs:
+  config:
+    description: >-
+      The JSON config, a plain path in the repository (no ./): the test files, the paths that always run every
+      test, tests that always run, declared test inputs, extra import folders. A change to it runs every test.
+    required: false
+    default: .github/test-select.json
+outputs:
+  all:
+    description: "'false' only when a pull request's tests were picked; test != 'false' (empty means every test)."
+    value: ${{ steps.select.outputs.all }}
+  count:
+    description: How many test files the list holds.
+    value: ${{ steps.select.outputs.count }}
+  total:
+    description: How many test files the config names.
+    value: ${{ steps.select.outputs.total }}
+  list:
+    description: A file with the test files to run, one per line, in config order (every test when all is not 'false').
+    value: ${{ steps.select.outputs.list }}
+  reason:
+    description: One line saying why.
+    value: ${{ steps.select.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    # Only code from this action's folder (the caller's pinned SHA) runs; the checkout is parsed, never run.
+    # The script also reads the runner's GITHUB_SHA and GITHUB_EVENT_PATH (HEAD must be GitHub's merge commit).
+    - id: select
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        EVENT: ${{ github.event_name }}
+      run: python3 -I "$GITHUB_ACTION_PATH/test_select.py" --config "$CONFIG" --event "$EVENT"
