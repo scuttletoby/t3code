@@ -37,7 +37,7 @@
     "t3ReleaseBaseUrl": "https://github.com/example/t3code/releases/download",
     "port": 3773,
     "maxRuntimeMode": "full-access",
-    "lockedSettings": { "agentSlots.enabled": true, "agentSlots.maxPerMachine": 2 },
+    "lockedSettings": {},
     "memoryMax": "8G",
     "cpuQuota": "400%",
     "nameservers": ["1.1.1.1", "9.9.9.9"],

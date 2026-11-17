@@ -40,6 +40,8 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                            'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; cmd=$2\n'
                            'case "$cmd" in */*) [ -x "$R$cmd" ] || [ -x "$cmd" ];; *) command -v "$cmd" >/dev/null;; esac'
                            ' || { echo "Failed to find executable $cmd: No such file or directory" >&2; exit 1; }\n',
+    # journalctl: prints what the test put in /log/journal (none: an empty journal)
+    'usr/bin/journalctl': 'R="${0%/usr/bin/journalctl}"; echo "$*" >>"$R/log/journalctl"; cat "$R/log/journal" 2>/dev/null; :\n',
     'usr/bin/systemctl': 'R="${0%/usr/bin/systemctl}"; echo "$*" >>"$R/log/systemctl"; S="$R/log/units"; mkdir -p "$S"\n'
                          '[ -e "$R/log/systemctl-fail" ] && { echo "systemctl: failed (test)" >&2; exit 1; }\n'
                          # what a started unit runs with: its ExecStart and T3's policy

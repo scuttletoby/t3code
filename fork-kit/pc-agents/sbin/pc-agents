@@ -250,6 +250,7 @@ def setup(source, sha):
         k.run(['/usr/bin/systemctl', 'disable', '--now'] + units)
         return say('a wall does not hold, so T3 is not enabled. After a first run: wsl --terminate <this distro> '
                    'from Windows, then run setup again') or 3
+    since = int(time.time()) - 1   # T3's journal from here on is this run's, not an earlier crash's
     k.run(['/usr/bin/systemctl', 'reset-failed', k.UNIT])   # a rerun within the start limit's 10 minutes still starts
     ran = k.run(['/usr/bin/systemctl', 'is-active', k.UNIT]).returncode == 0
     r = k.run(['/usr/bin/systemctl', 'enable', '--now'] + units)
@@ -261,12 +262,27 @@ def setup(source, sha):
     why = (r.stderr or r.stdout).strip()[-300:] if r.returncode else \
         stays_up() if k.lstat(k.PENDING) or not ran else None
     if why:
-        return say(f'T3 did not start or stay up ({why}): see journalctl -u {k.UNIT}; run setup again once fixed') or 1
+        said = t3_said(since)
+        return say(f'T3 did not start or stay up ({why}){"; its log: " + said if said else ""}: see journalctl -u '
+                   f'{k.UNIT}; run setup again once fixed') or 1
     if k.lstat(k.PENDING):
         os.unlink(k.ROOT + k.PENDING)
     say(f'done: T3 serves on port {c["port"]}. Next: tailscale up --advertise-tags={c["tailscaleTag"]} '
         '--accept-dns=false')
     return 0
+
+
+def t3_said(since):
+    """T3's last error line in its unit's journal since the epoch second since (a policy it cannot apply, a port in
+    use), or ''."""
+    try:
+        r = k.run(['/usr/bin/journalctl', '-u', k.UNIT, '--since', f'@{since}', '-n', '80', '-o', 'cat',
+                   '--no-pager'], timeout=30)
+    except OSError:
+        return ''
+    lines = [x.strip() for x in r.stdout.splitlines() if re.search(r'\bERROR\b|Error\b', x)]
+    # the unit's processes (the agents' too) write this journal: printable text only, never terminal controls
+    return re.sub(r'[^\x20-\x7e]', '?', lines[-1][:400]) if lines else ''
 
 
 def stays_up():
