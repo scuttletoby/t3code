@@ -718,6 +718,15 @@ describe("serve --hold-work on a seeded home", () => {
       const heldSources = ["scheduled-tasks", "waits", "usage-limit-recovery"];
       await when("the held sources", held, paths.stateDir, () => {
         const output = held.output();
+        const spans = spansFrom(paths.stateDir, 0).names;
+        // A leak ends the wait at once, so the checks below name it instead of a timeout.
+        if (
+          relayRequests(remote).length > 0 ||
+          PUBLISHER_STARTED.test(output) ||
+          HELD_SPANS.some((name) => spans.has(name))
+        ) {
+          return true;
+        }
         return (
           output.includes("Work is held: every consumer uses the held gate (--hold-work)") &&
           heldSources.every((source) =>
@@ -729,7 +738,7 @@ describe("serve --hold-work on a seeded home", () => {
           // that ignored the hold never logs it and the wait fails.
           HELD_LINES.every((line) => output.includes(line)) &&
           // Past the random wait before registration, and past the desired-link reconcile.
-          HELD_CONNECT_STEPS.every((name) => spansFrom(paths.stateDir, 0).names.has(name))
+          HELD_CONNECT_STEPS.every((name) => spans.has(name))
         );
       });
       await stop(held.child);
