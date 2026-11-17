@@ -111,14 +111,13 @@ const psiLine = (kind: string) =>
   new RegExp(`^${kind} avg10=(\\d+\\.\\d+) avg60=\\d+\\.\\d+ avg300=\\d+\\.\\d+ total=\\d+$`, "m");
 
 /**
- * A PSI file: `null` when it does not exist (or, with `offIsNone`, when the kernel has PSI turned off),
- * `"unreadable"` when it fails, is broken or is cut short.
+ * A PSI file: `null` when it does not exist or the kernel has PSI turned off, `"unreadable"` when it
+ * fails, is broken or is cut short. A box's PSI (`readBoxPsi`) turns `null` into `"unreadable"`
+ * itself: there the machine has PSI, so a box without it is not "calm".
  */
-function psiOf(read: CapacityFileRead, offIsNone: boolean): CapacityPsi | null | "unreadable" {
+function psiOf(read: CapacityFileRead): CapacityPsi | null | "unreadable" {
   if ("error" in read) {
-    return read.error === "missing" || (offIsNone && read.error === "unsupported")
-      ? null
-      : "unreadable";
+    return read.error === "missing" || read.error === "unsupported" ? null : "unreadable";
   }
   const some = psiLine("some").exec(read.text)?.[1];
   const full = psiLine("full").exec(read.text)?.[1];
@@ -249,7 +248,7 @@ async function readLinux(host: CapacityHost): Promise<MachineReadings> {
         : { totalMb: swapTotal, freeMb: swapFree };
 
   // psi=0 or CONFIG_PSI_DEFAULT_DISABLED: the file is there but EOPNOTSUPP; the machine has no PSI.
-  const psi = psiOf(await readText(host, "/proc/pressure/memory"), true);
+  const psi = psiOf(await readText(host, "/proc/pressure/memory"));
   const cpus = await containerCpus(host, cgroup);
   const hostCpus = cpuCoresOf(host);
   const cpuCores =
@@ -406,7 +405,7 @@ export async function readBoxPsi(
   if (machine.cgroup !== "v2") return null;
   const path = cgroupPath(box);
   if (path === null) return "unreadable";
-  const psi = psiOf(await readText(host, `${CGROUP}${path}/memory.pressure`), false);
+  const psi = psiOf(await readText(host, `${CGROUP}${path}/memory.pressure`));
   return psi === null ? "unreadable" : psi;
 }
 

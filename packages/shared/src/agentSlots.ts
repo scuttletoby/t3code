@@ -3,7 +3,7 @@
  * the decision and the refusal text. Nothing here reads a clock, the projection or the host; the
  * gate (`apps/server/src/slots/SlotGate.ts`) passes `now` and what it read.
  */
-import type { AgentSlotsSettings } from "@t3tools/contracts/waitFor";
+import type { AgentSlotsMode, AgentSlotsSettings } from "@t3tools/contracts/waitFor";
 
 const BYTES_PER_MB = 1024 * 1024;
 
@@ -35,6 +35,19 @@ export function effectiveSlotLimits(settings: AgentSlotsSettings): SlotLimits | 
     minFreeMemoryBytes,
     startGraceMs: settings.startGraceSeconds * 1000,
   };
+}
+
+/**
+ * The gate's mode (`AgentSlotsMode`). A file without `mode` keeps its old behaviour: switched on
+ * with typed numbers is `fixed`, exactly those numbers; switched off (the default) is `observe`,
+ * which never changes a decision. Any other text, such as a mode of a newer build, is `fixed`.
+ */
+export function agentSlotsMode(
+  settings: Pick<AgentSlotsSettings, "enabled" | "mode">,
+): AgentSlotsMode {
+  if (settings.mode === "observe" || settings.mode === "fixed") return settings.mode;
+  if (settings.mode === undefined && !settings.enabled) return "observe";
+  return "fixed";
 }
 
 /** Whether these limits need the running agents counted (else only memory is read). */
