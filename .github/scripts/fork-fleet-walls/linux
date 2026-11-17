@@ -539,23 +539,64 @@ def stop_defaults_used():
     return used, bad
 
 
+def shell_states(code):
+    """For each character of code (bash), where it is as bash reads it: 'c' code, 's' or 'd' in a single- or
+    double-quoted string, '#' in a comment. A sketch of bash's quoting (a backslash escapes the next character, a #
+    starts a comment only at a word's start; no heredocs, a quote inside $(...) in a string read as the string's
+    end): what it gets wrong only makes launcher_stops refuse more."""
+    out, state, i = [], 'c', 0
+    while i < len(code):
+        ch, mark = code[i], state
+        if state == 'c':
+            if ch == '\\':
+                out += ['c', 'c']
+                i += 2
+                continue
+            if ch in '\'"':
+                state = mark = 's' if ch == "'" else 'd'
+            elif ch == '#' and (i == 0 or code[i - 1] in ' \t\n;&|()<>'):
+                state = mark = '#'
+        elif state == 's' and ch == "'" or state == 'd' and ch == '"' or state == '#' and ch == '\n':
+            state = 'c'
+        elif state == 'd' and ch == '\\':
+            out += ['d', 'd']
+            i += 2
+            continue
+        out.append(mark)
+        i += 1
+    return ''.join(out[:len(code)])
+
+
 def launcher_stops():
     """The stop timeouts (own_stops) the installed launcher's start() gives every job unit it starts, as its
-    systemd-run command writes them (-p Key=value, quoted or not; not in a comment). The walls may sit beside an older
-    launcher (a kit not installed whole) whose start() gave none: systemd's defaults then decide the next job unit's
-    (issue #297). This guards against such an old launcher, not a hostile one (only root writes it, and launcher_safe
-    holds): a property in another form is not seen, so its default counts. A launcher not safe, no start(), or a value
-    written with an expansion: cannot tell."""
+    systemd-run command writes them (-p Key=value, quoted or not). The walls may sit beside an older launcher (a kit
+    not installed whole) whose start() gave none: systemd's defaults then decide the next job unit's (issue #297).
+    This guards against such an old launcher, not a hostile one (only root writes it, and launcher_safe holds): a
+    property in another form (--property=, -pKey=) is not seen, so its default counts. A launcher not safe, no
+    start() or more than one (bash runs the last, the walls would read the first), a Timeout...= after a # or in a
+    quoted string but a -p word's own value (each would count a key systemd-run never gets; issue #316), or a value
+    written with an expansion: cannot tell. Whole-line comments are dropped first."""
     fd = os.open(LAUNCHER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
     with os.fdopen(fd, 'rb') as f:
         launcher_safe(os.fstat(f.fileno()))
         text = f.read().decode('utf-8', 'replace')
+    if len(re.findall(r'^[ \t]*(?:function[ \t]+start(?![\w-])|start[ \t]*\(\))', text, re.M)) > 1:
+        raise ValueError(f'{LAUNCHER} has more than one start() (bash runs the last one)')
     start = re.search(r'^start\(\) \{\n(.*?)^\}$', text, re.M | re.S)
     if not start:
         raise ValueError(f'{LAUNCHER} has no start()')
     code = '\n'.join(line for line in start.group(1).split('\n') if not line.lstrip().startswith('#'))
+    states = shell_states(code)
+    words = list(re.finditer(r'(?<!\S)-p[ \t]+(["\']?)(Timeout[A-Za-z]*)=([^\s"\']*)\1(?!\S)', code))
+    words = [m for m in words if states[m.start()] == 'c']   # a -p word bash reads as code (its value may be quoted)
+    for m in re.finditer(r'Timeout[A-Za-z]*=', code):
+        if states[m.start()] != 'c' and m.start() not in {w.start(2) for w in words}:
+            raise ValueError(f'{LAUNCHER}: start() has {m.group()} '
+                             f'{"after a #" if states[m.start()] == "#" else "in a quoted string"}: the walls cannot '
+                             'tell if its systemd-run gets it')
     lines = []
-    for _, key, value in re.findall(r'(?<!\S)-p[ \t]+(["\']?)(Timeout[A-Za-z]*)=([^\s"\']*)\1(?!\S)', code):
+    for m in words:
+        _, key, value = m.groups()
         if re.search(r'[$`\\]', value):
             raise ValueError(f'{LAUNCHER}: start() gives its job units {key}={value}, which is not written out')
         lines.append((0, key, value))

@@ -1118,10 +1118,93 @@ class EveryWallsFile(WallsRunner):
                     self.assertIn('cannot tell', got)
                 elif want == 'FAIL':
                     self.assertIn("start()", got)
-        os.chmod(launcher, 0o775)   # not as safe as ask() wants it: cannot tell, before anything is read from it
-        write(launcher, real)
+        os.chmod(launcher, 0o775)   # not safe (launcher_stops and ask both refuse it; test_linux_launcher_stops_*
+        write(launcher, real)       # tests launcher_stops' own refusal): the wall cannot tell
         got = self.job_units({})
         self.assertTrue(got.startswith('FAIL'), got)
+
+    def test_linux_job_units_refuses_stop_timeouts_start_never_passes(self):
+        """Issue #316 item 1: a stop timeout that start()'s systemd-run never gets (one after a #, one in a quoted
+        string, on one line or across lines) or a second start() (bash runs the last one, the walls read the first)
+        must not count as start()'s own: each would let systemd's endless default pass. The walls cannot tell those:
+        FAIL. The launcher as it is (its -p words quoted or not, a ${#x} in start()) still PASSES."""
+        real = slurp(LAUNCHER)
+        both = ' -p TimeoutStopSec=90 -p TimeoutAbortSec=90 '
+        self.assertEqual(real.count(both), 1)
+        old = real.replace(both, ' ')   # a start() that gives none of its own
+        at = '\n  # Type=exec:'
+        self.assertEqual(old.count(at), 1)
+        endless = {'etc/systemd/system.conf': '[Manager]\nDefaultTimeoutStopSec=infinity\n'}   # the abort one:
+        fake = '-p TimeoutStopSec=90 -p TimeoutAbortSec=90'
+        second = (f'start() {{\n  "$SYSTEMD_RUN" -p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity -- x\n}}\n')
+        fails = {
+            'in an end-of-line comment': old.replace(at, f'\n  true # {fake}' + at),
+            'in a double-quoted string': old.replace(at, f'\n  echo "use {fake}" >/dev/null' + at),
+            'in a single-quoted string': old.replace(at, f"\n  echo 'use {fake}' >/dev/null" + at),
+            'in a string across lines': old.replace(at, f'\n  echo "use\n  {fake}" >/dev/null' + at),
+            'a second start()': real.replace('\ncheck_net() {\n', '\n' + second + '\ncheck_net() {\n'),
+            'a second start, function keyword': real.replace('\ncheck_net() {\n', '\n' + second.replace(
+                'start() {', 'function start {') + '\ncheck_net() {\n'),
+        }
+        launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
+        for name, text in fails.items():
+            with self.subTest(name):
+                write(launcher, text)
+                got = self.job_units(endless)
+                self.assertTrue(got.startswith('FAIL'), got)
+                self.assertIn('cannot tell', got)
+                self.assertIn('start()', got)
+        for name, text in {'the launcher': real, 'the launcher, quoted': real.replace(
+                both, ' -p "TimeoutStopSec=90" -p \'TimeoutAbortSec=90\' ')}.items():
+            with self.subTest(name):
+                write(launcher, text)
+                got = self.job_units(endless)
+                self.assertTrue(got.startswith('PASS'), got)
+
+    def test_linux_job_units_cannot_tell_an_unreadable_job_unit(self):
+        """Issue #316 item 2: only a job unit's transient file that is gone (FileNotFoundError: the unit ended) is
+        skipped; one that cannot be read for any other reason (mode 000, an I/O error) still counts: cannot tell."""
+        unit = 'run/systemd/transient/fork-fleet-ci-0.service'
+        m = fw_linux()
+        m.ROOT = self.root(overlay(LINUX, {**OLD_JOB, 'etc/systemd/system.conf': SLOW_DEFAULTS}))
+        read = m.file_lines
+
+        def eio(path, section=None):
+            if path == '/' + unit:
+                raise OSError(5, 'Input/output error', path)
+            return read(path, section)
+        with mock.patch.object(m, 'file_lines', eio), self.assertRaises(OSError):
+            m.stop_defaults_used()
+        if os.geteuid() == 0:
+            self.skipTest('root reads a mode 000 file')
+        got = self.job_units({unit: {'text': OLD_JOB[unit], 'mode': '000'}})
+        self.assertTrue(got.startswith('FAIL'), got)
+        self.assertIn('cannot tell (PermissionError', got)
+
+    def test_linux_launcher_stops_refuses_an_unsafe_launcher_itself(self):
+        """Issue #316 item 3 (the #306 lens nit): launcher_stops refuses a launcher that is a link (O_NOFOLLOW), not
+        this uid's alone (launcher_safe on what it opened), or no plain file (a FIFO: opened without blocking), before
+        it reads it; ask() refuses the same later, so this tests launcher_stops alone. A safe one is read."""
+        m = fw_linux()
+        folder = os.path.join(self.tmp, 'kit')
+        os.makedirs(folder, mode=0o755)
+        safe = os.path.join(folder, 'safe.sh')
+        write(safe, slurp(LAUNCHER))
+        os.chmod(safe, 0o755)
+        m.LAUNCHER = safe
+        self.assertEqual(m.launcher_stops(), {'TimeoutStopSec': '90', 'TimeoutAbortSec': '90'})
+        link = os.path.join(folder, 'link.sh')
+        os.symlink(safe, link)
+        writable = os.path.join(folder, 'writable.sh')
+        shutil.copy(safe, writable)
+        os.chmod(writable, 0o775)
+        fifo = os.path.join(folder, 'fifo.sh')
+        os.mkfifo(fifo, 0o755)
+        for path, error in ((link, OSError), (writable, ValueError), (fifo, ValueError)):
+            with self.subTest(os.path.basename(path)):
+                m.LAUNCHER = path
+                with self.assertRaises(error):
+                    m.launcher_stops()
 
     def job_units(self, change, links=()):
         """The linux job-units line on the passing fixture with change and links ((path, target)), through describe."""
