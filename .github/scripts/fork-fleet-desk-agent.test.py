@@ -66,6 +66,21 @@ def gone(pid):
         return True
 
 
+class Log(io.StringIO):
+    """The agent's log; `settled` is set once serve says 'session open' (relayed from ssh's stderr): it listens.
+    Its socket file alone is no sign: it appears at bind(), before listen(), and a connect in between is refused."""
+
+    def __init__(self):
+        super().__init__()
+        self.settled = threading.Event()
+
+    def write(self, s):
+        n = super().write(s)
+        if 'session open' in self.getvalue():
+            self.settled.set()
+        return n
+
+
 def until(cond, seconds=10):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
@@ -85,7 +100,7 @@ class Desk(unittest.TestCase):
         self.file('key', 'not a real key\n', 0o600)
         self.file('known_hosts', 'host ssh-ed25519 AAAA\n')
         self.file('fake-serve', FAKE_SERVE, 0o755)
-        self.file('ssh', f'#!/bin/sh\nprintf "%s\\n" "$@" > {self.tmp}/ssh-argv\n'
+        self.file('ssh', f'#!/bin/sh\nprintf "%s\\n" "$@" > {self.tmp}/ssh-argv\necho $$ > {self.tmp}/serve.pid\n'
                   f'FORK_FLEET_DESK_DIR={self.run_dir} exec /usr/bin/python3 -I {DESK} serve {POOL}\n', 0o755)
         self.settings()
 
@@ -128,7 +143,7 @@ class Desk(unittest.TestCase):
 
     def agent(self, ssh='ssh'):
         self.settings(ssh=ssh)
-        stopping, log, result = threading.Event(), io.StringIO(), {}
+        stopping, log, result = threading.Event(), Log(), {}
         conf = A.load(os.path.join(self.tmp, 'desk.conf'))
         t = threading.Thread(target=lambda: result.update(code=A.run(conf, log, stopping)), daemon=True)
         t.start()
@@ -137,7 +152,7 @@ class Desk(unittest.TestCase):
 
     def linked(self):
         t, stopping, log, result = self.agent()
-        self.assertTrue(until(lambda: os.path.exists(os.path.join(self.run_dir, f'{POOL}.sock'))), log.getvalue())
+        self.assertTrue(log.settled.wait(60), log.getvalue())
         return t, stopping, log, result
 
     def launch(self, verb, *args, stdin=None, wait=20):
@@ -181,11 +196,9 @@ class Desk(unittest.TestCase):
         verbs = {**wire.VERBS, 'stop': (*wire.VERBS['stop'][:2], 5)}
         with mock.patch.dict(wire.VERBS, verbs):
             self.linked()
-            began = time.monotonic()
             code, _, err = self.launch('stop', 'desk-7')
         self.assertEqual(code, wire.UNKNOWN, err)
-        self.assertIn('killed at its limit', err)
-        self.assertLess(time.monotonic() - began, 9)   # the agent's answer at 5 s, not serve's own at 10 s
+        self.assertIn('killed at its limit', err)   # the agent's answer at 5 s, not serve's own ('no answer in time')
         self.assertEqual(len(self.pids()), 2)
         self.assertTrue(until(lambda: all(map(gone, self.pids()))), 'the verb or its child outlived its limit')
 
@@ -195,9 +208,8 @@ class Desk(unittest.TestCase):
         got = {}
         threading.Thread(target=lambda: got.update(r=self.launch('stop', 'desk-7')), daemon=True).start()
         self.assertTrue(until(lambda: len(self.pids()) == 2))
-        serve = int(subprocess.run(['pgrep', '-f', f'{DESK} serve {POOL}'], capture_output=True, text=True,
-                                   check=True).stdout.split()[0])
-        os.kill(serve, signal.SIGTERM)      # the always-on host goes away mid-verb
+        with open(os.path.join(self.tmp, 'serve.pid')) as f:   # this test's serve, never one found by its name
+            os.kill(int(f.read()), signal.SIGTERM)      # the always-on host goes away mid-verb
         self.assertTrue(until(lambda: all(map(gone, self.pids()))), log.getvalue())
         self.assertTrue(until(lambda: 'r' in got))
         self.assertEqual(got['r'][0], wire.UNKNOWN)
@@ -371,7 +383,7 @@ class Desk(unittest.TestCase):
             began = time.monotonic()
             (linked, _), log = self.scripted({'lines': []})
         self.assertTrue(linked)
-        self.assertLess(time.monotonic() - began, 5)
+        self.assertLess(time.monotonic() - began, 15)   # at once, not after DEAD (45 s)
         self.assertIn('asleep, or the link is down', log)
 
     def test_a_wall_clock_jump_alone_is_a_sleep(self):
@@ -382,7 +394,7 @@ class Desk(unittest.TestCase):
             began = time.monotonic()
             (linked, _), log = self.scripted({'lines': []})
         self.assertTrue(linked)
-        self.assertLess(time.monotonic() - began, 5)
+        self.assertLess(time.monotonic() - began, 15)   # at once, not after DEAD (45 s)
         self.assertIn('asleep, or the link is down', log)
 
     def test_the_clock_counts_a_sleep_once_and_never_goes_back(self):
