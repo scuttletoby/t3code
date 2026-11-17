@@ -143,7 +143,7 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                     '*--force-confold*) :;; *) false;; esac; } || '
                     '{ echo "dpkg: error: end of file on stdin at conffile prompt (test)" >&2; exit 1; }\n'
                     'for f in "$R"/log/packages/*; do [ ! -e "$f" ] || sed -i "s/unpacked/installed/" "$f"; done\n'
-                    'rm -f "$R"/var/lib/dpkg/updates/[0-9]*\n',
+                    'for f in "$R"/var/lib/dpkg/updates/[0-9]*; do [ ! -e "$f" ] || rm "$f"; done\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
 }

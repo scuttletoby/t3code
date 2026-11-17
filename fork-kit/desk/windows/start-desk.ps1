@@ -121,12 +121,22 @@ function Read-WslConfig([string]$path) {
 # networkingMode and dnsTunneling were [experimental] keys before WSL 2.0; an old line there can still win over
 # [wsl2], so Merge-WslConfig removes them there (the [wsl2] ones are what the desk needs) and the check FAILs on them.
 $Experimental = @('networkingMode', 'dnsTunneling')
+# The section after line $l, as WSL's ParseSection reads a header: space or tab, an open bracket, a letter then letters
+# or digits, a close bracket, space or tab, then the end or a # comment; any case. A bracket line it rejects keeps the
+# length of $sec of the letters read (none: $sec as it was; fewer pad with NUL and match no section). $null: no bracket.
+function NextSection([string]$l, [string]$sec) {
+  if ($l -cnotmatch '^[ \t]*\[(([A-Za-z][A-Za-z0-9]*)(\][ \t]*(#.*)?$)?)?') { return $null }
+  if ($Matches[3]) { return $Matches[2].ToLower() }
+  if ($Matches[2]) { return $Matches[2].ToLower().PadRight($sec.Length, [char]0).Substring(0, $sec.Length) }
+  $sec
+}
 # A key=value line, trimmed of space and tab only, as WSL's config parser does: a non-breaking space or a form feed
 # stays in the value (WSL then rejects a memory= value, so it is rewritten), where .NET's \s would drop it.
 function SectionKeys([string[]]$lines, [string]$section) {   # the keys of one section only
   $keys = @{}; $sec = ''
   foreach ($l in $lines) {
-    if ($l -match '^\s*\[(.+)\]\s*$') { $sec = $Matches[1].Trim().ToLower(); continue }
+    $next = NextSection $l $sec
+    if ($null -ne $next) { $sec = $next; continue }
     if ($sec -eq $section -and $l -match '^[ \t]*([^=#; \t]+)[ \t]*=[ \t]*(.*?)[ \t]*$') { $keys[$Matches[1]] = $Matches[2] }
   }
   $keys
@@ -139,7 +149,8 @@ function MergeLines([string[]]$lines, $want) {
   $out = [Collections.Generic.List[string]]::new(); $notes = [Collections.Generic.List[string]]::new(); $sec = ''; $done = @{}
   function AddMissing { foreach ($k in $want.Keys) { if (-not $done[$k]) { $out.Add("$k=$($want[$k])"); $done[$k] = 1; $notes.Add("  [wsl2] ${k}: (not set) -> $($want[$k])") } } }
   foreach ($l in $lines) {
-    if ($l -match '^\s*\[(.+)\]\s*$') { if ($sec -eq 'wsl2') { AddMissing }; $sec = $Matches[1].Trim().ToLower(); $out.Add($l); continue }
+    $next = NextSection $l $sec
+    if ($null -ne $next) { if ($sec -eq 'wsl2' -and $next -ne 'wsl2') { AddMissing }; $sec = $next; $out.Add($l); continue }
     if ($sec -eq 'wsl2' -and $l -match '^[ \t]*([^=#; \t]+)[ \t]*=[ \t]*(.*?)[ \t]*$' -and $want.Contains($Matches[1])) {
       $k = $Matches[1]; $v = $Matches[2]
       if ($done[$k]) { $notes.Add("  [wsl2] $k=${v}: a repeated line, removed"); continue }

@@ -367,6 +367,59 @@ class Script(unittest.TestCase):
             self.assertIn(line, r.stdout)
 
     @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_section_headers_are_read_as_wsl_reads_them(self):
+        """lens #354: WSL's ParseSection (configfile.cpp) takes space or tab, '[', a letter then letters or digits,
+        ']', space or tab, then the end or a '#' comment, in any case. On a '[' line it rejects, the keys after it go
+        under the old section's length of the letters it had read: none read keeps the section."""
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, '.wslconfig')
+        want = '[wsl2]\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n'
+        # (old file, the [wsl2] memory WSL reads, [experimental] keys WSL reads, the file after the merge)
+        rows = (
+            ('[wsl2]\nmemory=9GB\n[experimental] # from an old guide\ndnsTunneling=false\n', '9GB', 'dnsTunneling',
+             want + '[experimental] # from an old guide\n'),
+            ('[experimental]\nautoProxy=true\n[ wsl2 ]\nmemory=4GB\n', '', 'autoProxy,memory',
+             '[experimental]\nautoProxy=true\n[ wsl2 ]\nmemory=4GB\n' + want),
+            ('[WSL2]\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '', None),
+            ('\t[wsl2]\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '', None),
+            # a vertical tab is not space to WSL: the line is rejected, so this is a repeated [wsl2] key
+            (want + '\v[experimental]\nnetworkingMode=mirrored\n', '9GB', '', want + '\v[experimental]\n'),
+            # rejected after the name: WSL keeps the old section's length (4) of it, 'expe' here, so neither section
+            ('[wsl2]\nmemory=9GB\n[experimental] old\nnetworkingMode=mirrored\n', '9GB', '',
+             want + '[experimental] old\nnetworkingMode=mirrored\n'),
+            # ... and from [boot] (also 4 letters) into wsl2
+            ('[boot]\nsystemd=true\n[wsl2] old\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '',
+             None),
+        )
+        script = os.path.join(d, 'merge.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = "9GB"; networkingMode = "nat"; '
+                    'guiApplications = "false" }\n$l = Read-WslConfig $args[0]\n'
+                    '"memory=$((Wsl2Keys $l)[\'memory\'])"\n'
+                    '"experimental=$((SectionKeys $l \'experimental\').Keys | Sort-Object | Join-String -Separator \',\')"\n'
+                    '"changed=$(Merge-WslConfig $args[0] $want)"\n'
+                    '"after=$(@(Changes (Read-WslConfig $args[0]) $want).Count)"\n'
+                    '"now=$((Wsl2Keys (Read-WslConfig $args[0]))[\'memory\'])"\n')
+        for old, memory, experimental, new in rows:
+            with self.subTest(old):
+                with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(old)
+                r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path],
+                                   capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                out = r.stdout.splitlines()
+                self.assertIn(f'memory={memory}', out)   # what the check at the end reads
+                self.assertIn(f'experimental={experimental}', out)
+                self.assertIn(f'changed={new is not None}', out)
+                self.assertEqual(slurp(path), old if new is None else new)
+                self.assertIn('after=0', out)
+                self.assertIn('now=9GB', out)
+                for n in os.listdir(d):
+                    if n.startswith('.wslconfig.bak-'):
+                        os.unlink(os.path.join(d, n))
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
     def test_the_memory_cap_kept_is_one_wsl_reads_within_its_bounds(self):
         """Without -MemoryGB, a higher cap a person set (more agents or jobs in WSL) is neither lowered nor a FAIL, nor
         a `wsl --shutdown` on every run (the live check's cap is the one kept), up to the RAM less 2 GB. With

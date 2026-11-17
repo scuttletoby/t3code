@@ -388,11 +388,36 @@ class Setup(Case):
     def test_dpkg_configure_runs_only_when_something_is_half_installed(self):
         """`dpkg --configure -a` takes dpkg's lock without waiting: on a fresh distro with nothing half-installed
         it is not run, so unattended-upgrades holding that lock is left to apt-get's own wait (#321). A journal file
-        whose name is not all digits is one apt-get does not look at either (#349)."""
-        self.write('/var/lib/dpkg/updates/tmp.i', '')
-        self.ready()
-        self.assertEqual(self.log('dpkg'), ['--audit'])
-        self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+        whose name is not all digits (the whole name: not 0003.new) is one apt-get does not look at either, and a
+        distro without that folder, or with it empty, has no journal (#349)."""
+        fresh = self.keep()
+        self.assertFalse(os.path.lexists(self.path('/var/lib/dpkg')))
+        for p in (None, '/var/lib/dpkg/updates/', '/var/lib/dpkg/updates/tmp.i', '/var/lib/dpkg/updates/0003.new'):
+            with self.subTest(p):
+                self.restore(fresh)
+                if p:
+                    self.write(p, '')
+                self.ready()
+                self.assertEqual(self.log('dpkg'), ['--audit'])
+                self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+
+    def test_an_updates_folder_it_cannot_read_counts_as_interrupted(self):
+        """apt skips a /var/lib/dpkg/updates it cannot read; setup runs `dpkg --configure -a` then, which costs one
+        dpkg run that waits for its lock and finds nothing to do (#349)."""
+        fresh = self.keep()
+        full = self.path('/var/lib/dpkg/updates')
+        self.addCleanup(lambda: os.path.isdir(full) and os.chmod(full, 0o755))
+        for how in ('a file', 'mode 000'):   # ENOTDIR, EACCES (the tests never run as root)
+            with self.subTest(how):
+                self.restore(fresh)
+                if how == 'a file':
+                    self.write('/var/lib/dpkg/updates', '')
+                else:
+                    self.write('/var/lib/dpkg/updates/', '')
+                    os.chmod(full, 0)
+                self.ready()
+                self.assertEqual(self.log('dpkg'), ['--audit', DPKG])
+                self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
 
     def test_dpkg_configure_runs_when_its_audit_fails(self):
         """A `dpkg --audit` that fails and names nothing (a status file it cannot parse) is not taken as all clear:
