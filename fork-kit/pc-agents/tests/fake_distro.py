@@ -81,20 +81,32 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          'esac\n',
     # apt-get [-o OPTION]... update|install -y PKG...: logs the rest (and the options, in /log/apt-get-options);
     # installs each package in /log/packages (nftables brings the fake nft kept in /log/nft-package). As real apt-get:
-    # refuses while a package is unpacked (dpkg was interrupted). /log/apt-locked-update (or -install) holds how many
-    # more runs find the lists (or archives) lock held, as while apt-daily runs: real apt-get does not wait for those.
-    # /log/apt-fail makes it fail; /log/dns holds the resolv.conf line `update` needs to reach the mirror; with
-    # /log/questions it fails unless noninteractive and keeping changed config files.
+    # refuses while a package is unpacked, and `install` while /var/lib/dpkg/updates holds a file named all digits
+    # (dpkg was interrupted). /log/apt-locked-update (or -install) holds how many more runs find the lists (or
+    # archives) lock held, as while apt-daily runs: real apt-get does not wait for those. Its lock messages are in
+    # German under a German locale (LC_ALL, else LC_MESSAGES, else LANG), as libapt's translations; /log/apt-denied
+    # makes the lock file one it may not open (not root). /log/apt-fail makes it fail; /log/dns holds the resolv.conf
+    # line `update` needs to reach the mirror; with /log/questions it fails unless noninteractive and keeping changed
+    # config files.
     'usr/bin/apt-get': 'R="${0%/usr/bin/apt-get}"; o=; while [ "$1" = -o ]; do o="$o $2"; shift 2; done\n'
                        'echo "$*" >>"$R/log/apt-get"; echo "${o# }" >>"$R/log/apt-get-options"\n'
+                       '[ "$1" = update ] && d=/var/lib/apt/lists || d=/var/cache/apt/archives\n'
+                       '[ -e "$R/log/apt-denied" ] && { echo "E: Could not open lock file $d/lock - open (13: '
+                       'Permission denied)" >&2; echo "E: Unable to lock directory $d/" >&2; exit 100; }\n'
                        'n=$(cat "$R/log/apt-locked-$1" 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then\n'
-                       '  echo $((n - 1)) >"$R/log/apt-locked-$1"; [ "$1" = update ] && d=/var/lib/apt/lists || '
-                       'd=/var/cache/apt/archives\n'
-                       '  echo "E: Could not get lock $d/lock. It is held by process 4242 (apt-get) (test)" >&2\n'
-                       '  echo "E: Unable to lock directory $d/" >&2; exit 100; fi\n'
+                       '  echo $((n - 1)) >"$R/log/apt-locked-$1"\n'
+                       '  case "${LC_ALL:-${LC_MESSAGES:-$LANG}}" in de*)\n'
+                       '    echo "E: Sperre $d/lock konnte nicht erlangt werden. Sie wird von Prozess 4242 (apt-get) '
+                       'gehalten (test)" >&2\n'
+                       '    echo "E: Das Verzeichnis $d/ kann nicht gesperrt werden." >&2;;\n'
+                       '  *) echo "E: Could not get lock $d/lock. It is held by process 4242 (apt-get) (test)" >&2\n'
+                       '    echo "E: Unable to lock directory $d/" >&2;; esac; exit 100; fi\n'
                        '[ -e "$R/log/apt-fail" ] && { echo "E: no network (test)" >&2; exit 100; }\n'
                        'grep -qs unpacked "$R"/log/packages/* && { echo "E: dpkg was interrupted, you must manually '
                        'run \'dpkg --configure -a\' to correct the problem." >&2; exit 100; }\n'
+                       '[ "$1" != install ] || ! ls "$R/var/lib/dpkg/updates" 2>/dev/null | grep -qxE "[0-9]+" || '
+                       '{ echo "E: dpkg was interrupted, you must manually run \'dpkg --configure -a\' to correct the '
+                       'problem." >&2; exit 100; }\n'
                        '[ ! -e "$R/log/questions" ] || { [ "$DEBIAN_FRONTEND" = noninteractive ] && case "$o" in '
                        '*Dpkg::Options::=--force-confold*) :;; *) false;; esac; } || '
                        '{ echo "E: end of file on stdin at conffile prompt (test)" >&2; exit 100; }\n'
@@ -107,23 +119,31 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
     'usr/bin/dpkg-query': 'R="${0%/usr/bin/dpkg-query}"; echo "$*" >>"$R/log/dpkg-query"; shift 2; rc=0\n'
                           'for p; do if [ -e "$R/log/packages/$p" ]; then printf "%s\\t%s\\n" "$p" "$(cat "$R/log/packages/$p")"\n'
                           '  else echo "dpkg-query: no packages found matching $p" >&2; rc=1; fi; done; exit $rc\n',
-    # dpkg --audit: names each package an apt-get stopped half-way left unpacked (no lock: it only reads).
-    # dpkg [--force-...]... --configure -a: finishes them. /log/dpkg-locked holds how many more runs find the lock
-    # held (real dpkg does not wait); /log/questions as for apt-get.
+    # dpkg --audit: names each package an apt-get stopped half-way left unpacked (no lock: it only reads) and, as
+    # real dpkg, exits 0 all the same; /log/dpkg-audit-fail makes it fail (exit 2) and name nothing, as on a status
+    # file it cannot parse. It does not name a package whose last state, in a journal file under
+    # /var/lib/dpkg/updates, is installed. dpkg [--force-...]... --configure -a: finishes them and merges that journal
+    # (removes its files). /log/dpkg-locked holds how many more runs find the lock held (real dpkg does not wait),
+    # with the message in German under a German locale; /log/questions as for apt-get.
     'usr/bin/dpkg': 'R="${0%/usr/bin/dpkg}"; echo "$*" >>"$R/log/dpkg"\n'
-                    'if [ "$1" = --audit ]; then rc=0; for f in "$R"/log/packages/*; do grep -qs unpacked "$f" || '
-                    'continue\n'
-                    '  [ $rc = 1 ] || echo "The following packages have been unpacked but not yet configured:"\n'
-                    '  echo " ${f##*/}"; rc=1; done; exit $rc; fi\n'
+                    'if [ "$1" = --audit ]; then [ ! -e "$R/log/dpkg-audit-fail" ] || '
+                    '{ echo "dpkg: error: parsing file \'/var/lib/dpkg/status\' (test)" >&2; exit 2; }; h=\n'
+                    '  for f in "$R"/log/packages/*; do grep -qs unpacked "$f" || continue\n'
+                    '  [ -n "$h" ] || echo "The following packages have been unpacked but not yet configured:"\n'
+                    '  echo " ${f##*/}"; h=1; done; exit 0; fi\n'
                     'n=$(cat "$R/log/dpkg-locked" 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then\n'
                     '  echo $((n - 1)) >"$R/log/dpkg-locked"\n'
-                    '  echo "dpkg: error: dpkg frontend lock was locked by another process with pid 4242 (test)" >&2\n'
+                    '  case "${LC_ALL:-${LC_MESSAGES:-$LANG}}" in de*) echo "dpkg: Fehler: dpkg-Frontend-Sperre wurde '
+                    'von einem anderen Prozess mit PID 4242 gesperrt (test)" >&2;;\n'
+                    '  *) echo "dpkg: error: dpkg frontend lock was locked by another process with pid 4242 (test)" >&2;; '
+                    'esac\n'
                     '  exit 2; fi\n'
 
                     '[ ! -e "$R/log/questions" ] || { [ "$DEBIAN_FRONTEND" = noninteractive ] && case "$*" in '
                     '*--force-confold*) :;; *) false;; esac; } || '
                     '{ echo "dpkg: error: end of file on stdin at conffile prompt (test)" >&2; exit 1; }\n'
-                    'for f in "$R"/log/packages/*; do [ ! -e "$f" ] || sed -i "s/unpacked/installed/" "$f"; done\n',
+                    'for f in "$R"/log/packages/*; do [ ! -e "$f" ] || sed -i "s/unpacked/installed/" "$f"; done\n'
+                    'rm -f "$R"/var/lib/dpkg/updates/[0-9]*\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
 }

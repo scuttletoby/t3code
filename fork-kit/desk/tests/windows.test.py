@@ -303,7 +303,11 @@ class Script(unittest.TestCase):
         path = os.path.join(d, '.wslconfig')
         for old, notes in (('[wsl2]\nmemory = 9GB\nNetworkingMode=NAT\n', []),
                            ('[wsl2]\nmemory=9GB\nnetworkingMode=nat\nmemory=12GB\n',
-                            ['[wsl2] memory=12GB: a repeated line, removed'])):
+                            ['[wsl2] memory=12GB: a repeated line, removed']),
+                           # WSL trims space and tab only: a key after a non-breaking space or a form feed is not
+                           # networkingMode to WSL, so it is not removed (and the check does not FAIL on it either)
+                           ('[wsl2]\nmemory=9GB\nnetworkingMode=nat\n[experimental]\n networkingMode=mirrored\n'
+                            '\fdnsTunneling=true\n', [])):
             with self.subTest(old):
                 with open(path, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(old)
