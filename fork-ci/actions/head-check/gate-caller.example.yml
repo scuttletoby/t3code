@@ -1,7 +1,8 @@
 # An example caller of the head gate (README.md, "The gate"). Copy it to .github/workflows/ on the project's default
 # branch and fill in the CAPITALS. It runs from the default branch's copy whatever a pull request changes, and gives
-# the pull request to the gate as a number, nothing more. Reviews and inline review comments start no run (README.md,
-# "Run again after a review"): an issue comment, a push or a dispatch does.
+# the pull request to the gate as a number, nothing more. Reviews and inline review comments start it through the
+# review trigger (review-trigger.example.yml, copied next to this file; README.md, "Run again after a review"): on its
+# finished run the gate looks the pull request up by that run's head.
 name: Head gate
 
 on:
@@ -9,6 +10,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
   issue_comment:
     types: [created, edited, deleted]
+  workflow_run:
+    workflows: [Head gate review trigger] # review-trigger.example.yml's name
+    types: [completed]
   workflow_dispatch:
     inputs:
       pr:
@@ -20,8 +24,17 @@ permissions: {}
 
 jobs:
   gate:
-    # A comment on an issue that is no pull request starts nothing.
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    # A comment on an issue that is no pull request starts nothing, nor does a review trigger run that did not finish
+    # (a newer one on the same pull request replaced it).
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request) &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    # Review trigger runs of one head (a burst of reviews or line comments): one judges, the newest waits, the ones in
+    # between are dropped while they wait. Never cancelled half-way (that would post a failure). Every other event has
+    # a group of its own, so it is never dropped.
+    concurrency:
+      group: ${{ github.event_name == 'workflow_run' && format('head-gate-review-{0}-{1}', github.workflow_ref, github.event.workflow_run.head_sha) || format('head-gate-run-{0}', github.run_id) }}
+      cancel-in-progress: false
     uses: scuttletoby/t3code/.github/workflows/fork-head-gate.yml@<release sha of ci/vN> # ci/vN
     permissions:
       contents: read
