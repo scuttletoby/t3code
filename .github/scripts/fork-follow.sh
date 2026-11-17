@@ -440,9 +440,11 @@ if [[ -n "$kept" ]]; then
     -m "Upstream $target_tag has them again: $(paste -sd ' ' <<< "$kept")"
 fi
 schema_check "$target" "After rebasing onto $target_tag, the series"
-seam_check "$target" "After rebasing onto $target_tag, the series"
 candidate="$(git rev-parse HEAD)"
+# Before the seam check, which also refuses an upstream file named like the fork's, so the report
+# says what to do about a workflow.
 refuse_upstream_fork_named "$target" "$target_tag" "$candidate"
+seam_check "$target" "After rebasing onto $target_tag, the series"
 refuse_outside_workflows "$base" "$target" "$target_tag" "$candidate"
 dropped="$(comm -23 <(sort <<< "$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
 

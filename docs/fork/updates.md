@@ -40,9 +40,15 @@ watches; it changes nothing on the machine, and `0` turns it off.
   makes a save refuse an interval no run could use and a load read one as its default.
 - The seam check ([`fork-seam-check.cjs`](../../.github/scripts/fork-seam-check.cjs)) refuses any
   line the fork adds to an upstream file beyond the seam lines pinned in
-  [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment. It runs on
-  every pull request (Fork tests, "Workflow lint and upstream drift") and in fork-follow before and
-  after each rebase, against the upstream commit the series sits on.
+  [`.github/fork-seams.json`](../../.github/fork-seams.json), with or without a comment, in every
+  upstream file, listed or not. It runs on every pull request (Fork tests, "Workflow lint and
+  upstream drift") and in fork-follow before and after each rebase, against the upstream commit
+  the series sits on. A pull request is judged by its base's list, never by its own: a new seam,
+  `pending` or `forkFiles` entry counts once the owner merges it. `pending` names upstream files
+  whose fork lines predate the rule; a pull request may change them but not grow them. A pull
+  request's run has no upstream commit, so it takes files named as the fork's (`fork`, `fork-*`,
+  `forkName*`, `FORK_*`) and `forkFiles` for the fork's own; from upstream, a pattern that matches
+  an upstream file fails.
 - [`serverSettings.forkDefaults.test.ts`](../../apps/server/src/serverSettings.forkDefaults.test.ts)
   loads the settings the way a server does and checks every fork setting is at its row's default
   with no file, `{}`, a file an upstream build wrote, a file cut off half-way and a file with a bad
