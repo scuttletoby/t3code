@@ -271,9 +271,10 @@ def _detail(error):
 @contextlib.contextmanager
 def run(state_dir, command, may_follow=()):
     """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished) unless its command
-    is in may_follow (`back` finishes a back or switch stopped half-way), journal begin and end. An exception ends the run "failed" and goes on (after a started step it then needs settling); Refused
-    after every started step is done ends it "refused" (no settling); a kill leaves it with no end for the next run
-    to report."""
+    is in may_follow (`back` finishes a back or switch stopped half-way), journal begin and end. An exception ends
+    the run "failed" and goes on (after a started step it then needs settling); Refused after every started step is
+    done ends it "refused" (no settling), except in a run that follows one: that one still needs settling until a
+    run ends ok. A kill leaves it with no end for the next run to report."""
     with lock(state_dir, command, exclusive=True):
         last = unfinished(state_dir)
         if last is not None and last['command'] not in may_follow:
