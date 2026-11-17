@@ -33,7 +33,7 @@
   },
   "pc-agents": {
     "organization": "Example home lab",
-    "t3Version": "0.0.30",
+    "t3Version": "0.1.9",
     "t3ReleaseBaseUrl": "https://github.com/example/t3code/releases/download",
     "port": 3773,
     "maxRuntimeMode": "full-access",
