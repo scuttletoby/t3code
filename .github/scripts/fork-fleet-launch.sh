@@ -24,10 +24,11 @@
 #                script answers free (free/v1, fork-kit/common/FREE.md: run by FREE_CHECK, its reader).
 #   stop NAME    stops that unit (a job on it fails: its runner is gone).
 #   prune        removes the copies and environment files whose unit is gone.
-#   refresh-net  every dispatcher pass: looks this host's own public address up again and, when what is blocked would
-#                change or the table is gone, re-applies the table (it covers running jobs too) and adds the new
-#                addresses to each running unit's IPAddressDeny. No lookup answers: it fails and changes nothing (the
-#                last block stays), and the dispatcher starts no runner on the pool this pass.
+#   refresh-net  every dispatcher pass: looks this host's own public address up again (once its last answer is
+#                OWN_ADDRESS_SECONDS old, or the table is gone, or a unit still waits for its IPAddressDeny) and, when
+#                what is blocked would change or the table is gone, re-applies the table (it covers running jobs too)
+#                and adds the new addresses to each running unit's IPAddressDeny. No lookup answers: it fails and
+#                changes nothing (the last block stays), and the dispatcher starts no runner on the pool this pass.
 #   check-net URL HOST:PORT...
 #                the proof of the network and the walls (.github/fork-fleet.md, host step 6): runs two probes in a
 #                runner's real sandbox, as a free runner user. Exit 0 only when URL (public) answers, every HOST:PORT
@@ -45,7 +46,7 @@
 # The network: each runner user has a namespace of its own, fork-fleet-USER, so a job has its own loopback and reaches
 # no service on this host's (nor an abstract socket). Its only link, ffh-UID (host side), goes to the public internet:
 # the nft table inet fork_fleet refuses the host itself, RFC 1918, CGNAT (Tailscale), link-local, every IPv6 packet
-# and this host's own public IPv4 addresses (own_address, before every start and every pass), and the unit's
+# and this host's own public IPv4 addresses (own_address, before every start and in refresh-net), and the unit's
 # IPAddressDeny refuses the same again, in the kernel, should the table ever go. Every start (re)makes the namespace
 # and the table under the launch lock and fails closed: no runner starts when either fails. The walls (sandbox): no
 # AF_VSOCK, io_uring or 32-bit system calls, only the pseudo devices, and of this host's files only what job_fs
@@ -58,8 +59,9 @@
 # RESERVE_MB, MAX_SECONDS, MEMINFO, NET_BASE (10.N: the runners' 10.N.0.0/16, one /30 per user from its uid, unused by
 # anything else on the host), RESOLV_CONF (the jobs' resolv.conf: public nameservers, as this host's own resolver is on
 # its loopback), OWN_ADDRESS_URLS (https URLs, comma-separated, that answer with the address they see: every public
-# address they give is blocked, at least one must answer), JOB_PATHS (the system paths every job sees:
-# fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only, comma-separated, say a
+# address they give is blocked, at least one must answer), OWN_ADDRESS_SECONDS (how long refresh-net keeps using its
+# last answer, at most 3600; 0: it looks up on every pass; start always looks up), JOB_PATHS (the system paths every
+# job sees: fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only, comma-separated, say a
 # tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an https
 # URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
 # empty for none), FREE_COMMAND (a free/v1 script's absolute path, empty for none) and FREE_CHECK (its reader,
@@ -116,10 +118,11 @@ conf_file=/dev/null
 RUNNER_USERS='' TEMPLATE=/opt/fork-fleet/template/runner-template WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
-SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com ALLOW_PATHS=''
+SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com OWN_ADDRESS_SECONDS=120
+ALLOW_PATHS=''
 JOB_PATHS='' RUNNER_RELEASE=https://api.github.com/repos/actions/runner/releases/latest
 RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download RUNNER_MIN='' FREE_COMMAND='' FREE_CHECK=''
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|JOB_PATHS|ALLOW_PATHS|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK)=([^[:space:]]*)$'
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|OWN_ADDRESS_SECONDS|JOB_PATHS|ALLOW_PATHS|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -130,6 +133,8 @@ done <"$conf_file"
 { [[ $NET_BASE =~ ^10\.(0|[1-9][0-9]{0,2})$ ]] && ((BASH_REMATCH[1] <= 255)); } || die "$conf: NET_BASE is 10.N (N up to 255)"
 own_url='https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?'
 [[ $OWN_ADDRESS_URLS =~ ^$own_url(,$own_url)*$ ]] || die "$conf: OWN_ADDRESS_URLS is a comma-separated list of https URLs"
+{ [[ $OWN_ADDRESS_SECONDS =~ ^[0-9]{1,4}$ ]] && ((10#$OWN_ADDRESS_SECONDS <= 3600)); } ||
+  die "$conf: OWN_ADDRESS_SECONDS is a number of seconds, at most 3600"
 PLAIN_PATH='(/[A-Za-z0-9._@+-]+)+'
 [[ $ALLOW_PATHS =~ ^($PLAIN_PATH(,$PLAIN_PATH)*)?$ ]] || die "$conf: ALLOW_PATHS is a comma-separated list of plain paths"
 # An absolute path (a relative one would be read from wherever this runs); on the fake machine, the fake one's.
@@ -838,14 +843,21 @@ docker_rules() {
 # refresh-net (each dispatcher pass): the address may change while a job runs (a new lease, a VPN that went down).
 # The table covers every runner's link, so re-applying it covers running jobs; their units get the new addresses too.
 # The same addresses in another order change nothing. A unit whose set-property failed is tried again next pass.
+# A pass within OWN_ADDRESS_SECONDS of the last answer (RUN_DIR/own-lookup, written once a pass is done) changes
+# nothing and asks no lookup service (each may throttle a host that asks every 20 s), unless the table is gone or a
+# unit waits for its retry.
 refresh_net() {
   local own name blocked old='' retry=$RUN_DIR/deny-retry
+  if lookup_fresh && [[ ! -e $retry ]] && nft list table inet fork_fleet >/dev/null 2>&1; then return 0; fi
   own=$(own_address)
   setup
   [[ ! -f $RUN_DIR/own-address ]] || old=$(<"$RUN_DIR/own-address")
   merge_own "$own"
   if [[ $(addr_set "$blocked") == "$(addr_set "$old")" && ! -e $retry ]] &&
-    nft list table inet fork_fleet >/dev/null 2>&1; then return 0; fi
+    nft list table inet fork_fleet >/dev/null 2>&1; then
+    lookup_done
+    return 0
+  fi
   local failed=''
   : >"$retry"
   table_up
@@ -855,6 +867,21 @@ refresh_net() {
   if [[ -n $failed ]]; then
     warn "refresh-net: IPAddressDeny not changed for$failed (the table blocks $blocked); tried again next pass"
   else rm -f -- "$retry"; fi
+  lookup_done
+}
+
+# Whether refresh-net's last answer is younger than OWN_ADDRESS_SECONDS: RUN_DIR/own-lookup (root's, as RUN_DIR is)
+# holds when it came. None, a garbled one or one from the future (the clock set back): not fresh.
+lookup_fresh() {
+  local last now=${EPOCHSECONDS-} f=$RUN_DIR/own-lookup
+  [[ $now =~ ^[1-9][0-9]*$ && -O $RUN_DIR && -f $f && -O $f && ! -L $f ]] || return 1
+  last=$(<"$f")
+  [[ $last =~ ^[1-9][0-9]{0,11}$ ]] && ((last <= now && now - last < 10#$OWN_ADDRESS_SECONDS))
+}
+
+lookup_done() {
+  printf '%s\n' "${EPOCHSECONDS-}" >"$RUN_DIR/own-lookup.new"
+  mv -f -- "$RUN_DIR/own-lookup.new" "$RUN_DIR/own-lookup"
 }
 
 addr_set() { tr ' ' '\n' <<<"$1" | sort -u | tr '\n' ' '; }
@@ -1167,9 +1194,11 @@ start() {
   ) || die "start: could not make $env_file, a new file: refused"
   # Type=exec: systemd-run returns once run.sh started, so the environment file has been read and can go.
   # ProtectSystem=strict: the job writes its copy and its own memory file systems, nothing else.
+  # Stop timeouts of its own (at most the walls' STOP_MAX): systemd's defaults never decide how long a job that ignores
+  # SIGTERM at RuntimeMaxSec runs on.
   "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" --working-directory "$dir" \
     -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" "${props[@]}" -p "ReadWritePaths=$dir" \
-    -p "RuntimeMaxSec=$MAX_SECONDS" -- "$dir/run.sh"
+    -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh"
 }
 
 # Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public addresses, which the
