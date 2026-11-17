@@ -1,0 +1,20 @@
+{
+  "about": "The one place the repository's Actions policy for pull_request_target is defined (issue #401). From 2026-12-02 GitHub blocks pull_request_target unless a repository Actions policy (Settings > Actions > Policies, rule 'Restrict events') allows it for the workflow file. pull_request_target.allowed: the fork workflows the policy must allow, exactly these. pull_request_target.upstream_blocked: upstream's workflows with that trigger; the fork keeps them disabled and the policy does not name them, so they stay blocked. fork-contracts.test.py (section policies) checks every workflow with the trigger is in one list. fork_checks: the check run fork-tests.yml's fork_checks_ran job must find on a pull request's head (fork-checks-ran.py), so a blocked or renamed fork-checks.yml fails the required fork-ci-result instead of passing silently.",
+  "pull_request_target": {
+    "allowed": [".github/workflows/fork-checks.yml"],
+    "upstream_blocked": [
+      ".github/workflows/desktop-macos-preview-publish.yml",
+      ".github/workflows/pr-limits.yml",
+      ".github/workflows/pr-size.yml",
+      ".github/workflows/pr-vouch.yml",
+      ".github/workflows/relay-preview-cleanup.yml"
+    ]
+  },
+  "fork_checks": {
+    "workflow": ".github/workflows/fork-checks.yml",
+    "check": "No database schema changes",
+    "outside_check": "Outside pull request",
+    "wait_seconds": 600,
+    "poll_seconds": 20
+  }
+}
