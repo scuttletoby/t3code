@@ -54,7 +54,9 @@ outputs:
 runs:
   using: composite
   steps:
-    # Only code from this action's folder (the caller's pinned SHA) runs; nothing from the checkout.
+    # Only code from this action's folder (the caller's pinned SHA) runs; nothing from the checkout. Before any git
+    # call, the checkout's .git config must be one actions/checkout writes (fork-ci git-clean): when it is not (one an
+    # earlier job left), no git runs and there is no report; report only, so the step still passes.
     - id: report
       shell: bash
       env:
@@ -68,6 +70,10 @@ runs:
         COMMENT: ${{ inputs.comment }}
         COMMENT_AUTHOR: ${{ inputs.comment-author }}
       run: |
+        if ! python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path "$CHECKOUT_PATH" --require; then
+          echo "::warning::weakened-tests: no report, git-clean refused the checkout's git config (above)"
+          exit 0
+        fi
         args=(--config "$CONFIG" --repo "$REPO" --pr "$PR" --base "$BASE" --head "$HEAD" --path "$CHECKOUT_PATH"
               --comment-author "$COMMENT_AUTHOR")
         [ "$COMMENT" = true ] || args+=(--no-comment)
