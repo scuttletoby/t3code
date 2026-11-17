@@ -357,17 +357,15 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     yield* PubSub.publish(changesPubSub, next);
   });
 
+  // A disabled instance has nothing to probe; a periodic check would only
+  // republish a snapshot that differs in checkedAt.
+  const checksSnapshotOnInterval = (snapshot: ServerProvider) =>
+    snapshot.enabled && (needsUsageRecovery(snapshot) || needsProviderRefresh(snapshot));
+
   const shouldRefreshOnInterval = Effect.gen(function* () {
-    const state = yield* Ref.get(snapshotStateRef);
-    // A disabled instance has nothing to probe; a periodic check would only
-    // republish a snapshot that differs in checkedAt.
-    if (
-      !state.snapshot.enabled ||
-      (!needsUsageRecovery(state.snapshot) && !needsProviderRefresh(state.snapshot))
-    ) {
-      return false;
-    }
-    const instanceId = state.snapshot.instanceId;
+    const { snapshot } = yield* Ref.get(snapshotStateRef);
+    if (!checksSnapshotOnInterval(snapshot)) return false;
+    const instanceId = snapshot.instanceId;
     const [genericDemand, instanceDemand] = yield* Effect.all([
       host.shouldRunBackgroundWork({ type: "provider-status" }),
       host.shouldRunBackgroundWork({ type: "provider-status", instanceId }),
@@ -455,6 +453,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     resolveMaintenance: input.resolveMaintenance,
     getSnapshot: Ref.get(snapshotStateRef).pipe(Effect.map((state) => state.snapshot)),
     isAwaitingFirstCheck: Ref.get(snapshotStateRef).pipe(Effect.map((state) => !state.checked)),
+    checksOnInterval: Ref.get(snapshotStateRef).pipe(
+      Effect.map((state) => checksSnapshotOnInterval(state.snapshot)),
+    ),
     refresh: input
       .resolveMaintenance({ fresh: true })
       .pipe(Effect.andThen(refreshSnapshot), Effect.tapError(Effect.logError), Effect.orDie),
