@@ -448,7 +448,11 @@ export class CloudLink extends Context.Service<
       EnvironmentCloudLinkStateResult,
       CloudLinkInternalError
     >;
-    readonly unlink: () => Effect.Effect<EnvironmentCloudRelayConfigResult, CloudLinkInternalError>;
+    readonly unlink: () => Effect.Effect<
+      EnvironmentCloudRelayConfigResult,
+      // Fork: a server held with `serve --hold-work` refuses (cloud/holdWorkConnect.ts).
+      CloudLinkInternalError | ManagedLimits.ManagedPolicyRefusedError
+    >;
     readonly updatePreferences: (
       input: EnvironmentCloudPreferencesRequest,
     ) => Effect.Effect<
