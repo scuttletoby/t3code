@@ -111,6 +111,15 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
   },
   {
     scope: "server",
+    key: "reviewRules",
+    default: { preset: "off" },
+    off: true,
+    reason:
+      "No review lens is listed, changed or checked until a person sets the preset; the repo's CI gate stays the guarantee.",
+    decidedIn: "#99",
+  },
+  {
+    scope: "server",
     key: "agentSlots",
     default: { enabled: false },
     fields: true,
@@ -198,6 +207,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     off: true,
     reason: "A project without its own handoff settings uses the server's.",
     decidedIn: "#215",
+  },
+  {
+    scope: "projectOverride",
+    key: "reviewRules",
+    default: undefined,
+    off: true,
+    reason: "A project without its own review rules uses the server's.",
+    decidedIn: "#99",
   },
 ];
 
