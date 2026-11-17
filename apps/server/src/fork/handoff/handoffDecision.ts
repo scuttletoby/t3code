@@ -99,7 +99,11 @@ export function handoffDecision(facts: HandoffFacts): HandoffDecision {
   const asked = facts.trigger === "asked";
   // A failed run (a usage limit too) or an interrupted one is never handed off unasked.
   if (!asked && run.state !== "completed") return skip("last-run-not-completed");
-  const size = facts.usedTokens;
+  // A reading that is not a number (NaN, Infinity) counts as missing: comparisons with it lie.
+  const finite = (value: number | undefined) =>
+    value !== undefined && Number.isFinite(value) ? value : undefined;
+  const size = finite(facts.usedTokens);
+  const cacheExpiresAtMs = finite(facts.cacheExpiresAtMs);
   if (size === undefined && !asked) return skip("no-size");
   if (size !== undefined && size < HANDOFF_MIN_TOKENS) return skip("too-small");
 
@@ -118,9 +122,9 @@ export function handoffDecision(facts: HandoffFacts): HandoffDecision {
   // The idle trigger: only while the cache is warm, and only at a quiet thread.
   if (facts.idleTokens === 0) return skip("idle-off");
   if ((size ?? 0) < facts.idleTokens) return skip("too-small");
-  if (facts.cacheExpiresAtMs === undefined) return skip("cache-expiry-unknown");
-  if (facts.nowMs >= facts.cacheExpiresAtMs) return skip("cache-expired");
-  const windowStartMs = facts.cacheExpiresAtMs - HANDOFF_IDLE_LEAD_MS[facts.source];
+  if (cacheExpiresAtMs === undefined) return skip("cache-expiry-unknown");
+  if (facts.nowMs >= cacheExpiresAtMs) return skip("cache-expired");
+  const windowStartMs = cacheExpiresAtMs - HANDOFF_IDLE_LEAD_MS[facts.source];
   // The timer reads the thread again then; a busy thread now may be quiet by then.
   if (facts.nowMs < windowStartMs) return { kind: "sleep", untilMs: windowStartMs };
   // Inside the window a busy thread is not waited for: its next turn end starts over.
