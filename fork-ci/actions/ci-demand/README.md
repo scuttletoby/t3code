@@ -60,19 +60,25 @@ Two choices to keep in mind when comparing before and after:
   first line, and `cache_write_failed` in `--json`) and a stop does not say to run again: the pages that failed were not saved, so it
   would ask for them again. Fix the cache folder first.
 - **Cache.** A jobs page is saved when the run and all its jobs are completed, keyed by run id and attempt (a re-run
-  is a new attempt, so a new page). A runs-list page is saved when every run in it is completed and the day ended over
-  an hour ago, and is reused for 12 hours (a later re-run changes it). Writes are a `.part-` file then a rename, so a
-  run killed mid-write leaves no half page under a name that is read. A file that is broken (bad JSON, a bad date, a
-  body that is not an object), saved for another page or in another cache format (an older or newer version of this
-  tool) is fetched again, never a crash. A write that fails (a full disk) is reported once and the run goes on
-  without saving (see above). `.part-` files older than an hour are removed.
+  is a new attempt, so a new page). A runs-list page is saved when every run in it is completed and the day ended
+  over an hour ago, and is reused for 12 hours (a later re-run changes it). Writes are a `.part-` file then a rename,
+  so a run killed mid-write leaves no half page under a name that is read. A file that is broken (bad JSON, nested
+  too deep, a bad date, a body that is not an object, or a field missing or of the wrong type, such as
+  `total_count` as text or a page without its runs or jobs), saved for another page or in another cache format (an
+  older or newer version of this tool) is fetched again: never a crash, and never counted as no runs or no jobs. A
+  date must be in the form GitHub writes, such as `2026-11-01T12:00:00Z`. A write that fails (a full disk, a
+  read-only folder) is reported once and the run goes on with the pages it can read (see above). `.part-` files
+  older than an hour are removed; one that cannot be removed (a read-only folder, a directory of that name) is
+  reported on its own line and the run goes on.
 - **Any OS.** It needs Python 3 and `gh`. Where the OS has user ids (Linux, macOS), a cache folder another user owns
   is refused and the folder is made 0700, also when it existed before; on Windows these checks are skipped. So on
   Linux or macOS the cache folder must allow private permissions: one on a filesystem where chmod has no effect (FAT
   or exFAT, WSL's `/mnt/c`, some network mounts) is refused (exit 2). Pick a folder on a normal disk, such as
   `$XDG_CACHE_HOME/ci-demand` or `~/.cache/ci-demand`. `gh` output and the config file are read as UTF-8 whatever the
   locale (a BOM is fine in the config file).
-- Exit codes: 0 complete, 2 bad arguments or an API error (404, no access, network down after retries), 3 incomplete.
+- Exit codes: 0 complete, 2 bad arguments (also a config file that is not JSON or not of the shape above) or an API
+  error (404, no access, network down after retries, an answer with a field missing or of the wrong type), 3 incomplete.
+  A bad file or answer is one line on stderr, not a traceback.
 
 ## General vs project
 
