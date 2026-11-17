@@ -1,0 +1,284 @@
+{
+  "about": "fork-fleet-walls-contract.test.py: `pass` is a fake machine on which every wall of `linux` holds (paths under FORK_FLEET_WALLS_ROOT; a string is a file's text, a path ending in / a folder, {\"text\", \"mode\"} a program); `fail` names each wall with the changes that make it fail (null removes a path).",
+  "pass": {
+    "proc/sys/kernel/ostype": "Linux\n",
+    "proc/sys/kernel/osrelease": "6.8.0-47-generic\n",
+    "proc/1/comm": "systemd\n",
+    "proc/sys/kernel/seccomp/actions_avail": "kill_process kill_thread trap errno user_notif trace log allow\n",
+    "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n54 29 0:54 / /c rw - 9p drvfs rw\n",
+    "run/": "",
+    "proc/self/ns/ipc": "",
+    "proc/self/ns/mnt": "",
+    "proc/self/ns/net": "",
+    "proc/kallsyms": "0000000000000000 T __cgroup_bpf_run_filter_sk\n0000000000000000 T __cgroup_bpf_run_filter_skb\n",
+    "proc/cmdline": "BOOT_IMAGE=/vmlinuz-6.8.0-47-generic root=UUID=0 ro quiet\n",
+    "usr/": "",
+    "etc/": "",
+    "etc/fstab": "UUID=0 / ext4 defaults 0 1\n# //nas.example/old /srv/old cifs username=u,password=old 0 0\n//nas.example/share /srv/share cifs credentials=/etc/nas.cred,uid=1000 0 0\n",
+    "etc/nas.cred": {
+      "text": "username=u\npassword=p\n",
+      "mode": "600"
+    },
+    "etc/xrdp/xrdp.ini": "[Xorg]\npassword=ask\n",
+    "etc/systemd/system/srv-media.mount": "[Unit]\nDescription=media share\n\n[Mount]\nWhat=//nas.example/media\nWhere=/srv/media\nType=cifs\nOptions=credentials=/etc/nas.cred,uid=1000\n",
+    "etc/systemd/system/srv-old.mount": {
+      "text": "[Mount]\nWhat=//nas.example/old\nWhere=/srv/old\nType=cifs\nOptions=username=u,password=owner-only\n",
+      "mode": "600"
+    },
+    "etc/systemd/system/srv-media.automount.d/override.conf": "[Automount]\n# Options=password=old\nTimeoutIdleSec=60\n",
+    "etc/environment": "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n",
+    "etc/profile.d/tools.sh": "export EDITOR=vi\nexport GPG_TTY=$(tty)\nexport GH_TOKEN=$(cat ~/.gh-token)\n[ -n \"$SSH_AUTH_SOCK\" ] && export SSH_KEY_HINT=\n",
+    "etc/profile.d/owner.sh": {
+      "text": "export DEPLOY_TOKEN=only-root-reads-this\n",
+      "mode": "600"
+    },
+    "etc/environment.d/10-locale.conf": "LANG=en_US.UTF-8\nPATH=${PATH}:/opt/tools/bin\n",
+    "etc/profile": "if [ \"$(id -u)\" -eq 0 ]; then PATH=\"/usr/sbin:/usr/bin\"; fi\nexport PATH\nexport https_proxy=http://proxy.example:3128\n",
+    "etc/bash.bashrc": "[ -z \"$PS1\" ] && return\nPS1='\\u@\\h:\\w\\$ '\nexport GH_TOKEN=\"${GH_TOKEN:-}\"\n",
+    "etc/systemd/system/backup.service": "[Service]\nEnvironment=\"LANG=C.UTF-8\" TZ=UTC\nEnvironmentFile=-/etc/default/backup\nExecStart=/usr/bin/backup\n",
+    "etc/default/backup": {
+      "text": "RESTIC_PASSWORD=only-root-reads-this\n",
+      "mode": "600"
+    },
+    "etc/zsh/zshrc": "if [[ \"$TERM\" != emacs ]]\nthen\n    typeset -A key\n    key=(\n        Home       \"${terminfo[khome]}\"\n    )\nfi\n",
+    "etc/environment.d/20-tools.conf": "TOKENIZERS_PARALLELISM=false\nGOOGLE_APPLICATION_CREDENTIALS=/opt/gcp/key.json\n",
+    "opt/gcp/key.json": {
+      "text": "{}\n",
+      "mode": "600"
+    }
+  },
+  "fail": {
+    "os": [
+      {
+        "proc/sys/kernel/osrelease": "6.6.36.3-microsoft-standard-WSL2\n"
+      },
+      {
+        "run/WSL/": ""
+      },
+      {
+        "usr/lib/wsl/": ""
+      },
+      {
+        "proc/sys/fs/binfmt_misc/WSLInterop-late": "enabled\n"
+      },
+      {
+        "proc/cmdline": "initrd=\\initrd.img WSL_ROOT_INIT=1 panic=-1 nr_cpus=8\n"
+      },
+      {
+        "proc/sys/kernel/ostype": null
+      }
+    ],
+    "kernel": [
+      {
+        "proc/sys/kernel/osrelease": "5.4.0-200-generic\n"
+      },
+      {
+        "proc/sys/kernel/osrelease": "generic\n"
+      }
+    ],
+    "systemd": [
+      {
+        "proc/1/comm": "init\n"
+      },
+      {
+        "proc/1/comm": null
+      }
+    ],
+    "cgroup2": [
+      {
+        "proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n36 35 0:30 / /sys/fs/cgroup/unified rw - cgroup2 cgroup2 rw\n"
+      },
+      {
+        "proc/self/mountinfo": "29 1 252:0 / / rw - ext4 /dev/vda1 rw\n"
+      },
+      {
+        "proc/self/mountinfo": "not a mount line\n"
+      },
+      {
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n54 29 0:54 / /c rw - 9p drvfs rw\n36 24 0:31 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n"
+      }
+    ],
+    "cgroup-bpf": [
+      {
+        "proc/kallsyms": "0000000000000000 T __cgroup_bpf_run_filter_sk\n"
+      },
+      {
+        "proc/kallsyms": null
+      },
+      {
+        "boot/config-6.8.0-47-generic": "CONFIG_CGROUPS=y\n# CONFIG_CGROUP_BPF is not set\n"
+      }
+    ],
+    "namespaces": [
+      {
+        "proc/self/ns/ipc": null
+      },
+      {
+        "proc/self/ns/": null
+      }
+    ],
+    "seccomp": [
+      {
+        "proc/sys/kernel/seccomp/actions_avail": null
+      },
+      {
+        "proc/sys/kernel/seccomp/actions_avail": "kill_process allow\n"
+      }
+    ],
+    "container": [
+      {
+        "run/systemd/container": "lxc\n"
+      },
+      {
+        ".dockerenv": ""
+      },
+      {
+        "run/.containerenv": ""
+      }
+    ],
+    "mounts": [
+      {
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n54 29 0:54 / /c rw - 9p drvfs rw\n60 29 0:60 / /usr rw - nfs4 nas.example:/usr rw\n"
+      },
+      {
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw - cifs //nas.example/root rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n54 29 0:54 / /c rw - 9p drvfs rw\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/srv/share\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/c\n",
+        "c/": ""
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/opt/tools\n",
+        "opt/tools/": "",
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n54 29 0:54 / /c rw - 9p drvfs rw\n61 29 0:61 / /opt/tools rw - 9p tools rw\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "WORK_ROOT=/data/runners\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "JOB_PATHS=/etc/fork-fleet/job-paths.txt\n"
+      },
+      {
+        "proc/self/mountinfo": null
+      },
+      {
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n54 29 0:54 / /c rw - 9p drvfs rw\n60 29 0:60 / /usr rw - ext4 /dev/vdc1 rw\n61 29 0:61 / /usr rw - nfs4 nas.example:/usr rw\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet.py": "",
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n54 29 0:54 / /c rw - 9p drvfs rw\n62 29 0:62 / /opt/fork-fleet/fork-fleet.py rw - nfs4 nas.example:/f rw\n"
+      },
+      {
+        "opt/fork-fleet/fork-fleet.json": "{}\n",
+        "proc/self/mountinfo": "24 29 0:22 / /sys rw,nosuid - sysfs sysfs rw\n29 1 252:0 / / rw,relatime - ext4 /dev/vda1 rw\n35 24 0:29 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n40 29 0:30 / /home/a\\040b rw - ext4 /dev/vdb1 rw\n50 29 0:50 / /srv/share rw - cifs //nas.example/share rw\n51 29 0:51 / /net rw - autofs /etc/auto.net rw\n52 29 0:52 / /data rw - nfs4 nas.example:/export rw\n53 29 8:17 / /media/owner/USB\\040STICK rw - vfat /dev/sdb1 rw\n54 29 0:54 / /c rw - 9p drvfs rw\n63 29 0:63 / /opt/fork-fleet/fork-fleet.json rw - 9p drvfs rw\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "RESOLV_CONF=/data/resolv.conf\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/mnt/tools\n",
+        "mnt/tools/": ""
+      }
+    ],
+    "job-units": [
+      {
+        "etc/systemd/system/service.d/10-x.conf": "[Service]\nPrivateDevices=no\n"
+      },
+      {
+        "run/systemd/system/fork-fleet-.service.d/10-gpu.conf": "[Service]\nBindReadOnlyPaths=/run/WSL:/run/WSL\n"
+      },
+      {
+        "usr/lib/systemd/system/fork-.service.d/x.conf": "[Service]\nSystemCallFilter=\n"
+      },
+      {
+        "etc/systemd/system/fork-fleet-ci-1.service.d/x.conf": "[Service]\nIPAddressDeny=\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "SYSTEMD_RUN=/usr/local/sbin/run-with-gpu\n"
+      },
+      {
+        "run/systemd/transient/fork-fleet-ci-1.service.d/50-IPAddressDeny.conf": "# This is a drop-in unit file extension, created via \"systemctl set-property\"\n# or an equivalent operation. Do not edit.\n[Service]\nIPAddressDeny=\nIPAddressDeny=203.0.113.7/32\n"
+      },
+      {
+        "etc/systemd/system/system.slice.d/10-lan.conf": "[Slice]\nIPAddressAllow=any\n"
+      },
+      {
+        "etc/systemd/system/service.d/10-slow.conf": "[Service]\nTimeoutStopSec=infinity\n"
+      }
+    ],
+    "etc-secrets": [
+      {
+        "etc/fstab": "UUID=0 / ext4 defaults 0 1\n//nas.example/share /srv/share cifs username=u,password=hunter2 0 0\n"
+      },
+      {
+        "etc/auto.nas": "share -fstype=cifs,username=u,pass=hunter2 ://nas.example/share\n"
+      },
+      {
+        "etc/nas.cred": "username=u\npassword=p\n"
+      },
+      {
+        "etc/samba/.smbcredentials": "username=u\npassword=p\n"
+      },
+      {
+        "etc/fstab": "//nas.example/s /srv/s cifs credentials=/etc/nas.secret 0 0\n",
+        "etc/nas.secret": "password=p\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.mount": "[Mount]\nWhat=//nas.example/share\nWhere=/srv/nas\nType=cifs\nOptions=username=me,password=hunter2,uid=1000\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.mount": "[Mount]\nWhat=//nas.example/share\nWhere=/srv/nas\nType=cifs\nOptions=pass=hunter2\n"
+      },
+      {
+        "etc/systemd/system/srv-media.mount.d/creds.conf": "[Mount]\nOptions=credentials=/etc/nas.secret\n",
+        "etc/nas.secret": "password=p\n"
+      },
+      {
+        "etc/systemd/system/srv-nas.automount.d/x.conf": "[Automount]\nOptions=username=u,password=hunter2\n"
+      },
+      {
+        "etc/environment": "PATH=\"/usr/bin:/bin\"\nGITHUB_TOKEN=ghp_example\n"
+      },
+      {
+        "etc/profile.d/tools.sh": "export EDITOR=vi\nexport OPENAI_API_KEY='sk-example'\n"
+      },
+      {
+        "etc/profile.d/nas.csh": "setenv NAS_PASSWORD hunter2\n"
+      },
+      {
+        "etc/environment.d/50-ci.conf": "GH_PAT=not-a-real-token\n"
+      },
+      {
+        "etc/profile": "export EDITOR=vi DEPLOY_TOKEN=not-a-real-token\n"
+      },
+      {
+        "etc/bash.bashrc": "[ -n \"$DEPLOY_TOKEN\" ] || export DEPLOY_TOKEN=\"${DEPLOY_TOKEN:-not-a-real-token}\"\n"
+      },
+      {
+        "etc/environment": "https_proxy=http://me:hunter2@proxy.example:3128\n"
+      },
+      {
+        "etc/systemd/system/backup.service": "[Service]\nEnvironment=RESTIC_PASSWORD=hunter2\nExecStart=/usr/bin/backup\n"
+      },
+      {
+        "etc/default/backup": "RESTIC_PASSWORD=hunter2\n"
+      },
+      {
+        "etc/systemd/system/nightly.service": "[Service]\nEnvironment = A=1 \\\n  RESTIC_PASSWORD=hunter2\n"
+      },
+      {
+        "etc/systemd/system/nightly.service": "[Service]\nSetCredential=restic.password:hunter2\n"
+      },
+      {
+        "usr/lib/systemd/system/telegraf.service": "[Service]\nEnvironmentFile=-/etc/default/telegraf\n",
+        "etc/default/telegraf": "INFLUX_TOKEN=hunter2hunter2\n"
+      },
+      {
+        "etc/fish/conf.d/gh.fish": "set -gx GH_TOKEN abc123secretvalue\n"
+      }
+    ]
+  }
+}
