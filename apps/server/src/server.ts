@@ -677,7 +677,8 @@ const layerServerRestart = Layer.effect(
 );
 
 const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
-  AgentAwarenessRelay.layer,
+  // Fork: a held server (`serve --hold-work`) publishes no agent activity.
+  HoldWorkConnect.agentActivityLayer(AgentAwarenessRelay.layer),
   HeldHooksWaker.layer,
   layerThreadSettlementWorker,
   layerIdleCompactionWorker,

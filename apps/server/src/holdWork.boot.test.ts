@@ -34,6 +34,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
+import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 
@@ -45,6 +46,8 @@ const modelSelection = {
 const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = modelSelection.instanceId;
 const projectId = ProjectId.make("project:hold-work");
+// The project of the one thread the agent activity publisher would send; nothing else uses it.
+const activityProjectId = ProjectId.make("project:hold-work-activity");
 
 const children = new Set<NodeChildProcess.ChildProcess>();
 afterEach(async () => {
@@ -114,6 +117,12 @@ const fakeRemote = () =>
 
 const relayRequests = (remote: FakeRemote) =>
   remote.requests.filter((request) => request.path.startsWith("/v1/"));
+const activityPublishes = (remote: FakeRemote) =>
+  remote.requests.filter(
+    (request) =>
+      request.path.endsWith("/agent-activity") &&
+      decodeURIComponent(request.path).includes("/threads/thread:hold-work:finished/"),
+  );
 const heartbeats = (remote: FakeRemote) =>
   remote.requests.filter(
     (request) => request.path === "/batch/" && request.body.includes('"server.boot.heartbeat"'),
@@ -161,6 +170,11 @@ const boot = async (
         XDG_STATE_HOME: NodePath.join(root, "state"),
         T3CODE_TELEMETRY_ENABLED: "true",
         T3CODE_POSTHOG_HOST: remote.url,
+        // A build with T3 Connect: startup then also reconciles the stored desired link. The
+        // address never resolves; the stored link points at the local fake server.
+        T3CODE_RELAY_URL: "https://relay.invalid",
+        T3CODE_CLERK_PUBLISHABLE_KEY: "pk_test_hold_work",
+        T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: "client-hold-work",
         NO_COLOR: "1",
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -270,6 +284,19 @@ const HELD_LINES = [
   "Startup analytics heartbeat held (--hold-work)",
   "Remote delegated task follower held (--hold-work)",
   "T3 Connect held (--hold-work)",
+  "Agent activity publishing held (--hold-work)",
+];
+
+/** What a publisher that started logs at once, before any of the held lines above. */
+const PUBLISHER_STARTED = /agent activity publishing (enabled|disabled|standby)/;
+
+/**
+ * Startup registers the tunnel after a random wait of up to 30 s, then reconciles the desired link.
+ * The held boot waits for the held calls' own spans, so both steps have been reached.
+ */
+const HELD_CONNECT_STEPS = [
+  "HoldWorkConnect.registerManagedTunnelRecovery",
+  "HoldWorkConnect.reconcileDesiredLink",
 ];
 
 /** The spans that show a hold was not kept: each runs only when its part starts. */
@@ -279,12 +306,13 @@ const HELD_SPANS = [
   "environment.cloud.registerManagedCloudTunnelRecovery",
   "environment.cloud.releaseManagedTunnelOnShutdown",
   "environment.cloud.startManagedCloudTunnelIfOriginConfirmed",
+  "environment.cloud.reconcileDesiredLinkIfStillDesired",
 ];
 
-const seedThreads = (dbPath: string, nowMs: number) => {
+const seedThreads = (dbPath: string, nowMs: number, activityRoot: string) => {
   const at = (offsetMs: number) => DateTime.makeUnsafe(nowMs + offsetMs);
   const iso = (offsetMs: number) => DateTime.formatIso(at(offsetMs));
-  const thread = (suffix: string, createdAt: DateTime.Utc) => ({
+  const thread = (suffix: string, createdAt: DateTime.Utc, inProject = projectId) => ({
     id: EventId.make(`event:hold-work:${suffix}:thread`),
     type: "thread.created" as const,
     threadId: ThreadId.make(`thread:hold-work:${suffix}`),
@@ -293,7 +321,7 @@ const seedThreads = (dbPath: string, nowMs: number) => {
       createdBy: "user" as const,
       creationSource: "web" as const,
       id: ThreadId.make(`thread:hold-work:${suffix}`),
-      projectId,
+      projectId: inProject,
       title: `hold-work ${suffix}`,
       providerInstanceId,
       modelSelection,
@@ -319,7 +347,7 @@ const seedThreads = (dbPath: string, nowMs: number) => {
   });
   const run = (
     suffix: string,
-    status: "running" | "interrupted" | "failed",
+    status: "running" | "interrupted" | "failed" | "completed",
     at: {
       requestedAt: DateTime.Utc;
       startedAt: DateTime.Utc | null;
@@ -368,9 +396,39 @@ const seedThreads = (dbPath: string, nowMs: number) => {
     completedAt: null,
   });
   const limited = { ...limitedRunning, status: "failed" as const, completedAt: at(-90 * 60_000) };
+  // Finished after the server started (dated ahead of the boot), so the agent activity publisher
+  // sends it on its first snapshot: the phone shows "Agent finished".
+  const finished = run("finished", "completed", {
+    requestedAt: at(-5 * 60_000),
+    startedAt: at(-5 * 60_000),
+    completedAt: at(10 * 60_000),
+  });
   return Effect.gen(function* () {
+    yield* (yield* ProjectStore.ProjectStoreV2).apply({
+      sequence: 0,
+      eventId: EventId.make("event:hold-work:activity-project"),
+      aggregateKind: "project",
+      aggregateId: activityProjectId,
+      occurredAt: iso(-2 * 60 * 60_000),
+      commandId: null,
+      causationEventId: null,
+      correlationId: null,
+      metadata: {},
+      type: "project.created",
+      payload: {
+        projectId: activityProjectId,
+        title: "hold-work activity",
+        workspaceRoot: activityRoot,
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: iso(-2 * 60 * 60_000),
+        updatedAt: iso(-2 * 60 * 60_000),
+      },
+    });
     const store = yield* ProjectionStore.ProjectionStoreV2;
     for (const event of [
+      thread("finished", at(-5 * 60_000), activityProjectId),
+      runEvent("finished", finished, "run.created"),
       thread("mid-turn", twoHoursAgo),
       runEvent("mid-turn", midTurn, "run.created"),
       thread("continued", twoHoursAgo),
@@ -452,7 +510,7 @@ const seedThreads = (dbPath: string, nowMs: number) => {
     }
   }).pipe(
     Effect.provide(
-      ProjectionStore.layer.pipe(
+      Layer.merge(ProjectionStore.layer, ProjectStore.layer).pipe(
         Layer.provideMerge(SqlitePersistence.layerFromPath(dbPath)),
         Layer.provide(NodeServices.layer),
       ),
@@ -479,6 +537,8 @@ const CONNECT_SECRETS = (relayUrl: string): Record<string, string> => ({
   "cloud-linked-user-id": "user-hold-work",
   "cloud-relay-environment-credential": "credential-hold-work",
   "cloud-cli-desired-link": "managed",
+  // Agent activity publishing on, as `t3 connect publish` leaves it.
+  "cloud-publish-agent-activity": "true",
   "cloud-cli-oauth-token": JSON.stringify({
     accessToken: "access-hold-work",
     refreshToken: "refresh-hold-work",
@@ -500,7 +560,9 @@ const seed = async (root: string, relayUrl: string) => {
   );
   // The child server reads the real clock, so the seed is dated from it (due, overdue, expired).
   const nowMs = DateTime.toEpochMillis(DateTime.nowUnsafe());
-  await seedThreads(dbPath, nowMs);
+  const activityRoot = NodePath.join(root, "activity-project");
+  NodeFS.mkdirSync(activityRoot, { recursive: true });
+  await seedThreads(dbPath, nowMs, activityRoot);
   const iso = (offsetMs: number) => DateTime.formatIso(DateTime.makeUnsafe(nowMs + offsetMs));
   {
     using db = new NodeSqlite.DatabaseSync(dbPath);
@@ -644,7 +706,7 @@ describe("serve --hold-work on a seeded home", () => {
       ]);
       expect(seeded.waits).toEqual([{ id: "w_abcdefghij", state: "waiting" }]);
 
-      expect(Object.keys(seeded.connect)).toHaveLength(7);
+      expect(Object.keys(seeded.connect)).toHaveLength(8);
       expect(seeded.remoteTask).toBeDefined();
 
       const held = await boot(root, remote, ["--hold-work"]);
@@ -665,11 +727,15 @@ describe("serve --hold-work on a seeded home", () => {
           ) &&
           // The holds outside the work gate. Each part logs this instead of starting, so a part
           // that ignored the hold never logs it and the wait fails.
-          HELD_LINES.every((line) => output.includes(line))
+          HELD_LINES.every((line) => output.includes(line)) &&
+          // Past the random wait before registration, and past the desired-link reconcile.
+          HELD_CONNECT_STEPS.every((name) => spansFrom(paths.stateDir, 0).names.has(name))
         );
       });
       await stop(held.child);
       const heldSpans = spansFrom(paths.stateDir, 0);
+      // The publisher logs its state when it starts, before any held line: a held one never does.
+      expect(held.output()).not.toMatch(PUBLISHER_STARTED);
 
       const afterHeld = snapshot(paths);
       // Nothing was claimed, advanced or marked failed.
@@ -716,6 +782,8 @@ describe("serve --hold-work on a seeded home", () => {
             (row) => row.effect_id === "effect:hold-work:continue" && row.status !== "pending",
           ) &&
           heartbeats(remote).length > 0 &&
+          // The finished thread's activity reaches the relay, so the held boot had it to send.
+          activityPublishes(remote).length > 0 &&
           spansFrom(paths.stateDir, heldSpans.end).names.has("RemoteDelegation.followOnce")
         );
       });
