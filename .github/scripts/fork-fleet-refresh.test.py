@@ -967,12 +967,14 @@ class Timer(unittest.TestCase):
 
     def test_the_service_writes_the_templates_own_folder_only(self):
         """The writable folder is the default template's own folder, and none of the files root runs (the launcher,
-        the dispatcher, its trust config, the job hook, the pc wrapper) is in it or under it."""
+        the dispatcher, its trust config, the job hook, the desk link and its wire format, seed and key tools) is in it
+        or under it."""
         service = unit('fork-fleet-refresh.service')['Service']
         rw = [p.lstrip('-') for p in service['ReadWritePaths'].split()]
         self.assertEqual(rw, [os.path.dirname(default_template())])
         root_dir = os.path.dirname(service['ExecStart'].split()[0])
-        for f in ('fork-fleet-launch.sh', 'fork-fleet.py', 'fork-fleet.json', 'hook.sh', 'launch-pc', 'SOURCE'):
+        for f in ('fork-fleet-launch.sh', 'fork-fleet.py', 'fork-fleet.json', 'hook.sh', 'fork-fleet-desk.py',
+                  'fork-fleet-desk-wire.py', 'fork-fleet-desk-seed.py', 'fork-fleet-desk-key.py', 'SOURCE'):
             path = f'{root_dir}/{f}'
             self.assertFalse(any(path == w or path.startswith(w.rstrip('/') + '/') for w in rw), path)
         self.assertNotIn('AF_UNIX', service['RestrictAddressFamilies'].split())
