@@ -58,12 +58,18 @@ export function useScopedSettingSource(keys: readonly (keyof ServerSettings)[]) 
   return scopedSettingsSource(targets, keys);
 }
 
+/** Fork: where a save failed and where it saved; absent when nothing was sent. */
+interface ScopedSaveFailure {
+  readonly failed: readonly string[];
+  readonly saved: readonly string[];
+}
+
 function useRunScopedPlan() {
   const persistServer = useAtomCommand(serverEnvironment.updateSettings, { reportFailure: false });
   return (
     environments: Parameters<typeof writeScopedSettings>[0],
     planner: Parameters<typeof writeScopedSettings>[1],
-    onFailed?: () => void,
+    onFailed?: (failure?: ScopedSaveFailure) => void,
     onSaved?: () => void,
   ) => {
     const plan = planner(environments);
@@ -119,7 +125,10 @@ function useRunScopedPlan() {
         onSaved?.();
         return;
       }
-      onFailed?.();
+      onFailed?.({
+        failed: failedEnvironments.map(({ label }) => label),
+        saved: savedEnvironments.map(({ label }) => label),
+      });
       toastManager.add({
         type: "error",
         title:
@@ -149,12 +158,15 @@ export function useUpdateScopedSettings() {
   const { scope, environments, deviceOnly } = useSettingsScope();
   const run = useRunScopedPlan();
   /**
-   * `onFailed` runs when any target rejects or drops the patch, so a draft can fall back;
-   * `onSaved` runs once every target has saved it, so a form can close only then.
+   * `onFailed` runs when any target rejects or drops the patch, so a draft can fall back (with
+   * where it failed and saved, unless nothing was sent); `onSaved` runs once every target has saved it, so a form can close only then.
    */
   return (
     patch: ScopedSettingsPatch,
-    options?: { readonly onFailed?: () => void; readonly onSaved?: () => void },
+    options?: {
+      readonly onFailed?: (failure?: ScopedSaveFailure) => void;
+      readonly onSaved?: () => void;
+    },
   ) =>
     run(
       environments,
