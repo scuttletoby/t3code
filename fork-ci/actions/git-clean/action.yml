@@ -1,0 +1,19 @@
+name: git-clean
+description: >-
+  The first step of a job, before actions/checkout. On a self-hosted runner it empties the reused workspace, so a git
+  config, hook or file an earlier job (pull request code) left there cannot run during this job's checkout. On a
+  GitHub-hosted runner (a fresh disk) it removes nothing. Then it refuses a .git config at the checkout path that
+  actions/checkout does not write. Needs git and python3.
+inputs:
+  path:
+    description: The checkout path or paths (actions/checkout's path), one per line, relative to the workspace.
+    required: false
+    default: "."
+runs:
+  using: composite
+  steps:
+    - name: Empty a reused workspace; refuse a git config actions/checkout does not write
+      shell: bash
+      env:
+        CHECKOUT_PATH: ${{ inputs.path }}
+      run: exec python3 -I "$GITHUB_ACTION_PATH/git_clean.py" prepare --path "$CHECKOUT_PATH"

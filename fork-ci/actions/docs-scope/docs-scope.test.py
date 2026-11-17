@@ -889,14 +889,15 @@ class Action(CleanEnv):
 
     def test_runs_only_its_own_script(self):
         runs = re.findall(r'^\s*run: (.*)$', self.text, re.M)
-        self.assertEqual(runs, ['python3 -I "$GITHUB_ACTION_PATH/docs_scope.py" --config "$CONFIG" '
+        self.assertEqual(runs, ['exec python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path . --require',   # the git-clean check of this pinned SHA
+                                'python3 -I "$GITHUB_ACTION_PATH/docs_scope.py" --config "$CONFIG" '
                                 '--event "$EVENT" --base "$BASE"'])
         self.assertNotIn('uses:', self.text)
         self.assertIn('using: composite', self.text)
 
     def test_inputs_reach_the_script_by_env_only(self):   # never ${{ }} inside run: (script injection)
-        run = re.search(r'^\s*run: (.*)$', self.text, re.M)[1]
-        self.assertNotIn('${{', run)
+        for run in re.findall(r'^\s*run: (.*)$', self.text, re.M):
+            self.assertNotIn('${{', run)
 
     def test_declares_every_output_the_script_writes(self):
         for name in ('docs_only', 'jobs', 'reason'):

@@ -74,6 +74,9 @@ GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
 # commit-graph (a planted objects/info/commit-graph(s) could change the parents git reports; git rebuilds nothing from it).
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
             '--no-replace-objects')
+# ... and no global or system config: on a self-hosted runner an earlier job may have written ~/.gitconfig. The same
+# two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
@@ -387,7 +390,7 @@ class Queue:
         token = self.read_token
         env = self.gh_env(token) if token else {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
         return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0'})
+                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0', **GIT_ENV})
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
@@ -443,7 +446,7 @@ class Queue:
             print(f'could not make {new}: {e}')
             return False
         r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True, env=no_token_env())
+                           capture_output=True, env={**no_token_env(), **GIT_ENV})
         if r.returncode != 0:
             print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
             return False
