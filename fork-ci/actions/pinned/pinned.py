@@ -16,7 +16,7 @@ and no good copy: FetchError, and the caller fails or falls back to its full ans
 also removes .part- files older than PART_AGE (a killed fetch), and the folders of other shas that nothing used for
 CACHE_DAYS and the run folders a killed run left that long ago. load() and run run the bytes that were checked, never
 a second read of the cache file, and refuse a file that would load its neighbours (neighbour_loads): those would be
-cache files nothing checked. run also refuses a cache under a folder someone else could write (shared_above).
+cache files nothing checked. Both refuse a cache under a folder someone else could write (shared_above).
 
   python3 -I pinned.py --config .github/fork-ci.json [--cache DIR] run <action> <file> [args...]
 runs that pinned script (python3 -I) with the arguments after its name, from a private copy of the checked bytes.
@@ -35,9 +35,9 @@ SHA = re.compile(r'[0-9a-f]{40}')
 PART_AGE = 3600     # seconds: an older .part- file is a killed fetch (a live one takes seconds)
 CACHE_DAYS = 14     # another sha's folder that nothing used for this long goes (a rerun of an old run fetches again)
 # modules that load code from a path (site: a .pth file runs code; builtins: its __import__ and exec; the private
-# twins of importlib, imp and ctypes; pydoc.importfile; unittest's discover)
+# twins of importlib, imp and ctypes; pydoc.importfile; unittest's discover; doctest.testfile)
 BY_PATH = ('importlib', 'runpy', 'imp', 'zipimport', 'pkgutil', 'site', 'pkg_resources', 'ctypes', 'builtins',
-           '_frozen_importlib', '_frozen_importlib_external', '_imp', '_ctypes', 'pydoc', 'unittest')
+           '_frozen_importlib', '_frozen_importlib_external', '_imp', '_ctypes', 'pydoc', 'unittest', 'doctest')
 SYS_IMPORT = ('path', 'meta_path', 'path_hooks', 'path_importer_cache', 'modules')   # the sys names imports go by
 # sys names that give the file's own path: frames (f_code.co_filename), tracebacks (tb_frame), the command line
 SYS_FRAME = ('_getframe', '_current_frames', '_getframemodulename', 'exc_info', 'exception', 'last_traceback',
@@ -165,12 +165,32 @@ def shared_above(cache):
             except FileNotFoundError:
                 up = os.path.dirname(up)
                 continue
+            except OSError as e:   # a folder above it has no x (EACCES): it cannot be checked, so it is refused
+                raise FetchError(unenterable(up, cache, e))
             if (st.st_uid not in (0, os.getuid()) or st.st_mode & 0o002
                     or st.st_mode & 0o020
                     and not (st.st_uid == os.getuid() and acl(up) is False and own_group(st.st_gid))):
                 bad.append(up)
             up = os.path.dirname(up)
     return bad
+
+
+def unenterable(up, cache, error):
+    """Why a folder above the cache could not be checked, naming the folder that cannot be entered and the fix."""
+    blocked = os.path.dirname(up)   # the lowest folder whose stat works is the one without x
+    while True:
+        try:
+            st = os.stat(blocked)
+            break
+        except OSError:
+            if os.path.dirname(blocked) == blocked:
+                st = None
+                break
+            blocked = os.path.dirname(blocked)
+    fix = (f'chmod u+x {blocked}' if st is not None and st.st_uid == os.getuid()
+           else 'pass --cache with a folder whose every parent you can enter and only you or root can write')
+    return (f'{blocked} cannot be entered ({error.strerror or error}), so {up} above the cache {cache} cannot be '
+            f'checked: it could be someone else\'s, so this cache is refused. Fix: {fix}')
 
 
 def fix_above(up):
@@ -296,8 +316,8 @@ def neighbour_loads(data):
         (__import__, __builtins__): every way to name a neighbour (exec(open(...)), a subprocess, os.chdir,
         site.addsitedir, a data file) starts from it. `from sys import` takes only SYS_FROM.
     Other imports come from the caller's own path (the standard library, an installed PyYAML), as any import of the
-    caller's does. A static check of the usual spellings, never complete (exec, eval or getattr of a built string, an
-    absolute path such as /proc/self/cmdline pass it), so run also puts its copy in a private folder inside the
+    caller's does. A static check of the usual spellings, never complete (a constant or built string passed to getattr,
+    eval or exec, stdlib introspection, an absolute path such as /proc/self/cmdline pass it), so load() and run also puts its copy in a private folder inside the
     checked cache and refuses a cache with a folder above it that someone else could write (shared_above): every `..`
     of the copy is ours or root's."""
     try:
@@ -383,8 +403,22 @@ def path(config, action, name, cache=None):
     return verified(config, action, name, cache)[0]
 
 
+def refuse_shared_above(cache, caller):
+    """FetchError when a folder above the cache is someone else's to write (shared_above), with each one's fix."""
+    shared = shared_above(cache)
+    if shared:
+        raise FetchError(f'{", ".join(shared)} above the cache {cache} can be written by someone else (not yours or '
+                         "root's, world-writable, a sticky temp folder too, or group-writable by a group that is not "
+                         "your own private one, or through an ACL): a script's `..` reaches it, so "
+                         f"{caller} refuses this cache. Fix: "
+                         + '; '.join(dict.fromkeys(fix_above(up) for up in shared)))
+
+
 def load(config, action, module, cache=None):
-    """The pinned fork module (e.g. load(cfg, 'gradle-cache', 'gradle_cache')), run from the bytes that were checked."""
+    """The pinned fork module (e.g. load(cfg, 'gradle-cache', 'gradle_cache')), run from the bytes that were checked.
+    Its __file__ is <cache>/<sha>/<action>/<file>, so its `../../..` is the folder above the cache: refused as in run."""
+    cache = cache or default_cache()
+    refuse_shared_above(cache, 'load')   # before private() makes any folder
     dest, data = self_contained(config, action, module + '.py', cache)
     mod = types.ModuleType(f'fork_ci_{module}')
     mod.__file__ = dest
@@ -396,13 +430,7 @@ def run(config, action, name, args=(), cache=None, runner=None):
     """Run the pinned script with python3 -I and args, from a private copy (<cache>/.run-X/<action>/<name>) of the
     bytes that were checked; its exit code. The copy goes after the run (a killed run's goes after CACHE_DAYS)."""
     cache = cache or default_cache()   # never None: mkdtemp(dir=None) is the shared temp folder
-    shared = shared_above(cache)   # before private() makes any folder: a refused cache leaves nothing behind
-    if shared:
-        raise FetchError(f'{", ".join(shared)} above the cache {cache} can be written by someone else (not yours or '
-                         "root's, world-writable, a sticky temp folder too, or group-writable by a group that is not "
-                         "your own private one, or through an ACL): a script's `..` reaches it, so run refuses this "
-                         "cache. Fix: "
-                         + '; '.join(dict.fromkeys(fix_above(up) for up in shared)))
+    refuse_shared_above(cache, 'run')   # before private() makes any folder: a refused cache leaves nothing behind
     private(cache)
     _, data = self_contained(config, action, name, cache)
     # 0700, ours alone: the bytes checked are the bytes run. In the checked cache, never the shared temp folder: the
