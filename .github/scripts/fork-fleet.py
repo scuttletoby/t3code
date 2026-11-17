@@ -1142,7 +1142,9 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
     # runner is stopped at once when a queued job of another run could be given it (the hook would refuse that job),
     # else after idle_passes passes (a runner that is just taking its own job is not busy yet). A runner's labels name
     # the run attempt it was made for, so no job of another attempt can be given it. The same holds under a label the
-    # pool had before: such a runner counts toward the pool's slots (units()), so an idle one is stopped too.
+    # pool had before: such a runner counts toward the pool's slots (units()), so an idle one is stopped too, but only
+    # when its unit is on this host. One under an old label may run on another host (the pool's launch moved with the
+    # label change, or a removed pool used the label): it holds no slot here, and `stop` would fail every pass (#342).
     for name, (p, r) in [*ours.items(), *old.items()]:
         if p['name'] in down:
             continue
@@ -1153,7 +1155,8 @@ def dispatch_pass(cfg, gh, hosts, state, now=time.time):
                 if e.code != 404:
                     raise
             say(f'{name}: deleted a registration with no runner behind it')
-        elif r.get('status') == 'online' and not r.get('busy') and int(name.rsplit('-', 1)[1]) not in queued_ids:
+        elif r.get('status') == 'online' and not r.get('busy') and int(name.rsplit('-', 1)[1]) not in queued_ids \
+                and (name in ours or name in units[p['name']]):
             state['idle'][name] = state['idle'].get(name, 0) + 1
             labels = [x.get('name') for x in r.get('labels') or [] if isinstance(x, dict)]
             if state['idle'][name] >= cfg['dispatch']['idle_passes'] or \
