@@ -75,7 +75,13 @@ REPORT_CLI = 'apps/server/src/cli/forkReport.ts'
 # Every key path check.py and live.py read from the report, with where it sits.
 REPORT_PATHS = ['reportVersion', 'version', 'ok', 'problems', 'problems.code', 'problems.message',
                 'database.pendingMigrations', 'database.counts', 'database.counts.threads',
-                'database.counts.projects', 'fork.featuresOn']
+                'database.counts.projects', 'database.counts.threadsArchived', 'database.counts.projectsArchived',
+                'fork.featuresOn']
+# What live.compare_counts relies on (fork #181): both reports count the same rows, every project and every thread
+# not deleted (sub-agent and archived threads included), so one report is compared with another, never with
+# `t3 thread list` (one project, no sub-agents).
+REPORT_COUNTS = ['projects: count("projection_projects", "deleted_at IS NULL", ["deleted_at"]),',
+                 'threads: count(threads, "deleted_at IS NULL", ["deleted_at"]),']
 
 
 def interface_paths(text, name):
@@ -123,6 +129,10 @@ class Report(unittest.TestCase):
         for key in REPORT_PATHS:
             with self.subTest(key):
                 self.assertIn(key, paths, f'{REPORT_FILE}: ForkReport.{key} moved or is gone')
+        for line in REPORT_COUNTS:
+            with self.subTest(line):
+                self.assertIn(line, text, f'{REPORT_FILE}: what a count counts changed: update live.compare_counts')
+        self.assertEqual(set(live.COUNTS), {p.split('.')[-1] for p in paths if p.startswith('database.counts.')})
         cli = source(REPORT_CLI)
         self.assertIn('Command.make("__fork-report"', cli)
         self.assertIn('Flag.String("base-dir")', cli)  # live.fork_report passes --base-dir <home>
