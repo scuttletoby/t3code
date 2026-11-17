@@ -50,10 +50,10 @@ ATTEMPTS, RETRY_SECONDS = 3, 10
 FIELDS = 'isDraft,headRefOid,comments,reviews'
 SHA = pr_queue.SHA
 REFUSED = pr_queue.REFUSED
-# Every git call: the queue's safe flags (no hooks, fsmonitor, commit-graph or replace refs) and no attributes file. git
-# runs in an empty folder with --git-dir, so the checkout's own .gitattributes (the pull request's) cannot change how
+# Every git call: the queue's safe flags (no hooks, fsmonitor, commit-graph, replace refs or attributes file). git runs
+# in an empty folder with --git-dir, so the checkout's own .gitattributes (the pull request's) cannot change how
 # merge-tree merges (merge=union would make a conflict "clean").
-GIT_SAFE = (*pr_queue.GIT_SAFE, '-c', 'core.attributesFile=/dev/null')
+GIT_SAFE = pr_queue.GIT_SAFE
 
 
 class Checkout:
@@ -78,7 +78,7 @@ class Checkout:
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
                                   errors=errors, capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-                                                            'GIT_ATTR_NOSYSTEM': '1', **pr_queue.GIT_ENV})
+                                                            **pr_queue.GIT_ENV})
 
     def problem(self):
         """Why the repository cannot be read as git made it, or None: not a git folder, shallow (the base's history is

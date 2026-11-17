@@ -159,7 +159,7 @@ default branch and posted by an App that only the default branch can use.
 | `config`          | (required)                         | the queue's JSON config, a path in the repository, read from the base commit                        |
 | `required-lenses` | (empty)                            | lens names, one per line, that must be among the reads; matched as lens keys (case, `r2`)           |
 | `pass-drafts`     | `false`                            | `true` passes a draft without reading its review; add `ready_for_review` to the workflow's triggers |
-| `path`            | `.`                                | where the merge commit is checked out                                                               |
+| `path`            | `.`                                | where the merge commit is checked out, relative to the workspace (an absolute path is refused)      |
 | `pr`              | `github.event.pull_request.number` | the pull request                                                                                    |
 | `repo`            | `github.repository`                | owner/name                                                                                          |
 | `token`           | `github.token`                     | reads the pull request's comments and reviews (`pull-requests: read`)                               |

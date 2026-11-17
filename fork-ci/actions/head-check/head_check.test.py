@@ -1229,6 +1229,28 @@ class Action(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertNotIn('forged', r.stdout + r.stderr)
 
+    def test_the_git_clean_check_reads_the_path_input(self):
+        """The first step checks the checkout at `path`, not the workspace: with the good checkout in src/ and a planted
+        one at the top, path src passes; with the two swapped, it is refused."""
+        step = self.action['runs']['steps'][0]
+        self.assertIn('git_clean.py', step['run'])
+        ws = tempfile.mkdtemp(prefix='head-check-ws-')
+        self.addCleanup(shutil.rmtree, ws, True)
+        env = {k: {'${{ inputs.path }}': 'src'}[v] for k, v in step['env'].items()}
+        for good, bad in (('src', '.'), ('.', 'src')):
+            with self.subTest(good=good):
+                for p in ('.git', 'src'):
+                    shutil.rmtree(os.path.join(ws, p), True)
+                for p in (good, bad):
+                    subprocess.run(['git', 'init', '-q', os.path.join(ws, p)], check=True, capture_output=True,
+                                   env={**os.environ, 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'})
+                with open(os.path.join(ws, bad, '.git', 'config'), 'a') as f:
+                    f.write('[core]\n\tfsmonitor = true\n')
+                r = subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', step['run']], cwd=ws,
+                                   env={'PATH': os.environ['PATH'], 'GITHUB_ACTION_PATH': HERE, 'GITHUB_WORKSPACE': ws,
+                                        **env}, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0 if good == 'src' else 2, r.stdout + r.stderr)
+
     def test_the_defaults_are_the_pull_request_events(self):
         inputs = self.action['inputs']
         self.assertEqual(inputs['pr']['default'], '${{ github.event.pull_request.number }}')

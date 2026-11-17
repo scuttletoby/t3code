@@ -11,10 +11,12 @@ calls), `core.hooksPath`, `attr.tree` with a merge driver, an include of another
 before any of its own steps runs pull request code.
 
 prepare: on a self-hosted runner (RUNNER_ENVIRONMENT is not `github-hosted`) every entry of GITHUB_WORKSPACE is
-removed, symlinks as links (never what they point to), so nothing outside the workspace is touched. A
-GitHub-hosted runner starts each job on a fresh disk, so nothing is removed there. Then `check` runs on each path.
+removed, symlinks as links (never what they point to), so nothing outside the workspace is touched. The workspace's
+real path must be its path below the runner's work folder (no symlink from RUNNER_WORKSPACE down). A GitHub-hosted
+runner starts each job on a fresh disk, so nothing is removed there. Then `check` runs on each path.
 
-check: `DIR/.git` must be a folder (not a .git file or symlink, which point git elsewhere), with no `commondir`, and
+check: `DIR/.git` must be a folder (not a .git file or symlink, which point git elsewhere), with no `commondir`, none
+of the files that change history or objects (UNTRUSTED_FILES; `shallow` only as a depth-1 checkout writes it), and
 every key of its config (and config.worktree) must be one actions/checkout writes, with a value of the kind it
 writes (ALLOWED). The include it writes for its token is allowed only to a git-credentials file in RUNNER_TEMP that
 holds nothing but the token header. Anything else is refused by name: nothing is repaired in place.
@@ -24,15 +26,21 @@ Exit 0: done; 2: refused (the step fails, so the job's checkout and git calls ne
 import argparse, os, re, stat, subprocess, sys, tempfile
 
 # Every fork-ci git call that reads a checkout runs with this environment and these flags (the actions' modules carry
-# copies: git_clean.test.py pins them to these). No global or system config (an earlier job may have written
-# ~/.gitconfig on a self-hosted runner); no hooks, fsmonitor command, commit-graph or replace refs from the repository.
-GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+# copies: git_clean.test.py pins them to these). No global or system config or attributes (an earlier job may have
+# written ~/.gitconfig or ~/.config/git/attributes on a self-hosted runner); no hooks, fsmonitor command, commit-graph
+# or replace refs from the repository.
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
-            '--no-replace-objects')
+            '-c', 'core.attributesFile=/dev/null', '--no-replace-objects')
+# Files in .git that change a commit's parents (grafts; --no-replace-objects does not turn them off), add another
+# repository's objects (alternates) or change how a file merges or diffs (info/attributes). actions/checkout writes
+# none of them. pr_queue.UNTRUSTED_FILES is this list and `shallow` (git_clean.test.py pins it).
+UNTRUSTED_FILES = ('info/grafts', 'objects/info/alternates', 'objects/info/http-alternates', 'info/attributes')
 
 BOOL = r'(?i:true|false|yes|no|on|off|1|0)'
 UUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 CREDENTIALS = 'credentials'   # a value checked by credentials_problem, not by a pattern
+URL = r'https://[^\s@]+|git@[A-Za-z0-9][A-Za-z0-9.-]*:[^\s]+'   # what checkout writes; a submodule's as in .gitmodules
 HEADER = (r'http\.https://[^/\s]+/\.extraheader', r'AUTHORIZATION: basic [A-Za-z0-9+/=]+')
 # (key, value): what actions/checkout (v4 to v7) and `git init` write, as `git config --list` prints a key (section and
 # name lower case, a subsection as written). Everything else is refused, among it every key that runs a command or
@@ -47,7 +55,7 @@ ALLOWED = tuple((re.compile(k), v if v == CREDENTIALS else re.compile(v)) for k,
     (r'extensions\.worktreeconfig', BOOL),
     (r'extensions\.partialclone', r'origin'),
     (r'gc\.auto', r'0'),
-    (r'remote\.origin\.url', r'https://[^\s@]+|git@[A-Za-z0-9.-]+:[^\s]+'),
+    (r'remote\.origin\.url', URL),
     (r'remote\.origin\.fetch', r'\+?refs/[^\s:]+:refs/[^\s:]+'),
     (r'remote\.origin\.promisor', BOOL),
     (r'remote\.origin\.partialclonefilter', r'[A-Za-z0-9:=+-]+'),
@@ -60,7 +68,7 @@ ALLOWED = tuple((re.compile(k), v if v == CREDENTIALS else re.compile(v)) for k,
     (r'filter\.lfs\.smudge', r'git-lfs smudge -- %f'),
     (r'filter\.lfs\.process', r'git-lfs filter-process'),
     (r'filter\.lfs\.required', BOOL),
-    (r'submodule\.[^\s]+\.url', r'https://[^\s@]+'),
+    (r'submodule\.[^\s]+\.url', URL),
     (r'submodule\.[^\s]+\.active', BOOL),
     (r'user\.(name|email)', r'[^\x00-\x1f\x7f]*'),
 ))
@@ -72,14 +80,19 @@ def say(text):
     print(text, flush=True)
 
 
-def entries(path, env):
-    """[(key, value)] of one config file read by git itself (no includes followed, no other config), or raises
-    ValueError with git's reason."""
+def git(env, *args):
+    """git with the fixed settings, from an empty folder, with nothing of the runner's environment but PATH."""
     with tempfile.TemporaryDirectory(prefix='git-clean-') as empty:
         clean = {'PATH': env.get('PATH') or os.defpath, 'LC_ALL': 'C', 'HOME': empty, 'GIT_TERMINAL_PROMPT': '0',
                  'GIT_CEILING_DIRECTORIES': os.path.dirname(empty), **GIT_ENV}
-        r = subprocess.run(['git', 'config', '--file', path, '--no-includes', '--null', '--list'], cwd=empty,
-                           env=clean, capture_output=True, stdin=subprocess.DEVNULL)
+        return subprocess.run(['git', *GIT_SAFE, *args], cwd=empty, env=clean, capture_output=True,
+                              stdin=subprocess.DEVNULL)
+
+
+def entries(path, env):
+    """[(key, value)] of one config file read by git itself (no includes followed, no other config), or raises
+    ValueError with git's reason."""
+    r = git(env, 'config', '--file', path, '--no-includes', '--null', '--list')
     if r.returncode != 0:
         raise ValueError(r.stderr.decode('utf-8', 'replace').strip()[:300] or f'git config exit {r.returncode}')
     out = []
@@ -133,16 +146,40 @@ def problems(repo, env, require=False):
         return [f'{dot} is not a folder (a .git file or symlink points git to another repository)']
     if os.path.lexists(os.path.join(dot, 'commondir')):
         return [f'{dot} holds commondir, which makes git read the config of another repository']
-    found = []
+    found = [f'{dot} holds {name}, which actions/checkout never writes (it changes what history or objects git reads)'
+             for name in UNTRUSTED_FILES if os.path.lexists(os.path.join(dot, *name.split('/')))]
     for name in ('config', 'config.worktree'):
         path = os.path.join(dot, name)
         if os.path.lexists(path):
             found += file_problems(path, ALLOWED, env)
-    return found
+    return found or shallow_problems(dot, env)
+
+
+def shallow_problems(dot, env):
+    """[why] `shallow` is not the one a fetch-depth 1 checkout writes: exactly HEAD's commit, one line. Any other cuts
+    history at commits git then reports as having no parents. Read only after the config passed (git runs here)."""
+    path = os.path.join(dot, 'shallow')
+    if not os.path.lexists(path):
+        return []
+    try:
+        with open(path, 'rb', opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW | os.O_NONBLOCK)) as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                raise OSError('not a file')
+            text = f.read(200)
+    except OSError as e:
+        return [f'{path} cannot be read ({e.strerror or e})']
+    r = git(env, '--git-dir', dot, 'rev-parse', '--verify', '--quiet', 'HEAD')
+    head = r.stdout.decode('ascii', 'replace').strip() if r.returncode == 0 else ''
+    if not head or text != (head + '\n').encode():
+        return [f'{path} is not the one commit (HEAD) a fetch-depth 1 checkout writes: check out with fetch-depth 0 '
+                f'or 1']
+    return []
 
 
 def workspace(env):
-    """(the workspace's real path, None) or (None, why it is refused)."""
+    """(the workspace's real path, None) or (None, why it is refused). Its real path must be its own path below the
+    runner's work folder (the parent of RUNNER_WORKSPACE): an earlier job that swapped RUNNER_WORKSPACE or a folder
+    below it for a symlink would otherwise point the wipe elsewhere, since realpath follows the link on both sides."""
     ws = env.get('GITHUB_WORKSPACE') or ''
     if not ws or not os.path.isabs(ws):
         return None, f'GITHUB_WORKSPACE {ws!r} is not an absolute path'
@@ -152,10 +189,15 @@ def workspace(env):
     if real == '/':
         return None, 'GITHUB_WORKSPACE is /'
     runner = env.get('RUNNER_WORKSPACE') or ''
-    if runner:
-        top = os.path.realpath(runner)
-        if os.path.commonpath([real, top]) != top or real == top:
-            return None, f'GITHUB_WORKSPACE {real} is not inside RUNNER_WORKSPACE {top}'
+    if not os.path.isabs(runner):
+        return None, f'RUNNER_WORKSPACE {runner!r} is not an absolute path'
+    runner, ws = os.path.normpath(runner), os.path.normpath(ws)
+    if os.path.commonpath([ws, runner]) != runner or ws == runner:
+        return None, f'GITHUB_WORKSPACE {ws} is not inside RUNNER_WORKSPACE {runner}'
+    work = os.path.realpath(os.path.dirname(runner))
+    expected = os.path.join(work, os.path.basename(runner), os.path.relpath(ws, runner))
+    if real != expected:
+        return None, f'GITHUB_WORKSPACE {ws} is {real}, not {expected}: a symlink below RUNNER_WORKSPACE'
     for name in ('HOME', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE'):
         other = env.get(name) or ''
         if other and os.path.isabs(other):
@@ -168,19 +210,53 @@ def workspace(env):
     return real, None
 
 
-def remove(path):
-    """Remove one entry without following a symlink; a folder is made writable first (a read-only one too)."""
-    st = os.lstat(path)
-    if not stat.S_ISDIR(st.st_mode):
-        os.unlink(path)
-        return
-    if st.st_mode & 0o700 != 0o700:
-        os.chmod(path, stat.S_IMODE(st.st_mode) | 0o700)
-    with os.scandir(path) as it:
-        names = [e.path for e in it]
-    for p in names:
-        remove(p)
-    os.rmdir(path)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def empty(top):
+    """Remove everything below the folder `top`, depth first with one folder open at a time and by name relative to
+    it (no recursion, no path longer than a name: any depth works). A symlink is removed as a link, never followed; a
+    folder is made writable before it is entered (a read-only one too). Raises OSError with the path that failed."""
+    fd, down = os.open(top, DIR_FLAGS), []
+    try:
+        while True:
+            folder = None
+            for name in sorted(os.listdir(fd)):
+                try:
+                    st = os.lstat(name, dir_fd=fd)
+                    if stat.S_ISDIR(st.st_mode):
+                        folder = folder or (name, st)
+                    else:
+                        os.unlink(name, dir_fd=fd)
+                except OSError as e:
+                    e.filename = os.path.join(top, *down, name)
+                    raise
+            if folder:
+                name, st = folder
+                try:
+                    if st.st_mode & 0o700 != 0o700:
+                        os.chmod(name, stat.S_IMODE(st.st_mode) | 0o700, dir_fd=fd)
+                    child = os.open(name, DIR_FLAGS, dir_fd=fd)
+                except OSError as e:
+                    e.filename = os.path.join(top, *down, name)
+                    raise
+                os.close(fd)
+                fd = child
+                down.append(name)
+            elif not down:
+                return
+            else:   # this folder is empty: back up to its parent and remove it
+                parent = os.open('..', DIR_FLAGS, dir_fd=fd)
+                os.close(fd)
+                fd = parent
+                name = down.pop()
+                try:
+                    os.rmdir(name, dir_fd=fd)
+                except OSError as e:
+                    e.filename = os.path.join(top, *down, name)
+                    raise
+    finally:
+        os.close(fd)
 
 
 def wipe(env):
@@ -192,14 +268,12 @@ def wipe(env):
     real, why = workspace(env)
     if why:
         return f'refused to empty the workspace: {why}'
-    with os.scandir(real) as it:
-        names = sorted(e.path for e in it)
-    for p in names:
-        try:
-            remove(p)
-        except OSError as e:
-            return f'could not remove {getattr(e, "filename", None) or p} ({e.strerror or e}): the workspace is half empty'
-    say(f'git-clean: emptied the workspace {real} ({len(names)} entries)')
+    try:
+        count = len(os.listdir(real))
+        empty(real)
+    except OSError as e:
+        return f'could not remove {getattr(e, "filename", None) or real} ({e.strerror or e}): the workspace is half empty'
+    say(f'git-clean: emptied the workspace {real} ({count} entries)')
     return None
 
 
@@ -221,7 +295,9 @@ def check(env, paths, require=False):
         repo, why = inside(env, p)
         bad += [why] if why else problems(repo, env, require)
     for why in bad:
-        say(f'::error::git-clean: {why}. On a self-hosted runner run fork-ci/actions/git-clean before actions/checkout')
+        say(f'::error::git-clean: {why}. Left by an earlier job on a self-hosted runner: run fork-ci/actions/git-clean '
+            f'before actions/checkout. Written by actions/checkout itself: see "What is refused" in '
+            f'fork-ci/actions/git-clean/README.md')
     return REFUSED if bad else 0
 
 
