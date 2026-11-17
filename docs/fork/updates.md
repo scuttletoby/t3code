@@ -52,7 +52,9 @@ watches; it changes nothing on the machine, and `0` turns it off.
   upstream file, listed or not. It runs on every pull request (Fork tests, "Workflow lint and
   upstream drift") and in fork-follow before and after each rebase, against the upstream commit
   the series sits on. A pull request is judged by its base's list, never by its own: a new seam,
-  `pending` or `forkFiles` entry counts once the owner merges it. `pending` maps upstream files
+  `pending` or `forkFiles` entry counts once the owner merges it. Its own list is only parsed: a
+  malformed one (bad JSON, an unknown key, a `lost` entry not in the form below, or none) is
+  refused, since once merged it would stop every later run. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
   also lowers the ceiling in the same change). Right after a rebase, below the ceiling is only a
