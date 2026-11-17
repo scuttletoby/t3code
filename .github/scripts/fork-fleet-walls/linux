@@ -217,8 +217,8 @@ MANAGER_CONFS = ('/etc/systemd/system.conf.d/*.conf', '/run/systemd/system.conf.
                  '/lib/systemd/system.conf.d/*.conf')
 JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutAbortSec': 'TimeoutAbortSec'}
 # The sha256 of the launcher (fork-fleet-launch.sh) these walls ship with, whose start() gives every job unit its own
-# stop timeouts (launcher_shipped). A changed launcher must change this pin and fork-fleet-walls/wsl2's with it
-# (fork-fleet-walls.test.py and fork-fleet-walls-wsl2.test.py check both against the launcher in the repo).
+# stop timeouts (launcher_shipped). The kit's one pin: fork-fleet-walls/wsl2 reads it from here (issue #365 item 2).
+# A changed launcher must change it (fork-fleet-walls.test.py checks it against the launcher in the repo).
 LAUNCHER_SHA256 = '0b4b4c10cca7f04cde8bcb732fba5dbd2dddc2b42b3535e37e92140c98598bc4'
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
