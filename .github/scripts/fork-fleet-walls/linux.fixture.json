@@ -1,5 +1,5 @@
 {
-  "about": "fork-fleet-walls.test.py: `pass` is a fake machine on which every wall of `linux` holds (paths under FORK_FLEET_WALLS_ROOT; a string is a file's text, a path ending in / a folder, {\"text\", \"mode\"} a program); `fail` names each wall with the changes that make it fail (null removes a path).",
+  "about": "fork-fleet-walls-contract.test.py: `pass` is a fake machine on which every wall of `linux` holds (paths under FORK_FLEET_WALLS_ROOT; a string is a file's text, a path ending in / a folder, {\"text\", \"mode\"} a program); `fail` names each wall with the changes that make it fail (null removes a path).",
   "pass": {
     "proc/sys/kernel/ostype": "Linux\n",
     "proc/sys/kernel/osrelease": "6.8.0-47-generic\n",
