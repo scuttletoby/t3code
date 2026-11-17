@@ -1,7 +1,8 @@
 #!/usr/bin/python3 -I
 """Fork only: the walls of a WSL2 distro, for fork-fleet-walls.py (its contract is there). A WSL2 distro is Linux to
 its kernel, so every wall of the linux file next to this one holds here too and is taken from it, not copied (its
-`os` aside): kernel, systemd, cgroup2, cgroup-bpf, namespaces, seccomp, container, mounts (what jobs see, as the
+`os` aside): kernel, systemd, cgroup2, cgroup-bpf, namespaces, seccomp, container (WSL's own `wsl` mark aside:
+container_wall), mounts (what jobs see, as the
 launcher beside this folder says with `fork-fleet-launch.sh paths`: Windows' drives at /mnt/c or /c, WSL's shares at
 /mnt/wsl and /usr/lib/wsl are outside it, so no job sees them), job-units and etc-secrets. A wall the linux file
 gains is a wall here too. The launcher is one file: the one the linux walls ask (`paths`) is the one whose job units'
@@ -112,6 +113,32 @@ def os_wall():
     if ('microsoft' not in release.lower() and not any(glob.glob(glob.escape(ROOT) + m) for m in LINUX.WSL_MARKS)
             and LINUX.WSL_CMDLINE not in (read('/proc/cmdline') or '')):
         return f'not WSL ({release}): its walls are fork-fleet-walls/linux'
+    return None
+
+
+def container_wall():
+    """WSL2's own systemd writes `wsl` to /run/systemd/container at every boot (it counts WSL as a container), so that
+    mark alone is no container: the walls hold, as the namespaces, seccomp and cgroup-bpf walls read. Any other kind,
+    Docker's or podman's mark, or a root that is not the host's (a user namespace, where systemd may drop a wall it
+    lacks the right for) is one, as in the linux file. systemd names WSL from the kernel's release before it reads a
+    container's own mark, so a container on WSL's kernel (nspawn, privileged LXC: no Docker or podman file, root's
+    uid_map) also writes `wsl`: what its manager leaves (/run/host/container-manager, `container=` in pid 1's
+    environment, which root reads) is read too."""
+    others = [p for p in ('/.dockerenv', '/run/.containerenv') if os.path.lexists(ROOT + p)]
+    if others:
+        return LINUX.container_wall()
+    if os.path.lexists(ROOT + '/run/systemd/container') and read('/run/systemd/container') != 'wsl':
+        return LINUX.container_wall()
+    if os.path.lexists(ROOT + '/run/host/container-manager'):
+        return ('/run/host/container-manager is there: in a container systemd drops some of the jobs\' walls without '
+                'an error')
+    env = [v for v in (read('/proc/1/environ') or '').split('\0') if v.startswith('container=')]
+    if env and env[-1] != 'container=wsl':
+        return f'pid 1 runs with {env[-1]}: in a container systemd drops some of the jobs\' walls without an error'
+    uid_map = read('/proc/self/uid_map')
+    if uid_map is None or uid_map.split() != ['0', '0', '4294967295']:
+        return (f'root here is not the host\'s root (/proc/self/uid_map is {uid_map!r}, not 0 0 4294967295): in a '
+                'user namespace systemd drops some of the jobs\' walls without an error')
     return None
 
 
@@ -570,7 +597,7 @@ def walls():
     out = [('os', 'a WSL2 kernel (not WSL1, not plain Linux)', os_wall)]
     for wall, what, test in LINUX.WALLS:
         if wall != 'os':
-            out.append((wall, what, systemd_wall if wall == 'systemd' else test))
+            out.append((wall, what, {'systemd': systemd_wall, 'container': container_wall}.get(wall, test)))
     return out + OWN
 
 
