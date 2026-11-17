@@ -36,6 +36,7 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as BootService from "../cloud/bootService.ts";
 import * as CliState from "../cloud/CliState.ts";
 import * as CliTokenManager from "../cloud/CliTokenManager.ts";
+import * as HoldWorkConnect from "../cloud/holdWorkConnect.ts";
 import { formatReachabilityFailure } from "../cloud/ConnectReachability.ts";
 import { filterRelayResponse } from "../cloud/relayResponse.ts";
 import {
@@ -511,6 +512,10 @@ const reportCloudDisconnectResults = Effect.fn("cloud.cli.report_disconnect_resu
 export const disconnectCloud = Effect.fn("cloud.cli.disconnect")(function* (options: {
   readonly clearAuthorization: boolean;
 }) {
+  // Fork: a held copy shares the live server's environment id; refuse before the relay delete.
+  yield* HoldWorkConnect.refuseCliUnlinkWhileHeld(
+    (yield* ServerConfig.ServerConfig).serverRuntimeStatePath,
+  );
   yield* CliState.setCliDesiredCloudLink(false);
   const liveResult = yield* runLiveCloudUnlink();
   const relayResult = yield* Effect.exit(unlinkRelayEnvironment());
