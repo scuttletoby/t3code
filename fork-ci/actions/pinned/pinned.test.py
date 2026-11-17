@@ -3,7 +3,7 @@ and no good copy is an error; a killed fetch's .part- file and an old pin's fold
 were checked. The README's bootstrap is run as written. No test reaches the network: every fetch is served here.
 Run: python3 fork-ci/actions/pinned/pinned.test.py
 """
-import contextlib, importlib.util, io, json, os, re, shutil, stat, struct, subprocess, sys, tempfile, time, unittest
+import contextlib, errno, importlib.util, io, json, os, re, shutil, stat, struct, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 try:
     import grp, pwd
@@ -899,6 +899,24 @@ class Above(Case):
         up = os.path.join(b, 'file', 'x')
         self.refused_before_anything(os.path.join(up, 'fci'), f'{up} above the cache', 'cannot be checked',
                                      'Fix: pass {how} with a folder', absent=('chmod', 'cannot be entered'))
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
+    def test_a_failing_realpath_in_the_error_handler_is_still_a_clean_refusal(self):   # #383 item 1
+        # A link changing at the wrong moment can make the handler's own realpath fail: the caller got that raw
+        # OSError. It falls back to the path as written: the same refusal, the same fix, nothing made.
+        locked, cache = self.locked()
+        real, failed = os.path.realpath, []
+
+        def realpath(p, *a, **k):
+            if p.startswith(locked + '/') and p != cache:   # shared_above's realpath(cache) works, the handler's fails
+                failed.append(p)
+                raise OSError(errno.ELOOP, 'a link changed')
+            return real(p, *a, **k)
+        with mock.patch.object(os.path, 'realpath', realpath):
+            self.refused_before_anything(cache, f'{locked} cannot be entered', f'Fix: chmod u+x {locked}', absent=())
+        self.assertIn(os.path.dirname(cache), failed, 'the handler called realpath and it failed')
+        os.chmod(locked, 0o700)
+        self.assertEqual(os.listdir(os.path.join(locked, 'a', 'b')), [], 'fail closed: nothing made under it')
 
     @unittest.skipUnless(hasattr(os, 'getuid'), 'owners and modes')
     def test_load_names_its_cache_argument_and_run_its_flag(self):   # #376 item 3 (#369 nit)
