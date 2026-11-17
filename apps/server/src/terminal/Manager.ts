@@ -1480,7 +1480,8 @@ function toSessionKey(threadId: string, terminalId: string): string {
   return `${threadId}\u0000${terminalId}`;
 }
 
-function shouldExcludeTerminalEnvKey(key: string): boolean {
+/** Also used by fork playtest steps, which get the same environment rule. */
+export function shouldExcludeTerminalEnvKey(key: string): boolean {
   const normalizedKey = key.toUpperCase();
   if (normalizedKey.startsWith("T3CODE_")) {
     return true;
