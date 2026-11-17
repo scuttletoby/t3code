@@ -3,7 +3,7 @@
 of every walls file in fork-fleet-walls/; the contract each must pass on fake machines from its <os>.fixture.json is
 in fork-fleet-walls-contract.test.py, which uses this file's helpers. A new walls file (and its fixture) is tested
 without a change to either file. Run: python3 <this>. Linux only."""
-import ast, base64, contextlib, importlib.machinery, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+import ast, base64, contextlib, hashlib, importlib.machinery, importlib.util, io, json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -916,6 +916,17 @@ class EveryWallsFile(WallsRunner):
             self.assertRegex(v, r'^[1-9][0-9]*$', k)
             self.assertLessEqual(int(v), stop_max, k)
 
+    def test_linux_launcher_pin_is_the_launchers(self):   # change the launcher, then both pins with it
+        """Issue #316: the linux walls pass only the launcher they ship with (LAUNCHER_SHA256, as the wsl2 walls pin
+        it), whose start() the test above and fork-fleet.test.py's test_start read. The pin is the sha256 of the
+        launcher in this repo, so a launcher change without a pin change fails here, not on a host as cannot tell."""
+        linux = slurp(os.path.join(FOLDER, 'linux'))
+        self.assertEqual(len(re.findall(r"^LAUNCHER_SHA256 = '[0-9a-f]{64}'$", linux, re.M)), 1)
+        with open(LAUNCHER, 'rb') as f:
+            self.assertEqual(fw_linux().LAUNCHER_SHA256, hashlib.sha256(f.read()).hexdigest(), 'fork-fleet-launch.sh '
+                             'changed: set LAUNCHER_SHA256 in fork-fleet-walls/linux and fork-fleet-walls/wsl2 to its '
+                             'sha256 (and read the change with the security lens)')
+
     def test_linux_job_units_reads_resets_slices_and_stop_timeouts(self):
         """PR #213 re-checks (correctness N1; security N2, N3). systemd's own set-property drop-in (refresh-net's, in
         /run/systemd/transient for a transient unit) starts with an empty IPAddressDeny= and then lists the merged
@@ -1077,11 +1088,10 @@ class EveryWallsFile(WallsRunner):
         self.assertFalse(os.path.exists(os.path.join(root, 'run/systemd/transient/fork-fleet-ci-0.service')))
 
     def test_linux_job_units_checks_the_launchers_own_stop_timeouts(self):
-        """Issue #297 item 3: the walls count systemd's defaults out only for units the installed launcher's start()
-        gives stop timeouts of its own. Beside an older launcher (a kit not installed whole, whose start() set none),
-        with no job unit loaded yet, an endless default FAILS (the next job unit would have it); a finite one, or the
-        launcher's own, PASSES. A start() that sets an endless one FAILS, and one whose value cannot be read (an
-        expansion) cannot be told."""
+        """Issue #297 item 3, issue #316: the walls count systemd's defaults out only for the launcher they ship with
+        (LAUNCHER_SHA256), whose start() gives every job unit stop timeouts of its own. Any other launcher, an older one
+        (a kit not installed whole, whose start() set none) too, or one whose start() sets them otherwise: cannot tell,
+        whatever the defaults. The launcher itself PASSES with an endless default and with a finite one."""
         real = slurp(LAUNCHER)
         both = ' -p TimeoutStopSec=90 -p TimeoutAbortSec=90 '
         self.assertEqual(real.count(both), 1)
@@ -1103,10 +1113,13 @@ class EveryWallsFile(WallsRunner):
                                                                  '-p TimeoutAbortSec=90 '), {}, 'FAIL'),
             ('a launcher that sets one through an expansion', real.replace(both, ' -p "TimeoutStopSec=$X" '
                                                                            '-p TimeoutAbortSec=90 '), {}, 'FAIL'),
-            ('an older launcher, a finite default', real.replace(both, ' '), {}, 'PASS'),
-            ('the launcher, an endless default', real, endless, 'PASS'),
+            ('an older launcher, a finite default', real.replace(both, ' '), {}, 'FAIL'),
             ('the launcher, quoted', real.replace(both, ' -p "TimeoutStopSec=90" -p \'TimeoutAbortSec=90\' '), endless,
-             'PASS'),
+             'FAIL'),
+            ('the launcher with a comment added', real + '# a comment\n', {}, 'FAIL'),
+            ('an empty launcher', '', {}, 'FAIL'),
+            ('the launcher, an endless default', real, endless, 'PASS'),
+            ('the launcher, a finite default', real, {}, 'PASS'),
         ]
         launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
         for name, text, change, want in cases:
@@ -1114,22 +1127,27 @@ class EveryWallsFile(WallsRunner):
                 write(launcher, text)
                 got = self.job_units(change)
                 self.assertTrue(got.startswith(want), got)
-                if 'expansion' in name:
-                    self.assertIn('cannot tell', got)
-                elif want == 'FAIL':
-                    self.assertIn("start()", got)
-        os.chmod(launcher, 0o775)   # not safe (launcher_stops and ask both refuse it; test_linux_launcher_stops_*
-        write(launcher, real)       # tests launcher_stops' own refusal): the wall cannot tell
+                if want == 'FAIL':
+                    self.assertIn('cannot tell (ValueError', got)
+                    self.assertIn('is not the launcher these walls ship with', got)
+        os.chmod(launcher, 0o775)   # not safe (launcher_shipped and ask both refuse it; test_linux_launcher_shipped_*
+        write(launcher, real)       # tests launcher_shipped's own refusal): the wall cannot tell
         got = self.job_units({})
         self.assertTrue(got.startswith('FAIL'), got)
+        self.assertIn('cannot tell', got)
+        os.remove(launcher)         # no launcher: cannot tell
+        got = self.job_units({})
+        self.assertTrue(got.startswith('FAIL'), got)
+        self.assertIn('cannot tell (FileNotFoundError', got)
 
     def test_linux_job_units_refuses_stop_timeouts_start_never_passes(self):
-        """Issue #316 item 1: a stop timeout that start()'s systemd-run never gets (one in a comment, a quoted string,
-        a heredoc, a $(...) or ${...} in a string) or a second start() anywhere (bash runs the last one, the walls read
-        the first) must not count as start()'s own: each would let systemd's endless default pass. A comment is
-        dropped (its timeouts never count: the default FAILs); the rest the walls cannot tell: FAIL. Each shape here
-        PASSed before the scanner held it. The launcher as it is (its -p words quoted or not), or with a timeout in a
-        comment, still PASSES."""
+        """Issue #316 item 1 and its lenses: a stop timeout that start()'s systemd-run never gets (one in a comment,
+        a quoted string, a heredoc, a $(...) or ${...} in a string, a [[ -p ]] test, an array, after a return), an
+        endless one it does get in a form a reading of bash misses (-pKey=, --property=, a quote inside the word, a
+        \\ + newline, a # inside a word), or a second start() anywhere (bash runs the last one): each PASSed some
+        reading of the launcher's bash. The walls read no bash now: a launcher that is not the one they ship with
+        (LAUNCHER_SHA256) cannot be told, whatever it changed, with an endless default or a finite one. Only the
+        launcher itself PASSES."""
         real = slurp(LAUNCHER)
         both = ' -p TimeoutStopSec=90 -p TimeoutAbortSec=90 '
         self.assertEqual(real.count(both), 1)
@@ -1140,6 +1158,8 @@ class EveryWallsFile(WallsRunner):
         fake = '-p TimeoutStopSec=90 -p TimeoutAbortSec=90'
         second = (f'start() {{\n  "$SYSTEMD_RUN" -p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity -- x\n}}\n')
         infinite = real.replace(both, ' -p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity ')
+        run_end = ' -- "$dir/run.sh"'   # the end of start()'s systemd-run line
+        self.assertEqual(old.count(run_end), 1)
         fails = {
             'in an end-of-line comment': old.replace(at, f'\n  true # {fake}' + at),
             'in a heredoc': old.replace(at, f'\n  cat >/dev/null <<EOF\n  {fake}\nEOF' + at),
@@ -1165,23 +1185,50 @@ class EveryWallsFile(WallsRunner):
             'a second start()': real.replace('\ncheck_net() {\n', '\n' + second + '\ncheck_net() {\n'),
             'a second start, function keyword': real.replace('\ncheck_net() {\n', '\n' + second.replace(
                 'start() {', 'function start {') + '\ncheck_net() {\n'),
+            # Round 2's lens: a # after an escaped character or a closing ) is no comment to bash.
+            'after a \\ + newline, a # at a line start': old.replace(at, f'\n  : a\\\n#"\n  {fake}\n  " #"' + at),
+            'after a \\;, a #': old.replace(at, f'\n  : \\;#"\n  {fake}\n  " #"' + at),
+            'after a \\ + blank, a #': old.replace(at, f'\n  : a\\ #"\n  {fake}\n  " #"' + at),
+            'after a $(...), a #': old.replace(at, f'\n  : x$(true)#"\n  {fake}\n  " #"' + at),
+            'after a $((...)), a #': old.replace(at, f'\n  : x$((1))#"\n  {fake}\n  " #"' + at),
+            'after a <(...), a #': old.replace(at, f'\n  : x<(true)#"\n  {fake}\n  " #"' + at),
+            'an endless one after a -p a\\ #b': real.replace(both, both + '-p Description=a\\ #b '
+                                                           '-p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity '),
+            'an endless one after a -p a$(true)#b': real.replace(
+                both, both + '-p Description=a$(true)#b -p TimeoutStopSec=infinity -p TimeoutAbortSec=infinity '),
+            'an endless one after a -p a#b': real.replace(both, both + '-p Description=a#b -p TimeoutStopSec=infinity '
+                                                      '-p TimeoutAbortSec=infinity '),
+            'a second start ( )': real.replace('\ncheck_net() {\n', '\n' + second.replace(
+                'start() {', 'start ( ) {') + '\ncheck_net() {\n'),
+            'a second start\\ + newline + ()': real.replace('\ncheck_net() {\n', '\n' + second.replace(
+                'start() {', 'start\\\n() {') + '\ncheck_net() {\n'),
+            # The audit: plain bash, no quoting trick. Nothing reaches systemd-run (1-3), or an endless one does, last.
+            'in a [[ -p ]] test': old.replace(at, f'\n  [[ {fake.replace(" -p", " && -p")} ]] || true' + at),
+            'in an array': old.replace(at, f'\n  local -a note=( {fake} )' + at),
+            'after a return': old.replace(run_end, run_end + f'\n  return\n  : {fake}'),
+            'an endless -pKey=': real.replace(both, both + '-pTimeoutStopSec=infinity '),
+            'an endless --property=': real.replace(both, both + '--property=TimeoutStopSec=infinity '),
+            'an endless one after -p \\ + newline': real.replace(both, both + '-p \\\n    TimeoutStopSec=infinity '),
+            'an endless one with "" in its value': real.replace(both, both + '-p TimeoutStopSec=infi""nity '),
+            'an endless one with a quoted key part': real.replace(both, both + '-p Time"out"StopSec=infinity '),
+            # The round-2 lens' follow-ups: a whole property from a variable, an inner function never called.
+            'a property from a variable': real.replace(both, both + '-p "$T" '),
+            'in an inner function never called': old.replace(at, f'\n  f() {{ : {fake}; }}' + at),
         }
         launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
         for name, text in fails.items():
-            with self.subTest(name):
-                write(launcher, text)
-                got = self.job_units(endless)
-                self.assertTrue(got.startswith('FAIL'), got)
-                self.assertIn('start()', got)
-                if 'comment' not in name or 'backticks' in name:
-                    self.assertIn('cannot tell', got)
-        for name, text in {'the launcher': real, 'the launcher, quoted': real.replace(
-                both, ' -p "TimeoutStopSec=90" -p \'TimeoutAbortSec=90\' '), 'the launcher, a timeout in comments':
-                real.replace(at, '\n  : # -p TimeoutStopSec=infinity\n  # -p TimeoutAbortSec=infinity' + at)}.items():
-            with self.subTest(name):
-                write(launcher, text)
-                got = self.job_units(endless)
-                self.assertTrue(got.startswith('PASS'), got)
+            for change in (endless, {}):
+                with self.subTest(name, default='endless' if change else 'finite'):
+                    self.assertNotEqual(text, real)
+                    write(launcher, text)
+                    got = self.job_units(change)
+                    self.assertTrue(got.startswith('FAIL'), got)
+                    self.assertIn('cannot tell (ValueError', got)
+                    self.assertIn('is not the launcher these walls ship with', got)
+        with self.subTest('the launcher'):
+            write(launcher, real)
+            got = self.job_units(endless)
+            self.assertTrue(got.startswith('PASS'), got)
 
     def test_linux_job_units_cannot_tell_an_unreadable_job_unit(self):
         """Issue #316 item 2: only a job unit's transient file that is gone (FileNotFoundError: the unit ended) is
@@ -1203,10 +1250,11 @@ class EveryWallsFile(WallsRunner):
         self.assertTrue(got.startswith('FAIL'), got)
         self.assertIn('cannot tell (PermissionError', got)
 
-    def test_linux_launcher_stops_refuses_an_unsafe_launcher_itself(self):
-        """Issue #316 item 3 (the #306 lens nit): launcher_stops refuses a launcher that is a link (O_NOFOLLOW), not
+    def test_linux_launcher_shipped_refuses_an_unsafe_launcher_itself(self):
+        """Issue #316 item 3 (the #306 lens nit): launcher_shipped refuses a launcher that is a link (O_NOFOLLOW), not
         this uid's alone (launcher_safe on what it opened), or no plain file (a FIFO: opened without blocking), before
-        it reads it; ask() refuses the same later, so this tests launcher_stops alone. A safe one is read."""
+        it reads it; ask() refuses the same later, so this tests launcher_shipped alone. A safe copy of the launcher
+        passes; a safe one with other bytes does not."""
         m = fw_linux()
         folder = os.path.join(self.tmp, 'kit')
         os.makedirs(folder, mode=0o755)
@@ -1214,7 +1262,14 @@ class EveryWallsFile(WallsRunner):
         write(safe, slurp(LAUNCHER))
         os.chmod(safe, 0o755)
         m.LAUNCHER = safe
-        self.assertEqual(m.launcher_stops(), {'TimeoutStopSec': '90', 'TimeoutAbortSec': '90'})
+        self.assertIsNone(m.launcher_shipped())
+        other = os.path.join(folder, 'other.sh')
+        write(other, slurp(LAUNCHER) + '# a comment\n')
+        os.chmod(other, 0o755)
+        m.LAUNCHER = other
+        with self.assertRaisesRegex(ValueError, 'is not the launcher these walls ship with'):
+            m.launcher_shipped()
+        m.LAUNCHER = safe
         link = os.path.join(folder, 'link.sh')
         os.symlink(safe, link)
         writable = os.path.join(folder, 'writable.sh')
@@ -1226,7 +1281,7 @@ class EveryWallsFile(WallsRunner):
             with self.subTest(os.path.basename(path)):
                 m.LAUNCHER = path
                 with self.assertRaises(error):
-                    m.launcher_stops()
+                    m.launcher_shipped()
 
     def job_units(self, change, links=()):
         """The linux job-units line on the passing fixture with change and links ((path, target)), through describe."""
