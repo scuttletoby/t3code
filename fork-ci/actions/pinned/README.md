@@ -38,19 +38,21 @@ paste what `files` prints.
 - `load()` and `run` take one self-contained file: one that touches `sys.path` (or the other `sys` names imports go
   by, also through an alias, `os.sys`, `from os import sys`, `getattr(x, 'sys')` or `x.__dict__['sys']`), imports a
   module that loads code from a path (`importlib`, `runpy`, `site`, `ctypes`, their private twins
-  `_frozen_importlib_external`, `_imp`, `_ctypes`, and `pydoc`, `unittest`, ...), uses a relative import, or names its
-  own path (`__file__`, `__spec__`, `__loader__`, `__cached__`, `sys.argv` other than `argv[k]`/`argv[k:]` with
+  `_frozen_importlib_external`, `_imp`, `_ctypes`, and `pydoc`, `unittest`, `doctest`, ...), uses a relative import,
+  or names its own path (`__file__`, `__spec__`, `__loader__`, `__cached__`, `sys.argv` other than `argv[k]`/`argv[k:]` with
   k >= 1, `sys.orig_argv`, `sys._getframe` and the other frame and traceback names, `globals()`, `locals()`, `vars()`,
   `co_filename`, `__code__`, `__traceback__`, `tb_frame`, `__main__`, `inspect`, `traceback`) or the importer
   (`__import__`, `__builtins__`) would load the files next to it, which nothing checked, so it is refused
   (`FetchError`). `from sys import` takes only a short list of names (`argv`, `exit`, `stdout`, ...).
   `pr-queue/pr_queue.py`, `head-check/*.py`, `fleet-watch/fleet_watch.py`, `test-select/test_select.py` and
   `test-select/trace_check.py` are such files: they run only from a checkout or a
-  workflow's `uses:`. The check is static and covers the usual spellings, not every one: `exec`, `eval` or `getattr`
-  of a built string, `compile`, `pickle`, `marshal`, a `logging` record's `pathname`, `warnings`, a subprocess of
-  `sys.executable`, and an absolute path (`/proc/self/cmdline`, `/tmp/x`, `tempfile.gettempdir()`) pass it, and
-  chasing them would refuse ordinary code. What protects is where the copy runs: `run` puts it in a fresh 0700 folder
-  inside the checked cache (`<cache>/.run-X/<action>/<file>`), and refuses a cache with a folder above it that someone
+  workflow's `uses:`. The check is static and covers the usual spellings, not every one: a constant or built string
+  passed to `getattr`, `eval` or `exec`, stdlib introspection (tracing, profiling, `gc`, `tracemalloc`,
+  `faulthandler`, the repr of a code or frame object), `compile`, `pickle`, `marshal`, a `logging` record's
+  `pathname`, `warnings`, a subprocess of `sys.executable`, and an absolute path (`/proc/self/cmdline`, `/tmp/x`,
+  `tempfile.gettempdir()`) pass it, and chasing them would refuse ordinary code. What protects is where the code runs:
+  `run` puts its copy in a fresh 0700 folder inside the checked cache (`<cache>/.run-X/<action>/<file>`), `load()`'s
+  module has `__file__` `<cache>/<sha>/<action>/<file>`, and both refuse a cache with a folder above it that someone
   else could write (not yours or root's, world-writable: a sticky `/tmp` too, or group-writable; by the path given and
   by its real path), so every `..` of the script is the run folder, the cache, or a folder only you or root can write,
   never the shared temp folder. One group-writable folder is accepted, as Debian's OpenSSH does for `StrictModes`: one
@@ -78,9 +80,11 @@ python3 -I pinned.py --config .github/fork-ci.json files
   arguments after the file name, and exits with its exit code. A fetch or check failure exits 1 (`pinned: <why>` on stderr).
 - `files` prints the `files` map at the config's `sha`, each file fetched and hashed (nothing is checked: this is how
   the map is made).
-- `--cache` defaults to `$XDG_CACHE_HOME/fork-ci-pinned` (`~/.cache/fork-ci-pinned`). `run` refuses a cache under a
-  folder someone else could write, before it makes any folder, and names each such folder with its fix:
-  `chmod g-w <folder>` (or `go-w`) for a folder of yours, another `--cache` under anyone else's (`/tmp/...`).
+- `--cache` defaults to `$XDG_CACHE_HOME/fork-ci-pinned` (`~/.cache/fork-ci-pinned`). `run` (and `load()`) refuse a
+  cache under a folder someone else could write, before they make any folder, and name each such folder with its fix:
+  `chmod g-w <folder>` (or `go-w`) for a folder of yours, another `--cache` under anyone else's (`/tmp/...`). A folder
+  above the cache you cannot enter (no `x`) cannot be checked, so it is refused the same way, named with its fix:
+  `chmod u+x <folder>` for yours, another `--cache` for anyone else's.
 
 ## Python API
 
@@ -107,9 +111,10 @@ symlink, not a folder, another user's, or group- or world-writable is refused be
 written (`FetchError` here, `ValueError` in the bootstrap; remove it and the next run makes it again). It is never
 chmodded: someone else could already have put something in it. Only a regular file is read, and prune never follows a
 symlink or opens a special file. Missing folders above it are made 0700 too, by both (so a first run under umask 002
-does not make a `~/.cache` that `run` then refuses). `run` also
-checks every folder above the cache (see above); `load()` and `path()` do not, as they run nothing from a copy's
-folder. Two limits, where the checked bytes still decide what runs: a folder above the cache can change after `run`
+does not make a `~/.cache` that `run` then refuses). `run` and
+`load()` also check every folder above the cache (see above): `load()`'s module has `__file__`
+`<cache>/<sha>/<action>/<file>`, so its `../../..` is the folder above the cache. `path()` does not: it runs nothing.
+Two limits, where the checked bytes still decide what runs: a folder above the cache can change after `run` or `load()`
 checked it (only its owner, you or root, can change it); and where there are no owners (Windows) only "a real folder"
 is checked, which a junction passes.
 
