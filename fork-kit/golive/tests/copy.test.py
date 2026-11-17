@@ -685,6 +685,19 @@ class Guard(CopyBase):
                     raise OSError('the start failed too')
         self.assertEqual(coldcopy.guard(config.load(), self.adapter, r.id), ['started t3code.service'])
 
+    def test_the_guard_never_starts_a_disabled_t3(self):
+        # A back W1 that failed after its stop disables T3 on purpose (a half-restored home): the guard of a copy
+        # run must not start it, whatever the copy run did.
+        with self.assertRaises(OSError):
+            with journal.run(self.m.state, 'copy') as r:
+                with r.step('stop-service'):
+                    self.adapter.stop()
+                    raise OSError('the start failed too')
+        self.adapter._svc(UnitFileState='disabled')
+        did = coldcopy.guard(config.load(), self.adapter, r.id)
+        self.assertIn('not enabled', did[0])
+        self.assertFalse(self.adapter.service()['active'])
+
     def test_a_journal_the_guard_cannot_read_fails_open(self):
         # Should fix 4: unreadable, the guard cannot tell whether the run stopped T3: it puts T3 back anyway.
         os.makedirs(self.m.state, exist_ok=True)
