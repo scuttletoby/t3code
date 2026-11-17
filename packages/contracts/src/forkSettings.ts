@@ -22,6 +22,7 @@ import {
   McpThreadProfiles,
   McpThreadProfilesPatch,
 } from "./mcpProfile.ts";
+import { ModelPolicy, ModelPolicyFromSettingsFile } from "./modelPolicy.ts";
 import { PlaytestSettings, PlaytestSettingsFromSettingsFile } from "./playtest.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
@@ -47,6 +48,7 @@ import {
 
 export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
+export * from "./modelPolicy.ts";
 export * from "./playtest.ts";
 export * from "./reviewRules.ts";
 export * from "./usagePacing.ts";
@@ -100,6 +102,8 @@ export const ForkServerSettingsFields = {
   handoff: HandoffSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   /** How this machine runs a review lens; off by default. A bad value reads as off, kept as written. */
   reviewRules: ReviewRulesFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  /** Which models agents may pick; off by default. A bad value reads as enforce, nothing allowed. */
+  modelPolicy: ModelPolicyFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -131,6 +135,8 @@ export const ForkServerSettingsPatchFields = {
   handoff: Schema.optionalKey(HandoffSettingsPatch),
   /** Strict: a save refuses a bad field, an unknown key, or a value without `preset`. */
   reviewRules: Schema.optionalKey(ReviewRulesPatch),
+  /** Strict: a save refuses a bad row, or a `defaultEffort` not in its row's `efforts`. */
+  modelPolicy: Schema.optionalKey(ModelPolicy),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -170,6 +176,8 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   handoff: "replace",
   // Whole, so the strict check sees the value that is saved; two saves at once, the last one wins.
   reviewRules: "replace",
+  // Whole: two saves at once, the last one wins.
+  modelPolicy: "replace",
 };
 
 /** The client settings' fork fields (stored in the browser); none yet. */
