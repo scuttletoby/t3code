@@ -55,7 +55,7 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
   "version": 1,
   "pc-agents": {
     "organization": "Example home lab",
-    "t3Version": "0.0.30",
+    "t3Version": "0.1.9",
     "t3ReleaseBaseUrl": "https://github.com/example/t3code/releases/download",
     "port": 3773,
     "maxRuntimeMode": "full-access",
@@ -72,7 +72,7 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 | Key                     | What                                                                                                              |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `organization`          | the name the managed policy shows in T3's settings                                                                |
-| `t3Version`             | the exact T3 version to run (the same as the T3 that links to this PC); installed with `scripts/install.sh`       |
+| `t3Version`             | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); installed with `scripts/install.sh`          |
 | `t3ReleaseBaseUrl`      | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                        |
 | `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                      |
 | `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                 |
@@ -84,6 +84,9 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 | `devPorts`              | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`) |
 | `peers`                 | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to         |
 | `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                |
+
+`t3Version` must be 0.1.7 or newer: older releases have no managed policy, so they would run with none of the kit's
+locks and with updates on. Setup and `check` refuse them, naming the key. (`t3 pair`, step 10, came earlier.)
 
 Every T3 setting can be locked through `lockedSettings`, the fork's own settings (`agentSlots`, `usagePacingGate`,
 `usagePacing`, `waitFor`, ...) too: the managed policy locks any key of the server settings, upstream's or the fork's
@@ -143,10 +146,19 @@ Commands are for Windows PowerShell unless a step says otherwise. `<distro>` is 
    If Claude says it cannot read its managed settings on `/mnt/c` (`EACCES`), choose "Continue without these
    settings": that is Windows' folder, which the walls hide on purpose. Then restart T3, which looks for providers
    only when it starts: `wsl -d <distro> -u root -- systemctl restart t3code-agents` (its start runs the check first).
+   Every agent of this T3 runs as `agent`, in the one home, so a tool installed there once is every agent's: install a
+   project's toolchain (Node, its package manager) the same way, through `as-agent`, before the first agent needs it.
+   Setup installs the system libraries they need (`libatomic1`, without which Node does not start, and `unzip`).
 8. **Log in to GitHub as the agent:** install `gh` (as root, from GitHub CLI's docs), then
    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- gh auth login --with-token` and paste
    a fine-grained token for the agents' repos into that window only. It waits without a prompt: paste the token,
-   press Enter, then Ctrl+D.
+   press Enter, then Ctrl+D. Then give the agent a git identity (its commits fail without one):
+   `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- git config --global user.name '<name>'`
+   and
+   `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- git config --global user.email '<email>'`,
+   with a name of your choice and an address that is no one's private one, for example the token account's noreply
+   address (`<id>+<login>@users.noreply.github.com`, shown in its GitHub email settings). Run again, they only set
+   the same values again.
 9. **Keep the distro running:** WSL stops a distro soon after its last window closes, and does not start one when
    Windows starts. A logon task of your own (no administrator needed) keeps this one running while you are logged
    in. In PowerShell, as yourself (the same task as the desk starter's, `fork-kit/desk/windows/start-desk.ps1`):
@@ -161,14 +173,18 @@ Commands are for Windows PowerShell unless a step says otherwise. `<distro>` is 
 10. **Pair, then link from the other T3:** this PC's T3 is walled from the Windows host on purpose, so a browser on
     this PC cannot open it, nor make a pairing code there. Make the code from the command line (PowerShell):
     `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents pair`. It runs T3's own `t3 pair` as the
-    agent under the walls, the T3 the unit runs (`/opt/pc-agents/t3/runtime/versions/<t3Version>/t3`), and prints a
-    token that expires in 5 minutes (`pc-agents pair --ttl 15m` for longer); the address it prints is the distro's
-    own, not one to link. A kit without `pair` (older than this step): the same through
-    `pc-agents as-agent -- /opt/pc-agents/t3/runtime/versions/<t3Version>/t3 pair` (an upgrade leaves the old
-    version's folder there, so name yours). In the other T3: Settings → Environments → Linked environments → Link,
-    with this PC's tailnet DNS name (MagicDNS: `http://<name>.<tailnet>.ts.net:<port>`; `tailscale status` there
-    shows the name), the token, and **Full access**. Not its tailnet IP address: T3 refuses to link a plain-http IP
-    address.
+    agent under the walls, the T3 of `t3Version` that the unit starts
+    (`/opt/pc-agents/t3/runtime/versions/<t3Version>/t3`; when setup has not installed that one yet, it says so: run
+    step 3 again), and prints a token that expires in 5 minutes; for longer:
+    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents pair --ttl 15m`. The token stays in this
+    PowerShell window's scrollback, usable by anyone who sees it until it is used or expires: give a long `--ttl` only
+    knowingly, and close the window once linked. The address it prints is the distro's own, not one to link. A kit
+    without `pair` (older than this step):
+    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- /opt/pc-agents/t3/runtime/versions/<t3Version>/t3 pair`
+    (an upgrade leaves the old version's folder there, so name yours). In the other T3: Settings → Environments →
+    Linked environments → Link, with this PC's tailnet DNS name (MagicDNS: `http://<name>.<tailnet>.ts.net:<port>`;
+    `tailscale status` there shows the name), the token, and **Full access**. Not its tailnet IP address: T3 refuses
+    to link a plain-http IP address.
 
 Run step 3 again for a new release or a changed machine file (and steps 4 and 5 if it asks); T3 restarts only when
 something changed. To remove everything: `wsl --unregister <distro>`.
@@ -213,6 +229,9 @@ allowed (connection tracking).
   `SIGHUP` (a closed window) stop setup the same way, the running download's whole group too.
 - **Start limit:** a rerun within 10 minutes of five failed starts still starts T3 (`systemctl reset-failed` first).
 - **An older kit's distro:** an `agent` made with a login shell gets `/usr/sbin/nologin` (`usermod`), once.
+- **Packages:** setup installs `nftables`, `libatomic1` and `unzip` when `dpkg` does not list one as installed (a
+  distro set up by an older kit gets the two new ones at its next run; no T3 restart for them). A package install
+  stopped half-way is finished first (`dpkg --configure -a`); a failed one stops setup, naming the command to run.
 - **A distro that is not fresh:** refused before anything is written, with the reasons: another login user, an
   `agent` with another uid or in another group, a file the kit would write that it did not write (or that was
   edited since, for example a hand-written `wsl.conf` or `policy.json`), a cron, at or ssh unit where the kit masks
