@@ -21,11 +21,9 @@ const ROW_ONE_LINE = /^ {2}\{.*\},?$/u;
 const ROW_SCOPE_KEY = /\bscope:\s*(["'])(\w+)\1,\s*key:\s*(["'])([A-Za-z0-9]+)\3/gu;
 
 /**
- * `<scope>.<key>` of each row of FORK_SETTING_DEFAULTS in forkDefaults.ts's text. Fails closed (a row it cannot read
- * would otherwise go unchecked): throws when the table is not found or is empty, when an entry between rows is not a
- * `{ ... }` object literal (a spread, a helper call), when a row is still open at the table's `];` (a column-0 `];`
- * inside a row ends the text table early), and when a row does not read as exactly one `scope: "<scope>", key:
- * "<key>"` (shorthand `{ scope, ... }`, a computed scope). Blank lines and `//` comments between rows are passed.
+ * `<scope>.<key>` of each row of FORK_SETTING_DEFAULTS in forkDefaults.ts's text. Fails closed, so no row goes
+ * unchecked: throws on a missing or empty table, an entry between rows that is not a `{ ... }` row (spread, helper
+ * call), a row still open at the `];`, or a row that is not exactly one `scope: "<scope>", key: "<key>"`.
  */
 function pinnedIds(text) {
   const head = /^export const FORK_SETTING_DEFAULTS\b[^=]*=\s*\[/mu.exec(text);
