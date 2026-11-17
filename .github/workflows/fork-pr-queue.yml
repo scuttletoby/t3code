@@ -34,7 +34,7 @@ on:
         default: false
     secrets:
       token:
-        description: Updates branches, comments and merges; not GITHUB_TOKEN (its branch updates start no workflow).
+        description: Updates branches, comments and merges, and nothing else; not GITHUB_TOKEN (its branch updates start no workflow).
         required: true
 
 permissions: {}
@@ -43,8 +43,16 @@ jobs:
   queue:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
+    # Every read of the queue uses this job's GITHUB_TOKEN, read-only: a personal access token cannot read check runs
+    # (`Resource not accessible by personal access token` on the PR list's checks). The caller's job must grant all of
+    # these too: a reusable workflow gets no more than its caller gives.
     permissions:
-      contents: read
+      actions: read # gh run list: which workflows still run on a head
+      checks: read # check runs and their annotations
+      contents: read # checkouts and the queue's git fetch
+      issues: read # a pull request's comments are issue comments
+      pull-requests: read # the list, views, reviews and their comments
+      statuses: read # commit statuses in the checks rollup
     concurrency:
       group: fork-pr-queue-${{ github.repository }}
       cancel-in-progress: false # a cancel is a stop half-way: the next run would have to finish it
