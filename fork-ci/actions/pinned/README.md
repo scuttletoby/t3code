@@ -31,18 +31,26 @@ paste what `files` prints.
 - Writes are whole or not at all: a `.part-` file, then a rename. A killed fetch leaves only a `.part-` file, which is
   never read and is removed after `PART_AGE` (an hour).
 - Every use marks its sha's folder used and removes the folders of other shas that nothing used for `CACHE_DAYS`
-  (14). Only 40-hex folders are ever removed; the pinned sha's own folder stays, however old.
+  (14), and the run folders (`.run-X`) a killed `run` left that long ago. Only 40-hex and `.run-` folders are ever
+  removed; the pinned sha's own folder stays, however old.
 - `load()` and `run` run the bytes that were checked, never a second read of the cache file (another job on the
   runner may write it between the check and the run).
 - `load()` and `run` take one self-contained file: one that touches `sys.path` (or the other `sys` names imports go
-  by, under any spelling), imports a module that loads code from a path (`importlib`, `runpy`, `site`, `ctypes`, ...),
-  uses a relative import, or names its own path (`__file__`, `__spec__`, `__loader__`) or `__import__` would load the
-  files next to it, which nothing checked, so it is refused (`FetchError`). `pr-queue/pr_queue.py`, `head-check/*.py`,
-  `fleet-watch/fleet_watch.py`, `test-select/test_select.py` and `test-select/trace_check.py` are such files: they run
-  only from a checkout or a workflow's `uses:`. The check is static, so `run` also puts its copy one folder down
-  (`<fresh 0700 folder>/<action>/<file>`): whatever it misses, the script's `..` is that private folder. Before #305 a
-  copy sat directly in the system temp folder, so `head_check.py`'s `../pr-queue` (or `test_select.py`'s
-  `../docs-scope`) was `$TMPDIR/pr-queue`, which any local user can make when `$TMPDIR` is `/tmp`.
+  by, also through an alias, `os.sys` or `from os import sys`), imports a module that loads code from a path
+  (`importlib`, `runpy`, `site`, `ctypes`, ...), uses a relative import, or names its own path (`__file__`,
+  `__spec__`, `__loader__`, `__cached__`, `argv[0]`, `sys._getframe`, `__main__`, `inspect`) or the importer
+  (`__import__`, `__builtins__`) would load the files next to it, which nothing checked, so it is refused
+  (`FetchError`). `pr-queue/pr_queue.py`, `head-check/*.py`, `fleet-watch/fleet_watch.py`,
+  `test-select/test_select.py` and `test-select/trace_check.py` are such files: they run only from a checkout or a
+  workflow's `uses:`. The check is static and covers the usual spellings, not every one (`globals()['__file__']`,
+  `traceback`, `exec` of built strings pass it), so what protects is where the copy runs: `run` puts it in a fresh
+  0700 folder inside the checked cache (`<cache>/.run-X/<action>/<file>`). Every `..` of the script is then that run
+  folder, the cache, or a folder above the cache, which must be yours (see below), never the shared temp folder. Before
+  #305 a copy sat directly in the system temp folder, so `head_check.py`'s `../pr-queue` (or `test_select.py`'s
+  `../docs-scope`) was `$TMPDIR/pr-queue`, which any local user can make when `$TMPDIR` is `/tmp`; until #331 the run
+  folder was in the system temp folder too, so `../..` reached it. Neither protects against a module that names an
+  absolute path (`/tmp/x`, `tempfile.gettempdir()`): no fork-ci module does today, and only review would catch a new
+  one that did.
 - A file the config does not name, a bad config, or no network and no good copy: `FetchError` (its subclass
   `Unreachable` for the network alone). Nothing is ever guessed.
 
@@ -53,7 +61,7 @@ python3 -I pinned.py --config .github/fork-ci.json [--cache DIR] run <action> <f
 python3 -I pinned.py --config .github/fork-ci.json files
 ```
 
-- `run` runs `python3 -I` on a private copy (`<fresh 0700 folder>/<action>/<file>`) of the checked bytes, with the
+- `run` runs `python3 -I` on a private copy (`<cache>/.run-X/<action>/<file>`) of the checked bytes, with the
   arguments after the file name, and exits with its exit code. A fetch or check failure exits 1 (`pinned: <why>` on stderr).
 - `files` prints the `files` map at the config's `sha`, each file fetched and hashed (nothing is checked: this is how
   the map is made).
