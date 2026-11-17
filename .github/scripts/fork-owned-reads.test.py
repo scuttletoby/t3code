@@ -58,8 +58,9 @@ LIST_LINES = [l.strip() for l in LIST.read_text().splitlines() if l.strip() and 
 ROOTS = sorted({l.lstrip("!").split("/")[0] for l in LIST_LINES})
 PATH_RE = re.compile(r"(?<![\w.-])(" + "|".join(map(re.escape, ROOTS)) + r")(/[\w.*/-]*)?")
 # A doc the list owns by its own line (FORK_CHANGES.md): naming it is a read, unlike a runbook a message points to
-# (a `.md` matched by a wider line such as `.github/fork-*`).
-OWNED_DOCS = {l for l in LIST_LINES if l.endswith(".md") and not l.startswith("!") and "*" not in l}
+# (a `.md` matched by a wider line such as `.github/fork-*`). A name counts only when it equals a line exactly, which
+# is what keeps those runbook pointers out (a `*.md` line matches only a name that writes the same `*`).
+OWNED_DOCS = {l for l in LIST_LINES if l.endswith(".md") and not l.startswith("!")}
 # A fork-owned folder named alone, as in `path.join(root, "fork-ci", name)`: counts as a path inside it.
 FOLDERS = {l.rstrip("/") for l in LIST_LINES if l.endswith("/") and l.count("/") == 1}
 # A path built from quoted parts: `".github", "fork-x"` (path.join), `Path(".github") / "fork-x"`, `".github/" + "x"`.
