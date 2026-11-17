@@ -731,6 +731,58 @@ how often a desktop asks: the key belongs to the pool's own desktop, one stream
 per pool runs at a time, and each is cut off at its deadline, so the most it
 costs is one file's reads and upload at a time.
 
+The desktop's side is the same script's `run`, hourly from
+`t3code-fleet-seed.timer` (the desk kit installs both). It takes only the
+names its own installed fleet config lists for its pool, and holds them to
+its own `every_hours` and `max_age_hours` and the smaller of its own and the
+host's `max_mb`: a host cannot make a desktop take more. Each new seed is
+unpacked with Python's tar data filter and a limit on what it would make on
+disk (each member's size plus 4 KiB for it and for each folder it makes, all
+within `max_mb`; a size below 0, or a size on a member that is not a file, is
+refused; at most 200,000 members and folders; no member more than 64
+folders deep or with a name over 1 KiB) and on memory (members are let go as
+they are unpacked; the extended pax or long-name headers before one member, and
+the global ones of the whole tar, at most 1 MiB; sparse members are refused, so
+make a seed without `--sparse`; a hard link must name a file unpacked before
+it, and a link whose path is already there, or that cannot be made, is refused,
+never copied from its target, which tarfile would look for in the rest of the
+stream), checked against the trailer (its size
+and date must be the list's too), checked again for links that lead out of
+it, made readable by every job (a cache's 0600 files too), and swapped in by a
+rename; ssh's stderr and the list are read with a limit. A seed that fails in
+any way is named in the log and the run goes on with the next; old copies
+are pruned at the start and the end of every run (so a run killed by its unit's
+memory or time limit cannot pile them up). A run fetches for at most two hours
+in all (the unit allows three), each seed at most 30 minutes. A seed torn again
+and again is tried again after about 1, 2, 4, 8, 16 and then every 24 hours (a
+link too slow for it does not spend every hour on it; a fetch that kills the
+run counts as torn; the times are approximate: the timer's 10 minute random
+delay and a 5 minute margin can make a wait up to an hour longer); another
+copy on the host is tried at once, but only once per wait (the try counts, so a
+host that remakes the seed every hour still meets the back-off). One torn on
+every try for more than a day makes the run exit 1, so `desk-install check` shows FAIL until it is
+fetched (`/var/lib/fork-fleet/seeds/.torn.json` names it and why); so does a
+run that cannot write that file (a full disk). A host that gives no list (down,
+an older kit, a half-done install) means no new seeds: each one here stays until
+its age drops it, the torn record is left as it is, and the run exits 0 (a host
+down for good shows in `desk-install check` only as seeds that age out). A
+desktop whose own fleet config is broken or lacks its pool, or whose Python's
+tarfile lacks the private parts the limits above rely on, fetches nothing and
+exits 2 (`desk-install check` shows the seed service's last result), but still
+drops each seed past the `max_age_hours` it was fetched with. Jobs see
+`/var/lib/fork-fleet/seeds/NAME` read-only (the launcher's `ALLOW_PATHS`;
+the unpacking and old copies beside it, `.new` and `.v`, are visible too and
+hold the same data), copy what they need from it when it is there, and run
+cold when it is not. A replaced copy is kept 24 hours for a job still reading
+it and removed by the next hourly prune, so it lives up to about 25 hours;
+there is no free-space check before unpacking (a full disk ends that seed's
+fetch and keeps the old one). **Disk budget per seed:** up to `max_mb` x
+(25 / `every_hours`, rounded up, + 2): the copy in use, the copies replaced in
+the last 25 hours, and one being unpacked (`every_hours` 1 and `max_mb` 4096:
+up to about 108 GiB; `every_hours` 6: about 28 GiB). Size `max_mb` and `every_hours` to the
+desktop's free disk. The state table (a torn download, the host down,
+clocks that disagree, a run that stopped half-way) is in the script's header.
+
 ## Owner steps on the repository
 
 Run these from a machine where `gh` is logged in as the owner. None of them

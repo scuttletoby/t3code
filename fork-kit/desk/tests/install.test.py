@@ -65,6 +65,8 @@ if name == 'ssh-keygen':
     open(key + '.pub', 'w').write('ssh-ed25519 AAAAfake desk-x\n')
 if name == 'systemctl' and args[0] in ('is-active', 'is-enabled'):
     sys.exit(1 if args[-1] in lines('down') else 0)
+if name == 'systemctl' and args[:3] == ['show', '-p', 'Result']:   # a unit's last result: the file `result`
+    print((lines('result') or ['success'])[0])
 if name == 'systemctl' and args[0] == 'list-units':   # runner units: the file `units`; `stuck` ones never stop
     print(''.join(f'{u} loaded active running runner\n' for u in lines('units')), end='')
 if name == 'systemctl' and args[0] == 'stop':
@@ -97,6 +99,7 @@ STUBS = {
                                                 '    print("bad settings", file=sys.stderr); sys.exit(2)\n'
                                                 'print("settings ok")\n',
     '.github/scripts/fork-fleet-desk-wire.py': '# wire\n',
+    '.github/scripts/fork-fleet-desk-seed.py': '# seed\n',
     '.github/scripts/fork-fleet-hook.sh': '#!/bin/bash\nexit 0\n',
     '.github/scripts/fork-fleet-job-paths.txt': '/usr\n',
     '.github/fork-fleet.json': json.dumps({'pools': [{'name': 'desktop'}, {'name': 'vm'}]}),
@@ -107,6 +110,8 @@ STUBS = {
     '.github/scripts/fork-fleet-desk-agent.service': '# agent unit\n[Service]\n',
     '.github/scripts/fork-fleet-refresh.service': '# refresh unit\n[Service]\n',
     '.github/scripts/fork-fleet-refresh.timer': '# refresh timer\n[Timer]\n',
+    '.github/scripts/fork-fleet-seed.service': '# seed unit\n[Service]\n',
+    '.github/scripts/fork-fleet-seed.timer': '# seed timer\n[Timer]\n',
 }
 
 
@@ -227,7 +232,8 @@ class Desk(unittest.TestCase):
         self.assertFalse([n for n in os.listdir(self.path('/opt/fork-fleet')) if n.startswith('.kit-stage')])
         launch = self.read('/etc/fork-fleet/launch.conf')
         self.assertTrue(launch.startswith(self.m.HEADER))
-        self.assertIn('RUNNER_USERS=fork-runner-1,fork-runner-2\n', launch)
+        self.assertIn('RUNNER_USERS=fork-runner-1,fork-runner-2\nALLOW_PATHS=/var/lib/fork-fleet/seeds\n', launch)
+        self.assertTrue(os.path.isfile(self.path('/opt/fork-fleet/fork-fleet-desk-seed.py')))
         self.assertNotIn('RESERVE_MB', launch)
         self.assertIn('POOL=desktop\nHOST=fleet-host.example\nPORT=22\nUSER=fleet-desk\n',
                       self.read('/etc/fork-fleet/desk.conf'))
@@ -248,8 +254,9 @@ class Desk(unittest.TestCase):
                          ['fork-runner-1', 'fork-runner-2'])
         order = [c for c in calls if c.startswith(('systemctl', 'launch')) and not c.startswith('systemctl show')]
         self.assertEqual(order, ['systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service '
-                                 'fork-fleet-desk-agent.service', 'systemctl daemon-reload',
-                                 'systemctl enable --now t3code-fleet-refresh.timer', 'launch prune',
+                                 't3code-fleet-seed.timer t3code-fleet-seed.service fork-fleet-desk-agent.service', 'systemctl daemon-reload',
+                                 'systemctl enable --now t3code-fleet-refresh.timer t3code-fleet-seed.timer',
+                                 'launch prune',
                                  'systemctl start --no-block t3code-fleet-refresh.service',
                                  'systemctl enable fork-fleet-desk-agent.service',
                                  'systemctl restart fork-fleet-desk-agent.service'])
@@ -337,7 +344,8 @@ class Desk(unittest.TestCase):
         self.assertIn('# new', self.read('/opt/fork-fleet/hook.sh'))
         self.assertEqual(os.stat(self.path('/opt/fork-fleet/fork-fleet-launch.sh')).st_ino, launcher)  # unchanged
         calls = self.calls()
-        stop = 'systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service fork-fleet-desk-agent.service'
+        stop = ('systemctl stop t3code-fleet-refresh.timer t3code-fleet-refresh.service t3code-fleet-seed.timer '
+                't3code-fleet-seed.service fork-fleet-desk-agent.service')
         self.assertLess(calls.index(stop), calls.index('systemctl restart fork-fleet-desk-agent.service'))
         self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['sha'], SHA2)
 
@@ -821,7 +829,8 @@ class Desk(unittest.TestCase):
         self.machine({'version': 1, 'desk': {**MACHINE['desk'], 'reserveMb': 4096, 'port': 2222, 'slots': 1,
                                              'netBase': '10.77'}})
         self.assertEqual(self.install()[0], 0)
-        self.assertIn('RUNNER_USERS=fork-runner-1\nRESERVE_MB=4096\nNET_BASE=10.77\n',
+        self.assertIn('RUNNER_USERS=fork-runner-1\nALLOW_PATHS=/var/lib/fork-fleet/seeds\nRESERVE_MB=4096\n'
+                      'NET_BASE=10.77\n',
                       self.read('/etc/fork-fleet/launch.conf'))
         self.assertTrue(self.read('/etc/fork-fleet/desk-known_hosts').endswith(
             f'[fleet-host.example]:2222 {HOST_KEY}\n'))
@@ -874,6 +883,7 @@ class Desk(unittest.TestCase):
         self.write(os.path.join(self.fakes, 'wall-fails'), '')
         self.write(os.path.join(self.fakes, 'agent-bad'), '')
         self.write(os.path.join(self.fakes, 'down'), 'fork-fleet-desk-agent.service\n')
+        self.write(os.path.join(self.fakes, 'result'), 'exit-code\n')   # the seed service failed its last run
         self.write(self.path('/opt/fork-fleet/hook.sh'), '#!/bin/bash\nevil\n', 0o755)
         self.write(self.path('/proc/sys/net/ipv4/ip_forward'), '0\n')
         os.unlink(os.path.join(self.fakes, 'users'))
@@ -881,10 +891,11 @@ class Desk(unittest.TestCase):
         self.assertEqual(code, 1)
         for line in ('FAIL  kit  /opt/fork-fleet/hook.sh: differs', 'FAIL  vsock  closed: open',
                      'FAIL  agent-settings  bad settings', 'FAIL  unit  fork-fleet-desk-agent.service',
-                     'PASS  unit  t3code-fleet-refresh.timer', 'FAIL  template', 'FAIL  runner-user  fork-runner-1',
-                     'FAIL  ip-forward'):
+                     'PASS  unit  t3code-fleet-refresh.timer', 'PASS  unit  t3code-fleet-seed.timer',
+                     'FAIL  unit  t3code-fleet-seed.service last run: exit-code', 'FAIL  template',
+                     'FAIL  runner-user  fork-runner-1', 'FAIL  ip-forward'):
             self.assertIn(line, out)
-        self.assertTrue(out.endswith('8 FAIL\n'), out)
+        self.assertTrue(out.endswith('9 FAIL\n'), out)
 
     def test_check_fails_on_a_drop_in_and_on_settings_the_machine_file_no_longer_gives(self):
         self.assertEqual(self.install()[0], 0)
@@ -933,12 +944,14 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.install()[0], 0)
         self.write(os.path.join(self.fakes, 'active'), 'desktop-1\n')
         self.write(self.path('/var/lib/fork-fleet/runners/x'), '')
+        self.write(self.path('/var/lib/fork-fleet/seeds/.v/m2.1/data/x'), '')
         self.write(os.path.join(self.fakes, 'netns'), 'fork-fleet-fork-runner-1\n')   # the namespaces that are there
         self.clear_calls()
         code, out, err = self.run_main('uninstall')
         self.assertEqual(code, 0, err)
         calls = self.calls()
-        for c in ('systemctl disable --now fork-fleet-desk-agent.service', 'launch active', 'launch stop desktop-1',
+        for c in ('systemctl disable --now fork-fleet-desk-agent.service',
+                  'systemctl disable --now t3code-fleet-seed.timer', 'launch active', 'launch stop desktop-1',
                   'launch prune', 'ip netns delete fork-fleet-fork-runner-1', 'nft delete table inet fork_fleet',
                   'userdel fork-runner-1', 'userdel fork-runner-2'):
             self.assertIn(c, calls)

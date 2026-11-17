@@ -50,15 +50,15 @@ recorded before any file is swapped, so a later install of a new release keeps i
 the always-on host with `fork-fleet-desk-key.py add POOL`. The first runner template is made in the background by
 the refresh timer; `check` says FAIL for `template` until it is there.
 
-`check` only reads: the installed files against their manifest (text, root owner and mode), the folders' and the
-desk key's (both halves) modes and root owner (not a link), the project's fleet config against the installed one, each unit against
-the release's (header plus `/opt/fork-fleet/units/UNIT`, mode and root owner), a restart a stopped install still owes, systemd drop-ins that change the kit's units,
-every wall of this OS (`fork-fleet-walls.py describe`), the agent's settings, the units, the template, the settings
-files against the machine file (text, mode and root owner), the runner users (each must exist, have no login shell,
-a locked password, a uid other than 0, its own group only (the main group is the group named after the user, and
-no other), no home that is there (`/nonexistent`) and no line in
-`cron.allow`/`at.allow`; and it names a user the kit made that a smaller `slots` no longer uses) and IPv4
-forwarding.
+`check` only reads: the installed files against their manifest (text, root owner and mode), the folders' and the desk
+key's (both halves) modes and root owner (not a link), the project's fleet config against the installed one, each
+unit against the release's (header plus `/opt/fork-fleet/units/UNIT`, mode and root owner), a restart a stopped
+install still owes, systemd drop-ins that change the kit's units, every wall of this OS (`fork-fleet-walls.py
+describe`), the agent's settings, the units (and the seed service's last result), the template, the settings files
+against the machine file (text, mode and root owner), the runner users (each must exist, have no login shell, a
+locked password, a uid other than 0, its own group only (the main group is the group named after the user, and no
+other), no home that is there (`/nonexistent`) and no line in `cron.allow`/`at.allow`; and it names a user the kit
+made that a smaller `slots` no longer uses) and IPv4 forwarding.
 
 A `fork-runner-N` user made by hand before the install is used, but only when it passes the same checks (no login
 shell, locked password, uid not 0, its own group only, no home that is there, not in an allow file; the launcher
@@ -71,6 +71,16 @@ same way, not followed or fixed. The folders above them (`/opt`, `/etc`, `/etc/s
 they are the system's, root-owned on a stock system, and a user who could write them could already change what root
 runs; keep them root's. One install or uninstall runs at a time (a lock on
 `/etc/fork-fleet`, which only root can open); a second one is refused.
+
+The seed timer (`t3code-fleet-seed.timer`) fetches the pool's warm caches, if its fleet config lists any, into
+`/var/lib/fork-fleet/seeds`, which jobs see read-only ([fork-fleet.md](../../.github/fork-fleet.md), "Seeds").
+A torn seed is tried again after about 1, 2, 4, 8, 16, then 24 hours (up to an hour later: the timer's random delay),
+or at once when the host offers another copy, but that only once per wait (a host that remakes the seed every hour
+still meets the back-off); one torn on every try for more than a day makes each run that reads the host's list exit
+1, so `check` shows the seed service's last run as failed (a run that cannot write the record, a full disk, exits 1
+too). `/var/lib/fork-fleet/seeds/.torn.json` names it and the host's reason (jobs can read that file
+too); a run without the host's list leaves it as it is and exits 0, so a host that stays down shows in `check` only
+as seeds that age out.
 
 ## Windows (WSL2)
 
@@ -141,9 +151,10 @@ parts run in the tests on a fake root.
 Uninstall stops every runner (through the launcher, then `systemctl stop` for any left). While one still runs it
 stops there and changes nothing else: the `fork_fleet` nft table, users and record stay; run it again. Then it
 removes every `fork-fleet-*` namespace and `ffh-*` link, the nft table, the kit's units, the files of its manifest,
-the template and runner copies, its settings and key, the users it made, and `cron.deny`/`at.deny` when the kit
-made them (otherwise the lines it added, for every runner user, also one that was there before). The record goes last. Anything else in its folders (a file the kit
-did not make, a drop-in) is kept and named. IPv4 forwarding stays on until the next reboot.
+the template, runner copies and seeds, its settings and key, the users it made, and `cron.deny`/`at.deny` when the kit
+made them (otherwise the lines it added, for every runner user, also one that was there before). The record goes
+last. Anything else in its folders (a file the kit did not make, a drop-in) is kept and named. IPv4 forwarding
+stays on until the next reboot.
 
 ## Why one flat folder
 
