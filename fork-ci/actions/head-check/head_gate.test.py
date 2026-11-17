@@ -476,7 +476,7 @@ class ReviewRun(Files, unittest.TestCase):
 
     def test_two_open_pull_requests_with_the_head_judge_it_once(self):   # #379: same branch into two bases
         # The gate judges a head, not a pull request (preflight lists every open pull request with it again), so the
-        # lowest number judges it once for all of them; the others are named in the log. Nothing is skipped: a lens
+        # head is judged once, in the job for the lowest number; the log lists them all. Nothing is skipped: a lens
         # read withdrawn on one of them leaves no stale pass. Order of the listing, a third one: the same answer.
         for rows in ([(12, self.H, REPO), (14, self.H, REPO)], [(14, self.H, REPO), (12, self.H.upper(), REPO)],
                      [(15, self.H, REPO), (14, self.H, REPO), (12, self.H, REPO), (13, self.OTHER, REPO)]):
@@ -485,8 +485,41 @@ class ReviewRun(Files, unittest.TestCase):
                 self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
                 self.assertNotIn('nothing to judge', out)
                 self.assertNotIn('each number', out)
-                others = ', '.join(f'#{n}' for n, h, _ in sorted(rows) if h.lower() == self.H and n != 12)
-                self.assertIn(f'#12 judges it for {others} too', out)
+                listed = ', '.join(f'#{n}' for n, h, _ in sorted(rows) if h.lower() == self.H)
+                self.assertIn(f'review run: open pull requests {listed} have the head ', out)
+                self.assertIn('judged once, in the job for #12 (the lowest number)', out)
+
+    def test_the_lowest_is_the_lowest_number_not_the_first_text(self):   # #400: 9 < 10 < 100, though '10' < '9'
+        for rows in ([(10, self.H, REPO), (9, self.H, REPO)],
+                     [(100, self.H, REPO), (9, self.H, REPO), (10, self.H, REPO)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, [{'pr': 9, 'sha': self.H}]), out)
+                self.assertIn('open pull requests #9, #10' + (', #100' if len(rows) == 3 else '') + ' have', out)
+
+    def test_the_log_names_no_pull_request_as_judged(self):   # #400: the lowest may be a draft or into another base
+        # The listing has no draft or base (HEAD_JQ), so this line cannot know which of them are judged: it names
+        # them as the open ones with the head, and target's "judging" line names the ones judged.
+        code, out, _ = self.review([(12, self.H, REPO), (14, self.H, REPO)])
+        self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+        self.assertNotRegex(out, r'#\d+ judges')
+        self.assertIn('the target step names the ones it judges (ready, into the default branch)', out)
+        code, out, _ = self.review([(12, self.H, REPO)])   # one: unchanged
+        self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+        self.assertIn('review run: #12 has the head ', out)
+        self.assertNotIn('judged once', out)
+
+    def test_a_number_listed_twice_is_named_once(self):   # #400: pages that overlap while the list changes
+        for rows in ([(12, self.H, REPO), (14, self.H, REPO), (14, self.H, REPO)],
+                     [(14, self.H, REPO), (12, self.H, REPO), (12, self.H, REPO), (14, self.H, REPO)],
+                     [(12, self.H, REPO), (12, self.H, REPO)]):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
+                line = next(l for l in out.splitlines() if l.startswith('review run:'))
+                want = 'open pull requests #12, #14 have' if 14 in (r[0] for r in rows) else '#12 has'
+                self.assertTrue(line.startswith(f'review run: {want} the head '), line)
+                self.assertEqual(line.count('#14'), int(14 in (r[0] for r in rows)), line)
 
     def test_one_of_two_closed_half_way_judges_the_one_left(self):   # stops half-way: the listing has the one left
         for rows in ([(14, self.H, REPO)], [(12, self.H, REPO)]):
@@ -533,6 +566,8 @@ class ReviewRun(Files, unittest.TestCase):
     def test_an_unreadable_or_odd_listing_is_refused_and_posts_nothing(self):   # stops half-way: an older check stays
         for rows in (answer(1, '', 'gh: Server Error (HTTP 502)'), answer(0, 'x\n'), answer(0, '[12, "x", null]\n'),
                      answer(0, '[true, "' + self.H + '", null]\n'), answer(0, '[12, "' + self.H + '", 5]\n'),
+                     answer(0, '["12", "' + self.H + '", "' + REPO + '"]\n'),   # #400: a number as a string
+                     answer(0, '[12.0, "' + self.H + '", "' + REPO + '"]\n'),
                      answer(0, '[12, false, "' + self.H + '", null]\n'),   # the old four-field row
                      answer(0, '[12, "' + self.H + '", "' + REPO + '", false]\n')):
             with self.subTest(rows=rows.stdout[:20]):
