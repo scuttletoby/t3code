@@ -49,6 +49,7 @@ import * as ServerConfig from "./config.ts";
 import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { renameRetiredAutoUpdateKeys } from "./cloud/autoUpdateSettings.ts";
+import { prepareSettingsFile } from "./fork/settingsFileRead.ts"; // Fork: renames, bad intervals
 import {
   deriveLegacyProjectOverrides,
   fallbackTextGenerationModelSelection,
@@ -403,7 +404,7 @@ export function decodeSettingsFileText(
   const parsed = decodeSettingsFileJsonExit(raw);
   return Exit.isFailure(parsed)
     ? parsed
-    : decodePersistedServerSettingsExit(withDefaults(renameRetiredAutoUpdateKeys(parsed.value)));
+    : decodePersistedServerSettingsExit(withDefaults(prepareSettingsFile(parsed.value)));
 }
 
 /** The load's lenient parse of a settings file's text (comments, trailing commas), before decoding. */
