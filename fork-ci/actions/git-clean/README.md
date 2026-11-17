@@ -34,8 +34,8 @@ Put it in every job that runs on a self-hosted runner and checks out code, befor
 other step that writes the workspace. With several checkouts, list their paths (`path: | ...`): all of them are
 checked.
 
-| Input  | Default | Meaning                                                                 |
-| ------ | ------- | ----------------------------------------------------------------------- |
+| Input  | Default | Meaning                                                              |
+| ------ | ------- | -------------------------------------------------------------------- |
 | `path` | `.`     | the checkout path or paths (actions/checkout's `path`), one per line |
 
 No outputs. A refusal fails the step, so the checkout and every later step do not run.
