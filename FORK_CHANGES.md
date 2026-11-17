@@ -7,8 +7,8 @@ says how to install the fork today.
 
 The rule for every change: a machine that never names a fork setting behaves as upstream's T3 Code.
 A setting is written as `server.<key>` (the server's `settings.json`) or `projectOverride.<key>`
-(one project's overrides). A test (`packages/shared/src/forkDocs.test.ts`) fails when a fork setting
-is missing here or a setting named here does not exist.
+(one project's overrides). A test (`.github/scripts/fork-changes-list.test.cjs`) fails when a fork
+setting is missing here or a setting named here does not exist.
 
 ## In T3 Code itself
 
