@@ -24,10 +24,12 @@ Cache (--cache, a folder the caller owns): a page is saved only when it cannot c
 run and all its jobs are completed (keyed by run id and attempt, so a re-run is a new page); a run-list page when
 every run in it is completed and its window ended over an hour ago, and then reused for LIST_MAX_AGE (a later re-run
 changes the run). Where the OS has user ids (not Windows), a folder another user owns is refused and the folder is
-made 0700 (a filesystem where chmod has no effect is refused). Writes are a `.part-` file then a rename. A file that is unreadable, half-written, damaged, saved for
-another page or in another FORMAT is fetched again; a failed write only costs the cache; `.part-` files older than
-an hour go.
-Exit: 0 complete, 2 bad arguments or an API error, 3 incomplete (budget).
+made 0700 (a filesystem where chmod has no effect is refused). Writes are a `.part-` file then a rename. A file
+that is unreadable, half-written, damaged (also nested too deep, or a page field missing or of the wrong type), saved
+for another page or in another FORMAT is fetched again; a failed write only costs the cache; `.part-` files older than
+an hour go (one that cannot be removed is reported and the run goes on).
+Exit: 0 complete, 2 bad arguments (a config file of the wrong shape too) or an API error (an answer with a field
+missing or of the wrong type too), 3 incomplete (budget).
 """
 import argparse, contextlib, datetime as dt, hashlib, json, math, os, re, subprocess, sys, time
 
@@ -86,22 +88,30 @@ class Api:
                 os.chmod(cache, 0o700)
                 if os.stat(cache).st_mode & 0o077:
                     raise ValueError(f'--cache {cache} cannot be made private (0700)')
+        cleanup_failed = None
         for name in os.listdir(cache):   # a killed write leaves a .part- file; it is never read
             p = os.path.join(cache, name)
-            if name.startswith('.part-') and now() - os.path.getmtime(p) > PART_AGE:
-                os.unlink(p)
+            try:
+                if name.startswith('.part-') and now() - os.path.getmtime(p) > PART_AGE:
+                    os.unlink(p)
+            except FileNotFoundError:
+                pass   # another run removed it first
+            except OSError as e:   # a read-only folder or a directory: only the clean-up failed (a save says its own)
+                cleanup_failed = cleanup_failed or e
+        if cleanup_failed:
+            print(f'ci-demand: old .part- file not removed ({shown(cleanup_failed)}); going on', file=sys.stderr)
 
     def _path(self, key):
         return os.path.join(self.cache, hashlib.sha256(key.encode()).hexdigest()[:40] + '.json')
 
-    def cached(self, key, max_age=None):
+    def cached(self, key, kind, max_age=None):
         try:
             with open(self._path(key), encoding='utf-8') as f:
                 doc = json.load(f)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):   # RecursionError: nested too deep
             return None
         if not (isinstance(doc, dict) and doc.get('v') == FORMAT and doc.get('key') == key
-                and isinstance(doc.get('body'), dict)):
+                and page_ok(doc.get('body'), kind)):   # a body field missing or of the wrong type: fetched again
             return None
         saved = doc.get('saved')
         try:   # float(): json.load reads NaN, Infinity and any-size integers; a huge one raises OverflowError
@@ -128,12 +138,16 @@ class Api:
         except OSError as e:
             with contextlib.suppress(OSError):
                 os.unlink(part)
-            if not self.save_failed:
-                self.save_failed = str(e)
-                print(f'ci-demand: cache not written ({shown(e)}); going on without it', file=sys.stderr)
+            self.write_failed(e)
 
-    def get(self, endpoint):
-        """The decoded JSON of one GET; Budget when the cap or reserve would be crossed."""
+    def write_failed(self, e):
+        """Reported once; the run goes on without saving."""
+        if not self.save_failed:
+            self.save_failed = str(e)
+            print(f'ci-demand: cache not written ({shown(e)}); going on without it', file=sys.stderr)
+
+    def get(self, endpoint, kind):
+        """The decoded JSON of one GET (a `kind` page, see page_ok); Budget when the cap or reserve would be crossed."""
         for attempt in range(RETRIES + 1):
             if self.requests >= self.max_requests:
                 raise Budget(f'--max-requests {self.max_requests} reached')
@@ -153,9 +167,12 @@ class Api:
                 if remaining is not None and remaining < reserve:
                     self.stop = f'rate limit: {remaining} left, reserve {reserve}'
                 try:
-                    return json.loads(body)
-                except ValueError:
+                    doc = json.loads(body)
+                except (ValueError, RecursionError):
                     raise ApiError(f'{endpoint}: not JSON')
+                if not page_ok(doc, kind):
+                    raise ApiError(f'{endpoint}: unexpected answer (a field missing or of the wrong type)')
+                return doc
             secondary = status in (403, 429) and 'rate limit' in body.lower()
             if status in (403, 429) and (h.get('retry-after') or remaining == 0 or secondary):
                 if h.get('retry-after', '').isdigit():
@@ -198,6 +215,44 @@ def ts(s):
     return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
+def is_count(n):
+    return isinstance(n, int) and not isinstance(n, bool) and n >= 0
+
+
+def is_date(s, needed=False):
+    """A date as GitHub writes it (2026-11-01T12:00:00Z; not the other ISO 8601 forms fromisoformat reads, as the day
+    is its first 10 characters); or, when not needed, empty (ts() gives None)."""
+    if not s:
+        return not needed
+    if not (isinstance(s, str) and re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z', s)):
+        return False
+    try:
+        return ts(s) is not None
+    except ValueError:   # a month 13 or a day 32
+        return False
+
+
+def run_ok(r):
+    return isinstance(r, dict) and is_count(r.get('id')) and is_date(r.get('created_at'), needed=True) \
+        and isinstance(r.get('path') or '', str)
+
+
+def job_ok(j):
+    if not isinstance(j, dict):
+        return False
+    labels = j.get('labels') or []
+    return isinstance(labels, list) and all(isinstance(x, str) for x in labels) \
+        and all(is_date(j.get(k)) for k in ('created_at', 'started_at', 'completed_at'))
+
+
+def page_ok(body, kind):
+    """A runs-list (`kind` 'workflow_runs') or jobs ('jobs') page that has the fields the counting uses, of their
+    types (a saved file can hold anything; a missing field would count as no runs or no jobs)."""
+    if not (isinstance(body, dict) and is_count(body.get('total_count')) and isinstance(body.get(kind), list)):
+        return False
+    return all(map(run_ok if kind == 'workflow_runs' else job_ok, body[kind]))
+
+
 def list_runs(api, repo, start, end, out):
     """Every run created in [start, end] into `out` (by id). A window over the API's 1000-run cap is split in two."""
     base = f'repos/{repo}/actions/runs?created={iso(start)}..{iso(end)}&per_page={PAGE}'
@@ -205,9 +260,9 @@ def list_runs(api, repo, start, end, out):
     page, seen = 1, 0
     while True:
         ep = f'{base}&page={page}'
-        body = api.cached(ep, LIST_MAX_AGE) if settled else None
+        body = api.cached(ep, 'workflow_runs', LIST_MAX_AGE) if settled else None
         if body is None:
-            body = api.get(ep)
+            body = api.get(ep, 'workflow_runs')
             if settled and all(r.get('status') == 'completed' for r in body.get('workflow_runs', [])):
                 api.save(ep, body)
         total = body.get('total_count', 0)
@@ -233,9 +288,9 @@ def run_jobs(api, repo, run):
     while True:
         ep = f'repos/{repo}/actions/runs/{run["id"]}/jobs?filter=all&per_page={PAGE}&page={page}'
         key = f'{ep}#attempt={run.get("run_attempt", 1)}'
-        body = api.cached(key)
+        body = api.cached(key, 'jobs')
         if body is None:
-            body = api.get(ep)
+            body = api.get(ep, 'jobs')
             if run.get('status') == 'completed' and all(j.get('status') == 'completed' for j in body.get('jobs', [])):
                 api.save(key, body)
         jobs += body.get('jobs', [])
@@ -375,9 +430,14 @@ def repo_of(args):
     repo = args.repo
     if args.config:
         with open(args.config, encoding='utf-8-sig') as f:   # utf-8-sig: a BOM (some Windows editors) is fine
-            repo = ((json.load(f) or {}).get('ciDemand') or {}).get('repo')
-        if not repo:
-            raise ValueError(f'{args.config}: no ciDemand.repo')
+            try:
+                doc = json.load(f)
+            except (ValueError, RecursionError) as e:
+                raise ValueError(f'{args.config}: not JSON ({e})')
+        section = doc.get('ciDemand') if isinstance(doc, dict) else None
+        repo = section.get('repo') if isinstance(section, dict) else None
+        if not repo or not isinstance(repo, str):
+            raise ValueError(f'{args.config}: no ciDemand.repo (a text "OWNER/REPO" in a "ciDemand" object)')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
         raise ValueError(f'not OWNER/REPO: {shown(repo)}')
     return repo
@@ -428,7 +488,7 @@ def main(argv=None):
     if stopped:
         head += (f'; INCOMPLETE: {stopped}, ' + ('' if listed else 'run list not finished, ') + f'{missing} runs without jobs'
                  + ('' if api.save_failed else '; run again with the same --cache'))
-    if api.save_failed:   # nothing new was saved: a run again would fetch the same pages, never further
+    if api.save_failed:   # the pages that failed were not saved: a run again would fetch them again
         head += f'; cache not written ({shown(api.save_failed)})' + (
             ', so a run again asks for the same pages: fix --cache first' if stopped else '')
     if args.json:
