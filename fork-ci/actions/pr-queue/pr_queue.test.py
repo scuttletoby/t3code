@@ -2670,12 +2670,13 @@ class GitCalls(unittest.TestCase):
 
     def test_git_gets_the_login_from_gh_only_and_never_prompts(self):
         q, argv, env = self.git_call('run-token', 'pat-token')
-        self.assertEqual(argv[:13], ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
-                                     '-c', 'core.commitGraph=false', '--no-replace-objects',
-                                     '-c', 'credential.https://github.com.helper=',
+        self.assertEqual(argv[:15], ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                                     '-c', 'core.commitGraph=false', '-c', 'core.attributesFile=/dev/null',
+                                     '--no-replace-objects', '-c', 'credential.https://github.com.helper=',
                                      '-c', 'credential.https://github.com.helper=!gh auth git-credential', '--git-dir'])
-        self.assertEqual(argv[13:], [q.cache, 'fetch', 'x'])
+        self.assertEqual(argv[15:], [q.cache, 'fetch', 'x'])
         self.assertEqual(env['GIT_TERMINAL_PROMPT'], '0')
+        self.assertEqual(env['GIT_ATTR_NOSYSTEM'], '1')
 
     def test_git_fetches_with_the_read_token_only(self):   # gh auth git-credential answers with GH_TOKEN
         q, argv, env = self.git_call('run-token', 'pat-token')

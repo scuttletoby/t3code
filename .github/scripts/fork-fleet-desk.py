@@ -21,11 +21,11 @@ pool's runners are started through that session.
   desktop's warm caches, never a session (fork-fleet-desk-seed.py; its lock DIR/POOL.seed.lock).
 DIR is /run/fork-fleet-desk, made at boot by systemd-tmpfiles (runbook): owned by the desk-link user, its group the
 socket group (who may connect: the dispatcher's user, or root), mode 0710 or 0750. The socket is 0660 in that group,
-and serve lets in only root, its own user and members of that group (SO_PEERCRED). Not as root (tests),
-$FORK_FLEET_DESK_DIR may name another DIR; for serve that only moves its own socket away from the dispatcher (sshd
-passes no such variable unless its AcceptEnv names it). $FORK_FLEET_DESK_USER names the desk-link user for `launch`
-(default USER). The link keeps no state of its own: the live session is the state. Wire format:
-fork-fleet-desk-wire.py. Standard library only.
+and serve lets in only root, its own user and members of that group (SO_PEERCRED); launch sends only to a socket whose
+peer is the directory's owner. Not as root (tests), $FORK_FLEET_DESK_DIR may name another DIR; for serve that only
+moves its own socket away from the dispatcher (sshd passes no such variable unless its AcceptEnv names it).
+$FORK_FLEET_DESK_USER names the desk-link user for `launch` (default USER). The link keeps no state of its own: the
+live session is the state. Wire format: fork-fleet-desk-wire.py. Standard library only.
 """
 import grp, importlib.util, os, pwd, selectors, signal, socket, stat, struct, sys, time
 
@@ -81,6 +81,11 @@ def desk_uid(env):
         return pwd.getpwnam(env.get('FORK_FLEET_DESK_USER') or USER).pw_uid
     except KeyError:
         return None
+
+
+def peer(sock):
+    """(pid, uid, gid) of the process at the other end of a connected Unix socket (SO_PEERCRED)."""
+    return struct.unpack('3i', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
 
 
 def pool_ok(pool):
@@ -265,7 +270,7 @@ class Session:
             time.sleep(0.05)                 # the listener stays readable: do not spin
             return
         try:
-            _, uid, gid = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            _, uid, gid = peer(client)
         except OSError:
             client.close()
             return
@@ -369,6 +374,14 @@ def launch(pool, verb, args, stdin, path, out=sys.stdout, err=sys.stderr, wait=N
                           wire.NO_SESSION) from None
         except OSError as e:
             raise Refused(f'cannot reach {sock_path}: {e.strerror}') from None
+        # The directory's owner may swap the socket between the lstat and the connect (root's launch): who listens
+        # must be that owner, or nothing is sent.
+        try:
+            uid = peer(s)[1]
+        except OSError as e:
+            raise Refused(f'cannot reach {sock_path}: {e.strerror}') from None
+        if uid != owner:
+            raise Refused(f'{sock_path} listens as uid {uid}, not its directory\'s owner {owner}: {verb} was not sent')
         try:
             s.settimeout(max(0.01, min(CLIENT, deadline - time.monotonic())))
             s.sendall(wire.encode(frame))
