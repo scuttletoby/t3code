@@ -271,6 +271,58 @@ class LensFindings(Case):
         self.assertEqual(self.urls, [])
 
 
+class Neighbours(Case):
+    """#96: load() and run run one checked file. A module that loads its neighbours (pr-queue/pr_queue.py puts its
+    folder on sys.path and imports config and lens) would run unchecked files from the cache: refused."""
+    BODY = (b'import os, sys\nsys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n'
+            b'import config  # noqa\n')
+
+    def setUp(self):
+        super().setUp()
+        self.config({'repo': 'owner/repo', 'sha': SHA, 'files': {'pr-queue/pr_queue.py': pinned.blob_id(self.BODY)}})
+        self.marker = os.path.join(self.root, 'planted-ran')
+        self.put(os.path.join(self.cache, SHA, 'pr-queue', 'config.py'),   # planted next to it, never checked
+                 f'open({self.marker!r}, "w").close()\n'.encode())
+        path, mods = list(sys.path), dict(sys.modules)
+        self.addCleanup(lambda: (sys.path.__setitem__(slice(None), path),
+                                 [sys.modules.pop(m) for m in set(sys.modules) - set(mods)]))
+
+    def test_load_refuses_a_module_that_imports_a_neighbour(self):
+        for _ in range(2):   # the same answer from a cache hit
+            with self.serve(self.BODY), self.assertRaisesRegex(pinned.FetchError, 'sys.path'):
+                pinned.load(self.cfg, 'pr-queue', 'pr_queue', self.cache)
+            self.assertFalse(os.path.exists(self.marker), 'the planted neighbour never ran')
+
+    def test_run_refuses_it_before_running_anything(self):
+        runs = []
+        with self.serve(self.BODY), mock.patch.object(pinned.subprocess, 'run', lambda *a, **k: runs.append(a)), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(pinned.main(['--config', self.cfg, '--cache', self.cache,
+                                          'run', 'pr-queue', 'pr_queue.py']), 1)
+        self.assertEqual(runs, [])
+        self.assertIn('sys.path', err.getvalue())
+
+    def test_what_loads_a_neighbour(self):
+        for body, found in ((b'import os, yaml, config\nfrom os import path\nfrom __future__ import annotations\n', []),
+                            (b'import sys\nsys.path.insert(0, "x")\nimport lens\n', ['sys.path']),
+                            (b'import sys\nprint(sys.path)\n', ['sys.path']), (b'from sys import path\n', ['sys.path']),
+                            (b'from . import lens\n', ['.']), (b'from .lens import x\n', ['.lens']),
+                            (b'import importlib.util\n', ['importlib.util']),
+                            (b'def f():\n    import runpy\n', ['runpy']), (b'not python(\n', ['(does not parse)'])):
+            with self.subTest(body=body):
+                self.assertEqual(pinned.neighbour_loads(body), found)
+
+    def test_the_fork_ci_modules_today(self):   # the ones a project loads pass; the ones with neighbours do not
+        actions = os.path.dirname(HERE)
+        for rel, ok in (('pinned/pinned.py', True), ('docs-scope/docs_scope.py', True),
+                        ('gradle-cache/gradle_cache.py', True), ('ci-demand/ci_demand.py', True),
+                        ('job-changed/job_changed.py', True), ('pr-queue/pr_queue.py', False),
+                        ('head-check/head_check.py', False), ('head-check/head_gate.py', False),
+                        ('fleet-watch/fleet_watch.py', False)):
+            with self.subTest(rel), open(os.path.join(actions, rel), 'rb') as f:
+                self.assertEqual(pinned.neighbour_loads(f.read()) == [], ok)
+
+
 class Run(Case):
     def test_run_executes_the_verified_bytes_even_if_the_cache_file_changes_after_the_check(self):
         body = b'print("good")\n'
@@ -449,6 +501,57 @@ class UmaskAndFifo(Bootstrap):
         part = self.put(os.path.join(self.cache, SHA, 'x', '.part-1'), b'', age=7200)
         pinned.prune(self.cache, SHA, now)
         self.assertFalse(os.path.exists(old)); self.assertFalse(os.path.exists(part))
+
+
+@unittest.skipUnless(hasattr(os, 'getuid'), 'POSIX owners and modes')
+class BootstrapCacheFolder(Bootstrap):
+    """#96: the bootstrap checks the cache folder (ours, a real folder, not group- or world-writable) before it reads or
+    writes anything in it, and fails closed otherwise; the same answer on every run."""
+    def refused(self, cache, inside):
+        self.cache = cache
+        for _ in range(2):   # a second run: refused again, still nothing read, fetched or written
+            with self.assertRaisesRegex(ValueError, 'cache folder'):
+                self.boot()
+            self.assertEqual(self.urls, [])
+            self.assertEqual(os.listdir(inside), [])
+
+    def test_a_folder_others_can_write_is_refused_and_left_as_it_is(self):
+        for mode in (0o770, 0o720, 0o702, 0o777, 0o1777):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.cache, mode)
+                self.refused(self.cache, self.cache)
+                self.assertEqual(os.stat(self.cache).st_mode & 0o7777, mode, 'not made private behind the owner')
+
+    def test_a_folder_another_user_owns_is_refused(self):
+        with mock.patch.object(os, 'getuid', lambda: os.stat(self.cache).st_uid + 1):
+            self.refused(self.cache, self.cache)
+
+    def test_a_symlinked_folder_is_refused_even_to_a_good_folder(self):
+        link = os.path.join(self.root, 'link')
+        os.symlink(self.cache, link)   # self.cache: ours and 0700
+        self.refused(link, self.cache)
+        empty = os.path.join(self.root, 'empty')
+        os.mkdir(empty, 0o700)
+        gone = os.path.join(self.root, 'gone')
+        os.symlink(os.path.join(empty, 'target'), gone)   # a dangling one: its target is not made
+        self.refused(gone, empty)
+
+    def test_a_fresh_folder_and_a_good_existing_one_work_on_every_run(self):
+        fresh = os.path.join(self.root, 'new', 'cache')   # its parent is missing too
+        for cache, mode in ((fresh, None), (os.path.join(self.root, '700'), 0o700),
+                            (os.path.join(self.root, '755'), 0o755)):   # 755: ours, only we can write it
+            with self.subTest(cache=cache, mode=mode and oct(mode)):
+                if mode:
+                    os.mkdir(cache)
+                    os.chmod(cache, mode)
+                self.cache, self.urls = cache, []
+                self.pdest = os.path.join(cache, SHA, 'pinned', 'pinned.py')
+                self.boot()
+                self.boot(error=OSError('the second run is a cache hit'))
+                self.assertEqual(len(self.urls), 1)
+                with open(self.pdest, 'rb') as f:
+                    self.assertEqual(f.read(), self.REAL)
+        self.assertEqual(os.stat(fresh).st_mode & 0o777, 0o700)
 
 
 class BootstrapFifo(Bootstrap):
