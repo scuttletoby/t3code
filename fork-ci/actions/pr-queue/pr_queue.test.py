@@ -3237,6 +3237,121 @@ class Cli(unittest.TestCase):
         self.config = os.path.join(self.repo, '.github', 'pr-queue.json')
         self.refused('has no commit checked out')
 
+    def test_a_config_blob_missing_from_a_partial_clone_is_refused_never_fetched(self):   # #435 item 1
+        # actions/checkout's sparse checkout is a --filter=blob:none clone: a pattern that does not match the config's
+        # own name ([1] is a glob) leaves its blob on the remote, and cat-file would fetch it with the stored token.
+        rel = '.github/q[1].json'
+        self.commit({rel: json.dumps(CFG_RAW)})
+        remote, pc = os.path.join(self.d, 'remote.git'), os.path.join(self.d, 'pc')
+        self.git('clone', '-q', '--bare', self.repo, remote)
+        subprocess.run(['git', '-C', remote, 'config', 'uploadpack.allowFilter', 'true'], check=True)
+        subprocess.run(['git', 'clone', '-q', '--filter=blob:none', '--no-checkout', 'file://' + remote, pc],
+                       check=True, capture_output=True)
+        subprocess.run(['git', '-C', pc, 'sparse-checkout', 'set', '--no-cone', rel], check=True, capture_output=True)
+        subprocess.run(['git', '-C', pc, 'checkout', '-q', 'main'], check=True, capture_output=True)
+        oid = subprocess.run(['git', '-C', pc, 'rev-parse', f'HEAD:{rel}'], check=True, capture_output=True,
+                             text=True).stdout.strip()
+
+        def local(sha):   # without fetching it
+            return subprocess.run(['git', '-C', pc, 'cat-file', '-e', sha], capture_output=True,
+                                  env={**os.environ, 'GIT_NO_LAZY_FETCH': '1', 'GIT_ALLOW_PROTOCOL': 'none'}).returncode == 0
+        self.assertFalse(local(oid), 'the clone holds the blob: the test reads nothing missing')
+        self.config = os.path.join(pc, rel)
+        for _ in range(2):   # runs again: the same refusal, still nothing fetched
+            self.refused(f'{rel} at ', 'not in this checkout', 'sparse-checkout pattern')
+            self.assertFalse(local(oid), 'the read fetched the blob')
+        subprocess.run(['git', '-C', pc, 'sparse-checkout', 'disable'], check=True, capture_output=True)   # the fix
+        code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+
+    def test_every_git_call_of_the_read_has_a_timeout(self):   # #435 item 1: a stuck git never holds the job
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(kw.get('timeout'))
+            if 'cat-file' in cmd:
+                raise subprocess.TimeoutExpired(cmd, kw.get('timeout'))
+            return subprocess.run(cmd, **kw)
+        with self.assertRaisesRegex(config.ConfigError, r'pr-queue\.json: git cat-file took over \d+ seconds'):
+            Q.committed_config(self.config, run=run)
+        self.assertTrue(calls and all(t == Q.GIT_READ_SECONDS for t in calls), calls)
+
+    def test_a_config_path_with_pathspec_magic_reads_only_that_name(self):   # #435 item 2: the exact-name check
+        self.commit({'x.json': json.dumps(CFG_RAW)})   # ls-tree -- ':(top)x.json' lists x.json
+        self.config = os.path.join(self.repo, ':(top)x.json')
+        self.refused('did not list one entry')
+
+    def test_a_leftover_replace_ref_does_not_change_the_config_read(self):   # #435 item 2: GIT_SAFE on the read
+        oid = self.git('rev-parse', 'HEAD:.github/pr-queue.json').decode().strip()
+        other = subprocess.run(['git', '-C', self.repo, 'hash-object', '-w', '--stdin'], check=True, capture_output=True,
+                               input=json.dumps({**CFG_RAW, 'replaced': 1}).encode()).stdout.decode().strip()
+        self.git('replace', oid, other)   # a self-hosted runner's .git can outlive a job
+        self.assertIn(b'replaced', self.git('cat-file', 'blob', oid), 'the replace ref does nothing')
+        code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+
+    def envs_of_the_read(self, extra):
+        envs = []
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            envs.append(kw.get('env'))
+            return real(cmd, **kw)
+        with unittest.mock.patch.dict(os.environ, extra), unittest.mock.patch.object(subprocess, 'run', run):
+            code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+        self.assertTrue(envs and None not in envs, envs)
+        return envs
+
+    def test_the_config_read_passes_no_token_to_git(self):   # #435 item 2
+        tokens = {k: 'secret-' + k for k in Q.TOKEN_VARS}
+        for env in self.envs_of_the_read(tokens):
+            self.assertEqual(set(env) & set(tokens), set())
+            # never a fetch: git 2.44+ honours the first, an older git still refuses every transport
+            self.assertEqual((env.get('GIT_NO_LAZY_FETCH'), env.get('GIT_ALLOW_PROTOCOL')), ('1', 'none'))
+
+    def test_the_config_read_ignores_git_variables_of_the_job(self):   # #435 item 6
+        other = os.path.join(self.d, 'other')
+        subprocess.run(['git', 'init', '-q', '-b', 'main', other], check=True)
+        os.makedirs(os.path.join(other, '.github'))
+        with open(os.path.join(other, '.github', 'pr-queue.json'), 'w') as f:
+            json.dump({**CFG_RAW, 'merge_method': 'merge'}, f)
+        subprocess.run(['git', '-C', other, 'add', '-A'], check=True)
+        subprocess.run(['git', '-C', other, 'commit', '-qm', 'other'], check=True, env={**os.environ, **GIT_ENV})
+        hostile = {'GIT_DIR': os.path.join(other, '.git'), 'GIT_WORK_TREE': self.repo,
+                   'GIT_OBJECT_DIRECTORY': os.path.join(other, '.git', 'objects'), 'GIT_NAMESPACE': 'x',
+                   'GIT_ALTERNATE_OBJECT_DIRECTORIES': os.path.join(other, '.git', 'objects'),
+                   'GIT_INDEX_FILE': os.path.join(self.d, 'index'), 'GIT_CONFIG_PARAMETERS': "'core.bare'='true'",
+                   'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'true',
+                   'GIT_ICASE_PATHSPECS': '1'}
+        for env in self.envs_of_the_read(hostile):
+            self.assertEqual(set(env) & set(hostile), set())
+
+    def test_the_queue_drops_one_list_of_git_variables(self):   # #435 item 6: every git call of the queue
+        hostile = {k: 'x' for k in Q.GIT_DROP}
+        hostile.update(GIT_CONFIG_KEY_3='core.bare', GIT_CONFIG_VALUE_3='true', GIT_TRACE='0', PATH='/bin')
+        env = Q.git_env(hostile)
+        self.assertEqual(env, {'GIT_TRACE': '0', 'PATH': '/bin', 'GIT_TERMINAL_PROMPT': '0', **Q.GIT_ENV})
+        for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+                     'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_COMMON_DIR'):
+            self.assertIn(name, Q.GIT_DROP)
+        q = object.__new__(Q.Queue)   # the cache's git and init
+        q.cache, q.read_token = os.path.join(self.d, 'cache', 'repo.git'), None
+        envs, real = [], subprocess.run
+
+        def run(cmd, **kw):
+            envs.append(kw.get('env'))
+            return real(cmd, **kw)
+        with unittest.mock.patch.dict(os.environ, {'GIT_DIR': self.repo + '/.git', 'GIT_CONFIG_COUNT': '1',
+                                                   'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'false'}), \
+                unittest.mock.patch.object(subprocess, 'run', run), \
+                unittest.mock.patch('sys.stdout', new_callable=io.StringIO) as out:
+            self.assertTrue(q.own_cache(), out.getvalue())
+            self.assertEqual(q.git('rev-parse', '--is-bare-repository').stdout.strip(), 'true')
+        self.assertTrue(envs)
+        for env in envs:
+            self.assertFalse({'GIT_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0'} & set(env), env)
+
     def test_an_old_git_is_refused(self):
         self.refused('git 2.38 or newer', git='git 2.38 or newer is needed (merge-tree --write-tree); found: git 2.34')
 
