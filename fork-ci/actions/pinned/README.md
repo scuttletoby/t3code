@@ -34,10 +34,15 @@ paste what `files` prints.
   (14). Only 40-hex folders are ever removed; the pinned sha's own folder stays, however old.
 - `load()` and `run` run the bytes that were checked, never a second read of the cache file (another job on the
   runner may write it between the check and the run).
-- `load()` and `run` take one self-contained file: one that touches `sys.path`, imports a module that loads code
-  from a path (`importlib`, `runpy`, ...) or uses a relative import would load the files next to it, which nothing
-  checked, so it is refused (`FetchError`). `pr-queue/pr_queue.py`, `head-check/*.py` and `fleet-watch/fleet_watch.py`
-  are such files: they run only from a checkout or a workflow's `uses:`.
+- `load()` and `run` take one self-contained file: one that touches `sys.path` (or the other `sys` names imports go
+  by, under any spelling), imports a module that loads code from a path (`importlib`, `runpy`, `site`, `ctypes`, ...),
+  uses a relative import, or names its own path (`__file__`, `__spec__`, `__loader__`) or `__import__` would load the
+  files next to it, which nothing checked, so it is refused (`FetchError`). `pr-queue/pr_queue.py`, `head-check/*.py`,
+  `fleet-watch/fleet_watch.py`, `test-select/test_select.py` and `test-select/trace_check.py` are such files: they run
+  only from a checkout or a workflow's `uses:`. The check is static, so `run` also puts its copy one folder down
+  (`<fresh 0700 folder>/<action>/<file>`): whatever it misses, the script's `..` is that private folder. Before #305 a
+  copy sat directly in the system temp folder, so `head_check.py`'s `../pr-queue` (or `test_select.py`'s
+  `../docs-scope`) was `$TMPDIR/pr-queue`, which any local user can make when `$TMPDIR` is `/tmp`.
 - A file the config does not name, a bad config, or no network and no good copy: `FetchError` (its subclass
   `Unreachable` for the network alone). Nothing is ever guessed.
 
@@ -48,8 +53,8 @@ python3 -I pinned.py --config .github/fork-ci.json [--cache DIR] run <action> <f
 python3 -I pinned.py --config .github/fork-ci.json files
 ```
 
-- `run` runs `python3 -I` on a private copy (a fresh 0700 folder) of the checked bytes, with the arguments after the
-  file name, and exits with its exit code. A fetch or check failure exits 1 (`pinned: <why>` on stderr).
+- `run` runs `python3 -I` on a private copy (`<fresh 0700 folder>/<action>/<file>`) of the checked bytes, with the
+  arguments after the file name, and exits with its exit code. A fetch or check failure exits 1 (`pinned: <why>` on stderr).
 - `files` prints the `files` map at the config's `sha`, each file fetched and hashed (nothing is checked: this is how
   the map is made).
 - `--cache` defaults to `$XDG_CACHE_HOME/fork-ci-pinned` (`~/.cache/fork-ci-pinned`).
@@ -73,11 +78,14 @@ Callers may import exactly these names; anything else in the module may change i
 | `default_cache()`, `PART_AGE`, `CACHE_DAYS`      | the defaults                                                                       |
 
 `config` is the path of the pin config file. `cache` is the cache folder; a project that used its own cache folder of
-the same layout (`<cache>/<sha>/<action>/<file>`) can pass it, and its checked copies are used as they are. The cache folder is kept private: our own folder is made
-0700 on use, one another user owns is refused (FetchError), and prune never follows a symlink or opens a special
-file in it. The bootstrap below makes a new one 0700, refuses one that is a symlink, another user's, or group- or
-world-writable before it reads or writes anything in it (remove it and the next run makes it again), and reads only a
-regular file.
+the same layout (`<cache>/<sha>/<action>/<file>`) can pass it, and its checked copies are used as they are. The cache folder is kept private, by one rule in this
+module and in the bootstrap below: a missing one is made 0700 (two first runs at once both get it), and one that is a
+symlink, not a folder, another user's, or group- or world-writable is refused before anything in it is read or
+written (`FetchError` here, `ValueError` in the bootstrap; remove it and the next run makes it again). It is never
+chmodded: someone else could already have put something in it. Only a regular file is read, and prune never follows a
+symlink or opens a special file. Two limits, where the checked bytes still decide what runs: only the cache folder
+itself is checked, so the folders above it must be yours and not writable by others either (the default `~/.cache`
+is); and where there are no owners (Windows) only "a real folder" is checked, which a junction passes.
 
 ## Loading this module: the bootstrap
 
@@ -106,7 +114,10 @@ def load_pinned(config, cache):
             and isinstance(want, str)):
         raise ValueError(f'{config}: needs "repo", "sha" (40 hex) and "files" with "pinned/pinned.py"')
     if not os.path.lexists(cache):
-        os.makedirs(cache, mode=0o700)
+        try:
+            os.makedirs(cache, mode=0o700)
+        except FileExistsError:   # another run made it first: the check below decides
+            pass
     st = os.lstat(cache)   # checked before anything in it is read or written
     if not stat.S_ISDIR(st.st_mode) or hasattr(os, 'getuid') and (st.st_uid != os.getuid() or st.st_mode & 0o022):
         raise ValueError(f'cache folder {cache} is not a folder of your own that only you can write (a symlink, '

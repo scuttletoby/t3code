@@ -29,7 +29,10 @@ NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._-]*\Z')   # \Z: no trailing newline
 SHA = re.compile(r'[0-9a-f]{40}')
 PART_AGE = 3600     # seconds: an older .part- file is a killed fetch (a live one takes seconds)
 CACHE_DAYS = 14     # another sha's folder that nothing used for this long goes (a rerun of an old run fetches again)
-BY_PATH = ('importlib', 'runpy', 'imp', 'zipimport', 'pkgutil')   # modules that load code from a path
+# modules that load code from a path (site: a .pth file runs code; builtins: its __import__ and exec)
+BY_PATH = ('importlib', 'runpy', 'imp', 'zipimport', 'pkgutil', 'site', 'pkg_resources', 'ctypes', 'builtins')
+SYS_IMPORT = ('path', 'meta_path', 'path_hooks', 'path_importer_cache', 'modules')   # the sys names imports go by
+OWN_PATH = ('__file__', '__spec__', '__loader__', '__cached__', '__import__')   # where a neighbour's path starts
 
 
 def default_cache():
@@ -73,18 +76,19 @@ def pin(config):
 
 
 def private(cache):
-    """Make the cache folder 0700: our own folder that others can reach is made 0700 (a umask 002 account makes
-    0775 folders), one another user owns is refused: there they could plant a symlink or a FIFO that prune or a read
-    would act on. (The bytes run are checked either way.)"""
-    os.makedirs(cache, mode=0o700, exist_ok=True)
-    st = os.stat(cache)
-    if not hasattr(os, 'getuid'):
-        return
-    if st.st_uid != os.getuid():
-        raise FetchError(f'cache folder {cache} is owned by another user ({st.st_uid}): pass --cache with a folder '
-                         'of your own')
-    if st.st_mode & 0o077:
-        os.chmod(cache, 0o700)
+    """The cache folder, made 0700 when missing and checked before anything in it is read or written: the README
+    bootstrap's rule, so `pinned.py --cache C run` takes exactly the folders load_pinned takes. A symlink, not a folder,
+    another user's, or one the group or others can write is refused, never chmodded: someone else could already have
+    put a symlink, a FIFO or a file in it that prune or a read would act on. (The bytes run are checked either way.)"""
+    if not os.path.lexists(cache):
+        try:
+            os.makedirs(cache, mode=0o700)
+        except FileExistsError:   # another run made it first (two first runs at once): the check below decides
+            pass
+    st = os.lstat(cache)
+    if not stat.S_ISDIR(st.st_mode) or hasattr(os, 'getuid') and (st.st_uid != os.getuid() or st.st_mode & 0o022):
+        raise FetchError(f'cache folder {cache} is not a folder of your own that only you can write (a symlink, '
+                         "another user's, or group- or world-writable): remove it or pass --cache with another")
 
 
 def read_regular(path):
@@ -181,28 +185,40 @@ def verified(config, action, name, cache=None):
 
 def neighbour_loads(data):
     """What in these Python bytes would load code from the file's own folder, which in the cache holds files nothing
-    checked: sys.path touched (pr-queue/pr_queue.py puts its folder first, then imports config and lens), a module that
-    loads code from a path (BY_PATH), or a relative import. load() and run refuse a file with any: they run one checked
-    file, never its neighbours. Other imports come from the caller's own path (the standard library, an installed
-    PyYAML), as any import of the caller's does. A static check: __import__() or exec() of a file read at run time
-    are not seen (no fork-ci module does either)."""
+    checked. load() and run refuse a file with any: they run one checked file, never its neighbours.
+      - sys.path: sys used for an import name (SYS_IMPORT: pr-queue/pr_queue.py puts its folder first, then imports
+        config and lens), or sys used as anything but `sys.<other name>` (an alias's .path, getattr, vars, `s = sys`);
+      - a module that loads code from a path or swaps the import (BY_PATH), or a relative import;
+      - the file's own path (OWN_PATH: __file__, __spec__, __loader__, __cached__) or __import__: every way to name a
+        neighbour (exec(open(...)), a subprocess, os.chdir, site.addsitedir, a data file) starts from it.
+    Other imports come from the caller's own path (the standard library, an installed PyYAML), as any import of the
+    caller's does. A static check: a module written to dodge it can, so run also puts its copy one folder down in a
+    private folder (`..` is ours)."""
     try:
         tree = ast.parse(data)
     except (SyntaxError, ValueError):
         return ['(does not parse)']
-    found = set()
+    found, sys_names = set(), {'sys'}
     for node in ast.walk(tree):
         names = []
         if isinstance(node, ast.Import):
             names = [a.name for a in node.names]
+            sys_names.update(a.asname for a in node.names if a.name == 'sys' and a.asname)
         elif isinstance(node, ast.ImportFrom):
             names = ['.' * node.level + (node.module or '')]
-            if node.module == 'sys' and any(a.name in ('path', '*') for a in node.names):
+            if node.module == 'sys' and any(a.name in (*SYS_IMPORT, '*') for a in node.names):
                 found.add('sys.path')
-        elif (isinstance(node, ast.Attribute) and node.attr == 'path' and isinstance(node.value, ast.Name)
-              and node.value.id == 'sys'):
-            found.add('sys.path')
         found.update(n for n in names if n.startswith('.') or n.split('.')[0] in BY_PATH)
+    parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name):
+            continue
+        if node.id in OWN_PATH:
+            found.add(node.id)
+        elif node.id in sys_names:
+            p = parent.get(node)
+            if not (isinstance(p, ast.Attribute) and p.attr not in SYS_IMPORT and not p.attr.startswith('__')):
+                found.add('sys.path')
     return sorted(found)
 
 
@@ -232,12 +248,14 @@ def load(config, action, module, cache=None):
 
 
 def run(config, action, name, args=(), cache=None, runner=None):
-    """Run the pinned script with python3 -I and args, from a private copy (mode 0700 folder) of the bytes that were
-    checked; its exit code. The copy goes after the run."""
+    """Run the pinned script with python3 -I and args, from a private copy (<0700 folder>/<action>/<name>) of the bytes
+    that were checked; its exit code. The copy goes after the run."""
     _, data = self_contained(config, action, name, cache)
     run_dir = tempfile.mkdtemp(prefix='fork-ci-run-')   # 0700, ours alone: the bytes checked are the bytes run
     try:
-        script = os.path.join(run_dir, name)
+        folder = os.path.join(run_dir, action)   # one down: the script's `..` is ours, never the shared temp folder
+        os.mkdir(folder, 0o700)
+        script = os.path.join(folder, name)
         with open(script, 'wb') as f:
             f.write(data)
         return (runner or subprocess.run)([sys.executable, '-I', script, *args]).returncode
