@@ -21,6 +21,7 @@ import {
   McpThreadProfiles,
   McpThreadProfilesPatch,
 } from "./mcpProfile.ts";
+import { PlaytestSettings, PlaytestSettingsFromSettingsFile } from "./playtest.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
@@ -39,6 +40,7 @@ import {
 } from "./waitFor.ts";
 
 export * from "./mcpProfile.ts";
+export * from "./playtest.ts";
 export * from "./usagePacing.ts";
 
 /** How often usage limits refresh while no client watches; 0 turns it off. */
@@ -84,6 +86,8 @@ export const ForkServerSettingsFields = {
   ),
   /** The owner's MCP profile pick per thread; it wins over the defaults above. */
   mcpThreadProfiles: McpThreadProfiles,
+  /** Playtest sessions and their adapter's steps; off by default. A bad value reads as off. */
+  playtest: PlaytestSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -109,6 +113,8 @@ export const ForkServerSettingsPatchFields = {
   /** `inherit` or a profile name; the server also refuses a name no profile has. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileName),
   mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
+  /** Strict: a save refuses a bad step, or `enabled` without all four steps. */
+  playtest: Schema.optionalKey(PlaytestSettings),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -142,6 +148,8 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   mcpSubagentProfile: "replace",
   // One pick per thread, so two picks at once keep both; a save past the cap is refused.
   mcpThreadProfiles: { replaceEntries: { maxEntries: MCP_THREAD_PROFILES_MAX } },
+  // Whole, so a step left out is removed and the strict check sees the value that is saved.
+  playtest: "replace",
 };
 
 /** The client settings' fork fields (stored in the browser); none yet. */
@@ -153,6 +161,8 @@ export const FORK_PROJECT_SCOPED_KEYS = [
   "waitChecks",
   "mcpProfile",
   "mcpSubagentProfile",
+  // A project's adapter replaces the server's whole, `enabled` included.
+  "playtest",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
 /** A project's overrides of fork settings, as the settings file holds them. */
@@ -163,18 +173,24 @@ export const ForkProjectOverrideFields = {
   mcpProfile: Schema.optionalKey(McpProfileRef),
   /** Absent or empty: the server's `mcpSubagentProfile`. Read leniently, as the server's. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileRef),
+  /**
+   * A bad value reads as off for that project, never as the server's adapter (`null` too). `null`
+   * is only a save's "clear", which the save removes, so it is never stored or read.
+   */
+  playtest: Schema.optionalKey(Schema.Union([PlaytestSettingsFromSettingsFile, Schema.Null])),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
 /**
- * Fork project keys a project save keeps when the project's entry leaves them out: upstream replaces
- * a project's entry whole, and a client that does not know a key (an older one) leaves it out, which
- * would quietly widen that project to the server's profile. `""` clears one. (`waitChecks` keeps
- * upstream's rule: left out is removed.)
+ * Fork project keys a project save keeps when the project's entry leaves them out, each with the
+ * value that clears it: upstream replaces a project's entry whole, and a client that does not know a
+ * key (an older one) leaves it out, which would quietly switch that project to the server's MCP
+ * profile or playtest adapter. (`waitChecks` keeps upstream's rule: left out is removed.)
  */
-export const FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT = [
-  "mcpProfile",
-  "mcpSubagentProfile",
-] as const satisfies ReadonlyArray<keyof typeof ForkProjectOverrideFields>;
+export const FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT = {
+  mcpProfile: "",
+  mcpSubagentProfile: "",
+  playtest: null,
+} as const satisfies Partial<Record<keyof typeof ForkProjectOverrideFields, "" | null>>;
 
 /** A project's overrides of fork settings in a patch (each project's set is replaced whole). */
 export const ForkProjectOverridePatchFields = {
@@ -186,6 +202,11 @@ export const ForkProjectOverridePatchFields = {
    */
   mcpProfile: Schema.optionalKey(McpProjectProfileRefPatch),
   mcpSubagentProfile: Schema.optionalKey(McpProjectProfileRefPatch),
+  /**
+   * A save refuses a bad step, or `enabled` without all four steps. Left out keeps the stored value;
+   * `null` clears it (the project then uses the server's).
+   */
+  playtest: Schema.optionalKey(Schema.NullOr(PlaytestSettings)),
 } satisfies Record<keyof typeof ForkProjectOverrideFields, unknown>;
 
 /**
