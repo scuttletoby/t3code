@@ -362,6 +362,18 @@ function findHiddenUpstreamFiles(upstreamFiles, isForkFile, atHead) {
     );
 }
 
+const KINDS = ["files", "pending", "forkFiles", "lost"];
+const SEAM_KEYS = ["why", "added"];
+
+/** Refuses a key the check does not read (a misspelt block guards nothing); "//…" is a comment. */
+function refuseUnknownKeys(object, known, where) {
+  for (const key of Object.keys(object)) {
+    if (!key.startsWith("//") && !known.includes(key)) {
+      throw new Error(`${CONFIG}: ${where}unknown key "${key}" (known: ${known.join(", ")})`);
+    }
+  }
+}
+
 const isStringList = (value) =>
   Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim() !== "");
 
@@ -372,6 +384,7 @@ function parseConfig(text) {
   if (typeof files !== "object" || files === null || Array.isArray(files)) {
     throw new Error(`${CONFIG}: "files" must be an object`);
   }
+  refuseUnknownKeys(config, KINDS, "");
   for (const [file, seam] of Object.entries(files)) {
     if (typeof seam?.why !== "string" || seam.why.trim() === "") {
       throw new Error(`${CONFIG}: ${file} needs a "why"`);
@@ -379,6 +392,7 @@ function parseConfig(text) {
     if (!Array.isArray(seam.added) || seam.added.some((line) => typeof line !== "string")) {
       throw new Error(`${CONFIG}: ${file}: "added" must be a list of lines`);
     }
+    refuseUnknownKeys(seam, SEAM_KEYS, `${file}: `);
   }
   if (config.forkFiles !== undefined && !isStringList(config.forkFiles)) {
     throw new Error(`${CONFIG}: "forkFiles" must be a list of paths`);
@@ -429,6 +443,21 @@ function parseConfig(text) {
     }
   }
   return { files, pending, forkFiles: config.forkFiles ?? [], lost };
+}
+
+/**
+ * Why a pull request's own list cannot become main's (its format only: its rules are not in force
+ * here), or undefined. Merged, a malformed list crashes every later run, the fix's run included.
+ */
+function ownListProblem(text) {
+  const own = `this change's own ${CONFIG}`;
+  if (text === undefined) return `${own}: this change deletes it.`;
+  try {
+    parseConfig(text);
+    return undefined;
+  } catch (error) {
+    return `${own} is malformed: ${error instanceof Error ? error.message : error}`;
+  }
 }
 
 const hasConfig = (rev) => entryAt(rev, CONFIG)?.type === "blob";
@@ -525,14 +554,24 @@ function main(argv) {
   const from = parsed.configRef ? `--config-ref ${configRef}` : upstream ? "the head" : "the base";
   const notes = [...findListedGone(config, { atBase, atHead }), ...unlisted.notes, ...lost.notes];
   for (const note of notes) console.log(`Note: ${note}`);
-  if (!upstream && textAt(head, CONFIG) !== textAt(mergeBase, CONFIG)) {
+  const ownList = textAt(head, CONFIG);
+  const editsList = !upstream && ownList !== textAt(mergeBase, CONFIG);
+  const listProblem = editsList ? ownListProblem(ownList) : undefined;
+  if (editsList) {
     console.log(
       `Note: this change edits ${CONFIG}; it is judged by the list in ${from}, not its own. ` +
         "A new seam or list entry takes effect once the owner merges it.",
     );
   }
   const counted = upstream ? "every upstream file" : "every upstream file it changes";
+  if (listProblem !== undefined) {
+    console.error(listProblem);
+    console.error(
+      `Fix the list in this change: merged, it is main's list, and a malformed one stops every later pull request and fork-follow run.`,
+    );
+  }
   if (reasons.length === 0 && ceilings.length === 0) {
+    if (listProblem !== undefined) return 1;
     console.log(
       `Fork lines in upstream files: only the pinned seams (${counted}; list from ${from}).`,
     );

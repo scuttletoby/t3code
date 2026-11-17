@@ -91,6 +91,26 @@
         "}),"
       ]
     },
+    "apps/server/src/cli/connect.ts": {
+      "why": "A server held with `serve --hold-work` shares the live server's environment id, so `t3 connect --disconnect` refuses before the relay delete (cloud/holdWorkConnect.ts).",
+      "added": [
+        "import * as HoldWorkConnect from \"../cloud/holdWorkConnect.ts\";",
+        "// Fork: a held copy shares the live server's environment id; refuse before the relay delete.",
+        "yield* HoldWorkConnect.refuseCliUnlinkWhileHeld(",
+        "(yield* ServerConfig.ServerConfig).serverRuntimeStatePath,",
+        ");"
+      ]
+    },
+    "apps/server/src/cloud/CloudLink.ts": {
+      "why": "unlink's error type takes the hold-work refusal (cloud/holdWorkConnect.ts); the one upstream line is split so the fork's error sits on its own line.",
+      "added": [
+        "readonly unlink: () => Effect.Effect<",
+        "EnvironmentCloudRelayConfigResult,",
+        "// Fork: a server held with `serve --hold-work` refuses (cloud/holdWorkConnect.ts).",
+        "CloudLinkInternalError | ManagedLimits.ManagedPolicyRefusedError",
+        ">;"
+      ]
+    },
     "apps/server/src/peer/RemoteDelegation.ts": {
       "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) rewrites this block, and its intent differs: after an interrupted, uncertain launch it stops the child there, while this seam keeps the child and follows it. Whoever brings #30249 in through fork-follow must choose on purpose between stopping and keeping (and expect a merge conflict on this block), then drop this seam or keep it.",
       "added": [
@@ -121,10 +141,10 @@
     "apps/server/src/cloud/selfUpdate.ts": 4,
     "apps/server/src/config.ts": 2,
     "apps/server/src/mcp/McpHttpServer.ts": 10,
-    "apps/server/src/mcp/OrchestratorMcpService.ts": 41,
+    "apps/server/src/mcp/OrchestratorMcpService.ts": 35,
     "apps/server/src/mcp/toolkits/environment/handlers.test.ts": 63,
     "apps/server/src/mcp/toolkits/project/handlers.test.ts": 48,
-    "apps/server/src/orchestration-v2/EffectWorker.ts": 31,
+    "apps/server/src/orchestration-v2/EffectWorker.ts": 28,
     "apps/server/src/orchestration-v2/ProjectionStore.ts": 7,
     "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts": 435,
     "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": 152,
@@ -147,17 +167,18 @@
     "apps/server/src/serverRuntimeState.ts": 4,
     "apps/server/src/terminal/Manager.ts": 2,
     "apps/server/vite.config.ts": 2,
+    "apps/web/src/cloud/linkEnvironment.test.ts": 34,
     "apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx": 277,
-    "apps/web/src/components/ChatMarkdown.tsx": 71,
+    "apps/web/src/components/ChatMarkdown.tsx": 63,
     "apps/web/src/components/chat/MarkdownFileLink.logic.ts": 74,
     "apps/web/src/components/chat/MarkdownFileLink.tsx": 148,
     "apps/web/src/components/media/mediaContent.ts": 8,
     "apps/web/src/components/settings/IntervalSecondsField.tsx": 4,
-    "apps/web/src/components/settings/SettingsPanels.tsx": 2,
-    "apps/web/src/components/settings/scopedSettings.test.ts": 57,
-    "apps/web/src/components/settings/scopedSettings.ts": 5,
+    "apps/web/src/components/settings/SettingsPanels.tsx": 4,
+    "apps/web/src/components/settings/scopedSettings.test.ts": 153,
+    "apps/web/src/components/settings/scopedSettings.ts": 9,
     "apps/web/src/components/settings/settingsSearch.ts": 25,
-    "apps/web/src/components/settings/useScopedSettings.ts": 14,
+    "apps/web/src/components/settings/useScopedSettings.ts": 27,
     "apps/web/src/index.css": 2,
     "apps/web/src/markdown-links.test.ts": 1,
     "apps/web/src/markdownFileHostPath.ts": 1,
@@ -172,8 +193,8 @@
     "packages/provider-core/src/server/managedProvider.test.ts": 39,
     "packages/provider-core/src/server/managedProvider.ts": 8,
     "packages/provider-core/src/server/snapshot.ts": 2,
-    "packages/shared/package.json": 28,
-    "packages/shared/src/cliRelease.test.ts": 43,
+    "packages/shared/package.json": 32,
+    "packages/shared/src/cliRelease.test.ts": 38,
     "packages/shared/src/cliRelease.ts": 11,
     "packages/shared/src/usageLimits.ts": 12,
     "vite.config.ts": 2
@@ -221,5 +242,144 @@
     "packages/shared/src/waitFor*",
     "scripts/lib/release-repository.ts",
     "scripts/release-repository.test.ts"
-  ]
+  ],
+  "//lost": "Seam and pending files that lost upstream lines, counted from upstream (as fork-follow runs the check): \"lines\", the upstream lines not kept in order and indentation; \"gone\", those whose text is gone. Held exactly, like a ceiling; an unlisted file counts 0. Lower a count when a line comes back, and keep each one small: a line counted here may move unseen.",
+  "lost": {
+    "packages/shared/src/serverSettings.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/serverSettings.ts": {
+      "lines": 10,
+      "gone": 8
+    },
+    "apps/server/src/cloud/CloudLink.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/desktop/src/electron/ElectronShell.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/background/BackgroundPolicy.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/cli/server.ts": {
+      "lines": 4,
+      "gone": 4
+    },
+    "apps/server/src/mcp/McpHttpServer.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/mcp/OrchestratorMcpService.ts": {
+      "lines": 4,
+      "gone": 4
+    },
+    "apps/server/src/orchestration-v2/EffectWorker.ts": {
+      "lines": 2,
+      "gone": 1
+    },
+    "apps/server/src/orchestration-v2/ProjectionStore.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": {
+      "lines": 5,
+      "gone": 5
+    },
+    "apps/server/src/orchestration-v2/ThreadLaunchService.ts": {
+      "lines": 7,
+      "gone": 3
+    },
+    "apps/server/src/orchestration-v2/ThreadManagementService.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/processRunner.ts": {
+      "lines": 2,
+      "gone": 2
+    },
+    "apps/server/src/scheduling/DueHint.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/server.ts": {
+      "lines": 6,
+      "gone": 6
+    },
+    "apps/server/src/serverRuntimeStartup.ts": {
+      "lines": 6,
+      "gone": 2
+    },
+    "apps/server/src/serverRuntimeState.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/server/src/terminal/Manager.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx": {
+      "lines": 9,
+      "gone": 9
+    },
+    "apps/web/src/components/ChatMarkdown.tsx": {
+      "lines": 2,
+      "gone": 1
+    },
+    "apps/web/src/components/chat/MarkdownFileLink.logic.ts": {
+      "lines": 22,
+      "gone": 20
+    },
+    "apps/web/src/components/chat/MarkdownFileLink.tsx": {
+      "lines": 32,
+      "gone": 28
+    },
+    "apps/web/src/components/media/mediaContent.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/web/src/components/settings/IntervalSecondsField.tsx": {
+      "lines": 1,
+      "gone": 1
+    },
+    "apps/web/src/components/settings/scopedSettings.ts": {
+      "lines": 3,
+      "gone": 3
+    },
+    "apps/web/src/components/settings/useScopedSettings.ts": {
+      "lines": 5,
+      "gone": 5
+    },
+    "apps/web/src/remoteOpen.test.ts": {
+      "lines": 2,
+      "gone": 2
+    },
+    "apps/web/src/remoteOpen.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "packages/contracts/src/editor.ts": {
+      "lines": 5,
+      "gone": 5
+    },
+    "packages/provider-core/src/server/managedProvider.ts": {
+      "lines": 10,
+      "gone": 8
+    },
+    "packages/shared/src/cliRelease.ts": {
+      "lines": 1,
+      "gone": 1
+    },
+    "packages/shared/src/usageLimits.ts": {
+      "lines": 1,
+      "gone": 1
+    }
+  }
 }
