@@ -191,6 +191,10 @@
       "types": "./src/capacityVectors.ts",
       "import": "./src/capacityVectors.ts"
     },
+    "./slotObserve": {
+      "types": "./src/slotObserve.ts",
+      "import": "./src/slotObserve.ts"
+    },
     "./capacityReadings": {
       "types": "./src/capacityReadings.ts",
       "import": "./src/capacityReadings.ts"

@@ -405,6 +405,15 @@
       "expect": { "cpuCores": null }
     },
     {
+      "name": "container CPU limit turned off",
+      "failed": true,
+      "why": "cpu.max gives EOPNOTSUPP: a failed read here, never 'no limit' (the host's 12 cores): cores unreadable",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/cpu.max": { "error": "unsupported" } } },
+      "read": "machine",
+      "expect": { "cpuCores": null }
+    },
+    {
       "name": "container with systemd inside",
       "why": "systemd-nspawn, LXC/Incus or podman --systemd: this process sits in a unit (0::/init.scope), not at the namespace root. The root's memory.max and cpu.max still exist, so the cap is the container's: 4096 / 3328 / 2 as in 'container with a memory and CPU limit'",
       "host": "linux-container",
@@ -435,6 +444,15 @@
       "why": "cannot tell which cgroup version, so not whether there is a cap: available and cores unreadable (never the host's 6886 / 12)",
       "host": "linux-container",
       "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": { "error": "unreadable" } } },
+      "read": "machine",
+      "expect": { "cgroup": "unreadable", "availableMb": null, "cpuCores": null }
+    },
+    {
+      "name": "container, cgroup.controllers turned off",
+      "failed": true,
+      "why": "EOPNOTSUPP on cgroup.controllers is not 'no cgroup v2 here': the version is unknown, so available and cores unreadable (never the host's 6886 / 12)",
+      "host": "linux-container",
+      "patch": { "files": { "/sys/fs/cgroup/cgroup.controllers": { "error": "unsupported" } } },
       "read": "machine",
       "expect": { "cgroup": "unreadable", "availableMb": null, "cpuCores": null }
     },
@@ -507,6 +525,21 @@
           "/sys/fs/cgroup/memory/memory.limit_in_bytes": "2147483648\n",
           "/sys/fs/cgroup/memory/memory.usage_in_bytes": "1073741824\n",
           "/sys/fs/cgroup/memory/memory.stat": { "error": "unreadable" }
+        }
+      },
+      "read": "machine",
+      "expect": { "cgroup": "unreadable", "availableMb": null, "cpuCores": null }
+    },
+    {
+      "name": "cgroup v1 container, root memory.stat turned off",
+      "failed": true,
+      "why": "as 'root memory.stat unreadable', with EOPNOTSUPP: not 'no cgroup v1 here', so cgroup unreadable, available and cores unreadable (never the host's 4096 / 4)",
+      "host": "linux-v1",
+      "patch": {
+        "files": {
+          "/sys/fs/cgroup/memory/memory.limit_in_bytes": "2147483648\n",
+          "/sys/fs/cgroup/memory/memory.usage_in_bytes": "1073741824\n",
+          "/sys/fs/cgroup/memory/memory.stat": { "error": "unsupported" }
         }
       },
       "read": "machine",

@@ -176,12 +176,26 @@ export const WaitChecksFromSettingsFile = Schema.Record(Schema.String, Schema.Un
 );
 
 /**
+ * How the slot gate decides. `fixed`: the typed limits below, nothing else. `observe`: the same
+ * decision, and the capacity rule runs beside it on live memory readings and only records what it
+ * would do (`wait_list` shows the last result). A later mode lets the rule decide.
+ */
+export const AgentSlotsMode = Schema.Literals(["fixed", "observe"]);
+export type AgentSlotsMode = typeof AgentSlotsMode.Type;
+
+/**
  * Server-wide agent slot limits. `enabled: false` leaves `delegate_task` as upstream's. Only
  * `delegate_task` is refused; threads started by `t3_thread_launch` or `create_threads` are counted
  * once they run, but never refused.
  */
 export const AgentSlotsSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * {@link AgentSlotsMode}, read by `agentSlotsMode` (shared/agentSlots.ts): absent is `fixed` while
+   * `enabled` (a file from before the key decides exactly as it did) and `observe` while off; any
+   * other text (a mode of a newer build) is `fixed`. Kept as written.
+   */
+  mode: Schema.optionalKey(Schema.String),
   /** Most running agents on this server; 0 = no limit. */
   maxPerMachine: nonNegativeIntDefault(0),
   /** Most running agents per provider instance; a missing instance or 0 has no limit. */
@@ -227,6 +241,8 @@ export type WaitForSettingsPatch = typeof WaitForSettingsPatch.Type;
 /** A field left out keeps its stored value; `maxPerAccount` is replaced whole. */
 export const AgentSlotsSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
+  /** Any text, like the stored value it may be sent back from; an unknown one reads as `fixed`. */
+  mode: Schema.optionalKey(Schema.String),
   maxPerMachine: NonNegativeIntPatch,
   maxPerAccount: Schema.optionalKey(Schema.Record(ProviderInstanceId, NonNegativeInt)),
   minFreeMemoryMb: NonNegativeIntPatch,
@@ -443,6 +459,44 @@ export type WaitListInput = typeof WaitListInput.Type;
 
 const SlotUse = Schema.Struct({ used: NonNegativeInt, max: Schema.NullOr(NonNegativeInt) });
 
+const SlotAnswer = Schema.Literals(["allow", "refuse"]);
+
+/** One slot decision with what the capacity rule would have answered (`observe` mode). */
+export const SlotRuleObservation = Schema.Struct({
+  at: IsoDateTime,
+  /** The gate's answer, the one that counted. */
+  today: SlotAnswer,
+  /** The rule's answer and why (`capacityDecision` reasons: fits, budget, elevated, ...). */
+  rule: SlotAnswer,
+  reason: Schema.String,
+  level: Schema.Literals(["ok", "elevated", "severe"]),
+  /** MB; `null` when the readings failed. Free can be negative. */
+  freeMb: Schema.NullOr(Schema.Int),
+  marginMb: Schema.NullOr(NonNegativeInt),
+  owedMb: Schema.NullOr(NonNegativeInt),
+  costMb: NonNegativeInt,
+  /** Agents the rule counted (running, starting, held); `null` when they could not be read. */
+  pieces: Schema.NullOr(NonNegativeInt),
+  /**
+   * `ok`: the reads finished (a file in them may still be unreadable; then `reason` says so).
+   * `failed`, `slow` (over the time limit) or `busy` (earlier reads still hang): the rule saw nothing.
+   */
+  readings: Schema.Literals(["ok", "failed", "slow", "busy"]),
+});
+export type SlotRuleObservation = typeof SlotRuleObservation.Type;
+
+/** The rule beside the gate since the server started (memory only). */
+export const SlotRuleStatus = Schema.Struct({
+  mode: Schema.Literal("observe"),
+  last: Schema.NullOr(SlotRuleObservation),
+  /** Decisions observed, and how many the rule answered the other way. */
+  observed: NonNegativeInt,
+  disagreed: NonNegativeInt,
+  /** Decisions not observed: too many observations were already waiting. */
+  skipped: NonNegativeInt,
+});
+export type SlotRuleStatus = typeof SlotRuleStatus.Type;
+
 export const WaitListResult = Schema.Struct({
   enabled: Schema.Boolean,
   /** Set when the store cannot be read, for example a file from a newer build. */
@@ -464,6 +518,8 @@ export const WaitListResult = Schema.Struct({
   checks: Schema.Array(
     Schema.Struct({ name: WaitCheckName, description: Schema.String, maxArgs: NonNegativeInt }),
   ),
+  /** The capacity rule beside the slot gate, while agent slots are in `observe` mode. */
+  slotRule: Schema.optionalKey(SlotRuleStatus),
   /** Only when agent slots are on. */
   slots: Schema.optionalKey(
     Schema.Struct({
