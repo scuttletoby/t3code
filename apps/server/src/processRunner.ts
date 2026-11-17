@@ -29,7 +29,8 @@ export interface ProcessRunInput {
   /** Runs after successful spawn, before cancellation can interrupt acquisition. */
   readonly onSpawn?: (() => void) | undefined;
   readonly maxOutputBytes?: number | undefined;
-  readonly outputMode?: "error" | "truncate" | undefined;
+  /** `tail` (fork, playtest) keeps the last `maxOutputBytes` instead of the first. */
+  readonly outputMode?: "error" | "truncate" | "tail" | undefined;
   readonly truncatedMarker?: string | undefined;
   /** Timed-out results discard partial stdout/stderr. */
   readonly timeoutBehavior?: "error" | "timedOutResult" | undefined;
@@ -149,6 +150,36 @@ const DEFAULT_TIMEOUT = "60 seconds";
 const FORCE_KILL_AFTER = "1 second";
 const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
+/** Fork (playtest): the last `maxBytes` of a stream, where a failing step prints its error. */
+const collectTail = <E>(stream: Stream.Stream<Uint8Array, E>, maxBytes: number) =>
+  stream.pipe(
+    Stream.runFold(
+      () => ({ chunks: [] as Uint8Array[], bytes: 0, dropped: false }),
+      (state, chunk) => {
+        state.chunks.push(chunk);
+        let bytes = state.bytes + chunk.byteLength;
+        let dropped = state.dropped;
+        // Whole chunks only; the cut inside the first one is made at the end.
+        while (state.chunks.length > 1 && bytes - state.chunks[0]!.byteLength >= maxBytes) {
+          bytes -= state.chunks.shift()!.byteLength;
+          dropped = true;
+        }
+        return { chunks: state.chunks, bytes, dropped };
+      },
+    ),
+    Effect.map((state): CollectedUint8StreamText => {
+      let kept = Buffer.concat(state.chunks, state.bytes);
+      const truncated = state.dropped || kept.byteLength > maxBytes;
+      if (kept.byteLength > maxBytes) kept = kept.subarray(kept.byteLength - maxBytes);
+      // Not from the middle of a character: skip UTF-8 continuation bytes at the cut.
+      let start = 0;
+      if (truncated) {
+        while (start < kept.byteLength && start < 3 && (kept[start]! & 0xc0) === 0x80) start += 1;
+      }
+      return { ...decodeUtf8(kept.subarray(start)), bytes: kept.byteLength - start, truncated };
+    }),
+  );
+
 const collectText = Effect.fnUntraced(function* (input: {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
@@ -157,7 +188,7 @@ const collectText = Effect.fnUntraced(function* (input: {
   readonly streamName: "stdout" | "stderr";
   readonly stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>;
   readonly maxOutputBytes: number;
-  readonly outputMode: "error" | "truncate";
+  readonly outputMode: "error" | "truncate" | "tail";
   readonly truncatedMarker: string;
 }) {
   const stream = input.stream.pipe(
@@ -173,6 +204,10 @@ const collectText = Effect.fnUntraced(function* (input: {
         }),
     ),
   );
+
+  if (input.outputMode === "tail") {
+    return yield* collectTail(stream, input.maxOutputBytes);
+  }
 
   if (input.outputMode === "truncate") {
     return yield* collectUint8StreamText({
