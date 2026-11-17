@@ -73,14 +73,16 @@ class Checkout:
         # Bare, git logs in the way the queue does (gh's login, GH_TOKEN), never with a helper of the machine's config.
         self.auth = pr_queue.GIT_AUTH if self.bare else ()
 
-    def git(self, *a, errors='strict'):
-        """errors: how git's output is decoded; 'surrogateescape' for file names, which need not be UTF-8."""
+    def git(self, *a, errors='strict', timeout=None):
+        """errors: how git's output is decoded; 'surrogateescape' for file names, which need not be UTF-8. timeout:
+        seconds, after which git is killed and subprocess.TimeoutExpired raised."""
         if self.run:
             return self.run(*a)
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
-                                  errors=errors, capture_output=True, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-                                                            'GIT_ATTR_NOSYSTEM': '1', **pr_queue.GIT_ENV})
+                                  errors=errors, capture_output=True, timeout=timeout,
+                                  env={**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_ATTR_NOSYSTEM': '1',
+                                       **pr_queue.GIT_ENV})
 
     def problem(self):
         """Why the repository cannot be read as git made it, or None: not a git folder, shallow (the base's history is
@@ -398,6 +400,10 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
 MAX_CONFIG_BYTES = 32 * 1024
 MAX_GLOB_LENGTH = 128   # characters of one glob in review.rules[].paths
 MAX_GLOB_TOTAL = 2048   # characters of all of them together
+# The queue opens the config from a checkout (config.load): only a regular file is one there. git keeps a symlink
+# (120000) as a blob of its target text, and a submodule (160000) can name any object, so the object alone says nothing.
+FILE_MODES = ('100644', '100755')
+MERGE_TREE_SECONDS = 300   # a merge that takes longer is refused; the gate's job has 15 minutes in all
 LOCKS = ('the base config would refuse every pull request after it, the one that fixes it too, and the queue would '
          'stop')
 
@@ -432,9 +438,10 @@ def merged_config_problem(checkout, path):
     """Why the config this pull request would merge must not merge, or None. The config that judges a head is the
     base's, so a head is judged by the old config and could merge a new one that does not parse (or is in enforce with
     a rule order enforce refuses, or is deleted); after it, the base config refuses every head, the one that fixes it
-    too, and the queue stops. So the config the merge leaves must parse (config.parse), under the caps above. It is
-    the merge's, never the head's own copy: two pull requests that each leave a good config can merge into a bad one,
-    and an older head's stale copy says nothing once an owner fixed the base. Checkout mode reads GitHub's merge commit
+    too, and the queue stops. So the config the merge leaves must parse (config.parse), under the caps above, and stay
+    a regular file (FILE_MODES: the queue opens it from a checkout). It is the merge's, never the head's own copy: two
+    pull requests that each leave a good config can merge into a bad one, and an older head's stale copy says nothing
+    once an owner fixed the base. Checkout mode reads GitHub's merge commit
     (HEAD), bare mode `git merge-tree` of the base and the head (a head that does not merge cleanly is refused: the
     merged config is unknown, and GitHub cannot merge it either). The merged config is never used for anything else:
     the rules that judge the head stay the base's. Any exception is a refusal that says why, never a crash or a pass."""
@@ -448,12 +455,32 @@ def merged_config_problem(checkout, path):
                 f'{type(e).__name__}: {review_judge.shown(str(e))[:300]}')
 
 
+def tree_entry(checkout, tree, rel):
+    """(mode, type, oid) of the entry `rel` in `tree` as git ls-tree lists it, or None when there is none. Raises
+    ValueError when git fails or lists anything but that one entry (the caller refuses)."""
+    r = checkout.git('ls-tree', '-z', tree, '--', rel, errors='surrogateescape')
+    records = [x for x in (r.stdout or '').split('\0') if x] if r.returncode == 0 else None
+    if records == []:
+        return None
+    meta, _, name = records[0].partition('\t') if records else ('', '', '')
+    fields = meta.split(' ')
+    if len(records or ()) != 1 or name != rel or len(fields) != 3 or not re.fullmatch(r'[0-7]{6}', fields[0]) \
+            or not SHA.fullmatch(fields[2]):
+        said = review_judge.shown((r.stderr if r.returncode else r.stdout or '').strip()[:200])
+        raise ValueError(f'git ls-tree {tree[:12]} -- {rel} did not list one entry: {said}')
+    return tuple(fields)
+
+
 def _merged_config_problem(checkout, path, base, head):
     rel = repo_path(path)
     merged = 'HEAD'
     if checkout.bare:
-        m = checkout.git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', base, head,
-                         errors='surrogateescape')
+        try:
+            m = checkout.git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', base, head,
+                             errors='surrogateescape', timeout=MERGE_TREE_SECONDS)
+        except subprocess.TimeoutExpired:
+            return (f'git merge-tree of the base {base[:12]} and the head {head[:12]} took over {MERGE_TREE_SECONDS} '
+                    'seconds, so the config it would merge is unknown')
         tree = (m.stdout or '').split()[:1]
         if m.returncode == 1:
             return (f'the head {head[:12]} does not merge cleanly into the base {base[:12]}, so the config it would '
@@ -462,18 +489,20 @@ def _merged_config_problem(checkout, path, base, head):
             said = review_judge.shown((m.stderr or m.stdout or '').strip()[:200])
             return f'git merge-tree of the base {base[:12]} and the head {head[:12]} failed: {said}'
         merged = tree[0]
-    new = checkout.git('rev-parse', '--verify', '-q', f'{merged}:{rel}')
-    if new.returncode != 0:
+    new = tree_entry(checkout, merged, rel)
+    if new is None:
         return (f'merged, this pull request deletes {path}: {LOCKS}. To stop using the queue, take its checks out of '
                 'the branch ruleset first')
-    old = checkout.git('rev-parse', '--verify', '-q', f'{base}:{rel}')
-    if old.returncode == 0 and old.stdout.strip() == new.stdout.strip():
-        return None   # the merge leaves the base's own config, which base_config parsed
-    oid = new.stdout.strip()
-    kind = checkout.git('cat-file', '-t', oid).stdout.strip()
-    if kind != 'blob':
-        what = review_judge.shown(kind[:20]) or 'thing'
-        return f'merged, this pull request leaves {path} as a {what}, not a file: {LOCKS}'
+    mode, kind, oid = new
+    if kind == 'tree':
+        return f'merged, this pull request leaves {path} as a tree, not a file: {LOCKS}'
+    if mode not in FILE_MODES or kind != 'blob':   # even when the base holds the same: unknown never passes
+        what = {'120000': 'symlink', '160000': 'submodule'}.get(mode) or review_judge.shown(kind[:20])
+        return (f'merged, this pull request leaves {path} as a {what} (mode {mode}), not a file (mode 100644 or '
+                '100755): the queue reads the config from a checkout, where it is no file, and would stop. Make it a '
+                'file again')
+    if tree_entry(checkout, base, rel) == new:
+        return None   # the merge leaves the base's own config, mode and text, which base_config parsed
     size = checkout.git('cat-file', '-s', oid).stdout.strip()
     if not size.isdigit() or int(size) > MAX_CONFIG_BYTES:
         return config_size_problem(path, size)
