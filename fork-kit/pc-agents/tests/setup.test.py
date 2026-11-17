@@ -387,10 +387,60 @@ class Setup(Case):
 
     def test_dpkg_configure_runs_only_when_something_is_half_installed(self):
         """`dpkg --configure -a` takes dpkg's lock without waiting: on a fresh distro with nothing half-installed
-        it is not run, so unattended-upgrades holding that lock is left to apt-get's own wait (#321)."""
+        it is not run, so unattended-upgrades holding that lock is left to apt-get's own wait (#321). A journal file
+        whose name is not all digits (the whole name: not 0003.new) is one apt-get does not look at either, and a
+        distro without that folder, or with it empty, has no journal (#349)."""
+        fresh = self.keep()
+        self.assertFalse(os.path.lexists(self.path('/var/lib/dpkg')))
+        for p in (None, '/var/lib/dpkg/updates/', '/var/lib/dpkg/updates/tmp.i', '/var/lib/dpkg/updates/0003.new'):
+            with self.subTest(p):
+                self.restore(fresh)
+                if p:
+                    self.write(p, '')
+                self.ready()
+                self.assertEqual(self.log('dpkg'), ['--audit'])
+                self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+
+    def test_an_updates_folder_it_cannot_read_counts_as_interrupted(self):
+        """apt skips a /var/lib/dpkg/updates it cannot read; setup runs `dpkg --configure -a` then, which costs one
+        dpkg run that waits for its lock and finds nothing to do (#349)."""
+        fresh = self.keep()
+        full = self.path('/var/lib/dpkg/updates')
+        self.addCleanup(lambda: os.path.isdir(full) and os.chmod(full, 0o755))
+        for how in ('a file', 'mode 000'):   # ENOTDIR, EACCES (the tests never run as root)
+            with self.subTest(how):
+                self.restore(fresh)
+                if how == 'a file':
+                    self.write('/var/lib/dpkg/updates', '')
+                else:
+                    self.write('/var/lib/dpkg/updates/', '')
+                    os.chmod(full, 0)
+                self.ready()
+                self.assertEqual(self.log('dpkg'), ['--audit', DPKG])
+                self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+
+    def test_dpkg_configure_runs_when_its_audit_fails(self):
+        """A `dpkg --audit` that fails and names nothing (a status file it cannot parse) is not taken as all clear:
+        `dpkg --configure -a` runs (#349)."""
+        self.write('/log/dpkg-audit-fail', '')
         self.ready()
-        self.assertEqual(self.log('dpkg'), ['--audit'])
+        self.assertEqual(self.log('dpkg'), ['--audit', DPKG])
+
+    def test_an_interrupted_dpkg_that_names_nothing_is_finished(self):
+        """dpkg stopped after its last status change but before saving it (`wsl --shutdown` during
+        unattended-upgrades): its journal under /var/lib/dpkg/updates says installed, so `dpkg --audit` names
+        nothing, yet apt-get install refuses ("dpkg was interrupted") while that folder holds a file named all
+        digits, on every run. Setup finishes it first, as apt asks; the next run has nothing to finish (#349)."""
+        self.write('/var/lib/dpkg/updates/0003', 'Package: unzip\nStatus: install ok installed\n')
+        self.write('/var/lib/dpkg/updates/tmp.i', '')
+        self.ready()
+        self.assertEqual(self.log('dpkg'), ['--audit', DPKG])
+        self.assertEqual(os.listdir(self.path('/var/lib/dpkg/updates')), ['tmp.i'])
         self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+        os.unlink(self.path('/log/packages/unzip'))   # and a later run with a package to install
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.log('dpkg'), ['--audit', DPKG, '--audit'])
 
     def test_a_lock_apt_daily_holds_is_waited_for(self):
         """A new distro where apt-daily runs: apt-get update's lists lock, install's archives lock and dpkg's own
@@ -403,6 +453,28 @@ class Setup(Case):
         self.assertEqual(self.log('apt-get'), ['update'] * 3 + ['install -y libatomic1 unzip'] * 3)
         self.assertEqual(self.read('/log/packages/libatomic1'), 'install ok installed\n')
         self.assertEqual(self.check()[0], 0)
+
+    def test_a_lock_is_told_apart_under_any_locale(self):
+        """sudo keeps LANG and LC_*, and apt and dpkg ship translations: setup runs them under LC_ALL=C, so a lock
+        held while the owner's locale is German is still waited for (#349)."""
+        env = {n: v for n, v in os.environ.items() if n not in ('LC_ALL', 'LC_MESSAGES')}
+        with mock.patch.dict(os.environ, {**env, 'LANG': 'de_DE.UTF-8'}, clear=True):
+            self.write('/log/packages/unzip', 'install ok unpacked')
+            for name in ('dpkg-locked', 'apt-locked-update', 'apt-locked-install'):
+                self.write('/log/' + name, '2')
+            self.ready()
+        self.assertEqual(self.log('dpkg'), ['--audit'] + [DPKG] * 3)
+        self.assertEqual(self.log('apt-get'), ['update'] * 3 + ['install -y libatomic1 unzip'] * 3)
+
+    def test_a_lock_file_it_may_not_open_is_not_waited_for(self):
+        """apt-get adds `Unable to lock directory` to any lock failure, also one no other apt-get causes (here the
+        lock file cannot be opened): that one is not tried again for 5 minutes, nor named as a busy apt (#349)."""
+        self.write('/log/apt-denied', '')
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('Permission denied', out)
+        self.assertNotIn('Another apt-get or dpkg still runs', out)
+        self.assertEqual(self.log('apt-get'), ['update'])
 
     def test_a_lock_held_past_the_wait_is_named_with_its_own_fix(self):
         """A lock still held after the wait (5 minutes on a machine): the advice is to wait for the other apt-get or
