@@ -211,3 +211,16 @@ export function reviewRulesDescription(
         : `${where}Off: nothing is listed, changed or checked.`;
   }
 }
+
+/**
+ * The panel's message for a failed save. When some environments saved, it names the ones that did
+ * not instead of claiming nothing changed; the toast has the reasons.
+ */
+export function reviewRulesSaveError(
+  failure: { readonly failed: readonly string[]; readonly saved: readonly string[] } | undefined,
+): string {
+  if (failure === undefined || failure.saved.length === 0) {
+    return "Not saved. The review rules stay as they were.";
+  }
+  return `Not saved on ${failure.failed.join(", ")}. Saved on ${failure.saved.join(", ")}.`;
+}

@@ -15,6 +15,7 @@ import {
   planReviewRulesOverrideClear,
   planReviewRulesWrite,
   reviewRulesDescription,
+  reviewRulesSaveError,
   reviewRulesState,
   reviewRulesSummary,
   unreadableReviewRulesText,
@@ -77,17 +78,22 @@ describe("the effective values", () => {
     expect(value("reportMaxChars")).toBe("60000 characters");
   });
 
-  it("marks hand-set fields and shows their values, a hand-set lens after approach", () => {
+  it("marks hand-set fields and shows their values, hand-set lenses after approach", () => {
     const stored = fromFile({
       preset: "recommended",
       minors: "free",
       reportMaxChars: 2000,
-      lensRunners: { security: { driver: "codex", model: "gpt-x", effort: "high" } },
+      lensRunners: {
+        security: { driver: "codex", model: "gpt-x", effort: "high" },
+        // Sorts before "approach" by name: approach still comes first.
+        accessibility: { driver: "codex", model: "gpt-x", effort: "high" },
+      },
     });
     const rows = effectiveReviewRulesRows(stored);
     const row = (key: string) => rows.find((candidate) => candidate.key === key)!;
-    expect(rows.map((candidate) => candidate.key).slice(1, 3)).toEqual([
+    expect(rows.map((candidate) => candidate.key).slice(1, 4)).toEqual([
       "lensRunners.approach",
+      "lensRunners.accessibility",
       "lensRunners.security",
     ]);
     expect(row("minors")).toMatchObject({ value: "No rule (free)", fromPreset: false });
@@ -171,5 +177,16 @@ describe("what a button saves", () => {
       kind: "write",
     });
     expect(planReviewRulesOverrideClear([fromFile({ preset: 3 })]).kind).toBe("confirm");
+  });
+});
+
+describe("a failed save", () => {
+  it("says nothing changed only when no environment saved", () => {
+    const nothing = "Not saved. The review rules stay as they were.";
+    expect(reviewRulesSaveError(undefined)).toBe(nothing);
+    expect(reviewRulesSaveError({ failed: ["Laptop"], saved: [] })).toBe(nothing);
+    expect(reviewRulesSaveError({ failed: ["Laptop", "Box"], saved: ["Server"] })).toBe(
+      "Not saved on Laptop, Box. Saved on Server.",
+    );
   });
 });

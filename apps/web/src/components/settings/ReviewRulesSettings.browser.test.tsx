@@ -6,7 +6,10 @@ import "~/index.css";
 import { act, render } from "../../../test/render";
 
 type Settings = typeof DEFAULT_SERVER_SETTINGS;
-type UpdateOptions = { readonly onFailed?: () => void; readonly onSaved?: () => void };
+type UpdateOptions = {
+  readonly onFailed?: (failure?: { failed: string[]; saved: string[] }) => void;
+  readonly onSaved?: () => void;
+};
 
 const state = vi.hoisted(() => ({
   settings: {} as Settings,
@@ -117,6 +120,20 @@ describe("ReviewRulesSettings (PK10 T6)", () => {
     await expect.element(recommendedButton()).toBeEnabled();
   });
 
+  it("names where a save failed when another environment saved", async () => {
+    setup({ preset: "off" });
+    await using screen = await render(<ReviewRulesSettings isProjectScope={false} />);
+
+    await userEvent.click(recommendedButton());
+    await act(() =>
+      state.update.mock.calls[0]![1]!.onFailed!({ failed: ["env-b"], saved: ["env-a"] }),
+    );
+    await expect.element(screen.getByRole("alert")).toBeVisible();
+    const text = screen.getByRole("alert").element().textContent;
+    expect(text).toContain("Not saved on env-b. Saved on env-a.");
+    expect(text).not.toContain("stay as they were");
+  });
+
   it("shows the effective values, marking hand-set ones", async () => {
     setup({ preset: "recommended", minors: "free" });
     await using screen = await render(<ReviewRulesSettings isProjectScope={false} />);
@@ -159,5 +176,21 @@ describe("ReviewRulesSettings (PK10 T6)", () => {
       .element(screen.getByText(/^This project overrides the environment's review rules/u))
       .toBeVisible();
     await expect.element(screen.getByText("5000 characters")).toBeVisible();
+  });
+
+  it("in a project without an override, replaces nothing of the environment's", async () => {
+    // The environment's hand-set fields stay there: no confirm about dropping them.
+    setup({ preset: "recommended", minors: "free" }, { overrides: false });
+    await using screen = await render(<ReviewRulesSettings isProjectScope />);
+
+    await userEvent.click(recommendedButton());
+    expect(page.getByRole("alertdialog").elements()).toHaveLength(0);
+    expect(state.update.mock.calls[0]![0]).toEqual({ reviewRules: { preset: "recommended" } });
+    await act(() => state.update.mock.calls[0]![1]!.onSaved!());
+
+    // The environment already has exactly the preset: the project can still pin its own.
+    setup({ preset: "recommended" }, { overrides: false });
+    await screen.rerender(<ReviewRulesSettings isProjectScope />);
+    await expect.element(recommendedButton()).toBeEnabled();
   });
 });

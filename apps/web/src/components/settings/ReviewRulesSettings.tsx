@@ -23,6 +23,7 @@ import {
   planReviewRulesOverrideClear,
   planReviewRulesWrite,
   reviewRulesDescription,
+  reviewRulesSaveError,
   reviewRulesState,
   reviewRulesSummary,
   unreadableReviewRulesText,
@@ -79,9 +80,9 @@ export function ReviewRulesSettings({ isProjectScope }: { readonly isProjectScop
       { reviewRules: { ...REVIEW_RULES_BUTTON_VALUE[choice] } },
       {
         onSaved: () => setSaving(false),
-        onFailed: () => {
+        onFailed: (failure) => {
           setSaving(false);
-          setSaveError("Not saved. The review rules stay as they were.");
+          setSaveError(reviewRulesSaveError(failure));
         },
       },
     );
