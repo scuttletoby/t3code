@@ -71,12 +71,25 @@ def _fsync_dir(path):
 
 
 @contextlib.contextmanager
-def lock(state_dir, command, exclusive, wait=False):
+def lock(state_dir, command, exclusive, wait=False, create=True):
     """Hold the kit's lock for a command; Busy when a changing run (or, for one, any command) holds it.
-    wait=True blocks until the lock is free instead (the guard waits for the run it watches to end)."""
-    _ensure_dir(state_dir)
+    wait=True blocks until the lock is free instead (the guard waits for the run it watches to end).
+    create=False (shared only; `status`, which writes nothing): no state folder or lock file is made; with no lock
+    file no golive run has ever taken the lock here, so it goes on without one."""
+    if exclusive and not create:
+        raise ValueError('a changing run makes its lock file')
     path, _ = _paths(state_dir)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    if create:
+        _ensure_dir(state_dir)
+    try:
+        fd = os.open(path, (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY) | os.O_CLOEXEC, 0o600)
+    except FileNotFoundError:
+        if create:
+            raise
+        fd = None
+    if fd is None:
+        yield
+        return
     try:
         try:
             fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if wait else fcntl.LOCK_NB))
@@ -269,25 +282,30 @@ def _detail(error):
 
 
 @contextlib.contextmanager
-def run(state_dir, command, scratch=False):
-    """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished), journal begin
-    and end. An exception ends the run "failed" and goes on (after a started step it then needs settling); Refused
-    after every started step is done ends it "refused" (no settling); a kill leaves it with no end for the next run
-    to report. scratch=True: every step changes only the run's own throwaway folder (rehearse's clone), so a stop or
-    an error needs no settling: the next run redoes it from the start."""
+def run(state_dir, command, may_follow=(), scratch=False):
+    """Begin a changing run: take the lock (Busy), refuse a run that needs settling (Unfinished) unless its command
+    is in may_follow (`back` finishes a back or switch stopped half-way), journal begin and end. An exception ends
+    the run "failed" and goes on (after a started step it then needs settling); Refused after every started step is
+    done ends it "refused" (no settling), except in a run that follows one: that one still needs settling until a
+    run ends ok. A kill leaves it with no end for the next run to report. scratch=True: every step changes only the
+    run's own throwaway folder (rehearse's clone), so a stop or an error needs no settling: the next run redoes it
+    from the start."""
     with lock(state_dir, command, exclusive=True):
         last = unfinished(state_dir)
-        if last is not None:
+        if last is not None and last['command'] not in may_follow:
             raise Unfinished(last)
         r = Run(state_dir, command)
         r._append('begin', command=command, pid=os.getpid(), **({'scratch': True} if scratch else {}))
         r._holds_lock = True
         try:
             try:
+                if last is not None:  # until this run ends ok, the home still needs settling (a refusal too)
+                    with r.step('follows', run=last['id']):
+                        pass
                 yield r
             except Refused as e:
                 # Refused inside a step, or after a step that never reached "done", is a failure like any other.
-                result = 'failed' if r._broken else 'refused'
+                result = 'failed' if r._broken or last is not None else 'refused'
                 r._append('end', result=result, detail=_detail(e))
                 raise
             except BaseException as e:
