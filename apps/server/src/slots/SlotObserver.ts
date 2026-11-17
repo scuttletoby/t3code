@@ -6,6 +6,7 @@
 import type { SlotRuleStatus } from "@t3tools/contracts/waitFor";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
+  DISPATCH_SAFETY_MS,
   liveReservations,
   liveStarting,
   onePerThread,
@@ -87,9 +88,6 @@ export function slicePath(slice: string): string {
   return parts.map((_, index) => `/${parts.slice(0, index + 1).join("-")}.slice`).join("");
 }
 
-/** One of the rule's own starts, and the thread that asked for it (its holds are used up). */
-type OwnStart = StartingEntry & { readonly threadId?: string | undefined };
-
 interface OwnPiece {
   readonly scope: { readonly unit: string; readonly slice: string } | undefined;
 }
@@ -126,7 +124,7 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
    * its child shows a run (then it counts as that run, once). A dispatch that ends with no child
    * stops counting at once.
    */
-  let ownStarts: ReadonlyArray<OwnStart> = [];
+  let ownStarts: ReadonlyArray<StartingEntry> = [];
   /**
    * While the gate keeps no records: held slots of the threads those starts were for, by key, until
    * they end. A start uses its thread's hold up, as the gate's `useUp` does with slots on (with slots
@@ -134,6 +132,12 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
    * the start stops counting (its child shows its run, or its dispatch ends).
    */
   const usedHolds = new Map<string, number>();
+  /**
+   * Slots off: threads allowed a start, noted at the decision (before any skip). The next good store
+   * read uses their holds up, whatever became of the start meanwhile, and drops the notes. Slots on
+   * drops them all; a note no read took goes after `DISPATCH_SAFETY_MS`.
+   */
+  const startedThreads = new Map<string, number>();
 
   const readFacts = async (pieces: ReadonlyArray<OwnPiece>): Promise<CapacityFacts> => {
     const machine = await readMachine(host);
@@ -212,15 +216,12 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
       );
       const live = liveReservations(heldRead.value, input.atMs);
       if (!input.gateRecords) {
-        // Also the starts this decision counts (a skipped or slow observation of a start's own
-        // decision leaves its hold to the next one).
-        const startedThreads = new Set(own.map((entry) => entry.threadId));
-        if (input.ownStart !== undefined) startedThreads.add(input.callerThreadId);
         for (const reservation of live) {
           if (startedThreads.has(reservation.threadId)) {
             usedHolds.set(reservation.key, reservation.untilMs);
           }
         }
+        startedThreads.clear();
       }
       const held = onePerThread(
         live.filter(
@@ -285,9 +286,16 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
       for (const [key, untilMs] of usedHolds) {
         if (input.gateRecords || untilMs <= input.atMs) usedHolds.delete(key);
       }
+      for (const [threadId, atMs] of startedThreads) {
+        if (input.gateRecords || input.atMs - atMs >= DISPATCH_SAFETY_MS) {
+          startedThreads.delete(threadId);
+        }
+      }
       const ownBefore = ownStarts;
       if (!input.gateRecords && input.ownStart !== undefined) {
-        ownStarts = [...ownStarts, { ...input.ownStart, threadId: input.callerThreadId }];
+        ownStarts = [...ownStarts, input.ownStart];
+        if (input.callerThreadId !== undefined)
+          startedThreads.set(input.callerThreadId, input.atMs);
       }
       if (waiting >= OBSERVE_MAX_WAITING) {
         return Ref.update(status, (current) => ({ ...current, skipped: current.skipped + 1 }));
@@ -332,6 +340,10 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
       }),
     status: Ref.get(status),
     /** What the rule keeps in memory (for tests: nothing past the point it stops counting). */
-    kept: Effect.sync(() => ({ starts: ownStarts.length, usedHolds: usedHolds.size })),
+    kept: Effect.sync(() => ({
+      starts: ownStarts.length,
+      usedHolds: usedHolds.size,
+      notes: startedThreads.size,
+    })),
   };
 });
