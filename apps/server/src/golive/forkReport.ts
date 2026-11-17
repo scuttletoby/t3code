@@ -114,6 +114,14 @@ function statOf(path: string, follow = true): NodeFS.Stats | undefined {
     throw cause;
   }
 }
+/** `statOf`, with any other error (such as `EACCES` or `ELOOP`) as its text instead of thrown. */
+function lookAt(path: string, follow = true): NodeFS.Stats | undefined | string {
+  try {
+    return statOf(path, follow);
+  } catch (cause) {
+    return errorText(cause);
+  }
+}
 
 /**
  * A read-only handle that writes nothing. A plain read-only open of a WAL database creates its
@@ -141,9 +149,6 @@ function openWithoutWriting(
     };
   }
   const mode = walSize === undefined || (walSize === 0 && !hasShm) ? "immutable" : "readonly-shm";
-  // A clean server stop between these checks and the read deletes the WAL; SQLite then creates an
-  // empty -wal and the open fails. It is left there: removing it could unlink the WAL of a server
-  // starting at that moment. A later report reads such a home `immutable`.
   const url = NodeURL.pathToFileURL(databasePath);
   url.search = mode === "immutable" ? "mode=ro&immutable=1" : "mode=ro&readonly_shm=1";
   try {
@@ -198,10 +203,25 @@ function readDatabase(databasePath: string, problems: Array<Problem>): ForkRepor
   }
   if (real.size === 0) return { ...empty, state: "empty" };
 
+  // A clean server stop between the WAL checks and the read deletes the WAL; SQLite then creates an
+  // empty -wal and the read fails. It stays: removing it could unlink the WAL of a server starting
+  // at that moment. The checks run again once, so the stopped home reads `immutable`.
+  let read = readOnce(realPath, empty);
+  if (read.database.openMode === "readonly-shm" && read.database.state === "unreadable") {
+    read = readOnce(realPath, empty);
+  }
+  problems.push(...read.problems);
+  return read.database;
+}
+
+function readOnce(
+  realPath: string,
+  empty: ReturnType<typeof unreadDatabase>,
+): { database: ForkReport["database"]; problems: Array<Problem> } {
+  const problems: Array<Problem> = [];
   const opened = openWithoutWriting(realPath);
   if (!("db" in opened)) {
-    problems.push(opened);
-    return { ...empty, state: "unreadable" };
+    return { database: { ...empty, state: "unreadable" }, problems: [opened] };
   }
   const { db, mode } = opened;
   try {
@@ -254,7 +274,7 @@ function readDatabase(databasePath: string, problems: Array<Problem>): ForkRepor
     }
 
     const threads = "orchestration_v2_projection_threads";
-    return {
+    const database: ForkReport["database"] = {
       ...empty,
       state: "present",
       openMode: mode,
@@ -275,12 +295,17 @@ function readDatabase(databasePath: string, problems: Array<Problem>): ForkRepor
         ]),
       },
     };
+    return { database, problems };
   } catch (cause) {
-    problems.push({
-      code: "database-unreadable",
-      message: `Could not read the database: ${errorText(cause)}`,
-    });
-    return { ...empty, state: "unreadable", openMode: mode };
+    return {
+      database: { ...empty, state: "unreadable", openMode: mode },
+      problems: [
+        {
+          code: "database-unreadable",
+          message: `Could not read the database: ${errorText(cause)}`,
+        },
+      ],
+    };
   } finally {
     try {
       db.close();
@@ -387,25 +412,38 @@ function readSettings(
 /** The report as the command prints it: indented JSON. */
 export const formatForkReport = (report: ForkReport): string => JSON.stringify(report, null, 2);
 
+/** Why a start could not use this home, or null; a stat error is reported, never thrown. */
+function whyNoHome(
+  home: string,
+  homeStat: ReturnType<typeof lookAt>,
+  stateStat: ReturnType<typeof lookAt> | null,
+  stateDir: string,
+): string | null {
+  if (homeStat === undefined) return `No T3 home folder at ${home}.`;
+  if (typeof homeStat === "string") return `${home} could not be looked at (${homeStat}).`;
+  if (stateStat === null) return `${home} is not a folder.`;
+  if (typeof stateStat === "string") {
+    return `${stateDir} could not be looked at (${stateStat}); a start would fail.`;
+  }
+  if (stateStat === undefined) {
+    return lookAt(stateDir, false) === undefined
+      ? null
+      : `${stateDir} is a link that leads nowhere; a start would fail.`;
+  }
+  return stateStat.isDirectory()
+    ? null
+    : `${stateDir} is not a folder, so this home holds no T3 state; a start would fail.`;
+}
+
 /** The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`). */
 export function readForkReport(baseDir: string, version: string = packageJson.version): ForkReport {
   const home = NodePath.resolve(baseDir);
   const stateDir = NodePath.join(home, "userdata");
   const problems: Array<Problem> = [];
-  const homeStat = statOf(home);
-  const exists = homeStat?.isDirectory() ?? false;
-  if (!exists) {
-    problems.push({
-      code: "home-missing",
-      message:
-        homeStat === undefined ? `No T3 home folder at ${home}.` : `${home} is not a folder.`,
-    });
-  } else if (statOf(stateDir)?.isDirectory() === false) {
-    problems.push({
-      code: "home-missing",
-      message: `${stateDir} is not a folder, so this home holds no T3 state; a start would fail.`,
-    });
-  }
+  const homeStat = lookAt(home);
+  const exists = typeof homeStat === "object" && homeStat.isDirectory();
+  const homeProblem = whyNoHome(home, homeStat, exists ? lookAt(stateDir) : null, stateDir);
+  if (homeProblem !== null) problems.push({ code: "home-missing", message: homeProblem });
   const databasePath = NodePath.join(stateDir, "statev2.sqlite");
   let database: ForkReport["database"];
   try {

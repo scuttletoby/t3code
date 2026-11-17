@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/cli";
+import { vi } from "vite-plus/test";
 
 import { cli } from "../binCli.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
@@ -24,6 +25,21 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
 import { FORK_REPORT_VERSION, formatForkReport, readForkReport } from "./forkReport.ts";
+
+/** Runs once, right after the report's last WAL check reads the path it names (the -shm). */
+const afterCheck = vi.hoisted(() => ({ path: "", run: () => {} }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeFS>();
+  const existsSync: typeof actual.existsSync = (path) => {
+    const exists = actual.existsSync(path);
+    if (path === afterCheck.path) {
+      afterCheck.path = "";
+      afterCheck.run();
+    }
+    return exists;
+  };
+  return { ...actual, existsSync };
+});
 
 const homes: Array<string> = [];
 const children: Array<NodeChildProcess.ChildProcess> = [];
@@ -248,6 +264,25 @@ describe("__fork-report writes nothing", () => {
     expect(report.ok).toBe(true);
   });
 
+  it("reads a home whose server stops cleanly between the WAL check and the open", () => {
+    const home = makeHome();
+    const server = new NodeSqlite.DatabaseSync(dbPathOf(home));
+    server.exec("PRAGMA wal_autocheckpoint = 0");
+    server.exec("INSERT INTO orchestration_v2_projection_threads VALUES ('t4', NULL, NULL)");
+    expect(NodeFS.statSync(`${dbPathOf(home)}-wal`).size).toBeGreaterThan(0);
+    // The last connection's close checkpoints the WAL into the file and deletes -wal and -shm.
+    afterCheck.path = `${dbPathOf(home)}-shm`;
+    afterCheck.run = () => server.close();
+
+    const report = readForkReport(home);
+
+    expect(afterCheck.path).toBe("");
+    expect(report.problems).toEqual([]);
+    expect(report.database.openMode).toBe("immutable");
+    expect(report.database.counts?.threads).toBe(3);
+    expect(report.ok).toBe(true);
+  });
+
   it("refuses a WAL with data but no -shm index instead of recovering it", () => {
     const home = makeHome();
     leaveCrashedWal(home);
@@ -323,9 +358,15 @@ describe("__fork-report on old, newer and empty state", () => {
     }),
   );
 
-  it("reports a userdata that is a file as no home, not as a fresh one", () => {
+  it.each([
+    ["a file", (userdata: string) => NodeFS.writeFileSync(userdata, "x")],
+    [
+      "a link to nothing",
+      (userdata: string) => NodeFS.symlinkSync(NodePath.join(tempDir(), "gone"), userdata),
+    ],
+  ] as const)("reports a userdata that is %s as no home, not as a fresh one", (_, layOut) => {
     const home = tempDir();
-    NodeFS.writeFileSync(NodePath.join(home, "userdata"), "x");
+    layOut(NodePath.join(home, "userdata"));
     const before = snapshot(home);
 
     const report = readForkReport(home);
@@ -337,6 +378,55 @@ describe("__fork-report on old, newer and empty state", () => {
     expect(report.problems.map((problem) => problem.code)).toEqual(["home-missing"]);
     expect(report.problems[0]!.message).toContain("userdata");
     expect(report.ok).toBe(false);
+  });
+
+  it.each([
+    ["a home that is a link loop", (home: string) => NodeFS.symlinkSync(home, home), false],
+    [
+      "a userdata that is a link loop",
+      (home: string) => {
+        NodeFS.mkdirSync(home);
+        NodeFS.symlinkSync("userdata", NodePath.join(home, "userdata"));
+      },
+      true,
+    ],
+  ] as const)("reports %s as no home instead of failing", (_, layOut, exists) => {
+    const parent = tempDir();
+    const home = NodePath.join(parent, "home");
+    layOut(home);
+    const before = snapshot(parent);
+
+    const report = readForkReport(home);
+
+    expect(snapshot(parent)).toEqual(before);
+    expect(report.home.exists).toBe(exists);
+    expect(report.problems[0]!.code).toBe("home-missing");
+    expect(report.problems[0]!.message).toContain("ELOOP");
+    expect(report.ok).toBe(false);
+  });
+
+  // Root bypasses folder permissions, so chmod cannot force EACCES.
+  it.skipIf(process.getuid?.() === 0).each([
+    ["a home it may not look into", "home", 0o600, true],
+    ["a home inside a folder it may not enter", "parent", 0o600, false],
+  ] as const)("reports %s as no home instead of failing", (_, lock, mode, exists) => {
+    const parent = tempDir();
+    const home = NodePath.join(parent, "home");
+    NodeFS.mkdirSync(NodePath.join(home, "userdata"), { recursive: true });
+    const locked = lock === "home" ? home : parent;
+    const before = snapshot(parent);
+    NodeFS.chmodSync(locked, mode);
+    try {
+      const report = readForkReport(home);
+
+      expect(report.home.exists).toBe(exists);
+      expect(report.problems[0]!.code).toBe("home-missing");
+      expect(report.problems[0]!.message).toContain("EACCES");
+      expect(report.ok).toBe(false);
+    } finally {
+      NodeFS.chmodSync(locked, 0o755);
+    }
+    expect(snapshot(parent)).toEqual(before);
   });
 
   it("reads an empty home as no database and every fork feature off", () => {
@@ -413,7 +503,10 @@ describe("__fork-report through a linked statev2.sqlite", () => {
     const looping = homeWithDatabaseLink(NodePath.join("..", "loop.sqlite"));
     NodeFS.symlinkSync(dbPathOf(looping), NodePath.join(looping, "loop.sqlite"));
 
-    for (const home of [dangling, looping]) {
+    for (const [home, wouldCreate] of [
+      [dangling, true],
+      [looping, false],
+    ] as const) {
       const before = [snapshot(elsewhere), snapshot(home)];
 
       const report = readForkReport(home);
@@ -422,6 +515,7 @@ describe("__fork-report through a linked statev2.sqlite", () => {
       expect(report.database.state).toBe("unreadable");
       expect(report.problems.map((problem) => problem.code)).toEqual(["database-unreadable"]);
       expect(report.problems[0]!.message).toContain("link");
+      expect(report.problems[0]!.message.includes("would create")).toBe(wouldCreate);
       expect(report.ok).toBe(false);
     }
   });
