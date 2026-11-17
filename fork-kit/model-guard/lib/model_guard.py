@@ -231,7 +231,9 @@ def check_pick(where, model, efforts, driver, rows, agent, problems, matched):
 # ---------- a Workflow script: a strict text check, not a sandbox. Every agent() call must be a plain call whose
 # options are an object literal naming model and effort as plain texts; anything the check cannot follow (a name
 # that reaches the global object or builds code, a computed key, another workflow, agent used other than as a
-# direct call, a / it cannot tell from a regular expression) refuses the whole script.
+# direct call) refuses the whole script. Telling a regular expression from a division needs a full JavaScript
+# parser, so the check does not guess: every / that does not open a comment is refused, and so is every line end
+# other than \n and \r\n (a bare \r, U+2028, U+2029), which JavaScript also ends a // comment at.
 
 class ScriptError(Exception):
     pass
@@ -242,11 +244,14 @@ WF_FORBIDDEN = frozenset((
     'Reflect', 'Proxy', 'with', '__proto__', 'prototype', 'getPrototypeOf', 'setPrototypeOf', 'defineProperty',
     'defineProperties', 'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'arguments', 'setTimeout',
     'setInterval'))
-# after these words a / starts a regular expression, and a [ starts an array (not a member access)
+# after these words a [ starts an array (not a member access)
 WF_EXPRESSION_WORDS = frozenset((
     'return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'new', 'delete', 'void', 'throw', 'instanceof', 'yield',
     'await', 'const', 'let', 'var', 'export'))
 WF_MAX_BYTES = 1024 * 1024
+WF_SLASH = ('a regular expression literal or a / operator (no regular expression literals or / operators in a '
+            'checked Workflow script: use new RegExp("...") or multiply instead)')
+_WF_ODD_LINE_END = re.compile('\r(?!\n)|[\u2028\u2029]')
 _WF_PUNCT = re.compile(r'>>>=|\.\.\.|===|!==|\*\*=|<<=|>>=|>>>|&&=|\|\|=|\?\?=|=>|==|!=|<=|>=|&&|\|\||\?\?|'
                        r'\?\.(?!\d)|\+\+|--|\+=|-=|\*=|%=|&=|\|=|\^=|\*\*|<<|>>|[{}()\[\];,<>+\-*%&|^!~?:=.]')
 _WF_NAME = re.compile(r'[A-Za-z_$][\w$]*', re.A)
@@ -255,28 +260,20 @@ _OPEN = {'(': ')', '[': ']', '{': '}', '`${': '}'}
 
 
 def _js_tokens(src):
-    """The script as tokens [kind, text, line, extra]: kind name, num, str (extra: it has an escape), regex or
-    punct (extra on ')': it closes an if/while/for/with header). A template literal without ${} is a str; one with
-    ${} is the puncts '`${', '}${' and '}`' around its code. Raises ScriptError for what the check refuses."""
-    toks, stack, parens = [], [], []
+    """The script as tokens [kind, text, line, extra]: kind name, num, str (extra: it has an escape) or punct. A
+    template literal without ${} is a str; one with ${} is the puncts '`${', '}${' and '}`' around its code. Raises
+    ScriptError for what the check refuses, among it every / that does not open a comment and every line end
+    other than \\n and \\r\\n."""
+    toks, stack, parens = [], [], 0
     i, n, line = 0, len(src), 1
 
     def fail(msg):
         raise ScriptError(f'line {line}: {msg}')
 
-    def regex_starts():
-        if not toks:
-            return True
-        kind, text, _, extra = toks[-1]
-        if kind == 'name':
-            return text in WF_EXPRESSION_WORDS
-        if kind in ('num', 'str', 'regex') or text in (']', '}`'):
-            return False
-        if text == ')':
-            return extra
-        if text in ('}', '++', '--'):
-            fail(f'a / after "{text}" could divide or start a regular expression: write it another way')
-        return True
+    odd = _WF_ODD_LINE_END.search(src)
+    if odd:
+        line += src.count('\n', 0, odd.start())
+        fail(f'a line end other than \\n or \\r\\n ({odd.group()!r}), which JavaScript also ends a // comment at')
 
     def template():
         nonlocal i, line
@@ -346,30 +343,7 @@ def _js_tokens(src):
                 toks.append(['punct', '`${', start, None])
                 stack.append(0)
         elif c == '/':
-            if regex_starts():
-                j, in_class = i + 1, False
-                while True:
-                    if j >= n or src[j] == '\n':
-                        fail('a regular expression is not closed on its line')
-                    if src[j] == '\\':
-                        j += 2
-                        continue
-                    if src[j] == '[':
-                        in_class = True
-                    elif src[j] == ']':
-                        in_class = False
-                    elif src[j] == '/' and not in_class:
-                        break
-                    j += 1
-                j += 1
-                while j < n and src[j].isascii() and src[j].isalpha():
-                    j += 1
-                toks.append(['regex', src[i:j], line, None])
-                i = j
-            else:
-                text = '/=' if src.startswith('/=', i) else '/'
-                toks.append(['punct', text, line, None])
-                i += len(text)
+            fail(WF_SLASH)
         elif c.isdigit() or (c == '.' and src[i + 1:i + 2].isdigit()):
             m = _WF_NUMBER.match(src, i)
             toks.append(['num', m.group(), line, None])
@@ -393,12 +367,11 @@ def _js_tokens(src):
                     continue
                 stack[-1] -= 1
             if text == '(':
-                parens.append(bool(toks) and toks[-1][0] == 'name' and toks[-1][1] in ('if', 'while', 'for', 'with'))
+                parens += 1
             elif text == ')':
                 if not parens:
                     fail('a ) without its (')
-                toks.append(['punct', ')', line, parens.pop()])
-                continue
+                parens -= 1
             toks.append(['punct', text, line, None])
         else:
             fail(f'the character {c!r} outside a string or comment')
@@ -508,7 +481,7 @@ def workflow_problems(args, rows, problems, matched):
             if kind != 'punct':
                 continue
             if text == '[':
-                if prev is not None and (prev[0] in ('num', 'str', 'regex')
+                if prev is not None and (prev[0] in ('num', 'str')
                                          or prev[0] == 'name' and prev[1] not in WF_EXPRESSION_WORDS
                                          or prev[0] == 'punct' and prev[1] in (')', ']', '}', '}`', '?.')):
                     if toks[k + 1][0] != 'num' or toks[k + 2][:2] != ['punct', ']']:

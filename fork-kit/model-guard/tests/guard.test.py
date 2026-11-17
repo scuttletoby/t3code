@@ -344,7 +344,7 @@ class Guard(unittest.TestCase):
         good = '''export const meta = {name: 'x', description: 'y'}
 // agent("in a comment", {}) is not a call
 const a = await agent(`plain ${1 + 2} prompt`, {label: 'a', model: 'large', effort: "high", schema: {type: 'object'}})
-const b = await pipeline(items, x => agent('p ' + x, {model: 'example-deep-2', effort: 'high',}), r => r.y[0] / 2)
+const b = await pipeline(items, x => agent('p ' + x, {model: 'example-deep-2', effort: 'high',}), r => r.y[0] * 0.5)
 const c = log("agent(") || items.map(i => i.agent)
 '''
         self.assertIn('is for most work', self.passed('Workflow', self.workflow(good)))
@@ -402,6 +402,53 @@ const c = log("agent(") || items.map(i => i.agent)
         for name, (args, why) in cases.items():
             with self.subTest(name):
                 self.refused('Workflow', args, why)
+
+    def test_workflow_hole_scripts_of_the_lenses_and_the_audit_are_refused(self):
+        # PR #275 round-2 lenses and audit: each of these passed the old regex-or-division guess, and JavaScript runs
+        # the hidden agent() call with a model the policy does not allow.
+        bad = '{model: "small", effort: "max"}'
+        slash = {
+            'of as a name': f"let of = 4; of / 1; agent('x', {bad}); 1 / 1",
+            'of divides a call': f"let p; const of = 1;\nof / (p = agent('x', {bad})) / 1;\nawait p",
+            'of /=': f"let of = 1;\nof /= agent('x', {bad}) / 1",
+            'property named like a keyword': f"const o = {{typeof: 4}}; o.typeof / 1; agent('x', {bad}); 1 / 1",
+            'Array.of': f"let p; Array.of / (p = agent('x', {bad})) / 1; await p",
+            'o.return': f"let p; const o = {{return: 1}}; o.return / (p = agent('x', {bad})) / 1; await p",
+            'method named if': f"const a = {{if: x => 4}}; a.if(1) / 1; agent('x', {bad}); 1 / 1",
+            'for await header': f"for await (const x of []) /'/; agent('x', {bad}); // '",
+            'debugger then a line break': f"debugger\n/'/; agent('x', {bad}); //'",
+            'break then a line break': f"for (;;) {{ break\n/'/; agent('x', {bad}); //'\n}}",
+            'continue then a line break': f"for (const i of [1]) {{ continue\n/'/; agent('x', {bad}); //'\n}}",
+            'class extends': f"class A extends /'/.constructor {{}}; agent('x', {bad}); //'",
+        }
+        line_ends = {
+            'bare CR ends a comment': f"// c\ragent('x', {bad})",
+            'U+2028 ends a comment': f"// c\u2028agent('x', {bad})",
+            'U+2029 ends a comment': f"// c\u2029agent('x', {bad})",
+            'after an allowed call': f"agent('a', {{model: 'large', effort: 'high'}}) // ok\u2028agent('x', {bad})",
+            'bare CR in a string': "agent('x\r', {model: 'large', effort: 'high'})",
+        }
+        for cases, why in ((slash, 'no regular expression literals or / operators'),
+                           (line_ends, 'a line end other than')):
+            for name, script in cases.items():
+                with self.subTest(name):
+                    self.refused('Workflow', self.workflow(script), why)
+
+    def test_workflow_division_and_regular_expressions_are_refused(self):
+        for script in ("const h = 4 / 2", "let h = 4; h /= 2", "const ok = /^a+$/.test(s)", "s.split(/,/)",
+                       "x = {} / 2", "agent('x', {model: 'large', effort: 'high'}); const r = 1/2"):
+            with self.subTest(script):
+                reason = self.refused('Workflow', self.workflow(script), 'the Workflow script cannot be checked')
+                self.assertIn('use new RegExp("...") or multiply instead', reason)
+
+    def test_workflow_slash_in_strings_templates_and_comments_and_crlf_pass(self):
+        script = ("// a comment with / and /re/g and 1 / 2\r\n"
+                  "/* a block / comment\r\n   over two lines */\r\n"
+                  "const a = await agent('a/b // not a comment /* nor this */', {model: 'large', effort: 'high'})\r\n"
+                  "const t = `path/${a.x}/more ${\"x/y\"} ${'/'}`\r\n"
+                  "const s = \"a/b\" + 'c/d' + `/*`\r\n")
+        self.assertIn('is for most work', self.passed('Workflow', self.workflow(script)))
+        self.assertIn('is for most work', self.passed('Workflow', self.workflow(script.replace('\r\n', '\n'))))
 
     # ---- the hook's input
 
@@ -686,6 +733,14 @@ MUTATIONS = {
                                       'test_workflow_that_cannot_be_read_is_refused'),
     'Workflow computed key refused': ("raise ScriptError(f'line {line}: a computed key')",
                                       "pass", 'test_workflow_that_cannot_be_read_is_refused'),
+    'Workflow: every / that opens no comment refused': (
+        '            fail(WF_SLASH)\n', "            toks.append(['punct', '/', line, None])\n            i += 1\n",
+        'test_workflow_division_and_regular_expressions_are_refused'),
+    'Workflow: the hole scripts hit the / rule': (
+        '            fail(WF_SLASH)\n', "            toks.append(['punct', '/', line, None])\n            i += 1\n",
+        'test_workflow_hole_scripts_of_the_lenses_and_the_audit_are_refused'),
+    'Workflow: odd line ends refused': ('    if odd:\n', '    if False:\n',
+                                        'test_workflow_hole_scripts_of_the_lenses_and_the_audit_are_refused'),
     'Workflow forbidden names': ("            if kind == 'name' and text in WF_FORBIDDEN:",
                                  '            if False:', 'test_workflow_that_cannot_be_read_is_refused'),
     'transfer fork refused': ("    if kind == 't3_thread_transfer' and args.get('action') == 'fork':",

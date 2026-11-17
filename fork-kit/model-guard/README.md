@@ -77,8 +77,12 @@ and the model of the session that makes the call.
   used any other way (renamed, passed on, called through a member), a computed key or member access other than
   `[number]`, a spread, a name that reaches the global object or builds code (`eval`, `Function`, `constructor`,
   `globalThis`, `this`, `import`, `require`, `Reflect`, `Proxy`, `__proto__` and more), letters outside ASCII
-  outside strings, a `/` it cannot tell from a regular expression, brackets that do not match, or a script over
-  1 MiB.
+  outside strings, brackets that do not match, or a script over 1 MiB. It also refuses **every `/` that does not
+  open a `//` or `/* */` comment**: a regular expression literal or a division (use `new RegExp("...")`, or
+  multiply). Telling the two apart needs a full JavaScript parser, so the hook does not guess. And it refuses a
+  line end other than `\n` or `\r\n` anywhere in the script (a bare `\r`, U+2028 or U+2029), because JavaScript
+  ends a `//` comment there too. A `/` inside a string, a template or a comment, and a script with `\r\n` line ends,
+  pass.
 - **`t3_thread_transfer` fork** starts a thread on the source thread's model, which the hook cannot see, so it is
   refused in `enforce`: start the thread with `t3_thread_launch` and a `modelSelection` instead. `merge_back` and
   `status` start no model and pass.
@@ -139,8 +143,28 @@ machine file), so an agent cannot widen its own policy.
 
 ## Turn it on (owner, as root)
 
-1. Install the kit (below). The installer writes the hook into Claude Code's **managed settings**, which only root
-   can change and which every Claude Code and Agent SDK session reads, whatever settings sources it uses
+1. Write the policy, for example `/etc/fork-kit/model-policy.json`, root-owned, mode 644, in folders that are
+   root-owned and not writable by others all the way up to `/`. Start with `"mode": "advise"` (or `"off"`).
+2. Name it in the machine file `/etc/fork-kit/machine.json` (see [common](../common/README.md)):
+
+   ```json
+   "model-guard": {
+     "policyFile": "/etc/fork-kit/model-policy.json"
+   }
+   ```
+
+   | Key               | Required | What                                                                    |
+   | ----------------- | -------- | ----------------------------------------------------------------------- |
+   | `policyFile`      | yes      | the policy; an absolute path                                            |
+   | `allowOtherHooks` | no       | `true` accepts user and project hooks next to the guard (default false) |
+
+3. Only now install the kit (below). Write the policy and the machine file first: from the installer's settings
+   step on, every session runs the hook, and with no usable policy the hook refuses every checked call in every
+   mode (`off` included, since the mode lives in the policy). On a machine with running agents, every `Agent`,
+   delegate, thread send and schedule call would be refused until steps 1 and 2 are done.
+
+   The installer writes the hook into Claude Code's **managed settings**, which only root can change and which
+   every Claude Code and Agent SDK session reads, whatever settings sources it uses
    ([Claude Code docs: managed settings](https://code.claude.com/docs/en/managed-settings)). Its own file there is
    `managed-settings.d/model-guard.json` in `/etc/claude-code` on Linux (`/Library/Application Support/ClaudeCode`
    on macOS, `C:\Program Files\ClaudeCode` on Windows; the kit itself is Linux only today):
@@ -173,7 +197,7 @@ machine file), so an agent cannot widen its own policy.
    version older than 2.1.295 a hook that hangs until the timeout lets the call through; the guard does no network
    or slow work, so it answers in well under a second.
 
-2. Turn on `allowManagedHooksOnly` in `managed-settings.json` (the owner's choice):
+4. Turn on `allowManagedHooksOnly` in `managed-settings.json` (the owner's choice):
 
    ```json
    { "allowManagedHooksOnly": true }
@@ -183,25 +207,42 @@ machine file), so an agent cannot widen its own policy.
    a call's input (`updatedInput`) after the guard has seen it. With `allowManagedHooksOnly` only managed hooks
    run, so an agent cannot add such a hook by editing its own settings. It also stops every user and project hook,
    so move the hooks you need into managed settings first. If you accept the risk instead, set
-   `"allowOtherHooks": true` in the machine file's section (step 4) and the self-check stops asking for it.
-
-3. Write the policy, for example `/etc/fork-kit/model-policy.json`, root-owned, mode 644, in folders that are
-   root-owned and not writable by others all the way up to `/`. Start with `"mode": "advise"`.
-4. Name it in the machine file `/etc/fork-kit/machine.json` (see [common](../common/README.md)):
-
-   ```json
-   "model-guard": {
-     "policyFile": "/etc/fork-kit/model-policy.json"
-   }
-   ```
-
-   | Key               | Required | What                                                                    |
-   | ----------------- | -------- | ----------------------------------------------------------------------- |
-   | `policyFile`      | yes      | the policy; an absolute path                                            |
-   | `allowOtherHooks` | no       | `true` accepts user and project hooks next to the guard (default false) |
+   `"allowOtherHooks": true` in the machine file's section (step 2) and the self-check stops asking for it.
+   `allowManagedHooksOnly` closes the hook route only: settings `env` can still change the model (see
+   [What `enforce` does not stop](#what-enforce-does-not-stop); owner decision #298).
 
 5. Run `model-guard --self-check`. When advise mode has shown no surprises, set `"mode": "enforce"`. The change
    counts from the next call; nothing needs restarting.
+
+## What `enforce` does not stop
+
+The guard catches honest mistakes: an agent that picks a model or effort the policy does not list. It is not a hard
+control against an agent that sets out to get around it. The open routes (as read in Claude Code 2.1.325):
+
+- **Settings `env`.** Claude Code applies the `env` block of its settings files to the session, and some variables
+  change the model after the guard has passed the call:
+  - `CLAUDE_CODE_SUBAGENT_MODEL`, and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` (the `Agent` tool's `model` is then
+    ignored); `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL` replaces the model of every Workflow `agent()` call;
+    `ANTHROPIC_DEFAULT_*_MODEL` change what an alias (and so a row's `aliases`) means;
+  - the **user** settings file is not filtered at all, and the agent can write it;
+  - the **project** and **local** settings files: Claude Code drops `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL` from them
+    with a warning, but not `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` or
+    `ANTHROPIC_DEFAULT_*_MODEL`.
+
+  Managed `env` is applied last and wins, but a pin there forces one model on every sub-agent, which does not fit a
+  policy with several rows.
+
+- **Other hooks.** A user or project `PreToolUse` hook can change a call's input after the guard has checked it.
+  `allowManagedHooksOnly` (step 4, owner decision #298) closes this route only, not `env`.
+- **The Workflow check reads text.** It refuses what it cannot read for sure, but it is not a JavaScript parser or
+  a sandbox.
+
+The hard stop is Claude Code's own managed model keys. They are read from managed settings only and applied where
+the model is resolved, not on the text of a call: `availableModels` with `enforceAvailableModels` (and
+`availableModelsMatch: "exact"`), `deniedModels`, `maxEffortLevel`, and `disableWorkflows` to turn Workflow off.
+**Not yet tested here:** whether they bind sub-agents, Workflow agents and T3's sessions on every path must be
+tried once. With them in place, the guard stays the layer that explains a refusal, checks T3's own tools and
+catches mistakes early.
 
 ## Self-check (the drift check)
 
