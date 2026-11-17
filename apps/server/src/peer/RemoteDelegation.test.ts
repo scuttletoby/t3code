@@ -25,6 +25,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -647,6 +648,11 @@ const makeLaptop = (
   kept?: Context.Context<Layer.Success<ReturnType<typeof layerLinkingEnvironment>>>,
   /** Runs as each follow attempt here starts, on its follower's fiber. */
   beforeFollow: Effect.Effect<void, Orchestrator.OrchestratorV2Error> = Effect.void,
+  /** Run on a delegating call's fiber: before it looks for the project there, and before it records its task. */
+  pauses: {
+    readonly beforeResolve?: Effect.Effect<void>;
+    readonly beforeRecord?: Effect.Effect<void>;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const linking = kept ?? (yield* layerLinkingEnvironment(laptop).pipe(Layer.build));
@@ -684,6 +690,11 @@ const makeLaptop = (
                   ...threads,
                   getThreadEventSequence: (threadId: ThreadId) =>
                     beforeFollow.pipe(Effect.andThen(threads.getThreadEventSequence(threadId))),
+                  dispatch: (command) =>
+                    (command.type === "delegated_task.remote.request"
+                      ? (pauses.beforeRecord ?? Effect.void)
+                      : Effect.void
+                    ).pipe(Effect.andThen(threads.dispatch(command))),
                 };
               }),
             ),
@@ -702,10 +713,12 @@ const makeLaptop = (
           Layer.provide(
             Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
               resolve: (cwd) =>
-                Effect.succeed(
-                  cwd === "/home/me/app"
-                    ? ({ canonicalKey: "github.com/acme/app" } as RepositoryIdentity)
-                    : null,
+                (pauses.beforeResolve ?? Effect.void).pipe(
+                  Effect.as(
+                    cwd === "/home/me/app"
+                      ? ({ canonicalKey: "github.com/acme/app" } as RepositoryIdentity)
+                      : null,
+                  ),
                 ),
             }),
           ),
@@ -1305,6 +1318,115 @@ it.effect("refuses worktree isolation for a task there before launching anything
       expect(result.isError).toBe(true);
       expect(JSON.stringify(result.content)).toContain("isolation");
       expect(yield* Ref.get(thread.launched)).toBeNull();
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+/** A point a delegating call stops at until the test lets it go on. */
+const makePause = Effect.gen(function* () {
+  const reached = yield* Deferred.make<void>();
+  const release = yield* Deferred.make<void>();
+  return {
+    reached,
+    release,
+    hold: Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+  };
+});
+
+/**
+ * Delegates to the box and interrupts the call at `pause`, as the parent's provider does when
+ * its turn moves on mid-call (a message steered into it), then lets the call go on.
+ */
+const delegateInterruptedAt = (
+  laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>,
+  pause: Effect.Success<typeof makePause>,
+) =>
+  Effect.gen(function* () {
+    const call = yield* delegateToBox(laptopEnv).pipe(Effect.forkChild);
+    yield* Deferred.await(pause.reached);
+    call.interruptUnsafe();
+    yield* Deferred.succeed(pause.release, undefined);
+    return yield* Fiber.await(call);
+  });
+
+it.effect.each(["after the launch there answered", "while the launch there is answered"] as const)(
+  "a delegate call interrupted %s still records and follows its task",
+  (step) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const pause = yield* makePause;
+        const a = yield* makeLaptop(
+          database,
+          offers,
+          undefined,
+          Effect.void,
+          step === "after the launch there answered" ? { beforeRecord: pause.hold } : {},
+        );
+        if (step === "while the launch there is answered") {
+          yield* Ref.set(thread.afterLaunch, pause.hold);
+        }
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+
+        const exit = yield* delegateInterruptedAt(a, pause);
+        // The caller hears nothing; the thread there is still this parent's task.
+        expect(Exit.hasInterrupts(exit)).toBe(true);
+        const launched = yield* Ref.get(thread.launched);
+        expect(launched).not.toBeNull();
+        const { subagents } = yield* a.orchestrator.getThreadProjection(parentThreadId);
+        expect(subagents).toHaveLength(1);
+        const taskId = subagents[0]!.id;
+        expect(subagents[0]!.remoteChild?.threadId).toBe(launched);
+
+        // The same call again (same clientRequestId) finds that task, not a second one.
+        const retried = yield* delegateToBox(a);
+        expect(retried.taskId).toBe(taskId);
+        expect((yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents).toHaveLength(
+          1,
+        );
+
+        // Its follower runs, so its end there reaches the parent here, once.
+        yield* Ref.set(thread.reply, "Done after all.");
+        yield* Ref.set(thread.status, "completed");
+        yield* Deferred.succeed(thread.finished, undefined);
+        expect(yield* taskResult(a, taskId)).toMatchObject({
+          status: "completed",
+          result: "Done after all.",
+        });
+        const parentRun = (yield* a.orchestrator.getThreadProjection(parentThreadId)).runs.find(
+          (run) => run.id === parentRunId,
+        );
+        expect(parentRun?.delegatedCompletion?.delivery?.taskIds).toEqual([taskId]);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("a delegate call interrupted before its launch there launches and records nothing", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const pause = yield* makePause;
+      const a = yield* makeLaptop(database, offers, undefined, Effect.void, {
+        beforeResolve: pause.hold,
+      });
+      yield* linkTo(a.links, b, "full-access");
+      yield* seedParent(a);
+
+      const exit = yield* delegateInterruptedAt(a, pause);
+      expect(Exit.hasInterrupts(exit)).toBe(true);
+      expect(yield* Ref.get(thread.launched)).toBeNull();
+      expect((yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents).toEqual([]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
