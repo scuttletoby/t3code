@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "mode": "shadow",
+  "rules": [
+    {
+      "name": "data",
+      "weight": "critical",
+      "paths": ["src/storage/**", "migrations/**"],
+      "lenses": ["data-1", "data-2"]
+    },
+    { "name": "docs", "weight": "light", "paths": ["docs/**", "**/*.md"], "lenses": [] },
+    { "name": "code", "weight": "normal", "paths": ["**"], "lenses": ["code"] }
+  ],
+  "lenses": {
+    "data-1": { "prompt": ".github/lenses/data.md" },
+    "data-2": { "prompt": ".github/lenses/data.md" },
+    "code": { "prompt": ".github/lenses/code.md" },
+    "approach": { "prompt": ".github/lenses/approach.md" }
+  },
+  "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
+  "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+  "findings": true,
+  "state_line": true
+}
