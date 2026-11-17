@@ -10,9 +10,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
-import type { OrchestrationV2DomainEvent, ThreadId } from "@t3tools/contracts";
+import { type OrchestrationV2DomainEvent, type ThreadId, TurnItemId } from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 
 import { ServerConfig } from "../config.ts";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -21,7 +23,6 @@ import * as DueHint from "../scheduling/DueHint.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { forkParked } from "../serverActivation.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
-import * as WaitDelivery from "../waits/WaitDelivery.ts";
 import * as PlaytestService from "./PlaytestService.ts";
 import { PLAYTEST_STORE_FILE } from "./PlaytestStore.ts";
 
@@ -69,12 +70,6 @@ const makeThreadGone = Effect.fn("PlaytestLayer.makeThreadGone")(function* () {
     );
 });
 
-/** Delivered, tried again later (same ids), or dropped: gone, stopped by a person, or refused. */
-export const noticeResultOf = (
-  result: WaitDelivery.WaitDeliveryResult,
-): PlaytestService.PlaytestNoticeResult =>
-  result.type === "delivered" ? "delivered" : result.type === "retry" ? "retry" : "dropped";
-
 /** A message the person wrote (not an agent's or T3's own), as activity for its thread's session. */
 export const personActivity = (
   event: OrchestrationV2DomainEvent,
@@ -86,15 +81,66 @@ export const personActivity = (
     : null;
 
 /**
- * The message about an end goes to the thread at most once (fixed ids). A thread that is gone,
- * stopped by a person, or refuses it does not get it; the session's status still says why it ended.
+ * The end notice for the person: a `system_notice` item (never a message), so it starts no agent
+ * turn. Its fixed id keeps it one item however often it is written. A gone thread drops it; an
+ * unreadable thread or a failed write is tried again later (`retry`).
  */
-const makeNotify = Effect.fn("PlaytestLayer.makeNotify")(function* () {
-  const delivery = yield* WaitDelivery.make();
+export const makeNotify = Effect.fn("PlaytestLayer.makeNotify")(function* () {
+  const threads = yield* ThreadManagement.ThreadManagementService;
+  const eventSink = yield* EventSink.EventSinkV2;
+  const ids = yield* IdAllocator.IdAllocatorV2;
   return (
     notice: PlaytestService.PlaytestNotice,
   ): Effect.Effect<PlaytestService.PlaytestNoticeResult> =>
-    delivery.deliver(notice).pipe(Effect.map(noticeResultOf));
+    Effect.gen(function* () {
+      const shell = yield* threads.getThreadShell(notice.threadId);
+      if (shell === null || shell.archivedAt !== null || shell.deletedAt !== null) {
+        return "dropped" as const;
+      }
+      const threadId = notice.threadId;
+      const runId = shell.latestRunId;
+      const now = yield* DateTime.now;
+      yield* eventSink.write({
+        events: [
+          {
+            id: yield* ids.allocate.event({ threadId }),
+            type: "turn-item.updated",
+            threadId,
+            // A thread with no run yet: the event has none; the item says null.
+            ...(runId === null ? {} : { runId }),
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make(notice.noticeId),
+              threadId,
+              runId,
+              nodeId: null,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              // EventSink allocates the real position; an item already there keeps its own.
+              ordinal: 0,
+              status: "completed",
+              title: notice.title,
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              type: "system_notice",
+              level: notice.level,
+              message: notice.text,
+            },
+          },
+        ],
+      });
+      return "delivered" as const;
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning(
+          `playtest: the notice for thread ${notice.threadId} could not be written now`,
+          cause,
+        ).pipe(Effect.as("retry" as const)),
+      ),
+    );
 });
 
 const isGone = (event: OrchestrationV2DomainEvent) =>

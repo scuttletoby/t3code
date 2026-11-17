@@ -9,6 +9,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -38,25 +39,87 @@ import {
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 
-/** The real clock moved by `advance`; sleeps (step time limits) stay real. */
+/**
+ * The real clock moved by `advance` (wall and monotonic) and `setBack` (wall only). Sleeps under a
+ * minute (step time limits) stay real; longer ones (the service's call limits) end only when
+ * `advance` moves the monotonic clock past them.
+ */
 const shiftedClock = Effect.gen(function* () {
   const real = yield* Clock.Clock;
-  let offset = 0;
-  const ms = () => real.currentTimeMillisUnsafe() + offset;
+  let wallOffset = 0;
+  let monoOffset = 0;
+  const ms = () => real.currentTimeMillisUnsafe() + wallOffset;
+  const monoNanos = () => real.monotonicTimeNanosUnsafe() + BigInt(monoOffset) * 1_000_000n;
+  const monoMs = () => Number(monoNanos() / 1_000_000n);
+  const sleepers = new Set<{ readonly until: number; readonly wake: Deferred.Deferred<void> }>();
+  let pulse = Deferred.makeUnsafe<void>();
+  const poke = () => {
+    const reached = pulse;
+    pulse = Deferred.makeUnsafe<void>();
+    Deferred.doneUnsafe(reached, Effect.void);
+  };
+  const wakeDue = () => {
+    for (const sleeper of sleepers) {
+      if (sleeper.until > monoMs()) continue;
+      sleepers.delete(sleeper);
+      Deferred.doneUnsafe(sleeper.wake, Effect.void);
+    }
+  };
   const clock: Clock.Clock = {
     currentTimeMillisUnsafe: ms,
     currentTimeMillis: Effect.sync(ms),
     currentTimeNanosUnsafe: () => BigInt(ms()) * 1_000_000n,
     currentTimeNanos: Effect.sync(() => BigInt(ms()) * 1_000_000n),
-    monotonicTimeNanosUnsafe: () => real.monotonicTimeNanosUnsafe(),
-    monotonicTimeNanos: real.monotonicTimeNanos,
-    sleep: (duration) => real.sleep(duration),
+    monotonicTimeNanosUnsafe: monoNanos,
+    monotonicTimeNanos: Effect.sync(monoNanos),
+    sleep: (duration) => {
+      const length = Duration.toMillis(duration);
+      if (length < MINUTE) return real.sleep(duration);
+      return Effect.suspend(() => {
+        const sleeper = { until: monoMs() + length, wake: Deferred.makeUnsafe<void>() };
+        sleepers.add(sleeper);
+        poke();
+        return Deferred.await(sleeper.wake).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              sleepers.delete(sleeper);
+              poke();
+            }),
+          ),
+        );
+      });
+    },
   };
   return {
     clock,
     nowMs: ms,
     iso: (shiftMs = 0) => DateTime.formatIso(DateTime.makeUnsafe(ms() + shiftMs)),
-    advance: (byMs: number) => Effect.sync(() => void (offset += byMs)),
+    advance: (byMs: number) =>
+      Effect.sync(() => {
+        wallOffset += byMs;
+        monoOffset += byMs;
+        wakeDue();
+      }),
+    /** The wall clock set back (as a person or NTP may); time itself goes on. */
+    setBack: (byMs: number) => Effect.sync(() => void (wallOffset -= byMs)),
+    /** How many call limits wait now. */
+    longSleeps: () => sleepers.size,
+    /** Marks a background call (a fake's, or a call limit's start or end), for `until`. */
+    poke,
+    /** Waits until `check` holds, looking again after every `poke` (20 s at most). */
+    until: (check: () => boolean, what = "a background call") =>
+      Effect.gen(function* () {
+        while (true) {
+          const next = pulse;
+          if (check()) return;
+          yield* Deferred.await(next);
+        }
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "20 seconds",
+          orElse: () => Effect.die(new Error(`timed out waiting for ${what}`)),
+        }),
+      ),
   };
 });
 type Time = Effect.Success<typeof shiftedClock>;
@@ -64,8 +127,12 @@ type Time = Effect.Success<typeof shiftedClock>;
 /** Every change the service reports, so a test can wait for a background step to settle. */
 const changeSignal = Effect.sync(() => {
   let next = Deferred.makeUnsafe<void>();
+  let count = 0;
   return {
+    /** How many changes the service has reported. */
+    count: () => count,
     onChange: Effect.suspend(() => {
+      count += 1;
       const reached = next;
       next = Deferred.makeUnsafe<void>();
       return Deferred.succeed(reached, undefined);
@@ -87,19 +154,42 @@ const changeSignal = Effect.sync(() => {
   };
 });
 
-/** A notify fake: records each notice and answers from `answers` (then "delivered"). */
-const notifyFake = (answers: Array<PlaytestService.PlaytestNoticeResult | "crash"> = []) => {
+/**
+ * A notify fake: records each notice (and calls `onCall`) and answers from `answers` (then
+ * "delivered"); "hang" never answers, and an Effect answers when it does.
+ */
+const notifyFake = (
+  answers: Array<
+    | PlaytestService.PlaytestNoticeResult
+    | "crash"
+    | "hang"
+    | Effect.Effect<PlaytestService.PlaytestNoticeResult>
+  > = [],
+  onCall: () => void = () => {},
+) => {
   const notices: Array<PlaytestService.PlaytestNotice> = [];
   return {
     notices,
     notify: (notice: PlaytestService.PlaytestNotice) =>
       Effect.suspend(() => {
         notices.push(notice);
+        onCall();
         const answer = answers.shift() ?? "delivered";
+        if (typeof answer !== "string") return answer;
+        if (answer === "hang") return Effect.never;
         return answer === "crash" ? Effect.die(new Error("boom")) : Effect.succeed(answer);
       }),
   };
 };
+
+/** `effect`, or a failed test when it has not returned in 10 seconds (a sweep that hangs). */
+const within10s = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.timeoutOrElse({
+      duration: "10 seconds",
+      orElse: () => Effect.die(new Error("the sweep did not return")),
+    }),
+  );
 
 /** A sweep world: the clock, the change signal, and a service on the fixture's store. */
 const world = Effect.gen(function* () {
@@ -276,8 +366,9 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
           const [notice] = fake.notices;
           assert.deepInclude(notice, {
             threadId: THREAD,
-            messageId: "playtest-pt_aaaaaaaaaa-end",
-            commandId: "playtest-pt_aaaaaaaaaa-end:0",
+            noticeId: "playtest-pt_aaaaaaaaaa-end",
+            title: "Playtest ended",
+            level: "warning",
           });
           assert.include(notice!.text, "its claim was gone when T3 renewed it");
           assert.include(notice!.text, "Release ran");
@@ -398,6 +489,8 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
           yield* service.runDue();
           yield* signal.until(Effect.map(status(service), (s) => s.notice === "sent"));
           assert.include(fake.notices[0]!.text, "nothing happened for 90 minutes");
+          assert.include(fake.notices[0]!.text, "start a new session when you are back");
+          assert.strictEqual(fake.notices[0]!.level, "info");
         }),
       ),
     ),
@@ -449,20 +542,29 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
               threadGone: (threadId) =>
                 Effect.sync(() => {
                   asked.push(threadId);
+                  time.poke();
                   return threadId === THREAD ? true : null;
                 }),
             },
           );
+          // The read runs in the background; the sweep after its answer ends the session.
           yield* service.runDue();
-          yield* signal.until(Effect.map(status(service), (s) => s.state === "ended"));
+          yield* signal.until(
+            Effect.andThen(
+              service.runDue(),
+              Effect.map(status(service), (s) => s.state === "ended"),
+            ),
+          );
           const gone = yield* status(service);
           assert.strictEqual(gone.endReason, "thread-gone");
           assert.notProperty(gone, "notice");
           assert.strictEqual((yield* status(service, OTHER_THREAD)).state, "active");
+          // An ended session's thread is not read again; the other one is.
+          const before = asked.length;
           yield* service.runDue();
+          yield* time.until(() => asked.length > before);
+          assert.deepStrictEqual(asked.slice(before), [OTHER_THREAD]);
           assert.deepStrictEqual(fake.notices, []);
-          // An ended session's thread is not read again.
-          assert.notInclude(asked.slice(2), THREAD);
         }),
       ),
     ),
@@ -569,11 +671,223 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
             yield* service.runDue();
             yield* signal.until(Effect.map(status(service), (s) => s.notice === "sent"));
             assert.strictEqual(fake.notices.length, 3);
-            // The same ids every time: the thread gets it at most once.
-            assert.deepStrictEqual(
-              new Set(fake.notices.map((notice) => `${notice.messageId} ${notice.commandId}`)).size,
-              1,
+            // The same id every time: the thread shows it at most once.
+            assert.deepStrictEqual(new Set(fake.notices.map((notice) => notice.noticeId)).size, 1);
+          }),
+        ),
+      ),
+  );
+
+  it.live(
+    "a thread read that hangs: the sweep returns, other sessions renew, and the read is bounded",
+    () =>
+      live(
+        withTime(({ fx, dir, time, signal }) =>
+          Effect.gen(function* () {
+            yield* writeStore(fx, [
+              freshSession(fx, dir, time),
+              freshSession(fx, dir, time, { id: "pt_bbbbbbbbbb", threadId: OTHER_THREAD }),
+            ]);
+            const asked: Array<ThreadId> = [];
+            let stopped = 0;
+            const service = yield* serviceIn(
+              { fx, dir, signal },
+              {
+                threadGone: (threadId) =>
+                  Effect.suspend(() => {
+                    asked.push(threadId);
+                    time.poke();
+                    return threadId === THREAD
+                      ? Effect.never.pipe(
+                          Effect.onInterrupt(() =>
+                            Effect.sync(() => {
+                              stopped += 1;
+                              time.poke();
+                            }),
+                          ),
+                        )
+                      : Effect.succeed(false);
+                  }),
+              },
             );
+            yield* within10s(service.runDue());
+            yield* signal.until(Effect.map(finished(dir, "renew"), (count) => count === 2));
+            assert.isDefined((yield* status(service, OTHER_THREAD)).renewedAt);
+            assert.isDefined((yield* status(service)).renewedAt);
+
+            // The next sweep runs too, and does not start a second read of the stuck thread.
+            yield* within10s(service.runDue());
+            yield* time.until(
+              () => asked.filter((id) => id === OTHER_THREAD).length === 2,
+              "the second read",
+            );
+            assert.strictEqual(asked.filter((id) => id === THREAD).length, 1);
+
+            // After the call limit the read is stopped and not taken as "gone"; it is read again.
+            yield* time.until(() => time.longSleeps() === 1, "one call limit");
+            const changes = signal.count();
+            yield* time.advance(PlaytestService.CALL_LIMIT_MS);
+            yield* signal.until(Effect.sync(() => signal.count() > changes));
+            assert.strictEqual(stopped, 1);
+            yield* service.runDue();
+            yield* time.until(
+              () => asked.filter((id) => id === THREAD).length === 2,
+              "the stuck thread read again",
+            );
+            assert.strictEqual((yield* status(service)).state, "active");
+          }),
+        ),
+      ),
+  );
+
+  it.live("a sweep while a release runs starts no second release", () =>
+    live(
+      withTime(({ fx, dir, time, signal }) =>
+        Effect.gen(function* () {
+          yield* writeStore(fx, [
+            freshSession(fx, dir, time, { state: "ending", endReason: "agent" }),
+          ]);
+          const service = yield* serviceIn({ fx, dir, signal });
+          yield* holdStep(dir, "release");
+          yield* service.runDue();
+          yield* stepStarted(dir, "release");
+          yield* service.runDue();
+          yield* time.advance(HOUR);
+          yield* service.runDue();
+          assert.strictEqual(yield* starts(dir, "release"), 1);
+          yield* openGate(dir, "release");
+          yield* signal.until(Effect.map(status(service), (s) => s.state === "ended"));
+          assert.strictEqual(yield* starts(dir, "release"), 1);
+        }),
+      ),
+    ),
+  );
+
+  it.live("a slow notice is not sent a second time while it runs", () =>
+    live(
+      withTime(({ fx, dir, time, signal }) =>
+        Effect.gen(function* () {
+          yield* writeStore(fx, [
+            freshSession(fx, dir, time, { lastActivityAt: time.iso(-2 * HOUR) }),
+          ]);
+          const answer = yield* Deferred.make<PlaytestService.PlaytestNoticeResult>();
+          const fake = notifyFake([Deferred.await(answer)], time.poke);
+          const service = yield* serviceIn({ fx, dir, signal }, { notify: fake.notify });
+          yield* service.runDue();
+          yield* signal.until(Effect.map(status(service), (s) => s.state === "ended"));
+          yield* service.runDue();
+          yield* time.until(() => fake.notices.length === 1);
+          yield* service.runDue();
+          yield* service.runDue();
+          assert.strictEqual(fake.notices.length, 1);
+          yield* Deferred.succeed(answer, "delivered");
+          yield* signal.until(Effect.map(status(service), (s) => s.notice === "sent"));
+          yield* service.runDue();
+          assert.strictEqual(fake.notices.length, 1);
+        }),
+      ),
+    ),
+  );
+
+  it.live("a wall clock set back does not hold up renew (monotonic timing)", () =>
+    live(
+      withTime(({ fx, dir, time, signal }) =>
+        Effect.gen(function* () {
+          yield* writeStore(fx, [freshSession(fx, dir, time)]);
+          const service = yield* serviceIn({ fx, dir, signal });
+          yield* service.runDue();
+          yield* signal.until(Effect.map(status(service), (s) => s.renewedAt !== undefined));
+
+          yield* time.setBack(HOUR);
+          // Still due ten minutes after the last renew, said in (set back) wall time.
+          const next = yield* service.runDue();
+          assert.isAtMost(next.nextDueAt, time.nowMs() + 10 * MINUTE);
+          assert.isAtLeast(next.nextDueAt, time.nowMs() + 9 * MINUTE);
+          assert.strictEqual(yield* starts(dir, "renew"), 1);
+
+          yield* time.advance(10 * MINUTE);
+          yield* service.runDue();
+          yield* signal.until(Effect.map(finished(dir, "renew"), (count) => count === 2));
+          assert.strictEqual((yield* status(service)).state, "active");
+        }),
+      ),
+    ),
+  );
+
+  it.live("a notice send that hangs is stopped after the call limit and tried again once", () =>
+    live(
+      withTime(({ fx, dir, time, signal }) =>
+        Effect.gen(function* () {
+          yield* writeStore(fx, [
+            freshSession(fx, dir, time, { lastActivityAt: time.iso(-2 * HOUR) }),
+          ]);
+          const fake = notifyFake(["hang"], time.poke);
+          const service = yield* serviceIn({ fx, dir, signal }, { notify: fake.notify });
+          yield* service.runDue();
+          yield* signal.until(Effect.map(status(service), (s) => s.state === "ended"));
+          yield* service.runDue();
+          yield* time.until(() => fake.notices.length === 1 && time.longSleeps() === 1);
+
+          yield* time.advance(PlaytestService.CALL_LIMIT_MS);
+          const settledTry = Effect.map(service.runDue(), (next) => next.nextDueAt);
+          yield* signal.until(Effect.map(settledTry, (at) => at !== Number.POSITIVE_INFINITY));
+          assert.strictEqual((yield* status(service)).notice, "due");
+          assert.strictEqual(fake.notices.length, 1);
+
+          yield* time.advance(MINUTE);
+          yield* service.runDue();
+          yield* signal.until(Effect.map(status(service), (s) => s.notice === "sent"));
+          assert.strictEqual(fake.notices.length, 2);
+          assert.strictEqual(fake.notices[0]!.noticeId, fake.notices[1]!.noticeId);
+        }),
+      ),
+    ),
+  );
+
+  it.live(
+    "renew failing longer than the claim lives ends the session as claim-gone, and says so once",
+    () =>
+      live(
+        withTime(({ fx, dir, time, signal }) =>
+          Effect.gen(function* () {
+            const fake = notifyFake();
+            const service = yield* serviceIn(
+              { fx, dir, signal },
+              { notify: fake.notify, overrides: { renewMinutes: 1 } },
+            );
+            assert.strictEqual(
+              (yield* service.start({ threadId: THREAD, target: "dev-1" })).outcome,
+              "started",
+            );
+            yield* setFile(dir, "renew.code", "3");
+            // One failed renew a minute (a sweep again after each change, until the renew ran).
+            for (const count of [1, 2]) {
+              yield* time.advance(MINUTE);
+              yield* signal.until(
+                Effect.andThen(
+                  service.runDue(),
+                  Effect.map(finished(dir, "renew"), (done) => done === count),
+                ),
+              );
+              assert.strictEqual((yield* status(service)).state, "active");
+            }
+            yield* time.advance(MINUTE);
+            yield* signal.until(
+              Effect.andThen(
+                service.runDue(),
+                Effect.map(status(service), (s) => s.state === "ended"),
+              ),
+            );
+            const ended = yield* status(service);
+            assert.deepInclude(ended, { endReason: "claim-gone", notice: "due" });
+            assert.include(ended.problem, "renew: failed for 3 minutes in a row");
+            assert.strictEqual(yield* starts(dir, "release"), 1);
+
+            yield* service.runDue();
+            yield* signal.until(Effect.map(status(service), (s) => s.notice === "sent"));
+            assert.strictEqual(fake.notices.length, 1);
+            assert.include(fake.notices[0]!.text, "could not renew its claim for 3 minutes");
+            assert.strictEqual(fake.notices[0]!.level, "warning");
           }),
         ),
       ),
@@ -627,9 +941,19 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
       adapter: { renewMinutes: 10, idleMinutes: 90, maxHours: 6 },
     } as unknown as PlaytestSessionRecord;
     const limit = PlaytestService.noticeText({ ...base, state: "ended", endReason: "time-limit" });
+    assert.include(limit, "The playtest of dev-1 ended");
     assert.include(limit, "time limit of 6 hours");
     assert.include(limit, "Release ran");
     assert.include(limit, "worktree and its changes are kept");
+    assert.include(limit, "start a new session when you are back");
+    // Written for the person: nothing that asks an agent to act.
+    assert.notMatch(limit, /\b(call|run|use) (the )?(playtest|start|tool)/iu);
+    const failed = PlaytestService.noticeText({
+      ...base,
+      state: "ended",
+      endReason: "claim-failed",
+    });
+    assert.include(failed, "start a new session to go on");
     const stuck = PlaytestService.noticeText({
       ...base,
       state: "ending",

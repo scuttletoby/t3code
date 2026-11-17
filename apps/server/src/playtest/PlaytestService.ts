@@ -31,6 +31,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
@@ -45,6 +46,23 @@ const RELEASE_PROBLEM = "release: ";
 const RENEW_PROBLEM = "renew: ";
 /** A renew, or a message about an end, that failed is tried again this soon (at most `renewMinutes`). */
 const RETRY_MS = 60_000;
+/**
+ * How long a thread read or a message send may take. A late read counts as "not known" (the thread
+ * is not taken as gone); a late send is stopped and tried again later (same notice id).
+ */
+export const CALL_LIMIT_MS = 60_000;
+const CALL_LIMIT = Duration.millis(CALL_LIMIT_MS);
+/**
+ * Renew failed this many `renewMinutes` in a row: the claim has expired on the target (which must
+ * let a claim live well past `renewMinutes`), so T3 ends the session as `claim-gone` and says so.
+ */
+const RENEW_LAPSE_PERIODS = 3;
+const RENEW_LAPSED = `${RENEW_PROBLEM}failed for `;
+/**
+ * Now on the monotonic clock, in ms: when a renew, a release or a message is due again. A wall
+ * clock set back must not hold them up; wall time is only stored and shown.
+ */
+const monotonicMillis = Effect.map(Clock.monotonicTimeNanos, (nanos) => Number(nanos / 1_000_000n));
 /** How much of a step's problem a message to the thread quotes. */
 const NOTICE_DETAIL_MAX = 300;
 /** A release that cannot even start ends the session anyway; the claim expires on the target. */
@@ -56,14 +74,18 @@ export type PlaytestPlace =
   | { readonly type: "ok"; readonly projectId: ProjectId; readonly worktree: string }
   | { readonly type: "unavailable"; readonly message: string };
 
-/** A message to the thread that T3 ended its session; the ids are the same on every try. */
+/**
+ * A notice for the person in the thread that T3 ended its session; it starts no agent turn. The id
+ * is the same on every try, so it shows once.
+ */
 export type PlaytestNotice = {
   readonly threadId: ThreadId;
-  readonly messageId: string;
-  readonly commandId: string;
+  readonly noticeId: string;
+  readonly title: string;
+  readonly level: "info" | "warning";
   readonly text: string;
 };
-/** `dropped`: the thread cannot take it (gone, stopped, refused); it is not tried again. */
+/** `dropped`: the thread cannot take it (gone); it is not tried again. */
 export type PlaytestNoticeResult = "delivered" | "dropped" | "retry";
 
 type OpKind = "claim" | "round" | "release";
@@ -159,7 +181,9 @@ function endWhy(session: PlaytestSessionRecord): string {
     case "time-limit":
       return `it reached its time limit of ${adapter.maxHours} hours`;
     case "claim-gone":
-      return "its claim was gone when T3 renewed it";
+      return session.problem?.startsWith(RENEW_LAPSED)
+        ? `T3 could not renew its claim for ${RENEW_LAPSE_PERIODS * adapter.renewMinutes} minutes, so the claim has expired on the target`
+        : "its claim was gone when T3 renewed it";
     case "claim-failed":
       return "T3 stopped while its claim ran";
     default:
@@ -167,7 +191,7 @@ function endWhy(session: PlaytestSessionRecord): string {
   }
 }
 
-/** The message about an end T3 made itself: why, and whether the target is back. */
+/** The notice about an end T3 made itself, for the person: why, and whether the target is back. */
 export function noticeText(session: PlaytestSessionRecord): string {
   const problem = session.problem === undefined ? "" : tail(session.problem, NOTICE_DETAIL_MAX);
   const release =
@@ -180,7 +204,21 @@ export function noticeText(session: PlaytestSessionRecord): string {
     session.endReason === "claim-gone" && problem !== "" && session.state === "ended"
       ? ` Renew said: ${problem}`
       : "";
-  return `Playtest session ${session.id} for ${session.target} ended: ${endWhy(session)}. ${release}${renew} The worktree and its changes are kept; start a new session to go on.`;
+  const next =
+    session.endReason === "idle" || session.endReason === "time-limit"
+      ? "start a new session when you are back"
+      : "start a new session to go on";
+  return `The playtest of ${session.target} ended (session ${session.id}): ${endWhy(session)}. ${release}${renew} The worktree and its changes are kept; ${next}.`;
+}
+
+/** A warning when the target may not be back as it was, or the claim was lost. */
+function noticeLevel(session: PlaytestSessionRecord): PlaytestNotice["level"] {
+  return session.state === "ending" ||
+    session.endReason === "claim-gone" ||
+    session.endReason === "claim-failed" ||
+    (session.problem?.startsWith(RELEASE_COULD_NOT_RUN) ?? false)
+    ? "warning"
+    : "info";
 }
 
 /** Why a process could not run, in one line, without its command line. */
@@ -226,13 +264,22 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
   const ops = new Map<string, Op>();
   /** Renews run beside a round (a long build must not let the claim expire); one per session. */
   const renewing = new Map<string, { fiber: Fiber.Fiber<void> | undefined }>();
+  // Times below are on the monotonic clock (`monotonicMillis`).
   /** The last renew this T3 tried, by session: none after a restart, so the first sweep renews. */
   const renewTried = new Map<string, { readonly at: number; readonly ok: boolean }>();
+  /**
+   * Since when the claim is known renewed, by session: its last good claim or renew, else (after a
+   * restart) its first failed renew. Renew failing `RENEW_LAPSE_PERIODS` periods from it ends it.
+   */
+  const renewGoodSince = new Map<string, number>();
   /** When this T3 last ran a session's release; none after a restart, so the first sweep runs it. */
   const releaseTried = new Map<string, number>();
-  /** Messages about an end: being sent now, and when one that could not be sent is tried again. */
+  /** Notices about an end: being sent now, and when one that could not be sent is tried again. */
   const noticeSending = new Set<string>();
   const noticeRetryAt = new Map<string, number>();
+  /** Thread reads that run now (at most one per thread), and the threads the last read found gone. */
+  const threadReads = new Set<ThreadId>();
+  const goneThreads = new Set<ThreadId>();
   const changed = input.onChange ?? Effect.void;
 
   const now = Effect.map(Clock.currentTimeMillis, iso);
@@ -423,7 +470,7 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     );
     yield* locked(
       Effect.gen(function* () {
-        releaseTried.set(id, yield* Clock.currentTimeMillis);
+        releaseTried.set(id, yield* monotonicMillis);
         const current = find(id);
         if (current === undefined || current.state !== "ending") return;
         const at = yield* now;
@@ -468,7 +515,11 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
           if (current === undefined || current.state !== "claiming") return false;
           const at = yield* now;
           // A claim just taken needs no renew before `renewMinutes`.
-          if (out.result === "ok") renewTried.set(id, { at: toMs(at), ok: true });
+          if (out.result === "ok") {
+            const monoMs = yield* monotonicMillis;
+            renewTried.set(id, { at: monoMs, ok: true });
+            renewGoodSince.set(id, monoMs);
+          }
           yield* record(
             replace(
               out.result === "ok"
@@ -617,7 +668,8 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
 
   /**
    * One renew, beside any round. Exit 0 moves `renewedAt`; exit 10 (the claim is gone) ends the
-   * session; any other answer is kept as the problem and tried again in a minute.
+   * session; any other answer is kept as the problem and tried again in a minute, until renew has
+   * failed for `RENEW_LAPSE_PERIODS` periods: the claim has expired, so that ends it too.
    */
   const renewBody = Effect.fnUntraced(function* (
     id: string,
@@ -636,7 +688,10 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     yield* locked(
       Effect.gen(function* () {
         const nowMs = yield* Clock.currentTimeMillis;
-        renewTried.set(id, { at: nowMs, ok: out.result === "ok" });
+        const monoMs = yield* monotonicMillis;
+        renewTried.set(id, { at: monoMs, ok: out.result === "ok" });
+        if (out.result === "ok") renewGoodSince.set(id, monoMs);
+        else if (!renewGoodSince.has(id)) renewGoodSince.set(id, monoMs);
         // Done before a claim-gone end below, so that end does not wait for this very fiber.
         if (renewing.get(id) === entry) renewing.delete(id);
         const current = find(id);
@@ -656,6 +711,22 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
               Effect.logWarning(`playtest: ${id} could not end: ${error.message}`),
             ),
           );
+        } else if (
+          monoMs - renewGoodSince.get(id)! >=
+          RENEW_LAPSE_PERIODS * current.adapter.renewMinutes * 60_000
+        ) {
+          const minutes = RENEW_LAPSE_PERIODS * current.adapter.renewMinutes;
+          yield* Effect.logWarning(
+            `playtest: renew of ${id} failed for ${minutes} minutes; its claim has expired, so the session ends`,
+          );
+          yield* beginEnd(current, "claim-gone", {
+            problem: `${RENEW_LAPSED}${minutes} minutes in a row; last: ${out.detail}`,
+            notice: true,
+          }).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning(`playtest: ${id} could not end: ${error.message}`),
+            ),
+          );
         } else {
           yield* Effect.logWarning(`playtest: renew of ${id} failed: ${out.detail}`);
           yield* record(
@@ -667,35 +738,52 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
     ).pipe(Effect.uninterruptible);
   });
 
-  /** Sends the message about an end T3 made itself; `sent` once delivered or not deliverable. */
+  /**
+   * Sends the notice about an end T3 made itself, within `CALL_LIMIT`; `sent` once delivered or
+   * not deliverable. A crash or a late answer leaves it `due`: it is tried again in a minute, with
+   * the same id, so the thread still shows it once.
+   */
   const sendNotice = Effect.fn("PlaytestService.sendNotice")(
     function* (id: string, notify: NonNullable<typeof input.notify>) {
       const session = find(id);
       if (session === undefined) return;
-      const result = yield* notify({
-        threadId: session.threadId,
-        messageId: `playtest-${id}-end`,
-        commandId: `playtest-${id}-end:0`,
-        text: noticeText(session),
-      }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning(`playtest: the message about ${id} crashed`, cause).pipe(
-            Effect.as<PlaytestNoticeResult>("retry"),
-          ),
+      const fiber = yield* Effect.suspend(() =>
+        notify({
+          threadId: session.threadId,
+          noticeId: `playtest-${id}-end`,
+          title: "Playtest ended",
+          level: noticeLevel(session),
+          text: noticeText(session),
+        }),
+      ).pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) =>
+            Effect.logWarning(`playtest: the notice about ${id} crashed`, cause).pipe(
+              Effect.as<PlaytestNoticeResult>("retry"),
+            ),
         ),
+        Effect.forkIn(runScope),
       );
+      const answer = yield* Fiber.join(fiber).pipe(Effect.timeoutOption(CALL_LIMIT));
+      if (Option.isNone(answer)) {
+        yield* Fiber.interrupt(fiber).pipe(Effect.forkIn(runScope));
+        yield* Effect.logWarning(
+          `playtest: the notice about ${id} gave no answer in ${Duration.format(CALL_LIMIT)}; it is stopped and tried again later`,
+        );
+      }
+      const result = Option.getOrElse(answer, (): PlaytestNoticeResult => "retry");
       yield* locked(
         Effect.gen(function* () {
-          const nowMs = yield* Clock.currentTimeMillis;
           const current = find(id);
           if (result === "retry") {
-            noticeRetryAt.set(id, nowMs + RETRY_MS);
+            noticeRetryAt.set(id, (yield* monotonicMillis) + RETRY_MS);
             return;
           }
           noticeRetryAt.delete(id);
           if (result === "dropped") {
             yield* Effect.logWarning(
-              `playtest: thread ${session.threadId} cannot take the message about ${id}`,
+              `playtest: thread ${session.threadId} cannot take the notice about ${id}`,
             );
           }
           if (current?.notice === "due") yield* record(replace({ ...current, notice: "sent" }), id);
@@ -720,9 +808,55 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
         (session.problem?.startsWith(RELEASE_PROBLEM) ?? false)));
 
   /**
-   * The worker's sweep: renew, the idle and time limits, ends for gone threads, what a restart cut,
-   * release retries, and one message about an end T3 made itself. Starts what is due and returns at once (steps run in this service's
-   * scope); `nextDueAt` is when something is due next (Infinity: nothing until a change).
+   * Reads whether a thread is gone, in the background and within `CALL_LIMIT` (one read per thread
+   * at a time); a gone thread calls the sweep again. A late read or one that cannot answer counts
+   * as "not known": the thread is not taken as gone, and the next sweep reads it again.
+   */
+  const readThread = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    threadGone: NonNullable<typeof input.threadGone>,
+  ) {
+    if (threadReads.has(threadId)) return;
+    threadReads.add(threadId);
+    const fiber = yield* Effect.suspend(() => threadGone(threadId)).pipe(
+      Effect.catchCauseIf(
+        (cause) => !Cause.hasInterruptsOnly(cause),
+        (cause) =>
+          Effect.logWarning(`playtest: thread ${threadId} could not be read`, cause).pipe(
+            Effect.as(null),
+          ),
+      ),
+      Effect.ensuring(Effect.sync(() => void threadReads.delete(threadId))),
+      Effect.forkIn(runScope),
+    );
+    yield* Fiber.join(fiber).pipe(
+      Effect.timeoutOption(CALL_LIMIT),
+      Effect.flatMap((answer) => {
+        if (Option.isNone(answer)) {
+          // Once it has stopped, a change: the next sweep reads the thread again.
+          return Fiber.interrupt(fiber).pipe(
+            Effect.andThen(changed),
+            Effect.forkIn(runScope),
+            Effect.andThen(
+              Effect.logWarning(
+                `playtest: thread ${threadId} gave no answer in ${Duration.format(CALL_LIMIT)}; it is not taken as gone and is read again later`,
+              ),
+            ),
+          );
+        }
+        if (answer.value === false) goneThreads.delete(threadId);
+        if (answer.value !== true || goneThreads.has(threadId)) return Effect.void;
+        goneThreads.add(threadId);
+        return changed;
+      }),
+      Effect.forkIn(runScope),
+    );
+  });
+
+  /**
+   * The worker's sweep (renew, limits, gone threads, restart cuts, release retries, end notices).
+   * Starts what is due and returns at once: steps, thread reads and notices run bounded in this
+   * service's scope, so one stuck call never holds up others. `nextDueAt`: Infinity = until a change.
    */
   const runDue = Effect.fn("PlaytestService.runDue")(function* () {
     const all = yield* locked(loaded).pipe(Effect.option);
@@ -730,21 +864,21 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
       // A store that cannot be read (or a newer one) is tried again later; start and end say why.
       return { nextDueAt: (yield* Clock.currentTimeMillis) + RETRY_MS };
     }
-    // Thread reads happen outside the lock; a thread gone after this read is caught next time.
-    const gone = new Set<ThreadId>();
+    // Thread reads run in the background; a gone thread found now ends its session next sweep.
     if (input.threadGone !== undefined) {
       const threads = new Set(
         all.value
           .filter((session) => session.state === "claiming" || session.state === "active")
           .map((session) => session.threadId),
       );
-      for (const threadId of threads) {
-        if ((yield* input.threadGone(threadId)) === true) gone.add(threadId);
-      }
+      for (const threadId of threads) yield* readThread(threadId, input.threadGone);
     }
     return yield* locked(
       Effect.gen(function* () {
         const nowMs = yield* Clock.currentTimeMillis;
+        const monoNow = yield* monotonicMillis;
+        /** A monotonic time as wall time, for `nextDueAt` (the worker's due hint is on wall time). */
+        const wallOf = (monoAt: number) => nowMs + (monoAt - monoNow);
         let nextDueAt = Number.POSITIVE_INFINITY;
         const dueAt = (at: number) => void (nextDueAt = Math.min(nextDueAt, at));
         const end = (
@@ -770,12 +904,12 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
             if (op !== undefined) continue;
             // Release failed, or T3 restarted before it worked: run it again.
             const tried = releaseTried.get(id);
-            const at = tried === undefined ? nowMs : tried + renewMs;
-            if (at > nowMs) dueAt(at);
+            const at = tried === undefined ? monoNow : tried + renewMs;
+            if (at > monoNow) dueAt(wallOf(at));
             else yield* runOp(id, "release", (release) => releaseNow(id, release));
             continue;
           }
-          if (gone.has(session.threadId)) {
+          if (goneThreads.has(session.threadId)) {
             yield* end(session, "thread-gone");
             continue;
           }
@@ -807,10 +941,10 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
           const tried = renewTried.get(id);
           const renewAt =
             tried === undefined
-              ? nowMs
+              ? monoNow
               : tried.at + (tried.ok ? renewMs : Math.min(renewMs, RETRY_MS));
-          if (renewAt > nowMs) {
-            dueAt(renewAt);
+          if (renewAt > monoNow) {
+            dueAt(wallOf(renewAt));
             continue;
           }
           const entry: { fiber: Fiber.Fiber<void> | undefined } = { fiber: undefined };
@@ -827,9 +961,9 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
         if (input.notify !== undefined) {
           for (const session of sessions ?? []) {
             if (!noticeReady(session) || noticeSending.has(session.id)) continue;
-            const retryAt = noticeRetryAt.get(session.id) ?? nowMs;
-            if (retryAt > nowMs) {
-              dueAt(retryAt);
+            const retryAt = noticeRetryAt.get(session.id) ?? monoNow;
+            if (retryAt > monoNow) {
+              dueAt(wallOf(retryAt));
               continue;
             }
             noticeSending.add(session.id);
@@ -903,6 +1037,8 @@ export const make = Effect.fn("PlaytestService.make")(function* (input: {
             }
             return yield* failure("busy", busyText(live, `start a session for ${target.value}`));
           }
+          // The thread was just read as there; an earlier "gone" answer is old.
+          goneThreads.delete(request.threadId);
           const at = yield* now;
           const session: PlaytestSessionRecord = {
             id: newSessionId(new Set(all.map((entry) => entry.id))),

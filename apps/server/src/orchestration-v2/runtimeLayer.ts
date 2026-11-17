@@ -424,12 +424,14 @@ export const layerProduction = Layer.mergeAll(
     ),
   ),
   // Fork (playtest): reads its file at the first call or sweep (empty unless a session was started).
+  // Its end notices are thread items written through the event sink (they start no agent turn).
   PlaytestLayer.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerThreadManagementProvided,
         layerOrchestratorProvided,
-        layerCommandReceiptStoreProvided,
+        layerEventSink,
+        IdAllocator.layer,
       ),
     ),
   ),
