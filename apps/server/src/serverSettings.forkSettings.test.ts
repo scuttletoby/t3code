@@ -9,6 +9,7 @@ import {
   clearProjectSettingsOverridesWithForkKeys,
   ForkSettingsWriteError,
 } from "@t3tools/shared/forkSettingsPatch";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -322,5 +323,160 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork MCP profile
       const file = (yield* readFile) as { projectSettingsOverrides: Record<string, unknown> };
       assert.deepStrictEqual(file.projectSettingsOverrides[PROJECT], { defaultAutoPull: true });
     }).pipe(Effect.provide(layerServerSettings())),
+  );
+});
+
+it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork playtest settings", (it) => {
+  const ADAPTER = {
+    enabled: true,
+    claim: { argv: ["/usr/local/bin/game", "claim"] },
+    renew: { argv: ["/usr/local/bin/game", "renew"] },
+    push: [{ name: "deploy", argv: ["/usr/local/bin/game", "deploy"], timeoutSeconds: 300 }],
+    release: { argv: ["/usr/local/bin/game", "release"] },
+  };
+  const savedStep = (argv: ReadonlyArray<string>, fields: Record<string, unknown> = {}) => ({
+    argv,
+    timeoutSeconds: 120,
+    description: "",
+    ...fields,
+  });
+  /** ADAPTER as the server saves it: steps whole, limits equal to their defaults left out. */
+  const SAVED_ADAPTER = {
+    enabled: true,
+    claim: savedStep(["/usr/local/bin/game", "claim"]),
+    renew: savedStep(["/usr/local/bin/game", "renew"]),
+    push: [
+      { name: "deploy", ...savedStep(["/usr/local/bin/game", "deploy"], { timeoutSeconds: 300 }) },
+    ],
+    release: savedStep(["/usr/local/bin/game", "release"]),
+  };
+  /** As read back: the limits the file leaves out (they are the defaults) filled in. */
+  const READ_ADAPTER = { ...SAVED_ADAPTER, renewMinutes: 10, idleMinutes: 90, maxHours: 6 };
+
+  it.effect("saves an adapter, and the same save again leaves the same file", () =>
+    Effect.gen(function* () {
+      const once = yield* loadThenPatch(FULL_FILE, { playtest: ADAPTER });
+      assert.deepStrictEqual(once, { ...SAVED_FULL_FILE, playtest: SAVED_ADAPTER });
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* service.updateSettings(decodePatch({ playtest: ADAPTER }));
+      assert.deepStrictEqual(yield* readFile, once);
+      assert.deepStrictEqual((yield* service.getSettings).playtest, READ_ADAPTER);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("writes nothing for playtest while it is off and the file never had it", () =>
+    Effect.gen(function* () {
+      const file = yield* loadThenPatch({}, { playtest: { enabled: false } });
+      assert.isFalse("playtest" in (file as Record<string, unknown>));
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("replaces a saved adapter whole: a step left out of the save is gone", () =>
+    Effect.gen(function* () {
+      const file = yield* loadThenPatch(
+        { ...FULL_FILE, playtest: ADAPTER },
+        { playtest: { claim: ADAPTER.claim } },
+      );
+      const playtest = (file as { playtest?: Record<string, unknown> }).playtest;
+      assert.deepStrictEqual(Object.keys(playtest ?? {}).toSorted(), ["claim"]);
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const settings = yield* service.getSettings;
+      assert.isFalse(settings.playtest.enabled);
+      assert.isUndefined(settings.playtest.renew);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("reads a bad file value as off, keeps the rest, and the next save drops it", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      // Turned on by hand without a release step, and a project with a relative program.
+      const bad = { ...ADAPTER, release: undefined };
+      yield* fs.writeFileString(
+        config.settingsPath,
+        JSON.stringify({
+          ...FULL_FILE,
+          playtest: bad,
+          projectSettingsOverrides: {
+            [PROJECT]: { playtest: { ...ADAPTER, claim: { argv: ["scripts/claim"] } } },
+          },
+        }),
+      );
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const settings = yield* service.getSettings;
+      assert.isFalse(settings.playtest.enabled);
+      assert.isFalse(
+        settings.projectSettingsOverrides[ProjectId.make(PROJECT)]?.playtest?.enabled ?? true,
+      );
+      assert.strictEqual(settings.enableAgentBrowserAccess, false);
+      assert.strictEqual(settings.waitFor.maxPerThread, 7);
+      yield* service.updateSettings(decodePatch({ enableAgentBrowserAccess: true }));
+      const file = (yield* readFile) as Record<string, unknown>;
+      assert.isFalse("playtest" in file);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("refuses a program that is not a full path on the server's OS", () =>
+    Effect.gen(function* () {
+      // Relative to the worktree there: `/…` is drive-relative on Windows, `C:\…` a file name elsewhere.
+      for (const [platform, program] of [
+        ["win32", "/opt/game"],
+        ["linux", "C:\\game"],
+      ] as const) {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(config.settingsPath, JSON.stringify(FULL_FILE));
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const error = yield* service
+          .updateSettings(
+            decodePatch({ playtest: { ...ADAPTER, claim: { argv: [program, "claim"] } } }),
+          )
+          .pipe(Effect.provideService(HostProcess.Platform, platform), Effect.flip);
+        assert.instanceOf(error.cause, ForkSettingsWriteError, platform);
+        assert.include((error.cause as Error).message, "not a full path on this server's OS");
+      }
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect(
+    "keeps a project off after every save: it never falls back to the server's adapter",
+    () =>
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        // The server's adapter is on; the project's value is bad (a relative program), so it is off.
+        yield* fs.writeFileString(
+          config.settingsPath,
+          JSON.stringify({
+            ...FULL_FILE,
+            playtest: ADAPTER,
+            projectSettingsOverrides: {
+              [PROJECT]: { playtest: { ...ADAPTER, claim: { argv: ["scripts/claim"] } } },
+            },
+          }),
+        );
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const projectPlaytest = Effect.gen(function* () {
+          const file = (yield* readFile) as {
+            projectSettingsOverrides: Record<string, { playtest?: { enabled: boolean } }>;
+          };
+          const read = (yield* service.getSettings).projectSettingsOverrides[
+            ProjectId.make(PROJECT)
+          ];
+          return {
+            file: file.projectSettingsOverrides[PROJECT]?.playtest?.enabled,
+            read: read?.playtest?.enabled,
+          };
+        });
+        // An unrelated save writes the project's value back as an explicit off.
+        yield* service.updateSettings(decodePatch({ enableAgentBrowserAccess: true }));
+        assert.deepStrictEqual(yield* projectPlaytest, { file: false, read: false });
+        // A client that does not know `playtest` saves the project's entry without it.
+        yield* service.updateSettings(
+          decodePatch({ projectSettingsOverrides: { [PROJECT]: { defaultAutoPull: true } } }),
+        );
+        assert.deepStrictEqual(yield* projectPlaytest, { file: false, read: false });
+        assert.isTrue((yield* service.getSettings).playtest.enabled);
+      }).pipe(Effect.provide(layerServerSettings())),
   );
 });

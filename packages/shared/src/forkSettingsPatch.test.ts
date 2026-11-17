@@ -1,11 +1,14 @@
 /// <reference types="vite-plus/client" />
 
 import {
+  DEFAULT_PLAYTEST_SETTINGS,
   DEFAULT_SERVER_SETTINGS,
   MCP_THREAD_PROFILES_MAX,
+  PlaytestSettings,
   ProjectId,
   ProviderInstanceId,
   type ServerSettings,
+  ServerSettingsPatch,
   ThreadId,
 } from "@t3tools/contracts";
 import { WaitCheck } from "@t3tools/contracts/waitFor";
@@ -18,6 +21,7 @@ import {
   clearProjectSettingsOverridesWithForkKeys,
   forkSettingsWriteProblem,
   keepLeftOutForkProjectKeys,
+  playtestProgramProblem,
   splitForkSettingsPatch,
 } from "./forkSettingsPatch.ts";
 import { clearProjectSettingsOverrides } from "./projectSettings.ts";
@@ -29,6 +33,19 @@ const claude = ProviderInstanceId.make("claude-a");
 const codex = ProviderInstanceId.make("codex-b");
 
 const greenCheck = Schema.decodeSync(WaitCheck)({ argv: ["/bin/true"] });
+const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+const decodePlaytest = Schema.decodeUnknownSync(PlaytestSettings);
+const playtestAdapter = (program: string) => {
+  const step = (name: string) => ({ argv: [program, name] });
+  return {
+    enabled: true,
+    claim: step("claim"),
+    renew: step("renew"),
+    push: [{ name: "deploy", ...step("deploy") }],
+    release: step("release"),
+  };
+};
+const PLAYTEST_ADAPTER = playtestAdapter("/usr/local/bin/game");
 
 const current: ServerSettings = {
   ...DEFAULT_SERVER_SETTINGS,
@@ -334,6 +351,41 @@ describe("fork settings save check (MCP profile references)", () => {
   });
 });
 
+describe("fork settings save check (playtest programs on the server's OS)", () => {
+  const project = ProjectId.make("project-1");
+  const adapter = (program: string) => decodePlaytest(playtestAdapter(program));
+  const settings = (
+    server: ServerSettings["playtest"],
+    projectValue?: ServerSettings["playtest"],
+  ): ServerSettings => ({
+    ...current,
+    playtest: server,
+    projectSettingsOverrides:
+      projectValue === undefined ? {} : { [project]: { playtest: projectValue } },
+  });
+  const off = settings(DEFAULT_PLAYTEST_SETTINGS);
+
+  it("refuses a program a save sets that is not fully qualified on this OS", () => {
+    // `/…` is drive-relative on Windows; `C:\…` is a relative file name on Linux and macOS.
+    expect(playtestProgramProblem(off, settings(adapter("/opt/game")), "win32")).toMatch(
+      /"\/opt\/game"/,
+    );
+    expect(playtestProgramProblem(off, settings(adapter("/opt/game")), "linux")).toBeUndefined();
+    expect(playtestProgramProblem(off, settings(adapter("C:\\game")), "linux")).toMatch(
+      /"C:\\game"/,
+    );
+    expect(playtestProgramProblem(off, settings(adapter("C:\\game")), "win32")).toBeUndefined();
+    const inProject = settings(DEFAULT_PLAYTEST_SETTINGS, adapter("/opt/game"));
+    expect(playtestProgramProblem(off, inProject, "win32")).toMatch(/project-1/);
+  });
+
+  it("never refuses a program the save leaves as it was, so a hand edit blocks no other save", () => {
+    const stored = settings(adapter("/opt/game"), adapter("/opt/game"));
+    const next = { ...stored, enableAgentBrowserAccess: !stored.enableAgentBrowserAccess };
+    expect(playtestProgramProblem(stored, next, "win32")).toBeUndefined();
+  });
+});
+
 describe("a project save keeps the fork keys its entry leaves out", () => {
   const project = ProjectId.make("project-1");
   const other = ProjectId.make("project-2");
@@ -424,6 +476,36 @@ describe("a project save keeps the fork keys its entry leaves out", () => {
         project
       ],
     ).toEqual({ mcpSubagentProfile: "lean" });
+  });
+
+  it("keeps a project's playtest value a save leaves out, so the project never falls back to the server's adapter", () => {
+    const own = decodePlaytest(PLAYTEST_ADAPTER);
+    const serverOn: ServerSettings = { ...base, playtest: own };
+    // An older client does not know `playtest` and saves the project's other fields without it.
+    const patch = { projectSettingsOverrides: { [project]: { defaultAutoPull: false } } };
+    for (const projectValue of [
+      DEFAULT_PLAYTEST_SETTINGS,
+      decodePlaytest({ ...PLAYTEST_ADAPTER, renewMinutes: 3 }),
+    ]) {
+      const s: ServerSettings = {
+        ...serverOn,
+        projectSettingsOverrides: { [project]: { playtest: projectValue, defaultAutoPull: true } },
+      };
+      const next = save(s, patch);
+      expect(next.projectSettingsOverrides[project]).toEqual({
+        playtest: projectValue,
+        defaultAutoPull: false,
+      });
+      expect(save(next, patch)).toEqual(next);
+    }
+    // Only an explicit `null` clears it (the project then uses the server's value again).
+    const s: ServerSettings = {
+      ...serverOn,
+      projectSettingsOverrides: { [project]: { playtest: DEFAULT_PLAYTEST_SETTINGS } },
+    };
+    const clear = decodePatch({ projectSettingsOverrides: { [project]: { playtest: null } } });
+    expect(save(s, clear).projectSettingsOverrides).toEqual({});
+    expect(save(save(s, clear), clear)).toEqual(save(s, clear));
   });
 
   it("returns the settings untouched when no project entry leaves a stored key out", () => {
@@ -518,6 +600,19 @@ describe("clearing a project's MCP profile (reset to inherited)", () => {
     const missing = ProjectId.make("missing");
     expect(clearProjectSettingsOverridesWithForkKeys(base, missing, ["mcpProfile"])).toBeNull();
     expect(clearProjectSettingsOverrides(base, missing, ["mcpProfile"])).toBeNull();
+  });
+
+  it("clears a project's playtest value with the fork's clear helper (it sends null)", () => {
+    const s = {
+      ...base,
+      projectSettingsOverrides: {
+        [p1]: { playtest: DEFAULT_PLAYTEST_SETTINGS, defaultAutoPull: true },
+      },
+    } as ServerSettings;
+    const entry = clearProjectSettingsOverridesWithForkKeys(s, p1, ["playtest"]);
+    expect(entry).toEqual({ playtest: null, defaultAutoPull: true });
+    const next = save(s, decodePatch({ projectSettingsOverrides: { [p1]: entry } }));
+    expect(next.projectSettingsOverrides[p1]).toEqual({ defaultAutoPull: true });
   });
 
   it("pins upstream's helper keeping the profile (it leaves the key out, like an older client)", () => {
