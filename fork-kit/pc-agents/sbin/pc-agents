@@ -117,32 +117,59 @@ def preflight(c, files):
 
 
 def root_alone(folder):
-    """Make folder and all in it the kit's owner's, writable by it alone, the folder itself 0755 (the agent runs its
-    t3). Upstream's install.sh unpacks as root with tar, which keeps the archive's owners (its build machine's uids),
-    and moves in a mktemp -d folder (0700). Links are owned, never followed."""
+    """Make folder and all in it the kit's owner's, writable by it alone, without setuid or setgid, the folder itself
+    0755 (the agent runs its t3). Upstream's install.sh unpacks as root with tar, which keeps the archive's owners and
+    modes, and moves in a mktemp -d folder (0700). The folder is closed (0700) while its insides are fixed and opened
+    last, so nothing else can reach in meanwhile. Links are owned, never followed."""
     top = k.ROOT + folder
-    for p in [top] + [os.path.join(here, n) for here, dirs, names in os.walk(top) for n in dirs + names]:
-        st = os.lstat(p)
-        if st.st_uid != k.OWNER or st.st_gid != k.OWNER:
-            os.lchown(p, k.OWNER, k.OWNER)
-        if not stat.S_ISLNK(st.st_mode):
-            os.chmod(p, 0o755 if p == top else stat.S_IMODE(st.st_mode) & ~0o022)
+    os.chmod(top, 0o700)
+    for here, dirs, names in os.walk(top):
+        for p in (os.path.join(here, n) for n in dirs + names):
+            st = os.lstat(p)
+            if st.st_uid != k.OWNER or st.st_gid != k.OWNER:
+                os.lchown(p, k.OWNER, k.OWNER)
+            if not stat.S_ISLNK(st.st_mode):
+                os.chmod(p, stat.S_IMODE(st.st_mode) & ~0o7022)
+    os.lchown(top, k.OWNER, k.OWNER)
+    os.chmod(top, 0o755)
+
+
+def loose(folder):
+    """Why the installed version folder is not as root_alone leaves it, or None."""
+    st = k.lstat(folder)
+    if st and stat.S_ISDIR(st.st_mode) and stat.S_IMODE(st.st_mode) != 0o755:
+        return f'{folder} is not mode 0755'
+    return tree(folder, folder)
 
 
 def install_t3(c, version, done):
     """Install T3 as root under k.T3 with upstream's scripts/install.sh (it checks SHA256SUMS and runs the new t3),
-    make it root's alone (root_alone), and record its t3's hash. A version folder that is not root's alone (an
-    older setup's install) is removed and installed again: what others could write is never trusted. Returns why
-    not, or None."""
+    make it root's alone (root_alone), and record its t3's hash. A version folder that is not (an older setup's
+    install, or one stopped before root_alone) is removed and installed again: what others could write is never
+    trusted. It is first moved aside in one step (a stop half-way leaves no part folder), with T3 stopped (it runs
+    from that folder; setup restarts it). Returns why not, or None."""
     folder = k.runtime(c)
-    if k.lstat(folder) and k.lstat(folder + '/t3') is None:
+    versions = os.path.dirname(folder)
+    if bad := [why for d in (k.T3, k.T3 + '/runtime', versions) if k.lstat(d) and
+               (why := k.safe(d, k.lstat(d), stat.S_ISDIR))]:
+        return '; '.join(bad)
+    for n in os.listdir(k.ROOT + versions) if k.lstat(versions) else []:
+        if n.startswith('.removing-'):   # a removal stopped half-way
+            shutil.rmtree(k.ROOT + versions + '/' + n)
+    st = k.lstat(folder)
+    if st and not stat.S_ISDIR(st.st_mode):
+        return f'{folder} is not a folder (not made by setup): remove it'
+    if st and k.lstat(folder + '/t3') is None:
         return f'{folder} is there but has no t3 (not made by setup): remove that folder'
-    if k.lstat(folder) and tree(folder, folder):
-        say(f'{folder} is not root\'s alone: removing it to install T3 {c["t3Version"]} again')
+    if st and (why := loose(folder)):
+        say(f'{why}: removing it to install T3 {c["t3Version"]} again')
         mark()
-        shutil.rmtree(k.ROOT + folder)
+        k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
+        aside = f'{versions}/.removing-{os.getpid()}'
+        os.rename(k.ROOT + folder, k.ROOT + aside)
         done.pop(folder + '/t3', None)
         keep(done)
+        shutil.rmtree(k.ROOT + aside)
     if k.lstat(folder) is None:
         say(f'installing T3 {c["t3Version"]} under {k.T3}')
         mark()
@@ -153,7 +180,7 @@ def install_t3(c, version, done):
         if r.returncode or k.lstat(folder + '/t3') is None:
             return f'T3 install failed: {(r.stderr or r.stdout).strip()[-400:]}'
         root_alone(folder)
-        if why := tree(folder, folder):
+        if why := loose(folder):
             return f'T3 installed, but not root\'s alone: {why}'
         mark()
     if not done.get(folder + '/t3'):   # a mismatch is left to the runtime wall; only a missing hash is added
@@ -281,7 +308,8 @@ def as_agent(cmd):
 
 
 def tree(top, inside=None):
-    """Why something in the folder top (itself included) is not root's alone, or a link out of inside; or None."""
+    """Why something in the folder top (itself included) is not root's alone (or is setuid/setgid), or a link out of
+    inside; or None."""
     bad = [why] if (why := k.safe(top, k.lstat(top), stat.S_ISDIR)) else []
     for here, dirs, names in os.walk(k.ROOT + top):
         for n in dirs + names:
@@ -291,6 +319,7 @@ def tree(top, inside=None):
                     os.path.realpath(k.ROOT + p).startswith(os.path.realpath(k.ROOT + inside) + '/'):
                 continue
             bad += [why] if (why := k.safe(p, st, lambda m: stat.S_ISDIR(m) or stat.S_ISREG(m))) else []
+            bad += [f'{p} is setuid or setgid'] if st.st_mode & (stat.S_ISUID | stat.S_ISGID) else []
     return bad[:3] and '; '.join(bad[:3])
 
 

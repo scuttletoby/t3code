@@ -165,8 +165,41 @@ class Setup(Case):
         for p in (d + '/lib', d + '/lib/x'):
             self.assertEqual(stat.S_IMODE(os.lstat(p).st_mode), 0o755, p)
         self.assertEqual(stat.S_IMODE(os.lstat(d + '/lib/x/m.js').st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(os.lstat(d + '/lib/s').st_mode), 0o755)   # no setuid left
         self.assertEqual(os.readlink(d + '/lib/y'), 'x')
         self.assertEqual(len(self.log('install')), 1)
+
+    def test_t3_with_a_link_out_is_refused_and_the_target_untouched(self):
+        self.terminate()
+        self.write('/log/install-link-out', '')
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('T3 installed, but not root\'s alone', out)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path('/log/outside')).st_mode), 0o664)
+        self.assertFalse([line for line in self.log() if line.startswith('enable')])
+
+    def test_setuid_in_the_runtime_fails_the_runtime_wall(self):
+        self.ready()
+        d = self.path('/opt/pc-agents/t3/runtime/versions/' + CONFIG['t3Version'])
+        self.write(d[len(self.root):] + '/x', '')
+        os.chmod(d + '/x', 0o4755)
+        self.assertIn('is setuid or setgid', cli.tree(d[len(self.root):], d[len(self.root):]) or '')
+
+    def test_runtime_closed_or_half_removed_is_installed_again(self):
+        self.ready()
+        v = '/opt/pc-agents/t3/runtime/versions/'
+        d = self.path(v + CONFIG['t3Version'])
+        os.chmod(d, 0o700)   # stopped before root_alone opened it: the agent could not run t3
+        self.write(v + '.removing-1/lib/a', '')   # a removal stopped half-way
+        os.unlink(self.path('/log/systemctl'))
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertIn('is not mode 0755: removing it', out)
+        self.assertIn('stop t3code-agents.service', self.log())
+        self.assertIn('restart t3code-agents.service', self.log())
+        self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o755)
+        self.assertEqual(sorted(os.listdir(self.path(v))), [CONFIG['t3Version']])
+        self.assertEqual(len(self.log('install')), 2)
 
     def test_loose_t3_from_an_older_setup_is_installed_again(self):
         self.terminate()
@@ -179,7 +212,7 @@ class Setup(Case):
         os.unlink(self.path('/log/install-loose'))
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)
-        self.assertIn('is not root\'s alone: removing it', out)
+        self.assertIn(': removing it to install T3', out)
         self.assertEqual(len(self.log('install')), 2)
         d = self.path('/opt/pc-agents/t3/runtime/versions/' + CONFIG['t3Version'])
         self.assertFalse(os.path.lexists(d + '/lib'))

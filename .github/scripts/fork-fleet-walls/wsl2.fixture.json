@@ -27,6 +27,7 @@
       "mode": "755"
     },
     "run/systemd/container": "wsl\n",
+    "proc/1/environ": "PATH=/usr/bin\u0000container=wsl\u0000",
     "proc/self/uid_map": "         0          0 4294967295\n"
   },
   "fail": {
@@ -96,6 +97,12 @@
       },
       {
         "proc/self/uid_map": null
+      },
+      {
+        "run/host/container-manager": "systemd-nspawn\n"
+      },
+      {
+        "proc/1/environ": "PATH=/usr/bin\u0000container=lxc\u0000"
       }
     ],
     "mounts": [

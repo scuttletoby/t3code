@@ -30,7 +30,11 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                    'chmod 755 "$d/t3"\n'
                    # install-loose: as upstream's tar leaves it (a mktemp -d top, the archive's group-writable modes)
                    '[ -e "$R/log/install-loose" ] && { mkdir -p "$d/lib/x"; echo x >"$d/lib/x/m.js"; chmod 775 "$d/lib" '
-                   '"$d/lib/x"; chmod 664 "$d/lib/x/m.js"; ln -s x "$d/lib/y"; chmod 700 "$d"; }; exit 0\n',
+                   '"$d/lib/x"; chmod 664 "$d/lib/x/m.js"; ln -s x "$d/lib/y"; echo s >"$d/lib/s"; chmod 4775 "$d/lib/s"; '
+                   'chmod 700 "$d"; }\n'
+                   # install-link-out: a link from the runtime to a file outside it
+                   '[ -e "$R/log/install-link-out" ] && { echo o >"$R/log/outside"; chmod 664 "$R/log/outside"; '
+                   'ln -s "$R/log/outside" "$d/out"; }; exit 0\n',
     # systemd-run: like the real one, a bare command name is looked up in the CALLER's PATH, before anything runs
     'usr/bin/systemd-run': 'R="${0%/usr/bin/systemd-run}"; printf "%s\\n" "$@" >"$R/log/systemd-run"\n'
                            'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; cmd=$2\n'
