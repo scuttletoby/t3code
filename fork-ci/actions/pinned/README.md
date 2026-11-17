@@ -34,6 +34,10 @@ paste what `files` prints.
   (14). Only 40-hex folders are ever removed; the pinned sha's own folder stays, however old.
 - `load()` and `run` run the bytes that were checked, never a second read of the cache file (another job on the
   runner may write it between the check and the run).
+- `load()` and `run` take one self-contained file: one that touches `sys.path`, imports a module that loads code
+  from a path (`importlib`, `runpy`, ...) or uses a relative import would load the files next to it, which nothing
+  checked, so it is refused (`FetchError`). `pr-queue/pr_queue.py`, `head-check/*.py` and `fleet-watch/fleet_watch.py`
+  are such files: they run only from a checkout or a workflow's `uses:`.
 - A file the config does not name, a bad config, or no network and no good copy: `FetchError` (its subclass
   `Unreachable` for the network alone). Nothing is ever guessed.
 
@@ -71,7 +75,9 @@ Callers may import exactly these names; anything else in the module may change i
 `config` is the path of the pin config file. `cache` is the cache folder; a project that used its own cache folder of
 the same layout (`<cache>/<sha>/<action>/<file>`) can pass it, and its checked copies are used as they are. The cache folder is kept private: our own folder is made
 0700 on use, one another user owns is refused (FetchError), and prune never follows a symlink or opens a special
-file in it. The bootstrap below makes it 0700 too and reads only a regular file.
+file in it. The bootstrap below makes a new one 0700, refuses one that is a symlink, another user's, or group- or
+world-writable before it reads or writes anything in it (remove it and the next run makes it again), and reads only a
+regular file.
 
 ## Loading this module: the bootstrap
 
@@ -88,7 +94,8 @@ import hashlib, json, os, re, stat, tempfile, types, urllib.request
 
 def load_pinned(config, cache):
     """fork-ci/actions/pinned/pinned.py at the config's sha, checked by its blob id (fork-ci/actions/pinned/README.md).
-    Raises OSError (no network, no good copy) or ValueError (a bad config, or bytes that are not the config's)."""
+    Raises OSError (no network, no good copy) or ValueError (a bad config, bytes that are not the config's, or a cache
+    folder others could write)."""
     with open(config, encoding='utf-8') as f:
         c = json.load(f)
     if not isinstance(c, dict) or not isinstance(c.get('files'), dict):
@@ -98,7 +105,12 @@ def load_pinned(config, cache):
             and '..' not in repo.split('/') and isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)
             and isinstance(want, str)):
         raise ValueError(f'{config}: needs "repo", "sha" (40 hex) and "files" with "pinned/pinned.py"')
-    os.makedirs(cache, mode=0o700, exist_ok=True)
+    if not os.path.lexists(cache):
+        os.makedirs(cache, mode=0o700)
+    st = os.lstat(cache)   # checked before anything in it is read or written
+    if not stat.S_ISDIR(st.st_mode) or hasattr(os, 'getuid') and (st.st_uid != os.getuid() or st.st_mode & 0o022):
+        raise ValueError(f'cache folder {cache} is not a folder of your own that only you can write (a symlink, '
+                         'another user\'s, or group- or world-writable): remove it or pass another')
     dest = os.path.join(cache, c['sha'], 'pinned', 'pinned.py')
     blob = lambda b: hashlib.sha1(b'blob %d\0' % len(b) + b).hexdigest()
     try:   # a regular file only: no symlink followed, no FIFO waited on
