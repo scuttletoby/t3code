@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests of fork-fleet-walls/wsl2 beyond the contract every walls file passes (fork-fleet-walls.test.py, from
+"""Tests of fork-fleet-walls/wsl2 beyond the contract every walls file passes (fork-fleet-walls-contract.test.py, from
 wsl2.fixture.json): that its reading of the launcher's sandbox() fits the real launcher, every change to that
 sandbox() that opens a wall (a fixture changes the fake machine only, and the launcher is the kit's, beside the walls
 folder), that it takes every linux wall from the linux file, and that it runs the linux file only from a source no
