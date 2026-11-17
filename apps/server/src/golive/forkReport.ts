@@ -103,9 +103,17 @@ const FORK_SETTINGS_KEYS = FORK_SERVER_SETTING_KEYS.flatMap((key) => {
 
 type Problem = ForkReport["problems"][number];
 
-const isFile = (path: string) =>
-  NodeFS.statSync(path, { throwIfNoEntry: false })?.isFile() ?? false;
 const errorText = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
+const errorCode = (cause: unknown) => (cause as NodeJS.ErrnoException | undefined)?.code;
+/** A path's stat (`lstat` with `follow: false`); undefined when it is absent or runs through a file. */
+function statOf(path: string, follow = true): NodeFS.Stats | undefined {
+  try {
+    return follow ? NodeFS.statSync(path) : NodeFS.lstatSync(path);
+  } catch (cause) {
+    if (errorCode(cause) === "ENOENT" || errorCode(cause) === "ENOTDIR") return undefined;
+    throw cause;
+  }
+}
 
 /**
  * A read-only handle that writes nothing. A plain read-only open of a WAL database creates its
@@ -133,6 +141,9 @@ function openWithoutWriting(
     };
   }
   const mode = walSize === undefined || (walSize === 0 && !hasShm) ? "immutable" : "readonly-shm";
+  // A clean server stop between these checks and the read deletes the WAL; SQLite then creates an
+  // empty -wal and the open fails. It is left there: removing it could unlink the WAL of a server
+  // starting at that moment. A later report reads such a home `immutable`.
   const url = NodeURL.pathToFileURL(databasePath);
   url.search = mode === "immutable" ? "mode=ro&immutable=1" : "mode=ro&readonly_shm=1";
   try {
@@ -145,33 +156,47 @@ function openWithoutWriting(
   }
 }
 
-function readDatabase(databasePath: string, problems: Array<Problem>): ForkReport["database"] {
-  const empty = {
-    path: databasePath,
+const unreadDatabase = (path: string) =>
+  ({
+    path,
     openMode: null,
     buildMigrationHead: BUILD_MIGRATION_HEAD,
     appliedMigrations: [],
     pendingMigrations: [],
     unknownMigrations: [],
     counts: null,
-  } as const;
-  if (NodeFS.lstatSync(databasePath, { throwIfNoEntry: false }) === undefined) {
-    return { ...empty, state: "missing" };
-  }
+  }) as const;
+
+function readDatabase(databasePath: string, problems: Array<Problem>): ForkReport["database"] {
+  const empty = unreadDatabase(databasePath);
+  if (statOf(databasePath, false) === undefined) return { ...empty, state: "missing" };
   // SQLite keeps -wal, -shm and -journal beside the file a link resolves to, so every check and the
   // open use the real path. A link that leads nowhere is not "no database": the data is elsewhere.
   let realPath: string;
   try {
     realPath = NodeFS.realpathSync(databasePath);
   } catch (cause) {
+    const code = errorCode(cause);
     problems.push({
       code: "database-unreadable",
-      message: `statev2.sqlite is a link that does not lead to a file (${errorText(cause)}); a start would create a new, empty database where it points.`,
+      message:
+        code === "ENOENT"
+          ? `statev2.sqlite is a link that does not lead to a file (${errorText(cause)}); a start would create a new, empty database where it points.`
+          : code === "ELOOP"
+            ? `statev2.sqlite is a link that does not lead to a file (${errorText(cause)}).`
+            : `statev2.sqlite could not be followed (${errorText(cause)}).`,
     });
     return { ...empty, state: "unreadable" };
   }
-  if (!isFile(realPath)) return { ...empty, state: "missing" };
-  if (NodeFS.statSync(realPath).size === 0) return { ...empty, state: "empty" };
+  const real = NodeFS.statSync(realPath);
+  if (!real.isFile()) {
+    problems.push({
+      code: "database-unreadable",
+      message: "statev2.sqlite is not a file (a folder, or a link to one); a start cannot open it.",
+    });
+    return { ...empty, state: "unreadable" };
+  }
+  if (real.size === 0) return { ...empty, state: "empty" };
 
   const opened = openWithoutWriting(realPath);
   if (!("db" in opened)) {
@@ -274,7 +299,7 @@ function readSettings(
   let raw: string | undefined;
   let readError: string | null = null;
   try {
-    if (NodeFS.statSync(settingsPath, { throwIfNoEntry: false }) !== undefined) {
+    if (statOf(settingsPath) !== undefined) {
       raw = NodeFS.readFileSync(settingsPath, "utf8");
     }
   } catch (cause) {
@@ -367,11 +392,31 @@ export function readForkReport(baseDir: string, version: string = packageJson.ve
   const home = NodePath.resolve(baseDir);
   const stateDir = NodePath.join(home, "userdata");
   const problems: Array<Problem> = [];
-  const exists = NodeFS.statSync(home, { throwIfNoEntry: false })?.isDirectory() ?? false;
+  const homeStat = statOf(home);
+  const exists = homeStat?.isDirectory() ?? false;
   if (!exists) {
-    problems.push({ code: "home-missing", message: `No T3 home folder at ${home}.` });
+    problems.push({
+      code: "home-missing",
+      message:
+        homeStat === undefined ? `No T3 home folder at ${home}.` : `${home} is not a folder.`,
+    });
+  } else if (statOf(stateDir)?.isDirectory() === false) {
+    problems.push({
+      code: "home-missing",
+      message: `${stateDir} is not a folder, so this home holds no T3 state; a start would fail.`,
+    });
   }
-  const database = readDatabase(NodePath.join(stateDir, "statev2.sqlite"), problems);
+  const databasePath = NodePath.join(stateDir, "statev2.sqlite");
+  let database: ForkReport["database"];
+  try {
+    database = readDatabase(databasePath, problems);
+  } catch (cause) {
+    problems.push({
+      code: "database-unreadable",
+      message: `Could not look at the database: ${errorText(cause)}`,
+    });
+    database = { ...unreadDatabase(databasePath), state: "unreadable" };
+  }
   const { settings, fork } = readSettings(NodePath.join(stateDir, "settings.json"), problems);
   return {
     reportVersion: FORK_REPORT_VERSION,
