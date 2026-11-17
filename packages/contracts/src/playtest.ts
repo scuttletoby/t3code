@@ -242,7 +242,9 @@ export type PlaytestSessionState = typeof PlaytestSessionState.Type;
 
 /**
  * Why a session ends. `agent` and `person` ask for it; `claim-refused` (exit 10, nothing to
- * release) and `claim-failed` end a session that never became active; the rest are T3's own ends.
+ * release) and `claim-failed` (also a claim cut by a T3 restart) end a session that never became
+ * active; the rest are T3's own ends: `claim-gone` (renew exited 10), `idle`, `time-limit`, and
+ * `thread-gone` (archived or deleted).
  */
 export const PlaytestEndReason = Schema.Literals([
   "agent",
@@ -308,6 +310,12 @@ export const PlaytestSessionRecord = Schema.Struct({
   endedAt: Schema.optionalKey(IsoDateTime),
   /** The last failed claim, renew or release step, and why. */
   problem: Schema.optionalKey(PlaytestDetail),
+  /**
+   * T3 ended the session on its own (idle, time limit, claim gone, a claim cut by a restart):
+   * `due` until one message about it reached the thread (or the thread could not take it), then
+   * `sent`. Absent for ends the agent or the person asked for. An older T3 ignores it.
+   */
+  notice: Schema.optionalKey(Schema.Literals(["due", "sent"])),
 });
 export type PlaytestSessionRecord = typeof PlaytestSessionRecord.Type;
 
