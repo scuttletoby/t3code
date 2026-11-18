@@ -59,12 +59,18 @@ watches; it changes nothing on the machine, and `0` turns it off.
   (a repeated `"//"` comment key is a duplicate too: give each comment its own `//name` key), since once merged it would stop every
   later run. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
-  upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
-  also lowers the ceiling in the same change). Right after a rebase, below the ceiling is only a
-  note in the run log and the run's summary: when upstream takes a fork line word for word, the
-  rebase drops it, and the ceiling could not have been lowered first. The next run, from the new
-  base, fails until a pull request lowers it. A pull request may change a pending file but not grow
-  it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
+  upstream (fork-follow fails above it and below it). So a pull request that moves fork lines out
+  of a pending file lowers its ceiling in its own list, in the same change: its run refuses one
+  that removes more lines than it adds and leaves its own ceiling above main's minus that many (it
+  reads its own list only for that, as a lower ceiling never widens the gate). Right after a rebase,
+  below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops
+  it, and the ceiling could not have been lowered first. fork-follow then lowers it itself, in a
+  commit of its own on the rebased series ("fork seams: lower counts after the rebase onto …", each
+  change in its body and in the run's summary), and checks the lowered list again before it goes
+  on. It never raises one. The one ceiling it cannot lower is a pending file with no fork line left
+  that a `lost` entry still names (a ceiling is 1 or more, and a `lost` entry needs its file in
+  `files` or `pending`): that stays a note, the next run refuses it, and a pull request moves the
+  file to `files` with `"added": []`. A pull request may change a pending file but not grow it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
   guard, or re-indented) add no line, so they are counted too, two ways: `lines`, the upstream lines
   it does not keep in order and indentation, and `gone`, those whose text it no longer has at all,
   so deleting a line already counted as moved or re-indented raises `gone`. `lost` maps such
@@ -75,9 +81,12 @@ watches; it changes nothing on the machine, and `0` turns it off.
   so keep each count small. Right after a rebase, a count or ceiling that rises came with the
   rebase, not a fork pull request: the refusal tells the operator to rebase by hand and raise it
   in the rebased series, or to push it and raise it with a list-only pull request to main
-  (fork-follow cannot commit it until #325 item 1). A pull request may drop a seam file's listed seam lines (no more
-  copies than listed) but lose no other line, and may not move a seam line: a moved copy of `}`
-  looks the same as upstream's (move one with two pull requests). In a pending file it cannot tell
+  (fork-follow lowers a count after a rebase, but never raises one). A pull request may drop a seam
+  file's listed seam lines (no more copies than listed) but lose no other line, and may not move a
+  seam line: a moved copy of `}` looks the same as upstream's (move one with two pull requests).
+  Dropped lines are counted by text, so where upstream has a listed line too (`}`), a pull request
+  may drop upstream's copy instead of the fork's and its run passes it; fork-follow, which counts
+  from upstream, refuses it unless the lines left read the same as with the fork's copy dropped. In a pending file it cannot tell
   upstream's lines from the fork's (moving a fork line out loses one), so there fork-follow counts
   them. A listed path that neither the base nor the head has (upstream
   renamed it) is a note: list both names until the old one is gone from the base. An upstream file
@@ -91,8 +100,13 @@ watches; it changes nothing on the machine, and `0` turns it off.
   file as upstream's, also before the rebase that brings upstream's copy. For the same
   reason a pull request's run counts upstream's copies of a seam line against its allowance: a
   seam line upstream also has (`}`, `/**`) cannot be added by a pull request, only checked by
-  fork-follow, so keep seam lines specific. A branch made before fork-follow last rebased main
-  is refused with one "update the branch" error. Only `--from-upstream` (which fork-follow passes)
+  fork-follow, so keep seam lines specific. A listed copy main's tip already has is spent too, not
+  only one the branch's merge-base has: two branches from one main that each add the one listed
+  copy are each green, and once one merges the other is refused ("update the branch from its
+  base"). The ruleset does not require a branch to be up to date before it merges, so two changes
+  that are fine apart but not together (a seam line in both, or a pending file each shrinks) still
+  need the later one updated from main to be judged together. A branch made before fork-follow last
+  rebased main is refused with one "update the branch" error. Only `--from-upstream` (which fork-follow passes)
   runs it from an upstream commit and reads the head's list; without it a base with no list is
   refused, and an upstream that is itself a fork with a list is still judged by this fork's list.
 - [`serverSettings.forkDefaults.test.ts`](../../apps/server/src/serverSettings.forkDefaults.test.ts)
@@ -186,12 +200,33 @@ a list-only pull request to main once it is pushed (fork-follow's refusal says h
 rests on the owner's review, not on code: a pull request's own list is only parsed, so no check
 refuses one that adds a `pending` file or raises a ceiling or count. What the code does hold:
 
-- A pull request's run is judged by main's list and reads no ceiling and no `lost` count: a pending
-  file may change but not grow, so a raised ceiling or count gives no pull request a line. A new
+- A pull request's run is judged by main's list and reads no `lost` count, and a ceiling only to
+  refuse a change that shrinks a pending file without lowering it in its own list: a pending file
+  may change but not grow, so a raised ceiling or count gives no pull request a line. A new
   `pending` entry does loosen it: that file's lines may then change, though not grow in number.
 - From upstream, fork-follow refuses a ceiling or count above the real count ("lower it", or
-  "remove it" when none is left), so room nobody uses does not stay. Right after a rebase that is
-  only a note, and the next run refuses it.
+  "remove it" when none is left), so room nobody uses does not stay. Right after a rebase it lowers
+  it in a commit of its own on the rebased series instead (only lowers: a rise is refused).
+
+When the list or the files under it change, the check fails closed:
+
+- **No list, an empty one, or one it cannot read** (bad JSON, `{}` with no `files`, an unknown
+  key such as a newer check's): a pull request's run against a base without the list is refused
+  (open it against main); a branch whose merge-base has none is refused ("update the branch"); a
+  list it cannot read stops the run with a crash (exit 3), which fork-follow reports as a failed
+  check and pushes nothing. A pull request's own list that is malformed is refused too.
+- **An old list** (from before `pending`, `lost` or `forkFiles` entries existed): a missing key is
+  empty, which is stricter, never looser: every fork line it does not list is refused.
+- **An upstream file renamed or deleted**: a pull request that deletes or renames an upstream file
+  is refused (except the listed removed workflows); from upstream, a listed file upstream renamed or
+  deleted, which neither the base nor the series has any more, is a note (list both names until the
+  old one is gone from the base), and under its new
+  name it is an unlisted upstream file, held to no fork line; a `pending` file the base lacks is
+  refused.
+- **Right after a rebase**: a ceiling or count that fell is lowered and committed into the series,
+  one that rose is refused with the operator's next step, and the next run judges the lowered list
+  from the new base. A re-run of the same rebase builds the same files (the lowering commit with
+  them), so it advances to a release an earlier run published from them.
 
 A pending file takes no new fork line (a pull request may change its lines but not add more, and a
 file cannot be in `files` and `pending`), so a new fork line goes in a seam file, after its lines
