@@ -14,7 +14,7 @@ import {
   WaitToolFailure,
 } from "@t3tools/contracts/waitFor";
 import * as Schema from "effect/Schema";
-import { Tool, Toolkit } from "effect/ai";
+import { McpSchema, Tool, Toolkit } from "effect/ai";
 
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import { Waits } from "../../../waits/WaitWorker.ts";
@@ -42,7 +42,8 @@ const WaitForTool = Tool.make("wait_for", {
   .annotate(Tool.Destructive, false)
   // The same condition twice is the same wait.
   .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const WaitListTool = Tool.make("wait_list", {
   description:
@@ -57,7 +58,8 @@ const WaitListTool = Tool.make("wait_list", {
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const WaitCancelTool = Tool.make("wait_cancel", {
   description:
