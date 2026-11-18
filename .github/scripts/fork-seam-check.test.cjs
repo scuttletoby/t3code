@@ -17,6 +17,7 @@ const {
   findUnlistedChanges,
   forkFileTest,
   lostLines,
+  lowerList,
   ownListProblem,
   parseConfig,
   parseRemoved,
@@ -1324,9 +1325,12 @@ test("from upstream, deleting an upstream line already counted as re-indented is
     assert.equal(first.status, 0, first.stderr);
     git("checkout", "-q", "-b", "pr", main);
     const pr = commit({ "p.ts": reindented.replace("    return deny();\n", "") }, "delete it");
-    // The pull request's run cannot tell upstream's lines from the fork's in a pending file ...
-    assert.equal(run(main, pr).status, 0);
-    // ... and the run from upstream refuses it: the line's text is gone.
+    // The pull request's run cannot tell upstream's lines from the fork's in a pending file, so it
+    // refuses a shrink that leaves the ceiling as it is (#311), saying to keep upstream's lines ...
+    const own = run(main, pr);
+    assert.equal(own.status, 1, own.stdout);
+    assert.match(own.stderr, /- p\.ts: "pending" with a ceiling of 1, .*keep upstream's lines/);
+    // ... and the run from upstream refuses it whatever the list says: the line's text is gone.
     const result = fromUpstream(upstream, pr);
     assert.equal(result.status, 1, result.stdout);
     assert.match(
@@ -1522,7 +1526,7 @@ test("after a rebase, a count that rises names the operator's next step", () => 
     assert.equal(reasons.length, 2);
     for (const reason of reasons) {
       if (afterRebase) {
-        assert.match(reason, /after the rebase .* rebase by hand .* #325/, reason);
+        assert.match(reason, /after the rebase .* rebase by hand .* never raises one/, reason);
         assert.doesNotMatch(reason, /a file of the fork's own/, reason);
       } else {
         assert.match(reason, /a file of the fork's own/, reason);
@@ -1981,4 +1985,217 @@ test("the real list takes upstream's MarkdownFileLink.logic.test.ts for an upstr
   );
   // The fork's other MarkdownFileLink files are upstream's already (in "pending").
   assert.equal(isForkFile("apps/web/src/components/chat/MarkdownFileLink.logic.ts"), false);
+});
+
+// A file named after an Object property read `lost[file]` from Object's prototype: its counts were
+// undefined, nothing compares above undefined, and every upstream line it lost passed (#416 item 3).
+test("from upstream, a file named like an Object property is held to a lost count of 0", () => {
+  for (const file of ["constructor", "toString", "__proto__"]) {
+    const config = { pending: { [file]: 1 } };
+    const { reasons } = lostIn(
+      config,
+      { [file]: GUARD_BASE },
+      { [file]: "import { x } from './x';\ndoSensitive();\nforkA();\n" },
+      true,
+    );
+    assert.equal(reasons.length, 2, `${file}: ${JSON.stringify(reasons)}`);
+    assert.match(reasons[0], /more than its "lost" lines count of 0/);
+  }
+});
+
+// A pull request that moved fork lines out of a "pending" file left main's ceiling above its count,
+// and the next run from upstream refused main for it (#311).
+const shrink = (pending, base, head, ownPending) =>
+  findUnlistedChanges(
+    { files: {}, pending, forkFiles: [] },
+    {
+      changed: Object.keys(head),
+      atBase: (file) => base[file],
+      atHead: (file) => head[file],
+      upstream: false,
+      isForkFile: () => false,
+      ownPending,
+    },
+  );
+test("from main, a change that shrinks a pending file lowers its ceiling in its own list", () => {
+  const base = { "p.ts": `${UP}forkA();\nforkB();\nforkC();\n` };
+  const head = { "p.ts": `${UP}forkA();\n` };
+  const { ceilings } = shrink({ "p.ts": 3 }, base, head, { "p.ts": 3 });
+  assert.deepEqual(ceilings.length, 1);
+  assert.match(
+    ceilings[0],
+    /^p\.ts: "pending" with a ceiling of 3, and this change removes 2 more lines than it adds .*: lower it to 1 in this change's \.github\/fork-seams\.json\.$/,
+  );
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, head, { "p.ts": 1 }), {
+    reasons: [],
+    ceilings: [],
+    rises: [],
+    notes: [],
+  });
+  // Still 2 is still too high; with no fork line left, the entry goes.
+  assert.match(shrink({ "p.ts": 3 }, base, head, { "p.ts": 2 }).ceilings[0], /lower it to 1/);
+  const none = { "p.ts": UP };
+  assert.match(
+    shrink({ "p.ts": 3 }, base, none, { "p.ts": 1 }).ceilings[0],
+    /removes 3 more lines .*: remove it from "pending" in this change's/,
+  );
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, none, {}).ceilings, []);
+  // A change that swaps one line for another, or grows, or has no own list read: not this rule.
+  const swap = { "p.ts": `${UP}forkA();\nforkB();\nforkD();\n` };
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, swap, { "p.ts": 3 }).ceilings, []);
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, head, undefined).ceilings, []);
+});
+
+test("the command line refuses a pull request that shrinks a pending file but keeps its ceiling", () => {
+  withRepo(({ git, commit, run }) => {
+    const config = { files: {}, pending: { "p.ts": 2 } };
+    const main = commit({ ...seams(config), "p.ts": `${UP}forkA();\nforkB();\n` }, "main");
+    git("checkout", "-q", "-b", "pr", main);
+    const pr = commit({ "p.ts": `${UP}forkA();\n` }, "move forkB out");
+    const kept = run(main, pr);
+    assert.equal(kept.status, 1, kept.stdout);
+    assert.match(
+      kept.stderr,
+      /- p\.ts: "pending" with a ceiling of 2, .* lower it to 1 in this change's/,
+    );
+    assert.match(
+      kept.stderr,
+      /Lower each "pending" ceiling .* in this change's list where the line says so/,
+    );
+    const lowered = commit(seams({ files: {}, pending: { "p.ts": 1 } }), "lower it");
+    const result = run(main, lowered);
+    assert.equal(result.status, 0, result.stderr);
+  });
+});
+
+// Two branches from one merge-base could each add the one listed copy of a seam line: each run
+// judged its own branch from the merge-base, and main ended with two copies (#311 item 3).
+test("from main, a listed copy the base branch already has since the merge-base is spent", () => {
+  const main = { "a.ts": BASE["a.ts"].replace("  a: 1,", "  ...fork,\n  a: 1,") };
+  const options = (tip) => ({
+    atBase: (file) => BASE[file],
+    atHead: (file) => main[file],
+    upstream: false,
+    atTip: (file) => tip[file],
+  });
+  assert.deepEqual(findSeamBreaches(SEAM, options(BASE)), []);
+  assert.deepEqual(findSeamBreaches(SEAM, options(main)), [
+    "a.ts: adds `...fork,` (the base branch has more copies than this branch's merge-base: update the branch from its base)",
+  ]);
+  // From upstream there is no base branch tip: each listed line is one copy over upstream's.
+  assert.deepEqual(findSeamBreaches(SEAM, { ...options(main), upstream: true }), []);
+});
+
+test("the command line spends a seam copy another branch merged since the merge-base", () => {
+  withRepo(({ git, commit, run }) => {
+    const start = commit({ ...seams({ files: SEAM }), ...BASE }, "main");
+    const withFork = { "a.ts": BASE["a.ts"].replace("  a: 1,", "  ...fork,\n  a: 1,") };
+    git("checkout", "-q", "-b", "second", start);
+    const second = commit(withFork, "second branch adds it too");
+    git("checkout", "-q", "--detach", start);
+    const first = commit(withFork, "first branch, merged");
+    const result = run(first, second);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr, /- a\.ts: adds `\.\.\.fork,` \(the base branch has more copies/);
+    assert.equal(run(start, second).status, 0);
+  });
+});
+
+// Right after a rebase, fork-follow commits the list with each ceiling and count it found too high
+// lowered (#325 item 1); it never raises one.
+test("lowerList lowers and removes entries, keeps comments and order, and never raises", () => {
+  const text = `${JSON.stringify(
+    {
+      "//": "comment",
+      files: { "s.ts": { why: "w", added: ["x();"] } },
+      pending: { "a.ts": 3, "b.ts": 2, "c.ts": 2, "e.ts": 4 },
+      lost: {
+        "c.ts": { lines: 2, gone: 1 },
+        "e.ts": { lines: 3, gone: 1 },
+        "s.ts": { lines: 1, gone: 0 },
+      },
+    },
+    null,
+    2,
+  )}\n`;
+  const lowered = {
+    pending: new Map([
+      ["a.ts", 1],
+      ["b.ts", 0],
+      ["c.ts", 0],
+      ["e.ts", 5],
+    ]),
+    lost: new Map([
+      ["c.ts", { lines: 1, gone: 1 }],
+      ["e.ts", { lines: 4, gone: 0 }],
+      ["s.ts", { lines: 0, gone: 0 }],
+    ]),
+  };
+  const result = lowerList(text, lowered);
+  assert.deepEqual(JSON.parse(result.text), {
+    "//": "comment",
+    files: { "s.ts": { why: "w", added: ["x();"] } },
+    // c.ts keeps its ceiling: "lost" still names it (the run after says so).
+    pending: { "a.ts": 1, "c.ts": 2, "e.ts": 4 },
+    // e.ts: only the count that fell is lowered.
+    lost: { "c.ts": { lines: 1, gone: 1 }, "e.ts": { lines: 3, gone: 0 } },
+  });
+  assert.equal(result.text, `${JSON.stringify(JSON.parse(result.text), null, 2)}\n`);
+  assert.deepEqual(result.changes, [
+    'c.ts: "lost" 2/1 -> 1/1',
+    'e.ts: "lost" 3/1 -> 3/0',
+    's.ts: "lost" 1/0 removed (no upstream line lost)',
+    'a.ts: "pending" 3 -> 1',
+    'b.ts: "pending" 2 removed (no fork line left)',
+  ]);
+  assert.equal(lowerList(text, { pending: new Map([["e.ts", 9]]), lost: new Map() }), undefined);
+  assert.equal(lowerList(text, { pending: new Map(), lost: new Map() }), undefined);
+});
+
+test("--lowered-list writes the lowered list after a rebase only, and only when it passes", () => {
+  withRepo(({ dir, commit, fromUpstream }) => {
+    const upstream = commit({ "p.ts": GUARD_BASE }, "upstream");
+    const config = { files: {}, pending: { "p.ts": 3 }, lost: { "p.ts": { lines: 2, gone: 1 } } };
+    const series = commit(
+      { ...seams(config), "p.ts": "import { x } from './x';\ndoSensitive();\nforkA();\n" },
+      "fork series",
+    );
+    const out = path.join(dir, "..", `${path.basename(dir)}-lowered.json`);
+    try {
+      const result = fromUpstream("--after-rebase", "--lowered-list", out, upstream, series);
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /^Lowered: p\.ts: "lost" 2\/1 -> 1\/1$/m);
+      assert.match(result.stdout, /^Lowered: p\.ts: "pending" 3 -> 1$/m);
+      assert.deepEqual(JSON.parse(fs.readFileSync(out, "utf8")), {
+        files: {},
+        pending: { "p.ts": 1 },
+        lost: { "p.ts": { lines: 1, gone: 1 } },
+      });
+      // Committed, the next run has nothing to lower and writes nothing.
+      fs.rmSync(out);
+      const lowered = commit(
+        seams({ files: {}, pending: { "p.ts": 1 }, lost: { "p.ts": { lines: 1, gone: 1 } } }),
+        "lowered",
+      );
+      const again = fromUpstream("--after-rebase", "--lowered-list", out, upstream, lowered);
+      assert.equal(again.status, 0, again.stderr);
+      assert.equal(fs.existsSync(out), false);
+      assert.doesNotMatch(again.stdout, /Lowered|Note/);
+      // A refused run writes nothing.
+      const rise = commit({ "p.ts": "doSensitive();\nforkA();\n" }, "loses another line");
+      assert.equal(fromUpstream("--after-rebase", "--lowered-list", out, upstream, rise).status, 1);
+      assert.equal(fs.existsSync(out), false);
+      // Only after a rebase, from upstream, with a path.
+      for (const args of [
+        ["--lowered-list", out, upstream, series],
+        ["--after-rebase", "--lowered-list", upstream, series],
+        ["--after-rebase", upstream, series, "--lowered-list"],
+      ]) {
+        assert.equal(fromUpstream(...args).status, 2, args.join(" "));
+      }
+      assert.equal(fs.existsSync(out), false);
+    } finally {
+      fs.rmSync(out, { force: true });
+    }
+  });
 });

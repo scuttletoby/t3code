@@ -629,26 +629,32 @@ for yes in yes on 1; do
 done
 
 # Upstream adopts a "pending" fork line word for word: the rebase drops it, so the series is below
-# its ceiling. Lowering the ceiling first fails the check on the old base, so after a rebase the
-# ceiling is only a note; the next run, from the new base, refuses it (a pull request lowers it).
+# its ceiling. Lowering the ceiling first fails the check on the old base, and left as it is the
+# next run (from the new base) refuses it: so after a rebase the plan commits the lowered list into
+# the series (#325), and the next run passes.
 new_upstream
 new_fork v0.1.10
-(cd "$root/work" && echo '{"files":{},"pending":{"u2.txt":1}}' > .github/fork-seams.json && echo "fork pending line" >> u2.txt \
-  && git add -A && git commit -q --amend --no-edit && git push -q --force origin main) > /dev/null 2>&1
+(cd "$root/work" && echo '{"files":{},"pending":{"u2.txt":1}}' > .github/fork-seams.json \
+  && echo "fork pending line" >> u2.txt && git add -A && git commit -q --amend --no-edit && git push -q --force origin main) > /dev/null 2>&1
 up_release v0.1.11 'echo "fork pending line" >> u2.txt'
 summary_before="earlier step line" plan
-check "plan: upstream taking a pending fork line rebases, noting the ceiling" \
-  eval 'action_is rebase && grep -q "Note: u2.txt: \"pending\" with no fork lines left" "$root/out"'
-# The plan log is seen only on a failure; the note also goes to the run's summary.
-check "plan: the after-rebase note is also in the step summary" \
-  eval 'has "u2.txt: \"pending\" with no fork lines left" "$root/summary.md" && has "lower it with a pull request to main" "$root/summary.md"'
+lowered_list() { git -C "$root/work" show "$(out candidate):.github/fork-seams.json"; }
+check "plan: upstream taking a pending fork line rebases, lowering the list in a commit of its own" \
+  eval 'action_is rebase && grep -q "lowered the seam list" "$root/out" \
+    && [[ "$(git -C "$root/work" log -1 --format=%s "$(out candidate)")" == "fork seams: lower counts after the rebase onto v0.1.11" ]] \
+    && [[ "$(node -e "console.log(JSON.stringify(JSON.parse(process.argv[1])))" "$(lowered_list)")" == "{\"files\":{},\"pending\":{}}" ]]'
+check "plan: the lowering commit names each change in its body" \
+  eval 'grep -qx -- "- u2.txt: \"pending\" 1 removed (no fork line left)" <<< "$(git -C "$root/work" log -1 --format=%b "$(out candidate)")"'
+# The plan log is seen only on a failure; what was lowered also goes to the run's summary.
+check "plan: the lowered list is also in the step summary" \
+  eval 'has "### Seam list lowered" "$root/summary.md" && has "u2.txt: \"pending\" 1 removed" "$root/summary.md" && hasnt "lower it with a pull request" "$root/summary.md"'
 # The runner's summary file may already hold lines: the notes are added, never written over.
 check "plan: the step summary notes are added after what was there" has "earlier step line" "$root/summary.md"
 work git reset -q --hard "$(out candidate)"
 work git push -q --force origin HEAD:main
 plan
-check "plan: the next run from the new base refuses the ceiling, naming the fix" \
-  eval 'has "u2.txt: \"pending\" with no fork lines left" "$root/report.md" && has "Lower each \"pending\" ceiling" "$root/report.md" && hasnt "a file of the fork" "$root/report.md" && [[ -z "$(out action)" ]]'
+check "plan: the next run from the new base passes the lowered list" \
+  eval 'action_is release && [[ ! -e "$root/report.md" ]] && hasnt "Note: " "$root/out"'
 
 in_candidate() { git -C "$root/work" cat-file -e "$(out candidate):.github/workflows/$1" 2> /dev/null; }
 

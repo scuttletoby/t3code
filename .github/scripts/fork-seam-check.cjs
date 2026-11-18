@@ -1,9 +1,12 @@
-// Usage: [--config-ref <rev>] <base> <head> | --from-upstream [--after-rebase] <upstream> <head>.
+// Usage: [--config-ref <rev>] <base> <head> | --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>.
 // Refuses <head>'s upstream-file changes beyond .github/fork-seams.json. A pull request's list is
-// <base>'s (or --config-ref's), never <head>'s; --from-upstream (fork-follow) reads <head>'s, even if
-// upstream has its own. --after-rebase: a ceiling above the count is a note. Reads git objects only.
+// <base>'s (or --config-ref's), never <head>'s (its own is read only for "pending" ceilings it must
+// lower); --from-upstream (fork-follow) reads <head>'s, even if upstream has its own. --after-rebase:
+// a ceiling above the count is a note, and --lowered-list writes the list with it lowered there.
+// Reads git objects only (and writes only that file).
 
 const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
 
 const CONFIG = ".github/fork-seams.json";
 // Upstream workflow files the fork deletes (fork-follow.sh keeps them deleted): with upstream's
@@ -151,9 +154,11 @@ function parseRemoved(text = "") {
  * Reasons for the seam files' lines: each listed line allows one copy more than `base` has (not from
  * upstream, `base` is main, whose copies spent it). On `today` (a pull request's run: the list's
  * commit date) an expired or dated-ahead announcement allows nothing: the copies it would allow in
- * date go to `late`, any more to the reasons.
+ * date go to `late`, any more to the reasons. `atTip` (a pull request's run: the base branch's tip)
+ * spends the allowance too: two branches from one merge-base cannot each add the one listed copy,
+ * once the first has merged (#311 item 3).
  */
-function findSeamBreaches(files, { atBase, atHead, upstream = false, today, late }) {
+function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, today, late }) {
   const reasons = [];
   const lateReasons = late ?? reasons;
   for (const [file, seam] of Object.entries(files)) {
@@ -180,11 +185,19 @@ function findSeamBreaches(files, { atBase, atHead, upstream = false, today, late
     const allowed = lineCounts((expired ? seam.added : seamLines(seam)).join("\n"));
     const inDate = expired ? lineCounts(seamLines(seam).join("\n")) : allowed;
     const baseCounts = lineCounts(base);
+    const tip = upstream || atTip === undefined ? undefined : atTip(file);
+    const tipCounts = tip === undefined ? new Map() : lineCounts(tip);
+    const spent = (line) => Math.max(baseCounts.get(line) ?? 0, tipCounts.get(line) ?? 0);
     const leftOf = (counts, line) => {
       const allowance = counts.get(line) ?? 0;
-      return upstream ? allowance : Math.max(0, allowance - (baseCounts.get(line) ?? 0));
+      return upstream ? allowance : Math.max(0, allowance - spent(line));
     };
-    const adds = (copies, line) => `${file}: adds ${copies === 1 ? "" : `${copies}× `}\`${line}\``;
+    const adds = (copies, line) =>
+      `${file}: adds ${copies === 1 ? "" : `${copies}× `}\`${line}\`${
+        (tipCounts.get(line) ?? 0) > (baseCounts.get(line) ?? 0)
+          ? " (the base branch has more copies than this branch's merge-base: update the branch from its base)"
+          : ""
+      }`;
     for (const [line, added] of addedLines(base, head)) {
       const left = leftOf(allowed, line);
       const extra = added - left;
@@ -243,16 +256,28 @@ function forkFileTest(patterns = []) {
 // The old base held the count exactly, so the rise came with the rebase (upstream's own change):
 // the operator's step, not a pull request author's (fork-follow cannot commit the raise itself).
 const AFTER_REBASE_RISE =
-  " after the rebase onto this base (upstream's own change did it, not a fork pull request): rebase by hand as docs/fork/updates.md says and raise the {count} in the rebased series before pushing it, or push it and then raise the {count} with a list-only pull request to main; fork-follow cannot raise it itself until #325 item 1.";
+  " after the rebase onto this base (upstream's own change did it, not a fork pull request): rebase by hand as docs/fork/updates.md says and raise the {count} in the rebased series before pushing it, or push it and then raise the {count} with a list-only pull request to main; fork-follow lowers a count after a rebase, but never raises one (raising one is the owner's review).";
 
 /**
  * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed`
  * names it). A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase
- * `notes`; exceeded after a rebase: `rises`, the operator's); on a PR it may change but not grow.
+ * `notes`; exceeded after a rebase: `rises`, the operator's); on a PR it may change but not grow,
+ * and one that shrinks lowers its ceiling in `ownPending` (the PR's own list) to match (#311).
+ * `lowered.pending` gets each ceiling a run from upstream finds too high: the count to lower it to.
  */
 function findUnlistedChanges(
   config,
-  { changed, atBase, atHead, upstream, isForkFile, removed = new Set(), afterRebase = false },
+  {
+    changed,
+    atBase,
+    atHead,
+    upstream,
+    isForkFile,
+    removed = new Set(),
+    afterRebase = false,
+    ownPending,
+    lowered,
+  },
 ) {
   const reasons = [];
   const ceilings = [];
@@ -307,7 +332,9 @@ function findUnlistedChanges(
       } else if (added < ceiling) {
         // A ceiling left too high is room to swap upstream lines for fork lines later, and a note
         // in the nightly log is never seen: refuse, naming the fix (only noted right after a
-        // rebase; the next run refuses it).
+        // rebase, where fork-follow commits the lowered list into the series: #325 item 1). Only a
+        // lower count goes to `lowered`: a rise is refused.
+        lowered?.pending.set(file, added);
         (afterRebase ? notes : ceilings).push(
           added === 0
             ? `${file}: "pending" with no fork lines left; remove it from the list.`
@@ -321,6 +348,23 @@ function findUnlistedChanges(
       reasons.push(
         `${file}: "pending" (fork lines to move out), and this change adds ${grows} more line${grows === 1 ? "" : "s"} than it removes.`,
       );
+    } else if (grows < 0 && ownPending !== undefined) {
+      // Main sits at its ceiling (fork-follow holds it there), so a change that moves fork lines
+      // out lowers it too. Left as it is, the next run from upstream refuses main for it, and the
+      // room left over would let a later change swap an upstream line for a fork line. The
+      // change's own list is read only for a lower ceiling: that is never a wider gate. This run
+      // cannot tell the fork's lines from upstream's here, so the text says both; an upstream
+      // line that goes is refused by the run from upstream ("lost" counts are held exact).
+      const want = ceiling + grows;
+      const own = Object.hasOwn(ownPending, file) ? ownPending[file] : 0;
+      if (own > Math.max(want, 0)) {
+        const removes = `${-grows} more line${grows === -1 ? "" : "s"} than it adds (keep upstream's lines; if they are fork lines moved out)`;
+        ceilings.push(
+          want > 0
+            ? `${file}: "pending" with a ceiling of ${ceiling}, and this change removes ${removes}: lower it to ${want} in this change's ${CONFIG}.`
+            : `${file}: "pending" with a ceiling of ${ceiling}, and this change removes ${removes}: remove it from "pending" in this change's ${CONFIG}.`,
+        );
+      }
     }
   }
   return { reasons, ceilings, rises, notes };
@@ -330,8 +374,9 @@ function findUnlistedChanges(
  * Upstream lines a seam or pending file lost: `lines` not kept in order, `gone` whose text is gone.
  * From upstream both are held to its "lost" entry (0 when unlisted); a rise after a rebase goes to
  * `rises`. On a PR only "added" lines may go: an announced line in main's file is upstream's.
+ * `lowered.lost` gets each entry a run from upstream finds too high: its counts ({0, 0}: remove it).
  */
-function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }) {
+function findLostLines(config, { atBase, atHead, upstream, afterRebase = false, lowered }) {
   const reasons = [];
   const ceilings = [];
   const rises = [];
@@ -369,7 +414,8 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }
       continue;
     }
     const counts = { lines, gone: total(gone) };
-    const held = lost[file] ?? { lines: 0, gone: 0 };
+    // Own keys only: a file named `constructor` would read Object's and never be refused.
+    const held = Object.hasOwn(lost, file) ? lost[file] : { lines: 0, gone: 0 };
     const below = [];
     for (const key of ["lines", "gone"]) {
       const text = say(counts[key], what[key]);
@@ -384,6 +430,7 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false }
       }
     }
     if (below.length > 0) {
+      lowered?.lost.set(file, counts);
       (afterRebase ? notes : ceilings).push(
         ...(lines === 0
           ? [
@@ -524,7 +571,8 @@ function findAnnouncementWarnings(ownFiles, baseFiles, today) {
   const warnings = [];
   for (const [file, seam] of Object.entries(ownFiles)) {
     if (seam.announced === undefined) continue;
-    if (JSON.stringify(baseFiles[file]?.announced) === JSON.stringify(seam.announced)) continue;
+    const before = Object.hasOwn(baseFiles, file) ? baseFiles[file].announced : undefined;
+    if (JSON.stringify(before) === JSON.stringify(seam.announced)) continue;
     const { since } = seam.announced;
     const fix = 'set "since" to the day this pull request merges.';
     const refused = dayAfter(since, ANNOUNCED_DAYS + 1);
@@ -727,6 +775,58 @@ function ownListProblem(text) {
   }
 }
 
+/**
+ * The list `text` with the ceilings and counts `lowered` names lowered ({ pending, lost }: Maps of
+ * file to count), as { text, changes }, or undefined when nothing changes. Only lowers: a count at
+ * 0 removes the entry, except a "pending" one a "lost" entry still names (removing it would leave
+ * the list malformed; the run after says so). Written with two-space JSON, as the list is, and
+ * parsed again before it is returned, so a lowered list is never one the check refuses.
+ */
+function lowerList(text, lowered) {
+  const raw = JSON.parse(text);
+  const changes = [];
+  const lost = raw.lost ?? {};
+  const counts = ({ lines, gone }) => `${lines}/${gone}`;
+  const lostAfter = Object.entries(lost).flatMap(([file, entry]) => {
+    const found = lowered.lost.get(file);
+    if (found === undefined) return [[file, entry]];
+    // Each count only lowers: one that rose is refused, and nothing is written then.
+    const to = {
+      lines: Math.min(found.lines, entry.lines),
+      gone: Math.min(found.gone, entry.gone),
+    };
+    if (to.lines === entry.lines && to.gone === entry.gone) return [[file, entry]];
+    if (to.lines === 0) {
+      changes.push(`${file}: "lost" ${counts(entry)} removed (no upstream line lost)`);
+      return [];
+    }
+    changes.push(`${file}: "lost" ${counts(entry)} -> ${counts(to)}`);
+    return [[file, { lines: to.lines, gone: to.gone }]];
+  });
+  if (raw.lost !== undefined) raw.lost = Object.fromEntries(lostAfter);
+  const stillLost = new Set(lostAfter.map(([file]) => file));
+  if (raw.pending !== undefined) {
+    raw.pending = Object.fromEntries(
+      Object.entries(raw.pending).flatMap(([file, ceiling]) => {
+        const to = lowered.pending.get(file);
+        if (to === undefined || to >= ceiling || (to === 0 && stillLost.has(file))) {
+          return [[file, ceiling]];
+        }
+        if (to === 0) {
+          changes.push(`${file}: "pending" ${ceiling} removed (no fork line left)`);
+          return [];
+        }
+        changes.push(`${file}: "pending" ${ceiling} -> ${to}`);
+        return [[file, to]];
+      }),
+    );
+  }
+  if (changes.length === 0) return undefined;
+  const lowerText = `${JSON.stringify(raw, null, 2)}\n`;
+  parseConfig(lowerText);
+  return { text: lowerText, changes };
+}
+
 const hasConfig = (rev) => entryAt(rev, CONFIG)?.type === "blob";
 
 /** Reads `<rev>:.github/fork-seams.json`; throws when that commit has none. */
@@ -745,17 +845,30 @@ function parseArgs(argv) {
   };
   const fromUpstream = flag("--from-upstream");
   const afterRebase = flag("--after-rebase");
-  let configRef;
-  const at = args.indexOf("--config-ref");
-  if (at !== -1) {
-    configRef = args[at + 1];
-    if (!configRef || configRef.startsWith("--")) return undefined;
+  const option = (name) => {
+    const at = args.indexOf(name);
+    if (at === -1) return { value: undefined };
+    const value = args[at + 1];
+    if (!value || value.startsWith("--")) return undefined;
     args.splice(at, 2);
-  }
+    return { value };
+  };
+  const configRef = option("--config-ref");
+  const loweredList = option("--lowered-list");
+  if (!configRef || !loweredList) return undefined;
   if (args.length !== 2 || args.some((arg) => arg.startsWith("--"))) return undefined;
   // A pull request's run never runs from upstream; only a run from upstream has a rebase behind it.
-  if (fromUpstream ? configRef !== undefined : afterRebase) return undefined;
-  return { configRef, fromUpstream, afterRebase, base: args[0], head: args[1] };
+  if (fromUpstream ? configRef.value !== undefined : afterRebase) return undefined;
+  // Only a run after a rebase lowers the list: fork-follow commits it into the rebased series.
+  if (loweredList.value !== undefined && !afterRebase) return undefined;
+  return {
+    configRef: configRef.value,
+    loweredList: loweredList.value,
+    fromUpstream,
+    afterRebase,
+    base: args[0],
+    head: args[1],
+  };
 }
 
 function main(argv) {
@@ -763,7 +876,7 @@ function main(argv) {
   if (!parsed) {
     console.error(
       "Usage: fork-seam-check.cjs [--config-ref <rev>] <base> <head>\n" +
-        "       fork-seam-check.cjs --from-upstream [--after-rebase] <upstream> <head>",
+        "       fork-seam-check.cjs --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>",
     );
     return 2;
   }
@@ -794,6 +907,21 @@ function main(argv) {
     .split("\0")
     .filter(Boolean);
   const isForkFile = forkFileTest(config.forkFiles);
+  const ownList = textAt(head, CONFIG);
+  const editsList = !upstream && ownList !== textAt(mergeBase, CONFIG);
+  const listProblem = editsList ? ownListProblem(ownList) : undefined;
+  // A pull request that moves fork lines out of a "pending" file lowers its ceiling in its own
+  // list (read only for that: a lower ceiling never widens the gate).
+  let ownPending;
+  if (!upstream && listProblem === undefined && ownList !== undefined) {
+    try {
+      ownPending = parseConfig(ownList).pending ?? {};
+    } catch {
+      ownPending = undefined; // The list judged it is main's; a malformed own one is said below.
+    }
+  }
+  const lowered =
+    parsed.loweredList === undefined ? undefined : { pending: new Map(), lost: new Map() };
   const unlisted = findUnlistedChanges(config, {
     changed,
     atBase,
@@ -802,8 +930,16 @@ function main(argv) {
     isForkFile,
     removed,
     afterRebase: parsed.afterRebase,
+    ownPending,
+    lowered,
   });
-  const lost = findLostLines(config, { atBase, atHead, upstream, afterRebase: parsed.afterRebase });
+  const lost = findLostLines(config, {
+    atBase,
+    atHead,
+    upstream,
+    afterRebase: parsed.afterRebase,
+    lowered,
+  });
   // A ceiling above the count is fixed by lowering it, not by moving lines: its own hint. A count
   // that rose with a rebase names the operator's step in its own text.
   const ceilings = [...unlisted.ceilings, ...lost.ceilings];
@@ -813,7 +949,16 @@ function main(argv) {
   const today = upstream ? undefined : commitDay(configRef);
   const late = [];
   const reasons = [
-    ...findSeamBreaches(config.files, { atBase, atHead, upstream, today, late }),
+    // A pull request's base is its base branch's tip: a listed copy another change has merged
+    // there since this branch's merge-base is spent (#311 item 3).
+    ...findSeamBreaches(config.files, {
+      atBase,
+      atHead,
+      upstream,
+      today,
+      late,
+      atTip: upstream ? undefined : (file) => textAt(base, file),
+    }),
     ...lost.reasons,
     ...unlisted.reasons,
     ...(upstream
@@ -836,9 +981,6 @@ function main(argv) {
   const from = parsed.configRef ? `--config-ref ${configRef}` : upstream ? "the head" : "the base";
   const notes = [...findListedGone(config, { atBase, atHead }), ...unlisted.notes, ...lost.notes];
   for (const note of notes) console.log(printable(`Note: ${note}`));
-  const ownList = textAt(head, CONFIG);
-  const editsList = !upstream && ownList !== textAt(mergeBase, CONFIG);
-  const listProblem = editsList ? ownListProblem(ownList) : undefined;
   if (editsList) {
     console.log(
       `Note: this change edits ${CONFIG}; it is judged by the list in ${from}, not its own. ` +
@@ -862,6 +1004,14 @@ function main(argv) {
   const refused = [...reasons, ...late, ...rises, ...ceilings, ...expired, ...landed];
   if (refused.length === 0) {
     if (listProblem !== undefined) return 1;
+    if (lowered !== undefined) {
+      // After a rebase only: fork-follow commits the lowered list into the rebased series.
+      const lower = lowerList(textAt(configRef, CONFIG), lowered);
+      if (lower !== undefined) {
+        fs.writeFileSync(parsed.loweredList, lower.text);
+        for (const change of lower.changes) console.log(printable(`Lowered: ${change}`));
+      }
+    }
     console.log(
       `Fork lines in upstream files: only the pinned seams (${counted}; list from ${from}).`,
     );
@@ -880,7 +1030,7 @@ function main(argv) {
   }
   if (ceilings.length > 0) {
     console.error(
-      `Lower each "pending" ceiling and "lost" count named above (or remove the entry) in ${CONFIG} with a pull request to main.`,
+      `Lower each "pending" ceiling and "lost" count named above (or remove the entry) in ${CONFIG}: in this change's list where the line says so, otherwise with a pull request to main.`,
     );
   }
   if (late.length > 0) {
@@ -916,6 +1066,7 @@ module.exports = {
   forkFileTest,
   lineCounts,
   lostLines,
+  lowerList,
   ownListProblem,
   parseConfig,
   parseRemoved,
