@@ -3,6 +3,7 @@
  * (`agentSlots`). A thin add-on over the shared settings rows: every write is an ordinary
  * settings patch from the person at the screen, under the same permission as project scripts.
  */
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
 import { DEFAULT_SERVER_SETTINGS, type ServerSettingsPatch } from "@t3tools/contracts";
 import type {
   AgentSlotsSettingsPatch,
@@ -32,7 +33,7 @@ import { AdvancedSettings } from "./AdvancedSettings";
 import { IntervalSecondsField } from "./IntervalSecondsField";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { SettingResetButton, SettingsRow, SettingsSection } from "./settingsLayout";
-import { searchableSetting } from "./settingsSearch";
+import { useSearchableSetting } from "./settingsSearch";
 import {
   useScopedSettings,
   useScopedSettingsMixed,
@@ -108,7 +109,7 @@ function NumberSettingRow({
       resetAction={
         !mixed && value !== defaultValue ? (
           <SettingResetButton
-            label={field.title.toLowerCase()}
+            ariaLabel={`Reset ${field.title.toLowerCase()} to default`}
             onClick={() => onCommit(defaultValue)}
           />
         ) : null
@@ -130,6 +131,7 @@ function NumberSettingRow({
 }
 
 function WaitForSection({ updateSettings }: { readonly updateSettings: UpdateSettings }) {
+  const searchableSetting = useSearchableSetting();
   const waitFor = useScopedSettings((settings) => settings.waitFor);
   const { targets } = useSettingsScope();
   const enabledMixed = targetsDiffer(targets, (settings) => settings.waitFor.enabled);
@@ -161,7 +163,7 @@ function WaitForSection({ updateSettings }: { readonly updateSettings: UpdateSet
         resetAction={
           !enabledMixed && waitFor.enabled !== DEFAULT_SERVER_SETTINGS.waitFor.enabled ? (
             <SettingResetButton
-              label="agent waits"
+              ariaLabel="Reset agent waits to default"
               onClick={() =>
                 updateSettings({ waitFor: { enabled: DEFAULT_SERVER_SETTINGS.waitFor.enabled } })
               }
@@ -343,6 +345,7 @@ function WaitCheckDialog({
 }
 
 function WaitChecksSection({ updateSettings }: { readonly updateSettings: UpdateSettings }) {
+  const searchableSetting = useSearchableSetting();
   const checks = useScopedSettings((settings) => settings.waitChecks);
   const mixed = useScopedSettingsMixed(["waitChecks"]);
   const canWrite = useScopedSettingsWriteAllowed();
@@ -466,6 +469,7 @@ function WaitChecksSection({ updateSettings }: { readonly updateSettings: Update
 }
 
 function AgentSlotsSection({ updateSettings }: { readonly updateSettings: UpdateSettings }) {
+  const searchableSetting = useSearchableSetting();
   const slots = useScopedSettings((settings) => settings.agentSlots);
   const { targets, environment, connectedEnvironments } = useSettingsScope();
   const providersByEnvironment = useEnvironmentProviders();
@@ -511,7 +515,7 @@ function AgentSlotsSection({ updateSettings }: { readonly updateSettings: Update
         resetAction={
           !enabledMixed && slots.enabled !== DEFAULT_SERVER_SETTINGS.agentSlots.enabled ? (
             <SettingResetButton
-              label="agent slots"
+              ariaLabel="Reset agent slots to default"
               onClick={() =>
                 updateSettings(patch({ enabled: DEFAULT_SERVER_SETTINGS.agentSlots.enabled }))
               }
