@@ -1001,6 +1001,14 @@ class PathRules(unittest.TestCase):
         self.assertEqual(code, H.REFUSED, out)
         self.assertIn(f'{CONFIG_PATH} at the base {base[:12]}: not UTF-8 text', out)
 
+    def test_a_base_config_that_is_not_utf8_is_a_refusal_whatever_the_locale(self):   # #442 item 8
+        # git's output is UTF-8 by contract, not by the job's locale: under a latin-1 one every byte decodes, and the
+        # UTF-16 config would be "not JSON" instead (UTF-8 mode, -X utf8, would hide this: text mode is UTF-8 there).
+        with unittest.mock.patch('locale.getencoding', return_value='latin-1'):
+            if not sys.flags.utf8_mode:   # the patch reaches text mode: the test reads what a latin-1 job does
+                self.assertEqual(subprocess.run(['printf', '\\377'], text=True, capture_output=True).stdout, '\xff')
+            self.test_a_base_config_that_is_not_utf8_is_a_refusal_never_a_crash()
+
     def test_a_config_that_is_no_regular_file_is_refused(self):   # #413 item 1: the queue open()s it and would stop
         base = self.base(mode=None)
         same = self.w.git(self.w.work, 'rev-parse', f'{base}:{CONFIG_PATH}')
@@ -1179,6 +1187,23 @@ class PathRulesBare(PathRules):
         self.assertIn(f'the head {head[:12]} does not merge cleanly into the base {b1[:12]}', out)
         self.assertEqual(self.check(b0, head, EVERY_LENS)[0], 0)   # the same head on the base it merges into
 
+    def test_a_conflict_stays_a_conflict_whatever_attribute_tree_the_job_names(self):   # #442 item 1
+        # GIT_ATTR_SOURCE names the tree git reads attributes from: one holding `* merge=union` makes merge-tree
+        # union-merge the conflict, and the gate would judge a merged config GitHub cannot make.
+        b0 = self.base('shadow')
+        head = self.head(b0, 'shadow', **{'docs/a.md': 'head\n'})
+        b1 = self.base('shadow', parent=b0, **{'docs/a.md': 'base\n', 'u/.gitattributes': '* merge=union\n'})
+        attrs = World.git(self.w.work, 'rev-parse', f'{b1}:u')
+        gate = self.w.checkout(b1, head)
+        union = subprocess.run(['git', '--git-dir', gate, 'merge-tree', '--write-tree', b1, head], capture_output=True,
+                               env={**os.environ, **GIT_ENV, 'GIT_ATTR_SOURCE': attrs})
+        self.assertEqual(union.returncode, 0, 'no union merge with GIT_ATTR_SOURCE on this git: the test reads nothing')
+        for _ in range(2):   # runs again: the same refusal
+            with unittest.mock.patch.dict(os.environ, {'GIT_ATTR_SOURCE': attrs}):
+                code, out = self.check(b1, head, EVERY_LENS)
+            self.assertEqual(code, H.REFUSED, out)
+            self.assertIn(f'the head {head[:12]} does not merge cleanly into the base {b1[:12]}', out)
+
     def test_the_merge_follows_a_directory_rename_as_the_queue_does(self):   # #413 item 4: merge.directoryRenames
         # pr_queue.holds merges with merge.directoryRenames=true, so the check does too: the base adds the config into a
         # folder the head renamed, the merge moves it along, and the config's path is gone (git's default, conflict,
@@ -1200,6 +1225,50 @@ class PathRulesBare(PathRules):
         self.assertEqual(code, H.REFUSED, out)
         self.assertIn(f'git merge-tree of the base {base[:12]} and the head {head[:12]} took over', out)
         self.assertEqual(self.check(base, head, EVERY_LENS)[0], 0)   # the same merge, given its time
+
+
+class GitEnvironment(unittest.TestCase):   # #442 item 2: pr_queue.GIT_RUN
+    """The gate's git calls get no program or transport of the job's environment where none can be needed: its local
+    calls reach no remote, and its fetch from GitHub (https) needs git's own helpers only. The checkout mode fetches
+    from the caller's origin, which may need them (ssh), so it keeps them, as before."""
+    def setUp(self):
+        self.JOB = {k: 'job-' + k for k in pr_queue.GIT_RUN}
+
+    def envs(self, call):
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(kw['env'])
+            return types.SimpleNamespace(returncode=0, stdout='', stderr='')
+        work = tempfile.mkdtemp(prefix='head-check-env-')
+        self.addCleanup(shutil.rmtree, work, True)
+        with unittest.mock.patch.object(subprocess, 'run', run), unittest.mock.patch.dict(os.environ, self.JOB):
+            call(work)
+        self.assertTrue(seen)
+        return [{k: env[k] for k in pr_queue.GIT_RUN if k in env} for env in seen]
+
+    def test_the_gate_runs_no_program_of_the_job_but_gits_own_for_its_fetch(self):
+        github = f'https://github.com/{REPO}.git'
+        exec_path = {'GIT_EXEC_PATH': 'job-GIT_EXEC_PATH'}
+        for name, call, want in (
+                ('git init', lambda d: head_gate.bare_repository(d, 'gate'), {}),
+                ('merge-tree', lambda d: H.Checkout(d, bare=(C, A), remote=github).git('merge-tree', C, A), {}),
+                ('cat-file', lambda d: H.Checkout(d, bare=(C, A), remote=github).has(A), {}),
+                ('the gate fetch', lambda d: head_gate.fetch(H.Checkout(d, bare=(C, A), remote=github), C, A),
+                 exec_path),
+                ('a read commit fetched', lambda d: H.Checkout(d, bare=(C, A), remote=github).fetch(A), exec_path),
+                ('--remote of the owner', lambda d: H.Checkout(d, bare=(C, A), remote='ssh://git@host/r.git').fetch(A),
+                 self.JOB)):
+            with self.subTest(name):
+                envs = self.envs(call)
+                self.assertEqual(envs[0], want)
+                self.assertTrue(all(e == {} for e in envs[1:]), envs)   # cat-file -e after a fetch: local
+
+    def test_the_checkout_mode_keeps_them_as_before(self):   # old callers: its origin is the caller's
+        for name, call in (('merge-base', lambda d: H.Checkout(d).git('merge-base', C, A)),
+                           ('fetch', lambda d: H.Checkout(d).fetch(A))):
+            with self.subTest(name):
+                self.assertEqual(self.envs(call)[0], self.JOB)
 
 
 class ChangedPaths(unittest.TestCase):
@@ -1309,6 +1378,17 @@ class MergedConfig(unittest.TestCase):
             with self.subTest(rel=ascii(rel)):
                 self.assertEqual(H.case_matches(Listing(), C, rel), {'.github/caf\u00e9.json', '.github/cafe\u0301.json',
                                                                      '.github/CAFE\u0301.json'})
+
+    def test_case_twins_fold_fully_not_only_lower_case(self):   # #442 item 3: casefold, never lower
+        sub = 'e' * 40
+        names = ('strasse.json', 'STRASSE.json', '\u017ftrasse.json', 'stra\u00dfe.json', 'strase.json', 'strasse.jsom')
+        trees = {C: f'040000 tree {sub}\t.github\0', sub: ''.join(f'100644 blob {B}\t{n}\0' for n in names)}
+
+        class Listing:
+            def git(self, *a, **kw):
+                return types.SimpleNamespace(returncode=0, stdout=trees[a[2]], stderr='')
+        self.assertEqual(H.case_matches(Listing(), C, '.github/strasse.json'),
+                         {'.github/' + n for n in names[:4]})   # the long s folds to s, sharp s to ss
 
     def test_a_config_that_is_not_utf8_is_a_refusal(self):   # strict: a config is text, and base_config reads it so
         def blob(*a):
