@@ -18,7 +18,7 @@
 .github/scripts/fork-fleet-desk-seed.test.py ~10s
 .github/scripts/fork-fleet-desk.test.py ~8s
 .github/scripts/fork-fleet.test.py ~47s
-.github/scripts/fork-fleet-refresh.test.py ~13s
+.github/scripts/fork-fleet-refresh.test.py ~46s
 .github/scripts/fork-fleet-walls.test.py ~75s
 .github/scripts/fork-fleet-walls-contract.test.py ~100s
 .github/scripts/fork-fleet-walls-wsl2.test.py ~36s
@@ -66,6 +66,7 @@ fork-kit/common/tests/free_contract.test.py ~5s
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py ~65s
 fork-kit/desk/tests/windows.test.py ~8s
+fork-kit/golive/tests/back.test.py ~35s
 fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
 fork-kit/golive/tests/copy.test.py ~26s

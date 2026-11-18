@@ -1,5 +1,5 @@
 {
-  "//": "Upstream files with fork lines, and every line the fork may add to each (indentation and blank lines ignored). Checked by .github/scripts/fork-seam-check.cjs against the base branch's copy of this file; see docs/fork/updates.md.",
+  "//": "Upstream files with fork lines, and every line the fork may add to each (indentation and blank lines ignored). Checked by .github/scripts/fork-seam-check.cjs against the base branch's copy of this file; see docs/fork/updates.md. A new line is first announced in its entry (\"announced\": {\"since\": day, \"added\": [lines]}), then added by a later pull request that moves it to \"added\" (docs/fork/updates.md, Adding a seam line).",
   "files": {
     "packages/contracts/src/settings.ts": {
       "why": "Fork settings live in forkSettings.ts; settings.ts takes them with one spread per struct. automaticUpdates stays inline: upstream's pending setting has the same name and place.",
@@ -109,6 +109,25 @@
         "CloudLinkInternalError | ManagedLimits.ManagedPolicyRefusedError",
         ">;"
       ]
+    },
+    "apps/server/src/peer/RemoteDelegation.ts": {
+      "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) rewrites this block, and its intent differs: after an interrupted, uncertain launch it stops the child there, while this seam keeps the child and follows it. Whoever brings #30249 in through fork-follow must choose on purpose between stopping and keeping (and expect a merge conflict on this block), then drop this seam or keep it.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-18",
+        "added": [
+          "// Fork: from the launch on, the task is recorded and followed even if this call is",
+          "// interrupted (the parent's turn moved on), else the thread there runs with nothing here",
+          "// following it or reporting its end. The reads above stay cancellable.",
+          "// prettier-ignore",
+          "return yield* Effect.gen(function* () { // Fork: start of launchAndRecord.",
+          "}).pipe(Effect.uninterruptible); // Fork: end of launchAndRecord.",
+          "// Fork: nothing here follows it, so stop it there, as a failed record does.",
+          "yield* Effect.logWarning(\"remote-delegation.record-found-no-task\", remoteChild);",
+          "const unfollowed = stopThere(followScope(scope.thread, remoteChild), remoteChild, \"stop\");",
+          "yield* unfollowed.pipe(Effect.ignoreCause({ log: true }));"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -212,7 +231,6 @@
     "apps/server/src/waits/",
     "apps/server/src/workAdmission*",
     "apps/web/src/clientPersistenceStorage.removedKeys.test.ts",
-    "apps/web/src/components/chat/MarkdownFileLink.logic.test.ts",
     "apps/web/src/components/settings/WaitsAndSlotsSettings*",
     "apps/web/src/components/settings/waitsAndSlotsSettings*",
     "packages/contracts/src/editor.test.ts",
@@ -227,9 +245,10 @@
     "packages/shared/src/capacity*",
     "packages/shared/src/waitFor*",
     "scripts/lib/release-repository.ts",
-    "scripts/release-repository.test.ts"
+    "scripts/release-repository.test.ts",
+    "!scripts/scenarios/fork-title-regenerates-from-inherited-history.e2e.ts"
   ],
-  "//lost": "Seam and pending files that lost upstream lines, counted from upstream (as fork-follow runs the check): \"lines\", the upstream lines not kept in order and indentation; \"gone\", those whose text is gone. Held exactly, like a ceiling; an unlisted file counts 0. Lower a count when a line comes back, and keep each one small: a line counted here may move unseen.",
+  "//lost": "Seam and pending files that lost upstream lines, counted from upstream (as fork-follow runs the check): \"lines\", the upstream lines not kept in order and indentation; \"gone\", those whose text is gone. Held exactly, like a ceiling; an unlisted file counts 0. Lower a count when a line comes back, and keep each one small: a count is not a set of lines, so a line counted here may move unseen, and in a pending file a pull request can put back one gone upstream line and delete another with both counts unchanged.",
   "lost": {
     "packages/shared/src/serverSettings.ts": {
       "lines": 1,
