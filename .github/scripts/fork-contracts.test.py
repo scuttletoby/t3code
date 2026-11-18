@@ -51,7 +51,7 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                running fork-checks-ran.py with the pinned env (PR_NUMBER too, #433), no
                continue-on-error, a checkout with its own timeout, and a job timeout that holds the worst
                case: the checkout's timeout, the wait cap (or the script's git calls, if longer) and one
-               last poll, from the script's own limits.
+               last poll, from the script's own limits, with a minute to spare for the job's set-up.
 
     python3 .github/scripts/fork-contracts.test.py
 
@@ -1664,6 +1664,9 @@ sys.dont_write_bytecode = True   # no __pycache__ in the tree
 _fcr_spec.loader.exec_module(_fcr)
 # The script's own limits (fork-checks-ran.test.py checks it keeps to them): its cap counts its git calls.
 POLICY_LIMITS = {k: getattr(_fcr, k) for k in ("GIT_TIMEOUT", "GIT_CALLS", "API_TIMEOUT", "API_CALLS_PER_POLL")}
+# Room the worst case leaves in the job timeout for the job's own set-up and the script's start (#449): a worst case
+# of exactly the timeout would be cancelled before its message.
+POLICY_MARGIN = 60
 
 
 def policy_worst_case(checkout, cap, limits):
@@ -1702,10 +1705,11 @@ def policy_job_problems(job, fc, limits=POLICY_LIMITS):
             problems.append(f"{where}: the second step is not `{POLICY_SCRIPT}` with the pinned env and nothing else")
     timeout, cap = job.get("timeout-minutes"), fc.get("wait_seconds")
     if not isinstance(timeout, int) or not isinstance(cap, int) or checkout_minutes is None \
-            or policy_worst_case(checkout_minutes * 60, cap, limits) > timeout * 60:
+            or policy_worst_case(checkout_minutes * 60, cap, limits) + POLICY_MARGIN > timeout * 60:
         problems.append(f"{where}: its worst case (checkout {checkout_minutes!r} min, fork_checks.wait_seconds "
-                        f"{cap!r} or the git calls {limits}, one last poll) does not fit the timeout ({timeout!r} min), "
-                        "so a timeout would cancel the job before its message")
+                        f"{cap!r} or the git calls {limits}, one last poll) plus {POLICY_MARGIN} s for the job's "
+                        f"set-up does not fit the timeout ({timeout!r} min), so a timeout would cancel the job before "
+                        "its message")
     return problems
 
 
@@ -1739,18 +1743,32 @@ def policy_problems(policies, wfs, tests_wf, limits=POLICY_LIMITS):
     return problems
 
 
+def policy_problems_or_crash(policies, wfs, tests_wf, limits=POLICY_LIMITS):
+    """policy_problems; a crash (a contract bug, or a mutation that cannot apply to the file) is one named problem,
+    so the later checks, the failure count and the clean-up still run (#449)."""
+    try:
+        return policy_problems(policies, wfs, tests_wf, limits)
+    except Exception as e:
+        return [f"the policy check crashed: {e!r}"]
+
+
 all_wfs = {str(p.relative_to(root)): load(p) for p in sorted(workflows_dir.glob("*.y*ml"))}
 policies = json.loads(policies_path.read_text()) if policies_path.is_file() else {}
 check("policies: .github/fork-actions-policies.json is there", bool(policies))
-problems = policy_problems(policies, all_wfs, fork_tests)
+problems = policy_problems_or_crash(policies, all_wfs, fork_tests)
 check("policies: every pull_request_target workflow is allowed or upstream_blocked, and fork-checks' check "
       "names are its jobs'", not problems, "; ".join(problems))
 
 
 def policy_mutant(mutate, limits=POLICY_LIMITS):
+    """(caught, detail): caught when the mutated files give a problem. A crash, in the mutation or in the check, is
+    not a catch but a named FAIL with its error (#449)."""
     p, w, t = copy.deepcopy(policies), copy.deepcopy(all_wfs), copy.deepcopy(fork_tests)
-    mutate(p, w, t)
-    return bool(policy_problems(p, w, t, limits))
+    try:
+        mutate(p, w, t)
+        return bool(policy_problems(p, w, t, limits)), ""
+    except Exception as e:
+        return False, f"crashed: {e!r}"
 
 
 FC = ".github/workflows/fork-checks.yml"
@@ -1829,7 +1847,7 @@ for label, mutate in {
     "fork_checks_ran's checkout with an extra env": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]["env"]
         .__setitem__("BASH_ENV", "x"),
 }.items():
-    check(f"policies: {label} fails", policy_mutant(mutate))
+    check(f"policies: {label} fails", *policy_mutant(mutate))
 # A crash in a mutation or in the check is a contract bug: a named FAIL, so the later checks, the count and the
 # clean-up still run (#449).
 crash = policy_mutant(lambda p, w, t: 1 / 0)
@@ -1841,7 +1859,7 @@ for label, change in {
     "more git calls than the budget holds": {"GIT_CALLS": 20},
     "a slower last poll than the budget holds": {"API_TIMEOUT": 200},
 }.items():
-    check(f"policies: {label} fails", policy_mutant(lambda p, w, t: None, {**POLICY_LIMITS, **change}))
+    check(f"policies: {label} fails", *policy_mutant(lambda p, w, t: None, {**POLICY_LIMITS, **change}))
 
 shutil.rmtree(work, ignore_errors=True)
 if failures:
