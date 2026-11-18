@@ -323,21 +323,33 @@ class Refusals(CheckBase):
                                                    'ActiveState': 'deactivating'}),
             'stop marker': lambda: self.m.write('home/runtime/.service-stopping', ''),
             'restarted': lambda: self.m.spawn_server(fx.LIVE),
+            # Fork #300 item 4: the auto-updater names an update while the report reads.
+            'update pending': lambda: self.m.write('home/runtime/service-state.json', json.dumps({
+                'protocol': 3, 'activeVersion': fx.LIVE, 'update': {'targetVersion': '0.1.10', 'status': 'pending'}})),
         }.items():
             with self.subTest(name):
                 self.m.standard()
                 if os.path.exists(self.m.path('home/runtime/.service-stopping')):
                     os.remove(self.m.path('home/runtime/.service-stopping'))
+                ran = []
 
                 def report(*a, **kw):
                     out = real(*a, **kw)
                     change()
+                    ran.append(out)
                     return out
                 with mock.patch.object(check.live, 'fork_report', report):
                     code, result, _ = self.check_json()
+                self.assertEqual(len(ran), 1, 'the report must have run for this probe')
                 self.assertEqual(code, 1, result)
                 self.assertNotIn('plan', result)
                 self.assertIn('T3 steady during the report', self.failed(result))
+                if name == 'update pending':
+                    self.assertIn('an update to 0.1.10 is pending', self.failed(result)['T3 steady during the report'])
+                # Fork #300 item 5: the answer is not used, so the result does not carry it either: a caller that
+                # reads counts or providers from a refused check finds none.
+                for key in ('counts', 'pendingMigrations', 'providers'):
+                    self.assertNotIn(key, result)
 
     def test_target_older_than_live(self):
         self.m.standard(target='0.1.8')

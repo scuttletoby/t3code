@@ -506,6 +506,10 @@ class Copy(CopyBase):
         said = str(e.exception)
         self.assertIn('if the kept files it names are back in the home, remove it', said)
         self.assertLess(said.index('remove it'), said.index('otherwise run the restore again'))
+        # Fork #300 item 7 in copy's own refusal: the copy's -wal or -journal is moved out, never deleted.
+        self.assertIn('first move out of userdata any -wal or -journal of the copy left beside the old database',
+                      said)
+        self.assertNotIn('first remove any', said)
         self.assertEqual((self.calls(), self.copies()), ([], []))
 
     def test_the_home_is_looked_at_again_just_before_the_stop(self):
@@ -1148,8 +1152,8 @@ class RealSqlite(CopyBase):
         self.write_rows(50, 'checkpoint')
         self.write_rows(30, 'leave-in-wal')
 
-    def write_rows(self, n, how):
-        subprocess.run([sys.executable, '-I', '-c', WAL_WRITER, self.db, str(n), how], check=True, timeout=60,
+    def write_rows(self, n, how, db=None):
+        subprocess.run([sys.executable, '-I', '-c', WAL_WRITER, db or self.db, str(n), how], check=True, timeout=60,
                        stdin=subprocess.DEVNULL)
 
     def open_rows(self, folder, with_wal=True):
@@ -1384,12 +1388,17 @@ class RealSqlite(CopyBase):
             self.assertIn("statev2.sqlite-wal is the copy's", said)
             self.assertIn('do NOT remove the record', said)
             self.assertNotIn('remove the record instead', said)
+            # Fork #300 item 7: the copy's own bytes too are moved out, never deleted (only the copy's manifest
+            # is checked, not that the copy folder still holds the file).
+            self.assertIn('move it out of userdata, and do NOT remove the record', said)
+            self.assertNotIn('remove it,', said)
+            # Fork #300 item 6: moved back, so the rerun finds every kept file gone and the record stale.
+            self.assertIn('the record is then stale', said)
         journal.settle(self.m.state, 'probe: looked')
         self.assertEqual(self.home_hashes(), before, 'a refused restore changed the home')
-        os.unlink(self.db + '-wal')  # what the README says: remove the half-way home's -wal
-        for n in ('-shm', '-journal'):
+        for n in ('-wal', '-shm', '-journal'):  # what the refusal says: move the half-way home's -wal out
             if os.path.exists(self.db + n):
-                os.unlink(self.db + n)
+                os.rename(self.db + n, self.m.path('moved-out' + n))
         result = self.restore_at(dest, '20990101T000003Z')
         self.assertIn('staleRecord', result)
         kept = {n.split(coldcopy.ASIDE)[0]: n for n in result['movedAside']}
@@ -1613,14 +1622,449 @@ class RealSqlite(CopyBase):
         # The copy's own refusal (a copy while the record is there) names it too, not only "a restore run would".
         problem = coldcopy._home_problem(config.load())
         self.assertIn("statev2.sqlite-wal is the copy's", problem)
-        # Following the advice: remove the copy's WAL, keep the record, run the restore again.
-        os.unlink(self.db + '-wal')
+        # Fork #300 item 6: copied back, no kept file is gone, so the record is not stale after the WAL is moved
+        # out: it stays live and the rerun names its kept files as the old home (asserted below).
+        for said in (str(e.exception), problem):
+            self.assertNotIn('the record is then stale', said)
+            self.assertIn('the record stays live', said)
+        # Following the advice: move the copy's WAL out, keep the record, run the restore again.
+        os.rename(self.db + '-wal', self.m.path('moved-out-wal'))
         result = self.restore_at(dest, '20990101T000002Z')
+        self.assertNotIn('staleRecord', result)
         self.assertEqual(result['movedAside'], rec['oldHome'], 'the copied-back record still names the old home')
         self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
         scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
         shutil.copy2(os.path.join(self.userdata, rec['oldHome'][0]), os.path.join(scratch, 'statev2.sqlite'))
         self.assertEqual(self.open_rows(scratch), ('ok', 100))
+
+    def test_a_copied_back_put_back_with_a_t3_s_commits_in_the_copys_wal_says_the_record_stays_live(self):
+        # Fork #300 item 6 for the "copy's WAL with more commits" group (state lens nit 3 on #471): a T3 ran on
+        # the half-way home, then the kept files were copied back. No kept file is gone, so after the WAL is
+        # moved out the record is live, not stale: the refusal must say so, and the rerun does so.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'checkpoint')
+        self.adapter.stop()
+        self.stop_after_the_wal_rename(dest, '20990101T000001Z')
+        self.write_rows(7, 'leave-in-wal')  # T3 on the half-way home, killed
+        with open(os.path.join(self.userdata, coldcopy.RESTORE_MARK)) as f:
+            rec = json.load(f)
+        for n in rec['oldHome']:
+            shutil.copy2(os.path.join(self.userdata, n), os.path.join(self.userdata, n.split(coldcopy.ASIDE)[0]))
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 87), 'old database + the mixed WAL: no error')
+        for said in self.refusals(dest) + [coldcopy._home_problem(config.load())]:
+            self.assertIn("statev2.sqlite-wal, statev2.sqlite-shm are the copy's WAL with more commits after",
+                          said)
+            self.assertIn('do NOT remove the record, then run the restore again (the record stays live: the rerun '
+                          'names its kept files as the old home)', said)
+            self.assertNotIn('the record is then stale', said)
+        for n in ('-wal', '-shm'):
+            os.rename(self.db + n, self.m.path('moved-out' + n))
+        result = self.restore_at(dest, '20990101T000002Z')
+        self.assertNotIn('staleRecord', result)
+        self.assertEqual((result['movedAside'], result['alsoKept']), (rec['oldHome'], []))
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+        scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+        shutil.copy2(os.path.join(self.userdata, rec['oldHome'][0]), os.path.join(scratch, 'statev2.sqlite'))
+        self.assertEqual(self.open_rows(scratch), ('ok', 100))
+
+    def test_a_copied_back_put_back_that_leaves_the_kept_shm_out_still_names_the_copys_wal(self):
+        # Fork #300 item 3 (data minor 3 on #288): the README says a kept -shm need not go back. The old home had
+        # a (stale) -shm and no -wal; the owner copies back the database and settings only. The kept -shm then has
+        # no twin in the home, and were it compared too, the copy-back would not be seen and nothing would name
+        # the copy's WAL beside the old database (fork #244 item 2 again).
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'checkpoint')
+        with open(self.db + '-shm', 'wb') as f:
+            f.write(b's' * 64)  # a stale -shm, as a T3 stopped without tidying leaves
+        self.adapter.stop()
+        self.assertFalse(os.path.exists(self.db + '-wal'), 'the old home must have no -wal for this probe')
+        self.stop_after_the_wal_rename(dest, '20990101T000001Z')
+        with open(os.path.join(self.userdata, coldcopy.RESTORE_MARK)) as f:
+            rec = json.load(f)
+        kept = {n.split(coldcopy.ASIDE)[0]: n for n in rec['oldHome']}
+        self.assertEqual(set(kept), {'statev2.sqlite', 'statev2.sqlite-shm', 'settings.json'})
+        for b in ('statev2.sqlite', 'settings.json'):
+            shutil.copy2(os.path.join(self.userdata, kept[b]), os.path.join(self.userdata, b))
+        self.assertFalse(os.path.exists(self.db + '-shm'), 'the kept -shm did not go back')
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80), 'old database + the copy\'s WAL: no error')
+        for said in self.refusals(dest):
+            self.assertIn("statev2.sqlite-wal is the copy's", said)
+            self.assertIn('do NOT remove the record', said)
+            self.assertIn('the record stays live', said)
+        # Following the advice: move the copy's WAL out, keep the record, run the restore again.
+        os.rename(self.db + '-wal', self.m.path('moved-out-wal'))
+        result = self.restore_at(dest, '20990101T000002Z')
+        self.assertEqual((result['movedAside'], result['alsoKept']), (rec['oldHome'], []))
+        self.assertNotIn('staleRecord', result)
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+        scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+        shutil.copy2(os.path.join(self.userdata, kept['statev2.sqlite']), os.path.join(scratch, 'statev2.sqlite'))
+        self.assertEqual(self.open_rows(scratch), ('ok', 100))
+
+    def test_a_record_that_names_only_a_shm_is_never_taken_as_copied_back(self):
+        # Fork #300 item 3 (state 3 on #288, the `kept and` guard): the old home held only a -shm (no database, no
+        # settings), so the record names only that. With no kept file to compare, "every kept file equals the
+        # home's" says nothing: the home is the half-way home, not a copied-back old home, and the copy's WAL in
+        # it belongs there. The record stays live and the rerun finishes.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.adapter.stop()
+        for n in ('statev2.sqlite', 'statev2.sqlite-wal', 'settings.json'):
+            os.remove(os.path.join(self.userdata, n))
+        self.assertTrue(os.path.exists(self.db + '-shm'))
+        self.stop_after_the_wal_rename(dest, '20990101T000001Z')
+        with open(os.path.join(self.userdata, coldcopy.RESTORE_MARK)) as f:
+            rec = json.load(f)
+        self.assertEqual(rec['oldHome'], ['statev2.sqlite-shm' + coldcopy.ASIDE + '20990101T000001Z'])
+        self.assertEqual(sha(self.db + '-wal'), sha(os.path.join(dest, 'userdata', 'statev2.sqlite-wal')))
+        self.assertEqual(coldcopy.stopped_restore(self.m.home, dest), rec)
+        coldcopy.plan_restore(dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+        result = self.restore_at(dest, '20990101T000002Z')
+        self.assertEqual((result['movedAside'], result['alsoKept']), (rec['oldHome'], []))
+        self.assertNotIn('staleRecord', result)
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+        self.assertFalse(os.path.exists(os.path.join(self.userdata, coldcopy.RESTORE_MARK)))
+
+    def test_a_copys_wal_that_changed_after_its_manifest_proves_nothing_about_a_wal_in_the_home(self):
+        # Fork #300 item 2 (data minor 2 / state 2 on #288): a copy's -wal header counts only while that file
+        # still matches its manifest SHA256. Here someone opened the copy folder's database in place, so its -wal
+        # changed after the manifest was written. The home's -wal (the copy's frames and a T3's after them) is
+        # then not proven "the copy's with more commits": it cannot be told.
+        self.distinct_stamps()
+        dest = self.copy(owner_says_go=True)['copy']
+        other = self.copy(owner_says_go=True)['copy']  # a second, untouched copy of the same home
+        self.write_rows(20, 'checkpoint')
+        self.adapter.stop()
+        self.assertFalse(os.path.exists(self.db + '-wal'))
+        self.stop_after_the_wal_rename(dest, '20990101T100001Z')
+        self.write_rows(7, 'leave-in-wal')  # T3 on the half-way home, killed
+        self.put_back_by_hand()
+        copys_wal = os.path.join(dest, 'userdata', 'statev2.sqlite-wal')
+        manifest_sum = sha(copys_wal)
+        self.write_rows(3, 'leave-in-wal', db=os.path.join(dest, 'userdata', 'statev2.sqlite'))
+        self.assertNotEqual(sha(copys_wal), manifest_sum, 'the copy\'s -wal must differ from its manifest')
+        with open(copys_wal, 'rb') as a, open(self.db + '-wal', 'rb') as b:
+            self.assertEqual(a.read(coldcopy.WAL_HEADER), b.read(coldcopy.WAL_HEADER), 'the probe needs one header')
+        before = self.home_hashes()
+        for call in (lambda: coldcopy.stopped_restore(self.m.home),
+                     lambda: coldcopy.stopped_restore(self.m.home, dest)):
+            with self.assertRaises(RuntimeError) as e:
+                call()
+            said = str(e.exception)
+            self.assertIn('whose statev2.sqlite-wal, statev2.sqlite-shm are cannot be told', said)
+            self.assertIn(f'{copys_wal} no longer matches its manifest, so its WAL header proves nothing', said)
+            self.assertNotIn('with more commits after', said)
+            self.assertNotIn("is the copy's", said)
+            self.assert_both_ways_and_how_to_tell(said)
+        self.assertIn('cannot be told', coldcopy._home_problem(config.load()))
+        self.assertEqual(self.home_hashes(), before, 'a refusal changed the home')
+        # The changed copy is itself refused for a restore; the untouched one still proves the header.
+        with self.assertRaises(coldcopy.Incomplete):
+            coldcopy.verify_copy(dest)
+        with self.assertRaises(RuntimeError) as e:
+            coldcopy.stopped_restore(self.m.home, other)
+        self.assertIn("the copy's WAL with more commits after", str(e.exception))
+        # Following either refusal: the WAL is moved out, the record kept, and the restore run again (from the
+        # copy that is whole): the record is stale and the old home is kept whole.
+        for n in ('-wal', '-shm'):
+            os.rename(self.db + n, self.m.path('moved-out' + n))
+        result = self.restore_at(other, '20990101T100002Z')
+        self.assertIn('staleRecord', result)
+        kept = {n.split(coldcopy.ASIDE)[0]: n for n in result['movedAside']}
+        scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+        shutil.copy2(os.path.join(self.userdata, kept['statev2.sqlite']), os.path.join(scratch, 'statev2.sqlite'))
+        self.assertEqual(self.open_rows(scratch), ('ok', 100))
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+
+    def move_back_but_delete_the_kept_wal_and_shm(self):
+        """The owner moves the kept database and settings back but deletes the kept -wal and -shm."""
+        with open(os.path.join(self.userdata, coldcopy.RESTORE_MARK)) as f:
+            rec = json.load(f)
+        for n in rec['oldHome']:
+            b = n.split(coldcopy.ASIDE)[0]
+            (os.unlink(os.path.join(self.userdata, n)) if b.endswith(('-wal', '-shm'))
+             else os.replace(os.path.join(self.userdata, n), os.path.join(self.userdata, b)))
+        return rec
+
+    def assert_gone_wal_cannot_be_told(self, dest):
+        kept_wal = 'statev2.sqlite-wal' + coldcopy.ASIDE + '20990101T000001Z'
+        said_all = self.refusals(dest) + [coldcopy._home_problem(config.load())]
+        for said in said_all:
+            self.assertIn('only partly put back', said)
+            self.assertIn(f"{kept_wal}: the home's statev2.sqlite-wal does not hold the kept bytes", said)
+            self.assertIn("begins with the header (salts included) of a copy's -wal", said)
+            self.assertIn('cannot be told', said)
+            self.assertIn('keep it and remove the record', said)  # moved back, a T3 appended since
+            self.assertIn('move it out of userdata (do not delete it), then remove the record', said)  # deleted
+            self.assertIn('scratch copies', said)
+            self.assertNotIn("holds the bytes of the copy's file", said)
+            # Fix round, both lenses' minor 1: both readings give more rows than the database alone, so the
+            # refusal no longer tells them apart by that, and it ends in a default that loses nothing.
+            self.assertIn("more rows than the database alone does not make it the old home's", said)
+            self.assertIn('what the old home wrote after the copy was taken is then missing', said)
+            self.assertIn('If you still cannot tell: move it out of userdata (do not delete it), then remove the '
+                          'record', said)
+            self.assertIn('the moved file keeps what it holds', said)
+
+    def kept_wal_before_it_goes(self):
+        """(kept name, bytes) of the kept -wal the record names, read while it is still there."""
+        with open(os.path.join(self.userdata, coldcopy.RESTORE_MARK)) as f:
+            name = [n for n in json.load(f)['oldHome'] if n.split(coldcopy.ASIDE)[0].endswith('-wal')][0]
+        with open(os.path.join(self.userdata, name), 'rb') as f:
+            return name, f.read()
+
+    def test_a_deleted_kept_wal_with_the_copys_wal_and_a_t3_s_frames_in_the_home_cannot_be_told(self):
+        # Fork #300 item 1 (data minor 1 on #288, its probe): the old home had a -wal (100 rows); a restore
+        # stopped after the copy's WAL went in; a T3 ran on that half-way home and was killed with 7 commits in
+        # the copy's WAL; the owner moved the kept database back and deleted the kept -wal and -shm. The home's
+        # -wal is then neither the copy's bytes nor the kept ones: the record was called stale and the rerun
+        # named the old database with the copy's WAL and T3's frames (87 rows) "the old home", without a word.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 100))
+        self.kill_before_the_record_removal(dest, '20990101T000001Z')
+        _, kept_bytes = self.kept_wal_before_it_goes()
+        self.write_rows(7, 'leave-in-wal')  # T3 on the half-way home, killed
+        self.move_back_but_delete_the_kept_wal_and_shm()
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 87), 'the copy\'s 80 rows + 7, not the old 100')
+        # Fix round, both lenses' minor 1: the row counts do not tell this from "moved back and appended to"
+        # (more rows than the database alone here too), but the kept bytes do: the home's -wal does not begin
+        # with them, so nothing proves it was moved back and the refusal stays.
+        self.assertEqual(self.open_rows(self.userdata, with_wal=False), ('ok', 50))
+        with open(self.db + '-wal', 'rb') as f:
+            self.assertNotEqual(f.read(len(kept_bytes)), kept_bytes)
+        self.assert_gone_wal_cannot_be_told(dest)
+        # Following the advice for a deleted kept -wal, which is also the default for an owner who cannot tell:
+        # this -wal goes out of userdata (kept by the owner), the record is removed, and the next restore
+        # finishes: it keeps the home as it now is and names no old home from the record.
+        os.rename(self.db + '-wal', self.m.path('moved-out-wal'))
+        os.unlink(os.path.join(self.userdata, coldcopy.RESTORE_MARK))
+        result = self.restore_at(dest, '20990101T000002Z')
+        self.assertNotIn('staleRecord', result)
+        self.assertTrue(all('20990101T000002Z' in n for n in result['movedAside']), result['movedAside'])
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+        self.assertFalse(os.path.exists(os.path.join(self.userdata, coldcopy.RESTORE_MARK)))
+
+    def test_a_moved_back_wal_a_t3_appended_to_since_begins_with_the_kept_bytes_and_is_the_old_home(self):
+        # Fork #300 item 1, the other reading, decided in code since the fix round (both lenses' minor 1): every
+        # kept file was moved back, then a T3 ran on the put-back home with the record forgotten and appended 7
+        # commits to the old WAL. A WAL the copy was taken with keeps its header while T3 appends, so the header
+        # cannot tell this from the deleted case above, and neither can row counts. The kept bytes can: SQLite
+        # only appends to a WAL until it starts it over, so the home's -wal begins with exactly the kept -wal's
+        # bytes (the record's SHA256), which the half-way home's WAL does not. The home is the old home: the
+        # record is stale, nothing is refused, and the rerun keeps all 107 rows.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+        self.kill_before_the_record_removal(dest, '20990101T000001Z')
+        kept_wal, kept_bytes = self.kept_wal_before_it_goes()
+        rec = self.put_back_by_hand()
+        self.write_rows(7, 'leave-in-wal')
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 107))
+        with open(self.db + '-wal', 'rb') as f:
+            home_wal = f.read()
+        self.assertGreater(len(home_wal), len(kept_bytes))
+        self.assertEqual(home_wal[:len(kept_bytes)], kept_bytes, 'the probe needs an appended-to WAL')
+        self.assertEqual(hashlib.sha256(kept_bytes).hexdigest(), rec['sums'][kept_wal])
+        self.assertNotEqual(rec['sums'][kept_wal], sha(os.path.join(dest, 'userdata', 'statev2.sqlite-wal')))
+        with open(os.path.join(dest, 'userdata', 'statev2.sqlite-wal'), 'rb') as f:
+            self.assertEqual(f.read(coldcopy.WAL_HEADER), home_wal[:coldcopy.WAL_HEADER], 'one header: item 1')
+        before = self.home_hashes()
+        self.assertIsNone(coldcopy.stopped_restore(self.m.home, dest))
+        self.assertIsNone(coldcopy.stopped_restore(self.m.home))
+        coldcopy.plan_restore(dest, self.m.home, from_home=self.m.home, version=fx.LIVE)
+        self.assertNotIn('cannot be told', coldcopy._home_problem(config.load()))
+        self.assertEqual(self.home_hashes(), before)
+        result = self.restore_at(dest, '20990101T000002Z')
+        self.assertIn('staleRecord', result)
+        kept = {n.split(coldcopy.ASIDE)[0]: n for n in result['movedAside']}
+        scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+        for n in ('statev2.sqlite', 'statev2.sqlite-wal'):
+            shutil.copy2(os.path.join(self.userdata, kept[n]), os.path.join(scratch, n))
+        self.assertEqual(self.open_rows(scratch), ('ok', 107))
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+        self.assertFalse(os.path.exists(os.path.join(self.userdata, coldcopy.RESTORE_MARK)))
+        # The state question: the restore run again has no record and the home is exactly the copy's: it keeps
+        # nothing a second time.
+        again = self.restore_at(dest, '20990101T000003Z')
+        self.assertIn('alreadyRestored', again)
+        self.assertEqual(again['movedAside'], [])
+
+    def test_a_moved_back_wal_whose_kept_bytes_are_the_copys_too_cannot_be_told_and_the_default_loses_nothing(self):
+        # What code still cannot tell (fix round, minor 1): the old home wrote nothing after the copy was taken,
+        # so the kept -wal holds the copy's bytes. "Moved back, then a T3 appended" and "deleted, with the
+        # half-way home's WAL (the copy's frames and a T3's) left" then both begin with the kept bytes: refused,
+        # with both readings. The owner here cannot tell and follows the default: the -wal goes out of userdata,
+        # the record is removed, the restore runs again and finishes. Nothing is lost: the database the rerun
+        # keeps and the moved-out -wal together open with every row (the 80 and T3's 7).
+        dest = self.copy(owner_says_go=True)['copy']
+        self.adapter.stop()
+        self.kill_before_the_record_removal(dest, '20990101T000001Z')
+        kept_wal, kept_bytes = self.kept_wal_before_it_goes()
+        rec = self.put_back_by_hand()
+        self.assertEqual(rec['sums'][kept_wal], sha(os.path.join(dest, 'userdata', 'statev2.sqlite-wal')))
+        self.write_rows(7, 'leave-in-wal')
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 87))
+        with open(self.db + '-wal', 'rb') as f:
+            self.assertEqual(f.read(len(kept_bytes)), kept_bytes, 'the probe needs an appended-to WAL')
+        self.assert_gone_wal_cannot_be_told(dest)
+        os.rename(self.db + '-wal', self.m.path('moved-out-wal'))
+        # The -wal out but the record still there: refused once more (one more step, no loop).
+        for said in self.refusals(dest):
+            self.assertIn('gone from the home too', said)
+            self.assertIn('remove the record once the home is right', said)
+        os.unlink(os.path.join(self.userdata, coldcopy.RESTORE_MARK))
+        result = self.restore_at(dest, '20990101T000002Z')
+        self.assertNotIn('staleRecord', result)
+        kept = {n.split(coldcopy.ASIDE)[0]: n for n in result['movedAside']}
+        self.assertNotIn('statev2.sqlite-wal', kept)
+        scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+        shutil.copy2(os.path.join(self.userdata, kept['statev2.sqlite']), os.path.join(scratch, 'statev2.sqlite'))
+        shutil.copy2(self.m.path('moved-out-wal'), os.path.join(scratch, 'statev2.sqlite-wal'))
+        self.assertEqual(self.open_rows(scratch), ('ok', 87))
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+        self.assertFalse(os.path.exists(os.path.join(self.userdata, coldcopy.RESTORE_MARK)))
+
+    def test_a_record_with_no_sum_for_its_kept_wal_still_refuses_an_appended_to_wal(self):
+        # The state question, an old or hand-edited record: with no SHA256 for the kept -wal nothing proves the
+        # home's -wal begins with it, so the moved-back-and-appended home is refused (the safe side), as before.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+        self.kill_before_the_record_removal(dest, '20990101T000001Z')
+        kept_wal, _ = self.kept_wal_before_it_goes()
+        rec = self.put_back_by_hand()
+        self.write_rows(7, 'leave-in-wal')
+        with open(os.path.join(self.userdata, coldcopy.RESTORE_MARK), 'w') as f:
+            json.dump({**rec, 'sums': {k: v for k, v in rec['sums'].items() if k != kept_wal}}, f)
+        self.assert_gone_wal_cannot_be_told(dest)
+
+    def test_a_copys_wal_that_changed_after_its_manifest_makes_a_gone_kept_wal_one_that_cannot_be_told(self):
+        # Fix round, both lenses' minor 2 (the limit the first round named): the record's copy holds a -wal that
+        # no longer matches its manifest (someone opened the copy folder's database in place), so its header
+        # proves nothing. The kept -wal was deleted and the half-way home's WAL (the copy's frames and a T3's)
+        # is in the home. With no header to compare, the record was called stale and that mix "the old home",
+        # without a word. The kit knows it cannot read that copy's -wal, so it now refuses: it cannot be told.
+        self.distinct_stamps()
+        dest = self.copy(owner_says_go=True)['copy']
+        other = self.copy(owner_says_go=True)['copy']  # a second, untouched copy of the same home
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+        self.kill_before_the_record_removal(dest, '20990101T000001Z')
+        self.write_rows(7, 'leave-in-wal')  # T3 on the half-way home, killed
+        copys_wal = os.path.join(dest, 'userdata', 'statev2.sqlite-wal')
+        with open(copys_wal, 'rb') as f:
+            copys_bytes = f.read()
+        kept_wal = 'statev2.sqlite-wal' + coldcopy.ASIDE + '20990101T000001Z'
+        self.move_back_but_delete_the_kept_wal_and_shm()
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 87))
+        changes = {'written to': lambda: self.write_rows(3, 'leave-in-wal',
+                                                         db=os.path.join(dest, 'userdata', 'statev2.sqlite')),
+                   'gone': lambda: os.unlink(copys_wal)}
+        before = self.home_hashes()
+        for how, change in changes.items():
+            with self.subTest(the_copys_wal=how):
+                change()
+                for call in (lambda: coldcopy.stopped_restore(self.m.home),
+                             lambda: coldcopy.plan_restore(other, self.m.home, from_home=self.m.home,
+                                                           version=fx.LIVE),
+                             lambda: coldcopy._home_problem(config.load())):
+                    try:
+                        said = call()
+                    except RuntimeError as e:
+                        said = str(e)
+                    self.assertIsInstance(said, str, 'the mix was taken as the old home')
+                    self.assertIn('only partly put back', said)
+                    self.assertIn(f"{kept_wal}: the home's statev2.sqlite-wal does not hold the kept bytes", said)
+                    self.assertIn(f'{copys_wal} no longer matches its manifest, so its WAL header proves nothing',
+                                  said)
+                    self.assertIn('cannot be told', said)
+                    self.assertNotIn('no readable manifest', said)
+                    self.assertIn('scratch copies', said)
+                    self.assertIn('for a -wal you still cannot tell: move it out of userdata (do not delete it)',
+                                  said)
+                    self.assertIn('remove the record once the home is right', said)
+                self.assertEqual(self.home_hashes(), before, 'a refusal changed the home')
+                # Put the copy's -wal right again for the next subtest.
+                with open(copys_wal, 'wb') as f:
+                    f.write(copys_bytes)
+                for n in ('-shm',):
+                    if os.path.exists(os.path.join(dest, 'userdata', 'statev2.sqlite' + n)):
+                        os.unlink(os.path.join(dest, 'userdata', 'statev2.sqlite' + n))
+        # With the copy's -wal as its manifest says, the header is proven again: item 1's refusal.
+        with self.assertRaises(RuntimeError) as e:
+            coldcopy.stopped_restore(self.m.home)
+        self.assertIn("begins with the header (salts included) of a copy's -wal", str(e.exception))
+        # Changed once more, and the advice followed: the -wal goes out of userdata, the record is removed, and
+        # the restore run again from the copy that is whole finishes.
+        changes['written to']()
+        with self.assertRaises(coldcopy.Incomplete):
+            coldcopy.verify_copy(dest)
+        os.rename(self.db + '-wal', self.m.path('moved-out-wal'))
+        with self.assertRaises(RuntimeError) as e:  # the record kept: one more step, no loop
+            coldcopy.stopped_restore(self.m.home)
+        self.assertIn('gone from the home too', str(e.exception))
+        os.unlink(os.path.join(self.userdata, coldcopy.RESTORE_MARK))
+        result = self.restore_at(other, '20990101T000002Z')
+        self.assertNotIn('staleRecord', result)
+        self.assertEqual(self.open_rows(self.userdata), ('ok', 80))
+        self.assertFalse(os.path.exists(os.path.join(self.userdata, coldcopy.RESTORE_MARK)))
+
+    def test_a_moved_back_wal_beside_a_copys_wal_that_changed_is_still_stale(self):
+        # The other side of minor 2: every kept file moved back holds the kept bytes (the record's SHA256), so
+        # it is moved back for sure, whatever the copy's -wal holds now.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+        self.kill_before_the_record_removal(dest, '20990101T000001Z')
+        self.put_back_by_hand()
+        self.write_rows(3, 'leave-in-wal', db=os.path.join(dest, 'userdata', 'statev2.sqlite'))
+        self.assertIsNone(coldcopy.stopped_restore(self.m.home))
+
+    def test_a_copys_wal_too_short_for_a_header_that_matches_its_manifest_is_not_a_changed_one(self):
+        # The state question for minor 2, an empty -wal: SQLite leaves a 0-byte -wal after a truncating
+        # checkpoint. A copy that holds one, as its manifest says, has no header to give and did not change: it
+        # must not turn every gone kept -wal into one that cannot be told. Gone or of other bytes, it did change.
+        dest = self.copy(owner_says_go=True)['copy']
+        copys_wal = os.path.join(dest, 'userdata', 'statev2.sqlite-wal')
+        _, _, heads, changed = coldcopy._copy_sums({'copy': dest})
+        self.assertEqual((set(heads), changed), ({'statev2.sqlite-wal'}, {}))
+        manifest = os.path.join(dest, coldcopy.MANIFEST)
+        with open(manifest) as f:
+            m = json.load(f)
+        for e in m['files']:
+            if e['path'] == 'statev2.sqlite-wal':
+                e['sha256'], e['bytes'] = hashlib.sha256(b'').hexdigest(), 0
+        with open(manifest, 'w') as f:
+            json.dump(m, f)
+        self.assertEqual(coldcopy._copy_sums({'copy': dest})[2:], ({}, {'statev2.sqlite-wal': [copys_wal]}))
+        with open(copys_wal, 'wb'):
+            pass
+        self.assertEqual(coldcopy._copy_sums({'copy': dest})[2:], ({}, {}))
+        os.unlink(copys_wal)
+        self.assertEqual(coldcopy._copy_sums({'copy': dest})[2:], ({}, {'statev2.sqlite-wal': [copys_wal]}))
+
+    def test_a_moved_back_wal_that_started_over_since_is_still_stale(self):
+        # The other side of item 1: the moved-back WAL was checkpointed and started over by a T3 on the put-back
+        # home, so it no longer begins with the copy's header (new salts). Nothing says it holds the copy's
+        # frames: the record is stale, as before.
+        dest = self.copy(owner_says_go=True)['copy']
+        self.write_rows(20, 'leave-in-wal')
+        self.adapter.stop()
+        self.kill_before_the_record_removal(dest, '20990101T000001Z')
+        self.put_back_by_hand()
+        self.write_rows(1, 'checkpoint')  # T3 on the put-back home closes cleanly: the WAL is gone,
+        self.write_rows(6, 'leave-in-wal')  # and a new one starts with new salts
+        with open(os.path.join(dest, 'userdata', 'statev2.sqlite-wal'), 'rb') as a, open(self.db + '-wal', 'rb') as b:
+            self.assertNotEqual(a.read(coldcopy.WAL_HEADER), b.read(coldcopy.WAL_HEADER))
+        self.assertIsNone(coldcopy.stopped_restore(self.m.home, dest))
+        result = self.restore_at(dest, '20990101T000002Z')
+        self.assertIn('staleRecord', result)
+        kept = {n.split(coldcopy.ASIDE)[0]: n for n in result['movedAside']}
+        scratch = tempfile.mkdtemp(prefix='golive-kept-', dir=self.m.root)
+        for n in ('statev2.sqlite', 'statev2.sqlite-wal'):
+            shutil.copy2(os.path.join(self.userdata, kept[n]), os.path.join(scratch, n))
+        self.assertEqual(self.open_rows(scratch), ('ok', 107))
 
     def test_a_restore_stopped_once_the_old_files_are_kept_is_rerun_with_no_second_kept_set(self):
         # The state question for item 2: right after the kept files are written, every kept file equals its home
@@ -1821,6 +2265,77 @@ class CommandLine(CopyBase):
         code = coldcopy.main_copy(config.load(), self.adapter, True, True, out, err)
         self.assertEqual(code, 0, err.getvalue())
         self.assertIn('copy done', out.getvalue())
+
+
+class WalBeginsWith(unittest.TestCase):
+    """_wal_begins_with: does a WAL begin, up to a whole frame, with the bytes of a SHA256 (fork #300 fix round)."""
+    PAGE = 512
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='golive-walprefix-')
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.path = os.path.join(self.dir, 'x.sqlite-wal')
+        header = b'\x37\x7f\x06\x82' + (3007000).to_bytes(4, 'big') + self.PAGE.to_bytes(4, 'big') + os.urandom(20)
+        self.frame = 24 + self.PAGE
+        self.wal = header + os.urandom(4 * self.frame)
+        self.write(self.wal)
+
+    def write(self, data):
+        with open(self.path, 'wb') as f:
+            f.write(data)
+
+    def begins(self, data):
+        return coldcopy._wal_begins_with(self.path, hashlib.sha256(data).hexdigest())
+
+    def test_the_header_and_whole_frames_are_found_and_nothing_else_is(self):
+        for k in range(5):
+            with self.subTest(frames=k):
+                self.assertTrue(self.begins(self.wal[:32 + k * self.frame]))
+        for cut in (0, 31, 33, 32 + self.frame - 1, 32 + self.frame + 1, len(self.wal) - 1):
+            with self.subTest(cut=cut):
+                self.assertFalse(self.begins(self.wal[:cut]), 'not a whole frame: cannot be a kept -wal appended to')
+        self.assertFalse(self.begins(self.wal + b'x'), 'longer than the file')
+        torn = self.wal + os.urandom(100)
+        self.write(torn)
+        self.assertFalse(self.begins(torn), 'a last frame cut short is not a whole frame, even as the whole file')
+        self.assertTrue(self.begins(self.wal), 'the whole frames before it still are')
+        self.write(self.wal)
+        other = bytearray(self.wal[:32 + 2 * self.frame])
+        other[40] ^= 1
+        self.assertFalse(self.begins(bytes(other)), 'a frame of other bytes')
+
+    def test_a_tail_that_was_written_over_is_not_begun_with(self):
+        # A WAL that started over keeps its length: old frames stay after the new ones until they are written
+        # over. A kept -wal with such a tail, moved back and written to, no longer begins with the kept bytes.
+        kept = self.wal
+        home = bytearray(kept)
+        home[32 + 2 * self.frame:32 + 3 * self.frame] = os.urandom(self.frame)
+        self.write(bytes(home) + os.urandom(self.frame))
+        self.assertFalse(self.begins(kept))
+        self.assertTrue(self.begins(kept[:32 + 2 * self.frame]))
+
+    def test_what_is_not_a_wal_or_has_no_sum_begins_with_nothing(self):
+        self.assertFalse(coldcopy._wal_begins_with(self.path, None))
+        self.assertFalse(coldcopy._wal_begins_with(self.path, ''))
+        self.assertFalse(coldcopy._wal_begins_with(os.path.join(self.dir, 'none'), hashlib.sha256(b'').hexdigest()))
+        os.symlink(self.path, os.path.join(self.dir, 'link'))
+        self.assertFalse(coldcopy._wal_begins_with(os.path.join(self.dir, 'link'),
+                                                   hashlib.sha256(self.wal[:32]).hexdigest()))
+        for page in (0, 1, 500, 513, 131072):
+            with self.subTest(page_size=page):
+                self.write(self.wal[:8] + page.to_bytes(4, 'big') + self.wal[12:])
+                with open(self.path, 'rb') as f:
+                    self.assertFalse(self.begins(f.read(32)), 'no page size, no frame to count by')
+        self.write(self.wal[:20])
+        self.assertFalse(self.begins(self.wal[:20]), 'shorter than a header')
+        self.write(b'')
+        self.assertFalse(self.begins(b''))
+
+    def test_a_page_size_of_65536_is_read(self):
+        big = self.wal[:8] + (65536).to_bytes(4, 'big') + self.wal[12:32] + os.urandom(2 * (24 + 65536))
+        self.write(big)
+        self.assertTrue(self.begins(big[:32 + 24 + 65536]))
+        self.assertFalse(self.begins(big[:32 + self.frame]))
 
 
 class Manifest(unittest.TestCase):
