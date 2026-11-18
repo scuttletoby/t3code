@@ -6,15 +6,13 @@ import * as Schema from "effect/Schema";
 import { Command, Flag, GlobalFlag } from "effect/cli";
 import * as CliError from "effect/cli/CliError";
 
-import {
-  awaitServiceLauncherStop,
-  resolveServiceLauncherMode,
-} from "../cloud/serviceLauncherClient.ts";
+import { awaitServiceLauncherStop } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import { awaitLauncherLoss } from "../launcherWatch.ts";
 import * as DatabaseMaintenance from "../persistence/DatabaseMaintenance.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as AutomaticPort from "./automaticPort.ts";
+import * as ForkHoldWork from "./forkHoldWork.ts";
 import { type CliServerFlags, resolveServerConfig, sharedServerCommandFlags } from "./config.ts";
 
 const encodeCommand = Schema.encodeEffect(Schema.fromJsonString(Schema.String));
@@ -28,7 +26,7 @@ const runServerCommand = Effect.fn("server.runServerCommand")(function* (
     readonly holdWork?: boolean;
   },
 ) {
-  if (options?.holdWork === true) yield* refuseHoldWorkForBootService;
+  if (options?.holdWork === true) yield* ForkHoldWork.refuseHoldWork(flags.baseDir);
   // Before config resolution, which claims a port and creates directories.
   const { runServer } = yield* Effect.promise(() => import("../server.ts"));
   const logLevel = yield* GlobalFlag.LogLevel;
@@ -87,27 +85,9 @@ export const startCommand = Command.make("start", { ...sharedServerCommandFlags 
 // Fork (go-live kit): a server that starts no agent work, to try a build on a copy of a T3 home.
 const holdWorkFlag = Flag.Boolean("hold-work").pipe(
   Flag.withDescription(
-    "Start no agent work, for trying a build on a copy of a T3 home: no turn, launch, scheduled task, wait, usage-limit resume, project pull, linked-environment follow-up, startup analytics ping or T3 Connect tunnel (a copy's stored link is kept, unused). Startup recovery and provider status checks (which start the provider CLIs, no turn) still run. Refused for the background service.",
+    "Start no agent work, for trying a build on a copy of a T3 home: no turn, launch, scheduled task, wait, usage-limit resume, project pull, linked-environment follow-up, startup analytics ping or T3 Connect tunnel (a copy's stored link is kept, unused). Startup recovery and provider status checks (which start the provider CLIs, no turn) still run. Needs --base-dir; refused on the default home and for the background service.",
   ),
   Flag.withDefault(false),
-);
-
-/** The background service must never run held: its threads would silently stop working. A
- * launcher context that cannot be read refuses too. */
-export const refuseHoldWorkForBootService = resolveServiceLauncherMode().pipe(
-  Effect.map(({ managed }) => managed),
-  Effect.orElseSucceed(() => true),
-  Effect.flatMap((managed) =>
-    managed
-      ? Effect.fail(
-          new CliError.UserError({
-            cause: "hold-work",
-            userMessage:
-              "--hold-work is refused for the background service. Run `t3 serve --hold-work --base-dir <copy>` by hand on a copy of a T3 home.",
-          }),
-        )
-      : Effect.void,
-  ),
 );
 
 // Serve never bootstraps a project, so it does not offer the flag that asks for one.
