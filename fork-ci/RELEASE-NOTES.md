@@ -13,6 +13,34 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: the cache's objects are checked before each merge check (#457)
+
+- Before its merge check the queue runs `git fsck` on its cache. git checks an object's hash on only some reads,
+  never of a tree or blob `merge-tree` reads: a tree or blob an earlier job stored under one side's name made a real
+  conflict merge clean. In an update the check runs in the background, while GitHub updates the branch. A cache
+  `git fsck` finds broken, or one a fetch fails on for a reason that is not the network or the login, is downloaded
+  from scratch once and checked again; one still broken is not merged in (the run keeps `STATE`, and the PR comment
+  says the cache fails `git fsck`). Old formats `git fetch` takes (time zone `+99999`, a tree out of order, an odd
+  `.gitmodules`) are ignored; a hash mismatch, a missing object or a corrupt pack never is. A cache that fails the same
+  way as right after its download from scratch is not downloaded again: a person must look. A fetch's `git gc` runs
+  in the foreground. `git fsck` reads every object on one core: about 28 seconds for 270,000 objects, at most once
+  per run.
+- The queue's cache and the gate's repository are made with `GIT_DEFAULT_HASH=sha1` and
+  `GIT_DEFAULT_REF_FORMAT=files` (every git call gets both), and `HEAD` is written by the queue whatever branch git's
+  `init` names (git 3.0 plans `main`). A git that still makes another format (an `[extensions]` section) is refused
+  with the extension named: no cache, nothing fetched or merged; in the gate the head's check run fails.
+- git calls that reach no remote (the queue's, the gate's `merge-tree`, and `head_check.py` in bare mode) drop
+  `GIT_TRACE*` and `GIT_CURL_VERBOSE`, as the fetches from GitHub do; `HTTPS://` counts as https in any case. The
+  head check's checkout mode keeps them, as before (a partial clone may fetch from `origin`).
+- A plain `http://` remote, a `transport::address` remote and one that starts with `-` are refused: GitHub redirects
+  http to https, where git hands the token over, a remote helper runs any program, and git reads `-...` as an
+  option. `head_check.py --bare --remote ''` is refused (exit 2) instead of becoming `origin`.
+- The gate checks git (2.43 or newer) and its remote before it makes its repository: either problem fails the head's
+  check run ("not judged: ..."), with nothing made or fetched.
+
+**Upgrade:** nothing to do. A kept cache is checked on its next merge check (it was made by the same code, so it
+passes); a broken one is downloaded from scratch once.
+
 ### pr-queue and head-check: no attributes from HEAD; local git calls run no job program (#450)
 
 - Every git call of the queue, the gate and the head check reads attributes from the empty tree
@@ -31,8 +59,10 @@ nothing.
   for the gate).
 
 **Upgrade:** the queue, the gate and the head check need git 2.43 or newer (`GIT_ATTR_SOURCE` came in 2.41, and
-`merge-tree` with it crashed before 2.43); an older git is refused (exit 2), never run without it. A kept queue cache
-is rebuilt once if its `HEAD` is not the queue's; nothing else to do.
+`merge-tree` with it crashed before 2.43); an older git never merges or judges anything. The queue refuses to start
+(exit 2; it reads its config with git first and decides nothing on it), the head check refuses (exit 2), and the gate
+fails the head's check run before it makes its repository (#457). A kept queue cache is rebuilt once if its `HEAD` is
+not the queue's; nothing else to do.
 
 ### pr-queue and head-check: GIT_ATTR_SOURCE and the job's git programs (#442)
 
