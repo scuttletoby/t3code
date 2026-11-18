@@ -37,6 +37,7 @@ CLASSES = (
     ('worktrees', 'rule:worktrees'),
     ('all docker volumes', 'rule:docker'),
     ('temp', 'rule:tmp'),
+    ('cold folders', 'rule:compress-cold'),
     ('agent tool homes', AGENT_HOMES),
     ('T3 data', T3_DATA),
     ('build caches', None),
@@ -47,6 +48,11 @@ MIN_MERGED_HOURS = 24    # a worktree goes no sooner than this after its pull re
 MIN_USED_HOURS = 24      # nor sooner than this after anything in it or its own git state last changed
 MIN_DOCKER_DAYS = 7      # an unused anonymous volume goes no sooner than this after it was made
 MIN_LOG_LINES = 10
+MIN_COLD_DAYS = 7        # compress-cold: a file is compressed no sooner than this after it was last changed or read
+MIN_KEEP_FREE_GB = 1     # compress-cold: the disk keeps at least this much free with a whole copy written
+# Folders compress-cold never takes, whatever the section says, nor a folder inside one or holding one: Claude Code
+# reads its transcripts as plain text (resume, usage scans), so they stay as they are (#468).
+COMPRESS_NEVER = ('~/.claude*',)
 # Folders any tool rebuilds, so an ignored one does not keep a worktree. A repository adds its own (regenerable).
 REGENERABLE = ('node_modules', '__pycache__', '.pytest_cache')
 
@@ -123,6 +129,7 @@ SPEC = {
     'docker': (dict, {}, None),
     'tmp': (dict, {}, None),
     'daily': (dict, {}, None),
+    'compressCold': (dict, {}, None),
 }
 WORKTREES_SPEC = {
     'repos': (list, (), None),
@@ -151,6 +158,16 @@ DAILY_SPEC = {
     'keepDays': (int, 30, _at_least(1)),                # its dated plan and compare files are kept this long
     'compare': (list, (), None),                        # the old tools' dry runs (compare.py), each a COMPARE_SPEC
 }
+# `compress-cold` (compress.py): files in these folders nobody changed or read for `days` are replaced by a checked
+# zstd copy. Without folders the rule does nothing.
+COMPRESS_SPEC = {
+    'folders': (list, (), None),                        # each a FOLDER_SPEC
+    'keepFreeGB': (int, 5, _at_least(MIN_KEEP_FREE_GB)),   # GB the disk keeps free with a whole copy written
+}
+FOLDER_SPEC = {
+    'path': (str, machine_file.REQUIRED, _path),        # the folder; files at any depth in it are looked at
+    'days': (int, machine_file.REQUIRED, _at_least(MIN_COLD_DAYS)),     # days without a change or a read
+}
 COMPARE_SPEC = {
     'name': (str, machine_file.REQUIRED, None),
     'command': (list, machine_file.REQUIRED, None),     # argv; the first is an absolute path; run without a shell
@@ -164,7 +181,9 @@ SOURCE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 # floor. 'own file': the cleaner's own log (it must be a new file or the cleaner's, never a must-keep path).
 # 'loosens': it takes a refusal away for what it names. Only `regenerable` does, and only for literal names it
 # lists (never a wildcard and never a credential-looking name). 'compare only': read by `fork-cleaner compare`
-# alone, which runs another tool's dry run and reads its output; it decides no delete.
+# alone, which runs another tool's dry run and reads its output; it decides no delete. The compressCold keys pick
+# folders, also in must-keep paths: that rule deletes no content (it keeps every file, as a copy read back and
+# checked before the original goes), and every other refusal still holds there (compress.py).
 KEY_KINDS = {
     'logFile': 'own file', 'logLines': 'floor', 'mustKeep': 'keeps more', 'worktrees': 'picks', 'docker': 'picks',
     'tmp': 'picks', 'worktrees.repos': 'picks', 'worktrees.mergedHours': 'floor', 'repos.root': 'picks',
@@ -173,6 +192,8 @@ KEY_KINDS = {
     'daily': 'picks', 'daily.mode': 'picks', 'daily.oldTimers': 'keeps more', 'daily.outDir': 'own file',
     'daily.keepDays': 'floor', 'daily.compare': 'compare only', 'compare.name': 'compare only',
     'compare.command': 'compare only', 'compare.pattern': 'compare only',
+    'compressCold': 'picks', 'compressCold.folders': 'picks', 'compressCold.keepFreeGB': 'floor',
+    'folders.path': 'picks', 'folders.days': 'floor',
 }
 
 
@@ -193,6 +214,13 @@ def must_keep_match(patterns, path):
 class Repo:
     def __init__(self, root, github, regenerable, branches=()):
         self.root, self.github, self.regenerable, self.branches = root, github, regenerable, branches
+
+
+class ColdFolder:
+    """One folder of compress-cold: its files untouched for `days` are compressed."""
+
+    def __init__(self, path, days):
+        self.path, self.days = path, days
 
 
 class Source:
@@ -279,12 +307,51 @@ class Config:
         if _holds(self.daily_dir, self.home):
             raise machine_file.MachineFileError(f'{where}.daily.outDir: {daily["outDir"]} is the home folder or holds it')
 
+        self.cold_folders = self._cold(values['compressCold'], f'{where}.compressCold', values['logFile'], daily['outDir'])
+
         for root in self.roots():
             for key, text, own in (('logFile', values['logFile'], self.log_file),
                                    ('daily.outDir', daily['outDir'], self.daily_dir)):
                 if _holds(root, own) or _holds(own, root):
                     raise machine_file.MachineFileError(f'{where}.{key}: {text} is inside {root}, a folder '
                                                         'the cleaner deletes from')
+
+    def _cold(self, section, where, log_text, out_text):
+        """The folders of compress-cold. A folder may be inside a must-keep path (the rule keeps every file's
+        content), but never one of them whole or a folder above one (`~/.codex` holds logins and settings; name
+        `~/.codex/sessions`), never in or above COMPRESS_NEVER, the cleaner's own files or a folder another rule
+        deletes from, and never in or above another of its folders."""
+        values = machine_file.fields(section, COMPRESS_SPEC, where)
+        self.keep_free = values['keepFreeGB'] * 1024 ** 3
+        folders = []
+        never = [tuple(self._expand(text).split('/')[1:]) for text in COMPRESS_NEVER]
+        for i, entry in enumerate(values['folders']):
+            at = f'{where}.folders[{i}]'
+            folder = machine_file.fields(entry, FOLDER_SPEC, at)
+            path, text = self._expand(folder['path']), folder['path']
+            parts = tuple(path.split('/')[1:])
+            if _holds(path, self.home):
+                raise machine_file.MachineFileError(f'{at}.path: {text} is the home folder or holds it')
+            if must_keep_match(never, path) is not None:
+                raise machine_file.MachineFileError(f'{at}.path: {text} is in, or holds, a folder this rule never '
+                                                    f'takes ({", ".join(COMPRESS_NEVER)}: read as plain text)')
+            held = [p for p in self.must_keep if must_keep_match((p,), path) is not None and len(parts) <= len(p)]
+            if held:
+                raise machine_file.MachineFileError(f'{at}.path: {text} is or holds the must-keep path /{"/".join(held[0])}: '
+                                                    'name a folder inside it (its settings and logins stay as they are)')
+            for key, own_text, own in (('logFile', log_text, self.log_file), ('daily.outDir', out_text, self.daily_dir)):
+                if _holds(path, own) or _holds(own, path):
+                    raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {key} {own_text}')
+            for root in self.roots():
+                if _holds(path, root) or _holds(root, path):
+                    raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {root}, a folder '
+                                                        'another rule deletes from')
+            for other in folders:
+                if _holds(path, other.path) or _holds(other.path, path):
+                    raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {other.path}, '
+                                                        'another of its folders')
+            folders.append(ColdFolder(path, folder['days']))
+        return tuple(folders)
 
     def _expand(self, text):
         return os.path.normpath(os.path.join(self.home, text[2:]) if text.startswith('~/') else text)

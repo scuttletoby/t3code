@@ -12,7 +12,7 @@ from unittest import mock
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
 LIB = os.path.join(KIT, 'lib', 'cleaner')
-MODULES = ('config', 'facts', 'guard', 'rules', 'engine', 'report', 'compare', 'daily')
+MODULES = ('config', 'facts', 'guard', 'compress', 'rules', 'engine', 'report', 'compare', 'daily')
 if COMMON not in sys.path:
     sys.path.insert(0, COMMON)
 
