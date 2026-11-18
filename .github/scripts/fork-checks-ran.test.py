@@ -28,11 +28,24 @@ def job(name, status='completed', conclusion='success'):
             'html_url': f'https://github.invalid/job/{abs(hash(name)) % 1000}'}
 
 
-def wr(rid, jobs, path=WF, event='pull_request_target', status='completed', prs=(7,), head_repo='o/r'):
-    """A run of fork-checks.yml on SHA; by default one of pull request #7 (PR_ENV) from this repository."""
-    return {'id': rid, 'path': path, 'event': event, 'status': status, 'jobs': jobs,
-            'pull_requests': [{'number': n, 'head': {'sha': SHA}} for n in prs],
-            'head_repository': {'full_name': head_repo}}
+REPO_ID, OTHER_ID = 101, 202   # GitHub's ids of this repository (o/r) and of another one
+
+
+def pr(number, ref='feature', repo_id=REPO_ID):
+    """A pull_requests entry as GitHub gives it: its head repo has an id, a short name and an API url, no full_name."""
+    return {'id': 5000 + number, 'number': number, 'url': f'https://api.github.invalid/repos/o/r/pulls/{number}',
+            'head': {'ref': ref, 'sha': SHA, 'repo': {'id': repo_id, 'name': 'r',
+                                                      'url': 'https://api.github.invalid/repos/o/r'}},
+            'base': {'ref': 'main', 'sha': BASE, 'repo': {'id': REPO_ID, 'name': 'r',
+                                                         'url': 'https://api.github.invalid/repos/o/r'}}}
+
+
+def wr(rid, jobs, path=WF, event='pull_request_target', status='completed', prs=(7,), head_repo='o/r', branch='feature'):
+    """A run of fork-checks.yml on SHA; by default one of pull request #7 (PR_ENV) from this repository's branch
+    `feature`. prs: numbers (entries from that branch) or whole entries."""
+    return {'id': rid, 'path': path, 'event': event, 'status': status, 'jobs': jobs, 'head_branch': branch,
+            'pull_requests': [p if isinstance(p, dict) else pr(p, branch) for p in prs],
+            'head_repository': {'full_name': head_repo, 'id': REPO_ID if head_repo == 'o/r' else OTHER_ID}}
 
 
 class Clock:
@@ -247,6 +260,55 @@ class Check(unittest.TestCase):
             self.assertEqual(code, 1, (run, out))
             self.assertIn('fork-checks did not run', out)
             self.assertNotIn('actions/runs/5/jobs', ' '.join(fake.paths))
+
+    # --- GitHub lists a pull request on runs whose head SHA OR head branch matches it (#443) ------------------------
+    def test_a_second_pull_request_from_another_branch_at_the_same_commit_does_not_count(self):
+        # PR #11 from branch `other` at the same commit, against a base whose fork-checks.yml is a no-op: GitHub may
+        # list this PR (#7, branch `feature`) on #11's run too. Only the entry from the run's own branch counts.
+        other = wr(9, [job(CFG['check'])], branch='other', prs=(pr(7, 'feature'), pr(11, 'other')))
+        for runs in ([wr(3, [job(CFG['check'], 'completed', 'failure')]), other], [other]):
+            fake = Fake([runs])
+            code, out, _ = check(fake)
+            self.assertEqual(code, 1, out)
+            self.assertNotIn('actions/runs/9/jobs', ' '.join(fake.paths))
+        # ... while this PR's own run, which lists #11 too, still counts for #7.
+        own = wr(3, [job(CFG['check'])], prs=(pr(11, 'other'), pr(7, 'feature')))
+        self.assertEqual(check(Fake([[other, own]]))[0], 0)
+
+    def test_an_entry_whose_head_is_another_repository_does_not_count(self):
+        code, out, _ = check(Fake([[wr(5, [job(CFG['check'])], prs=(pr(7, 'feature', OTHER_ID),))]]))
+        self.assertEqual(code, 1, out)
+        self.assertIn('fork-checks did not run', out)
+
+    def test_missing_head_fields_fail_closed(self):
+        # Without the head branch and repository on both sides the entry cannot be tied to this run: never counted.
+        entry, run = pr(7), wr(5, [job(CFG['check'])])
+        bad_entries = [{k: v for k, v in entry.items() if k != 'head'}, {**entry, 'head': None}, {**entry, 'head': 'feature'},
+                       {**entry, 'head': {**entry['head'], 'ref': None}}, {**entry, 'head': {**entry['head'], 'ref': ''}},
+                       {**entry, 'head': {k: v for k, v in entry['head'].items() if k != 'ref'}},
+                       {**entry, 'head': {k: v for k, v in entry['head'].items() if k != 'repo'}},
+                       {**entry, 'head': {**entry['head'], 'repo': None}},
+                       {**entry, 'head': {**entry['head'], 'repo': {'name': 'r'}}},
+                       {**entry, 'head': {**entry['head'], 'repo': {'id': str(REPO_ID)}}},
+                       {**entry, 'head': {**entry['head'], 'repo': {'id': True}}}]
+        bad_runs = [{**run, 'pull_requests': [e]} for e in bad_entries]
+        bad_runs += [{k: v for k, v in run.items() if k != 'head_branch'}, {**run, 'head_branch': None},
+                     {**run, 'head_branch': ''}, {**run, 'head_repository': {'full_name': 'o/r'}},
+                     {**run, 'head_repository': {'full_name': 'o/r', 'id': None}}]
+        # Both sides missing must not match each other either (None == None).
+        bad_runs += [{**run, 'head_branch': None, 'pull_requests': [{**entry, 'head': {**entry['head'], 'ref': None}}]},
+                     {**run, 'head_branch': '', 'pull_requests': [{**entry, 'head': {**entry['head'], 'ref': ''}}]},
+                     {**run, 'head_repository': {'full_name': 'o/r', 'id': True},
+                      'pull_requests': [{**entry, 'head': {**entry['head'], 'repo': {'id': True}}}]},
+                     {**run, 'head_repository': {'full_name': 'o/r'},
+                      'pull_requests': [{**entry, 'head': {**entry['head'], 'repo': {'name': 'r'}}}]}]
+        for bad in bad_runs:
+            fake = Fake([[bad]])
+            code, out, _ = check(fake)
+            self.assertEqual(code, 1, (bad, out))
+            self.assertIn('fork-checks did not run', out)
+            self.assertNotIn('actions/runs/5/jobs', ' '.join(fake.paths), bad)
+        self.assertEqual(check(Fake([[run]]))[0], 0)   # the same run, whole, passes
 
     def test_no_run_of_this_pull_request_fails_with_a_clear_message(self):
         code, out, _ = check(Fake([[wr(9, [job(CFG['check'])], prs=(11,))]]))
