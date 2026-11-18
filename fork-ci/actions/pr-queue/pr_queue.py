@@ -58,9 +58,10 @@ TESTED_BASE = 'pr_queue tested base'   # the annotation title the tested-base ac
 BASE_RED = ('FAILURE', 'ERROR')   # "the base was red": a real failure. CANCELLED, STALE, STARTUP_FAILURE, TIMED_OUT,
 # SKIPPED, not reported or running say nothing about the base's code (a busy runner times out or cancels base runs)
 UPDATES = 3   # holds() follows at most this many queue updates in a row
-GIT_MIN = (2, 38)   # git merge-tree --write-tree
+GIT_MIN = (2, 43)   # merge-tree --write-tree (2.38) with GIT_ATTR_SOURCE (2.41; merge-tree crashed with it until 2.43)
 REFUSED, SILENT = 2, 3
 READ_TOKEN, WRITE_TOKEN = 'PR_QUEUE_READ_TOKEN', 'PR_QUEUE_WRITE_TOKEN'
+READ_LOGIN = f"{READ_TOKEN} (the run's read token: contents read)"
 # Never passed on: each gh and git gets exactly one token, as GH_TOKEN (gh_env).
 TOKEN_VARS = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', READ_TOKEN, WRITE_TOKEN)
 READ_PERMISSIONS = 'actions, checks, contents, issues, pull-requests and statuses: read'
@@ -78,9 +79,18 @@ GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c'
 # ~/.gitconfig or ~/.config/git/attributes. The same
 # two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
 GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
+# The tree git reads `.gitattributes` from, for every call git_env makes: the empty tree, so no attribute file of any
+# commit counts. Without it a bare repository's HEAD (git 2.43 to 2.45 read `HEAD:.gitattributes` there) or an
+# `attr.tree` is one: `* merge=union` there makes merge-tree's conflict clean. Git knows the empty tree in every
+# repository, even one with no objects. GIT_ATTR_SOURCE is read from git 2.41 (an older git ignores it without a word,
+# so git_problem refuses it: GIT_MIN). Kept apart from GIT_ENV, which other actions share (git_clean.test.py).
+EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+GIT_ATTRS = {'GIT_ATTR_SOURCE': EMPTY_TREE}
+# One language for git's messages: the queue and the gate match them (GONE_RE, NO_LOGIN_RE) and read them as UTF-8.
+GIT_LANG = {'LC_ALL': 'C'}
 # Never passed on to git (git_env): variables of the job that point git at another repository, object store, index,
-# config, attribute tree (GIT_ATTR_SOURCE: `* merge=union` makes merge-tree's conflict clean) or pathspec rule than
-# the call names, or run another diff program. The job's environment is the owner's, but each git call says alone
+# config, attribute tree (GIT_ATTR_SOURCE: git_env sets its own, GIT_ATTRS) or pathspec rule than the call names, or
+# run another diff program. The job's environment is the owner's, but each git call says alone
 # what it reads.
 GIT_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
             'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
@@ -92,9 +102,19 @@ GIT_DROP_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 # a call that reaches no remote, and (all but GIT_EXEC_PATH, where git finds its own https helper and index-pack) from
 # a fetch from an https URL: its login is GIT_AUTH's or none, and ssh, the git:// proxy and a protocol list are never
 # needed there. A fetch from another remote (a checkout's origin, an owner's ssh URL) keeps them: it may need them.
+# Only a call that fetches names its remote: the cache's and the gate's local calls (merge-tree, cat-file, rev-parse)
+# run none of them, GIT_EXEC_PATH included.
 GIT_RUN = ('GIT_EXEC_PATH', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS',
            'GIT_ALLOW_PROTOCOL')
+# Traces of an https fetch: they write its headers (the login) and its talk with GitHub to stderr or a file, and the
+# gate puts git's stderr into a public summary. Dropped there; a fetch from another remote carries no token of ours.
+GIT_TRACE_PREFIXES = ('GIT_TRACE', 'GIT_CURL_VERBOSE')
 GIT_READ_SECONDS = 60   # each git call of the config read
+# The cache's HEAD, as the queue writes it (what `git init --template=` writes): a branch that is never made, so HEAD
+# names no commit and no tree. A cache with any other HEAD (a ref or sha an earlier job planted) is rebuilt.
+CACHE_HEAD = 'ref: refs/heads/master\n'
+# git's words for a fetch that needed a login it did not have (none given, or one GitHub refused)
+NO_LOGIN_RE = re.compile(r'could not read (Username|Password)|terminal prompts disabled|Authentication failed', re.I)
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
@@ -315,20 +335,31 @@ def no_token_env():
 
 
 def git_env(env, remote=None):
-    """`env` for a git call: without GIT_DROP, with GIT_ENV and no prompt. `remote`: None for a call that reaches no
-    remote, else the URL or remote name it fetches from, which decides what of GIT_RUN it keeps. Tokens are the
-    caller's to drop."""
-    drop = set(GIT_DROP)
+    """`env` for a git call: without GIT_DROP, with GIT_ENV, GIT_ATTRS, GIT_LANG and no prompt. `remote`: None for a
+    call that reaches no remote, else the URL or remote name it fetches from, which decides what of GIT_RUN it keeps
+    (an https fetch also drops the traces, GIT_TRACE_PREFIXES). Tokens are the caller's to drop."""
+    drop, prefixes = set(GIT_DROP), GIT_DROP_PREFIXES
     if remote is None:
         drop.update(GIT_RUN)
     elif remote.startswith('https://'):
         drop.update(set(GIT_RUN) - {'GIT_EXEC_PATH'})
-    return {**{k: v for k, v in env.items() if k not in drop and not k.startswith(GIT_DROP_PREFIXES)},
-            'GIT_TERMINAL_PROMPT': '0', **GIT_ENV}
+        prefixes += GIT_TRACE_PREFIXES
+    return {**{k: v for k, v in env.items() if k not in drop and not k.startswith(prefixes)},
+            'GIT_TERMINAL_PROMPT': '0', **GIT_LANG, **GIT_ENV, **GIT_ATTRS}
+
+
+def fetch_failed(stderr, login):
+    """What a failed fetch says: git's own words, and when they are about a login, which one was missing or refused
+    (`login`: where the run's token comes from)."""
+    said = f'git fetch failed: {stderr.strip()[:300]}'
+    if NO_LOGIN_RE.search(stderr):
+        said += f' (git found no login for GitHub, or GitHub refused it: check {login})'
+    return said
 
 
 def git_problem(run=subprocess.run):
-    """Why this git cannot run the queue (merge-tree --write-tree needs GIT_MIN), or None."""
+    """Why this git cannot run the queue (merge-tree --write-tree that reads attributes from GIT_ATTRS needs GIT_MIN),
+    or None."""
     try:
         r = run(['git', 'version'], text=True, capture_output=True, env=no_token_env())
         out = r.stdout.strip()
@@ -337,7 +368,8 @@ def git_problem(run=subprocess.run):
     m = re.match(r'git version (\d+)\.(\d+)', out)
     if m and tuple(map(int, m.groups())) >= GIT_MIN:
         return None
-    return f'git {".".join(map(str, GIT_MIN))} or newer is needed (merge-tree --write-tree); found: {out[:80] or "none"}'
+    return (f'git {".".join(map(str, GIT_MIN))} or newer is needed (merge-tree --write-tree that honours GIT_ATTR_SOURCE); '
+            f'found: {out[:80] or "none"}')
 
 
 def committed_config(path, run=None):
@@ -482,20 +514,22 @@ class Queue:
             self.said.add(key)
             print(text)
 
-    def git(self, *a):
-        """git in the cache. It only fetches: with the run's read token, and with no token at all when there is none
-        (never gh's own login of the machine)."""
+    def git(self, *a, fetch=False):
+        """git in the cache, with the run's read token, and with no token at all when there is none (never gh's own
+        login of the machine). `fetch`: the call fetches from the remote (only Queue.fetch's two), so it keeps what of
+        the job's GIT_RUN the remote may need; every other call runs none of it (git_env)."""
         token = self.read_token
         env = self.gh_env(token) if token else no_token_env()
         return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env=git_env(env, self.remote))
+                              text=True, capture_output=True, env=git_env(env, self.remote if fetch else None))
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
         """Why the cache is not the one the queue made, or None. git runs there with the token in its environment, and
         its objects decide what is re-armed: only a directory of this user that no one else can enter, whose config is
-        CACHE_CONFIG, that holds none of the files that make git read other objects or history (UNTRUSTED_FILES) and
-        that is a bare repository, counts."""
+        CACHE_CONFIG and whose HEAD is CACHE_HEAD naming no commit (a HEAD is an attribute source in a bare repository),
+        that holds none of the files that make git read other objects or history (UNTRUSTED_FILES) and that is a bare
+        repository, counts."""
         try:
             st = os.lstat(self.cache)
             if not stat.S_ISDIR(st.st_mode):
@@ -505,6 +539,9 @@ class Queue:
             with open(os.path.join(self.cache, 'config'), opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
                 if f.read() != CACHE_CONFIG:
                     return 'has a config the queue did not write'
+            with open(os.path.join(self.cache, 'HEAD'), opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
+                if f.read() != CACHE_HEAD:
+                    return 'has a HEAD the queue did not write'
             for name in UNTRUSTED_FILES:
                 if os.path.lexists(os.path.join(self.cache, name)):
                     return f'holds {name}, which the queue never writes'
@@ -512,6 +549,8 @@ class Queue:
             return f'cannot be checked ({e})'
         if self.git('rev-parse', '--is-bare-repository').stdout.strip() != 'true':
             return 'is not a bare git repository'
+        if self.git('rev-parse', '-q', '--verify', 'HEAD').returncode != 1:   # 1: no such commit, as the queue made it
+            return 'has a branch at HEAD: HEAD names a commit (the queue never makes its branch)'
         return None
 
     def own_cache(self):
@@ -550,6 +589,7 @@ class Queue:
             return False
         try:
             write_text(os.path.join(new, 'config'), CACHE_CONFIG)
+            write_text(os.path.join(new, 'HEAD'), CACHE_HEAD)   # what git init wrote; said here, not left to its default
             os.rename(new, self.cache)
         except OSError as e:   # something made the cache between the two steps: the next run sets it aside
             print(f'could not move the new repository to {self.cache}: {e}')
@@ -568,15 +608,15 @@ class Queue:
         if not self.own_cache():
             return None
         r = self.git('fetch', '-q', '--no-tags', self.remote, f'+refs/heads/{base}:refs/queue/base',
-                     f'+refs/pull/{n}/head:refs/queue/pr{n}')
+                     f'+refs/pull/{n}/head:refs/queue/pr{n}', fetch=True)
         if r.returncode != 0:
-            print(f'#{n}: git fetch failed: {r.stderr.strip()[:300]}')
+            print(f'#{n}: {fetch_failed(r.stderr, READ_LOGIN)}')
             return None
         missing = [s for s in shas if not self.has(s)]
         if missing:   # a read commit no ref reaches any more (GitHub keeps it)
-            r = self.git('fetch', '-q', '--no-tags', self.remote, *missing)
+            r = self.git('fetch', '-q', '--no-tags', self.remote, *missing, fetch=True)
             if r.returncode != 0 and not GONE_RE.search(r.stderr):   # a network error is no "not on GitHub"
-                print(f'#{n}: git fetch of {", ".join(s[:12] for s in missing)} failed: {r.stderr.strip()[:300]}')
+                print(f'#{n}: {fetch_failed(r.stderr, READ_LOGIN)} (of {", ".join(s[:12] for s in missing)})')
                 return None
         return all(self.has(s) for s in shas)
 

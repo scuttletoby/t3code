@@ -664,7 +664,7 @@ def fetch(checkout, base, head):
     """The base tip and the head, by sha, with their history, into refs only the gate names. None or why not."""
     r = checkout.git('-c', 'gc.auto=0', 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
                      checkout.remote, f'{base}:refs/gate/base', f'{head}:refs/gate/head', fetch=True)
-    return None if r.returncode == 0 else f'git fetch failed: {r.stderr.strip()[:300]}'
+    return None if r.returncode == 0 else pr_queue.fetch_failed(r.stderr, 'GH_TOKEN (the gate\'s read token)')
 
 
 def empty_lenses_problem(checkout, config_path):
