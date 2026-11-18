@@ -586,6 +586,12 @@ jobs:
       - name: Check generated Expo GraphQL operations
         run: vp run --filter t3 generate --check
 
+      - name: Check generated Linear GraphQL operations
+        run: vp run --filter @t3tools/issue-tracker-linear generate --check
+
+      - name: Check i18n catalogs
+        run: vp run i18n:check
+
       - name: Check
         run: vp check
 
@@ -828,11 +834,11 @@ jobs:
         if: matrix.shard == 1
         run: python3 -B .github/scripts/stage-preview-bundle.test.py
 
-      # Upstream's ci.yml runs the first four; the fork adds thread-transfer-report,
+      # Upstream's ci.yml runs the first five; the fork adds thread-transfer-report,
       # which upstream runs from a workflow_run of its CI (disabled in the fork).
       - name: Test release checks
         if: matrix.shard == 1
-        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/test-delta.test.cjs .github/scripts/thread-transfer-report.test.cjs
+        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/vercel-deployment-output.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/mobile-ios-preview-record.test.cjs .github/scripts/test-delta.test.cjs .github/scripts/thread-transfer-report.test.cjs
 
       - name: Finish installing browser secret helper build libraries
         if: steps.shard.outputs.any == 'true'
