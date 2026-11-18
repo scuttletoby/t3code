@@ -40,7 +40,7 @@ and no comment says so yet (STATE stays, the next run finishes it).
     PR_QUEUE_READ_TOKEN=... PR_QUEUE_WRITE_TOKEN=... \
     pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 """
-import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, time, urllib.parse
+import argparse, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, threading, time, urllib.parse, zlib
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -143,9 +143,21 @@ FSCK_IGNORE = tuple(a for i in FSCK_FORMAT_IDS for a in ('-c', f'fsck.{i}=ignore
 # A fetch's automatic gc runs before the fetch returns, never detached: a repack in the background deletes packs and
 # loose objects while the next git fsck reads them (a false "broken", and a download from scratch).
 NO_DETACH = ('-c', 'gc.autoDetach=false', '-c', 'maintenance.autoDetach=false')
-# In the cache: git fsck's lines right after a download from scratch that it still found broken. The same lines on a
-# later run are GitHub's own history, not an earlier job's object: that run does not download it all again.
-FSCK_KNOWN = 'queue-fsck-known'
+# STATE + this, next to the queue's plan and never in the cache: what the cache's check said right after a download
+# from scratch that it still failed (git fsck's lines, or the merge check's one line). The same words on a later run
+# are GitHub's own history, not an earlier job's object: that run does not download it all again. An older queue kept
+# it in the cache (`queue-fsck-known`), where whoever can write the cache could plant one: that file is never read.
+FSCK_KNOWN = '.fsck-known'
+# CACHE + this: the merge check's own repository (Queue.holds_checked), made new for each check and deleted after it.
+MERGE_COPY = '.merge'
+# How long the merge check's object reader (Copy: one `git cat-file --batch`) may owe one answer, the line that names
+# an object or its next 1 MiB, before it is stopped and the run knows nothing (STATE stays). An answer takes
+# milliseconds; this is for a reader that hangs. The run's other git calls have no limit but the job's.
+CAT_SECONDS = 120
+# A merge check follows at most this many merge bases (bases_of): a history with more is not taken as the change read.
+MERGE_BASES = 8
+# A commit as git reads it: the tree line, then the parent lines right after it.
+COMMIT_RE = re.compile(rb'tree ([0-9a-f]{40})\n((?:parent [0-9a-f]{40}\n)*)')
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
@@ -184,7 +196,12 @@ CHECK_NOT_DONE_RE = re.compile(r'required status checks?\b(?:"[^"\n]*"|[^."\n])*
                                r'(?:queued|in progress|expected|pending)\b', re.I)
 
 
-def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
+def merge_tree(git, p, side):
+    """git's merge of the commits `p` and `side`: exit 0 and the tree's name when clean."""
+    return git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', p, side)
+
+
+def holds(git, head, read, depth=UPDATES, base='refs/queue/base', merge=None):
     """Step 4's rule on commits `git` (a callable running git in one repository) already has: `head` is `read`, or a
     parent P of `head` is on `base` and head's tree is `git merge-tree --write-tree P X` byte for byte, where X is
     `read` or head's other parent when that one holds this itself (an earlier queue update: GitHub merges the new base
@@ -192,11 +209,14 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same.
 
     git's output is decoded strictly by the callers. A conflict lists the conflicted files by name, and a name need
-    not be UTF-8: that is no same change (a clean merge prints only the tree id), said once, never a crash."""
+    not be UTF-8: that is no same change (a clean merge prints only the tree id), said once, never a crash.
+
+    `merge`: what runs each merge-tree, as merge_tree(git, p, side) does (the queue's copies the objects that merge
+    reads first: Queue.holds_checked)."""
     if head == read:
         return True
     try:
-        return _holds(git, head, read, depth, base)
+        return _holds(git, head, read, depth, base, merge or (lambda p, side: merge_tree(git, p, side)))
     except UnicodeDecodeError as e:
         print(f'::warning::pr-queue: git printed bytes that are not UTF-8 while checking {head[:12]} against the read '
               f'{read[:12]} (a conflict naming a file whose name is not UTF-8: {e.reason}, byte {e.start}): the head '
@@ -204,7 +224,7 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
         return False
 
 
-def _holds(git, head, read, depth, base):
+def _holds(git, head, read, depth, base, merge):
     if head == read:
         return True
     tree = git('rev-parse', '--verify', '-q', head + '^{tree}').stdout.strip()
@@ -212,12 +232,230 @@ def _holds(git, head, read, depth, base):
     for p in parents:
         if git('merge-base', '--is-ancestor', p, base).returncode != 0:
             continue
-        sides = [read] + [h for h in parents if h != p and depth > 1 and _holds(git, h, read, depth - 1, base)]
+        sides = [read] + [h for h in parents if h != p and depth > 1
+                          and _holds(git, h, read, depth - 1, base, merge)]
         for side in dict.fromkeys(sides):
-            m = git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', p, side)
+            m = merge(p, side)
             if m.returncode == 0 and tree and m.stdout.split()[:1] == [tree]:
                 return True
     return False
+
+
+class Changed(Exception):
+    """An object the merge check needs is not in the cache as its name says: missing, unreadable or other content."""
+
+
+class Copy:
+    """The objects of one merge check, copied out of the cache into a repository of their own (`to`, new and empty)
+    with every hash checked on the way. git checks no hash of a tree or blob merge-tree reads nor of a commit a walk
+    reads, and the cache's git fsck ends before the merge check (in an update, minutes before): whoever can write the
+    cache could change an object in between. One `git cat-file --batch` (`argv`, `env`) hands each object out the way
+    any git call finds it; this process hashes what it got (`<type> <size>\\0<content>`, SHA-1) and writes it to `to`
+    as a loose object only when that is its name. The merge check then runs in `to`: it reads only objects hashed
+    here, and nothing written to the cache after an object was copied can reach it. The trees git itself makes there
+    (of two or more merge bases) are written by git into `to`, where nothing was planted under their names.
+
+    Changed: an object is missing, cannot be read or does not hash to its name. OSError: `to` cannot be written, or
+    (TimeoutError) cat-file gave no answer for CAT_SECONDS, which says nothing about the cache's objects."""
+
+    def __init__(self, argv, env, to):
+        self.to, self.seen, self.folders = to, set(), set()
+        self.tree_of, self.trees, self.whole, self.walked = {}, {}, set(), set()   # commit: its tree; tree: entries
+        self.cat = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        self.asked, self.stalled, self.done = None, False, threading.Event()   # asked: since when said() waits
+        self.watcher = threading.Thread(target=self.watch, daemon=True)
+        self.watcher.start()
+
+    def watch(self):
+        """Stops a cat-file that owes one answer (said) for more than CAT_SECONDS: git opens a loose object with a
+        plain open(), so a FIFO planted under an object's name would hold it, and with it the run and the queue's
+        lock, until the job's time limit. The reads themselves are not touched: a stopped cat-file can only give
+        less than was asked for, never other bytes. Between two answers (while git merges) nothing is counted."""
+        while not self.done.wait(min(1.0, CAT_SECONDS / 4)):
+            asked = self.asked
+            if asked is not None and time.monotonic() - asked > CAT_SECONDS:
+                self.stalled = True
+                self.cat.kill()
+                return
+
+    def close(self):
+        """cat-file stopped and reaped (a run that is killed outright closes its stdin, which ends it too)."""
+        self.done.set()
+        self.watcher.join()
+        self.cat.kill()
+        for pipe in (self.cat.stdin, self.cat.stdout):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        self.cat.wait()
+
+    def said(self, name, n=None):
+        """cat-file's next line (after asking for `name`), or its next `n` bytes; Changed when it gives less, and
+        TimeoutError when it gave less because it was stopped after CAT_SECONDS without an answer (watch)."""
+        self.asked = time.monotonic()
+        try:
+            if n is None:
+                self.cat.stdin.write(name.encode() + b'\n')
+                self.cat.stdin.flush()
+                got = self.cat.stdout.readline()
+            else:
+                got = self.cat.stdout.read(n)
+        except (OSError, ValueError) as e:
+            got = e
+        finally:
+            self.asked = None
+        if self.stalled:   # whatever came before it was stopped: never taken, and no word on the object
+            raise TimeoutError(f'git cat-file gave no answer for {CAT_SECONDS:g} s (object {name}) and was stopped')
+        if isinstance(got, Exception):
+            raise Changed(f'object {name} cannot be read (git cat-file: {got})') from None
+        if n is not None and len(got) != n:
+            raise Changed(f'object {name} cannot be read (git cat-file stopped)')
+        return got
+
+    def take(self, name, kind):
+        """Object `name`, which must be a `kind`, copied if it was not yet: its content when it is a commit or a
+        tree copied now, else None."""
+        if name in self.seen:
+            return None
+        # No test pins the name echo, the type or the newline after the content below: a wrong name or type fails
+        # the hash (the type is in the hashed header), a lost newline fails the next header. Kept as a second net.
+        line = self.said(name).split()
+        if len(line) != 3 or line[0] != name.encode() or not line[2].isdigit():
+            raise Changed(f'object {name} is missing or cannot be read')
+        if line[1] != kind.encode():
+            raise Changed(f'object {name} is a {line[1][:20].decode("ascii", "replace")}, not a {kind}')
+        left = int(line[2])
+        header = b'%s %d\0' % (line[1], left)
+        hashed, packed, kept = hashlib.sha1(header), zlib.compressobj(1), []
+        folder = os.path.join(self.to, 'objects', name[:2])
+        if folder not in self.folders:
+            os.makedirs(folder, exist_ok=True)
+            self.folders.add(folder)
+        path = os.path.join(folder, name[2:])
+        with open(path + '.new', 'wb') as out:   # git may have written this name itself (a merge's result)
+            out.write(packed.compress(header))
+            while left:
+                part = self.said(name, min(left, 1 << 20))
+                left -= len(part)
+                hashed.update(part)
+                out.write(packed.compress(part))
+                if kind != 'blob':
+                    kept.append(part)
+            out.write(packed.flush())
+        if self.said(name, 1) != b'\n':
+            raise Changed(f'object {name} cannot be read (git cat-file said something else)')
+        if hashed.hexdigest() != name:
+            raise Changed(f'object {name} does not hash to its name')
+        os.replace(path + '.new', path)
+        self.seen.add(name)
+        return None if kind == 'blob' else b''.join(kept)
+
+    def take_commits(self, *tips):
+        """Every commit these reach. A history in which each commit hashes to its name is the one GitHub sent: every
+        walk in `to` (rev-list, merge-base, merge-tree's merge bases) then reads real parents."""
+        todo = list(tips)
+        while todo:
+            name = todo.pop()
+            body = self.take(name, 'commit')
+            if body is None:
+                if name not in self.tree_of:
+                    raise Changed(f'object {name} is not a commit')
+                continue
+            links = COMMIT_RE.match(body)
+            if not links:
+                raise Changed(f'object {name} is not a commit git can read')
+            self.tree_of[name] = links.group(1).decode()
+            todo += [line.split()[1].decode() for line in links.group(2).splitlines()]
+
+    def tree(self, name):
+        """{entry name: [(mode, object name), ...]} of tree `name` (one entry per name, but for an old tree that
+        holds a name twice), copied on first use."""
+        if name not in self.trees:
+            body = self.take(name, 'tree')
+            if body is None:
+                raise Changed(f'object {name} is not a tree')
+            entries, at = {}, 0
+            try:
+                while at < len(body):
+                    space = body.index(b' ', at)
+                    end = body.index(b'\0', space)
+                    oid = body[end + 1:end + 21]
+                    if len(oid) != 20:
+                        raise ValueError
+                    entries.setdefault(body[space + 1:end], []).append((int(body[at:space], 8), oid.hex()))
+                    at = end + 21
+            except ValueError:
+                raise Changed(f'object {name} is not a tree git can read') from None
+            self.trees[name] = entries
+        return self.trees[name]
+
+    def take_entry(self, mode, name):
+        """One tree entry's object; True for a tree. A submodule's commit (mode 160000) is another repository's:
+        the cache never holds it and no merge reads it."""
+        if stat.S_IFMT(mode) == 0o160000:
+            return False
+        if stat.S_ISDIR(mode):
+            self.tree(name)
+            return True
+        self.take(name, 'blob')
+        return False
+
+    def take_whole(self, root):
+        """Tree `root` and everything in it."""
+        todo = [root]
+        while todo:
+            name = todo.pop()
+            if name not in self.whole:
+                self.whole.add(name)
+                todo += [oid for entry in self.tree(name).values() for mode, oid in entry if self.take_entry(mode, oid)]
+
+    def take_merged(self, roots):
+        """What a merge of the commits with these root trees (the two sides and every merge base) can read: the
+        root trees, and below them every entry that is not the same object with the same mode in all of them, with
+        all that is under such an entry in each. An entry that is the same in all of them git takes as it is, without
+        reading it or anything under it (in a merge of merge bases too: the tree that makes has the same entry
+        there), and a rename is found only among paths that differ."""
+        todo = [tuple(roots)]
+        while todo:
+            at = todo.pop()
+            if at in self.walked:
+                continue
+            self.walked.add(at)
+            listed = [self.tree(t) if t else {} for t in at]
+            for name in set().union(*listed):
+                here = [entries.get(name) for entries in listed]
+                if all(h == here[0] for h in here):
+                    continue
+                below = []
+                for h in here:
+                    trees = [oid for mode, oid in h or () if self.take_entry(mode, oid)]
+                    if len(h or ()) > 1:   # a name held twice: all of each, nothing left out
+                        for oid in trees:
+                            self.take_whole(oid)
+                    below.append(trees[0] if len(trees) == 1 and len(h) == 1 else None)
+                if any(below):
+                    todo.append(tuple(below))
+
+
+def bases_of(git, p, side):
+    """The commits whose trees `git merge-tree p side` reads besides the two: their merge bases. Two or more of them
+    git first merges into one, pair by pair, and each of those merges reads its own merge bases, which are among the
+    merge bases of the pairs: so those are added too, until none is new. None when there are more than MERGE_BASES."""
+    def pair(a, b):
+        return [c for c in git('merge-base', '--all', a, b).stdout.split() if SHA.fullmatch(c)]
+    found, done = list(dict.fromkeys(pair(p, side))), set()
+    while len(found) > 1:
+        pairs = [(a, b) for i, a in enumerate(found) for b in found[i + 1:] if (a, b) not in done]
+        if not pairs:
+            break
+        for a, b in pairs:
+            done.add((a, b))
+            found += [c for c in pair(a, b) if c not in found]
+            if len(found) > MERGE_BASES:
+                return None
+    return found
 
 
 def connection(found, after):
@@ -523,9 +761,11 @@ class Queue:
 
     def __init__(self, repo, cfg, state, cache, lock, sleep=time.sleep, read_token=None, write_token=None):
         self.repo, self.cfg, self.state, self.cache, self.lock, self.sleep = repo, cfg, state, cache, lock, sleep
+        self.known = state + FSCK_KNOWN
         self.read_token, self.write_token, self.said = read_token, write_token, set()
         self.remote = f'https://github.com/{repo}.git'
         self.later, self.fetch_error, self.fsck_said = None, '', ''   # check_later, fetch, objects_problem
+        self.rebuilt = False   # this run downloaded the cache from scratch (fetch_again): never a second time
         self.unknown = 'the queue could not fetch from GitHub'   # why fetch_checked knows nothing (PR comment words)
         self.review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association,
                                   cfg.lens_author_associations)
@@ -595,19 +835,19 @@ class Queue:
             self.said.add(key)
             print(text)
 
-    def git(self, *a, fetch=False, errors='strict'):
+    def git(self, *a, fetch=False, errors='strict', repo=None):
         """git in the cache, with the run's read token, and with no token at all when there is none (never gh's own
         login of the machine). `fetch`: the call fetches from the remote (only Queue.fetch's two), so it keeps what of
         the job's GIT_RUN the remote may need; every other call runs none of it (git_env). `errors`: how git's output
-        is decoded (UTF-8)."""
-        argv, env = self.git_call(*a, fetch=fetch)
+        is decoded (UTF-8). `repo`: another repository than the cache (the merge check's own: holds_checked)."""
+        argv, env = self.git_call(*a, fetch=fetch, repo=repo)
         return subprocess.run(argv, text=True, encoding='utf-8', errors=errors, capture_output=True, env=env)
 
-    def git_call(self, *a, fetch=False):
+    def git_call(self, *a, fetch=False, repo=None):
         """The argv and environment of Queue.git's call."""
         token = self.read_token
         env = self.gh_env(token) if token else no_token_env()
-        return (['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
+        return (['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', repo or self.cache, *a],
                 git_env(env, self.remote if fetch else None))
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
@@ -725,13 +965,32 @@ class Queue:
             p.communicate()
 
     def known_broken(self):
-        """git fsck's lines the cache gave right after its download from scratch (FSCK_KNOWN), or None."""
+        """What the cache's check said right after its download from scratch (self.known), or None. Only a record the
+        queue wrote counts: a regular file of this user that no one else can write, never a link (as STATE). Any
+        other is no record, so the cache is downloaded once more and the record written again."""
         try:
-            with open(os.path.join(self.cache, FSCK_KNOWN), encoding='utf-8', errors='replace',
-                      opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
-                return f.read()
+            with open(self.known, 'rb', opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW | os.O_NONBLOCK)) as f:
+                info = os.fstat(f.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                    return None
+                return f.read().decode('utf-8', 'replace')
         except OSError:
             return None
+
+    def keep_known(self, said):
+        try:
+            write_text(self.known, said)
+        except OSError as e:
+            print(f'could not keep what the check of {self.cache} said in {self.known}: {e}')
+
+    def forget_known(self):
+        """A check the cache passed: an older record says nothing about this cache any more."""
+        try:
+            os.remove(self.known)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f'could not delete {self.known}: {e}')
 
     def has(self, sha):
         return bool(SHA.fullmatch(sha or '')) and self.git('cat-file', '-e', sha + '^{commit}').returncode == 0
@@ -765,9 +1024,12 @@ class Queue:
         as fetch returns them, and None for a cache that is still broken after a download from scratch. A cache found
         broken (by this run's earlier background check, after the fetch, or after a fetch that failed for a cause
         that is neither the network nor the login) is set aside and downloaded from scratch once, then checked again.
-        A cache whose check gives the same lines as right after its own download from scratch (FSCK_KNOWN) is not
-        downloaded again. `later`: the check after a good fetch runs in the background (check_later). self.unknown
-        says why None, in words for a PR comment (no runner paths)."""
+        A cache whose check gives the same lines as right after its own download from scratch (self.known) is not
+        downloaded again, and neither is one this run already downloaded from scratch (self.rebuilt: it passed its
+        check then, so it was written since; nothing is kept in self.known, and the next run downloads it). `later`:
+        the check after a good fetch runs in the background (check_later). self.unknown says why None, in words for a
+        PR comment (no runner paths). What the check passes is still not what the merge check reads: that runs on a
+        copy whose hashes are checked as it is made (holds_checked)."""
         self.unknown = 'the queue could not fetch from GitHub'
         before = self.checked_before()
         problem = before
@@ -790,14 +1052,24 @@ class Queue:
             self.unknown = ("the queue's git cache fails git fsck the same way as right after a download from "
                             "GitHub (the run's log says why), so a person must look")
             return None
+        if self.rebuilt:
+            print(f'#{n}: {self.cache} {problem}, after this run already downloaded it from scratch: not downloaded a '
+                  'second time in one run and not merged in')
+            self.unknown = ("the queue's git cache fails git fsck again after this run fetched it again from GitHub "
+                            "(the run's log says why)")
+            return None
+        return self.fetch_again(base, n, shas, problem)
+
+    def fetch_again(self, base, n, shas, problem):
+        """The cache, which `problem`, set aside and downloaded from scratch, then checked (objects_problem): as
+        fetch returns, and None for one that is still broken (its lines kept: self.known). At most once per run:
+        the callers ask self.rebuilt first."""
+        self.rebuilt = True
         print(f'{self.cache} {problem}: rebuilding it')
         got = self.fetch(base, n, *shas) if set_aside(self.cache) else None
         if got and (problem := self.objects_problem()):
             print(f'#{n}: {self.cache}, fetched again from GitHub, still {problem}: not merged in')
-            try:
-                write_text(os.path.join(self.cache, FSCK_KNOWN), self.fsck_said)
-            except OSError as e:
-                print(f'could not keep git fsck\'s lines in {self.cache}: {e}')
+            self.keep_known(self.fsck_said)
             self.unknown = ("the queue's git cache fails git fsck even when fetched again from GitHub "
                             "(the run's log says why)")
             return None
@@ -805,13 +1077,107 @@ class Queue:
 
     def same_change(self, base, n, head, read):
         """Step 4's check (holds) on GitHub's commits: True, False (any other content or a git error), or None when
-        nothing could be fetched (the caller keeps STATE and tries again). Only full shas count."""
+        nothing is known (nothing could be fetched, or the cache's objects are not GitHub's: the caller keeps STATE
+        and tries again). Only full shas count.
+
+        The check runs on a copy of the objects it reads, each hashed as it is copied (holds_checked). An object that
+        is missing or not what its name says, though git fsck passed, was written while this run went on: the cache is
+        downloaded from scratch and the check made again, as for a cache git fsck finds broken. One that fails in a
+        cache this run downloaded from scratch (for this or, before, for its git fsck: self.rebuilt, so one download
+        per run) says None, and its line is kept (self.known) so the next run does not download it all once more."""
         if not (SHA.fullmatch(head or '') and SHA.fullmatch(read or '')):
             return False
         if head == read:
             return True
-        got = self.fetch_checked(base, n, head, read)   # checked right before the merge check
-        return holds(self.git, head, read) if got else got
+        got = self.fetch_checked(base, n, head, read)   # the whole cache: finds and rebuilds a broken one
+        for _ in range(2):   # the check, and once more after the run's one download from scratch
+            if not got:
+                return got
+            try:
+                same = self.holds_checked(head, read)
+            except OSError as e:   # no room, no folder, or a reader that hangs: nothing is known, the cache is kept
+                print(f'#{n}: could not copy the objects of the merge check out of {self.cache}: {e}')
+                self.unknown = "the queue could not copy the objects of its merge check (the run's log says why)"
+                return None
+            except Changed as e:
+                problem = (f'has an object the merge check reads that is missing or not what its name says, although '
+                           f'git fsck passed ({e})')
+                said = f'merge check: {e}'
+                if self.rebuilt or said == self.known_broken():
+                    if self.rebuilt:
+                        print(f'#{n}: {self.cache}, fetched again from GitHub, still {problem}: not merged in')
+                        self.keep_known(said)
+                    else:
+                        print(f'#{n}: {self.cache} {problem}: the same way as right after its download from '
+                              'scratch. Not downloaded again and not merged in: a person must look')
+                    self.unknown = ("the queue's git cache has an object that is missing or not what its name says, "
+                                    "although git fsck passed and even when fetched again from GitHub (the run's log "
+                                    "says why), so a person must look")
+                    return None
+                got = self.fetch_again(base, n, (head, read), problem)
+            else:
+                self.forget_known()
+                return same
+        # Not reached while fetch_again counts its download (self.rebuilt). Should that ever break: nothing is known.
+        print(f'#{n}: the merge check of {self.cache} failed again after a download from scratch: not merged in')
+        self.unknown = "the queue's merge check failed again after its git cache was fetched again from GitHub"
+        return None
+
+    def holds_checked(self, head, read):
+        """holds() in a repository of its own (CACHE + MERGE_COPY, deleted before this returns) that holds only what
+        this call copied out of the cache and hashed (Copy): every commit head, read and the base reach, and for each
+        merge-tree the trees and blobs that merge can read, copied right before it. Should git still miss an object
+        there, all of the merged commits' trees are copied and the merge is run once more; a merge git calls clean
+        with an error on stderr is never taken as clean. Changed: an object is not what its name says. OSError: the
+        copy cannot be made. A folder a killed run left is deleted first."""
+        base = self.git('rev-parse', '--verify', '-q', 'refs/queue/base^{commit}').stdout.strip()
+        if not SHA.fullmatch(base):
+            raise Changed('refs/queue/base names no commit')
+        to = self.cache + MERGE_COPY
+        if not set_aside(to):
+            raise OSError(f'{to} is in the way')
+        try:
+            os.mkdir(to, 0o700)   # new, and no one else can enter it
+            os.chmod(to, 0o700)
+            problem = init_bare(to)
+            if problem:
+                raise OSError(problem)
+            copy = Copy(*self.git_call('cat-file', '--batch'), to)
+            try:
+                copy.take_commits(head, read, base)
+
+                def git(*a, **kw):
+                    for arg in a:   # git names a commit's tree (holds: rev-parse) only when the tree is there
+                        if arg.endswith('^{tree}') and arg[:-len('^{tree}')] in copy.tree_of:
+                            copy.tree(copy.tree_of[arg[:-len('^{tree}')]])
+                    return self.git(*a, repo=to, **kw)
+
+                def merge(p, side):
+                    bases = bases_of(git, p, side)
+                    if bases is None:
+                        print(f'::warning::pr-queue: {p[:12]} and {side[:12]} have more than {MERGE_BASES} merge '
+                              'bases (with those of each pair of them): not merged, so the head is not taken as the '
+                              'change read')
+                        return subprocess.CompletedProcess(['git', 'merge-tree'], 1, '', '')
+                    roots = [copy.tree_of[c] for c in (p, side, *bases)]
+                    copy.take_merged(roots)
+                    m = merge_tree(git, p, side)
+                    # A merge or a conflict says nothing on stderr. Anything else with a merge base: git stopped, or
+                    # went on without an object (a git that cannot read a commit's tree merges it as an empty one).
+                    if bases and (m.returncode not in (0, 1) or m.stderr.strip()):
+                        for root in roots:
+                            copy.take_whole(root)
+                        m = merge_tree(git, p, side)
+                    if m.returncode == 0 and m.stderr.strip():
+                        print(f'::warning::pr-queue: git merge-tree of {p[:12]} and {side[:12]} called the merge clean '
+                              f'and said {m.stderr.strip()[:300]!r}: not taken as a clean merge')
+                        m.returncode = 1
+                    return m
+                return holds(git, head, read, base=base, merge=merge)
+            finally:
+                copy.close()
+        finally:
+            remove_old(to)
 
     # --- which armed PRs wait, and why ------------------------------------------------------------------------------
     def red_checks(self, pr):
@@ -1445,6 +1811,18 @@ class Queue:
         return 0
 
 
+def own_name(path):
+    """`path` without what follows its last name (`/`, `/.`): the queue makes its other files by adding to the path
+    (CACHE.merge, CACHE.new, CACHE.old-*, STATE.lock, STATE.tmp, STATE.fsck-known), and after `CACHE/` those would be
+    inside the cache, where set_aside deletes what is in the way. Nothing else is changed: a `..` is the kernel's to
+    follow (it may come after a link)."""
+    while True:
+        head, tail = os.path.split(path)
+        if tail not in ('', '.') or head == path:
+            return path
+        path = head
+
+
 def cli(argv=None, env=None):
     env = os.environ if env is None else env
     p = argparse.ArgumentParser(prog='pr_queue.py', description='Merge queue: one waiting PR per run (README.md).')
@@ -1455,7 +1833,8 @@ def cli(argv=None, env=None):
     p.add_argument('--lock-file', help='absolute; default: the state file + .lock')
     p.add_argument('--dry-run', action='store_true', help='say what a run would do; write nothing')
     a = p.parse_args(argv)
-    lock = a.lock_file or a.state_file + '.lock'
+    a.state_file, a.cache = own_name(a.state_file), own_name(a.cache)
+    lock = own_name(a.lock_file or a.state_file + '.lock')
     problems = []
     if env.get('RUNNER_ENVIRONMENT') == 'github-hosted':
         problems.append('this is a GitHub-hosted runner: its disk goes with the job, and with it the plan of a run that '
@@ -1466,6 +1845,9 @@ def cli(argv=None, env=None):
     for flag, path in (('--state-file', a.state_file), ('--cache', a.cache), ('--lock-file', lock)):
         if not os.path.isabs(path):
             problems.append(f'{flag} {path!r} is not an absolute path')
+        elif os.path.basename(path) in ('', '..'):   # / or a path that ends in ..
+            problems.append(f'{flag} {path!r} does not end in a name of its own: the queue makes its other files '
+                            'beside it, by adding to that name')
         elif work and (os.path.realpath(path) + os.sep).startswith(work + os.sep):
             problems.append(f'{flag} {path} is inside the job\'s workspace, which the next checkout empties')
     try:
