@@ -49,8 +49,9 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                fork-checks' check names are its jobs' names, and fork-tests.yml's fork_checks_ran is
                exactly the pinned job (#430): its if:, permissions, the shared checkout and the step
                running fork-checks-ran.py with the pinned env (PR_NUMBER too, #433), no
-               continue-on-error, and a timeout that holds the worst case: the checkout, the wait cap (or
-               the script's git calls, if longer) and one last poll, from the script's own limits.
+               continue-on-error, a checkout with its own timeout, and a job timeout that holds the worst
+               case: the checkout's timeout, the wait cap (or the script's git calls, if longer) and one
+               last poll, from the script's own limits.
 
     python3 .github/scripts/fork-contracts.test.py
 
@@ -349,9 +350,12 @@ def checkout_problems(wfs):
     for name, job_id, step in shared:
         env = step.get("env") or {}
         same = {k: step.get(k) for k in ("name", "shell", "run")} == {k: first.get(k) for k in ("name", "shell", "run")}
-        if not same or set(step) != {"name", "shell", "env", "run"} or set(env) != {"REF", "HISTORY", "SPARSE"} \
-                or env.get("HISTORY") not in ("full", "tip"):
+        if not same or set(step) - {"timeout-minutes"} != {"name", "shell", "env", "run"} \
+                or set(env) != {"REF", "HISTORY", "SPARSE"} or env.get("HISTORY") not in ("full", "tip"):
             problems.append(f"{name}/{job_id}: not the shared checkout step")
+        # A job may bound its checkout (fork_checks_ran does, #443): a whole number of minutes, at least 1.
+        if "timeout-minutes" in step and not (type(step["timeout-minutes"]) is int and step["timeout-minutes"] > 0):
+            problems.append(f"{name}/{job_id}: the shared checkout's timeout-minutes is not a positive whole number")
     return problems
 
 
@@ -386,6 +390,14 @@ check("checkout: actions/checkout with persist-credentials: false fails",
 check("checkout: a copy that drifts from the shared step fails",
       checkout_mutant(lambda w: first_step(w, "fork-follow.yml", "advance").__setitem__(
           "run", first_step(w, "fork-follow.yml", "advance")["run"].replace(" --no-recurse-submodules", ""))))
+for bad in ("3", True, 0, -1):
+    check(f"checkout: a copy with timeout-minutes {bad!r} fails",
+          checkout_mutant(lambda w, bad=bad: first_step(w, "fork-follow.yml", "advance").__setitem__(
+              "timeout-minutes", bad)))
+check("checkout: a copy with another key (continue-on-error) fails",
+      checkout_mutant(lambda w: first_step(w, "fork-follow.yml", "advance").__setitem__("continue-on-error", True)))
+check("checkout: a copy with timeout-minutes 3 passes",
+      not checkout_mutant(lambda w: first_step(w, "fork-follow.yml", "advance").__setitem__("timeout-minutes", 3)))
 check("checkout: a copy with a token in its env fails",
       checkout_mutant(lambda w: first_step(w, "fork-release.yml", "assemble")["env"].__setitem__(
           "GH_TOKEN", "${{ github.token }}")))
@@ -1646,7 +1658,6 @@ POLICY_ENV = {
 }
 POLICY_CHECKOUT_ENV = {"REF": "${{ github.sha }}", "HISTORY": "tip", "SPARSE": "/.github/scripts/"}
 POLICY_JOB_KEYS = {"name", "if", "runs-on", "timeout-minutes", "permissions", "steps"}
-POLICY_CHECKOUT_BUDGET = 180  # seconds for the token-free sparse checkout of one commit (a few seconds in CI)
 _fcr_spec = importlib.util.spec_from_file_location("fork_checks_ran", root / ".github/scripts/fork-checks-ran.py")
 _fcr = importlib.util.module_from_spec(_fcr_spec)
 sys.dont_write_bytecode = True   # no __pycache__ in the tree
@@ -1655,10 +1666,10 @@ _fcr_spec.loader.exec_module(_fcr)
 POLICY_LIMITS = {k: getattr(_fcr, k) for k in ("GIT_TIMEOUT", "GIT_CALLS", "API_TIMEOUT", "API_CALLS_PER_POLL")}
 
 
-def policy_worst_case(cap, limits):
-    """Seconds fork_checks_ran can take: the checkout, then the cap (the git calls run inside it, or past it if they
-    take longer), then one last poll after the deadline."""
-    return (POLICY_CHECKOUT_BUDGET + max(cap, limits["GIT_TIMEOUT"] * limits["GIT_CALLS"])
+def policy_worst_case(checkout, cap, limits):
+    """Seconds fork_checks_ran can take: the checkout (its step's own timeout, #443), then the cap (the git calls run
+    inside it, or past it if they take longer), then one last poll after the deadline."""
+    return (checkout + max(cap, limits["GIT_TIMEOUT"] * limits["GIT_CALLS"])
             + limits["API_TIMEOUT"] * limits["API_CALLS_PER_POLL"])
 
 
@@ -1674,18 +1685,25 @@ def policy_job_problems(job, fc, limits=POLICY_LIMITS):
     if job.get("permissions") != {"actions": "read", "contents": "read"}:
         problems.append(f"{where}: permissions are not exactly actions: read, contents: read")
     steps_ = job.get("steps") or []
+    checkout_minutes = None
     if len(steps_) != 2:
         problems.append(f"{where}: not exactly two steps (checkout, script)")
     else:
         checkout, script = steps_
+        # Its own timeout, so a slow checkout fails as that step, not as the job cancelled (#443).
+        checkout_minutes = checkout.get("timeout-minutes")
+        if type(checkout_minutes) is not int or checkout_minutes <= 0:
+            problems.append(f"{where}: the checkout step has no timeout-minutes of its own (a positive whole number)")
+            checkout_minutes = None
         if "git init" not in str(checkout.get("run", "")) or checkout.get("env") != POLICY_CHECKOUT_ENV:
             problems.append(f"{where}: the first step is not the shared checkout of github.sha with only the script")
         if set(script) != {"name", "env", "run"} or str(script.get("run", "")).strip() != POLICY_SCRIPT \
                 or script.get("env") != POLICY_ENV:
             problems.append(f"{where}: the second step is not `{POLICY_SCRIPT}` with the pinned env and nothing else")
     timeout, cap = job.get("timeout-minutes"), fc.get("wait_seconds")
-    if not isinstance(timeout, int) or not isinstance(cap, int) or policy_worst_case(cap, limits) > timeout * 60:
-        problems.append(f"{where}: its worst case (checkout {POLICY_CHECKOUT_BUDGET} s, fork_checks.wait_seconds "
+    if not isinstance(timeout, int) or not isinstance(cap, int) or checkout_minutes is None \
+            or policy_worst_case(checkout_minutes * 60, cap, limits) > timeout * 60:
+        problems.append(f"{where}: its worst case (checkout {checkout_minutes!r} min, fork_checks.wait_seconds "
                         f"{cap!r} or the git calls {limits}, one last poll) does not fit the timeout ({timeout!r} min), "
                         "so a timeout would cancel the job before its message")
     return problems
@@ -1780,7 +1798,19 @@ for label, mutate in {
         "wait_seconds", t["jobs"]["fork_checks_ran"]["timeout-minutes"] * 60),
     "a job timeout cut below the cap": lambda p, w, t: t["jobs"]["fork_checks_ran"].__setitem__("timeout-minutes", 10),
     "a cap that leaves no room for the last poll": lambda p, w, t: p["fork_checks"].__setitem__(
-        "wait_seconds", t["jobs"]["fork_checks_ran"]["timeout-minutes"] * 60 - POLICY_CHECKOUT_BUDGET - 1),
+        "wait_seconds", (t["jobs"]["fork_checks_ran"]["timeout-minutes"]
+                         - (t["jobs"]["fork_checks_ran"]["steps"][0].get("timeout-minutes") or 0)) * 60 - 1),
+    # The checkout's own timeout (#443): there, a whole number, and counted in the worst case.
+    "fork_checks_ran's checkout without its own timeout": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]
+        .pop("timeout-minutes", None),
+    "fork_checks_ran's checkout timeout as text": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]
+        .__setitem__("timeout-minutes", "3"),
+    "fork_checks_ran's checkout timeout true": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]
+        .__setitem__("timeout-minutes", True),
+    "fork_checks_ran's checkout timeout zero": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]
+        .__setitem__("timeout-minutes", 0),
+    "a checkout timeout that breaks the budget": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]
+        .__setitem__("timeout-minutes", (t["jobs"]["fork_checks_ran"]["steps"][0].get("timeout-minutes") or 0) + 2),
     "fork_checks_ran without PR_NUMBER": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
         .pop("PR_NUMBER"),
     "fork_checks_ran with PR_NUMBER from elsewhere": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
