@@ -32,7 +32,7 @@ INSTALLER = '/usr/local/sbin/fork-cleaner-install'
 UNIT_DIR = '/etc/systemd/user'
 LINKS = {COMMAND: CURRENT + '/bin/fork-cleaner', INSTALLER: CURRENT + '/sbin/fork-cleaner-install'}
 
-MODULES = ('__init__', 'compare', 'config', 'daily', 'engine', 'facts', 'guard', 'report', 'rules')
+MODULES = ('__init__', 'compare', 'compress', 'config', 'daily', 'engine', 'facts', 'guard', 'report', 'rules')
 SOURCE_FILES = (('bin/fork-cleaner', 'sbin/fork-cleaner-install', 'README.md', 'common/machine_file.py',
                  'systemd/fork-cleaner.service', 'systemd/fork-cleaner.timer')
                 + tuple(f'lib/cleaner/{name}.py' for name in MODULES))

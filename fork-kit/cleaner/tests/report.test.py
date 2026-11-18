@@ -85,7 +85,7 @@ class Classes(Case):
     def test_every_rule_and_every_must_keep_path_has_a_class(self):
         cf = self.c.config
         sources = [s for _, s in cf.CLASSES]
-        self.assertEqual(sorted(s for s in sources if isinstance(s, str)), ['rule:docker', 'rule:tmp', 'rule:worktrees'])
+        self.assertEqual(sorted(s for s in sources if isinstance(s, str)), ['rule:compress-cold', 'rule:docker', 'rule:tmp', 'rule:worktrees'])
         self.assertEqual(sorted(p for s in sources if isinstance(s, tuple) for p in s), sorted(cf.MUST_KEEP))
         self.assertEqual(cf.MUST_KEEP, cf.AGENT_HOMES + cf.T3_DATA)
         # Every rule of the rule list (rules.RULES, which plan() runs) has its class, and every class names a rule.
@@ -102,7 +102,10 @@ class Classes(Case):
         """A plan names only rules of rules.RULES (so each has a class): every rule here keeps something."""
         os.chmod(self.trees, 0o300)
         os.chmod(self.tmp, 0o300)
-        cfg = self.repo_cfg(docker={'enabled': True}, tmp={'root': self.tmp, 'patterns': {'job-*': 1}})
+        cold = self.mkdir('cold')
+        os.chmod(cold, 0o300)
+        cfg = self.repo_cfg(docker={'enabled': True}, tmp={'root': self.tmp, 'patterns': {'job-*': 1}},
+                            compressCold={'folders': [{'path': cold, 'days': 7}]})
 
         def dangling():
             raise self.c.facts.Unreadable('Docker is down')

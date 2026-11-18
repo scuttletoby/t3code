@@ -793,7 +793,8 @@ class Config(Case):
         cf = self.c.config
         keys = set(cf.SPEC) | {f'worktrees.{k}' for k in cf.WORKTREES_SPEC} | {f'repos.{k}' for k in cf.REPO_SPEC} \
             | {f'docker.{k}' for k in cf.DOCKER_SPEC} | {f'tmp.{k}' for k in cf.TMP_SPEC} \
-            | {f'daily.{k}' for k in cf.DAILY_SPEC} | {f'compare.{k}' for k in cf.COMPARE_SPEC}
+            | {f'daily.{k}' for k in cf.DAILY_SPEC} | {f'compare.{k}' for k in cf.COMPARE_SPEC} \
+            | {f'compressCold.{k}' for k in cf.COMPRESS_SPEC} | {f'folders.{k}' for k in cf.FOLDER_SPEC}
         self.assertEqual(set(cf.KEY_KINDS), keys)
         self.assertLessEqual(set(cf.KEY_KINDS.values()), {'own file', 'floor', 'keeps more', 'picks', 'loosens', 'compare only'})
         self.assertEqual([k for k, v in cf.KEY_KINDS.items() if v == 'loosens'], ['repos.regenerable'])
@@ -846,9 +847,9 @@ MUTATIONS = {
     'tmp: the last check in the temp folder only': ('rules', 'if os.path.dirname(item.path) != cfg.tmp_root:', 'if False:',
                                                     Tmp, 'test_the_last_check_takes_only_entries_of_the_temp_folder'),
     'docker: no --force': ('facts', "'volume', 'rm', name)", "'volume', 'rm', '--force', name)", Docker, 'test_docker_is_asked_again_just_before_the_delete'),
-    'plan deletes nothing': ('engine', "if not really:\n            out(f'would delete", "if False:\n            out(f'would delete", Engine, 'test_plan_changes_nothing_and_writes_no_log'),
+    'plan deletes nothing': ('engine', "if not really:\n            out(f'{would} {told}')", "if False:\n            out(f'{would} {told}')", Engine, 'test_plan_changes_nothing_and_writes_no_log'),
     'plan writes no log': ('engine', 'log = Log(cfg) if really else None', 'log = Log(cfg)', Engine, 'test_plan_changes_nothing_and_writes_no_log'),
-    'one log line per delete': ('engine', "out(f'deleted {told}')", 'pass',
+    'one log line per delete': ('engine', "out(f'{done} {getattr(item, \"result\", None) or told}')", 'pass',
                                 Engine, 'test_run_writes_one_log_line_for_each_delete'),
     'the log is trimmed': ('engine', 'if len(lines) > self.cfg.log_lines:', 'if False:', Engine, 'test_the_log_keeps_its_newest_lines'),
     'a failed delete fails the run': ('engine', 'failed += 1', 'pass', Engine, 'test_a_delete_that_fails_is_reported_and_the_run_goes_on'),
@@ -862,7 +863,7 @@ MUTATIONS = {
     'the log: never in a must-keep path': ('config', 'if kept is not None or any(', 'if False and any(',
                                            Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
     'the log: never in a root': ('config', 'if _holds(root, own) or _holds(own, root):', 'if False:', Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
-    'the log: deleting before the delete': ('engine', "log.write(one_line(f'deleting {told}'))", 'pass',
+    'the log: deleting before the delete': ('engine', "log.write(one_line(f'{doing} {told}'))", 'pass',
                                             Engine, 'test_run_writes_one_log_line_for_each_delete'),
     'the log: a failed write stops the run': ('engine', "raise LogError(f'the log {self.cfg.log_file}: {ex.strerror}') from None", 'pass',
                                               Engine, 'test_a_log_that_cannot_be_written_stops_the_run_before_the_next_delete'),
@@ -879,7 +880,7 @@ MUTATIONS = {
                                                  Engine, 'test_a_delete_that_stopped_part_way_is_named_and_kept'),
     'half deleted: an unreadable journal stops a run': ('engine', "        if really:\n            out(f'stopped:", "        if False:\n            out(f'stopped:",
                                                         Engine, 'test_a_journal_it_cannot_read_stops_the_run'),
-    'the journal: written before the delete': ('engine', 'journal.append(entry)\n        write_journal(cfg, journal)\n        try:',
+    'the journal: written before the delete': ('engine', 'journal.append(entry)\n            write_journal(cfg, journal)\n        try:',
                                                'journal.append(entry)\n        try:', Engine, 'test_the_journal_names_a_delete_before_it_starts'),
     'the journal: a failed write stops the run': ('engine', "raise LogError(f'the journal {cfg.journal_file}: {ex.strerror}') from None", 'return',
                                                   Engine, 'test_a_journal_that_cannot_be_written_stops_the_run'),

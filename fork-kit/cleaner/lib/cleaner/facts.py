@@ -163,10 +163,22 @@ class Mounts:
     """`points`: every mount point of the cleaner's own mount namespace. `lines`: (mount point, device, root) of each
     of them, where root is the folder of its filesystem it shows. `sources`: (device, root) of every mount, in any
     mount namespace the cleaner may read, that shows one folder of a filesystem rather than all of it: the source of
-    a bind mount (a container volume, a sandbox). A device is "major:minor" as mountinfo writes it."""
+    a bind mount (a container volume, a sandbox). `options`: {mount point: its per-mount options} (`noatime`,
+    `relatime`, ...). A device is "major:minor" as mountinfo writes it."""
 
-    def __init__(self, points=('/',), lines=(), sources=()):
+    def __init__(self, points=('/',), lines=(), sources=(), options=None):
         self.points, self.lines, self.sources = set(points), list(lines), set(sources)
+        self.options = {point: frozenset(opts) for point, opts in (options or {}).items()}
+
+    def options_of(self, path):
+        """The per-mount options of the deepest mount point that holds `path` (a real path, no links in it), or
+        None when no known mount point holds it."""
+        best = None
+        for point in self.options:
+            if point == '/' or path == point or path.startswith(point + '/'):
+                if best is None or len(point) > len(best):
+                    best = point
+        return None if best is None else self.options[best]
 
     def on_filesystem(self, path, dev):
         """Where `path` is on its own filesystem (the root of the deepest mount holding it, plus the rest), or None
@@ -193,9 +205,9 @@ class Mounts:
         return inside[0] if inside else None
 
 
-def _mount_lines(path):
-    """[(mount point, device, root)] of one mountinfo file. Raises Unreadable when it cannot be read or a line is
-    strange."""
+def _mount_lines(path, options=None):
+    """[(mount point, device, root)] of one mountinfo file; `options`, a dict, gets {mount point: its per-mount
+    options}. Raises Unreadable when it cannot be read or a line is strange."""
     try:
         with open(path, errors='surrogateescape') as f:
             lines = f.read().splitlines()
@@ -206,7 +218,10 @@ def _mount_lines(path):
         fields = line.split(' ')
         if len(fields) < 10 or '-' not in fields[6:] or not re.match(r'^\d+:\d+$', fields[2]):
             raise Unreadable(f'{path}: a line it cannot use: {line[:80]!r}')
-        out.append((os.path.normpath(_unescape(fields[4])), fields[2], os.path.normpath(_unescape(fields[3]))))
+        point = os.path.normpath(_unescape(fields[4]))
+        out.append((point, fields[2], os.path.normpath(_unescape(fields[3]))))
+        if options is not None:
+            options[point] = fields[5].split(',')      # a later mount on the same point hides the earlier one
     return out
 
 
@@ -215,7 +230,8 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc'):
     number, so only this list shows it. Also the bind mount sources of every other mount namespace the cleaner can
     read (its own user's processes): a folder a container or a sandbox shows. Raises Unreadable when its own list
     cannot be read or does not even hold /; another process's list that cannot be read is not seen."""
-    lines = _mount_lines(path)
+    options = {}
+    lines = _mount_lines(path, options)
     points = {point for point, _, _ in lines}
     if '/' not in points:
         raise Unreadable(f'{path} does not name /')
@@ -238,7 +254,7 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc'):
         except Unreadable:
             continue
         sources.update((device, root) for _, device, root in other if root != '/')
-    return Mounts(points, lines, sources)
+    return Mounts(points, lines, sources, options)
 
 
 # --- systemd units ------------------------------------------------------------------------------------------------
