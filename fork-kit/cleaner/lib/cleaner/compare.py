@@ -24,8 +24,8 @@ from . import engine
 
 TIMEOUT = 1800                  # seconds one old dry run may take
 NEW_ONLY = 3                    # the exit code when the compare is complete and something is new only
-WOULD = re.compile(r'^would delete (.+?) \((?:[0-9.]+ (?:B|KB|MB|GB)|size not known), (\w+): (.*)\)$')
-KEPT = re.compile(r'^kept (.+?) \((\w+): ([^:)]+)(?:: (.*))?\)$')
+WOULD = re.compile(r'^would delete (.+?) \((?:[0-9.]+ (?:B|KB|MB|GB)|size not known), ([\w-]+): (.*)\)$')
+KEPT = re.compile(r'^kept (.+?) \(([\w-]+): ([^:)]+)(?:: (.*))?\)$')
 
 
 def _within(path, folder):

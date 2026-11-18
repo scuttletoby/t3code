@@ -1,21 +1,21 @@
-"""The three rules: `worktrees`, `docker` and `tmp`. A rule only names what it wants gone and why; whether a path
+"""The four rules: `worktrees`, `docker`, `tmp` and `agent-scratch`. A rule only names what it wants gone and why; whether a path
 may go at all is the guard's answer (guard.py), and every rule asks it.
 
 `plan` reads and decides, and changes nothing. `recheck` reads everything about one item again, just before its
 delete. `delete` is the only code in the kit that removes anything.
 """
-import errno, fnmatch, os, re, stat
+import calendar, errno, fnmatch, hashlib, json, os, re, shutil, stat, sys, time
 
 from . import compress, guard
 from .config import matches
-from .facts import (Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_tags, lonely, merged_seconds,
+from .facts import (DELETED, Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_tags, lonely, merged_seconds,
                     origin_url, orphaned_worktree, present, reflog, remote_refs, remote_urls, remove_volume,
                     remove_worktree, worktree_list)
 from .guard import CREDENTIAL_NAMES, Refusal
 
 DAY = 86400
 # Names in the temp folder no pattern can take: hidden entries (sockets of the desktop), what the system or a
-# login session owns, and agent scratch folders (their own rule, which needs the owner's yes, is not built yet).
+# login session owns, and agent scratch folders (the agent-scratch rule's, never the tmp rule's).
 TMP_NEVER = ('.*', 'claude-*', 'tmux-*', 'ssh-*', 'systemd-private-*', 'snap-private-tmp', 'snap.*', 'lost+found')
 ANONYMOUS = re.compile(r'^[0-9a-f]{64}$')       # the name Docker gives a volume nobody named
 EMPTY_PRS = {'merged': [], 'open': []}
@@ -50,6 +50,22 @@ class Kept:
 class Plan:
     def __init__(self):
         self.items, self.kept = [], []
+
+
+def human(n):
+    if n is None:
+        return 'size not known'
+    if n < 1024:
+        return f'{n} B'
+    for unit in ('KB', 'MB', 'GB'):
+        n /= 1024
+        if n < 1024:
+            break
+    return f'{n:.1f} {unit}'
+
+
+def files_text(n):
+    return f'{n} file' if n == 1 else f'{n} files'
 
 
 def days_text(n):
@@ -118,6 +134,541 @@ def plan_tmp(cfg, facts, plan, measure):
             plan.items.append(Item('path', path, 'tmp', why, look.size, look))
 
 
+# --- agent-scratch ------------------------------------------------------------------------------------------------
+# The scratch folder of one agent session is `<root>/<project>/<session id>` (Claude Code: /tmp/claude-<uid>/<the
+# project folder, as a name>/<the session's uuid>). Only folders named like a session id are looked at.
+SESSION_NAME = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+SCRATCH = 'agent-scratch'
+MANIFEST = 'manifest.json'
+NO_FOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+class KeepFirstError(Exception):
+    """The copy into the archive could not be made or verified: the session folder stays."""
+
+
+def _stamp(seconds):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(seconds))
+
+
+def _seconds(stamp):
+    try:
+        return float(calendar.timegm(time.strptime(stamp, '%Y-%m-%dT%H:%M:%SZ')))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+class Found:
+    """What keep first finds in a session folder. `keep`: (name, size, source) of each file it copies (`source`:
+    the parts of the path it is read from, inside the session folder; for an output that is a link, where the link
+    leads). `held`: (name, size) of each report over maxFileBytes, which keeps the session whole (it is not copied,
+    and nothing may be deleted before it is). `listed`: (name, size, source) of each command output over
+    maxFileBytes: not copied, and named in the manifest with its sha256. `out`: (name, link text) of each output
+    that is a link out of the session folder (to a sub-agent's transcript, which stays): never followed."""
+
+    def __init__(self):
+        self.keep, self.held, self.listed, self.out = [], [], [], []
+
+
+def _matching(path, pattern, look):
+    """(entry path, relative parts, lstat) of each entry the pattern names in the session folder: folders on the
+    way are real folders the last check walked, never a link, never a git folder or a clone."""
+    bases = [(path, ())]
+    for depth, glob in enumerate(pattern):
+        last = depth == len(pattern) - 1
+        nxt = []
+        for base, rel in bases:
+            try:
+                with os.scandir(base) as it:
+                    entries = list(it)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as ex:
+                raise Unreadable(f'{base}: {ex.strerror}') from None
+            for entry in entries:
+                if entry.name == '.git' or not fnmatch.fnmatchcase(entry.name, glob):
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                if st.st_ino not in look.seen:
+                    continue
+                if last:
+                    nxt.append((entry.path, rel + (entry.name,), st))
+                elif stat.S_ISDIR(st.st_mode) and not os.path.lexists(os.path.join(entry.path, '.git')):
+                    nxt.append((entry.path, rel + (entry.name,)))
+        bases = nxt
+    return sorted(bases, key=lambda b: b[1])
+
+
+def _inside(path, entry_path, look):
+    """For an output that is a link: (parts, lstat) of the regular file it leads to when that is in the session
+    folder and the last check walked it; None when it leads out (or to anything else)."""
+    if os.path.realpath(path) != path:
+        return None
+    target = os.path.realpath(entry_path)
+    if not target.startswith(path + '/'):
+        return None
+    try:
+        st = os.lstat(target)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_ino not in look.seen:
+        return None
+    return tuple(target[len(path) + 1:].split('/')), st
+
+
+def keep_first_files(cfg, path, look):
+    """What keep first copies, holds or names in a session folder (Found). The machine file's report patterns:
+    regular files only, never through a link, never inside a git folder; a report over maxFileBytes holds the
+    session. Its output patterns: the same, and a link is resolved only to a regular file inside the session
+    folder; an output over maxFileBytes is named, not copied."""
+    found, names = Found(), set()
+    for outputs, patterns in ((False, cfg.keep_patterns), (True, cfg.keep_outputs)):
+        for pattern in patterns:
+            for entry_path, rel, st in _matching(path, pattern, look):
+                name = '/'.join(rel)
+                if name in names:
+                    continue
+                source = rel
+                if outputs and stat.S_ISLNK(st.st_mode):
+                    resolved = _inside(path, entry_path, look)
+                    if resolved is None:
+                        try:
+                            found.out.append((name, os.readlink(entry_path)))
+                        except OSError:
+                            found.out.append((name, '?'))
+                        names.add(name)
+                        continue
+                    source, st = resolved
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                names.add(name)
+                if st.st_size <= cfg.keep_max_file:
+                    found.keep.append((name, st.st_size, source))
+                elif outputs:
+                    found.listed.append((name, st.st_size, source))
+                else:
+                    found.held.append((name, st.st_size))
+    found.keep.sort()
+    return found
+
+
+def _open_session(item):
+    """A descriptor of the session folder, opened one name at a time from /, never through a link, and only when
+    it is still the folder the last check judged."""
+    try:
+        parent = _open_parent(item.path)
+        try:
+            top = os.open(os.path.basename(item.path), DIR_FLAGS, dir_fd=parent)
+        finally:
+            os.close(parent)
+    except OSError as ex:
+        raise KeepFirstError(f'{item.path}: {ex.strerror}') from None
+    st = os.fstat(top)
+    if item.look is None or item.look.ident != (st.st_dev, st.st_ino):
+        os.close(top)
+        raise KeepFirstError(f'{item.path} is not what the last check saw')
+    return top
+
+
+def _open_in(top, parts, look):
+    """A descriptor of the file `parts` in the open session folder: every folder on the way entered by descriptor
+    and never through a link, the file opened without following a link, and only a regular file the last check
+    walked (its inode)."""
+    fd = top
+    try:
+        for part in parts[:-1]:
+            new = os.open(part, DIR_FLAGS, dir_fd=fd)
+            if fd != top:
+                os.close(fd)
+            fd = new
+        out = os.open(parts[-1], NO_FOLLOW, dir_fd=fd)
+    except OSError as ex:
+        raise KeepFirstError(f'{"/".join(parts)}: {ex.strerror}') from None
+    finally:
+        if fd != top:
+            os.close(fd)
+    st = os.fstat(out)
+    if not stat.S_ISREG(st.st_mode) or st.st_ino not in look.seen:
+        os.close(out)
+        raise KeepFirstError(f'{"/".join(parts)}: not the regular file the last check saw')
+    return out
+
+
+def _read_fd(fd, sha=None):
+    """The whole file (or, with `sha`, only its size, the content fed to `sha`); closes the descriptor."""
+    try:
+        chunks, size = [], 0
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                return size if sha is not None else b''.join(chunks)
+            size += len(chunk)
+            if sha is None:
+                chunks.append(chunk)
+            else:
+                sha.update(chunk)
+    finally:
+        os.close(fd)
+
+
+def _read_whole(path):
+    return _read_fd(os.open(path, NO_FOLLOW))
+
+
+def _sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_manifest(folder):
+    """The manifest of an archived copy as ({path: sha256} of the copied files, {path: sha256} of the files only
+    named); None when there is none or it cannot be used."""
+    try:
+        manifest = json.loads(_read_whole(os.path.join(folder, MANIFEST)))
+        return ({f['path']: f['sha256'] for f in manifest['files']},
+                {f['path']: f['sha256'] for f in manifest.get('notCopied', [])})
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _verified(folder, wanted, named=None):
+    """True when the archived copy in `folder` (a real folder, never a link) holds every (path, sha256) of
+    `wanted`, each file read back, and names every (path, sha256) of `named`."""
+    try:
+        if not stat.S_ISDIR(os.lstat(folder).st_mode):
+            return False
+    except OSError:
+        return False
+    have = _read_manifest(folder)
+    if have is None or any(have[0].get(name) != sha for name, sha in wanted.items()):
+        return False
+    if any(have[1].get(name) != sha for name, sha in (named or {}).items()):
+        return False
+    try:
+        return all(_sha(_read_whole(os.path.join(folder, *name.split('/')))) == sha for name, sha in wanted.items())
+    except OSError:
+        return False
+
+
+def _sync_folder(folder):
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _own_folder(path, top):
+    """Makes the folder `path` and every missing folder above it (mode 0700), each synced into its parent, so a
+    copy in it outlives a power cut. Every folder from `top` (the archive) down to `path` must then be a real folder
+    of this user: the copy is never written through a link."""
+    missing, here = [], path
+    while not os.path.lexists(here):
+        missing.append(here)
+        here = os.path.dirname(here)
+    for folder in reversed(missing):
+        try:
+            os.mkdir(folder, 0o700)
+        except FileExistsError:
+            pass
+        _sync_folder(os.path.dirname(folder))
+    here = path
+    while True:
+        st = os.lstat(here)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise KeepFirstError(f'{here}: a link, not a folder, or not this user\'s: no copy is written there')
+        if here == top:
+            return
+        here = os.path.dirname(here)
+
+
+def keep_first(cfg, item):
+    """Copies the files worth keeping (keep_first_files) of a session folder into the archive, verifies the copy
+    and returns what it says about it; None when there is nothing to keep. Raises KeepFirstError when the copy
+    cannot be made or read back, or a report is too large to copy: the folder then stays. Runs again safely: a copy
+    already in the archive that holds the same files with the same sha256 is used as it is; a half-written copy
+    (`.<session>.partial`, the cleaner's own) is thrown away and made again; a different older copy stays, and the
+    new one gets the next free name."""
+    try:
+        found = keep_first_files(cfg, item.path, item.look)
+    except Unreadable as ex:
+        raise KeepFirstError(str(ex)) from None
+    if found.held:
+        raise KeepFirstError(f'{found.held[0][0]}: larger than maxFileBytes: the session stays')
+    if ([(name, size) for name, size, _ in found.keep] != list(item.look.keep_first) or
+            [(name, size) for name, size, _ in found.listed] != list(item.look.keep_named)):
+        raise KeepFirstError('what is worth keeping is not what the last check saw: the session stays')
+    if not found.keep and not found.listed:
+        return None
+    project, session = item.path.split('/')[-2:]
+    data, named, sizes = {}, {}, {}
+    top = _open_session(item)
+    try:
+        for name, _, source in found.keep:
+            data[name] = _read_fd(_open_in(top, source, item.look))
+        for name, _, source in found.listed:
+            sha = hashlib.sha256()
+            sizes[name] = _read_fd(_open_in(top, source, item.look), sha)
+            named[name] = sha.hexdigest()
+    except OSError as ex:
+        raise KeepFirstError(f'{ex.filename or item.path}: {ex.strerror}') from None
+    finally:
+        os.close(top)
+    wanted = {name: _sha(body) for name, body in data.items()}
+    total = sum(len(body) for body in data.values())
+    folder = os.path.join(cfg.keep_archive, project)
+    final = os.path.join(folder, session)
+    told = f'{files_text(len(data))} ({human(total)})' + (f', {len(named)} larger named only' if named else '')
+    try:
+        _own_folder(folder, cfg.keep_archive)
+        versions = [final] + [f'{final}.{n}' for n in range(2, 100)]
+        for version in versions:
+            if not os.path.lexists(version):
+                break
+            if _verified(version, wanted, named):
+                return f'{told} already in {version} (verified)'
+        else:
+            raise KeepFirstError(f'{final}: 99 different copies are there already')
+        partial = os.path.join(folder, f'.{session}.partial')
+        if os.path.lexists(partial):
+            _remove_own(partial)
+        os.mkdir(partial, 0o700)
+        for name, body in data.items():
+            target = os.path.join(partial, *name.split('/'))
+            os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, body)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        manifest = {'version': 1, 'rule': SCRATCH, 'source': item.path, 'project': project, 'session': session,
+                    'keptAt': _stamp(time.time()),
+                    'files': [{'path': name, 'bytes': len(data[name]), 'sha256': wanted[name]} for name in sorted(data)],
+                    'notCopied': [{'path': name, 'bytes': sizes[name], 'sha256': named[name],
+                                   'why': f'larger than maxFileBytes ({cfg.keep_max_file})'} for name in sorted(named)],
+                    'linksOut': [{'path': name, 'to': to, 'why': 'a link out of the session folder: not followed'}
+                                 for name, to in found.out]}
+        fd = os.open(os.path.join(partial, MANIFEST), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, (json.dumps(manifest, indent=1) + '\n').encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        for here, _, _ in os.walk(partial):
+            _sync_folder(here)
+        if not _verified(partial, wanted, named):
+            raise KeepFirstError(f'{partial}: the copy does not read back the same')
+        os.rename(partial, version)
+        _sync_folder(folder)
+    except OSError as ex:
+        raise KeepFirstError(f'{ex.filename or folder}: {ex.strerror}') from None
+    if not _verified(version, wanted, named):
+        raise KeepFirstError(f'{version}: the copy does not read back the same')
+    return f'{told} in {version} (verified)'
+
+
+def _remove_own(partial):
+    """Removes a half-written copy of the cleaner's own from the archive, never through a link: a link or a file at
+    its name is unlinked as itself (whatever it leads to stays), and a folder is removed by descriptors, which
+    refuse a link at the top and never follow one below (shutil.rmtree's fd-based walk)."""
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise KeepFirstError(f'{partial}: this system cannot remove a folder without following links')
+    st = os.lstat(partial)
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(partial)
+        return
+    shutil.rmtree(partial)
+
+
+# Processes of the user that hide their open files and environment on purpose (not dumpable, so only root may
+# read them) and hold no agent session: a login session's helpers and the key agents. The name excuses only what
+# cannot be read: what can be read of such a process (its command line, its sockets) still keeps a session. Any
+# other hidden process of the user is judged by its nearest readable ancestor (_judged_by); one with none keeps
+# every session ("could not read"). Compared with /proc/<pid>/comm.
+HIDDEN_OK = ('systemd', '(sd-pam)', 'gpg-agent', 'ssh-agent', 'scdaemon', 'keyboxd', 'gnome-keyring-d')
+# The user's service manager (systemd --user): where an ancestor walk stops, as at pid 1. A hidden process started
+# by it, or by pid 1, has no agent above it to be judged by.
+USER_MANAGER = 'systemd'
+
+
+def _judged_by(p, own):
+    """The nearest ancestor of the hidden process `p` that can be read in full and is the user's own: what it works
+    in, has open and names decides for `p` too (a Codex started by an agent's tool hides itself, and its parent
+    names the agent's session). None when there is none short of pid 1 or the user's service manager, or an
+    ancestor is not the user's, has ended or cannot be told."""
+    by_pid = {q.pid: q for q in own}
+    walked, pid = set(), p.parent
+    while pid is not None and pid > 1 and pid not in walked:
+        walked.add(pid)
+        q = by_pid.get(pid)
+        if q is None or q.name == USER_MANAGER:
+            return None
+        if not q.hidden:
+            return q
+        pid = q.parent
+    return None
+
+
+def session_alive(cfg, facts, path, look):
+    """A refusal when the session may still be alive (README, agent-scratch): its transcript changed within
+    `days`; a process works in its folder, has something in it open or names its path; a process names its id; a
+    process of the user cannot be read in full; or a process works in another session of the same project without
+    naming that one, and started before this session last changed (after /clear or /resume a session's process
+    works on under a new id). None when it is gone. Asked as late as possible: the plan and the last check ask it
+    last, and the run asks it again after keep first, just before the delete."""
+    sid, project = os.path.basename(path), os.path.dirname(path)
+    days = cfg.scratch_days
+    try:
+        transcripts = facts.transcripts()
+    except Unreadable as ex:
+        return Refusal('could not read', f'the transcripts ({ex})')
+    said = transcripts.get(sid)
+    if said is not None and facts.now - said < days * DAY:
+        return Refusal(f'transcript changed under {days_text(days)} ago', f'{_stamp(said)}')
+    try:
+        processes = facts.processes()
+    except Unreadable as ex:
+        return Refusal('could not read', f'the process list ({ex})')
+    if processes.uses(path):
+        return Refusal('session alive', 'a process works in it, has a file or folder in it open, or names its path')
+    if processes.names(sid):
+        return Refusal('session alive', 'a process names its id (command line or environment)')
+    # A hidden process with a readable ancestor is that ancestor's: the ancestor's command line, environment, working
+    # folder and open files were asked above and are asked below, like every other process.
+    unread = [p for p in processes.own if p.hidden and p.name not in HIDDEN_OK and _judged_by(p, processes.own) is None]
+    if unread:
+        return Refusal('could not read', f'process {unread[0].pid} ({unread[0].name or "?"}) of this user does not '
+                                         'show its open files or environment')
+    newest = max(look.newest if look is not None else 0.0, said or 0.0)
+    for p in processes.own:
+        for where in sorted(p.paths):
+            if where.endswith(DELETED):
+                where = where[:-len(DELETED)]
+            if not where.startswith(project + '/'):
+                continue
+            other = where[len(project) + 1:].split('/')[0]
+            if other == sid or (SESSION_NAME.match(other) and other in p.words):
+                continue                # this one (uses), or a session the process names: it is that one's
+            if p.start is None or p.start <= newest:
+                return Refusal('session alive', f'process {p.pid} ({p.name or "?"}) works in {other} of the same '
+                               'project without naming it, and started before this session last changed')
+    return None
+
+
+def scratch_answer(cfg, facts, path, started=None):
+    """(why, look) for one session folder, or None when the rule does not take it (changed too recently).
+    `started`: an earlier run began to delete it at this time (seconds); then the folders' own times do not count
+    (that delete changed them), and nothing that is not a folder may have changed since."""
+    sid = os.path.basename(path)
+    if not SESSION_NAME.match(sid):
+        return None
+    try:
+        top = guard.changed(os.lstat(path))
+    except FileNotFoundError:
+        return None
+    except OSError as ex:
+        return '', guard.Look(Refusal('could not read', f'{path}: {ex.strerror}'))
+    days = cfg.scratch_days
+    look = guard.examine(cfg, facts, path, 'path')
+    if started is None:
+        age = facts.now - max(top, look.newest)
+        if age < days * DAY:
+            return None
+        why = f'session gone, not changed for {days_text(int((age + 1) // DAY))}'
+    else:
+        if look.newest_file > started:
+            look.refusal = look.refusal or Refusal('changed since the delete began', f'after {_stamp(started)}')
+        why = f'finishing the delete an earlier run began at {_stamp(started)}, session gone'
+    if look.refusal is not None:
+        return why, look
+    # A lock-named file directly in the session folder. Deeper, `yarn.lock` or `Cargo.lock` of a clone is ordinary
+    # content; a lock a process holds anywhere in it is the guard's `in use`.
+    try:
+        with os.scandir(path) as it:
+            locks = sorted(entry.name for entry in it if guard.matches(entry.name, guard.LOCK_NAMES))
+    except OSError as ex:
+        look.refusal = Refusal('could not read', f'{path}: {ex.strerror}')
+        return why, look
+    if locks:
+        look.refusal = Refusal('lock file', some(locks))
+        return why, look
+    try:
+        found = keep_first_files(cfg, path, look)
+    except Unreadable as ex:
+        look.refusal = Refusal('could not read', str(ex))
+        return why, look
+    if found.held:
+        look.refusal = Refusal('report too large to keep first',
+                               f'{some([name for name, _ in found.held])}: more than maxFileBytes '
+                               f'({human(cfg.keep_max_file)}); it stays until a person keeps it or it is gone')
+        return why, look
+    total = sum(size for _, size, _ in found.keep)
+    if total > cfg.keep_max_session:
+        look.refusal = Refusal('too much to keep first', f'{files_text(len(found.keep))}, {human(total)}: more than '
+                                                         f'maxSessionBytes ({human(cfg.keep_max_session)})')
+        return why, look
+    # The session: asked last, so that the answer is as late as possible.
+    look.refusal = session_alive(cfg, facts, path, look)
+    if look.refusal is not None:
+        return why, look
+    look.keep_first = [(name, size) for name, size, _ in found.keep]
+    look.keep_named = [(name, size) for name, size, _ in found.listed]
+    first = f'keep first: {files_text(len(found.keep))} ({human(total)})' if found.keep else 'nothing to keep first'
+    if found.listed:
+        first += f', {len(found.listed)} larger output{"s" if len(found.listed) != 1 else ""} named only'
+    return f'{why}; {first}', look
+
+
+def plan_scratch(cfg, facts, plan, measure):
+    if not cfg.scratch_enabled:
+        return
+    projects, problem = _entries(cfg.scratch_root)
+    if problem:
+        plan.kept.append(Kept(cfg.scratch_root, SCRATCH, problem.code, problem.detail))
+    for project in projects or ():
+        folder = os.path.join(cfg.scratch_root, project)
+        try:
+            st = os.lstat(folder)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            plan.kept.append(Kept(folder, SCRATCH, 'symbolic link', 'a link is never followed and never removed'))
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        names, problem = _entries(folder)
+        if problem:
+            plan.kept.append(Kept(folder, SCRATCH, problem.code, problem.detail))
+        for name in names or ():
+            path = os.path.join(folder, name)
+            answer = scratch_answer(cfg, facts, path)
+            if answer is None:
+                continue
+            why, look = answer
+            if look.refusal is not None:
+                plan.kept.append(Kept(path, SCRATCH, look.refusal.code, look.refusal.detail, guard.measure(path) if measure else None))
+            else:
+                plan.items.append(Item('session', path, SCRATCH, why, look.size, look))
+
+
+def finish_scratch(cfg, facts, entry):
+    """An agent-scratch folder an earlier run began to delete (its journal line): an Item to finish it, or a Kept
+    with the reason it stays. The whole folder was judged deletable then; what is left is judged again now."""
+    path = entry['path']
+    started = _seconds(entry.get('at'))
+    if started is None or not cfg.scratch_enabled or not cfg.session_parent(os.path.dirname(path)):
+        return None
+    answer = scratch_answer(cfg, facts, path, started)
+    if answer is None:
+        return None
+    why, look = answer
+    if look.refusal is not None:
+        return Kept(path, SCRATCH, look.refusal.code, look.refusal.detail)
+    item = Item('session', path, SCRATCH, why, look.size, look)
+    item.started = started
+    return item
+
+
 # --- deleting -----------------------------------------------------------------------------------------------------
 # Every delete goes through descriptors, one name at a time, and never through a link: a name that is a link now is
 # removed as a link, and a folder is entered only when it is the folder the name showed a moment before.
@@ -142,7 +693,10 @@ def _open_parent(path):
 def _clear(top, names, look, shown):
     """Removes `names` from the open folder `top`, each folder with everything in it. Every entry must be one the
     last check saw (its inode, on its device): a folder moved in since, a new mount or a new file stops the delete
-    there, so nothing the check did not judge is removed."""
+    there, so nothing the check did not judge is removed. With `look.checked` (agent scratch: when the last
+    liveness check began), an entry whose inode changed since then also stops it: a new file can get the inode
+    number of one just deleted (ext4 gives it out again at once), and only its inode time shows it is new. A file
+    with several hard links is let through: deleting one of its names changes the inode time of the others."""
     stack = [(top, sorted(names, reverse=True), None, shown)]
     try:
         while stack:
@@ -157,6 +711,10 @@ def _clear(top, names, look, shown):
             st = os.stat(name, dir_fd=here, follow_symlinks=False)
             if st.st_dev != look.ident[0] or st.st_ino not in look.seen:  # seen
                 raise Unreadable(f'{where}/{name}: not there at the last check (moved in, made or mounted since): the delete stopped')
+            if (look.checked is not None and st.st_ctime >= look.checked and  # made since
+                    (stat.S_ISDIR(st.st_mode) or (st.st_nlink == 1 and st.st_ino not in look.linked))):
+                raise Unreadable(f'{where}/{name}: changed after the last check (a new file can reuse an inode '
+                                 'number): the delete stopped')
             if not stat.S_ISDIR(st.st_mode):
                 os.unlink(name, dir_fd=here)
                 continue
@@ -170,6 +728,22 @@ def _clear(top, names, look, shown):
         for here, _, done, _ in stack:
             if done is not None:
                 os.close(here)
+
+
+# Linux's CLOCK_REALTIME_COARSE (Python names no constant for it): the clock the kernel stamps file times with.
+CLOCK_COARSE = getattr(time, 'CLOCK_REALTIME_COARSE', 5)
+
+
+def clock():
+    """Now, by the clock file times are stamped with, so a file changed after this moment never shows an earlier
+    time: on Linux the coarse clock (the precise one runs up to a tick ahead of file times). Elsewhere the precise
+    clock, a tenth of a second back."""
+    if sys.platform.startswith('linux'):
+        try:
+            return time.clock_gettime(CLOCK_COARSE)
+        except OSError:
+            pass
+    return time.time() - 0.1
 
 
 def remove_tree(path, look, last=None):
@@ -585,7 +1159,8 @@ def delete_clone(item):
 # --- all rules ----------------------------------------------------------------------------------------------------
 # The rules, by the name each one writes on what it plans: the one list of them. The disk report (report.py) needs
 # a class for each (config.CLASSES), and report.test.py fails for a rule here that has none.
-RULES = {'worktrees': plan_worktrees, 'docker': plan_docker, 'tmp': plan_tmp, compress.RULE: compress.plan_compress}
+RULES = {'worktrees': plan_worktrees, 'docker': plan_docker, 'tmp': plan_tmp, SCRATCH: plan_scratch,
+         compress.RULE: compress.plan_compress}
 # Kinds whose step never leaves a path half gone (compress.py: the original or its checked copy is always there),
 # so the journal of deletes in progress does not name them. WORDS: what the engine says of them (plan, run, done)
 # and NOUNS what it counts them as.
@@ -610,6 +1185,14 @@ def recheck(cfg, facts, item):
         return recheck_tree(cfg, facts, item)
     if item.kind in ('compress', 'part'):
         return compress.recheck(cfg, facts, item)
+    if item.kind == 'session':
+        if not cfg.session_parent(os.path.dirname(item.path)):
+            return Refusal('not a candidate', 'not a session folder of the agent-scratch root of the machine file')
+        answer = scratch_answer(cfg, facts, item.path, getattr(item, 'started', None))
+        if answer is None:
+            return Refusal('not a candidate', 'it changed, or the rule no longer takes it')
+        item.look = answer[1]
+        return answer[1].refusal
     if os.path.dirname(item.path) != cfg.tmp_root:
         return Refusal('not a candidate', 'not in the temp folder of the machine file')
     answer = tmp_answer(cfg, facts, item.path)
@@ -620,5 +1203,5 @@ def recheck(cfg, facts, item):
 
 
 def delete(item):
-    {'path': delete_path, 'worktree': delete_worktree, 'clone': delete_clone, 'volume': lambda i: remove_volume(i.path),
-     'compress': compress.compress, 'part': compress.remove_part}[item.kind](item)
+    {'path': delete_path, 'session': delete_path, 'worktree': delete_worktree, 'clone': delete_clone,
+     'volume': lambda i: remove_volume(i.path), 'compress': compress.compress, 'part': compress.remove_part}[item.kind](item)

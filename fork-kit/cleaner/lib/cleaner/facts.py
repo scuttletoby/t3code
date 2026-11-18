@@ -4,7 +4,7 @@ One rule for every reader here: no answer means keep. A reader that cannot give 
 and whoever asked keeps the thing it asked about. Nothing in this file changes anything, except remove_worktree and
 remove_volume at the very end, which the engine calls after every check has passed again.
 """
-import calendar, ipaddress, json, os, re, socket, stat, subprocess, time
+import calendar, errno, fnmatch, ipaddress, json, os, re, socket, stat, subprocess, time
 
 UNIT_DIRS = ('/etc/systemd/system', '/run/systemd/system', '/run/systemd/transient', '/etc/systemd/user',
              '~/.config/systemd/user', '/run/user/{uid}/systemd/user', '/run/user/{uid}/systemd/transient')
@@ -24,16 +24,45 @@ class Unreadable(Exception):
 
 
 # --- processes ---------------------------------------------------------------------------------------------------
+# A word of a command line or an environment: what a session id is made of. A path splits into its parts.
+WORD = re.compile(r'[A-Za-z0-9_.-]+')
 # Before and after a path named inside longer text: what may stand next to a whole path, not inside a longer name.
 EDGE = r'\s"\'=:;,&|()<>`'
 
 
+class Proc:
+    """One process of the cleaner's own user. `paths`: what it works in or has open (its working folder, its root,
+    every open descriptor). `words`: the words of its command line and its environment. `start`: when it started
+    (seconds since the epoch; None when not known). `hidden`: a part of it could not be read although it is the
+    user's own (a process that is not dumpable, such as gpg-agent: its open files and environment are root's to
+    read). `name`: its short name (/proc/<pid>/comm). `parent`: the pid of its parent (from /proc/<pid>/stat, which
+    a hidden process shows too); None when not known."""
+
+    def __init__(self, pid, name='', paths=(), words=(), start=None, hidden=False, parent=None):
+        self.pid, self.name, self.paths, self.words = pid, name, set(paths), set(words)
+        self.start, self.hidden, self.parent = start, hidden, parent
+
+
 class Processes:
     """`busy`: every path a process uses, and every folder above each. `locks`: the inodes with a held file lock.
-    `texts`: the command lines as text, so a path with a space in it (`sh -c 'cd "/tmp/my dir"'`) is seen too."""
+    `texts`: the command lines as text, so a path with a space in it (`sh -c 'cd "/tmp/my dir"'`) is seen too.
+    `words`: every word of every command line and of the environment of each process the user may read (a session
+    id: `--session-id=<id>`, `CLAUDE_CODE_SESSION_ID=<id>`, or a path with it). `own`: the user's own processes,
+    one Proc each (the agent-scratch rule asks which session folder each one works in)."""
 
-    def __init__(self, busy=(), locks=(), texts=()):
+    def __init__(self, busy=(), locks=(), texts=(), words=(), own=()):
         self.busy, self.locks, self.texts = set(busy), set(locks), list(texts)
+        self.words = set(words)
+        for text in self.texts:
+            self.words.update(WORD.findall(text))
+        self.own = list(own)
+        for one in self.own:
+            self.words.update(one.words)
+
+    def names(self, word):
+        """True when a process names `word` (a session id) as a whole word on its command line or in its
+        environment."""
+        return word in self.words
 
     def uses(self, path):
         """True when a process uses `path` or something in it, or a command line names it."""
@@ -54,21 +83,6 @@ def ancestors(path):
         path = parent
 
 
-def links(folder):
-    """Where the links in a /proc folder point; none when the folder cannot be read (another user's process)."""
-    out = []
-    try:
-        names = os.listdir(folder)
-    except OSError:
-        return out
-    for name in names:
-        try:
-            out.append(os.readlink(os.path.join(folder, name)))
-        except OSError:
-            pass
-    return out
-
-
 def _command_paths(args, cwd):
     """Every path a command line may name: whole arguments, the value after `=`, and paths inside longer text
     (`sh -c "cd /x; ./run"`). A relative argument is read from the working folder. Too many is fine: a path named
@@ -86,6 +100,36 @@ def _command_paths(args, cwd):
     return out
 
 
+def _boot_time(proc):
+    try:
+        with open(os.path.join(proc, 'stat')) as f:
+            for line in f:
+                if line.startswith('btime '):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _stat(base, boot):
+    """(start, parent) of a process from /proc/<pid>/stat: when it started (seconds since the epoch, field 22) and
+    its parent's pid (field 4); each None when not known."""
+    try:
+        with open(os.path.join(base, 'stat'), 'rb') as f:
+            fields = f.read().rsplit(b')', 1)[1].split()
+    except (OSError, IndexError):
+        return None, None
+    try:
+        parent = int(fields[1])
+    except (ValueError, IndexError):
+        parent = None
+    try:
+        start = None if boot is None else boot + int(fields[19]) / os.sysconf('SC_CLK_TCK')
+    except (ValueError, IndexError):
+        start = None
+    return start, parent
+
+
 def read_processes(proc='/proc', me=None):
     """Processes for everything now running. The cleaner sees its own user's processes in full and of other users
     what the kernel shows it (usually the command line). Raises Unreadable when the list, the lock list or the
@@ -99,27 +143,64 @@ def read_processes(proc='/proc', me=None):
             socket_lines = f.read().splitlines()[1:]
     except OSError as ex:
         raise Unreadable(f'{ex.filename or proc}: {ex.strerror}') from None
-    paths, seen, texts = set(), set(), []
+    paths, seen, texts, words, own = set(), set(), [], set(), []
+    uid, boot = os.getuid(), _boot_time(proc)
     for pid in pids:
         base = os.path.join(proc, pid)
+        try:
+            mine = os.lstat(base).st_uid == uid
+        except OSError:
+            continue                    # it ended
+        one = Proc(int(pid))
         cwd = None
         for name in ('cwd', 'root', 'exe'):
             try:
                 target = os.readlink(os.path.join(base, name))
-            except OSError:
+            except OSError as ex:
+                one.hidden = one.hidden or (mine and name != 'exe' and ex.errno in (errno.EACCES, errno.EPERM))
                 continue
-            paths.add(target)
+            paths.add(target)           # its folder, root or program
+            if name != 'exe':
+                one.paths.add(target)
             if name == 'cwd':
                 cwd = target
                 seen.add(int(pid))
-        paths.update(links(os.path.join(base, 'fd')))
+        try:
+            fds = os.listdir(os.path.join(base, 'fd'))
+        except OSError as ex:
+            fds = []
+            one.hidden = one.hidden or (mine and ex.errno in (errno.EACCES, errno.EPERM))
+        for name in fds:
+            try:
+                target = os.readlink(os.path.join(base, 'fd', name))
+            except OSError:
+                continue
+            paths.add(target)           # an open file
+            one.paths.add(target)
         try:
             with open(os.path.join(base, 'cmdline'), 'rb') as f:
                 args = [a.decode('utf-8', 'surrogateescape') for a in f.read().split(b'\0') if a]
             paths.update(_command_paths(args, cwd))
             texts.append(' '.join(args))
+            one.words.update(WORD.findall(' '.join(args)))
         except OSError:
             pass
+        try:
+            # Only the user's own processes show it: what an agent's tools inherit (its session id) is here.
+            with open(os.path.join(base, 'environ'), 'rb') as f:
+                found = WORD.findall(f.read().decode('utf-8', 'surrogateescape'))
+            words.update(found)
+            one.words.update(found)
+        except OSError as ex:
+            one.hidden = one.hidden or (mine and ex.errno in (errno.EACCES, errno.EPERM))
+        if mine:
+            try:
+                with open(os.path.join(base, 'comm'), errors='replace') as f:
+                    one.name = f.read().strip()
+            except OSError:
+                pass
+            one.start, one.parent = _stat(base, boot)
+            own.append(one)
         try:
             with open(os.path.join(base, 'maps'), errors='surrogateescape') as f:
                 for line in f:
@@ -150,7 +231,7 @@ def read_processes(proc='/proc', me=None):
             found = LOCK_INODE.match(field)
             if found:
                 locks.add(int(found.group(1)))
-    return Processes(busy, locks, texts)
+    return Processes(busy, locks, texts, words, own)
 
 
 # --- mounts -------------------------------------------------------------------------------------------------------
@@ -639,6 +720,63 @@ def docker_volume_sizes():
     return sizes, folder
 
 
+# --- agent transcripts -------------------------------------------------------------------------------------------
+# Where agent tools keep a session's transcript, named after its id: `<id>.jsonl`, and a folder `<id>` of its
+# sub-agents. The folders are the machine file's (agentScratch.transcripts). Only their times are read (never their
+# content), and nothing here changes them: they are must-keep.
+def transcript_folders(globs):
+    """The real paths of the folders the patterns match (a link on the way, such as a config folder that is a link,
+    is followed). Raises Unreadable when a folder on the way cannot be read, or a pattern matches no folder at all
+    (a transcript folder that is not there could be one that moved: no answer is no "no transcript")."""
+    out = []
+    for pattern in globs:
+        found = ['/']
+        for part in pattern.strip('/').split('/'):
+            nxt = []
+            for base in found:
+                if not any(c in part for c in '*?['):
+                    path = os.path.join(base, part)
+                    if os.path.isdir(path):
+                        nxt.append(path)
+                    continue
+                try:
+                    names = sorted(os.listdir(base))
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                except OSError as ex:
+                    raise Unreadable(f'{base}: {ex.strerror}') from None
+                for name in names:
+                    path = os.path.join(base, name)
+                    if fnmatch.fnmatchcase(name, part) and os.path.isdir(path):
+                        nxt.append(path)
+            found = nxt
+        if not found:
+            raise Unreadable(f'no folder matches {pattern}')
+        for folder in found:
+            real = os.path.realpath(folder)
+            if real not in out:
+                out.append(real)
+    return out
+
+
+def read_transcripts(globs):
+    """{session id: the newest change of its transcript files}. Raises Unreadable when a folder cannot be read or a
+    pattern matches no folder (transcript_folders)."""
+    out = {}
+    for folder in transcript_folders(globs):
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    sid = entry.name[:-len('.jsonl')] if entry.name.endswith('.jsonl') else entry.name
+                    st = entry.stat(follow_symlinks=False)
+                    out[sid] = max(out.get(sid, 0.0), st.st_mtime, st.st_ctime)
+        except FileNotFoundError:
+            continue
+        except OSError as ex:
+            raise Unreadable(f'{ex.filename or folder}: {ex.strerror}') from None
+    return out
+
+
 # --- one view of it all -------------------------------------------------------------------------------------------
 class Facts:
     """What one run knows. While planning, the process list and the mounts are read again when they are older than
@@ -646,18 +784,19 @@ class Facts:
     it before the last check of each delete, so that check reads the process list, the mounts, the units, the pull
     request lists and Docker's list anew. A reader that failed keeps failing until then."""
 
-    def __init__(self, cfg, processes=None, units=None, prs=None, dangling=None, now=None, mounts=None):
+    def __init__(self, cfg, processes=None, units=None, prs=None, dangling=None, now=None, mounts=None, transcripts=None):
         self.cfg = cfg
         self.now = time.time() if now is None else now
         self._read_processes = processes or read_processes
         self._read_mounts = mounts or read_mounts
         self._read_units = units or (lambda: read_units(home=cfg.home))
+        self._read_transcripts = transcripts or (lambda: read_transcripts(cfg.transcript_globs))
         self._read_prs = prs or github_prs
         self.dangling = dangling or docker_dangling
         self.forget()
 
     def forget(self):
-        self._processes = self._mounts = self._units = None
+        self._processes = self._mounts = self._units = self._transcripts = None
         self._prs = {}
 
     @staticmethod
@@ -682,6 +821,11 @@ class Facts:
         if self._mounts is None or time.monotonic() - self._mounts[0] >= PROCESS_SECONDS:
             self._mounts = (time.monotonic(), self._answer(self._read_mounts))
         return self._give(self._mounts[1])
+
+    def transcripts(self):
+        if self._transcripts is None:
+            self._transcripts = (self._answer(self._read_transcripts),)
+        return self._give(self._transcripts[0])
 
     def units(self):
         if self._units is None:
