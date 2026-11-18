@@ -6,7 +6,7 @@ delete. `delete` is the only code in the kit that removes anything.
 """
 import errno, fnmatch, os, re, stat
 
-from . import guard
+from . import compress, guard
 from .config import matches
 from .facts import (Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_tags, lonely, merged_seconds,
                     origin_url, orphaned_worktree, present, reflog, remote_refs, remote_urls, remove_volume,
@@ -585,7 +585,13 @@ def delete_clone(item):
 # --- all rules ----------------------------------------------------------------------------------------------------
 # The rules, by the name each one writes on what it plans: the one list of them. The disk report (report.py) needs
 # a class for each (config.CLASSES), and report.test.py fails for a rule here that has none.
-RULES = {'worktrees': plan_worktrees, 'docker': plan_docker, 'tmp': plan_tmp}
+RULES = {'worktrees': plan_worktrees, 'docker': plan_docker, 'tmp': plan_tmp, compress.RULE: compress.plan_compress}
+# Kinds whose step never leaves a path half gone (compress.py: the original or its checked copy is always there),
+# so the journal of deletes in progress does not name them. WORDS: what the engine says of them (plan, run, done)
+# and NOUNS what it counts them as.
+UNJOURNALED = ('compress', 'part')
+WORDS = {'compress': ('would compress', 'compressing', 'compressed')}
+NOUNS = {'compress': 'file', 'part': 'part file'}
 
 
 def plan(cfg, facts, measure=False):
@@ -602,6 +608,8 @@ def recheck(cfg, facts, item):
         return recheck_volume(cfg, facts, item)
     if item.kind in ('worktree', 'clone'):
         return recheck_tree(cfg, facts, item)
+    if item.kind in ('compress', 'part'):
+        return compress.recheck(cfg, facts, item)
     if os.path.dirname(item.path) != cfg.tmp_root:
         return Refusal('not a candidate', 'not in the temp folder of the machine file')
     answer = tmp_answer(cfg, facts, item.path)
@@ -612,4 +620,5 @@ def recheck(cfg, facts, item):
 
 
 def delete(item):
-    {'path': delete_path, 'worktree': delete_worktree, 'clone': delete_clone, 'volume': lambda i: remove_volume(i.path)}[item.kind](item)
+    {'path': delete_path, 'worktree': delete_worktree, 'clone': delete_clone, 'volume': lambda i: remove_volume(i.path),
+     'compress': compress.compress, 'part': compress.remove_part}[item.kind](item)

@@ -28,7 +28,8 @@ fork-cleaner compare  what plan would delete next to what the old tools' dry run
 fork-cleaner daily    what the timer runs: plan, report and compare (cleaner.daily.mode "compare", the default),
                       or run and report ("run", refused while a timer in cleaner.daily.oldTimers is on or unknown)
 
-What may go is decided by three rules (worktrees, docker, tmp) and the "cleaner" section of the machine file.
+What may go is decided by three rules (worktrees, docker, tmp) and the "cleaner" section of the machine file; a
+fourth (compress-cold) replaces cold files in the folders it names by a checked zstd copy, and deletes no content.
 What must stay is decided by the code and cannot be turned off. Exit code: 0 done, 1 something could not be read or
 deleted (it was kept), 2 wrong command or no usable machine file (nothing was done), 3 (compare and daily only)
 every step worked and the compare found paths only fork-cleaner would delete.'''
@@ -236,8 +237,10 @@ def delete_all(cfg, facts, items, really, out, log=None, journal=None):
     failed = 0
     for item in sorted(items, key=lambda i: i.label):
         told = f'{item.label} ({human(item.size)}, {item.rule}: {item.why})'
+        would, doing, done = rules.WORDS.get(item.kind, ('would delete', 'deleting', 'deleted'))
+        journaled = item.kind not in rules.UNJOURNALED
         if not really:
-            out(f'would delete {told}')
+            out(f'{would} {told}')
             continue
         facts.forget()                  # the last check reads the machine anew, not what the plan saw
         refusal = rules.recheck(cfg, facts, item)
@@ -245,26 +248,39 @@ def delete_all(cfg, facts, items, really, out, log=None, journal=None):
             item.done, item.refusal = 'refused', refusal
             out(f'REFUSED {item.label} ({item.rule}: {refusal.code}{": " + refusal.detail if refusal.detail else ""})')
             continue
-        log.write(one_line(f'deleting {told}'))           # a failed write stops the run before the delete
+        log.write(one_line(f'{doing} {told}'))           # a failed write stops the run before the delete
         entry = {'kind': item.kind, 'path': item.path, 'rule': item.rule,
                  'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-        journal.append(entry)
-        write_journal(cfg, journal)
+        if journaled:
+            journal.append(entry)
+            write_journal(cfg, journal)
         try:
             rules.delete(item)
         except (OSError, Unreadable) as ex:
             failed += 1
             item.done = 'failed'
-            if isinstance(ex, Untouched) or (item.kind != 'volume' and not os.path.lexists(item.path)):
+            if not journaled:
+                pass                    # its step leaves nothing half gone (rules.UNJOURNALED)
+            elif isinstance(ex, Untouched) or (item.kind != 'volume' and not os.path.lexists(item.path)):
                 journal.remove(entry)   # nothing was removed, or all of it was: nothing is half gone
                 write_journal(cfg, journal)
             out(f'FAILED {item.label} ({item.rule}: {ex})' + (' (half deleted: see the next plan)' if entry in journal else ''))
             continue
-        journal.remove(entry)
-        write_journal(cfg, journal)
+        if journaled:
+            journal.remove(entry)
+            write_journal(cfg, journal)
         item.done = 'deleted'
-        out(f'deleted {told}')
+        out(f'{done} {getattr(item, "result", None) or told}')
     return failed
+
+
+def _compressed(items, really):
+    """What compressing these frees: after a run, what it freed; in a plan, their size and the estimate."""
+    if really:
+        return f'{sized(items)} freed'
+    guesses = [item.estimate for item in items if getattr(item, 'estimate', None) is not None]
+    about = human(sum(guesses)) + ('' if len(guesses) == len(items) else ' and more') if guesses else 'size not known'
+    return f'{sized(items)}, frees about {about}'
 
 
 def _groups(things, key):
@@ -309,18 +325,24 @@ def _execute(cfg, facts, really, say, log):
     failed = delete_all(cfg, facts, plan.items, really, out, log, journal)
 
     refused = [item for item in plan.items if item.done == 'refused']
-    gone = [item for item in plan.items if item.done == ('deleted' if really else None)]
+    done = [item for item in plan.items if item.done == ('deleted' if really else None)]
+    gone = [item for item in done if item.kind != 'compress']
+    packed = [item for item in done if item.kind == 'compress']
     verb = 'deleted' if really else 'would delete'
-    for (rule, kind), group in _groups(gone, lambda i: (i.rule, i.kind)):
-        say(f'  {rule}: {verb} {count(len(group), kind)} ({sized(group)})')
+    for (rule, kind), group in _groups(done, lambda i: (i.rule, i.kind)):
+        words = rules.WORDS.get(kind, ('would delete', 'deleting', 'deleted'))
+        say(f'  {rule}: {words[2] if really else words[0]} {count(len(group), rules.NOUNS.get(kind, kind))} '
+            f'({_compressed(group, really) if kind == "compress" else sized(group)})')
     for (rule, kind), group in _groups([i for i in plan.items if i.done == 'failed'], lambda i: (i.rule, i.kind)):
-        say(f'  {rule}: failed {count(len(group), kind)} ({sized(group)})')
+        say(f'  {rule}: failed {count(len(group), rules.NOUNS.get(kind, kind))} ({sized(group)})')
     for (rule, code), group in _groups(plan.kept, lambda k: (k.rule, k.code)):
         say(f'  {rule}: kept {len(group)} ({sized(group)}): {code}')
     for (rule, code), group in _groups(refused, lambda i: (i.rule, i.refusal.code)):
         say(f'  {rule}: kept {len(group)} ({sized(group)}): {code} (at the last check before the delete)')
     kept = len(plan.kept) + len(refused)
-    out(f'total: {verb} {len(gone)} ({sized(gone)}), kept {kept}' + (f', failed {failed}' if really else ''))
+    out(f'total: {verb} {len(gone)} ({sized(gone)})'
+        + (f', {"compressed" if really else "would compress"} {len(packed)} ({_compressed(packed, really)})' if packed else '')
+        + f', kept {kept}' + (f', failed {failed}' if really else ''))
 
     unread = unread_journal or any(k.code in ('could not read', 'half deleted') for k in plan.kept)
     unread = unread or any(item.refusal.code == 'could not read' for item in refused)

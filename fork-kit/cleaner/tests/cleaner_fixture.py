@@ -12,7 +12,7 @@ from unittest import mock
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
 LIB = os.path.join(KIT, 'lib', 'cleaner')
-MODULES = ('config', 'facts', 'guard', 'rules', 'engine', 'report', 'compare', 'daily')
+MODULES = ('config', 'facts', 'guard', 'compress', 'rules', 'engine', 'report', 'compare', 'daily')
 if COMMON not in sys.path:
     sys.path.insert(0, COMMON)
 
@@ -147,6 +147,7 @@ class Case(unittest.TestCase):
         self.busy, self.unit_names, self.locks, self.texts = set(), set(), set(), []
         self.mount_points = {'/'}
         self.mount_lines, self.bind_sources = [], set()     # (point, device, root) and (device, root)
+        self.mount_options = {'/': ('rw', 'relatime')}       # {point: its per-mount options}
         # Tests set a file's age with its modification time. The kit also counts the inode change time, which no
         # test can set, so the tests read the modification time alone; one test puts the real reader back.
         self.real_changed = self.c.guard.changed
@@ -221,7 +222,7 @@ class Case(unittest.TestCase):
     def facts(self, cfg, **over):
         readers = {'processes': self.processes, 'units': lambda: set(self.unit_names),
                    'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
-                   'dangling': lambda: [], 'now': self.now, 'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources)}
+                   'dangling': lambda: [], 'now': self.now, 'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):

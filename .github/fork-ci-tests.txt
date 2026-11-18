@@ -63,6 +63,7 @@ fork-ci/actions/pr-queue/tested-base/tested_base.test.py
 fork-ci/actions/test-select/test-select.test.py ~15s
 fork-ci/actions/test-select/trace-check.test.py
 fork-ci/actions/weakened-tests/weakened_tests.test.py
+fork-kit/cleaner/tests/compress.test.py
 fork-kit/cleaner/tests/daily.test.py
 fork-kit/cleaner/tests/engine.test.py
 fork-kit/cleaner/tests/guard.test.py
