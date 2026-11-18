@@ -734,6 +734,24 @@ class Config(Case):
         with self.assertRaises(machine_file.MachineFileError):
             self.cfg(compressCold={'keepFreeGB': 0})
 
+    def test_never_where_agent_scratch_deletes_or_keeps_first(self):
+        """While agent-scratch is on, its root is a folder another rule deletes from and its keep-first archive is
+        one of the cleaner's own files: compress-cold takes neither, nor a folder inside or above one. Off, both may
+        be named."""
+        scratch = self.mkdir('scratch')
+        archive = self.path('data', 'kept')
+        on = {'enabled': True, 'root': scratch, 'keepFirst': {'archive': archive}}
+        for path, why in ((scratch, 'another rule deletes from'), (os.path.join(scratch, 'project'), 'another rule deletes from'),
+                          (archive, 'agentScratch.keepFirst.archive'), (os.path.join(archive, 'x'), 'agentScratch.keepFirst.archive'),
+                          (self.path('data'), 'agentScratch.keepFirst.archive')):
+            with self.subTest(path=path), self.assertRaises(machine_file.MachineFileError) as raised:
+                self.cfg(compressCold={'folders': [{'path': path, 'days': 30}]}, agentScratch=on)
+            self.assertIn(why, str(raised.exception))
+        off = {**on, 'enabled': False}
+        for path in (scratch, archive):
+            cfg = self.cfg(compressCold={'folders': [{'path': path, 'days': 30}]}, agentScratch=off)
+            self.assertEqual([f.path for f in cfg.cold_folders], [path])
+
     def test_a_claude_home_that_is_a_link_is_never_taken_where_it_leads(self):
         real = self.mkdir('data', 'claude-real', 'projects')
         os.symlink(os.path.dirname(real), os.path.join(self.home, '.claude'))
@@ -877,6 +895,12 @@ MUTATIONS = {
     'config: no overlap with another rule': ('config', "raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {root}, a folder '\n"
                                              "                                                        'another rule deletes from')", 'pass',
                                              Config, 'test_folders_it_refuses'),
+    'config: never the agent-scratch root': ('config', "for root in self.roots() | ({self.scratch_root} if self.scratch_enabled else set()):\n                if _holds(path, root)",
+                                             "for root in self.roots():\n                if _holds(path, root)",
+                                             Config, 'test_never_where_agent_scratch_deletes_or_keeps_first'),
+    'config: never the keep-first archive': ('config', "('daily.outDir', out_text, self.daily_dir)) + archive:",
+                                             "('daily.outDir', out_text, self.daily_dir)):",
+                                             Config, 'test_never_where_agent_scratch_deletes_or_keeps_first'),
     'the report counts compressing': ("report", "if verb == 'compressed':", 'if False:', Report, 'test_the_report_counts_what_compressing_freed'),
 }
 
