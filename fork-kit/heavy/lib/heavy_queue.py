@@ -18,7 +18,8 @@ owed     for every admitted job: the part of its reservation it has not used yet
 and the slice is not under memory pressure (full avg10 > pressureFull10 or some avg60 > pressureSome60), and the
 machine has swapFreeMinMb of swap free (not checked on a machine without swap), and then the optional admitCommand
 (the machine's own check, argv with {mb} filled in, run under the queue lock with a time limit) exits 0; any other
-exit, or no answer in admitTimeoutSeconds, means not now and the job keeps its place. Waiting jobs go in order of
+exit, or no answer in admitTimeoutSeconds, means not now and the job keeps its place (but no room is kept for it
+by the jobs behind it until it is admitted; the pass limit still holds for it). Waiting jobs go in order of
 arrival. A job that does not fit lets later jobs pass. Once it has waited passLimitSeconds, nothing passes it while
 that helps it: while a queued job runs whose end would make room for it. A job that cannot fit even with every
 queued job ended (memory outside the queue is short) does not hold the others. A job larger than the whole budget
@@ -34,14 +35,16 @@ crashes frees its place, and nothing in the folder can keep the queue stuck. A l
 
 Waiting polls the real figures every pollSeconds (default 2) and prints the reason and the position when they
 change and once a minute. After --wait seconds (default 7200) heavy gives up with exit 76. The queue lock is never
-waited for blocking: a waiter gives up on it with the rest of --wait (at least 5 s), the verbs after 30 s. INT,
+waited for blocking: a waiter gives up on it with the rest of --wait (at least 5 s), the verbs and peaks after 30 s
+(+ admitTimeoutSeconds with an admit command), after a stop signal after 2 s; a finished job needs no lock. INT,
 TERM and HUP are blocked while waiting and taken with sigtimedwait, so a stop never cuts a lock take in half.
 
 Wait log: every admission, give-up and stop is one JSON line in ~/.local/state/heavy/waits.log (kept to the last
 few thousand lines); `heavy waits` sums it per day. Peaks: while an admitted job runs, its scope's `used` is
 sampled every few seconds and once more when it ends; the highest sample of every run (failed and killed runs too)
 goes into ~/.local/state/heavy/peaks.json (the last 20 per kind). The reservation is the highest of those x 1.15,
-rounded up to 128 MB, never below the start value and at most 4x it. Sampling can miss a spike shorter than the
+rounded up to 128 MB, never below the start value, at most 4x it, and a learned value at most the budget minus
+vmReserveMb (one leaky run must not learn a value that is never admitted while other jobs use the slice). Sampling can miss a spike shorter than the
 interval, so a kind with short spikes should get a start value above its spikes.
 
 Settings: the optional "queue" object in the machine file's "heavy" section (fork-kit/common/README.md); without
@@ -53,7 +56,9 @@ KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 VERSION = 1
 MB = 1 << 20
 LOCK_RETRY = 0.05           # seconds between two tries of the queue lock
-LOCK_TIMEOUT = 30           # the verbs, logging and clean-up wait at most this long for the queue lock
+LOCK_TIMEOUT = 30           # the verbs, logging and peaks wait this long for the queue lock (+ admitTimeoutSeconds)
+STOP_LOCK_WAIT = 2          # after a stop signal: a short try for the lock (the log line, the peak), never 30 s
+HOOK_OUTPUT_GRACE = 1       # seconds an admit command's output may stay open after it exited
 LOCK_MIN = 5                # a waiter waits at least this long for the lock, even with --wait 0
 STOP_SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 DEFAULT_MB = 3072
@@ -97,9 +102,11 @@ def _argv(value):
         return 'must be a list of non-empty strings'
     if not os.path.isabs(value[0]):
         return 'the first word must be an absolute path'
-    if not (os.path.isfile(value[0]) and os.access(value[0], os.X_OK)):
-        return f'{value[0]} is not a program this user can run'
-    return None
+    return None                     # that it can be run is checked per job (ask_hook): a missing one stops that job
+
+
+def runnable(path):
+    return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
 SETTINGS = {
@@ -363,8 +370,12 @@ class Queue:
         if fd is not None:
             os.close(fd)
 
+    def lock_wait(self):
+        """How long the verbs and the peaks wait for the queue lock: longer than one admit command can hold it."""
+        return LOCK_TIMEOUT + (self.cfg['admitTimeoutSeconds'] if self.cfg.get('admitCommand') else 0)
+
     def __enter__(self):
-        self.take(self.monotonic() + LOCK_TIMEOUT)
+        self.take(self.monotonic() + self.lock_wait())
         return self
 
     def __exit__(self, *exc):
@@ -493,10 +504,13 @@ class Queue:
 
         shares = 0
         for t in ahead:
+            # a waiter the admit command refused on its last look does not take its room on its next one either:
+            # it gets no share and holds the queue only by the pass limit, as any waiter that does not fit
+            refused = t.data.get('hookNo') is True
             if t.mb * MB > budget:
-                if alone_fits(t, shares):
+                if not refused and alone_fits(t, shares):
                     return False, f'{t.kind} ({t.mb} MB, larger than the budget) is first and runs alone', fig
-            elif need(t) <= room - shares:
+            elif not refused and need(t) <= room - shares:
                 shares += need(t)       # its share: it takes it on its own next look
                 continue
             if self.waited(t) >= cfg['passLimitSeconds'] and holding_helps(t, shares):
@@ -517,6 +531,9 @@ class Queue:
         argv = self.cfg.get('admitCommand') or []
         if not argv:
             return True, 'fits'
+        if not runnable(argv[0]):
+            raise Refused(f'heavy.queue.admitCommand: {argv[0]} is not a program this user can run, so this job '
+                          f'cannot be checked; not running it (fix the program or remove the setting)')
         code, line = self.hook([w.replace('{mb}', str(mb)) for w in argv], self.cfg['admitTimeoutSeconds'])
         if code == 0:
             return True, 'fits, and the admit command says yes'
@@ -524,18 +541,38 @@ class Queue:
         detail = f': {line}' if code is not None and line else ''
         return False, f'the admit command says not now ({what}{detail})'
 
+    def look(self, t):
+        """One look for waiting ticket t (under the lock): the queue's rule, then the admit command. Whether the admit
+        command refused it goes into its ticket (hookNo), so the jobs behind it do not keep its room for it."""
+        ok, why, fig = self.decide(t, self.tickets(), self.box.facts(self.cfg))
+        refused = False
+        if ok:
+            ok, why = self.ask_hook(t.mb)
+            refused = not ok
+        if t.data.get('hookNo', False) != refused:
+            t.data['hookNo'] = refused
+            self.write(t)
+        return ok, why, fig
+
+    def reservation(self, kind, start_mb):
+        """reservation() for this queue's slice: a learned value stays at most the budget minus vmReserveMb."""
+        cap = self.box.facts(self.cfg)['budget'] // MB - self.cfg['vmReserveMb']
+        return reservation(kind, start_mb, self.box.state_dir, self.out, cap_mb=cap)
+
     # ----- waiting -----
 
-    def enter(self, kind, mb, scope, cmd, wait_s):
+    def enter(self, kind, mb, scope, cmd, wait_s, keep_blocked=False):
         """Wait until the job fits; returns its held Ticket. Raises GaveUp after wait_s, Stopped on INT/TERM/HUP.
         The stop signals stay blocked the whole time and are only taken in pause(), so no signal can land between
-        taking a lock and keeping its fd."""
+        taking a lock and keeping its fd. keep_blocked: once admitted they stay blocked (heavy takes them itself,
+        so a Ctrl-C just after the admission is no traceback); every other end restores the mask."""
         sigs = [s for s in STOP_SIGS if signal.getsignal(s) != signal.SIG_IGN]
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
         self.sigs = sigs
         start = self.monotonic()
         lock_deadline = max(start + wait_s, start + LOCK_MIN)
         t = None
+        admitted = False
         try:
             with _Locked(self, lock_deadline):
                 t = self.create(kind, mb, scope, cmd)
@@ -543,10 +580,7 @@ class Queue:
             while True:
                 self.box.refresh()                      # may ask systemd: outside the lock
                 with _Locked(self, lock_deadline):
-                    facts = self.box.facts(self.cfg)
-                    ok, why, fig = self.decide(t, self.tickets(), facts)
-                    if ok:
-                        ok, why = self.ask_hook(mb)
+                    ok, why, fig = self.look(t)
                     waited = self.monotonic() - start
                     if ok:
                         self.stop_pending()             # a stop that came while deciding wins over the admission
@@ -555,10 +589,16 @@ class Queue:
                         self.log(kind, mb, waited, 'admitted')
                         if waited >= 1:
                             self.out(f'admitted {kind} ({mb} MB) after waiting {_dur(waited)} for memory')
+                        admitted = True
                         return t
                     if waited >= wait_s:
                         self.log(kind, mb, waited, 'gave-up')
-                        raise GaveUp(f'gave up after waiting {_dur(waited)} for memory: {kind} {why}')
+                        whole = ''
+                        if mb >= fig['budgetMb']:
+                            whole = (f' (its reservation {mb} MB is not below the whole budget of {fig["budgetMb"]} '
+                                     f'MB: it runs only when the slice is near empty; lower --mb or raise the '
+                                     f"slice's memory.high)")
+                        raise GaveUp(f'gave up after waiting {_dur(waited)} for memory: {kind} {why}{whole}')
                 key = (why.split(',')[0].split('(')[0], fig['position'])
                 if key != last or last_print is None or self.monotonic() - last_print >= PRINT_EVERY:
                     self.out(f'waiting for memory: {kind} {why} (budget {fig["budgetMb"]} MB, used '
@@ -570,7 +610,7 @@ class Queue:
         except Stopped:
             self.sigs = None                            # clean-up below waits without ending on a second signal
             try:
-                with self:
+                with _Locked(self, self.monotonic() + STOP_LOCK_WAIT):
                     self.log(kind, mb, self.monotonic() - start, 'stopped')
             except Exception:
                 pass
@@ -586,7 +626,8 @@ class Queue:
             raise
         finally:
             self.sigs = None
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            if not (admitted and keep_blocked):
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
     # ----- wait log -----
 
@@ -627,27 +668,58 @@ class _Locked:
 
 
 def run_hook(argv, timeout):
-    """(exit code, last output line) of the admit command; (None, why) when it could not run or did not answer in
-    time (then its whole process group is killed). It gets no stdin and an unblocked signal mask."""
-    import subprocess
+    """(exit code, last output line) of the admit command; (None, why) when it could not run, did not answer in
+    time, or exited but left a process that holds its output open (its whole process group is then killed). Its
+    output is read with a deadline, never until an EOF that may not come. It gets no stdin and an open signal mask."""
+    import select, subprocess
     try:
         p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              close_fds=True, start_new_session=True,
                              preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, []))
     except OSError as e:
         return None, f'cannot be run: {e.strerror or e}'
-    try:
-        out, _ = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+
+    def cut(why):
         try:
             os.killpg(p.pid, signal.SIGKILL)
         except OSError:
             pass
         p.wait()
+        return None, why
+
+    fd, out = p.stdout.fileno(), b''
+    deadline = time.monotonic() + timeout
+    exited_at = None
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                return cut(f'no answer in {timeout:g} s')
+            if p.poll() is not None:
+                exited_at = exited_at or now
+                if now - exited_at >= HOOK_OUTPUT_GRACE:
+                    return cut(f'exit {p.returncode}, but a process it started still holds its output open')
+            if select.select([fd], [], [], min(0.1, deadline - now))[0]:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                out = (out + chunk)[-65536:]
+        try:
+            p.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return cut(f'no answer in {timeout:g} s')
+    finally:
         p.stdout.close()
-        return None, f'no answer in {timeout:g} s'
     lines = [x.strip() for x in out.decode('utf-8', 'replace').splitlines() if x.strip()]
     return p.returncode, (lines[-1][:200] if lines else '')
+
+
+def stopped_already():
+    """Raise Stopped for an INT/TERM/HUP that is pending (blocked, as enter(keep_blocked=True) leaves them)."""
+    sigs = [s for s in STOP_SIGS if signal.getsignal(s) != signal.SIG_IGN]
+    info = signal.sigtimedwait(sigs, 0) if sigs else None
+    if info is not None:
+        raise Stopped(info.si_signo)
 
 
 def close(t):
@@ -658,15 +730,13 @@ def close(t):
 
 
 def release(queue, t):
-    """The job ended: delete the ticket (under the lock) and drop its flock. A crash skips this; the next look
-    deletes the ticket instead. When the lock does not come within LOCK_TIMEOUT, only the flock is dropped."""
+    """The job ended: delete the ticket and drop its flock. The delete needs no queue lock, so a slow admit command
+    never delays it and leftovers that inherited the fd (HEAVY_KEEP=1) hold nothing: an unlink is atomic, and a look
+    that opened the ticket just before still finds it held (counted once more at most). A crash skips this; the next
+    look deletes the ticket instead."""
     if t is None or t.fd is None:
         return
-    try:
-        with queue:
-            _unlink(os.path.join(queue.box.queue_dir, t.name))
-    except Exception:
-        pass
+    _unlink(os.path.join(queue.box.queue_dir, t.name))
     close(t)
 
 
@@ -774,9 +844,10 @@ def read_peaks(state_dir, out=say):
     return kinds, True
 
 
-def reservation(kind, start_mb, state_dir, out=say):
+def reservation(kind, start_mb, state_dir, out=say, cap_mb=None):
     """(MB to reserve, how it was chosen): the highest peak of the kind's recent runs x 1.15, rounded up to 128 MB;
-    never below the start value (learning only ever raises it) and at most 4x it."""
+    never below the start value (learning only ever raises it), at most 4x it, and at most cap_mb (Queue.reservation:
+    the budget minus vmReserveMb), so one run that leaked cannot learn a value that is never admitted."""
     runs = read_peaks(state_dir, out)[0].get(kind, [])
     if not runs:
         return start_mb, 'start value (no measured runs yet)'
@@ -784,14 +855,20 @@ def reservation(kind, start_mb, state_dir, out=say):
     mb = int(math.ceil(top * LEARN_MARGIN / LEARN_ROUND_MB)) * LEARN_ROUND_MB
     if mb <= start_mb:
         return start_mb, f'start value (highest of the last {len(runs)} runs: {top} MB)'
-    return min(start_mb * 4, mb), f'learned (highest of the last {len(runs)} runs: {top} MB, x {LEARN_MARGIN})'
+    how = f'learned (highest of the last {len(runs)} runs: {top} MB, x {LEARN_MARGIN})'
+    mb = min(start_mb * 4, mb)
+    if cap_mb is not None and mb > cap_mb:
+        mb = max(start_mb, cap_mb // LEARN_ROUND_MB * LEARN_ROUND_MB)
+        how += f', capped at the budget minus vmReserveMb ({mb} MB)'
+    return mb, how
 
 
-def record_peak(queue, kind, peak_mb):
-    """Add a run's peak to the kind's history (under the queue lock: two jobs ending together keep both)."""
+def record_peak(queue, kind, peak_mb, wait=None):
+    """Add a run's peak to the kind's history (under the queue lock: two jobs ending together keep both). wait: how
+    long to try for the lock (default Queue.lock_wait(); after a stop signal STOP_LOCK_WAIT)."""
     d = queue.box.state_dir
     try:
-        with queue:
+        with _Locked(queue, queue.monotonic() + (queue.lock_wait() if wait is None else wait)):
             kinds, writable = read_peaks(d, queue.out)
             if not writable:
                 return
@@ -818,9 +895,13 @@ class Sampler:
         if used:
             self.peak = max(self.peak, used)
 
-    def record(self):
+    def record(self, wait=None):
         if self.peak:
-            record_peak(self.queue, self.ticket.kind, _mb(self.peak))
+            record_peak(self.queue, self.ticket.kind, _mb(self.peak), wait)
+
+    def record_soon(self):
+        """record() after a stop signal: a short try for the lock, so a "stop now" never waits on the queue."""
+        self.record(STOP_LOCK_WAIT)
 
 
 # ---------- the verbs ----------
@@ -865,7 +946,9 @@ def queue_main(queue, argv):
           f'free for new jobs {max(0, m["freeMb"])}; available {m["availableMb"]} MB; pressure full10 '
           f'{m["pressureFull10"]:.1f}% some60 {m["pressureSome60"]:.1f}%; swap free {m["swapFreeMb"]} MB')
     if st['settings']['admitCommand']:
-        print(f'  admit command: {" ".join(st["settings"]["admitCommand"])}')
+        argv = st['settings']['admitCommand']
+        bad = '' if runnable(argv[0]) else '  (NOT a program this user can run: queued jobs that fit stop with exit 1)'
+        print(f'  admit command: {" ".join(argv)}{bad}')
     n = 0
     for r in st['jobs']:
         age = _dur(now - r['since']) if r['since'] else '?'

@@ -455,14 +455,18 @@ def run(argv, cfg, job=None):
     grace = cfg['grace_seconds']
     unit = unit_name(argv[0], keep)
     env[b'HEAVY_SCOPE'] = unit.encode()
-    queue = ticket = sampler = None
+    queue = ticket = sampler = child_mask = None
     if job is not None and not nested:
         hq = queue_module()
+        child_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])     # the mask now: the command's, as without a queue
         try:
             queue = queue_for(hq, cfg, systemctl, slice_cg, limits)
             hq.check_kind(job['kind'])
-            mb, _how = hq.reservation(job['kind'], job['mb'], queue.box.state_dir)
-            ticket = queue.enter(job['kind'], mb, unit, os.path.basename(argv[0]), job['wait'])
+            mb, _how = queue.reservation(job['kind'], job['mb'])
+            # admitted: INT/TERM/HUP stay blocked from here until run_scope takes them, so one that comes just after
+            # the admission is no traceback; one that came already stops heavy here, before the command starts
+            ticket = queue.enter(job['kind'], mb, unit, os.path.basename(argv[0]), job['wait'], keep_blocked=True)
+            hq.stopped_already()
         except OSError as e:
             say(f'memory queue: {e}; not running {argv[0]}')
             return 1
@@ -470,20 +474,24 @@ def run(argv, cfg, job=None):
             say(f'{e}; not running {argv[0]}')
             return hq.EXIT_GAVE_UP
         except hq.Stopped as e:
-            say(f'{signal.Signals(e.sig).name} while waiting for memory; not running {argv[0]}')
+            if ticket is not None:
+                hq.release(queue, ticket)
+                say(f'{signal.Signals(e.sig).name} just after the memory queue admitted it; not running {argv[0]}')
+            else:
+                say(f'{signal.Signals(e.sig).name} while waiting for memory; not running {argv[0]}')
             return finish(e.sig, None)
         sampler = hq.Sampler(queue, ticket)
         # The command inherits the ticket's flock: a heavy killed with -9 keeps the job's reservation until the
         # processes it started are gone (a normal end deletes the ticket, so a process that lives on holds nothing).
         os.set_inheritable(ticket.fd, True)
     try:
-        return run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler)
+        return run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask)
     finally:
         if ticket is not None:
             hq.release(queue, ticket)
 
 
-def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler):
+def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask=None):
 
     ignored = [s for s in WATCH + FORWARD if signal.getsignal(s) == signal.SIG_IGN]
     watch = [s for s in WATCH if s not in ignored]
@@ -496,7 +504,8 @@ def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler
            '-p', f'TimeoutStopSec={grace:g}s', '--', *argv]
     probe = GroupProbe(list(WATCH + FORWARD))
     try:
-        child = subprocess.Popen(cmd, close_fds=False, env=env, preexec_fn=child_setup(restore, old_mask))
+        child = subprocess.Popen(cmd, close_fds=False, env=env,
+                                 preexec_fn=child_setup(restore, old_mask if child_mask is None else child_mask))
     except OSError as e:
         probe.close()
         say(f'cannot start systemd-run: {e}')
@@ -565,7 +574,8 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, s
 
     if sampler is not None:             # one more look before the leftovers stop; every run teaches the queue,
         sampler.sample()                # failed and killed ones too (the reservation only ever goes up)
-        sampler.record()
+        if status is not None:          # after a signal to heavy only a short try for the lock: it wants out
+            sampler.record() if got is None else sampler.record_soon()
 
     if status is None:                              # a signal to heavy, and the command is still running
         cg, pids = scope_state(systemctl, unit)
@@ -578,6 +588,8 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, s
         except OSError:
             pass
         _, status = os.waitpid(child.pid, 0)
+        if sampler is not None:         # stop now: after the scope stop, and only a short try for the queue lock
+            sampler.record_soon()
         name = signal.Signals(got).name
         if text:
             say(f'{name}: stopped {text}')

@@ -64,8 +64,13 @@ their real use is in the slice's figures).
   has used. While a queued job runs, heavy samples its scope's memory every 3 s and once more when the command
   ends; the highest sample of every run goes into the kind's history (`peaks.json`, last 20 runs), failed and
   OOM-killed runs too (they often peak highest). The reservation is the highest of those peaks x 1.15, rounded up
-  to 128 MB, never below the start value and at most 4x it. Kinds and start values are project facts: they live in
-  the project's config, which passes them as `--kind`/`--mb`.
+  to 128 MB, never below the start value, at most 4x it, and a learned value at most the budget minus `vmReserveMb`.
+  That last cap keeps one run that leaked (and hit the slice's `memory.high`) from learning a value at or above the
+  budget, which could then only run while the slice is near empty and so never while plain `heavy` jobs run: the
+  kind would give up with 76 again and again and never record a lower peak. It is the one case where the
+  reservation can be below a real peak; the slice's `memory.high`/`memory.max` still catch a real overrun. A start
+  value above the budget stays as set. Kinds and start values are project facts: they live in the project's config,
+  which passes them as `--kind`/`--mb`.
 - **Sampling limits:** a spike shorter than 3 s can be missed, and a job that is killed for memory is seen at its
   last sample, not at the moment it was killed. That is why the reservation keeps a margin and never drops under
   the start value: set the start value from a real peak, not a typical run.
@@ -80,8 +85,12 @@ their real use is in the slice's figures).
 - **Admit command (optional):** `admitCommand` is a program and its arguments (`{mb}` becomes the reservation),
   asked after the queue's own rule says yes, under the queue's lock. Exit 0 admits the job; any other exit, or no
   answer within `admitTimeoutSeconds` (its process group is then killed), means not now: the job keeps its place
-  and asks again on the next look. Its last output line is shown as the reason. `heavy queue --json` shows the
-  setting (`settings.admitCommand`), so a caller can tell whether the machine's own check already runs here.
+  and asks again on the next look. Its last output line is shown as the reason. Its output is read with a deadline:
+  a command that exits but leaves a process holding its output open is not now too (that process group is
+  killed). The refusal goes into the job's ticket: until it is admitted, the jobs behind it do not keep its room for
+  it, so a later job that fits (and that the command admits) starts; once it has waited `passLimitSeconds` it holds
+  them by the pass-limit rule below, as any job that does not fit. `heavy queue --json` shows the setting
+  (`settings.admitCommand`), so a caller can tell whether the machine's own check already runs here.
 - **Order:** first come, first served. A job that does not fit lets later jobs that do fit pass until it has waited
   `passLimitSeconds` (10 min, on the monotonic clock); after that nothing passes it while that helps it: while queued
   jobs run (or are about to) whose end would make room for it. A job that would not fit even with every queued job
@@ -97,9 +106,13 @@ their real use is in the slice's figures).
   exits 76 by itself has no such line: a caller that must tell them apart reads stderr. INT, TERM or HUP while
   waiting end it as they would end the command.
 - **The queue's lock is never waited on without an end:** a lock held by a stuck process ends the wait with exit 76
-  after `--wait` seconds (at least 5), and `heavy queue`/`heavy waits` after 30 s. INT, TERM and HUP stay blocked
-  while heavy waits in the queue and are taken only between looks, never while it holds the lock. The admit
-  command is the one thing run under the lock, and `admitTimeoutSeconds` bounds it.
+  after `--wait` seconds (at least 5), and `heavy queue` and saving a peak after 30 s plus `admitTimeoutSeconds`
+  when an admit command is set (longer than one admit command can hold the lock). A finished job deletes its ticket
+  without the lock. INT, TERM and HUP stay blocked while heavy waits in the queue and are taken only between looks,
+  never while it holds the lock; once a job is admitted they stay blocked until heavy waits on the command, so one
+  that comes in between stops heavy before the command starts, with one line. After a stop signal heavy tries for
+  the lock only 2 s (the wait-log line, the peak), so a second Ctrl-C ("stop now") never waits on the queue. The
+  admit command is the one thing run under the lock, and `admitTimeoutSeconds` bounds it.
 - **Minutes waited:** each admission, give-up and stop is one JSON line in `~/.local/state/heavy/waits.log`;
   `heavy waits` sums it per UTC day (jobs, minutes waited, longest wait, give-ups, minutes per kind). That figure
   decides whether a machine needs more memory.
@@ -155,6 +168,14 @@ refuses it.
   before: the ticket.)
 - **Stops half-way through a write:** `peaks.json` and `waits.log` are written to `<file>.<pid>.tmp` and renamed;
   a failed write removes its temporary file, and the next writer removes ones whose process is gone.
+- **The admit command's program is missing** (removed or not yet installed): settings still load, `heavy queue`
+  works and marks it, and jobs the queue's own rule holds keep waiting. A job that reaches the admit command stops
+  with exit 1 and a line naming the program, and does not run: without its check it must not start, and waiting
+  `--wait` for a program that may never come back would hide the fault. Fix the program or remove the setting.
+- **The admit command hangs, or its leftover holds its output:** not now after `admitTimeoutSeconds` (or 1 s after
+  it exited); its process group is killed and the job asks again on the next look.
+- **One leaky run of a kind:** its peak counts (failed runs too), but the learned value is capped at the budget
+  minus `vmReserveMb`, so the kind is still admitted while other jobs use the slice.
 
 ## Leftover sweep
 

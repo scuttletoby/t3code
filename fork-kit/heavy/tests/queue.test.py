@@ -377,6 +377,127 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(hq.run_hook(['/bin/sh', '-c', 'exit 0'], 5)[0], 0)
         self.assertIsNone(hq.run_hook([os.path.join(self.host.dir, 'missing')], 5)[0])
 
+    def refusing(self, refused_mb):
+        """A queue whose admit command refuses only jobs of refused_mb (another tool's reservation leaves too little
+        for them, as a t3-capacity-style check says)."""
+        def hook(argv, timeout):
+            return (1, 'NOT OK') if argv[-1] == str(refused_mb) else (0, '')
+        settings = dict(self.cfg, admitCommand=['/bin/true', '{mb}'])
+        return self.hq().Queue(self.host.box, settings, now=self.clock.now, sleep=self.clock.sleep,
+                               monotonic=self.clock.monotonic, out=self.lines.append, hook=hook)
+
+    def test_a_waiter_the_admit_command_refuses_keeps_no_room_for_itself(self):
+        q = self.refusing(3072)                     # budget 4608 MB; nothing runs
+        x = self.other('x', 3072, since=self.clock.now() - 7000)    # first, and long past the pass limit
+        with q:
+            ok, why, _ = q.look(x)
+        self.assertFalse(ok)
+        self.assertIn('admit command says not now', why)
+        self.assertIs(self.live()[0].data['hookNo'], True)          # written into its ticket
+        y = q.enter('y', 2048, 'y.scope', 'x', 0)   # fits the queue and the admit command: starts on this look
+        self.assertEqual(y.state, 'admitted')
+        self.hq().release(q, y)
+
+    def test_a_refused_waiter_past_the_pass_limit_still_holds_while_a_running_job_would_make_room(self):
+        self.other('running', 1000, 'admitted', scope='heavy-run.scope')
+        self.host.set_scope('heavy-run.scope', 1000)
+        self.host.set_slice(used_mb=1000)
+        q = self.refusing(3072)
+        x = self.other('x', 3072, since=self.clock.now() - 601)
+        with q:
+            self.assertFalse(q.look(x)[0])
+        ok, why, _ = self.decide(2048)              # y fits, but x gets its turn once the running job ends
+        self.assertFalse(ok)
+        self.assertIn('pass limit', why)
+
+    def test_a_real_admit_command_whose_leftover_holds_its_output_is_not_now(self):
+        hq = self.hq()
+        pid_file = os.path.join(self.host.dir, 'leftover.pid')
+        start = time.monotonic()
+        code, line = hq.run_hook(['/bin/sh', '-c', f'sleep 60 & echo $! > {pid_file}; echo OK; exit 0'], 20)
+        self.assertLess(time.monotonic() - start, 5)    # not the 20 s timeout
+        self.assertIsNone(code)
+        self.assertIn('exit 0, but a process it started still holds its output open', line)
+        with open(pid_file) as f:
+            pid = int(f.read())
+        end = time.monotonic() + 5
+        while os.path.exists(f'/proc/{pid}') and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertFalse(os.path.exists(f'/proc/{pid}'), 'the leftover of the admit command was not killed')
+        # a leftover that lets go of the output does not change the answer
+        self.assertEqual(hq.run_hook(['/bin/sh', '-c', 'sleep 1 >/dev/null 2>&1 & echo fine; exit 0'], 5), (0, 'fine'))
+
+    def test_a_missing_admit_command_stops_the_job_that_needs_it_not_the_queue(self):
+        hq = self.hq()
+        missing = os.path.join(self.host.dir, 'gone')
+        q = self.queue(admitCommand=[missing, '{mb}'])
+        with self.assertRaises(hq.Refused) as cm:
+            q.enter('gradle', 2048, 's.scope', 'x', 60)
+        self.assertIn(f'{missing} is not a program this user can run', str(cm.exception))
+        self.assertEqual(self.host.files(), [])     # its ticket is gone
+        self.assertEqual(hq.status(q)['settings']['admitCommand'], [missing, '{mb}'])    # heavy queue still works
+        self.host.set_slice(used_mb=4500)
+        with self.assertRaises(hq.GaveUp):          # a job the queue's own rule holds still just waits
+            q.enter('gradle', 2048, 's.scope', 'x', 5)
+
+    def hold_lock(self):
+        """The queue lock, taken through another open file (to the queue: another process holds it)."""
+        with self.q:
+            pass
+        fd = os.open(os.path.join(self.host.box.queue_dir, 'lock'), os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        return fd
+
+    def test_a_finished_job_deletes_its_ticket_while_the_lock_is_taken(self):
+        t = self.q.enter('gradle', 2048, 's.scope', 'x', 60)
+        self.hold_lock()                            # a slow admit command, or a stuck process
+        start = self.clock.now()
+        self.hq().release(self.q, t)
+        self.assertEqual(self.host.files(), [])
+        self.assertIsNone(t.fd)
+        self.assertEqual(self.clock.now(), start)   # and it did not wait for the lock
+
+    def test_peaks_and_verbs_wait_longer_than_one_admit_command(self):
+        hq = self.hq()
+        fd = self.hold_lock()
+        give_back = self.clock.now() + hq.LOCK_TIMEOUT + 10     # an admit command that took 40 s of its 50 s
+        self.clock.hooks.append(lambda c: c.t >= give_back and fcntl.flock(fd, fcntl.LOCK_UN))
+        q = self.queue(admitCommand=['/bin/true'], admitTimeoutSeconds=50)
+        self.assertEqual(q.lock_wait(), hq.LOCK_TIMEOUT + 50)
+        self.assertEqual(self.q.lock_wait(), hq.LOCK_TIMEOUT)   # no admit command: the plain wait
+        hq.record_peak(q, 'gradle', 1000)
+        self.assertEqual(hq.read_peaks(self.host.state)[0], {'gradle': [1000]})
+        self.assertEqual(hq.status(q)['queue'], {'running': 0, 'waiting': 0})
+
+    def test_a_stop_signal_saves_the_peak_with_a_short_try_only(self):
+        hq = self.hq()
+        t = self.other('gradle', 2048, 'admitted', scope='heavy-g.scope')
+        self.hold_lock()
+        self.host.set_scope('heavy-g.scope', 1400)
+        s = hq.Sampler(self.queue(admitCommand=['/bin/true']), t)
+        s.sample()
+        start = self.clock.now()
+        s.record_soon()
+        self.assertLessEqual(self.clock.now() - start, hq.STOP_LOCK_WAIT + 0.5)
+        self.assertIn('could not record the peak of gradle', self.lines[-1])
+
+    def test_a_stop_just_after_the_admission_stays_pending_for_heavy(self):
+        hq = self.hq()
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, before)
+        t = self.q.enter('gradle', 2048, 's.scope', 'x', 60, keep_blocked=True)
+        self.addCleanup(hq.release, self.q, t)
+        self.assertIn(signal.SIGINT, signal.pthread_sigmask(signal.SIG_BLOCK, []))
+        os.kill(os.getpid(), signal.SIGINT)         # Ctrl-C right after the admission: no KeyboardInterrupt here
+        with self.assertRaises(hq.Stopped) as cm:
+            hq.stopped_already()                    # heavy takes it before it starts the command
+        self.assertEqual(cm.exception.sig, signal.SIGINT)
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
+        t2 = self.q.enter('gradle', 100, 's2.scope', 'x', 60)   # without keep_blocked the mask comes back
+        hq.release(self.q, t2)
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), before)
+
     def test_gives_up_after_the_wait_and_leaves_no_ticket(self):
         self.host.set_slice(used_mb=4500)
         with self.assertRaises(self.hq().GaveUp) as cm:
@@ -643,6 +764,32 @@ class QueueTests(unittest.TestCase):
         hq.record_peak(self.q, 'huge', 100000)
         self.assertEqual(hq.reservation('huge', 768, self.host.state)[0], 3072)
 
+    def test_one_leaky_run_does_not_lock_its_kind_out(self):
+        hq = self.hq()
+        for peak in [1400] * 19 + [4200]:          # one build leaked up to the slice's memory.high
+            hq.record_peak(self.q, 'gradle', peak)
+        self.assertEqual(hq.reservation('gradle', 2048, self.host.state)[0], 4864)     # uncapped: > budget 4608
+        self.host.set_slice(used_mb=900)            # a plain heavy job (a test server) in the slice
+        mb, how = self.q.reservation('gradle', 2048)
+        self.assertEqual(mb, 4608 - 1024)           # the budget minus vmReserveMb
+        self.assertIn('capped', how)
+        t = self.q.enter('gradle', mb, 'g.scope', 'gradlew', 0)
+        self.assertEqual(t.state, 'admitted')       # the kind still runs; the slice's limits catch a real overrun
+        self.hq().release(self.q, t)
+
+    def test_the_cap_never_goes_below_the_start_value_or_lowers_a_normal_peak(self):
+        hq = self.hq()
+        hq.record_peak(self.q, 'big', 9000)
+        self.assertEqual(self.q.reservation('big', 5000)[0], 5000)    # a start value above the budget stays
+        hq.record_peak(self.q, 'gradle', 2300)
+        self.assertEqual(self.q.reservation('gradle', 2048)[0], 2688)  # under the cap: the learned value
+
+    def test_a_give_up_of_a_job_as_large_as_the_budget_says_so(self):
+        self.host.set_slice(used_mb=900)
+        with self.assertRaises(self.hq().GaveUp) as cm:
+            self.q.enter('gradle', 4608, 'g.scope', 'gradlew', 0)
+        self.assertIn('is not below the whole budget of 4608 MB', str(cm.exception))
+
     def test_only_the_last_20_runs_count(self):
         hq = self.hq()
         for peak in [9000] * 5 + [2500] * 20:
@@ -738,10 +885,13 @@ class QueueTests(unittest.TestCase):
         plain = os.path.join(self.host.dir, 'not-a-program')
         with open(plain, 'w') as f:
             f.write('')
-        for bad in (['sh', '-c', 'true'], [plain], [''], '/bin/true', [1], {'admitTimeoutSeconds': 0}):
+        for bad in (['sh', '-c', 'true'], [''], '/bin/true', [1], {'admitTimeoutSeconds': 0}):
             data = bad if isinstance(bad, dict) else {'admitCommand': bad}
             with self.subTest(bad=bad), self.assertRaises(hq.Refused):
                 hq.settings(self.machine({'version': 1, 'heavy': {'queue': data}}), os.getuid())
+        # a path that is not a program (yet, or any more) is not refused here: it stops the job that needs it
+        cfg = hq.settings(self.machine({'version': 1, 'heavy': {'queue': {'admitCommand': [plain]}}}), os.getuid())
+        self.assertEqual(cfg['admitCommand'], [plain])
 
     def test_the_sweep_accepts_the_queue_key(self):
         sweep = load_module('heavy_sweep', SWEEP)
@@ -805,8 +955,23 @@ MUTATIONS = {
                              'test_a_job_larger_than_the_budget_waits_for_the_others'),
     'oversized still needs free memory': ('and (box_room is None or need(t) <= box_room))', 'and True)',
                                           'test_a_job_larger_than_the_budget_still_needs_the_machines_free_memory'),
-    'the admit command': ('ok, why = self.ask_hook(mb)', 'pass',
+    'the admit command': ('ok, why = self.ask_hook(t.mb)', 'pass',
                           'test_the_admit_command_saying_no_keeps_the_job_waiting_in_its_place'),
+    'a refused waiter holds no share': ("refused = t.data.get('hookNo') is True", 'refused = False',
+                                        'test_a_waiter_the_admit_command_refuses_keeps_no_room_for_itself'),
+    'a learned value can be admitted': ('if cap_mb is not None and mb > cap_mb:', 'if False:',
+                                        'test_one_leaky_run_does_not_lock_its_kind_out'),
+    'a missing admit command stops its job': ('        if not runnable(argv[0]):\n', '        if False:\n',
+                                              'test_a_missing_admit_command_stops_the_job_that_needs_it_not_the_queue'),
+    'the release needs no lock': ("    _unlink(os.path.join(queue.box.queue_dir, t.name))\n    close(t)\n",
+                                  "    try:\n        with queue:\n            _unlink(os.path.join(queue.box.queue_dir, "
+                                  "t.name))\n    except Exception:\n        pass\n    close(t)\n",
+                                  'test_a_finished_job_deletes_its_ticket_while_the_lock_is_taken'),
+    'the lock waits outlast the admit command': ("return LOCK_TIMEOUT + (self.cfg['admitTimeoutSeconds'] if",
+                                                 "return LOCK_TIMEOUT + (0 if",
+                                                 'test_peaks_and_verbs_wait_longer_than_one_admit_command'),
+    'stop signals stay blocked once admitted': ('if not (admitted and keep_blocked):', 'if True:',
+                                                'test_a_stop_just_after_the_admission_stays_pending_for_heavy'),
     'stop signals blocked in the lock': ('old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)',
                                          'old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])',
                                          'test_a_signal_while_the_lock_is_held_is_taken_after_it_is_given_back'),
