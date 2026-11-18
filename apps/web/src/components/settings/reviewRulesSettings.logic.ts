@@ -2,6 +2,7 @@
  * Fork: pure helpers for the review rules panel (`reviewRules`). The panel only writes the
  * person's own settings through the normal settings patch; nothing here is reachable by an agent.
  */
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
 import {
   type ReviewMinors,
   type ReviewRules,
