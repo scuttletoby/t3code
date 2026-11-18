@@ -129,11 +129,9 @@ function parseRemoved(text = "") {
 }
 
 /**
- * Reasons for the seam files' lines. A line is the fork's when `head` has it more often than `base`;
- * each listed line allows one. Not from upstream, `base` is main, whose copies spent the allowance.
- * `today` (a pull request's run: the date of the commit whose list judges it, never the pull
- * request's): an announcement more than its days old, or dated ahead, allows nothing (from upstream
- * it is refused on its own). A line only such an announcement allows goes to `late` if given.
+ * Reasons for the seam files' lines: each listed line allows one copy more than `base` has (not from
+ * upstream, `base` is main, whose copies spent it). On `today` (a pull request's run: the list's
+ * commit date) an expired or dated-ahead announcement allows nothing; such lines go to `late`.
  */
 function findSeamBreaches(files, { atBase, atHead, upstream = false, today, late }) {
   const reasons = [];
