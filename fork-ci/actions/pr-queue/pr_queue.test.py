@@ -2138,6 +2138,31 @@ class HoldsReadsAnyFileName(unittest.TestCase):   # #374 item 5: merge-tree name
         self.assertIs(Q.holds(self.git, read, read), True)   # the read itself: no git at all
 
 
+class HoldsIgnoresTheJobsAttributeSource(unittest.TestCase):   # #442 item 1: GIT_ATTR_SOURCE is in GIT_DROP
+    """GIT_ATTR_SOURCE makes git read attributes from a tree of its choice. Naming one that holds `* merge=union`
+    makes merge-tree union-merge a conflict, so a conflict resolution nobody read would be the merge's own tree."""
+
+    def test_a_conflict_stays_a_conflict_whatever_tree_the_job_names(self):
+        w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'c.json': '{"a": 1}\n'})
+        read = w.commit({'c.json': '{"a": 2}\n'}, [m0])
+        m1 = w.commit({'c.json': '{"a": 3}\n', 'u/.gitattributes': '* merge=union\n'}, [m0])
+        attrs = w.git(w.work, 'rev-parse', f'{m1}:u')
+        union = subprocess.run(['git', 'merge-tree', '--write-tree', m1, read], cwd=w.work, text=True,
+                               capture_output=True, env={**os.environ, 'GIT_ATTR_SOURCE': attrs})
+        self.assertEqual(union.returncode, 0, 'no union merge with GIT_ATTR_SOURCE on this git: the test reads nothing')
+        head = w.keep(w.git(w.work, 'commit-tree', union.stdout.split()[0], '-p', read, '-p', m1, '-m', 'union'))
+        w.set('refs/heads/main', m1)
+        w.set('refs/pull/7/head', head)
+        q = make_queue(w.dir, remote=w.remote)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIs(q.fetch('main', 7, read), True)
+            for _ in range(2):   # runs again: the same answer
+                with unittest.mock.patch.dict(os.environ, {'GIT_ATTR_SOURCE': attrs}):
+                    self.assertIs(Q.holds(q.git, head, read), False)
+
+
 class Conflict(unittest.TestCase):
     """An armed PR that conflicts with its base (merge state DIRTY) cannot merge, the queue cannot update it, and
     GitHub leaves auto-merge on without a word. It is told once per head and passed over; before, only the run log
@@ -2655,13 +2680,13 @@ class StackedPrsAreRetargetedNeverClosed(unittest.TestCase):
 
 
 class GitCalls(unittest.TestCase):
-    def git_call(self, read=None, write=None):
+    def git_call(self, read=None, write=None, remote=None, job=None):
         d = tempfile.mkdtemp(prefix='pr-queue-git-')
         self.addCleanup(shutil.rmtree, d, True)
-        q = make_queue(d)
+        q = make_queue(d, remote=remote)
         q.read_token, q.write_token = read, write
         seen = []
-        env = {'GH_TOKEN': 'machine-token', 'GITHUB_TOKEN': 'other-token', Q.WRITE_TOKEN: 'pat-token'}
+        env = {'GH_TOKEN': 'machine-token', 'GITHUB_TOKEN': 'other-token', Q.WRITE_TOKEN: 'pat-token', **(job or {})}
         with unittest.mock.patch.object(Q.subprocess, 'run', lambda argv, **kw: seen.append((argv, kw)) or ok()), \
                 unittest.mock.patch.dict(os.environ, env):
             q.git('fetch', 'x')
@@ -2686,6 +2711,16 @@ class GitCalls(unittest.TestCase):
         q, argv, env = self.git_call()
         self.assertNotIn('credential.https://github.com.helper=!gh auth git-credential', argv)
         self.assertEqual([k for k in Q.TOKEN_VARS if k in env], [])
+
+    def test_the_cache_fetches_from_github_with_no_program_of_the_job_but_gits_own(self):   # #442 item 2
+        # Queue.remote is always https://github.com/...: ssh, a git:// proxy and a login prompt are never needed (the
+        # login is gh's, or none at all), and git's default protocols allow https.
+        job = {k: 'job-' + k for k in Q.GIT_RUN}
+        self.assertEqual(Q.Queue(REPO, CFG, *('/nowhere',) * 3).remote, f'https://github.com/{REPO}.git')
+        for read in ('run-token', None):
+            with self.subTest(read=read):
+                q, argv, env = self.git_call(read, remote=f'https://github.com/{REPO}.git', job=job)
+                self.assertEqual({k: env[k] for k in Q.GIT_RUN if k in env}, {'GIT_EXEC_PATH': 'job-GIT_EXEC_PATH'})
 
     def test_the_empty_helper_resets_any_helper_the_machine_set(self):   # git's rule, checked on this git
         d = tempfile.mkdtemp(prefix='pr-queue-git-')
@@ -3332,11 +3367,16 @@ class Cli(unittest.TestCase):
         hostile.update(GIT_CONFIG_KEY_3='core.bare', GIT_CONFIG_VALUE_3='true', GIT_TRACE='0', PATH='/bin')
         env = Q.git_env(hostile)
         self.assertEqual(env, {'GIT_TRACE': '0', 'PATH': '/bin', 'GIT_TERMINAL_PROMPT': '0', **Q.GIT_ENV})
-        for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-                     'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_COMMON_DIR'):
-            self.assertIn(name, Q.GIT_DROP)
+        for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
+                     'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_CONFIG',
+                     'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_REPLACE_REF_BASE', 'GIT_GRAFT_FILE',
+                     'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH', 'GIT_PREFIX', 'GIT_IMPLICIT_WORK_TREE',
+                     'GIT_INTERNAL_SUPER_PREFIX', 'GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS', 'GIT_NOGLOB_PATHSPECS',
+                     'GIT_ICASE_PATHSPECS', 'GIT_ATTR_SOURCE', 'GIT_EXTERNAL_DIFF'):   # #442 items 1, 2, 6: each name
+            with self.subTest(name):
+                self.assertIn(name, Q.GIT_DROP)
         q = object.__new__(Q.Queue)   # the cache's git and init
-        q.cache, q.read_token = os.path.join(self.d, 'cache', 'repo.git'), None
+        q.cache, q.read_token, q.remote = os.path.join(self.d, 'cache', 'repo.git'), None, 'https://github.com/o/r.git'
         envs, real = [], subprocess.run
 
         def run(cmd, **kw):
@@ -3351,6 +3391,33 @@ class Cli(unittest.TestCase):
         self.assertTrue(envs)
         for env in envs:
             self.assertFalse({'GIT_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0'} & set(env), env)
+
+    def test_programs_and_transports_of_the_job_reach_only_a_fetch_that_may_need_them(self):   # #442 item 2
+        names = {'GIT_EXEC_PATH', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS',
+                 'GIT_ALLOW_PROTOCOL'}
+        self.assertLessEqual(names, set(Q.GIT_RUN))
+        job = {**{k: 'x' for k in Q.GIT_RUN}, 'PATH': '/bin'}
+        plain = {'PATH': '/bin', 'GIT_TERMINAL_PROMPT': '0', **Q.GIT_ENV}
+        self.assertEqual(Q.git_env(job), plain)   # a call that reaches no remote runs none of them
+        # https with the queue's own login (or none): no ssh, no git:// proxy, no prompt, git's default protocols;
+        # git's own helpers (remote-https, index-pack) are found through GIT_EXEC_PATH
+        self.assertEqual(Q.git_env(job, 'https://github.com/o/r.git'), {**plain, 'GIT_EXEC_PATH': 'x'})
+        for remote in ('origin', '/srv/r.git', 'file:///srv/r.git', 'ssh://git@host/r.git', 'git@host:r.git'):
+            with self.subTest(remote):   # the caller's remote: it may need them, so they stay
+                self.assertEqual(Q.git_env(job, remote), {**job, **plain})
+
+    def test_the_config_read_runs_no_program_of_the_job(self):   # #442 item 2: it reaches no remote
+        job = {k: os.path.join(self.d, 'nowhere') for k in Q.GIT_RUN}
+        for env in self.envs_of_the_read(job):
+            self.assertEqual({k: env[k] for k in Q.GIT_RUN if k in env}, {'GIT_ALLOW_PROTOCOL': 'none'})
+
+    def test_a_blob_missing_from_a_full_clone_is_not_blamed_on_a_sparse_pattern(self):   # #442 item 5
+        oid = self.git('rev-parse', 'HEAD:.github/pr-queue.json').decode().strip()
+        os.remove(os.path.join(self.repo, '.git', 'objects', oid[:2], oid[2:]))   # a lost or broken object
+        for _ in range(2):   # runs again: the same refusal
+            out = self.refused('.github/pr-queue.json: cannot read .github/pr-queue.json at ')
+            self.assertNotIn('sparse-checkout', out)
+            self.assertNotIn('not in this checkout', out)
 
     def test_an_old_git_is_refused(self):
         self.refused('git 2.38 or newer', git='git 2.38 or newer is needed (merge-tree --write-tree); found: git 2.34')
