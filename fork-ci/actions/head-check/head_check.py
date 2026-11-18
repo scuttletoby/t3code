@@ -73,15 +73,17 @@ class Checkout:
         # Bare, git logs in the way the queue does (gh's login, GH_TOKEN), never with a helper of the machine's config.
         self.auth = pr_queue.GIT_AUTH if self.bare else ()
 
-    def git(self, *a, errors='strict', timeout=None):
-        """errors: how git's output is decoded; 'surrogateescape' for file names, which need not be UTF-8. timeout:
-        seconds, after which git is killed and subprocess.TimeoutExpired raised."""
+    def git(self, *a, errors='strict', timeout=None, fetch=False):
+        """errors: how git's output is decoded (as UTF-8, whatever the locale); 'surrogateescape' for file names, which
+        need not be UTF-8. timeout: seconds, after which git is killed and subprocess.TimeoutExpired raised. fetch: the
+        call fetches from `remote` (pr_queue.git_env: what of the job's GIT_RUN it keeps). In checkout mode every call
+        may fetch from the caller's origin (a partial clone's missing object), so each keeps them, as before."""
         if self.run:
             return self.run(*a)
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
-                                  errors=errors, capture_output=True, timeout=timeout,
-                                  env=pr_queue.git_env(os.environ))
+                                  encoding='utf-8', errors=errors, capture_output=True, timeout=timeout,
+                                  env=pr_queue.git_env(os.environ, self.remote if fetch or not self.bare else None))
 
     def problem(self):
         """Why the repository cannot be read as git made it, or None: not a git folder, shallow (the base's history is
@@ -118,7 +120,8 @@ class Checkout:
     def fetch(self, sha):
         """A read commit no ref of the repository reaches (a force-push dropped it; GitHub keeps it), from origin with the
         credentials the checkout stored or the gate's environment gives (none: a private repository then fails)."""
-        return self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha).returncode == 0 \
+        return self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha,
+                        fetch=True).returncode == 0 \
             and self.has(sha)
 
 
@@ -471,7 +474,9 @@ def tree_entry(checkout, tree, rel):
 
 
 def folded(name):
-    """`name` as a case-insensitive file system compares it: case folded, NFC and NFD as one (APFS, HFS+)."""
+    """`name` as a case-insensitive file system compares it: fully case folded (`ſ` is `s`, `ß` is `ss`), NFC and
+    NFD as one (APFS, HFS+). NTFS compares with its own upcase table, which may pair names this keeps apart (`ı`, `İ`
+    and `i`): out of scope, like HFS+'s ignorable code points."""
     return unicodedata.normalize('NFD', unicodedata.normalize('NFD', name).casefold())
 
 
