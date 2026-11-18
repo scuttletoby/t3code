@@ -144,6 +144,16 @@ def killing_copy_file(*args):
         os.kill(os.getpid(), 9)
     return copy_file(*args)
 coldcopy._copy_file = killing_copy_file
+leaves = coldcopy.link_leaves
+def capped_leaves(rel, look):  # one that never stops (no hop limit) fails at once, not at the parent's timeout
+    calls = [0]
+    def counted(path):
+        calls[0] += 1
+        if calls[0] > 1000:
+            sys.exit('link_leaves(%r) looked up more than 1000 paths: it does not stop at a loop' % rel)
+        return look(path)
+    return leaves(rel, counted)
+coldcopy.link_leaves = capped_leaves
 rehearse.run_rehearse(config.load(), say=lambda line: None)
 '''
 
@@ -1097,6 +1107,27 @@ class Links(Base):
     """Links inside userdata (#441): the clone never holds a link out of its own tree, and the rehearsal folder never
     lands where a link of the live userdata leads."""
 
+    LOOKS = 1000  # far more than LINK_HOPS links of any case here need
+
+    def setUp(self):
+        super().setUp()
+        bounded = coldcopy.link_leaves
+
+        def capped(rel, look):
+            """link_leaves with its look()s counted: one that never stops (no hop limit) fails at once, not after
+            CI's job timeout."""
+            calls = itertools.count(1)
+
+            def counted(path):
+                if next(calls) > self.LOOKS:
+                    raise AssertionError(f'link_leaves({rel!r}) looked up more than {self.LOOKS} paths: it does not '
+                                         'stop at a loop (the hop limit)')
+                return look(path)
+            return bounded(rel, counted)
+        patcher = mock.patch.object(coldcopy, 'link_leaves', capped)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def linked_copy(self, links, name=f't3-copy-20990105T000000Z-{fx.LIVE}'):
         """A finished copy whose userdata also holds these links ({path: target}), recorded as a copy records them
         (links as links); a file of the same path is replaced by the link."""
@@ -1127,6 +1158,7 @@ class Links(Base):
     CASES = (
         ('abs-out', None, False),  # absolute, to a folder elsewhere (target set in the test)
         ('rel-out', '../../outside', False),  # relative, out by '..'
+        ('dot-out', './../outside', False),  # the same after a '.': a '.' is no folder to go up from
         ('deep/er/rel-out', '../../../../x', False),  # the same, two levels below userdata
         ('chain-a', 'chain-b', False),  # a chain: inside, then out
         ('chain-b', '../outside', False),
@@ -1169,11 +1201,11 @@ class Links(Base):
                          'the copy is never changed')
 
     def test_a_copy_whose_settings_or_database_is_a_link_out_is_refused_before_any_step(self):
-        for name in ('settings.json', 'statev2.sqlite'):
-            with self.subTest(name):
+        for i, name in enumerate(('settings.json', 'statev2.sqlite', 'statev2.sqlite-wal', 'statev2.sqlite-journal')):
+            with self.subTest(name):  # a left-out WAL or journal would quietly rehearse an older database
                 self.m.write('dotfiles/' + name, 'x')
                 copy = self.linked_copy({name: self.m.path('dotfiles/' + name)},
-                                        name=f't3-copy-2099010{6 if name == "settings.json" else 7}T000000Z-{fx.LIVE}')
+                                        name=f't3-copy-2099012{i}T000000Z-{fx.LIVE}')
                 self.refused(f'{name} in the copy', copy_dir=copy)
                 self.assertFalse(os.path.lexists(self.root()))
 
@@ -1315,6 +1347,120 @@ class Links(Base):
         os.chmod(shut, 0)
         self.addCleanup(os.chmod, shut, 0o700)
         self.refused('cannot tell where its links lead')
+
+    def test_a_live_link_whose_target_cannot_be_looked_at_is_refused_by_name(self):
+        """A loop, a link through a file, a link into a folder the kit may not read: where it leads cannot be told,
+        so the run is refused naming the link (no traceback), the old rehearsal folder is kept, and a run after the
+        link is fixed passes."""
+        self.rehearse()  # an old rehearsal folder to keep
+        root = self.root()
+        old = self.m.snapshot(root)
+        shut = self.m.path('shut')
+        os.makedirs(shut)
+        cases = [('loop', 'loop'), ('through-a-file', 'settings.json/x')]
+        if os.geteuid() != 0:  # root reads any folder
+            os.chmod(shut, 0)
+            self.addCleanup(os.chmod, shut, 0o700)
+            cases.append(('unreadable', shut + '/x'))
+        for rel, target in cases:
+            with self.subTest(rel):
+                link = self.live_link(rel, target)
+                text = self.refused(f'cannot tell where the live link {link} leads')
+                self.assertIn('nothing was changed', text)
+                self.assertEqual(self.m.snapshot(root), old, 'the old rehearsal folder is kept')
+                self.assertFalse(journal.needs_settling(self.runs()[-1]))
+                os.unlink(link)
+        self.rehearse()  # with the link gone, the run passes again
+
+    def test_a_live_folder_removed_during_the_walk_is_refused_with_run_again(self):
+        """The live T3 runs while the kit walks its userdata: a folder it removes mid-walk is no fault of the home;
+        the refusal says to run again, and the run again passes."""
+        self.rehearse()  # an old rehearsal folder to keep
+        old = self.m.snapshot(self.root())
+        userdata = os.path.join(self.m.home, 'userdata')
+        goes = os.path.join(userdata, 'goes')
+        os.makedirs(goes)
+        walk = os.walk
+
+        def walk_and_remove(top, *a, **kw):
+            for i, step in enumerate(walk(top, *a, **kw)):
+                yield step
+                if i == 0 and os.path.normpath(top) == userdata and os.path.isdir(goes):
+                    os.rmdir(goes)  # listed by the walk, gone before it is read
+        with mock.patch.object(os, 'walk', walk_and_remove):
+            text = self.refused('run again')
+        self.assertIn('removed during the walk', text)
+        self.assertEqual(self.m.snapshot(self.root()), old)
+        self.rehearse()
+
+    def test_a_live_link_to_the_backups_folder_under_another_name_is_caught_by_file_id(self):
+        """A bind mount gives a folder a second name that real paths cannot see through; the mount list does not
+        show it here either, so only the file id of where the link leads catches it (simulated: no root to mount)."""
+        alias = self.m.path('alias')
+        os.symlink(self.m.backups, alias)
+        link = self.live_link('attachments-bound', alias)
+        real = os.path.realpath
+
+        def bind_name(p, *a, **kw):  # the link leads to `alias`, which no real path shows to be the backups folder
+            return alias if os.path.normpath(p) == link else real(p, *a, **kw)
+        with mock.patch.object(os.path, 'realpath', bind_name):
+            self.refused(f'where the live link {link} leads ({alias})')
+        self.assertFalse(os.path.lexists(self.root()))
+
+    def test_a_copy_that_cannot_be_read_is_refused_before_any_step(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads any folder')
+        shut = os.path.join(self.copy_dir, 'userdata', 'shut')
+        os.makedirs(shut)
+        os.chmod(shut, 0)
+        self.addCleanup(os.chmod, shut, 0o700)
+        self.refused(f'{os.path.normpath(self.copy_dir)} cannot be read')
+        self.assertFalse(os.path.lexists(self.root()))
+
+    def test_a_clone_whose_links_cannot_be_read_fails_r0_before_anything_runs_on_it(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads any folder')
+        append, shut = journal.Run._append, os.path.join(self.root(), 'home', 'userdata', 'shut')
+
+        def shut_at_clone(run, event, **fields):
+            if fields.get('step') == 'clone' and fields.get('phase') == 'done':
+                os.mkdir(shut)
+                os.chmod(shut, 0)
+            append(run, event, **fields)
+        with mock.patch.object(journal.Run, '_append', shut_at_clone):
+            text = self.failed('R0 on the clone: its links cannot be read')
+        self.assertIn('nothing ran on it', text)
+        self.assertFalse([c for c in self.stub_calls() if c['argv'][0] == '__service-preflight'])
+        os.chmod(shut, 0o700)
+        self.rehearse()  # the failed run's clone is thrown away and redone
+
+    def test_r0_on_the_clone_reads_links_as_a_case_folding_folder_resolves_them(self):
+        """On a folder that ignores case (ext4 casefold, vfat, ntfs), `x -> SUB/D/../..` with `sub/d -> ..` leads
+        above the tree, but the plan's names are case-sensitive, so the copy keeps x. R0 on the clone reads each
+        link from the disk, as the kernel resolves it, and finds it. Simulated: no case-folding filesystem here."""
+        ud = self.m.path('fold/userdata')
+        os.makedirs(os.path.join(ud, 'sub'))
+        os.symlink('..', os.path.join(ud, 'sub', 'd'))
+        os.symlink('SUB/D/../..', os.path.join(ud, 'x'))
+        self.assertEqual(coldcopy.links_out(coldcopy.plan(ud)[0]), [], 'the plan keeps x (the documented limit)')
+        islink, readlink = os.path.islink, os.readlink
+
+        def folded(p):
+            p = os.fspath(p)
+            if not p.startswith(ud + os.sep):
+                return p
+            cur = ud
+            for part in os.path.relpath(p, ud).split(os.sep):
+                try:
+                    names = {n.lower(): n for n in os.listdir(cur)}
+                except OSError:
+                    names = {}
+                cur = os.path.join(cur, names.get(part.lower(), part))
+            return cur
+        with mock.patch.object(os.path, 'islink', lambda p: islink(folded(p))), \
+                mock.patch.object(os, 'readlink', lambda p, *a, **kw: readlink(folded(p), *a, **kw)):
+            out = rehearse._links_out_of(ud)
+        self.assertEqual([(rel, why) for rel, _, why, _ in out], [('x', 'x goes above the tree')])
 
 
 class StoppedHalfWay(Base):

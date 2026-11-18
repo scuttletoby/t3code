@@ -19,8 +19,9 @@ LIVE_DEFAULT_PORT = 3773
 POLL, READY_WAIT, STOP_WAIT, T3_TIMEOUT, MIGRATE_TIMEOUT, MB = 0.5, 300, 60, 120, 3600, 1024 * 1024
 MIGRATE = ('auth', 'session', 'list', '--json')  # R2: read-only, offline, migrates (tests/contract.test.py)
 # A link out of the copy is left out of the clone (coldcopy.links_out); these are refused instead: the rehearsal checks
-# them, and the copy holds only the link (upstream allows a linked settings.json and database).
-READ_BY_REHEARSAL = (live.DATABASE, 'settings.json')
+# them, and the copy holds only the link (upstream allows a linked settings.json and database). The database's WAL and
+# journal too: one left out would quietly rehearse an older database.
+READ_BY_REHEARSAL = (*coldcopy._family(live.DATABASE), 'settings.json')
 MIN_PYTHON = (3, 11)  # _remove's shutil.rmtree(dir_fd=); older: a TypeError half-way through every removal
 
 
@@ -88,9 +89,11 @@ def _overlap(path, other):
 
 
 def _live_links(home, done='nothing was changed'):
-    """[(link, where it leads: its real path)] of every link in the live userdata, at any depth the copy walks (links
-    are not followed into). The live T3 reads and writes where they lead, so that is live data too. Links inside a
-    folder a link leads to are not walked (the copy does not follow them either)."""
+    """[(link, where it leads: its real path)] of every link in the live userdata, at any depth, also in the folders
+    the copy skips (links are not followed into). The live T3 reads and writes where they lead, so that is live data
+    too. Links inside a folder a link leads to are not walked (the copy does not follow them either). The live T3 runs
+    meanwhile: a folder it removes during the walk refuses the run with "run again" (the walk cannot tell whether
+    it was moved, links and all, to a part already walked)."""
     userdata = os.path.join(home, 'userdata')
     if not os.path.isdir(userdata):
         return []
@@ -99,6 +102,10 @@ def _live_links(home, done='nothing was changed'):
         for d, dirs, names in os.walk(userdata, onerror=coldcopy._raise):
             found += [(os.path.join(d, n), os.path.realpath(os.path.join(d, n))) for n in sorted(dirs + names)
                       if os.path.islink(os.path.join(d, n))]
+    except FileNotFoundError as e:
+        raise journal.Refused(f'a folder of the live userdata {userdata} was removed during the walk ({e}), by the '
+                              f'live T3 most likely: run again, as the kit cannot tell where its links lead; '
+                              f'{done}') from None
     except OSError as e:
         raise journal.Refused(f'the live userdata {userdata} cannot be read ({e}): the kit cannot tell where its links '
                               f'lead; {done}') from None
@@ -120,6 +127,9 @@ def _not_live(path, home, done='nothing was changed'):
             near = _overlap(path, target)
         except FileNotFoundError:  # dangling: the live T3 may make it, so its path counts
             near = os.path.commonpath([real, target]) in (real, target)
+        except OSError as e:  # a loop, a link through a file, into a folder the kit may not read
+            raise journal.Refused(f'the kit cannot tell where the live link {link} leads ({e.strerror}: {target}), so '
+                                  f'not whether {path} is apart from it; fix or remove that link; {done}') from None
         if near:
             raise journal.Refused(f'{path} is where the live link {link} leads ({target}), or inside it or around it: '
                                   f'the live T3 reads and writes there; a rehearsal runs only on a clone apart from '
