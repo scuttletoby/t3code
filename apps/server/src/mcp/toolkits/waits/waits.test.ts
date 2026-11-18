@@ -642,13 +642,18 @@ it.layer(NodeServices.layer)("wait tools", (it) => {
         // Reading is allowed.
         assert.strictEqual(succeeded(yield* call("wait_list", {}, readOnly)).waits?.length, 1);
 
+        // Outside a thread the tools that act as the calling thread are not offered at all.
         for (const [name, args] of [
           ["wait_for", fileWait(watched("ready"))],
           ["wait_list", {}],
-          ["wait_cancel", { waitId: "w_aaaaaaaaaa" }],
         ] as const) {
-          assert.isTrue((yield* call(name, args, noThread)).isError, name);
+          const error = yield* call(name, args, noThread).pipe(Effect.flip);
+          assert.include(String(error.message), "not found", name);
         }
+        assert.isTrue(
+          (yield* call("wait_cancel", { waitId: "w_aaaaaaaaaa" }, noThread)).isError,
+          "wait_cancel",
+        );
       }).pipe(Effect.provide(toolsLayer({ filePath, settings: ON })));
       expect(yield* storedWaits(filePath)).toMatchObject([{ state: "waiting" }]);
       assert.strictEqual((yield* storedWaits(filePath)).length, 1);
