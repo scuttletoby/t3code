@@ -2,7 +2,7 @@
 
 `t3-golive` moves a T3 home that runs as a boot service from its current build to a newer one (for example a
 fork build), with a cold copy of the data first and a way back. It is built in steps; this folder has the
-**core**, the **copy**, the **rehearsal**, the way **back** and **status** so far:
+**core**, the **copy**, the **rehearsal**, the way **back**, **status** and the **switch** so far:
 
 | Part              | File                        | What it does                                                 |
 | ----------------- | --------------------------- | ------------------------------------------------------------ |
@@ -15,8 +15,9 @@ fork build), with a cold copy of the data first and a way back. It is built in s
 | `rehearse`        | `lib/golive/rehearse.py`    | the target build tried on a clone of a copy (R0-R5)          |
 | `back`, `status`  | `lib/golive/back.py`        | the way back (W1-W3); read only: is T3 up and right?         |
 | kept runtime      | `lib/golive/keptruntime.py` | the old build's runtime, kept for W1 (upstream prunes it)    |
+| `switch`, verify  | `lib/golive/switch.py`      | the move itself, verify, the automatic way back, the guard   |
 
-The switch comes in its own PR. The owner's runbook is `docs/fork/go-live.md`. Install from `ci-release` comes with it.
+The owner's runbook is `docs/fork/go-live.md`. Install from `ci-release` comes later.
 
 ## `t3-golive check`
 
@@ -188,6 +189,95 @@ putting back the kept files the record names and removing the record. Putting ba
 a T3 ran on it after the stop, run the restore again instead (it keeps what that T3 wrote). The kit never
 removes kept files; `kept_files` lists them, and a restore's refusal for free disk names them, with the ones the
 record of a restore stopped half-way names listed apart as files that must stay.
+
+## `t3-golive switch [--owner-says-go]`: the move
+
+Runs detached (a transient unit `t3-golive-switch-<time>`) unless `--here`. `--here` is what that unit runs: it is
+refused anywhere else (a terminal, the boot service), because only the unit gives a stop time to put T3 back
+(`TimeoutStopSec` = `switch.guard_after` at the shortest limit, `KillMode=mixed`: a stop sends SIGTERM to the run
+only). From step 1 on, SIGINT, SIGTERM and SIGHUP are noted, never raised: the run finishes the step it is in,
+stops at its next one (the verify at once) and puts T3 back as below; a signal before the stop refuses with the
+post hooks run. An interrupt that still gets through leaves no end line, as a kill does, so the guard acts on the
+run. Each `t3` the run starts runs in its own process group with a fixed environment and dies with the run. It
+refuses, with nothing changed, unless `check` passes (the fork-features-off check is part of it);
+the live report gives every count (an unknown count refuses: the verify could not tell what must be kept); the
+staged target archive is whole and its sha256 is the one the last `rehearse` run journalled (`targetSha256`: a
+rehearsal from before this field, or of another build, refuses with "rehearse again"); that rehearsal passed for
+this target **and** the live build and ended less than `rehearsalMaxAgeHours` ago (default 72; a rehearsal that
+ended after the clock's now refuses); the target would run exactly the migrations the rehearsal ran; the home has
+no kit leftovers; the old runtime can be kept (`keptruntime.plan_keep`); every disk keeps `freeFloorMb` free after
+what lands on it (the copy on `backupDir`, the kept runtime on `stateDir`, the installed target in the home,
+summed when they share a disk); and (without `--owner-says-go`) the machine is quiet. `switch.passed_rehearsal`
+reads the record `rehearse` writes: a `rehearse` run that ended "ok" whose step `result` is done with
+`{fromVersion, targetVersion, targetSha256, migrations, migrateSeconds, readySeconds}`; the rehearsal's time is
+migrate plus ready, rounded up. Then, each a journalled step:
+
+0. `keep-runtime`: upstream's `update` (step 8) may prune the old runtime W1 needs, so `keptruntime.keep` (#397)
+   keeps it first, outside the home. A failed keep refuses, T3 not stopped.
+1. `guard` (the boot id journalled: a guard on a later boot needs consent for W1, below; an unreadable boot id
+   refuses, T3 not stopped): a second transient unit runs `switch-guard --run <id> --wait` and its timer fires `switch-guard --run
+   <id>` after the latest the run can end (`switch.guard_after`: every wait at its longest, the verify limit twice,
+   the way back, plus 10 minutes). Not up: refused, T3 not stopped.
+2. `pre-hooks`, then quiet again; a failure runs the post hooks and refuses (T3 not stopped).
+3. `stopping`: stop the service, wait until the server is gone and its ownership lock is free (held from here to
+   the update), and see that nothing changed while it stopped. The step's facts name the copy folder, the old
+   build and the time limit: the guard reads them.
+4. `cold-copy`, `read-back`, `manifest`: as `copy` does, while T3 is stopped, into a NEW folder
+   `<backupDir>/t3-switch-<time>-<old>` (an existing one refuses), plus `extra/`: `runtime/service-state.json` and
+   the unit file; every file read back on both sides. The manifest is written last. `t3-golive back` lists these
+   copies beside `t3-copy-*`.
+5. `old-preflight`: the OLD build's `__service-preflight` on the copy's database must say `ready`.
+6. `install-target`: the staged runtime is copied into `runtime/versions/.golive-install-<target>`, checked
+   against the rehearsed archive (sha256 and every file), given upstream's `.install-complete`, and renamed into
+   `runtime/versions/<target>` whole (a folder already there is used when it is exactly that build, else set aside
+   as `.golive-aside-*`, never deleted). Safe to run again. Its facts record the installed runtime
+   (`runtimeSha256`: every path, kind and content sum) for the verify.
+7. `before`: the stopped home's report, read now (nothing can write), by the target build just installed and
+   checked (never the stage, which nothing checked since the prechecks): the counts the verify compares with, the
+   provider instances; it fails unless every count is known, the report is ok, fork features are off and the
+   pending migrations are those the rehearsal ran.
+8. `update` (the owner lock let go first): `<home's target t3> update <target> --base-dir <home> --yes` with a
+   fixed environment (no `T3CODE_RELEASE_BASE_URL` or other variable reaches it); the target is installed already,
+   so it downloads nothing. A managed mirror policy (`/etc/t3code/policy.json`) is still asked whether the target is
+   published, and its refusal fails the update, which means W1. The service is
+   started if `update` did not start it, and the `t3` links into this home's runtimes (`runtime/launchers` and the
+   default `~/.local/bin/t3`) are pointed at the target.
+9. `verify` (design 4.5), until it holds or the time limit (3 x the rehearsal's time, at least 10 minutes): the
+   service active; the server is the target, from this home's runtime; service state names the target with no
+   update pending; no markers; something answers HTTP on its port; the links point at the target; the target's
+   report says no migration is pending, counts are not lower than in step 5, provider instances are the same
+   (compared by SHA256 only), fork features are all off and it is ok; and the runtime the server runs is still
+   byte for byte what step 6 recorded (checked first and when all else holds: a mismatch fails at once, it cannot
+   heal; a restaged archive does not matter any more).
+10. `post-hooks`. Exit 0: verified.
+
+A failure or a late verify goes back on its own. From step 8 on (its `update` started) that is #397's W1,
+`back.restore_and_downgrade(..., automatic=True)`, once (its downgrade too runs with the fixed environment): its steps `plan`, `runtime` (the kept old runtime put
+back if a prune took it), `stop-service` (T3 disabled first, then stopped), `restore` (the step-4 copy), `update`
+(`<old t3> update <old> --allow-downgrade --yes`) and `verify`, then `rolled-back`. Before step 8 nothing T3
+reads was changed: `back-start` starts the old build again. Then the post hooks; the run ends "failed" and needs
+`settle` (the journal says "rolled back" or "old build runs", the copy stays).
+
+A W1 that fails follows #397's W1 contract: T3 stays stopped and disabled (the home may be half-restored, so
+neither the target nor the old build is started on it), the post hooks do not run (background jobs stay paused),
+`t3-golive status` exits 1 naming the run and where it stopped, and `t3-golive back --way w1` resumes it (it finds
+the `t3-switch-*` copy and the kept runtime). Nothing runs W1 a second time on its own.
+
+The guard (`switch-guard`) waits for the kit lock, so a run or a `back` still going is waited for, never acted
+on (the timer too). It does nothing when the run is not the last one, ended, was settled, or its journal says it
+is final ("verified", "rolled back", or the old build started again); otherwise it puts T3 back as above from
+what the journal says the run got to (W1 only if no W1 stopped T3 yet; a W1 that got past its own update or
+verify is only verified again and recorded "rolled back"), runs the post hooks if the run paused the
+jobs, did not resume them and no failed W1 holds them, and ends the run "failed". A journal it cannot read fails
+open: it starts the service if it is not active and runs the post hooks. It logs to `<stateDir>/guard.log`.
+
+A reboot ends both transient units. The enabled service then starts whatever build the unit names (the target if
+the update ran) and `check` refuses until settle. A guard run on another boot than the one step 1 journalled (or
+for a run that journalled none) does no W1 on its own: the target may have served work since, and W1 restores the
+copy over it. It says so and changes nothing (no end line); the owner runs `t3-golive status`, then `t3-golive
+switch-guard --run <id> --lose-work-since <copy time>` (or `t3-golive back --way w1 --lose-work-since <copy
+time>`), as `back` asks: a wrong time refuses. Starting the old build again (the run was stopped before its update)
+needs no consent on any boot. Then `settle`.
 
 ## Failure table
 
@@ -504,7 +594,8 @@ the lock and the journal; it is required, and no environment variable moves it, 
 outside the T3 home (check writes nothing there). `freeFloorMb` is optional (default 2048). For `copy`:
 `quietCommand` (optional; without it `copy` needs `--owner-says-go`), `preHooks` and `postHooks` (optional
 lists of absolute paths, run with no arguments; each must be safe to run twice), `quietWaitSeconds` (default
-7200, at least 60: two samples 60 s apart) and `stopLimitSeconds` (default 1800). An unknown key, a
+7200, at least 60: two samples 60 s apart) and `stopLimitSeconds` (default 1800). For `switch`:
+`rehearsalMaxAgeHours` (default 72). An unknown key, a
 missing key, a wrong type or a newer `version` is refused by name (the shared loader, `fork-kit/common`).
 
 ## Lock and journal
@@ -530,6 +621,7 @@ python3 -I -B fork-kit/golive/tests/journal.test.py    # lock, journal, adapter,
 python3 -I -B fork-kit/golive/tests/copy.test.py       # copy, guard, restore on a fake machine
 python3 -I -B fork-kit/golive/tests/back.test.py       # back W1-W3 and status, a stub t3 for every build
 python3 -I -B fork-kit/golive/tests/rehearse.test.py   # rehearse R0-R5 with a stub t3 (old and fork build)
+python3 -I -B fork-kit/golive/tests/switch.test.py     # switch, verify, way back, guard on a fake machine
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
 python3 -I -B fork-kit/common/tests/machine_file.test.py
 ```
