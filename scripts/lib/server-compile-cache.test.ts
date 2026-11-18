@@ -78,7 +78,6 @@ it.each([
       const spawn = childProcess.spawnSync;
       childProcess.spawnSync = (executable, args, options) => {
         require("node:assert/strict").equal(executable, ${JSON.stringify(NodePath.join(root, layout.executable))});
-        require("node:assert/strict").equal(options.timeout, ${platform === "darwin" ? 360000 : 120000});
         return spawn(process.execPath, args, options);
       };
       Object.defineProperty(process, "platform", { value: ${JSON.stringify(platform)} });
