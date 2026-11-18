@@ -62,9 +62,10 @@ of T3: the copy, the switch and every way back. Each must be safe to run twice.
    the ones from before the switch. `fork features: all off`, and the kept runtime is listed as usable.
 6. **By hand.** On each provider account, send one message in one thread and see the answer arrive. Reload
    the app and see it again.
-7. **Two days.** Run `t3-golive status` once a day for two days. Anything but `T3 is up:`: read its lines,
-   then decide on the way back below. The other first lines are `T3 is up but not right`, `T3 is restarting
-   or starting`, `T3 is DOWN` and `T3 state unknown`. Take no `t3-golive copy` in these days (see below).
+7. **Then go on.** No waiting period. Run `t3-golive status` after each later change and whenever something
+   looks off. Anything but `T3 is up:`: read its lines, then decide on the way back below. The other first
+   lines are `T3 is up but not right`, `T3 is restarting or starting`, `T3 is DOWN` and `T3 state unknown`.
+   Take no `t3-golive copy` until you are sure you will not need W1 (see below).
 
 ## The way back
 
@@ -120,16 +121,16 @@ with their sizes, to remove by hand once sure.
 ## Then: one feature at a time
 
 Each feature is its own setting in the home's `userdata/settings.json`, read again without a restart.
-Switch on one, watch a day or more, then the next. After each change, `t3-golive status` lists what is on.
+Switch on one and run its check; when the check passes, switch on the next. There is no waiting period. After each change, `t3-golive status` lists what is on.
 Each one's **off again** is a single edit of that one setting; nothing else changes back.
 
-| When      | Setting           | On                                                        | Check                                                                                                                             | Off again                  |
-| --------- | ----------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| Day 0     | none              | -                                                         | `status`: `fork features: all off`                                                                                                | -                          |
-| Day 1-2   | `agentSlots`      | `"agentSlots": { "enabled": true, "maxPerMachine": <n> }` | A `delegate_task` above `<n>` running agents is refused; below it, starts                                                         | `"enabled": false`         |
-| Day 3     | `waitFor`         | `"waitFor": { "enabled": true }`                          | One test wait (a file that appears) arrives once, and survives a restart of T3 between the wait and the event                     | `"enabled": false`         |
-| Day 5     | `usagePacingGate` | `"usagePacingGate": "advise"`                             | A `delegate_task` reply carries a pace note; nothing is held or moved                                                             | `"usagePacingGate": "off"` |
-| Day 10 on | old project tools | -                                                         | Retire, one at a time, the tools this machine used before the fork for what the features now do; keep each until it is not missed | put the tool back          |
+| Step | Setting           | On                                                        | Check                                                                                                                             | Off again                  |
+| ---- | ----------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| 0    | none              | -                                                         | `status`: `fork features: all off`                                                                                                | -                          |
+| 1    | `agentSlots`      | `"agentSlots": { "enabled": true, "maxPerMachine": <n> }` | A `delegate_task` above `<n>` running agents is refused; below it, starts                                                         | `"enabled": false`         |
+| 2    | `waitFor`         | `"waitFor": { "enabled": true }`                          | One test wait (a file that appears) arrives once, and survives a restart of T3 between the wait and the event                     | `"enabled": false`         |
+| 3    | `usagePacingGate` | `"usagePacingGate": "advise"`                             | A `delegate_task` reply carries a pace note; nothing is held or moved                                                             | `"usagePacingGate": "off"` |
+| 4    | old project tools | -                                                         | Retire, one at a time, the tools this machine used before the fork for what the features now do; keep each until it is not missed | put the tool back          |
 
 Later, and each a decision of its own: `"usagePacingGate": "enforce"` (tasks are held, moved or run at a
 lower effort; off again: `"advise"`), and `"automaticUpdates": true` (the boot service updates itself to
