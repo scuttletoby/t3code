@@ -73,6 +73,8 @@ describe("work held for an automatic update", () => {
     readonly live?: boolean;
     /** Stored as running, but no provider turn accepted it: recovery rewinds it to unstarted. */
     readonly rewound?: boolean;
+    /** The same, but stored as starting with a start time: only that time shows the rewind. */
+    readonly rewoundStarting?: boolean;
   }
 
   /** A thread with an unstarted run, and optionally a message queued behind it. */
@@ -87,7 +89,7 @@ describe("work held for an automatic update", () => {
     const queuedMessageId = MessageId.make(`message_update_hold_queued_${suffix}`);
     const preparing = input.kind === "worktree preparation";
     const requestedAtMs = input.requestedAtMs ?? HELD_AT + MINUTE;
-    const started = input.rewound === true;
+    const started = input.rewound === true || input.rewoundStarting === true;
     const projection = {
       thread: input.live
         ? {
@@ -107,7 +109,7 @@ describe("work held for an automatic update", () => {
       runs: [
         {
           id: runId,
-          status: started ? "running" : preparing ? "preparing" : "starting",
+          status: input.rewound === true ? "running" : preparing ? "preparing" : "starting",
           startedAt: started ? DateTime.makeUnsafe(requestedAtMs) : null,
           requestedAt: DateTime.makeUnsafe(requestedAtMs),
           activeAttemptId: attemptId,
@@ -556,6 +558,48 @@ describe("work held for an automatic update", () => {
           .some((update) => update.id === world.threads[0]!.runId && update.queueHeld === true),
       );
     }),
+  );
+
+  it.effect("does not hold a rewound run stored as starting with a start time: one resend", () =>
+    Effect.gen(function* () {
+      // Its status is the one recovery rewinds it to, so only the start time tells it was started.
+      const world = yield* heldWorld([
+        { kind: "scheduled run", live: true, rewoundStarting: true },
+      ]);
+      const [thread] = world.threads;
+      const process = yield* world.startProcess();
+      assert.deepEqual(world.starts(), [thread!.runId]);
+      // Held, its rewind (start time cleared) would never be written.
+      assert.isTrue(
+        world
+          .runUpdates()
+          .some((update) => update.id === thread!.runId && update.startedAt === null),
+      );
+      assert.deepInclude(yield* world.marker, { runs: [] });
+      yield* process.gate.startHeldWork;
+      assert.deepEqual(world.starts(), [thread!.runId]);
+    }),
+  );
+
+  it.effect(
+    "holds no queued run on a thread with no held head: both wait in the visible held queue",
+    () =>
+      Effect.gen(function* () {
+        // The rewound head is not held, so nothing would start the run queued behind it.
+        const world = yield* heldWorld([
+          { kind: "user message", live: true, rewound: true, queuedBehind: true },
+        ]);
+        const [thread] = world.threads;
+        const process = yield* world.startProcess();
+        assert.deepInclude(yield* world.marker, { runs: [] });
+        yield* process.gate.startHeldWork;
+        assert.deepEqual(world.starts(), []);
+        const queueHeld = (runId: RunId) =>
+          world.runUpdates().some((update) => update.id === runId && update.queueHeld === true);
+        assert.isTrue(queueHeld(thread!.runId));
+        assert.isTrue(queueHeld(thread!.queuedRunId));
+        assert.equal(process.summary.terminalizedRuns, 0);
+      }),
   );
 
   it.effect("sends a rewound run the marker lists again once, never as held work too", () =>
