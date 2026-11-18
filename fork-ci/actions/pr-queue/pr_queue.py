@@ -86,6 +86,11 @@ GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATT
 # so git_problem refuses it: GIT_MIN). Kept apart from GIT_ENV, which other actions share (git_clean.test.py).
 EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 GIT_ATTRS = {'GIT_ATTR_SOURCE': EMPTY_TREE}
+# What a new repository is made with, whatever the job's environment or git's own default says (git 3.0 plans SHA-256
+# and reftable): the queue's cache and the gate's repository hold SHA-1 objects and files refs, as GitHub's commits,
+# EMPTY_TREE and CACHE_CONFIG (format 0, no extensions) are. git reads GIT_DEFAULT_REF_FORMAT from 2.45 (an older one
+# makes files refs anyway); init_bare refuses a repository a git made otherwise.
+GIT_FORMATS = {'GIT_DEFAULT_HASH': 'sha1', 'GIT_DEFAULT_REF_FORMAT': 'files'}
 # One language for git's messages: the queue and the gate match them (GONE_RE, NO_LOGIN_RE) and read them as UTF-8.
 GIT_LANG = {'LC_ALL': 'C'}
 # Never passed on to git (git_env): variables of the job that point git at another repository, object store, index,
@@ -106,8 +111,9 @@ GIT_DROP_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 # run none of them, GIT_EXEC_PATH included.
 GIT_RUN = ('GIT_EXEC_PATH', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS',
            'GIT_ALLOW_PROTOCOL')
-# Traces of an https fetch: they write its headers (the login) and its talk with GitHub to stderr or a file, and the
-# gate puts git's stderr into a public summary. Dropped there; a fetch from another remote carries no token of ours.
+# Traces: they write an https fetch's headers (the login) and its talk with GitHub to stderr or a file, and the gate
+# puts git's stderr into a public summary (a merge-tree's too). Dropped from every call but a fetch from another
+# remote, which carries no token of ours (remote_problem refuses plain http, where GitHub's redirect would ask for it).
 GIT_TRACE_PREFIXES = ('GIT_TRACE', 'GIT_CURL_VERBOSE')
 GIT_READ_SECONDS = 60   # each git call of the config read
 # The cache's HEAD, as the queue writes it (what `git init --template=` writes): a branch that is never made, so HEAD
@@ -115,6 +121,31 @@ GIT_READ_SECONDS = 60   # each git call of the config read
 CACHE_HEAD = 'ref: refs/heads/master\n'
 # git's words for a fetch that needed a login it did not have (none given, or one GitHub refused)
 NO_LOGIN_RE = re.compile(r'could not read (Username|Password)|terminal prompts disabled|Authentication failed', re.I)
+# git's words for a fetch the network failed (curl's errors, a transfer cut off). Any other failed fetch may be the
+# cache's fault (an object git cannot read under a name the fetch needs), so the cache is checked (fetch_checked).
+NETWORK_RE = re.compile(r'unable to access|RPC failed|Could not resolve host', re.I)
+# git fsck's message ids for an object whose hash is right but whose content is in an old or odd format: a commit
+# with time zone +99999, a zero-padded date or a missing space; a tree with entries out of order or twice; a
+# .gitmodules or .gitattributes git would not check out. git fetch takes them (transfer.fsckObjects is off) and old
+# imports hold them, but plain git fsck calls them errors: a cache with such history would fail every check and be
+# downloaded again on every run. objects_problem ignores them. What the check is for stays an error, since none of
+# it is a message id: an object that does not hash to its name, a missing or unreadable object, a broken link, a
+# corrupt pack or index. So do the ids for a commit git cannot parse (bad parent or tree line, no tree), an object it
+# could not read, and the tags the queue never fetches (--no-tags). Each id is one git 2.43 (GIT_MIN) knows: git
+# refuses to run with an unknown one.
+FSCK_FORMAT_IDS = ('badDate', 'badDateOverflow', 'badEmail', 'badName', 'badTimezone', 'missingAuthor',
+                   'missingCommitter', 'missingEmail', 'missingNameBeforeEmail', 'missingSpaceBeforeDate',
+                   'missingSpaceBeforeEmail', 'multipleAuthors', 'zeroPaddedDate', 'duplicateEntries', 'treeNotSorted',
+                   'gitmodulesBlob', 'gitmodulesLarge', 'gitmodulesName', 'gitmodulesPath', 'gitmodulesSymlink',
+                   'gitmodulesUpdate', 'gitmodulesUrl', 'gitattributesBlob', 'gitattributesLarge',
+                   'gitattributesLineLength')
+FSCK_IGNORE = tuple(a for i in FSCK_FORMAT_IDS for a in ('-c', f'fsck.{i}=ignore'))
+# A fetch's automatic gc runs before the fetch returns, never detached: a repack in the background deletes packs and
+# loose objects while the next git fsck reads them (a false "broken", and a download from scratch).
+NO_DETACH = ('-c', 'gc.autoDetach=false', '-c', 'maintenance.autoDetach=false')
+# In the cache: git fsck's lines right after a download from scratch that it still found broken. The same lines on a
+# later run are GitHub's own history, not an earlier job's object: that run does not download it all again.
+FSCK_KNOWN = 'queue-fsck-known'
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
@@ -335,17 +366,65 @@ def no_token_env():
 
 
 def git_env(env, remote=None):
-    """`env` for a git call: without GIT_DROP, with GIT_ENV, GIT_ATTRS, GIT_LANG and no prompt. `remote`: None for a
-    call that reaches no remote, else the URL or remote name it fetches from, which decides what of GIT_RUN it keeps
-    (an https fetch also drops the traces, GIT_TRACE_PREFIXES). Tokens are the caller's to drop."""
+    """`env` for a git call: without GIT_DROP, with GIT_ENV, GIT_ATTRS, GIT_FORMATS, GIT_LANG and no prompt. `remote`:
+    None for a call that reaches no remote, else the URL or remote name it fetches from, which decides what of GIT_RUN
+    it keeps. Only a fetch from a remote that is not https keeps the traces (GIT_TRACE_PREFIXES). Tokens are the
+    caller's to drop."""
     drop, prefixes = set(GIT_DROP), GIT_DROP_PREFIXES
     if remote is None:
         drop.update(GIT_RUN)
-    elif remote.startswith('https://'):
+        prefixes += GIT_TRACE_PREFIXES
+    elif remote.lower().startswith('https://'):   # git reads the scheme in any case: HTTPS:// is https too
         drop.update(set(GIT_RUN) - {'GIT_EXEC_PATH'})
         prefixes += GIT_TRACE_PREFIXES
     return {**{k: v for k, v in env.items() if k not in drop and not k.startswith(prefixes)},
-            'GIT_TERMINAL_PROMPT': '0', **GIT_LANG, **GIT_ENV, **GIT_ATTRS}
+            'GIT_TERMINAL_PROMPT': '0', **GIT_LANG, **GIT_ENV, **GIT_ATTRS, **GIT_FORMATS}
+
+
+def remote_problem(remote):
+    """Why a fetch that carries the run's token (GIT_AUTH: gh's login for https://github.com) must not go to
+    `remote`, or None. Plain http keeps the job's traces (git_env), and GitHub redirects it to https, where git then
+    asks the helper for the token; a `transport::address` remote runs whichever remote helper it names on any address,
+    https included. An ssh URL, a path or a file:// URL gets no token."""
+    if not remote:
+        return 'the remote is empty'
+    if remote.startswith('-'):
+        return f'the remote {remote[:100]} starts with -: git would read it as an option'
+    if remote.lower().startswith('http://'):
+        return (f'the remote {remote[:100]} is plain http: GitHub would redirect it to https and git would hand the '
+                'token over with the traces kept. Use https')
+    if re.match(r'[A-Za-z][A-Za-z0-9+.-]*::', remote):
+        return f'the remote {remote[:100]} names a remote helper (transport::address): give a URL or a path'
+    return None
+
+
+def init_bare(path):
+    """Makes the empty folder `path` a bare repository as the queue's cache and the gate's repository are:
+    `git init --bare --template=` (no hooks, no sample files), then CACHE_CONFIG and CACHE_HEAD written over what git
+    wrote, never left to git's defaults (git 3.0 plans `main`). None, or why it could not be made. A repository git made
+    in another format than SHA-1 objects with files refs (format 0, no extensions: a git that ignored GIT_FORMATS) is
+    refused, never written over: CACHE_CONFIG would then name a format its refs or objects are not in."""
+    r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
+                       capture_output=True, env=git_env(no_token_env()))
+    if r.returncode != 0:
+        return f'git init failed: {r.stderr.strip()[:300]}'
+    try:
+        with open(os.path.join(path, 'config'), encoding='utf-8', errors='replace') as f:
+            made = f.read()
+        version = re.search(r'^\s*repositoryformatversion\s*=\s*(\S*)', made, re.M | re.I)
+        section = re.search(r'^\s*\[\s*extensions\s*\]([^[]*)', made, re.M | re.I)
+        if section or (version and version.group(1) != '0'):
+            said = ', '.join(f'extensions.{k}={v}' for k, v in
+                             re.findall(r'^\s*([\w.-]+)\s*=\s*(\S*)', section.group(1) if section else '', re.M))
+            said = said or (f'format version {version.group(1)}' if version else 'an [extensions] section')
+            return (f'git init made a repository with {said[:200]}: the '
+                    'queue reads only SHA-1 objects and files refs (format 0, no extensions), and this git ignored '
+                    'GIT_DEFAULT_HASH=sha1 and GIT_DEFAULT_REF_FORMAT=files')
+        write_text(os.path.join(path, 'config'), CACHE_CONFIG)
+        write_text(os.path.join(path, 'HEAD'), CACHE_HEAD)
+    except OSError as e:
+        return f'could not read or write its config: {e}'
+    return None
 
 
 def fetch_failed(stderr, login):
@@ -446,6 +525,8 @@ class Queue:
         self.repo, self.cfg, self.state, self.cache, self.lock, self.sleep = repo, cfg, state, cache, lock, sleep
         self.read_token, self.write_token, self.said = read_token, write_token, set()
         self.remote = f'https://github.com/{repo}.git'
+        self.later, self.fetch_error, self.fsck_said = None, '', ''   # check_later, fetch, objects_problem
+        self.unknown = 'the queue could not fetch from GitHub'   # why fetch_checked knows nothing (PR comment words)
         self.review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association,
                                   cfg.lens_author_associations)
 
@@ -514,14 +595,20 @@ class Queue:
             self.said.add(key)
             print(text)
 
-    def git(self, *a, fetch=False):
+    def git(self, *a, fetch=False, errors='strict'):
         """git in the cache, with the run's read token, and with no token at all when there is none (never gh's own
         login of the machine). `fetch`: the call fetches from the remote (only Queue.fetch's two), so it keeps what of
-        the job's GIT_RUN the remote may need; every other call runs none of it (git_env)."""
+        the job's GIT_RUN the remote may need; every other call runs none of it (git_env). `errors`: how git's output
+        is decoded (UTF-8)."""
+        argv, env = self.git_call(*a, fetch=fetch)
+        return subprocess.run(argv, text=True, encoding='utf-8', errors=errors, capture_output=True, env=env)
+
+    def git_call(self, *a, fetch=False):
+        """The argv and environment of Queue.git's call."""
         token = self.read_token
         env = self.gh_env(token) if token else no_token_env()
-        return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env=git_env(env, self.remote if fetch else None))
+        return (['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
+                git_env(env, self.remote if fetch else None))
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
@@ -582,19 +669,69 @@ class Queue:
         except OSError as e:
             print(f'could not make {new}: {e}')
             return False
-        r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True, env=git_env(no_token_env()))
-        if r.returncode != 0:
-            print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
+        problem = init_bare(new)
+        if problem:
+            print(f'could not make {self.cache}: {problem}')
             return False
         try:
-            write_text(os.path.join(new, 'config'), CACHE_CONFIG)
-            write_text(os.path.join(new, 'HEAD'), CACHE_HEAD)   # what git init wrote; said here, not left to its default
             os.rename(new, self.cache)
         except OSError as e:   # something made the cache between the two steps: the next run sets it aside
             print(f'could not move the new repository to {self.cache}: {e}')
             return False
         return True
+
+    def objects_problem(self, r=None):
+        """Why the cache's objects are not what GitHub sent, or None. git checks an object's hash on only some reads
+        (rev-parse, merge-base and merge-tree of a commit; never a tree or blob merge-tree reads, nor a commit rev-list
+        walks), and the cache is kept between runs: a tree or blob an earlier job wrote under the name of one side's
+        (a loose object where the real one is loose too, as a small fetch leaves it, or a pack of its own) makes a real
+        conflict merge clean. git fsck checks the hash of every object, loose and packed, and that each ref's history
+        is complete; an old format GitHub serves is no problem (FSCK_FORMAT_IDS). It reads every object, on one core:
+        about 30 s for 270,000 objects. `r`: the answer of a git fsck already run (check_later). Keeps git fsck's
+        lines in self.fsck_said (fetch_checked compares them)."""
+        if r is None:
+            r = self.git(*FSCK_IGNORE, 'fsck', '--no-dangling', '--no-reflogs', '--no-progress', errors='replace')
+        if r.returncode == 0:
+            self.fsck_said = ''
+            return None
+        said = [line for line in (r.stderr + r.stdout).splitlines() if line.strip()]
+        self.fsck_said = '\n'.join(sorted(set(said)))
+        return f'has objects git fsck finds broken or missing ({said[0][:200] if said else f"exit {r.returncode}"})'
+
+    def check_later(self):
+        """objects_problem's git fsck, started in the background (update(), right after its fetch): it reads the cache
+        while the disarm, the branch update and the wait for the new head run, none of which touches the cache. The
+        next fetch_checked waits for its answer before it fetches, and update() stops it if the run ends first."""
+        argv, env = self.git_call(*FSCK_IGNORE, 'fsck', '--no-dangling', '--no-reflogs', '--no-progress')
+        try:
+            self.later = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                          encoding='utf-8', errors='replace')
+        except OSError as e:   # checked in the foreground then
+            print(f'could not start git fsck in the background: {e}')
+
+    def checked_before(self):
+        """The background check's answer: None when none ran, '' for a healthy cache, else the problem."""
+        p, self.later = self.later, None
+        if p is None:
+            return None
+        out, err = p.communicate()
+        return self.objects_problem(subprocess.CompletedProcess(p.args, p.returncode, out, err)) or ''
+
+    def stop_check(self):
+        """The background check, if one still runs, stopped and reaped."""
+        p, self.later = self.later, None
+        if p is not None:
+            p.kill()
+            p.communicate()
+
+    def known_broken(self):
+        """git fsck's lines the cache gave right after its download from scratch (FSCK_KNOWN), or None."""
+        try:
+            with open(os.path.join(self.cache, FSCK_KNOWN), encoding='utf-8', errors='replace',
+                      opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
+                return f.read()
+        except OSError:
+            return None
 
     def has(self, sha):
         return bool(SHA.fullmatch(sha or '')) and self.git('cat-file', '-e', sha + '^{commit}').returncode == 0
@@ -603,22 +740,68 @@ class Queue:
         """The base branch (refs/queue/base), PR n's head and `shas` into the cache. True when every sha is there,
         False when the refs came but a sha is not on GitHub, None when nothing could be fetched (no cache, a git or
         network error: nothing is known)."""
+        self.fetch_error = ''   # git fetch's words when it failed (fetch_checked)
         if not re.fullmatch(r'[\w./-]+', base or '') or not all(SHA.fullmatch(s or '') for s in shas):
             return False
         if not self.own_cache():
             return None
-        r = self.git('fetch', '-q', '--no-tags', self.remote, f'+refs/heads/{base}:refs/queue/base',
+        r = self.git(*NO_DETACH, 'fetch', '-q', '--no-tags', self.remote, f'+refs/heads/{base}:refs/queue/base',
                      f'+refs/pull/{n}/head:refs/queue/pr{n}', fetch=True)
         if r.returncode != 0:
             print(f'#{n}: {fetch_failed(r.stderr, READ_LOGIN)}')
+            self.fetch_error = r.stderr
             return None
         missing = [s for s in shas if not self.has(s)]
         if missing:   # a read commit no ref reaches any more (GitHub keeps it)
-            r = self.git('fetch', '-q', '--no-tags', self.remote, *missing, fetch=True)
+            r = self.git(*NO_DETACH, 'fetch', '-q', '--no-tags', self.remote, *missing, fetch=True)
             if r.returncode != 0 and not GONE_RE.search(r.stderr):   # a network error is no "not on GitHub"
                 print(f'#{n}: {fetch_failed(r.stderr, READ_LOGIN)} (of {", ".join(s[:12] for s in missing)})')
+                self.fetch_error = r.stderr
                 return None
         return all(self.has(s) for s in shas)
+
+    def fetch_checked(self, base, n, *shas, later=False):
+        """fetch, with the cache's objects checked (objects_problem) before anything reads them: True, False or None
+        as fetch returns them, and None for a cache that is still broken after a download from scratch. A cache found
+        broken (by this run's earlier background check, after the fetch, or after a fetch that failed for a cause
+        that is neither the network nor the login) is set aside and downloaded from scratch once, then checked again.
+        A cache whose check gives the same lines as right after its own download from scratch (FSCK_KNOWN) is not
+        downloaded again. `later`: the check after a good fetch runs in the background (check_later). self.unknown
+        says why None, in words for a PR comment (no runner paths)."""
+        self.unknown = 'the queue could not fetch from GitHub'
+        before = self.checked_before()
+        problem = before
+        if not problem:
+            got = self.fetch(base, n, *shas)
+            if got is None and self.fetch_error and not (NO_LOGIN_RE.search(self.fetch_error)
+                                                         or NETWORK_RE.search(self.fetch_error)):
+                problem = self.objects_problem()
+            elif got and before is None:
+                if later:
+                    self.check_later()
+                    return got
+                problem = self.objects_problem()
+            if not problem:
+                return got
+        if self.fsck_said and self.fsck_said == self.known_broken():
+            print(f'#{n}: {self.cache} {problem}: the same way as right after its download from scratch, so the '
+                  'history GitHub serves fails this git fsck. Not downloaded again and not merged in: a person must '
+                  'look')
+            self.unknown = ("the queue's git cache fails git fsck the same way as right after a download from "
+                            "GitHub (the run's log says why), so a person must look")
+            return None
+        print(f'{self.cache} {problem}: rebuilding it')
+        got = self.fetch(base, n, *shas) if set_aside(self.cache) else None
+        if got and (problem := self.objects_problem()):
+            print(f'#{n}: {self.cache}, fetched again from GitHub, still {problem}: not merged in')
+            try:
+                write_text(os.path.join(self.cache, FSCK_KNOWN), self.fsck_said)
+            except OSError as e:
+                print(f'could not keep git fsck\'s lines in {self.cache}: {e}')
+            self.unknown = ("the queue's git cache fails git fsck even when fetched again from GitHub "
+                            "(the run's log says why)")
+            return None
+        return got
 
     def same_change(self, base, n, head, read):
         """Step 4's check (holds) on GitHub's commits: True, False (any other content or a git error), or None when
@@ -627,7 +810,7 @@ class Queue:
             return False
         if head == read:
             return True
-        got = self.fetch(base, n, head, read)
+        got = self.fetch_checked(base, n, head, read)   # checked right before the merge check
         return holds(self.git, head, read) if got else got
 
     # --- which armed PRs wait, and why ------------------------------------------------------------------------------
@@ -997,12 +1180,15 @@ class Queue:
                   f'and re-arm if the new head stays the change read at {(read or "?")[:12]}'
                   + ('' if read else f' ({why})'))
             return 0
-        fetched = bool(read) and self.fetch(base, n, read)
-        if read and fetched is None:   # nothing changed yet: an armed PR stays as it was, the next run tries again
-            print(f'#{n}: could not fetch from GitHub (see above): nothing changed, the next run tries again')
-            return 1
-        self.write_state({'repo': self.repo, 'pr': n, 'old': old, 'base': base, 'read': read})
-        code = self.update_off(n, old, base, read, fetched, why)
+        try:
+            fetched = bool(read) and self.fetch_checked(base, n, read, later=True)
+            if read and fetched is None:   # nothing changed yet: an armed PR stays as it was, the next run tries again
+                print(f'#{n}: {self.unknown} (see above): nothing changed, the next run tries again')
+                return 1
+            self.write_state({'repo': self.repo, 'pr': n, 'old': old, 'base': base, 'read': read})
+            code = self.update_off(n, old, base, read, fetched, why)
+        finally:
+            self.stop_check()
         if code != SILENT:
             self.drop_state()
         return code
@@ -1034,7 +1220,7 @@ class Queue:
             return SILENT
         same = self.same_change(base, n, head, read)
         if same is None:
-            print(f'#{n}: could not fetch {head[:12]} to check it: STATE stays, the next run finishes it')
+            print(f'#{n}: {self.unknown}, so {head[:12]} was not checked: STATE stays, the next run finishes it')
             return SILENT
         if not same:
             return self.leave_off(n, f'the new head {head[:12]} is not exactly the change read at {read[:12]} merged '
@@ -1118,8 +1304,8 @@ class Queue:
                                      f'off at {old}; {why or "it stored no read commit"}, so it was not re-armed: which '
                                      'head the review vouches for is unclear.', self.read_advice(why or ''))
         elif same is None:   # never OFF and silent: say it once on the PR, as for a gh error
-            print(f'#{n}: could not fetch from GitHub to check {head[:12]}: trying again next run, no other PR meanwhile')
-            return self.tell_once(st, n, f'the queue could not fetch {head[:12]} from GitHub to check it')
+            print(f'#{n}: {self.unknown}, so {head[:12]} was not checked: trying again next run, no other PR meanwhile')
+            return self.tell_once(st, n, f'{self.unknown}, so it could not check {head[:12]}')
         elif same:
             r = self.arm(n, head)
             if r.returncode == 0:

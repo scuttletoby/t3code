@@ -389,9 +389,31 @@ a merge reads a file), and a cache that is not that user's alone (mode
 `0700`), has a config or a `HEAD` the queue did not write, has a branch at
 `HEAD`, or holds a file that changes what its objects say or how a merge reads
 them (`info/grafts`, `shallow`, `objects/info/alternates`,
-`objects/info/http-alternates` or `info/attributes`) is rebuilt, never used. A job of the same user
-can still change the cache between that check and git's next read: only the
-runner rule above stops that.
+`objects/info/http-alternates` or `info/attributes`) is rebuilt, never used.
+git checks an object's hash on only some reads (never a tree or a blob
+`merge-tree` reads), so the queue runs `git fsck` on the cache before its merge
+check: an object stored under another object's name (a tree or a blob that
+makes a conflict merge clean) is found there. In an update it runs in the
+background right after the first fetch, while GitHub updates the branch, and
+the queue waits for it before it fetches the new head; in a run that finishes
+a stopped one it runs right after the fetch. Old formats that `git fetch`
+takes (a commit with time zone `+99999`, a tree out of order, an odd
+`.gitmodules`) are no problem (`FSCK_FORMAT_IDS`); an object that does not
+hash to its name, a missing or unreadable one, or a corrupt pack is. A cache
+`git fsck` finds broken, or one a fetch fails on for a reason that is not the
+network or the login, is downloaded from scratch once and checked again; one
+still broken after that is not merged in (STATE stays, and the PR comment says
+the cache fails `git fsck`). If a later run's `git fsck` gives the same lines
+as right after that download, the history GitHub serves is what fails: the
+queue does not download it again, and a person must look. A fetch's automatic
+`git gc` runs in the foreground, so no repack races the check. `git fsck`
+reads every object on one core: about 30 seconds for 270,000 objects, at most
+once per run (the queue makes at most one merge check per run). The cache is
+made with SHA-1 objects and files refs whatever git's defaults
+(`GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT`; git 3.0 plans others); a git
+that makes another format is refused, never written over. A job of the same
+user can still change the cache between that check and git's next read: only
+the runner rule above stops that.
 
 | Exit | Meaning                                                                                                     |
 | ---- | ----------------------------------------------------------------------------------------------------------- |
