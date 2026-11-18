@@ -209,6 +209,7 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `locked`                       | `git worktree lock` was used on it                                                                                                          |
 | `no branch`                    | HEAD is detached                                                                                                                            |
+| `no commit`                    | its branch has no commit: deleted under the worktree, or never had one                                                                      |
 | `open PR`                      | an open pull request has its branch                                                                                                         |
 | `base branch`                  | it is GitHub's default branch (`git ls-remote --symref`), or a pull request merges into its branch                                          |
 | `no merged PR`                 | no merged pull request **from this repository** (not a fork) has its branch                                                                 |

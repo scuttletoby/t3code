@@ -340,6 +340,10 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
     branch = branch[len('refs/heads/'):] if branch.startswith('refs/heads/') else ''
     if not branch:
         return Refusal('no branch', 'HEAD is detached')
+    if not head.strip('0'):
+        # The branch has no commit: it was deleted under the worktree, or never had one (`git checkout --orphan`).
+        # What is in the worktree (staged files too) is in no commit anywhere.
+        return Refusal('no commit', f'{branch} has no commit (deleted under it, or never had one)')
     if repo.branches and not matches(branch, repo.branches):
         return Refusal('branch not listed', f'{branch} matches none of {some(list(repo.branches))}')
 

@@ -238,6 +238,11 @@ class Worktrees(Case):
         self.assertKept(plan, locked, 'locked', 'under review')
         self.assertKept(plan, detached, 'no branch')
 
+    def test_a_worktree_whose_branch_has_no_commit_is_kept(self):
+        tree = self.finished('gone', number=3)
+        self.git(tree, 'update-ref', '-d', 'refs/heads/gone')        # the branch deleted under the worktree
+        self.assertKept(self.planned(), tree, 'no commit', 'gone has no commit')
+
     def test_another_git_folder_inside_keeps_it(self):
         tree = self.finished()
         self.clone('vendored', into=self.mkdir(tree, 'node_modules'))
@@ -759,6 +764,7 @@ MUTATIONS = {
     'commits only in its reflog': ('rules', 'if alone:  # reflog', 'if False:', Worktrees, 'test_a_commit_only_its_reflog_still_has_keeps_it'),
     'locked': ('rules', "if entry.get('locked') is not None:", 'if False:', Worktrees, 'test_a_locked_or_detached_worktree_is_kept'),
     'no branch': ('rules', 'if not branch:', 'if False:', Worktrees, 'test_a_locked_or_detached_worktree_is_kept'),
+    'no commit': ('rules', "if not head.strip('0'):", 'if False:', Worktrees, 'test_a_worktree_whose_branch_has_no_commit_is_kept'),
     'another git folder inside': ('guard', 'if nested:', 'if False:', Worktrees, 'test_another_git_folder_inside_keeps_it'),
     'only the listed repository': ('rules', 'if not same_repo(url, repo.github):', 'if False:', Worktrees, 'test_only_folders_of_the_listed_repository_are_looked_at'),
     'the last check before a delete': ('engine', 'refusal = rules.recheck(cfg, facts, item)', 'refusal = None', Worktrees, 'test_everything_is_read_again_just_before_the_delete'),
