@@ -50,9 +50,10 @@ done
 case "$method $path" in
   "GET repos/me/t3code") body="{\"has_issues\":$(cat "$api/has_issues"),\"parent\":{\"full_name\":\"up/t3code\"}}" ;;
   "GET repos/me/t3code/actions/workflows") body="$(cat "$api/workflows.json")" ;;
-  # The workflow disable route, matched on its last path segment: written as one literal
-  # .../workflows/<id>/disable pattern, command guards that refuse real disable calls refuse to
-  # run this test. Any other PUT under actions/workflows has no route, as before.
+  # The route that switches one workflow off, matched on its last path segment. Neither the route
+  # as one literal pattern nor its two-word name is written here: a command guard that refuses the
+  # real call reads this file too, and would then refuse to run the test. Any other PUT under
+  # actions/workflows has no route, as before.
   "PUT repos/me/t3code/actions/workflows/"*)
     [[ "${path##*/}" == disable ]] || { echo "fake gh: no route for $method $path" >&2; exit 1; }
     echo "disable $path" >> "$api/writes"; exit 0 ;;
