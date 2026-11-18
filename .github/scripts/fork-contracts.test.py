@@ -1811,6 +1811,10 @@ for label, mutate in {
         .__setitem__("timeout-minutes", 0),
     "a checkout timeout that breaks the budget": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]
         .__setitem__("timeout-minutes", (t["jobs"]["fork_checks_ran"]["steps"][0].get("timeout-minutes") or 0) + 2),
+    # Worst case exactly the job timeout leaves nothing for the job's set-up: cancelled before the message (#449).
+    "a checkout timeout that fills the job timeout exactly": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]
+        .__setitem__("timeout-minutes", (t["jobs"]["fork_checks_ran"]["timeout-minutes"] * 60
+                                         - policy_worst_case(0, p["fork_checks"]["wait_seconds"], POLICY_LIMITS)) // 60),
     "fork_checks_ran without PR_NUMBER": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
         .pop("PR_NUMBER"),
     "fork_checks_ran with PR_NUMBER from elsewhere": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
@@ -1826,6 +1830,11 @@ for label, mutate in {
         .__setitem__("BASH_ENV", "x"),
 }.items():
     check(f"policies: {label} fails", policy_mutant(mutate))
+# A crash in a mutation or in the check is a contract bug: a named FAIL, so the later checks, the count and the
+# clean-up still run (#449).
+crash = policy_mutant(lambda p, w, t: 1 / 0)
+check("policies: a mutant that crashes is a named FAIL, not a traceback",
+      crash[0] is False and "ZeroDivisionError" in crash[1], repr(crash))
 # The script's limits, as if it changed them: the budget must still fit (#433 fix round 1, nit of both lenses).
 for label, change in {
     "git calls that outlast the job": {"GIT_TIMEOUT": 300},
