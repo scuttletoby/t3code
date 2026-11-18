@@ -28,8 +28,9 @@ fork-cleaner compare  what plan would delete next to what the old tools' dry run
 fork-cleaner daily    what the timer runs: plan, report and compare (cleaner.daily.mode "compare", the default),
                       or run and report ("run", refused while a timer in cleaner.daily.oldTimers is on or unknown)
 
-What may go is decided by three rules (worktrees, docker, tmp) and the "cleaner" section of the machine file; a
-fourth (compress-cold) replaces cold files in the folders it names by a checked zstd copy, and deletes no content.
+What may go is decided by four rules (worktrees, docker, tmp, agent-scratch) and the "cleaner" section of the machine
+file; a fifth (compress-cold) replaces cold files in the folders it names by a checked zstd copy, and deletes no
+content.
 What must stay is decided by the code and cannot be turned off. Exit code: 0 done, 1 something could not be read or
 deleted (it was kept), 2 wrong command or no usable machine file (nothing was done), 3 (compare and daily only)
 every step worked and the compare found paths only fork-cleaner would delete.'''
@@ -80,16 +81,7 @@ def log_problem(fd=None, path=None):
     return None if STAMP.match(first) else 'its first line is not a line of the cleaner\'s log'
 
 
-def human(n):
-    if n is None:
-        return 'size not known'
-    if n < 1024:
-        return f'{n} B'
-    for unit in ('KB', 'MB', 'GB'):
-        n /= 1024
-        if n < 1024:
-            break
-    return f'{n:.1f} {unit}'
+human = rules.human
 
 
 def sized(things):
@@ -217,17 +209,24 @@ def write_journal(cfg, entries):
         raise LogError(f'the journal {cfg.journal_file}: {ex.strerror}') from None
 
 
-def half_deleted(cfg, entries):
-    """(kept, left): a Kept for each path a delete started on that is still there, and the journal lines still
-    true. A volume, or a path that is gone, has nothing left to name."""
-    kept, left = [], []
+def half_deleted(cfg, entries, facts=None):
+    """(kept, left, finish): a Kept for each path a delete started on that is still there, the journal lines still
+    true, and the items to finish. A volume, or a path that is gone, has nothing left to name. An agent session's
+    scratch folder is judged again (rules.finish_scratch): when every check passes for what is left, the run
+    finishes the delete; otherwise it is kept as half deleted, with the reason."""
+    kept, left, finish = [], [], []
     for entry in entries:
         if entry['kind'] == 'volume' or not os.path.lexists(entry['path']):
             continue
         left.append(entry)
+        again = rules.finish_scratch(cfg, facts, entry) if facts is not None and entry['rule'] == rules.SCRATCH else None
+        if isinstance(again, rules.Item):
+            finish.append(again)
+            continue
+        why = f'{again.code}: {again.detail}; ' if again is not None else ''
         kept.append(rules.Kept(entry['path'], entry['rule'], 'half deleted',
-                               f'since {entry.get("at", "?")}: ' + HALF.format(journal=cfg.journal_file)))
-    return kept, left
+                               f'since {entry.get("at", "?")}: {why}' + HALF.format(journal=cfg.journal_file)))
+    return kept, left, finish
 
 
 # --- deleting -----------------------------------------------------------------------------------------------------
@@ -241,6 +240,11 @@ def delete_all(cfg, facts, items, really, out, log=None, journal=None):
         journaled = item.kind not in rules.UNJOURNALED
         if not really:
             out(f'{would} {told}')
+            look = item.look
+            for name, size in (look.keep_first if look is not None else ()):
+                out(f'  would keep first {item.path}/{name} ({human(size)})')
+            for name, size in (look.keep_named if look is not None else ()):
+                out(f'  would name only {item.path}/{name} ({human(size)}, too large to copy)')
             continue
         facts.forget()                  # the last check reads the machine anew, not what the plan saw
         refusal = rules.recheck(cfg, facts, item)
@@ -248,10 +252,32 @@ def delete_all(cfg, facts, items, really, out, log=None, journal=None):
             item.done, item.refusal = 'refused', refusal
             out(f'REFUSED {item.label} ({item.rule}: {refusal.code}{": " + refusal.detail if refusal.detail else ""})')
             continue
+        if item.kind == 'session':
+            # Keep first: what is worth keeping is copied out and read back before anything is deleted. A copy
+            # that fails keeps the folder whole.
+            try:
+                kept = rules.keep_first(cfg, item)
+            except rules.KeepFirstError as ex:
+                failed += 1
+                item.done = 'failed'
+                out(f'FAILED {item.label} ({item.rule}: keep first: {ex}): nothing deleted')
+                continue
+            if kept is not None:
+                out(f'kept first {item.path}: {kept}')
+            # The copy took a while: is the session still gone? Read anew right before the first unlink.
+            facts.forget()
+            item.look.checked = rules.clock()           # a file changed after this stops the delete (_clear)
+            refusal = rules.session_alive(cfg, facts, item.path, item.look)
+            if refusal is not None:
+                item.done, item.refusal = 'refused', refusal
+                out(f'REFUSED {item.label} ({item.rule}: {refusal.code}{": " + refusal.detail if refusal.detail else ""})')
+                continue
         log.write(one_line(f'{doing} {told}'))           # a failed write stops the run before the delete
-        entry = {'kind': item.kind, 'path': item.path, 'rule': item.rule,
-                 'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-        if journaled:
+        # A delete an earlier run began (a session folder it finishes now) keeps its first line until it is done.
+        prior = [e for e in journal if e['kind'] == item.kind and e['path'] == item.path] if journaled else []
+        entry = prior[0] if prior else {'kind': item.kind, 'path': item.path, 'rule': item.rule,
+                                        'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+        if journaled and not prior:
             journal.append(entry)
             write_journal(cfg, journal)
         try:
@@ -259,9 +285,10 @@ def delete_all(cfg, facts, items, really, out, log=None, journal=None):
         except (OSError, Unreadable) as ex:
             failed += 1
             item.done = 'failed'
+            gone = item.kind != 'volume' and not os.path.lexists(item.path)
             if not journaled:
                 pass                    # its step leaves nothing half gone (rules.UNJOURNALED)
-            elif isinstance(ex, Untouched) or (item.kind != 'volume' and not os.path.lexists(item.path)):
+            elif gone or (isinstance(ex, Untouched) and not prior):
                 journal.remove(entry)   # nothing was removed, or all of it was: nothing is half gone
                 write_journal(cfg, journal)
             out(f'FAILED {item.label} ({item.rule}: {ex})' + (' (half deleted: see the next plan)' if entry in journal else ''))
@@ -307,17 +334,18 @@ def _execute(cfg, facts, really, say, log):
         entries, unread_journal = [], True
     else:
         unread_journal = False
-    half, journal = half_deleted(cfg, entries)
+    half, journal, finish = half_deleted(cfg, entries, facts)
     if really and journal != entries:
         write_journal(cfg, journal)
     plan = rules.plan(cfg, facts, measure=not really)
+    plan.items += finish
     if unread_journal:              # a plan only: anything may be half deleted, so nothing would be deleted
         plan.kept += [rules.Kept(item.path, item.rule, 'could not read', 'the journal of deletes in progress cannot '
                                  'be read, and it may name this as half deleted', item.size)
                       for item in plan.items if item.kind != 'volume']
         plan.items = [item for item in plan.items if item.kind == 'volume']
-    halves = {kept.path for kept in half}
-    plan.items = [item for item in plan.items if item.kind == 'volume' or item.path not in halves]
+    halves = {kept.path for kept in half} | {item.path for item in finish}
+    plan.items = [item for item in plan.items if item.kind == 'volume' or item.path not in halves or item in finish]
     plan.kept = [kept for kept in plan.kept if kept.rule == 'docker' or kept.path not in halves] + half
     for kept in sorted(plan.kept, key=lambda k: (k.rule, k.path)):
         shown = f'docker volume {kept.path}' if kept.rule == 'docker' and kept.path != 'docker' else kept.path
@@ -333,6 +361,10 @@ def _execute(cfg, facts, really, say, log):
         words = rules.WORDS.get(kind, ('would delete', 'deleting', 'deleted'))
         say(f'  {rule}: {words[2] if really else words[0]} {count(len(group), rules.NOUNS.get(kind, kind))} '
             f'({_compressed(group, really) if kind == "compress" else sized(group)})')
+        first = [size for item in group for _, size in (item.look.keep_first if item.look is not None else ())]
+        if first:
+            say(f'  {rule}: {"kept" if really else "would keep"} first {count(len(first), "file")} ({human(sum(first))}) '
+                f'in {cfg.keep_archive}')
     for (rule, kind), group in _groups([i for i in plan.items if i.done == 'failed'], lambda i: (i.rule, i.kind)):
         say(f'  {rule}: failed {count(len(group), rules.NOUNS.get(kind, kind))} ({sized(group)})')
     for (rule, code), group in _groups(plan.kept, lambda k: (k.rule, k.code)):
