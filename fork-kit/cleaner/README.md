@@ -1,13 +1,14 @@
 # cleaner: free disk space by rules, and never delete what could be needed
 
-`fork-cleaner` removes what a host no longer needs: finished git worktrees, unused anonymous Docker volumes and old
-temp folders. Which folders, which repositories and how many days come from the machine file. What must never go
+`fork-cleaner` removes what a host no longer needs: finished git worktrees, unused anonymous Docker volumes, old
+temp folders, and the scratch folders of agent sessions that are over (after it has copied out the small reports
+in them worth keeping). Which folders, which repositories and how many days come from the machine file. What must never go
 is in the code and cannot be switched off.
 
 It lives in `fork-kit` because it runs on a machine (not in CI and not inside T3), reads its facts from the
 machine file like every kit, and ships with the kits in `ci-release`. `fork-ci` holds only what CI itself runs.
 
-The core, three rules, an [installer](#install) and one [daily timer](#the-daily-timer). While the tools it is
+The core, four rules, an [installer](#install) and one [daily timer](#the-daily-timer). While the tools it is
 to replace still delete on a host, the timer runs in compare mode: it plans, reports and compares what it would
 delete with what they would, and deletes nothing.
 
@@ -16,7 +17,7 @@ delete with what they would, and deletes nothing.
 | config       | `lib/cleaner/config.py`                                 | reads the `cleaner` section of the machine file               |
 | facts        | `lib/cleaner/facts.py`                                  | reads the process list, systemd units, git, GitHub and Docker |
 | guard        | `lib/cleaner/guard.py`                                  | the hard refusals: asked about every path, twice              |
-| rules        | `lib/cleaner/rules.py`                                  | `worktrees`, `docker`, `tmp`: what each wants gone, and why   |
+| rules        | `lib/cleaner/rules.py`                                  | `worktrees`, `docker`, `tmp`, `agent-scratch`: what and why   |
 | compress     | `lib/cleaner/compress.py`                               | `compress-cold`: cold files replaced by a checked zstd copy   |
 | `plan`,`run` | `lib/cleaner/engine.py`                                 | the two commands, the lock and the log                        |
 | `report`     | `lib/cleaner/report.py`                                 | one line: GB per class, and what runs freed                   |
@@ -52,8 +53,12 @@ and clones of one repository makes N + 1 reads. Each item's last check also runs
 time, never through a link: the entry must still be the folder (same device and inode) the last check judged,
 and every file and folder removed under it must be one the last check walked. A link or another folder swapped
 in after the last check is refused with `FAILED ... is not what the last check saw ... nothing removed` (exit
-1); something moved into it since stops the delete there (`not there at the last check`, half deleted). A
-worktree is checked the same way just before `git worktree remove` runs.
+1); something moved into it since stops the delete there (`not there at the last check`, half deleted). An
+agent session's folder is also stopped by anything whose inode time is after the check right before its delete
+(`changed after the last check`, half deleted): ext4 hands a freed inode number to the next new file at once, so
+the inode number alone does not show a file made during the delete. A file with several hard links is let
+through (deleting one name changes the others' inode time). A worktree is checked the same way just before
+`git worktree remove` runs.
 
 It refuses to run as root (exit 2): `~` would then be root's home, and the must-keep paths would miss the
 user's own agent folders.
@@ -103,6 +108,13 @@ that cannot be written stops the run before that delete. A journal that cannot b
 file, stops `run` before any delete; `plan` says so, lists every planned path as `kept ... could not read`
 instead of `would delete`, and exits 1.
 
+One exception: an [`agent-scratch`](#agent-scratch) session folder is judged again by the next run, as #466
+asked. When every check still passes for what is left (the session is still gone, no lock, nothing in use, no
+git work only there) and no file in it changed after the delete began (its journal time), the run finishes the
+delete (`finishing the delete an earlier run began at ...`), keeping its journal line until it is done. Otherwise
+it stays `half deleted`, with the reason in front: `kept <path> (agent-scratch: half deleted: since ...: session
+alive: ...)`.
+
 ## The report
 
 `fork-cleaner report` prints one line for the daily report of this host, for example:
@@ -119,7 +131,8 @@ not be read) (180.2 GB of 250.0 GB used); freed since the last report at 2026-01
 
 - **The classes** are `CLASSES` in `config.py`, the one list, and each name says what it measures. A rule's class
   is what that rule looks at: `worktrees` (the worktrees and clones of the listed repositories), `temp` (the temp
-  entries a pattern takes) and `all docker volumes` (every volume, named ones too: Docker measures them all, and
+  entries a pattern takes), `agent scratch` (every session folder of the agent-scratch root, idle or not; `off`
+  while the rule is off) and `all docker volumes` (every volume, named ones too: Docker measures them all, and
   the rule takes only unused anonymous ones). A must-keep class is its group of must-keep paths, whole:
   `agent tool homes` (`AGENT_HOMES`: the agent tools' home folders, with transcripts, sessions, settings and
   caches) and `T3 data` (`T3_DATA`). `build caches` has no rule yet. Every rule of `rules.RULES` (the list `plan`
@@ -203,7 +216,7 @@ off this list.
   itself (a folder without read permission) cannot be read in full, what was asked about stays, the line says
   `could not read`, and the command ends with exit code 1.
 
-## The three rules
+## The four rules
 
 ### `worktrees`
 
@@ -265,7 +278,116 @@ default list is empty: with no pattern the rule does nothing. "Changed" is the n
 entry and of everything in it, so a folder copied today with old dates is new.
 
 Never taken, whatever the patterns say: hidden entries, `claude-*`, `tmux-*`, `ssh-*`, `systemd-private-*`,
-`snap-private-tmp`, `snap.*` and `lost+found`. Agent scratch folders get a rule of their own later.
+`snap-private-tmp`, `snap.*` and `lost+found`. Agent scratch folders have a rule of their own:
+[`agent-scratch`](#agent-scratch).
+
+### `agent-scratch`
+
+Off unless the machine file says `"enabled": true`. Agent sessions leave a scratch folder per session in the temp
+folder (Claude Code: `/tmp/claude-<uid>/<project, as a name>/<session id>/` with `scratchpad/`, `tasks/` and
+`images/`), and nothing removes them. The rule looks at the folders two levels below `root` (default
+`/tmp/claude-{uid}`, `{uid}` being the user's id) whose name is a session id (a uuid); the project folders
+themselves never go, and a project folder that is a link is kept and named. The root must be one user's own
+folder: never a shared temp folder itself (`/tmp`, `/var/tmp`, `/dev/shm`, `/run/user`, the user's own runtime
+folder `/run/user/<uid>` or `$XDG_RUNTIME_DIR`, `$TMPDIR`), never `/`, home or above it, never a folder that is,
+holds or is inside a `transcripts` folder (by its path or its real path: agent logs are never deleted), and when
+it is there, a real folder (not a link) of the cleaner's user; anything else stops the run as a machine file
+error. A session folder goes only when all of this holds, the hard refusals of
+[What it never deletes](#what-it-never-deletes) included:
+
+| Kept as                               | When                                                                                                                                                                                     |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (not listed)                          | anything in it changed less than `days` ago (3 or more): the newest content or inode time of all of it                                                                                   |
+| `lock file`                           | a lock-named file is directly in it (`*.lock`, `lock`, `*.lck`); deeper, a clone's `yarn.lock` or `Cargo.lock` is ordinary content (a lock a process _holds_ anywhere in it is `in use`) |
+| `transcript changed under 3 days ago` | the session's transcript (`<id>.jsonl` or its `<id>/` folder in a folder `transcripts` names) changed within `days`                                                                      |
+| `session alive`, `in use`             | the session may still be alive: see [What counts as alive](#what-counts-as-alive)                                                                                                        |
+| `could not read`                      | the process list, a process of the user (see below), a transcript folder or a folder in it cannot be read in full, or a `transcripts` pattern matches no folder                          |
+| `git: unpushed commits`, ...          | a clone in it holds uncommitted, untracked, stashed or unpushed work: kept, and the clone is named                                                                                       |
+| `report too large to keep first`      | a file a `keepFirst.patterns` pattern takes is over `maxFileBytes`: it stays until a person keeps it or it is gone (nothing is deleted before it is saved)                               |
+| `too much to keep first`              | the files to keep first add up to more than `maxSessionBytes`                                                                                                                            |
+| `credential name`, ...                | every refusal of the list above                                                                                                                                                          |
+
+Transcripts are read by their times only, never their content, and are never changed (they are must-keep). Where
+they are comes from the machine file (`transcripts`, default `~/.claude*/projects/*`: one folder per project);
+each match is resolved to its real path, so a config folder that is a link (or `CLAUDE_CONFIG_DIR` named there)
+works. A pattern that matches no folder at all is `could not read` for every session, never "no transcript": a
+transcript folder that moved must not make every session look gone.
+
+##### What counts as alive
+
+Asked last in the plan, again by the last check before each delete, and once more after keep first, right before
+the first unlink (the copy can take a while). A session folder is kept when any of these holds:
+
+1. `in use` (the plan and the last check) or `session alive` (after keep first): a process of any user works in
+   the folder or below it (its working folder or root), has a file or folder in it open (`/proc/<pid>/fd`, a
+   deleted file included; a running session holds its `tasks/` folder open), maps a file in it, listens on a
+   socket in it, holds a lock in it, or names its path on its command line.
+2. `session alive`: a process names the id as a whole word, on its command line (`--session-id`, `--resume <id>`)
+   or in its environment (`CLAUDE_CODE_SESSION_ID`, which every tool and MCP server of a session inherits). Of other
+   users' processes only the command line is visible.
+3. `could not read`: the process list cannot be read, or a process of the cleaner's own user hides its open files,
+   working folder or environment (a process that is not dumpable, such as the Codex CLI) and has no readable
+   ancestor to be judged by. A hidden process is judged by its nearest ancestor (`/proc/<pid>/stat` shows the
+   parent even of a hidden process) that is the user's own and can be read in full: what that ancestor works in,
+   holds open and names decides, under 1, 2 and 4 like any process (a Codex started by an agent's tool is that
+   agent's session's; one started by the T3 server is no session's). Hidden ancestors are walked past; the walk
+   stops, with no ancestor, at pid 1, the user's service manager (`systemd --user`), a process of another user or
+   one that has ended. The login session's helpers that hide on purpose and hold no session (`systemd`,
+   `(sd-pam)`, `gpg-agent`, `ssh-agent`, `scdaemon`, `keyboxd`, `gnome-keyring-d`, by `/proc/<pid>/comm`) need no
+   ancestor. Their name excuses only what cannot be read: what can be read of such a process (its command line,
+   such as a `--homedir` in a session; a socket in `/proc/net/unix`) still counts under 1 and 2.
+4. `session alive`: after `/clear` (or a resume under a new id) the same process works on under another id. So a
+   process of the user that works in or holds open another session folder of the _same project_ without naming
+   that session's id, and that started before this session last changed (its folder or its transcript; a start
+   time that cannot be read counts as before), keeps this session.
+5. `transcript changed under ... ago`: as above.
+
+Not covered: an interactive `claude` (no id on its command line) after `/clear`, when it holds nothing in the old
+folder and its tools carry only the new id. (A T3-started session is covered: its process names its first id on
+its command line for as long as it lives, so 2 keeps the old folder.) Also not covered: a hidden process whose
+readable ancestor works elsewhere, but which itself works in a session folder (it cannot be seen). Its old folder goes once it and its transcript are `days` old; what is worth
+keeping in it is kept first.
+
+#### Keep first
+
+Before a session folder is deleted, the files in it worth keeping for analysis are copied out (#466: "before raw
+data is deleted, check whether anything in it is worth keeping; save that first; only then delete"). What is
+worth keeping is set in the machine file (`keepFirst.patterns`, relative to the session folder; `*` within one
+part). The default takes the small text reports an agent writes in its scratchpad, and not the clones,
+downloads, media and build output deeper in it:
+
+```
+scratchpad/*.md  scratchpad/*.json  scratchpad/*.txt  scratchpad/*.tsv  scratchpad/*.csv  scratchpad/*/*.md
+```
+
+The list cannot be empty (keep first cannot be turned off; `[]` is a machine file error). A report over
+`maxFileBytes` (256 KB) is not copied and keeps the whole session (`report too large to keep first`). Links are
+never followed, and nothing inside a git folder or a clone is taken. Nothing else is read or analysed.
+
+The full output of the session's background commands is kept too (`keepFirst.outputs`, default
+`tasks/*.output`; a transcript holds only what the agent read of it), up to the same `maxFileBytes` each. An output
+that is a link is followed only to a regular file inside the session folder; a link out (a sub-agent's output
+links to its transcript, which stays anyway) is never followed and is listed in the manifest's `linksOut`. A
+larger output is not copied and does not hold the session: the manifest's `notCopied` names its path, size and
+sha256, so the record of what was there stays.
+
+Every file is read by descriptor, one folder at a time from the session folder and never through a link, and only
+when it is the file the last check walked; keep first refuses (and the folder stays) when what it finds is not what
+the last check saw. The copy goes to `<archive>/<project>/<session id>/` (default archive
+`~/.local/state/fork-cleaner/kept`), with a `manifest.json`: the source folder, the project, the session, the time,
+and each file's path, size and sha256. New archive folders are made with mode 0700, each synced into its parent,
+and every folder from the archive down must be a real folder of the cleaner's user (a link there fails keep
+first). The copy is written as `.<session id>.partial`, every file and folder synced, read back and checked
+against the sha256 of what was read from the session, renamed into place (the parent synced), and read back once
+more. A `.<session id>.partial` already there is the cleaner's own half-written copy and is removed without
+following a link: a link or a file at that name is unlinked as itself (what it leads to stays), and a folder is
+removed by descriptors. Only then is the session folder deleted; a
+copy that cannot be made or does not read back the same fails that delete (`FAILED ...: keep first: ...: nothing
+deleted`, exit 1) and the folder stays whole. The run logs `kept first <path>: <n> files (<size>) in <copy>
+(verified)` before its `deleting` line. The cleaner never deletes from the archive.
+
+`plan` shows both: each session it would delete, the files it would keep first under it (`  would keep first
+<path> (<size>)`), and a total (`agent-scratch: would keep first 2432 files (27.8 MB) in <archive>`).
 
 ## `compress-cold`: smaller, never gone
 
@@ -326,8 +448,9 @@ frees nothing there; that is safe (nothing changes, the run exits 0). The copy g
 ACL it would get from its folder is removed. The config refuses a folder that is `/`, the home folder or above it, a
 must-keep path itself or a folder above one (`~/.codex` holds logins: name `~/.codex/sessions`), anything in or
 above `~/.claude*` or the folder a `~/.claude*` link leads to (Claude Code reads its transcripts as plain text), a
-folder named like `*log-archive*` or inside one, the cleaner's own log or daily folder, a
-folder another rule deletes from, or a folder in or above another of its folders.
+folder named like `*log-archive*` or inside one, the cleaner's own log or daily folder (and, while `agent-scratch`
+is on, its keep-first archive), a folder another rule deletes from (the `agent-scratch` root among them while that
+rule is on), or a folder in or above another of its folders.
 
 **The plan** says `would compress <file> (<size>, compress-cold: not changed or read for N days ...)` for each file,
 and per folder group how much it would free: one zstd run over the start of every file (64 KB each, 16 MB in all)
@@ -382,6 +505,11 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
       "root": "/tmp",
       "patterns": { "example-build-*": 7, "example-crash-*": 1 }
     },
+    "agentScratch": {
+      "enabled": true,
+      "days": 3,
+      "keepFirst": { "maxSessionBytes": 8388608 }
+    },
     "daily": {
       "mode": "compare",
       "oldTimers": ["example-retention.timer"],
@@ -397,26 +525,35 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 }
 ```
 
-| Key                             | Default                                   | Meaning                                                                                           |
-| ------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `logFile`                       | `~/.local/state/fork-cleaner/cleaner.log` | the log; its locks, journal and report mark are beside it (new, or the cleaner's own)             |
-| `logLines`                      | 5000                                      | lines the log keeps (10 or more)                                                                  |
-| `mustKeep`                      | none                                      | more paths that are never deleted (`*` within one part)                                           |
-| `worktrees.repos[].root`        | required                                  | the folder the clones and worktrees are directly in                                               |
-| `worktrees.repos[].github`      | required                                  | `owner/name` on GitHub                                                                            |
-| `worktrees.repos[].regenerable` | none                                      | plain names of ignored build folders, on top of `node_modules`, `__pycache__` and `.pytest_cache` |
-| `worktrees.repos[].branches`    | all                                       | branch patterns (shell style, case as written; `*` crosses `/`): only these branches are taken    |
-| `worktrees.mergedHours`         | 24                                        | hours after the merge (24 or more)                                                                |
-| `worktrees.usedHours`           | 24                                        | hours since the worktree or clone was last used (24 or more)                                      |
-| `docker.enabled`                | false                                     | turns the rule on                                                                                 |
-| `docker.days`                   | 7                                         | age of an unused anonymous volume (7 or more)                                                     |
-| `tmp.root`                      | `/tmp`                                    | the temp folder                                                                                   |
-| `tmp.patterns`                  | none                                      | name pattern to days without a change (1 or more)                                                 |
-| `daily.mode`                    | `compare`                                 | what the timer does: `compare` (deletes nothing) or `run`                                         |
-| `daily.oldTimers`               | none                                      | timers (user or system) of the tools this one replaces: `run` refuses while one is on or unknown  |
-| `daily.outDir`                  | `~/.local/state/fork-cleaner/daily`       | where `daily` writes its files                                                                    |
-| `daily.keepDays`                | 30                                        | days `daily` keeps its dated files (1 or more)                                                    |
-| `daily.compare[]`               | none                                      | the old tools' dry runs: `name`, `command` (absolute program, no shell), `pattern` (one group)    |
+| Key                                      | Default                                   | Meaning                                                                                              |
+| ---------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `logFile`                                | `~/.local/state/fork-cleaner/cleaner.log` | the log; its locks, journal and report mark are beside it (new, or the cleaner's own)                |
+| `logLines`                               | 5000                                      | lines the log keeps (10 or more)                                                                     |
+| `mustKeep`                               | none                                      | more paths that are never deleted (`*` within one part)                                              |
+| `worktrees.repos[].root`                 | required                                  | the folder the clones and worktrees are directly in                                                  |
+| `worktrees.repos[].github`               | required                                  | `owner/name` on GitHub                                                                               |
+| `worktrees.repos[].regenerable`          | none                                      | plain names of ignored build folders, on top of `node_modules`, `__pycache__` and `.pytest_cache`    |
+| `worktrees.repos[].branches`             | all                                       | branch patterns (shell style, case as written; `*` crosses `/`): only these branches are taken       |
+| `worktrees.mergedHours`                  | 24                                        | hours after the merge (24 or more)                                                                   |
+| `worktrees.usedHours`                    | 24                                        | hours since the worktree or clone was last used (24 or more)                                         |
+| `docker.enabled`                         | false                                     | turns the rule on                                                                                    |
+| `docker.days`                            | 7                                         | age of an unused anonymous volume (7 or more)                                                        |
+| `tmp.root`                               | `/tmp`                                    | the temp folder                                                                                      |
+| `tmp.patterns`                           | none                                      | name pattern to days without a change (1 or more)                                                    |
+| `agentScratch.enabled`                   | false                                     | turns the rule on                                                                                    |
+| `agentScratch.root`                      | `/tmp/claude-{uid}`                       | the folder of the project folders; `{uid}` is the user's id; one user's own folder (see above)       |
+| `agentScratch.transcripts`               | `["~/.claude*/projects/*"]`               | the folders of the sessions' transcripts (patterns; at least one; one matching nothing keeps all)    |
+| `agentScratch.days`                      | 3                                         | days without a change, of the folder and of its transcript (3 or more)                               |
+| `agentScratch.keepFirst.archive`         | `~/.local/state/fork-cleaner/kept`        | where the files kept first go (never in a folder the cleaner deletes from)                           |
+| `agentScratch.keepFirst.patterns`        | the list above                            | the reports kept first, relative to the session folder; at least one; a larger one keeps the session |
+| `agentScratch.keepFirst.outputs`         | `["tasks/*.output"]`                      | the command outputs kept first; at least one; a larger one is named in the manifest, not copied      |
+| `agentScratch.keepFirst.maxFileBytes`    | 262144                                    | the largest file kept first (65536 or more)                                                          |
+| `agentScratch.keepFirst.maxSessionBytes` | 8388608                                   | more than this to keep first: the session stays whole                                                |
+| `daily.mode`                             | `compare`                                 | what the timer does: `compare` (deletes nothing) or `run`                                            |
+| `daily.oldTimers`                        | none                                      | timers (user or system) of the tools this one replaces: `run` refuses while one is on or unknown     |
+| `daily.outDir`                           | `~/.local/state/fork-cleaner/daily`       | where `daily` writes its files                                                                       |
+| `daily.keepDays`                         | 30                                        | days `daily` keeps its dated files (1 or more)                                                       |
+| `daily.compare[]`                        | none                                      | the old tools' dry runs: `name`, `command` (absolute program, no shell), `pattern` (one group)       |
 
 An empty section (`"cleaner": {}`) is valid and does nothing. An unknown key, a wrong type, a number below its
 floor, a root folder that is `/`, the home folder or a folder above it: the command names the file and the key,
@@ -520,7 +657,23 @@ The installer writes no machine file: the `cleaner` section is the owner's, writ
   total line.
 - **it stops half-way:** the entry it was deleting (temp folder, clone or worktree) is named `half deleted` by
   every later plan and run, never judged or deleted again, and the run exits 1 until a person acts; see
-  [Half-deleted entries](#half-deleted-entries) for what to do.
+  [Half-deleted entries](#half-deleted-entries) for what to do. An agent session's folder is judged again and
+  finished when every check passes and nothing in it changed since the delete began.
+- **agent-scratch, keep first stopped half-way:** a half-written copy (`.<session>.partial`) is thrown away and
+  made again by the next run; a copy that was made but whose delete never ran is found, read back and used again
+  (no second copy); an older copy that differs stays, and the new one is `<session>.2`, and so on.
+- **agent-scratch, the session comes back between plan and delete:** the last check reads the process list,
+  the transcripts and the folder anew; it is `REFUSED` and nothing is copied or deleted. If it comes back while
+  keep first copies, the check after the copy refuses it: the copy stays in the archive (the next run uses it
+  again) and nothing is deleted.
+- **agent-scratch, the session comes back during the delete:** a file it makes after the last check (its inode
+  time is later) stops the delete there, even when it got the inode number of a file just deleted; the rest
+  stays, `half deleted`, exit 1, and the next run sees "changed since the delete began".
+- **agent-scratch, a half delete hit a hard-linked file:** unlinking one name of a file with another name changes
+  its inode time, which the next run reads as "changed since the delete began": the session stays `half deleted`
+  and the run exits 1 until a person removes it. This fails safe and is left so.
+- **agent-scratch, the root is empty or missing:** nothing to do, exit 0. A machine file without
+  `agentScratch` leaves the rule off and the root is not even read.
 - **something is in use:** it is kept and named. A process, unit or pull request that arrives between plan and
   delete is seen by the last check before the delete.
 - **the config is old, empty or wrong:** an empty section does nothing; anything it does not understand stops the
@@ -557,6 +710,7 @@ python3 -I -B fork-kit/cleaner/tests/worktrees.test.py
 python3 -I -B fork-kit/cleaner/tests/engine.test.py
 python3 -I -B fork-kit/cleaner/tests/report.test.py
 python3 -I -B fork-kit/cleaner/tests/compress.test.py
+python3 -I -B fork-kit/cleaner/tests/scratch.test.py
 python3 -I -B fork-kit/cleaner/tests/daily.test.py
 python3 -I -B fork-kit/cleaner/tests/install.test.py
 ```

@@ -30,7 +30,7 @@ RULES = tuple(source[len('rule:'):] for _, source in CLASSES if isinstance(sourc
 DELETED = re.compile(r' \((\d+ B|\d+\.\d [KMG]B|size not known), (' + '|'.join(RULES) + r'): ')
 UNITS = {'B': 1, 'KB': 1024, 'MB': 1024 ** 2, 'GB': 1024 ** 3}
 # The other lines a run writes to the log (engine.py): understood, and not a delete.
-OTHER_LINES = ('deleting ', 'compressing ', 'FAILED ', 'REFUSED ', 'total: ', 'stopped: ')
+OTHER_LINES = ('deleting ', 'compressing ', 'kept first ', 'FAILED ', 'REFUSED ', 'total: ', 'stopped: ')
 MARK_VERSION = 1
 
 
@@ -182,6 +182,17 @@ def measure(cfg, sizer, name, source, docker):
         for folder in cfg.cold_folders:     # without folders the rule looks at nothing
             if os.path.lexists(folder.path):
                 sized.add(sizer.size(folder.path))
+    elif source == 'rule:agent-scratch':
+        if not cfg.scratch_enabled:
+            sized.note = 'off'              # as in a plan: the rule looks at nothing
+        else:
+            for project in _names(cfg.scratch_root, sized):
+                folder = os.path.join(cfg.scratch_root, project)
+                if os.path.islink(folder) or not os.path.isdir(folder):
+                    continue
+                for entry in _names(folder, sized):
+                    if rules.SESSION_NAME.match(entry):
+                        sized.add(sizer.size(os.path.join(folder, entry)))
     elif source == 'rule:docker':
         if not cfg.docker_enabled:
             sized.note = 'off'              # as in a plan: Docker is not even asked

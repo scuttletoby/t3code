@@ -37,7 +37,12 @@ class Look:
 
     def __init__(self, refusal=None, size=0, newest=0.0):
         self.refusal, self.size, self.newest = refusal, size, newest
+        self.newest_file = 0.0      # the newest change of anything in it that is not a folder (a delete changes folders)
+        self.keep_first = []        # agent-scratch: (relative path, size) of what is copied to the archive first
+        self.keep_named = []        # agent-scratch: (relative path, size) of the outputs too large to copy: named only
         self.ident, self.seen = None, set()
+        self.linked = set()         # the inodes in `seen` of files with several hard links
+        self.checked = None         # agent-scratch: when the last liveness check began (rules.clock); see _clear
 
 
 def changed(st):
@@ -183,7 +188,7 @@ def _in_use(facts, path, inodes):
 
 def _check(cfg, facts, path, kind, look):
     root = os.path.dirname(path)
-    if os.path.dirname(path) not in cfg.roots() or os.path.normpath(path) != path:
+    if not (root in cfg.roots() or cfg.session_parent(root)) or os.path.normpath(path) != path:
         return Refusal('not in a configured root', 'only what is directly in a configured folder may go')
     try:
         st, rst = os.lstat(path), os.lstat(root)
@@ -265,11 +270,14 @@ def _check(cfg, facts, path, kind, look):
             inodes.append((est.st_ino, shown))
             look.seen.add(est.st_ino)
             look.newest = max(look.newest, changed(est))
+            if not stat.S_ISDIR(est.st_mode):
+                look.newest_file = max(look.newest_file, changed(est))
             twice = est.st_nlink > 1 and not stat.S_ISDIR(est.st_mode)          # a hard link counts once
             if not twice or (est.st_dev, est.st_ino) not in counted:
                 look.size += est.st_blocks * 512
             if twice:
                 counted.add((est.st_dev, est.st_ino))
+                look.linked.add(est.st_ino)
             if is_device(est):
                 return Refusal('not a file or folder', f'{shown} is a device')
             if plain and entry.name == '.git':
