@@ -247,14 +247,16 @@ cmd_check_archives() {
   local dir="${1:?directory}" archive tmp work name stem program found=0
   # One folder for the unpacked archives, removed however the check ends: a refusal exits from
   # inside the loop. Expanded now: the trap runs at exit, after this function's locals are gone.
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/fork-release.XXXXXX")"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/fork-release.XXXXXX")" \
+    || die "Could not make a temporary folder in ${TMPDIR:-/tmp}, so the archives in $dir were not checked."
   # shellcheck disable=SC2064
   trap "rm -rf -- $(printf '%q' "$tmp")" EXIT
   shopt -s nullglob
   for archive in "$dir"/t3-*.tar.gz "$dir"/t3-*.zip; do
     found=1
     # Each archive in a folder of its own, so one cannot stand in for another's program.
-    work="$(mktemp -d "$tmp/XXXXXX")"
+    work="$(mktemp -d "$tmp/XXXXXX")" \
+      || die "Could not make a folder in $tmp to unpack $(basename "$archive"), so it was not checked."
     case "$archive" in
       *.tar.gz) tar -xzf "$archive" -C "$work" ;;
       *.zip) python3 -I -m zipfile -e "$archive" "$work" ;;
