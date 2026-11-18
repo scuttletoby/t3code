@@ -113,6 +113,23 @@ describe("WaitsAndSlotsSettings (#105)", () => {
     await expect.element(screen.getByText("Agents on Codex B")).toBeVisible();
   });
 
+  it("names each number field with the unit it counts in", async () => {
+    setup(onlyEnvironment);
+    await using screen = await render(<WaitsAndSlotsSettings isProjectScope={false} />);
+
+    await expect.element(screen.getByText("Agents on Claude A")).toBeVisible();
+    // The unit beside a field is separate text, so the field's own name has to say it.
+    const names = [
+      "Default time limit in hours",
+      "Open waits per thread in waits",
+      "Agents on Claude A in agents",
+    ];
+    const unnamed = names.filter(
+      (name) => screen.getByRole("textbox", { name, exact: true }).query() === null,
+    );
+    expect(unnamed).toEqual([]);
+  });
+
   it("an administrator lock on waitChecks makes Edit and Remove inert, like Add check", async () => {
     setup([
       {
