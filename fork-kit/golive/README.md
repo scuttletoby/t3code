@@ -486,9 +486,11 @@ Without `--way` it is read only and says which way back is possible now, and why
 home (`manifest.json`; incomplete copies are named, never used) taken under an older build whose t3 is still whole
 in `runtime/versions/<v>/` (`.install-complete`) or kept by the kit (below); W2 needs a fork build live
 (`.fork.N`) and its base nightly (the version without `.fork.N`) installed in the home or staged in `stageDir` like
-the target (checksums checked); W3 needs an upstream stable newer than that base, installed or staged. With `--way`
-it runs detached (a transient unit; stopping or restarting T3 kills a T3 terminal), `--here` in the calling process
-(refused inside the boot service).
+the target (checksums checked); W3 needs an upstream stable newer than that base, installed or staged. Behind a
+back left half-way the list goes by the rule `--way` goes by (`back.possible`): the stopped way reads "run it
+again" with what its rerun does (or why it cannot run), and every other way reads not possible, naming the way to
+run again, unless it may follow a W1 stuck on its verify (below). With `--way` it runs detached (a transient unit;
+stopping or restarting T3 kills a T3 terminal), `--here` in the calling process (refused inside the boot service).
 
 - **W1, restore and downgrade** (loses everything since the copy): by hand it is refused unless
   `--lose-work-since` names the copy's time exactly as `back` prints it (`createdAt` of the manifest), and it first
@@ -510,6 +512,31 @@ it runs detached (a transient unit; stopping or restarting T3 kills a T3 termina
   skips that) and runs the post hooks, so work T3 served in between is never restored over. A post hook that fails
   after the verify leaves T3 running and enabled: the rerun runs only the post hooks. If the service state names
   another build by then, the rerun is a whole W1 again.
+- **A W1 stuck on its verify may be followed by W2 or W3** (fork #440). When a W1 (by hand, or the switch's
+  automatic one) got past its update, every rerun of W1 only verifies again. A verify that finishes and fails (the
+  old build does not come up on the restored home, in that run, a rerun or the switch's guard) is journalled as
+  such: a `verify-failed` step follows it. A verify that was cut off (the run was killed or stopped, the machine
+  went down) leaves no such step and is not a failed one: the old build may be up or still coming up, `status`
+  says "was cut off", and W1 is run again. After two verifies that finished and failed, the newest verify being one
+  of them (`back.FAILS_TO_FOLLOW`: the W1's own and its rerun's; the rerun changes nothing, so a build that starts
+  late or a service manager that did not answer once does not send the home on to another build),
+  `t3-golive back --way w2` or `--way w3` may follow it; the failed W1, `status` and `back` without `--way` say
+  so, and before that they say what is still missing. A journal from a kit before the `verify-failed` step reads
+  on the safe side: its failed verifies count as cut off, so two reruns of W1 under this kit must fail first.
+  Neither W2 nor W3 restores, so nothing is restored a second time and no work is restored over: it runs its update
+  on the data as that W1 left it (the restored copy), to the base of the newest fork build a `switch` in the
+  journal names (the service state names the old build by then), and when it ends ok the journal is settled. It
+  runs no pre hook again (that W1 ran them) and, like that W1, no post hook after a failure: the post hooks run
+  when it ends ok. Until then only that same way follows: W1 and the other way are refused, so W1 is not run again
+  behind it. Refused, with nothing changed: a W1 that stopped before its update ended ok (the home may be
+  half-restored: only W1 finishes that); a W1 past its update with fewer than two failed verifies, or whose newest
+  verify was cut off (run W1 again first); a W2 or W3 to the very build that W1 could not verify; and, only while
+  the service state names no fork build (with one named there, W2 and W3 go from that build as they always do, and
+  the journal is not asked): a journal in which no switch names a fork build, and a W2 or W3 to a build older
+  than the one whose data that W1 put back. The newest fork build a switch names is not always the build that W1
+  went back from (a build put in by hand, a copy taken under a later build); its base may then be older than the
+  restored data's build, and `update --allow-downgrade` would run under data a newer build wrote. A fork build's
+  data counts as its base nightly's.
 - **W2, the same-base upstream nightly** (loses nothing): the fork adds no migrations, so the upstream nightly the
   fork build is cut from runs the migrated database as it is: between the pre and the post hooks,
   `<that t3> update <base> --allow-downgrade --yes`, then the same verify. **Read from the code, untried on a live
@@ -522,8 +549,9 @@ it runs detached (a transient unit; stopping or restarting T3 kills a T3 termina
 the copy run: a failed pre hook runs the post hooks and refuses before T3 is touched; the post hooks run after the
 verify. After a failure they run for W2 and W3 (T3 was never stopped) and for a W1 that never stopped T3; once a W1
 stopped T3, they do not run until a back ends ok (background jobs stay paused while T3 is down on a half-restored
-home; the error and `status` say so). A killed back runs no post hook (back has no guard): background jobs stay
-paused until a back runs again (each hook must be safe twice).
+home; the error and `status` say so), and that holds for a W2 or W3 that follows that W1 too. A killed back runs
+no post hook (back has no guard): background jobs stay paused until a back runs again (each hook must be safe
+twice).
 
 ### The kept runtime (`lib/golive/keptruntime.py`)
 
