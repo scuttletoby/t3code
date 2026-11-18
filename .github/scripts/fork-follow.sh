@@ -193,11 +193,39 @@ schema_check "$base" "The series"
 # upstream commit, which --from-upstream says (the series' own list judges it, even when upstream
 # is a fork with a list of its own). After a rebase (--after-rebase), a "pending" ceiling or "lost"
 # count above the file's lines is only a note: upstream taking a fork line drops it in the rebase,
-# and the next run (from the new base) refuses it.
+# and the next run (from the new base) would refuse it. So the series gets a commit that lowers each
+# one (#325); a count that rose is still refused, as raising one is the owner's review.
 seam_refusal="Fork changes to upstream files must stay within the seam lines"
+seam_run() { # seam_run BASE [--after-rebase]: the check's exit status; its output in seam-check.log
+  local status=0 lower=()
+  rm -f "$logs/seam-lowered.json"
+  [[ -z "${2:-}" ]] || lower=("$2" --lowered-list "$logs/seam-lowered.json")
+  node .github/scripts/fork-seam-check.cjs --from-upstream ${lower[@]+"${lower[@]}"} "$1" HEAD > "$logs/seam-check.log" 2>&1 || status=$?
+  return "$status"
+}
 seam_check() { # seam_check BASE WHAT [--after-rebase]
   local status=0
-  node .github/scripts/fork-seam-check.cjs --from-upstream ${3:+"$3"} "$1" HEAD > "$logs/seam-check.log" 2>&1 || status=$?
+  seam_run "$1" ${3:+"$3"} || status=$?
+  if ((status == 0)) && [[ -f "$logs/seam-lowered.json" ]]; then
+    local lowered
+    lowered="$(grep '^Lowered: ' "$logs/seam-check.log" | sed 's/^Lowered: /- /')"
+    cp "$logs/seam-lowered.json" .github/fork-seams.json
+    git add -- .github/fork-seams.json
+    as_fork commit -q -m "fork seams: lower counts after the rebase onto $target_tag" -m "$lowered"
+    printf '%s\n' "$2 lowered the seam list (.github/fork-seams.json) in a commit of its own:" "$lowered" >&2
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+      printf '%s\n' "### Seam list lowered: $2" "" "$lowered" "" \
+        "Committed into the series; the fork lines or upstream lines these counted are gone." \
+        "" >> "$GITHUB_STEP_SUMMARY"
+    fi
+    # The lowered list is judged again: it must pass and lower nothing more.
+    status=0
+    seam_run "$1" ${3:+"$3"} || status=$?
+    if ((status == 0)) && [[ -f "$logs/seam-lowered.json" ]]; then
+      fail "The seam list fork-follow lowered still lowers again, so it was not committed as checked:" \
+        "$(quoted "$(cat "$logs/seam-check.log")")" "" "The series was left as it is."
+    fi
+  fi
   if ((status == 0)); then
     local notes
     notes="$(grep '^Note: ' "$logs/seam-check.log" || true)"
@@ -206,7 +234,7 @@ seam_check() { # seam_check BASE WHAT [--after-rebase]
     # The log is seen only when the plan fails: the notes go to the run's summary too.
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
       printf '%s\n' "### Seam check notes: $2" "" "$(sed 's/^Note: /- /' <<< "$notes")" "" \
-        "A ceiling or count named here is refused by the next run; lower it with a pull request to main." \
+        "A ceiling or count still named here (one fork-follow could not lower) is refused by the next run; fix it with a pull request to main (docs/fork/updates.md)." \
         "" >> "$GITHUB_STEP_SUMMARY"
     fi
     return 0
@@ -555,6 +583,7 @@ candidate="$(git rev-parse HEAD)"
 # says what to do about a workflow.
 refuse_upstream_fork_named "$target" "$target_tag" "$candidate"
 seam_check "$target" "After rebasing onto $target_tag, the series" --after-rebase
+candidate="$(git rev-parse HEAD)" # The seam check may have committed a lowered list.
 refuse_outside_workflows "$base" "$target" "$target_tag" "$candidate"
 dropped="$(comm -23 <(sort <<< "$before") <(git log --format=%s "$target..HEAD" | sort) | paste -sd ';' -)"
 
