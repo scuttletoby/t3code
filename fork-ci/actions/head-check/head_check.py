@@ -26,7 +26,7 @@ request with no lens comments and no required lens (nothing to compare); a draft
 never pass, when anything is unknown: GitHub unreadable after ATTEMPTS (the reviews' flags and inline comments too), a
 malformed answer, a checkout whose merge commit merges another head than the one GitHub reports, a read commit that is
 not in the checkout and cannot be fetched.
-Refuse to start (exit 2, before GitHub is read) on a config or argument error, a git older than 2.38, and a checkout
+Refuse to start (exit 2, before GitHub is read) on a config or argument error, a git older than 2.43, and a checkout
 that is not GitHub's two-parent merge commit, is shallow or is tampered with. Reads only (a fetch of a missing read
 commit into the job's own checkout aside) and posts nothing: a re-run on the same head gives the same answer, and a
 run stopped half-way leaves nothing behind.
@@ -375,7 +375,7 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
     p.add_argument('--bare', action='store_true', help='read a bare repository (head_gate.py) instead of a checkout')
     p.add_argument('--base', default='', help='with --bare: the base tip the config is read from')
     p.add_argument('--head', default='', help='with --bare: the head GitHub named when the base was read')
-    p.add_argument('--remote', default='origin', help='with --bare: where a missing read commit is fetched from')
+    p.add_argument('--remote', help='with --bare: where a missing read commit is fetched from (default origin)')
     a = p.parse_args(argv)
     required, problems = argument_problems(a.repo, a.pr, a.required_lenses)
     bare = None
@@ -385,7 +385,9 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
                      if not SHA.fullmatch(v)]
     elif a.base or a.head:
         problems.append('--base and --head need --bare (a checkout names its own through its merge commit)')
-    checkout = Checkout(a.path, git, bare=bare, remote=a.remote)
+    if a.remote is not None and not a.bare:
+        problems.append("--remote needs --bare (a checkout fetches from its own origin)")
+    checkout = Checkout(a.path, git, bare=bare, remote=a.remote or 'origin')
     if git is None:
         problems += filter(None, [pr_queue.git_problem(), checkout.problem()])
     code, ok, reason, rows = decide(a.repo, a.pr, a.config, checkout, required, a.pass_drafts, gh, sleep, out, problems)
