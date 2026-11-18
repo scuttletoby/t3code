@@ -600,7 +600,7 @@ class SameChangeBare(SameChange):
     def test_a_remote_that_is_no_url_or_path_is_refused(self):   # #457 item 4: never "origin" for an empty one
         path = self.w.checkout(self.m1, self.read)
         for remote, says in (('', 'the remote is empty'), ('http://github.com/o/r.git', 'plain http'),
-                             ('ext::sh -c id', 'remote helper')):
+                             ('ext::sh -c id', 'remote helper'), ('--upload-pack=touch x', 'starts with -')):
             with self.subTest(remote):
                 for _ in range(2):
                     calls, out = [], []

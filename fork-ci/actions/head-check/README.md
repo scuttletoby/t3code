@@ -78,8 +78,8 @@ read from the empty tree): neither the pull request's `.gitattributes` nor a
 bare repository's `HEAD` or `attr.tree` can turn a conflict into a clean merge.
 `--remote` (where a missing read commit is fetched from) needs `--bare`, and
 is refused when it is empty, plain `http://` (GitHub would redirect it to
-https, and git would hand the token over) or a `transport::address` remote
-helper.
+https, and git would hand the token over), a `transport::address` remote
+helper, or starts with `-` (git would read it as an option).
 
 It reads only and posts nothing. The one write is a fetch, into the job's own
 checkout, of a read commit the head dropped (a rebase or force-push; GitHub
