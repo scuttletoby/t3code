@@ -285,7 +285,9 @@ settings files may still exist; it moves with the add-ons.
 `t3 serve --hold-work --base-dir <copy>` starts a server on a copy of a T3 home with the work gate
 (`apps/server/src/workAdmission.ts`) held from boot until exit. Use it to look at a new build's
 threads, settings and migrations before it replaces a running T3. It is refused for the background
-service.
+service, without `--base-dir`, and on the default home (`~/.t3`, also through a symlink), before it
+starts or writes anything: a held boot marks its home as a copy (below), and on the live home that
+would hold its T3 Connect at every later boot. `T3CODE_HOME` alone does not name the home for it.
 
 Held (nothing of it starts until the server restarts without the flag, except T3 Connect: see below):
 
@@ -312,8 +314,9 @@ Held (nothing of it starts until the server restarts without the flag, except T3
   - Every boot of that home holds T3 Connect and agent activity publishing as above, with or without
     `--hold-work`, and logs the marker's path. A copy started normally (`t3 serve` or `t3 up` on its
     home) runs its work but never registers or releases the tunnel under the shared environment id.
-    The server reads the marker once as it starts: one added while it runs counts from its next
-    start.
+    The server reads the marker once as it starts, and T3 Connect and agent activity publishing
+    share that one read, so they always agree. A marker added or deleted while it runs counts from
+    its next start.
   - `t3 connect login`, `link`, `unlink` and `logout`, `t3 connect publish` turning publishing on,
     and `t3 up` turning T3 Connect on or off are refused on that home, running or not, before they
     send anything or change the link or sign-in (the CLI may still create the home's folders and
@@ -322,11 +325,15 @@ Held (nothing of it starts until the server restarts without the flag, except T3
     the copied sign-in, which the running server shares.
 
   Anything at that path counts, even an empty file or a dangling symlink, and so does a path that
-  cannot be checked. If the home is not a copy, delete the file and run the command or start the
+  cannot be checked (a disk or permission error holds T3 Connect for that boot, on purpose). If the home is not a copy, delete the file and run the command or start the
   server again.
 
-  A copy with no marker is not protected: one that has never booted held, or one held-booted only by
-  a build from before the marker (its first held boot on a newer build marks it). Neither the CLI
+  A copy with no marker is not protected: one that has never booted held, one held-booted only by
+  a build from before the marker (its first held boot on a newer build marks it), or one copied with
+  only `userdata/` from a marked copy (as the go-live kit's `copy` step copies). The marker sits in
+  the home, beside `userdata/`, while the shared identity sits in `userdata/`: such a copy carries
+  the identity but not the marker. (That is also why restoring `userdata/` can never bring the
+  marker into the live home.) Neither the CLI
   nor the server can tell it from the running server's home: never run those commands against it or
   start it normally. Delete the copy's home instead.
 
