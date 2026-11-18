@@ -1,0 +1,10 @@
+#!/usr/bin/python3 -IB
+"""fork-cleaner: the cleaner kit (lib/cleaner). Frees disk space by rules; never deletes what could be needed.
+-I: no environment variable, user site folder or current folder changes what Python loads. The code is loaded
+only from this file's real folder; the shared machine-file loader comes from common/ beside the kit."""
+import os, sys
+kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+common = os.path.join(kit, 'common')
+sys.path[:0] = [os.path.join(kit, 'lib'), common if os.path.isdir(common) else os.path.join(os.path.dirname(kit), 'common')]
+from cleaner import engine  # noqa: E402
+sys.exit(engine.main(sys.argv[1:]))
