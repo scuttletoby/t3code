@@ -9,7 +9,8 @@ import errno, fnmatch, os, re, stat
 from . import guard
 from .config import matches
 from .facts import (Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_tags, lonely, merged_seconds,
-                    origin_url, present, reflog, remote_refs, remote_urls, remove_volume, remove_worktree, worktree_list)
+                    origin_url, orphaned_worktree, present, reflog, remote_refs, remote_urls, remove_volume,
+                    remove_worktree, worktree_list)
 from .guard import CREDENTIAL_NAMES, Refusal
 
 DAY = 86400
@@ -19,6 +20,9 @@ TMP_NEVER = ('.*', 'claude-*', 'tmux-*', 'ssh-*', 'systemd-private-*', 'snap-pri
 ANONYMOUS = re.compile(r'^[0-9a-f]{64}$')       # the name Docker gives a volume nobody named
 EMPTY_PRS = {'merged': [], 'open': []}
 GITHUB_URL = re.compile(r'^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?$')
+# In a worktree's own git folder: files the commands of somebody working in it write (`fetch` writes FETCH_HEAD).
+USE_MARKS = ('HEAD', 'index', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG')
+REFLOG_LINE = re.compile(rb'(?:[0-9a-f]{40}|[0-9a-f]{64}) (?:[0-9a-f]{40}|[0-9a-f]{64}) [^<>\n]*<[^<>\n]*> (\d+) [+-]\d{4}(?:\t[^\n]*)?')
 # In a worktree's own git folder: an operation somebody started and did not finish.
 MARKS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-merge', 'rebase-apply', 'index.lock')
 
@@ -337,6 +341,12 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
     branch = branch[len('refs/heads/'):] if branch.startswith('refs/heads/') else ''
     if not branch:
         return Refusal('no branch', 'HEAD is detached')
+    if not head.strip('0'):
+        # The branch has no commit: it was deleted under the worktree, or never had one (`git checkout --orphan`).
+        # What is in the worktree (staged files too) is in no commit anywhere.
+        return Refusal('no commit', f'{branch} has no commit (deleted under it, or never had one)')
+    if repo.branches and not matches(branch, repo.branches):
+        return Refusal('branch not listed', f'{branch} matches none of {some(list(repo.branches))}')
 
     opened = [row for row in prs['open'] if row['headRefName'] == branch]
     if opened:
@@ -433,13 +443,64 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
 
     look = guard.examine(cfg, facts, path, kind)
     out['look'] = look
-    return look.refusal
+    if look.refusal is not None:
+        return look.refusal
+    # Somebody may still use it although its pull request merged: an agent's shell between two commands holds no
+    # file open. Any change to its files (build output too) or to its own git state says it was used.
+    used, what = last_used(path, git_dir, look)
+    age = facts.now - used
+    if age < cfg.used_hours * 3600:
+        return Refusal(f'used under {cfg.used_hours} h ago', f'{what} changed {int(max(age, 0) // 3600)} h ago')
+    return None
+
+
+def last_used(path, git_dir, look):
+    """(time, what) of the newest sign of use: a change to anything in the folder (the guard's look, which walks
+    all of it, a clone's git folder too), to the git files a command in it writes (USE_MARKS), or the newest time
+    written in its own HEAD reflog. The reflog file's own change time does not count: `git gc` rewrites it.
+    Raises Unreadable when a reflog line cannot be read."""
+    used, what = look.newest, 'a file in it'
+    for name in USE_MARKS:
+        try:
+            when = guard.changed(os.lstat(os.path.join(git_dir, name)))
+        except FileNotFoundError:
+            continue                    # most are there only after the command that writes them
+        except OSError as ex:
+            raise Unreadable(f'{name} in its git folder: {ex.strerror}') from None
+        if when > used:
+            used, what = when, f'git {name}'
+    when = reflog_newest(os.path.join(git_dir, 'logs', 'HEAD'))
+    if when > used:
+        used, what = when, 'its HEAD reflog'
+    return used, what
+
+
+def reflog_newest(path):
+    """The newest time a reflog file names; 0 when there is no such file."""
+    try:
+        with open(path, 'rb') as f:
+            lines = f.read().split(b'\n')
+    except FileNotFoundError:
+        return 0.0
+    except OSError as ex:
+        raise Unreadable(f'{path}: {ex.strerror}') from None
+    newest = 0.0
+    for number, line in enumerate(lines, 1):
+        found = REFLOG_LINE.fullmatch(line)
+        if found:
+            newest = max(newest, float(found.group(1)))
+        elif line or number < len(lines):  # the text ends with a newline: only the last piece may be empty
+            raise Unreadable(f'line {number} of its HEAD reflog is no reflog line')
+    return newest
 
 
 def tree_of(repo, path):
     """'worktree' or 'clone' when `path` is one of the listed repository (by its origin URL), the folders this rule
-    looks at; None for anything else. Raises Unreadable when it cannot tell. The disk report's worktrees class."""
+    looks at; None for anything else. Raises Unreadable when it cannot tell. The disk report's worktrees class.
+    An orphaned worktree in the repository's folder counts as one (tree_answer keeps it under that name)."""
     kind = tree_kind(path)
+    if kind == 'worktree' and orphaned_worktree(path) is not None:
+        return kind
     return kind if kind is not None and same_repo(origin_url(path), repo.github) else None
 
 
@@ -452,6 +513,9 @@ def tree_answer(cfg, facts, repo, path):
         return 'folder', Refusal('could not read', str(ex)), '', None
     if kind is None:
         return None
+    gone = orphaned_worktree(path) if kind == 'worktree' else None
+    if gone is not None:            # whose it is cannot be read: it is in this repository's folder, and kept
+        return kind, Refusal('orphaned worktree', f'its git folder {gone} is gone (the main repository was removed)'), '', None
     try:
         url = origin_url(path)
     except Unreadable as ex:
