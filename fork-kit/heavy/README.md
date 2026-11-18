@@ -24,6 +24,9 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 | `heavy sweep [--dry-run]`    | one leftover sweep (below); the user timer runs it every 5 minutes                           |
 | `heavy sweep --json`         | looks only: what a sweep would stop or report, as JSON                                       |
 | `heavy docker-label`         | the owner label for a container a test starts (below)                                        |
+| `heavy --kind K <cmd>`       | waits in the memory queue until the job fits, then runs it (`--mb`, `--wait`: below)         |
+| `heavy queue [--json]`       | what the memory queue runs and holds, and the figures behind it                              |
+| `heavy waits [--days N]`     | minutes waited for memory per day (`--json` too)                                             |
 | `heavy -- <command>`         | runs a command named like one of the words above                                             |
 
 The command gets the same folder, environment, stdin, stdout, stderr and open files. heavy exits with the command's
@@ -49,6 +52,64 @@ limits), or when the slice has neither `MemoryMax` nor `MemoryHigh`.
 **Nested.** `heavy` inside a `heavy` command runs the inner command in the outer scope; the outer heavy cleans it
 up and prints the one line. With `HEAVY_KEEP=1`, the inner one gets a scope of its own (outside the outer one).
 `HEAVY_KEEP` is in the command's environment, so commands it starts that also use heavy keep their leftovers too.
+
+## Memory queue
+
+One queue for every heavy job of a user on the machine (CI jobs, agent builds, test servers), instead of a fixed
+number of build slots: `heavy --kind <name> [--mb N] <command>` reserves the memory the job needs and starts it only
+when that fits; the others wait in order. Without `--kind` heavy runs at once, as before (such jobs still count:
+their real use is in the slice's figures).
+
+- **What a job reserves:** its learned peak once its kind has 3 clean runs (exit 0), else `--mb` (the project's
+  measured start value), else 3072 MB. While a queued job runs, heavy samples its scope's memory every 3 s; after
+  exit 0 the highest sample goes into the kind's history (`peaks.json`, last 20 runs). The learned value is their
+  95th percentile x 1.15, rounded up to 128 MB, kept between half and 4x the start value. Kinds and start values
+  are project facts: they live in the project's config, which passes them as `--kind`/`--mb`.
+- **When it fits:** reservation <= budget - used - owed, and <= MemAvailable - `vmReserveMb` - owed, and the
+  slice is not under memory pressure. budget = the slice's `memory.high` (else `memory.max`, else `budgetMb`) minus
+  `headroomMb`; used = the slice's memory that is not clean cache, plus its swap (t3-capacity's box rule); owed =
+  for each admitted job, the part of its reservation its scope has not used yet (so a job that has not grown yet
+  still holds its room, and one that has is counted once).
+- **Order:** first come, first served. A job that does not fit lets later, smaller jobs pass until it has waited
+  `passLimitSeconds` (10 min); then nothing passes it, so big jobs never starve. A job larger than the whole budget
+  runs alone, once it is first and nothing else runs.
+- **Waiting** is a poll of the real figures every `pollSeconds` (2 s). heavy prints the reason and the position
+  when they change and once a minute, for example
+  `heavy: waiting for memory: typecheck needs 3072 MB, room 1108 MB (budget 4608 MB, used 3500, reserved not yet
+  used 0, available 9000); position 1 of 2, waited 1m00s`. After `--wait` seconds (default 7200) it gives up with
+  exit 76 and does not run the command. INT, TERM or HUP while waiting end it as they would end the command.
+- **Minutes waited:** each admission, give-up and stop is one JSON line in `~/.local/state/heavy/waits.log`;
+  `heavy waits` sums it per UTC day (jobs, minutes waited, longest wait, give-ups, minutes per kind). That figure
+  decides whether a machine needs more memory.
+- **Nested:** a `heavy --kind` inside a heavy command does not queue again: the outer job holds the memory.
+- **Limits:** the queue is per user and slice. It does not cap a job at its reservation (a job that grows past it
+  is still counted, in `used`).
+
+### Queue settings
+
+The optional `queue` object in the machine file's `heavy` section; without the file or the key the defaults hold:
+
+```json
+{ "version": 1, "heavy": { "queue": { "headroomMb": 512, "vmReserveMb": 1024, "pressureFull10": 5,
+  "pressureSome60": 10, "passLimitSeconds": 600, "pollSeconds": 2, "budgetMb": 0 } } }
+```
+
+`budgetMb` 0 means the slice's limit. An unknown key or a bad value is refused (heavy then runs no queued job; the
+message names the key). Install the release with the queue before you add the key: an older sweep refuses it.
+
+### The queue runs again, stops half-way, or meets old or empty state
+
+- **A waiter or a job dies** (any way, `kill -9` too): each job holds an exclusive `flock` on its own ticket file
+  in `/run/user/<uid>/heavy-queue/<slice>/` for its whole life. The kernel drops the lock with the process; the next
+  look (under the queue's lock) deletes tickets nobody holds. Nothing can stay reserved for a process that is gone.
+- **Runs again:** a new ticket gets the next place after the live ones; a finished job deletes its ticket.
+- **Reboot / empty state:** `/run/user/<uid>` is empty after a reboot; the folder is made again (mode 700, refused
+  when it is not the user's own). A missing wait log or peak history starts empty.
+- **Old or garbled state:** a live ticket that cannot be read (garbled, or another version's) counts as admitted at
+  3072 MB, with a note in `heavy queue`. A broken `peaks.json` starts a new history; one written by a newer heavy is
+  neither used nor changed. Links and other files in the folder are not followed.
+- **Two callers at the same instant:** taking a place and every admission happen under one `flock` on the queue's
+  `lock` file, so two callers always get two places, in order.
 
 ## Leftover sweep
 
@@ -221,8 +282,10 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | `/etc/heavy/installed.tsv`                      | every installed path with its link target or hash (`--self-check`)        |
 | `/etc/systemd/user/<slice>`                     | only with limit options: the slice unit                                   |
 | `/etc/systemd/user/heavy-sweep.{service,timer}` | only with `--sweep-timer`: the leftover sweep (each user enables it)      |
-| `/etc/fork-kit/machine.json`                    | written by the owner, never the kit: sweep settings                       |
+| `/etc/fork-kit/machine.json`                    | written by the owner, never the kit: sweep and queue settings             |
 | `~/.local/state/heavy-sweep/`                   | each user's sweep log, last report and lock                               |
+| `/run/user/<uid>/heavy-queue/<slice>/`          | the memory queue: its lock and one ticket per queued job (tmpfs)          |
+| `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`)        |
 
 ## Install (owner, as root)
 
@@ -264,6 +327,11 @@ removes them again). Upgrade: the same line again. Remove:
   has a unit with a memory limit (install with limit options, or add the unit).
 
 ## Tests
+
+`python3 -I -B fork-kit/heavy/tests/queue.test.py`: the memory queue on a fake cgroup tree and meminfo with a fake
+clock; real processes where the kernel matters (a waiter killed with -9, a crashed job, two callers at the same
+instant). Its red check breaks each admission and clean-up rule and shows the test for it then fails.
+`heavy.test.py` runs one queued job and one give-up (exit 76) with the real systemd user manager.
 
 `python3 -I -B fork-kit/heavy/tests/sweep.test.py`: the sweep on a fake host (a fake `/proc`, fake `systemctl`
 and `docker` from `tests/fake_tools.py`, a temporary machine file), no root and nothing real swept. Its red check

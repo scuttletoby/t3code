@@ -8,7 +8,7 @@ HEAVY_TEST_BIN runs the suite against another wrapper: with tests/old-heavy.sh (
 leftover test fails, which is the red check. Every test stops what it started: processes are found by their
 temporary folder in the command line, scopes by those processes.
 """
-import os, re, shutil, signal, subprocess, sys, tempfile, time, unittest
+import json, os, re, shutil, signal, subprocess, sys, tempfile, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEAVY = os.environ.get('HEAVY_TEST_BIN') or os.path.join(KIT, 'bin', 'heavy')
@@ -440,6 +440,44 @@ class Heavy(unittest.TestCase):
         r = self.heavy()
         self.assertEqual(r.returncode, 2)
         self.assertIn('usage: heavy', r.stderr)
+
+    # --- the memory queue (lib/heavy_queue.py; the rules themselves: tests/queue.test.py) ---------------------------
+
+    def queue_module(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader('heavy_queue', os.path.join(KIT, 'lib', 'heavy_queue.py'))
+        spec = importlib.util.spec_from_loader('heavy_queue', loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+
+    def test_a_queued_job_runs_is_logged_and_leaves_its_peak(self):
+        env = dict(self.env, HOME=self.dir)
+        r = self.heavy('--kind', 'heavy-test', '--mb', '64', '--', 'sleep', '4', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        state = os.path.join(self.dir, '.local', 'state', 'heavy')
+        with open(os.path.join(state, 'waits.log')) as f:
+            self.assertIn('"outcome": "admitted"', f.read())
+        with open(os.path.join(state, 'peaks.json')) as f:
+            self.assertGreater(len(json.load(f)['kinds']['heavy-test']), 0)
+        r = self.heavy('queue', '--json', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(os.getpid(), [j['pid'] for j in json.loads(r.stdout)['jobs']])
+
+    def test_a_queued_job_that_never_fits_gives_up_with_76(self):
+        hq = self.queue_module()
+        q = hq.Queue(hq.Box(SLICE, '', None), hq.machine_file.fields({}, hq.SETTINGS, 'test'), out=lambda m: None)
+        with q:                                     # a job that holds far more than any machine has
+            t = q.create('heavy-test-holder', 1 << 30, 'heavy-test-holder.scope', 'x')
+            t.data['state'] = 'admitted'
+            q.write(t)
+        try:
+            r = self.heavy('--kind', 'heavy-test', '--mb', '64', '--wait', '0', '--', 'true',
+                           env=dict(self.env, HOME=self.dir))
+        finally:
+            hq.release(q, t)
+        self.assertEqual(r.returncode, 76, r.stderr)
+        self.assertIn('gave up after waiting', r.stderr)
 
     # --- red check -----------------------------------------------------------------------------------------------
 
