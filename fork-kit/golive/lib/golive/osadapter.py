@@ -14,6 +14,7 @@ TIMEOUT = 30
 CGROUP_FILE = '/proc/self/cgroup'  # tests only change it
 MOUNTINFO = '/proc/self/mountinfo'  # tests only change it
 _UNIT_NAME = re.compile(r'^[A-Za-z0-9_.@-]{1,200}$')
+_PROPERTY = re.compile(r'^[A-Za-z]{1,40}=[A-Za-z0-9.]{1,40}$')
 
 
 class Unsupported(Exception):
@@ -90,6 +91,18 @@ class SystemdUser:
         except OSError:
             return True  # cannot tell: treat it as inside (fail closed)
 
+    def own_unit(self):
+        """The systemd unit this process runs in (the last field of its cgroup path, e.g. `name.service`), or
+        None when that cannot be read."""
+        try:
+            with open(CGROUP_FILE, encoding='utf-8') as f:
+                fields = [line.rstrip('\n').split(':', 2) for line in f]
+        except OSError:
+            return None
+        # systemd's own hierarchy: cgroup v2's single line, or v1's name=systemd line
+        names = {f[2].rsplit('/', 1)[-1] for f in fields if len(f) == 3 and f[1] in ('', 'name=systemd')}
+        return names.pop() if len(names) == 1 and '' not in names else None
+
     def unit_active(self, unit):
         """True while a transient unit (the copy's guard) runs; read only."""
         if not _UNIT_NAME.match(unit):
@@ -107,19 +120,23 @@ class SystemdUser:
         """Not started at boot (`back` keeps T3 off a half-restored home; upstream's update enables it again)."""
         self._run([SYSTEMCTL, '--user', 'disable', UNIT])
 
-    def run_detached(self, unit, argv, guard_after_seconds=None, guard_argv=None):
-        """Run argv as a transient user unit that outlives its caller (a restart of T3 kills anything inside it).
-        With a guard, a second transient timer runs guard_argv after guard_after_seconds, whatever happens to the
-        first (a crash or a reboot cannot leave T3 down)."""
+    def run_detached(self, unit, argv, guard_after_seconds=None, guard_argv=None, properties=()):
+        """Run argv as a transient user unit that outlives its caller (a restart of T3 kills anything inside it),
+        with the unit `properties` (Name=value). With a guard, a second transient timer runs guard_argv after
+        guard_after_seconds, whatever happens to the first (a crash or a reboot cannot leave T3 down)."""
         for name in (unit, f'{unit}-guard'):
             if not _UNIT_NAME.match(name):
                 raise AdapterError(f'not a safe unit name: {name!r}')
+        for prop in properties:
+            if not _PROPERTY.match(prop):
+                raise AdapterError(f'not a safe unit property: {prop!r}')
         if guard_argv is not None:
             if not (isinstance(guard_after_seconds, int) and guard_after_seconds > 0):
                 raise AdapterError('a guard needs a time in whole seconds')
             self._run([SYSTEMD_RUN, '--user', '--quiet', '--collect', f'--unit={unit}-guard',
                        f'--on-active={guard_after_seconds}s', '--timer-property=AccuracySec=1s', '--', *guard_argv])
-        self._run([SYSTEMD_RUN, '--user', '--quiet', '--collect', f'--unit={unit}', '--', *argv])
+        self._run([SYSTEMD_RUN, '--user', '--quiet', '--collect', f'--unit={unit}',
+                   *(f'--property={prop}' for prop in properties), '--', *argv])
 
 
 def _unescape(field):
