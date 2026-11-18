@@ -2,7 +2,7 @@ name: pr-queue
 description: >-
   A merge queue for a repository whose ruleset requires pull requests to be up to date: each run brings one waiting
   pull request up to date and turns auto-merge back on only for the head the review read (README.md). Needs a
-  self-hosted runner whose disk outlives the job, with git 2.38+, gh and python3.
+  self-hosted runner whose disk outlives the job, with git 2.43+, gh and python3.
 inputs:
   repo:
     description: The repository, owner/name.
