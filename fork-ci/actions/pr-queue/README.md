@@ -411,9 +411,48 @@ reads every object on one core: about 30 seconds for 270,000 objects, at most
 once per run (the queue makes at most one merge check per run). The cache is
 made with SHA-1 objects and files refs whatever git's defaults
 (`GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT`; git 3.0 plans others); a git
-that makes another format is refused, never written over. A job of the same
-user can still change the cache between that check and git's next read: only
-the runner rule above stops that.
+that makes another format is refused, never written over.
+
+That check ends before the merge check starts (in an update, minutes before),
+and whoever can write the cache could change an object in between. So the
+merge check never reads the cache. Right before it, the queue makes a
+repository of its own (`CACHE.merge`, mode `0700`, new in every run) and
+copies into it the objects the check reads: each one comes out of the cache
+through one `git cat-file --batch`, the queue hashes it itself, and only an
+object that hashes to its name is written. Every git call of the merge check
+(`merge-base`, `rev-parse`, `merge-tree`) then runs in that copy, so what is
+written to the cache after an object was copied cannot reach the merge.
+Copied are every commit the head, the change read and the base reach, and for
+each `merge-tree` the trees and blobs it can read: the root trees of the two
+sides and of their merge bases, and below them everything that is not the
+same entry in all of them (what no side changed is not read by a merge and is
+left out; a submodule entry names a commit of another repository and is never
+copied). On this fork (270,000 objects, 11,500 commits) that is about 2
+seconds for the commits and a fraction of a second for a merge of 300 changed
+files. Should git still say anything on stderr or stop there, the whole trees
+of the merged commits are copied (about 10 seconds a tree here) and the merge
+runs once more; a merge git calls clean while it reports an error is never
+taken as clean, and two sides with more than 8 merge bases are not merged at
+all (the head is then not the change read). An object that is missing or not
+what its name says is handled as a failed `git fsck` is: the cache is
+downloaded from scratch once and the merge check runs again in the same run;
+if it fails again, nothing is merged in, STATE stays and the PR comment says
+so; a download that fails the same way as the last one is not repeated. If
+the copy cannot be made (no room on the disk) nothing is known either, and the
+cache is kept. The copy is deleted when the check ends; what a killed run left
+at `CACHE.merge` is deleted by the next check.
+
+What the last download from scratch failed on is kept in `STATE.fsck-known`,
+next to the plan and not in the cache, and it is read only as a regular file
+of the queue's user that no one else can write. It can only stop a second
+download of the same broken history, never let a merge through; a healthy
+check deletes it. (Until this version it was `queue-fsck-known` inside the
+cache. That file is no longer read.)
+
+What is left for the runner rule above: a job of the same user can still
+write the queue's ref or config in the cache between the fetch and the moment
+the queue reads them, and can write into `CACHE.merge` during the seconds it
+exists.
 
 | Exit | Meaning                                                                                                     |
 | ---- | ----------------------------------------------------------------------------------------------------------- |
@@ -449,6 +488,11 @@ live in a comment of the queue's own login instead (trusted by
 the base from GitHub anyway, and a failed write before the disarm would only
 mean no disarm. That stays open for a queue that moves several pull requests at
 once, and for GitHub-hosted runners.
+
+Next to the plan the queue keeps `STATE.fsck-known` (what the last download
+of the cache from scratch failed on, if it did), and next to the cache
+`CACHE.merge` exists while a merge check runs. Both are the queue's own: give
+each queue its own `--state-file` and `--cache`.
 
 `--lock-file` (default: `STATE.lock`) keeps two runs from overlapping.
 `--dry-run` takes no lock and writes nothing: no `STATE`, no cache, no comment.

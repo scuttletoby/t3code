@@ -13,6 +13,31 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue: the merge check reads a checked copy, never the cache; FSCK_KNOWN out of the cache (#465)
+
+- `git fsck` on the cache ends before the merge check starts (in an update it runs in the background, minutes
+  before), and whoever can write the cache could change an object in between. The merge check now runs in a
+  repository of its own (`CACHE.merge`, mode `0700`, made new and deleted in every check): each object it reads is
+  taken out of the cache through one `git cat-file --batch`, hashed by the queue, and written there only when the
+  hash is its name. Copied are the commits the head, the change read and the base reach, and per `merge-tree` the
+  trees and blobs that differ between the two sides and their merge bases. Measured on this fork (270,000 objects,
+  11,500 commits): about 2 seconds for the commits, 0.1 seconds for a merge of 300 changed files.
+- An object that is missing or not what its name says is handled as a failed `git fsck` is: one download from
+  scratch and the merge check once more in the same run; a second failure merges nothing in (the run keeps `STATE`
+  and the PR comment says so), and a download that fails the same way as the last one is not repeated.
+- If git says anything on stderr or stops in the copy, the whole trees of the merged commits are copied and the merge
+  runs once more. A merge git calls clean while it reports an error is not taken as clean (git 2.43 merges a root
+  tree it cannot read as an empty one, with exit 0). More than 8 merge bases: not merged, the head is not the change
+  read.
+- What the last download from scratch failed on is kept in `STATE.fsck-known` (next to the plan, mode `0600`, read
+  only as a regular file of the queue's user that no one else can write), no longer in the cache as
+  `queue-fsck-known`.
+
+**Upgrade:** nothing to do. A `queue-fsck-known` inside a kept cache is ignored (never read, not deleted): a cache
+whose history fails `git fsck` from GitHub itself is downloaded from scratch once more, then the new record stops
+the next download. The copy is made beside the cache (`CACHE.merge`), where the queue already sets a broken cache
+aside.
+
 ### pr-queue and head-check: the cache's objects are checked before each merge check (#457)
 
 - Before its merge check the queue runs `git fsck` on its cache. git checks an object's hash on only some reads,
