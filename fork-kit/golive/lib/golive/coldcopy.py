@@ -330,9 +330,11 @@ def _file_sum(path):
 def _copy_sums(mark, copy_dir=None):
     """({name: {SHA256}} of the files the copies a restore record names (and copy_dir) hold, by their manifests;
     [those copies whose manifest cannot be read, so what they hold is unknown]; {name: {first WAL_HEADER bytes}} of
-    each -wal those copies hold that still matches its manifest SHA256)."""
+    each -wal those copies hold that still matches its manifest SHA256; {name: [path]} of each -wal of those copies
+    that is gone or no longer matches its manifest SHA256 (someone opened the copy's database in place), so its
+    header proves nothing: what begins with it is unknown, as with a copy that cannot be read)."""
     copies = [mark.get('copy')] + list(mark.get('alsoCopies', [])) + ([copy_dir] if copy_dir else [])
-    sums, unread, heads = {}, [], {}
+    sums, unread, heads, changed = {}, [], {}, {}
     for c in dict.fromkeys(os.path.normpath(c) if isinstance(c, str) else c for c in copies):
         try:
             if not isinstance(c, str):
@@ -345,27 +347,63 @@ def _copy_sums(mark, copy_dir=None):
             if isinstance(e, dict) and e.get('kind') == 'file' and isinstance(e.get('path'), str):
                 sums.setdefault(e['path'], set()).add(e.get('sha256'))
                 if e['path'].endswith('-wal') and '/' not in e['path']:
-                    head = _wal_head(os.path.join(c, 'userdata', e['path']), e.get('sha256'))
-                    if head is not None:
+                    wal = os.path.join(c, 'userdata', e['path'])
+                    try:
+                        digest = _file_sum(wal)
+                    except OSError:
+                        digest = None
+                    if digest is None or digest != e.get('sha256'):  # gone, unreadable, or other bytes
+                        changed.setdefault(e['path'], []).append(wal)
+                        continue
+                    head = _wal_head(wal)
+                    if head is not None:  # None: shorter than a header (an empty -wal), as its manifest says
                         heads.setdefault(e['path'], set()).add(head)
-    return sums, unread, heads
+    return sums, unread, heads, changed
 
 
 WAL_HEADER = 32  # SQLite's WAL header: magic, version, page size, checkpoint count, the two salts, its checksum
 
 
-def _wal_head(path, sha256=None):
-    """The WAL header of a regular file at path (None when it is shorter, not a regular file, or, with sha256, not
-    those bytes). The salts in it are new each time SQLite starts a WAL over: a WAL that begins with a copy's header
-    holds that copy's frames, whatever was appended after them."""
+WAL_FRAME_HEADER = 24  # before each page in a WAL; a frame is this and one page
+
+
+def _wal_head(path):
+    """The WAL header of a regular file at path (None when it is shorter or not a regular file). The salts in it
+    are new each time SQLite starts a WAL over: a WAL that begins with a copy's header holds that copy's frames,
+    whatever was appended after them."""
     try:
-        if not stat.S_ISREG(os.lstat(path).st_mode) or (sha256 is not None and _hash(path) != sha256):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
             return None
         with open(path, 'rb') as f:
             head = f.read(WAL_HEADER)
     except OSError:
         return None
     return head if len(head) == WAL_HEADER else None
+
+
+def _wal_begins_with(path, sha256):
+    """True when the WAL at path begins with exactly the bytes of that SHA256, up to its header or a whole frame
+    after it (a record holds a kept file's SHA256, not its length; a WAL ends on a whole frame). SQLite only appends
+    to a WAL until it starts it over, so a WAL that was moved back and appended to since begins with the bytes it
+    had when it was kept. False for anything else: no SHA256, not a regular file, no WAL page size in its header,
+    other bytes, or a kept length that is not a whole number of frames."""
+    try:
+        if not sha256 or not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        with open(path, 'rb') as f:
+            head = f.read(WAL_HEADER)
+            page = int.from_bytes(head[8:12], 'big')
+            if len(head) != WAL_HEADER or not 512 <= page <= 65536 or page & (page - 1):
+                return False
+            h = hashlib.sha256(head)
+            while h.hexdigest() != sha256:
+                frame = f.read(WAL_FRAME_HEADER + page)
+                if len(frame) != WAL_FRAME_HEADER + page:
+                    return False
+                h.update(frame)
+            return True
+    except OSError:
+        return False
 
 
 def _them(names, one='it', more='them'):
@@ -378,10 +416,13 @@ def _read_record(home, copy_dir=None):
     need not go back). A kept file gone while the home's file of that name holds the bytes of a copy's file (by the
     copy's manifest; one the record's copies restored, or copy_dir) and the kept file did not ('sums') is not moved
     back: it was deleted, and the home holds the half-way home's file. When a copy the record names cannot be read,
-    a kept file gone is taken as moved back only when the home's file holds the kept file's bytes ('sums'). The same
-    for a kept -wal gone while the home's -wal begins with the header of a copy's -wal: the copy's frames with a
-    T3's after them, or the old WAL moved back and appended to since (a WAL the copy was taken with keeps its
-    header), which cannot be told apart (fork #300). And the
+    a kept file gone is taken as moved back only when the home's file holds the kept file's bytes ('sums'); the same
+    for a kept -wal when a copy's -wal of that name is gone or no longer matches its manifest (its header then
+    proves nothing). And the same for a kept -wal gone while the home's -wal begins with the header of a copy's
+    -wal: the copy's frames with a T3's after them, or the old WAL moved back and appended to since (a WAL the copy
+    was taken with keeps its header). Those two are told apart by the kept bytes (fork #300): a -wal that begins
+    with exactly the kept -wal's bytes ('sums', see _wal_begins_with), which are not also a copy's -wal's, was
+    moved back and appended to: the home is the old home. Otherwise it cannot be told, and is not moved back. And the
     home then holds no -wal, -journal or -shm of a database the record names that the old home did not have: such a
     file is the half-way home's (the copy's WAL, or what a T3 started after the stop wrote), and next to the old
     database it would serve, or on the first checkpoint write, another database's pages.
@@ -393,8 +434,9 @@ def _read_record(home, copy_dir=None):
     rerun would keep that mix as the old home and name no more the kept files still out, such as the WAL with the
     commits), or a file of the half-way home is left beside it; the message names the files and whose each is: the
     copy's by its SHA256 or the copy's with more frames by its WAL header (move it out of userdata, keep the
-    record), a stray -shm (always safe to remove), or one that cannot be told (both readings, and how to tell them
-    apart on scratch copies)."""
+    record), a stray -shm (always safe to remove), or one that cannot be told (both readings, how to tell them
+    apart on scratch copies, and for a -wal what to do when that does not tell either: move it out of userdata,
+    never delete it)."""
     userdata = os.path.join(home, 'userdata')
     path = os.path.join(userdata, RESTORE_MARK)
     try:
@@ -430,7 +472,7 @@ def _read_record(home, copy_dir=None):
                                     for n in kept):
             _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved=False)
         return mark, False
-    sums, unread, heads = _copy_sums(mark, copy_dir)
+    sums, unread, heads, changed = _copy_sums(mark, copy_dir)
     kept_sums = mark.get('sums', {})
     def copys(name, digest):
         return digest is not None and digest in sums.get(name, ())
@@ -438,21 +480,25 @@ def _read_record(home, copy_dir=None):
            and not _same_file(os.path.join(userdata, n), os.path.join(userdata, base(n)))]
     lost = [n for n in gone if not base(n).endswith('-shm') and not os.path.lexists(os.path.join(userdata, base(n)))]
     lost_copy = []  # deleted: the home's file of that name is the copy's, and the kept one was not
-    unknown = []  # a copy cannot be read, and the home's file is not the kept bytes: moved back or deleted?
-    appended = []  # a -wal, not the kept bytes, that begins with a copy's WAL header: moved back or deleted?
+    unknown = []  # a copy (or its -wal) cannot be read, the home's file is not the kept bytes: moved back or deleted?
+    appended = []  # a -wal that begins with a copy's WAL header, not proven to begin with the kept bytes: the same
     for n in gone:
         if base(n).endswith('-shm') or n in lost:
             continue
-        digest = _file_sum(os.path.join(userdata, base(n)))
+        in_home = os.path.join(userdata, base(n))
+        digest = _file_sum(in_home)
         if copys(base(n), digest) and kept_sums.get(n) != digest:
             lost_copy.append(n)
-        elif unread and digest is not None and kept_sums.get(n) != digest:
+        elif (unread or changed.get(base(n))) and digest is not None and kept_sums.get(n) != digest:
             unknown.append(n)
         elif (base(n).endswith('-wal') and digest is not None and kept_sums.get(n) != digest
-              and _wal_head(os.path.join(userdata, base(n))) in heads.get(base(n), ())):
+              and _wal_head(in_home) in heads.get(base(n), ())):
             # Fork #300: the copy's frames with a T3's after them (the kept -wal was deleted), or the old WAL moved
             # back and appended to since: a WAL the copy was taken with keeps its header, so the header cannot say.
-            appended.append(n)
+            # The kept bytes can: only a -wal that was moved back begins with them. Unless they are a copy's -wal's
+            # too (the old home wrote nothing after that copy): then the half-way home's WAL begins with them as well.
+            if copys(base(n), kept_sums.get(n)) or not _wal_begins_with(in_home, kept_sums.get(n)):
+                appended.append(n)
     if out or lost or lost_copy or unknown or appended:
         said = ([f'{", ".join(out)} not back in the home'] if out else []) \
             + ([f'{", ".join(lost)} gone from the home too'] if lost else []) \
@@ -461,14 +507,19 @@ def _read_record(home, copy_dir=None):
                 f'copy\'s file (its manifest SHA256), not the kept {_them(lost_copy, "one", "ones")}, so '
                 f'{_them(lost_copy)} was deleted'] if lost_copy else []) \
             + ([f'{", ".join(unknown)}: the home\'s {", ".join(base(n) for n in unknown)} '
-                f'{_them(unknown, "does", "do")} not hold the kept bytes (the SHA256 in the record), and with no '
-                f'readable manifest in {", ".join(unread)} it cannot be told whether {_them(unknown, "it", "they")} '
+                f'{_them(unknown, "does", "do")} not hold the kept bytes (the SHA256 in the record), and with '
+                f'{_unread_why(unread, changed, [base(n) for n in unknown])} it cannot be told whether '
+                f'{_them(unknown, "it", "they")} '
                 f'{_them(unknown, "was", "were")} moved back and written since, or deleted with the half-way home\'s '
-                f'file left in {_them(unknown, "its", "their")} place; to tell a database or its -wal, ' + _SCRATCH]
+                f'file left in {_them(unknown, "its", "their")} place; to tell a database or its -wal, ' + _SCRATCH
+                + ('; for a -wal you still cannot tell: ' + _WAL_OUT + ': ' + _WAL_OUT_WHY
+                   if any(base(n).endswith('-wal') for n in unknown) else '')]
                if unknown else []) \
             + ([f'{", ".join(appended)}: the home\'s {", ".join(base(n) for n in appended)} '
                 f'{_them(appended, "does", "do")} not hold the kept bytes (the SHA256 in the record) and '
-                f'{_them(appended, "begins", "begin")} with the header (salts included) of a copy\'s -wal, so it '
+                f'{_them(appended, "begins", "begin")} with the header (salts included) of a copy\'s -wal, and '
+                f'nothing proves {_them(appended, "it is", "they are")} the kept -wal with more frames after it (no '
+                'whole frames from its start are the kept bytes, or the kept bytes are a copy\'s -wal\'s too), so it '
                 f'cannot be told whether {_them(appended, "it", "they")} {_them(appended, "was", "were")} moved back '
                 f'and a T3 appended to {_them(appended)} since (a WAL the copy was taken with keeps its header; the '
                 f'home is then the old home: keep {_them(appended)} and remove the record), or deleted with the '
@@ -476,7 +527,8 @@ def _read_record(home, copy_dir=None):
                 f'{_them(appended, "its", "their")} place (what only the kept -wal held is then gone unless that '
                 f'file can be got back, and the home\'s -wal is not the old home\'s: move {_them(appended)} out of '
                 f'userdata (do not delete {_them(appended)}), then remove the record). Whoever put the files back '
-                'knows which; if not, ' + _SCRATCH] if appended else [])
+                'knows which; if not, ' + _SCRATCH + '. If you still cannot tell: ' + _WAL_OUT + ', then remove the '
+                'record: ' + _WAL_OUT_WHY] if appended else [])
         raise RuntimeError(f'{path} names the kept files of the old home, but they are only partly put back '
                            f'({", ".join(gone)} gone from the kept files; ' + '; '.join(said) + '): '
                            'finish putting the kept files back (a rerun then names any -wal, -journal or -shm left '
@@ -490,7 +542,23 @@ def _read_record(home, copy_dir=None):
 _SCRATCH = ('open scratch copies, never the files in the home: copy the database alone into one empty folder and the '
             'database with the -wal into another, open each with sqlite3 and compare the row counts (PRAGMA '
             'integrity_check too): the old home\'s WAL gives a whole database with what it holds alone plus newer '
-            'rows; a WAL of the copy\'s database gives the copy\'s rows, or fewer than the database alone')
+            'rows, the old home\'s last among them; a WAL of the copy\'s database gives the copy\'s rows, or fewer '
+            'than the database alone, or, with a T3\'s commits after the copy\'s frames, the copy\'s rows and that '
+            'T3\'s (more rows than the database alone does not make it the old home\'s: what the old home wrote '
+            'after the copy was taken is then missing)')
+# The way out for a -wal when nothing tells whose it is: out of userdata, never deleted (what follows it differs).
+_WAL_OUT = 'move it out of userdata (do not delete it)'
+_WAL_OUT_WHY = ('nothing more is lost, the moved file keeps what it holds (if it was the old home\'s WAL, it goes '
+                'with the database the next restore keeps)')
+
+
+def _unread_why(unread, changed, names):
+    """Why a copy's files or WAL header are unknown: no readable manifest, or a -wal (of `names`) that changed."""
+    wals = [w for n in names for w in changed.get(n, [])]
+    return ' and '.join(
+        ([f'no readable manifest in {", ".join(unread)}'] if unread else [])
+        + ([f'{", ".join(wals)} no longer {_them(wals, "matches its manifest", "match their manifests")}, so '
+            f'{_them(wals, "its", "their")} WAL header proves nothing'] if wals else []))
 
 
 def _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved):
@@ -501,7 +569,7 @@ def _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved):
     still there, so the record stays live and the rerun names them as the old home)."""
     then = ('the record is then stale: the home is kept as the old home' if moved else
             'the record stays live: the rerun names its kept files as the old home')
-    sums, unread, heads = _copy_sums(mark, copy_dir)
+    sums, unread, heads, changed = _copy_sums(mark, copy_dir)
     wals = [c for c in foreign if not c.endswith('-shm')]
     theirs = [c for c in wals if sums.get(c, set()) & {_file_sum(os.path.join(userdata, c))} - {None}]
     mixed = [c for c in wals if c not in theirs and c.endswith('-wal')
@@ -534,8 +602,9 @@ def _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved):
                     f'({then})')
     if groups['unsure']:
         g = groups['unsure']
+        why = _unread_why([], changed, g)
         why = (f'no readable manifest in {", ".join(unread)}, so the copy\'s files are unknown' if unread else
-               'not its SHA256, not its WAL header')
+               'not its SHA256, not its WAL header' + (f'; {why}' if why else ''))
         said.append(f'whose {", ".join(g)} {_them(g, "is", "are")} cannot be told ({why}). Either a T3 ran on the '
                     'put-back home with the record still there and wrote it: then it holds that T3\'s newest '
                     'commits: keep it and remove the record. Or a T3 ran on the half-way home (the copy\'s database) '
