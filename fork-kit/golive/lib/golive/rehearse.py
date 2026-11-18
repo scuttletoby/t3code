@@ -102,26 +102,36 @@ def _apart(a, b):
             and os.path.commonpath([a, b]) not in (os.path.normpath(a), os.path.normpath(b)))
 
 
+def _no_list(e, what, done):
+    """The refusal when the mount list cannot be read: a system without one, or a read that failed now (named)."""
+    why = 'run again' if isinstance(e, osadapter.Unreadable) else 'rehearse cannot run on this system'
+    return journal.Refused(f'{e}: {why}, as the kit cannot tell whether {what}; {done}')
+
+
 def _not_bound_live(path, home, done):
     """Refused when the mount list shows `path` as a folder of a filesystem that is, holds or is inside a folder of
     the live T3 data: the home, where its userdata really is (a link elsewhere, or its own partition), and each
     mount at or under either. A bind of any folder of these (at the backups folder, say) gives no file id the kit
     compares, but its mount names the folder it came from (field 4) on its device. Refused too when the list cannot
-    tell: rehearse then cannot run on this system at all. The kit tells filesystems apart only by that device: the
+    tell: rehearse then cannot run on this system at all (or, after a passing read error, until it reads); refused
+    too when the mount tree cannot tell which mount is on top (osadapter.source). The kit tells filesystems apart only by that device: the
     same files through a second mount of their own (NFS twice, FUSE/bindfs, a Windows drive twice on WSL) pass."""
     try:
         entries = osadapter.mounts()
     except osadapter.Unsupported as e:
-        raise journal.Refused(f'{e}: rehearse cannot run on this system, as the kit cannot tell whether {path} is a '
-                              f'bind mount of a folder of the live T3 home; {done}') from None
+        raise _no_list(e, f'{path} is a bind mount of a folder of the live T3 home', done) from None
     tops = (os.path.realpath(home), os.path.realpath(os.path.join(home, 'userdata')))
-    mine = osadapter.source(os.path.realpath(path), entries)
-    live_ones = [(top, osadapter.source(top, entries)) for top in tops]
+    try:
+        mine = osadapter.source(os.path.realpath(path), entries)
+        live_ones = [(top, osadapter.source(top, entries)) for top in tops]
+    except osadapter.Unsupported as e:
+        raise journal.Refused(f'{e}; so the kit cannot tell whether {path} is a bind mount of a folder of the live T3 '
+                              f'home; {done}') from None
     if mine is None or any(one is None for _, one in live_ones):
         raise journal.Refused(f'the mount list {osadapter.MOUNTINFO} holds no mount of {path} or of {home}: the kit '
                               f'cannot tell whether one is a bind mount of the other; {done}')
-    live_ones += [(point, (dev, root)) for dev, root, point in entries
-                  if any(os.path.commonpath([os.path.normpath(point), top]) == top for top in tops)]
+    live_ones += [(m.point, (m.dev, m.root)) for m in entries
+                  if any(os.path.commonpath([os.path.normpath(m.point), top]) == top for top in tops)]
     for where, (dev, folder) in live_ones:
         if dev == mine[0] and not _apart(mine[1], folder):
             raise journal.Refused(f'{path} is, by a bind mount, {mine[1]} of device {mine[0]}: the live T3 data at '
@@ -245,8 +255,7 @@ def _guard_old(cfg, root):
     try:
         points = osadapter.mount_points()
     except osadapter.Unsupported as e:
-        raise journal.Refused(f'{e}: rehearse cannot run on this system, as the kit cannot tell whether a mount is '
-                              f'in the old rehearsal folder {root}; nothing was changed') from None
+        raise _no_list(e, f'a mount is in the old rehearsal folder {root}', 'nothing was changed') from None
     real = os.path.realpath(root)
     inside = [m for m in points if os.path.commonpath([real, os.path.normpath(m)]) == real]
     if inside:
@@ -329,9 +338,10 @@ def _clone(run, cfg, p):
 
 def _r0_clone(cfg, p):
     """R0 on the clone itself, apart from how it was made: nothing in it may lead to the live T3. The clone exists
-    by now, so a refusal here is a failure of the run (only the clone was made)."""
+    by now, so a refusal here is a failure of the run (only the rehearsal folder was redone)."""
     try:
-        _not_live(p['home'], cfg.home, done='only the clone was made; nothing ran on it')
+        _not_live(p['home'], cfg.home, done='only the rehearsal folder was redone (any previous rehearsal folder was '
+                                            'removed, the clone made); nothing ran on it')
     except journal.Refused as e:
         raise Failed(f'R0 on the clone: {e}') from None
     found = [n for n in NEVER_IN_CLONE if os.path.lexists(os.path.join(p['home'], 'userdata', n))]

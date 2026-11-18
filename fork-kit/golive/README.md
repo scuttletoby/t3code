@@ -256,26 +256,33 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   bind mount of any folder inside the live home, at the backups folder say, keeps the device and gives no id the
   kit compares, but its mountinfo line names the folder it came from, so the folder the rehearsal folder is on its
   filesystem must be apart from each folder of the live data: the home, where its `userdata` really is (a link
-  elsewhere, or its own partition), and every mount at or under either; the mount that holds a path is the last one
-  in the list that covers it, as a later mount on a parent hides an earlier one below it); an old one is a real folder (no link) that bears the kit's
+  elsewhere, or its own partition), and every mount at or under either; the mount that holds a path is the one on
+  top, found by the mount tree (mount id and parent id), not by the list's order, which a moved mount or one placed
+  beneath another does not keep: from the one mount above the path with no parent listed, into the child above the
+  path with the shortest mount point, until none; where the tree cannot tell (a parent missing, a cycle, two
+  mounts on one point with one parent) the run is refused); an old one is a real folder (no link) that bears the kit's
   mark `.golive-rehearsal` (or is empty), with no folder in it that is the live home or on another device, no mount
   point at or under it in the system's mount list (`/proc/self/mountinfo`: a bind mount of the same filesystem keeps
   its device id), and no link to another home's ownership lock; no server holds it; the copy is not inside it (nor
   a link into it); the port is free and is neither the live port nor 3773; `backupDir` holds 3 x the copy plus the
   floor. Where the mount list cannot be read or is empty (any OS but Linux, no `/proc`), every run is refused before
   any step: rehearse cannot run on that system at all (it cannot tell a bind mount), and removing an old rehearsal
-  folder by hand does not change that. **R0 on the clone**: the clone leaves out
+  folder by hand does not change that. Where reading it failed this time (too many open files, say), the refusal
+  names the error: run again. **R0 on the clone**: the clone leaves out
   `secrets/` and the live machine's process records (`device/`, `relay-clients/`), with what a copy never holds
   (`server-runtime.json`, the ownership lock); it reads back against the manifest and is checked to hold none of
   those: a runtime record would point the CLI at the LIVE server; and it is apart from the live data as above (if
-  not, the run fails: only the clone was made, nothing ran on it).
+  not, the run fails: only the rehearsal folder was redone, any previous one removed and the clone made; nothing ran
+  on it).
 - **The clone step** runs the old-folder guard again right before it removes anything (a mount or a swap since R0
   is caught), then removes the old folder with its mark last: it opens the folder without following a link, checks
   it is the one the guard checked (device and inode), and removes its contents through that handle, so a swap of the
   path after the check removes nothing of what is there now.
 - **Limits of these checks**: filesystems are told apart only by the mount list's device number, so the same files
   reached through a second mount of their own (NFS mounted twice, a FUSE or bindfs view, a Windows drive mounted
-  twice on WSL) are not caught: keep `backupDir` off any such second view of the live home. The guard takes the old
+  twice on WSL) are not caught: keep `backupDir` off any such second view of the live home. Only the kit's own mount
+  view is read: a live service with its own mount namespace (systemd `BindPaths=`, say) can see the live data at a
+  path the kit does not know. The guard takes the old
   folder's identity first and then checks by path: a swap still there at its end is refused, a swap away and back
   during it (a same-user process racing the kit) is not. A mount made inside the old folder after the guard (root
   only) is not checked by the removal, and the last `rmdir` goes by path (it only ever removes an empty folder).
@@ -314,6 +321,8 @@ reusing one half-migrated. A run that needs settling still blocks it.
 | A swap (link, other folder) after that check            | The run fails; what is at the path now is never removed                       |
 | A mount point at or under the folder                    | Refused; never removed                                                        |
 | No mount list (not Linux, no `/proc`, an empty list)    | Refused before any step: rehearse cannot run there at all                     |
+| Reading the mount list failed this time                 | Refused before any step, naming the error; run again                          |
+| Mount tree cannot tell which mount is on top            | Refused before any step (a parent missing, a cycle, two on one point)         |
 | Python older than 3.11                                  | Refused before any step; an old rehearsal folder is kept                      |
 | `--copy` inside the rehearsal folder, or a link into it | Refused before any step: the clone step would remove it                       |
 | R2 left migrations pending                              | The run fails before R3: the server would migrate unmeasured                  |
