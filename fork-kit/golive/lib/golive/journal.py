@@ -218,6 +218,9 @@ class Run:
         self._holds_lock = False
         self._step = None
         self._broken = None  # the step an exception left without "done"
+        # True: an interrupt or kill that is not an Exception (KeyboardInterrupt, SystemExit) leaves no end line, as a
+        # SIGKILL would, so a guard waiting on this run (the switch's) puts things back; see run().
+        self.hold_end = False
 
     @property
     def in_step(self):
@@ -287,9 +290,10 @@ def run(state_dir, command, may_follow=(), scratch=False):
     is in may_follow (`back` finishes a back or switch stopped half-way), journal begin and end. An exception ends
     the run "failed" and goes on (after a started step it then needs settling); Refused after every started step is
     done ends it "refused" (no settling), except in a run that follows one: that one still needs settling until a
-    run ends ok. A kill leaves it with no end for the next run to report. scratch=True: every step changes only the
-    run's own throwaway folder (rehearse's clone), so a stop or an error needs no settling: the next run redoes it
-    from the start."""
+    run ends ok. A kill leaves it with no end for the next run to report; so does an interrupt that is not an
+    Exception once the run set hold_end (its guard then acts). scratch=True: every step changes only the run's own
+    throwaway folder (rehearse's clone), so a stop or an error needs no settling: the next run redoes it from the
+    start."""
     with lock(state_dir, command, exclusive=True):
         last = unfinished(state_dir)
         if last is not None and last['command'] not in may_follow:
@@ -309,6 +313,8 @@ def run(state_dir, command, may_follow=(), scratch=False):
                 r._append('end', result=result, detail=_detail(e))
                 raise
             except BaseException as e:
+                if r.hold_end and not isinstance(e, Exception):
+                    raise  # no end line: to the journal this is a kill, and the run's guard acts on it
                 r._append('end', result='failed', detail=_detail(e))
                 raise
             r._append('end', result='ok', detail=None)

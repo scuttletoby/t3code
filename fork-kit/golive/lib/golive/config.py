@@ -75,6 +75,7 @@ SPEC = {
     'postHooks': (list, (), _absolute_list),
     'quietWaitSeconds': (int, 7200, _quiet_wait),    # how long to wait for a quiet point, then give up
     'stopLimitSeconds': (int, 1800, _positive),      # longest T3 stays stopped for a copy; then it starts again
+    'rehearsalMaxAgeHours': (int, 72, _positive),    # switch refuses a rehearsal older than this
 }
 # The kit's own folders; none may be the T3 home or inside it (check promises to write nothing there).
 OWN_FOLDERS = ('stateDir', 'backupDir', 'stageDir')
@@ -98,6 +99,7 @@ class Config:
         self.pre_hooks, self.post_hooks = tuple(values['preHooks']), tuple(values['postHooks'])
         self.quiet_wait_seconds = values['quietWaitSeconds']
         self.stop_limit_seconds = values['stopLimitSeconds']
+        self.rehearsal_max_age_hours = values['rehearsalMaxAgeHours']
         for key in OWN_FOLDERS:
             if _inside(values[key], self.home):
                 raise machine_file.MachineFileError(

@@ -29,7 +29,8 @@
     "preHooks": ["/srv/example/golive/bin/pause-jobs"],
     "postHooks": ["/srv/example/golive/bin/resume-jobs"],
     "quietWaitSeconds": 7200,
-    "stopLimitSeconds": 1800
+    "stopLimitSeconds": 1800,
+    "rehearsalMaxAgeHours": 72
   },
   "pc-agents": {
     "organization": "Example home lab",
