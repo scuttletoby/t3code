@@ -19,8 +19,8 @@ import random
 import sys
 import time
 
-SHRINK_RUNS = 300   # plays at most while shrinking one failure
-SHRINK_SECONDS = 20   # and at most this long (a backstop: SHRINK_RUNS normally ends it first)
+SHRINK_RUNS = 300   # plays at most while shrinking one failure: the cap. A test with slow plays passes runs= so
+SHRINK_SECONDS = 20   # that runs x one play stays under this backstop, which only ends a shrink that got slower
 MAX_TRIES = 100000
 
 
@@ -42,7 +42,7 @@ def settings(seed, tries, env=None):
         raw = env.get(name, '')
         if raw == '':
             return default
-        if not raw.strip().isdigit() or not low <= int(raw) <= high:
+        if not (raw.isascii() and raw.isdigit()) or not low <= int(raw) <= high:   # isdigit alone takes '²', '٣'
             raise ValueError(f'{name}={raw!r} is not a whole number from {low} to {high}')
         return int(raw)
     seed = number('LAWS_SEED', seed, 0, 2 ** 63)
@@ -59,6 +59,9 @@ def rng_for(name, seed, i):
 
 
 def failure_key(e):
+    """What shrinking keeps: the law's name, or for a crash its exception type. So two different crashes of one type
+    (two KeyErrors) count as the same failure, and a shrunk list may show the other one: its report names the crash
+    it ended with."""
     return e.law if isinstance(e, Broken) else type(e).__name__
 
 
@@ -73,7 +76,8 @@ def play_once(play, steps):
 
 def shrink(play, steps, key, runs=SHRINK_RUNS, seconds=SHRINK_SECONDS, clock=time.monotonic):
     """(shortest list found, its exception, whether shrinking finished): drops runs of steps, halving the run length,
-    and keeps a shorter list only when it breaks the same law (key). Capped by `runs` plays and `seconds`."""
+    and keeps a shorter list only when it breaks the same law (key). Capped by `runs` plays (the cap a test sizes to
+    its plays) and by `seconds` (a backstop)."""
     best, error, done = list(steps), None, True
     end, used = clock() + seconds, 0
     chunk = max(len(best) // 2, 1)

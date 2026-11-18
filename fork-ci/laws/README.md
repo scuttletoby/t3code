@@ -52,6 +52,10 @@ def play(steps):              # a fresh start every time; raise laws.Broken('L1 
 laws.check('my-laws', generate, play, seed=464, tries=40)
 ```
 
+Shrinking stops after `runs` plays (default 300) or 20 s, whichever comes first. The play count is the cap; the
+time is a backstop. A test whose plays are slow passes a smaller `runs=` (the pr-queue pilot: 50 plays of about
+0.35 s), so the count ends a shrink and the same failure always shrinks to the same list.
+
 `play` raises `laws.Broken(law, detail)` when a law does not hold; any other exception fails too (keyed by
 its type). Shrinking keeps a shorter list only when it breaks the same law, so the printed list shows that
 law and not another bug met on the way.

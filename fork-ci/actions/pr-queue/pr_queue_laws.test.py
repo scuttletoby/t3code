@@ -4,11 +4,13 @@ The contract these keep: fork-ci/laws/README.md. pr_queue.test.py tests each ste
 plays generated histories against the real Queue: people arm and disarm, authors push (new content, a merge of main, an
 edit of a main file, a force-push back), lenses post reads (of the head, of an older head, of no commit), CI passes,
 fails or runs, main moves, GitHub merges, and queue runs come in between, some killed half-way (at a gh call, after a
-write GitHub applied, at a git call), some with a gh call that fails or that GitHub applied but reported as failed,
-with a push, a main move or a CI result in the middle of the run, with a head GitHub shows late, and with arm
-refusals "required check is queued". The start state is EMPTY (no plan, no cache) or OLD (a cache an earlier run left,
-maybe emptied, a plan in an older queue's format without `repo`, a `.bad` plan, folders a killed run left). Every run
-is a new Queue on the same STATE, cache and lock: what a rerun after a stop sees.
+write GitHub applied, at a git call), some with a gh call that fails or that GitHub applied but reported as failed
+(aimed at a call number or at the first disarm, arm, update-branch or comment; sometimes the read-back after it fails
+too), with a git fetch that fails as the network does, with a push, a main move, a CI result or a person's arm or disarm
+in the middle of the run, with a head GitHub shows late, and with arm refusals "required check is queued". The start
+state is EMPTY (no plan, no cache) or OLD (a cache an earlier run left, maybe emptied, an older queue's plan without
+`repo` at a head it already updated, a plan cut off half-way, a `.bad` plan, folders a killed run left). Every run is a
+new Queue on the same STATE, cache and lock: what a rerun after a stop sees.
 
 The laws, checked at every gh call and after every run:
   L1 the queue arms only a change someone vouched for: the head it names in --match-head-commit is exactly the lenses'
@@ -17,11 +19,20 @@ The laws, checked at every gh call and after every run:
   L2 while a plan names a PR, the queue writes to no other PR; a run turns auto-merge off on at most one PR.
   L3 update-branch only on a PR this run turned off, while it is off.
   L4 never off and silent: after every run (killed or not), each PR the queue turned off is armed again, was told on
-     the PR (leave_off, tell_once), or is named by the plan the next run finishes.
-  L5 only allowed moves: the queue turns off only an armed PR and arms only a PR it turned off itself (never one a
-     person left off or never armed). The one exception is documented (README.md, "A plan does not say who turned
-     auto-merge off"): the PR a stopped run's plan names is re-armed even if a person disarmed it after the stop.
+     the PR (leave_off, tell_once), or is named by the plan the next run finishes. Stated exception (README.md, "An
+     unreadable plan ... is kept as STATE.bad, the run fails"): when the plan itself is broken, the PR it named may stay
+     OFF with only the run's log line saying so.
+  L5 only allowed moves: the queue turns off only an armed PR and arms only a PR this run turned off or the plan it
+     finishes names, and only while it is off by the queue. The documented exception (README.md, "A plan does not say
+     who turned auto-merge off"): that PR is re-armed even if a person disarmed it after the run that wrote the plan
+     ended.
   L6 a stopped run is always finished: one run without faults after any history leaves no plan.
+  L7 progress: an update with nothing in its way (no faults but a head shown late within the polls, lenses that agree
+     on the head, a green head, no conflict) ends armed.
+
+Known limit (not in the README; a finding of #464, pinned in FIXED as "mid-run race"): a person who arms or disarms
+the PR in the middle of the run that moves it is overridden. The queue acts on its own read of the PR and GitHub has
+no compare-and-set for auto-merge, so L3 and L5 let that run (and the run that finishes its plan) go on.
 
 The model of GitHub is real git (a local bare repository; fetch by sha as on GitHub) and a fake `gh`, as in
 pr_queue.test.py. The guard below fails the run if anything starts the real gh; nothing reaches the network.
@@ -76,6 +87,7 @@ CFG = config.parse(json.dumps({
     'override': {'prefix': 'tool ready --head', 'author_association': 'OWNER'}, 'ready_command': 'tool ready {pr}',
     'push_command': 'tool push', 'lens_format_doc': 'docs/review.md', 'head_check': 'review-check'}))
 CHECKS = ('build', 'test', 'review-check')
+WRITE_KINDS = ('disarm', 'update-branch', 'arm', 'comment')   # the queue's writes, as fault targets
 BOGUS = 'de' * 20   # a full sha that is no commit
 LENS = 'lens'   # built at run time: no line of this file starts with the lens marker
 OFF_SAID = ('pr_queue turned auto-merge OFF', 'pr_queue was stopped half-way')
@@ -83,7 +95,8 @@ QUEUED = 'GraphQL: Required status check "build" is queued (mergePullRequest)'
 HUB_ENV = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
            'GIT_COMMITTER_EMAIL': 't@t', 'GIT_AUTHOR_DATE': '1762473600 +0000',
            'GIT_COMMITTER_DATE': '1762473600 +0000'}   # fixed dates: the same steps make the same shas
-SEED, TRIES = 464, 60   # CI: this seed and these tries (fork-ci/laws/README.md); LAWS_SEED / LAWS_TRIES for more
+SEED, TRIES = 464, 72   # CI: this seed and these tries (fork-ci/laws/README.md); LAWS_SEED / LAWS_TRIES for more
+SHRINK_RUNS = 50   # a play takes about 0.35 s: 50 plays stay under laws.SHRINK_SECONDS, the backstop
 
 # What the fixed seed must reach (laws.Coverage): a generator that drifts into proving nothing goes red.
 MUST_SEE = (
@@ -93,11 +106,20 @@ MUST_SEE = (
     'gh call failed', 'applied but reported failed', 'event in the middle of a run', 'head shown late past the polls',
     'arm refused: check queued', 'not exactly the change read', 'lenses disagree', 'merge state DIRTY',
     'merge state UNKNOWN', 'merged by GitHub', 'red check skipped',
+    # each fault on each kind of write, and what the queue does after a disarm it cannot be sure of
+    *(f'{f} on {k}' for f in ('kill', 'kill_after', 'fail', 'lie') for k in WRITE_KINDS),
+    'disarm failed', 'disarm unclear: STATE stays', 'git fetch failed', 'merge check unknown',
+    'merge check unknown in recover', 'recovered a plan at a newer head than its read', 'broken plan kept as .bad',
+    'a person arms mid-run', 'a person disarms mid-run',
+    'update with nothing in its way',
 )
 
 
 class Killed(BaseException):
-    """The process dies here (the job timeout, kill -9)."""
+    """The process dies here (the job timeout, kill -9). Simulated by an exception, so the queue's stack unwinds: its
+    finally blocks and with blocks still run (the lock is let go, a merge copy is removed), which a real kill -9 does
+    not. What a real kill leaves on disk beyond the plan (CACHE.merge, CACHE.new, CACHE.old-*) therefore comes only
+    from the OLD start state's leftover folders."""
 
 
 def ok(out=''):
@@ -114,6 +136,9 @@ class PR:
         self.state, self.armed, self.mode = 'OPEN', False, 'never'   # mode: armed, queue-off, human-off, never
         self.armed_heads, self.told = set(), False   # heads it had while armed; queue said OFF since its disarm
         self.comments, self.lenses, self.created, self.unknown = [], [], created, 0
+        # plan_run: the run whose plan named it at its disarm; off_after: the last run that had ended when a person
+        # turned it off; raced: the run in which a person armed or disarmed it mid-run; plan_lost: its plan is broken
+        self.plan_run, self.off_after, self.raced, self.plan_lost = None, None, None, False
 
 
 class World:
@@ -133,8 +158,9 @@ class World:
         self.main, self.prs, self.checks = [], {}, {}
         self.seen, self.out, self.step_no = set(), '', 0
         self.in_run, self.faults, self.events, self.queued, self.update_lag = False, {}, {}, 0, 0
-        self.calls = self.git_calls = 0
-        self.disarmed_now = set()
+        self.calls = self.git_calls = self.fetches = 0
+        self.disarmed_now, self.kind_faults, self.after_faults, self.fired = set(), {}, {}, set()
+        self.bad_said, self.progress, self.no_faults = False, None, False
 
     # --- git on "GitHub" --------------------------------------------------------------------------------------------
     def g(self, *a, input=None, codes=(0,)):
@@ -217,12 +243,19 @@ class World:
             shutil.rmtree(self.cache)
             os.mkdir(self.cache)
             self.seen.add('old cache emptied')
-        if plan:   # an older queue stopped right after its disarm of #1; its plan has no `repo`
+        if plan:   # an older queue turned #1 off, updated it and stopped before re-arming it; its plan has no `repo`
             p = self.prs[1]
-            p.armed_heads.add(p.head)
-            p.mode, p.told = 'queue-off', False
-            Q.write_text(self.state, json.dumps({'pr': 1, 'old': p.head, 'base': 'main', 'read': p.head}))
-            self.seen.add('old plan without repo')
+            read = p.head
+            p.armed_heads.add(read)
+            p.mode, p.told, p.plan_run = 'queue-off', False, self.runs
+            self.push(1, 'same')   # its update: the head is the change read merged with main, so read != head
+            if plan == 'broken':   # cut off half-way: which PR it names is lost (README: kept as STATE.bad)
+                Q.write_text(self.state, '{"pr": ')
+                p.plan_lost = True
+                self.seen.add('broken plan')
+            else:
+                Q.write_text(self.state, json.dumps({'pr': 1, 'old': read, 'base': 'main', 'read': read}))
+                self.seen.add('old plan without repo')
         if bad:
             Q.write_text(self.state + '.bad', '{"pr": ')
         if leftover:
@@ -252,6 +285,12 @@ class World:
             p.armed_heads.add(p.head)
         elif what == 'disarm' and p.armed:
             p.armed, p.mode = False, 'human-off'
+            p.off_after = self.runs - 1 if self.in_run else self.runs
+        else:
+            return
+        if self.in_run:   # after the queue may have read it: GitHub has no compare-and-set for auto-merge
+            p.raced = self.runs
+            self.seen.add(f'a person {what}s mid-run')
 
     def push(self, n, kind, lag=0):
         p = self.open(n)
@@ -371,15 +410,32 @@ class World:
                 'comments': comments, 'reviews': [],
                 'commits': [{'oid': s} for s in p.history if s in self.anc[head] and s not in self.anc[self.tip()]]}
 
+    @staticmethod
+    def call_kind(write, a):
+        """A fault's target besides a call number: disarm, arm, update-branch, comment (the writes), or a read."""
+        if a[:2] == ('pr', 'merge'):
+            return 'disarm' if '--disable-auto' in a else 'arm'
+        if a[:2] in (('pr', 'update-branch'), ('pr', 'comment')):
+            return a[1]
+        return ('poster ' if write else '') + ' '.join(a[:2])
+
     def gh_call(self, write, a):
         self.calls += 1
         k = self.calls
         for ev in self.events.pop(k, ()):
             self.seen.add('event in the middle of a run')
             self.apply(ev)
+        kind = self.call_kind(write, a)
         fault = self.faults.get(k)
+        if kind not in self.fired:   # the first call of each kind: the faults aimed at that kind
+            self.fired.add(kind)
+            fault = fault or self.kind_faults.get(kind)
+            if kind in self.after_faults:
+                self.faults.setdefault(k + 1, self.after_faults[kind])
+        if fault in ('kill', 'fail', 'kill_after') and kind in WRITE_KINDS:
+            self.seen.add(f'{fault} on {kind}')
         if fault == 'kill':
-            raise Killed(f'gh call {k}')
+            raise Killed(f'gh call {k} ({kind})')
         if fault == 'fail':
             self.seen.add('gh call failed')
             return failed('HTTP 502: Bad Gateway')
@@ -387,9 +443,11 @@ class World:
         if fault == 'kill_after':
             if write:
                 self.seen.add('killed after GitHub applied a write')
-            raise Killed(f'after gh call {k}')
+            raise Killed(f'after gh call {k} ({kind})')
         if fault == 'lie' and r.returncode == 0:
             self.seen.add('applied but reported failed' if write else 'gh call failed')
+            if kind in WRITE_KINDS:
+                self.seen.add(f'lie on {kind}')
             return failed('HTTP 502: Bad Gateway')
         return r
 
@@ -410,12 +468,16 @@ class World:
             return ok(json.dumps([{'status': done, 'workflowName': 'ci'}]))
         raise Broken('unknown gh call', f'the queue read {a[:3]} that this model does not answer')
 
-    def plan_pr(self):
+    def plan(self):
         try:
             with open(self.state) as f:
-                return json.load(f).get('pr')
-        except (OSError, ValueError, AttributeError):
+                st = json.load(f)
+            return st if isinstance(st, dict) else None
+        except (OSError, ValueError):
             return None
+
+    def plan_pr(self):
+        return (self.plan() or {}).get('pr')
 
     def gh_write(self, a):
         if a[:2] == ('pr', 'view'):   # tell(): the poster's own read (viewerDidAuthor)
@@ -444,12 +506,23 @@ class World:
         return ok()
 
     def disarm(self, p):
+        if self.plan_pr() == p.n:
+            p.plan_run = self.runs
+        if p.state == 'OPEN' and not p.armed and p.raced == self.runs:
+            # a person turned it off after the queue's view, before this call. GitHub's words for turning off an
+            # auto-merge that is not on are not documented; the model answers with an error (the queue reads any
+            # error back with a view, so another error would go the same way)
+            return failed('GraphQL: auto-merge is not enabled for this pull request (disablePullRequestAutoMerge)')
         if not p.armed or p.state != 'OPEN':
             raise Broken('L5 allowed moves', f'the queue turned off #{p.n}, which is {p.mode}, not armed')
         self.disarmed_now.add(p.n)
         if len(self.disarmed_now) > 1:
             raise Broken('L2 one PR at a time', f'one run turned off #{sorted(self.disarmed_now)}')
-        p.armed, p.mode, p.told = False, 'queue-off', False
+        p.armed, p.mode, p.told, p.plan_lost = False, 'queue-off', False, False
+        if self.no_faults and p.lag == 0 and self.green(p.head) and self.tip() not in self.anc[p.head] \
+                and self.merged(p.head, self.tip()) is not None and (not p.lenses
+                                                                     or set(dict(p.lenses).values()) == {p.head}):
+            self.progress = p.n   # L7: nothing is in the way of this update
         return ok()
 
     def vouched(self, p):
@@ -478,10 +551,27 @@ class World:
         return False
 
     def arm(self, p, head):
-        if p.mode == 'human-off' and self.in_recover() and self.plan_pr() == p.n:
-            self.seen.add('re-armed after a person disarmed it (README)')   # "A plan does not say who turned it off"
-        elif p.mode != 'queue-off':
+        recovering = self.in_recover() and self.plan_pr() == p.n
+        if p.n not in self.disarmed_now and not recovering:
+            raise Broken('L5 allowed moves', f'the queue armed #{p.n}, which this run did not turn off and no plan '
+                                             'names')
+        if p.mode == 'queue-off':
+            pass
+        elif p.mode == 'human-off' and recovering and p.off_after is not None and p.plan_run is not None \
+                and p.off_after >= p.plan_run:
+            # README.md: "A plan does not say who turned auto-merge off: a pull request a person disarmed after the
+            # stop is re-armed too, if its head holds the change read." Only after the run that wrote the plan ended.
+            self.seen.add('re-armed after a person disarmed it (README)')
+        elif p.raced is not None and p.raced in (self.runs, p.plan_run):
+            # Known limit, not in the README (a test finding of #464): a person arms or disarms the PR in the middle
+            # of the run that reads and moves it. The queue acts on its own read of the PR, and GitHub has no
+            # compare-and-set for auto-merge, so the person's change is overridden (FIXED, "mid-run race").
+            self.seen.add('mid-run race: re-armed over a person (known limit)')
+        else:
             raise Broken('L5 allowed moves', f'the queue armed #{p.n}, which is {p.mode}: only a PR it turned off')
+        st = self.plan() or {}
+        if recovering and st.get('read') and st['read'] != head:
+            self.seen.add('recovered a plan at a newer head than its read')
         reads = self.vouched(p)
         if not any(self.exactly_read(head, r) for r in reads):
             raise Broken('L1 arms only what was read',
@@ -503,8 +593,10 @@ class World:
         return not self.disarmed_now
 
     def update_branch(self, p):
-        if p.n not in self.disarmed_now or p.armed:
+        if p.n not in self.disarmed_now or (p.armed and p.raced != self.runs):
             raise Broken('L3 update only what it turned off', f'update-branch on #{p.n} ({p.mode}, armed {p.armed})')
+        if p.armed:   # a person armed it again after the queue's disarm (the mid-run race above)
+            self.seen.add('mid-run race: update-branch on a PR a person re-armed (known limit)')
         tip = self.tip()
         if tip in self.anc[p.head]:
             return failed('HEAD is already up to date with main')
@@ -519,11 +611,20 @@ class World:
     # --- a queue run --------------------------------------------------------------------------------------------------
     def run_queue(self, faults=()):
         self.runs += 1
-        self.calls = self.git_calls = 0
-        self.faults, self.events, self.queued, self.update_lag, git_kill = {}, {}, 0, 0, None
+        self.calls = self.git_calls = self.fetches = 0
+        self.faults, self.events, self.queued, self.update_lag, git_kill, git_fail = {}, {}, 0, 0, None, None
+        self.kind_faults, self.after_faults, self.fired = {}, {}, set()
+        # L7's "nothing in its way": no faults but a head GitHub shows late within the queue's polls
+        self.no_faults = all(f[0] == 'lag' and f[1] < CFG.wait_seconds // CFG.poll_seconds for f in faults)
+        self.progress = None
         for f in faults:
             if f[0] in ('kill', 'kill_after', 'fail', 'lie'):
-                self.faults.setdefault(f[1], f[0])
+                if isinstance(f[1], int):   # the call number
+                    self.faults.setdefault(f[1], f[0])
+                elif f[1].startswith('after '):   # the call right after the first of that kind
+                    self.after_faults.setdefault(f[1][len('after '):], f[0])
+                else:   # the first call of that kind (call_kind)
+                    self.kind_faults.setdefault(f[1], f[0])
             elif f[0] == 'event':
                 self.events.setdefault(f[1], []).append(f[2])
             elif f[0] == 'queued':
@@ -532,6 +633,8 @@ class World:
                 self.update_lag = f[1]
             elif f[0] == 'git_kill':
                 git_kill = f[1]
+            elif f[0] == 'git_fail':   # the k-th git fetch fails as the network does (exit 128)
+                git_fail = f[1]
             else:
                 raise ValueError(f'unknown fault {f!r}')
         self.disarmed_now = set()
@@ -546,30 +649,53 @@ class World:
             if self.git_calls == git_kill:
                 self.seen.add('killed at a git call')
                 raise Killed(f'git call {self.git_calls}')
+            if 'fetch' in a:
+                self.fetches += 1
+                if self.fetches == git_fail:
+                    self.seen.add('git fetch failed')
+                    return subprocess.CompletedProcess(['git', *a], 128, '', "fatal: unable to access "
+                                                       "'https://github.com/owner/proj/': Could not resolve host")
             return real_git(*a, **kw)
         q.git = git
         killed = None
         out = io.StringIO()
+        self.in_run = True
         try:
             with contextlib.redirect_stdout(out):
                 q.main()
         except Killed as e:
             killed = e
         finally:
+            self.in_run = False
             q.stop_check()
             self.out = out.getvalue()
         if killed and os.path.exists(self.state):
             self.seen.add('killed with a plan on disk')
         for line, kind in (('is not exactly the change read', 'not exactly the change read'),
                            ('did not all read one head', 'lenses disagree'),
-                           ('failed (its author fixes it)', 'red check skipped')):
+                           ('failed (its author fixes it)', 'red check skipped'),
+                           ('auto-merge may be OFF now: STATE stays', 'disarm unclear: STATE stays'),
+                           ('could not turn auto-merge off, so not updating', 'disarm failed'),
+                           ('was not checked: STATE stays', 'merge check unknown'),
+                           ('was not checked: trying again next run', 'merge check unknown in recover')):
             if line in self.out:
                 self.seen.add(kind)
-        self.never_silent(f'after run {self.runs}' + (f' (killed: {killed})' if killed else ''))
+        if 'a PR may have auto-merge OFF and nothing says so' in self.out and os.path.exists(self.state + '.bad'):
+            self.bad_said = True   # README: kept as STATE.bad, the run fails, a log line says a PR may be OFF
+            self.seen.add('broken plan kept as .bad')
+        when = f'after run {self.runs}' + (f' (killed: {killed})' if killed else '')
+        self.never_silent(when)
+        p = self.prs.get(self.progress)
+        if p and p.state == 'OPEN' and not p.armed:
+            raise Broken('L7 an update with nothing in its way ends armed', f'#{p.n} ({p.mode}) {when}')
+        if p:
+            self.seen.add('update with nothing in its way')
 
     def never_silent(self, when):
         plan = self.plan_pr()
         for p in self.prs.values():
+            if p.plan_lost and (os.path.exists(self.state) or self.bad_said):
+                continue   # L4's stated exception: a broken plan (README: STATE.bad, the run fails, a log line)
             if p.state == 'OPEN' and p.mode == 'queue-off' and not p.told and plan != p.n:
                 raise Broken('L4 never off and silent', f'#{p.n} is off since a queue disarm, nothing said it and no '
                                                         f'plan names it, {when}')
@@ -609,23 +735,27 @@ def a_step(rng):
 
 
 def a_faults(rng):
-    if rng.random() < 0.3:
+    if rng.random() < 0.25:
         return ()
     out = []
     for _ in range(rng.choice((1, 1, 2))):
         r = rng.random()
-        k = rng.choice((1, 2, rng.randint(3, 14)))   # call 1 is recover's view when a plan is on disk
-        if r < 0.22:
-            out.append((rng.choice(('kill', 'kill', 'kill_after')), k))
-        elif r < 0.40:
-            out.append((rng.choice(('fail', 'lie')), k))
-        elif r < 0.47:
+        if r < 0.62:   # a fault at a call: the first call of a kind of write, or a call number (1: recover's view)
+            k = rng.choice(WRITE_KINDS + ('comment',)) if r < 0.4 else rng.choice((1, 2, rng.randint(3, 14)))
+            f = rng.choice(('kill', 'kill_after', 'fail', 'lie'))
+            out.append((f, k))
+            if f == 'lie' and rng.random() < 0.4:   # applied, reported failed, and the read-back fails too
+                out.append(('fail', k + 1 if isinstance(k, int) else f'after {k}'))
+        elif r < 0.66:
             out.append(('git_kill', rng.randint(1, 40)))
-        elif r < 0.67:
+        elif r < 0.72:
+            out.append(('git_fail', rng.choice((1, 1, 2, 3))))
+        elif r < 0.86:
             ev = rng.choice((('push', rng.randint(1, 3), rng.choice(('new', 'same')), 0),
-                             ('main', 'file', 0), ('ci', rng.randint(1, 3), 'pass')))
+                             ('main', 'file', 0), ('ci', rng.randint(1, 3), 'pass'),
+                             ('arm', rng.randint(1, 3)), ('disarm', rng.randint(1, 3))))
             out.append(('event', rng.randint(2, 12), ev))
-        elif r < 0.80:
+        elif r < 0.93:
             out.append(('queued', rng.choice((1, 2, 6))))
         else:
             out.append(('lag', rng.choice((1, 3, 13))))
@@ -634,12 +764,19 @@ def a_faults(rng):
 
 def generate(rng):
     if rng.random() < 0.5:
-        start = ('start', 'OLD', rng.choice((0, 1, 1)), rng.choice((0, 1)), rng.choice((0, 1)),
+        start = ('start', 'OLD', rng.choice((0, 1, 1, 'broken')), rng.choice((0, 1)), rng.choice((0, 1)),
                  rng.choice(('good', 'good', 'emptied')))
     else:
         start = ('start', 'EMPTY')
-    steps = [start, ('arm', 1), ('main', 'file', 0)]   # most histories start with something to queue
+    # most histories start with something to queue; an OLD plan's PR stays off for the first run to recover
+    steps = [start] + ([] if start[1] == 'OLD' and start[2] else [('arm', 1)]) + [('main', 'file', 0)]
     steps += [a_step(rng) for _ in range(rng.randint(14, 34))]
+    if rng.random() < 0.35:   # a run stopped after the update, then a rerun that cannot fetch: recover's merge
+        i = rng.randint(len(steps) // 2, len(steps))   # check is unknown, and maybe its tell_once comment breaks too
+        stop = rng.choice((('kill_after', 'update-branch'), ('kill', 'arm'), ('lag', 13), ('git_fail', 2)))
+        again = (('git_fail', 1),) + ((rng.choice(('kill', 'kill_after', 'fail', 'lie')), 'comment'),
+                                      ) * (rng.random() < 0.5)
+        steps[i:i] = [('main', 'file', 0), ('run', (stop,)), ('run', again)]
     return steps
 
 
@@ -655,6 +792,7 @@ def play(steps, seen=None):
                 if s[0] != 'start':
                     w.apply(s)
             w.settle()
+            return w
         except Broken as e:
             tail = '\n'.join(w.out.strip().splitlines()[-6:])
             raise Broken(e.law, f'{e.detail} (step {w.step_no}; the last queue run printed:\n{tail})') from None
@@ -664,21 +802,28 @@ def play(steps, seen=None):
 
 
 # Histories a law once broke (laws README, "A failure"), and hand-written ones each law must reject when the queue is
-# broken that way. Every list here is played on every run, whatever the seed.
+# broken that way. Every list here is played on every run, whatever the seed; KNOWN says what each must reach (and,
+# for the ones of a known limit, that the limit still shows, so a change of the behaviour or the doc is seen).
 FIXED = {
     # an author pushes new content while the queue's update runs: the new head is not the change read
     'push during the update': [
         ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0),
         ('run', (('event', 4, ('push', 1, 'new', 0)),)),
     ],
-    # a run killed after its disarm; a lens reads the merged head; the next run re-arms only that change
-    'killed after the disarm, then recovered': [
+    # a run killed right after its update-branch took effect; the author pushes new content; the next run's recover
+    # must not arm that head (not the change the lens read) and leaves the PR OFF with a comment
+    'killed after the update, then recovered': [
         ('start', 'EMPTY'), ('lens', 1, 'a', 'head'), ('arm', 1), ('main', 'file', 0),
-        ('run', (('kill_after', 5),)), ('push', 1, 'new', 0), ('run', ()),
+        ('run', (('kill_after', 'update-branch'),)), ('push', 1, 'new', 0), ('run', ()),
     ],
-    # an older queue's plan without `repo`, an emptied cache and the folders a killed run left
+    # an older queue's plan without `repo` at an updated head (read != head: the merge check runs), an emptied cache
+    # and the folders a killed run left
     'old state': [
         ('start', 'OLD', 1, 1, 1, 'emptied'), ('run', ()),
+    ],
+    # a plan cut off half-way: kept as STATE.bad, the run fails, a log line says a PR may be OFF (L4's exception)
+    'broken plan': [
+        ('start', 'OLD', 'broken', 0, 0, 'good'), ('run', ()), ('run', ()),
     ],
     # L5 found this; it is the documented limit (README.md, "A plan does not say who turned auto-merge off"): a run
     # stops after its disarm, a person arms and disarms again, and the next run re-arms the change read
@@ -686,22 +831,79 @@ FIXED = {
         ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('kill_after', 4),)), ('arm', 1),
         ('disarm', 1), ('run', ()),
     ],
+    # the disarm took effect but gh reported it failed (call 4 is the disarm): the read-back shows it off, so the
+    # plan stays and the next run finishes it
+    'disarm applied, reported failed': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('lie', 4),)),
+    ],
+    # ... and the read-back fails too: unclear whether it is off, so the plan stays
+    'disarm applied, reported failed, read-back fails': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('lie', 4), ('fail', 5))),
+    ],
+    # a git fetch fails after the update: the merge check is unknown, the plan stays; the rerun cannot fetch either
+    # and says it once on the PR (tell_once); then a run finishes it
+    'merge check unknown, then told once': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('git_fail', 2),)),
+        ('run', (('git_fail', 1),)),
+    ],
+    # Known limit, not in the README (test finding of #464): a person turns auto-merge off after the queue's view and
+    # before its disarm. GitHub answers the disarm with an error (the model's stand-in, see World.disarm), the
+    # read-back shows it off, the plan stays, and the next run re-arms the PR the person turned off.
+    'mid-run race: a person disarms before the queue does': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('event', 4, ('disarm', 1)),)),
+    ],
+    # L7: GitHub shows the updated head one poll late; the queue waits for it and arms it (not the old head)
+    'update shown one poll late': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('ci', 1, 'pass'), ('run', (('lag', 1),)),
+    ],
+    # ... the same limit the other way: a person arms it again after the queue's disarm, and the queue updates it
+    'mid-run race: a person re-arms during the update': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('event', 5, ('arm', 1)),)),
+    ],
 }
+KNOWN = {   # what each fixed history must reach, and #1's auto-merge at the end
+    'push during the update': ({'not exactly the change read', 'left OFF with a comment'}, False),
+    'killed after the update, then recovered': ({'kill_after on update-branch', 'killed with a plan on disk',
+                                                 'left OFF with a comment'}, False),
+    'old state': ({'old plan without repo', 'old cache emptied', 'leftover folders', 'recover armed',
+                   'recovered a plan at a newer head than its read'}, True),
+    'broken plan': ({'broken plan', 'broken plan kept as .bad'}, False),
+    'a person disarms after a stop': ({'kill_after on disarm', 're-armed after a person disarmed it (README)'}, True),
+    'disarm applied, reported failed': ({'lie on disarm', 'disarm unclear: STATE stays', 'recover armed'}, True),
+    'disarm applied, reported failed, read-back fails': ({'lie on disarm', 'disarm unclear: STATE stays',
+                                                          'recover armed'}, True),
+    'merge check unknown, then told once': ({'merge check unknown', 'merge check unknown in recover',
+                                             'told once (tell_once)', 'recover armed'}, True),
+    'mid-run race: a person disarms before the queue does': ({'a person disarms mid-run', 'disarm failed',
+                                                              'disarm unclear: STATE stays',
+                                                              'mid-run race: re-armed over a person (known limit)'},
+                                                             True),
+    'update shown one poll late': ({'update with nothing in its way', 'queue armed after update'}, True),
+    'mid-run race: a person re-arms during the update': ({'a person arms mid-run', 'mid-run race: update-branch on '
+                                                          'a PR a person re-armed (known limit)'}, True),
+}
+README = os.path.join(HERE, 'README.md')
 
 
 class LawsOfTheQueue(unittest.TestCase):
     def test_fixed_histories(self):
+        self.assertEqual(set(FIXED), set(KNOWN))
         for name, steps in FIXED.items():
             with self.subTest(name):
                 seen = set()
-                play(steps, seen)
-                if name == 'a person disarms after a stop':   # the README's sentence and the code agree
-                    self.assertIn('re-armed after a person disarmed it (README)', seen)
+                w = play(steps, seen)
+                want, armed = KNOWN[name]
+                self.assertEqual(want - seen, set())
+                self.assertEqual(w.prs[1].armed, armed)
+
+    def test_the_documented_limit_is_in_the_readme(self):
+        with open(README) as f:
+            self.assertIn('A plan does not say who turned auto-merge off', ' '.join(f.read().split()))
 
     def test_generated_histories(self):
         seen = set()
         played = laws.check('pr-queue', generate, lambda steps: play(steps, seen), seed=SEED, tries=TRIES,
-                            rerun=f'python3 -I -B {os.path.relpath(__file__)}')
+                            rerun=f'python3 -I -B {os.path.relpath(__file__)}', runs=SHRINK_RUNS)
         if not any(os.environ.get(k) for k in ('LAWS_SEED', 'LAWS_TRIES', 'LAWS_TRY')):   # the CI run: all of it
             cover = laws.Coverage(MUST_SEE)
             for kind in seen:

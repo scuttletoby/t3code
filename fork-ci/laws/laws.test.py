@@ -1,6 +1,7 @@
 """Tests of laws.py, the law-test runner (run: python3 -I -B fork-ci/laws/laws.test.py)."""
 import os
 import sys
+import time
 import unittest
 import unittest.mock
 
@@ -63,7 +64,8 @@ class Runner(unittest.TestCase):
 
     def test_a_bad_setting_fails_never_fewer_tries(self):
         for env in ({'LAWS_SEED': 'x'}, {'LAWS_SEED': '-1'}, {'LAWS_TRIES': '0'}, {'LAWS_TRIES': '2.5'},
-                    {'LAWS_TRIES': ' '}, {'LAWS_TRY': '7'}, {'LAWS_TRY': '3', 'LAWS_TRIES': '3'}):
+                    {'LAWS_TRIES': ' '}, {'LAWS_TRIES': ' 3'}, {'LAWS_TRIES': '\u00b2'}, {'LAWS_SEED': '\u0663'},
+                    {'LAWS_TRY': '7'}, {'LAWS_TRY': '3', 'LAWS_TRIES': '3'}):
             with self.subTest(env), self.assertRaises(ValueError):
                 self.check(lambda s: None, tries=5, env=env)
         self.assertEqual(laws.settings(9, 4, {'LAWS_SEED': '', 'LAWS_TRIES': ''}), (9, 4, None))
@@ -96,10 +98,16 @@ class Runner(unittest.TestCase):
         self.assertIn('(1 of ', str(e.exception))
 
     def test_it_never_sleeps(self):
-        with unittest.mock.patch('time.sleep', side_effect=AssertionError('slept')):
+        # recorded, not raised: play_once takes any exception in a play for a failure, so a raise would hide there
+        slept = []
+        with unittest.mock.patch('time.sleep', side_effect=slept.append):
             with self.assertRaises(AssertionError) as e:
-                self.check()
-        self.assertIn('law broken', str(e.exception))
+                self.check()   # tries, a failure and its shrinking
+            self.assertIn('law broken', str(e.exception))
+            self.assertEqual(slept, [])
+            with self.assertRaises(AssertionError):   # and the patch does see a sleep inside a play
+                self.check(lambda s: (time.sleep(0), no_3_before_7(s)))
+        self.assertTrue(slept)
 
     def test_coverage_names_what_the_seed_no_longer_reaches(self):
         c = laws.Coverage(('a', 'b', 'c'))
