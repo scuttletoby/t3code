@@ -78,6 +78,14 @@ UPSTREAM = [
      'return `t3-${version}-${platformKey}.${platformKey.startsWith("win32") ? "zip" : "tar.gz"}`;',
      'archive name t3-<version>-<platform>.tar.gz'),
     # back and status (back.py)
+    # switch._install_target: the rehearsed build installed by the kit, so the update downloads nothing
+    ('apps/server/src/cli/update.ts', '      ? Effect.succeed(input.requestedVersion)',
+     'switch: update <exact version> looks no version up'),
+    ('apps/server/src/cloud/pinnedRuntime.ts',
+     'entryExists && Option.isSome(sentinel) && sentinel.value.trim() === input.version;',
+     'switch._install_target: a runtime with t3 and .install-complete naming the version is used, not downloaded'),
+    ('apps/server/src/cli/update.ts', '    requirePublishedRelease: mirror !== undefined,',
+     'switch: only a managed update mirror makes the update ask the network about an installed runtime'),
     ('apps/server/src/cloud/pinnedRuntime.ts', 'sentinelPath: path.join(versionDir, ".install-complete"),',
      'back.installed_t3: a whole runtime has runtime/versions/<v>/.install-complete'),
     ('apps/server/src/cloud/pinnedRuntime.ts', 'const PINNED_RUNTIME_LAUNCHERS_FILE = "launchers";',

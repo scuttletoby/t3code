@@ -193,55 +193,75 @@ record of a restore stopped half-way names listed apart as files that must stay.
 ## `t3-golive switch [--owner-says-go]`: the move
 
 Runs detached (a transient unit `t3-golive-switch-<time>`) unless `--here`; `--here` inside the boot service
-is refused. It refuses, with nothing changed, unless `check` passes; the last `rehearse` run passed for this
-exact target **and** the live build, and ended less than `rehearsalMaxAgeHours` ago (default 72); the target
-would run exactly the migrations the rehearsal ran; the home has no kit leftovers; free disk holds the copy
-plus the old runtime; and (without `--owner-says-go`) the machine is quiet. The fork-features-off check is part
-of `check`. `switch.passed_rehearsal` reads the record `rehearse` (go-live PR 5) writes: a `rehearse` run that
-ended "ok" whose step `result` is done with `{fromVersion, targetVersion, migrations, migrateSeconds,
-readySeconds}`; the rehearsal's time is migrate plus ready, rounded up. Then, each a journalled step:
+is refused. It refuses, with nothing changed, unless `check` passes (the fork-features-off check is part of it);
+the live report gives every count (an unknown count refuses: the verify could not tell what must be kept); the
+staged target archive is whole and its sha256 is the one the last `rehearse` run journalled (`targetSha256`: a
+rehearsal from before this field, or of another build, refuses with "rehearse again"); that rehearsal passed for
+this target **and** the live build and ended less than `rehearsalMaxAgeHours` ago (default 72; a rehearsal that
+ended after the clock's now refuses); the target would run exactly the migrations the rehearsal ran; the home has
+no kit leftovers; the old runtime can be kept (`keptruntime.plan_keep`); every disk keeps `freeFloorMb` free after
+what lands on it (the copy on `backupDir`, the kept runtime on `stateDir`, the installed target in the home,
+summed when they share a disk); and (without `--owner-says-go`) the machine is quiet. `switch.passed_rehearsal`
+reads the record `rehearse` writes: a `rehearse` run that ended "ok" whose step `result` is done with
+`{fromVersion, targetVersion, targetSha256, migrations, migrateSeconds, readySeconds}`; the rehearsal's time is
+migrate plus ready, rounded up. Then, each a journalled step:
 
-0. `keep-old-build`: upstream's `update` (step 6) may prune the old runtime W1 needs, so it is kept first,
-   outside `runtime/versions`; a failed keep refuses, T3 not stopped. **Not wired yet:** `switch.keep_old_build`
-   is the call site for go-live PR 7's keep helper and keeps nothing until then (the stopgap is the copy's
-   `extra/` below).
-1. `guard`: a second transient unit runs `back --auto --run <id> --wait` and its timer fires `back --auto --run
-   <id>` after the latest the run should have ended. Not up: refused, T3 not stopped.
+0. `keep-runtime`: upstream's `update` (step 8) may prune the old runtime W1 needs, so `keptruntime.keep` (#397)
+   keeps it first, outside the home. A failed keep refuses, T3 not stopped.
+1. `guard`: a second transient unit runs `switch-guard --run <id> --wait` and its timer fires `switch-guard --run
+   <id>` after the latest the run can end (`switch.guard_after`: every wait at its longest, the verify limit twice,
+   the way back, plus 10 minutes). Not up: refused, T3 not stopped.
 2. `pre-hooks`, then quiet again; a failure runs the post hooks and refuses (T3 not stopped).
 3. `stopping`: stop the service, wait until the server is gone and its ownership lock is free (held from here to
-   the update), and see that nothing changed while it stopped. The step's facts name the copy folder, the
-   old build, the counts before and the time limit: the guard reads them.
-4. `cold-copy`, `read-back`, `manifest`: as `copy` does, into a NEW folder `<backupDir>/t3-switch-<time>-<old>`
-   (an existing one refuses), plus `extra/`: the old build's runtime folder, `runtime/service-state.json` and
-   the unit file; every file read back on both sides. The manifest is written last.
-5. `old-preflight`: the OLD build's `__service-preflight` on the copy's database must say `ready`.
-6. `update`: `<staged target t3> update <target> --base-dir <home> --yes`, the service started if `update` did
-   not start it, and the `t3` links into this home's runtimes (`runtime/launchers` and the default
-   `~/.local/bin/t3`) pointed at the target.
-7. `verify` (design 4.5), until it holds or the time limit (3 x the rehearsal's time, at least 10 minutes):
-   the service active; the server is the target, from this home's runtime; service state names the target
-   with no update pending; no markers; something answers HTTP on its port; the links point at the target; the
-   staged report says no migration is pending, counts are not lower than before, provider instances are the
-   same (compared by SHA256 only), fork features are all off and it is ok.
-8. `post-hooks`. Exit 0: verified.
+   the update), and see that nothing changed while it stopped. The step's facts name the copy folder, the old
+   build and the time limit: the guard reads them.
+4. `cold-copy`, `read-back`, `manifest`: as `copy` does, while T3 is stopped, into a NEW folder
+   `<backupDir>/t3-switch-<time>-<old>` (an existing one refuses), plus `extra/`: `runtime/service-state.json` and
+   the unit file; every file read back on both sides. The manifest is written last. `t3-golive back` lists these
+   copies beside `t3-copy-*`.
+5. `before`: the stopped home's report, read now (nothing can write): the counts the verify compares with, the
+   provider instances; it fails unless every count is known, the report is ok, fork features are off and the
+   pending migrations are those the rehearsal ran.
+6. `old-preflight`: the OLD build's `__service-preflight` on the copy's database must say `ready`.
+7. `install-target`: the staged runtime is copied into `runtime/versions/.golive-install-<target>`, checked
+   against the rehearsed archive (sha256 and every file), given upstream's `.install-complete`, and renamed into
+   `runtime/versions/<target>` whole (a folder already there is used when it is exactly that build, else set aside
+   as `.golive-aside-*`, never deleted). Safe to run again.
+8. `update` (the owner lock let go first): `<home's target t3> update <target> --base-dir <home> --yes` with a
+   fixed environment (nothing can point it at another release server); the target is installed already, so it downloads nothing. The service is
+   started if `update` did not start it, and the `t3` links into this home's runtimes (`runtime/launchers` and the
+   default `~/.local/bin/t3`) are pointed at the target.
+9. `verify` (design 4.5), until it holds or the time limit (3 x the rehearsal's time, at least 10 minutes): the
+   service active; the server is the target, from this home's runtime; service state names the target with no
+   update pending; no markers; something answers HTTP on its port; the links point at the target; the target's
+   report says no migration is pending, counts are not lower than in step 5, provider instances are the same
+   (compared by SHA256 only), fork features are all off and it is ok; and the runtime the server runs is still
+   byte for byte the rehearsed archive.
+10. `post-hooks`. Exit 0: verified.
 
-A failure or a late verify goes back on its own (W1; go-live PR 7 takes this seam over as its `back`): from
-step 6 on, `back-stop`, `back-restore` (the copy's database and settings; the target's kept aside as
-`*.golive-aside-*`), `back-downgrade` (the old runtime from the copy if a prune took it; `<old t3> update <old>
---allow-downgrade --yes`; links back), `back-verify` (as verify, but the migrations pending again and the counts
-equal to before). Before step 6 nothing was changed: `back-start` starts the old build again. Then the post hooks;
-the run ends "failed" and needs `settle` (the journal says "rolled back", the copy stays).
+A failure or a late verify goes back on its own. From step 8 on (its `update` started) that is #397's W1,
+`back.restore_and_downgrade(..., automatic=True)`, once: its steps `plan`, `runtime` (the kept old runtime put
+back if a prune took it), `stop-service` (T3 disabled first, then stopped), `restore` (the step-4 copy), `update`
+(`<old t3> update <old> --allow-downgrade --yes`) and `verify`, then `rolled-back`. Before step 8 nothing T3
+reads was changed: `back-start` starts the old build again. Then the post hooks; the run ends "failed" and needs
+`settle` (the journal says "rolled back" or "old build runs", the copy stays).
 
-The guard (`back --auto`) takes the kit lock: while a run holds it, it waits (`--wait`, beside the run) or does
-nothing (the timer). It does nothing when the run is not the last one, or its journal says it is final (ended
-ok or refused, settled, "verified", "rolled back", or the old build started again); otherwise it puts T3 back as
-above from what the journal says the run got to, runs the post hooks if the run paused the jobs and did not
-resume them, and ends the run "failed". A journal it cannot read fails open: it starts the service if it is not
-active and runs the post hooks. It logs to `<stateDir>/guard.log`.
+A W1 that fails follows #397's W1 contract: T3 stays stopped and disabled (the home may be half-restored, so
+neither the target nor the old build is started on it), the post hooks do not run (background jobs stay paused),
+`t3-golive status` exits 1 naming the run and where it stopped, and `t3-golive back --way w1` resumes it (it finds
+the `t3-switch-*` copy and the kept runtime). Nothing runs W1 a second time on its own.
 
-Not covered: a reboot ends both transient units. The enabled service then starts whatever build the unit
-names, `check` refuses until settle, and the owner runs `t3-golive back --auto --run <id>` by hand (the run id
-is in the journal) before `settle`.
+The guard (`switch-guard`) waits for the kit lock, so a run or a `back` still going is waited for, never acted
+on (the timer too). It does nothing when the run is not the last one, ended, was settled, or its journal says it
+is final ("verified", "rolled back", or the old build started again); otherwise it puts T3 back as above from
+what the journal says the run got to (W1 only if no W1 stopped T3 yet), runs the post hooks if the run paused the
+jobs, did not resume them and no failed W1 holds them, and ends the run "failed". A journal it cannot read fails
+open: it starts the service if it is not active and runs the post hooks. It logs to `<stateDir>/guard.log`.
+
+Not covered: a reboot ends both transient units. The enabled service then starts whatever build the unit names
+(the target if the update ran), `check` refuses until settle, and the owner runs `t3-golive status`, then
+`t3-golive back --way w1 --lose-work-since <copy time>` (or `switch-guard --run <id>` when T3 was never stopped)
+before `settle`.
 
 ## Failure table
 

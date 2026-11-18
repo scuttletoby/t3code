@@ -7,7 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golive_fixture as fx  # noqa: E402
-from golive import check, coldcopy, config, journal, rehearse  # noqa: E402
+from golive import check, coldcopy, config, journal, live, rehearse  # noqa: E402
 
 OLD_HEAD, NEW_HEAD = 81, 83
 
@@ -359,6 +359,22 @@ class Rehearse(Base):
         # The clone holds no secrets, no runtime record and no ownership lock of the live home.
         self.assertNotIn('secrets', os.listdir(os.path.join(home, 'userdata')))
         self.assertFalse(self.server_left())
+
+    def test_the_record_names_the_staged_archive_it_rehearsed(self):
+        # The switch installs exactly this archive (by its sha256): the rehearsal is bound to its bytes, not to a
+        # version string a rebuilt stage could reuse.
+        _, digest = live.staged_archive(self.m.stage, fx.TARGET)
+        self.assertEqual(self.rehearse()['targetSha256'], digest)
+
+    def test_a_stage_changed_during_the_rehearsal_fails(self):
+        real = rehearse._r0_clone
+
+        def then_restage(cfg, p):
+            real(cfg, p)
+            self.m.stage_release(fx.TARGET, files={'t3': self.stub(fx.TARGET, NEW_HEAD), 'lib/runtime.txt': 'other'})
+        with mock.patch.object(rehearse, '_r0_clone', then_restage):
+            self.failed('stage')
+        self.assertNotIn(('result', 'done'), self.steps())
 
     def test_a_run_again_throws_the_old_clone_away_and_redoes_it(self):
         self.rehearse()

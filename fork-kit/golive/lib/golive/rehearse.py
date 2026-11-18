@@ -174,7 +174,7 @@ def _prechecks(cfg, copy_dir, port):
     if not (os.path.isfile(old) and os.access(old, os.X_OK)):
         raise journal.Refused(f'{old} (the old build) is missing; nothing was changed')
     try:
-        fork = live.staged_runtime(cfg.stage_dir, cfg.target_version)
+        fork, target_sha = live.staged_build(cfg.stage_dir, cfg.target_version)
     except live.NotLive as e:
         raise journal.Refused(f'{e}; nothing was changed') from None
     helped = _t3([fork, 'serve', '--help'])
@@ -190,7 +190,8 @@ def _prechecks(cfg, copy_dir, port):
     if coldcopy._free_bytes(coldcopy._existing(cfg.backup_dir)) < need:
         raise journal.Refused(f'{cfg.backup_dir} needs {need // MB} MB free for the rehearsal; nothing was changed')
     return {'copy': copy_dir, 'manifest': m, 'from': old_version, 'protocol': protocol, 'old': old, 'fork': fork,
-            'root': root, 'home': os.path.join(root, 'home'), 'port': _choose_port(cfg, port)}
+            'targetSha256': target_sha, 'root': root, 'home': os.path.join(root, 'home'),
+            'port': _choose_port(cfg, port)}
 
 
 def _guard_old(cfg, root):
@@ -396,7 +397,8 @@ def run_rehearse(cfg, copy_dir=None, port=None, say=print):
     with journal.run(cfg.state_dir, 'rehearse', scratch=True) as run:
         p = _prechecks(cfg, copy_dir, port)
         result = {'copy': p['copy'], 'copySha256': coldcopy._hash(os.path.join(p['copy'], coldcopy.MANIFEST)),
-                  'fromVersion': p['from'], 'targetVersion': cfg.target_version, 'port': p['port']}
+                  'fromVersion': p['from'], 'targetVersion': cfg.target_version, 'targetSha256': p['targetSha256'],
+                  'port': p['port']}
         with run.step('clone', copy=p['copy'], home=p['home']):
             _clone(run, cfg, p)
         _r0_clone(cfg, p)
@@ -459,6 +461,13 @@ def run_rehearse(cfg, copy_dir=None, port=None, say=print):
             facts['old'], why = _preflight(p['old'], p['home'], p['protocol'], p['from'])
             if facts['old'] != 'ready':
                 raise Failed(f'R5: the old build\'s preflight on the restored clone says {facts["old"]}: {why}')
+        try:  # the switch installs the archive this sum names: it must be the one that ran here, start to end
+            again = live.staged_build(cfg.stage_dir, cfg.target_version)[1]
+        except live.NotLive as e:
+            raise Failed(f'the staged target cannot be read again after the rehearsal: {e}') from None
+        if again != p['targetSha256']:
+            raise Failed(f'the staged target changed during the rehearsal (archive sha256 {p["targetSha256"]} -> '
+                         f'{again}): rehearse again')
         result['totalSeconds'] = round(time.monotonic() - began, 3)
         with run.step('result') as facts:
             facts.update(result)

@@ -150,10 +150,9 @@ def _sha256(stream):
     return h.hexdigest()
 
 
-def staged_runtime(stage_dir, version):
-    """Check the staged release: SHA256SUMS lists the archive and its hash matches, and the extracted runtime in
-    <stage>/<version>/ holds exactly the archive's files, byte for byte. Returns the runtime's t3 path.
-    Raises NotLive with the reason. Reads only; the archive is read as a stream."""
+def staged_archive(stage_dir, version):
+    """(archive path, sha256) of the staged release archive of `version` for this machine, once SHA256SUMS lists
+    it and its bytes match that line. Raises NotLive with the reason. Reads only."""
     key = platform_key()
     if key is None or key.startswith('win32'):
         raise NotLive(f'no release archive for this machine ({sys.platform} {platform.machine()})')
@@ -174,27 +173,59 @@ def staged_runtime(stage_dir, version):
                 raise NotLive(f'{archive_path} does not match its SHA256SUMS line')
     except OSError as e:
         raise NotLive(f'{archive_path} cannot be read: {e}') from None
-    runtime = os.path.join(stage_dir, version)
+    return archive_path, listed[archive]
+
+
+class _Hashing:
+    """A read-only stream that hashes every byte read through it (tarfile reads the archive once, in order)."""
+
+    def __init__(self, f):
+        self.f, self.h = f, hashlib.sha256()
+
+    def read(self, n=-1):
+        data = self.f.read(n)
+        self.h.update(data)
+        return data
+
+    def rest(self):
+        for chunk in iter(lambda: self.f.read(1 << 20), b''):
+            self.h.update(chunk)
+        return self.h.hexdigest()
+
+
+def runtime_matches(archive_path, runtime, extra_ok=()):
+    """Check that the runtime folder holds exactly the archive's files, byte for byte (no links; `extra_ok`: names
+    at its top the archive lacks, such as upstream's .install-complete). Returns the sha256 of the archive bytes it
+    compared against, read in the same pass, so a caller that wants a given archive compares that sum. Raises
+    NotLive. Reads only."""
+    archive = os.path.basename(archive_path)
     seen = set()
     try:
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            for member in tar:
-                parts = member.name.split('/', 1)
-                if len(parts) < 2 or not parts[1] or member.isdir():
-                    continue
-                rel = parts[1]
-                if rel.startswith('/') or '..' in rel.split('/') or not member.isfile():
-                    raise NotLive(f'{archive} holds {rel}, which is not a plain file')
-                seen.add(rel)
-                local = os.path.join(runtime, rel)
-                try:
-                    with open(local, 'rb') as f:
-                        same = _sha256(f) == _sha256(tar.extractfile(member))
-                except OSError:
-                    raise NotLive(f'{local} is missing: extract {archive} into {runtime} '
-                                  '(tar -xzf ... --strip-components=1)') from None
-                if not same:
-                    raise NotLive(f'{local} differs from the file in {archive}')
+        with open(archive_path, 'rb') as raw:
+            stream = _Hashing(raw)
+            with tarfile.open(fileobj=stream, mode='r|gz') as tar:
+                for member in tar:
+                    parts = member.name.split('/', 1)
+                    if len(parts) < 2 or not parts[1] or member.isdir():
+                        continue
+                    rel = parts[1]
+                    if rel.startswith('/') or '..' in rel.split('/') or not member.isfile():
+                        raise NotLive(f'{archive} holds {rel}, which is not a plain file')
+                    seen.add(rel)
+                    local = os.path.join(runtime, rel)
+                    try:
+                        if os.path.islink(local):
+                            raise OSError('a link')
+                        with open(local, 'rb') as f:
+                            same = _sha256(f) == _sha256(tar.extractfile(member))
+                    except OSError:
+                        raise NotLive(f'{local} is missing: extract {archive} into {runtime} '
+                                      '(tar -xzf ... --strip-components=1)') from None
+                    if not same:
+                        raise NotLive(f'{local} differs from the file in {archive}')
+            digest = stream.rest()
+    except OSError as e:
+        raise NotLive(f'{archive_path} cannot be read: {e}') from None
     except (tarfile.TarError, EOFError) as e:
         raise NotLive(f'{archive_path} cannot be read as an archive: {e}') from None
     extra, links = [], []
@@ -203,17 +234,31 @@ def staged_runtime(stage_dir, version):
             rel = os.path.relpath(os.path.join(d, n), runtime)
             if os.path.islink(os.path.join(d, n)):
                 links.append(rel)  # os.walk does not go into a linked folder, and a linked file is not the archive's
-            elif n in names and rel not in seen:
+            elif n in names and rel not in seen and rel not in extra_ok:
                 extra.append(rel)
     if links:
         raise NotLive(f'{runtime} holds links, which the archive does not: {", ".join(sorted(links)[:5])}')
     extra.sort()
     if extra:
         raise NotLive(f'{runtime} holds files that are not in {archive}: {", ".join(extra[:5])}')
-    binary = os.path.join(runtime, 't3')
-    if 't3' not in seen or not os.access(binary, os.X_OK):
-        raise NotLive(f'{binary} is not an executable from {archive}')
-    return binary
+    if 't3' not in seen or not os.access(os.path.join(runtime, 't3'), os.X_OK):
+        raise NotLive(f'{os.path.join(runtime, "t3")} is not an executable from {archive}')
+    return digest
+
+
+def staged_build(stage_dir, version):
+    """(t3 path, archive sha256) of the staged release: SHA256SUMS lists the archive and its hash matches, and the
+    extracted runtime in <stage>/<version>/ holds exactly the archive's files, byte for byte. Raises NotLive."""
+    archive_path, digest = staged_archive(stage_dir, version)
+    runtime = os.path.join(stage_dir, version)
+    if runtime_matches(archive_path, runtime) != digest:
+        raise NotLive(f'{archive_path} changed while it was read: stage it again')
+    return os.path.join(runtime, 't3'), digest
+
+
+def staged_runtime(stage_dir, version):
+    """The staged release's t3 path, checked as staged_build() checks it. Raises NotLive with the reason."""
+    return staged_build(stage_dir, version)[0]
 
 
 COUNTS = ('projects', 'projectsArchived', 'threads', 'threadsArchived')

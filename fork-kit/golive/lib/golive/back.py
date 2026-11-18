@@ -64,9 +64,10 @@ def _upstream_t3(cfg, version):
 
 
 def copies(cfg):
-    """Read only: [(folder, manifest)] of the finished copies of this home in backupDir, newest first."""
+    """Read only: [(folder, manifest)] of the finished copies of this home in backupDir, newest first: those of
+    `t3-golive copy` (t3-copy-*) and of the switch (t3-switch-*, taken while T3 was stopped for it)."""
     try:
-        names = [n for n in os.listdir(cfg.backup_dir) if n.startswith('t3-copy-')]
+        names = [n for n in os.listdir(cfg.backup_dir) if n.startswith(('t3-copy-', 't3-switch-'))]
     except FileNotFoundError:
         return []
     found = []

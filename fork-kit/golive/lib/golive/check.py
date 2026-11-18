@@ -359,19 +359,21 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     p = sub.add_parser('guard', help=argparse.SUPPRESS)
     p.add_argument('--run', required=True)
     p = sub.add_parser('switch', help='move the live T3 to the target build, verify it, go back on its own if not',
-                       description='Needs a passed, fresh rehearsal of this target from the live build. At a quiet '
-                                   'point: stop the boot service, cold copy its userdata, runtime and unit to a new '
-                                   'folder in backupDir, check the old build can start on the copy, update to the '
-                                   'target with the staged build and verify. A failed or late verify goes back on '
-                                   'its own; a guard unit goes back if the run dies. Runs detached unless --here.')
+                       description='Needs a passed, fresh rehearsal of this staged build (its archive sha256) from '
+                                   'the live build. Keeps the old runtime outside the home, then at a quiet point: '
+                                   'stop the boot service, cold copy its userdata to a new folder in backupDir, '
+                                   'check the old build can start on the copy, install the staged build it '
+                                   'rehearsed, update to it and verify (the build that runs is checked byte for '
+                                   'byte). A failed or late verify goes back on its own (W1, once); a guard unit '
+                                   'puts T3 back if the run dies. Runs detached unless --here.')
     p.add_argument('--owner-says-go', action='store_true',
                    help='do not wait for a quiet point (the owner says now is fine)')
     p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
     p = sub.add_parser('switch-guard', help='after a switch run that died: put T3 back as its journal says',
-                       description='What the switch guard runs (its unit and timer). Goes back only if the given '
-                                   'switch run is the last run, has no end line or never started its way back, and '
-                                   'its journal says neither "verified" nor "rolled back"; does nothing while another '
-                                   'run holds the lock. Going back by hand is `t3-golive back`.')
+                       description='What the switch guard runs (its unit and timer). Waits for the kit lock, then '
+                                   'acts only if the given switch run is the last run and has no end line (it was '
+                                   'killed): starts the old build again, or runs W1 once, never after a W1 stopped '
+                                   'T3. Going back by hand is `t3-golive back`.')
     p.add_argument('--run', required=True, help='the switch run id (in the journal)')
     p.add_argument('--wait', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -397,7 +399,7 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     if args.command in ('switch', 'switch-guard'):
         from golive import switch
         if args.command == 'switch-guard':
-            switch.back_auto(cfg, adapter, args.run, args.wait, say=lambda line: print(line, file=out, flush=True))
+            switch.guard(cfg, adapter, args.run, args.wait, say=lambda line: print(line, file=out, flush=True))
             return 0
         return switch.main_switch(cfg, adapter, args.here, args.owner_says_go, out, err)
     if args.command in ('copy', 'guard'):

@@ -164,7 +164,7 @@ class Machine:
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode='w:gz') as tar:
             for rel, text in files.items():
-                data = text.encode()
+                data = text if isinstance(text, bytes) else text.encode()
                 info = tarfile.TarInfo(f'{stem}/{rel}')
                 info.size, info.mode = len(data), 0o755 if rel == 't3' else 0o644
                 tar.addfile(info, io.BytesIO(data))
@@ -245,7 +245,7 @@ class FakeAdapter(osadapter.SystemdUser):
         if not osadapter._UNIT_NAME.match(unit):
             raise osadapter.AdapterError(f'not a safe unit name: {unit!r}')
         self._record('run_detached', unit, argv, *([guard_after_seconds, guard_argv] if guard_argv else []))
-        if self.guard_up and argv[1:3] in (['guard', '--run'], ['back', '--auto']):  # copy's guard; switch's
+        if self.guard_up and argv[1:3] in (['guard', '--run'], ['switch-guard', '--run']):  # copy's guard; switch's
             from golive import coldcopy
             run_id = argv[argv.index('--run') + 1]
             coldcopy._guard_log(os.path.join(self.root, 'kit-state'), {'run': run_id, 'waiting': True})
