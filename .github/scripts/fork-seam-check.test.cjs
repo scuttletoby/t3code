@@ -1646,7 +1646,10 @@ test("from upstream, an announced line the head has and upstream does not stops 
     const day = "2026-11-18T12:00:00Z";
     const upstream = commit({ ...BASE, "n.ts": UP }, "upstream", day);
     const head = commit({ "n.ts": `${UP}forkNew();\n`, ...seams(ANNOUNCED()) }, "kept", day);
-    for (const args of [[upstream, head], ["--after-rebase", upstream, head]]) {
+    for (const args of [
+      [upstream, head],
+      ["--after-rebase", upstream, head],
+    ]) {
       const result = fromUpstream(...args);
       assert.equal(result.status, 1, result.stdout);
       assert.match(
