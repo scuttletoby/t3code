@@ -1,9 +1,7 @@
 // Usage: [--config-ref <rev>] <base> <head> | --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>.
-// Refuses <head>'s upstream-file changes beyond .github/fork-seams.json. A pull request's list is
-// <base>'s (or --config-ref's), never <head>'s (its own is read only for "pending" ceilings it must
-// lower); --from-upstream (fork-follow) reads <head>'s, even if upstream has its own. --after-rebase:
-// a ceiling above the count is a note, and --lowered-list writes the list with it lowered there.
-// Reads git objects only (and writes only that file).
+// Refuses <head>'s upstream-file changes beyond .github/fork-seams.json: a PR uses <base>'s list (its own only for
+// "pending" ceilings it must lower); --from-upstream reads <head>'s. --after-rebase notes a too-high ceiling and
+// --lowered-list writes the lowered list. Reads git objects only (and writes only that file).
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -151,12 +149,10 @@ function parseRemoved(text = "") {
 }
 
 /**
- * Reasons for the seam files' lines: each listed line allows one copy more than `base` has (not from
- * upstream, `base` is main, whose copies spent it). On `today` (a pull request's run: the list's
- * commit date) an expired or dated-ahead announcement allows nothing: the copies it would allow in
- * date go to `late`, any more to the reasons. `atTip` (a pull request's run: the base branch's tip)
- * spends the allowance too: two branches from one merge-base cannot each add the one listed copy,
- * once the first has merged (#311 item 3).
+ * Reasons for the seam files' lines: each listed line allows one copy more than `base` has (on a PR, main).
+ * On `today` (a PR's run: the list's commit date) an expired or dated-ahead announcement allows nothing; its
+ * in-date copies go to `late`. `atTip` (a PR's run: the base tip) spends the allowance too, so two branches
+ * from one merge-base cannot each add the one listed copy once the first has merged.
  */
 function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, today, late }) {
   const reasons = [];
@@ -259,11 +255,10 @@ const AFTER_REBASE_RISE =
   " after the rebase onto this base (upstream's own change did it, not a fork pull request): rebase by hand as docs/fork/updates.md says and raise the {count} in the rebased series before pushing it, or push it and then raise the {count} with a list-only pull request to main; fork-follow lowers a count after a rebase, but never raises one (raising one is the owner's review).";
 
 /**
- * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed`
- * names it). A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase
- * `notes`; exceeded after a rebase: `rises`, the operator's); on a PR it may change but not grow,
- * and one that shrinks lowers its ceiling in `ownPending` (the PR's own list) to match (#311).
- * `lowered.pending` gets each ceiling a run from upstream finds too high: the count to lower it to.
+ * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed` names it).
+ * A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase `notes`; exceeded:
+ * `rises`); on a PR it may not grow, and a shrink lowers its ceiling in `ownPending` to match.
+ * `lowered.pending` gets the count each too-high ceiling from upstream lowers to.
  */
 function findUnlistedChanges(
   config,
@@ -332,7 +327,7 @@ function findUnlistedChanges(
       } else if (added < ceiling) {
         // A ceiling left too high is room to swap upstream lines for fork lines later, and a note
         // in the nightly log is never seen: refuse, naming the fix (only noted right after a
-        // rebase, where fork-follow commits the lowered list into the series: #325 item 1). Only a
+        // rebase, where fork-follow commits the lowered list into the series). Only a
         // lower count goes to `lowered`: a rise is refused.
         lowered?.pending.set(file, added);
         (afterRebase ? notes : ceilings).push(
@@ -349,12 +344,10 @@ function findUnlistedChanges(
         `${file}: "pending" (fork lines to move out), and this change adds ${grows} more line${grows === 1 ? "" : "s"} than it removes.`,
       );
     } else if (grows < 0 && ownPending !== undefined) {
-      // Main sits at its ceiling (fork-follow holds it there), so a change that moves fork lines
-      // out lowers it too. Left as it is, the next run from upstream refuses main for it, and the
-      // room left over would let a later change swap an upstream line for a fork line. The
-      // change's own list is read only for a lower ceiling: that is never a wider gate. This run
-      // cannot tell the fork's lines from upstream's here, so the text says both; an upstream
-      // line that goes is refused by the run from upstream ("lost" counts are held exact).
+      // Main sits at its ceiling, so a change that moves fork lines out must lower it too, or the next
+      // run from upstream refuses main and the spare room could later admit a fork line. The change's
+      // own list is read only for a lower ceiling (never a wider gate). This run cannot tell fork lines
+      // from upstream's, so the text names both; the run from upstream holds "lost" counts exact.
       const want = ceiling + grows;
       const own = Object.hasOwn(ownPending, file) ? ownPending[file] : 0;
       if (own > Math.max(want, 0)) {
@@ -776,11 +769,10 @@ function ownListProblem(text) {
 }
 
 /**
- * The list `text` with the ceilings and counts `lowered` names lowered ({ pending, lost }: Maps of
- * file to count), as { text, changes }, or undefined when nothing changes. Only lowers: a count at
- * 0 removes the entry, except a "pending" one a "lost" entry still names (removing it would leave
- * the list malformed; the run after says so). Written with two-space JSON, as the list is, and
- * parsed again before it is returned, so a lowered list is never one the check refuses.
+ * `text` with the counts in `lowered` ({ pending, lost }: Maps of file to count) lowered, as { text, changes },
+ * or undefined when nothing changes. Only lowers; a count at 0 removes the entry, except a "pending" one a
+ * "lost" entry still names (that would leave the list malformed). Two-space JSON, parsed again before it is
+ * returned, so a lowered list is never one the check refuses.
  */
 function lowerList(text, lowered) {
   const raw = JSON.parse(text);
@@ -950,7 +942,7 @@ function main(argv) {
   const late = [];
   const reasons = [
     // A pull request's base is its base branch's tip: a listed copy another change has merged
-    // there since this branch's merge-base is spent (#311 item 3).
+    // there since this branch's merge-base is spent.
     ...findSeamBreaches(config.files, {
       atBase,
       atHead,

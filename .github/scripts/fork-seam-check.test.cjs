@@ -1326,7 +1326,7 @@ test("from upstream, deleting an upstream line already counted as re-indented is
     git("checkout", "-q", "-b", "pr", main);
     const pr = commit({ "p.ts": reindented.replace("    return deny();\n", "") }, "delete it");
     // The pull request's run cannot tell upstream's lines from the fork's in a pending file, so it
-    // refuses a shrink that leaves the ceiling as it is (#311), saying to keep upstream's lines ...
+    // refuses a shrink that leaves the ceiling as it is, saying to keep upstream's lines ...
     const own = run(main, pr);
     assert.equal(own.status, 1, own.stdout);
     assert.match(own.stderr, /- p\.ts: "pending" with a ceiling of 1, .*keep upstream's lines/);
@@ -1988,7 +1988,7 @@ test("the real list takes upstream's MarkdownFileLink.logic.test.ts for an upstr
 });
 
 // A file named after an Object property read `lost[file]` from Object's prototype: its counts were
-// undefined, nothing compares above undefined, and every upstream line it lost passed (#416 item 3).
+// undefined, nothing compares above undefined, and every upstream line it lost passed.
 test("from upstream, a file named like an Object property is held to a lost count of 0", () => {
   for (const file of ["constructor", "toString", "__proto__"]) {
     const config = { pending: { [file]: 1 } };
@@ -2004,7 +2004,7 @@ test("from upstream, a file named like an Object property is held to a lost coun
 });
 
 // A pull request that moved fork lines out of a "pending" file left main's ceiling above its count,
-// and the next run from upstream refused main for it (#311).
+// and the next run from upstream refused main for it.
 const shrink = (pending, base, head, ownPending) =>
   findUnlistedChanges(
     { files: {}, pending, forkFiles: [] },
@@ -2069,7 +2069,7 @@ test("the command line refuses a pull request that shrinks a pending file but ke
 });
 
 // Two branches from one merge-base could each add the one listed copy of a seam line: each run
-// judged its own branch from the merge-base, and main ended with two copies (#311 item 3).
+// judged its own branch from the merge-base, and main ended with two copies.
 test("from main, a listed copy the base branch already has since the merge-base is spent", () => {
   const main = { "a.ts": BASE["a.ts"].replace("  a: 1,", "  ...fork,\n  a: 1,") };
   const options = (tip) => ({
@@ -2102,7 +2102,7 @@ test("the command line spends a seam copy another branch merged since the merge-
 });
 
 // Right after a rebase, fork-follow commits the list with each ceiling and count it found too high
-// lowered (#325 item 1); it never raises one.
+// lowered; it never raises one.
 test("lowerList lowers and removes entries, keeps comments and order, and never raises", () => {
   const text = `${JSON.stringify(
     {
