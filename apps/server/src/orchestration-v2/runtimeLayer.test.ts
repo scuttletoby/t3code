@@ -13097,36 +13097,36 @@ it.effect.each([
       // and the database are what the old process left.
       yield* TestClock.adjust("30 seconds");
       yield* recovery.reconcile("startup");
-      // Startup starts held work once the launcher committed the update.
-      yield* gate.startHeldWork;
-      for (const threadId of threads) {
-        const projection = yield* orchestrator.getThreadProjection(threadId);
-        const run = projection.runs[0]!;
-        const restartedAt = DateTime.formatIso(yield* DateTime.now);
-        const effects = [
-          ...(yield* outbox.listByCommandId(CommandId.make(`${threadId}:message`))),
-          ...(yield* outbox.listByCommandId(
-            CommandId.make(`command:update-hold:start:${run.id}:${restartedAt}`),
-          )),
-        ];
-        const pendingStarts = effects.filter(
-          (effect) =>
-            effect.status === "pending" &&
-            effect.request.type === "provider-turn.start" &&
-            effect.request.runId === run.id,
-        );
-        if (marker) {
-          // Neither cancelled nor left in the queue the user has to release: it starts.
-          assert.equal(run.status, "starting", threadId);
-          assert.notEqual(run.queueHeld, true, threadId);
-          assert.lengthOf(pendingStarts, 1, threadId);
-        } else {
-          // Upstream: a user message waits in the held queue, an agent's message is cancelled.
-          assert.isTrue(
-            threadId.includes("-user-") ? run.queueHeld === true : run.status === "cancelled",
-            `${threadId}: ${run.status}`,
+      // Before the launcher commits the update, then after: startup starts the held work.
+      for (const committed of [false, true]) {
+        if (committed) yield* gate.startHeldWork;
+        for (const threadId of threads) {
+          const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+          const restartedAt = DateTime.formatIso(yield* DateTime.now);
+          const effects = [
+            ...(yield* outbox.listByCommandId(CommandId.make(`${threadId}:message`))),
+            ...(yield* outbox.listByCommandId(CommandId.make(`command:restart-resend:${run.id}`))),
+            ...(yield* outbox.listByCommandId(
+              CommandId.make(`command:update-hold:start:${run.id}:${restartedAt}`),
+            )),
+          ];
+          const pendingStarts = effects.filter(
+            (effect) =>
+              effect.status === "pending" &&
+              effect.request.type === "provider-turn.start" &&
+              effect.request.runId === run.id,
           );
-          assert.lengthOf(pendingStarts, 0, threadId);
+          const agent = threadId.includes("-agent-");
+          if (marker) {
+            // Not cancelled, sent again or left in the held queue: it starts once, on the commit.
+            assert.equal(run.status, "starting", threadId);
+            assert.notEqual(run.queueHeld, true, threadId);
+            assert.lengthOf(pendingStarts, committed ? 1 : 0, threadId);
+          } else {
+            // Upstream: a user message waits in the held queue, an agent's message is sent again.
+            assert.equal(run.queueHeld === true, !agent, `${threadId}: ${run.status}`);
+            assert.lengthOf(pendingStarts, agent ? 1 : 0, threadId);
+          }
         }
       }
     }).pipe(
