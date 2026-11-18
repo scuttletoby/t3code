@@ -244,11 +244,17 @@ cmd_check_bundle() {
 }
 
 cmd_check_archives() {
-  local dir="${1:?directory}" archive work name stem program found=0
+  local dir="${1:?directory}" archive tmp work name stem program found=0
+  # One folder for the unpacked archives, removed however the check ends: a refusal exits from
+  # inside the loop. Expanded now: the trap runs at exit, after this function's locals are gone.
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/fork-release.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- $(printf '%q' "$tmp")" EXIT
   shopt -s nullglob
   for archive in "$dir"/t3-*.tar.gz "$dir"/t3-*.zip; do
     found=1
-    work="$(mktemp -d)"
+    # Each archive in a folder of its own, so one cannot stand in for another's program.
+    work="$(mktemp -d "$tmp/XXXXXX")"
     case "$archive" in
       *.tar.gz) tar -xzf "$archive" -C "$work" ;;
       *.zip) python3 -I -m zipfile -e "$archive" "$work" ;;

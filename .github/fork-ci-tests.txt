@@ -37,6 +37,7 @@
 .github/scripts/fork-reusable-permissions.test.py
 .github/scripts/fork-schema-check.test.cjs ~7s
 .github/scripts/fork-seam-check.test.cjs
+.github/scripts/fork-temp-files.test.sh
 .github/scripts/fork-secret-scan.test.sh run by .github/workflows/fork-secret-scan.yml
 .github/scripts/fork-test-shards.test.cjs
 .github/scripts/fork-tests-drift.test.cjs
