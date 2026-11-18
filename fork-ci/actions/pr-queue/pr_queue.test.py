@@ -3362,14 +3362,14 @@ class HoldsChecksTheCachesObjects(unittest.TestCase):   # #457 item 1
             self.assertEqual(record, self.q.state + '.fsck-known', 'next to STATE')
             self.assertFalse(os.path.lexists(inside), 'nothing of the queue in the cache but git\'s files')
 
-            def others_can_write():
+            def others_can_write(_):
                 os.chmod(record, 0o666)
 
-            def a_link():
+            def a_link(_):
                 os.replace(record, record + '.real')
                 os.symlink(record + '.real', record)
 
-            def someone_elses():
+            def someone_elses(undo):   # by inode, so only for this subtest: a later record may get the same inode
                 info = os.stat(record)
                 real_fstat = os.fstat
 
@@ -3378,23 +3378,21 @@ class HoldsChecksTheCachesObjects(unittest.TestCase):   # #457 item 1
                     if (got.st_dev, got.st_ino) != (info.st_dev, info.st_ino):
                         return got
                     return os.stat_result((*got[:4], got.st_uid + 1, *got[5:]))
-                patched = unittest.mock.patch.object(Q.os, 'fstat', fstat)
-                patched.start()
-                self.addCleanup(patched.stop)
+                undo.enter_context(unittest.mock.patch.object(Q.os, 'fstat', fstat))
 
-            def an_older_queues():   # the old place: ignored, so one more download, then kept in the new place
+            def an_older_queues(_):   # the old place: ignored, so one more download, then kept in the new place
                 os.replace(record, inside)
 
-            def a_fifo_fed_the_same_lines():   # this user's, mode 0600, and a writer that says what the queue wrote
+            def a_fifo_fed_the_same_lines(_):   # this user's, mode 0600, and a writer that says what the queue wrote
                 with open(record, 'rb') as f:
                     said = f.read()
                 os.remove(record)
                 self.feed_fifo(record, said)
             for spoil in (others_can_write, a_link, someone_elses, an_older_queues, a_fifo_fed_the_same_lines):
-                with self.subTest(spoil=spoil.__name__):
+                with self.subTest(spoil=spoil.__name__), contextlib.ExitStack() as undo:
                     self.assertIn('the same way', run())
                     self.assertEqual(len(fetches), 1, 'the record as the queue wrote it: no download')
-                    spoil()
+                    spoil(undo)
                     self.assertIn('rebuilding it', run())
                     self.assertEqual(len(fetches), 2, 'no record of the queue\'s own: one download from scratch')
                     self.assertEqual(os.lstat(record).st_mode & 0o7777, 0o600, 'written again, a file of its own')
