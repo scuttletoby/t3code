@@ -13,6 +13,23 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: GIT_ATTR_SOURCE and the job's git programs (#442)
+
+- Every git call of the queue and the head check also drops `GIT_ATTR_SOURCE` and `GIT_EXTERNAL_DIFF`. With
+  `GIT_ATTR_SOURCE` naming a tree that holds `* merge=union`, the gate's `git merge-tree` and the queue's same-change
+  rule union-merged a conflict instead of refusing it.
+- The queue's and the gate's git calls drop the job's `GIT_EXEC_PATH`, `GIT_SSH`, `GIT_SSH_COMMAND`,
+  `GIT_PROXY_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS` and `GIT_ALLOW_PROTOCOL` (`pr_queue.GIT_RUN`) where none can be
+  needed: a call that reaches no remote drops all of them, a fetch from GitHub (https) keeps `GIT_EXEC_PATH` only.
+  A fetch from another remote (the gate's `--remote`, the head check's origin in checkout mode) keeps them.
+- The head check decodes git's output as UTF-8 whatever the job's locale, so a base config that is not UTF-8 is
+  "not UTF-8 text" under any locale.
+- The queue's config read names the sparse-checkout pattern only when the blob is missing from a partial clone; any
+  other `cat-file` failure says git's own error.
+
+**Upgrade:** a job that needs `GIT_ASKPASS` or `GIT_SSH_COMMAND` for the queue's or the gate's fetch from GitHub no
+longer gets it: the queue and the gate log in with the run's token (`gh`), as documented.
+
 ### pr-queue and head-check: follow-ups of the git config read (#435)
 
 - The queue's config read fetches nothing and is timed. In a partial clone (actions/checkout's sparse checkout) a
