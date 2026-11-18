@@ -17,14 +17,21 @@ import machine_file
 from . import config, rules
 from .facts import Facts, Unreadable, Untouched
 
-USAGE = 'usage: fork-cleaner plan | fork-cleaner run | fork-cleaner report   (fork-cleaner --help says more)'
+USAGE = ('usage: fork-cleaner plan | run | report [--out FILE] [--no-mark] | compare | daily   '
+         '(fork-cleaner --help says more)')
 HELP = '''fork-cleaner plan     print what a run would delete and what it keeps; changes nothing
 fork-cleaner run      delete it, one log line per delete
 fork-cleaner report   one line: GB per class on this host, and what runs freed since the last report
+                      --out FILE: append the line to FILE first; the mark moves only once it is there
+                      --no-mark: leave the mark where it is (the next report counts the same deletes again)
+fork-cleaner compare  what plan would delete next to what the old tools' dry runs would (cleaner.daily.compare)
+fork-cleaner daily    what the timer runs: plan, report and compare (cleaner.daily.mode "compare", the default),
+                      or run and report ("run", refused while a timer in cleaner.daily.oldTimers is on or unknown)
 
 What may go is decided by three rules (worktrees, docker, tmp) and the "cleaner" section of the machine file.
 What must stay is decided by the code and cannot be turned off. Exit code: 0 done, 1 something could not be read or
-deleted (it was kept), 2 wrong command or no usable machine file (nothing was done).'''
+deleted (it was kept), 2 wrong command or no usable machine file (nothing was done), 3 (compare and daily only)
+every step worked and the compare found paths only fork-cleaner would delete.'''
 NEW = os.O_CREAT | os.O_NOFOLLOW        # the lock and the log are made when missing, and are never reached by a link
 STAMP = re.compile(rb'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ ')   # how every line of the cleaner's log starts
 HALF = ('an earlier run stopped while deleting it, so it may be partly gone; nothing judges it again until you '
@@ -352,7 +359,19 @@ def main(argv, say=print):
     if argv == ['--help']:
         say(HELP)
         return 0
-    if argv not in (['plan'], ['run'], ['report']):
+    command, options = (argv[0] if argv else None), list(argv[1:])
+    out, mark = None, True
+    if command == 'report':
+        while options:
+            option = options.pop(0)
+            if option == '--no-mark':
+                mark = False
+            elif option == '--out' and options and options[0].startswith('/') and out is None:
+                out = os.path.normpath(options.pop(0))
+            else:
+                say(USAGE)
+                return 2
+    if command not in ('plan', 'run', 'report', 'compare', 'daily') or options:
         say(USAGE)
         return 2
     if os.geteuid() == 0:
@@ -364,7 +383,13 @@ def main(argv, say=print):
     except machine_file.MachineFileError as ex:
         say(f'fork-cleaner: {ex}')
         return 2  # config
-    if argv == ['report']:
-        from . import report        # report.py builds on this module
-        return report.report(cfg, say)
-    return execute(cfg, Facts(cfg), argv == ['run'], say)
+    if command == 'report':
+        from . import report        # report.py, compare.py and daily.py build on this module
+        return report.report(cfg, say, out=out, mark=mark)
+    if command == 'compare':
+        from . import compare
+        return compare.compare(cfg, Facts(cfg), say)
+    if command == 'daily':
+        from . import daily
+        return daily.daily(cfg, say)
+    return execute(cfg, Facts(cfg), command == 'run', say)

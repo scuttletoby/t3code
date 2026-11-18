@@ -48,6 +48,32 @@
   "model-guard": {
     "policyFile": "/etc/fork-kit/model-policy.json"
   },
+  "cleaner": {
+    "logFile": "~/.local/state/fork-cleaner/cleaner.log",
+    "mustKeep": ["/srv/example/ledger"],
+    "worktrees": {
+      "repos": [
+        {
+          "root": "~/worktrees",
+          "github": "example-owner/example-repo",
+          "regenerable": ["dist"],
+          "branches": ["work/*"]
+        }
+      ]
+    },
+    "tmp": { "root": "/tmp", "patterns": { "example-build-*": 7 } },
+    "daily": {
+      "mode": "compare",
+      "oldTimers": ["example-retention.timer"],
+      "compare": [
+        {
+          "name": "example-retention",
+          "command": ["/usr/local/bin/example-retention", "--dry-run"],
+          "pattern": "^would remove (/.+?) \\("
+        }
+      ]
+    }
+  },
   "desk": {
     "pool": "pc",
     "host": "fleet-host.example",

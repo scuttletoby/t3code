@@ -5,7 +5,7 @@ RedCheck breaks each rule in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/report.test.py
 """
-import contextlib, fcntl, json, os, shutil, sys, time, types, unittest
+import contextlib, fcntl, json, os, shutil, stat, sys, time, types, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -39,13 +39,14 @@ class Case(fx.Case):
     def no_docker(self):
         raise AssertionError('Docker was asked')
 
-    def report(self, cfg, docker=None, disk=(100 * GB, 200 * GB, None), mounts=lambda: {'/'}):
+    def report(self, cfg, docker=None, disk=(100 * GB, 200 * GB, None), mounts=lambda: {'/'}, **options):
         """(exit code, lines) of one report. `disk` is (used, size, device) of the home folder's disk; device None
-        means the home folder's own. `mounts` gives the mount points."""
+        means the home folder's own. `mounts` gives the mount points. `options`: out, mark."""
         used, size, dev = disk
         lines = []
         code = self.c.report.report(cfg, lines.append, docker=docker or self.no_docker, host=HOST, mounts=mounts,
-                                    disk_of=lambda cfg: (used, size, dev if dev is not None else os.stat(cfg.home).st_dev))
+                                    disk_of=lambda cfg: (used, size, dev if dev is not None else os.stat(cfg.home).st_dev),
+                                    **options)
         return code, lines
 
     def part(self, line, name):
@@ -127,8 +128,9 @@ class Classes(Case):
         tree = self.worktree(clone, 'fix-1')
         self.big(os.path.join(tree, 'build.bin'), 2)
         gone = self.clone('gone', into=self.mkdir('elsewhere'))
-        orphan = self.worktree(gone, 'fix-2')                          # its main repository is removed below
+        orphan = self.worktree(gone, 'fix-2')                          # its main repository is broken below
         shutil.rmtree(gone)
+        os.makedirs(os.path.join(gone, '.git', 'worktrees', 'fix-2'))  # its git folder is there, and git fails
         sized = self.classes(self.repo_cfg())['worktrees']
         self.assertEqual(sized.problems, [])
         self.assertGreaterEqual(sized.total, 2 * MB)
@@ -139,6 +141,19 @@ class Classes(Case):
         text = self.part(lines[0], 'worktrees')
         self.assertTrue(text.startswith('0.0 GB (could not read 1 worktree: ' + orphan + ' ('), text)
         self.assertIn('(with what could not be read)', self.part(lines[0], 'everything else'))
+
+    def test_an_orphaned_worktree_counts_and_is_no_error(self):
+        """A worktree whose main repository is gone (its git folder too) is no "could not read": git can never
+        answer for it, and the worktrees rule keeps it under its own name. It counts in the class."""
+        gone = self.clone('gone', into=self.mkdir('elsewhere'))
+        orphan = self.worktree(gone, 'fix-2')
+        self.big(os.path.join(orphan, 'build.bin'), 2)
+        shutil.rmtree(gone)
+        sized = self.classes(self.repo_cfg())['worktrees']
+        self.assertEqual((sized.problems, sized.unread), ([], []))
+        self.assertGreaterEqual(sized.total, 2 * MB)
+        code, lines = self.report(self.repo_cfg())
+        self.assertEqual(code, 0, lines)
 
     def test_temp_is_the_entries_a_pattern_takes(self):
         self.big(self.path('tmp', 'job-1', 'a.bin'), 2)                # taken by the pattern, whatever its age
@@ -437,6 +452,83 @@ class Freed(Case):
         self.assertIn('the next report counts these deletes again', lines[-1])
 
 
+    def test_with_out_the_line_is_written_before_the_mark_moves(self):
+        """#491: a line that went nowhere must be counted again. With --out the line is appended to the file (and
+        synced) first; when that fails the mark stays, so the next report counts the same deletes."""
+        cfg = self.cfg()
+        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB')])
+        out = self.path('state', 'daily', 'report.log')
+        code, lines = self.report(cfg, out=out)
+        self.assertEqual(code, 0, lines)
+        with open(out) as f:
+            self.assertEqual(f.read(), lines[0] + '\n')
+        self.assertIn('2.0 GB (1 delete)', lines[0])
+        self.assertTrue(os.path.isfile(cfg.report_file))
+        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB'), self.deleted('/tmp/b', '3.0 GB')])
+        os.remove(out)
+        os.mkdir(out)                                          # the line cannot be written
+        mark = open(cfg.report_file).read()
+        code, lines = self.report(cfg, out=out)
+        self.assertEqual(code, 1, lines)
+        self.assertIn('the mark stays', lines[-1])
+        self.assertEqual(open(cfg.report_file).read(), mark)
+        os.rmdir(out)
+        code, lines = self.report(cfg, out=out)                # delivered now: the same delete is counted
+        self.assertEqual(code, 0, lines)
+        self.assertIn(' 3.0 GB (1 delete)', lines[0])
+        os.remove(out)
+        os.symlink(self.path('elsewhere.log'), out)            # never written through a link
+        self.assertEqual(self.report(cfg, out=out)[0], 1)
+        self.assertFalse(os.path.lexists(self.path('elsewhere.log')))
+        os.remove(out)
+        open(out, 'w').close()                                 # there already: only the line is synced
+        mark = open(cfg.report_file).read()
+        with mock.patch.object(self.c.report.os, 'fsync', side_effect=OSError(5, 'Input/output error')):
+            self.assertEqual(self.report(cfg, out=out)[0], 1)      # written but not known to be on disk
+        self.assertEqual(open(cfg.report_file).read(), mark)
+
+    def test_with_out_a_new_file_is_synced_with_its_folder(self):
+        """The first line makes the file: its folder is synced too, else a power cut can keep the mark and lose the
+        file. A file already there needs only its own sync."""
+        cfg = self.cfg()
+        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB')])
+        out = self.path('state', 'daily', 'report.log')
+        synced, real = [], os.fsync
+
+        def fsync(fd):
+            synced.append('folder' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+            real(fd)
+        for there, want in ((False, ['file', 'folder']), (True, ['file'])):
+            with self.subTest(there=there):
+                synced.clear()
+                with mock.patch.object(self.c.report.os, 'fsync', fsync):
+                    code, lines = self.report(cfg, out=out)
+                self.assertEqual(code, 0, lines)
+                self.assertEqual(synced, want)
+
+    def test_no_mark_leaves_the_mark(self):
+        cfg = self.cfg()
+        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB')])
+        for _ in range(2):
+            code, lines = self.report(cfg, mark=False)
+            self.assertEqual(code, 0, lines)
+            self.assertIn('2.0 GB (1 delete)', lines[0])
+            self.assertFalse(os.path.lexists(cfg.report_file))
+
+    def test_an_old_tools_log_left_behind_is_not_read_or_changed(self):
+        """#491, state: the tool the cleaner replaces leaves its log, with lines that look like the cleaner's
+        ("<time> deleted <path> (<size>, <rule>: ...)"). The cleaner's own log is another file: the old deletes are
+        not counted, and the old log is not touched."""
+        old = self.file(self.path('home', '.local', 'state', 'old-retention.log'),
+                        self.deleted('/tmp/old', '9.0 GB') + '\n')
+        before = (open(old).read(), os.stat(old).st_mtime)
+        cfg = self.cfg(logFile='~/.local/state/fork-cleaner/cleaner.log')
+        code, lines = self.report(cfg, out=self.path('state', 'daily', 'report.log'))
+        self.assertEqual(code, 0, lines)
+        self.assertIn('freed 0.0 GB (no delete in the log yet)', lines[0])
+        self.assertEqual((open(old).read(), os.stat(old).st_mtime), before)
+
+
 class Command(Case):
     def test_the_command_reads_the_machine_file(self):
         path = self.path('machine.json')
@@ -450,9 +542,24 @@ class Command(Case):
             with mock.patch.object(self.c.engine.os, 'geteuid', lambda: 0):
                 self.assertEqual(self.c.engine.main(['report'], say=lines.append), 2)
             self.assertEqual(self.c.engine.main(['report', '--all'], say=lines.append), 2)
+            for bad in (['report', '--out'], ['report', '--out', 'relative.log'], ['plan', '--no-mark'],
+                        ['report', '--out', '/a', '--out', '/b']):
+                self.assertEqual(self.c.engine.main(bad, say=lines.append), 2, bad)
+            out = self.path('out', 'report.log')
+            self.assertEqual(self.c.engine.main(['report', '--no-mark', '--out', out], say=lines.append), 0)
+            with open(out) as f:
+                self.assertEqual(f.read(), lines[-1] + '\n')
 
 
 MUTATIONS = {
+    'out: the mark moves only after the line is written': ('report', "            return 1\n    say(line)", "            pass\n    say(line)",
+                                                           Freed, 'test_with_out_the_line_is_written_before_the_mark_moves'),
+    'out: synced': ('report', '        os.fsync(fd)\n', '', Freed, 'test_with_out_the_line_is_written_before_the_mark_moves'),
+    'out: a new file\'s folder synced': ('report', '            os.fsync(dfd)\n', '            pass\n', Freed,
+                                         'test_with_out_a_new_file_is_synced_with_its_folder'),
+    'an orphaned worktree counts': ('rules', "    if kind == 'worktree' and orphaned_worktree(path) is not None:\n        return kind\n",
+                                    '', Classes, 'test_an_orphaned_worktree_counts_and_is_no_error'),
+    'no mark': ('report', 'if mark and got.problem is None', 'if got.problem is None', Freed, 'test_no_mark_leaves_the_mark'),
     'one class list': ('report', 'for name, source in CLASSES]', "for name, source in CLASSES[:1]]",
                        Classes, 'test_the_classes_are_the_cleaners_own_list'),
     'worktrees: the rule\'s own folders': ('report', 'if kind is not None:', 'if True:', Classes, 'test_worktrees_are_the_folders_the_rule_looks_at'),
