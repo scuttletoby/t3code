@@ -145,8 +145,7 @@
     "apps/server/src/mcp/toolkits/project/handlers.test.ts": 48,
     "apps/server/src/orchestration-v2/EffectWorker.ts": 28,
     "apps/server/src/orchestration-v2/ProjectionStore.ts": 7,
-    "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts": 435,
-    "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": 152,
+    "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": 127,
     "apps/server/src/orchestration-v2/ThreadLaunchService.test.ts": 84,
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": 13,
     "apps/server/src/orchestration-v2/ThreadManagementService.ts": 1,
@@ -251,8 +250,8 @@
       "gone": 1
     },
     "apps/server/src/serverSettings.ts": {
-      "lines": 10,
-      "gone": 8
+      "lines": 9,
+      "gone": 7
     },
     "apps/server/src/cloud/CloudLink.ts": {
       "lines": 1,
@@ -286,13 +285,9 @@
       "lines": 1,
       "gone": 1
     },
-    "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts": {
+    "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": {
       "lines": 1,
       "gone": 1
-    },
-    "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": {
-      "lines": 5,
-      "gone": 5
     },
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": {
       "lines": 7,
@@ -335,8 +330,8 @@
       "gone": 1
     },
     "apps/web/src/components/chat/MarkdownFileLink.logic.ts": {
-      "lines": 22,
-      "gone": 20
+      "lines": 20,
+      "gone": 18
     },
     "apps/web/src/components/chat/MarkdownFileLink.tsx": {
       "lines": 32,
