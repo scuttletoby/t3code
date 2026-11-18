@@ -48,7 +48,6 @@ REPORT="${REPORT:-fork-follow-report.md}"
 OUTPUT="${GITHUB_OUTPUT:-/dev/stdout}"
 ORIGIN="${ORIGIN:-origin}"
 REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:-this repository}}"
-logs="${RUNNER_TEMP:-$(mktemp -d)}"
 upstream_url="${UPSTREAM_URL:-https://github.com/$UPSTREAM.git}"
 reported=""
 
@@ -72,6 +71,16 @@ on_error() {
   cat "$REPORT" >&2
 }
 trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+# The logs of the steps below. In a run they go to RUNNER_TEMP, which is the runner's. Anywhere
+# else the plan makes a folder of its own and removes it however it ends (also on TERM, INT and
+# HUP; a subshell does not inherit the trap). Only KILL leaves it, and its name says whose it was.
+if [[ -n "${RUNNER_TEMP:-}" ]]; then
+  logs="$RUNNER_TEMP"
+else
+  logs="$(mktemp -d "${TMPDIR:-/tmp}/fork-follow.XXXXXX")"
+  trap 'rm -rf "$logs" || true' EXIT
+fi
 
 head="$(git rev-parse HEAD)"
 run_sha="${RUN_SHA:-$head}"

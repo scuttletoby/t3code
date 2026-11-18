@@ -144,7 +144,9 @@ case "$ACTION" in
      fi ;;
 esac
 
-body="$(mktemp)"
+body="$(mktemp "${TMPDIR:-/tmp}/fork-follow-report.XXXXXX")"
+# Removed however the report ends (a cancelled run ends it while it waits for GitHub).
+trap 'rm -f "$body"' EXIT
 {
   if [[ "$failed" == true ]]; then
     echo "## $title"
@@ -204,5 +206,4 @@ fi
   cat "$body"
   [[ -z "$note" ]] || printf '\n%s\n' "$note"
 } >> "$SUMMARY"
-rm -f "$body"
 [[ "$failed" != true ]]
