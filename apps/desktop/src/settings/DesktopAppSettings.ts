@@ -41,6 +41,8 @@ export interface DesktopSettings {
   readonly wslDistro: string | null;
   // Requires restart because the pool chooses its primary spec at layer initialization.
   readonly wslOnly: boolean;
+  /** Download new releases by themselves and install them when the app quits. Absent means off. */
+  readonly autoUpdate?: boolean;
 }
 
 export interface DesktopSettingsChange {
@@ -109,6 +111,7 @@ const DesktopSettingsDocument = Schema.Struct({
   wslMode: optionalReadableKey(Schema.Literals(["local", "wsl"])),
   wslDistro: optionalReadableKey(Schema.NullOr(Schema.String)),
   wslOnly: optionalReadableKey(Schema.Boolean),
+  autoUpdate: optionalReadableKey(Schema.Boolean),
 });
 
 type DesktopSettingsDocument = typeof DesktopSettingsDocument.Type;
@@ -240,6 +243,7 @@ function normalizeDesktopSettingsDocument(
     wslBackendEnabled,
     wslDistro: normalizeWslDistro(parsed.wslDistro),
     wslOnly: parsed.wslOnly === true,
+    ...(parsed.autoUpdate === true ? { autoUpdate: true } : {}),
   };
 }
 
@@ -285,6 +289,9 @@ function toDesktopSettingsDocument(
   }
   if (settings.wslOnly !== defaults.wslOnly) {
     document.wslOnly = settings.wslOnly;
+  }
+  if (settings.autoUpdate === true) {
+    document.autoUpdate = true;
   }
 
   return document;

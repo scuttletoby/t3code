@@ -44,6 +44,8 @@ export interface UpdatesHarnessOptions {
   readonly savedChannel?: DesktopAppSettings.DesktopSettings["updateChannel"];
   /** Adds a WSL backend beside the primary, as on a Windows host with WSL enabled. */
   readonly wslBackend?: boolean;
+  /** Starts with the autoUpdate setting; `setAutoUpdate` changes it later. */
+  readonly autoUpdate?: boolean;
 }
 
 export function makeHarness(options: UpdatesHarnessOptions = {}) {
@@ -57,6 +59,7 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
   const listeners = new Map<string, Set<(...args: readonly unknown[]) => void>>();
   const sentStates: DesktopUpdateState[] = [];
   const installSteps: string[] = [];
+  const autoInstallOnAppQuit: boolean[] = [];
 
   const addListener = (eventName: string, listener: (...args: readonly unknown[]) => void) => {
     const eventListeners = listeners.get(eventName) ?? new Set();
@@ -81,7 +84,10 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
         feedUrls.push(options);
       }),
     setAutoDownload: () => Effect.void,
-    setAutoInstallOnAppQuit: () => Effect.void,
+    setAutoInstallOnAppQuit: (value) =>
+      Effect.sync(() => {
+        autoInstallOnAppQuit.push(value);
+      }),
     setChannel: () => Effect.void,
     setAllowPrerelease: () => Effect.void,
     allowDowngrade: Effect.sync(() => allowDowngrade),
@@ -208,10 +214,14 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     ...(options.savedChannel === undefined
       ? {}
       : { updateChannel: options.savedChannel, updateChannelConfiguredByUser: true }),
+    ...(options.autoUpdate === undefined ? {} : { autoUpdate: options.autoUpdate }),
   };
   const setUpdateChannelError = options.setUpdateChannelError;
   const layerSettings =
-    setUpdateChannelError || options.beforeSetUpdateChannel || options.savedChannel
+    setUpdateChannelError ||
+    options.beforeSetUpdateChannel ||
+    options.savedChannel ||
+    options.autoUpdate !== undefined
       ? Layer.succeed(DesktopAppSettings.DesktopAppSettings, {
           get: Effect.sync(() => testSettings),
           load: Effect.sync(() => testSettings),
@@ -316,6 +326,11 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     checkCount: () => checkCount,
     quitAndInstalls: () => quitAndInstallCount,
     installSteps,
+    /** Every value the updater's install-on-quit flag was set to, in order. */
+    autoInstallOnAppQuit,
+    setAutoUpdate: (value: boolean) => {
+      testSettings = { ...testSettings, autoUpdate: value };
+    },
     updateRestartMarkers,
     updateInProgressMarker: () =>
       [...updateMarkerContents].find(([path]) => path.endsWith("/desktop-update-in-progress"))?.[1],
