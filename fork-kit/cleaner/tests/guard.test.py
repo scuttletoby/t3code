@@ -583,10 +583,9 @@ class GitFolders(GuardCase):
 MUTATIONS = {
     'must keep: the built-in paths': ('guard', 'kept = must_keep_match(cfg.must_keep, path)', 'kept = None',
                                       MustKeep, 'test_transcripts_sessions_and_t3_data_are_never_deleted'),
-    'must keep: the agent homes whole': ('config', "'~/.claude*', '~/.codex*', '~/.t3*/userdata',",
-                                         "'~/.claude*/projects', '~/.codex*/sessions', '~/.t3*/userdata',",
+    'must keep: the agent homes whole': ('config', "'~/.claude*', '~/.codex*',\n", "'~/.claude*/projects', '~/.codex*/sessions',\n",
                                          MustKeep, 'test_the_agent_homes_are_kept_whole'),
-    'must keep: T3 development data': ('config', "'~/.t3*/dev',", '', MustKeep, 'test_t3_development_data_and_other_agent_tools_are_kept'),
+    'must keep: T3 development data': ('config', "T3_DATA = ('~/.t3*/userdata', '~/.t3*/dev')", "T3_DATA = ('~/.t3*/userdata',)", MustKeep, 'test_t3_development_data_and_other_agent_tools_are_kept'),
     'must keep: other agent tools': ('config', "'~/.gemini', ", '', MustKeep, 'test_t3_development_data_and_other_agent_tools_are_kept'),
     'must keep: through a link': ('config', 'for form in (self._expand(text), os.path.realpath(self._expand(text))):',
                                   'for form in (self._expand(text),):', MustKeep, 'test_a_must_keep_path_written_through_a_link'),
