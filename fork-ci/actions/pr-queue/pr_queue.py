@@ -40,7 +40,7 @@ and no comment says so yet (STATE stays, the next run finishes it).
     PR_QUEUE_READ_TOKEN=... PR_QUEUE_WRITE_TOKEN=... \
     pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 """
-import argparse, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, time, urllib.parse, zlib
+import argparse, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, threading, time, urllib.parse, zlib
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -150,6 +150,10 @@ NO_DETACH = ('-c', 'gc.autoDetach=false', '-c', 'maintenance.autoDetach=false')
 FSCK_KNOWN = '.fsck-known'
 # CACHE + this: the merge check's own repository (Queue.holds_checked), made new for each check and deleted after it.
 MERGE_COPY = '.merge'
+# How long the merge check's object reader (Copy: one `git cat-file --batch`) may owe one answer, the line that names
+# an object or its next 1 MiB, before it is stopped and the run knows nothing (STATE stays). An answer takes
+# milliseconds; this is for a reader that hangs. The run's other git calls have no limit but the job's.
+CAT_SECONDS = 120
 # A merge check follows at most this many merge bases (bases_of): a history with more is not taken as the change read.
 MERGE_BASES = 8
 # A commit as git reads it: the tree line, then the parent lines right after it.
@@ -251,16 +255,34 @@ class Copy:
     here, and nothing written to the cache after an object was copied can reach it. The trees git itself makes there
     (of two or more merge bases) are written by git into `to`, where nothing was planted under their names.
 
-    Changed: an object is missing, cannot be read or does not hash to its name. OSError: `to` cannot be written."""
+    Changed: an object is missing, cannot be read or does not hash to its name. OSError: `to` cannot be written, or
+    (TimeoutError) cat-file gave no answer for CAT_SECONDS, which says nothing about the cache's objects."""
 
     def __init__(self, argv, env, to):
         self.to, self.seen, self.folders = to, set(), set()
         self.tree_of, self.trees, self.whole, self.walked = {}, {}, set(), set()   # commit: its tree; tree: entries
         self.cat = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL)
+        self.asked, self.stalled, self.done = None, False, threading.Event()   # asked: since when said() waits
+        self.watcher = threading.Thread(target=self.watch, daemon=True)
+        self.watcher.start()
+
+    def watch(self):
+        """Stops a cat-file that owes one answer (said) for more than CAT_SECONDS: git opens a loose object with a
+        plain open(), so a FIFO planted under an object's name would hold it, and with it the run and the queue's
+        lock, until the job's time limit. The reads themselves are not touched: a stopped cat-file can only give
+        less than was asked for, never other bytes. Between two answers (while git merges) nothing is counted."""
+        while not self.done.wait(min(1.0, CAT_SECONDS / 4)):
+            asked = self.asked
+            if asked is not None and time.monotonic() - asked > CAT_SECONDS:
+                self.stalled = True
+                self.cat.kill()
+                return
 
     def close(self):
         """cat-file stopped and reaped (a run that is killed outright closes its stdin, which ends it too)."""
+        self.done.set()
+        self.watcher.join()
         self.cat.kill()
         for pipe in (self.cat.stdin, self.cat.stdout):
             try:
@@ -270,16 +292,25 @@ class Copy:
         self.cat.wait()
 
     def said(self, name, n=None):
-        """cat-file's next line (after asking for `name`), or its next `n` bytes; Changed when it gives less."""
+        """cat-file's next line (after asking for `name`), or its next `n` bytes; Changed when it gives less, and
+        TimeoutError when it gave less because it was stopped after CAT_SECONDS without an answer (watch)."""
+        self.asked = time.monotonic()
         try:
             if n is None:
                 self.cat.stdin.write(name.encode() + b'\n')
                 self.cat.stdin.flush()
-                return self.cat.stdout.readline()
-            got = self.cat.stdout.read(n)
+                got = self.cat.stdout.readline()
+            else:
+                got = self.cat.stdout.read(n)
         except (OSError, ValueError) as e:
-            raise Changed(f'object {name} cannot be read (git cat-file: {e})') from None
-        if len(got) != n:
+            got = e
+        finally:
+            self.asked = None
+        if self.stalled:   # whatever came before it was stopped: never taken, and no word on the object
+            raise TimeoutError(f'git cat-file gave no answer for {CAT_SECONDS:g} s (object {name}) and was stopped')
+        if isinstance(got, Exception):
+            raise Changed(f'object {name} cannot be read (git cat-file: {got})') from None
+        if n is not None and len(got) != n:
             raise Changed(f'object {name} cannot be read (git cat-file stopped)')
         return got
 
@@ -288,6 +319,8 @@ class Copy:
         tree copied now, else None."""
         if name in self.seen:
             return None
+        # No test pins the name echo, the type or the newline after the content below: a wrong name or type fails
+        # the hash (the type is in the hashed header), a lost newline fails the next header. Kept as a second net.
         line = self.said(name).split()
         if len(line) != 3 or line[0] != name.encode() or not line[2].isdigit():
             raise Changed(f'object {name} is missing or cannot be read')
@@ -732,6 +765,7 @@ class Queue:
         self.read_token, self.write_token, self.said = read_token, write_token, set()
         self.remote = f'https://github.com/{repo}.git'
         self.later, self.fetch_error, self.fsck_said = None, '', ''   # check_later, fetch, objects_problem
+        self.rebuilt = False   # this run downloaded the cache from scratch (fetch_again): never a second time
         self.unknown = 'the queue could not fetch from GitHub'   # why fetch_checked knows nothing (PR comment words)
         self.review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association,
                                   cfg.lens_author_associations)
@@ -991,9 +1025,11 @@ class Queue:
         broken (by this run's earlier background check, after the fetch, or after a fetch that failed for a cause
         that is neither the network nor the login) is set aside and downloaded from scratch once, then checked again.
         A cache whose check gives the same lines as right after its own download from scratch (self.known) is not
-        downloaded again. `later`: the check after a good fetch runs in the background (check_later). self.unknown
-        says why None, in words for a PR comment (no runner paths). What the check passes is still not what the merge
-        check reads: that runs on a copy whose hashes are checked as it is made (holds_checked)."""
+        downloaded again, and neither is one this run already downloaded from scratch (self.rebuilt: it passed its
+        check then, so it was written since; nothing is kept in self.known, and the next run downloads it). `later`:
+        the check after a good fetch runs in the background (check_later). self.unknown says why None, in words for a
+        PR comment (no runner paths). What the check passes is still not what the merge check reads: that runs on a
+        copy whose hashes are checked as it is made (holds_checked)."""
         self.unknown = 'the queue could not fetch from GitHub'
         before = self.checked_before()
         problem = before
@@ -1016,11 +1052,19 @@ class Queue:
             self.unknown = ("the queue's git cache fails git fsck the same way as right after a download from "
                             "GitHub (the run's log says why), so a person must look")
             return None
+        if self.rebuilt:
+            print(f'#{n}: {self.cache} {problem}, after this run already downloaded it from scratch: not downloaded a '
+                  'second time in one run and not merged in')
+            self.unknown = ("the queue's git cache fails git fsck again after this run fetched it again from GitHub "
+                            "(the run's log says why)")
+            return None
         return self.fetch_again(base, n, shas, problem)
 
     def fetch_again(self, base, n, shas, problem):
         """The cache, which `problem`, set aside and downloaded from scratch, then checked (objects_problem): as
-        fetch returns, and None for one that is still broken (its lines kept: self.known)."""
+        fetch returns, and None for one that is still broken (its lines kept: self.known). At most once per run:
+        the callers ask self.rebuilt first."""
+        self.rebuilt = True
         print(f'{self.cache} {problem}: rebuilding it')
         got = self.fetch(base, n, *shas) if set_aside(self.cache) else None
         if got and (problem := self.objects_problem()):
@@ -1038,19 +1082,20 @@ class Queue:
 
         The check runs on a copy of the objects it reads, each hashed as it is copied (holds_checked). An object that
         is missing or not what its name says, though git fsck passed, was written while this run went on: the cache is
-        downloaded from scratch once and the check made again, as for a cache git fsck finds broken. One that fails
-        again says None, and its line is kept (self.known) so the next run does not download it all once more."""
+        downloaded from scratch and the check made again, as for a cache git fsck finds broken. One that fails in a
+        cache this run downloaded from scratch (for this or, before, for its git fsck: self.rebuilt, so one download
+        per run) says None, and its line is kept (self.known) so the next run does not download it all once more."""
         if not (SHA.fullmatch(head or '') and SHA.fullmatch(read or '')):
             return False
         if head == read:
             return True
         got = self.fetch_checked(base, n, head, read)   # the whole cache: finds and rebuilds a broken one
-        for fetched_again in (False, True):
+        for _ in range(2):   # the check, and once more after the run's one download from scratch
             if not got:
                 return got
             try:
                 same = self.holds_checked(head, read)
-            except OSError as e:   # no room, or its folder cannot be made: nothing is known, and the cache is kept
+            except OSError as e:   # no room, no folder, or a reader that hangs: nothing is known, the cache is kept
                 print(f'#{n}: could not copy the objects of the merge check out of {self.cache}: {e}')
                 self.unknown = "the queue could not copy the objects of its merge check (the run's log says why)"
                 return None
@@ -1058,8 +1103,8 @@ class Queue:
                 problem = (f'has an object the merge check reads that is missing or not what its name says, although '
                            f'git fsck passed ({e})')
                 said = f'merge check: {e}'
-                if fetched_again or said == self.known_broken():
-                    if fetched_again:
+                if self.rebuilt or said == self.known_broken():
+                    if self.rebuilt:
                         print(f'#{n}: {self.cache}, fetched again from GitHub, still {problem}: not merged in')
                         self.keep_known(said)
                     else:
@@ -1073,7 +1118,10 @@ class Queue:
             else:
                 self.forget_known()
                 return same
-        return got
+        # Not reached while fetch_again counts its download (self.rebuilt). Should that ever break: nothing is known.
+        print(f'#{n}: the merge check of {self.cache} failed again after a download from scratch: not merged in')
+        self.unknown = "the queue's merge check failed again after its git cache was fetched again from GitHub"
+        return None
 
     def holds_checked(self, head, read):
         """holds() in a repository of its own (CACHE + MERGE_COPY, deleted before this returns) that holds only what
@@ -1763,6 +1811,18 @@ class Queue:
         return 0
 
 
+def own_name(path):
+    """`path` without what follows its last name (`/`, `/.`): the queue makes its other files by adding to the path
+    (CACHE.merge, CACHE.new, CACHE.old-*, STATE.lock, STATE.tmp, STATE.fsck-known), and after `CACHE/` those would be
+    inside the cache, where set_aside deletes what is in the way. Nothing else is changed: a `..` is the kernel's to
+    follow (it may come after a link)."""
+    while True:
+        head, tail = os.path.split(path)
+        if tail not in ('', '.') or head == path:
+            return path
+        path = head
+
+
 def cli(argv=None, env=None):
     env = os.environ if env is None else env
     p = argparse.ArgumentParser(prog='pr_queue.py', description='Merge queue: one waiting PR per run (README.md).')
@@ -1773,7 +1833,8 @@ def cli(argv=None, env=None):
     p.add_argument('--lock-file', help='absolute; default: the state file + .lock')
     p.add_argument('--dry-run', action='store_true', help='say what a run would do; write nothing')
     a = p.parse_args(argv)
-    lock = a.lock_file or a.state_file + '.lock'
+    a.state_file, a.cache = own_name(a.state_file), own_name(a.cache)
+    lock = own_name(a.lock_file or a.state_file + '.lock')
     problems = []
     if env.get('RUNNER_ENVIRONMENT') == 'github-hosted':
         problems.append('this is a GitHub-hosted runner: its disk goes with the job, and with it the plan of a run that '
@@ -1784,6 +1845,9 @@ def cli(argv=None, env=None):
     for flag, path in (('--state-file', a.state_file), ('--cache', a.cache), ('--lock-file', lock)):
         if not os.path.isabs(path):
             problems.append(f'{flag} {path!r} is not an absolute path')
+        elif os.path.basename(path) in ('', '..'):   # / or a path that ends in ..
+            problems.append(f'{flag} {path!r} does not end in a name of its own: the queue makes its other files '
+                            'beside it, by adding to that name')
         elif work and (os.path.realpath(path) + os.sep).startswith(work + os.sep):
             problems.append(f'{flag} {path} is inside the job\'s workspace, which the next checkout empties')
     try:

@@ -403,7 +403,10 @@ hash to its name, a missing or unreadable one, or a corrupt pack is. A cache
 `git fsck` finds broken, or one a fetch fails on for a reason that is not the
 network or the login, is downloaded from scratch once and checked again; one
 still broken after that is not merged in (STATE stays, and the PR comment says
-the cache fails `git fsck`). If a later run's `git fsck` gives the same lines
+the cache fails `git fsck`). One run downloads the cache from scratch at most
+once, whether `git fsck`, a fetch or the merge check below asked for it: a
+cache that fails again in that run is not downloaded a second time and not
+merged in, STATE stays and the next run starts over. If a later run's `git fsck` gives the same lines
 as right after that download, the history GitHub serves is what fails: the
 queue does not download it again, and a person must look. A fetch's automatic
 `git gc` runs in the foreground, so no repack races the check. `git fsck`
@@ -435,11 +438,14 @@ runs once more; a merge git calls clean while it reports an error is never
 taken as clean, and two sides with more than 8 merge bases are not merged at
 all (the head is then not the change read). An object that is missing or not
 what its name says is handled as a failed `git fsck` is: the cache is
-downloaded from scratch once and the merge check runs again in the same run;
-if it fails again, nothing is merged in, STATE stays and the PR comment says
-so; a download that fails the same way as the last one is not repeated. If
-the copy cannot be made (no room on the disk) nothing is known either, and the
-cache is kept. The copy is deleted when the check ends; what a killed run left
+downloaded from scratch and the merge check runs again in the same run; if it
+fails again, or if this run had already downloaded the cache (one download a
+run, as above), nothing is merged in, STATE stays and the PR comment says so;
+a download that fails the same way as the last one is not repeated. If the
+copy cannot be made (no room on the disk) nothing is known either, and the
+cache is kept. The same holds for a reader that hangs: a `git cat-file` that
+owes one answer (the line that names an object, or the next 1 MiB of it) for
+120 seconds is stopped, and nothing is merged in. The copy is deleted when the check ends; what a killed run left
 at `CACHE.merge` is deleted by the next check.
 
 What the last download from scratch failed on is kept in `STATE.fsck-known`,
@@ -452,7 +458,16 @@ cache. That file is no longer read.)
 What is left for the runner rule above: a job of the same user can still
 write the queue's ref or config in the cache between the fetch and the moment
 the queue reads them, and can write into `CACHE.merge` during the seconds it
-exists.
+exists. It can also make a git call wait without end (a FIFO where an object
+file should be): only the merge check's object reader has the 120-second limit
+above; `git fetch`, `git fsck` and the calls in the copy have no limit but the
+job's `timeout-minutes`. Nothing is merged in while one waits, and STATE
+stays.
+
+The queue's own hash is Python's SHA-1, which does not detect a collision
+attack as git's does (sha1dc). That is enough here: one of two colliding
+objects would have to come from GitHub, which refuses them, and the cache's
+`git fsck` hashes with git's own.
 
 | Exit | Meaning                                                                                                     |
 | ---- | ----------------------------------------------------------------------------------------------------------- |
@@ -463,9 +478,13 @@ exists.
 
 It refuses to start on a GitHub-hosted runner (its disk, and with it the plan,
 goes with the job), with a `--repo` that is not `owner/name`, a relative path,
-a path inside the job's workspace (the next checkout empties it), a config
-error, or a git older than 2.43 (`merge-tree --write-tree` that honours
-`GIT_ATTR_SOURCE`).
+a path inside the job's workspace (the next checkout empties it), a path that
+is `/` or ends in `..`, a config error, or a git older than 2.43
+(`merge-tree --write-tree` that honours `GIT_ATTR_SOURCE`). A `/` or `/.` at
+the end of `--state-file`, `--cache` or `--lock-file` is dropped: the queue
+names its other files (`CACHE.merge`, `CACHE.new`, `CACHE.old-*`, `STATE.lock`,
+`STATE.fsck-known`) by adding to those paths, and they belong beside the cache
+and the plan, not inside.
 
 `--state-file` (`STATE`) holds the plan of the run that turned auto-merge off:
 `{"repo", "pr", "old", "base", "read"}` (and `"told"` once the pull request was

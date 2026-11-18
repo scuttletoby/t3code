@@ -24,7 +24,10 @@ nothing.
   11,500 commits): about 2 seconds for the commits, 0.1 seconds for a merge of 300 changed files.
 - An object that is missing or not what its name says is handled as a failed `git fsck` is: one download from
   scratch and the merge check once more in the same run; a second failure merges nothing in (the run keeps `STATE`
-  and the PR comment says so), and a download that fails the same way as the last one is not repeated.
+  and the PR comment says so), and a download that fails the same way as the last one is not repeated. One run
+  downloads the cache from scratch at most once, whether `git fsck`, a fetch or the merge check asked for it.
+- The merge check's object reader has a time limit: a `git cat-file` that owes one answer for 120 seconds is stopped,
+  nothing is merged in and `STATE` stays. The queue's other git calls have no limit but the job's.
 - If git says anything on stderr or stops in the copy, the whole trees of the merged commits are copied and the merge
   runs once more. A merge git calls clean while it reports an error is not taken as clean (git 2.43 merges a root
   tree it cannot read as an empty one, with exit 0). More than 8 merge bases: not merged, the head is not the change
@@ -32,11 +35,14 @@ nothing.
 - What the last download from scratch failed on is kept in `STATE.fsck-known` (next to the plan, mode `0600`, read
   only as a regular file of the queue's user that no one else can write), no longer in the cache as
   `queue-fsck-known`.
+- A `/` or `/.` at the end of `--state-file`, `--cache` or `--lock-file` is dropped, so the copy, `CACHE.new` and
+  `CACHE.old-*` are made beside the cache, never inside it; a path that is `/` or ends in `..` is refused (exit 2).
 
 **Upgrade:** nothing to do. A `queue-fsck-known` inside a kept cache is ignored (never read, not deleted): a cache
 whose history fails `git fsck` from GitHub itself is downloaded from scratch once more, then the new record stops
 the next download. The copy is made beside the cache (`CACHE.merge`), where the queue already sets a broken cache
-aside.
+aside. Only for a queue called with `--cache CACHE/`: a `.new` or `.old-*` an earlier version left inside the cache
+is no longer swept: delete it by hand (nothing reads it).
 
 ### pr-queue and head-check: the cache's objects are checked before each merge check (#457)
 
