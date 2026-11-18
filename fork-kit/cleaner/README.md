@@ -7,21 +7,32 @@ is in the code and cannot be switched off.
 It lives in `fork-kit` because it runs on a machine (not in CI and not inside T3), reads its facts from the
 machine file like every kit, and ships with the kits in `ci-release`. `fork-ci` holds only what CI itself runs.
 
-This is the first part: the core and three rules. No installer and no timer yet: nothing runs it by itself.
+The core, three rules, an [installer](#install) and one [daily timer](#the-daily-timer). While the tools it is
+to replace still delete on a host, the timer runs in compare mode: it plans, reports and compares what it would
+delete with what they would, and deletes nothing.
 
-| Part         | File                    | What it does                                                  |
-| ------------ | ----------------------- | ------------------------------------------------------------- |
-| config       | `lib/cleaner/config.py` | reads the `cleaner` section of the machine file               |
-| facts        | `lib/cleaner/facts.py`  | reads the process list, systemd units, git, GitHub and Docker |
-| guard        | `lib/cleaner/guard.py`  | the hard refusals: asked about every path, twice              |
-| rules        | `lib/cleaner/rules.py`  | `worktrees`, `docker`, `tmp`: what each wants gone, and why   |
-| `plan`,`run` | `lib/cleaner/engine.py` | the two commands, the lock and the log                        |
+| Part         | File                                                    | What it does                                                  |
+| ------------ | ------------------------------------------------------- | ------------------------------------------------------------- |
+| config       | `lib/cleaner/config.py`                                 | reads the `cleaner` section of the machine file               |
+| facts        | `lib/cleaner/facts.py`                                  | reads the process list, systemd units, git, GitHub and Docker |
+| guard        | `lib/cleaner/guard.py`                                  | the hard refusals: asked about every path, twice              |
+| rules        | `lib/cleaner/rules.py`                                  | `worktrees`, `docker`, `tmp`: what each wants gone, and why   |
+| `plan`,`run` | `lib/cleaner/engine.py`                                 | the two commands, the lock and the log                        |
+| `report`     | `lib/cleaner/report.py`                                 | one line: GB per class, and what runs freed                   |
+| `compare`    | `lib/cleaner/compare.py`                                | its plan next to the dry runs of the tools it replaces        |
+| `daily`      | `lib/cleaner/daily.py`                                  | what the timer runs: compare mode or run mode                 |
+| installer    | `sbin/fork-cleaner-install`, `bootstrap.sh`, `systemd/` | the version folder, the links, the timer                      |
 
 ## Commands
 
 ```
 fork-cleaner plan    # prints what a run would delete and what it keeps; changes nothing
 fork-cleaner run     # deletes it; one log line per delete
+fork-cleaner report  # one line for the daily report: GB per class, and what runs freed; deletes nothing
+fork-cleaner report --out FILE   # the same, appended to FILE before the mark moves
+fork-cleaner report --no-mark    # the same, and the mark stays: the next report counts these deletes again
+fork-cleaner compare # its plan next to the old tools' dry runs; deletes nothing
+fork-cleaner daily   # what the timer runs (cleaner.daily.mode)
 ```
 
 `plan` writes no file, takes no lock and makes no log. `run` takes a lock (one run at a time), plans, then reads
@@ -57,7 +68,9 @@ total: would delete 1 (1.2 GB), kept 1
 ```
 
 Exit code 0: done. 1: something could not be read or a delete failed (it was kept). 2: wrong command, or no
-usable machine file (nothing was done). There is no `--force` and no option that names another config file.
+usable machine file (nothing was done). 3 (`compare` and `daily` only): every step worked, and the compare found
+paths only fork-cleaner would delete (see [The daily timer](#the-daily-timer)). There is no `--force` and no
+option that names another config file.
 
 The log (`logFile`, private to the user) gets a `deleting X` line before each delete and a `deleted X` (or
 `FAILED X`) line after it, a line per delete refused at the last check, and the total of each run. It keeps its
@@ -88,6 +101,59 @@ delete") does leave its line. The journal line is written (and synced) before th
 that cannot be written stops the run before that delete. A journal that cannot be read, or is not a regular
 file, stops `run` before any delete; `plan` says so, lists every planned path as `kept ... could not read`
 instead of `would delete`, and exits 1.
+
+## The report
+
+`fork-cleaner report` prints one line for the daily report of this host, for example:
+
+```
+disk on host-1: worktrees 12.3 GB (could not read 1 worktree: /home/u/work/x (config: exit 128)), all docker
+volumes off, temp 0.4 GB (on another disk), agent tool homes 20.1 GB, T3 data could not read
+(/home/u/.t3/userdata/x: Permission denied), build caches no rule yet, everything else 139.3 GB (with what could
+not be read) (180.2 GB of 250.0 GB used); freed since the last report at 2026-01-02T03:04:05Z 2.1 GB (4 deletes,
+1 of unknown size); 2 log lines not understood, skipped
+```
+
+(one line; wrapped here). It deletes nothing.
+
+- **The classes** are `CLASSES` in `config.py`, the one list, and each name says what it measures. A rule's class
+  is what that rule looks at: `worktrees` (the worktrees and clones of the listed repositories), `temp` (the temp
+  entries a pattern takes) and `all docker volumes` (every volume, named ones too: Docker measures them all, and
+  the rule takes only unused anonymous ones). A must-keep class is its group of must-keep paths, whole:
+  `agent tool homes` (`AGENT_HOMES`: the agent tools' home folders, with transcripts, sessions, settings and
+  caches) and `T3 data` (`T3_DATA`). `build caches` has no rule yet. Every rule of `rules.RULES` (the list `plan`
+  runs) needs a class; a test fails until it has one. `everything else` is the used space of the home folder's
+  disk that no class holds; a class on another disk says `(on another disk)` and is not taken off it.
+- **Sizes** are blocks on disk. A link is never followed (it counts as itself), another filesystem or a mount
+  point inside is not entered (a bind mount of a folder of the same disk too: the mount list
+  `/proc/self/mountinfo` shows it), and each folder and each hard-linked file counts once in the whole report, in
+  the first class that reaches it. Docker's volumes are root's, so their size is Docker's own (`docker system df
+  -v`); with the `docker` rule off, Docker is not asked (`all docker volumes off`).
+- **Could not read:** a class that cannot be read in full (a folder without permission, Docker that gives no
+  full answer) says `could not read` and why; the other classes still print, and the command exits 1. A
+  worktree that cannot be read (its main repository is gone, say) is named, and the others still count:
+  `worktrees 12.3 GB (could not read 1 worktree: <path> (<why>))`, exit 1. A mount list it cannot read is said
+  at the end of the line (a bind mount may then be counted twice), exit 1.
+- **Freed** adds up the `deleted` lines of the log after the last line the previous report counted. That line is
+  kept in the mark `<logFile>.reported`. No log: `freed 0.0 GB`. No mark yet, or a mark it cannot use (it says so
+  and exits 1): the whole log counts. When the log was trimmed past that line, every line left is newer and
+  counts, but the deletes trimmed away with it were never counted, so the figure says `at least ... GB; log
+  trimmed since the last report`. A line it does not understand (an older or newer version's, or a delete without
+  a size and rule it knows) is skipped and counted. A line still being written (no line end yet) waits for the
+  next report. A log that is not the cleaner's: `freed could not read`, exit 1, and the mark stays.
+- **One at a time:** a report holds a lock (`<logFile>.reported.lock`) while it reads the log and moves the mark.
+  A second report meanwhile prints `another report is running`, exits 1 and leaves the mark, so no delete is
+  counted twice. The mark and its lock are the only files the report writes, and only when the log's folder is
+  there.
+- **The mark moves only once the line is kept.** With `--out FILE` (an absolute path) the line is appended to
+  FILE and synced to disk first; FILE must be a regular file or new (a link, folder or pipe is refused). Only
+  then does the mark move (a new FILE's folder is synced too, so its name survives a power cut). When the line
+  cannot be written, it is still printed, the mark stays, the command
+  says so and exits 1, and the next report counts those deletes again. Without `--out` the mark moves once the
+  line is printed. `--no-mark` never moves it (a caller that delivers the line its own way moves it by running
+  `report` again with `--out`). The daily timer uses `--out` with `report.log` in its folder. Delivery is at least
+  once: a report killed after the line is written and before the mark moves writes those deletes again in the
+  next line, so a sum over FILE can count them twice (the mark itself never does).
 
 ## What it never deletes
 
@@ -144,30 +210,34 @@ For each repository listed in the machine file: the folders directly in `root` t
 clone **of that GitHub repository** (by the `origin` URL in the folder's own git config). Other folders in the same
 `root` are not looked at. One goes only when all of this holds:
 
-| Kept as                        | When                                                                                                              |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `locked`                       | `git worktree lock` was used on it                                                                                |
-| `no branch`                    | HEAD is detached                                                                                                  |
-| `open PR`                      | an open pull request has its branch                                                                               |
-| `base branch`                  | it is GitHub's default branch (`git ls-remote --symref`), or a pull request merges into its branch                |
-| `no merged PR`                 | no merged pull request **from this repository** (not a fork) has its branch                                       |
-| `commits not in the merged PR` | HEAD is not the head of a merged pull request of that branch, nor inside one                                      |
-| `merged under 24 h ago`        | the pull request merged less than `mergedHours` ago (24 or more)                                                  |
-| `uncommitted or untracked`     | `git status` shows anything                                                                                       |
-| `ignored files`                | a file git ignores is in it that is not build output (see `regenerable`)                                          |
-| `hidden from git status`       | a file is marked skip-worktree or assume-unchanged                                                                |
-| `unfinished git operation`     | a merge, rebase, cherry-pick, revert or bisect is under way, or `index.lock`                                      |
-| `refs of its own`              | it has `refs/worktree/*`, `refs/bisect/*` or `refs/rewritten/*`                                                   |
-| `commits only in its reflog`   | worktree: a commit made with no branch checked out, that no branch ever held                                      |
-| `worktrees hang off it`        | clone: git still lists a worktree whose folder is there (anywhere), or locked                                     |
-| `stash entries`                | clone: `git stash list` is not empty                                                                              |
-| `commits GitHub does not have` | clone: a commit on any branch, tag or reflog that no ref on GitHub (`git ls-remote`) or listed pull request holds |
-| `tags GitHub does not have`    | clone: a tag GitHub does not have with the same name and object                                                   |
-| `origin on this machine`       | clone: a URL git really uses for `origin` (after `insteadOf`) is a folder or host on this machine                 |
-| `git: unpushed commits`, ...   | a submodule repository in its git folder (also after `git submodule deinit`) holds work that is only here         |
-| `another git folder inside`    | a nested clone or submodule                                                                                       |
-| `in use`, `KEEP file`, ...     | every refusal of the list above                                                                                   |
-| `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                           |
+| Kept as                        | When                                                                                                                                        |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `locked`                       | `git worktree lock` was used on it                                                                                                          |
+| `no branch`                    | HEAD is detached                                                                                                                            |
+| `no commit`                    | its branch has no commit: deleted under the worktree, or never had one                                                                      |
+| `open PR`                      | an open pull request has its branch                                                                                                         |
+| `base branch`                  | it is GitHub's default branch (`git ls-remote --symref`), or a pull request merges into its branch                                          |
+| `no merged PR`                 | no merged pull request **from this repository** (not a fork) has its branch                                                                 |
+| `commits not in the merged PR` | HEAD is not the head of a merged pull request of that branch, nor inside one                                                                |
+| `merged under 24 h ago`        | the pull request merged less than `mergedHours` ago (24 or more)                                                                            |
+| `branch not listed`            | `branches` is set and the branch matches none of its patterns                                                                               |
+| `used under 24 h ago`          | in the last `usedHours` (24 or more): a file in it, its HEAD reflog, `HEAD`, `index`, `ORIG_HEAD`, `FETCH_HEAD` or `COMMIT_EDITMSG` changed |
+| `uncommitted or untracked`     | `git status` shows anything                                                                                                                 |
+| `ignored files`                | a file git ignores is in it that is not build output (see `regenerable`)                                                                    |
+| `hidden from git status`       | a file is marked skip-worktree or assume-unchanged                                                                                          |
+| `unfinished git operation`     | a merge, rebase, cherry-pick, revert or bisect is under way, or `index.lock`                                                                |
+| `refs of its own`              | it has `refs/worktree/*`, `refs/bisect/*` or `refs/rewritten/*`                                                                             |
+| `commits only in its reflog`   | worktree: a commit made with no branch checked out, that no branch ever held                                                                |
+| `worktrees hang off it`        | clone: git still lists a worktree whose folder is there (anywhere), or locked                                                               |
+| `stash entries`                | clone: `git stash list` is not empty                                                                                                        |
+| `commits GitHub does not have` | clone: a commit on any branch, tag or reflog that no ref on GitHub (`git ls-remote`) or listed pull request holds                           |
+| `tags GitHub does not have`    | clone: a tag GitHub does not have with the same name and object                                                                             |
+| `origin on this machine`       | clone: a URL git really uses for `origin` (after `insteadOf`) is a folder or host on this machine                                           |
+| `git: unpushed commits`, ...   | a submodule repository in its git folder (also after `git submodule deinit`) holds work that is only here                                   |
+| `another git folder inside`    | a nested clone or submodule                                                                                                                 |
+| `in use`, `KEEP file`, ...     | every refusal of the list above                                                                                                             |
+| `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                                                     |
+| `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0); also in a temp folder               |
 
 A worktree is removed with `git worktree remove`, never with `--force`: git itself refuses when a file changed
 after the last check. The local branch and its reflog stay in the clone, so a commit that was amended or reset
@@ -213,7 +283,8 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
         {
           "root": "~/worktrees",
           "github": "example-owner/example-repo",
-          "regenerable": ["dist", "coverage"]
+          "regenerable": ["dist", "coverage"],
+          "branches": ["work/*"]
         }
       ]
     },
@@ -221,6 +292,17 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
     "tmp": {
       "root": "/tmp",
       "patterns": { "example-build-*": 7, "example-crash-*": 1 }
+    },
+    "daily": {
+      "mode": "compare",
+      "oldTimers": ["example-retention.timer"],
+      "compare": [
+        {
+          "name": "example-retention",
+          "command": ["/usr/local/bin/example-retention", "--dry-run"],
+          "pattern": "^would remove (/.+?) \\("
+        }
+      ]
     }
   }
 }
@@ -228,17 +310,24 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 
 | Key                             | Default                                   | Meaning                                                                                           |
 | ------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `logFile`                       | `~/.local/state/fork-cleaner/cleaner.log` | the log; the lock and the journal are beside it (new, or the cleaner's own)                       |
+| `logFile`                       | `~/.local/state/fork-cleaner/cleaner.log` | the log; its locks, journal and report mark are beside it (new, or the cleaner's own)             |
 | `logLines`                      | 5000                                      | lines the log keeps (10 or more)                                                                  |
 | `mustKeep`                      | none                                      | more paths that are never deleted (`*` within one part)                                           |
 | `worktrees.repos[].root`        | required                                  | the folder the clones and worktrees are directly in                                               |
 | `worktrees.repos[].github`      | required                                  | `owner/name` on GitHub                                                                            |
 | `worktrees.repos[].regenerable` | none                                      | plain names of ignored build folders, on top of `node_modules`, `__pycache__` and `.pytest_cache` |
+| `worktrees.repos[].branches`    | all                                       | branch patterns (shell style, case as written; `*` crosses `/`): only these branches are taken    |
 | `worktrees.mergedHours`         | 24                                        | hours after the merge (24 or more)                                                                |
+| `worktrees.usedHours`           | 24                                        | hours since the worktree or clone was last used (24 or more)                                      |
 | `docker.enabled`                | false                                     | turns the rule on                                                                                 |
 | `docker.days`                   | 7                                         | age of an unused anonymous volume (7 or more)                                                     |
 | `tmp.root`                      | `/tmp`                                    | the temp folder                                                                                   |
 | `tmp.patterns`                  | none                                      | name pattern to days without a change (1 or more)                                                 |
+| `daily.mode`                    | `compare`                                 | what the timer does: `compare` (deletes nothing) or `run`                                         |
+| `daily.oldTimers`               | none                                      | timers (user or system) of the tools this one replaces: `run` refuses while one is on or unknown  |
+| `daily.outDir`                  | `~/.local/state/fork-cleaner/daily`       | where `daily` writes its files                                                                    |
+| `daily.keepDays`                | 30                                        | days `daily` keeps its dated files (1 or more)                                                    |
+| `daily.compare[]`               | none                                      | the old tools' dry runs: `name`, `command` (absolute program, no shell), `pattern` (one group)    |
 
 An empty section (`"cleaner": {}`) is valid and does nothing. An unknown key, a wrong type, a number below its
 floor, a root folder that is `/`, the home folder or a folder above it: the command names the file and the key,
@@ -250,6 +339,91 @@ only: no `/` and no wildcard, so `["*"]` is refused and can never take the `igno
 frees an ignored folder of that name (and what is in it), never a file, and never a credential-looking name.
 
 GitHub is read with the `gh` command of the user the cleaner runs as.
+
+## The daily timer
+
+`fork-cleaner daily` is what the kit's one timer (`fork-cleaner.timer`, once a day) runs. `cleaner.daily.mode` in
+the machine file says what it does:
+
+- **`compare`** (the default): `plan`, then the report, then the [compare](#the-compare). Nothing is deleted,
+  whatever else runs on the host.
+- **`run`**: `run` (deletes), then the report. It refuses (exit 2, nothing deleted, nothing written) unless every
+  timer in `oldTimers` is provably off: two cleaners must not both delete. Each timer is asked in the user
+  (`systemctl --user`) and the system scope (`systemctl --system`). It counts as off only when at least one scope
+  knows it, and in each scope that does it is `disabled` or `masked` **and** `inactive` or `failed`, **and** the
+  service it starts is `inactive` or `failed` (a run still deleting, `active` or `activating`, counts as on). A
+  timer no scope knows refuses too: a misspelled name, or another user's timer, cannot be proven off; remove it
+  from `oldTimers` once the old tool is gone. systemd that cannot answer refuses.
+
+Everything goes to `outDir`: `plan-<day>.txt` (or `run-<day>.txt`) and `compare-<day>.txt` (each written whole,
+kept `keepDays` days; a second run on the same day writes `plan-<day>.2.txt`, `.3.txt` and so on, never over the
+first), and `report.log`, which gets each report's line before the mark moves. Only files of those names are ever
+removed there. `outDir` may not be in a must-keep path, in or above a folder a rule deletes from, or be or hold
+the home folder. The command prints one summary line (the journal keeps it), which ends with its exit code in
+words:
+
+| exit | meaning                                                                                                                                      |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | done                                                                                                                                         |
+| 1    | something failed: a step could not read something, a file could not be written or trimmed, a source of the compare failed, the report failed |
+| 2    | refused: run mode with an old timer on or unknown, or the plan refused                                                                       |
+| 3    | compare mode: every step worked, and the compare found "new only" paths (each a bug until explained)                                         |
+
+A 1 always wins over a 3: exit 3 never hides a real failure. An orphaned worktree (`orphaned worktree` above) is
+kept and is no failure.
+
+## The compare
+
+`fork-cleaner compare` (and `daily` in compare mode) runs `plan` and the dry run of each tool listed in
+`cleaner.daily.compare`: its `command` (an absolute program and its arguments, run without a shell and with no
+input; it must be read-only by its own promise) and a `pattern` whose one group is a path that tool would delete.
+Every path goes in one of three lists:
+
+```
+compare: fork-cleaner would delete 3, the old tools 4 (example-retention 4)
+new only (a bug until explained): 1
+  /tmp/example-build-9 (tmp: not changed for 9 days (example-build-*: 7 days))
+old only (fork-cleaner keeps it): 2
+  /home/u/worktrees/fix-1 [example-retention] (worktrees: open PR: #12)
+  /tmp/x [example-retention] (no kept line: no rule of fork-cleaner takes it, or it is too new for one)
+both: 2
+```
+
+**New only** is what this tool would delete and no old one would: each is a bug until somebody explains it, and
+the exit code is 3. **Old only** is where it is stricter, with its reason. A cleaner path is **both** only when an
+old tool names that path or a folder it is in (the old tool deletes all of it too). A cleaner folder that holds
+what an old tool deletes (the old tool deletes `/x/cache`, fork-cleaner all of `/x`) is new only, with
+`deletes more: the old tools only /x/cache in it`; an old folder that holds a cleaner path is old only, with
+`deletes more: fork-cleaner only ... in it`. A dry run that cannot start or ends with an exit code other than 0
+makes the compare `incomplete` (exit 1, which wins over 3); what it printed still counts. Nothing is deleted.
+
+## Install
+
+From a commit of the fork's protected release branch, as root:
+
+```
+sh bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
+```
+
+The bootstrap checks the commit is on `ci-release`, downloads exactly that commit and runs
+`sbin/fork-cleaner-install install`. That copies the kit into `/usr/local/libexec/fork-cleaner/versions/<sha>/`
+(root-owned, with `MANIFEST.sha256`), runs its `--help` as a self-test, switches `current` to it and links
+`/usr/local/bin/fork-cleaner`. `--timer` writes the user units `fork-cleaner.service` and `fork-cleaner.timer` in
+`/etc/systemd/user/`; each user who wants it runs
+`systemctl --user daemon-reload && systemctl --user enable --now fork-cleaner.timer`. `--no-timer` removes them;
+without either option the last choice stays (`/etc/fork-cleaner/config.json`). A unit of the same name the kit did
+not write is refused and left alone. `fork-cleaner-install self-check` reports drift from `installed.tsv`;
+`uninstall` removes the kit, and leaves the machine file and what the cleaner wrote in each home. Safe to run
+again or to stop at any step; one installer at a time (`uninstall` too).
+
+The installer reads the source without following a link anywhere below `--source` (a file or a folder on the way
+that is a link is refused, never copied), so a link to a file only root may read cannot end up in the
+world-readable copy. A copy of the same release that changed is made again beside it, self-tested, and only then
+swapped in, in one step (`renameat2` exchange; two renames where the filesystem has none): a copy that stops half
+way or fails its self-test leaves the copy in use as it was. The bootstrap passes only `--timer` or `--no-timer`
+on to the installer; any other option is refused.
+
+The installer writes no machine file: the `cleaner` section is the owner's, written by hand.
 
 ## What happens when ...
 
@@ -264,6 +438,10 @@ GitHub is read with the `gh` command of the user the cleaner runs as.
   command before it reads a single folder.
 - **GitHub, git or Docker is down:** everything that needed the answer is kept, and the exit code is 1.
 - **two runs start at once:** the second one stops with "another run" and deletes nothing.
+- **the tool it replaces is still installed:** compare mode runs beside it and deletes nothing; run mode refuses
+  while a timer in `oldTimers` is on, still running, or unknown.
+- **the old tool's log and state are left behind:** never read, changed or counted. The report counts only this
+  tool's own log, so the old tool's deletes are not in its freed figure.
 
 ## Limits
 
@@ -288,6 +466,9 @@ GitHub is read with the `gh` command of the user the cleaner runs as.
 python3 -I -B fork-kit/cleaner/tests/guard.test.py
 python3 -I -B fork-kit/cleaner/tests/worktrees.test.py
 python3 -I -B fork-kit/cleaner/tests/engine.test.py
+python3 -I -B fork-kit/cleaner/tests/report.test.py
+python3 -I -B fork-kit/cleaner/tests/daily.test.py
+python3 -I -B fork-kit/cleaner/tests/install.test.py
 ```
 
 Everything lives in one temporary folder per test: real git repositories whose "GitHub" is a bare repository, stub

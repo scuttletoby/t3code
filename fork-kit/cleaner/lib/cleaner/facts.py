@@ -4,7 +4,7 @@ One rule for every reader here: no answer means keep. A reader that cannot give 
 and whoever asked keeps the thing it asked about. Nothing in this file changes anything, except remove_worktree and
 remove_volume at the very end, which the engine calls after every check has passed again.
 """
-import calendar, ipaddress, json, os, re, socket, subprocess, time
+import calendar, ipaddress, json, os, re, socket, stat, subprocess, time
 
 UNIT_DIRS = ('/etc/systemd/system', '/run/systemd/system', '/run/systemd/transient', '/etc/systemd/user',
              '~/.config/systemd/user', '/run/user/{uid}/systemd/user', '/run/user/{uid}/systemd/transient')
@@ -347,6 +347,36 @@ def worktree_list(cwd, bare=False):
     return entries
 
 
+def orphaned_worktree(folder):
+    """The git folder a worktree's `.git` file names, when that folder is gone (its main repository was removed or
+    moved): git cannot answer anything about the worktree, and never will. None for anything else: no `.git` file,
+    one that cannot be read (that stays "could not read"), or a git folder that is there."""
+    dot = os.path.join(folder, '.git')
+    try:
+        fd = os.open(dot, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        text = os.read(fd, 4096).decode('utf-8', 'surrogateescape')
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    lines = text.splitlines()
+    if len(lines) != 1 or not lines[0].startswith('gitdir: ') or not lines[0][len('gitdir: '):].strip():
+        return None
+    gitdir = os.path.normpath(os.path.join(folder, lines[0][len('gitdir: '):].strip()))
+    try:
+        os.lstat(gitdir)
+    except (FileNotFoundError, NotADirectoryError):
+        return gitdir
+    except OSError:
+        return None             # cannot tell: no answer means keep, as "could not read"
+    return None
+
+
 def origin_url(cwd):
     """remote.origin.url as the repository's own config has it (no insteadOf rewrite); '' when it has none."""
     url = ''
@@ -569,6 +599,28 @@ def docker_dangling():
 def remove_volume(name):
     """`docker volume rm`, never with --force: Docker itself refuses a volume a container uses."""
     _docker('volume', 'rm', name)
+
+
+# Docker's sizes are decimal (units.HumanSize): 1 kB is 1000 bytes.
+DOCKER_SIZE = re.compile(r'^(\d+(?:\.\d+)?)(B|kB|KB|MB|GB|TB|PB)$')
+DOCKER_UNITS = {'B': 1, 'kB': 1000, 'KB': 1000, 'MB': 1000 ** 2, 'GB': 1000 ** 3, 'TB': 1000 ** 4, 'PB': 1000 ** 5}
+
+
+def docker_volume_sizes():
+    """(sizes, folder): {name: bytes} of every volume, named ones too, as Docker itself measures them (`docker
+    system df -v`: its folders are root's, so the user cannot walk them), and Docker's own folder, where they are.
+    Raises Unreadable when Docker gives no full answer, a size it could not measure included."""
+    sizes = {}
+    for line in _docker('system', 'df', '-v', '--format', '{{range .Volumes}}{{.Name}}\t{{.Size}}\n{{end}}').splitlines():
+        if not line:
+            continue
+        fields = line.split('\t')
+        found = DOCKER_SIZE.match(fields[1]) if len(fields) == 2 else None
+        if not found:
+            raise Unreadable(f'Docker (docker system df printed a volume size it cannot use: {line[:80]!r})')
+        sizes[fields[0]] = int(float(found.group(1)) * DOCKER_UNITS[found.group(2)])
+    folder = _docker('info', '--format', '{{.DockerRootDir}}').strip()
+    return sizes, folder
 
 
 # --- one view of it all -------------------------------------------------------------------------------------------

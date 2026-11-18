@@ -12,7 +12,7 @@ from unittest import mock
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
 LIB = os.path.join(KIT, 'lib', 'cleaner')
-MODULES = ('config', 'facts', 'guard', 'rules', 'engine')
+MODULES = ('config', 'facts', 'guard', 'rules', 'engine', 'report', 'compare', 'daily')
 if COMMON not in sys.path:
     sys.path.insert(0, COMMON)
 
@@ -99,6 +99,11 @@ elif args[:2] == ['volume', 'rm']:
     del volumes[name]
     with open({state!r}, 'w') as f:
         json.dump(state, f)
+elif args[:3] == ['system', 'df', '-v']:
+    for name, v in volumes.items():
+        print(name, v.get('size', '0B'), sep='\t')
+elif args[:1] == ['info']:
+    print(state.get('root', '/'))
 else:
     sys.exit(64)
 '''
@@ -137,7 +142,7 @@ class Case(unittest.TestCase):
         self.addCleanup(env.stop)
         for name in [n for n in os.environ if n.startswith('GIT_') and n not in ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM')]:
             del os.environ[name]
-        self.section = {'logFile': self.path('state', 'cleaner.log')}
+        self.section = {'logFile': self.path('state', 'cleaner.log'), 'daily': {'outDir': self.path('state', 'daily')}}
         self.merged, self.open = [], []
         self.busy, self.unit_names, self.locks, self.texts = set(), set(), set(), []
         self.mount_points = {'/'}
@@ -148,6 +153,12 @@ class Case(unittest.TestCase):
         clock = mock.patch.object(self.c.guard, 'changed', lambda st: st.st_mtime)
         clock.start()
         self.addCleanup(clock.stop)
+        # The worktrees rule keeps a worktree used in the last day. Tests make a tree and judge it at once, so they
+        # read "never used"; the tests of that refusal (worktrees.test.py, Used) put the real reader back.
+        self.real_last_used = self.c.rules.last_used
+        unused = mock.patch.object(self.c.rules, 'last_used', lambda path, git_dir, look: (0.0, 'nothing'))
+        unused.start()
+        self.addCleanup(unused.stop)
 
     def close(self):
         for root, dirs, _ in os.walk(self.dir):

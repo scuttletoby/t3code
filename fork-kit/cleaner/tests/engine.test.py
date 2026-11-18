@@ -629,7 +629,7 @@ class Engine(Case):
         with self.assertRaises(machine_file.MachineFileError):
             self.tmp_cfg(logFile='~/into-tmp/cleaner.log')
         # The lock and the journal next to the log are the cleaner's own files too: never in a must-keep path.
-        for own in ('cleaner.log.lock', 'cleaner.log.deleting'):
+        for own in ('cleaner.log.lock', 'cleaner.log.deleting', 'cleaner.log.reported'):
             with self.subTest(own=own), self.assertRaises(machine_file.MachineFileError):
                 self.cfg(mustKeep=[self.path('state', own)])
         self.cfg(mustKeep=[self.path('state', 'cleaner.log.other')])
@@ -792,9 +792,10 @@ class Config(Case):
         takes plain names only (worktrees.test.py). A new key fails here until it is placed and argued for."""
         cf = self.c.config
         keys = set(cf.SPEC) | {f'worktrees.{k}' for k in cf.WORKTREES_SPEC} | {f'repos.{k}' for k in cf.REPO_SPEC} \
-            | {f'docker.{k}' for k in cf.DOCKER_SPEC} | {f'tmp.{k}' for k in cf.TMP_SPEC}
+            | {f'docker.{k}' for k in cf.DOCKER_SPEC} | {f'tmp.{k}' for k in cf.TMP_SPEC} \
+            | {f'daily.{k}' for k in cf.DAILY_SPEC} | {f'compare.{k}' for k in cf.COMPARE_SPEC}
         self.assertEqual(set(cf.KEY_KINDS), keys)
-        self.assertLessEqual(set(cf.KEY_KINDS.values()), {'own file', 'floor', 'keeps more', 'picks', 'loosens'})
+        self.assertLessEqual(set(cf.KEY_KINDS.values()), {'own file', 'floor', 'keeps more', 'picks', 'loosens', 'compare only'})
         self.assertEqual([k for k, v in cf.KEY_KINDS.items() if v == 'loosens'], ['repos.regenerable'])
 
     def test_the_launcher_runs(self):
@@ -860,7 +861,7 @@ MUTATIONS = {
     'the log: a plan says so too': ('engine', 'return 2  # log', 'pass', Engine, 'test_a_log_file_that_is_not_the_cleaners_is_never_written'),
     'the log: never in a must-keep path': ('config', 'if kept is not None or any(', 'if False and any(',
                                            Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
-    'the log: never in a root': ('config', 'if _holds(root, self.log_file):', 'if False:', Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
+    'the log: never in a root': ('config', 'if _holds(root, own) or _holds(own, root):', 'if False:', Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
     'the log: deleting before the delete': ('engine', "log.write(one_line(f'deleting {told}'))", 'pass',
                                             Engine, 'test_run_writes_one_log_line_for_each_delete'),
     'the log: a failed write stops the run': ('engine', "raise LogError(f'the log {self.cfg.log_file}: {ex.strerror}') from None", 'pass',
@@ -895,7 +896,7 @@ MUTATIONS = {
     'the log: its owner': ('engine', "if st.st_uid != os.getuid():", 'if False:', Engine, 'test_a_log_of_another_owner_is_not_the_cleaners'),
     'the log: its folder through links': ('config', 'os.path.join(os.path.realpath(os.path.dirname(log)), os.path.basename(log))', 'log',
                                           Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
-    'the log: lock and journal never in a must-keep path': ('config', 'for own in (self.log_file, self.lock_file, self.journal_file):',
+    'the log: lock and journal never in a must-keep path': ('config', 'for own in (self.log_file, self.lock_file, self.journal_file, self.report_file, self.report_lock_file):',
                                                             'for own in (self.log_file,):', Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
     'delete: the entry the last check judged': ('rules', 'if (st.st_dev, st.st_ino) != look.ident:  # ident', 'if False:',
                                                 Tmp, 'test_an_entry_swapped_after_the_last_check_is_never_followed'),
