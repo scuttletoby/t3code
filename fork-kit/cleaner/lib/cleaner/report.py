@@ -11,6 +11,10 @@ following a link and without entering another filesystem or a mount point (a bin
 each folder and each hard-linked file counts once in the whole report (in the first class that reaches it). A class
 that cannot be read in full says "could not read" and the others still print; a worktree that cannot be read is
 named, and the worktrees that can be still count. Docker's volumes are root's, so Docker's own measure is used.
+
+With `--out` the line is written (and synced) before the mark moves: at least once, never lost. A report stopped
+between the two (killed, a power cut) leaves the mark where it was, so the next report counts the same deletes
+again, and two lines in the file then name overlapping "freed" figures. The mark's own line says from when.
 """
 import errno, fcntl, fnmatch, json, os, re, socket, stat, tempfile, time
 
@@ -356,9 +360,15 @@ def take_lock(cfg):
 
 
 def deliver(out, line):
-    """Appends the line to the file `out` and waits until it is on disk. Raises OSError when it cannot."""
-    os.makedirs(os.path.dirname(out), mode=0o700, exist_ok=True)
-    fd = os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    """Appends the line to the file `out` and waits until it is on disk, and the file's name too when this made the
+    file (else a power cut could leave the mark moved and no file). Raises OSError when it cannot."""
+    folder = os.path.dirname(out)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd, made = os.open(out, flags), False
+    except FileNotFoundError:
+        fd, made = os.open(out, flags | os.O_CREAT | os.O_EXCL, 0o600), True
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, 'not a regular file')
@@ -366,6 +376,12 @@ def deliver(out, line):
         os.fsync(fd)
     finally:
         os.close(fd)
+    if made:
+        dfd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
 
 def report(cfg, say=print, docker=docker_volume_sizes, host=None, disk_of=disk, mounts=mount_points, out=None, mark=True):

@@ -26,11 +26,12 @@ fork-cleaner report   one line: GB per class on this host, and what runs freed s
                       --no-mark: leave the mark where it is (the next report counts the same deletes again)
 fork-cleaner compare  what plan would delete next to what the old tools' dry runs would (cleaner.daily.compare)
 fork-cleaner daily    what the timer runs: plan, report and compare (cleaner.daily.mode "compare", the default),
-                      or run and report ("run", refused while a timer in cleaner.daily.oldTimers is on)
+                      or run and report ("run", refused while a timer in cleaner.daily.oldTimers is on or unknown)
 
 What may go is decided by three rules (worktrees, docker, tmp) and the "cleaner" section of the machine file.
 What must stay is decided by the code and cannot be turned off. Exit code: 0 done, 1 something could not be read or
-deleted (it was kept), 2 wrong command or no usable machine file (nothing was done).'''
+deleted (it was kept), 2 wrong command or no usable machine file (nothing was done), 3 (compare and daily only)
+every step worked and the compare found paths only fork-cleaner would delete.'''
 NEW = os.O_CREAT | os.O_NOFOLLOW        # the lock and the log are made when missing, and are never reached by a link
 STAMP = re.compile(rb'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ ')   # how every line of the cleaner's log starts
 HALF = ('an earlier run stopped while deleting it, so it may be partly gone; nothing judges it again until you '

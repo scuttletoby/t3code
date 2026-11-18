@@ -17,13 +17,13 @@ unset TMPDIR CURL_HOME SSL_CERT_FILE SSL_CERT_DIR || true
 
 die() { echo "fork-cleaner-bootstrap: $*" >&2; exit 1; }
 
-repo='' sha='' branch='ci-release' api='https://api.github.com' codeload='https://codeload.github.com'
+repo='' sha='' timer='' branch='ci-release' api='https://api.github.com' codeload='https://codeload.github.com'
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) repo="${2-}"; shift 2 ;;
-    --sha) sha="${2-}"; shift 2 ;;
-    --release-branch) branch="${2-}"; shift 2 ;;
-    --timer|--no-timer) break ;;
+    --repo) [ $# -ge 2 ] || die "--repo needs a value"; repo="$2"; shift 2 ;;
+    --sha) [ $# -ge 2 ] || die "--sha needs a value"; sha="$2"; shift 2 ;;
+    --release-branch) [ $# -ge 2 ] || die "--release-branch needs a value"; branch="$2"; shift 2 ;;
+    --timer|--no-timer) timer="$1"; shift ;;   # only these reach the installer: never a second --sha or --source
     *) die "unknown option $1 (see the top of this file)" ;;
   esac
 done
@@ -58,4 +58,4 @@ top="$(find "$work/src" -mindepth 1 -maxdepth 1 -type d)"
 kit="$top/fork-kit/cleaner"
 [ -f "$kit/sbin/fork-cleaner-install" ] || die "release $sha has no fork-kit/cleaner installer (is it a release with the kit?)"
 echo "fork-cleaner-bootstrap: release $sha of $repo, download sha256 $(sha256sum "$work/kit.tar.gz" | cut -d' ' -f1)"
-python3 -I -B "$kit/sbin/fork-cleaner-install" install --source "$kit" --sha "$sha" "$@"
+python3 -I -B "$kit/sbin/fork-cleaner-install" install --source "$kit" --sha "$sha" ${timer:+"$timer"}

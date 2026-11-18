@@ -9,7 +9,8 @@ import errno, fnmatch, os, re, stat
 from . import guard
 from .config import matches
 from .facts import (Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_tags, lonely, merged_seconds,
-                    origin_url, present, reflog, remote_refs, remote_urls, remove_volume, remove_worktree, worktree_list)
+                    origin_url, orphaned_worktree, present, reflog, remote_refs, remote_urls, remove_volume,
+                    remove_worktree, worktree_list)
 from .guard import CREDENTIAL_NAMES, Refusal
 
 DAY = 86400
@@ -19,10 +20,10 @@ TMP_NEVER = ('.*', 'claude-*', 'tmux-*', 'ssh-*', 'systemd-private-*', 'snap-pri
 ANONYMOUS = re.compile(r'^[0-9a-f]{64}$')       # the name Docker gives a volume nobody named
 EMPTY_PRS = {'merged': [], 'open': []}
 GITHUB_URL = re.compile(r'^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?$')
-# In a worktree's own git folder: an operation somebody started and did not finish.
 # In a worktree's own git folder: files the commands of somebody working in it write (`fetch` writes FETCH_HEAD).
 USE_MARKS = ('HEAD', 'index', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG')
 REFLOG_LINE = re.compile(rb'(?:[0-9a-f]{40}|[0-9a-f]{64}) (?:[0-9a-f]{40}|[0-9a-f]{64}) [^<>\n]*<[^<>\n]*> (\d+) [+-]\d{4}(?:\t[^\n]*)?')
+# In a worktree's own git folder: an operation somebody started and did not finish.
 MARKS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-merge', 'rebase-apply', 'index.lock')
 
 
@@ -495,8 +496,11 @@ def reflog_newest(path):
 
 def tree_of(repo, path):
     """'worktree' or 'clone' when `path` is one of the listed repository (by its origin URL), the folders this rule
-    looks at; None for anything else. Raises Unreadable when it cannot tell. The disk report's worktrees class."""
+    looks at; None for anything else. Raises Unreadable when it cannot tell. The disk report's worktrees class.
+    An orphaned worktree in the repository's folder counts as one (tree_answer keeps it under that name)."""
     kind = tree_kind(path)
+    if kind == 'worktree' and orphaned_worktree(path) is not None:
+        return kind
     return kind if kind is not None and same_repo(origin_url(path), repo.github) else None
 
 
@@ -509,6 +513,9 @@ def tree_answer(cfg, facts, repo, path):
         return 'folder', Refusal('could not read', str(ex)), '', None
     if kind is None:
         return None
+    gone = orphaned_worktree(path) if kind == 'worktree' else None
+    if gone is not None:            # whose it is cannot be read: it is in this repository's folder, and kept
+        return kind, Refusal('orphaned worktree', f'its git folder {gone} is gone (the main repository was removed)'), '', None
     try:
         url = origin_url(path)
     except Unreadable as ex:

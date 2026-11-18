@@ -5,29 +5,50 @@ shell, with no input, read-only by its own promise) and a regular expression who
 would delete. The compare runs each, runs the cleaner's plan, and sorts every path into:
 
 - new only: the cleaner would delete it and no old tool would. Each one is a bug until somebody explains it, and
-  makes the exit code 1.
+  makes the exit code 3.
 - old only: an old tool would delete it and the cleaner keeps it (its reason is named): the cleaner is stricter.
 - both.
 
-A path counts as the same when it is the other path or inside it (an old tool may name a folder the cleaner names
-an entry of, or the other way round). A source that cannot run, or ends with an exit code other than 0, makes
-the compare incomplete (exit code 1): what it printed is still used. Nothing is deleted.
+A cleaner path counts as "both" only when an old tool names that path or a folder it is in: then the old tool
+deletes all of it too. A cleaner path that holds what an old tool names (the old tool deletes /x/cache, the cleaner
+all of /x) is "new only", with what the old tool deletes of it: the rest is what only the cleaner deletes. In the
+same way an old path that holds a cleaner path is "old only" (the old tool deletes more).
+
+Exit codes: 0 every source ran and nothing is new only; 1 incomplete (a source could not run or ended with an exit
+code other than 0, or the plan could not read something: what was printed is still used); 2 the plan refused;
+3 complete, and something is new only. Nothing is deleted.
 """
 import os, re, subprocess
 
 from . import engine
 
 TIMEOUT = 1800                  # seconds one old dry run may take
+NEW_ONLY = 3                    # the exit code when the compare is complete and something is new only
 WOULD = re.compile(r'^would delete (.+?) \((?:[0-9.]+ (?:B|KB|MB|GB)|size not known), (\w+): (.*)\)$')
 KEPT = re.compile(r'^kept (.+?) \((\w+): ([^:)]+)(?:: (.*))?\)$')
 
 
+def _within(path, folder):
+    """True when `path` is `folder` or inside it."""
+    return path == folder or path.startswith(folder.rstrip('/') + '/')
+
+
 def _inside(path, others):
-    """The first of `others` that `path` is, is inside of, or holds; None when there is none."""
-    for other in others:
-        if path == other or path.startswith(other.rstrip('/') + '/') or other.startswith(path.rstrip('/') + '/'):
-            return other
-    return None
+    """The first of `others` that `path` is or is inside of; None when there is none."""
+    return next((other for other in others if _within(path, other)), None)
+
+
+def _held(path, others):
+    """The ones of `others` inside `path` (not `path` itself), sorted."""
+    return sorted(other for other in others if other != path and _within(other, path))
+
+
+def _more(path, others, who):
+    """'; deletes more: ...' when `path` holds some of `others` (what `who` deletes of it), else ''."""
+    held = _held(path, others)
+    if not held:
+        return ''
+    return f'; deletes more: {who} only {", ".join(held[:3])}{" ..." if len(held) > 3 else ""} in it'
 
 
 def read_plan(lines):
@@ -63,8 +84,8 @@ def old_paths(source, run=subprocess.run):
 
 
 def compare(cfg, facts, say=print, run=subprocess.run, plan_lines=None):
-    """Prints the compare; returns the exit code: 0 when every source ran and nothing is new only, 1 otherwise,
-    2 when the plan itself refused. `plan_lines`: a plan's lines already made (daily.py), else it plans now."""
+    """Prints the compare; returns the exit code (the module's text): 0, 1 incomplete, 2 the plan refused,
+    3 new only. `plan_lines`: a plan's lines already made (daily.py), else it plans now."""
     plan_code = 0
     if plan_lines is None:
         plan_lines = []
@@ -90,10 +111,12 @@ def compare(cfg, facts, say=print, run=subprocess.run, plan_lines=None):
     say(f'new only (a bug until explained): {len(new_only)}')
     for path in new_only:
         rule, why = would[path]
-        say(f'  {path} ({rule}: {why})')
+        say(f'  {path} ({rule}: {why}{_more(path, olds, "the old tools")})')
     say(f'old only (fork-cleaner keeps it): {len(old_only)}')
     for path in old_only:
         reason = kept.get(path) or next((f'{v} (at {k})' for k, v in kept.items() if _inside(path, [k])), None)
+        if not reason and _held(path, would):
+            reason = _more(path, would, 'fork-cleaner')[2:]
         say(f'  {path} [{", ".join(olds[path])}] ({reason or "no kept line: no rule of fork-cleaner takes it, or it is too new for one"})')
     say(f'both: {len(both)}')
     for path in both:
@@ -102,4 +125,4 @@ def compare(cfg, facts, say=print, run=subprocess.run, plan_lines=None):
         say(f'incomplete: {problem}')
     if plan_code:
         say(f'incomplete: the plan ended with exit code {plan_code} (something could not be read)')
-    return 1 if new_only or problems or plan_code else 0
+    return 1 if problems or plan_code else NEW_ONLY if new_only else 0

@@ -15,7 +15,7 @@ without either option keeps it. What `daily` does (compare: plan, report and com
 and refuses while an old tool's timer is on) is set in the machine file (cleaner.daily), not here. Safe to run again,
 and to stop at any step; one installer at a time.
 """
-import argparse, contextlib, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
+import argparse, contextlib, ctypes, errno, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
 PREFIX = ''          # tests only: every fixed path below is read under this folder
 ROOT_UID = 0         # tests only: who must run the installer and own the installed files
@@ -51,12 +51,46 @@ def p(path):
     return PREFIX + path
 
 
-def source_file(source, rel):
-    """Where a kit file is in the source: common/ is shared by the kits and sits next to them (fork-kit/common);
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+AT_FDCWD, RENAME_EXCHANGE = -100, 2
+
+
+def source_base(source, rel):
+    """The folder a kit file is read from: common/ is shared by the kits and sits next to them (fork-kit/common);
     a source folder that has its own common/ (a copy) is used as it is."""
-    if rel.startswith('common/') and not os.path.isfile(os.path.join(source, rel)):
-        return os.path.join(os.path.dirname(os.path.normpath(source)), rel)
-    return os.path.join(source, rel)
+    if rel.startswith('common/') and not os.path.lexists(os.path.join(source, rel)):
+        return os.path.dirname(os.path.normpath(source))
+    return source
+
+
+def read_source(source, rel):
+    """The bytes of one kit file of the source. Below the source folder no link is followed: a link (to a file
+    only root may read, say) is refused, never copied, and so is anything that is not a regular file."""
+    base, parts = source_base(source, rel), rel.split('/')
+    try:
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as e:
+        raise Refused(f'--source {source}: {e.strerror} (point it at the fork-kit/cleaner folder)') from None
+    try:
+        for part in parts[:-1]:
+            new = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = new
+        ffd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Refused(f'--source {source}: {rel}: a link is on its way or it is not a file (the installer '
+                          'copies no links)') from None
+        raise Refused(f'--source {source}: {rel}: {e.strerror} (point it at the fork-kit/cleaner folder)') from None
+    finally:
+        os.close(fd)
+    try:
+        if not stat.S_ISREG(os.fstat(ffd).st_mode):
+            raise Refused(f'--source {source}: {rel} is not a regular file')
+        with os.fdopen(ffd, 'rb', closefd=False) as f:
+            return f.read()
+    finally:
+        os.close(ffd)
 
 
 def say(msg):
@@ -185,37 +219,86 @@ def tree_problems(folder):
     return problems
 
 
+def _renameat2():
+    """libc's renameat2, or None where there is none."""
+    try:
+        fn = ctypes.CDLL(None, use_errno=True).renameat2
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def exchange(new, dest):
+    """Puts the folder `new` at `dest` and the old `dest` at `new`, in one step where the kernel and the
+    filesystem can (renameat2 RENAME_EXCHANGE): `dest` is never missing. Elsewhere two renames, with a moment in
+    which it is (the unit then skips its run: ConditionPathExists)."""
+    fn = _renameat2()
+    if fn is not None:
+        if fn(AT_FDCWD, os.fsencode(new), AT_FDCWD, os.fsencode(dest), RENAME_EXCHANGE) == 0:
+            return
+        err = ctypes.get_errno()
+        if err not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+            raise OSError(err, os.strerror(err), dest)
+    aside = new + '-old'
+    os.rename(dest, aside)
+    try:
+        os.rename(new, dest)
+    except BaseException:
+        os.rename(aside, dest)          # the old copy back where it was
+        raise
+    os.rename(aside, new)
+
+
 def copy_tool(source, sha):
+    """versions/<sha>, checked: the copy there when it is whole and unchanged, else a new copy made beside it and
+    self-tested first, and only then put in its place in one step. A copy that fails stops here, and the version
+    in use is the one it was. Refused when a self-test fails."""
     versions = p(VERSIONS)
     dest = os.path.join(versions, sha)
-    if os.path.lexists(dest):
-        if os.path.isdir(dest) and not os.path.islink(dest) and not tree_problems(dest) \
-                and set(read_manifest(dest)) == set(SOURCE_FILES):
-            return dest
-        say(f'versions/{sha} is incomplete or changed: made again')
-        shutil.rmtree(dest) if not os.path.islink(dest) else os.unlink(dest)
-    for name in os.listdir(versions):   # a run that stopped while copying
+    if os.path.lexists(dest) and os.path.isdir(dest) and not os.path.islink(dest) and not tree_problems(dest) \
+            and set(read_manifest(dest)) == set(SOURCE_FILES):
+        problems = self_test(dest)
+        if problems:
+            raise Refused('the copy failed its self-test (nothing was changed):\n  ' + '\n  '.join(problems))
+        return dest
+    for name in os.listdir(versions):   # a run that stopped while copying (or an old copy it swapped out)
         if name.startswith('.tmp-'):
             shutil.rmtree(os.path.join(versions, name), ignore_errors=True)
     tmp = tempfile.mkdtemp(prefix=f'.tmp-{sha[:12]}-', dir=versions)
-    lines = []
-    for rel in sorted(SOURCE_FILES):
-        dst = os.path.join(tmp, rel)
-        os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
-        with open(source_file(source, rel), 'rb') as f:
-            data = f.read()
-        with open(dst, 'wb') as f:
-            f.write(data)
-        os.chmod(dst, 0o755 if rel in EXECUTABLE else 0o644)
-        lines.append(f'{hashlib.sha256(data).hexdigest()}  {rel}')
-    with open(os.path.join(tmp, 'MANIFEST.sha256'), 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-    os.chmod(os.path.join(tmp, 'MANIFEST.sha256'), 0o644)
-    for dirpath, dirnames, _ in os.walk(tmp):
-        for name in dirnames:
-            os.chmod(os.path.join(dirpath, name), 0o755)
-    os.chmod(tmp, 0o755)
-    os.rename(tmp, dest)
+    try:
+        lines = []
+        for rel in sorted(SOURCE_FILES):
+            dst = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
+            data = read_source(source, rel)
+            with open(dst, 'wb') as f:
+                f.write(data)
+            os.chmod(dst, 0o755 if rel in EXECUTABLE else 0o644)
+            lines.append(f'{hashlib.sha256(data).hexdigest()}  {rel}')
+        with open(os.path.join(tmp, 'MANIFEST.sha256'), 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        os.chmod(os.path.join(tmp, 'MANIFEST.sha256'), 0o644)
+        for dirpath, dirnames, _ in os.walk(tmp):
+            for name in dirnames:
+                os.chmod(os.path.join(dirpath, name), 0o755)
+        os.chmod(tmp, 0o755)
+        problems = self_test(tmp)
+        if problems:
+            raise Refused('the new copy failed its self-test (the version in use is unchanged):\n  '
+                          + '\n  '.join(problems))
+        if not os.path.lexists(dest):
+            os.rename(tmp, dest)
+            return dest
+        say(f'versions/{sha} is incomplete or changed: made again')
+        if os.path.islink(dest) or not os.path.isdir(dest):
+            os.unlink(dest)
+            os.rename(tmp, dest)
+            return dest
+        exchange(tmp, dest)             # the old copy is now at tmp, removed below
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     return dest
 
 
@@ -249,8 +332,7 @@ def check_options(a):
     if not SHA_RE.match(a.sha or ''):
         raise Refused('--sha must be the full 40-character release commit')
     for rel in SOURCE_FILES:
-        if not os.path.isfile(source_file(a.source or '', rel)):
-            raise Refused(f'--source {a.source}: {rel} is missing (point it at the fork-kit/cleaner folder)')
+        read_source(os.path.realpath(a.source or ''), rel)
 
 
 def self_test(dest):
@@ -302,11 +384,8 @@ def _install(a, done):
     for path in (ETC, LIBEXEC, VERSIONS):
         ensure_dir(path)
     done('folders')
-    dest = copy_tool(os.path.realpath(a.source), a.sha)
+    dest = copy_tool(os.path.realpath(a.source), a.sha)     # self-tested before it is used
     done('copy')
-    problems = self_test(dest)
-    if problems:
-        raise Refused('the new copy failed its self-test (the version in use is unchanged):\n  ' + '\n  '.join(problems))
     done('self-test')
     write_file(CONFIG, json.dumps({'version': 1, 'timer': timer}, indent=2, sort_keys=True) + '\n')
     done('config')
@@ -342,6 +421,11 @@ def _install(a, done):
 def uninstall():
     if os.geteuid() != ROOT_UID:
         raise Refused('run this as root')
+    with install_lock():                # never from under a running install
+        return _uninstall()
+
+
+def _uninstall():
     for path, target in LINKS.items():
         if ours(path, target):
             os.unlink(p(path))

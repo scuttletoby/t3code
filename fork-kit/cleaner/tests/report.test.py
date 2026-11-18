@@ -5,7 +5,7 @@ RedCheck breaks each rule in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/report.test.py
 """
-import contextlib, fcntl, json, os, shutil, sys, time, types, unittest
+import contextlib, fcntl, json, os, shutil, stat, sys, time, types, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -128,8 +128,9 @@ class Classes(Case):
         tree = self.worktree(clone, 'fix-1')
         self.big(os.path.join(tree, 'build.bin'), 2)
         gone = self.clone('gone', into=self.mkdir('elsewhere'))
-        orphan = self.worktree(gone, 'fix-2')                          # its main repository is removed below
+        orphan = self.worktree(gone, 'fix-2')                          # its main repository is broken below
         shutil.rmtree(gone)
+        os.makedirs(os.path.join(gone, '.git', 'worktrees', 'fix-2'))  # its git folder is there, and git fails
         sized = self.classes(self.repo_cfg())['worktrees']
         self.assertEqual(sized.problems, [])
         self.assertGreaterEqual(sized.total, 2 * MB)
@@ -140,6 +141,19 @@ class Classes(Case):
         text = self.part(lines[0], 'worktrees')
         self.assertTrue(text.startswith('0.0 GB (could not read 1 worktree: ' + orphan + ' ('), text)
         self.assertIn('(with what could not be read)', self.part(lines[0], 'everything else'))
+
+    def test_an_orphaned_worktree_counts_and_is_no_error(self):
+        """A worktree whose main repository is gone (its git folder too) is no "could not read": git can never
+        answer for it, and the worktrees rule keeps it under its own name. It counts in the class."""
+        gone = self.clone('gone', into=self.mkdir('elsewhere'))
+        orphan = self.worktree(gone, 'fix-2')
+        self.big(os.path.join(orphan, 'build.bin'), 2)
+        shutil.rmtree(gone)
+        sized = self.classes(self.repo_cfg())['worktrees']
+        self.assertEqual((sized.problems, sized.unread), ([], []))
+        self.assertGreaterEqual(sized.total, 2 * MB)
+        code, lines = self.report(self.repo_cfg())
+        self.assertEqual(code, 0, lines)
 
     def test_temp_is_the_entries_a_pattern_takes(self):
         self.big(self.path('tmp', 'job-1', 'a.bin'), 2)                # taken by the pattern, whatever its age
@@ -467,10 +481,30 @@ class Freed(Case):
         self.assertEqual(self.report(cfg, out=out)[0], 1)
         self.assertFalse(os.path.lexists(self.path('elsewhere.log')))
         os.remove(out)
+        open(out, 'w').close()                                 # there already: only the line is synced
         mark = open(cfg.report_file).read()
         with mock.patch.object(self.c.report.os, 'fsync', side_effect=OSError(5, 'Input/output error')):
             self.assertEqual(self.report(cfg, out=out)[0], 1)      # written but not known to be on disk
         self.assertEqual(open(cfg.report_file).read(), mark)
+
+    def test_with_out_a_new_file_is_synced_with_its_folder(self):
+        """The first line makes the file: its folder is synced too, else a power cut can keep the mark and lose the
+        file. A file already there needs only its own sync."""
+        cfg = self.cfg()
+        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB')])
+        out = self.path('state', 'daily', 'report.log')
+        synced, real = [], os.fsync
+
+        def fsync(fd):
+            synced.append('folder' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+            real(fd)
+        for there, want in ((False, ['file', 'folder']), (True, ['file'])):
+            with self.subTest(there=there):
+                synced.clear()
+                with mock.patch.object(self.c.report.os, 'fsync', fsync):
+                    code, lines = self.report(cfg, out=out)
+                self.assertEqual(code, 0, lines)
+                self.assertEqual(synced, want)
 
     def test_no_mark_leaves_the_mark(self):
         cfg = self.cfg()
@@ -521,6 +555,10 @@ MUTATIONS = {
     'out: the mark moves only after the line is written': ('report', "            return 1\n    say(line)", "            pass\n    say(line)",
                                                            Freed, 'test_with_out_the_line_is_written_before_the_mark_moves'),
     'out: synced': ('report', '        os.fsync(fd)\n', '', Freed, 'test_with_out_the_line_is_written_before_the_mark_moves'),
+    'out: a new file\'s folder synced': ('report', '            os.fsync(dfd)\n', '            pass\n', Freed,
+                                         'test_with_out_a_new_file_is_synced_with_its_folder'),
+    'an orphaned worktree counts': ('rules', "    if kind == 'worktree' and orphaned_worktree(path) is not None:\n        return kind\n",
+                                    '', Classes, 'test_an_orphaned_worktree_counts_and_is_no_error'),
     'no mark': ('report', 'if mark and got.problem is None', 'if got.problem is None', Freed, 'test_no_mark_leaves_the_mark'),
     'one class list': ('report', 'for name, source in CLASSES]', "for name, source in CLASSES[:1]]",
                        Classes, 'test_the_classes_are_the_cleaners_own_list'),

@@ -68,7 +68,9 @@ total: would delete 1 (1.2 GB), kept 1
 ```
 
 Exit code 0: done. 1: something could not be read or a delete failed (it was kept). 2: wrong command, or no
-usable machine file (nothing was done). There is no `--force` and no option that names another config file.
+usable machine file (nothing was done). 3 (`compare` and `daily` only): every step worked, and the compare found
+paths only fork-cleaner would delete (see [The daily timer](#the-daily-timer)). There is no `--force` and no
+option that names another config file.
 
 The log (`logFile`, private to the user) gets a `deleting X` line before each delete and a `deleted X` (or
 `FAILED X`) line after it, a line per delete refused at the last check, and the total of each run. It keeps its
@@ -145,10 +147,13 @@ not be read) (180.2 GB of 250.0 GB used); freed since the last report at 2026-01
   there.
 - **The mark moves only once the line is kept.** With `--out FILE` (an absolute path) the line is appended to
   FILE and synced to disk first; FILE must be a regular file or new (a link, folder or pipe is refused). Only
-  then does the mark move. When the line cannot be written, it is still printed, the mark stays, the command
+  then does the mark move (a new FILE's folder is synced too, so its name survives a power cut). When the line
+  cannot be written, it is still printed, the mark stays, the command
   says so and exits 1, and the next report counts those deletes again. Without `--out` the mark moves once the
   line is printed. `--no-mark` never moves it (a caller that delivers the line its own way moves it by running
-  `report` again with `--out`). The daily timer uses `--out` with `report.log` in its folder.
+  `report` again with `--out`). The daily timer uses `--out` with `report.log` in its folder. Delivery is at least
+  once: a report killed after the line is written and before the mark moves writes those deletes again in the
+  next line, so a sum over FILE can count them twice (the mark itself never does).
 
 ## What it never deletes
 
@@ -232,6 +237,7 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `another git folder inside`    | a nested clone or submodule                                                                                                                 |
 | `in use`, `KEEP file`, ...     | every refusal of the list above                                                                                                             |
 | `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                                                     |
+| `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0); also in a temp folder |
 
 A worktree is removed with `git worktree remove`, never with `--force`: git itself refuses when a file changed
 after the last check. The local branch and its reflog stay in the clone, so a commit that was amended or reset
@@ -318,7 +324,7 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 | `tmp.root`                      | `/tmp`                                    | the temp folder                                                                                   |
 | `tmp.patterns`                  | none                                      | name pattern to days without a change (1 or more)                                                 |
 | `daily.mode`                    | `compare`                                 | what the timer does: `compare` (deletes nothing) or `run`                                         |
-| `daily.oldTimers`               | none                                      | user timers of the tools this one replaces: `run` refuses while one is on                         |
+| `daily.oldTimers`               | none                                      | timers (user or system) of the tools this one replaces: `run` refuses while one is on or unknown  |
 | `daily.outDir`                  | `~/.local/state/fork-cleaner/daily`       | where `daily` writes its files                                                                    |
 | `daily.keepDays`                | 30                                        | days `daily` keeps its dated files (1 or more)                                                    |
 | `daily.compare[]`               | none                                      | the old tools' dry runs: `name`, `command` (absolute program, no shell), `pattern` (one group)    |
@@ -341,16 +347,30 @@ the machine file says what it does:
 
 - **`compare`** (the default): `plan`, then the report, then the [compare](#the-compare). Nothing is deleted,
   whatever else runs on the host.
-- **`run`**: `run` (deletes), then the report. It refuses (exit 2, nothing deleted, nothing written) while a timer
-  in `oldTimers` is enabled or active for this user, or when `systemctl --user` cannot say: two cleaners must not
-  both delete. A timer counts as off only when it is `disabled`, `masked` or not found **and** `inactive` or
-  `failed`.
+- **`run`**: `run` (deletes), then the report. It refuses (exit 2, nothing deleted, nothing written) unless every
+  timer in `oldTimers` is provably off: two cleaners must not both delete. Each timer is asked in the user
+  (`systemctl --user`) and the system scope (`systemctl --system`). It counts as off only when at least one scope
+  knows it, and in each scope that does it is `disabled` or `masked` **and** `inactive` or `failed`, **and** the
+  service it starts is `inactive` or `failed` (a run still deleting, `active` or `activating`, counts as on). A
+  timer no scope knows refuses too: a misspelled name, or another user's timer, cannot be proven off; remove it
+  from `oldTimers` once the old tool is gone. systemd that cannot answer refuses.
 
 Everything goes to `outDir`: `plan-<day>.txt` (or `run-<day>.txt`) and `compare-<day>.txt` (each written whole,
-kept `keepDays` days), and `report.log`, which gets each report's line before the mark moves. Only files of those
-names are ever removed there. `outDir` may not be in a must-keep path, in or above a folder a rule deletes from,
-or hold the home folder. The command prints one summary line (the journal keeps it) and exits with the highest
-code of its steps.
+kept `keepDays` days; a second run on the same day writes `plan-<day>.2.txt`, `.3.txt` and so on, never over the
+first), and `report.log`, which gets each report's line before the mark moves. Only files of those names are ever
+removed there. `outDir` may not be in a must-keep path, in or above a folder a rule deletes from, or be or hold
+the home folder. The command prints one summary line (the journal keeps it), which ends with its exit code in
+words:
+
+| exit | meaning                                                                                                     |
+| ---- | ----------------------------------------------------------------------------------------------------------- |
+| 0    | done                                                                                                        |
+| 1    | something failed: a step could not read something, a file could not be written or trimmed, a source of the compare failed, the report failed |
+| 2    | refused: run mode with an old timer on or unknown, or the plan refused                                      |
+| 3    | compare mode: every step worked, and the compare found "new only" paths (each a bug until explained)        |
+
+A 1 always wins over a 3: exit 3 never hides a real failure. An orphaned worktree (`orphaned worktree` above) is
+kept and is no failure.
 
 ## The compare
 
@@ -370,9 +390,12 @@ both: 2
 ```
 
 **New only** is what this tool would delete and no old one would: each is a bug until somebody explains it, and
-the exit code is 1. **Old only** is where it is stricter, with its reason. A path counts as the same when it is
-the other one or inside it. A dry run that cannot start or ends with an exit code other than 0 makes the compare
-`incomplete` (exit 1); what it printed still counts. Nothing is deleted.
+the exit code is 3. **Old only** is where it is stricter, with its reason. A cleaner path is **both** only when an
+old tool names that path or a folder it is in (the old tool deletes all of it too). A cleaner folder that holds
+what an old tool deletes (the old tool deletes `/x/cache`, fork-cleaner all of `/x`) is new only, with
+`deletes more: the old tools only /x/cache in it`; an old folder that holds a cleaner path is old only, with
+`deletes more: fork-cleaner only ... in it`. A dry run that cannot start or ends with an exit code other than 0
+makes the compare `incomplete` (exit 1, which wins over 3); what it printed still counts. Nothing is deleted.
 
 ## Install
 
@@ -391,7 +414,14 @@ The bootstrap checks the commit is on `ci-release`, downloads exactly that commi
 without either option the last choice stays (`/etc/fork-cleaner/config.json`). A unit of the same name the kit did
 not write is refused and left alone. `fork-cleaner-install self-check` reports drift from `installed.tsv`;
 `uninstall` removes the kit, and leaves the machine file and what the cleaner wrote in each home. Safe to run
-again or to stop at any step; one installer at a time.
+again or to stop at any step; one installer at a time (`uninstall` too).
+
+The installer reads the source without following a link anywhere below `--source` (a file or a folder on the way
+that is a link is refused, never copied), so a link to a file only root may read cannot end up in the
+world-readable copy. A copy of the same release that changed is made again beside it, self-tested, and only then
+swapped in, in one step (`renameat2` exchange; two renames where the filesystem has none): a copy that stops half
+way or fails its self-test leaves the copy in use as it was. The bootstrap passes only `--timer` or `--no-timer`
+on to the installer; any other option is refused.
 
 The installer writes no machine file: the `cleaner` section is the owner's, written by hand.
 
@@ -409,7 +439,7 @@ The installer writes no machine file: the `cleaner` section is the owner's, writ
 - **GitHub, git or Docker is down:** everything that needed the answer is kept, and the exit code is 1.
 - **two runs start at once:** the second one stops with "another run" and deletes nothing.
 - **the tool it replaces is still installed:** compare mode runs beside it and deletes nothing; run mode refuses
-  while a timer in `oldTimers` is on.
+  while a timer in `oldTimers` is on, still running, or unknown.
 - **the old tool's log and state are left behind:** never read, changed or counted. The report counts only this
   tool's own log, so the old tool's deletes are not in its freed figure.
 

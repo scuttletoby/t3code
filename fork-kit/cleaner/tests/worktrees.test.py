@@ -306,6 +306,16 @@ class Worktrees(Case):
         os.rename(tree, self.path('trees', 'moved'))
         self.assertKept(self.planned(), self.path('trees', 'moved'), 'could not read', 'moved')
 
+    def test_a_worktree_whose_main_repository_is_gone_is_kept_as_orphaned(self):
+        """Its .git file names a git folder that is gone: git can never answer for it. It is kept, under its own name
+        (no "could not read", which would mark every daily run failed)."""
+        clone = self.clone('elsewhere-base', into=self.mkdir('elsewhere'))
+        tree = self.finished(clone=clone)
+        shutil.rmtree(clone)
+        plan = self.planned()
+        self.assertKept(plan, tree, 'orphaned worktree', 'is gone (the main repository was removed)')
+        self.assertTrue(os.path.isdir(tree))
+
     def test_the_last_check_wants_the_same_kind(self):
         tree = self.finished()
         cfg = self.repo_cfg()
@@ -739,6 +749,8 @@ class GitHub(Case):
 
 MUTATIONS = {
     'open PR': ('rules', 'if opened:', 'if False:', Worktrees, 'test_an_open_pull_request_keeps_it'),
+    'orphaned worktree': ('rules', "gone = orphaned_worktree(path) if kind == 'worktree' else None", 'gone = None',
+                          Worktrees, 'test_a_worktree_whose_main_repository_is_gone_is_kept_as_orphaned'),
     'no merged PR': ('rules', 'if not merged:', 'if False:', Worktrees, 'test_no_merged_pull_request_keeps_it'),
     'merged under 24 h ago': ('rules', 'if age < cfg.merged_hours * 3600:', 'if False:', Worktrees, 'test_merged_less_than_a_day_ago_keeps_it'),
     'the 24 h floor': ('config', "'mergedHours': (int, MIN_MERGED_HOURS, _at_least(MIN_MERGED_HOURS))", "'mergedHours': (int, MIN_MERGED_HOURS, None)",
