@@ -24,7 +24,8 @@ import { readSettingsFile } from "../fork/settingsFileRead.ts";
 /**
  * Fork (go-live kit): what a T3 home holds, read without writing a byte. It never migrates, never
  * takes the ownership lock and never creates a file or folder, so it can run on a stopped home, on
- * a copy, or beside a running server. Bump `reportVersion` when a key the kit reads changes.
+ * a copy, or beside a running server. Not while one stops: see `readDatabase` for the empty `-wal`.
+ * Bump `reportVersion` when a key the kit reads changes.
  */
 export const FORK_REPORT_VERSION = 1;
 
@@ -210,12 +211,11 @@ function readDatabase(databasePath: string, problems: Array<Problem>): ForkRepor
   if (real.size === 0) return { ...empty, state: "empty" };
 
   // A clean server stop between the WAL checks and the read deletes the WAL; SQLite then creates an
-  // empty -wal and the read fails. It stays: removing it could unlink the WAL of a server starting
-  // at that moment. The checks run again once, so the stopped home reads `immutable`.
+  // empty -wal and the read (or the open itself) fails. It stays: removing it could unlink the WAL
+  // of a server starting at that moment. Any failed first attempt runs the checks and the read once
+  // more, so the stopped home reads `immutable`; a second failure is the one reported.
   let read = readOnce(realPath, empty);
-  if (read.database.openMode === "readonly-shm" && read.database.state === "unreadable") {
-    read = readOnce(realPath, empty);
-  }
+  if (read.database.state === "unreadable") read = readOnce(realPath, empty);
   problems.push(...read.problems);
   return read.database;
 }
@@ -431,7 +431,11 @@ function whyNoHome(
   stateStat: ReturnType<typeof lookAt> | null,
   stateDir: string,
 ): string | null {
-  if (homeStat === undefined) return `No T3 home folder at ${home}.`;
+  if (homeStat === undefined) {
+    return lookAt(home, false) === undefined
+      ? `No T3 home folder at ${home}.`
+      : `${home} is a link that leads nowhere; a start would fail.`;
+  }
   if (typeof homeStat === "string") return `${home} could not be looked at (${homeStat}).`;
   if (stateStat === null) return `${home} is not a folder.`;
   if (typeof stateStat === "string") {
@@ -442,9 +446,16 @@ function whyNoHome(
       ? null
       : `${stateDir} is a link that leads nowhere; a start would fail.`;
   }
-  return stateStat.isDirectory()
-    ? null
-    : `${stateDir} is not a folder, so this home holds no T3 state; a start would fail.`;
+  if (!stateStat.isDirectory()) {
+    return `${stateDir} is not a folder, so this home holds no T3 state; a start would fail.`;
+  }
+  // A folder it may not enter hides the database and settings.json; name the folder, not only them.
+  try {
+    NodeFS.accessSync(stateDir, NodeFS.constants.X_OK);
+  } catch (cause) {
+    return `${stateDir} cannot be entered (${errorText(cause)}); a start would fail.`;
+  }
+  return null;
 }
 
 /** The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`). */

@@ -17,10 +17,15 @@ for …", see [project settings](../user/project-settings.md)). An agent's tools
 fork setting.
 
 To check what a T3 home has switched on without changing anything, the fork's hidden command
-`t3 __fork-report --base-dir <home>` prints it as JSON. Not covered: run it while T3 is running or
-stopped, not while it is stopping. A clean stop at the instant the report opens the database leaves
-an empty `statev2.sqlite-wal` (harmless; T3 reuses it); the report then reads the stopped database
-again, so its answer stays right.
+`t3 __fork-report --base-dir <home>` prints it as JSON. It never migrates, takes no lock and creates
+no file, with the one exception below.
+
+Not covered: a T3 that is stopping. Run the report while T3 is running or stopped. A clean stop at
+the instant the report opens the database leaves an empty `statev2.sqlite-wal` behind
+([#179](https://github.com/scuttletoby/t3code/issues/179)): harmless, since T3 reuses it, but a file
+the report created. The report does not remove it: a T3 starting at that moment may already be
+using it. When the first open or read fails, the report checks and reads once more, so its answer is
+about the stopped database; only a second failure is reported.
 
 ## Settings
 
