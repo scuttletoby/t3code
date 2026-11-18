@@ -86,6 +86,11 @@ GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATT
 # so git_problem refuses it: GIT_MIN). Kept apart from GIT_ENV, which other actions share (git_clean.test.py).
 EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 GIT_ATTRS = {'GIT_ATTR_SOURCE': EMPTY_TREE}
+# What a new repository is made with, whatever the job's environment or git's own default says (git 3.0 plans SHA-256
+# and reftable): the queue's cache and the gate's repository hold SHA-1 objects and files refs, as GitHub's commits,
+# EMPTY_TREE and CACHE_CONFIG (format 0, no extensions) are. git reads GIT_DEFAULT_REF_FORMAT from 2.45 (an older one
+# makes files refs anyway); init_bare refuses a repository a git made otherwise.
+GIT_FORMATS = {'GIT_DEFAULT_HASH': 'sha1', 'GIT_DEFAULT_REF_FORMAT': 'files'}
 # One language for git's messages: the queue and the gate match them (GONE_RE, NO_LOGIN_RE) and read them as UTF-8.
 GIT_LANG = {'LC_ALL': 'C'}
 # Never passed on to git (git_env): variables of the job that point git at another repository, object store, index,
@@ -106,8 +111,9 @@ GIT_DROP_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 # run none of them, GIT_EXEC_PATH included.
 GIT_RUN = ('GIT_EXEC_PATH', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS',
            'GIT_ALLOW_PROTOCOL')
-# Traces of an https fetch: they write its headers (the login) and its talk with GitHub to stderr or a file, and the
-# gate puts git's stderr into a public summary. Dropped there; a fetch from another remote carries no token of ours.
+# Traces: they write an https fetch's headers (the login) and its talk with GitHub to stderr or a file, and the gate
+# puts git's stderr into a public summary (a merge-tree's too). Dropped from every call but a fetch from another
+# remote, which carries no token of ours (remote_problem refuses plain http, where GitHub's redirect would ask for it).
 GIT_TRACE_PREFIXES = ('GIT_TRACE', 'GIT_CURL_VERBOSE')
 GIT_READ_SECONDS = 60   # each git call of the config read
 # The cache's HEAD, as the queue writes it (what `git init --template=` writes): a branch that is never made, so HEAD
@@ -335,17 +341,63 @@ def no_token_env():
 
 
 def git_env(env, remote=None):
-    """`env` for a git call: without GIT_DROP, with GIT_ENV, GIT_ATTRS, GIT_LANG and no prompt. `remote`: None for a
-    call that reaches no remote, else the URL or remote name it fetches from, which decides what of GIT_RUN it keeps
-    (an https fetch also drops the traces, GIT_TRACE_PREFIXES). Tokens are the caller's to drop."""
+    """`env` for a git call: without GIT_DROP, with GIT_ENV, GIT_ATTRS, GIT_FORMATS, GIT_LANG and no prompt. `remote`:
+    None for a call that reaches no remote, else the URL or remote name it fetches from, which decides what of GIT_RUN
+    it keeps. Only a fetch from a remote that is not https keeps the traces (GIT_TRACE_PREFIXES). Tokens are the
+    caller's to drop."""
     drop, prefixes = set(GIT_DROP), GIT_DROP_PREFIXES
     if remote is None:
         drop.update(GIT_RUN)
-    elif remote.startswith('https://'):
+        prefixes += GIT_TRACE_PREFIXES
+    elif remote.lower().startswith('https://'):   # git reads the scheme in any case: HTTPS:// is https too
         drop.update(set(GIT_RUN) - {'GIT_EXEC_PATH'})
         prefixes += GIT_TRACE_PREFIXES
     return {**{k: v for k, v in env.items() if k not in drop and not k.startswith(prefixes)},
-            'GIT_TERMINAL_PROMPT': '0', **GIT_LANG, **GIT_ENV, **GIT_ATTRS}
+            'GIT_TERMINAL_PROMPT': '0', **GIT_LANG, **GIT_ENV, **GIT_ATTRS, **GIT_FORMATS}
+
+
+def remote_problem(remote):
+    """Why a fetch that carries the run's token (GIT_AUTH: gh's login for https://github.com) must not go to
+    `remote`, or None. Plain http keeps the job's traces (git_env), and GitHub redirects it to https, where git then
+    asks the helper for the token; a `transport::address` remote runs whichever remote helper it names on any address,
+    https included. An ssh URL, a path or a file:// URL gets no token."""
+    if not remote:
+        return 'the remote is empty'
+    if remote.lower().startswith('http://'):
+        return (f'the remote {remote[:100]} is plain http: GitHub would redirect it to https and git would hand the '
+                'token over with the traces kept. Use https')
+    if re.match(r'[A-Za-z][A-Za-z0-9+.-]*::', remote):
+        return f'the remote {remote[:100]} names a remote helper (transport::address): give a URL or a path'
+    return None
+
+
+def init_bare(path):
+    """Makes the empty folder `path` a bare repository as the queue's cache and the gate's repository are:
+    `git init --bare --template=` (no hooks, no sample files), then CACHE_CONFIG and CACHE_HEAD written over what git
+    wrote, never left to git's defaults (git 3.0 plans `main`). None, or why it could not be made. A repository git made
+    in another format than SHA-1 objects with files refs (format 0, no extensions: a git that ignored GIT_FORMATS) is
+    refused, never written over: CACHE_CONFIG would then name a format its refs or objects are not in."""
+    r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
+                       capture_output=True, env=git_env(no_token_env()))
+    if r.returncode != 0:
+        return f'git init failed: {r.stderr.strip()[:300]}'
+    try:
+        with open(os.path.join(path, 'config'), encoding='utf-8', errors='replace') as f:
+            made = f.read()
+        version = re.search(r'^\s*repositoryformatversion\s*=\s*(\S*)', made, re.M | re.I)
+        section = re.search(r'^\s*\[\s*extensions\s*\]([^[]*)', made, re.M | re.I)
+        if section or (version and version.group(1) != '0'):
+            said = ', '.join(f'extensions.{k}={v}' for k, v in
+                             re.findall(r'^\s*([\w.-]+)\s*=\s*(\S*)', section.group(1) if section else '', re.M))
+            said = said or (f'format version {version.group(1)}' if version else 'an [extensions] section')
+            return (f'git init made a repository with {said[:200]}: the '
+                    'queue reads only SHA-1 objects and files refs (format 0, no extensions), and this git ignored '
+                    'GIT_DEFAULT_HASH=sha1 and GIT_DEFAULT_REF_FORMAT=files')
+        write_text(os.path.join(path, 'config'), CACHE_CONFIG)
+        write_text(os.path.join(path, 'HEAD'), CACHE_HEAD)
+    except OSError as e:
+        return f'could not read or write its config: {e}'
+    return None
 
 
 def fetch_failed(stderr, login):
@@ -514,14 +566,16 @@ class Queue:
             self.said.add(key)
             print(text)
 
-    def git(self, *a, fetch=False):
+    def git(self, *a, fetch=False, errors='strict'):
         """git in the cache, with the run's read token, and with no token at all when there is none (never gh's own
         login of the machine). `fetch`: the call fetches from the remote (only Queue.fetch's two), so it keeps what of
-        the job's GIT_RUN the remote may need; every other call runs none of it (git_env)."""
+        the job's GIT_RUN the remote may need; every other call runs none of it (git_env). `errors`: how git's output
+        is decoded (UTF-8)."""
         token = self.read_token
         env = self.gh_env(token) if token else no_token_env()
         return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env=git_env(env, self.remote if fetch else None))
+                              text=True, encoding='utf-8', errors=errors, capture_output=True,
+                              env=git_env(env, self.remote if fetch else None))
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
@@ -582,19 +636,28 @@ class Queue:
         except OSError as e:
             print(f'could not make {new}: {e}')
             return False
-        r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True, env=git_env(no_token_env()))
-        if r.returncode != 0:
-            print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
+        problem = init_bare(new)
+        if problem:
+            print(f'could not make {self.cache}: {problem}')
             return False
         try:
-            write_text(os.path.join(new, 'config'), CACHE_CONFIG)
-            write_text(os.path.join(new, 'HEAD'), CACHE_HEAD)   # what git init wrote; said here, not left to its default
             os.rename(new, self.cache)
         except OSError as e:   # something made the cache between the two steps: the next run sets it aside
             print(f'could not move the new repository to {self.cache}: {e}')
             return False
         return True
+
+    def objects_problem(self):
+        """Why the cache's objects are not what GitHub sent, or None. git checks the hash of a commit it parses, never
+        of a tree or blob merge-tree reads, and the cache is kept between runs: a tree an earlier job wrote under the
+        name of one side's tree (a loose object where the real one is loose too, as a small fetch leaves it, or a pack
+        of its own) makes a real conflict merge clean. git fsck checks the hash of every object, loose and packed, and
+        that each ref's history is complete. It reads every object: a large repository's cache takes some seconds."""
+        r = self.git('fsck', '--no-dangling', '--no-reflogs', '--no-progress', errors='replace')
+        if r.returncode == 0:
+            return None
+        said = (r.stderr.strip() or r.stdout.strip()).splitlines()
+        return f'has objects git fsck finds broken or missing ({said[0][:200] if said else f"exit {r.returncode}"})'
 
     def has(self, sha):
         return bool(SHA.fullmatch(sha or '')) and self.git('cat-file', '-e', sha + '^{commit}').returncode == 0
@@ -628,6 +691,12 @@ class Queue:
         if head == read:
             return True
         got = self.fetch(base, n, head, read)
+        if got and (problem := self.objects_problem()):   # right before the merge check: objects_problem
+            print(f'{self.cache} {problem}: rebuilding it')
+            got = self.fetch(base, n, head, read) if set_aside(self.cache) else None
+            if got and (problem := self.objects_problem()):
+                print(f'#{n}: {self.cache}, fetched again from GitHub, still {problem}: not merged in')
+                return None
         return holds(self.git, head, read) if got else got
 
     # --- which armed PRs wait, and why ------------------------------------------------------------------------------

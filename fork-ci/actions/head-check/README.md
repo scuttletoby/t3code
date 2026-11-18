@@ -76,7 +76,10 @@ alternates, `info/attributes`). A refusal is a red required check too. git
 runs with no hooks, no fsmonitor, no replace refs and no attributes (they are
 read from the empty tree): neither the pull request's `.gitattributes` nor a
 bare repository's `HEAD` or `attr.tree` can turn a conflict into a clean merge.
-`--remote` (where a missing read commit is fetched from) needs `--bare`.
+`--remote` (where a missing read commit is fetched from) needs `--bare`, and
+is refused when it is empty, plain `http://` (GitHub would redirect it to
+https, and git would hand the token over) or a `transport::address` remote
+helper.
 
 It reads only and posts nothing. The one write is a fetch, into the job's own
 checkout, of a read commit the head dropped (a rebase or force-push; GitHub
@@ -220,7 +223,13 @@ How it works:
   from the caller's tree. Nothing of the pull request is checked out: the
   head and the base tip are read from the API and fetched by sha into a new
   bare repository, and `head_check.decide` (the same rule code as the action,
-  in bare mode) judges them. The config is read from the base tip.
+  in bare mode) judges them. The config is read from the base tip. Before it
+  makes that repository the gate checks its git (2.43 or newer) and its
+  remote (https, a path or a remote name): either problem fails the head's
+  check run ("not judged: ..."), with no repository made and nothing fetched.
+  The repository is made as the queue makes its cache (SHA-1 objects and files
+  refs, whatever git's defaults): a git that makes another format fails the
+  head too, never judged in a repository its config misnames.
 - **A check run belongs to a commit, not to a pull request.** The newest check
   run of the name on a head counts for every pull request with that head. So
   the gate judges a head, never one pull request alone:

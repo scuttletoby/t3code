@@ -389,9 +389,19 @@ a merge reads a file), and a cache that is not that user's alone (mode
 `0700`), has a config or a `HEAD` the queue did not write, has a branch at
 `HEAD`, or holds a file that changes what its objects say or how a merge reads
 them (`info/grafts`, `shallow`, `objects/info/alternates`,
-`objects/info/http-alternates` or `info/attributes`) is rebuilt, never used. A job of the same user
-can still change the cache between that check and git's next read: only the
-runner rule above stops that.
+`objects/info/http-alternates` or `info/attributes`) is rebuilt, never used.
+git checks the hash of a commit it reads, never of a tree or a blob
+`merge-tree` reads, so before each merge check the queue runs `git fsck` on
+the cache: an object stored under another object's name (a tree that makes a
+conflict merge clean) is found there. A cache `git fsck` finds broken is
+rebuilt and fetched again; one still broken after that is not merged in, and
+the next run tries again. `git fsck` reads every object, so on a large
+repository each merge check takes some seconds more (about 30 seconds for
+260,000 objects). The cache is made with SHA-1 objects and files refs whatever
+git's defaults (`GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT`; git 3.0 plans
+others); a git that makes another format is refused, never written over. A job
+of the same user can still change the cache between that check and git's next
+read: only the runner rule above stops that.
 
 | Exit | Meaning                                                                                                     |
 | ---- | ----------------------------------------------------------------------------------------------------------- |

@@ -13,6 +13,27 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: the cache's objects are checked before each merge check (#457)
+
+- Before each merge check the queue runs `git fsck` on its cache. git checks the hash of a commit it reads, never of
+  a tree or blob `merge-tree` reads: a tree an earlier job stored under one side's tree name made a real conflict merge
+  clean. A cache `git fsck` finds broken is rebuilt and fetched again; one still broken is not merged in (the run keeps
+  `STATE` and tries again). `git fsck` reads every object: a large repository's merge check takes some seconds more.
+- The queue's cache and the gate's repository are made with `GIT_DEFAULT_HASH=sha1` and
+  `GIT_DEFAULT_REF_FORMAT=files` (every git call gets both), and `HEAD` is written by the queue whatever branch git's
+  `init` names (git 3.0 plans `main`). A git that still makes another format (an `[extensions]` section) is refused
+  with the extension named: no cache, nothing fetched or merged; in the gate the head's check run fails.
+- git calls that reach no remote (the gate's `merge-tree`, the queue's) drop `GIT_TRACE*` and `GIT_CURL_VERBOSE`, as
+  the fetches from GitHub do; `HTTPS://` counts as https in any case.
+- A plain `http://` remote and a `transport::address` remote are refused: GitHub redirects http to https, where git
+  hands the token over, and a remote helper runs any program. `head_check.py --bare --remote ''` is refused (exit 2)
+  instead of becoming `origin`.
+- The gate checks git (2.43 or newer) and its remote before it makes its repository: either problem fails the head's
+  check run ("not judged: ..."), with nothing made or fetched.
+
+**Upgrade:** nothing to do. A kept cache is checked on its next merge check (it was made by the same code, so it
+passes); a broken one is rebuilt once.
+
 ### pr-queue and head-check: no attributes from HEAD; local git calls run no job program (#450)
 
 - Every git call of the queue, the gate and the head check reads attributes from the empty tree
@@ -31,8 +52,10 @@ nothing.
   for the gate).
 
 **Upgrade:** the queue, the gate and the head check need git 2.43 or newer (`GIT_ATTR_SOURCE` came in 2.41, and
-`merge-tree` with it crashed before 2.43); an older git is refused (exit 2), never run without it. A kept queue cache
-is rebuilt once if its `HEAD` is not the queue's; nothing else to do.
+`merge-tree` with it crashed before 2.43); an older git never merges or judges anything. The queue refuses to start
+(exit 2; it reads its config with git first and decides nothing on it), the head check refuses (exit 2), and the gate
+fails the head's check run before it makes its repository (#457). A kept queue cache is rebuilt once if its `HEAD` is
+not the queue's; nothing else to do.
 
 ### pr-queue and head-check: GIT_ATTR_SOURCE and the job's git programs (#442)
 

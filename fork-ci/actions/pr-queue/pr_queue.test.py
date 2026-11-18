@@ -41,7 +41,7 @@ def _gh_never_ran():
 
 atexit.register(_gh_never_ran)
 
-import argparse, contextlib, fcntl, io, json, subprocess, unittest, unittest.mock  # noqa: E402
+import argparse, contextlib, fcntl, io, json, subprocess, unittest, unittest.mock, zlib  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -67,7 +67,8 @@ READ_AT = r'(?i)read at\s*:|\blens\s*:'
 # --- the World: real commits, a local "GitHub" ----------------------------------------------------------------------
 # What git_env sets on every git call of the queue, whatever the job's environment holds.
 FORCED = {'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C', **Q.GIT_ENV,
-          'GIT_ATTR_SOURCE': '4b825dc642cb6eb9a060e54bf8d69288fbee4904'}   # the empty tree
+          'GIT_ATTR_SOURCE': '4b825dc642cb6eb9a060e54bf8d69288fbee4904',   # the empty tree
+          'GIT_DEFAULT_HASH': 'sha1', 'GIT_DEFAULT_REF_FORMAT': 'files'}   # #457 item 3: what CACHE_CONFIG names
 GIT_ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
            'GIT_EDITOR': 'true'}
 
@@ -1182,6 +1183,83 @@ class OwnCache(Base):
                 self.assertIn("is not this user's alone", out)
                 self.assertEqual(os.stat(self.q.cache).st_mode & 0o777, 0o700)
 
+    def init_writes(self, head=None, config=None):
+        """subprocess.run, where `git init` also writes `head` to HEAD and adds `config` to the config, as another git
+        would (git 3.0: HEAD names main; a reftable or SHA-256 default)."""
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            r = real(cmd, **kw)
+            if 'init' in cmd and r.returncode == 0:
+                if head is not None:
+                    with open(os.path.join(cmd[-1], 'HEAD'), 'w') as f:
+                        f.write(head)
+                if config is not None:
+                    with open(os.path.join(cmd[-1], 'config'), 'a') as f:
+                        f.write(config)
+            return r
+        return unittest.mock.patch.object(subprocess, 'run', run)
+
+    def test_a_git_whose_init_names_another_branch_still_makes_the_queues_head(self):   # #457 item 2: git 3.0, main
+        with self.init_writes(head='ref: refs/heads/main\n'):
+            for _ in range(3):   # made once, then kept: never rebuilt for a HEAD git chose
+                got, out = self.fetch(self.c)
+                self.assertTrue(got, out)
+                self.assertNotIn('rebuilding', out)
+                with open(os.path.join(self.q.cache, 'HEAD')) as f:
+                    self.assertEqual(f.read(), Q.CACHE_HEAD)
+                self.assertIsNone(self.q.cache_problem())
+
+    def test_a_head_or_config_that_is_a_link_is_never_followed(self):   # #457 item 4: cache_problem's O_NOFOLLOW
+        for name, text in (('HEAD', Q.CACHE_HEAD), ('config', Q.CACHE_CONFIG)):
+            with self.subTest(name):
+                self.assertTrue(self.fetch(self.c)[0])
+                target = os.path.join(self.w.dir, name + '-elsewhere')   # what the queue would write, but elsewhere
+                with open(target, 'w') as f:
+                    f.write(text)
+                path = os.path.join(self.q.cache, name)
+                os.remove(path)
+                os.symlink(target, path)
+                self.assertIn('cannot be checked', self.q.cache_problem())
+                got, out = self.fetch(self.up)
+                self.assertTrue(got, out)
+                self.assertIn('cannot be checked', out)
+                self.assertIn('rebuilding it', out)
+                self.assertFalse(os.path.islink(path))
+                got, out = self.fetch(self.up)   # runs again: kept
+                self.assertTrue(got, out)
+                self.assertNotIn('rebuilding', out)
+
+    def test_the_jobs_default_formats_never_reach_the_cache(self):   # #457 item 3: git 3.0 defaults, or a job's
+        envs, real = [], subprocess.run
+
+        def run(cmd, **kw):
+            if 'init' in cmd:
+                envs.append(kw.get('env'))
+            return real(cmd, **kw)
+        job = {'GIT_DEFAULT_HASH': 'sha256', 'GIT_DEFAULT_REF_FORMAT': 'reftable'}
+        with unittest.mock.patch.dict(os.environ, job), unittest.mock.patch.object(subprocess, 'run', run):
+            for _ in range(2):
+                got, out = self.fetch(self.c)
+                self.assertTrue(got, out)
+                self.assertNotIn('rebuilding', out)
+                self.assertEqual(self.q.git('rev-parse', '--show-object-format').stdout.strip(), 'sha1')
+        self.assertEqual(len(envs), 1, 'made once')
+        self.assertEqual({k: envs[0].get(k) for k in job}, Q.GIT_FORMATS)
+
+    def test_a_git_that_makes_another_format_is_refused_clearly(self):   # #457 item 3: refused, never written over
+        for extension in ('\n[extensions]\n\trefStorage = reftable\n', '\n[extensions]\n\tobjectFormat = sha256\n'):
+            with self.subTest(extension.split()[1]), self.init_writes(config=extension):
+                shutil.rmtree(self.q.cache, ignore_errors=True)
+                for _ in range(2):   # runs again: the same refusal, nothing fetched, nothing merged
+                    got, out = self.fetch(self.c)
+                    self.assertIsNone(got, out)
+                    self.assertIn('git init made a repository with extensions.' + extension.split()[1], out)
+                    self.assertIn('GIT_DEFAULT_HASH=sha1', out)
+                    self.assertFalse(os.path.lexists(self.q.cache))
+        got, out = self.fetch(self.c)   # a git that keeps the formats again: made as the queue's
+        self.assertTrue(got, out)
+
 
 def own(comment):
     """A PR comment for a fake `gh pr view`: a plain body is one the queue's own login posted."""
@@ -2254,6 +2332,120 @@ class HoldsReadsNoAttributesOfTheCache(unittest.TestCase):   # #450 item 1
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertIs(self.q.same_change('main', 7, self.head, self.read), False)
         self.assertIn('rebuilding it', out.getvalue())
+
+
+class HoldsChecksTheCachesObjects(unittest.TestCase):   # #457 item 1
+    """git checks the hash of a commit it parses, never of a tree or blob merge-tree reads. The cache is kept between
+    runs: an earlier job on the runner (the same user) could write another tree under the name of one side's tree, and
+    merge-tree would merge a real conflict clean. Before each merge check the queue runs git fsck on the cache; a cache
+    it finds broken is set aside and fetched again, never merged in."""
+
+    def setUp(self):
+        w = self.w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'c.json': '{"a": 1}\n'})
+        self.read = w.commit({'c.json': '{"a": 2}\n'}, [m0])
+        self.m1 = w.commit({'c.json': '{"a": 3}\n'}, [m0])
+        # what a planted tree makes merge-tree say: the base's side alone, the change read gone without a word
+        self.head = w.keep(w.git(w.work, 'commit-tree', self.m1 + '^{tree}', '-p', self.read, '-p', self.m1,
+                                 '-m', 'lost'))
+        w.set('refs/heads/main', self.m1)
+        w.set('refs/pull/7/head', self.head)
+        self.run_again()
+        got, out = run_quiet(self.q.fetch, 'main', 7, self.read)
+        self.assertIs(got, True, out)
+        self.assertIs(Q.holds(self.q.git, self.head, self.read), False, 'a real conflict')
+
+    def run_again(self):
+        """The next run: a new Queue on the same cache."""
+        self.q = make_queue(self.w.dir, remote=self.w.remote)
+        self.fscks = []
+        git = self.q.git
+
+        def counted(*a, **kw):
+            if 'fsck' in a:
+                self.fscks.append(a)
+            return git(*a, **kw)
+        self.q.git = counted
+
+    def cache_git(self, *a):
+        return World.git(self.w.dir, '--git-dir', self.q.cache, *a)
+
+    def plant(self):
+        """The read side's tree object replaced by the base side's tree, at the same name (a loose object, as a small
+        fetch leaves it: git reads a packed object before a loose one, so a packed one is replaced by a pack)."""
+        victim, donor = self.cache_git('rev-parse', self.read + '^{tree}', self.m1 + '^{tree}').split()
+        body = subprocess.run(['git', '--git-dir', self.q.cache, 'cat-file', 'tree', donor], capture_output=True,
+                              check=True).stdout
+        path = os.path.join(self.q.cache, 'objects', victim[:2], victim[2:])
+        self.assertTrue(os.path.exists(path), 'a small fetch leaves loose objects')
+        os.chmod(path, 0o644)
+        with open(path, 'wb') as f:
+            f.write(zlib.compress(b'tree %d\0' % len(body) + body))
+        self.assertIs(Q.holds(self.q.git, self.head, self.read), True,
+                      'the planted tree does not merge the conflict clean on this git: the test reads nothing')
+
+    def same_change(self):
+        return run_quiet(self.q.same_change, 'main', 7, self.head, self.read)
+
+    def test_a_replaced_tree_object_makes_the_run_refuse(self):   # the lens's case
+        for planted in range(2):   # planted again in the rebuilt cache: refused again
+            with self.subTest(planted=planted):
+                self.plant()
+                self.run_again()
+                same, out = self.same_change()
+                self.assertIs(same, False, out)
+                self.assertIn('git fsck', out)
+                self.assertIn('rebuilding it', out)
+                fsck = subprocess.run(['git', '--git-dir', self.q.cache, 'fsck', '--no-dangling'], capture_output=True)
+                self.assertEqual(fsck.returncode, 0, 'the rebuilt cache holds only what was fetched')
+                for _ in range(2):   # runs again: the rebuilt cache is kept and gives the same answer
+                    self.run_again()
+                    same, out = self.same_change()
+                    self.assertIs(same, False, out)
+                    self.assertNotIn('rebuilding', out)
+                    self.assertEqual(len(self.fscks), 1, 'one check before the merge check')
+
+    def test_a_cache_still_broken_after_the_rebuild_is_never_merged(self):   # nothing is known: STATE stays
+        self.q.objects_problem = lambda: 'has objects git fsck finds broken (planted)'
+        with unittest.mock.patch.object(Q, 'holds', side_effect=AssertionError('merged in a broken cache')):
+            for _ in range(2):
+                same, out = self.same_change()
+                self.assertIsNone(same, out)
+                self.assertIn('fetched again', out)
+
+    def test_a_kept_healthy_cache_is_checked_and_kept(self):   # a cache from before the fix: the same files
+        for _ in range(2):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            self.assertNotIn('rebuilding', out)
+            self.assertEqual(len(self.fscks), 1)
+        self.cache_git('repack', '-adq')   # git's own gc packs it: still the queue's
+        self.run_again()
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertNotIn('rebuilding', out)
+
+    def test_a_new_empty_cache_is_made_fetched_and_checked(self):
+        shutil.rmtree(self.q.cache)
+        for _ in range(2):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            self.assertNotIn('rebuilding', out)
+            self.assertEqual(len(self.fscks), 1)
+
+    def test_a_fetch_stopped_half_way_leaves_a_cache_that_still_answers(self):   # killed while writing objects
+        for name in (os.path.join('objects', 'pack', 'tmp_pack_x1Y2z3'), os.path.join('objects', 'ab', 'tmp_obj_x')):
+            path = os.path.join(self.q.cache, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'wb') as f:
+                f.write(b'PACK\0\0\0\2half')
+        for _ in range(2):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
 
 
 class Conflict(unittest.TestCase):
@@ -3520,7 +3712,7 @@ class Cli(unittest.TestCase):
         hostile = {k: 'x' for k in Q.GIT_DROP}
         hostile.update(GIT_CONFIG_KEY_3='core.bare', GIT_CONFIG_VALUE_3='true', GIT_TRACE='0', PATH='/bin')
         env = Q.git_env(hostile)
-        self.assertEqual(env, {'GIT_TRACE': '0', 'PATH': '/bin', **FORCED})
+        self.assertEqual(env, {'PATH': '/bin', **FORCED})   # #457 item 4: a local call writes no trace either
         for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
                      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_CONFIG',
                      'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_REPLACE_REF_BASE', 'GIT_GRAFT_FILE',
@@ -3556,6 +3748,7 @@ class Cli(unittest.TestCase):
         # https with the queue's own login (or none): no ssh, no git:// proxy, no prompt, git's default protocols;
         # git's own helpers (remote-https, index-pack) are found through GIT_EXEC_PATH
         self.assertEqual(Q.git_env(job, 'https://github.com/o/r.git'), {**plain, 'GIT_EXEC_PATH': 'x'})
+        self.assertEqual(Q.git_env(job, 'Https://github.com/o/r.git'), {**plain, 'GIT_EXEC_PATH': 'x'})
         for remote in ('origin', '/srv/r.git', 'file:///srv/r.git', 'ssh://git@host/r.git', 'git@host:r.git',
                        'http://host/r.git'):   # #450 item 6: plain http is no GitHub fetch either
             with self.subTest(remote):   # the caller's remote: it may need them, so they stay
@@ -3566,10 +3759,23 @@ class Cli(unittest.TestCase):
                                   'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_CURL_VERBOSE')}
         trace['GIT_TRACE_REDACT'] = '0'
         job = {**trace, 'PATH': '/bin'}
-        self.assertEqual(Q.git_env(job, 'https://github.com/o/r.git'), {'PATH': '/bin', **FORCED})
-        for remote in (None, 'origin', 'ssh://git@host/r.git'):   # no token of the queue's goes there
+        for remote in (None, 'https://github.com/o/r.git', 'HTTPS://GitHub.com/o/r.git'):   # #457 item 4: local calls
+            with self.subTest(remote):   # (the gate's merge-tree, the queue's), and https in any case
+                self.assertEqual(Q.git_env(job, remote), {'PATH': '/bin', **FORCED})
+        for remote in ('origin', 'ssh://git@host/r.git'):   # no token of the queue's goes there
             with self.subTest(remote):
                 self.assertLessEqual(trace.items(), Q.git_env(job, remote).items())
+
+    def test_only_a_url_or_a_path_is_a_remote_a_token_goes_to(self):   # #457 item 4
+        for remote in ('https://github.com/o/r.git', 'HTTPS://github.com/o/r.git', 'origin', '/srv/r.git',
+                       'file:///srv/r.git', 'ssh://git@host/r.git', 'git@host:r.git', 'C:/srv/r.git'):
+            with self.subTest(remote):
+                self.assertIsNone(Q.remote_problem(remote))
+        for remote, said in (('', 'empty'), (None, 'empty'), ('http://github.com/o/r.git', 'plain http'),
+                             ('HTTP://github.com/o/r.git', 'plain http'), ('ext::sh -c id', 'remote helper'),
+                             ('fd::3', 'remote helper'), ('https::github.com/o/r.git', 'remote helper')):
+            with self.subTest(remote):
+                self.assertIn(said, Q.remote_problem(remote))
 
     def test_git_speaks_one_language(self):   # #450 item 4: messages are matched and decoded as UTF-8
         env = Q.git_env({'LC_ALL': 'de_DE.ISO-8859-1', 'LANG': 'de_DE', 'LANGUAGE': 'de', 'LC_MESSAGES': 'de_DE'})
