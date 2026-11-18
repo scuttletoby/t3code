@@ -124,6 +124,17 @@
         "const unfollowed = stopThere(followScope(scope.thread, remoteChild), remoteChild, \"stop\");",
         "yield* unfollowed.pipe(Effect.ignoreCause({ log: true }));"
       ]
+    },
+    "apps/web/src/components/ChatView.browser.test.tsx": {
+      "why": "#474: upstream's test \"an interrupted image-only first send of a new thread says it may not have been sent\" presses Enter once the pasted image's tile shows. The tile shows while the image still compresses, and the composer refuses a send then (\"Still compressing a pasted image\"), so on a loaded runner the launch never came and the test went red. The fork line waits until the tile's preview button is enabled, which is when the image is ready. Drop this seam when upstream's test waits for the ready image itself.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-18",
+        "added": [
+          "// Fork: the tile shows while the image still compresses, and that Enter sends nothing.",
+          "await expect.element(page.getByRole(\"button\", { name: \"Preview shot.png\" })).toBeEnabled();"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
