@@ -20,6 +20,20 @@ function git(args) {
   });
 }
 
+/**
+ * The committer date (YYYY-MM-DD) of the commit `rev` names. A tag is peeled (`git show <tag>`
+ * prints the tag before the date); anything but a day throws, as no day compares as "not expired".
+ */
+function commitDay(rev) {
+  const day = git(["show", "-s", "--format=%cs", `${rev}^{commit}`]).trim();
+  if (!isDay(day)) {
+    throw new Error(
+      `${rev}: no commit date (git show --format=%cs printed ${JSON.stringify(day.slice(0, 40))}); announcements are dated by it.`,
+    );
+  }
+  return day;
+}
+
 /** The tree entry for `file` in `rev` ({ type, id }), or undefined. Reads trees only. */
 function entryAt(rev, file) {
   const record = git(["ls-tree", "-z", "--full-tree", rev, "--", file]).split("\0")[0];
@@ -61,12 +75,20 @@ const total = (lines) => lines.reduce((sum, [, extra]) => sum + extra, 0);
 /** A seam entry's lines: its "added" ones and those it announces (step 1 of a new line). */
 const seamLines = (seam) => [...seam.added, ...(seam.announced?.added ?? [])];
 
-/** `text` with control characters escaped: a list's key with a newline cannot start a log line. */
+// Control characters, then those that print as nothing or reorder text: soft hyphen, bidi marks,
+// Hangul fillers, zero-width characters, variation selectors and tag characters.
+const UNPRINTABLE =
+  /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\u3164\ufe00-\ufe0f\ufeff\uffa0\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu;
+
+/**
+ * `text` with those characters escaped: a list's key with a newline cannot start a log line, and
+ * a bidi or invisible character shows as itself, not as the text it reorders or hides.
+ */
 const printable = (text) =>
-  String(text).replace(
-    /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u2028\u2029]/g,
-    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
+  String(text).replace(UNPRINTABLE, (char) => {
+    const hex = char.codePointAt(0).toString(16);
+    return hex.length > 4 ? `\\u{${hex}}` : `\\u${hex.padStart(4, "0")}`;
+  });
 
 /**
  * The non-blank lines in order, with their indentation (in YAML or Python it is meaning) but no
@@ -126,13 +148,14 @@ function parseRemoved(text = "") {
 }
 
 /**
- * Reasons for the seam files' lines. A line is the fork's when `head` has it more often than `base`;
- * each listed line allows one. Not from upstream, `base` is main, whose copies spent the allowance.
- * `today` (a pull request's run: main's commit date, never the pull request's): an announcement
- * more than its days old allows nothing (from upstream it is refused on its own).
+ * Reasons for the seam files' lines: each listed line allows one copy more than `base` has (not from
+ * upstream, `base` is main, whose copies spent it). On `today` (a pull request's run: the list's
+ * commit date) an expired or dated-ahead announcement allows nothing: the copies it would allow in
+ * date go to `late`, any more to the reasons.
  */
-function findSeamBreaches(files, { atBase, atHead, upstream = false, today }) {
+function findSeamBreaches(files, { atBase, atHead, upstream = false, today, late }) {
   const reasons = [];
+  const lateReasons = late ?? reasons;
   for (const [file, seam] of Object.entries(files)) {
     const base = atBase(file);
     const head = atHead(file);
@@ -150,20 +173,34 @@ function findSeamBreaches(files, { atBase, atHead, upstream = false, today }) {
       continue;
     }
     const since = seam.announced?.since;
-    const expired = today !== undefined && since !== undefined && isExpired(since, today);
+    const expired =
+      today !== undefined &&
+      since !== undefined &&
+      (isExpired(since, today) || isAhead(since, today));
     const allowed = lineCounts((expired ? seam.added : seamLines(seam)).join("\n"));
-    const announced = expired ? lineCounts(seam.announced.added.join("\n")) : new Map();
+    const inDate = expired ? lineCounts(seamLines(seam).join("\n")) : allowed;
     const baseCounts = lineCounts(base);
+    const leftOf = (counts, line) => {
+      const allowance = counts.get(line) ?? 0;
+      return upstream ? allowance : Math.max(0, allowance - (baseCounts.get(line) ?? 0));
+    };
+    const adds = (copies, line) => `${file}: adds ${copies === 1 ? "" : `${copies}× `}\`${line}\``;
     for (const [line, added] of addedLines(base, head)) {
-      const allowance = allowed.get(line) ?? 0;
-      const left = upstream ? allowance : Math.max(0, allowance - (baseCounts.get(line) ?? 0));
+      const left = leftOf(allowed, line);
       const extra = added - left;
-      if (extra > 0) {
-        const why = announced.has(line)
-          ? ` (its announcement of ${since} is more than ${ANNOUNCED_DAYS} days before ${today}, main's commit date: announce it again with a list-only pull request)`
-          : "";
-        reasons.push(`${file}: adds ${extra === 1 ? "" : `${extra}× `}\`${line}\`${why}`);
+      if (extra <= 0) continue;
+      // Only the copies the announcement would allow in date are its to fix; the rest are refused
+      // either way.
+      const lateCopies = Math.min(extra, leftOf(inDate, line) - left);
+      if (lateCopies > 0) {
+        const when = isAhead(since, today)
+          ? "is dated after"
+          : `is more than ${ANNOUNCED_DAYS} days before`;
+        lateReasons.push(
+          `${adds(lateCopies, line)} (its announcement of ${since} ${when} ${today}, the list's commit date: announce it again with a list-only pull request)`,
+        );
       }
+      if (extra > lateCopies) reasons.push(adds(extra - lateCopies, line));
     }
   }
   return reasons;
@@ -438,11 +475,21 @@ function findStaleSeamLines(files, read) {
 const ANNOUNCED_DAYS = 14;
 const WARN_DAYS = 3;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const dayNumber = (day) => Date.parse(`${day}T00:00:00Z`) / DAY_MS;
+/** `day` as a count of days. Throws on anything but a day: NaN compares as "not expired". */
+function dayNumber(day) {
+  if (!isDay(day)) {
+    throw new Error(`not a day (YYYY-MM-DD): ${JSON.stringify(String(day).slice(0, 40))}`);
+  }
+  return Date.parse(`${day}T00:00:00Z`) / DAY_MS;
+}
+// The day an announcement made again carries: "today" would lose the days its review takes.
+const SINCE_AGAIN = 'set "since" to the day that pull request merges';
 const dayAfter = (day, days) =>
   new Date((dayNumber(day) + days) * DAY_MS).toISOString().slice(0, 10);
 /** Whether an announcement of `since` is more than its days old on `today`. */
 const isExpired = (since, today) => dayNumber(today) - dayNumber(since) > ANNOUNCED_DAYS;
+/** Whether `since` is after `today`, beyond the one day left for time zones. */
+const isAhead = (since, today) => dayNumber(since) - dayNumber(today) > 1;
 
 /**
  * Announcements past their days, or dated after `today` (the head's commit date: a fresh rebase is
@@ -454,14 +501,12 @@ function findExpiredAnnouncements(files, today) {
   for (const [file, seam] of Object.entries(files)) {
     if (seam.announced === undefined) continue;
     const { since, added } = seam.announced;
-    const days = dayNumber(today) - dayNumber(since);
     const lines = `${added.length} line${added.length === 1 ? "" : "s"} "announced" on ${since}`;
     if (isExpired(since, today)) {
       reasons.push(
-        `${file}: ${lines}, more than ${ANNOUNCED_DAYS} days before ${today} (the head's commit date): add ${added.length === 1 ? "it" : "them"} (step 2) or remove the announcement.`,
+        `${file}: ${lines}, more than ${ANNOUNCED_DAYS} days before ${today} (the head's commit date): announce ${added.length === 1 ? "it" : "them"} again (${SINCE_AGAIN}) or remove the announcement, with a list-only pull request to main.`,
       );
-    } else if (days < -1) {
-      // One day is left for time zones.
+    } else if (isAhead(since, today)) {
       reasons.push(
         `${file}: ${lines}, after ${today} (the head's commit date): date it the day it is announced.`,
       );
@@ -483,7 +528,7 @@ function findAnnouncementWarnings(ownFiles, baseFiles, today) {
     const { since } = seam.announced;
     const fix = 'set "since" to the day this pull request merges.';
     const refused = dayAfter(since, ANNOUNCED_DAYS + 1);
-    if (dayNumber(since) - dayNumber(today) > 1) {
+    if (isAhead(since, today)) {
       warnings.push(
         `${file}: "announced" on ${since}, after today (${today}), so fork-follow refuses it: ${fix}`,
       );
@@ -527,6 +572,16 @@ function refuseUnknownKeys(object, known, where) {
 const isStringList = (value) =>
   Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim() !== "");
 
+/** Refuses a listed line with a line break: split, it would allow a line nobody listed as one. */
+function refuseLineBreaks(file, lines) {
+  const broken = lines.find((line) => /[\n\r]/.test(line));
+  if (broken !== undefined) {
+    throw new Error(
+      `${CONFIG}: ${file}: a listed line holds a line break (one line per item): ${JSON.stringify(broken)}`,
+    );
+  }
+}
+
 /** The config, checked; throws on a malformed config so the check never runs empty. */
 function parseConfig(text) {
   const config = JSON.parse(text);
@@ -546,6 +601,7 @@ function parseConfig(text) {
       throw new Error(`${CONFIG}: ${file}: "added" must be a list of lines`);
     }
     refuseUnknownKeys(seam, SEAM_KEYS, `${file}: `);
+    refuseLineBreaks(file, seam.added);
     if (seam.announced !== undefined) {
       const announced = seam.announced;
       const shape = `${CONFIG}: ${file}: "announced" needs {"since": "YYYY-MM-DD", "added": [lines]}: the day it is announced and at least one line`;
@@ -556,6 +612,7 @@ function parseConfig(text) {
       if (!isDay(announced.since) || !isStringList(announced.added) || !announced.added.length) {
         throw new Error(shape);
       }
+      refuseLineBreaks(file, announced.added);
       // Counted twice, a copied line would allow a second copy that nobody reviewed.
       const listed = new Set(seam.added.map((line) => line.trim()));
       const both = announced.added.find((line) => listed.has(line.trim()));
@@ -751,11 +808,12 @@ function main(argv) {
   // that rose with a rebase names the operator's step in its own text.
   const ceilings = [...unlisted.ceilings, ...lost.ceilings];
   const rises = [...unlisted.rises, ...lost.rises];
-  const commitDay = (rev) => git(["show", "-s", "--format=%cs", rev]).trim();
-  // A pull request's run dates an announcement by main's commit: its own author sets its date.
-  const today = upstream ? undefined : commitDay(base);
+  // A pull request's run dates an announcement by the commit whose list judges it (main's): its
+  // own author sets its own date, and fork-checks' base can be older than the list's commit.
+  const today = upstream ? undefined : commitDay(configRef);
+  const late = [];
   const reasons = [
-    ...findSeamBreaches(config.files, { atBase, atHead, upstream, today }),
+    ...findSeamBreaches(config.files, { atBase, atHead, upstream, today, late }),
     ...lost.reasons,
     ...unlisted.reasons,
     ...(upstream
@@ -801,7 +859,7 @@ function main(argv) {
       `Fix the list in this change: merged, it is main's list, and a malformed one stops every later pull request and fork-follow run.`,
     );
   }
-  const refused = [...reasons, ...rises, ...ceilings, ...expired, ...landed];
+  const refused = [...reasons, ...late, ...rises, ...ceilings, ...expired, ...landed];
   if (refused.length === 0) {
     if (listProblem !== undefined) return 1;
     console.log(
@@ -825,9 +883,14 @@ function main(argv) {
       `Lower each "pending" ceiling and "lost" count named above (or remove the entry) in ${CONFIG} with a pull request to main.`,
     );
   }
+  if (late.length > 0) {
+    console.error(
+      `Announce each line named above again (${SINCE_AGAIN}) in ${CONFIG} with a list-only pull request to main, then update this change from main (docs/fork/updates.md, "Adding a seam line").`,
+    );
+  }
   if (expired.length > 0) {
     console.error(
-      `Add each announced line (step 2) or remove its announcement in ${CONFIG}, with a pull request to main (docs/fork/updates.md, "Adding a seam line").`,
+      `Announce each line named above again (${SINCE_AGAIN}) or remove its announcement, with a list-only pull request to main; only then step 2. Step 2 alone is refused once main's commit date is past the announcement's days too (a pull request's run dates it by that; docs/fork/updates.md, "Adding a seam line").`,
     );
   }
   if (landed.length > 0) {
