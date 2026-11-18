@@ -144,7 +144,10 @@ case "$ACTION" in
      fi ;;
 esac
 
-body="$(mktemp "${TMPDIR:-/tmp}/fork-follow-report.XXXXXX")"
+# Without the file there is no body for the summary or the issue: stop here and say so in the run,
+# instead of posting an empty one.
+body="$(mktemp "${TMPDIR:-/tmp}/fork-follow-report.XXXXXX")" \
+  || { echo "::error::Could not make a temporary file in ${TMPDIR:-/tmp}, so nothing was reported." >&2; exit 1; }
 # Removed however the report ends (a cancelled run ends it while it waits for GitHub).
 trap 'rm -f "$body"' EXIT
 {
