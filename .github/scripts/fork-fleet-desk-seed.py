@@ -178,20 +178,30 @@ def offer(pool, command, lock_dir, out=1, err=sys.stderr, config=CONFIG, files=F
             try:
                 sha, sent = send(fd, out, st.st_size)
                 after = os.fstat(fd)
+                # Timestamps tick coarsely: a same-size rewrite in the tick of the last change (its mtime put back)
+                # moves none of them, so the bytes are read again. A rename over NAME.tar leaves them as they were.
+                same = (sent == st.st_size and (after.st_size, after.st_mtime_ns) == (st.st_size, st.st_mtime_ns)
+                        and summed(fd, sent) == sha)
             finally:
                 os.close(fd)
         finally:
             os.close(lock)
-        # A rename over NAME.tar unlinks the open file (st_nlink 0), which changes its ctime but not its bytes:
-        # only a file still in place must keep its ctime (a rewrite with the old mtime put back).
-        same = ('st_size', 'st_mtime_ns') + (('st_ctime_ns',) if after.st_nlink else ())
-        if sent != st.st_size or any(getattr(after, k) != getattr(st, k) for k in same):
+        if not same:
             raise Refused(f'{name}: it changed while it was sent (made in place, not by rename?)', 4)
         print(f'seed {name} {sent} {sha} {int(st.st_mtime)}', file=err, flush=True)
         return 0
     except Refused as e:
         print(f'fork-fleet-desk seed: {e}', file=err, flush=True)
         return e.code
+
+
+def summed(fd, size):
+    """The sha256 of FD's first SIZE bytes as they are now."""
+    sha, at = hashlib.sha256(), 0
+    while at < size and (data := os.pread(fd, min(PIECE, size - at), at)):
+        sha.update(data)
+        at += len(data)
+    return sha.hexdigest()
 
 
 class Stalled(Exception):

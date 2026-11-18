@@ -245,15 +245,21 @@ class Host(Base):
 
     def test_a_same_size_rewrite_with_its_old_date_put_back_is_exit_4(self):
         self.make('m2', {'a': b'x' * 3000})
-        path, send = self.tar('m2'), seed.send
+        path, send, fstat = self.tar('m2'), seed.send, os.fstat
 
         def rewriting(fd, out, size):
-            st = os.stat(path)
-            with open(path, 'r+b') as f:   # in place, same size, the old mtime put back: only ctime tells
+            st, sent = os.stat(path), send(fd, out, size)
+            with open(path, 'r+b') as f:   # in place after bytes were sent, same size, the old mtime put back
                 f.write(b'y' * 512)
             os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
-            return send(fd, out, size)
-        with mock.patch.object(seed, 'send', rewriting):
+            return sent
+
+        def same_tick(fd):   # the rewrite lands in the tick of the last change: no timestamp moves
+            st = fstat(fd)
+            return os.stat_result(st[:9] + (0,), {'st_ctime': 0.0, 'st_ctime_ns': 0, 'st_atime': st.st_atime,
+                                                   'st_mtime': st.st_mtime, 'st_atime_ns': st.st_atime_ns,
+                                                   'st_mtime_ns': st.st_mtime_ns})
+        with mock.patch.object(seed, 'send', rewriting), mock.patch.object(seed.os, 'fstat', same_tick):
             code, _, err = self.offer('seed m2')
         self.assertEqual(code, 4)
         self.assertIn('changed while it was sent', err)
