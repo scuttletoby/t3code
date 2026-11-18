@@ -1278,7 +1278,8 @@ class Round2(SwitchBase):
         self.assertNotIn('before', self.names('started'))  # install-target refused the changed stage first
         self.assertEqual(self.done('back-start')[0]['version'], fx.LIVE)
         journal.settle(self.m.state, 'test: put right')
-        self.m.stage_release(fx.TARGET, files={'t3': open(SLEEP, 'rb').read(), 'lib/runtime.txt': 'runtime data'})
+        with open(SLEEP, 'rb') as f:
+            self.m.stage_release(fx.TARGET, files={'t3': f.read(), 'lib/runtime.txt': 'runtime data'})
         self.rehearsed()
         ran.clear()
         with mock.patch.object(switch, '_report', report), \
