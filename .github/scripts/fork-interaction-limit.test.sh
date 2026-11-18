@@ -69,6 +69,10 @@ GH
 
 script="$here/fork-interaction-limit.sh"
 export STUB_STATE="$root/state" FORK_TEST_NOW=1800000000 GITHUB_REPOSITORY=owner/repo
+# The script makes its temporary files in a folder of this test: a leftover is seen at the end of
+# this file and goes with $root (fork-temp-files.test.sh has the cases, one by one).
+export TMPDIR="$root/tmp"
+mkdir -p "$TMPDIR"
 unset REPOSITORY GITHUB_STEP_SUMMARY RUN_URL
 fails=0
 day=86400
@@ -312,6 +316,10 @@ set +e
 out="$(GH_TOKEN=x bash "$script" check 2>&1)"; rc=$?
 set -e
 expect "guard: a token in test mode refuses" 'rc_is 1 && says "a GitHub token is set"'
+
+# Every call above, passing or refused: what the script made in TMPDIR is gone again.
+out="$(ls -A "$TMPDIR")" rc=0
+expect "temp: the script left nothing in TMPDIR" '[[ -z "$out" ]]'
 
 echo
 if (( fails )); then
