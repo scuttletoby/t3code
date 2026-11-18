@@ -12,7 +12,7 @@ from unittest import mock
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
 LIB = os.path.join(KIT, 'lib', 'cleaner')
-MODULES = ('config', 'facts', 'guard', 'rules', 'engine')
+MODULES = ('config', 'facts', 'guard', 'rules', 'engine', 'report')
 if COMMON not in sys.path:
     sys.path.insert(0, COMMON)
 
@@ -99,6 +99,11 @@ elif args[:2] == ['volume', 'rm']:
     del volumes[name]
     with open({state!r}, 'w') as f:
         json.dump(state, f)
+elif args[:3] == ['system', 'df', '-v']:
+    for name, v in volumes.items():
+        print(name, v.get('size', '0B'), sep='\t')
+elif args[:1] == ['info']:
+    print(state.get('root', '/'))
 else:
     sys.exit(64)
 '''

@@ -16,13 +16,27 @@ MACHINE_OWNER = 0    # tests only: the uid that must own it (root)
 # Never deleted, whatever a rule or the section says: the agent tools' homes whole (transcripts, sessions, their
 # databases, settings and logins) and T3's data folders (its databases and logs; `dev` is a development build's).
 # `~` is the home of the user the cleaner runs as; * and ? match within one path part.
-MUST_KEEP = (
-    '~/.claude*', '~/.codex*', '~/.t3*/userdata', '~/.t3*/dev',
+AGENT_HOMES = (
+    '~/.claude*', '~/.codex*',
     # other agent tools, where they keep sessions, history and logins
     '~/.gemini', '~/.qwen', '~/.cursor', '~/.config/Cursor', '~/.aider*', '~/.continue', '~/.copilot',
     '~/.config/github-copilot', '~/.codeium', '~/.kiro', '~/.amazon-q', '~/.config/amazon-q', '~/.local/share/amazon-q',
     '~/.config/opencode', '~/.local/share/opencode', '~/.local/state/opencode', '~/.config/crush',
     '~/.local/share/crush', '~/.config/goose', '~/.local/share/goose', '~/.config/amp', '~/.local/share/amp',
+)
+T3_DATA = ('~/.t3*/userdata', '~/.t3*/dev')
+MUST_KEEP = AGENT_HOMES + T3_DATA
+# The classes of the disk report (`fork-cleaner report`, report.py), in its order: the one list it sizes. A rule's
+# class is what that rule looks at ('rule:<name>', the same selection the rule makes); a must-keep class is its
+# group above; None is a class no rule takes yet. What is in none of them is "everything else". A new rule or a
+# new must-keep group gets its class here (report.test.py fails until it does).
+CLASSES = (
+    ('worktrees', 'rule:worktrees'),
+    ('docker volumes', 'rule:docker'),
+    ('temp', 'rule:tmp'),
+    ('agent transcripts', AGENT_HOMES),
+    ('T3 data', T3_DATA),
+    ('build caches', None),
 )
 # Never deleted wherever they are: a folder or file with one of these names, and anything that holds one.
 MUST_KEEP_NAMES = ('repair-backups', '*log-archive*')
@@ -157,7 +171,8 @@ class Config:
         self.log_file = os.path.join(os.path.realpath(os.path.dirname(log)), os.path.basename(log))
         self.lock_file = self.log_file + '.lock'
         self.journal_file = self.log_file + '.deleting'     # deletes started and not ended (engine.py)
-        for own in (self.log_file, self.lock_file, self.journal_file):
+        self.report_file = self.log_file + '.reported'      # the last line of the log the last report counted
+        for own in (self.log_file, self.lock_file, self.journal_file, self.report_file):
             kept = must_keep_match(self.must_keep, own)
             if kept is not None or any(fnmatch.fnmatchcase(part.lower(), glob) for part in own.split('/') for glob in MUST_KEEP_NAMES):
                 raise machine_file.MachineFileError(f'{where}.logFile: {values["logFile"]} is in a must-keep path, '

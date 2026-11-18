@@ -16,12 +16,14 @@ This is the first part: the core and three rules. No installer and no timer yet:
 | guard        | `lib/cleaner/guard.py`  | the hard refusals: asked about every path, twice              |
 | rules        | `lib/cleaner/rules.py`  | `worktrees`, `docker`, `tmp`: what each wants gone, and why   |
 | `plan`,`run` | `lib/cleaner/engine.py` | the two commands, the lock and the log                        |
+| `report`     | `lib/cleaner/report.py` | one line: GB per class, and what runs freed                   |
 
 ## Commands
 
 ```
 fork-cleaner plan    # prints what a run would delete and what it keeps; changes nothing
 fork-cleaner run     # deletes it; one log line per delete
+fork-cleaner report  # one line for the daily report: GB per class, and what runs freed; deletes nothing
 ```
 
 `plan` writes no file, takes no lock and makes no log. `run` takes a lock (one run at a time), plans, then reads
@@ -88,6 +90,38 @@ delete") does leave its line. The journal line is written (and synced) before th
 that cannot be written stops the run before that delete. A journal that cannot be read, or is not a regular
 file, stops `run` before any delete; `plan` says so, lists every planned path as `kept ... could not read`
 instead of `would delete`, and exits 1.
+
+## The report
+
+`fork-cleaner report` prints one line for the daily report of this host, for example:
+
+```
+disk on host-1: worktrees 12.3 GB, docker volumes off, temp 0.4 GB (on another disk), agent transcripts 20.1 GB,
+T3 data could not read (/home/u/.t3/userdata/x: Permission denied), build caches no rule yet, everything else
+139.3 GB (with what could not be read) (180.2 GB of 250.0 GB used); freed since the last report at
+2026-01-02T03:04:05Z 2.1 GB (4 deletes, 1 of unknown size); 2 log lines not understood, skipped
+```
+
+(one line; wrapped here). It deletes nothing and needs no lock.
+
+- **The classes** are `CLASSES` in `config.py`, the one list: a rule's class is what that rule looks at (the
+  worktrees and clones of the listed repositories, the temp entries a pattern takes, Docker's volumes), a
+  must-keep class is its group of must-keep paths (`AGENT_HOMES`, `T3_DATA`). `build caches` has no rule yet.
+  `everything else` is the used space of the home folder's disk that no class holds; a class on another disk says
+  `(on another disk)` and is not taken off it.
+- **Sizes** are blocks on disk. A link is never followed (it counts as itself), another filesystem mounted inside
+  is not entered, and each folder and each hard-linked file counts once in the whole report, in the first class
+  that reaches it. Docker's volumes are root's, so their size is Docker's own (`docker system df -v`, all volumes,
+  named ones too); with the `docker` rule off, Docker is not asked (`docker volumes off`).
+- **Could not read:** a class that cannot be read in full (a folder without permission, Docker that gives no
+  full answer) says `could not read` and why; the other classes still print, and the command exits 1.
+- **Freed** adds up the `deleted` lines of the log after the last line the previous report counted. That line is
+  kept in the mark `<logFile>.reported` (the only file the report writes, and only when the log has a line). No
+  log: `freed 0.0 GB`. No mark yet, or a mark it cannot use (it says so and exits 1): the whole log counts. When
+  the log was trimmed past that line, every line left is newer, so the whole log counts. A line it does not
+  understand (an older or newer version's, or a delete without a size and rule it knows) is skipped and counted.
+  A line still being written (no line end yet) waits for the next report. A log that is not the cleaner's: `freed
+  could not read`, exit 1, and the mark stays.
 
 ## What it never deletes
 
@@ -228,7 +262,7 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 
 | Key                             | Default                                   | Meaning                                                                                           |
 | ------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `logFile`                       | `~/.local/state/fork-cleaner/cleaner.log` | the log; the lock and the journal are beside it (new, or the cleaner's own)                       |
+| `logFile`                       | `~/.local/state/fork-cleaner/cleaner.log` | the log; the lock, journal and report mark are beside it (new, or the cleaner's own)              |
 | `logLines`                      | 5000                                      | lines the log keeps (10 or more)                                                                  |
 | `mustKeep`                      | none                                      | more paths that are never deleted (`*` within one part)                                           |
 | `worktrees.repos[].root`        | required                                  | the folder the clones and worktrees are directly in                                               |
@@ -288,6 +322,7 @@ GitHub is read with the `gh` command of the user the cleaner runs as.
 python3 -I -B fork-kit/cleaner/tests/guard.test.py
 python3 -I -B fork-kit/cleaner/tests/worktrees.test.py
 python3 -I -B fork-kit/cleaner/tests/engine.test.py
+python3 -I -B fork-kit/cleaner/tests/report.test.py
 ```
 
 Everything lives in one temporary folder per test: real git repositories whose "GitHub" is a bare repository, stub

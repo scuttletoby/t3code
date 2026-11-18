@@ -571,6 +571,28 @@ def remove_volume(name):
     _docker('volume', 'rm', name)
 
 
+# Docker's sizes are decimal (units.HumanSize): 1 kB is 1000 bytes.
+DOCKER_SIZE = re.compile(r'^(\d+(?:\.\d+)?)(B|kB|KB|MB|GB|TB|PB)$')
+DOCKER_UNITS = {'B': 1, 'kB': 1000, 'KB': 1000, 'MB': 1000 ** 2, 'GB': 1000 ** 3, 'TB': 1000 ** 4, 'PB': 1000 ** 5}
+
+
+def docker_volume_sizes():
+    """(sizes, folder): {name: bytes} of every volume, named ones too, as Docker itself measures them (`docker
+    system df -v`: its folders are root's, so the user cannot walk them), and Docker's own folder, where they are.
+    Raises Unreadable when Docker gives no full answer, a size it could not measure included."""
+    sizes = {}
+    for line in _docker('system', 'df', '-v', '--format', '{{range .Volumes}}{{.Name}}\t{{.Size}}\n{{end}}').splitlines():
+        if not line:
+            continue
+        fields = line.split('\t')
+        found = DOCKER_SIZE.match(fields[1]) if len(fields) == 2 else None
+        if not found:
+            raise Unreadable(f'Docker (docker system df printed a volume size it cannot use: {line[:80]!r})')
+        sizes[fields[0]] = int(float(found.group(1)) * DOCKER_UNITS[found.group(2)])
+    folder = _docker('info', '--format', '{{.DockerRootDir}}').strip()
+    return sizes, folder
+
+
 # --- one view of it all -------------------------------------------------------------------------------------------
 class Facts:
     """What one run knows. While planning, the process list and the mounts are read again when they are older than

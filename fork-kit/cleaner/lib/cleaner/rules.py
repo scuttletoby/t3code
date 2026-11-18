@@ -63,10 +63,9 @@ def _entries(root):
 
 
 # --- tmp ----------------------------------------------------------------------------------------------------------
-def tmp_answer(cfg, facts, path):
-    """(why, look) for one entry of the temp folder, or None when the rule does not take it: no pattern matches
-    its name, or it changed too recently."""
-    name = os.path.basename(path)
+def tmp_match(cfg, name):
+    """(pattern, days) of the first pattern that takes an entry of the temp folder called `name`; None when no
+    pattern matches or no pattern may take it. The disk report's temp class is the entries this takes."""
     if matches(name, TMP_NEVER):
         return None
     match = None
@@ -74,6 +73,13 @@ def tmp_answer(cfg, facts, path):
         if fnmatch.fnmatchcase(name, pattern):
             match = (pattern, days)
             break
+    return match
+
+
+def tmp_answer(cfg, facts, path):
+    """(why, look) for one entry of the temp folder, or None when the rule does not take it: no pattern matches
+    its name, or it changed too recently."""
+    match = tmp_match(cfg, os.path.basename(path))
     if match is None:
         return None
     pattern, days = match
@@ -428,6 +434,13 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
     look = guard.examine(cfg, facts, path, kind)
     out['look'] = look
     return look.refusal
+
+
+def tree_of(repo, path):
+    """'worktree' or 'clone' when `path` is one of the listed repository (by its origin URL), the folders this rule
+    looks at; None for anything else. Raises Unreadable when it cannot tell. The disk report's worktrees class."""
+    kind = tree_kind(path)
+    return kind if kind is not None and same_repo(origin_url(path), repo.github) else None
 
 
 def tree_answer(cfg, facts, repo, path):
